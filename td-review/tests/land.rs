@@ -1129,6 +1129,168 @@ fn a_no_push_sentinel_behind_a_real_pushurl_still_blocks_the_remote() -> Res<()>
     Ok(())
 }
 
+/// `remote.<name>.skipPushAll` takes a remote out of `--push`/`P` and out of
+/// nothing else — the difference from `no_push`, which is a push url nothing
+/// can push to. The push by name at the end is the whole point of the option:
+/// a laptop that is usually asleep is still a remote you push to on the days
+/// it is awake.
+#[test]
+fn a_remote_that_opts_out_of_push_all_is_left_out_and_still_pushable_by_name() -> Res<()> {
+    let s = scenario("skip-pushall")?;
+    let before = git(&s.backup, &["rev-parse", "main"])?.trim().to_string();
+    git(&s.work, &["config", "remote.backup.skipPushAll", "true"])?;
+
+    let (ok, output) =
+        review(&s.work, &["--land", "origin/work-0001-feature", "--squash", "--yes", "--push"])?;
+    assert!(ok, "{output}");
+    assert!(
+        output.contains("backup left out: remote.backup.skipPushAll is set"),
+        "the run must say which remote it left out, and why:\n{output}"
+    );
+    assert!(!output.contains("==> backup"), "the opted-out remote was pushed to:\n{output}");
+    assert_eq!(
+        git(&s.backup, &["rev-parse", "main"])?.trim(),
+        before,
+        "backup was published to despite opting out of the push-all"
+    );
+    // Still an ordinary remote: what it opted out of was the push-all.
+    let head = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
+    git(&s.work, &["push", "backup", "main"])?;
+    assert_eq!(git(&s.backup, &["rev-parse", "main"])?.trim(), head);
+    Ok(())
+}
+
+/// `--delete-landed` sweeps the remotes the push REACHED, which is no longer
+/// every pushable one: a remote that sat the push-all out never took the
+/// landing, so deleting its copy of the branch would leave that remote with
+/// neither. The TUI's sweep was already scoped this way for a mirror that
+/// rejected a push; an opt-out is the same shape.
+#[test]
+fn the_landed_sweep_spares_a_branch_on_a_remote_the_push_all_left_out() -> Res<()> {
+    let s = scenario("skip-pushall-sweep")?;
+    // backup carries the branch too, so there is something to spare.
+    git(&s.work, &["push", "backup", "origin/work-0001-feature:refs/heads/work-0001-feature"])?;
+    git(&s.work, &["fetch", "-q", "backup"])?;
+    git(&s.work, &["config", "remote.backup.skipPushAll", "true"])?;
+
+    let (ok, output) = review(
+        &s.work,
+        &["--land", "origin/work-0001-feature", "--squash", "--yes", "--push", "--delete-landed"],
+    )?;
+    assert!(ok, "{output}");
+    let heads = git(&s.backup, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])?;
+    assert!(
+        heads.contains("work-0001-feature"),
+        "a remote the push-all left out must keep its branch: {heads}\n{output}"
+    );
+    // Kept is not the same as forgotten: the run says so, as the push says
+    // which remotes it left out.
+    assert!(
+        output.contains("backup/work-0001-feature kept: the push did not reach backup"),
+        "the run must say the branch was kept, and why:\n{output}"
+    );
+    let heads = git(&s.origin, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])?;
+    assert!(
+        !heads.contains("work-0001-feature"),
+        "the remote that took the landing should have been swept: {heads}\n{output}"
+    );
+    Ok(())
+}
+
+/// `on` is a boolean to git and to nothing that compares against the string
+/// `true`, so this is what pins `--type=bool` itself: without it the value
+/// comes back as `on`, the remote is pushed to, and every other test here
+/// still passes.
+#[test]
+fn a_spelling_only_git_reads_as_true_still_opts_the_remote_out() -> Res<()> {
+    let s = scenario("skip-pushall-on")?;
+    let before = git(&s.backup, &["rev-parse", "main"])?.trim().to_string();
+    git(&s.work, &["config", "remote.backup.skipPushAll", "on"])?;
+
+    let (ok, output) =
+        review(&s.work, &["--land", "origin/work-0001-feature", "--squash", "--yes", "--push"])?;
+    assert!(ok, "{output}");
+    assert!(output.contains("backup left out"), "`on` must opt the remote out:\n{output}");
+    assert_eq!(
+        git(&s.backup, &["rev-parse", "main"])?.trim(),
+        before,
+        "backup was published to despite `skipPushAll = on`"
+    );
+    Ok(())
+}
+
+/// A landing nobody would take is still a landing that published nothing, so
+/// `--push` fails as it does when every remote is `no_push`. What changes is
+/// the reason it gives: a config the operator wrote, not one nobody meant.
+#[test]
+fn a_push_all_every_remote_opted_out_of_fails_saying_so() -> Res<()> {
+    let s = scenario("skip-pushall-all")?;
+    for remote in ["origin", "backup", "archive"] {
+        git(&s.work, &["config", &format!("remote.{remote}.skipPushAll"), "true"])?;
+    }
+
+    let (ok, output) =
+        review(&s.work, &["--land", "origin/work-0001-feature", "--squash", "--yes", "--push"])?;
+    assert!(!ok, "a commit published nowhere is not a successful --push:\n{output}");
+    assert!(
+        output.contains("every remote asked to be left out"),
+        "the reason must be the opt-out, not ineligibility:\n{output}"
+    );
+    // The landing itself happened: only the publish did not.
+    assert_eq!(git(&s.work, &["rev-list", "--count", "main"])?.trim(), "2");
+    Ok(())
+}
+
+/// git parses the value, so a repeated key resolves to its LAST value as git
+/// resolves one.
+#[test]
+fn the_opt_out_is_a_git_boolean_and_the_last_value_wins() -> Res<()> {
+    let s = scenario("skip-pushall-bool")?;
+    // The `false` added after the opt-out is what decides, as it would for any
+    // git config.
+    git(&s.work, &["config", "remote.backup.skipPushAll", "yes"])?;
+    git(&s.work, &["config", "--add", "remote.backup.skipPushAll", "false"])?;
+
+    let (ok, output) =
+        review(&s.work, &["--land", "origin/work-0001-feature", "--squash", "--yes", "--push"])?;
+    assert!(ok, "{output}");
+    assert!(!output.contains("backup left out"), "the last value must win:\n{output}");
+    assert_eq!(
+        git(&s.backup, &["rev-parse", "main"])?.trim(),
+        git(&s.work, &["rev-parse", "main"])?.trim(),
+        "backup opted back in and was not published to"
+    );
+    Ok(())
+}
+
+/// A value git cannot read as a boolean is not permission to push: the remote
+/// is left out and git's own diagnostic — which names the key and the value —
+/// is what says so. The landing itself still succeeds and still publishes
+/// everywhere else.
+#[test]
+fn an_opt_out_that_is_not_a_boolean_leaves_the_remote_out_and_says_why() -> Res<()> {
+    let s = scenario("skip-pushall-junk")?;
+    let before = git(&s.backup, &["rev-parse", "main"])?.trim().to_string();
+    git(&s.work, &["config", "remote.backup.skipPushAll", "sometimes"])?;
+
+    let (ok, output) =
+        review(&s.work, &["--land", "origin/work-0001-feature", "--squash", "--yes", "--push"])?;
+    assert!(ok, "an unreadable opt-out must not fail the landing:\n{output}");
+    assert!(output.contains("backup left out:"), "output: {output}");
+    assert!(output.contains("sometimes"), "git's diagnostic must name the value:\n{output}");
+    assert_eq!(
+        git(&s.backup, &["rev-parse", "main"])?.trim(),
+        before,
+        "a remote whose opt-out cannot be read was pushed to"
+    );
+    assert_eq!(
+        git(&s.origin, &["rev-parse", "main"])?.trim(),
+        git(&s.work, &["rev-parse", "main"])?.trim(),
+        "the other remotes must still be published to"
+    );
+    Ok(())
+}
+
 #[test]
 fn a_partial_push_failure_is_reported_as_failure() -> Res<()> {
     let s = scenario("partialpush")?;
@@ -1738,7 +1900,7 @@ fn delete_landed_is_not_a_failure_when_there_is_nothing_to_delete() -> Res<()> {
         &["--land", "archive/work-0001-feature", "--squash", "--yes", "--push", "--delete-landed"],
     )?;
     assert!(ok, "an empty cleanup is not a failed landing:\n{output}");
-    assert!(output.contains("no pushable remote carries the landed"), "output: {output}");
+    assert!(output.contains("no remote this push reached carries the landed"), "output: {output}");
     Ok(())
 }
 

@@ -5,7 +5,7 @@
 use std::fs;
 use std::io;
 
-use crate::git::{Git, HeadClaim, MergeResult, NO_PUSH};
+use crate::git::{Git, HeadClaim, MergeResult, NO_PUSH, SKIP_PUSH_ALL};
 use crate::term::{Line, Style, CYAN, GREEN, RED, YELLOW};
 
 /// How a branch is taken onto the base.
@@ -1007,6 +1007,57 @@ pub fn delete_branch(
     Ok(Pushed { log, all_ok, reached })
 }
 
+/// Why a push-all left a remote alone.
+#[derive(Debug)]
+pub enum LeftOut {
+    /// `remote.<name>.skipPushAll` asked to be.
+    OptedOut,
+    /// Its value is not a boolean at all, carrying git's own diagnostic — which
+    /// names both the key and what it holds. Left out rather than pushed to:
+    /// a stated intent nobody can read is not permission to push on a keystroke.
+    Unreadable(String),
+}
+
+impl LeftOut {
+    /// The whole line, remote and reason — the record that this remote was not
+    /// published to.
+    pub fn line(&self, remote: &str) -> String {
+        match self {
+            LeftOut::OptedOut => {
+                format!("{remote} left out: remote.{remote}.{SKIP_PUSH_ALL} is set")
+            }
+            LeftOut::Unreadable(e) => format!("{remote} left out: {e}"),
+        }
+    }
+}
+
+/// Which remotes a push-all publishes to, and which of them it leaves alone.
+pub struct PushAllTargets {
+    /// Passed to [`push_all`] as they come from `git remote`, sentinel and all:
+    /// the `no_push` skip is the push's own, and it reports it per target.
+    pub targets: Vec<(String, String)>,
+    /// Never a silent omission: the line naming the targets does not name what
+    /// is missing from it, so nothing else would say the laptop was skipped.
+    pub left_out: Vec<(String, LeftOut)>,
+}
+
+/// Split every configured remote into the ones a push-all takes and the ones
+/// `remote.<name>.skipPushAll` excuses. The one place both the TUI's `P` and
+/// the CLI's `--push` decide this; `p` and a hand-typed `git push <remote>`
+/// name a remote and so go there whatever it has configured.
+pub fn push_all_targets(git: &Git) -> io::Result<PushAllTargets> {
+    let mut targets = Vec::new();
+    let mut left_out = Vec::new();
+    for (name, url) in git.remotes()? {
+        match git.skips_push_all(&name) {
+            Ok(false) => targets.push((name, url)),
+            Ok(true) => left_out.push((name, LeftOut::OptedOut)),
+            Err(e) => left_out.push((name, LeftOut::Unreadable(format!("{e}")))),
+        }
+    }
+    Ok(PushAllTargets { targets, left_out })
+}
+
 /// Push the just-committed `sha` to every remote, skipping the `no_push` ones
 /// — what `git pushall` does, with the refspec spelled out rather than left to
 /// `push.default`, and pinned to the reviewed commit rather than to HEAD.
@@ -1031,7 +1082,10 @@ pub fn push_all(
     }
 
     if remotes.is_empty() {
-        log.push(Line::new("no remotes configured — nothing to publish", Style::fg(YELLOW)));
+        // Not "no remotes configured": since `skipPushAll` an empty target list
+        // is as likely to be every remote opting out, and the caller has
+        // already said which by name.
+        log.push(Line::new("no remote to publish to", Style::fg(YELLOW)));
         return Ok(Pushed { log, all_ok: true, reached: Vec::new() });
     }
     let refspec = format!("{sha}:refs/heads/{base}");

@@ -37,12 +37,16 @@ options:
                       commits onto the base; needs --yes
       --squash        with --land, collapse them into one commit instead
       --push          with --land, also push the base to every remote (`P`;
-                      the TUI's `p` pushes to the base's remote alone)
+                      the TUI's `p` pushes to the base's remote alone). A
+                      remote with `remote.<name>.skipPushAll` set is left out
+                      of this and of `P`, and of nothing else
       --expect <oid>  with --land, require the branch to still be at <oid>
       --expect-base <oid>
                       with --land, require the base to still be at <oid>
-      --delete <br>   delete <br> from every pushable remote; needs --yes
-      --delete-landed with --land --push, delete the branch once it is published
+      --delete <br>   delete <br> from every pushable remote, skipPushAll or
+                      not — it names a branch, not a push; needs --yes
+      --delete-landed with --land --push, delete the branch once it is
+                      published, from the remotes the push reached
       --prune-worktrees
                       show the worktrees whose branch has fully landed (clean,
                       unpushed, not -rolling); removes them with --yes
@@ -53,7 +57,8 @@ keys (TUI):
   j/k move   enter review   r reload   / filter   D delete   w worktrees
   ? help   q quit
   f fetch the base's remote   F fetch every remote
-  p push the base to its remote   P push the base to every remote
+  p push the base to its remote   P push the base to every remote that has
+  not set remote.<name>.skipPushAll
   in review: j/k or space/b scroll, p pager, s squash + land, r rebase + land
   landing commits only; p publishes it afterwards, unconfirmed, and
   deletes the branches it published from the remotes it reached
@@ -326,7 +331,7 @@ fn delete_headless(
     base: &str,
     branch: &str,
     yes: bool,
-    landed_oid: Option<&str>,
+    landed: Option<(&str, &[String])>,
 ) -> io::Result<ExitCode> {
     if !yes {
         return Err(io::Error::other(
@@ -335,15 +340,37 @@ fn delete_headless(
     }
     let remotes = git.remote_names()?;
     let (named, short) = git::split_remote(branch, &remotes);
-    // Post-land cleanup sweeps every remote holding the commit we just took —
-    // `--delete-landed` only runs after `--push` reached them all, and the oid
-    // filter is what makes it safe; an ad-hoc `--delete origin/x` touches only
-    // the remote it names.
-    let only = if landed_oid.is_some() { None } else { named.map(|n| vec![n.to_string()]) };
+    // Post-land cleanup considers every remote — so it can SAY which ones it
+    // leaves alone — and deletes only from those the push REACHED, as the
+    // TUI's sweep does: a remote that did not take the landing must keep its
+    // copy of the branch, which since `skipPushAll` includes one that was
+    // never asked. The oid filter is what makes even the reached ones safe; an
+    // ad-hoc `--delete origin/x` touches only the remote it names.
+    let landed_oid = landed.map(|(oid, _)| oid);
+    let only = match landed {
+        Some(_) => None,
+        None => named.map(|n| vec![n.to_string()]),
+    };
     let (targets, diverged) = land::delete_plan(git, short, only.as_deref(), landed_oid)?;
     for d in &diverged {
         println!("{}/{} is not the landed commit — left alone", scrub(&d.remote), scrub(short));
     }
+    let targets = match landed {
+        Some((_, reached)) => {
+            let (theirs, mine): (Vec<_>, Vec<_>) =
+                targets.into_iter().partition(|t| !reached.contains(&t.remote));
+            for t in &theirs {
+                println!(
+                    "{}/{} kept: the push did not reach {}",
+                    scrub(&t.remote),
+                    scrub(short),
+                    scrub(&t.remote)
+                );
+            }
+            mine
+        }
+        None => targets,
+    };
     let deleted = land::delete_branch(git, base, short, &targets)?;
     for line in &deleted.log {
         println!("{}", scrub(&line.text));
@@ -358,7 +385,9 @@ fn delete_headless(
             eprintln!("td-review: no pushable remote carries '{}'", scrub(short));
             return Ok(ExitCode::FAILURE);
         }
-        println!("no pushable remote carries the landed {}", scrub(short));
+        // Not "no pushable remote": one that sat the push-all out is pushable
+        // and was simply never asked, and it is named above as kept.
+        println!("no remote this push reached carries the landed {}", scrub(short));
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -403,7 +432,10 @@ fn land_headless(git: &Git, base: &str, branch: &str, args: &Args) -> io::Result
         let Outcome::Committed { sha } = &landing.outcome else {
             return Ok(ExitCode::FAILURE);
         };
-        let remotes = git.remotes()?;
+        let land::PushAllTargets { targets: remotes, left_out } = land::push_all_targets(git)?;
+        for (name, why) in &left_out {
+            println!("{}", scrub(&why.line(name)));
+        }
         // A push publishes every local commit on the base, not only the one
         // just landed; name them rather than let them ride along unannounced.
         let unpushed = git.unpushed(base)?;
@@ -421,7 +453,15 @@ fn land_headless(git: &Git, base: &str, branch: &str, args: &Args) -> io::Result
             return Ok(ExitCode::FAILURE);
         }
         if pushed.count() == 0 {
-            eprintln!("td-review: no remote was eligible — the commit was not published");
+            // Still a failure — `--push` was asked for and the commit is local
+            // — but which reason it was matters to whoever reads the log: one
+            // is a config nobody meant, the other is one they wrote.
+            let why = if remotes.is_empty() && !left_out.is_empty() {
+                "every remote asked to be left out"
+            } else {
+                "no remote was eligible"
+            };
+            eprintln!("td-review: {why} — the commit was not published");
             return Ok(ExitCode::FAILURE);
         }
         // Only ever after a verified publish: the branch is the sole copy of
@@ -437,9 +477,8 @@ fn land_headless(git: &Git, base: &str, branch: &str, args: &Args) -> io::Result
             }
             // A failed cleanup is not a failed landing: the work is published.
             // Report it distinctly rather than as "nothing landed".
-            if delete_headless(git, base, branch, true, landed_oid.as_deref())?
-                != ExitCode::SUCCESS
-            {
+            let landed = landed_oid.as_deref().map(|oid| (oid, pushed.reached.as_slice()));
+            if delete_headless(git, base, branch, true, landed)? != ExitCode::SUCCESS {
                 eprintln!("td-review: landed and published, but the branch delete failed");
                 return Ok(ExitCode::from(3));
             }

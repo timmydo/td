@@ -40,6 +40,10 @@ enum Prompt {
     Sweep { paths: Vec<String> },
 }
 
+/// What a push publishes to: the remotes and their push URLs, plus whoever a
+/// push-all left out. `p` names one remote, so its second half is always empty.
+type Targets = (Vec<(String, String)>, Vec<(String, land::LeftOut)>);
+
 /// Names of the remotes a push would actually reach.
 fn pushable(remotes: &[(String, String)]) -> Vec<&str> {
     remotes
@@ -563,16 +567,19 @@ impl App {
         Ok(())
     }
 
-    /// The remotes `p`/`P` would publish to, or `None` having said why there is
-    /// nothing to publish to.
-    fn push_targets(&mut self, all: bool) -> io::Result<Option<Vec<(String, String)>>> {
-        let remotes = self.git.remotes()?;
+    /// The remotes `p`/`P` would publish to and any the push-all left out, or
+    /// `None` having said why there is nothing to publish to. Only `P`
+    /// consults `skipPushAll`: `p` asks for one named remote, and naming it is
+    /// the whole of the decision, so it can leave nobody out.
+    fn push_targets(&mut self, all: bool) -> io::Result<Option<Targets>> {
         if all {
-            return Ok(Some(remotes));
+            let t = land::push_all_targets(&self.git)?;
+            return Ok(Some((t.targets, t.left_out)));
         }
+        let remotes = self.git.remotes()?;
         match self.git.default_remote(&self.base)? {
             DefaultRemote::Remote(name) => {
-                Ok(Some(remotes.into_iter().filter(|(n, _)| n == &name).collect()))
+                Ok(Some((remotes.into_iter().filter(|(n, _)| n == &name).collect(), Vec::new())))
             }
             DefaultRemote::NoRemotes => {
                 self.note("no remotes configured", Style::fg(YELLOW));
@@ -585,14 +592,28 @@ impl App {
         }
     }
 
+    /// Every remote a push-all left out, by name and reason. The line naming
+    /// the targets cannot say what is missing from it, so this is the only
+    /// record that a remote was not published to — and an unreadable value is
+    /// a config error to fix rather than something the operator asked for.
+    fn log_left_out(&mut self, left_out: &[(String, land::LeftOut)]) {
+        for (name, why) in left_out {
+            let style = match why {
+                land::LeftOut::OptedOut => Style::dim(),
+                land::LeftOut::Unreadable(_) => Style::fg(YELLOW),
+            };
+            self.log.push(Line::new(format!("  {}", why.line(name)), style));
+        }
+    }
+
     /// `p` publishes the base to its own remote, `P` to every remote — no
     /// confirmation: the keystroke is the decision. A push carries every local
     /// commit the target lacks, not only the last landing, so the pane records
     /// them per target, and `push_all` still refuses if the base moved since
     /// the commit was read below.
     fn push_base(&mut self, all: bool, term: &mut dyn Ui) -> io::Result<()> {
-        let remotes = match self.push_targets(all) {
-            Ok(Some(remotes)) => remotes,
+        let (remotes, left_out) = match self.push_targets(all) {
+            Ok(Some(targets)) => targets,
             // push_targets said why on the status bar.
             Ok(None) => return Ok(()),
             // Naming the targets is a query, not the push: report it rather
@@ -603,11 +624,27 @@ impl App {
             }
         };
         if pushable(&remotes).is_empty() {
-            let why = if remotes.is_empty() {
-                "no remotes configured".to_string()
-            } else {
-                format!("every target is marked {} — nothing to push", git::NO_PUSH)
+            let why = match (remotes.is_empty(), left_out.is_empty()) {
+                (true, true) => "no remotes configured".to_string(),
+                // The status bar is one row, so the reason per remote is on the
+                // pane below rather than crammed into it.
+                (true, false) => "every remote was left out — nothing to push".to_string(),
+                _ => format!("every target is marked {} — nothing to push", git::NO_PUSH),
             };
+            // Opened for this alone when there is nothing to push: it is the
+            // case where WHY matters most, and an unreadable value would
+            // otherwise be reported as an opt-out somebody chose.
+            if !left_out.is_empty() {
+                self.screen = Screen::Log;
+                if !self.log.is_empty() {
+                    self.log.push(Line::blank());
+                }
+                self.log_title = format!("not pushing {}", self.base);
+                self.log
+                    .push(Line::new(format!("not pushing {}: {why}", self.base), Style::fg(YELLOW)));
+                self.log_left_out(&left_out);
+                self.log_to_end(term);
+            }
             self.note(why, Style::fg(YELLOW));
             return Ok(());
         }
@@ -633,6 +670,7 @@ impl App {
             ),
             Style::fg(CYAN),
         ));
+        self.log_left_out(&left_out);
         if let Some((upstream, n)) = &self.base_stale {
             self.log.push(Line::new(
                 format!(
@@ -1302,7 +1340,9 @@ fn help_lines() -> Vec<Line> {
             ("F", "fetch + prune every remote, mirrors included"),
             ("p", "push the base to its remote (else origin), then delete"),
             ("", "the branches that push published — no confirmation"),
-            ("P", "the same, to every remote (no_push skipped)"),
+            ("P", "the same, to every remote — bar the no_push ones and"),
+            ("", "any with `git config remote.<name>.skipPushAll true`,"),
+            ("", "which `p` and a hand-typed `git push` still reach"),
             ("r", "re-read branches"),
             ("/", "filter by branch name (esc clears)"),
             ("D", "delete the selected branch from the remote its row names"),
@@ -2183,6 +2223,65 @@ mod tests {
         assert!(!pushed.all_ok, "{text}");
         assert_eq!(pushed.count(), 0, "{text}");
         assert!(text.contains("refusing to push"), "{text}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `remote.<name>.skipPushAll` is `P`'s opt-out and nothing else's: `p`
+    /// asks for one named remote, and naming it is the whole of the decision.
+    /// Both halves in one test, because either alone would pass on a shell
+    /// that had simply stopped pushing to that remote.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn a_remote_can_opt_out_of_push_all_without_opting_out_of_a_push_that_names_it() {
+        let (root, work) = repo("skip-pushall");
+        let laptop = root.join("laptop.git");
+        git_in(&root, &["init", "--bare", "-b", "main", &laptop.to_string_lossy()]);
+        git_in(&work, &["remote", "add", "laptop", &laptop.to_string_lossy()]);
+        git_in(&work, &["config", "remote.laptop.skipPushAll", "true"]);
+        let mut app = app_on(&work);
+        let mut ui = FakeUi::new();
+
+        app.handle(Key::Char('P'), &mut ui).unwrap();
+
+        let log = app.log.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(
+            log.contains("laptop left out: remote.laptop.skipPushAll is set"),
+            "the pane must say which remote it left out, and why:\n{log}"
+        );
+        assert!(!log.contains("==> laptop"), "P pushed to the opted-out remote:\n{log}");
+        let heads = git_in(&laptop, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
+        assert!(heads.trim().is_empty(), "P published to the opted-out remote: {heads}");
+
+        // Same remote, now the base's own: `p` names it, so it goes. `q` first
+        // — the push left the pane up, where `p` is a scroll.
+        git_in(&work, &["config", "branch.main.remote", "laptop"]);
+        for key in [Key::Char('q'), Key::Char('p')] {
+            app.handle(key, &mut ui).unwrap();
+        }
+
+        let heads = git_in(&laptop, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
+        assert!(heads.contains("main"), "p must reach the remote it names: {heads}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Nothing left to push is the case where the reason matters MOST, and it
+    /// is the one that used to return before the pane had it: a value git could
+    /// not read would have been reported as an opt-out somebody chose, with the
+    /// diagnostic naming it nowhere on screen.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn a_push_all_with_nothing_left_to_push_still_names_what_it_left_out() {
+        let (root, work) = repo("skip-pushall-none");
+        git_in(&work, &["config", "remote.origin.skipPushAll", "sometimes"]);
+        let mut app = app_on(&work);
+        let mut ui = FakeUi::new();
+
+        app.handle(Key::Char('P'), &mut ui).unwrap();
+
+        assert_eq!(app.status, "every remote was left out — nothing to push");
+        let log = app.log.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(log.contains("origin left out:"), "the pane must name the remote:\n{log}");
+        assert!(log.contains("sometimes"), "git's diagnostic must reach the pane:\n{log}");
         let _ = std::fs::remove_dir_all(root);
     }
 

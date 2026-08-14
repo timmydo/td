@@ -19,6 +19,16 @@ const FS: char = '\x1f';
 /// convention `git pushall` already honours.
 pub const NO_PUSH: &str = "no_push";
 
+/// `git config remote.<name>.skipPushAll true` takes a remote out of the
+/// push-all (`P`, `--push`) and out of nothing else. Named after git's own
+/// `remote.<name>.skipFetchAll`, which is the same opt-out on the fetch side.
+/// It is the [`NO_PUSH`] sentinel's opposite number: that one is a push URL
+/// nothing can push to, for a remote that must never be written to, and it
+/// disables `git push <remote>` by hand as much as anything else. This is for
+/// a remote that is merely usually unreachable — a laptop that sleeps — where
+/// the push must still work on the days it is asked for by name.
+pub const SKIP_PUSH_ALL: &str = "skipPushAll";
+
 /// The suffix marking a workstream branch that outlives its own landings
 /// (AGENTS.md, "Parallel work"). Landing one does not finish it: the agent
 /// rebases onto the new base and keeps going, so the automatic post-push sweep
@@ -664,6 +674,27 @@ impl Git {
             out.push((name.to_string(), url));
         }
         Ok(out)
+    }
+
+    /// Whether `remote` has opted out of the push-all with [`SKIP_PUSH_ALL`].
+    /// git parses the value, so every spelling of a boolean it takes anywhere
+    /// else (`true`, `yes`, `on`, `1`, the bare key) is taken here, and a
+    /// repeated key resolves to its LAST value as git resolves one. `Err`
+    /// carries git's own diagnostic for a value that is not a boolean at all:
+    /// the caller reports it and leaves the remote out, since a stated intent
+    /// nobody can read is not permission to push on a keystroke.
+    pub fn skips_push_all(&self, remote: &str) -> io::Result<bool> {
+        let key = format!("remote.{remote}.{SKIP_PUSH_ALL}");
+        let run = self.run(&["config", "--type=bool", "--get-all", &key])?;
+        match (run.ok, run.code) {
+            (true, _) => {
+                Ok(run.stdout.lines().map(str::trim).rfind(|l| !l.is_empty()) == Some("true"))
+            }
+            // 1 is git's "no such key", which is every remote that never opted
+            // out — not a failure to report.
+            (false, Some(1)) => Ok(false),
+            _ => Err(io::Error::other(run.failure())),
+        }
     }
 }
 
