@@ -1,7 +1,7 @@
+use crate::help::HelpAction;
 use crate::keyboard::{
     KeyInput, KeyState, ModifierState, MOD_ALT, MOD_CAPS, MOD_CONTROL, MOD_LOGO, MOD_NUM, MOD_SHIFT,
 };
-use crate::help::HelpAction;
 use crate::launcher::{LaunchOptions, LaunchProcesses, LaunchRequest, LauncherAction};
 use crate::layout::{Axis, Command, Direction};
 use crate::pointer::{
@@ -1653,8 +1653,10 @@ mod tests {
         Launcher(LauncherAction),
         Launch(LaunchRequest),
         Help(HelpAction),
-        /// Documented but not a key, so this row is exercised elsewhere.
-        Pointer,
+        /// Documented but not a key, so this row is exercised elsewhere. Its
+        /// word is carried here because the mouse has two ways to focus and
+        /// the sheet names both.
+        Pointer(&'static str),
     }
 
     impl Bound {
@@ -1663,7 +1665,7 @@ mod tests {
         /// name the right chord beside a description of something else.
         fn action(&self) -> &'static str {
             match self {
-                Bound::Command(Command::Focus(_)) | Bound::Pointer => "FOCUS A TILE",
+                Bound::Command(Command::Focus(_)) | Bound::Pointer(_) => "FOCUS A TILE",
                 Bound::Command(Command::Move(_)) => "MOVE A TILE",
                 Bound::Command(Command::SwitchWorkspace(_)) => "SWITCH WORKSPACE",
                 Bound::Command(Command::MoveToWorkspace(_)) => "MOVE TO WORKSPACE",
@@ -1766,7 +1768,8 @@ mod tests {
                 KEY_SLASH,
                 Bound::Help(HelpAction::Toggle),
             ),
-            (&[], 0, Bound::Pointer),
+            (&[], 0, Bound::Pointer("HOVER")),
+            (&[], 0, Bound::Pointer("CLICK")),
         ];
         assert_eq!(
             probes.len(),
@@ -1775,8 +1778,8 @@ mod tests {
         );
         for (probe, row) in probes.iter().zip(crate::help::ROWS) {
             let (modifiers, code, expected) = probe;
-            if *expected == Bound::Pointer {
-                assert_eq!(row.keys, "CLICK");
+            if let Bound::Pointer(keys) = expected {
+                assert_eq!(row.keys, *keys);
                 assert_eq!(row.action, expected.action());
                 continue;
             }
@@ -1914,10 +1917,7 @@ mod tests {
         }
         assert!(!bindings.lock().unwrap().help_open);
         let target = target.lock().unwrap();
-        assert_eq!(
-            target.help_actions,
-            [HelpAction::Toggle, HelpAction::Close]
-        );
+        assert_eq!(target.help_actions, [HelpAction::Toggle, HelpAction::Close]);
         assert_eq!(target.launched, []);
         assert_eq!(target.commands, []);
     }
@@ -2173,7 +2173,10 @@ mod tests {
         // would split the layout once per repeat interval.
         assert_eq!(bindings.feed(key(KEY_RIGHT, KEY_REPEAT)).command, None);
         assert_eq!(bindings.feed(key(KEY_V, KEY_REPEAT)).command, None);
-        assert_eq!(press(&mut bindings, KEY_V), Some(Command::SetSplit(Axis::Vertical)));
+        assert_eq!(
+            press(&mut bindings, KEY_V),
+            Some(Command::SetSplit(Axis::Vertical))
+        );
         assert_eq!(bindings.feed(key(KEY_V, KEY_REPEAT)).command, None);
         bindings.feed(key(KEY_V, KEY_RELEASE));
         assert_eq!(
@@ -2699,9 +2702,23 @@ mod tests {
         });
         let bindings = Mutex::new(KeyBindings::default());
         let mut pointer = PointerMotion::default();
-        apply(&target, key(KEY_LEFTMETA, KEY_PRESS), 0, &bindings, &mut pointer).unwrap();
+        apply(
+            &target,
+            key(KEY_LEFTMETA, KEY_PRESS),
+            0,
+            &bindings,
+            &mut pointer,
+        )
+        .unwrap();
         runtime.lock().unwrap().fail_next_repaint();
-        assert!(apply(&target, key(KEY_ENTER, KEY_PRESS), 0, &bindings, &mut pointer).is_err());
+        assert!(apply(
+            &target,
+            key(KEY_ENTER, KEY_PRESS),
+            0,
+            &bindings,
+            &mut pointer
+        )
+        .is_err());
         assert!(!runtime.lock().unwrap().launcher_visible());
         assert!(!bindings.lock().unwrap().launcher_open);
     }
@@ -2730,7 +2747,14 @@ mod tests {
         });
         let bindings = Mutex::new(KeyBindings::default());
         let mut pointer = PointerMotion::default();
-        apply(&target, key(BTN_MOUSE, KEY_PRESS), 0, &bindings, &mut pointer).unwrap();
+        apply(
+            &target,
+            key(BTN_MOUSE, KEY_PRESS),
+            0,
+            &bindings,
+            &mut pointer,
+        )
+        .unwrap();
         apply(
             &target,
             Event {

@@ -457,11 +457,16 @@ impl Scene {
             .map(|surface| (surface.width, surface.height))
     }
 
-    pub fn move_pointer(&mut self, dx: i32, dy: i32, width: usize, height: usize) {
+    /// Answers whether the pointer actually MOVED, which a nonzero delta does
+    /// not settle: a delta pointing off the edge of the output is clamped
+    /// away, leaving a report that asked to move and did not.
+    pub fn move_pointer(&mut self, dx: i32, dy: i32, width: usize, height: usize) -> bool {
         let max_x = i32::try_from(width.saturating_sub(1)).unwrap_or(i32::MAX);
         let max_y = i32::try_from(height.saturating_sub(1)).unwrap_or(i32::MAX);
+        let was = (self.pointer_x, self.pointer_y);
         self.pointer_x = self.pointer_x.saturating_add(dx).clamp(0, max_x);
         self.pointer_y = self.pointer_y.saturating_add(dy).clamp(0, max_y);
+        was != (self.pointer_x, self.pointer_y)
     }
 
     #[cfg(test)]
@@ -509,6 +514,13 @@ impl Scene {
         changed
     }
 
+    /// Whether a preview is up, which is the same question as the arrangement
+    /// differing from the layout: one is only ever held while it does.
+    #[cfg(test)]
+    pub fn preview_is_live(&self) -> bool {
+        self.preview.is_some()
+    }
+
     /// Take the preview as the arrangement itself. The drop is applied by
     /// KEEPING what was drawn rather than by computing it a second time,
     /// which is the whole of what the preview promises: there is no other
@@ -536,14 +548,32 @@ impl Scene {
             .is_some_and(|placement| placement.key == key)
     }
 
-    /// The window an ALT press picks up: the one under the pointer, band or
-    /// client area, and only where a drag of it could reach somewhere. A
-    /// press that could move nothing must not be taken from the client — a
-    /// fullscreen one would lose every Alt click it has.
-    pub fn draggable_at_pointer(&self, width: usize, height: usize) -> Option<SurfaceKey> {
+    /// The window under the pointer, band or client area. `None` over the
+    /// status bar, a gap or a border — nowhere that belongs to a window, so
+    /// nothing to answer. A stacked-away leaf answers only for its own BAND:
+    /// every leaf of a stack shares one content rectangle, so that rectangle
+    /// is the SHOWN leaf's and `tile_at`'s `visible` guard is what keeps a
+    /// hidden one from claiming it.
+    ///
+    /// The TILE is the window, not the client's pixels within it: an
+    /// undersized buffer or a narrow input region delivers nothing over the
+    /// rest of the tile, and this answers there anyway. Same decision the
+    /// band already is, and deliberate — a client cannot decline the keyboard
+    /// by shrinking, which would leave part of a tile nothing could focus.
+    /// The cost is that a press and a hover over such a spot no longer name
+    /// the same target.
+    pub fn window_at_pointer(&self, width: usize, height: usize) -> Option<SurfaceKey> {
         let placements = self.tiled_placements(width, height);
         let (x, y) = self.pointer_at_usize()?;
-        let key = placements.get(tile_at(&placements, x, y)?)?.key;
+        Some(placements.get(tile_at(&placements, x, y)?)?.key)
+    }
+
+    /// The window an ALT press picks up: the one under the pointer, and only
+    /// where a drag of it could reach somewhere. A press that could move
+    /// nothing must not be taken from the client — a fullscreen one would
+    /// lose every Alt click it has.
+    pub fn draggable_at_pointer(&self, width: usize, height: usize) -> Option<SurfaceKey> {
+        let key = self.window_at_pointer(width, height)?;
         self.layout.can_drag(key).then_some(key)
     }
 
@@ -2038,11 +2068,20 @@ mod tests {
     #[test]
     fn pointer_motion_clamps_to_the_output() {
         let mut scene = Scene::new();
-        scene.move_pointer(-9, -4, 10, 8);
+        // The answer is whether the pointer MOVED, not whether one was asked
+        // for: everything downstream — the paint owed, the focus re-answered,
+        // the drop re-derived — turns on the position having changed.
+        assert!(!scene.move_pointer(-9, -4, 10, 8));
         assert_eq!((scene.pointer_x, scene.pointer_y), (0, 0));
-        scene.move_pointer(i32::MAX, i32::MAX, 10, 8);
+        assert!(scene.move_pointer(i32::MAX, i32::MAX, 10, 8));
         assert_eq!((scene.pointer_x, scene.pointer_y), (9, 7));
-        scene.move_pointer(1, 1, 0, 0);
+        // Asked for, clamped away, and so not a move.
+        assert!(!scene.move_pointer(i32::MAX, i32::MAX, 10, 8));
+        assert_eq!((scene.pointer_x, scene.pointer_y), (9, 7));
+        // One axis alone is enough to be one.
+        assert!(scene.move_pointer(0, -1, 10, 8));
+        assert!(!scene.move_pointer(0, 0, 10, 8));
+        assert!(scene.move_pointer(1, 1, 0, 0));
         assert_eq!((scene.pointer_x, scene.pointer_y), (0, 0));
     }
 

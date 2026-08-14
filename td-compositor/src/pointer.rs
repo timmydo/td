@@ -70,8 +70,9 @@ pub struct RoutedPointerFrame {
 }
 
 /// What one report produced: the routed events, and — separately — the surface
-/// a press in it established a grab on, which is what click-to-focus needs and
-/// what the events alone do not say, and whether a press in it was CLAIMED by
+/// a press in it established a grab on, which is what the click half of the
+/// focus policy needs and what the events alone do not say, and whether a
+/// press in it was CLAIMED by
 /// the compositor rather than delivered.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PointerFrameResult {

@@ -475,9 +475,20 @@ impl Runtime {
         dy: i32,
         buttons: &[PointerButtonInput],
     ) -> Result<(), String> {
-        self.scene
-            .move_pointer(dx, dy, self.framebuffer.width, self.framebuffer.height);
+        // Whether the pointer MOVED, which a nonzero delta does not prove: an
+        // outward one at the edge of the output is clamped away, and a report
+        // that changed no coordinate owes no paint, re-answers no focus and
+        // re-derives no drop.
+        let moved =
+            self.scene
+                .move_pointer(dx, dy, self.framebuffer.width, self.framebuffer.height);
         let modal = self.scene.modal();
+        // Sampled BEFORE the frame, because the frame is what ENDS a grab: a
+        // report carrying the last release along with its motion would
+        // otherwise be read as ungrabbed motion, and whether the two arrived
+        // together is a property of the device's batching rather than of
+        // anything the operator did.
+        let grabbed = self.pointer.grab_surface().is_some();
         let (hover, grab) = self.routed_pointer_targets();
         let mut modal_buttons = Vec::new();
         let buttons = if modal {
@@ -506,24 +517,55 @@ impl Runtime {
         })?;
         let alt_press = result.claimed;
         self.publish_pointer(result.frames);
-        if dx != 0 || dy != 0 {
+        if moved {
             // Coalesced by the caller: a reader batch that carries many reports
             // owes one paint, not one per report. Before the focus below, so a
             // focusing repaint settles this debt instead of being followed by
             // a second paint of the identical scene.
             self.defer_repaint();
         }
-        // Click to focus. The pointer model reports the surface a press
-        // ESTABLISHED a grab on, which is by construction the one the button
-        // event was routed to, so focus cannot disagree with delivery; and a
-        // press made DURING a grab establishes nothing, so dragging off a tile
-        // does not take focus with it. A modal launcher filters presses out
-        // above, so nothing is established and the overlay keeps focus.
-        if let Some(clicked) = result.pressed_on {
-            self.focus_surface(clicked)?;
+        // Focus follows the mouse, and only on MOTION under three suspensions
+        // — DESIGN.md §"KEYBOARD focus FOLLOWS THE POINTER" is the statement
+        // of it, kept in one place because this had already drifted from it
+        // once.
+        let hovered = if moved && !modal && self.dragging.is_none() && !grabbed {
+            self.scene
+                .window_at_pointer(self.framebuffer.width, self.framebuffer.height)
+        } else {
+            None
+        };
+        // Both focus paints and the drag run whatever the ones before them
+        // did, and the failures are joined, as `settle` and the overlay
+        // rollbacks report theirs. A `?` here returned before `drag`, so a
+        // report carrying motion AND the Alt press that starts a gesture lost
+        // the gesture to a failed paint — with the press already withheld from
+        // its client, leaving nothing to retry it with.
+        let mut failures = Vec::new();
+        if let Some(hovered) = hovered {
+            if let Err(error) = self.focus_surface(hovered) {
+                failures.push(error);
+            }
         }
-        self.drag(modal, dx != 0 || dy != 0, alt_press, buttons)?;
-        Ok(())
+        // Click to focus, which the hover above does not make redundant: it
+        // focuses a window the pointer is ALREADY over, the state a
+        // `Super+arrow` leaves behind. The pointer model reports the surface a
+        // press ESTABLISHED a grab on, which is by construction the one the
+        // button event was routed to, so focus cannot disagree with delivery;
+        // and a press made DURING a grab establishes nothing, so dragging off
+        // a tile does not take focus with it. A modal overlay filters presses
+        // out above, so nothing is established and the overlay keeps focus.
+        if let Some(clicked) = result.pressed_on {
+            if let Err(error) = self.focus_surface(clicked) {
+                failures.push(error);
+            }
+        }
+        if let Err(error) = self.drag(modal, moved, alt_press, buttons) {
+            failures.push(error);
+        }
+        if failures.is_empty() {
+            return Ok(());
+        }
+        Err(failures.join("; "))
     }
 
     /// The drag. A press picks a window up and focuses it; from the first
@@ -2921,7 +2963,7 @@ mod tests {
             button: 272,
             state: PointerButtonState::Released,
         };
-        // Hovering alone is not focusing: this compositor is click-to-focus.
+        // Focus follows the pointer, so the move alone carries it.
         runtime
             .pointer_frame(
                 1,
@@ -2930,8 +2972,13 @@ mod tests {
                 &[],
             )
             .unwrap();
-        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
 
+        // A press still focuses where it lands with the pointer STILL, which
+        // is the state a keyboard move leaves behind: focus carried off the
+        // window under the pointer, and no motion coming to bring it back.
+        runtime.command(Command::Focus(Direction::Right)).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
         runtime.pointer_frame(2, 0, 0, &[press(2)]).unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
 
@@ -2972,11 +3019,595 @@ mod tests {
 
         // A HELD grab must not keep re-asserting its focus, or the keyboard
         // could never move it while a button is down: `Super+Left` here would
-        // be undone by the next twitch of the mouse.
+        // be undone by the next twitch of the mouse. That covers both halves
+        // of the policy — the press established nothing, and the motion is
+        // the client's while it holds the pointer.
         runtime.command(Command::Focus(Direction::Left)).unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
         runtime.pointer_frame(10, 1, 0, &[]).unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+    }
+
+    #[test]
+    fn focus_follows_the_pointer_between_tiles() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-hover-focus-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let first = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let second = SurfaceKey {
+            client: 2,
+            object: 20,
+        };
+        runtime.commit(first, surface([1, 2, 3, 0])).unwrap();
+        runtime.commit(second, surface([4, 5, 6, 0])).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+
+        let goto = |runtime: &mut Runtime, x: usize, y: usize| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            let (dx, dy) = (
+                i32::try_from(x).unwrap() - at_x,
+                i32::try_from(y).unwrap() - at_y,
+            );
+            runtime.pointer_frame(1, dx, dy, &[]).unwrap();
+        };
+        let tile = |runtime: &Runtime, key: SurfaceKey| {
+            let placements = runtime.scene.tiled_placements(240, 120);
+            let at = placements
+                .iter()
+                .position(|placement| placement.key == key)
+                .unwrap();
+            *placements.get(at).unwrap()
+        };
+
+        let one = tile(&runtime, first);
+        let two = tile(&runtime, second);
+        goto(&mut runtime, one.rect.x + 2, one.rect.y + 2);
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+
+        // A BAND is as much the window as its client pixels are — it is the
+        // handle a drag picks the window up by — so hovering one focuses.
+        goto(&mut runtime, two.band.x + 2, two.band.y + 2);
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+
+        // Anywhere belonging to NO window keeps the focus that was there
+        // rather than clearing it: the status bar above a tile, and the gap
+        // BETWEEN the two, which is the one an operator crosses on the way
+        // from one to the other. Both points are over `first`'s side of the
+        // screen while focus is on `second`, so a rule that let either answer
+        // would move focus and be caught.
+        goto(&mut runtime, one.rect.x + 2, 2);
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+        let gap = one.rect.x + one.rect.width + 2;
+        assert!(gap < two.rect.x, "{gap} is not between the two tiles");
+        goto(&mut runtime, gap, one.rect.y + 2);
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+
+        goto(&mut runtime, one.rect.x + 2, one.rect.y + 2);
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+    }
+
+    #[test]
+    fn a_grab_released_with_its_own_motion_does_not_hand_focus_over() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-hover-focus-ungrab-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let first = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let second = SurfaceKey {
+            client: 2,
+            object: 20,
+        };
+        runtime.commit(first, surface([1, 2, 3, 0])).unwrap();
+        runtime.commit(second, surface([4, 5, 6, 0])).unwrap();
+        let layout = runtime.layout_snapshot();
+        let one = layout.get(&first).unwrap().rect;
+        let two = layout.get(&second).unwrap().rect;
+
+        runtime
+            .pointer_frame(
+                1,
+                i32::try_from(one.x.saturating_add(2)).unwrap(),
+                i32::try_from(one.y.saturating_add(2)).unwrap(),
+                &[],
+            )
+            .unwrap();
+        runtime
+            .pointer_frame(
+                2,
+                0,
+                0,
+                &[PointerButtonInput {
+                    time: 2,
+                    button: 272,
+                    state: PointerButtonState::Pressed,
+                }],
+            )
+            .unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+
+        // The motion and the last RELEASE in one report, which is the shape a
+        // mouse reporting its whole bitmap per poll produces. That motion
+        // happened while the grab was held and is the client's; the frame is
+        // also what ends the grab, so reading the grab afterwards would call
+        // it ungrabbed and hand focus to whatever it was dragged over —
+        // making focus depend on the device's batching rather than on
+        // anything the operator did.
+        let dx = i32::try_from(two.x)
+            .unwrap()
+            .saturating_sub(i32::try_from(one.x.saturating_add(2)).unwrap())
+            .saturating_add(2);
+        runtime
+            .pointer_frame(
+                3,
+                dx,
+                0,
+                &[PointerButtonInput {
+                    time: 3,
+                    button: 272,
+                    state: PointerButtonState::Released,
+                }],
+            )
+            .unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+        assert!(runtime.pointer.grab_surface().is_none());
+
+        // And the next motion, which no grab covers, does follow.
+        runtime.pointer_frame(4, 1, 0, &[]).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+    }
+
+    #[test]
+    fn hover_cannot_focus_what_the_screen_is_not_showing() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-hover-focus-hidden-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let first = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let second = SurfaceKey {
+            client: 2,
+            object: 20,
+        };
+        runtime.commit(first, surface([1, 2, 3, 0])).unwrap();
+        runtime.commit(second, surface([4, 5, 6, 0])).unwrap();
+        let one = runtime.layout_snapshot().get(&first).unwrap().rect;
+        let goto = |runtime: &mut Runtime, x: usize, y: usize| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            let (dx, dy) = (
+                i32::try_from(x).unwrap() - at_x,
+                i32::try_from(y).unwrap() - at_y,
+            );
+            runtime.pointer_frame(1, dx, dy, &[]).unwrap();
+        };
+
+        // FULLSCREEN. The pointer is over where `first` was, and a hover must
+        // not put the keyboard on a window the screen is not showing. It
+        // holds through `Layout::focus_key`'s refusal rather than through the
+        // gate above, which is why it is worth a test of its own: a hover
+        // that answered from the unstacked geometry would regress it with
+        // every other test still green.
+        runtime.command(Command::ToggleFullscreen).unwrap();
+        goto(&mut runtime, one.x + 2, one.y + 2);
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+        runtime.command(Command::ToggleFullscreen).unwrap();
+        goto(&mut runtime, one.x + 3, one.y + 3);
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+
+        // And a leaf of ANOTHER workspace. An EMPTY workspace is the shape
+        // that can be got wrong: the pointer sits exactly where a window is
+        // on workspace 1, and the answer must be that there is no window
+        // under it rather than that one.
+        runtime.command(Command::SwitchWorkspace(2)).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, None);
+        goto(&mut runtime, one.x + 4, one.y + 4);
+        assert_eq!(runtime.keyboard_snapshot().focus, None);
+    }
+
+    #[test]
+    fn hover_focuses_a_tile_its_client_does_not_fill() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-hover-focus-undersized-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let first = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let second = SurfaceKey {
+            client: 2,
+            object: 20,
+        };
+        runtime.commit(first, surface([1, 2, 3, 0])).unwrap();
+        // A 2x2 buffer in a tile many times its size: everything past it is
+        // empty tile space that DELIVERS nothing — `pointer_target` answers
+        // None there, so under click-to-focus the click could not focus it.
+        runtime
+            .commit(
+                second,
+                Surface {
+                    width: 2,
+                    height: 2,
+                    pixels: [4, 5, 6, 0].repeat(4),
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        let two = runtime.layout_snapshot().get(&second).unwrap().rect;
+        let inside = (
+            two.x + two.width.saturating_sub(2),
+            two.y + two.height.saturating_sub(2),
+        );
+
+        // The TILE is the window here, which is the same decision the title
+        // BAND already is: a band delivers nothing either and hovering one
+        // focuses. What it costs is that the two halves of the focus policy
+        // no longer agree about their target — a press there focuses nothing
+        // where a hover focuses the tile — and what it buys is that a client
+        // cannot decline the keyboard by committing a small buffer or a
+        // narrow input region, which in a tiling compositor would leave part
+        // of a tile that nothing can focus.
+        runtime
+            .pointer_frame(
+                1,
+                i32::try_from(inside.0).unwrap(),
+                i32::try_from(inside.1).unwrap(),
+                &[],
+            )
+            .unwrap();
+        assert!(
+            runtime.scene.pointer_target(240, 120).is_none(),
+            "the probe point is inside the client, so it proves nothing"
+        );
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+        runtime
+            .pointer_frame(
+                2,
+                -i32::try_from(inside.0).unwrap(),
+                -i32::try_from(inside.1).unwrap(),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+        let one = runtime.layout_snapshot().get(&first).unwrap().rect;
+        runtime
+            .pointer_frame(
+                3,
+                i32::try_from(one.x + 2).unwrap(),
+                i32::try_from(one.y + 2).unwrap(),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+    }
+
+    #[test]
+    fn a_failed_hover_paint_does_not_swallow_the_press_in_its_report() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-hover-focus-failed-paint-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let first = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let second = SurfaceKey {
+            client: 2,
+            object: 20,
+        };
+        runtime.commit(first, surface([1, 2, 3, 0])).unwrap();
+        runtime.commit(second, surface([4, 5, 6, 0])).unwrap();
+        let one = runtime.layout_snapshot().get(&first).unwrap().rect;
+        runtime
+            .modifiers(ModifierState {
+                depressed: MOD_ALT,
+                latched: 0,
+                locked: 0,
+                group: 0,
+            })
+            .unwrap();
+
+        // Motion onto the other tile AND the Alt press that picks it up, in
+        // one report, with the focusing paint failing. The press is withheld
+        // from its client by the claim, so a gesture dropped here is one the
+        // operator has no way to retry — and the failure is still reported.
+        runtime.fail_next_repaint();
+        let outcome = runtime.pointer_frame(
+            1,
+            i32::try_from(one.x + 2).unwrap(),
+            i32::try_from(one.y + 2).unwrap(),
+            &[PointerButtonInput {
+                time: 1,
+                button: 272,
+                state: PointerButtonState::Pressed,
+            }],
+        );
+        assert!(outcome.is_err(), "the failed paint was not reported");
+        runtime.clear_repaint_failure();
+        assert_eq!(
+            runtime.dragging.as_ref().map(|drag| drag.key),
+            Some(first),
+            "the failed paint swallowed the gesture"
+        );
+    }
+
+    #[test]
+    fn a_delta_clamped_away_at_the_edge_is_not_a_move() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-hover-focus-clamp-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let key = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
+        runtime.flush_paint().unwrap();
+        assert!(!runtime.paint_pending());
+
+        // Every edge of this output is bar or gap, so the pointer's window
+        // cannot be asked about there. The paint debt is the observable, and
+        // it is the SAME `moved` the focus and the drop read.
+        runtime.pointer_frame(1, 10_000, 0, &[]).unwrap();
+        assert!(
+            runtime.paint_pending(),
+            "travelling to the edge owed no paint"
+        );
+        runtime.flush_paint().unwrap();
+        assert!(!runtime.paint_pending());
+
+        runtime.pointer_frame(2, 10_000, 0, &[]).unwrap();
+        assert!(
+            !runtime.paint_pending(),
+            "a delta clamped away at the edge was taken for a move"
+        );
+    }
+
+    #[test]
+    fn sweeping_a_stacks_bands_shows_each_leaf_they_name() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-hover-focus-stack-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let height = 600;
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, height, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let keys: Vec<SurfaceKey> = (1..=3)
+            .map(|object| SurfaceKey { client: 1, object })
+            .collect();
+        for (index, key) in keys.iter().enumerate() {
+            let shade = u8::try_from(index).unwrap().saturating_add(1);
+            runtime
+                .commit(*key, surface([shade, shade, shade, 0]))
+                .unwrap();
+        }
+        runtime.command(Command::ToggleStacked).unwrap();
+        let shown = |runtime: &Runtime| {
+            runtime
+                .scene
+                .tiled_placements(240, height)
+                .iter()
+                .position(|placement| placement.visible)
+                .and_then(|at| {
+                    runtime
+                        .scene
+                        .tiled_placements(240, height)
+                        .get(at)
+                        .map(|placement| placement.key)
+                })
+        };
+        let band = |runtime: &Runtime, key: SurfaceKey| {
+            let placements = runtime.scene.tiled_placements(240, height);
+            let at = placements
+                .iter()
+                .position(|placement| placement.key == key)
+                .unwrap();
+            placements.get(at).unwrap().band
+        };
+        let goto = |runtime: &mut Runtime, x: usize, y: usize| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            let (dx, dy) = (
+                i32::try_from(x).unwrap() - at_x,
+                i32::try_from(y).unwrap() - at_y,
+            );
+            runtime.pointer_frame(1, dx, dy, &[]).unwrap();
+        };
+        assert_eq!(shown(&runtime), keys.get(2).copied());
+
+        // A stack's shown leaf is its most recently focused, so this reaches
+        // one place past the keyboard: sweeping the run of bands flips through
+        // the windows, one per band crossed. Walked in run order and back, so
+        // a rule that only ever moved one way would be caught. The bands do
+        // not move as it goes — every leaf of a stack gets the same content
+        // rectangle, so which one is SHOWN changes no geometry — which is why
+        // the sweep is a walk rather than a search.
+        let bands: Vec<crate::layout::Rect> = keys.iter().map(|key| band(&runtime, *key)).collect();
+        for (at, key) in keys.iter().enumerate().chain(keys.iter().enumerate().rev()) {
+            let strip = bands.get(at).unwrap();
+            goto(&mut runtime, strip.x + 2, strip.y + 2);
+            assert_eq!(runtime.keyboard_snapshot().focus, Some(*key), "band {at}");
+            assert_eq!(shown(&runtime), Some(*key), "band {at}");
+            assert_eq!(
+                bands,
+                keys.iter()
+                    .map(|key| band(&runtime, *key))
+                    .collect::<Vec<_>>(),
+                "the bands moved under the sweep"
+            );
+        }
+
+        // The one CONTENT rectangle beneath the bands belongs to the leaf
+        // being SHOWN, not to the first leaf under the stack: they all have
+        // the same rect, and the hit test's visibility guard is the only
+        // thing that tells them apart. Asked while the shown leaf is the
+        // LAST, so answering from tree order would name a different one.
+        let last = keys.last().copied().unwrap();
+        let strip = bands.last().unwrap();
+        goto(&mut runtime, strip.x + 2, strip.y + 2);
+        assert_eq!(shown(&runtime), Some(last));
+        let content = {
+            let placements = runtime.scene.tiled_placements(240, height);
+            let at = placements
+                .iter()
+                .position(|placement| placement.key == last)
+                .unwrap();
+            placements.get(at).unwrap().rect
+        };
+        goto(&mut runtime, content.x + 2, content.y + 2);
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(last));
+    }
+
+    #[test]
+    fn a_still_pointer_does_not_re_answer_focus() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-hover-focus-still-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let first = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let second = SurfaceKey {
+            client: 2,
+            object: 20,
+        };
+        runtime.commit(first, surface([1, 2, 3, 0])).unwrap();
+        runtime.commit(second, surface([4, 5, 6, 0])).unwrap();
+        let rect = runtime.layout_snapshot().get(&first).unwrap().rect;
+        runtime
+            .pointer_frame(
+                1,
+                i32::try_from(rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(rect.y.saturating_add(2)).unwrap(),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+
+        // The keyboard moves focus off the window the pointer is over, and
+        // frames that carry no motion leave it there: a still pointer cannot
+        // have changed which window is under it, so re-answering would undo
+        // every `Super+Left` the moment a button or a wheel arrived.
+        runtime.command(Command::Focus(Direction::Right)).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+        runtime.pointer_frame(2, 0, 0, &[]).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+    }
+
+    #[test]
+    fn a_live_drag_keeps_focus_on_the_window_it_carries() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-hover-focus-drag-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let first = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let second = SurfaceKey {
+            client: 2,
+            object: 20,
+        };
+        runtime.commit(first, surface([1, 2, 3, 0])).unwrap();
+        runtime.commit(second, surface([4, 5, 6, 0])).unwrap();
+        let tile = |runtime: &Runtime, key: SurfaceKey| {
+            let placements = runtime.scene.tiled_placements(240, 120);
+            let at = placements
+                .iter()
+                .position(|placement| placement.key == key)
+                .unwrap();
+            *placements.get(at).unwrap()
+        };
+        let goto = |runtime: &mut Runtime, x: usize, y: usize, buttons: &[PointerButtonInput]| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            let (dx, dy) = (
+                i32::try_from(x).unwrap() - at_x,
+                i32::try_from(y).unwrap() - at_y,
+            );
+            runtime.pointer_frame(1, dx, dy, buttons).unwrap();
+        };
+
+        // A band press establishes no grab — a band belongs to no client — so
+        // the drag itself is the only thing holding focus still here.
+        let handle = tile(&runtime, first).band;
+        goto(
+            &mut runtime,
+            handle.x + 2,
+            handle.y + 2,
+            &[PointerButtonInput {
+                time: 2,
+                button: 272,
+                state: PointerButtonState::Pressed,
+            }],
+        );
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+        assert!(runtime.pointer.grab_surface().is_none());
+
+        // A drag crosses other windows on purpose, and focus belongs to the
+        // one being carried: letting it follow would hand the keyboard to
+        // whatever the operator merely passed over on the way.
+        //
+        // Asserted on the LAYOUT's focus rather than the keyboard's, which
+        // during a drag is answered by the PREVIEW — and a preview focuses
+        // whatever it moved, so it reads `first` whether or not the guard
+        // holds. The layout is what a hover would actually change. Dropped
+        // into the far half of the tile so a preview really does exist,
+        // rather than onto the half where the drop is a no-op and the
+        // layout's focus shows through by accident.
+        let over = tile(&runtime, second).rect;
+        goto(
+            &mut runtime,
+            over.x + 2,
+            over.y + over.height.saturating_sub(2),
+            &[],
+        );
+        assert!(
+            runtime.scene.preview_is_live(),
+            "no preview to be fooled by"
+        );
+        assert_eq!(runtime.scene.layout().focused(), Some(first));
     }
 
     #[test]
@@ -3361,7 +3992,7 @@ mod tests {
     }
 
     #[test]
-    fn a_press_while_the_launcher_is_modal_does_not_move_focus() {
+    fn a_modal_launcher_keeps_focus_from_the_pointer() {
         let path = std::env::temp_dir().join(format!(
             "td-runtime-click-focus-modal-{}-{}",
             std::process::id(),
@@ -3382,6 +4013,11 @@ mod tests {
         runtime.commit(second, surface([4, 5, 6, 0])).unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
         let rect = runtime.layout_snapshot().get(&first).unwrap().rect;
+        runtime.launcher(LauncherAction::Open).unwrap();
+
+        // An overlay owns the screen while it is up, so neither half of the
+        // focus policy reaches past it: not the motion onto the other tile,
+        // and not the press that lands there.
         runtime
             .pointer_frame(
                 1,
@@ -3390,8 +4026,7 @@ mod tests {
                 &[],
             )
             .unwrap();
-
-        runtime.launcher(LauncherAction::Open).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
         runtime
             .pointer_frame(
                 2,

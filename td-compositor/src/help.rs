@@ -64,9 +64,15 @@ pub const ROWS: &[Row] = &[
         keys: "SUPER+?",
         action: "THIS HELP",
     },
-    // Not a chord, and the only line here the dispatch test cannot drive. It
-    // earns its place because a cheat sheet that omits the mouse leaves the
-    // operator believing the keyboard is the only way to focus.
+    // Not chords, and the only lines here the dispatch test cannot drive.
+    // They earn their place because a cheat sheet that omits the mouse leaves
+    // the operator believing the keyboard is the only way to focus — and HOVER
+    // is now the mouse's primary way, with the click the one that works when
+    // the pointer is already where it wants to be.
+    Row {
+        keys: "HOVER",
+        action: "FOCUS A TILE",
+    },
     Row {
         keys: "CLICK",
         action: "FOCUS A TILE",
@@ -174,7 +180,9 @@ mod tests {
     use super::*;
 
     fn text_width(text: &str) -> usize {
-        text.len().saturating_mul(ui::GLYPH_ADVANCE).saturating_mul(SCALE)
+        text.len()
+            .saturating_mul(ui::GLYPH_ADVANCE)
+            .saturating_mul(SCALE)
     }
 
     #[test]

@@ -704,10 +704,11 @@ A client already holding an implicit grab is the exception, and it owns every
 button until it lets go. The pointer model routes a press made during a grab
 to the grabbing surface, so that press IS delivered wherever it lands: taking
 it as a handle would make one button both the window's and the compositor's,
-and would move focus mid-grab, which click-to-focus refuses for the same
-reason. Neither press begins a drag while a grab is held — which is a rule
-about the grab AT THE PRESS, not for the length of a gesture: a second button
-pressed during a live drag is still the client's and still establishes one.
+and would move focus mid-grab, which both halves of the focus policy refuse
+for the same reason. Neither press begins a drag while a grab is held —
+which is a rule about the grab AT THE PRESS, not for the length of a
+gesture: a second button pressed during a live drag is still the client's
+and still establishes one.
 
 A drag is also forgotten when the window it names goes away — on a single
 toplevel's removal, on a whole client's, and on an unmap. Object ids are
@@ -996,10 +997,62 @@ continue to the pressed surface until every button is released. If another
 press follows the last release in the same frame, focus first reconciles with
 the surface under the cursor and the new grab starts there.
 
-That same press is what moves KEYBOARD focus: this compositor is
-click-to-focus, not focus-follows-mouse. Hovering delivers motion and changes
-nothing else, which is what keeps a tile's focus from flickering as the
-pointer crosses it on the way somewhere. The surface focused is the one the
+KEYBOARD focus FOLLOWS THE POINTER: a motion that leaves the cursor over a
+different window aims the keyboard at it, with no click to say so. Only on
+MOTION — a cursor that did not change POSITION cannot have changed which
+window is under it, so a still pointer never re-answers the question and a
+`Super+arrow` is not undone by the next button or wheel report that happens
+to arrive. A nonzero delta is not that question's answer: one pointing off
+the edge of the output is clamped away, leaving a report that asked to move
+and did not. The paint owed, the focus re-answered and the drop re-derived
+all read the same "moved", which is what `Scene::move_pointer` reports.
+A window is its TILE, and its title band as much as its client pixels: the
+band is the handle a drag picks it up by, and the tile is what a tiling
+compositor means by the window. So an undersized buffer or a narrow input
+region — which DELIVER nothing over the rest of the tile, and under
+click-to-focus could not be clicked into focus there — are hovered into
+focus anyway. Deliberate: a client cannot decline the keyboard by shrinking,
+which would otherwise leave part of a tile nothing could focus. The cost is
+that the two halves no longer name the same target over such a spot, where
+a press focuses nothing and a hover focuses the tile.
+
+Anywhere belonging to no window — the status bar, a gap, a border — KEEPS
+the focus that was there rather than clearing it, so crossing a gap on the
+way between two tiles does not leave the keyboard aimed at nothing. A
+stacked-away leaf answers for its own BAND alone: every leaf of a stack
+shares one content rectangle, so that rectangle belongs to the leaf being
+SHOWN, and the hit test's visibility guard is what keeps a hidden one from
+claiming it.
+
+What that gives up is the argument the previous policy was written on: a
+pointer crossing a tile on its way somewhere else focuses it in passing, so
+a `Super+arrow` followed by any mouse movement loses the window it chose.
+That is what focus-follows-mouse IS, and it is what was asked for. It
+reaches one place beyond the keyboard, too: the shown leaf of a STACK is its
+most recently focused, so sweeping the pointer down a stack's run of bands
+flips through the windows it presents, one per band crossed — the same thing
+clicking each band in turn already did.
+
+Three things suspend it, and each would otherwise aim the keyboard somewhere
+the operator did not. A modal launcher owns the screen and keeps focus for as
+long as it is up. A DRAG carries the pointer across other windows on purpose,
+and focus belongs to the window being carried. And a client holding an
+implicit grab owns the pointer until it lets go, which is the same reason a
+press made during one establishes nothing.
+
+That grab is sampled BEFORE the frame, because the frame is what ends one: a
+report carrying the last release along with its motion clears the grab in the
+same call that delivered the motion to the grabbing client, so reading it
+afterwards would call that motion ungrabbed and hand focus to whatever the
+pointer was dragged over. Whether the motion and the release arrive together
+or in two reports is the device's batching, not anything the operator did,
+and focus must not turn on it.
+
+That same press ALSO moves keyboard focus, and it is not made redundant by
+the above: it focuses a window the pointer is ALREADY over, which is what a
+`Super+arrow` leaves behind — focus carried off the hovered window with no
+motion coming to bring it back — and what a newly mapped window under a still
+cursor leaves. The surface focused is the one the
 press ESTABLISHED its grab on — the same surface the button event was routed
 to, so keyboard focus cannot disagree with delivery — and only a press that
 starts a grab counts, so a second button pressed mid-drag does not drag focus
@@ -1028,7 +1081,9 @@ launcher filters presses out before any of this, so nothing is established and
 the overlay keeps focus while it is up. A focusing click repaints
 synchronously, which settles any paint the same report's motion deferred; and
 because it can fail as any other paint can, a click can now end the evdev
-reader where only keys and commands could before.
+reader where only keys and commands could before. A focusing HOVER is the
+same paint and carries the same consequence, which widens that from a report
+with a button in it to any report that moved.
 
 Removing or hiding the grabbed surface cancels the grab and reconciles focus
 without leaving a stale surface reference. Partial button or motion records
@@ -1248,13 +1303,19 @@ The landing must prove:
   checked at several output sizes with the bar's rows proved unclickable,
   and the runtime is held to repainting only on a changed line and to
   restoring the previous one when that paint fails;
-- click-to-focus is proved end to end through the runtime — hovering does
-  not focus, a press does, a press over the gap does not, a mid-drag press
-  does not follow the pointer, a release-and-press in one report focuses
-  where the press landed, a press behind the modal launcher focuses nothing,
-  and a held grab does not undo a keyboard focus command — with the pointer
-  model's press report and `Layout::focus_key`'s refusals tested on their
-  own, each positive case carrying a control that the same click DOES focus;
+- the focus policy is proved end to end through the runtime in both its
+  halves — a hover focuses, and does so over a band and over a tile its
+  client does not fill; a still pointer, a delta clamped away at the edge,
+  a modal overlay, a live drag and a held grab each leave focus alone, the
+  grab whether or not its last release shares a report with the motion;
+  fullscreen and an empty workspace refuse a hover that would reach past
+  them; sweeping a stack's bands shows each leaf they name; and a press
+  focuses where it lands with the pointer still, not over the gap, not
+  mid-drag, and where the press landed when a release and a press share one
+  report — with the pointer model's press report and `Layout::focus_key`'s
+  refusals tested on their own, each positive case carrying a control that
+  the same gesture DOES focus, and a failed focus paint proved not to
+  swallow the press in its own report;
 - scene tests prove pointer hit testing excludes gaps and clipped-away
   pixels while retaining local coordinates for an implicit grab, and server
   tests pin per-region and aggregate retained-operation ceilings;
