@@ -1275,6 +1275,92 @@ fn an_ignore_trap_is_inherited_by_a_child() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+/// A REGULAR builtin's error ends the COMMAND; a SPECIAL one ends the shell.
+///
+/// ash wraps every builtin in its own handler and re-raises only when the command
+/// word was special (ash.c:10619). Surviving is what makes `cd`'s write ORDER
+/// observable at all, so it is pinned here too: ash writes OLDPWD before `curdir`
+/// moves (ash.c:2865, 2883) and has already chdir'd, so a refusal on OLDPWD
+/// leaves the `pwd` builtin behind while a CHILD sees the new directory. A test
+/// that asked only `pwd` could not tell that order from moving both together.
+#[test]
+fn a_regular_builtins_error_ends_the_command_not_the_shell(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let run = |program: &str| -> Result<(String, i32), Box<dyn std::error::Error>> {
+        let out = std::process::Command::new(&shell)
+            .arg("-c")
+            .arg(program)
+            .env("TD_SH_BIN", &shell)
+            .output()?;
+        let code = out.status.code().ok_or_else(|| format!("{program}: killed"))?;
+        Ok((String::from_utf8_lossy(&out.stdout).into_owned(), code))
+    };
+    // The diagnostic goes to stderr, the status stands, and the line runs on.
+    for program in [
+        "readonly N; read N </dev/null; echo AFTER",
+        "readonly O; getopts ab O -a; echo AFTER",
+        "readonly OPTIND; getopts ab O -a; echo AFTER",
+        "cd /; readonly PWD; cd /tmp; echo AFTER",
+        "cd /; readonly OLDPWD; cd /tmp; echo AFTER",
+    ] {
+        assert_eq!(run(program)?, ("AFTER\n".to_string(), 0), "{program}");
+    }
+    // ...and a special builtin still ends it, which is what keeps this a rule
+    // rather than "nothing is fatal". `local` is special in ash but not POSIX.
+    for program in [
+        "f() { readonly L; local L; }; f; echo AFTER",
+        "readonly E=1; export E=2; echo AFTER",
+    ] {
+        assert_eq!(run(program)?, (String::new(), 2), "{program}");
+    }
+    // Surviving also makes `getopts`' hidden cursor observable, and a REFUSED
+    // write has to leave the scan restartable rather than advanced -- ash parks
+    // a sentinel on entry and restores the cursor only once every write lands,
+    // so the next call rescans from word 1. Asserting only that the line ran on
+    // would miss this entirely: the shell survives either way.
+    for (program, want) in [
+        ("set -- -a -b; readonly O; getopts ab O; getopts ab X; echo \"$X/$OPTIND\"", "a/2\n"),
+        (
+            "set -- -a -b -c; getopts abc X; readonly Y; getopts abc Y; \
+             getopts abc Z; echo \"$Z/$OPTIND\"",
+            "a/2\n",
+        ),
+        // OPTARG is refusable too, and earlier in the same scan.
+        (
+            "set -- -a -b; getopts ab X; readonly OPTARG; getopts ab Y; \
+             getopts ab Z; echo \"$Z/$OPTIND\"",
+            "/2\n",
+        ),
+        // OPTARG is UNSET when the scan ends (ash.c:11692), which td-sh skipped
+        // -- and that one is visible with no `readonly` in play at all.
+        ("set -- -c val; getopts \"c:\" O; getopts \"c:\" O; echo \"[$OPTARG]\"", "[]\n"),
+        // The unset is refusable exactly as the writes are, `unsetvar` being
+        // `setvar(s, NULL, 0)`, so it ends the command and restarts the scan.
+        (
+            "readonly OPTARG=old; set -- -Z; getopts a O; echo \"rc=$? OPTIND=$OPTIND\"",
+            "rc=2 OPTIND=1\n",
+        ),
+        // ...and with nothing refused the scan simply runs on, so the rows above
+        // are about the refusal rather than about `getopts` generally.
+        ("set -- -a -b; getopts ab O; getopts ab X; echo \"$X/$OPTIND\"", "b/3\n"),
+    ] {
+        assert_eq!(run(program)?.0, want, "{program}");
+    }
+    // Only `/` and `/tmp`, so the case needs nothing the kernel does not give it.
+    let cd = |ro: &str, show: &str| {
+        format!(
+            "cd /; cd /tmp; readonly {ro}; cd /; \
+             echo \"builtin=$(pwd) child=$(\"$TD_SH_BIN\" -c pwd) {show}\""
+        )
+    };
+    // The refusal lands BEFORE the shell's idea of the directory moves...
+    assert_eq!(run(&cd("OLDPWD", "PWD=$PWD"))?.0, "builtin=/tmp child=/ PWD=/tmp\n");
+    // ...and after it, for the write that comes second.
+    assert_eq!(run(&cd("PWD", "OLDPWD=$OLDPWD"))?.0, "builtin=/ child=/ OLDPWD=/tmp\n");
+    Ok(())
+}
+
 /// The Oils helper stand-in the corpus expects on PATH, built by this crate as
 /// a second bin. `run_case` stages it under every name in `SPEC_HELPERS`.
 fn spec_helpers_bin() -> PathBuf {

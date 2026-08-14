@@ -709,7 +709,7 @@ impl Shell {
             // dash reports this through sh_error, which ends a non-interactive
             // shell with status 2 -- not a status a script can test.
             Some(v) if v.readonly && !dynamic => {
-                return Err(self.fatal(&format!("{name}: is read only"), 2));
+                return Err(self.readonly_fatal(name));
             }
             Some(v) => {
                 // dash's LINENO stops answering with the line the moment
@@ -1857,11 +1857,14 @@ fn run_builtin(
 }
 
 /// Whether an `Abort` raised inside this builtin's body stops at the command
-/// boundary. dash keys it on the COMMAND WORD's own flags (`spclbltin` is locked
-/// to the first word), so only `command`, which is not special and which resolves
-/// what follows, hands the error back as a status.
+/// boundary. ash wraps EVERY builtin in its own handler and re-raises only for a
+/// SPECIAL one (ash.c:10619), so a regular builtin's error ends the COMMAND and
+/// leaves its status standing. `command` was named here alone, but it is an
+/// instance of that rule rather than an exception to it: `spclbltin` is locked to
+/// the FIRST word (ash.c:10418), which is why it strips fatality from what
+/// follows.
 fn swallows_abort(bi: builtin::Builtin) -> bool {
-    matches!(bi, builtin::Builtin::Command)
+    !builtin::is_ash_special(bi)
 }
 
 /// Whether this signal is on its way out of the shell rather than out of a
@@ -4266,11 +4269,24 @@ mod tests {
             "echo ${undefined_var:?bad}; echo SAME",
             "set -u; echo $undefined_var; echo SAME",
             "readonly RO=1; RO=2; echo SAME",
-            "set -- -a; OPTIND=abc; getopts a o; echo SAME",
         ] {
             let (status, out, _) =
                 run_capturing_interactive_units(&[bad, "set +u", "echo NEXT"]);
             assert_eq!(out, "NEXT\n", "{bad}");
+            assert_eq!(status, 0, "{bad}");
+        }
+        // The contrast, and the whole of what `swallows_abort` decides: a REGULAR
+        // builtin's error ends the COMMAND alone, so the rest of the line runs.
+        // ash re-raises out of `evalbltin` for a special builtin only
+        // (ash.c:10619), which is why every row above is one.
+        for bad in [
+            "set -- -a; OPTIND=abc; getopts a o; echo SAME",
+            "readonly N; read N </dev/null; echo SAME",
+            "readonly O; getopts ab O -a; echo SAME",
+        ] {
+            let (status, out, _) =
+                run_capturing_interactive_units(&[bad, "set +u", "echo NEXT"]);
+            assert_eq!(out, "SAME\nNEXT\n", "{bad}");
             assert_eq!(status, 0, "{bad}");
         }
         // The redirection case also has to leave the prefix assignment undone,

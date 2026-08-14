@@ -988,6 +988,13 @@ impl Shell {
         let _ = exec::write_stderr(self, msg);
         Sig::Abort(status)
     }
+
+    /// The one spelling of a readonly refusal. `unset_var` answers with a bool,
+    /// so `getopts`' OPTARG unset has to raise its own and would otherwise drift
+    /// from the assignment path silently.
+    pub fn readonly_fatal(&self, name: &str) -> Sig {
+        self.fatal(&format!("{name}: is read only"), 2)
+    }
 }
 
 #[cfg(test)]

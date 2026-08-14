@@ -1969,34 +1969,34 @@ fn getopts(sh: &mut Shell, argv: &[String]) -> R<()> {
     match takes_arg {
         None => {
             if silent {
-                sh.set_var("OPTARG", &c.to_string())?;
+                getopts_write(sh, "OPTARG", &c.to_string())?;
             } else {
                 err_line(sh, &format!("Illegal option -{c}"));
-                sh.unset_var("OPTARG");
+                getopts_unset_optarg(sh)?;
             }
             letter = '?';
             off = if at >= word.len() { -1 } else { at as i64 };
         }
         Some(false) => {
-            sh.set_var("OPTARG", "")?;
+            getopts_write(sh, "OPTARG", "")?;
             off = if at >= word.len() { -1 } else { at as i64 };
         }
         Some(true) => {
             off = -1;
             if at < word.len() {
                 let tail = String::from_utf8_lossy(word.as_bytes().get(at..).unwrap_or(&[])).into_owned();
-                sh.set_var("OPTARG", &tail)?;
+                getopts_write(sh, "OPTARG", &tail)?;
             } else if let Some(a) = args.get((optind - 1) as usize).cloned() {
-                sh.set_var("OPTARG", &a)?;
+                getopts_write(sh, "OPTARG", &a)?;
                 optind += 1;
             } else if silent {
-                sh.set_var("OPTARG", &c.to_string())?;
+                getopts_write(sh, "OPTARG", &c.to_string())?;
                 letter = ':';
             } else {
                 // Bare and capitalised for the same reason its neighbour is:
                 // `fprintf` to stderr (ash.c:11736), not a shell diagnostic.
                 err_line(sh, &format!("No arg for -{c} option"));
-                sh.unset_var("OPTARG");
+                getopts_unset_optarg(sh)?;
                 letter = '?';
             }
         }
@@ -2014,19 +2014,53 @@ fn getopts(sh: &mut Shell, argv: &[String]) -> R<()> {
     ok(sh)
 }
 
-// End of options: report `?` through `name` and stop, leaving OPTARG alone.
+// End of options: report `?` through `name` and stop. ash unsets OPTARG here
+// too (ash.c:11692, the `atend` label).
 fn getopts_done(sh: &mut Shell, name: &str, optind: i64) -> R<()> {
+    getopts_unset_optarg(sh)?;
     getopts_store(sh, name, optind, "?")?;
     sh.getopts_optind = optind;
     sh.getopts_off = -1;
     status(sh, 1)
 }
 
+/// Any `getopts` write that can be REFUSED, which is every one of them once a
+/// regular builtin's error stops killing the shell.
+///
+/// ash parks `shellparam.optind = -1` on entry (ash.c:11680) and puts the real
+/// cursor back only after the last write lands (ash.c:11757), so a refusal
+/// leaves the scan restartable: the next call reads that sentinel through
+/// `(unsigned)optind > nparam + 1` (ash.c:11777) and starts at word 1. td-sh
+/// has no unsigned reinterpretation to lean on, so it spells the restart out.
+fn getopts_write(sh: &mut Shell, name: &str, value: &str) -> R<()> {
+    let r = sh.set_var(name, value);
+    if r.is_err() {
+        sh.getopts_optind = 1;
+        sh.getopts_off = -1;
+    }
+    r
+}
+
+/// The three `OPTARG` unsets, refusable for the same reason: ash's `unsetvar`
+/// IS `setvar(s, NULL, 0)` (ash.c:2525), so a readonly OPTARG raises there
+/// exactly as an assignment would.
+fn getopts_unset_optarg(sh: &mut Shell) -> R<()> {
+    if sh.unset_var("OPTARG") {
+        return Ok(());
+    }
+    sh.getopts_optind = 1;
+    sh.getopts_off = -1;
+    // `unset_var` reports refusal as a bool, so this is the one refusal whose
+    // message is not `set_var`'s own; it borrows the wording rather than
+    // repeating it.
+    Err(sh.readonly_fatal("OPTARG"))
+}
+
 // Publish OPTIND and the option letter, skipping a name that is not an identifier.
 fn getopts_store(sh: &mut Shell, name: &str, optind: i64, letter: &str) -> R<()> {
-    sh.set_var("OPTIND", &optind.to_string())?;
+    getopts_write(sh, "OPTIND", &optind.to_string())?;
     if ast::is_name(name) {
-        sh.set_var(name, letter)?;
+        getopts_write(sh, name, letter)?;
     }
     Ok(())
 }
@@ -3095,13 +3129,18 @@ fn cd(sh: &mut Shell, argv: &[String]) -> R<()> {
     // With `-P` dash passes no logical path to setpwd, which then takes the
     // physical one; otherwise the name walked to is kept.
     let new = if physical { phys.clone() } else { target };
-    let old = std::mem::replace(&mut sh.logical_cwd, new.clone());
+    // ash's `setpwd` order (ash.c:2865, 2883, 2885): OLDPWD is written BEFORE
+    // `curdir` moves, so a refusal there leaves `pwd` where it was. The chdir is
+    // committed either way -- `sh.cwd` is what children are given, and ash has
+    // already chdir'd by the time `setpwd` runs.
+    let old = sh.logical_cwd.to_string_lossy().into_owned();
     sh.cwd = phys;
     // Both are exported, as dash's setpwd writes them. The variables are the one
     // place the path has to become a String, so a name that is not UTF-8 is lossy
     // THERE while the shell's own directory keeps its bytes.
-    sh.set_var("OLDPWD", &old.to_string_lossy())?;
+    sh.set_var("OLDPWD", &old)?;
     sh.export_var("OLDPWD");
+    sh.logical_cwd = new.clone();
     sh.set_var("PWD", &new.to_string_lossy())?;
     sh.export_var("PWD");
     if print {
@@ -6121,11 +6160,15 @@ mod tests {
         assert_eq!(run_capturing("set -- -a; getopts a o; set -- x; echo $OPTIND").1, "2\n");
         assert_eq!(run_capturing("readonly OPTIND; set -- x; echo ok=$?").1, "ok=0\n");
         // dash's number(): an all-digit OPTIND is taken (0 coerced up to 1), and
-        // anything else -- negative, signed, padded, non-numeric -- is fatal.
+        // anything else -- negative, signed, padded, non-numeric -- is an error.
+        // It ends the COMMAND and not the shell, `getopts` being regular, so the
+        // status stands and the next command runs.
         assert_eq!(run_capturing("set -- -a; OPTIND=0; getopts a o; echo \"$o $?\"").1, "a 0\n");
         for bad in ["-1", "abc", "' 2'", "+1"] {
-            let (status, out, _) = run_capturing(&format!("OPTIND={bad}; getopts a: x; echo unreached"));
-            assert_eq!((status, out.as_str()), (2, ""), "OPTIND={bad} should be fatal");
+            let (_, out, err) =
+                run_capturing(&format!("OPTIND={bad}; getopts a: x; echo \"st=$?\"; echo AFTER"));
+            assert_eq!(out, "st=2\nAFTER\n", "OPTIND={bad}");
+            assert!(err.contains("Illegal number"), "OPTIND={bad}: {err:?}");
         }
     }
 
