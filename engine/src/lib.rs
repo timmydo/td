@@ -19,6 +19,7 @@
 //! it (together with `crc32`) exactly as td-boot includes `sha256`.
 pub mod crc32;
 pub mod exit;
+pub mod fat;
 pub mod gpt;
 pub mod json;
 pub mod sha256;
