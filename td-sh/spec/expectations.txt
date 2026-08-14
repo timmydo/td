@@ -530,7 +530,6 @@ xfail builtin-fc.test.sh::fc -ln lists history commands without numbers
 xfail builtin-fc.test.sh::fc -lnr lists history commands without numbers in reverse order
 xfail builtin-fc.test.sh::fc -lr [first] [last] where first and last are reversed indexes does not undo reverse
 xfail builtin-fc.test.sh::fc -lr lists history commands in reverse order
-xfail builtin-getopts.test.sh::OPTIND should be >= 1 (regression)
 xfail builtin-history.test.sh::HISTFILE is defined initially
 xfail builtin-history.test.sh::HISTFILE set to array
 xfail builtin-history.test.sh::HISTFILE unset

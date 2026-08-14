@@ -1919,16 +1919,7 @@ fn getopts(sh: &mut Shell, argv: &[String]) -> R<()> {
     } else {
         sh.params.clone()
     };
-    // dash treats an OPTIND that is not a positive integer as fatal, rather than
-    // quietly restarting the scan; ash ignores it (`is_number` guards its
-    // `number()` call), which is a divergence of its own and not this one.
     let mut optind = sh.getopts_optind;
-    if optind < 1 {
-        let shown = sh.get_var("OPTIND").unwrap_or_default();
-        err_line(sh, &format!("getopts: Illegal number: {shown}"));
-        sh.set_status(2);
-        return Err(Sig::Abort(2));
-    }
     let mut off = sh.getopts_off;
     // A scan left past the end of a now-shorter argument list starts over.
     if optind > args.len() as i64 + 1 {
@@ -6145,7 +6136,7 @@ mod tests {
             run_capturing("set -- -ab; getopts ab o; OPTIND=2; getopts ab o; echo \"$o $?\"").1,
             "? 1\n"
         );
-        // OPTIND is 1 before any getopts, and a non-positive one is fatal.
+        // OPTIND is 1 before any getopts.
         assert_eq!(run_capturing("echo $OPTIND").1, "1\n");
         // The cursor is per argument frame: a function scans its OWN arguments
         // from the start, the caller resumes where it left off, and `shift` (which
@@ -6159,17 +6150,145 @@ mod tests {
         // getopts published, so a readonly OPTIND is not disturbed either.
         assert_eq!(run_capturing("set -- -a; getopts a o; set -- x; echo $OPTIND").1, "2\n");
         assert_eq!(run_capturing("readonly OPTIND; set -- x; echo ok=$?").1, "ok=0\n");
-        // dash's number(): an all-digit OPTIND is taken (0 coerced up to 1), and
-        // anything else -- negative, signed, padded, non-numeric -- is an error.
-        // It ends the COMMAND and not the shell, `getopts` being regular, so the
-        // status stands and the next command runs.
-        assert_eq!(run_capturing("set -- -a; OPTIND=0; getopts a o; echo \"$o $?\"").1, "a 0\n");
-        for bad in ["-1", "abc", "' 2'", "+1"] {
-            let (_, out, err) =
-                run_capturing(&format!("OPTIND={bad}; getopts a: x; echo \"st=$?\"; echo AFTER"));
-            assert_eq!(out, "st=2\nAFTER\n", "OPTIND={bad}");
-            assert!(err.contains("Illegal number"), "OPTIND={bad}: {err:?}");
+        // ash's `getoptsreset`: all-digits is taken, anything else IS the number
+        // 1, silently -- `is_number` guards the only `Illegal number` raise, so
+        // no OPTIND value reaches it.
+        for bad in [
+            "-1", "abc", "' 2'", "+1", "''", "1x", "0x2", "e", "'1 '", "' '", "x1", "1.0", "-0",
+        ] {
+            let (_, out, err) = run_capturing(&format!(
+                "set -- -a -b; OPTIND={bad}; getopts ab o; echo \"$o $? $OPTIND\""
+            ));
+            assert_eq!(out, "a 0 2\n", "OPTIND={bad}");
+            assert_eq!(err, "", "OPTIND={bad}");
         }
+        // The coercions that look like errors and are not: 0 becomes 1, and a
+        // value PAST the end restarts -- but nparam+1 is a finished scan, not a
+        // past-the-end one, so 3 reports `?` where 4 starts over.
+        for (v, want) in [
+            ("0", "a 0 2\n"),
+            ("1", "a 0 2\n"),
+            ("2", "b 0 3\n"),
+            ("3", "? 1 3\n"),
+            ("4", "a 0 2\n"),
+            ("99", "a 0 2\n"),
+        ] {
+            assert_eq!(
+                run_capturing(&format!(
+                    "set -- -a -b; OPTIND={v}; getopts ab o; echo \"$o $? $OPTIND\""
+                ))
+                .1,
+                want,
+                "OPTIND={v}"
+            );
+        }
+        // `atoi` has no octal, so `010` is ten. It needs a list long enough for
+        // 8 and 10 to be different words -- on a short one both are past the end
+        // and restart alike, which witnesses nothing.
+        let long = "set -- -a -a -a -a -a -a -a -b -b -c -c -c";
+        for (v, want) in [("010", "c 11\n"), ("10", "c 11\n"), ("8", "b 9\n")] {
+            assert_eq!(
+                run_capturing(&format!("{long}; OPTIND={v}; getopts abc o; echo \"$o $OPTIND\"")).1,
+                want,
+                "OPTIND={v}"
+            );
+        }
+        // The magnitudes, and with them the ONE deliberate divergence. ash's
+        // `number()` returns `atoi`'s `int`, so ash SEEKS to a value whose low 32
+        // bits land in [2, nparam+1] where an i64 sees something enormous and
+        // restarts. That window repeats every 2^32 rather than being a single
+        // pair: with two parameters 2^32+2 and 2^33+2 both give ash `b 0 3`.
+        // Everything on either side agrees, whether by saturating, by truncating
+        // to a negative, or by being past the end either way. Pinned so a change
+        // to the parse cannot reverse the choice silently.
+        for (v, want) in [
+            ("2147483647", "a 0 2\n"),
+            ("2147483648", "a 0 2\n"),
+            ("4294967295", "a 0 2\n"),
+            ("4294967296", "a 0 2\n"),
+            ("4294967297", "a 0 2\n"),
+            ("4294967298", "a 0 2\n"),
+            ("4294967299", "a 0 2\n"),
+            ("4294967300", "a 0 2\n"),
+            ("8589934594", "a 0 2\n"),
+            ("9223372036854775807", "a 0 2\n"),
+            ("9223372036854775808", "a 0 2\n"),
+            ("99999999999999999999", "a 0 2\n"),
+        ] {
+            assert_eq!(
+                run_capturing(&format!(
+                    "set -- -a -b; OPTIND={v}; getopts ab o; echo \"$o $? $OPTIND\""
+                ))
+                .1,
+                want,
+                "OPTIND={v}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_write_to_optind_restarts_the_scan() {
+        // ash hangs `getoptsreset` off the VARIABLE (ash.c:2164), so the reset is
+        // not about assignment syntax: whatever writes OPTIND puts the cursor back
+        // to word 1. `unset` reaches it through the other hook and belongs here
+        // because it is the same observable, not the same path.
+        for w in [
+            "OPTIND=abc",
+            "export OPTIND=abc",
+            "for OPTIND in abc; do :; done",
+            "unset OPTIND",
+            "read OPTIND <<EOF\nabc\nEOF",
+        ] {
+            assert_eq!(
+                run_capturing(&format!(
+                    "set -- -a -b; getopts ab o; {w}\ngetopts ab p; echo \"$p $? $OPTIND\""
+                ))
+                .1,
+                "a 0 2\n",
+                "{w}"
+            );
+        }
+        // An assignment PREFIX is scoped to its command and fires the hook again
+        // on the restore, so the cursor ends where it started -- for a function
+        // and for an external alike. These agree with ash for that reason rather
+        // than by luck, which is why they are pinned beside the resets.
+        for w in ["f() { :; }; OPTIND=abc f", "OPTIND=abc true"] {
+            assert_eq!(
+                run_capturing(&format!(
+                    "set -- -a -b; getopts ab o; {w}; getopts ab p; echo \"$p $? $OPTIND\""
+                ))
+                .1,
+                "b 0 3\n",
+                "{w}"
+            );
+        }
+        // `local OPTIND=abc` resets, but the frame is the FUNCTION's own argument
+        // list -- empty here -- so the scan there ends at once and the caller's
+        // cursor is untouched by it.
+        assert_eq!(
+            run_capturing(
+                "set -- -a -b; getopts ab o; \
+                 f() { local OPTIND=abc; getopts ab p; echo \"in:$p\"; }; f; \
+                 getopts ab q; echo \"$q $OPTIND\""
+            )
+            .1,
+            "in:?\nb 3\n"
+        );
+        // Only the hidden cursor resets; the VALUE stands until the next getopts
+        // publishes a number over it.
+        assert_eq!(run_capturing("OPTIND=abc; echo \"[$OPTIND]\"").1, "[abc]\n");
+        assert_eq!(
+            run_capturing("set -- -a; OPTIND=abc; getopts a o; echo \"[$OPTIND]\"").1,
+            "[2]\n"
+        );
+        // A half-consumed cluster goes with it: `-ab` rescans from `-a`.
+        assert_eq!(
+            run_capturing(
+                "set -- -ab; getopts ab o; OPTIND=abc; getopts ab p; echo \"$o $p $OPTIND\""
+            )
+            .1,
+            "a a 2\n"
+        );
     }
 
     #[test]

@@ -653,10 +653,9 @@ impl Shell {
     /// Assign a shell variable, honouring the readonly attribute. A write to a
     /// readonly name is dash's sh_error, so it goes out as `Sig::Abort` and `?`
     /// carries it to the nearest handler rather than leaving a status to test.
-    /// dash's OPTIND hook (`getoptsreset`): any assignment moves the cursor and
-    /// abandons a half-consumed word. dash's number() takes an all-digit string
-    /// only (so " 2", "+1" and "-1" are all rejected) and coerces 0 up to 1; a
-    /// rejected value parks -1, which `getopts` reports when it next runs.
+    /// ash's OPTIND hook (`getoptsreset`): any assignment moves the cursor and
+    /// abandons a half-consumed word. An all-digit string is taken (0 coerced up
+    /// to 1) and anything else -- " 2", "+1", "-1", the empty string -- IS 1.
     fn var_hook(&mut self, name: &str, value: &str) {
         match self.vars.get(name).and_then(|v| v.dynamic) {
             Some(Dyn::Random) => {
@@ -671,17 +670,19 @@ impl Shell {
         if name != "OPTIND" {
             return;
         }
+        // ash's `getoptsreset` (ash.c:2272) assigns 1 first and takes the value
+        // only if `is_number` passes, which is what stops `number()` reaching its
+        // `Illegal number` raise: anything else restarts the scan silently.
         let digits = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
         self.getopts_optind =
-            if digits { value.parse::<i64>().unwrap_or(i64::MAX).max(1) } else { -1 };
+            if digits { value.parse::<i64>().unwrap_or(i64::MAX).max(1) } else { 1 };
         self.getopts_off = -1;
     }
 
     /// The same hook for the value going AWAY. ash fires it on an unset too
-    /// (`unsetvar` is `setvar(s, NULL, 0)`), where `getoptsreset` restarts the
-    /// scan at word 1 for anything that is not a number (ash.c:2272) rather than
-    /// parking the error an assignment parks. dash rejects `unset OPTIND`
-    /// outright, so ash decides this one.
+    /// (`unsetvar` is `setvar(s, NULL, 0)`), which reaches `getoptsreset` with no
+    /// value and so restarts at word 1. dash rejects `unset OPTIND` outright, so
+    /// ash decides this one.
     fn unset_hook(&mut self, name: &str) {
         // ash: "as soon as they're unset, they're no longer dynamic" (the
         // comment on `lookupvar`). `local VAR` reaches this through the same
@@ -4280,7 +4281,7 @@ mod tests {
         // ash re-raises out of `evalbltin` for a special builtin only
         // (ash.c:10619), which is why every row above is one.
         for bad in [
-            "set -- -a; OPTIND=abc; getopts a o; echo SAME",
+            "readonly OPTARG=x; set -- -Z; getopts a O; echo SAME",
             "readonly N; read N </dev/null; echo SAME",
             "readonly O; getopts ab O -a; echo SAME",
         ] {
@@ -4643,9 +4644,9 @@ mod tests {
             run("set -- -ab; getopts ab o; f() { :; }; OPTIND=1 f; getopts ab o; echo $o,$OPTIND");
         assert_eq!(out, "?,2\n");
         // Restoring a name that did NOT exist is an unset, and ash fires the hook
-        // for that too -- restarting at word 1 rather than parking the error a
-        // non-numeric ASSIGNMENT parks. Only a temp value above 1 can tell the two
-        // apart, which is why these use 2.
+        // for that too -- so the cursor goes back to word 1 rather than keeping
+        // where the temporary value left it. Only a temp value above 1 can tell
+        // those apart, which is why these use 2.
         for src in [
             "unset OPTIND; set -- -a -b; f() { :; }; OPTIND=2 f; getopts ab o",
             "unset OPTIND; set -- -a -b; OPTIND=2 true; getopts ab o",
