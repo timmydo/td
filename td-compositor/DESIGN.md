@@ -606,8 +606,9 @@ since it is the one the operator was acting on.
 
 DRAGGING a window is the same move with the destination named by the pointer
 instead of by a direction. A press on a title BAND picks the window up and
-focuses it; the release drops it beside whatever is under the pointer then,
-on the side the pointer is in. Which side is read along the TARGET's own
+focuses it; from there the screen shows the drop ITSELF, and the release
+keeps what is on it. The side the window lands on is the side the pointer is
+in. Which side is read along the TARGET's own
 container — top or bottom in a column, left or right in a row — since that is
 the direction its neighbours actually lie in, and within whichever rectangle
 the pointer is in rather than over the tile as a whole, because a stacked
@@ -638,23 +639,93 @@ and would move focus mid-grab, which click-to-focus refuses for the same
 reason. Nothing is picked up while a grab is held.
 
 A drag is also forgotten when the window it names goes away — on a single
-toplevel's removal and on a whole client's. Object ids are recycled per
-client, so a stale one does not merely name nothing: it can come to name a
-DIFFERENT window, and the release would then move one nobody picked
-up. A release off every tile cancels rather
+toplevel's removal, on a whole client's, and on an unmap. Object ids are
+recycled per client, so a stale one does not merely name nothing: it can come
+to name a DIFFERENT window, and the release would then move one nobody picked
+up. The unmap case is the one that can be UNDONE — the same surface maps again
+and is the same window — so a drag that survived it would come back to life
+and move that window under a button pressed before it ever vanished.
+
+A press that picks NOTHING up ends whatever was live, rather than leaving a
+picture standing with no drag able to commit or clear it. That is not
+reachable while every release arrives, since a second press of a held button
+is not forwarded, but a batch that overflows its transition limit is reset and
+the release in it is what goes.
+
+A release off every tile cancels rather
 than moving to nowhere, and an overlay going up drops what was held, since it
 covers the screen the operator was aiming at. That cancel happens where the
 overlay BECOMES visible rather than on the next modal pointer frame, because
 an overlay is opened from the keyboard: raising and dismissing one without
-moving the mouse would otherwise leave the drag standing.
+moving the mouse would otherwise leave the drag standing. It is folded into
+the paint the overlay already owes rather than settling on its own, since a
+failure of its own would be the one path through those two that returns
+without restoring what it changed.
 
 A drop reports whether the ARRANGEMENT changed rather than whether it was
 asked for, so putting a window back exactly where it came from — the
 commonest gesture there is — costs no repaint and no round of configures.
 
-There is no drag INDICATOR yet: nothing on screen follows the pointer or
-marks where a drop would land, so the gesture is currently blind between
-press and release.
+The drag INDICATOR is the drop, drawn. Rather than an outline following the
+pointer, the compositor lays out the arrangement a release would leave and
+puts THAT on screen, so what the operator sees is what they get: the release
+does not apply a computation, it keeps the picture. There is no second answer
+for it to disagree with, and a release on a STILL pointer owes nothing — no
+paint and no round of configures — because the screen and the map published to
+clients have both been reading the preview since it went up. Clients are
+configured for it too, or the picture would be a lie the moment one of them
+redrew into it.
+
+FOCUS is read off the arrangement as the geometry is, because a preview
+carries its own: the drop focuses what it moved, and the map published to
+clients marks that window active. Answering from the layout underneath would
+aim the keyboard at one window while telling every client another had been
+activated. The layout's own focus is left alone, so a cancelled drag hands it
+back rather than keeping the drop's.
+
+TWO arrangements are in play during a drag and they are deliberately
+different. What is DRAWN is the result: the layout with the dragged window
+moved to where the pointer says. What the pointer is measured AGAINST is the
+layout with that window taken OUT. Aiming at the picture would let a tile be
+pushed away by the very motion aiming at it — worse, the pointer would come to
+rest over the dragged window, which refuses its own drop, so the next frame
+would fall back to the arrangement and the one after that would move it again:
+a picture alternating between two answers with the mouse held still. Removing
+it once, up front, is what makes the target stable, and it is also what the
+picture would look like anyway with the window lifted off.
+
+The band a window was picked up by is a DEAD ZONE. With the dragged window
+taken out, the pixel under the press belongs to whichever neighbour grew into
+it, so without the dead zone a press alone would move the window and a click
+on a title bar would stop being a click. It is read out of the arrangement
+rather than the preview, so it is one fixed rectangle for the whole gesture
+and returning the pointer to it puts the window back.
+
+The preview is DERIVED, never a second source of truth: it is rebuilt from the
+arrangement on every pointer frame and dropped by every change to it, so a
+window arriving or leaving mid-drag cannot leave a stale picture standing. The
+drag itself survives that and re-previews on the next motion; a release in the
+window between them lands nothing, which is the honest answer when the
+arrangement the drop was aimed at no longer exists. Dropping a preview COUNTS
+as a layout change to whatever mutation dropped it, even one that changed
+nothing itself: the screen moves, and the map published to clients was the
+previewed one, so a mutation reporting only its own change would leave those
+two disagreeing.
+
+Button transitions are handled in the ORDER they happened, one pass over the
+frame. A frame can carry several — evdev keeps every transition up to its
+SYN_REPORT — and a release followed by a press is one window dropped and the
+next picked up in a single batch. Handling all the presses first would let the
+new drag consume the old one's release: the old drop lost and the new drag
+ended where it began.
+
+The picture is a frame behind the pointer when a batch carries both the motion
+that chose the drop and the release that takes it, so a release brings it up
+to date first — but only when that frame MOVED. On a still pointer there is
+nothing new to account for, and computing an answer anyway is how a release
+after an invalidated preview would commit one the operator never saw; the
+reflow can also move the dead zone under a motionless pointer, so a title-bar
+click would move the window.
 
 STACKING is the second arrangement a container can take, toggled by
 `Super+s`. Its leaves' bands run down its top, one after another, and ONE of

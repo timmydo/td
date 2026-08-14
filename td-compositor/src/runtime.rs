@@ -307,6 +307,7 @@ impl Runtime {
     }
 
     pub fn unmap(&mut self, key: SurfaceKey) -> Result<(), String> {
+        self.forget_drag(|dragged| dragged == key);
         let layout_changed = self.scene.unmap(key);
         self.repaint()?;
         self.refresh_focus()?;
@@ -344,6 +345,7 @@ impl Runtime {
     pub fn launcher(&mut self, action: LauncherAction) -> Result<Option<LaunchRequest>, String> {
         let checkpoint = self.scene.launcher_checkpoint();
         let request = self.scene.launcher(action);
+        let restored = self.cancel_drag_under_overlay();
         if let Err(error) = self.repaint() {
             self.scene.restore_launcher(checkpoint);
             return Err(error);
@@ -357,7 +359,9 @@ impl Runtime {
             }
             return Err(error);
         }
-        self.cancel_drag_under_overlay();
+        if restored && self.refresh_layout()? {
+            self.publish_layout();
+        }
         Ok(request)
     }
 
@@ -367,10 +371,38 @@ impl Runtime {
     /// without moving the mouse, and no modal pointer frame ever happens — so
     /// the release would perform a drop the operator could not see themselves
     /// aiming at.
-    fn cancel_drag_under_overlay(&mut self) {
-        if self.scene.modal() {
-            self.dragging = None;
+    ///
+    /// Folded into the paint the overlay already owes rather than settling on
+    /// its own: a failure here would otherwise be the one path through these
+    /// two that returns without restoring what it changed. Answers whether
+    /// putting the arrangement back moved the screen, which is a round of
+    /// configures the caller owes its clients.
+    fn cancel_drag_under_overlay(&mut self) -> bool {
+        if !self.scene.modal() {
+            return false;
         }
+        self.dragging = None;
+        self.scene.clear_preview()
+    }
+
+    /// Put the window back down where it was picked up and end the drag.
+    fn cancel_drag(&mut self) -> Result<(), String> {
+        self.dragging = None;
+        if self.scene.clear_preview() {
+            self.settle_layout()?;
+        }
+        Ok(())
+    }
+
+    /// Repaint, re-aim the keyboard and republish, for a change to the
+    /// arrangement on screen.
+    fn settle_layout(&mut self) -> Result<(), String> {
+        self.repaint()?;
+        self.refresh_focus()?;
+        if self.refresh_layout()? {
+            self.publish_layout();
+        }
+        Ok(())
     }
 
     /// Take a new status line. Repaints only when the TEXT changed, so a
@@ -401,13 +433,16 @@ impl Runtime {
         if self.scene.set_help(action.target(before)) == before {
             return Ok(before);
         }
+        let restored = self.cancel_drag_under_overlay();
         if let Err(error) = self.repaint() {
             return Err(self.restore_help(before, error));
         }
         if let Err(error) = self.refresh_focus() {
             return Err(self.restore_help(before, error));
         }
-        self.cancel_drag_under_overlay();
+        if restored && self.refresh_layout()? {
+            self.publish_layout();
+        }
         Ok(self.scene.help_visible())
     }
 
@@ -480,12 +515,13 @@ impl Runtime {
         if let Some(clicked) = result.pressed_on {
             self.focus_surface(clicked)?;
         }
-        self.drag(modal, buttons)?;
+        self.drag(modal, dx != 0 || dy != 0, buttons)?;
         Ok(())
     }
 
     /// The title-band drag. A press on a band picks the window up and focuses
-    /// it; the release drops it beside whatever is under the pointer then.
+    /// it; from the first motion off that band the screen shows the drop
+    /// itself, and the release keeps it.
     ///
     /// Entirely outside the pointer model, and it has to be: a band belongs to
     /// no client, so a press on one establishes no grab and delivers nothing.
@@ -493,12 +529,22 @@ impl Runtime {
     /// rather than worked around. A modal overlay owns every button while it
     /// is up, so nothing is picked up under one — and anything already held is
     /// dropped, since the operator can no longer see where it would land.
-    fn drag(&mut self, modal: bool, buttons: &[PointerButtonInput]) -> Result<(), String> {
+    fn drag(
+        &mut self,
+        modal: bool,
+        moved: bool,
+        buttons: &[PointerButtonInput],
+    ) -> Result<(), String> {
         if modal {
-            self.dragging = None;
-            return Ok(());
+            return self.cancel_drag();
         }
         let (width, height) = (self.framebuffer.width, self.framebuffer.height);
+        // One pass, in the order the transitions happened. A frame can carry
+        // several — evdev keeps every transition up to its SYN_REPORT — and a
+        // release followed by a press is a window dropped and the next one
+        // picked up in one batch. Handling all the presses first would let the
+        // new drag consume the old one's release: the old drop lost and the
+        // new drag ended where it started.
         for input in buttons {
             if input.button != POINTER_BUTTON_LEFT {
                 continue;
@@ -516,28 +562,48 @@ impl Runtime {
                     if self.pointer.grab_surface().is_some() {
                         continue;
                     }
-                    self.dragging = self.scene.band_at_pointer(width, height);
-                    if let Some(key) = self.dragging {
-                        self.focus_surface(key)?;
+                    // A press that lands off every band starts nothing, and
+                    // ENDS whatever was live: leaving a picture up with no
+                    // drag to commit or clear it would strand the screen and
+                    // the clients on an arrangement the layout never took.
+                    match self.scene.band_at_pointer(width, height) {
+                        Some(key) => {
+                            self.dragging = Some(key);
+                            self.focus_surface(key)?;
+                        }
+                        None => self.cancel_drag()?,
                     }
                 }
                 PointerButtonState::Released => {
                     let Some(dragged) = self.dragging.take() else {
                         continue;
                     };
-                    // Off every tile — the desktop, the bar — is a cancelled
-                    // drag rather than a move to nowhere.
-                    let Some((target, before)) = self.scene.drop_target(width, height) else {
-                        continue;
-                    };
-                    if self.scene.drop_beside(dragged, target, before) {
-                        self.repaint()?;
-                        self.refresh_focus()?;
-                        if self.refresh_layout()? {
-                            self.publish_layout();
-                        }
+                    // The reader coalesces a batch, so the motion that chose
+                    // the drop and the release that takes it commonly arrive
+                    // together and the picture is a frame behind the pointer.
+                    // Brought up to date only when this frame MOVED: on a
+                    // still pointer there is nothing new to account for, and
+                    // computing one anyway would commit an answer the
+                    // operator never saw — which is exactly a release that
+                    // follows a window mapping the preview away.
+                    if moved && self.scene.preview_drop(dragged, width, height) {
+                        self.settle_layout()?;
                     }
+                    // Nothing is decided here. The drop went into the picture
+                    // the moment the pointer reached it, so the release only
+                    // KEEPS that picture — and off every tile, or still on
+                    // the band it came from, there is no picture to keep and
+                    // the drag simply ends. Promoting it owes neither a paint
+                    // nor a round of configures: the screen and the map
+                    // published to clients have both been reading the preview
+                    // since it went up.
+                    self.scene.commit_preview();
                 }
+            }
+        }
+        if let Some(dragged) = self.dragging {
+            if self.scene.preview_drop(dragged, width, height) {
+                self.settle_layout()?;
             }
         }
         Ok(())
@@ -1604,6 +1670,25 @@ mod tests {
             "a recycled id inherited a drag it never began"
         );
 
+        // UNMAPPING is the third way a window leaves, and unlike the two
+        // above it can be undone: the same surface maps again and is the same
+        // window, so a drag that survived would come back to life and move it
+        // under a button pressed before it ever vanished.
+        let handle = band(&runtime, 1).band;
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(26)]);
+        runtime.unmap(*keys.first().unwrap()).unwrap();
+        runtime
+            .commit(*keys.first().unwrap(), surface([6, 6, 6, 0]))
+            .unwrap();
+        let remapped = order(&runtime);
+        let target = band(&runtime, 3).rect;
+        goto(&mut runtime, target.x + 2, target.y + 2, &[release(27)]);
+        assert_eq!(
+            order(&runtime),
+            remapped,
+            "a remapped window inherited the drag it was unmapped under"
+        );
+
         // The LAUNCHER is the other overlay and a second call site, so it
         // gets the same assertion rather than being taken on trust.
         let handle = band(&runtime, 1).band;
@@ -1628,6 +1713,256 @@ mod tests {
         let target = band(&runtime, 2).rect;
         goto(&mut runtime, target.x + 2, target.y + 2, &[release(13)]);
         assert_eq!(order(&runtime), [2, 3, 1], "an overlay let a drag begin");
+        runtime.scene.layout().check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_drag_shows_its_drop_before_the_button_is_released() {
+        // The drag as an operator performs it, in the frames it actually
+        // arrives in: press, then MOTION, then release. The old indicator was
+        // computed at the release, so nothing on screen between those frames
+        // said where the window would land. Now the motion frame IS the
+        // landing, and the release keeps it.
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-drag-preview-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let height = 600;
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, height, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let keys: Vec<SurfaceKey> = (1..=3)
+            .map(|object| SurfaceKey { client: 1, object })
+            .collect();
+        runtime
+            .commit(*keys.first().unwrap(), surface([1, 2, 3, 0]))
+            .unwrap();
+        runtime
+            .commit(*keys.get(1).unwrap(), surface([4, 5, 6, 0]))
+            .unwrap();
+        runtime.command(Command::SetSplit(Axis::Vertical)).unwrap();
+        runtime
+            .commit(*keys.get(2).unwrap(), surface([7, 8, 9, 0]))
+            .unwrap();
+        let tiles = |runtime: &Runtime| runtime.scene.tiled_placements(240, height);
+        let order = |runtime: &Runtime| {
+            tiles(runtime)
+                .iter()
+                .map(|placement| placement.key.object)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(&runtime), [1, 2, 3]);
+        let band = |runtime: &Runtime, object: u32| {
+            let placements = tiles(runtime);
+            let at = placements
+                .iter()
+                .position(|placement| placement.key.object == object)
+                .unwrap();
+            *placements.get(at).unwrap()
+        };
+        let goto = |runtime: &mut Runtime, x: usize, y: usize, buttons: &[PointerButtonInput]| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            let (dx, dy) = (
+                i32::try_from(x).unwrap() - at_x,
+                i32::try_from(y).unwrap() - at_y,
+            );
+            runtime.pointer_frame(1, dx, dy, buttons).unwrap()
+        };
+        let press = |time| PointerButtonInput {
+            time,
+            button: 272,
+            state: PointerButtonState::Pressed,
+        };
+        let release = |time| PointerButtonInput {
+            time,
+            button: 272,
+            state: PointerButtonState::Released,
+        };
+
+        // Picking 1 up moves nothing yet: the pointer has not left its band.
+        // Geometry rather than whole placements, since the press legitimately
+        // takes focus and focus is one of their fields.
+        let geometry = |runtime: &Runtime| {
+            tiles(runtime)
+                .iter()
+                .map(|placement| (placement.key.object, placement.rect, placement.band))
+                .collect::<Vec<_>>()
+        };
+        let undragged = geometry(&runtime);
+        let handle = band(&runtime, 1).band;
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(2)]);
+        assert_eq!(
+            geometry(&runtime),
+            undragged,
+            "the press alone moved a window"
+        );
+        let picked_up = runtime.layout_snapshot();
+
+        // The motion frame, with the button still down and no release in it.
+        let target = band(&runtime, 3).rect;
+        goto(
+            &mut runtime,
+            target.x + 2,
+            target.y + target.height - 2,
+            &[],
+        );
+        assert_eq!(
+            order(&runtime),
+            [2, 3, 1],
+            "the drop was not on screen before the release"
+        );
+        let previewed = tiles(&runtime);
+        let published = runtime.layout_snapshot();
+        // Clients are configured for the preview, or the picture is a lie the
+        // moment any of them redraws into it.
+        assert_ne!(published, picked_up, "the preview published no layout");
+        // And the KEYBOARD is aimed at what the picture says is active. These
+        // come from different sources — one the arrangement's own focus, the
+        // other the published map's activation — so a preview read off the
+        // layout underneath would aim them at different windows.
+        assert_eq!(
+            runtime.keyboard_snapshot().focus,
+            keys.first().copied(),
+            "the keyboard and the picture disagree about what is focused"
+        );
+
+        // The release. It has nothing left to decide, so it owes no paint and
+        // no round of configures — and the map published to clients must come
+        // out byte-identical, which a release that recomputed the drop could
+        // not promise.
+        goto(
+            &mut runtime,
+            target.x + 2,
+            target.y + target.height - 2,
+            &[release(3)],
+        );
+        assert_eq!(
+            tiles(&runtime),
+            previewed,
+            "the release moved what the preview had promised"
+        );
+        assert_eq!(runtime.layout_snapshot(), published);
+        runtime.scene.layout().check_invariants().unwrap();
+
+        // Aiming somewhere and then leaving every tile puts the arrangement
+        // back, so a cancelled drag looks like one BEFORE the button is let
+        // go rather than only after.
+        let settled = geometry(&runtime);
+        let handle = band(&runtime, 2).band;
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(4)]);
+        let target = band(&runtime, 1).rect;
+        goto(&mut runtime, target.x + 2, target.y + 2, &[]);
+        assert_ne!(geometry(&runtime), settled, "the drag previewed nothing");
+        goto(&mut runtime, 0, height - 1, &[]);
+        assert_eq!(
+            geometry(&runtime),
+            settled,
+            "leaving every tile did not put the arrangement back"
+        );
+        goto(&mut runtime, 0, height - 1, &[release(5)]);
+        assert_eq!(geometry(&runtime), settled);
+        runtime.scene.layout().check_invariants().unwrap();
+
+        // A frame carrying a RELEASE and then a PRESS — one window dropped
+        // and the next picked up in a single batch, which evdev keeps whole
+        // up to its SYN_REPORT. Handled out of order, the new drag would
+        // consume the old one's release: the drop lost and the drag ended
+        // where it began.
+        let start = order(&runtime);
+        let dragged = *start.first().unwrap();
+        let handle = band(&runtime, dragged).band;
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(6)]);
+        // The BOTTOM half of the topmost band, so the drop lands after it and
+        // the order comes out different from the one it started in.
+        let onto = band(&runtime, *start.get(1).unwrap()).band;
+        goto(
+            &mut runtime,
+            onto.x + 2,
+            onto.y + onto.height - 2,
+            &[release(7), press(8)],
+        );
+        assert_eq!(
+            order(&runtime),
+            [*start.get(1).unwrap(), dragged, *start.get(2).unwrap()],
+            "the release in a release-then-press frame dropped nothing"
+        );
+        assert!(
+            runtime.dragging.is_some(),
+            "the press in a release-then-press frame picked nothing up"
+        );
+        goto(&mut runtime, 0, height - 1, &[release(9)]);
+        runtime.scene.layout().check_invariants().unwrap();
+
+        // A release that arrives with the pointer STILL, after something
+        // invalidated the preview, lands nothing. Recomputing one on a still
+        // pointer would commit an answer the operator never saw — and the
+        // reflow can move the dead zone under them, so it could move a window
+        // for a title-bar click that never moved the mouse.
+        let settled = geometry(&runtime);
+        let handle = band(&runtime, *order(&runtime).first().unwrap()).band;
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(10)]);
+        let onto = band(&runtime, *order(&runtime).get(1).unwrap()).rect;
+        goto(&mut runtime, onto.x + 2, onto.y + 2, &[]);
+        assert_ne!(geometry(&runtime), settled, "the drag previewed nothing");
+        // A mutation that changes NOTHING itself still drops the picture, and
+        // owes the clients the round of configures that puts them back: a
+        // surface that was never in the layout detaching is the case, and its
+        // own answer is "no change".
+        let previewed = runtime.layout_snapshot();
+        runtime
+            .remove(SurfaceKey {
+                client: 8,
+                object: 8,
+            })
+            .unwrap();
+        assert_eq!(geometry(&runtime), settled, "the picture outlived its base");
+        assert_ne!(
+            runtime.layout_snapshot(),
+            previewed,
+            "the clients were left holding previewed geometry"
+        );
+        goto(&mut runtime, 0, height - 1, &[release(13)]);
+
+        // A press that picks NOTHING up ends whatever was live rather than
+        // leaving its picture standing with nothing able to commit or clear
+        // it. Not reachable while every release arrives — a second press of a
+        // held button is not forwarded — but a batch that overflows its
+        // transition limit is reset, and the release in it is what goes.
+        let handle = band(&runtime, *order(&runtime).first().unwrap()).band;
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(14)]);
+        let onto = band(&runtime, *order(&runtime).get(1).unwrap()).rect;
+        goto(&mut runtime, onto.x + 2, onto.y + 2, &[]);
+        assert_ne!(geometry(&runtime), settled, "the drag previewed nothing");
+        goto(&mut runtime, 0, height - 1, &[press(15)]);
+        assert!(runtime.dragging.is_none(), "the drag outlived a lost press");
+        assert_eq!(
+            geometry(&runtime),
+            settled,
+            "a press that picked nothing up stranded the picture"
+        );
+        goto(&mut runtime, 0, height - 1, &[release(16)]);
+
+        // A window arriving drops the picture too, since it is derived from
+        // an arrangement that no longer holds.
+        let handle = band(&runtime, *order(&runtime).first().unwrap()).band;
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(12)]);
+        let onto = band(&runtime, *order(&runtime).get(1).unwrap()).rect;
+        goto(&mut runtime, onto.x + 2, onto.y + 2, &[]);
+        assert_ne!(geometry(&runtime), settled, "the drag previewed nothing");
+        let guest = SurfaceKey {
+            client: 3,
+            object: 1,
+        };
+        runtime.commit(guest, surface([5, 5, 5, 0])).unwrap();
+        let arrived = geometry(&runtime);
+        goto(&mut runtime, onto.x + 2, onto.y + 2, &[release(11)]);
+        assert_eq!(
+            geometry(&runtime),
+            arrived,
+            "a still release after an invalidated preview moved a window"
+        );
+        runtime.remove(guest).unwrap();
         runtime.scene.layout().check_invariants().unwrap();
     }
 

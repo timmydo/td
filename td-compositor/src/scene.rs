@@ -165,6 +165,11 @@ pub struct Scene {
     pointer_x: i32,
     pointer_y: i32,
     surface_bytes: usize,
+    /// What a drag is drawing INSTEAD of `layout`. Not a second source of
+    /// truth: it is derived from `layout` on every pointer frame and dropped
+    /// by every mutation of it, so nothing here can outlive what it was
+    /// computed from.
+    preview: Option<Layout>,
     launcher: Launcher,
     help: Help,
     status: String,
@@ -180,6 +185,7 @@ impl Scene {
             pointer_x: 0,
             pointer_y: 0,
             surface_bytes: 0,
+            preview: None,
             launcher: Launcher::new(),
             help: Help::default(),
             status: String::new(),
@@ -209,6 +215,7 @@ impl Scene {
         self.surface_bytes = next;
         if is_new {
             self.layout.map(key);
+            self.preview = None;
         }
         Ok(is_new)
     }
@@ -291,7 +298,11 @@ impl Scene {
         let layout_changed = self.layout.contains(key);
         self.discard_pixels(key);
         self.layout.unmap(key);
-        layout_changed
+        // Dropping a drag's preview moves the screen even when the unmap
+        // itself did not — an already-unmapped surface detaching is the case
+        // — and the map published to clients was the previewed one, so it
+        // counts as a layout change or those two are left disagreeing.
+        self.clear_preview() || layout_changed
     }
 
     pub fn remove(&mut self, key: SurfaceKey) -> bool {
@@ -299,7 +310,7 @@ impl Scene {
         self.discard_pixels(key);
         self.titles.remove(&key);
         self.layout.forget(key);
-        layout_changed
+        self.clear_preview() || layout_changed
     }
 
     pub fn remove_client(&mut self, client: u64) -> bool {
@@ -316,11 +327,12 @@ impl Scene {
         self.titles.retain(|key, _| key.client != client);
         self.surface_bytes = self.surface_bytes.saturating_sub(removed);
         self.layout.unmap_client(client);
-        layout_changed
+        self.clear_preview() || layout_changed
     }
 
     pub fn command(&mut self, command: Command) {
         self.layout.apply(command);
+        self.preview = None;
     }
 
     pub fn focus_key(&mut self, key: SurfaceKey) -> bool {
@@ -363,9 +375,9 @@ impl Scene {
     }
 
     pub fn views(&self, width: usize, height: usize) -> Vec<ViewLayout> {
-        let mut views = self
-            .layout
-            .views(width, self.tiled_height(height), GAP, TITLE_HEIGHT);
+        let mut views =
+            self.arrangement()
+                .views(width, self.tiled_height(height), GAP, TITLE_HEIGHT);
         for view in &mut views {
             view.rect.y = view.rect.y.saturating_add(BAR_HEIGHT);
         }
@@ -382,9 +394,24 @@ impl Scene {
     }
 
     pub(crate) fn tiled_placements(&self, width: usize, height: usize) -> Vec<Placement> {
-        let mut placements =
-            self.layout
-                .placements(width, self.tiled_height(height), GAP, TITLE_HEIGHT);
+        self.placements_of(self.arrangement(), width, height)
+    }
+
+    /// The arrangement to DRAW and to report: a drag's preview while one is
+    /// up, the layout itself otherwise. Every consumer of tiling geometry
+    /// reads this, for the reason `tiled_height` gives — two of them
+    /// disagreeing mid-drag is a click landing on a different tile than the
+    /// one under the cursor.
+    fn arrangement(&self) -> &Layout {
+        self.preview.as_ref().unwrap_or(&self.layout)
+    }
+
+    /// The same geometry for an arbitrary arrangement rather than the one on
+    /// screen. A drag needs both at once: what is DRAWN is the result of the
+    /// drop, and what the drop is aimed at is computed against the arrangement
+    /// with the dragged window taken out.
+    fn placements_of(&self, layout: &Layout, width: usize, height: usize) -> Vec<Placement> {
+        let mut placements = layout.placements(width, self.tiled_height(height), GAP, TITLE_HEIGHT);
         for placement in &mut placements {
             placement.rect.y = placement.rect.y.saturating_add(BAR_HEIGHT);
             placement.band.y = placement.band.y.saturating_add(BAR_HEIGHT);
@@ -404,8 +431,13 @@ impl Scene {
         Some(std::mem::replace(&mut self.status, status))
     }
 
+    /// Read off the ARRANGEMENT rather than the layout, as the geometry is:
+    /// a preview carries its own focus — the drop focuses what it moved — and
+    /// the map published to clients marks that window active. Answering from
+    /// the layout instead would aim the keyboard at one window while telling
+    /// every client another was activated.
     pub fn focused(&self) -> Option<SurfaceKey> {
-        self.layout.focused()
+        self.arrangement().focused()
     }
 
     #[cfg(test)]
@@ -438,8 +470,65 @@ impl Scene {
         &self.layout
     }
 
-    pub fn drop_beside(&mut self, dragged: SurfaceKey, target: SurfaceKey, before: bool) -> bool {
-        self.layout.drop_beside(dragged, target, before)
+    /// Draw the drop a release would perform, rather than an outline of it.
+    ///
+    /// TWO arrangements are in play and they are deliberately different. What
+    /// is DRAWN is the result — the layout with the dragged window moved to
+    /// where the pointer says. What the pointer is measured AGAINST is the
+    /// layout with that window taken OUT, which does not re-flow as the
+    /// preview does: aiming at the picture would let a tile be pushed away by
+    /// the very motion aiming at it, and a target that moves when approached
+    /// can oscillate between two answers over one pixel.
+    ///
+    /// The band the window was picked up by is a DEAD ZONE, or a press alone
+    /// would move it. Answers whether the screen would differ, so a pointer
+    /// moving inside one half costs no repaint.
+    pub fn preview_drop(&mut self, dragged: SurfaceKey, width: usize, height: usize) -> bool {
+        let mut preview = self.layout.clone();
+        // Read out of `layout` rather than the preview, so the dead zone is
+        // one fixed rectangle for the whole gesture.
+        if !self.pointer_on_band_of(dragged, width, height) {
+            let mut base = self.layout.clone();
+            base.unmap(dragged);
+            if let Some((target, before)) = self.drop_target_in(&base, width, height) {
+                preview.drop_beside(dragged, target, before);
+            }
+        }
+        let changed = self.arrangement() != &preview;
+        self.preview = (preview != self.layout).then_some(preview);
+        changed
+    }
+
+    /// Take the preview as the arrangement itself. The drop is applied by
+    /// KEEPING what was drawn rather than by computing it a second time,
+    /// which is the whole of what the preview promises: there is no other
+    /// answer for the release to disagree with.
+    pub fn commit_preview(&mut self) -> bool {
+        // A preview is only ever held while it DIFFERS from the layout, so
+        // holding one and changing the arrangement are the same question.
+        let Some(preview) = self.preview.take() else {
+            return false;
+        };
+        self.layout = preview;
+        true
+    }
+
+    /// Drop the preview and go back to the arrangement itself. Answers
+    /// whether the screen moves, by the same invariant `commit_preview` reads.
+    pub fn clear_preview(&mut self) -> bool {
+        self.preview.take().is_some()
+    }
+
+    fn pointer_on_band_of(&self, key: SurfaceKey, width: usize, height: usize) -> bool {
+        let (Ok(x), Ok(y)) = (
+            usize::try_from(self.pointer_x),
+            usize::try_from(self.pointer_y),
+        ) else {
+            return false;
+        };
+        self.placements_of(&self.layout, width, height)
+            .iter()
+            .any(|placement| placement.key == key && contains(placement.band, x, y))
     }
 
     /// The window whose TITLE BAND the pointer is over, which is the handle a
@@ -464,8 +553,23 @@ impl Scene {
     /// Within whichever rectangle the pointer is in rather than over the tile
     /// as a whole, because in a stack a leaf's band and its client area are
     /// far apart and a midpoint between them is in neither.
-    pub fn drop_target(&self, width: usize, height: usize) -> Option<(SurfaceKey, bool)> {
-        let placements = self.tiled_placements(width, height);
+    #[cfg(test)]
+    fn drop_target(&self, width: usize, height: usize) -> Option<(SurfaceKey, bool)> {
+        self.drop_target_in(self.arrangement(), width, height)
+    }
+
+    /// Where a drop aimed at `layout` would land. A drag passes the
+    /// arrangement with the dragged window REMOVED, which is constant for the
+    /// whole gesture: aiming at what is on screen instead would let the
+    /// preview re-flow the very tile the pointer is over, so moving toward a
+    /// slot could push that slot away.
+    pub fn drop_target_in(
+        &self,
+        layout: &Layout,
+        width: usize,
+        height: usize,
+    ) -> Option<(SurfaceKey, bool)> {
+        let placements = self.placements_of(layout, width, height);
         let x = usize::try_from(self.pointer_x).ok()?;
         let y = usize::try_from(self.pointer_y).ok()?;
         let index = placements.iter().position(|placement| {
@@ -483,7 +587,7 @@ impl Scene {
             // are above and below even when the container is a row.
             y < zone.y.saturating_add(zone.height / 2)
         } else {
-            match self.layout.parent_axis(placement.key) {
+            match layout.parent_axis(placement.key) {
                 Some(Axis::Horizontal) => x < zone.x.saturating_add(zone.width / 2),
                 // `None` is a lone window, which cannot be a drop target: the
                 // only thing that could be dropped on it is itself.
@@ -2048,6 +2152,304 @@ mod tests {
         scene.commit(key, surface([1, 2, 3, 0], 1, 1)).unwrap();
         assert_eq!(scene.layout.placements(100, 100, 0, 0).len(), 1);
         assert!(scene.layout.check_invariants().is_ok());
+    }
+
+    /// `H[1, V[2, 3]]` — a window beside a column of two — on an output tall
+    /// enough that a client area is taller than its own band, which is what
+    /// keeps a drop onto a tile distinguishable from one onto a band.
+    fn a_window_beside_a_column() -> Scene {
+        let mut scene = Scene::new();
+        for object in 1..=2 {
+            scene
+                .commit(
+                    SurfaceKey { client: 1, object },
+                    surface([1, 1, 1, 0], 8, 8),
+                )
+                .unwrap();
+        }
+        scene.command(Command::SetSplit(crate::layout::Axis::Vertical));
+        scene
+            .commit(
+                SurfaceKey {
+                    client: 1,
+                    object: 3,
+                },
+                surface([1, 1, 1, 0], 8, 8),
+            )
+            .unwrap();
+        scene
+    }
+
+    fn tile_order(scene: &Scene, width: usize, height: usize) -> Vec<u32> {
+        scene
+            .tiled_placements(width, height)
+            .iter()
+            .map(|placement| placement.key.object)
+            .collect()
+    }
+
+    fn tile(scene: &Scene, width: usize, height: usize, object: u32) -> Placement {
+        let placements = scene.tiled_placements(width, height);
+        let at = placements
+            .iter()
+            .position(|placement| placement.key.object == object)
+            .unwrap();
+        *placements.get(at).unwrap()
+    }
+
+    fn painted(scene: &Scene, width: usize, height: usize) -> Vec<u8> {
+        let mut frame = vec![0u8; width.saturating_mul(height).saturating_mul(4)];
+        scene.render(&mut frame, width, height, width.saturating_mul(4));
+        frame
+    }
+
+    #[test]
+    fn a_drag_preview_is_the_pixels_the_release_leaves() {
+        // The whole of what the preview promises, asserted where the operator
+        // reads it: the FRAME. Dropping is not "apply what was computed" but
+        // "keep what was drawn", so the release cannot move a pixel — and the
+        // clients are owed nothing further either, since the map published to
+        // them was the previewed one all along.
+        let mut scene = a_window_beside_a_column();
+        let (width, height) = (240, 600);
+        let dragged = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        assert!(
+            tile(&scene, width, height, 3).rect.height > tile(&scene, width, height, 3).band.height,
+            "the output is too short to tell a tile from its band"
+        );
+        let undragged = painted(&scene, width, height);
+        let undragged_views = scene.views(width, height);
+
+        // The bottom half of 3, which in a COLUMN means below it.
+        let target = tile(&scene, width, height, 3).rect;
+        scene.pointer_x = i32::try_from(target.x + 2).unwrap();
+        scene.pointer_y = i32::try_from(target.y + target.height - 2).unwrap();
+        assert!(scene.preview_drop(dragged, width, height));
+        let previewed = painted(&scene, width, height);
+        let previewed_views = scene.views(width, height);
+        assert_ne!(
+            previewed_views, undragged_views,
+            "the clients were never told the window had moved"
+        );
+        assert_eq!(tile_order(&scene, width, height), [2, 3, 1]);
+        // Without this the two frames below could agree by both being the
+        // undragged one, and the test would pass having previewed nothing.
+        assert_ne!(
+            previewed, undragged,
+            "the preview did not change the screen"
+        );
+
+        assert!(scene.commit_preview());
+        assert_eq!(
+            painted(&scene, width, height),
+            previewed,
+            "the release moved pixels the preview had promised"
+        );
+        assert_eq!(scene.views(width, height), previewed_views);
+        assert_eq!(tile_order(&scene, width, height), [2, 3, 1]);
+        // And the picture is now the layout's own, not an overlay on it.
+        assert!(scene.preview.is_none());
+        assert_eq!(tile_order(&scene, width, height), [2, 3, 1]);
+        scene.layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn the_band_a_drag_was_picked_up_by_previews_nothing() {
+        // A click on a title bar has to stay a click. With the dragged window
+        // taken out of the arrangement the target is measured against, the
+        // pixel under a press belongs to whichever neighbour grew into it, so
+        // without the dead zone a press ALONE would move the window.
+        let mut scene = a_window_beside_a_column();
+        let (width, height) = (240, 600);
+        let dragged = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        let handle = tile(&scene, width, height, 1).band;
+        let undragged = scene.tiled_placements(width, height);
+        for (x, y) in [
+            (handle.x, handle.y),
+            (handle.x + handle.width / 2, handle.y + handle.height / 2),
+            (
+                handle.x + handle.width - 1,
+                handle.y + handle.height.saturating_sub(1),
+            ),
+        ] {
+            scene.pointer_x = i32::try_from(x).unwrap();
+            scene.pointer_y = i32::try_from(y).unwrap();
+            assert!(
+                !scene.preview_drop(dragged, width, height),
+                "the band previewed a drop at {x},{y}"
+            );
+            assert!(!scene.commit_preview(), "a press alone moved the window");
+            assert_eq!(scene.tiled_placements(width, height), undragged);
+        }
+
+        // One row BELOW the band it was picked up by, the drag is live —
+        // without which the assertions above would hold for a dead zone that
+        // had swallowed the whole screen. Compared as GEOMETRY rather than as
+        // an order: this drop lands 1 first in the column it was beside, so
+        // the tiles come out in the same sequence and only their rectangles
+        // say the arrangement moved at all.
+        scene.pointer_x = i32::try_from(handle.x + 2).unwrap();
+        scene.pointer_y = i32::try_from(handle.y + handle.height).unwrap();
+        assert!(scene.preview_drop(dragged, width, height));
+        assert_ne!(scene.tiled_placements(width, height), undragged);
+    }
+
+    #[test]
+    fn a_preview_does_not_move_the_target_it_is_aimed_at() {
+        // Why the target is measured against the arrangement with the dragged
+        // window REMOVED rather than against the picture. The picture
+        // re-flows around the drop, so a pointer that has not moved would be
+        // over a different tile on the next frame — over the dragged window
+        // itself, which refuses its own drop, so the preview would fall back
+        // to the arrangement and the frame after that would put it back. A
+        // picture alternating between two answers while the mouse is still.
+        let mut scene = a_window_beside_a_column();
+        let (width, height) = (240, 600);
+        let dragged = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        let target = tile(&scene, width, height, 3).rect;
+        scene.pointer_x = i32::try_from(target.x + 2).unwrap();
+        scene.pointer_y = i32::try_from(target.y + 2).unwrap();
+        assert!(scene.preview_drop(dragged, width, height));
+        assert_eq!(tile_order(&scene, width, height), [2, 1, 3]);
+        for again in 0..4 {
+            assert!(
+                !scene.preview_drop(dragged, width, height),
+                "the preview changed on frame {again} with the pointer still"
+            );
+            assert_eq!(tile_order(&scene, width, height), [2, 1, 3]);
+        }
+    }
+
+    #[test]
+    fn a_window_arriving_or_leaving_under_a_drag_drops_the_preview() {
+        // The preview is derived from the arrangement, so it may not outlive
+        // a change to it: a stale one would keep drawing a window that has
+        // gone, or lay out around one that has arrived.
+        let (width, height) = (240, 600);
+        let dragged = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        let aim = |scene: &mut Scene| {
+            let target = tile(scene, width, height, 3).rect;
+            scene.pointer_x = i32::try_from(target.x + 2).unwrap();
+            scene.pointer_y = i32::try_from(target.y + 2).unwrap();
+            assert!(scene.preview_drop(dragged, width, height));
+        };
+
+        let mut scene = a_window_beside_a_column();
+        aim(&mut scene);
+        assert!(scene.unmap(SurfaceKey {
+            client: 1,
+            object: 2
+        }));
+        assert!(scene.preview.is_none(), "the preview outlived an unmap");
+
+        let mut scene = a_window_beside_a_column();
+        aim(&mut scene);
+        scene
+            .commit(
+                SurfaceKey {
+                    client: 2,
+                    object: 1,
+                },
+                surface([1, 1, 1, 0], 8, 8),
+            )
+            .unwrap();
+        assert!(scene.preview.is_none(), "the preview outlived a new window");
+
+        let mut scene = a_window_beside_a_column();
+        aim(&mut scene);
+        scene.command(Command::Focus(crate::layout::Direction::Up));
+        assert!(scene.preview.is_none(), "the preview outlived a command");
+    }
+
+    #[test]
+    fn a_preview_carries_the_focus_its_drop_would_leave() {
+        // Focus is read off the ARRANGEMENT for the reason its geometry is.
+        // A drop focuses what it moved, and the map published to clients
+        // marks that window active; answering from the layout underneath
+        // would aim the keyboard at one window while telling every client
+        // another had been activated.
+        let mut scene = a_window_beside_a_column();
+        let (width, height) = (240, 600);
+        let dragged = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        // 3 was mapped last and so is focused; move focus off it, or the
+        // preview's own focus and the layout's would agree by accident.
+        let elsewhere = SurfaceKey {
+            client: 1,
+            object: 2,
+        };
+        assert!(scene.focus_key(elsewhere));
+        assert_eq!(scene.focused(), Some(elsewhere));
+
+        let target = tile(&scene, width, height, 2).rect;
+        scene.pointer_x = i32::try_from(target.x + 2).unwrap();
+        scene.pointer_y = i32::try_from(target.y + 2).unwrap();
+        assert!(scene.preview_drop(dragged, width, height));
+        assert_eq!(
+            scene.focused(),
+            Some(dragged),
+            "the picture and the keyboard disagree about what is focused"
+        );
+        // And the layout underneath is untouched, so a cancelled drag hands
+        // focus back rather than keeping the drop's.
+        assert_eq!(scene.layout.focused(), Some(elsewhere));
+        assert!(scene.clear_preview());
+        assert_eq!(scene.focused(), Some(elsewhere));
+    }
+
+    #[test]
+    fn dropping_a_preview_counts_as_a_layout_change() {
+        // A mutation that changes nothing about the layout can still move the
+        // screen, by dropping the preview drawn over it. Its caller repaints
+        // and republishes on that answer, so reporting the layout's own
+        // change alone leaves the map published to clients holding previewed
+        // geometry the screen no longer shows.
+        let (width, height) = (240, 600);
+        let dragged = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        let stranger = SurfaceKey {
+            client: 9,
+            object: 9,
+        };
+        let aim = |scene: &mut Scene| {
+            let target = tile(scene, width, height, 3).rect;
+            scene.pointer_x = i32::try_from(target.x + 2).unwrap();
+            scene.pointer_y = i32::try_from(target.y + 2).unwrap();
+            assert!(scene.preview_drop(dragged, width, height));
+        };
+
+        // A surface that is not in the layout at all: without the preview
+        // this unmap is a no-op and says so.
+        let mut scene = a_window_beside_a_column();
+        assert!(!scene.unmap(stranger), "the stranger was in the layout");
+        aim(&mut scene);
+        assert!(scene.unmap(stranger), "a dropped preview went unreported");
+
+        let mut scene = a_window_beside_a_column();
+        assert!(!scene.remove(stranger));
+        aim(&mut scene);
+        assert!(scene.remove(stranger), "a dropped preview went unreported");
+
+        let mut scene = a_window_beside_a_column();
+        assert!(!scene.remove_client(9));
+        aim(&mut scene);
+        assert!(scene.remove_client(9), "a dropped preview went unreported");
     }
 
     #[test]
