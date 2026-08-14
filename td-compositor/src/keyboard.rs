@@ -322,6 +322,11 @@ impl KeyboardState {
         }))
     }
 
+    /// The modifiers alone, without the key roster a snapshot allocates.
+    pub fn held(&self) -> ModifierState {
+        self.modifiers
+    }
+
     pub fn modifiers(
         &mut self,
         modifiers: ModifierState,

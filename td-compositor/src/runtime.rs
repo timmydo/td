@@ -1,7 +1,7 @@
 use crate::framebuffer::Framebuffer;
 use crate::help::HelpAction;
 use crate::keyboard::{
-    KeyInput, KeyboardSnapshot, KeyboardState, ModifierState, RoutedKeyboardEvent,
+    KeyInput, KeyboardSnapshot, KeyboardState, ModifierState, RoutedKeyboardEvent, MOD_ALT,
 };
 use crate::launcher::{LaunchRequest, LauncherAction};
 use crate::layout::{Command, ViewLayout};
@@ -160,10 +160,17 @@ pub struct Runtime {
     pointer: PointerState,
     keyboard_subscribers: BTreeMap<u64, KeyboardSender>,
     pending_paint: bool,
-    /// The window a title-band press picked up, held until the button is
-    /// released. Nothing in the pointer model can carry it: a band reaches no
-    /// client, so no grab is established and no client is told any of this.
-    dragging: Option<SurfaceKey>,
+    /// The window a press picked up, held until the button is released.
+    /// Nothing in the pointer model carries it: neither press a drag begins
+    /// with is delivered, so no client is told any of this.
+    dragging: Option<Drag>,
+}
+
+/// A drag in progress, and what holds it open: a band drag by the BUTTON
+/// alone, an Alt drag by the modifier as well.
+struct Drag {
+    key: SurfaceKey,
+    held_by_alt: bool,
 }
 
 impl Runtime {
@@ -290,7 +297,7 @@ impl Runtime {
     /// name a DIFFERENT window, and the release would move one the operator
     /// never picked up.
     fn forget_drag(&mut self, gone: impl Fn(SurfaceKey) -> bool) {
-        if self.dragging.is_some_and(&gone) {
+        if self.dragging.as_ref().is_some_and(|drag| gone(drag.key)) {
             self.dragging = None;
         }
     }
@@ -497,7 +504,20 @@ impl Runtime {
         } else {
             buttons
         };
-        let result = self.pointer.frame(time, hover, grab, buttons)?;
+        // What a claim looks like; the pointer model says when one holds,
+        // since the grab a claim must not steal moves WITHIN a report. Gated
+        // on picking something up, so a press that could move nothing is
+        // never taken from its client. The release needs no such care: the
+        // model sends one only for a press it accepted.
+        let alt = self.keyboard.held().depressed & MOD_ALT != 0
+            && self
+                .scene
+                .draggable_at_pointer(self.framebuffer.width, self.framebuffer.height)
+                .is_some();
+        let result = self.pointer.frame(time, hover, grab, buttons, |input| {
+            alt && input.button == POINTER_BUTTON_LEFT
+        })?;
+        let alt_press = result.claimed;
         self.publish_pointer(result.frames);
         if dx != 0 || dy != 0 {
             // Coalesced by the caller: a reader batch that carries many reports
@@ -515,24 +535,29 @@ impl Runtime {
         if let Some(clicked) = result.pressed_on {
             self.focus_surface(clicked)?;
         }
-        self.drag(modal, dx != 0 || dy != 0, buttons)?;
+        self.drag(modal, dx != 0 || dy != 0, alt_press, buttons)?;
         Ok(())
     }
 
-    /// The title-band drag. A press on a band picks the window up and focuses
-    /// it; from the first motion off that band the screen shows the drop
-    /// itself, and the release keeps it.
+    /// The drag. A press picks a window up and focuses it; from the first
+    /// motion off that window the screen shows the drop itself, and the
+    /// release keeps it. Two presses start one: a BARE press on a title band,
+    /// and an ALT press anywhere on a window — the band is the handle that
+    /// exists without a modifier, and the modifier is what makes the whole
+    /// window one.
     ///
     /// Entirely outside the pointer model, and it has to be: a band belongs to
     /// no client, so a press on one establishes no grab and delivers nothing.
     /// That is the same seam that makes a band's click reach no client, used
-    /// rather than worked around. A modal overlay owns every button while it
-    /// is up, so nothing is picked up under one — and anything already held is
-    /// dropped, since the operator can no longer see where it would land.
+    /// rather than worked around, and an Alt press is withheld to reach it.
+    /// A modal overlay owns every button while it is up, so nothing is picked
+    /// up under one — and anything already held is dropped, since the operator
+    /// can no longer see where it would land.
     fn drag(
         &mut self,
         modal: bool,
         moved: bool,
+        alt_press: bool,
         buttons: &[PointerButtonInput],
     ) -> Result<(), String> {
         if modal {
@@ -551,31 +576,35 @@ impl Runtime {
             }
             match input.state {
                 PointerButtonState::Pressed => {
-                    // A client already holding an implicit grab owns every
-                    // button until it lets go, and this press was DELIVERED to
-                    // it — the pointer model routes a press made during a grab
-                    // to the grabbing surface and reports establishing nothing.
-                    // Picking a band up here would make one button both the
-                    // window's and the compositor's, and move focus during a
-                    // grab, which the click-to-focus path above refuses for
-                    // exactly this reason.
-                    if self.pointer.grab_surface().is_some() {
+                    // An ALT press takes the whole window; it is the press the
+                    // model reported claiming, so no second answer exists to
+                    // disagree with. A bare one takes the band, and only with
+                    // no grab held: such a press was DELIVERED to the grabbing
+                    // surface, so taking it would make one button both the
+                    // window's and the compositor's.
+                    let picked = if alt_press {
+                        self.scene.draggable_at_pointer(width, height)
+                    } else if self.pointer.grab_surface().is_some() {
                         continue;
-                    }
-                    // A press that lands off every band starts nothing, and
-                    // ENDS whatever was live: leaving a picture up with no
-                    // drag to commit or clear it would strand the screen and
-                    // the clients on an arrangement the layout never took.
-                    match self.scene.band_at_pointer(width, height) {
+                    } else {
+                        self.scene.band_at_pointer(width, height)
+                    };
+                    // A press that picks nothing up ENDS whatever was live: a
+                    // picture with no drag to commit or clear it would strand
+                    // the screen on an arrangement the layout never took.
+                    match picked {
                         Some(key) => {
-                            self.dragging = Some(key);
+                            self.dragging = Some(Drag {
+                                key,
+                                held_by_alt: alt_press,
+                            });
                             self.focus_surface(key)?;
                         }
                         None => self.cancel_drag()?,
                     }
                 }
                 PointerButtonState::Released => {
-                    let Some(dragged) = self.dragging.take() else {
+                    let Some(Drag { key: dragged, .. }) = self.dragging.take() else {
                         continue;
                     };
                     // The reader coalesces a batch, so the motion that chose
@@ -601,7 +630,7 @@ impl Runtime {
                 }
             }
         }
-        if let Some(dragged) = self.dragging {
+        if let Some(dragged) = self.dragging.as_ref().map(|drag| drag.key) {
             if self.scene.preview_drop(dragged, width, height) {
                 self.settle_layout()?;
             }
@@ -634,6 +663,16 @@ impl Runtime {
     pub fn modifiers(&mut self, modifiers: ModifierState) -> Result<(), String> {
         if let Some(event) = self.keyboard.modifiers(modifiers)? {
             self.publish_keyboard_event(event);
+        }
+        // The modifier is half of what holds an Alt gesture open, so letting
+        // it go abandons the drag and the picture with it — which is the
+        // whole of the revert, the layout underneath never having moved.
+        if self
+            .dragging
+            .as_ref()
+            .is_some_and(|drag| drag.held_by_alt && modifiers.depressed & MOD_ALT == 0)
+        {
+            self.cancel_drag()?;
         }
         Ok(())
     }
@@ -842,6 +881,7 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keyboard::MOD_ALT as TEST_MOD_ALT;
     use crate::keyboard::{KeyState, KeyboardEvent, MOD_SHIFT};
     use crate::layout::{Axis, Direction};
     use crate::pointer::{PointerButtonState, PointerEvent};
@@ -849,6 +889,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc::TryRecvError;
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -1964,6 +2005,407 @@ mod tests {
         );
         runtime.remove(guest).unwrap();
         runtime.scene.layout().check_invariants().unwrap();
+    }
+
+    #[test]
+    fn an_alt_press_drags_a_window_and_letting_alt_go_puts_it_back() {
+        // The second way to pick a window up: ALT and the left button, from
+        // anywhere on it rather than from its title band alone. The band is
+        // the handle that exists without a modifier; the modifier is what
+        // makes the whole window one. Letting ALT go before the button
+        // abandons the gesture — the modifier is half of what holds it open —
+        // where letting the BUTTON go completes it.
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-alt-drag-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let height = 600;
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, height, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let keys: Vec<SurfaceKey> = (1..=3)
+            .map(|object| SurfaceKey { client: 1, object })
+            .collect();
+        runtime
+            .commit(*keys.first().unwrap(), surface([1, 2, 3, 0]))
+            .unwrap();
+        runtime
+            .commit(*keys.get(1).unwrap(), surface([4, 5, 6, 0]))
+            .unwrap();
+        runtime.command(Command::SetSplit(Axis::Vertical)).unwrap();
+        runtime
+            .commit(*keys.get(2).unwrap(), surface([7, 8, 9, 0]))
+            .unwrap();
+        let tiles = |runtime: &Runtime| runtime.scene.tiled_placements(240, height);
+        let order = |runtime: &Runtime| {
+            tiles(runtime)
+                .iter()
+                .map(|placement| placement.key.object)
+                .collect::<Vec<_>>()
+        };
+        let geometry = |runtime: &Runtime| {
+            tiles(runtime)
+                .iter()
+                .map(|placement| (placement.key.object, placement.rect, placement.band))
+                .collect::<Vec<_>>()
+        };
+        let at = |runtime: &Runtime, object: u32| {
+            let placements = tiles(runtime);
+            let index = placements
+                .iter()
+                .position(|placement| placement.key.object == object)
+                .unwrap();
+            *placements.get(index).unwrap()
+        };
+        let goto = |runtime: &mut Runtime, x: usize, y: usize, buttons: &[PointerButtonInput]| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            let (dx, dy) = (
+                i32::try_from(x).unwrap() - at_x,
+                i32::try_from(y).unwrap() - at_y,
+            );
+            runtime.pointer_frame(1, dx, dy, buttons).unwrap()
+        };
+        let press = |time| PointerButtonInput {
+            time,
+            button: 272,
+            state: PointerButtonState::Pressed,
+        };
+        let release = |time| PointerButtonInput {
+            time,
+            button: 272,
+            state: PointerButtonState::Released,
+        };
+        let alt = |runtime: &mut Runtime, down: bool| {
+            runtime
+                .modifiers(ModifierState {
+                    depressed: if down { TEST_MOD_ALT } else { 0 },
+                    ..ModifierState::default()
+                })
+                .unwrap();
+        };
+        assert_eq!(order(&runtime), [1, 2, 3]);
+
+        // What the CLIENT is told, which is the half no geometry can show. A
+        // grab is only established by a press, so it answers for the press
+        // alone; that the RELEASE of a withheld press is inert is the pointer
+        // model's own rule — it sends one only for a press it delivered — and
+        // is asserted here rather than assumed, since the gesture rests on
+        // it in place of bookkeeping of its own.
+        let subscription = runtime
+            .subscribe_input_with_activity(
+                1,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .unwrap();
+        let (events, events_stop) = subscription.split();
+        let buttons_seen = |events: &Receiver<KeyboardDelivery>| {
+            let mut seen = Vec::new();
+            loop {
+                match events.try_recv() {
+                    Ok(KeyboardDelivery::Pointer(frame)) => {
+                        seen.extend(frame.events.into_iter().filter(|event| {
+                            matches!(event, crate::pointer::PointerEvent::Button { .. })
+                        }));
+                    }
+                    Ok(_) => {}
+                    // A dead channel drains empty, which is what every
+                    // assertion below expects to see, so it is refused rather
+                    // than counted as "nothing was delivered".
+                    Err(TryRecvError::Disconnected) => panic!("the client's channel closed"),
+                    Err(TryRecvError::Empty) => break,
+                }
+            }
+            seen
+        };
+
+        // Without ALT, a press on a CLIENT area is the client's: it picks
+        // nothing up and DOES establish a grab. That contrast is the point of
+        // the modifier, so it is asserted rather than assumed.
+        let body = at(&runtime, 1).rect;
+        goto(&mut runtime, body.x + 2, body.y + 2, &[press(2)]);
+        assert!(runtime.dragging.is_none(), "a bare client press dragged");
+        assert!(
+            runtime.pointer.grab_surface().is_some(),
+            "a bare client press was withheld"
+        );
+        goto(&mut runtime, body.x + 2, body.y + 2, &[release(3)]);
+        assert_eq!(
+            buttons_seen(&events).len(),
+            2,
+            "a bare press and release did not reach the client"
+        );
+
+        // With ALT the same press is the COMPOSITOR's. No grab is
+        // established, because the client is never told about it.
+        alt(&mut runtime, true);
+        let settled = geometry(&runtime);
+        goto(&mut runtime, body.x + 2, body.y + 2, &[press(4)]);
+        assert!(
+            runtime.dragging.is_some(),
+            "an alt press on a client area picked nothing up"
+        );
+        assert!(
+            runtime.pointer.grab_surface().is_none(),
+            "the alt press established a grab"
+        );
+        assert_eq!(
+            buttons_seen(&events),
+            [],
+            "the alt press reached the client"
+        );
+        assert_eq!(
+            geometry(&runtime),
+            settled,
+            "the press alone moved a window"
+        );
+
+        // It drags like any other: the picture is the drop before the button
+        // comes up, and the release keeps it.
+        let onto = at(&runtime, 3).rect;
+        goto(&mut runtime, onto.x + 2, onto.y + onto.height - 2, &[]);
+        assert_eq!(order(&runtime), [2, 3, 1], "the alt drag previewed nothing");
+        let previewed = geometry(&runtime);
+        goto(
+            &mut runtime,
+            onto.x + 2,
+            onto.y + onto.height - 2,
+            &[release(5)],
+        );
+        assert_eq!(
+            geometry(&runtime),
+            previewed,
+            "the release moved the picture"
+        );
+        assert!(runtime.dragging.is_none());
+        assert_eq!(
+            buttons_seen(&events),
+            [],
+            "the release of a withheld press reached the client"
+        );
+        runtime.scene.layout().check_invariants().unwrap();
+
+        // Letting ALT go first puts the window back, and the release that
+        // follows still reaches no client: the press it belongs to was never
+        // delivered, whatever became of the drag in between.
+        let settled = geometry(&runtime);
+        let body = at(&runtime, *order(&runtime).first().unwrap()).rect;
+        goto(&mut runtime, body.x + 2, body.y + 2, &[press(6)]);
+        let onto = at(&runtime, *order(&runtime).get(2).unwrap()).rect;
+        goto(&mut runtime, onto.x + 2, onto.y + 2, &[]);
+        assert_ne!(
+            geometry(&runtime),
+            settled,
+            "the alt drag previewed nothing"
+        );
+        alt(&mut runtime, false);
+        assert_eq!(
+            geometry(&runtime),
+            settled,
+            "letting alt go did not put the window back"
+        );
+        assert!(runtime.dragging.is_none(), "the alt drag outlived alt");
+
+        // Moving on with the button still down previews nothing, since the
+        // gesture is over rather than merely paused.
+        let elsewhere = at(&runtime, *order(&runtime).get(1).unwrap()).rect;
+        goto(&mut runtime, elsewhere.x + 2, elsewhere.y + 2, &[]);
+        assert_eq!(geometry(&runtime), settled, "an abandoned drag came back");
+        goto(
+            &mut runtime,
+            elsewhere.x + 2,
+            elsewhere.y + 2,
+            &[release(7)],
+        );
+        assert_eq!(geometry(&runtime), settled, "the release moved a window");
+        assert_eq!(
+            buttons_seen(&events),
+            [],
+            "the release of a press abandoned with alt reached the client"
+        );
+        runtime.scene.layout().check_invariants().unwrap();
+
+        // A band pressed UNDER alt is an alt drag like any other, so letting
+        // the modifier go abandons it. Which gesture a press begins is
+        // decided by whether alt was down AT THE PRESS.
+        alt(&mut runtime, true);
+        let settled = geometry(&runtime);
+        let handle = at(&runtime, *order(&runtime).first().unwrap()).band;
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(8)]);
+        let onto = at(&runtime, *order(&runtime).get(2).unwrap()).rect;
+        goto(&mut runtime, onto.x + 2, onto.y + 2, &[]);
+        assert_ne!(
+            geometry(&runtime),
+            settled,
+            "the band drag previewed nothing"
+        );
+        alt(&mut runtime, false);
+        assert_eq!(
+            geometry(&runtime),
+            settled,
+            "a band pressed under alt was not held by it"
+        );
+        goto(&mut runtime, onto.x + 2, onto.y + 2, &[release(9)]);
+
+        // And one pressed WITHOUT it is not: the modifier going up and down
+        // during that drag changes nothing, and the drop lands exactly the
+        // picture that was on screen.
+        let handle = at(&runtime, *order(&runtime).first().unwrap()).band;
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(22)]);
+        alt(&mut runtime, true);
+        alt(&mut runtime, false);
+        let onto = at(&runtime, *order(&runtime).get(2).unwrap()).rect;
+        goto(&mut runtime, onto.x + 2, onto.y + 2, &[]);
+        let previewed = geometry(&runtime);
+        assert_ne!(previewed, settled, "a band drag was abandoned with alt");
+        goto(&mut runtime, onto.x + 2, onto.y + 2, &[release(23)]);
+        assert_eq!(geometry(&runtime), previewed, "the drop moved the picture");
+        runtime.scene.layout().check_invariants().unwrap();
+
+        // A client already holding a grab keeps its button, ALT or not. Such
+        // a press IS delivered to the grabbing surface, so taking it for a
+        // gesture would make one button both the window's and the
+        // compositor's — and the filter and the drag would disagree about
+        // which of them owned it.
+        let right = |time, state| PointerButtonInput {
+            time,
+            button: 273,
+            state,
+        };
+        let body = at(&runtime, *order(&runtime).first().unwrap()).rect;
+        goto(
+            &mut runtime,
+            body.x + 2,
+            body.y + 2,
+            &[right(10, PointerButtonState::Pressed)],
+        );
+        assert!(runtime.pointer.grab_surface().is_some(), "no grab was held");
+        let held = geometry(&runtime);
+        buttons_seen(&events);
+        alt(&mut runtime, true);
+        goto(&mut runtime, body.x + 2, body.y + 2, &[press(11)]);
+        assert!(
+            runtime.dragging.is_none(),
+            "an alt press took a button its client was holding"
+        );
+        assert_eq!(
+            buttons_seen(&events).len(),
+            1,
+            "the alt press was withheld from the client holding the button"
+        );
+        assert_eq!(geometry(&runtime), held);
+        goto(
+            &mut runtime,
+            body.x + 2,
+            body.y + 2,
+            &[release(12), right(13, PointerButtonState::Released)],
+        );
+
+        // The same rule when the grab is made INSIDE the report: evdev keeps
+        // every transition up to its SYN_REPORT, so the right press that
+        // establishes it and the left press beside it arrive together. An
+        // answer computed once for the report, before either was processed,
+        // would take a button the client had just grabbed.
+        buttons_seen(&events);
+        goto(
+            &mut runtime,
+            body.x + 2,
+            body.y + 2,
+            &[right(14, PointerButtonState::Pressed), press(15)],
+        );
+        assert!(
+            runtime.dragging.is_none(),
+            "an alt press took a button grabbed beside it in one report"
+        );
+        assert_eq!(
+            buttons_seen(&events).len(),
+            2,
+            "the left press was withheld from a client that had just grabbed"
+        );
+        assert_eq!(geometry(&runtime), held);
+        goto(
+            &mut runtime,
+            body.x + 2,
+            body.y + 2,
+            &[release(16), right(17, PointerButtonState::Released)],
+        );
+
+        // And the other direction, which the same one answer gets wrong the
+        // other way: the grab ENDS earlier in the report, so the left press
+        // beside it is the compositor's after all.
+        goto(
+            &mut runtime,
+            body.x + 2,
+            body.y + 2,
+            &[right(18, PointerButtonState::Pressed)],
+        );
+        assert!(runtime.pointer.grab_surface().is_some(), "no grab was held");
+        buttons_seen(&events);
+        goto(
+            &mut runtime,
+            body.x + 2,
+            body.y + 2,
+            &[right(19, PointerButtonState::Released), press(20)],
+        );
+        assert!(
+            runtime.dragging.is_some(),
+            "an alt press was refused for a grab that had already ended"
+        );
+        assert_eq!(
+            buttons_seen(&events).len(),
+            1,
+            "the claimed press reached the client"
+        );
+        assert_eq!(geometry(&runtime), held, "the press alone moved a window");
+        goto(&mut runtime, body.x + 2, body.y + 2, &[release(21)]);
+        alt(&mut runtime, false);
+        runtime.scene.layout().check_invariants().unwrap();
+
+        // A press that could move NOTHING is left to its client. Under
+        // fullscreen the one placement covers the output, so every alt click
+        // anywhere in that client would be taken and none of them could ever
+        // land — the whole application silently losing the modifier.
+        alt(&mut runtime, true);
+        runtime.command(Command::ToggleFullscreen).unwrap();
+        let whole = at(&runtime, *order(&runtime).first().unwrap()).rect;
+        let full = geometry(&runtime);
+        buttons_seen(&events);
+        goto(&mut runtime, whole.x + 2, whole.y + 2, &[press(24)]);
+        assert!(
+            runtime.dragging.is_none(),
+            "an alt press picked up a fullscreen window"
+        );
+        assert_eq!(
+            buttons_seen(&events).len(),
+            1,
+            "a fullscreen client lost its alt click"
+        );
+        goto(&mut runtime, whole.x + 2, whole.y + 2, &[release(25)]);
+        assert_eq!(geometry(&runtime), full);
+        runtime.command(Command::ToggleFullscreen).unwrap();
+
+        // A LONE window is the other case: there is nothing to land beside,
+        // so the gesture could not move it either.
+        runtime.remove(*keys.get(1).unwrap()).unwrap();
+        runtime.remove(*keys.get(2).unwrap()).unwrap();
+        let alone = at(&runtime, *order(&runtime).first().unwrap()).rect;
+        buttons_seen(&events);
+        goto(&mut runtime, alone.x + 2, alone.y + 2, &[press(26)]);
+        assert!(
+            runtime.dragging.is_none(),
+            "an alt press picked up the only window"
+        );
+        assert_eq!(
+            buttons_seen(&events).len(),
+            1,
+            "the only window lost its alt click"
+        );
+        goto(&mut runtime, alone.x + 2, alone.y + 2, &[release(27)]);
+        alt(&mut runtime, false);
+        runtime.scene.layout().check_invariants().unwrap();
+        events_stop.stop();
+        runtime.unsubscribe_keyboard(1);
     }
 
     #[test]

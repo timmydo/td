@@ -627,16 +627,71 @@ once at the END leaves the target's container standing.
 
 The whole drag lives outside the pointer protocol and has to: a band belongs
 to no client, so a press on one establishes no grab. That is the same seam
-that makes a click on a band reach no client, used rather than worked around,
-and it is why only the BTN_LEFT press, and only on a band, is a handle — a
-press on a client area is that client's.
+that makes a click on a band reach no client, used rather than worked around.
+
+TWO presses start a drag. A bare BTN_LEFT press on a title band, and an ALT
+press anywhere on a window — its band or its client area. The band is the
+handle that exists without a modifier, so a window can be moved with the mouse
+alone; the modifier is what makes the whole window one, so a window whose band
+is a sliver in a crowded stack is still draggable. A bare press on a client
+area remains that client's.
+
+An Alt PRESS is withheld from the client. It is what starts the gesture, so
+handing it on would leave the client acting on a click the operator aimed at
+the compositor. That is the same seam a band uses — the compositor keeping a
+button to itself — reached by a CLAIM rather than by geometry, since an Alt
+press lands on a client area where a band press does not.
+
+A press that could move NOTHING is not claimed. Under fullscreen the one
+placement covers the output, so every Alt click anywhere in that client would
+be taken and none of them could ever land — an application silently losing the
+modifier everywhere. A lone window is the same case for a different reason:
+there is nothing to land it beside. So the claim asks whether a drag of the
+window under the pointer could reach anywhere, and leaves the click to its
+client when it could not. That is also what keeps this gesture from reaching
+around the rule the tiling commands already have, where `Move` refuses to pull
+a fullscreen window into an arrangement nobody asked for.
+
+The claim is answered by the pointer model, walking the report's transitions
+in ORDER, rather than by the compositor once for the report. A report carries
+every transition up to its SYN_REPORT, so the grab a claimed press must not
+steal can be established or dropped by an earlier transition IN THE SAME ONE:
+answered once, a right press beside a left one would let the left be taken
+from a client that had just grabbed it, and a right RELEASE beside one would
+refuse a press whose grab had already ended. The model owns the grab, so it
+owns the question; what the compositor supplies is only what a claim looks
+like. That is also what keeps the claim and the drag from disagreeing about
+who owns a button — the drag acts on the presses the model reports having
+claimed, rather than on a second answer of its own.
+
+Its RELEASE needs no handling of its own. A claimed press enters neither of
+the model's button sets, so its release stops at the first of them — the one
+that asks whether the button was down at all — and never reaches a client.
+Withholding it as well would be a second copy of that bookkeeping, and one
+that can DISAGREE with it: a batch that overflows its transition limit is
+reset, and a genuine press delivered after such a reset would have its release
+swallowed by that second copy and its grab left standing, which is worse than
+the case it was guarding.
+
+Letting ALT go before the button PUTS THE WINDOW BACK. The modifier is half of
+what holds that gesture open, so releasing it abandons the drag rather than
+completing it, and the picture goes with it — which is the whole of the
+revert, since the layout underneath was never touched. The release that
+eventually follows still reaches no client, by the rule above: the press it
+belongs to was never delivered, whatever became of the drag in between.
+Pressing Alt again does not resume — the gesture ended, and only a new press
+starts one. Which gesture a press begins is decided by whether Alt was down AT
+THE PRESS, so a band pressed under Alt is an Alt drag, and a band drag is not
+ended by a modifier that never held it open.
 
 A client already holding an implicit grab is the exception, and it owns every
 button until it lets go. The pointer model routes a press made during a grab
 to the grabbing surface, so that press IS delivered wherever it lands: taking
 it as a handle would make one button both the window's and the compositor's,
 and would move focus mid-grab, which click-to-focus refuses for the same
-reason. Nothing is picked up while a grab is held.
+reason. Neither press begins a drag while a grab is held — which is a rule
+about the grab AT THE PRESS, not for the length of a gesture: a second button
+pressed during a live drag is still the client's and still establishes one.
 
 A drag is also forgotten when the window it names goes away — on a single
 toplevel's removal, on a whole client's, and on an unmap. Object ids are
@@ -694,12 +749,26 @@ a picture alternating between two answers with the mouse held still. Removing
 it once, up front, is what makes the target stable, and it is also what the
 picture would look like anyway with the window lifted off.
 
-The band a window was picked up by is a DEAD ZONE. With the dragged window
-taken out, the pixel under the press belongs to whichever neighbour grew into
-it, so without the dead zone a press alone would move the window and a click
-on a title bar would stop being a click. It is read out of the arrangement
-rather than the preview, so it is one fixed rectangle for the whole gesture
-and returning the pointer to it puts the window back.
+The window that was picked up is a DEAD ZONE. With it taken out, the pixel
+under the press belongs to whichever neighbour grew into it, so without the
+dead zone a press alone would move the window and a click on a title bar would
+stop being a click. The zone is the whole window rather than its band, which
+is what an Alt press needs — that one lands anywhere on a window, so a
+band-sized zone would leave a press on a client area moving it — and it reads
+better for the band too: dragging DOWN into a window's own body used to
+re-parent it beside whichever neighbour had grown into that space. It is the
+window's band and its client area asked SEPARATELY rather than as one
+rectangle, since in a stack other windows' bands lie between them. And it is
+read out of the arrangement rather than the preview, so it is fixed for the
+whole gesture and returning the pointer to it puts the window back.
+
+Widening it costs something inside a STACK, and the cost is worth writing
+down: for the leaf a stack is showing, the zone is now its band plus the whole
+shared content rect, so the live drop targets left within that stack are the
+other leaves' bands alone — the same slivers this gesture exists to avoid
+needing. Dropping ELSEWHERE is unaffected, and a stack of two is unaffected
+either way, so this is a rough edge rather than a hole; closing it wants a
+drop zone inside a stack that is not a band, which is its own change.
 
 The preview is DERIVED, never a second source of truth: it is rebuilt from the
 arrangement on every pointer frame and dropped by every change to it, so a

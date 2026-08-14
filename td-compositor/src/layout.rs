@@ -478,6 +478,21 @@ impl Layout {
     /// drop onto the top or bottom half of a tile means, and in a row it is
     /// left or right. Answers whether the tree changed, so a caller can skip
     /// the repaint a drop onto the dragged window itself does not owe.
+    /// Whether dragging this window could reach anywhere at all: a workspace
+    /// that is not fullscreen, and a second window to land beside. Asked
+    /// BEFORE a gesture takes a button, since one that cannot move anything
+    /// would swallow the click with nothing to show for it.
+    pub fn can_drag(&self, key: SurfaceKey) -> bool {
+        let Some(workspace) = self.workspaces.get(&self.active) else {
+            return false;
+        };
+        if workspace.fullscreen.is_some() {
+            return false;
+        }
+        let leaves = workspace.leaves();
+        leaves.len() > 1 && leaves.contains(&key)
+    }
+
     pub fn drop_beside(&mut self, dragged: SurfaceKey, target: SurfaceKey, before: bool) -> bool {
         if dragged == target {
             return false;

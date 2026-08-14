@@ -132,6 +132,16 @@ const TITLE_TEXT: [u8; 4] = [0xf0, 0xe8, 0xf8, 0];
 /// shown, so a stack's frame is the client area alone whichever leaf that is.
 /// The band is then its own strip, which is how a stack reads: one title per
 /// window, with the shown one framed beneath them all.
+/// The placement a point is in: a band, or a client area that is actually
+/// shown. A stacked-away leaf is its band and nothing else, so the two
+/// rectangles are asked SEPARATELY rather than as one union — their union
+/// would swallow the bands lying between them.
+fn tile_at(placements: &[Placement], x: usize, y: usize) -> Option<usize> {
+    placements.iter().position(|placement| {
+        contains(placement.band, x, y) || (placement.visible && contains(placement.rect, x, y))
+    })
+}
+
 fn frame_rect(placement: &Placement) -> Rect {
     if placement.stacked {
         return placement.rect;
@@ -480,14 +490,14 @@ impl Scene {
     /// the very motion aiming at it, and a target that moves when approached
     /// can oscillate between two answers over one pixel.
     ///
-    /// The band the window was picked up by is a DEAD ZONE, or a press alone
-    /// would move it. Answers whether the screen would differ, so a pointer
-    /// moving inside one half costs no repaint.
+    /// The window that was picked up is a DEAD ZONE, or a press alone would
+    /// move it. Answers whether the screen would differ, so a pointer moving
+    /// inside one half costs no repaint.
     pub fn preview_drop(&mut self, dragged: SurfaceKey, width: usize, height: usize) -> bool {
         let mut preview = self.layout.clone();
         // Read out of `layout` rather than the preview, so the dead zone is
-        // one fixed rectangle for the whole gesture.
-        if !self.pointer_on_band_of(dragged, width, height) {
+        // fixed for the whole gesture.
+        if !self.pointer_on_dragged(dragged, width, height) {
             let mut base = self.layout.clone();
             base.unmap(dragged);
             if let Some((target, before)) = self.drop_target_in(&base, width, height) {
@@ -519,22 +529,35 @@ impl Scene {
         self.preview.take().is_some()
     }
 
-    fn pointer_on_band_of(&self, key: SurfaceKey, width: usize, height: usize) -> bool {
-        let (Ok(x), Ok(y)) = (
-            usize::try_from(self.pointer_x),
-            usize::try_from(self.pointer_y),
-        ) else {
-            return false;
-        };
-        self.placements_of(&self.layout, width, height)
-            .iter()
-            .any(|placement| placement.key == key && contains(placement.band, x, y))
+    fn pointer_on_dragged(&self, key: SurfaceKey, width: usize, height: usize) -> bool {
+        let placements = self.placements_of(&self.layout, width, height);
+        self.pointer_at_usize()
+            .and_then(|(x, y)| placements.get(tile_at(&placements, x, y)?))
+            .is_some_and(|placement| placement.key == key)
+    }
+
+    /// The window an ALT press picks up: the one under the pointer, band or
+    /// client area, and only where a drag of it could reach somewhere. A
+    /// press that could move nothing must not be taken from the client — a
+    /// fullscreen one would lose every Alt click it has.
+    pub fn draggable_at_pointer(&self, width: usize, height: usize) -> Option<SurfaceKey> {
+        let placements = self.tiled_placements(width, height);
+        let (x, y) = self.pointer_at_usize()?;
+        let key = placements.get(tile_at(&placements, x, y)?)?.key;
+        self.layout.can_drag(key).then_some(key)
+    }
+
+    fn pointer_at_usize(&self) -> Option<(usize, usize)> {
+        Some((
+            usize::try_from(self.pointer_x).ok()?,
+            usize::try_from(self.pointer_y).ok()?,
+        ))
     }
 
     /// The window whose TITLE BAND the pointer is over, which is the handle a
-    /// drag takes. A band reaches no client — the hit test above knows only
-    /// client areas — so this is a question only the compositor answers, and
-    /// the seam that makes a band draggable without a client ever seeing it.
+    /// bare drag takes. A band reaches no client — the hit test above knows
+    /// only client areas — so this is a question only the compositor answers,
+    /// and the seam that makes a band draggable without a client seeing it.
     pub fn band_at_pointer(&self, width: usize, height: usize) -> Option<SurfaceKey> {
         let placements = self.tiled_placements(width, height);
         let x = usize::try_from(self.pointer_x).ok()?;
@@ -570,12 +593,8 @@ impl Scene {
         height: usize,
     ) -> Option<(SurfaceKey, bool)> {
         let placements = self.placements_of(layout, width, height);
-        let x = usize::try_from(self.pointer_x).ok()?;
-        let y = usize::try_from(self.pointer_y).ok()?;
-        let index = placements.iter().position(|placement| {
-            contains(placement.band, x, y) || (placement.visible && contains(placement.rect, x, y))
-        })?;
-        let placement = placements.get(index)?;
+        let (x, y) = self.pointer_at_usize()?;
+        let placement = placements.get(tile_at(&placements, x, y)?)?;
         let zone = if contains(placement.band, x, y) {
             placement.band
         } else {
@@ -2257,11 +2276,18 @@ mod tests {
     }
 
     #[test]
-    fn the_band_a_drag_was_picked_up_by_previews_nothing() {
+    fn the_window_a_drag_was_picked_up_by_previews_nothing() {
         // A click on a title bar has to stay a click. With the dragged window
         // taken out of the arrangement the target is measured against, the
         // pixel under a press belongs to whichever neighbour grew into it, so
         // without the dead zone a press ALONE would move the window.
+        //
+        // The zone is the whole window rather than its band, which is what an
+        // Alt press needs — that one lands anywhere on a window, so a band-
+        // sized zone would leave a press on a client area moving it. It also
+        // reads better for the band: dragging DOWN into the window's own body
+        // used to re-parent it beside whichever neighbour had grown into that
+        // space, which is a jump nobody asked for.
         let mut scene = a_window_beside_a_column();
         let (width, height) = (240, 600);
         let dragged = SurfaceKey {
@@ -2269,6 +2295,7 @@ mod tests {
             object: 1,
         };
         let handle = tile(&scene, width, height, 1).band;
+        let body = tile(&scene, width, height, 1).rect;
         let undragged = scene.tiled_placements(width, height);
         for (x, y) in [
             (handle.x, handle.y),
@@ -2277,25 +2304,32 @@ mod tests {
                 handle.x + handle.width - 1,
                 handle.y + handle.height.saturating_sub(1),
             ),
+            (body.x + 1, body.y),
+            (body.x + body.width / 2, body.y + body.height / 2),
+            (
+                body.x + body.width - 1,
+                body.y + body.height.saturating_sub(1),
+            ),
         ] {
             scene.pointer_x = i32::try_from(x).unwrap();
             scene.pointer_y = i32::try_from(y).unwrap();
             assert!(
                 !scene.preview_drop(dragged, width, height),
-                "the band previewed a drop at {x},{y}"
+                "the window previewed a drop at {x},{y}"
             );
             assert!(!scene.commit_preview(), "a press alone moved the window");
             assert_eq!(scene.tiled_placements(width, height), undragged);
         }
 
-        // One row BELOW the band it was picked up by, the drag is live —
-        // without which the assertions above would hold for a dead zone that
-        // had swallowed the whole screen. Compared as GEOMETRY rather than as
-        // an order: this drop lands 1 first in the column it was beside, so
-        // the tiles come out in the same sequence and only their rectangles
-        // say the arrangement moved at all.
-        scene.pointer_x = i32::try_from(handle.x + 2).unwrap();
-        scene.pointer_y = i32::try_from(handle.y + handle.height).unwrap();
+        // On a DIFFERENT window the drag is live — without which the
+        // assertions above would hold for a dead zone that had swallowed the
+        // whole screen. Compared as GEOMETRY rather than as an order: this
+        // drop lands 1 first in the column it was beside, so the tiles come
+        // out in the same sequence and only their rectangles say the
+        // arrangement moved at all.
+        let onto = tile(&scene, width, height, 2).rect;
+        scene.pointer_x = i32::try_from(onto.x + 2).unwrap();
+        scene.pointer_y = i32::try_from(onto.y + 2).unwrap();
         assert!(scene.preview_drop(dragged, width, height));
         assert_ne!(scene.tiled_placements(width, height), undragged);
     }

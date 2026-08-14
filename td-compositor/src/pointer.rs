@@ -71,11 +71,13 @@ pub struct RoutedPointerFrame {
 
 /// What one report produced: the routed events, and — separately — the surface
 /// a press in it established a grab on, which is what click-to-focus needs and
-/// what the events alone do not say.
+/// what the events alone do not say, and whether a press in it was CLAIMED by
+/// the compositor rather than delivered.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PointerFrameResult {
     pub frames: Vec<RoutedPointerFrame>,
     pub pressed_on: Option<SurfaceKey>,
+    pub claimed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -115,12 +117,20 @@ impl PointerState {
         self.grab
     }
 
+    /// `claim` names presses the COMPOSITOR takes for itself — a gesture of
+    /// its own rather than a click for a client. It is asked here, walking the
+    /// transitions in order, rather than by the caller over the whole report:
+    /// a report can carry several, so the grab a press must not steal may be
+    /// established or dropped by an earlier transition IN THE SAME ONE. An
+    /// answer computed once for the report would take a button a client had
+    /// just grabbed, and refuse one whose grab had just ended.
     pub fn frame(
         &mut self,
         time: u32,
         hover: Option<PointerTarget>,
         grab_target: Option<PointerTarget>,
         buttons: &[PointerButtonInput],
+        claim: impl Fn(PointerButtonInput) -> bool,
     ) -> Result<PointerFrameResult, String> {
         if buttons.len() > MAX_POINTER_BUTTON_TRANSITIONS_PER_FRAME {
             return Err(format!(
@@ -139,7 +149,14 @@ impl PointerState {
         };
         next.transition(target, time, &mut events);
         let mut pressed_on = None;
+        let mut claimed = false;
         for input in buttons {
+            // A claimed press enters neither `pressed` nor `delivered`, so
+            // its release stops at the `changed` check below and is inert.
+            if input.state == PointerButtonState::Pressed && next.grab.is_none() && claim(*input) {
+                claimed = true;
+                continue;
+            }
             // Every establishing press in one frame names the SAME surface: a
             // press establishes only when no grab is held, and with no grab
             // held `transition` has already pointed focus at `hover`. So which
@@ -157,7 +174,11 @@ impl PointerState {
             ));
         }
         let frames = self.finish(next, events)?;
-        Ok(PointerFrameResult { frames, pressed_on })
+        Ok(PointerFrameResult {
+            frames,
+            pressed_on,
+            claimed,
+        })
     }
 
     pub fn refresh(
@@ -166,7 +187,9 @@ impl PointerState {
         grab_target: Option<PointerTarget>,
     ) -> Result<Vec<RoutedPointerFrame>, String> {
         // No buttons, so no press: the caller has nothing to learn from it.
-        Ok(self.frame(self.last_time, hover, grab_target, &[])?.frames)
+        Ok(self
+            .frame(self.last_time, hover, grab_target, &[], |_| false)?
+            .frames)
     }
 
     fn reconcile_grab(&mut self, grab_target: Option<PointerTarget>) {
@@ -306,7 +329,21 @@ mod tests {
             grab_target: Option<PointerTarget>,
             buttons: &[PointerButtonInput],
         ) -> Result<Vec<RoutedPointerFrame>, String> {
-            Ok(self.frame(time, hover, grab_target, buttons)?.frames)
+            Ok(self
+                .frame(time, hover, grab_target, buttons, |_| false)?
+                .frames)
+        }
+
+        /// The whole result, for a report in which the compositor claims
+        /// nothing — which is every report but an Alt gesture's.
+        fn unclaimed(
+            &mut self,
+            time: u32,
+            hover: Option<PointerTarget>,
+            grab_target: Option<PointerTarget>,
+            buttons: &[PointerButtonInput],
+        ) -> Result<PointerFrameResult, String> {
+            self.frame(time, hover, grab_target, buttons, |_| false)
         }
     }
 
@@ -467,14 +504,17 @@ mod tests {
 
         // No press, no report — and the answer is not the CURRENT hover.
         assert_eq!(
-            state.frame(1, Some(first), None, &[]).unwrap().pressed_on,
+            state
+                .unclaimed(1, Some(first), None, &[])
+                .unwrap()
+                .pressed_on,
             None
         );
         // A press over nothing establishes nothing.
         let mut empty = PointerState::default();
         assert_eq!(
             empty
-                .frame(1, None, None, &[press(1, 272)])
+                .unclaimed(1, None, None, &[press(1, 272)])
                 .unwrap()
                 .pressed_on,
             None
@@ -482,7 +522,7 @@ mod tests {
 
         assert_eq!(
             state
-                .frame(2, Some(first), None, &[press(2, 272)])
+                .unclaimed(2, Some(first), None, &[press(2, 272)])
                 .unwrap()
                 .pressed_on,
             Some(first.surface)
@@ -492,7 +532,7 @@ mod tests {
         let grabbed = target(1, 10, 14, 15);
         assert_eq!(
             state
-                .frame(3, Some(second), Some(grabbed), &[press(3, 273)])
+                .unclaimed(3, Some(second), Some(grabbed), &[press(3, 273)])
                 .unwrap()
                 .pressed_on,
             None
@@ -500,7 +540,7 @@ mod tests {
         // Release both and press again in one frame: the grab moves to where
         // the pointer now is, and that is what is reported.
         let ended = state
-            .frame(
+            .unclaimed(
                 4,
                 Some(second),
                 Some(grabbed),
@@ -514,9 +554,9 @@ mod tests {
         // a press establishes only with no grab held and focus is `hover`
         // whenever none is. So recording the first or the last cannot differ.
         let mut twice = PointerState::default();
-        twice.frame(1, Some(first), None, &[]).unwrap();
+        twice.unclaimed(1, Some(first), None, &[]).unwrap();
         let both = twice
-            .frame(
+            .unclaimed(
                 2,
                 Some(first),
                 None,
@@ -529,9 +569,9 @@ mod tests {
         // ends with no grab at all, which sampling `grab` could not tell from
         // a frame that had no press in it.
         let mut quick = PointerState::default();
-        quick.frame(1, Some(first), None, &[]).unwrap();
+        quick.unclaimed(1, Some(first), None, &[]).unwrap();
         let clicked = quick
-            .frame(2, Some(first), None, &[press(2, 272), release(2, 272)])
+            .unclaimed(2, Some(first), None, &[press(2, 272), release(2, 272)])
             .unwrap();
         assert_eq!(clicked.pressed_on, Some(first.surface));
         assert_eq!(quick.grab_surface(), None);
