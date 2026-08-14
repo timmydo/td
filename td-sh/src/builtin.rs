@@ -5376,20 +5376,136 @@ mod tests {
                 format!("unset {name}; set -a; {name}=1 true"),
             ] {
                 let (_, out, _) = run_capturing(&format!("{src}; export -p"));
-                assert!(!out.contains(&format!("export {name}")), "{src}: {out:?}");
+                assert!(!lists(&out, name), "{src}: {out:?}");
             }
         }
         // The flag would outlive `set +a`, so a survivor here reaches a CHILD's
         // environment and not just the listing.
         let (_, out, _) = run_capturing("set -a; f() { local MAIL; }; f; set +a; MAIL=x; export -p");
-        assert!(!out.contains("export MAIL"), "{out:?}");
+        assert!(!lists(&out, "MAIL"), "{out:?}");
         // A name ash does NOT seed still gets the survivor -- `LC_ALL` is in
         // `varinit_data` but under an `#if` this build has off, which is why
         // the roster was measured rather than read.
         for name in ["LC_ALL", "LC_CTYPE", "HOME", "TDZ"] {
             let src = format!("unset {name}; set -a; f() {{ local {name}; }}; f; export -p");
             let (_, out, _) = run_capturing(&src);
-            assert!(out.contains(&format!("export {name}")), "{src}: {out:?}");
+            assert!(lists(&out, name), "{src}: {out:?}");
+        }
+    }
+
+    /// Whether `export -p` lists this exact name. A bare `contains` for MAIL is
+    /// satisfied by `export MAILPATH`, which is the roster's own neighbour.
+    fn lists(out: &str, name: &str) -> bool {
+        out.lines().any(|l| {
+            l.strip_prefix("export ")
+                .and_then(|rest| rest.strip_prefix(name))
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
+        })
+    }
+
+    /// ash's discard test ORs in the entry's OWN `VSTRFIXED` (ash.c:2440), so a
+    /// name it seeds survives an `unset` and line 2449 puts the `VEXPORT` back.
+    #[test]
+    fn a_name_ash_seeds_keeps_its_entry_and_export_flag_past_unset() {
+        // The flag survives, so a later assignment still reaches a child.
+        let (_, out, _) = run_capturing("export MAIL=old; unset MAIL; MAIL=new; export -p");
+        assert!(lists(&out, "MAIL"), "{out:?}");
+        // Through a frame too, which is the same entry seen by `local`.
+        let (_, out, _) =
+            run_capturing("export MAIL=1; unset MAIL; f() { local MAIL=2; }; f; export -p");
+        assert!(lists(&out, "MAIL"), "{out:?}");
+        // An ORDINARY name keeps nothing: its entry really goes.
+        let (_, out, _) = run_capturing("export TDZ=1; unset TDZ; TDZ=2; export -p");
+        assert!(!lists(&out, "TDZ"), "{out:?}");
+        // What survives is the FLAG and not a value: the name still reads
+        // unset, and an unexported seeded name is not listed at all.
+        for name in ["MAIL", "PATH", "HISTFILE"] {
+            let src = format!("unset {name}; echo \"[${{{name}-U}}]\"");
+            let (_, out, _) = run_capturing(&src);
+            assert_eq!(out, "[U]\n", "{src}");
+            let (_, out, _) = run_capturing(&format!("unset {name}; export -p"));
+            assert!(!lists(&out, name), "{src}: {out:?}");
+        }
+        // The dynamic ones stay dead after their unset, as ash's comment on
+        // `lookupvar` has it -- keeping the entry must not resurrect them.
+        for name in ["RANDOM", "LINENO"] {
+            let src = format!("unset {name}; echo \"[${{{name}-U}}]\"");
+            let (_, out, _) = run_capturing(&src);
+            assert_eq!(out, "[U]\n", "{src}");
+        }
+    }
+
+    /// The same for `export -n` and `readonly`, which DECLARE a name rather
+    /// than restoring one: `findvar` finds what ash seeds, so `exportcmd` edits
+    /// the flags in place and never reaches the `setvar` that `set -a` would
+    /// export through (ash.c:14158-14161).
+    #[test]
+    fn a_name_ash_seeds_is_not_a_fresh_name_for_export_n_or_readonly() {
+        const SEEDED: [&str; 14] = [
+            "IFS",
+            "MAIL",
+            "MAILPATH",
+            "PATH",
+            "PS1",
+            "PS2",
+            "PS4",
+            "OPTIND",
+            "LINENO",
+            "FUNCNAME",
+            "RANDOM",
+            "EPOCHSECONDS",
+            "EPOCHREALTIME",
+            "HISTFILE",
+        ];
+        // Both spellings, because `export -n` CLEARS the flag whatever it was:
+        // unlike `readonly` it has no prior state to preserve, so the seeded
+        // name agrees with ash whether or not it was exported first.
+        for name in SEEDED {
+            for pre in [
+                format!("unset {name}"),
+                format!("export {name}=old; unset {name}"),
+            ] {
+                let src = format!("{pre}; set -a; export -n {name}; export -p");
+                let (_, out, _) = run_capturing(&src);
+                assert!(!lists(&out, name), "{src}: {out:?}");
+            }
+        }
+        // A name ash does NOT seed still gets it, which is the contrast.
+        for name in ["LC_ALL", "LC_CTYPE", "HOME", "TDZ"] {
+            let src = format!("unset {name}; set -a; export -n {name}; export -p");
+            let (_, out, _) = run_capturing(&src);
+            assert!(lists(&out, name), "{src}: {out:?}");
+        }
+        // A VALUE puts it back on ash's `setvar` path (`p != NULL`,
+        // ash.c:14155), where the export happens for a seeded name too.
+        for decl in ["readonly MAIL=1", "export MAIL=1", "export -n MAIL=1"] {
+            let src = format!("unset MAIL; set -a; {decl}; export -p");
+            let (_, out, _) = run_capturing(&src);
+            assert!(lists(&out, "MAIL"), "{src}: {out:?}");
+        }
+        // Plain `export` marks a seeded name however it gets there.
+        let (_, out, _) = run_capturing("unset MAIL; set -a; export MAIL; export -p");
+        assert!(lists(&out, "MAIL"), "{out:?}");
+        // `readonly` needs BOTH halves to agree, and they pull opposite ways:
+        // exported-first keeps the flag the entry carried across the unset,
+        // clean has no flag to keep. A roster alone answers only the second,
+        // which is why the entry itself is what this rests on.
+        let (_, out, _) =
+            run_capturing("export MAIL=old; unset MAIL; set -a; readonly MAIL; export -p");
+        assert!(lists(&out, "MAIL"), "{out:?}");
+        for name in SEEDED {
+            let src = format!("unset {name}; set -a; readonly {name}; export -p");
+            let (_, out, _) = run_capturing(&src);
+            assert!(!lists(&out, name), "{src}: {out:?}");
+        }
+        // And the declaration still TOOK, for every one of them: withholding
+        // the export must not be a `readonly` quietly dropped instead. RANDOM
+        // is in that list because the `unset` clears its dynamic flag, so the
+        // exemption that would let an assignment through no longer applies.
+        for name in SEEDED {
+            let src = format!("unset {name}; set -a; readonly {name}; {name}=x");
+            let (_, _, err) = run_capturing(&src);
+            assert!(err.contains(&format!("{name}: is read only")), "{src}: {err:?}");
         }
     }
 

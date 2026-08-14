@@ -756,13 +756,12 @@ impl Shell {
         }
     }
 
-    /// `export -n`. An absent name gets ash's valueless entry (`setvar` with
-    /// no value, ash.c:14164), which is discarded (ash.c:2458) unless `set -a`
-    /// has put the export flag back on it (ash.c:2417).
+    /// `export -n`. `set -a` exports an absent name's fresh entry (ash.c:2417
+    /// via 14164); a name ash SEEDS is found and flag-edited instead (14158).
     pub fn unexport(&mut self, name: &str) {
         if let Some(v) = self.vars.get_mut(name) {
             v.exported = false;
-        } else if self.opts.allexport {
+        } else if self.opts.allexport && !ash_seeds_entry(name) {
             self.export(name);
         }
     }
@@ -775,9 +774,9 @@ impl Shell {
                 name.to_string(),
                 Var {
                     value: None,
-                    // ash.c:14164 creates this through `setvar`, whose
-                    // `setvareq` ORs `VEXPORT` in under `set -a` (ash.c:2417).
-                    exported: self.opts.allexport,
+                    // `set -a` exports a fresh entry (ash.c:2417 via 14164),
+                    // never a seeded one, which `exportcmd` flag-edits (14158).
+                    exported: self.opts.allexport && !ash_seeds_entry(name),
                     readonly: true,
                     localised: false,
                     dynamic: None,
@@ -822,10 +821,16 @@ impl Shell {
         // Under `set -a`, `setvareq` ORs `VEXPORT` into the flags an unset writes
         // (ash.c:2417), so the free test below it can never hold: the entry
         // survives -- created, if the name was new -- and only the value goes.
-        self.unset_hook(name);
         if self.opts.allexport {
             return self.unset_value(name);
         }
+        // A seeded entry survives the unset (ash.c:2440) and keeps its
+        // `VEXPORT` (2449), which a later bare `readonly` then flag-edits.
+        if ash_seeds_entry(name) {
+            return self.unset_value(name);
+        }
+        // Once per path: the three branches above hook inside `unset_value`.
+        self.unset_hook(name);
         self.vars.remove(name);
         true
     }
@@ -1920,8 +1925,8 @@ fn undo_binding(sh: &mut Shell, entry: Local) {
 }
 
 /// Names ash's `varinit_data` (ash.c:2154-2181) keeps a permanent vartab entry
-/// for, as THIS build configures it. `mklocal`'s `findvar` never fails for one
-/// (ash.c:10011), so its pop restores that entry rather than unsetting it.
+/// for, as THIS build configures it. `findvar` finds one, so `mklocal` saves it
+/// rather than recording an unset (10011) and `exportcmd` flag-edits it (14158).
 fn ash_seeds_entry(name: &str) -> bool {
     matches!(
         name,
