@@ -872,11 +872,43 @@ argument one level down from decoration preceding client pixels.
 are: nothing on screen would report the change, and leaving fullscreen would
 land the operator in an arrangement they never asked for.
 
-Directional focus and movement do NOT honour stacking. They ask for the
-arrangement the container would have unstacked, because in a stack every
-leaf shares the one content rectangle and `Super+Up` would have no geometry
-to decide on. Stacking is about what is DRAWN, and the tree a chord walks is
-the same either way.
+Directional focus and movement ask for the arrangement the container would
+have UNSTACKED, because in a stack every leaf shares the one content
+rectangle and there is no geometry to rank them by. Stacking is about what
+is DRAWN, and the tree a chord walks is otherwise the same either way.
+
+Directional FOCUS is the exception, and movement is not: `Super+Shift+Down`
+still reads the unstacked arrangement, so on a stacked row it carries the
+window OUT of the container rather than down the band list — the chord that
+walks the bands and the chord that carries a window along them are
+perpendicular there. Recorded rather than fixed, and the reason to be wary of
+fixing it by symmetry: a move that reordered the run would have to mean
+something different again on a stacked column.
+
+`Super+Up`/`Down` are that exception, and they are the one direction that can
+be answered without geometry: a stack runs its bands top to bottom whatever
+axis the container has, so those two walk the RUN — the leaves the OUTERMOST
+stacked ancestor presents, in band order. Outermost because that is where the
+renderer stops: the first stacked container met from the root is handed to
+`place_stack`, which draws one band per leaf beneath it, so a stack nested in
+another is not presented at all and its run is bands nobody can see. Without
+any of this a stack made from a ROW answered only Left/Right, for bands the
+operator could see running vertically. The run is consulted first and only
+steps INSIDE it; a step off either end falls through to the geometry, which
+is what lets the same chord leave the stack rather than trapping focus in it.
+
+Two consequences are recorded rather than fixed. Left/Right are untouched, so
+they still read the unstacked arrangement: a stacked COLUMN is left for its
+neighbour, while in a stacked ROW they walk the run as `Down` does — the same
+chord meaning different things for arrangements that look identical, since a
+stack hides which axis made it. And coming BACK to a stack lands on neither
+the run's first leaf nor the one the stack is SHOWING, but on whichever leaf
+the geometric tie-break picks — the lowest-keyed among equal ranks, since
+every leaf in the stack shares the rectangle being ranked. The
+fall-through search also starts from the focused leaf's unstacked fraction
+rather than the stack's whole area, so a window below another part of a
+stacked row can be missed; that is how directional focus has always left a
+stack and is not introduced here.
 
 Client-side decoration negotiation, clipboard, drag-and-drop, subsurfaces,
 popups, output reconfiguration, fractional scale, screen capture, data

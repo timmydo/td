@@ -837,6 +837,18 @@ impl Layout {
         let Some(workspace) = self.workspaces.get(&self.active) else {
             return;
         };
+        // Inside a stack, `Up`/`Down` walk the RUN rather than the geometry.
+        // Nothing else can: a stack gives every leaf beneath it the same
+        // content rectangle, so the ranking below has no way to tell them
+        // apart, and a stack made from a ROW would answer left and right for
+        // bands that visibly run top to bottom. Falling through at the ends
+        // is what lets the same key leave the stack for whatever is beyond it.
+        if let Some(root) = workspace.root.as_ref() {
+            if let Some(target) = stack_neighbour(root, focused, direction) {
+                self.workspace_mut(self.active).focus(target);
+                return;
+            }
+        }
         let placements = unstacked_placements(workspace, VIRTUAL_EXTENT, VIRTUAL_EXTENT, 0);
         if let Some(target) = directional_target(&placements, focused, direction) {
             self.workspace_mut(self.active).focus(target);
@@ -1044,6 +1056,48 @@ fn detach(node: Node, key: SurfaceKey) -> Option<Node> {
             })
         }
     }
+}
+
+/// The leaf `direction` reaches from `key` WITHIN the stack presenting it, or
+/// `None` when there is no stack or the step would leave it.
+///
+/// The OUTERMOST stacked ancestor is the one that presents `key`, because
+/// that is where the renderer stops: `place_node` hands the first stacked
+/// container it meets to `place_stack`, which draws one band per LEAF beneath
+/// it. A stack nested inside another is therefore not shown at all, and
+/// walking its run would step through bands nobody can see. Same container
+/// `toggle_stacked` unstacks, for the same reason. Only `Up`/`Down` walk it,
+/// because that is the direction the bands run — `Left`/`Right` keep their
+/// geometric meaning so a stacked column can still be left for its neighbour.
+fn stack_neighbour(node: &Node, key: SurfaceKey, direction: Direction) -> Option<SurfaceKey> {
+    let step: isize = match direction {
+        Direction::Up => -1,
+        Direction::Down => 1,
+        Direction::Left | Direction::Right => return None,
+    };
+    let run = stack_run(node, key)?;
+    let at = run.iter().position(|candidate| *candidate == key)?;
+    let next = isize::try_from(at).ok()?.checked_add(step)?;
+    run.get(usize::try_from(next).ok()?).copied()
+}
+
+/// Every leaf the outermost stacked ancestor of `key` presents, in band order
+/// — which is `leaves` exactly, since `place_stack` builds its run the same
+/// way.
+fn stack_run(node: &Node, key: SurfaceKey) -> Option<Vec<SurfaceKey>> {
+    let Node::Split {
+        children, stacked, ..
+    } = node
+    else {
+        return None;
+    };
+    let index = children.iter().position(|child| child.contains(key))?;
+    if *stacked {
+        let mut keys = Vec::new();
+        node.leaves(&mut keys);
+        return Some(keys);
+    }
+    stack_run(children.get(index)?, key)
 }
 
 fn parent_axis(node: &Node, key: SurfaceKey) -> Option<Axis> {
@@ -1834,6 +1888,184 @@ mod tests {
         layout.apply(Command::ToggleFullscreen);
         assert!(layout.focus_key(key(2)));
         assert_eq!(layout.focused(), Some(key(2)));
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn up_and_down_walk_a_stack_whatever_axis_it_was_made_from() {
+        // A stack shows its bands top to bottom whatever the container is, so
+        // Up/Down follow that run. The ROW is the case that needs saying: its
+        // leaves expand back into a horizontal split, which answered only
+        // Left/Right while the operator was looking at a vertical list.
+        let mut layout = Layout::new();
+        for object in 1..=3 {
+            layout.map(key(object));
+        }
+        assert_eq!(layout.parent_axis(key(3)), Some(Axis::Horizontal));
+        layout.apply(Command::ToggleStacked);
+        assert_eq!(layout.focused(), Some(key(3)));
+
+        for expected in [2, 1] {
+            layout.apply(Command::Focus(Direction::Up));
+            assert_eq!(layout.focused(), Some(key(expected)), "up to {expected}");
+        }
+        // The top of the run, and nothing above the stack to fall through to.
+        layout.apply(Command::Focus(Direction::Up));
+        assert_eq!(layout.focused(), Some(key(1)));
+        for expected in [2, 3] {
+            layout.apply(Command::Focus(Direction::Down));
+            assert_eq!(layout.focused(), Some(key(expected)), "down to {expected}");
+        }
+        layout.apply(Command::Focus(Direction::Down));
+        assert_eq!(layout.focused(), Some(key(3)));
+
+        // Left/Right are UNCHANGED, and for this stack they still walk it:
+        // the run expands back into the row it was made from, which is why
+        // they worked here while Up/Down — the direction the bands actually
+        // run — did not.
+        layout.apply(Command::Focus(Direction::Left));
+        assert_eq!(layout.focused(), Some(key(2)));
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn left_and_right_leave_a_stack_rather_than_walking_it() {
+        // A stacked COLUMN beside another window is what tells the two apart:
+        // in a stacked ROW the run and the geometry agree either way, so only
+        // this shape shows that Left/Right were left alone. Walking the run in
+        // every direction would trap the operator in the stack.
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.map(key(2));
+        layout.apply(Command::SetSplit(Axis::Vertical));
+        layout.map(key(3));
+        assert_eq!(layout.parent_axis(key(3)), Some(Axis::Vertical));
+        layout.apply(Command::ToggleStacked);
+        assert_eq!(layout.focused(), Some(key(3)));
+
+        layout.apply(Command::Focus(Direction::Left));
+        assert_eq!(layout.focused(), Some(key(1)), "Left must leave the stack");
+        // Coming BACK lands on neither the run's first leaf nor the one the
+        // stack is SHOWING, but on whichever the geometric tie-break picks —
+        // the lowest-keyed among equal ranks, every leaf in the stack sharing
+        // the rectangle being ranked. Here that happens to be the run's first
+        // too, so the shape cannot tell those apart; asserted as it is rather
+        // than as it should be, so the day it is fixed this test says so.
+        layout.apply(Command::Focus(Direction::Right));
+        assert_eq!(layout.focused(), Some(key(2)));
+        // Down still walks the run it is in.
+        layout.apply(Command::Focus(Direction::Down));
+        assert_eq!(layout.focused(), Some(key(3)));
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_nested_stack_walks_the_run_that_is_actually_drawn() {
+        // `Hstacked[1, Vstacked[2, 3]]`. The renderer stops at the OUTER
+        // stack and gives it one band per leaf beneath it, so the screen shows
+        // a single run [1, 2, 3] and the inner stack is not presented at all.
+        // Walking the nearest stacked ancestor instead would consult the
+        // hidden run [2, 3], where `Up` from 2 has nowhere to go.
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.map(key(2));
+        layout.apply(Command::SetSplit(Axis::Vertical));
+        layout.map(key(3));
+        layout.apply(Command::ToggleStacked);
+        assert_eq!(layout.focused(), Some(key(3)));
+        // Now stack the outer row as well, from a leaf that is its child.
+        layout.focus_key(key(1));
+        layout.apply(Command::ToggleStacked);
+        let bands = layout.placements(200, 400, 0, 20);
+        assert!(bands.iter().all(|placement| placement.stacked));
+        assert_eq!(
+            bands
+                .iter()
+                .map(|placement| placement.key.object)
+                .collect::<Vec<_>>(),
+            [1, 2, 3],
+            "the drawn run is the outer stack's"
+        );
+
+        layout.focus_key(key(2));
+        layout.apply(Command::Focus(Direction::Up));
+        assert_eq!(layout.focused(), Some(key(1)), "up the DRAWN run");
+        layout.apply(Command::Focus(Direction::Down));
+        assert_eq!(layout.focused(), Some(key(2)));
+        layout.apply(Command::Focus(Direction::Down));
+        assert_eq!(layout.focused(), Some(key(3)));
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_step_off_the_end_of_a_stack_leaves_it() {
+        // `V[Hstacked[1, 3], 2]` — the stack must NOT be the root, or every
+        // step is an ordinary run walk and nothing here leaves anything. The
+        // run is `[1, 3]` across the top half, with 2 below the whole of it,
+        // so `Down` from the LAST band is the fall-through: the run has no
+        // next leaf and the geometry answers with the window underneath.
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.apply(Command::SetSplit(Axis::Vertical));
+        layout.map(key(2));
+        layout.focus_key(key(1));
+        layout.apply(Command::SetSplit(Axis::Horizontal));
+        layout.map(key(3));
+        layout.apply(Command::ToggleStacked);
+        let run: Vec<u32> = layout
+            .placements(200, 400, 0, 20)
+            .iter()
+            .filter(|placement| placement.stacked)
+            .map(|placement| placement.key.object)
+            .collect();
+        assert_eq!(run, [1, 3], "the stack is the top half, not the root");
+
+        assert_eq!(layout.focused(), Some(key(3)));
+        layout.apply(Command::Focus(Direction::Up));
+        assert_eq!(layout.focused(), Some(key(1)), "walked the run");
+        layout.apply(Command::Focus(Direction::Down));
+        assert_eq!(layout.focused(), Some(key(3)), "walked it back");
+        // Off the end of the run, so the geometry answers: 2 is below.
+        layout.apply(Command::Focus(Direction::Down));
+        assert_eq!(layout.focused(), Some(key(2)), "left the stack");
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_stack_of_splits_walks_every_band_it_draws() {
+        // `Hstacked[V[1, 3], V[2, 4]]`. td draws one band per LEAF beneath a
+        // stack rather than one per child — `place_stack` says so — so the run
+        // is all four. Walking per CHILD would step 1 to 2 and skip the band
+        // for 3 that is drawn between them.
+        // Stacked FIRST, then its children split: `ToggleStacked` stacks the
+        // container a leaf is a direct child of, so splitting first would
+        // stack an inner column instead of the row.
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.map(key(2));
+        layout.apply(Command::ToggleStacked);
+        layout.focus_key(key(1));
+        layout.apply(Command::SetSplit(Axis::Vertical));
+        layout.map(key(3));
+        layout.focus_key(key(2));
+        layout.apply(Command::SetSplit(Axis::Vertical));
+        layout.map(key(4));
+        let placements = layout.placements(200, 400, 0, 20);
+        assert!(
+            placements.iter().all(|placement| placement.stacked),
+            "the ROW is the stack, and it presents all four"
+        );
+        let run: Vec<u32> = placements
+            .iter()
+            .map(|placement| placement.key.object)
+            .collect();
+        assert_eq!(run, [1, 3, 2, 4], "the drawn band order");
+        layout.focus_key(key(1));
+
+        for expected in [3, 2, 4] {
+            layout.apply(Command::Focus(Direction::Down));
+            assert_eq!(layout.focused(), Some(key(expected)), "down to {expected}");
+        }
         layout.check_invariants().unwrap();
     }
 
