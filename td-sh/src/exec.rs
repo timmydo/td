@@ -775,7 +775,9 @@ impl Shell {
                 name.to_string(),
                 Var {
                     value: None,
-                    exported: false,
+                    // ash.c:14164 creates this through `setvar`, whose
+                    // `setvareq` ORs `VEXPORT` in under `set -a` (ash.c:2417).
+                    exported: self.opts.allexport,
                     readonly: true,
                     localised: false,
                     dynamic: None,

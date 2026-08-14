@@ -5309,6 +5309,32 @@ mod tests {
         assert!(!out.contains("export A") && !out.contains("export B"), "{out:?}");
     }
 
+    /// `readonly NAME` on a name that does not exist yet creates its entry
+    /// through `setvar` (ash.c:14164), which ORs `VEXPORT` in under `set -a`
+    /// (ash.c:2417) -- so the declaration marks it for export as well.
+    #[test]
+    fn a_readonly_declaration_under_allexport_marks_the_name_for_export() {
+        let (_, out, _) = run_capturing("set -a; readonly TDR; set +a; export -p");
+        assert!(out.contains("export TDR"), "{out:?}");
+        // Without it, `readonly` says nothing about exporting.
+        let (_, out, _) = run_capturing("readonly TDR; export -p");
+        assert!(!out.contains("export TDR"), "{out:?}");
+        // Either way it is READONLY, which is the half that was never in doubt.
+        for src in ["set -a; readonly TDR; TDR=1", "readonly TDR; TDR=1"] {
+            let (status, _, err) = run_capturing(src);
+            assert_eq!(status, 2, "{src}");
+            assert!(err.contains("is read only"), "{src}: {err:?}");
+        }
+        // An EXISTING name is untouched by this: the entry is already there, so
+        // the insert that consults `set -a` never runs. The second spelling is
+        // the one that pins it -- the first passes even if the existing arm
+        // consults `set -a` too, since it is off.
+        for src in ["TDR=1; readonly TDR; export -p", "TDR=1; set -a; readonly TDR; set +a; export -p"] {
+            let (_, out, _) = run_capturing(src);
+            assert!(!out.contains("export TDR"), "{src}: {out:?}");
+        }
+    }
+
     #[test]
     fn a_declaration_builtins_assignment_operand_is_not_field_split() {
         // ash's `pseudovarflag` (ash.c:10416): for these four, a word whose RAW
