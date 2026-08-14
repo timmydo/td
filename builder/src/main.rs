@@ -50,11 +50,11 @@ mod tar;
 mod toolchain_x86_64;
 mod xz;
 
-// The JSON value/parser/canonical writer and SHA-256 live in the shared,
-// std-only td-engine (one copy for td-builder + td-recipe-eval). Re-exported at
-// crate root so existing `crate::json::` / `json::` (and `sha256::`) paths are
-// unchanged.
-pub use td_engine::{json, sha256};
+// The JSON value/parser/canonical writer, SHA-256 and CRC-32 live in the
+// shared, std-only td-engine (one copy for td-builder + td-recipe-eval).
+// Re-exported at crate root so existing `crate::json::` / `json::` (and
+// `sha256::`) paths are unchanged.
+pub use td_engine::{crc32, json, sha256};
 
 use std::ffi::CString;
 use std::os::fd::AsRawFd;

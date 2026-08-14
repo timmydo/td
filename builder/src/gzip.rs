@@ -3,6 +3,7 @@
 //! Kept in-tree and std-only for the same reason as `tar.rs`: source seed
 //! preparation should not require host unpackers or a Rust crate dependency.
 
+use crate::crc32::crc32;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -639,35 +640,6 @@ fn skip_zero_terminated(input: &[u8], pos: usize, what: &str) -> Result<usize, S
         }
     }
     Err(format!("{what} is not nul-terminated"))
-}
-
-fn crc32(input: &[u8]) -> u32 {
-    let table = crc32_table();
-    let mut crc = 0xffff_ffffu32;
-    for b in input {
-        let idx = ((crc ^ u32::from(*b)) & 0xff) as usize;
-        let table_value = table.get(idx).copied().unwrap_or(0);
-        crc = (crc >> 8) ^ table_value;
-    }
-    !crc
-}
-
-fn crc32_table() -> [u32; 256] {
-    let mut table = [0u32; 256];
-    for i in 0..256usize {
-        let mut crc = u32::try_from(i).unwrap_or(0);
-        for _ in 0..8 {
-            if crc & 1 == 0 {
-                crc >>= 1;
-            } else {
-                crc = (crc >> 1) ^ 0xedb8_8320;
-            }
-        }
-        if let Some(slot) = table.get_mut(i) {
-            *slot = crc;
-        }
-    }
-    table
 }
 
 #[cfg(test)]
