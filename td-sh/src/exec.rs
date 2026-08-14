@@ -756,6 +756,17 @@ impl Shell {
         }
     }
 
+    /// `export -n`. An absent name gets ash's valueless entry (`setvar` with
+    /// no value, ash.c:14164), which is discarded (ash.c:2458) unless `set -a`
+    /// has put the export flag back on it (ash.c:2417).
+    pub fn unexport(&mut self, name: &str) {
+        if let Some(v) = self.vars.get_mut(name) {
+            v.exported = false;
+        } else if self.opts.allexport {
+            self.export(name);
+        }
+    }
+
     pub fn set_readonly(&mut self, name: &str) {
         if let Some(v) = self.vars.get_mut(name) {
             v.readonly = true;

@@ -1717,6 +1717,9 @@ fn export(sh: &mut Shell, argv: &[String], readonly: bool) -> R<()> {
     let cmd = if readonly { "readonly" } else { "export" };
     let mut any = false;
     let mut options = true;
+    // Set for `readonly` too, which ignores it: its arms never read this
+    // (ash.c:14143-14145).
+    let mut unexport = false;
     for arg in argv.iter().skip(1) {
         if options && arg == "--" {
             options = false;
@@ -1725,16 +1728,21 @@ fn export(sh: &mut Shell, argv: &[String], readonly: bool) -> R<()> {
         // ash reads the cluster letter by letter and an unknown one is fatal, so
         // `export -px` is a usage error here. dash instead calls `nextopt` ONCE
         // and never looks at the rest, so `-px` lists and exits 0; this follows
-        // ash. (`-n`, which ash also takes, is not implemented yet.)
+        // ash.
         if options && arg.len() > 1 && arg.starts_with('-') {
             // A plain loop, not a search combinator: this source is embedded
             // verbatim in the td-sh recipe, whose ladder guard rejects that tool's
             // bare name as a token (see the note in arith.rs).
             let mut bad = None;
             for c in arg.chars().skip(1) {
-                if c != 'p' {
-                    bad = Some(c);
-                    break;
+                match c {
+                    // `-p` is accepted and does NOTHING.
+                    'p' => {}
+                    'n' => unexport = true,
+                    _ => {
+                        bad = Some(c);
+                        break;
+                    }
                 }
             }
             if let Some(c) = bad {
@@ -1752,9 +1760,12 @@ fn export(sh: &mut Shell, argv: &[String], readonly: bool) -> R<()> {
                 sh.set_var(name, value)?;
                 if readonly {
                     sh.set_readonly(name);
-                } else {
+                } else if !unexport {
                     sh.export(name);
                 }
+                // No `unexport` arm: an assignment goes through `setvar`
+                // (ash.c:14164), which preserves the flags already there
+                // (ash.c:2449), so it only declines to ADD the export.
             }
             None => {
                 if !ast::is_name(arg) {
@@ -1762,6 +1773,8 @@ fn export(sh: &mut Shell, argv: &[String], readonly: bool) -> R<()> {
                 }
                 if readonly {
                     sh.set_readonly(arg);
+                } else if unexport {
+                    sh.unexport(arg);
                 } else {
                     sh.export(arg);
                 }
@@ -5195,12 +5208,10 @@ mod tests {
 
     #[test]
     fn an_unknown_option_to_export_or_readonly_is_fatal() {
-        // On a special builtin an unknown option ends the script. `-n` is the
-        // one row here that is not really unknown: ash takes it unconditionally
-        // (`nextopt("np")`, ash.c:14137) and td-sh has not got it, so that row
-        // pins a gap rather than a refusal.
+        // On a special builtin an unknown option ends the script. `n` and `p`
+        // are the only two that are not (`nextopt("np")`, ash.c:14137).
         for (src, err) in [
-            ("export -n undef; echo reached", "export: illegal option -n\n"),
+            ("export -z x; echo reached", "export: illegal option -z\n"),
             ("readonly -q x; echo reached", "readonly: illegal option -q\n"),
             // ash reads the WHOLE cluster, so a bad letter after a good one is
             // still fatal -- and names the letter it stopped on, not the word.
@@ -5214,6 +5225,88 @@ mod tests {
         // `-p` and `--` stay options, and everything after `--` is a name.
         let (status, out, _) = run_capturing("export -p; readonly -- a=1; echo \"[$a]\"");
         assert_eq!((status, out.as_str()), (0, "[1]\n"));
+    }
+
+    /// `export -n` takes the export attribute away and leaves the VALUE, and
+    /// `readonly` accepts the same letter and ignores it (ash.c:14137-14145).
+    #[test]
+    fn export_minus_n_unexports_and_readonly_ignores_it() {
+        // `-p` is accepted and does nothing, so `-n` wins over it either order.
+        for opts in ["-n", "-pn", "-np", "-n -p"] {
+            let src = format!("TDN=1; export TDN; export {opts} TDN; export -p");
+            let (status, out, err) = run_capturing(&src);
+            assert_eq!((status, err.as_str()), (0, ""), "{opts}");
+            assert!(!out.contains("export TDN"), "{opts} left it exported: {out:?}");
+        }
+        // `-p` on its own must NOT do that: it is accepted and ignored, so a
+        // name beside it stays exported.
+        let (_, out, _) = run_capturing("TDN=1; export -p TDN; export -p");
+        assert!(out.contains("export TDN='1'"), "{out:?}");
+        // The VALUE survives -- this is not `unset`.
+        let (_, out, _) = run_capturing("TDN=1; export TDN; export -n TDN; echo \"[$TDN]\"");
+        assert_eq!(out, "[1]\n");
+        // An ASSIGNMENT declines to ADD the export and never takes one away, so
+        // these two spellings of `-n` differ in a way `unset` has no analogue for.
+        let (_, out, _) = run_capturing("export -n TDN=2; export -p");
+        assert!(!out.contains("export TDN"), "{out:?}");
+        let (_, out, _) = run_capturing("TDN=1; export TDN; export -n TDN=2; export -p");
+        assert!(out.contains("export TDN='2'"), "{out:?}");
+        // A name that does not exist stays unset rather than becoming empty.
+        let (status, out, _) = run_capturing("export -n TDNEW; echo \"[${TDNEW-UNSET}]\"");
+        assert_eq!((status, out.as_str()), (0, "[UNSET]\n"));
+        let (_, out, _) = run_capturing("export -n TDNEW; TDNEW=1; export -p");
+        assert!(!out.contains("export TDNEW"), "{out:?}");
+        // Under `set -a` that same absent name comes out EXPORTED, which is
+        // `-n` marking for export the one thing it was asked not to.
+        let (_, out, _) = run_capturing("set -a; export -n TDNEW; set +a; export -p");
+        assert!(out.contains("export TDNEW"), "{out:?}");
+        let (_, out, _) = run_capturing("set -a; export -n TDNEW; set +a; TDNEW=1; export -p");
+        assert!(out.contains("export TDNEW='1'"), "{out:?}");
+        // An existing name is NOT re-exported that way: that arm writes the
+        // flags outright rather than going through `setvar` (ash.c:14160).
+        let (_, out, _) = run_capturing("set -a; TDN=1; export TDN; export -n TDN; export -p");
+        assert!(!out.contains("export TDN"), "{out:?}");
+        // A CLONE must not carry it back: these are threads over one `Shell`,
+        // so "the subshell did not leak" is a property of this shell rather
+        // than of the fork every other one gets it from.
+        for form in ["(export -n TDN)", "x=$(export -n TDN)", "export -n TDN | cat"] {
+            let src = format!("TDN=1; export TDN; {form}; export -p");
+            let (_, out, _) = run_capturing(&src);
+            assert!(out.contains("export TDN='1'"), "{form} leaked: {out:?}");
+        }
+        // A FUNCTION shares the shell, so there it does reach the caller.
+        let (_, out, _) = run_capturing("TDN=1; export TDN; f() { export -n TDN; }; f; export -p");
+        assert!(!out.contains("export TDN"), "{out:?}");
+        // Re-exporting afterwards works, and `-n` with no operand still lists.
+        let (_, out, _) = run_capturing("TDN=1; export TDN; export -n TDN; export TDN; export -n");
+        assert!(out.contains("export TDN='1'"), "{out:?}");
+        // `readonly -n` is accepted and does NOT lift the attribute, so the
+        // assignment after it is still the fatal one. `-n` is the ONLY thing
+        // making this name readonly: preserving an attribute it never applied
+        // would pass the obvious spelling and still be wrong. The third is the
+        // other half of "ignores it" -- it must not unexport either.
+        for src in ["readonly -n R; R=2; echo reached", "R=1; readonly R; readonly -n R; R=2"] {
+            let (status, out, err) = run_capturing(src);
+            assert_eq!((status, out.as_str()), (2, ""), "{src}");
+            assert!(err.contains("is read only"), "{src}: {err:?}");
+        }
+        let (_, out, _) = run_capturing("TDN=1; export TDN; readonly -n TDN; export -p");
+        assert!(out.contains("export TDN='1'"), "{out:?}");
+        // `-n` takes nothing else away: not READONLY, not the LOCAL scope, and
+        // not the distinction between a valueless name and an empty one.
+        let (status, _, err) = run_capturing("X=1; export X; readonly X; export -n X; X=2");
+        assert_eq!(status, 2);
+        assert!(err.contains("is read only"), "{err:?}");
+        // The LOCAL mark, which only `unset` reads: a name still marked keeps
+        // its entry (and so its export) where an unmarked one is removed whole.
+        let (_, out, _) =
+            run_capturing("f() { local X; export -n X; export X; unset X; X=2; export -p; }; f");
+        assert!(out.contains("export X='2'"), "{out:?}");
+        let (_, out, _) = run_capturing("export TDNV; export -n TDNV; echo \"[${TDNV-UNSET}]\"");
+        assert_eq!(out, "[UNSET]\n");
+        // EVERY operand, not just the first.
+        let (_, out, _) = run_capturing("A=1; B=2; export A B; export -n A B; export -p");
+        assert!(!out.contains("export A") && !out.contains("export B"), "{out:?}");
     }
 
     #[test]

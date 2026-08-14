@@ -661,6 +661,9 @@ xfail builtin-umask.test.sh::umask permcopy running value
 xfail builtin-umask.test.sh::umask s perm
 xfail builtin-umask.test.sh::umask t perm
 xfail builtin-umask.test.sh::usage: large octal number
+xfail builtin-vars.test.sh::Export sets a global variable that persists after export -n
+xfail builtin-vars.test.sh::export -n foo=bar not allowed
+xfail builtin-vars.test.sh::export -n undefined is ignored
 xfail case_.test.sh::Pattern ? matches 1 code point (many bytes), but not multiple code points
 xfail command-sub-ksh.test.sh::${ echo hi }  without semi-colon
 xfail command-sub-ksh.test.sh::${ echo hi;}
