@@ -88,8 +88,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let scratch_name = scratch_name("check", &[stem, &index.to_string()]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?;
-    let _lock = lock_file(&runner.lock_path())?;
-    runner.setup()?;
+    let _lock = lock_ladder_for_run(&runner)?;
     crate::checks::run(check_runner, &runner, stem)
 }
 
@@ -116,7 +115,7 @@ pub fn verify_store_cli(args: &[String]) -> Result<(), String> {
     // Hold the ladder lock across the fsck so it sees a stable cache: a concurrent build
     // commit or a `clear-store` would otherwise race the re-hash (spurious "corruption") or
     // swap the whole cache out from under it. Same lock `run`/`clear-store` take.
-    let _lock = lock_file(&runner.lock_path())?;
+    let _lock = lock_ladder(&runner.lock_path(), LadderLock::Exclusive)?;
     runner.verify_store()
 }
 
@@ -180,7 +179,7 @@ fn clear_ladder(lw: &Path) -> Result<(), String> {
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
-    let _lock = lock_file(&lock_path)?;
+    let _lock = lock_ladder(&lock_path, LadderLock::Exclusive)?;
     // A prior clear that crashed between the swap-aside and the reap would leave this sibling
     // tombstone; remove it first (idempotent) so it cannot accrete. Race-free under the ladder
     // lock, which serializes clears, so a fixed name needs no pid tag.
@@ -197,7 +196,22 @@ fn clear_ladder(lw: &Path) -> Result<(), String> {
         // is gone, and no committer can recreate `<lw>/build-cache.commit.lock` until a fresh
         // build — which must first take the ladder lock we still hold — recreates lw.
         {
-            let _commit_lock = lock_file(&lw.join(CACHE_COMMIT_LOCK_BASENAME))?;
+            // BOTH commit locks: the seed store has one of its own now, so a clear that
+            // took only the cache's could rename the ladder out from under an intern
+            // mid-MERGE. No deadlock to reason about — nothing else takes both, and two
+            // clears cannot overlap, each holding the ladder exclusively — so the order
+            // here is only for the reader.
+            //
+            // This does NOT cover an orphaned `store-add-recursive` for its whole run —
+            // it holds the seed lock only across the cold commit and the db merge, and
+            // the NAR walks between them are deliberately unlocked (see main.rs). A
+            // clear landing in that window renames the tree the orphan is reading; the
+            // orphan then reds or writes into the tombstone, which is discarded either
+            // way. Nothing SURVIVING is corrupted, which is the property this dance is
+            // for; excluding the orphan outright would need a lease held across the
+            // walks, which is the serialization that made concurrency pointless.
+            let _cache_lock = lock_file(&lw.join(CACHE_COMMIT_LOCK_BASENAME))?;
+            let _seed_lock = lock_file(&lw.join(SEED_COMMIT_LOCK_BASENAME))?;
             fs::rename(lw, &tomb)
                 .map_err(|e| format!("clear-store: swap {} aside: {e}", lw.display()))?;
         }
@@ -222,6 +236,11 @@ fn clearing_tombstone_path(lw: &Path) -> PathBuf {
 /// `cache_commit_lock_path`, and eviction can never take DIFFERENT locks — a divergence would
 /// break the "clear/evict never races a direct committer" invariant with no compile error.
 const CACHE_COMMIT_LOCK_BASENAME: &str = "build-cache.commit.lock";
+
+/// The seed store's commit lock, the sibling `lock_store_commit` derives from the
+/// seed db's parent (`<lw>/seed-db`) — kept beside that dir for the same reason the
+/// cache's is kept beside `build-cache/`.
+const SEED_COMMIT_LOCK_BASENAME: &str = "seed-db.commit.lock";
 
 /// Fail closed on a `clear-store` target that would recursively delete more than a ladder.
 /// A ladder work dir is always an absolute path at least THREE plain segments deep
@@ -290,7 +309,7 @@ pub fn qemu_boot_cli(args: &[String]) -> Result<(), String> {
     let scratch_name = scratch_name("qemu-boot", &[stem]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
     warm_operator_inputs(&runner, &targets);
-    let _lock = lock_file(&runner.lock_path())?;
+    let _lock = lock_ladder(&runner.lock_path(), LadderLock::Exclusive)?;
     runner.setup()?;
     crate::checks::qemu_boot::run(&runner)
 }
@@ -323,7 +342,7 @@ pub fn qemu_boot_erofs_cli(args: &[String]) -> Result<(), String> {
     let scratch_name = scratch_name("qemu-boot", &[stem]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
     warm_operator_inputs(&runner, &targets);
-    let _lock = lock_file(&runner.lock_path())?;
+    let _lock = lock_ladder(&runner.lock_path(), LadderLock::Exclusive)?;
     runner.setup()?;
     crate::checks::qemu_boot::run_erofs(&runner)
 }
@@ -356,7 +375,7 @@ pub fn qemu_boot_system_cli(args: &[String]) -> Result<(), String> {
     let scratch_name = scratch_name("qemu-boot", &[stem]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
     warm_operator_inputs(&runner, &targets);
-    let _lock = lock_file(&runner.lock_path())?;
+    let _lock = lock_ladder(&runner.lock_path(), LadderLock::Exclusive)?;
     runner.setup()?;
     crate::checks::qemu_boot::run_system(&runner)
 }
@@ -388,7 +407,7 @@ pub fn qemu_boot_net_cli(args: &[String]) -> Result<(), String> {
     let scratch_name = scratch_name("qemu-boot", &[stem]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
     warm_operator_inputs(&runner, &targets);
-    let _lock = lock_file(&runner.lock_path())?;
+    let _lock = lock_ladder(&runner.lock_path(), LadderLock::Exclusive)?;
     runner.setup()?;
     crate::checks::qemu_boot::run_net(&runner)
 }
@@ -422,7 +441,7 @@ pub fn qemu_boot_kexec_cli(args: &[String]) -> Result<(), String> {
     let scratch_name = scratch_name("qemu-boot", &[stem]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
     warm_operator_inputs(&runner, &targets);
-    let _lock = lock_file(&runner.lock_path())?;
+    let _lock = lock_ladder(&runner.lock_path(), LadderLock::Exclusive)?;
     runner.setup()?;
     crate::checks::qemu_boot::run_kexec(&runner)
 }
@@ -467,7 +486,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let scratch_name = scratch_name("run", &[stem]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
     warm_operator_inputs(&runner, &targets);
-    let lock = lock_file(&runner.lock_path())?;
+    let lock = lock_ladder(&runner.lock_path(), LadderLock::Exclusive)?;
     runner.setup()?;
     // The interactive boot runs unbounded (until the operator quits qemu), so hand the
     // ladder lock to the runner: it releases it after the build, before the boot, so the
@@ -555,11 +574,10 @@ pub fn build_cli(args: &[String]) -> Result<(), String> {
         let _t = timed_phase("harness new/stage0-place");
         RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress()
     };
-    let _lock = lock_file(&runner.lock_path())?;
-    {
+    let _lock = {
         let _t = timed_phase("harness setup");
-        runner.setup()?;
-    }
+        lock_ladder_for_run(&runner)?
+    };
     runner.build_recipe_target(target, &outputs)
 }
 
@@ -601,8 +619,10 @@ fn catalog_seed_universe() -> Result<Vec<SeedInput>, String> {
 /// source cache, like any ladder run.
 pub fn seed_digests_cli() -> Result<(), String> {
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
-    let runner = RecipeCheckRunner::new(root, "seed-digests")?;
-    let _lock = lock_file(&runner.lock_path())?;
+    let mut runner = RecipeCheckRunner::new(root, "seed-digests")?;
+    // Everything this run registers is written aside — see `generator_db_path`.
+    runner.db = generator_db_path(&runner.lw, &runner.scratch_id());
+    let _lock = lock_ladder(&runner.lock_path(), LadderLock::Exclusive)?;
     runner.setup()?;
     let mut rows: BTreeMap<String, String> = BTreeMap::new();
     for input in catalog_seed_universe()? {
@@ -612,6 +632,9 @@ pub fn seed_digests_cli() -> Result<(), String> {
             path_basename_str(&derived)?.to_string(),
         );
     }
+    // Best-effort: the rows have served their purpose (the basenames are in `rows`),
+    // and a kept file would just accumulate one per generator run.
+    let _ = fs::remove_file(&runner.db);
     println!(
         "# seed/seed-digests.txt — the compiled seed-digest table (re #469).\n\
          # Every admissible seed input's expected store basename, derived from its\n\
@@ -741,46 +764,114 @@ fn sanitize_scratch_component(s: &str) -> String {
     }
 }
 
-/// The trailing `-<pid>` a `scratch_name` appends. Returns the pid iff the last
-/// `-`-separated component is a non-empty all-ASCII-digit run — so a reaper can tell
-/// an abandoned scratch tree apart from any other directory. None for anything that
-/// does not end in a numeric pid (never touched by the reaper).
+/// The trailing `-<pid>` a `scratch_name` appends, ignoring a `.<n>` disambiguator
+/// `claim_scratch` may have added. Returns the pid iff that component is a non-empty
+/// all-ASCII-digit run — so a reaper can tell one of our scratch trees apart from any
+/// other directory. None for anything not so shaped (never touched by the reaper).
+///
+/// The pid is a DEBUGGING HINT and nothing more: it says which process made the tree
+/// on the host, and is deliberately not asked whether it is alive. See `claim_scratch`.
 fn trailing_pid(name: &str) -> Option<u32> {
-    let last = name.rsplit('-').next()?;
+    let stem = match name.rsplit_once('.') {
+        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => name,
+    };
+    let last = stem.rsplit('-').next()?;
     if last.is_empty() || !last.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     last.parse::<u32>().ok()
 }
 
-/// A pid is live iff `/proc/<pid>` exists. The reaper runs under the ladder lock, so no
-/// other same-ladder run is mid-build when it fires; this check's load-bearing job is to
-/// never reap OUR OWN just-created scratch, with defense-in-depth for a leftover tree of
-/// some still-alive process. Pid reuse can only make a dead scratch LOOK live (skip →
-/// under-reap, harmless); it can never make our live scratch look dead, so an in-progress
-/// build is never reaped.
-fn pid_is_alive(pid: u32) -> bool {
-    Path::new("/proc").join(pid.to_string()).exists()
-}
-
-/// The pid of a reapable scratch tree, or None. A tree is reapable only if it is one of
-/// OUR trees — `scratch_name` emits `build-…-<pid>` / `check-…-<pid>` / `qemu-boot-…-<pid>`
-/// / `run-…-<pid>` — AND ends in a numeric pid. The prefix guard means a coincidental
-/// sibling such as `gcc-14` or `glibc-241` can never be reaped (belt-and-braces: this dir
-/// holds only our scratch trees anyway). The `qemu-boot-` and `run-` prefixes are
-/// essential: the host-side qemu-boot and interactive `run` tools create per-boot scratch
-/// trees here too, and without them a crashed/killed boot's tree (which can hold a
-/// multi-GiB kernel build) would leak forever. Split out so the reaper's eligibility rule
-/// is unit-testable.
-fn reapable_dead_pid(name: &str) -> Option<u32> {
+/// Whether a directory name is one of OUR scratch trees, and so eligible for reaping —
+/// `scratch_name` emits `build-…` / `check-…` / `qemu-boot-…` / `run-…` ending in a
+/// numeric pid, optionally `.<n>`-disambiguated. The prefix guard means a coincidental
+/// sibling such as `gcc-14` or `glibc-241` can never be reaped (belt-and-braces: this
+/// dir holds only our scratch trees anyway). The `qemu-boot-` and `run-` prefixes are
+/// essential: the host-side qemu-boot and interactive `run` tools create per-boot
+/// scratch trees here too, and without them a crashed/killed boot's tree (which can
+/// hold a multi-GiB kernel build) would leak forever. Split out so the reaper's
+/// eligibility rule is unit-testable.
+///
+/// Eligible is not reapable: whether the tree is ABANDONED is answered by its claim
+/// lock, never by this name.
+fn reapable_scratch(name: &str) -> bool {
     if !name.starts_with("build-")
         && !name.starts_with("check-")
         && !name.starts_with("qemu-boot-")
         && !name.starts_with("run-")
     {
-        return None;
+        return false;
     }
-    trailing_pid(name)
+    trailing_pid(name).is_some()
+}
+
+/// The staging temp a build-run memo is published through. Split out as a pure function
+/// because the property that matters is a property of the NAME — that two live runs
+/// cannot pick the same one — and a concurrency test cannot pin it: whether two racing
+/// renames actually collide is a matter of timing, so such a test passes just as happily
+/// with the run id removed. This one fails the moment it is.
+fn build_run_memo_temp_name(target: &str, fingerprint: &str, run_id: &str) -> String {
+    format!(
+        ".{}.{fingerprint}.{run_id}.tmp",
+        sanitize_target_for_filename(target)
+    )
+}
+
+/// The claim lock for a scratch NAME, a dotfile beside the tree it guards. Dotted so
+/// the reaper's `read_dir` cannot mistake it for a scratch tree, and a SIBLING rather
+/// than a child so it survives the tree being removed.
+fn scratch_claim_lock(scratch_root: &Path, name: &str) -> PathBuf {
+    scratch_root.join(format!(".{name}.claim"))
+}
+
+/// The number of `.<n>` disambiguators tried before a claim gives up. A collision needs
+/// one live peer per attempt on the identical check, so this is far past any real fleet.
+const SCRATCH_CLAIM_ATTEMPTS: usize = 64;
+
+/// Claim a scratch directory EXCLUSIVELY, returning the claimed path and the lock that
+/// holds it. The lock must outlive the run.
+///
+/// This replaces asking `/proc` whether a pid is alive, which stopped being answerable
+/// the moment runs overlapped. The ladder is bind-mounted into the loop sandbox at the
+/// same absolute path (`check_loop`), and that sandbox unshares `CLONE_NEWPID` over a
+/// FRESH procfs — so a peer's pid is simply ABSENT from a sandboxed `/proc` (its live
+/// tree reads as dead and was reaped under it), and two sandboxed runs of the same
+/// check hold the SAME low pid (one `setup` then wiped the other's live tree). Both
+/// were invisible while the exclusive ladder lock meant only one run existed at a time.
+///
+/// An flock is namespace-independent and answers exactly the question asked: the kernel
+/// releases it when the owning process dies, however it dies. The lock file is NEVER
+/// unlinked — reaping removes the TREE only — because a claimant that had the old inode
+/// open would otherwise lock a file already replaced at that path, and two runs would
+/// hold one name. It is empty, and bounded by the names a ladder ever uses.
+fn claim_scratch(scratch_root: &Path, name: &str) -> Result<(PathBuf, File), String> {
+    for attempt in 0..SCRATCH_CLAIM_ATTEMPTS {
+        let candidate = match attempt {
+            0 => name.to_string(),
+            n => format!("{name}.{}", n + 1),
+        };
+        let lock_path = scratch_claim_lock(scratch_root, &candidate);
+        let lock = open_lock_file(&lock_path)?;
+        match lock.try_lock() {
+            // A live peer owns this name — in this or any other pid namespace.
+            Err(std::fs::TryLockError::WouldBlock) => continue,
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!("claim {}: {e}", lock_path.display()))
+            }
+            Ok(()) => {}
+        }
+        // Ours now, so a leftover tree under this name is a DEAD predecessor's and is
+        // the one thing safe to clear here: nothing else may hold this name.
+        let dir = scratch_root.join(&candidate);
+        remove_path_if_exists(&dir)?;
+        return Ok((dir, lock));
+    }
+    Err(format!(
+        "ladder: {SCRATCH_CLAIM_ATTEMPTS} live runs already hold a scratch named {name} \
+         under {} — refusing to share one",
+        scratch_root.display()
+    ))
 }
 
 /// The ladder work dir — the tree `check-run`/`build-run` build into and the explicit
@@ -805,6 +896,53 @@ fn shared_sources_dir(home: Option<&Path>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".td/sources"))
 }
 
+/// The seed db for THIS worktree's compiled pin table, `<lw>/seed-db/<digest>.db`.
+///
+/// `<lw>` is machine-wide but a pin table is a branch's, so ONE shared db is a db
+/// every run must reconcile to its own table — deleting rows, and the trees under
+/// them, that a peer worktree still pins. Keyed, there is nothing to reconcile: a
+/// table change lands on a fresh db and re-interns, so a pin bump costs the changed
+/// seed rather than a cold climb. The STORE stays shared and unkeyed — items are
+/// content-addressed, so a basename two tables both name is the same bytes, and the
+/// common seeds (every fetched tarball) are interned once for the machine.
+/// The retained seed store, `<lw>/seed-store`.
+///
+/// NOT the `<lw>/store` this replaces, and the rename is the whole point: a binary
+/// from before the keyed db still runs `prune_unpinned_seeds` at every setup, and
+/// that prune DELETES trees whose basename ITS table does not pin — including ones a
+/// keyed db here vouches, which would then red at `build-plan` with the tree simply
+/// missing. Its exclusive ladder lock keeps the two apart in time and repairs
+/// nothing. An old pruner cannot reach a path it does not know, so the cut-over is
+/// the rename; the cost is one re-intern per machine, from the already-warm source
+/// cache. `<lw>/store` is left where it is for those binaries to keep using.
+fn seed_store_dir(lw: &Path) -> PathBuf {
+    lw.join("seed-store")
+}
+
+/// A DISPOSABLE seed db for the table GENERATOR, beside the keyed ones.
+///
+/// `seed-digests` derives the whole seed universe from the pins and interns what it
+/// derives — which during a pin bump is exactly a basename the CURRENT table does not
+/// pin. Merged into the current table's db that is a row `authenticate_seed_db`
+/// rejects the WHOLE db over, and with the unpinned-seed prune gone nothing heals it:
+/// regenerating the table would brick every worktree still on the old one, including
+/// the one running the generator. So the generator's rows go where nothing
+/// authenticates them. Under the SAME parent as the keyed dbs deliberately —
+/// `lock_store_commit` derives the shared store's commit lock from the db's parent,
+/// and the generator interns into that store like any other run.
+fn generator_db_path(lw: &Path, scratch_id: &str) -> PathBuf {
+    lw.join("seed-db")
+        .join(format!(".generator-{scratch_id}.db"))
+}
+
+fn seed_db_path(lw: &Path) -> Result<PathBuf, String> {
+    let digest = crate::seed_digests::table_digest()?;
+    // 16 hex chars: this names a cache directory, not a trust anchor — the table
+    // itself is the authority and is compiled in.
+    let short = digest.get(..16).unwrap_or(digest.as_str());
+    Ok(lw.join("seed-db").join(format!("{short}.db")))
+}
+
 /// The ladder's sibling lock, `<lw>.lock`. APPENDS `.lock` to the whole path rather than
 /// `with_extension` (which would REPLACE a dotted final component, e.g. a ladder path
 /// ending in `.v2`, and collide two distinct ladders on one lock). Shared by the build runner
@@ -816,7 +954,8 @@ fn ladder_lock_path(lw: &Path) -> PathBuf {
 }
 
 /// The DEDICATED persistent build-output cache (store, db) under the ladder work dir.
-/// Deliberately DISTINCT from the seed store/db (`<lw>/store`, `<lw>/db`): those hold
+/// Deliberately DISTINCT from the seed store/db (`<lw>/seed-store`,
+/// `<lw>/seed-db/<table>.db`): those hold
 /// interned seed inputs and #468 authenticates the seed db as a seed-only authority, so a
 /// recipe OUTPUT committed there would be rejected as an unpinned seed. The cache lives in
 /// its own subtree so reuse never pollutes the seed authority. Shared across worktrees and
@@ -1064,17 +1203,97 @@ fn selected_check_runner(stem: &str, index: usize) -> Result<CheckRunner, String
     ))
 }
 
-fn lock_file(path: &Path) -> Result<File, String> {
+/// How a caller holds the ladder: EXCLUSIVE for whole-ladder operations
+/// (`clear-store`, the fsck, the boot harnesses), SHARED for a build or check,
+/// which reads the warm cache and writes only its own pid-tagged scratch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LadderLock {
+    Shared,
+    Exclusive,
+}
+
+/// A build or check may SHARE the ladder — unless eviction is armed, which makes
+/// `setup()` rename `build-cache/` aside, and a concurrent reader of that cache
+/// cannot survive it. Nothing else in a run mutates the shared ladder: the seed db
+/// is keyed per pin table (so there is no prune), the scratch is pid-private, and
+/// store commits take the separate per-store commit lock. Pure, so the policy is
+/// testable without the ambient env.
+fn ladder_lock_mode(cache_cap: Option<u64>) -> LadderLock {
+    match cache_cap {
+        Some(_) => LadderLock::Exclusive,
+        None => LadderLock::Shared,
+    }
+}
+
+/// Take the ladder for a build or check, holding it for the WHOLE run — setup
+/// included. One acquisition, so no window where the run holds nothing and a
+/// `clear-store` could wipe the tree out from under it.
+fn lock_ladder_for_run(runner: &RecipeCheckRunner) -> Result<File, String> {
+    lock_ladder_for_run_with_cache_cap(runner, explicit_ladder_cache_cap())
+}
+
+/// The cap is read ONCE, here, and the SAME value both picks the lock mode and drives
+/// setup. Reading it twice is not equivalent: an env change between the two — or any
+/// future caller that passes a cap to one and not the other — takes the ladder SHARED
+/// and then evicts, and eviction renames `build-cache/` aside under concurrent readers
+/// that cannot survive it. Threading the value is what makes "cap armed ⇒ exclusive"
+/// structural rather than a convention two call sites separately honour.
+fn lock_ladder_for_run_with_cache_cap(
+    runner: &RecipeCheckRunner,
+    cache_cap: Option<u64>,
+) -> Result<File, String> {
+    let held = lock_ladder(&runner.lock_path(), ladder_lock_mode(cache_cap))?;
+    runner.setup_with_cache_cap(cache_cap)?;
+    Ok(held)
+}
+
+fn open_lock_file(path: &Path) -> Result<File, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
-    let file = OpenOptions::new()
+    OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(path)
-        .map_err(|e| format!("open lock {}: {e}", path.display()))?;
+        .map_err(|e| format!("open lock {}: {e}", path.display()))
+}
+
+fn lock_ladder(path: &Path, mode: LadderLock) -> Result<File, String> {
+    let file = open_lock_file(path)?;
+    let held = match mode {
+        LadderLock::Shared => file.lock_shared(),
+        // flock grants no writer preference, so a steady stream of builds can hold an
+        // exclusive waiter (`clear-store`, the fsck) out for as long as they keep
+        // overlapping. Nothing here can preempt them — but before this the queue always
+        // drained, so an operator now needs telling WHY the command is sitting there.
+        //
+        // ONLY for the ladder. The commit locks go through `lock_file`, which waits
+        // plainly: they are taken twice per intern and held for a db merge, so a
+        // contended one is ordinary and announcing each would bury a gate log the
+        // runner captures wholesale — under a message about "builds", which a
+        // sub-second merge is not.
+        LadderLock::Exclusive => match file.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) => {
+                eprintln!(
+                    "ladder: waiting for concurrent builds to release {}",
+                    path.display()
+                );
+                file.lock()
+            }
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+            Ok(()) => Ok(()),
+        },
+    };
+    held.map_err(|e| format!("lock {}: {e}", path.display()))?;
+    Ok(file)
+}
+
+/// A plain EXCLUSIVE flock, waiting silently — the commit locks, which have no shared
+/// mode at all, and the whole-tree ladder operations that already announce themselves.
+fn lock_file(path: &Path) -> Result<File, String> {
+    let file = open_lock_file(path)?;
     file.lock()
         .map_err(|e| format!("lock {}: {e}", path.display()))?;
     Ok(file)
@@ -1106,6 +1325,13 @@ pub(crate) struct RecipeCheckRunner {
     /// `qemu-boot`) sees each rung land. Off for gate `check-run`, whose output the
     /// gate captures wholesale.
     stream_progress: bool,
+    /// Store paths this pin table's seed db vouches: `None` until first asked, then
+    /// kept current as this run registers — see `db_vouches`.
+    vouched: std::sync::Mutex<Option<HashSet<String>>>,
+    /// The exclusive claim on `scratch`, held for this runner's whole life: it is what
+    /// tells a peer's reaper that this tree is live (see `claim_scratch`). `None` only
+    /// in tests, which construct the struct directly and share no ladder.
+    scratch_lock: Option<File>,
 }
 
 pub(crate) struct RecipeNode {
@@ -1287,9 +1513,11 @@ impl RecipeCheckRunner {
         };
         let lw = ladder_work_dir(&root, home.as_deref());
         let sources_dir = shared_sources_dir(home.as_deref());
-        let store = lw.join("store");
-        let db = lw.join("db");
-        let scratch = lw.join("scratch").join(scratch_name);
+        let store = seed_store_dir(&lw);
+        let db = seed_db_path(&lw)?;
+        // Claimed here rather than in setup(): the claim is what makes this name OURS,
+        // and every path below is derived from it.
+        let (scratch, scratch_lock) = claim_scratch(&lw.join("scratch"), scratch_name)?;
         // Emitted recipe JSON is current-graph-only, so it lives under the
         // per-invocation scratch, not a shared/persistent dir.
         let recipes = scratch.join("recipes");
@@ -1307,6 +1535,8 @@ impl RecipeCheckRunner {
             scratch,
             daemon_dir,
             stream_progress: false,
+            vouched: std::sync::Mutex::new(None),
+            scratch_lock: Some(scratch_lock),
         })
     }
 
@@ -1358,8 +1588,12 @@ impl RecipeCheckRunner {
     pub(crate) fn verify_store(&self) -> Result<(), String> {
         let (cache_store, cache_db) = self.build_cache_paths();
         let mut checked = 0u32;
-        if self.db.exists() {
-            self.store_verify_pair(&self.db, &self.store)?;
+        // EVERY keyed seed db, not just this branch's. The store they register into is
+        // shared and unkeyed, so an item only a PEER table vouches is still an item in
+        // this ladder — fscking one db would leave it unreachable by the only thing that
+        // re-hashes it, and the fsck is what `clear-store`'s advice rests on.
+        for db in self.seed_dbs()? {
+            self.store_verify_pair(&db, &self.store)?;
             checked += 1;
         }
         if cache_db.exists() {
@@ -1368,13 +1602,39 @@ impl RecipeCheckRunner {
         }
         if checked == 0 {
             return Err(format!(
-                "nothing to verify: neither the seed store db {} nor the build cache db {} \
+                "nothing to verify: neither a seed db under {} nor the build cache db {} \
                  exists — build the ladder first (e.g. `td-recipe-eval run system-x86-64`)",
-                self.db.display(),
+                self.db.parent().unwrap_or(&self.lw).display(),
                 cache_db.display()
             ));
         }
         Ok(())
+    }
+
+    /// Every pin table's seed db on this ladder, sorted so a failure names the same one
+    /// run to run. Dotfiles are skipped: the table GENERATOR's disposable db lives here
+    /// too (see `generator_db_path`) and is deliberately not an authority.
+    fn seed_dbs(&self) -> Result<Vec<PathBuf>, String> {
+        let Some(dir) = self.db.parent() else {
+            return Ok(Vec::new());
+        };
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("read {}: {e}", dir.display())),
+        };
+        let mut dbs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "db"))
+            .filter(|p| {
+                !p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with('.'))
+            })
+            .collect();
+        dbs.sort();
+        Ok(dbs)
     }
 
     /// One `td-builder store-verify DB STORE` fsck: re-hash every registered path against its
@@ -1410,8 +1670,7 @@ impl RecipeCheckRunner {
     /// being silently re-derived. The seeds re-intern idempotently every run regardless
     /// (`ensure_seed_input`), so a retained, intact seed store is reused, not clobbered.
     pub(crate) fn setup(&self) -> Result<(), String> {
-        self.setup_with_cache_cap(explicit_ladder_cache_cap())?;
-        self.prune_unpinned_seeds()
+        self.setup_with_cache_cap(explicit_ladder_cache_cap())
     }
 
     /// setup() with the eviction cap injected — the env-reading `setup()` is the production
@@ -1423,50 +1682,24 @@ impl RecipeCheckRunner {
     fn setup_with_cache_cap(&self, cache_cap: Option<u64>) -> Result<(), String> {
         fs::create_dir_all(&self.store)
             .map_err(|e| format!("mkdir {}: {e}", self.store.display()))?;
-        // Only THIS invocation's private, pid-tagged scratch is (re)created fresh — a stale
-        // same-pid tree is a dead predecessor's leftover, never persisted store state.
-        remove_path_if_exists(&self.scratch)?;
+        // The seed db lives one level down now (keyed per pin table), and the atomic
+        // write that publishes it stages a sibling temp — neither creates the dir.
+        if let Some(dir) = self.db.parent() {
+            fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+        }
+        // Only THIS invocation's private, CLAIMED scratch is created — `claim_scratch`
+        // already cleared any dead predecessor's tree under the name it won, and no
+        // live run can hold that name, so nothing here can reach persisted store state.
         fs::create_dir_all(&self.scratch)
             .map_err(|e| format!("mkdir {}: {e}", self.scratch.display()))?;
-        // Reclaim disk from abandoned predecessors' scratch trees; under the ladder lock,
-        // so reaping a dead pid's tree never races a live build.
+        // Reclaim disk from abandoned predecessors' scratch trees. Safe under a SHARED
+        // ladder because it reaps by CLAIM rather than by name: a live peer's tree is
+        // one whose lock it cannot take, in this or any other pid namespace.
         self.reap_dead_scratch();
         match cache_cap {
             Some(cap) => self.evict_build_cache_if_over_watermark(cap),
             None => Ok(()),
         }
-    }
-
-    /// Drop retained seed items the compiled table no longer pins, so a table change
-    /// costs a re-derive of the changed seed rather than the whole ladder.
-    ///
-    /// `build-plan` authenticates the seed db WHOLESALE: ONE row on an unpinned
-    /// basename reds every plan, for every target. That is exactly the state a
-    /// legitimate table change leaves a warm ladder in — the old basename is still
-    /// registered — so without this, bumping a pin or editing a `local_source` means
-    /// a full cold climb, and the recovery hint on the resulting red says
-    /// `clear-store', which throws the cache away to reach the same place. Dropping
-    /// the row concedes nothing: the table is the authority, so an item it does not
-    /// pin could never be typed `AuditedSeed` anyway.
-    fn prune_unpinned_seeds(&self) -> Result<(), String> {
-        if !self.db.is_file() {
-            return Ok(());
-        }
-        let mut cmd = self.builder_command();
-        cmd.arg("seed-prune")
-            .arg(path_str(&self.store)?)
-            .arg(path_str(&self.db)?);
-        // A torn/unreadable seed db reds HERE now rather than at build-plan, so it
-        // needs build-plan's recovery hint or the reset it names goes unsaid.
-        let out = command_output(&mut cmd, "td-builder seed-prune")
-            .map_err(|e| with_seed_reset_hint(e, &self.lw))?;
-        // Erasing an item from the trust store is not a silent event. A seed the
-        // compiled table does not pin is exactly the anomaly `authenticate_seed_db`
-        // exists to red on; it holds no authority, but somebody should see it go.
-        for line in out.lines().filter(|l| l.contains("pruned")) {
-            eprintln!("ladder: {}", line.trim());
-        }
-        Ok(())
     }
 
     /// Coarse disk reclaim for the SHARED build-output cache: over the high-watermark cap,
@@ -1556,11 +1789,11 @@ impl RecipeCheckRunner {
 
     /// Best-effort removal of ABANDONED per-pid scratch trees under `scratch/`. Each
     /// build-/check-run works in `scratch/<name>-<pid>` and never removes it on exit, so
-    /// dead runs' trees pile up. Runs under the ladder lock (setup holds it), so no other
-    /// same-ladder run is mid-build; remove only trees whose trailing `-<pid>` names a DEAD
-    /// process. A LIVE pid is ours (never reap our own in-progress scratch) or some other
-    /// still-alive process whose tree we defer — so a running build is never reaped. Never
-    /// fails setup — any error leaves the tree for a later pass.
+    /// dead runs' trees pile up. Removes only trees whose CLAIM it can take, which is
+    /// what makes it safe with peers holding the ladder SHARED: our own in-progress
+    /// scratch and every live peer's are locked, so neither is ever a candidate, and
+    /// that holds across pid namespaces where `/proc` did not. Never fails setup — any
+    /// error leaves the tree for a later pass.
     fn reap_dead_scratch(&self) {
         let dir = match self.scratch.parent() {
             Some(d) => d,
@@ -1575,11 +1808,21 @@ impl RecipeCheckRunner {
                 Ok(n) => n,
                 Err(_) => continue,
             };
-            match reapable_dead_pid(&name) {
-                Some(pid) if !pid_is_alive(pid) => {
-                    let _ = fs::remove_dir_all(entry.path());
-                }
-                _ => {}
+            if !reapable_scratch(&name) {
+                continue;
+            }
+            // Liveness is the CLAIM, not the name: take the tree's lock or leave the
+            // tree alone. A claim we can take is one whose owner is gone (the kernel
+            // drops an flock however a process dies), including our own dead
+            // predecessors. Our OWN tree is never a candidate — we are holding its
+            // claim. The lock file itself is deliberately left behind; see
+            // `claim_scratch`.
+            let lock = match open_lock_file(&scratch_claim_lock(dir, &name)) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            if matches!(lock.try_lock(), Ok(())) {
+                let _ = fs::remove_dir_all(entry.path());
             }
         }
     }
@@ -1718,6 +1961,65 @@ impl RecipeCheckRunner {
         store_path_recursive_with(&self.tb, &self.root, name, src)
     }
 
+    /// This run's claimed scratch basename — unique among LIVE runs on this ladder,
+    /// whatever pid namespace each is in. The identity anything shared must be keyed
+    /// by. Falls back to the pid only for a directly-constructed test runner.
+    fn scratch_id(&self) -> String {
+        self.scratch
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| process::id().to_string())
+    }
+
+    /// Whether THIS pin table's seed db already vouches `derived`.
+    ///
+    /// The db is read at most once per run and the answer then kept UP TO DATE as this
+    /// run registers. A read-only cache would be correct but slow where it matters: a
+    /// run prepares several targets, `classify_graph_inputs` dedupes only within one
+    /// graph, and on a table's first run every seed starts unvouched — so a seed shared
+    /// by K targets would be re-hashed and re-merged K times, over trees the size of the
+    /// linux, gcc and rust sources. That is the very latency this change is about.
+    ///
+    /// An unreadable or absent db vouches NOTHING, which registers rather than skips —
+    /// the fail-closed direction — and so does a poisoned mutex, which is why neither is
+    /// an error path.
+    fn db_vouches(&self, derived: &str) -> bool {
+        let Ok(mut guard) = self.vouched.lock() else {
+            return false;
+        };
+        let set = guard.get_or_insert_with(|| {
+            if !self.db.is_file() {
+                return HashSet::new();
+            }
+            let Ok(db_s) = path_str(&self.db) else {
+                return HashSet::new();
+            };
+            let mut cmd = self.builder_command();
+            cmd.arg("store-query").arg(db_s).arg("info");
+            match command_output(&mut cmd, "td-builder store-query") {
+                Ok(out) => out
+                    .lines()
+                    .filter_map(|l| l.split('|').next())
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                Err(_) => HashSet::new(),
+            }
+        });
+        set.contains(derived)
+    }
+
+    /// Record a path this run has just registered, so a later target sharing the seed
+    /// does not re-hash it. Silent on a poisoned mutex: the cost is redundant work.
+    fn record_vouched(&self, derived: &str) {
+        if let Ok(mut guard) = self.vouched.lock() {
+            if let Some(set) = guard.as_mut() {
+                set.insert(derived.to_string());
+            }
+        }
+    }
+
     fn store_add_recursive(&self, name: &str, src: &Path) -> Result<String, String> {
         let src_s = path_str(src)?;
         let store_s = path_str(&self.store)?;
@@ -1847,8 +2149,43 @@ impl RecipeCheckRunner {
             return self.ensure_local_source(key, path);
         }
         if let Some(base) = crate::seed_digests::expected(input.key())? {
-            if self.store.join(base).exists() {
+            let tree = self.store.join(base);
+            if tree.exists() {
                 let derived = format!("{TD_STORE_DIR}/{base}");
+                // A warm STORE is no longer evidence that this table's db has the row:
+                // the store is shared across pin tables and the db is not, so on a
+                // table's first run here every seed is already interned and none is
+                // registered. Register from the interned tree — content-addressed, so
+                // this re-hashes and merges the row without re-fetching or re-verifying
+                // the pin, which the address already settled.
+                if !self.db_vouches(&derived) {
+                    // GATE FIRST, then intern — `ensure_local_source`'s rule, and for its
+                    // reason. `store_add_recursive` merges the row as part of interning,
+                    // so a tree that no longer content-addresses to its own name would
+                    // land an unpinned row in this table's db; `authenticate_seed_db`
+                    // judges that db WHOLESALE, so ONE such row reds every later
+                    // build-plan for every target — and the prune that used to drop it
+                    // is gone. Computing the address first keeps the failure to this
+                    // seed, where it belongs.
+                    let got = self.store_path_recursive(input.key(), &tree)?;
+                    if got != derived {
+                        return Err(format!(
+                            "seed {} is interned at {base} but re-hashes to {got} — the \
+                             store item does not content-address to its own name; remove \
+                             it to re-intern (re #469)",
+                            input.key()
+                        ));
+                    }
+                    let added = self.store_add_recursive(input.key(), &tree)?;
+                    if added != derived {
+                        return Err(format!(
+                            "seed {} registered as {added}, not the {derived} its own \
+                             bytes address (re #469)",
+                            input.key()
+                        ));
+                    }
+                    self.record_vouched(&derived);
+                }
                 self.stage_store_path(&derived)?;
                 return Ok(derived);
             }
@@ -1951,8 +2288,9 @@ impl RecipeCheckRunner {
         // The ONLY way to force a from-stage0 cold climb is the explicit `clear-store`, which
         // resets the whole ladder; nothing reclaims the cache implicitly except an opt-in
         // TD_CHECK_LADDER_CACHE_CAP_BYTES high-watermark eviction in setup().
-        // Safe under the global ladder lock (build-runs are serialized — no concurrent
-        // writer to the cache). The builder commits each rung ATOMICALLY (stage into a
+        // Concurrent writers to the cache are the ordinary case now that build-runs hold
+        // the ladder SHARED; what keeps them apart is the builder's own per-store commit
+        // lock, not this caller. The builder commits each rung ATOMICALLY (stage into a
         // sibling temp, then rename — commit_canonical_atomic / commit_tree_checked), so a
         // kill mid-commit leaves only a swept temp, never a torn tree at the destination;
         // an unregistered mismatching orphan is removed and re-committed, never served. The
@@ -2353,12 +2691,14 @@ impl RecipeCheckRunner {
         fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
         let path = self.build_run_memo_path(target, fingerprint);
         // Atomic publish: temp then rename, so a kill mid-write never leaves a torn
-        // memo a later run would half-read. Build-runs serialize under the ladder
-        // lock, so there is no concurrent writer to race; the temp name is static
-        // per target (not pid-tagged) so a crashed run's orphan is reaped here on
-        // the next write of this target rather than leaking one per dead pid. `lw`
-        // is shared across runs (unlike the per-run scratch tdstore), so this
-        // matters more here than for the staging temp.
+        // memo a later run would half-read. The temp is qualified by fingerprint AND
+        // pid because build-runs no longer serialize under the ladder lock — they
+        // hold it SHARED. A temp named per target alone is one name two live runs
+        // both unlink, write and rename: the loser's rename hits ENOENT, and the
+        // winner can publish the OTHER's bytes under its own fingerprint, which
+        // `parse_build_run_memo` then rejects on read and turns into a full climb.
+        // The orphan a crash leaves is inert exactly as a stale `.map` is (its name
+        // is never looked up), and is cleaned by the same wholesale `clear-store`.
         //
         // The published `.map` is per fingerprint and is NOT reaped: `lw` (hence
         // this dir) is shared across all worktrees, whose distinct evaluator
@@ -2367,7 +2707,16 @@ impl RecipeCheckRunner {
         // side by side (mirroring the loop-userland map, check_loop.rs); a stale one
         // is inert (its fingerprint never matches, so it is never read) and is
         // cleaned only wholesale by `clear-store`.
-        let tmp = dir.join(format!(".{}.tmp", sanitize_target_for_filename(target)));
+        // Qualified by this run's CLAIMED SCRATCH NAME, not by its pid: the pid is
+        // namespace-local and two sandboxed runs share one (see `claim_scratch`),
+        // which would put them back on a single temp name. The claim makes the
+        // scratch name unique among live runs by construction, so it is the only
+        // name here that distinguishes them.
+        let tmp = dir.join(build_run_memo_temp_name(
+            target,
+            fingerprint,
+            &self.scratch_id(),
+        ));
         remove_path_if_exists(&tmp)?;
         fs::write(&tmp, serialize_build_run_memo(fingerprint, steps))
             .map_err(|e| format!("write {}: {e}", tmp.display()))?;
@@ -2921,21 +3270,18 @@ fn place_stage0_builder(
 ///
 /// Two very different failures used to share one line, and the shared line said
 /// `clear-store'. For a TORN seed that is right — the bytes are unusable and must be
-/// re-derived. For an UNPINNED one it is actively destructive: the store merely holds an
-/// item the compiled table does not pin (another branch's table, or a pin this branch
-/// changed), `seed-prune` drops it in milliseconds, and `clear-store' instead discards the
+/// re-derived. For an UNPINNED one it is actively destructive: `clear-store' discards the
 /// whole shared ladder — build cache included, which is hours of other people's rungs —
 /// and lands on the identical red, because throwing bytes away cannot correct a table.
 fn seed_reset_hint(lw: &Path, err: &str) -> String {
     if unpinned_seed_in(err.as_bytes()) {
         return format!(
-            "hint: the ladder's retained seed store holds an item the compiled seed-digest \
-             table does not pin — a pin or `local_source' changed here, or another branch \
-             sharing the ladder ({}) interned its own. `td-builder seed-prune STORE DB' drops \
-             it, and the ladder does that at every setup, so re-running usually suffices. Do \
-             NOT `clear-store': it discards the whole shared build cache and cannot correct a \
-             stale table — if the table is what is wrong, regenerate it \
-             (`td-recipe-eval seed-digests', or `local-source-digests' for an in-tree source).",
+            "hint: the seed db for this pin table vouches an item the table does not pin. \
+             The db is keyed by the table's row set, so a peer branch's seeds cannot land in \
+             it and a pin change starts a fresh one — which leaves a stale TABLE as the \
+             remaining cause: regenerate it (`td-recipe-eval seed-digests', or \
+             `local-source-digests' for an in-tree source). Do NOT `clear-store' the ladder \
+             ({}): it discards the whole shared build cache and cannot correct a table.",
             lw.display()
         );
     }
@@ -2947,15 +3293,16 @@ fn seed_reset_hint(lw: &Path, err: &str) -> String {
     )
 }
 
-/// The one stale-seed marker that `seed-prune` fixes and `clear-store` does not: a retained
-/// item on a basename the compiled table has no row for.
+/// The one stale-seed marker `clear-store` does not fix: a db row on a basename the
+/// compiled table has no row for. Keying the db per table makes it unreachable from a
+/// peer branch; it survives as a detector because a stale TABLE still reaches it.
 fn unpinned_seed_in(bytes: &[u8]) -> bool {
     contains_subslice(bytes, b"is not a basename the compiled seed-digest table pins")
 }
 
 /// A retained-seed failure marker — a plan-seed-db authentication red
-/// (`authenticate_seed_db`/`authenticate_ca_db`: a pinned-seed change, or rows an accumulated
-/// cross-branch db can no longer vouch for), a corrupt content-addressed seed item
+/// (`authenticate_seed_db`/`authenticate_ca_db`: a pinned-seed change), a corrupt
+/// content-addressed seed item
 /// (`store-add-recursive`'s idempotent re-intern rejecting a torn tree), or an `--auto`
 /// provenance red (`auto_seed_provenance`: a retained seed gone missing or content-address
 /// mismatched). All three clear with the same `clear-store` re-derive-from-pins reset.
@@ -3600,6 +3947,11 @@ chmod 755 '{}'
     // short-circuits (this runner's `tb` is empty, so it cannot have derived anything),
     // and the local source declines to, reaching the staging step — which reds here
     // because the test root holds no such directory.
+    //
+    // The vouch set is planted rather than read, because the store being warm is no
+    // longer sufficient — the db must also carry the row (see `db_vouches`) —
+    // and reading it for real would need the builder this runner deliberately lacks.
+    // `a_warm_tree_this_tables_db_does_not_vouch_is_re_registered` covers the gate itself.
     #[test]
     fn warm_seed_store_answers_for_a_pin_but_never_for_a_local_source() {
         let lw = env::temp_dir().join(format!("td-warm-seed-{}", process::id()));
@@ -3612,6 +3964,12 @@ chmod 755 '{}'
         for key in ["stage0-source", "sshd-source"] {
             fs::create_dir_all(runner.store.join(pinned_basename(key))).unwrap();
         }
+        *runner.vouched.lock().unwrap() = Some(
+            ["stage0-source", "sshd-source"]
+                .iter()
+                .map(|k| format!("{TD_STORE_DIR}/{}", pinned_basename(k)))
+                .collect(),
+        );
 
         let warm = runner
             .ensure_seed_input(&SeedInput::Stage0 {
@@ -3630,6 +3988,47 @@ chmod 755 '{}'
             })
             .expect_err("a local source must re-hash even with its basename interned");
         assert!(err.contains("local source"), "got: {err}");
+        let _ = fs::remove_dir_all(&lw);
+    }
+
+    // The store is shared across pin tables and the db is not, so a warm TREE is not
+    // evidence this table's db has the row: on a table's first run every seed is
+    // already interned and none is registered. Left short-circuiting on presence
+    // alone, the db stays empty and `build-plan --auto` reds on a seed db that is not
+    // even a file — which is exactly what a live run did before this gate existed.
+    //
+    // Observed through the re-registration ATTEMPT: with an empty vouch set the warm
+    // path must reach the re-hash, which needs the builder this runner has none of.
+    // An error naming it is the gate firing; `Ok` would be the short-circuit that
+    // regressed. It is `store-path-recursive` rather than `store-add-recursive`
+    // because the address is COMPUTED before anything is interned — see the gate
+    // there, which is what keeps a bad tree out of this table's db.
+    #[test]
+    fn a_warm_tree_this_tables_db_does_not_vouch_is_re_registered() {
+        let lw = env::temp_dir().join(format!("td-unvouched-seed-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        let mut runner = shared_test_runner(&lw);
+        runner.root = lw.join("root");
+        fs::create_dir_all(&runner.root).unwrap();
+        fs::create_dir_all(&runner.store).unwrap();
+        fs::create_dir_all(&runner.scratch).unwrap();
+        fs::create_dir_all(runner.store.join(pinned_basename("stage0-source"))).unwrap();
+        // No db at all — a pin table that has never run on this ladder.
+        assert!(!runner.db.exists());
+        assert!(
+            !runner.db_vouches(&format!("{TD_STORE_DIR}/{}", pinned_basename("stage0-source"))),
+            "an absent db vouches nothing, which is the fail-closed direction"
+        );
+
+        let err = runner
+            .ensure_seed_input(&SeedInput::Stage0 {
+                key: "stage0-source".into(),
+            })
+            .expect_err("a warm tree the db does not vouch must re-register, not short-circuit");
+        assert!(
+            err.contains("store-path-recursive"),
+            "the gate must re-hash BEFORE interning, so this is where it stops: {err}"
+        );
         let _ = fs::remove_dir_all(&lw);
     }
 
@@ -3655,6 +4054,7 @@ chmod 755 '{}'
         fs::create_dir_all(&runner.scratch).unwrap();
         // A retained ladder: one interned seed plus its db.
         fs::create_dir_all(runner.store.join(pinned_basename("stage0-source"))).unwrap();
+        fs::create_dir_all(runner.db.parent().unwrap()).unwrap();
         fs::write(&runner.db, b"the retained seed registrations").unwrap();
         let store_before = dir_listing(&runner.store);
         let db_before = fs::read(&runner.db).unwrap();
@@ -3775,34 +4175,105 @@ chmod 755 '{}'
 
     #[test]
     fn scratch_name_round_trips_through_trailing_pid() {
-        // Whatever scratch_name emits, the reaper must recover this pid from it
-        // (so our OWN live scratch is always identified as live, never reaped).
+        // Whatever scratch_name emits stays recognizable as one of our trees — both
+        // as emitted and after a claim has disambiguated it.
         let n = scratch_name("build", &["oyacc"]);
         assert_eq!(trailing_pid(&n), Some(process::id()));
-        assert!(pid_is_alive(process::id()));
+        assert!(reapable_scratch(&n));
+        assert!(reapable_scratch(&format!("{n}.2")));
     }
 
     #[test]
-    fn reapable_dead_pid_requires_our_scratch_prefix() {
-        // Our own trees are reapable...
-        assert_eq!(reapable_dead_pid("build-oyacc-4059"), Some(4059));
-        assert_eq!(reapable_dead_pid("check-make-test-1-12345"), Some(12345));
+    fn reapable_scratch_requires_our_scratch_prefix() {
+        // Our own trees are eligible...
+        assert!(reapable_scratch("build-oyacc-4059"));
+        assert!(reapable_scratch("check-make-test-1-12345"));
         // ...including the host-side qemu-boot tool's per-boot scratch (a killed boot's
         // multi-GiB kernel-build tree would otherwise leak forever).
-        assert_eq!(reapable_dead_pid("qemu-boot-linux-x86-64-22760"), Some(22760));
+        assert!(reapable_scratch("qemu-boot-linux-x86-64-22760"));
         // ...and the interactive `run` tool's per-boot scratch (same multi-GiB leak risk).
-        assert_eq!(reapable_dead_pid("run-system-x86-64-31820"), Some(31820));
+        assert!(reapable_scratch("run-system-x86-64-31820"));
+        // ...and a claim-disambiguated one, which two same-pid runs in different pid
+        // namespaces now produce.
+        assert!(reapable_scratch("check-make-test-1-12345.3"));
         // ...but a coincidental numeric-suffixed sibling is NEVER reaped.
-        assert_eq!(reapable_dead_pid("gcc-14"), None);
-        assert_eq!(reapable_dead_pid("glibc-241"), None);
-        assert_eq!(reapable_dead_pid("binutils-244"), None);
-        assert_eq!(reapable_dead_pid("build-cache"), None); // the cache dir, no pid
-        assert_eq!(reapable_dead_pid("store"), None);
-        // And a real scratch name always round-trips (our live tree stays identified).
-        assert_eq!(
-            reapable_dead_pid(&scratch_name("build", &["oyacc"])),
-            Some(process::id())
+        assert!(!reapable_scratch("gcc-14"));
+        assert!(!reapable_scratch("glibc-241"));
+        assert!(!reapable_scratch("binutils-244"));
+        assert!(!reapable_scratch("build-cache")); // the cache dir, no pid
+        assert!(!reapable_scratch("store"));
+        assert!(!reapable_scratch("seed-store"));
+        // A claim lock is a dotfile, so read_dir never offers it as a tree anyway —
+        // but it must not read as one either.
+        assert!(!reapable_scratch(".check-make-test-1-9.claim"));
+    }
+
+    // The reaper's whole safety rule, and the one the pid could not express: a tree
+    // whose claim is HELD is live and must survive, whoever holds it and in whatever
+    // pid namespace; a tree whose claim is free is abandoned and goes. Driven with a
+    // real lock rather than a real peer, since a peer in another pid namespace is
+    // exactly what the gate cannot spawn.
+    #[test]
+    fn the_reaper_spares_a_claimed_tree_and_takes_an_unclaimed_one() {
+        let lw = env::temp_dir().join(format!("td-reap-claim-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        let runner = shared_test_runner(&lw);
+        let scratch_root = lw.join("scratch");
+
+        // A live peer: a HELD claim, then its tree — the order production uses, since
+        // claiming CLEARS whatever the name held. The name carries a pid that is not
+        // ours and need not exist here; under the old rule that alone condemned it.
+        let live = "check-peer-test-1-999999";
+        let held = claim_scratch(&scratch_root, live).unwrap().1;
+        fs::create_dir_all(scratch_root.join(live)).unwrap();
+
+        // An abandoned tree: same shape, claim free.
+        let dead = "check-dead-test-1-999998";
+        fs::create_dir_all(scratch_root.join(dead)).unwrap();
+
+        runner.reap_dead_scratch();
+
+        assert!(
+            scratch_root.join(live).is_dir(),
+            "a claimed tree is a LIVE peer's and must survive the reaper"
         );
+        assert!(
+            !scratch_root.join(dead).exists(),
+            "an unclaimed tree is abandoned and must be reclaimed"
+        );
+        // The claim FILE survives either way — reaping it would let two runs hold one
+        // name through the replaced inode.
+        assert!(scratch_claim_lock(&scratch_root, dead).is_file());
+        drop(held);
+        let _ = fs::remove_dir_all(&lw);
+    }
+
+    // Two runs asking for the SAME scratch name get DIFFERENT directories while both
+    // are live. This is what two sandboxed peers do: a fresh pid namespace hands each
+    // the same low pid, so `check-<spec>-<index>-<pid>` collided and `setup` wiped a
+    // live tree. Asserted on the second claim rather than on a pid, because the claim
+    // is what now decides.
+    #[test]
+    fn two_live_claims_on_one_name_get_separate_scratch_dirs() {
+        let lw = env::temp_dir().join(format!("td-claim-collide-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        let root = lw.join("scratch");
+        let name = "check-td-boot-test-1-1";
+
+        let (first, hold_first) = claim_scratch(&root, name).unwrap();
+        let (second, _hold_second) = claim_scratch(&root, name).unwrap();
+        assert_ne!(first, second, "a live claim must not be handed out twice");
+        assert_eq!(first.file_name().and_then(|n| n.to_str()), Some(name));
+        // Still one of ours, so it is still reapable once abandoned.
+        let base = second.file_name().and_then(|n| n.to_str()).unwrap();
+        assert!(reapable_scratch(base));
+
+        // Released, the first name is reusable — a dead predecessor does not cost a
+        // name forever.
+        drop(hold_first);
+        let (again, _hold) = claim_scratch(&root, name).unwrap();
+        assert_eq!(again, first);
+        let _ = fs::remove_dir_all(&lw);
     }
 
     /// A minimal runner pointed at a throwaway ladder tree, for the fs-level
@@ -3817,12 +4288,18 @@ chmod 755 '{}'
             builder_db: PathBuf::new(),
             lw: lw.to_path_buf(),
             sources_dir: lw.join("sources"),
-            store: lw.join("store"),
-            db: lw.join("db"),
+            // The real derivations, not `lw/store` and `lw/db`: these tests assert what
+            // setup() and clear-store do to the seed store and db, and a helper that
+            // invented its own paths would assert it about files production never writes.
+            store: seed_store_dir(lw),
+            db: seed_db_path(lw).expect("compiled pin table parses"),
             recipes: scratch.join("recipes"),
             scratch,
             daemon_dir: None,
             stream_progress: false,
+            vouched: std::sync::Mutex::new(None),
+            // Not claimed: this runner shares no ladder with anything.
+            scratch_lock: None,
         }
     }
 
@@ -3844,11 +4321,12 @@ chmod 755 '{}'
             b"toolchain",
         )
         .unwrap();
-        fs::create_dir_all(lw.join("store")).unwrap();
-        fs::write(lw.join("store").join("seed-item"), b"interned-seed").unwrap();
-        fs::write(lw.join("db"), b"this ladder's registered seed rows").unwrap();
-
+        fs::create_dir_all(seed_store_dir(&lw)).unwrap();
+        fs::write(seed_store_dir(&lw).join("seed-item"), b"interned-seed").unwrap();
         let runner = shared_test_runner(&lw);
+        fs::create_dir_all(runner.db.parent().unwrap()).unwrap();
+        fs::write(&runner.db, b"this ladder's registered seed rows").unwrap();
+
         // No cap ⇒ no eviction, so even the tiny sentinel build-cache survives; this stays
         // hermetic against the ambient TD_CHECK_LADDER_CACHE_CAP_BYTES knob.
         runner.setup_with_cache_cap(None).unwrap();
@@ -3860,8 +4338,8 @@ chmod 755 '{}'
             .join("store")
             .join("rung-sentinel")
             .is_file());
-        assert!(lw.join("store").join("seed-item").is_file());
-        assert!(lw.join("db").is_file());
+        assert!(seed_store_dir(&lw).join("seed-item").is_file());
+        assert!(runner.db.is_file(), "the seed db for this pin table survives");
         // The per-invocation scratch is freshly created.
         assert!(runner.scratch.is_dir());
         let _ = fs::remove_dir_all(&lw);
@@ -3885,8 +4363,8 @@ chmod 755 '{}'
         let _ = fs::remove_dir_all(&tomb);
         fs::create_dir_all(lw.join("build-cache").join("store")).unwrap();
         fs::write(lw.join("build-cache").join("store").join("rung"), b"x").unwrap();
-        fs::create_dir_all(lw.join("store")).unwrap();
-        fs::write(lw.join("store").join("seed-item"), b"y").unwrap();
+        fs::create_dir_all(seed_store_dir(&lw)).unwrap();
+        fs::write(seed_store_dir(&lw).join("seed-item"), b"y").unwrap();
         fs::write(lw.join("db"), b"rows").unwrap();
         // Materialize the sibling lock as a build would, so we can assert it survives.
         drop(lock_file(&lock).unwrap());
@@ -4024,20 +4502,201 @@ chmod 755 '{}'
         let _ = fs::remove_dir_all(&lw);
     }
 
+    // The point of the shared mode: two builds hold the ladder at once. Under the
+    // exclusive lock this pair serialized, which is what made every recipe check on
+    // the machine — across all worktrees — run one at a time.
+    #[test]
+    fn a_shared_ladder_admits_a_second_holder_and_still_excludes_a_writer() {
+        // Only the sibling `<lw>.lock` is materialized here — `lw` itself is never
+        // created, so there is no tree to reap. The name must still be unique:
+        // `setup_preserves_all_persisted_ladder_state` owns `td-ladder-shared-<pid>`
+        // and these run concurrently in one test binary.
+        let lw = env::temp_dir().join(format!("td-ladder-sharemode-{}", process::id()));
+        let lock = ladder_lock_path(&lw);
+        let _ = fs::remove_file(&lock);
+
+        // The fix itself: two builds hold it at once. Under the exclusive lock the
+        // second acquisition blocks forever instead.
+        let first = lock_ladder(&lock, LadderLock::Shared).unwrap();
+        let second = lock_ladder(&lock, LadderLock::Shared).unwrap();
+        drop(second);
+        drop(first);
+
+        // And the direction that keeps a wipe off a live build: while `clear-store`
+        // or the fsck holds the ladder EXCLUSIVE, a build cannot take it shared.
+        // Matched as WouldBlock rather than any Err — an ENOLCK/EOPNOTSUPP filesystem
+        // would satisfy `is_err()` without anything about sharing being observed.
+        let wiper = lock_ladder(&lock, LadderLock::Exclusive).unwrap();
+        let build = open_lock_file(&lock).unwrap();
+        assert!(
+            matches!(build.try_lock_shared(), Err(std::fs::TryLockError::WouldBlock)),
+            "a build must not join a ladder held exclusively"
+        );
+        drop(wiper);
+        // BLOCKING, as every production caller is. A `try_lock_shared` here fails
+        // intermittently with WouldBlock while `/proc/locks` shows the inode already
+        // free: releasing on close is not ordered against a lock request on another
+        // descriptor. The claim is that a build is admitted, not how fast — so this
+        // waits, and a regression that never admits hangs rather than passing.
+        drop(build);
+        drop(lock_ladder(&lock, LadderLock::Shared).unwrap());
+
+        let _ = fs::remove_file(&lock);
+    }
+
+    // A run takes the ladder ONCE and holds it across setup and the build, so there is
+    // no window in which it holds nothing and `clear-store` could wipe the tree under
+    // it. What it holds is shared, so a peer build joins.
+    //
+    // The cap is passed EXPLICITLY, not read from the env: with
+    // `TD_CHECK_LADDER_CACHE_CAP_BYTES` set the run would take the ladder exclusively
+    // and the peer acquire below — a blocking `lock_shared` on a second descriptor of
+    // a file this process already holds exclusively — would deadlock. A gate that
+    // hangs with no output is worse than one that fails, and the sibling
+    // `setup_preserves_all_persisted_ladder_state` guards the same knob the same way.
+    #[test]
+    fn a_run_holds_one_shared_ladder_across_setup_and_build() {
+        let lw = env::temp_dir().join(format!("td-run-lock-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        let _ = fs::remove_file(ladder_lock_path(&lw));
+        let runner = shared_test_runner(&lw);
+
+        let held = lock_ladder_for_run_with_cache_cap(&runner, None).unwrap();
+
+        // setup() ran under that same hold: this invocation's private scratch exists.
+        assert!(runner.scratch.is_dir(), "setup() ran while the ladder was held");
+        // A peer build joins it.
+        let peer = lock_ladder(&runner.lock_path(), LadderLock::Shared).unwrap();
+        drop(peer);
+        drop(held);
+
+        let _ = fs::remove_file(ladder_lock_path(&lw));
+        let _ = fs::remove_dir_all(&lw);
+    }
+
+    // Eviction renames build-cache/ aside, which a concurrent reader of that cache
+    // cannot survive — so an armed cap takes the ladder exclusively. The default is no
+    // cap, which is the shared hot path. Tied to the parser rather than restating it:
+    // `0` disarms eviction and so must land on the shared side.
+    #[test]
+    fn ladder_lock_mode_is_shared_unless_eviction_is_armed() {
+        assert_eq!(ladder_lock_mode(None), LadderLock::Shared);
+        assert_eq!(ladder_lock_mode(Some(1)), LadderLock::Exclusive);
+        assert_eq!(ladder_lock_mode(parse_cache_cap(Some("0"))), LadderLock::Shared);
+        assert_eq!(ladder_lock_mode(parse_cache_cap(Some("4096"))), LadderLock::Exclusive);
+    }
+
+    // `clear-store` must take the SEED store's commit lock as well as the cache's, and it
+    // names that lock by a constant while the committer derives it from the db path. A
+    // drift between the two is a clear racing an orphaned intern with nothing to say so,
+    // so pin the constant against the derivation `lock_store_commit` performs.
+    #[test]
+    fn the_seed_commit_lock_constant_is_what_the_committer_derives() {
+        let lw = Path::new("/tmp/some-ladder");
+        let db = seed_db_path(lw).unwrap();
+        // lock_store_commit anchors on the db's PARENT and appends `.commit.lock`.
+        let parent = db.parent().unwrap();
+        let mut derived = parent.as_os_str().to_os_string();
+        derived.push(".commit.lock");
+        assert_eq!(PathBuf::from(derived), lw.join(SEED_COMMIT_LOCK_BASENAME));
+        // And it is a sibling of seed-db/, never inside it — the eviction/rename argument.
+        assert_eq!(lw.join(SEED_COMMIT_LOCK_BASENAME).parent(), Some(lw));
+    }
+
+    // `verify-store` fscks EVERY pin table's seed db, not just the running branch's:
+    // the store is shared and unkeyed, so an item only a peer table registers is still
+    // this ladder's and must still be re-hashable. The generator's disposable db is
+    // excluded — it is a dotfile and holds no authority.
+    #[test]
+    fn the_fsck_covers_every_keyed_seed_db_and_not_the_generators() {
+        let lw = env::temp_dir().join(format!("td-fsck-scope-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        let runner = shared_test_runner(&lw);
+        let dir = runner.db.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&dir).unwrap();
+
+        // No seed-db dir yet ⇒ nothing to verify, not an error.
+        assert!(runner.seed_dbs().unwrap().is_empty());
+
+        fs::write(&runner.db, b"ours").unwrap();
+        let peer = dir.join("00112233aabbccdd.db");
+        fs::write(&peer, b"a peer branch's table").unwrap();
+        fs::write(dir.join(".generator-seed-digests-7.db"), b"disposable").unwrap();
+        fs::write(dir.join("notes.txt"), b"not a db").unwrap();
+
+        let found = runner.seed_dbs().unwrap();
+        assert!(found.contains(&runner.db), "our own db must be fscked: {found:?}");
+        assert!(found.contains(&peer), "a peer table's db must be fscked too: {found:?}");
+        assert_eq!(found.len(), 2, "only the authoritative dbs: {found:?}");
+        // Sorted, so a failure names the same db run to run.
+        let mut sorted = found.clone();
+        sorted.sort();
+        assert_eq!(found, sorted);
+        let _ = fs::remove_dir_all(&lw);
+    }
+
+    // The TABLE GENERATOR must not write into the db any run authenticates. It interns
+    // what it derives, and during a pin bump that is precisely a basename the current
+    // table does not pin — one row `authenticate_seed_db` rejects a whole db over, with
+    // no prune left to heal it. So its db is a separate, disposable file; and it stays
+    // under the keyed dbs' parent, because `lock_store_commit` derives the shared seed
+    // store's commit lock from that parent and the generator interns into that store.
+    #[test]
+    fn the_table_generator_writes_beside_the_keyed_dbs_but_never_into_one() {
+        let lw = Path::new("/tmp/some-ladder");
+        let keyed = seed_db_path(lw).unwrap();
+        let generator = generator_db_path(lw, "seed-digests-4242");
+        assert_ne!(generator, keyed, "the generator must not write the keyed db");
+        assert_eq!(generator.parent(), keyed.parent(), "same commit-lock parent");
+        // Distinct per run, so two generators cannot merge into one file.
+        assert_ne!(generator, generator_db_path(lw, "seed-digests-4243"));
+    }
+
+    // The seed store moved with the keyed db, and that rename IS the rollout barrier:
+    // an old binary still runs `seed-prune` over `<lw>/store` and deletes trees whose
+    // basename ITS table does not pin — which a keyed db here may vouch. It cannot
+    // reach a path it does not know.
+    #[test]
+    fn the_seed_store_is_not_the_path_an_old_pruner_deletes_from() {
+        let lw = Path::new("/tmp/some-ladder");
+        assert_eq!(seed_store_dir(lw), lw.join("seed-store"));
+        assert_ne!(seed_store_dir(lw), lw.join("store"));
+        // Under the ladder, so `clear-store` still reclaims it wholesale.
+        assert_eq!(seed_store_dir(lw).parent(), Some(lw));
+    }
+
+    // The seed db is keyed by the compiled table's ROW SET, which is what lets branches
+    // with different pins share one machine-wide ladder without pruning each other's
+    // seeds. Keyed on the rows, not the file: a comment edit must not fork a db.
+    #[test]
+    fn the_seed_db_is_keyed_by_the_pin_table_and_sits_under_the_ladder() {
+        let lw = Path::new("/tmp/some-ladder");
+        let db = seed_db_path(lw).unwrap();
+        assert_eq!(db.parent(), Some(lw.join("seed-db").as_path()));
+        assert!(db.extension().is_some_and(|e| e == "db"));
+        // Stable across calls, and the digest is over the parsed rows.
+        assert_eq!(db, seed_db_path(lw).unwrap());
+        let digest = crate::seed_digests::table_digest().unwrap();
+        assert_eq!(digest.len(), 64, "a sha256 hex digest");
+        assert!(db.to_string_lossy().contains(digest.get(..16).unwrap_or("")));
+        // The STORE is deliberately NOT keyed — content-addressed items are shared.
+        assert_eq!(seed_store_dir(lw), shared_test_runner(lw).store);
+    }
+
     // setup() never wipes the seed store/db: it retains it across runs. A from-stage0
     // clean-room run is an explicit `clear-store` first, never a side effect of setup().
     #[test]
     fn setup_retains_the_seed_store_across_runs() {
         let lw = env::temp_dir().join(format!("td-ladder-{}", process::id()));
         let _ = fs::remove_dir_all(&lw);
-        fs::create_dir_all(lw.join("store")).unwrap();
-        fs::write(lw.join("store").join("prior-seed"), b"x").unwrap();
+        fs::create_dir_all(seed_store_dir(&lw)).unwrap();
+        fs::write(seed_store_dir(&lw).join("prior-seed"), b"x").unwrap();
 
         let runner = shared_test_runner(&lw);
         runner.setup().unwrap();
 
         // The prior run's seed survives — setup() no longer wipes it.
-        assert!(lw.join("store").join("prior-seed").is_file());
+        assert!(seed_store_dir(&lw).join("prior-seed").is_file());
         assert!(runner.scratch.is_dir());
         let _ = fs::remove_dir_all(&lw);
     }
@@ -4105,17 +4764,16 @@ chmod 755 '{}'
         for torn_case in [torn, auto_missing, auto_tampered] {
             assert!(with_seed_reset_hint(torn_case.to_string(), lw).contains("clear-store"));
         }
-        // An UNPINNED one must NOT. `seed-prune` drops the row in milliseconds; clear-store
-        // throws away the shared ladder — every other branch's cached rungs with it — and
-        // lands on the same red, because discarding bytes cannot correct a table. This is
-        // the advice that turns one stale row into hours of everybody's rebuilt rungs.
+        // An UNPINNED one must NOT: clear-store throws away the shared ladder — every
+        // other branch's cached rungs with it — and lands on the same red, because
+        // discarding bytes cannot correct a table. This is the advice that turns one
+        // stale row into hours of everybody's rebuilt rungs.
         let unpinned = with_seed_reset_hint(db_red.to_string(), lw);
         assert!(
             !unpinned.contains("Run `td-recipe-eval clear-store`"),
             "an unpinned seed must not be sent to clear-store: {unpinned}"
         );
         assert!(unpinned.contains("Do NOT `clear-store'"), "{unpinned}");
-        assert!(unpinned.contains("seed-prune"), "{unpinned}");
         assert!(unpinned.contains("seed-digests"), "{unpinned}");
 
         let unrelated = "ladder: pinned tarball not warm (/x/foo.tar) - run 'td-feed warm sources'";
@@ -4173,7 +4831,7 @@ chmod 755 '{}'
         let (cache_store, cache_db) = build_cache_paths(lw);
         assert_eq!(cache_store, lw.join("build-cache").join("store"));
         assert_eq!(cache_db, lw.join("build-cache").join("db"));
-        let seed_store = lw.join("store");
+        let seed_store = seed_store_dir(lw);
         let seed_db = lw.join("db");
         assert_ne!(cache_store, seed_store);
         assert_ne!(cache_db, seed_db);
@@ -4323,6 +4981,8 @@ chmod 755 '{}'
             scratch: tmp.join("scratch"),
             daemon_dir: None,
             stream_progress: false,
+            vouched: std::sync::Mutex::new(None),
+            scratch_lock: None,
         };
 
         let got = runner.ladder_out_from(&current, "rust-toolchain").unwrap();
@@ -4593,5 +5253,70 @@ chmod 755 '{}'
         assert!(dir.join("system-x86-64.bbb.map").exists());
         assert!(dir.join("busybox-x86-64.ccc.map").exists());
         let _ = fs::remove_dir_all(&lw);
+    }
+
+    // Build-runs hold the ladder SHARED, so two of them publish memos for the same
+    // target at once. With one temp name per target they unlink and rename each
+    // other's file: the loser gets ENOENT, or a map is published carrying the other's
+    // fingerprint, which reads back as a miss and costs a full climb. Both must land,
+    // and each must carry its OWN steps.
+    #[test]
+    fn concurrent_memo_writes_for_one_target_do_not_clobber_each_other() {
+        let lw = env::temp_dir().join(format!("td-memo-race-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        let runner = shared_test_runner(&lw);
+        let dir = lw.join("build-run-memo");
+
+        let fps = ["aaa", "bbb", "ccc", "ddd"];
+        std::thread::scope(|scope| {
+            for fp in fps {
+                let runner = &runner;
+                scope.spawn(move || {
+                    let mut steps = BTreeMap::new();
+                    steps.insert("system-x86-64".to_string(), format!("out-{fp}"));
+                    runner.write_build_run_memo("system-x86-64", fp, &steps).unwrap();
+                });
+            }
+        });
+
+        for fp in fps {
+            let map = dir.join(format!("system-x86-64.{fp}.map"));
+            assert!(map.is_file(), "{fp}: memo lost to a concurrent writer");
+            // Published under its own fingerprint AND carrying its own bytes — a
+            // cross-published map would parse back as a miss.
+            let text = fs::read_to_string(&map).unwrap();
+            let parsed = parse_build_run_memo(&text, fp)
+                .unwrap_or_else(|| panic!("{fp}: memo does not read back for its fingerprint"));
+            assert_eq!(parsed.get("system-x86-64").map(String::as_str), Some(&*format!("out-{fp}")));
+        }
+        let _ = fs::remove_dir_all(&lw);
+    }
+
+    // The case the RUN ID exists for, which varying the fingerprint above cannot show:
+    // same target, SAME fingerprint, two runs. That is two sandboxed peers of one gate,
+    // and it is why the qualifier cannot be the pid — a fresh pid namespace hands both
+    // the same low one.
+    //
+    // Asserted on the NAME rather than by racing two writers, deliberately. A race is
+    // only a probability: driving two threads through `write_build_run_memo` passes
+    // with the run id deleted, because whether the two renames actually interleave is
+    // timing. This distinguishes the fix from its absence every time.
+    #[test]
+    fn two_runs_on_one_target_and_fingerprint_get_different_memo_temps() {
+        let a = build_run_memo_temp_name("system-x86-64", "same-fp", "check-system-1-1");
+        let b = build_run_memo_temp_name("system-x86-64", "same-fp", "check-system-1-1.2");
+        assert_ne!(a, b, "two live runs must not stage through one temp name");
+        // Dotted, so it is never mistaken for a published `.map`, and it does carry the
+        // fingerprint — a temp per target alone was the original collision.
+        for name in [&a, &b] {
+            assert!(name.starts_with('.') && name.ends_with(".tmp"), "{name}");
+            assert!(name.contains("same-fp"), "{name}");
+        }
+        // And the same run asking twice is stable — the temp is unlinked and rewritten,
+        // not accumulated per call.
+        assert_eq!(
+            a,
+            build_run_memo_temp_name("system-x86-64", "same-fp", "check-system-1-1")
+        );
     }
 }

@@ -902,12 +902,17 @@ fn remove_store_path(path: &Path) -> Result<(), String> {
 
 /// Acquire the exclusive per-store commit lock (`<db>.commit.lock`), so the sweep, the
 /// registered-path snapshot, the tree commits, the db merge, and the receipt write form one
-/// critical section per store/db. The client-side ladder lock serializes recipe-check builds
-/// but does NOT cover a committer that reaches the same cache another way — a parent-death-
-/// orphaned builder child, or a direct `store-commit`/`build-recipe` with TD_PERSIST_* at the
-/// cache; since recovery DELETES a torn orphan, an unlocked second writer racing the snapshot
-/// could clobber a just-registered path. Different stores use different lock files, so
-/// unrelated builds never contend. Blocks until free; the guard releases on drop / process exit.
+/// critical section per store/db.
+///
+/// This lock is now the WHOLE of the mutual exclusion, not a backstop to the caller's. The
+/// client-side ladder lock used to serialize recipe-check builds; it is held SHARED since
+/// checks stopped queueing on it, so concurrent committers are the ordinary case rather
+/// than the exception this was written for. Those exceptions still hold too — a
+/// parent-death-orphaned builder child, or a direct `store-commit`/`build-recipe` with
+/// TD_PERSIST_* at the cache — and since recovery DELETES a torn orphan, an unlocked second
+/// writer racing the snapshot could clobber a just-registered path. Different stores use
+/// different lock files, so unrelated builds never contend. Blocks until free; the guard
+/// releases on drop / process exit.
 fn lock_store_commit(db: &Path) -> Result<std::fs::File, String> {
     // Site the lock as a SIBLING of the store directory (db's parent), never inside it: the
     // shared build-cache's whole dir is renamed aside and recreated by over-cap eviction, so a
@@ -1408,18 +1413,36 @@ fn store_add_recursive(
     // partial tree at the content-addressed basename — so a later run's
     // presence check (ensure_seed_input trusts a seed on `.exists()`) can never
     // observe a half-written seed.
+    //
+    // Two things here need the SAME commit lock `store-verify` takes, and
+    // for the reason stated there — the primitive protects itself rather than relying on
+    // the caller's ladder lock, which recipe checks now hold SHARED. Neither covers the
+    // WARM path's two NAR walks (the verify below and the registration scan under it),
+    // which is what every check-run pays for every seed it re-interns: those are reads of
+    // an immutable content-addressed tree, so holding a lock across them would serialize
+    // the one part of this that is genuinely parallel. Measured: with them inside the
+    // lock, four concurrent checks were SLOWER than four sequential ones.
     std::fs::create_dir_all(store_dir).map_err(|e| e.to_string())?;
     let disk = Path::new(store_dir).join(&base);
-    if disk.symlink_metadata().is_ok() {
-        let got = nar_hash_path(&disk).map_err(|e| e.to_string())?;
-        if got != nar {
-            return Err(format!(
-                "store item {} exists but hashes {got}, expected {nar} — corrupt content-addressed item; refusing to re-register it; remove it to re-intern (re #469)",
-                disk.display()
-            ));
+    if disk.symlink_metadata().is_err() {
+        // COLD. Locked, and re-checked INSIDE the lock: `commit_canonical_atomic` ends in
+        // a rename onto `disk`, and rename onto a populated directory is ENOTEMPTY rather
+        // than a benign last-writer-wins, so two cold interns of the same seed must not
+        // both reach it.
+        let _commit_lock = lock_store_commit(Path::new(out_db))?;
+        if disk.symlink_metadata().is_err() {
+            commit_canonical_atomic(Path::new(src), &disk)?;
         }
-    } else {
-        commit_canonical_atomic(Path::new(src), &disk)?;
+    }
+    // WARM (or just committed above). Unlocked: a content-addressed tree cannot change
+    // under us — nothing prunes the seed store any more, and a `clear-store` takes the
+    // ladder EXCLUSIVELY, which this caller holds shared for the whole build.
+    let got = nar_hash_path(&disk).map_err(|e| e.to_string())?;
+    if got != nar {
+        return Err(format!(
+            "store item {} exists but hashes {got}, expected {nar} — corrupt content-addressed item; refusing to re-register it; remove it to re-intern (re #469)",
+            disk.display()
+        ));
     }
     // Register: NAR hash + size of the tree td restored (the `build`
     // machinery), references scanned among the single-path closure.
@@ -1439,6 +1462,10 @@ fn store_add_recursive(
         refs,
         deriver: String::new(), // a source add has none
     };
+    // The one part that MUST be serialized: a read-modify-write over the whole db, so two
+    // concurrent interns of different seeds would otherwise each read the same bytes and
+    // the later write would drop the other's row, leaving a store tree nothing vouches.
+    let _commit_lock = lock_store_commit(Path::new(out_db))?;
     merge_output_db(Path::new(out_db), std::slice::from_ref(&reg))?;
     Ok(path)
 }
@@ -1451,15 +1478,14 @@ fn store_add_recursive(
 /// dropped row's item was already missing, or when the row was too malformed to
 /// name a delete target (see the escape guard below).
 ///
-/// Takes the ALREADY-OPENED db, so a caller that inspects it first — GC's
-/// liveness closure, `seed-prune`'s is-anything-unpinned check — decides and
-/// rewrites from one snapshot rather than re-reading between the two.
+/// Takes the ALREADY-OPENED db, so the caller — GC's liveness closure, now the
+/// only one — decides and rewrites from one snapshot rather than re-reading
+/// between the two.
 ///
 /// The surviving db carries ValidPaths + Refs only: the deriver scaffold and
 /// DerivationOutputs are deliberately not carried over, because a pruned store
 /// is content + references — the build-derivation mapping is rebuilt by
-/// registration, not by pruning. Shared by GC's liveness sweep and
-/// `seed-prune`'s compiled-table prune, which differ only in `keep`.
+/// registration, not by pruning.
 fn retain_registered_paths(
     store_dir: &str,
     db_path: &str,
@@ -5507,7 +5533,7 @@ fn seed_digests_expected(key: &str) -> Result<Option<&'static str>, String> {
 
 /// Every basename the COMPILED seed-digest table pins, whatever key pins it.
 /// The admissible seed universe by content address: `authenticate_seed_db`
-/// rejects a db row outside it, and `seed-prune` drops one.
+/// rejects a db row outside it.
 fn compiled_pinned_basenames() -> Result<std::collections::HashSet<&'static str>, String> {
     let mut pinned = std::collections::HashSet::new();
     for (n, line) in SEED_DIGESTS.lines().enumerate() {
@@ -8493,64 +8519,6 @@ fn main() -> ExitCode {
                 }
             }
         }
-        // seed-prune: drop from a RETAINED seed store/db every registered item whose
-        // basename the compiled seed-digest table no longer pins. Without it a table
-        // change (a pin bump, or an edit to a `local_source` tree) bricks every warm
-        // ladder: `authenticate_seed_db` rejects the WHOLE db over one stale row, so
-        // plans for unrelated targets red until the ladder is thrown away and
-        // re-climbed. The table is the authority, so an item it does not pin holds no
-        // authority to lose — dropping it is the cheap, correct healing. Usage:
-        //   seed-prune STORE-DIR DB
-        // Prints how many items were pruned / remain.
-        Some("seed-prune") if args.len() == 4 => {
-            let (store_dir, db_path) = (&args[2], &args[3]);
-            let run = || -> Result<String, String> {
-                if !Path::new(db_path).is_file() {
-                    return Ok("seed-prune: no seed db yet, nothing to prune".to_string());
-                }
-                let _commit_lock = lock_store_commit(Path::new(db_path))?;
-                let pinned = compiled_pinned_basenames()?;
-                // A table that pins nothing would authorize deleting the entire seed
-                // store. It cannot happen (the row set is compiled in and unit-tested
-                // non-empty), which is exactly why an unattended deleter should say so
-                // rather than act on it.
-                if pinned.is_empty() {
-                    return Err("compiled seed-digest table pins nothing — refusing to \
-                                prune every retained seed (re #469)"
-                        .to_string());
-                }
-                // Look before rewriting. The ladder prunes on EVERY setup, and the
-                // overwhelmingly common answer is "nothing to do" — rewriting a healthy
-                // db that often is a torn-write lottery this command exists to avoid
-                // losing, and it would also strip the scaffolding rows for no reason.
-                let bytes = std::fs::read(db_path).map_err(|e| e.to_string())?;
-                let db = store_db_read::Db::open(bytes)?;
-                let unpinned = db.hashes_by_path()?.into_iter().any(|(path, _)| {
-                    !pinned.contains(path.rsplit('/').next().unwrap_or(path.as_str()))
-                });
-                if !unpinned {
-                    return Ok("seed-prune: every retained seed is pinned, nothing to prune"
-                        .to_string());
-                }
-                let (pruned, _deleted, kept) =
-                    retain_registered_paths(store_dir, db_path, &db, |_p, base| {
-                        pinned.contains(base)
-                    })?;
-                Ok(format!(
-                    "seed-prune: pruned {pruned} unpinned items, {kept} pinned remain"
-                ))
-            };
-            match run() {
-                Ok(msg) => {
-                    println!("{msg}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("td-builder: seed-prune: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
         // The generic `build DRV CLOSURE SCRATCH` and `realize DRV STORE-DIR SCRATCH`
         // arms are DELETED (re #469 typed origins): both took their entire staging
         // manifest from the caller-writable TD_EXTRA_DBS env — self-issued authority
@@ -9615,7 +9583,6 @@ fn main() -> ExitCode {
             eprintln!("       td-builder store-add-output OUTPUT DERIVER CLOSURE-FILE STORE-DIR OUT-DB");
             eprintln!("       td-builder store-verify DB STORE-ROOT");
             eprintln!("       td-builder store-gc-sweep STORE-DIR DB ROOT");
-            eprintln!("       td-builder seed-prune STORE-DIR DB        # drop seeds the compiled table no longer pins");
             eprintln!("       td-builder resolve LOCKFILE NAME...");
             eprintln!("       td-builder build-recipe RECIPE-JSON LOCK SCRATCH-DIR STORE-DIR [SRC-STORE-DIR SRC-DB] [--recipe-output-store STORE] [--recipe-output-db DB]...");
             eprintln!("       td-builder build-plan --auto TARGET RECIPE-DIR MAP-FILE SEED-STORE SEED-DB SCRATCH");
@@ -11272,68 +11239,13 @@ daemon build START (2/2 active)
         // And it stays a pure computation once the store DOES exist.
         assert_eq!(computed, store_path_recursive("thing", &src_s).unwrap());
         std::fs::remove_dir_all(&d).ok();
-    }
-
-    // seed-prune drops exactly the retained items the compiled table no longer pins,
-    // and keeps the pinned ones. Without it a table change (a pin bump, or an edited
-    // local_source) leaves the old basename registered, and authenticate_seed_db —
-    // which judges the db WHOLESALE — reds every later plan for every target until
-    // the whole ladder is discarded. Asserted as a pair: after pruning, the same db
-    // that authenticate_seed_db rejected authenticates.
-    #[test]
-    fn seed_prune_drops_unpinned_items_and_heals_a_warm_seed_db() {
-        let d = std::env::temp_dir().join(format!("td-seed-prune-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        let items = d.join("items");
-        std::fs::create_dir_all(&items).unwrap();
-        let reg = |p: &str, h: &str| OutputReg {
-            store_path: p.to_string(),
-            nar_hash: h.to_string(),
-            nar_size: 7,
-            refs: vec![],
-            deriver: String::new(),
-        };
-        let hash_of = |path: &str| {
-            let base = path.rsplit('/').next().unwrap_or(path);
-            nar_hash_path(&items.join(base)).unwrap()
-        };
-        // A warm seed store: one item the table pins, one it does not (the shape a
-        // stale local-source row leaves behind).
-        let pinned = intern_real_patch_seed(&items, "patch-glibc-boot-2.16.0");
-        let stale = intern_test_seed(&items, "sshd-source", b"the pre-edit tree");
-        let db = d.join("seed.db");
-        write_output_db(
-            &[reg(&pinned, &hash_of(&pinned)), reg(&stale, &hash_of(&stale))],
-            &db,
-        )
-        .unwrap();
-        let (db_s, items_s) = (db.to_string_lossy().into_owned(), items.to_string_lossy().into_owned());
-
-        // Warm and contaminated: the whole db is rejected over the one unpinned row.
-        let err = authenticate_seed_db(&db_s, &items).unwrap_err();
-        assert!(err.contains("not a basename the compiled seed-digest table pins"), "{err}");
-
-        let pinned_set = compiled_pinned_basenames().unwrap();
-        let opened = store_db_read::Db::open(std::fs::read(&db).unwrap()).unwrap();
-        let (dropped, deleted, kept) =
-            retain_registered_paths(&items_s, &db_s, &opened, |_p, base| pinned_set.contains(base))
-                .unwrap();
-        assert_eq!((dropped, deleted, kept), (1, 1, 1));
-        let stale_base = stale.rsplit('/').next().unwrap();
-        assert!(!items.join(stale_base).exists(), "the unpinned item's bytes go too");
-        let pinned_base = pinned.rsplit('/').next().unwrap();
-        assert!(items.join(pinned_base).exists(), "a pinned item must survive");
-        // Healed: the retained db now vouches for the pinned universe only, so plans
-        // for every OTHER target proceed — no clear-store, no cold climb.
-        authenticate_seed_db(&db_s, &items).unwrap();
-        std::fs::remove_dir_all(&d).ok();
+        std::fs::remove_file(d.with_extension("commit.lock")).ok();
     }
 
     // A db row does not get to choose what gets deleted. `<store>/..` names the
-    // store's PARENT, and pruning runs unattended on every ladder setup, so a row
-    // whose path is not a canonical store item loses its registration and NOTHING is
-    // removed. Asserted on the parent dir itself, which the naive join would have fed
-    // to remove_dir_all.
+    // store's PARENT, so a row whose path is not a canonical store item loses its
+    // registration and NOTHING is removed. Asserted on the parent dir itself, which
+    // the naive join would have fed to remove_dir_all.
     #[test]
     fn retain_registered_paths_never_deletes_outside_the_store() {
         let d = std::env::temp_dir().join(format!("td-retain-esc-{}", std::process::id()));
@@ -11627,6 +11539,103 @@ daemon build START (2/2 active)
             );
         }
         std::fs::remove_dir_all(&d).ok();
+        std::fs::remove_file(d.with_extension("commit.lock")).ok();
+    }
+
+    // Concurrent interns must not lose each other's rows. In one process they collide on
+    // `write_atomic`'s pid-keyed staging temp; across processes — the real shape, each
+    // intern being its own `td-builder store-add-recursive` — the db merge is a
+    // read-modify-write and the later write drops the earlier's row, leaving a store tree
+    // the db does not vouch. One commit lock closes both; this drives the in-process
+    // shape, which exercises the same critical section.
+    #[test]
+    fn concurrent_interns_of_different_seeds_all_stay_vouched() {
+        const N: usize = 8;
+        let d = std::env::temp_dir().join(format!("td-seed-db-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        for i in 0..N {
+            let s = d.join(format!("src{i}"));
+            std::fs::create_dir_all(&s).unwrap();
+            std::fs::write(s.join("file"), format!("seed-{i}\n")).unwrap();
+        }
+        let (store, db) = (d.join("store"), d.join("seed.db"));
+        let store_s = store.to_string_lossy().to_string();
+        let db_s = db.to_string_lossy().to_string();
+
+        let paths: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..N)
+                .map(|i| {
+                    let (store_s, db_s) = (store_s.clone(), db_s.clone());
+                    let src = d.join(format!("src{i}")).to_string_lossy().to_string();
+                    scope.spawn(move || {
+                        store_add_recursive(&format!("seed-{i}"), &src, &store_s, &db_s).unwrap()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let hashes = store_db_read::Db::open(std::fs::read(&db).unwrap())
+            .unwrap()
+            .hashes_by_path()
+            .unwrap();
+        assert_eq!(hashes.len(), N, "every concurrent intern stays vouched: {hashes:?}");
+        for p in &paths {
+            assert!(
+                hashes.get(p.as_str()).is_some_and(|h| h.starts_with("sha256:")),
+                "{p} lost from the merged seed db: {hashes:?}"
+            );
+        }
+        std::fs::remove_dir_all(&d).ok();
+        // `lock_store_commit` anchors on the db's parent, so the lock is a SIBLING of
+        // `d` and the tree removal above cannot reach it.
+        std::fs::remove_file(d.with_extension("commit.lock")).ok();
+    }
+
+    // WHY that lock is needed in the CROSS-PROCESS shape, shown without two processes:
+    // the merge is a read-modify-write over the WHOLE db, so two interns that both read
+    // the same base each produce a db carrying the base plus only their OWN new row.
+    // Whichever writes second wins outright and the other seed is left in the store with
+    // nothing vouching it. The concurrent test above cannot show this directly — in one
+    // process the writers collide on write_atomic's pid-keyed staging temp first — so
+    // this pins the mechanism the lock actually exists for.
+    #[test]
+    fn two_merges_over_one_base_each_drop_the_others_row() {
+        let reg = |p: &str| OutputReg {
+            store_path: p.to_string(),
+            nar_hash: format!("sha256:{}", "0".repeat(64)),
+            nar_size: 1,
+            refs: Vec::new(),
+            deriver: String::new(),
+        };
+        let base = merge_regs(None, &[reg("/td/store/aaa-seed-base")]).unwrap();
+        // Two interns, each reading the SAME base and adding its own seed.
+        let first = merge_regs(Some(&base), &[reg("/td/store/bbb-seed-one")]).unwrap();
+        let second = merge_regs(Some(&base), &[reg("/td/store/ccc-seed-two")]).unwrap();
+
+        let paths = |bytes: &[u8]| -> Vec<String> {
+            let mut v: Vec<String> = store_db_read::Db::open(bytes.to_vec())
+                .unwrap()
+                .hashes_by_path()
+                .unwrap()
+                .into_keys()
+                .collect();
+            v.sort();
+            v
+        };
+        // Both kept the base row, so neither is a truncation — each simply never saw
+        // the other's intern.
+        for db in [&first, &second] {
+            assert!(paths(db).iter().any(|p| p.contains("aaa-seed-base")));
+        }
+        assert!(
+            !paths(&first).iter().any(|p| p.contains("ccc-seed-two")),
+            "first writer's db cannot carry a row it never read"
+        );
+        assert!(
+            !paths(&second).iter().any(|p| p.contains("bbb-seed-one")),
+            "second writer would clobber the first's seed row"
+        );
     }
 
     // store-add-builder must be idempotent for the same reason store-add-recursive

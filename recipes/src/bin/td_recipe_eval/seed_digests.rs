@@ -66,6 +66,25 @@ pub(crate) fn rows() -> Result<Vec<(&'static str, &'static str)>, String> {
     parse(TABLE)
 }
 
+/// A stable identity for the compiled table, which the seed db is keyed by: a
+/// table belongs to a BRANCH, while the ladder holding the db is machine-wide.
+///
+/// Over the sorted ROW SET rather than the file bytes, so editing the header
+/// comment or reordering rows does not fork a db that would hold exactly the same
+/// seeds — and so two worktrees whose tables agree keep sharing one.
+pub(crate) fn table_digest() -> Result<String, String> {
+    let mut rows = rows()?;
+    rows.sort_unstable();
+    let mut canon = String::new();
+    for (key, base) in rows {
+        canon.push_str(key);
+        canon.push(' ');
+        canon.push_str(base);
+        canon.push('\n');
+    }
+    Ok(td_engine::sha256::hex_digest(canon.as_bytes()))
+}
+
 /// The compiled expected basename for a seed key, if pinned.
 pub(crate) fn expected(key: &str) -> Result<Option<&'static str>, String> {
     Ok(rows()?
