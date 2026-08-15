@@ -794,12 +794,14 @@ td-txt-authored case files
   and is pinned in divergence.test.txt.
 
   That rule is what makes td-txt's REFUSALS visible from both sides. td-txt's
-  scan raises on options GNU accepts -- `-b`, `--color` and the rest of the
-  deliberate omissions below -- so `grep --help -b` is a refusal at exit 2
+  scan raises on options GNU accepts -- `-P`, `--color` and the rest of the
+  deliberate omissions below -- so `grep --help -P` is a refusal at exit 2
   here where GNU prints its usage at exit 0. The refusal is the pinned decision
   and the deferral only decides WHEN it is reached; before it, the same command
-  written the other way round (`grep -b --help`) already refused, so this makes
+  written the other way round (`grep -P --help`) already refused, so this makes
   the two orders agree with each other rather than one of them agree with GNU.
+  That case read `-b` until `-b` was served; the point is the refusal rather
+  than which option carries it.
 
   `-r`'s WALK admits the ROOT and the tree below it by different rules. The root
   is FOLLOWED, so a symlinked directory named as an operand is descended and a
@@ -1981,16 +1983,26 @@ td-txt-authored case files
     `'--sandbox' '--separate' '--silent'`, td-txt's alphabetical table order,
     where GNU walks `longopts[]` (sed.c:197) and answers `'--silent'
     '--sandbox' '--separate'`. sed's table is that declaration now, arities
-    included. grep's stayed alphabetical because reordering it buys nothing
-    measurable, and that is a measurement rather than a guess. Sweeping 2,184
-    spellings -- every one- and two-character prefix, bare and with `=1` and
-    `=` -- there are 42 where GNU and td-txt BOTH report an ambiguity; 30 of
-    those differ, every one of them by the SET above, and NOT ONE by order
-    alone. (A further 18 are the same divergence seen from the side: with
-    fewer candidates a prefix that is ambiguous to GNU resolves here, or the
-    reverse, so only one of the two reports an ambiguity at all.) Reordering
-    changes which order a list is printed in and none of those lines is
-    wrong about its order.
+    included. grep's stayed alphabetical because reordering it bought nothing
+    measurable, and that was a measurement rather than a guess. It is no longer
+    true, and what changed it is worth more than the number. Sweeping 2,268
+    spellings -- every one- and two-character prefix over `a-z` and `-`, bare
+    and with `=1` and `=` -- there are 48 where GNU and td-txt BOTH report an
+    ambiguity: 12 identical, 30 differing by the SET above, and SIX by ORDER
+    ALONE. Those six are two prefixes in three spellings each, `--d` and `--de`,
+    where td-txt answers `--dereference-recursive` first and GNU answers it
+    last.
+
+    That last count was NOT ONE when this was written, and the `-D` landing is
+    what moved it. Before `--devices` existed the two tools disagreed about
+    `--d`'s SET -- GNU had a candidate td-txt lacked -- and `--de` was not
+    ambiguous here at all. Adding the option closed the set gap and UNCOVERED an
+    order gap that had been hiding behind it: a landing that strictly reduced
+    one divergence introduced another without touching the table's order. That
+    is the general shape to expect as options are served, rather than anything
+    about `-D`. Reordering grep's table now buys those six spellings where it
+    previously bought nothing; it is still a separate landing, and it is now one
+    with a reason.
 
   - `-V` is an option GNU sed still TAKES, with an argument, and td-txt refuses.
     GNU's getopt string carries it (the obsolete `--version` spelling) but its
@@ -2314,16 +2326,59 @@ td-txt-authored case files
     `lineno + 1 ..= lineno + dropped`, so the replayed tail starts one past the
     subtraction, which is an off-by-one a test caught rather than a reading.
 
-  - GNU's `-b` is WRONG across a run of NULs it skipped, which is recorded
-    here rather than reproduced because td-txt does not implement `-b` at all
-    (`invalid option -- 'b'`, exit 2). GNU credits the LINE count for a
-    discarded read (grep.c:1024) and nothing for the byte count, so the offset
-    it prints is the one within the last read it kept: over 4 MiB of NULs
-    followed by `hello`, `grep -z -b hello` says `65536:hello` where the
-    offset is 4194304, while `-n` on the same run is right. Noted because a
-    future `-b` has to choose between GNU's answer and the true one, and that
-    is a decision rather than an oversight -- everything else in this file is
-    scored byte-for-byte against GNU.
+  - `-b`/`--byte-offset` prints where a record STARTS, and under `-o` where each
+    MATCH starts. It comes after the line number rather than before it, so
+    `grep -bn` prints `2:6:beta`; the two are independent, and a context line
+    carries its own offset with the `-` separator the rest of its prefix uses.
+    The counting modes print no line to prefix and so ignore it. Offsets are raw
+    byte positions in the INPUT: a CR is one of them, an unterminated last record
+    still has one, and under `-z` they are the NUL-separated record starts. That
+    holds for every record the reader did not have to JOIN across a dropped run;
+    the exception is below, and it is GNU's too.
+
+    Across a run of NULs the reader SKIPPED, td-txt deliberately prints
+    something else. GNU credits the LINE count for a discarded read
+    (`totalnl = add_count (totalnl, fillsize)`, grep.c:1024) and never credits
+    the byte count for one, because `totalcc` only ever advances by what a
+    buffer actually held (grep.c:1627). `-b` then prints
+    `totalcc + (beg - bufbeg)` (grep.c:1196), so what comes out is the bytes GNU
+    SCANNED rather than the position in the file: `run mod 98304`, one
+    `INITIAL_BUFSIZE` (grep.c:886). Measured across ten run lengths, it tracks
+    that modulus exactly -- 100000 gives 1696, 131072 gives 32768, 196608 gives
+    0, and 1, 4 and 16 MiB all give 65536 because that whole family is congruent
+    mod 96 KiB.
+
+    So GNU's number is not meaningless, and it is not the option's: `-b` is
+    documented as a byte offset into the input, and bytes-scanned is a different
+    quantity that coincides with it only when nothing was skipped. What settles
+    the divergence is that GNU CONTRADICTS ITSELF -- `-n` counts the discarded
+    lines while `-b` declines to count the discarded bytes, both on the same
+    record, so `grep -z -b -n` on a 1 MiB run prints `1048577:65536:hello`: one
+    line, two fields, two accounts of where it is. td-txt prints
+    `1048577:1048576:hello`, and what the test asserts is that the two fields
+    AGREE, not that the offset takes any particular value. This is the trade the
+    streaming entry above already makes: reproduce GNU's rule, decline its
+    arithmetic where the arithmetic contradicts the rule's own neighbour.
+
+    A record JOINED across a dropped run keeps the offset it BEGAN at rather than
+    one past the gap, which is `take_skipped`'s two halves seen from the byte
+    count instead of from `-B` context: a run with nothing open starts the next
+    record past itself, and a run a carry spans belongs to the record already
+    going. Reporting the tail would name a position the record does not occupy.
+
+    That divergence reaches exactly as far as where a record STARTS and no
+    further. A joined record is NON-CONTIGUOUS in the input, so a span inside
+    one has no single position there: `-o` therefore indexes the ASSEMBLED
+    record, and `bar` after a 192 KiB dropped run reports 98304 rather than the
+    294912 it physically sits at. GNU prints 98304 too, so this is agreement
+    and not a second divergence -- the offset arithmetic is shared, and only
+    GNU's count of the bytes it discarded is declined.
+
+    Implementing it also retires a substitution in td's own ladder: glibc's build
+    wants `grep -ob U`, which the recipes replaced with an awk program because
+    this option was refused. `grep -ob U` now matches GNU byte for byte, so that
+    replacement can go -- in its own landing, since it touches recipes rather
+    than this crate.
 
   - A SPARSE file is binary to GNU before any NUL has been read, and td-txt
     does not follow. This is the SECOND door to the verdict above: GNU asks

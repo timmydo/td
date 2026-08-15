@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 2334;
+const CORPUS_FLOOR: usize = 2344;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -3082,5 +3082,129 @@ fn a_directory_is_not_a_device() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(String::from_utf8_lossy(&out.stderr), err_want, "{args:?}");
         assert_eq!(out.status.code(), Some(code), "{args:?}");
     }
+    Ok(())
+}
+
+
+/// `-b` across a run of NULs the reader SKIPPED, where td-txt deliberately does
+/// not print what GNU prints. GNU credits `totalnl` for a dropped read
+/// (grep.c:1024) and never credits `totalcc`, which advances only by what a
+/// buffer held (grep.c:1627) — so `-b`, printing `totalcc + (beg - bufbeg)`
+/// (grep.c:1196), reports the bytes GNU SCANNED rather than the position in the
+/// file. That is `run mod 98304`, one `INITIAL_BUFSIZE` (grep.c:886), and it
+/// MOVES with the input: 1696 at 100000, 32768 at 131072, 0 at 196608. The 1, 4
+/// and 16 MiB runs all give 65536 because that family is congruent mod 96 KiB.
+///
+/// So the number is not meaningless — it is a real quantity, just not the one
+/// `-b` names. What settles it is that GNU CONTRADICTS ITSELF: `-n` counts the
+/// discarded lines where `-b` declines to count the discarded bytes, on the same
+/// record, so `grep -z -b -n` prints `1048577:65536:hello` — one line, two
+/// fields, two different accounts of where the record is. td-txt prints
+/// `1048577:1048576:hello`, and the assertion below is that the two fields
+/// agree rather than that the offset takes any particular value.
+///
+/// This is the same trade the streaming entry makes elsewhere: reproduce GNU's
+/// RULE, decline arithmetic that contradicts the rule's own neighbour.
+#[test]
+fn a_byte_offset_past_a_skipped_run_counts_the_bytes_that_were_there()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("b-skip")?;
+    // A whole number of 96 KiB read buffers, so every NUL lands in a fill that
+    // can be dropped and `hello` opens a fresh one.
+    let run = 3 * 96 * 1024;
+    let mut data = vec![0u8; run];
+    data.extend_from_slice(b"hello\x00");
+    std::fs::write(dir.join("z"), &data)?;
+    let want_at = run.to_string();
+    let want_no = (run + 1).to_string();
+    for (args, want) in [
+        (vec!["grep", "-z", "-b", "hello", "z"], format!("{want_at}:hello\0")),
+        (vec!["grep", "-z", "-n", "hello", "z"], format!("{want_no}:hello\0")),
+        // Both together: the two fields describe the same record, which is the
+        // property GNU loses here.
+        (
+            vec!["grep", "-z", "-b", "-n", "hello", "z"],
+            format!("{want_no}:{want_at}:hello\0"),
+        ),
+    ] {
+        let out = std::process::Command::new(bin())
+            .args(&args)
+            .current_dir(&dir.0)
+            .env("LC_ALL", "C")
+            .output()?;
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want, "{args:?}");
+        assert_eq!(out.status.code(), Some(0), "{args:?}");
+    }
+    // The `-B` replay carries offsets too, and they are the run's own tail
+    // rather than the match's. A record BEFORE the run is what makes GNU agree
+    // about the context at all, so this shape isolates the offsets: GNU prints
+    // these three lines with these NUMBERS, under offsets 98303..=98306 that
+    // step by one from a start the discarded reads never moved.
+    let mut lead = b"a\x00".to_vec();
+    lead.extend(std::iter::repeat_n(0u8, 2 * 96 * 1024));
+    lead.extend_from_slice(b"hello\x00");
+    std::fs::write(dir.join("s"), &lead)?;
+    let n = 2 * 96 * 1024;
+    let out = std::process::Command::new(bin())
+        .args(["grep", "-z", "-n", "-b", "-B", "3", "hello", "s"])
+        .current_dir(&dir.0)
+        .env("LC_ALL", "C")
+        .output()?;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!(
+            "{}-{}-\0{}-{}-\0{}-{}-\0{}:{}:hello\0",
+            n - 1,
+            n - 1,
+            n,
+            n,
+            n + 1,
+            n + 1,
+            n + 2,
+            n + 2
+        ),
+    );
+    Ok(())
+}
+
+/// A record JOINED across a dropped run keeps the offset it began at, not one
+/// past the gap. The two halves of `take_skipped` split here exactly as they do
+/// for `-B` context: a run with nothing open starts the next record past
+/// itself, and a run that a carry spans belongs to the record already going.
+/// Without that split the joined record would report the offset of its TAIL,
+/// which is a position it does not occupy.
+#[test]
+fn a_joined_record_keeps_the_offset_it_began_at()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("b-join")?;
+    let buf = 96 * 1024;
+    // The carry fills a whole buffer, so the run starts exactly at the next one.
+    let mut data = b"foo".to_vec();
+    data.extend(std::iter::repeat_n(b'x', buf - 3));
+    data.extend(std::iter::repeat_n(0u8, 2 * buf));
+    data.extend_from_slice(b"bar\x00");
+    std::fs::write(dir.join("j"), &data)?;
+    let out = std::process::Command::new(bin())
+        .args(["grep", "-z", "-b", "^foo.*bar$", "j"])
+        .current_dir(&dir.0)
+        .env("LC_ALL", "C")
+        .output()?;
+    let got = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        got.starts_with("0:foo"),
+        "the joined record reported an offset past the gap it began before: {:?}",
+        got.get(..24)
+    );
+    // Under `-o` the span is indexed in the ASSEMBLED record, so `bar` reports
+    // 98304 and not the 294912 it physically sits at: the record is not
+    // contiguous, and a span inside one has no single position in the input.
+    // GNU prints 98304 here too -- the divergence above is about where a record
+    // STARTS and reaches no further than that.
+    let out = std::process::Command::new(bin())
+        .args(["grep", "-z", "-b", "-o", "bar", "j"])
+        .current_dir(&dir.0)
+        .env("LC_ALL", "C")
+        .output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "98304:bar\0");
     Ok(())
 }

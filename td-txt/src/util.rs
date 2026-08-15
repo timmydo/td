@@ -459,6 +459,13 @@ pub struct Records<R> {
     /// A read failure deferred until the bytes read before it were handed over.
     pending: Option<std::io::Error>,
     consumed: u64,
+    /// Where the record `line()` returns STARTS, counted from the first byte of
+    /// the input. `consumed` cannot answer this: it is bytes taken from the
+    /// SOURCE and runs a whole buffer ahead of the record being handed out.
+    at: u64,
+    /// Bytes accounted for, records and their separators and any dropped run
+    /// alike. A record's `at` is this as it stood when that record BEGAN.
+    emitted: u64,
 }
 
 impl<R: std::io::Read> Records<R> {
@@ -495,6 +502,8 @@ impl<R: std::io::Read> Records<R> {
             skipped_joined: false,
             pending: None,
             consumed: 0,
+            at: 0,
+            emitted: 0,
         }
     }
 
@@ -535,6 +544,14 @@ impl<R: std::io::Read> Records<R> {
         self.consumed
     }
 
+    /// Byte offset of the record `line()` returns, which is what `grep -b`
+    /// prints. Counted over the INPUT rather than over what was searched, so a
+    /// run of NULs dropped by `skip_zero_fills` still moves it -- those bytes
+    /// are in the file whether or not anything looked at them.
+    pub fn offset(&self) -> u64 {
+        self.at
+    }
+
     /// The source itself. sed hands descriptor 0 back its over-read by SEEKING the
     /// reader's own duplicate of it, which is here.
     pub fn source_mut(&mut self) -> &mut R {
@@ -568,6 +585,8 @@ impl<R: std::io::Read> Records<R> {
         self.skipped = 0;
         self.skipped_joined = false;
         self.consumed = 0;
+        self.at = 0;
+        self.emitted = 0;
     }
 
     pub fn line(&self) -> &[u8] {
@@ -634,6 +653,14 @@ impl<R: std::io::Read> Records<R> {
                 // it just the same, so only the `-B` replay is told apart.
                 self.skipped = self.skipped.saturating_add(n as u64);
                 self.skipped_joined |= self.spilled;
+                self.emitted = self.emitted.saturating_add(n as u64);
+                // With nothing carried, no record has begun, so the next one
+                // starts PAST this run. With a record open it began before the
+                // run and keeps the offset it already has -- the same split the
+                // `-B` replay makes, seen from the byte count.
+                if !self.spilled {
+                    self.at = self.emitted;
+                }
                 continue;
             }
             if zapping {
@@ -650,6 +677,7 @@ impl<R: std::io::Read> Records<R> {
         self.spill.clear();
         self.spilled = false;
         self.terminated = false;
+        self.at = self.emitted;
         // A failure held back from the previous call so the bytes read BEFORE it
         // could be searched first. Reported now, once, and not again.
         if let Some(err) = self.pending.take() {
@@ -668,6 +696,15 @@ impl<R: std::io::Read> Records<R> {
                 } else {
                     (self.start, self.end) = (s, e);
                 }
+                // `spill` already holds the whole record, the `s..e` tail
+                // included: the branch above appended it before this ran.
+                let len = match self.spilled {
+                    true => self.spill.len(),
+                    false => e.saturating_sub(s),
+                };
+                // The separator is a byte of the input too, so it counts.
+                self.emitted =
+                    self.emitted.saturating_add(len as u64).saturating_add(1);
                 return Ok(true);
             }
             // No separator in what is held: carry the remainder and refill. The
@@ -681,7 +718,12 @@ impl<R: std::io::Read> Records<R> {
             }
             if self.eof {
                 // A final record carrying no separator of its own.
-                return Ok(self.spilled && !self.spill.is_empty());
+                let live = self.spilled && !self.spill.is_empty();
+                if live {
+                    self.emitted =
+                        self.emitted.saturating_add(self.spill.len() as u64);
+                }
+                return Ok(live);
             }
             if let Err(e) = self.fill() {
                 // Bytes were read, and THEN the next read failed. Those bytes
@@ -689,6 +731,12 @@ impl<R: std::io::Read> Records<R> {
                 // replaced kept them as `ReadFail::partial` for the same reason
                 // -- so hand them over and report the failure on the next call.
                 if self.spilled && !self.spill.is_empty() {
+                    // Counted like the EOF record it resembles, and for a
+                    // reason EOF does not have: `pending` is cleared when it is
+                    // reported, so a reader that fails once and then yields
+                    // more would carry this record's length as a shortfall in
+                    // every offset after it.
+                    self.emitted = self.emitted.saturating_add(self.spill.len() as u64);
                     self.pending = Some(e);
                     return Ok(true);
                 }
@@ -1484,6 +1532,28 @@ mod tests {
         assert!(rec.next().is_err(), "the deferred failure was never reported");
     }
 
+    /// The partial record a failed read leaves behind is counted like the EOF
+    /// record it resembles. `pending` is cleared when it is reported, so a
+    /// reader that fails once and then yields more keeps going -- and without
+    /// the count every offset after it is short by that record's length. grep
+    /// stops at the error, but `Records` is public and this is what it promises.
+    #[test]
+    fn a_partial_record_from_a_failed_read_still_counts_its_bytes() {
+        let src = Scripted(vec![
+            Ok(b"match"),
+            err(std::io::ErrorKind::Other),
+            Ok(b"after\n"),
+        ]);
+        let mut rec = Records::new(src, b'\n');
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line(), b"match");
+        assert_eq!(rec.offset(), 0);
+        assert!(rec.next().is_err());
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line(), b"after");
+        assert_eq!(rec.offset(), 5, "the partial record's bytes went uncounted");
+    }
+
     #[test]
     fn a_failure_with_nothing_buffered_is_reported_at_once() {
         let src = Scripted(vec![err(std::io::ErrorKind::PermissionDenied)]);
@@ -1657,6 +1727,24 @@ mod tests {
         assert!(rec.next().unwrap());
         assert_eq!(rec.line(), b"ab", "the read that tripped the verdict was dropped");
         assert_eq!(rec.take_skipped().0, 0);
+    }
+
+    /// A record CARRIED across a buffer contributes its whole length to the
+    /// count, not just the tail that completed it. Nothing above reaches this:
+    /// a corpus case cannot span a 96 KiB buffer, and the conformance tests that
+    /// can end their file at the joined record, so the offset AFTER a spilled
+    /// one goes unread. Taking the tail alone leaves every later record short by
+    /// the carry -- `e - s` here is 1 where the record is 5.
+    #[test]
+    fn a_record_carried_across_a_buffer_counts_its_whole_length() {
+        let src = Scripted(vec![Ok(b"abcd"), Ok(b"e\nf\n")]);
+        let mut rec = Records::with_buffer(src, b'\n', 4);
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line(), b"abcde");
+        assert_eq!(rec.offset(), 0);
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line(), b"f");
+        assert_eq!(rec.offset(), 6, "the carried bytes were not counted");
     }
 
     /// Off unless asked, so sed and `grep -a` see every empty record the bytes

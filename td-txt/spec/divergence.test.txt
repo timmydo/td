@@ -37,6 +37,23 @@ a
 ## status: 1
 ## stderr-contains: the `e' flag is not supported
 
+#### grep refuses -u, the option that exists only to modify -b
+# GNU takes `-u`/`--unix-byte-offsets`, warns that it is obsolete, and then
+# does nothing with it: `grep -ub` prints exactly what `grep -b` prints. It
+# dates from the MS-DOS ports, where a text-mode read and the file on disk
+# disagreed about CRLF and `-b` needed telling which it meant. On a POSIX
+# system the two never disagree, so there is no second answer for it to
+# select. Recorded here because it is the one option whose whole subject is
+# `-b`, and `-b` is now served -- so a reader looking for it should find why
+# it is not, rather than nothing.
+## argv: grep -ub a
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: invalid option -- 'u'
+
 #### grep refuses -P rather than pretending to have PCRE
 # GNU grep's -P switches to a whole second regex engine (PCRE). td-txt carries
 # one POSIX engine; accepting -P and quietly running POSIX semantics would
@@ -103,7 +120,7 @@ sed (td-txt) 0.1.0
 # include/exclude globs this applet refuses two cases below.
 ## argv: grep --help
 ## stdout:
-usage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
+usage: grep [-abEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
 ## END
 ## stderr-json: ""
 ## status: 0
@@ -129,32 +146,21 @@ grep (td-txt) 0.1.0
 #### --help outranks what comes after the scan, a bad pattern included
 ## argv: grep --help -e [
 ## stdout:
-usage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
+usage: grep [-abEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
 ## END
 ## stderr-json: ""
 ## status: 0
 
 #### but an option td-txt REFUSES is raised during the scan, so it outranks --help
-# GNU accepts -b and prints its usage at exit 0. The refusal is the decision
+# GNU accepts -P and prints its usage at exit 0. The refusal is the decision
 # pinned below; this case pins that --help does not smuggle a refused option
-# past it, the same answer `grep -b --help` has always given.
-## argv: grep --help -b a
+# past it, the same answer `grep -P --help` has always given. It read -b until
+# -b was served, and the point is the refusal rather than which option carries
+# it.
+## argv: grep --help -P a
 ## stdout-json: ""
-## stderr-contains: invalid option -- 'b'
+## stderr-contains: invalid option -- 'P'
 ## status: 2
-
-#### grep refuses -b rather than reporting a byte offset it does not track
-# GNU's -b prefixes each output line with its byte offset. Nothing on the image
-# or in td's recipes uses it — glibc's build wants `grep -ob U', and the ladder
-# SUBSTITUTES an awk program for that line rather than requiring it — so it is
-# refused instead of guessed at.
-## argv: grep -b a
-## stdin:
-a
-## END
-## stdout-json: ""
-## status: 2
-## stderr-contains: invalid option -- 'b'
 
 #### grep refuses --color rather than emitting or dropping escapes
 ## argv: grep --color=auto a

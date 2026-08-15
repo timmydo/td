@@ -6263,7 +6263,7 @@ MATCH
 ## argv: grep "-\x80" x
 ## stdin-json: "a\n"
 ## stdout-json: ""
-## stderr-json: "grep: invalid option -- '\x80'\nusage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## stderr-json: "grep: invalid option -- '\x80'\nusage: grep [-abEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
 ## status: 2
 
 #### -D skip does not reach stdin, which is exempt by descriptor
@@ -6308,3 +6308,83 @@ a
 ## stdout-json: ""
 ## status: 2
 ## stderr-json: "grep: unknown devices method\n"
+
+#### -b prefixes the byte offset of the line, and the closed entry's own input
+## argv: grep -b a
+## stdin:
+a
+## END
+## stdout-json: "0:a\n"
+## status: 0
+
+#### --byte-offset is the long spelling, and `--b` is ambiguous with two others
+## argv: grep --byte-offset a
+## stdin:
+a
+## END
+## stdout-json: "0:a\n"
+## status: 0
+
+#### -bn puts the line number FIRST and the offset after it
+## argv: grep -bn beta
+## stdin:
+alpha
+beta
+## END
+## stdout-json: "2:6:beta\n"
+## status: 0
+
+#### -b under -o is the offset of the MATCH, not of the line
+## argv: grep -bo l
+## stdin:
+alpha
+hello
+## END
+## stdout-json: "1:l\n8:l\n9:l\n"
+## status: 0
+
+#### glibc's build spelling, which td's ladder substituted an awk program for
+## argv: grep -ob U
+## stdin:
+aUb
+UxU
+## END
+## stdout-json: "1:U\n4:U\n6:U\n"
+## status: 0
+
+#### -b counts raw bytes, so a CR is one of them
+## argv: grep -b beta
+## stdin-json: "alpha\r\nbeta\r\n"
+## stdout-json: "7:beta\r\n"
+## status: 0
+
+#### a record with no trailing separator still has an offset
+## argv: grep -b two
+## stdin-json: "one\ntwo"
+## stdout-json: "4:two\n"
+## status: 0
+
+#### -b is ignored by the counting modes, which print no line to prefix
+## argv: grep -bc beta
+## stdin:
+alpha
+beta
+## END
+## stdout-json: "1\n"
+## status: 0
+
+#### and -b context lines carry their own offsets, with the context separator
+## argv: grep -b -C 1 beta
+## stdin:
+alpha
+beta
+gamma
+## END
+## stdout-json: "0-alpha\n6:beta\n11-gamma\n"
+## status: 0
+
+#### -bz counts the NUL-separated records
+## argv: grep -bz beta
+## stdin-json: "alpha\u0000beta\u0000"
+## stdout-json: "6:beta\u0000"
+## status: 0

@@ -23,7 +23,7 @@ use crate::util::{
 /// scanner stops there; the `-A`/`-B`/`-C` argument has no such limit.
 const NUM_DIGIT_CAP: usize = 21;
 
-const USAGE: &str = "usage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] \
+const USAGE: &str = "usage: grep [-abEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] \
                      [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] \
                      [PATTERN] [FILE]...";
 
@@ -107,6 +107,7 @@ struct Conf {
     quiet: bool,
     no_messages: bool,
     line_number: bool,
+    byte_offset: bool,
     /// `None` until `-H`/`-h` or the file count decides it.
     with_filename: Option<bool>,
     dirs: Dirs,
@@ -143,6 +144,7 @@ impl Default for Conf {
             quiet: false,
             no_messages: false,
             line_number: false,
+            byte_offset: false,
             with_filename: None,
             dirs: Dirs::Read,
             devices: Devices::ReadCommandLine,
@@ -628,6 +630,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                 b'q' => conf.quiet = true,
                 b's' => conf.no_messages = true,
                 b'n' => conf.line_number = true,
+                b'b' => conf.byte_offset = true,
                 b'h' => conf.with_filename = Some(false),
                 b'H' => conf.with_filename = Some(true),
                 b'd' => {
@@ -988,6 +991,7 @@ const LONG_OPTIONS: &[(&[u8], Arg)] = &[
     (b"after-context", Arg::Required),
     (b"basic-regexp", Arg::None),
     (b"before-context", Arg::Required),
+    (b"byte-offset", Arg::None),
     (b"context", Arg::Required),
     (b"count", Arg::None),
     (b"dereference-recursive", Arg::None),
@@ -1176,6 +1180,7 @@ fn parse_long(
         b"quiet" | b"silent" => conf.quiet = true,
         b"no-messages" => conf.no_messages = true,
         b"line-number" => conf.line_number = true,
+        b"byte-offset" => conf.byte_offset = true,
         b"with-filename" => conf.with_filename = Some(true),
         b"no-filename" => conf.with_filename = Some(false),
         b"directories" => {
@@ -1375,12 +1380,22 @@ fn compile(conf: &Conf, lines: &[Vec<u8>]) -> Result<Patterns, String> {
 /// `lineno` is `None` where the output has no line to name -- a `-c` count line
 /// takes the file name under `-n` but never a number, since the count is of the
 /// whole file.
+/// WHERE a printed line sits: the record number `-n` prints and the byte offset
+/// `-b` prints. Paired because every prefix wants both or neither and they are
+/// written together, and kept as two `Option`s rather than one because under
+/// `-o` the offset moves per span while the number does not.
+#[derive(Clone, Copy)]
+struct At {
+    no: Option<u64>,
+    byte: Option<u64>,
+}
+
 fn prefix(
     out: &mut Out,
     grep: &Grep,
     path: &[u8],
     show_name: bool,
-    lineno: Option<u64>,
+    at: At,
     sep: u8,
 ) -> std::io::Result<()> {
     if show_name {
@@ -1390,7 +1405,15 @@ fn prefix(
         out.write(&[if grep.conf.null_name { 0 } else { sep }])?;
     }
     if grep.conf.line_number {
-        if let Some(n) = lineno {
+        if let Some(n) = at.no {
+            out.write(&number(n))?;
+            out.write(&[sep])?;
+        }
+    }
+    // AFTER the line number: `grep -bn` prints `2:6:beta`, not the other way
+    // round, and the two are independent rather than one implying the other.
+    if grep.conf.byte_offset {
+        if let Some(n) = at.byte {
             out.write(&number(n))?;
             out.write(&[sep])?;
         }
@@ -1406,7 +1429,9 @@ fn write_spans(
     out: &mut Out,
     display: &[u8],
     show_name: bool,
-    lineno: u64,
+    // The LINE's position. Each span reprints it with its own byte offset, this
+    // one's plus the span's place in the line, which is what `-bo` prints.
+    line_at: At,
     sep: u8,
     line: &[u8],
 ) -> Result<(), String> {
@@ -1414,19 +1439,26 @@ fn write_spans(
         r.map_err(|e| format!("write error: {}", errmsg(&e)))
     };
     let data_sep = if grep.conf.null_data { 0u8 } else { b'\n' };
-    let mut at = 0usize;
-    while let Some((s, e)) = grep.match_at(line, at, OnBudget::Fail)? {
+    // A cursor INTO the line, not an offset: `At` next door means the other one.
+    let mut scan = 0usize;
+    while let Some((s, e)) = grep.match_at(line, scan, OnBudget::Fail)? {
         if e == s {
-            at = s + 1;
-            if at > line.len() {
+            scan = s + 1;
+            if scan > line.len() {
                 break;
             }
             continue;
         }
-        io(prefix(out, grep, display, show_name, Some(lineno), sep))?;
+        let span = At {
+            no: line_at.no,
+            byte: line_at
+                .byte
+                .map(|b| b.saturating_add(u64::try_from(s).unwrap_or(u64::MAX))),
+        };
+        io(prefix(out, grep, display, show_name, span, sep))?;
         io(out.write(line.get(s..e).unwrap_or_default()))?;
         io(out.write(&[data_sep]))?;
-        at = e;
+        scan = e;
     }
     Ok(())
 }
@@ -1436,7 +1468,7 @@ fn write_spans(
 /// reallocated per line, and a search without `-B` builds none at all.
 struct Before {
     cap: usize,
-    slots: Vec<(Vec<u8>, bool, u64)>,
+    slots: Vec<(Vec<u8>, bool, u64, u64)>,
     /// Where the next push lands, once the ring is full.
     head: usize,
 }
@@ -1454,7 +1486,7 @@ impl Before {
     /// this is the one place a search's memory is driven by an OPTION rather
     /// than by a buffer, and it has to fail the way a read does -- a diagnosed
     /// `out of memory` and exit 2, not the abort a bare `Vec::push` gives.
-    fn push(&mut self, line: &[u8], term: bool, no: u64) -> Result<(), ()> {
+    fn push(&mut self, line: &[u8], term: bool, no: u64, at: u64) -> Result<(), ()> {
         if self.cap == 0 {
             return Ok(());
         }
@@ -1463,7 +1495,7 @@ impl Before {
             text.try_reserve(line.len()).map_err(|_| ())?;
             text.extend_from_slice(line);
             self.slots.try_reserve(1).map_err(|_| ())?;
-            self.slots.push((text, term, no));
+            self.slots.push((text, term, no, at));
             return Ok(());
         }
         if let Some(slot) = self.slots.get_mut(self.head) {
@@ -1472,6 +1504,7 @@ impl Before {
             slot.0.extend_from_slice(line);
             slot.1 = term;
             slot.2 = no;
+            slot.3 = at;
         }
         self.head = self.head.saturating_add(1) % self.cap;
         Ok(())
@@ -1481,7 +1514,11 @@ impl Before {
     /// they print in. Where to start is ARITHMETIC rather than a scan: the ring
     /// holds a contiguous run ending at the line before the current one, so a
     /// `-B 1000000` window is not walked a million times to print three lines.
-    fn iter_from(&self, first: u64, oldest: u64) -> impl Iterator<Item = &(Vec<u8>, bool, u64)> {
+    fn iter_from(
+        &self,
+        first: u64,
+        oldest: u64,
+    ) -> impl Iterator<Item = &(Vec<u8>, bool, u64, u64)> {
         let n = self.slots.len();
         let base = if n < self.cap { 0 } else { self.head };
         let skip = usize::try_from(first.saturating_sub(oldest)).unwrap_or(usize::MAX).min(n);
@@ -1586,13 +1623,18 @@ fn search_file(
             // range starts one PAST the subtraction.
             let first =
                 lineno.saturating_add(dropped).saturating_sub(replay).saturating_add(1);
+            // Their BYTES are the tail of the run, which ended where this
+            // record begins -- one byte each, being a separator and nothing else.
+            let first_at = rec.offset().saturating_sub(replay);
             for i in 0..replay {
-                if window.push(b"", true, first.saturating_add(i)).is_err() {
+                let at = first_at.saturating_add(i);
+                if window.push(b"", true, first.saturating_add(i), at).is_err() {
                     return Err("out of memory".to_string());
                 }
             }
         }
         lineno = lineno.saturating_add(dropped).saturating_add(1);
+        let at = rec.offset();
         let line = rec.line();
         // The binary verdict is asked HERE rather than once per file: it is the
         // buffer this record arrived in that decides, and a NUL in a later
@@ -1637,14 +1679,17 @@ fn search_file(
                     // The window holds lines strictly older than this one, so
                     // `ctx_start` alone bounds the run -- there is no upper end
                     // to test for.
-                    for (ctx, ctx_term, no) in window.iter_from(ctx_start, window.oldest(lineno)) {
+                    let oldest = window.oldest(lineno);
+                    for (ctx, ctx_term, no, ctx_at) in window.iter_from(ctx_start, oldest) {
                         if grep.conf.only {
                             if grep.conf.prints_context_spans() {
-                                write_spans(grep, out, display, show_name, *no, b'-', ctx)?;
+                                let w = At { no: Some(*no), byte: Some(*ctx_at) };
+                                write_spans(grep, out, display, show_name, w, b'-', ctx)?;
                             }
                             continue;
                         }
-                        io(prefix(out, grep, display, show_name, Some(*no), b'-'))?;
+                        let w = At { no: Some(*no), byte: Some(*ctx_at) };
+                        io(prefix(out, grep, display, show_name, w, b'-'))?;
                         io(out.write(ctx))?;
                         // Only the LAST record can lack a separator, so this is
                         // the same test the whole-file form spelled as "or there
@@ -1656,10 +1701,12 @@ fn search_file(
                 }
                 if grep.conf.only {
                     if grep.conf.prints_selected_spans() {
-                        write_spans(grep, out, display, show_name, lineno, b':', line)?;
+                        let w = At { no: Some(lineno), byte: Some(at) };
+                        write_spans(grep, out, display, show_name, w, b':', line)?;
                     }
                 } else {
-                    io(prefix(out, grep, display, show_name, Some(lineno), b':'))?;
+                    let w = At { no: Some(lineno), byte: Some(at) };
+                    io(prefix(out, grep, display, show_name, w, b':'))?;
                     io(out.write(line))?;
                     // GNU terminates every line it prints, including a final
                     // input line that carried no newline of its own.
@@ -1680,10 +1727,12 @@ fn search_file(
         } else if pending_after > 0 && !grep.conf.count {
             if grep.conf.only {
                 if grep.conf.prints_context_spans() {
-                    write_spans(grep, out, display, show_name, lineno, b'-', line)?;
+                    let w = At { no: Some(lineno), byte: Some(at) };
+                    write_spans(grep, out, display, show_name, w, b'-', line)?;
                 }
             } else {
-                io(prefix(out, grep, display, show_name, Some(lineno), b'-'))?;
+                let w = At { no: Some(lineno), byte: Some(at) };
+                io(prefix(out, grep, display, show_name, w, b'-'))?;
                 io(out.write(line))?;
                 io(out.write(&[sep]))?;
             }
@@ -1693,7 +1742,7 @@ fn search_file(
         if out.is_broken() {
             break;
         }
-        if keep_window && window.push(rec.line(), rec.terminated(), lineno).is_err() {
+        if keep_window && window.push(rec.line(), rec.terminated(), lineno, at).is_err() {
             if !grep.conf.no_messages {
                 errb(&name_in("", display, ": out of memory"));
             }
@@ -1709,7 +1758,7 @@ fn search_file(
     // `-l`/`-L` outrank `-c` the same way: GNU goes quiet for everything but the
     // NAME, so `grep -cl a f` prints `f` and not the count before it.
     if grep.conf.count && !grep.conf.files_with && !grep.conf.files_without {
-        io(prefix(out, grep, display, show_name, None, b':'))?;
+        io(prefix(out, grep, display, show_name, At { no: None, byte: None }, b':'))?;
         io(out.write(&number(count)))?;
         io(out.write(b"\n"))?;
     }
