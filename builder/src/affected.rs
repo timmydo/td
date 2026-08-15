@@ -1,8 +1,8 @@
 //! affected-checks — `td-builder affected-checks` (rust-migration C1).
 //!
 //! Maps a branch's changed paths to a right-sized check set and decides whether the
-//! full `./check.sh` is waived or required — the local PR-readiness gate (CLAUDE.md
-//! §"Diff-sized local check and waiver"). This is the cutover of
+//! full `td-builder check` is waived or required — the local pre-push gate
+//! (AGENTS.md §"Tests"). This is the cutover of
 //! `tools/affected-checks.sh`: the 1284-line shell dispatcher is DELETED and callers
 //! invoke this subcommand directly.
 //!
@@ -212,7 +212,7 @@ fn stem_of(file: &Path) -> Option<String> {
 /// check-engine smoke covers them — parity with the old extractor, which
 /// scanned CHEAP/HEAVY/FAST/SYSTEM/PARKED and intentionally not ENGINE).
 /// PARKED gates stay mapped: a parked gate (a human unhooked it pending a
-/// tracked fix) remains an on-demand `./check.sh <gate>` target.
+/// tracked fix) remains an on-demand `td-builder check <gate>` target.
 fn target_from_gate_file(file: &Path) -> Option<String> {
     let stem = stem_of(file)?;
     let def = def_for_stem(&stem)?;
@@ -741,7 +741,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     if p == "tests/heal-revert.sh" {
         // The heal primitive's behavioral test — git is absent from the loop
-        // sandbox, so it is not a ./check.sh gate; the dev host runs it directly.
+        // sandbox, so it is not a gate at all; the dev host runs it directly.
         sel.add_preflight("shell-syntax");
         sel.add_preflight("heal-revert");
         return;
