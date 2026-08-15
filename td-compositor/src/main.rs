@@ -680,34 +680,47 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
     }
 
     /// `ioctl(2)`'s request number chooses the operation, so the roster is the
-    /// confinement: these four values, one entry point, and four callers.
+    /// confinement: these six values, one entry point, and five callers.
     #[test]
-    fn the_ioctl_surface_is_four_pinned_requests_and_four_wrappers() {
+    fn the_ioctl_surface_is_six_pinned_requests_and_five_wrappers() {
         for request in [
             "const TIOCSPTLCK: usize = 0x4004_5431;",
             "const TIOCGPTPEER: usize = 0x5441;",
             "const TIOCSWINSZ: usize = 0x5414;",
             "const TIOCGWINSZ: usize = 0x5413;",
+            "const EVIOCGABS_X: usize = 0x8018_4540;",
+            "const EVIOCGABS_Y: usize = 0x8018_4541;",
         ] {
             assert!(SYS.contains(request), "{request}");
         }
         assert_eq!(occurrences(SYS, "const TIOC"), 4);
+        assert_eq!(occurrences(SYS, "const EVIOCGABS"), 2);
+        // The two evdev requests differ in ONE nibble, and the size field of
+        // each has to be the 24 bytes `ABSINFO_WORDS` declares — so the axis
+        // is chosen by an enum ARM rather than by a number at a call site.
+        // Counted over the shipped half alone, as the roster scans below are:
+        // the crate's own tests name these numbers to assert things about
+        // them, and a pin that moved whenever a test did would pin nothing.
+        // Three each: the declaration, the guard, and the arm that picks it.
+        assert_eq!(occurrences(SYS, "const ABSINFO_WORDS: usize = 6;"), 1);
+        assert_eq!(occurrences(production(SYS), "EVIOCGABS_X"), 3);
+        assert_eq!(occurrences(production(SYS), "EVIOCGABS_Y"), 3);
         // The guard names each request once more; every other mention is a
         // wrapper passing it to the one entry point.
         let guard = r#"    if !matches!(
         request,
-        TIOCSPTLCK | TIOCGPTPEER | TIOCSWINSZ | TIOCGWINSZ
+        TIOCSPTLCK | TIOCGPTPEER | TIOCSWINSZ | TIOCGWINSZ | EVIOCGABS_X | EVIOCGABS_Y
     ) {"#;
         assert_eq!(occurrences(SYS, guard), 1);
         let entry = r#"    errno_result(syscall3(SYS_IOCTL, fd as usize, request, argument), operation)"#;
         assert_eq!(occurrences(SYS, entry), 1);
         assert_eq!(occurrences(SYS, "fn ioctl("), 1);
-        // One definition plus exactly four call sites: a FIFTH wrapper reusing
+        // One definition plus exactly five call sites: a SIXTH wrapper reusing
         // a pinned request would satisfy every other assertion here.
         let production_sys = production(SYS);
         let mentions = occurrences(production_sys, "ioctl(");
         let prose = occurrences(production_sys, "ioctl(2)");
-        assert_eq!(mentions - prose, 5);
+        assert_eq!(mentions - prose, 6);
         // The four wrappers, each reaching that entry point exactly once with
         // its own request and its own operand.
         for (wrapper, call) in [
@@ -731,14 +744,28 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             assert!(SYS.contains(wrapper), "{wrapper}");
             assert_eq!(occurrences(SYS, call), 1, "{wrapper}");
         }
+        // The fifth takes its request from an AXIS rather than being handed
+        // one, so the two evdev numbers are unreachable from any call site.
+        assert!(SYS.contains("pub fn absolute_info(device: &impl AsRawFd, axis: AbsAxis)"));
+        assert_eq!(
+            occurrences(
+                SYS,
+                "        device.as_raw_fd(),\n        request,\n        (&mut words as *mut [i32; ABSINFO_WORDS]) as usize,\n        name,"
+            ),
+            1
+        );
         // The peer's open flags are pinned rather than chosen by a caller: the
         // slave belongs to the child, so O_NOCTTY cannot be forgotten.
         assert!(SYS.contains("const PTY_PEER_FLAGS: usize = 0o2 | 0o400 | 0o2_000_000;"));
         // The eight bytes the kernel reads are an array whose layout the
-        // language guarantees, not an attribute nobody can observe.
+        // language guarantees, not an attribute nobody can observe. Same for
+        // the absinfo's twenty-four, where the three leading words are the
+        // same type and a slipped index is a well-formed wrong range.
         assert!(SYS.contains("fn winsize_words(size: WindowSize) -> [u16; 4] {"));
         assert_eq!(occurrences(SYS, "as *const [u16; 4]"), 1);
         assert_eq!(occurrences(SYS, "as *mut [u16; 4]"), 1);
+        assert_eq!(occurrences(SYS, "as *mut [i32; ABSINFO_WORDS]"), 1);
+        assert!(SYS.contains("fn absinfo(words: [i32; ABSINFO_WORDS]) -> AbsInfo {"));
     }
 
     #[test]
@@ -773,11 +800,12 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         }
     }
 
-    /// Two disjoint reviewed surfaces live behind one syscall body, so each is
-    /// pinned to its own module: descriptor transport to the protocol
-    /// endpoints, terminal control to the PTY adapter. Nothing else names
-    /// `sys` at all — an alias elsewhere would give an audited call a name
-    /// neither of these scans looks for.
+    /// Three disjoint reviewed surfaces live behind one syscall body, so each
+    /// is pinned to its own module: descriptor transport to the protocol
+    /// endpoints, terminal control to the PTY adapter, an absolute device's
+    /// axis range to the evdev reader. Nothing else names `sys` at all — an
+    /// alias elsewhere would give an audited call a name none of these scans
+    /// looks for.
     #[test]
     fn each_confined_operation_is_reachable_only_from_its_own_module() {
         const TRANSPORT: &[&str] = &[
@@ -792,12 +820,35 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             "sys::set_window_size(",
             "sys::window_size(",
         ];
+        // The third surface, and the reason the module list below grew: an
+        // absolute pointer's range is asked for where the device file is
+        // opened, and again only at a recovery.
+        const ABSOLUTE: &[&str] = &["sys::absolute_info("];
+        // Each axis asked once and asked FOR ITS OWN COORDINATE, neither of
+        // which a runtime test on this gate can see: a pair that asks X twice,
+        // or that crosses the two, is a well-formed pair of ranges that maps
+        // every report to the wrong part of the screen, and the gate has no
+        // absolute device to notice with. The counts alone catch only the
+        // first — crossing the two leaves both at one — so the call sites are
+        // pinned whole, as `sys.rs`'s wrappers are.
+        let input = production(include_str!("input.rs"));
+        assert_eq!(occurrences(input, "sys::AbsAxis::X"), 1);
+        assert_eq!(occurrences(input, "sys::AbsAxis::Y"), 1);
+        for call in [
+            "let x = sys::absolute_info(device, sys::AbsAxis::X).ok()?;",
+            "let y = sys::absolute_info(device, sys::AbsAxis::Y).ok()?;",
+        ] {
+            assert!(input.contains(call), "input.rs no longer spells `{call}`");
+        }
         let production_main = production(MAIN);
         for (name, source) in std::iter::once(("main.rs", production_main))
             .chain(OTHER.iter().copied())
             .chain(TEST_ONLY.iter().copied())
         {
-            if matches!(name, "client.rs" | "conn.rs" | "server.rs" | "pty.rs") {
+            if matches!(
+                name,
+                "client.rs" | "conn.rs" | "server.rs" | "pty.rs" | "input.rs"
+            ) {
                 continue;
             }
             assert!(
@@ -862,14 +913,33 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             );
             assert!(!pty.contains(operation), "pty.rs reached {operation}");
         }
+        let input = include_str!("input.rs");
         for operation in TERMINAL {
             assert!(pty.contains(operation), "{operation}");
             assert!(
                 !client.contains(operation)
                     && !conn.contains(operation)
-                    && !server.contains(operation),
-                "a protocol endpoint reached {operation}"
+                    && !server.contains(operation)
+                    && !input.contains(operation),
+                "a module outside the terminal reached {operation}"
             );
+        }
+        // The three surfaces are DISJOINT, which is what makes the roster a
+        // statement about each rather than about their union: the input reader
+        // may ask a device for its range and nothing else, and no module that
+        // speaks the protocol or drives a terminal may ask at all.
+        for operation in ABSOLUTE {
+            assert!(input.contains(operation), "{operation}");
+            assert!(
+                !client.contains(operation)
+                    && !conn.contains(operation)
+                    && !server.contains(operation)
+                    && !pty.contains(operation),
+                "a module outside the input reader reached {operation}"
+            );
+        }
+        for operation in TRANSPORT.iter().chain(TERMINAL) {
+            assert!(!input.contains(operation), "input.rs reached {operation}");
         }
         // Both wrappers are generic over `AsRawFd`, so inside pty.rs they
         // would type-check against ANY terminal — including an operator's.

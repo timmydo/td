@@ -9,7 +9,7 @@ use crate::pointer::{
     PointerButtonInput, PointerButtonState, PointerSnapshot, PointerState, PointerTarget,
     RoutedPointerFrame,
 };
-use crate::scene::{Scene, SharedInputRegion, Surface, SurfaceKey};
+use crate::scene::{Fraction, Scene, SharedInputRegion, Surface, SurfaceKey};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -482,6 +482,37 @@ impl Runtime {
         let moved =
             self.scene
                 .move_pointer(dx, dy, self.framebuffer.width, self.framebuffer.height);
+        self.pointer_report(time, moved, buttons)
+    }
+
+    /// The same report from an ABSOLUTE device, which says where the pointer
+    /// IS rather than how far it went. Everything after the placement is the
+    /// relative path's, unchanged and deliberately so: what differs between a
+    /// mouse and a tablet is how the position is arrived at, and nothing about
+    /// focus, grabs, claims or drags should be able to tell them apart.
+    ///
+    /// Both axes always: a report that named only one is completed by the
+    /// reader from where THAT device last was, so nothing here has to reason
+    /// about a coordinate the shared cursor happens to be holding.
+    pub fn pointer_frame_at(
+        &mut self,
+        time: u32,
+        x: Fraction,
+        y: Fraction,
+        buttons: &[PointerButtonInput],
+    ) -> Result<(), String> {
+        let moved = self
+            .scene
+            .place_pointer(x, y, self.framebuffer.width, self.framebuffer.height);
+        self.pointer_report(time, moved, buttons)
+    }
+
+    fn pointer_report(
+        &mut self,
+        time: u32,
+        moved: bool,
+        buttons: &[PointerButtonInput],
+    ) -> Result<(), String> {
         let modal = self.scene.modal();
         // Sampled BEFORE the frame, because the frame is what ENDS a grab: a
         // report carrying the last release along with its motion would

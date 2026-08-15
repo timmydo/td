@@ -271,8 +271,43 @@ back. The readback is the point, as it is for `losetup`'s read-only flag:
 nothing observable distinguishes a `TIOCSWINSZ` the kernel applied from
 one it clamped or ignored, and a child that lays out its screen for a size
 the terminal does not have is a terminal that looks broken with every test
-green. The request roster is enforced in code, not only in a test — one
-`ioctl` entry point refuses anything outside the four before issuing the
+green. Two more requests joined that roster for the ABSOLUTE pointer:
+`EVIOCGABS(ABS_X)`/`EVIOCGABS(ABS_Y)` (0x80184540/0x80184541), reached only
+from `input.rs`, which is a THIRD disjoint module on this surface rather
+than a widening of either existing one. A tablet reports a position in its
+own units, so mapping one to a screen needs the device's declared range, and
+nothing but this ioctl reports it — `/sys` carries which axes exist but not
+their bounds, and guessing would put the pointer somewhere other than where
+the operator is pointing. It is asked at open, and again only where an
+answer can have gone stale without a report saying so — a recovery, which a
+`SYN_DROPPED` and a button overflow both reach, since each discards a report
+this crate never sees the axes of; the SPAN is a property of the device rather
+than of any report, so nothing asks per frame. A device that
+refuses it is relative, which is the ordinary case and not an error. It asks
+for three of the six words: the two bounds, and `value` — where the axis IS
+at the moment it is asked, which is the only account of a device's position
+before it has reported anything, and which the kernel needs because it omits
+an axis whose value has not changed. The argument is pinned for the winsize
+buffer's reason, arriving at it differently. `EVIOCGABS` copies
+`sizeof(struct input_absinfo)` — 24 bytes, six `__s32` — through the pointer,
+and unlike the winsize and termios calls it takes that length from the MINIMUM
+of the REQUEST NUMBER's own size field and its own `sizeof`. Half of that is
+protective, and the half that is not is the reason the two must be pinned
+TOGETHER: an oversized number cannot make the copy longer, but a buffer
+shortened without the number is 24 bytes written into less — an out-of-bounds
+kernel write from code the compiler reads as safe. Both numbers encode that
+same 24 and a test checks it against `ABSINFO_WORDS`, so the two cannot drift
+apart. The axis is named by an ENUM
+rather
+than by a number at the call site, td-sh's `Disposition` shape: the two
+requests differ in one nibble, and a caller free to compose one could
+compose a third. Its buffer is an `[i32; 6]` for the winsize reason and
+more sharply — `value`, `minimum` and `maximum` are three ADJACENT words of
+the same type, so an index off by one is a well-formed position and range
+that maps every report to the wrong part of the screen, with nothing
+observable to say so.
+The request roster is enforced in code, not only in a test — one
+`ioctl` entry point refuses anything outside the six before issuing the
 syscall — and the winsize argument is an `[u16; 4]` rather than a
 `#[repr(C)]` struct so its field ORDER is a tested function; a swapped
 rows/columns pair is a well-formed resize to a different size.
@@ -282,19 +317,35 @@ NOT `OwnedFd::from_raw_fd`: that would be a second scoped allow of a
 different shape — a descriptor adoption rather than the
 syscall-instruction layer — and the crate can reopen by descriptor
 identity instead. Deliberately NOT in that surface: framebuffer and evdev
-I/O (ordinary files), Unix socket setup and byte I/O (`std`), mmap (wl_shm
+READING (ordinary files — every input REPORT td acts on arrives as bytes off
+a `File`; the one thing that does not is the POSITION a resync reads, since
+`EVIOCGABS` answers `value` beside the bounds and the recovery frame
+publishes it, which is a cursor move that came through this surface rather
+than through a file), Unix socket setup and
+byte I/O (`std`), mmap (wl_shm
 pixels are copied with `FileExt`), device ownership (safe `td-seatd`), or
 anything else the PTY needs — no termios call (the slave's kernel defaults
 ARE the canonical-input policy), no `setsid(2)` or `TIOCSCTTY` (the child
 gets its session from the declared `td-init` input's `cttyhack --stdin`),
 and no `fork`/`execve`/`dup2` (`Command` plus `Stdio::from(File)` cover
-all three). `td-compositor/DESIGN.md` is the normative UI-stack
+all three). Nor, on the evdev side: `EVIOCGABS` for any axis but X and Y
+(a pressure or tilt axis is not a place on a screen, and the request number
+is composed from the axis, so serving one would mean composing them);
+`EVIOCGBIT`/`EVIOCGNAME` (which axes a device HAS is answered by whether
+`EVIOCGABS` reports a SPAN — the call itself succeeds for every axis on a
+device that has an absinfo table at all, zeroed where it has none — and its
+name by `/sys`); and `EVIOCGRAB`, which would
+take a device away from everything else on the machine — td's compositor
+owns the console outright, so there is nothing to take it from, and a grab
+that outlived a crash would leave a keyboard nothing can type on.
+`td-compositor/DESIGN.md` is the normative UI-stack
 specification. Its confinement tests pin the allow count, assembly body,
 syscall numbers, callers, and absence of unsafe from every other module;
 adding another syscall or scoped allow is an amendment there AND here. The
-two surfaces behind the one body are pinned to disjoint modules —
+three surfaces behind the one body are pinned to disjoint modules —
 transport to `client.rs`/`conn.rs`/`server.rs`, terminal control to
-`pty.rs`, and no other module names `sys` at all. `conn.rs` is the client
+`pty.rs`, the absolute-axis range to `input.rs`, and no other module names
+`sys` at all. `conn.rs` is the client
 transport itself, extracted from `client.rs` so the terminal is a second
 USER of one connection rather than a second copy of it; the descriptor
 queue is intrinsic to that connection, so it moved with it. That widens the

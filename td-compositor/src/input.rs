@@ -8,6 +8,8 @@ use crate::pointer::{
     PointerButtonInput, PointerButtonState, MAX_POINTER_BUTTON_TRANSITIONS_PER_FRAME,
 };
 use crate::runtime::Runtime;
+use crate::scene::Fraction;
+use crate::sys;
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::Read;
@@ -24,10 +26,13 @@ const READ_BATCH_BYTES: usize = EVENT_SIZE * READ_BATCH_RECORDS;
 const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;
 const EV_REL: u16 = 2;
+const EV_ABS: u16 = 3;
 const SYN_REPORT: u16 = 0;
 const SYN_DROPPED: u16 = 3;
 const REL_X: u16 = 0;
 const REL_Y: u16 = 1;
+const ABS_X: u16 = 0;
+const ABS_Y: u16 = 1;
 const KEY_ESC: u16 = 1;
 const KEY_1: u16 = 2;
 const KEY_2: u16 = 3;
@@ -482,10 +487,68 @@ impl Event {
     }
 }
 
+/// Where a device's absolute axes are and what they report over, read once per
+/// device when its reader starts. A device with neither is relative and carries
+/// `None`, which is what makes an ordinary mouse cost no ioctl and no branch it
+/// does not use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AbsoluteAxes {
+    x: sys::AbsInfo,
+    y: sys::AbsInfo,
+}
+
+impl AbsoluteAxes {
+    /// A device is absolute exactly when BOTH its axes have a span to place a
+    /// value in. Asked of `fraction` rather than of the numbers, so the
+    /// admission test and the scaling cannot come to different conclusions
+    /// about a span.
+    fn declared(x: sys::AbsInfo, y: sys::AbsInfo) -> Option<Self> {
+        (Self::fraction(x, x.maximum).denominator > 0
+            && Self::fraction(y, y.maximum).denominator > 0)
+            .then_some(Self { x, y })
+    }
+
+    /// Where along the axis a raw value sits, as the EXACT ratio of the
+    /// device's own offset to the device's own span — nothing is rescaled
+    /// here, since a second division is a second flooring.
+    ///
+    /// Values outside the declared range are CLAMPED rather than refused: a
+    /// device may report past its own bounds, and the honest reading of one
+    /// that does is the edge it went past. A span that is not positive answers
+    /// a zero DENOMINATOR rather than an error, which is `declared`'s question
+    /// and which `across` reads as the near edge.
+    fn fraction(axis: sys::AbsInfo, value: i32) -> Fraction {
+        let span = i64::from(axis.maximum).saturating_sub(i64::from(axis.minimum));
+        let offset = i64::from(value)
+            .saturating_sub(i64::from(axis.minimum))
+            .clamp(0, span.max(0));
+        Fraction {
+            numerator: u32::try_from(offset).unwrap_or(u32::MAX),
+            denominator: u32::try_from(span).unwrap_or(0),
+        }
+    }
+}
+
 #[derive(Default)]
 struct PointerMotion {
     dx: i32,
     dy: i32,
+    /// The absolute value each axis reported in the frame being built. A
+    /// tablet sends a POSITION rather than a movement, so the frame carries
+    /// the newest one rather than a sum. Separate options because the kernel
+    /// omits an axis whose value has not changed, so a report can name one and
+    /// say nothing about the other.
+    abs_x: Option<i32>,
+    abs_y: Option<i32>,
+    /// Where THIS DEVICE last was, which is what an omitted axis means. The
+    /// cursor's own coordinate will not do: it is shared, so a relative mouse
+    /// moving between two tablet reports would leave the axis the tablet did
+    /// not mention wherever the MOUSE put it, which is nowhere the stylus is.
+    /// `None` until the first report, and answered from `input_absinfo.value`
+    /// then — the axis's position at open, which is the only way to know where
+    /// a device is before it has said anything.
+    held_x: Option<i32>,
+    held_y: Option<i32>,
     pressed: BTreeSet<u16>,
     buttons: Vec<PointerButtonTransition>,
     overflowed: bool,
@@ -497,11 +560,21 @@ struct PointerButtonTransition {
     pressed: bool,
 }
 
+/// Where a frame says the pointer is. A relative device can only say how far
+/// it moved; an absolute one says where it IS, as a fraction of its own span
+/// along BOTH axes. Both even though a report may name only one: the reader
+/// holds where the device last was, so the axis a report omits is answered
+/// from that device rather than from the shared cursor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PointerPlace {
+    By { dx: i32, dy: i32 },
+    At { x: Fraction, y: Fraction },
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct PointerFrame {
     time: u32,
-    dx: i32,
-    dy: i32,
+    place: PointerPlace,
     buttons: Vec<PointerButtonTransition>,
 }
 
@@ -522,6 +595,18 @@ trait InputTarget {
         time: u32,
         dx: i32,
         dy: i32,
+        buttons: &[PointerButtonInput],
+    ) -> Result<(), String>;
+
+    /// The absolute form of the same report. Separate rather than one method
+    /// with a sum type, because the two are different questions to everything
+    /// downstream: one composes with where the pointer was and the other
+    /// replaces it.
+    fn pointer_frame_at(
+        &mut self,
+        time: u32,
+        x: Fraction,
+        y: Fraction,
         buttons: &[PointerButtonInput],
     ) -> Result<(), String>;
 
@@ -611,6 +696,19 @@ impl InputTarget for LiveInputTarget {
             .pointer_frame(time, dx, dy, buttons)
     }
 
+    fn pointer_frame_at(
+        &mut self,
+        time: u32,
+        x: Fraction,
+        y: Fraction,
+        buttons: &[PointerButtonInput],
+    ) -> Result<(), String> {
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .pointer_frame_at(time, x, y, buttons)
+    }
+
     fn flush(&mut self) -> Result<(), String> {
         self.runtime
             .lock()
@@ -620,10 +718,14 @@ impl InputTarget for LiveInputTarget {
 }
 
 impl PointerMotion {
-    fn feed(&mut self, event: Event) -> Option<PointerFrame> {
+    fn feed(&mut self, event: Event, axes: Option<AbsoluteAxes>) -> Option<PointerFrame> {
         match (event.kind, event.code) {
             (EV_REL, REL_X) => self.dx = self.dx.saturating_add(event.value),
             (EV_REL, REL_Y) => self.dy = self.dy.saturating_add(event.value),
+            // Recorded raw. Whether it MEANS anything is the frame's question,
+            // since only a declared range turns a value into a place.
+            (EV_ABS, ABS_X) => self.abs_x = Some(event.value),
+            (EV_ABS, ABS_Y) => self.abs_y = Some(event.value),
             (EV_KEY, BTN_MOUSE..=BTN_TASK)
                 if event.value == KEY_PRESS || event.value == KEY_RELEASE =>
             {
@@ -637,6 +739,8 @@ impl PointerMotion {
                     if self.buttons.len() >= MAX_POINTER_BUTTON_TRANSITIONS_PER_FRAME {
                         self.dx = 0;
                         self.dy = 0;
+                        self.abs_x = None;
+                        self.abs_y = None;
                         self.pressed.clear();
                         self.buttons.clear();
                         self.overflowed = true;
@@ -648,17 +752,91 @@ impl PointerMotion {
                     }
                 }
             }
-            (EV_SYN, SYN_REPORT) if self.dx != 0 || self.dy != 0 || !self.buttons.is_empty() => {
-                return Some(PointerFrame {
-                    time: event.time,
-                    dx: std::mem::take(&mut self.dx),
-                    dy: std::mem::take(&mut self.dy),
-                    buttons: std::mem::take(&mut self.buttons),
-                });
-            }
+            (EV_SYN, SYN_REPORT) => return self.frame(event.time, axes),
             _ => {}
         }
         None
+    }
+
+    /// A device with no absolute axes, which is every test about deltas and
+    /// buttons — and the ordinary mouse those tests are written for.
+    #[cfg(test)]
+    fn feed_relative(&mut self, event: Event) -> Option<PointerFrame> {
+        self.feed(event, None)
+    }
+
+    /// Abandon the frame being accumulated and every button believed held,
+    /// which is what a dropped batch and a button overflow both mean.
+    ///
+    /// The HELD POSITION survives, deliberately: it is not frame state but the
+    /// last thing this device said about where it is, and the alternative on
+    /// the next one-axis report is the position the kernel gave at OPEN — a
+    /// jump to wherever the device was when the compositor started. The
+    /// kernel's advice after `SYN_DROPPED` is to re-query the device, which
+    /// this reader cannot do: it takes an `impl Read` so its tests can drive
+    /// it from a byte slice, and a slice has no descriptor to ask. Keeping
+    /// the last known position is the closest thing available, and it is what
+    /// every ordinary report between two frames already relies on.
+    fn reset(&mut self) {
+        let (held_x, held_y) = (self.held_x, self.held_y);
+        *self = PointerMotion::default();
+        self.held_x = held_x;
+        self.held_y = held_y;
+    }
+
+    /// Adopt a position the DEVICE reported out of band, which only the
+    /// recovery may do: it has just re-read the device, so this is where it
+    /// is, and anything remembered from before the gap is a guess.
+    fn hold(&mut self, x: i32, y: i32) {
+        self.held_x = Some(x);
+        self.held_y = Some(y);
+    }
+
+    /// Close the frame being accumulated, or answer `None` where it would say
+    /// nothing. A position WINS over a delta in the same frame rather than
+    /// composing with it: the two are different claims about the same pointer,
+    /// and a device that sends both — a touchpad in absolute mode — means the
+    /// place, with the deltas its own smoothing of the way there.
+    ///
+    /// An absolute device's frame is a PLACE unless the only thing in it is a
+    /// distance. A BUTTON needs somewhere to land as much as a motion does,
+    /// and a click that did not move is the ordinary case rather than a corner
+    /// one: the kernel drops both axes as unchanged, so a tablet tapped twice
+    /// in the same spot sends nothing but `BTN_*`. Read as a zero delta it
+    /// would click wherever another device last left the shared cursor.
+    fn frame(&mut self, time: u32, axes: Option<AbsoluteAxes>) -> Option<PointerFrame> {
+        let buttons = std::mem::take(&mut self.buttons);
+        let (dx, dy) = (std::mem::take(&mut self.dx), std::mem::take(&mut self.dy));
+        let (raw_x, raw_y) = (self.abs_x.take(), self.abs_y.take());
+        let place = match axes {
+            Some(axes) if raw_x.is_some() || raw_y.is_some() || !buttons.is_empty() => {
+                let x = raw_x.or(self.held_x).unwrap_or(axes.x.value);
+                let y = raw_y.or(self.held_y).unwrap_or(axes.y.value);
+                self.held_x = Some(x);
+                self.held_y = Some(y);
+                PointerPlace::At {
+                    x: AbsoluteAxes::fraction(axes.x, x),
+                    y: AbsoluteAxes::fraction(axes.y, y),
+                }
+            }
+            _ => PointerPlace::By { dx, dy },
+        };
+        // A frame that neither moves the pointer nor changes a button is one
+        // the compositor owes nothing for. An absolute frame is never that:
+        // the arm above is taken only when an axis reported or a button
+        // changed, and the kernel drops an axis whose value did not change.
+        let silent = match place {
+            PointerPlace::By { dx, dy } => dx == 0 && dy == 0,
+            PointerPlace::At { .. } => false,
+        };
+        if silent && buttons.is_empty() {
+            return None;
+        }
+        Some(PointerFrame {
+            time,
+            place,
+            buttons,
+        })
     }
 }
 
@@ -828,8 +1006,9 @@ fn apply<T: InputTarget>(
     device: usize,
     bindings: &Mutex<KeyBindings>,
     pointer: &mut PointerMotion,
+    axes: Option<AbsoluteAxes>,
 ) -> Result<(), String> {
-    let frame = pointer.feed(event);
+    let frame = pointer.feed(event, axes);
     if event.kind != EV_KEY && frame.is_none() {
         return Ok(());
     }
@@ -853,19 +1032,38 @@ fn apply<T: InputTarget>(
         .map_err(|_| "runtime lock poisoned".to_string())?;
     deliver_key_decision(&mut *runtime, &mut bindings, decision)?;
     if let Some(frame) = frame {
-        let mut buttons = bindings.pointer_device_changes(device, &frame.buttons, frame.time);
-        if bindings.launcher_open || bindings.help_open {
-            buttons.retain(|button| button.state == PointerButtonState::Released);
-        }
-        let delivery = if frame.dx != 0 || frame.dy != 0 || !buttons.is_empty() {
-            runtime.pointer_frame(frame.time, frame.dx, frame.dy, &buttons)
-        } else {
-            Ok(())
-        };
-        bindings.commit_pointer_device(device, &pointer.pressed, &buttons);
-        delivery?;
+        deliver_pointer_frame(
+            &mut *runtime,
+            &mut bindings,
+            device,
+            &frame,
+            &pointer.pressed,
+        )?;
     }
     Ok(())
+}
+
+/// Put one pointer frame through the button bookkeeping, the overlay filter,
+/// and the place or distance itself. Two callers: an ordinary report, and the
+/// recovery below, which has a position to publish and no event to hang it on.
+fn deliver_pointer_frame<T: InputTarget>(
+    runtime: &mut T,
+    bindings: &mut KeyBindings,
+    device: usize,
+    frame: &PointerFrame,
+    pressed: &BTreeSet<u16>,
+) -> Result<(), String> {
+    let mut buttons = bindings.pointer_device_changes(device, &frame.buttons, frame.time);
+    if bindings.launcher_open || bindings.help_open {
+        buttons.retain(|button| button.state == PointerButtonState::Released);
+    }
+    let delivery = match frame.place {
+        PointerPlace::By { dx, dy } if dx == 0 && dy == 0 && buttons.is_empty() => Ok(()),
+        PointerPlace::By { dx, dy } => runtime.pointer_frame(frame.time, dx, dy, &buttons),
+        PointerPlace::At { x, y } => runtime.pointer_frame_at(frame.time, x, y, &buttons),
+    };
+    bindings.commit_pointer_device(device, pressed, &buttons);
+    delivery
 }
 
 fn deliver_key_decision<T: InputTarget>(
@@ -984,31 +1182,105 @@ fn release_device<T: InputTarget>(
     }
 }
 
+/// What a reader carries between one device's events: the frame being
+/// accumulated, whether a dropped batch is still being discarded, what the
+/// device said about its absolute axes, and how to ask it again.
+struct DeviceState<'a> {
+    pointer: PointerMotion,
+    dropped: bool,
+    axes: Option<AbsoluteAxes>,
+    resync: &'a mut dyn FnMut() -> Option<AbsoluteAxes>,
+}
+
+impl DeviceState<'_> {
+    fn new(
+        axes: Option<AbsoluteAxes>,
+        resync: &mut dyn FnMut() -> Option<AbsoluteAxes>,
+    ) -> DeviceState<'_> {
+        DeviceState {
+            pointer: PointerMotion::default(),
+            dropped: false,
+            axes,
+            resync,
+        }
+    }
+
+    /// The recovery boundary, and the one moment the device can be asked.
+    /// `SYN_DROPPED` means reports were lost, and the kernel does not re-send
+    /// an axis it believes unchanged — it compares against the value IT last
+    /// emitted, not the one that arrived — so an axis that moved inside the
+    /// gap would stay stale until it moved again. Only the device still knows.
+    /// A resync that fails leaves the held position standing, which is the
+    /// best remaining answer rather than a jump back to the position at open.
+    ///
+    /// Answers the frame that PUBLISHES the fresh position, because nothing
+    /// else will: from here the kernel sends only changes, so a device that
+    /// moved during the gap and then stopped would leave the cursor wherever
+    /// it was until it happened to move again. Buttonless — the drop already
+    /// released everything this device held.
+    fn recover(&mut self, time: u32) -> Option<PointerFrame> {
+        self.axes?;
+        let fresh = (self.resync)()?;
+        self.axes = Some(fresh);
+        self.pointer.hold(fresh.x.value, fresh.y.value);
+        Some(PointerFrame {
+            time,
+            place: PointerPlace::At {
+                x: AbsoluteAxes::fraction(fresh.x, fresh.x.value),
+                y: AbsoluteAxes::fraction(fresh.y, fresh.y.value),
+            },
+            buttons: Vec::new(),
+        })
+    }
+}
+
 fn apply_device_event<T: InputTarget>(
     runtime: &Mutex<T>,
     event: Event,
     device: usize,
     bindings: &Mutex<KeyBindings>,
-    pointer: &mut PointerMotion,
-    dropped: &mut bool,
+    state: &mut DeviceState<'_>,
 ) -> Result<(), String> {
-    if *dropped {
+    if state.dropped {
         if event.kind == EV_SYN && event.code == SYN_REPORT {
-            *dropped = false;
+            state.dropped = false;
+            if let Some(frame) = state.recover(event.time) {
+                // Same lock order as `apply`: bindings, then the runtime.
+                let mut bindings = bindings
+                    .lock()
+                    .map_err(|_| "input bindings lock poisoned".to_string())?;
+                let mut runtime = runtime
+                    .lock()
+                    .map_err(|_| "runtime lock poisoned".to_string())?;
+                deliver_pointer_frame(
+                    &mut *runtime,
+                    &mut bindings,
+                    device,
+                    &frame,
+                    &state.pointer.pressed,
+                )?;
+            }
         }
         return Ok(());
     }
     if event.kind == EV_SYN && event.code == SYN_DROPPED {
-        *pointer = PointerMotion::default();
+        state.pointer.reset();
         release_device(runtime, device, bindings, event.time)?;
-        *dropped = true;
+        state.dropped = true;
         return Ok(());
     }
-    apply(runtime, event, device, bindings, pointer)?;
-    if pointer.overflowed {
-        *pointer = PointerMotion::default();
+    apply(
+        runtime,
+        event,
+        device,
+        bindings,
+        &mut state.pointer,
+        state.axes,
+    )?;
+    if state.pointer.overflowed {
+        state.pointer.reset();
         release_device(runtime, device, bindings, event.time)?;
-        *dropped = true;
+        state.dropped = true;
     }
     Ok(())
 }
@@ -1039,11 +1311,12 @@ fn read_device<T: InputTarget>(
     device: usize,
     target: &Mutex<T>,
     bindings: &Mutex<KeyBindings>,
+    axes: Option<AbsoluteAxes>,
+    resync: &mut dyn FnMut() -> Option<AbsoluteAxes>,
 ) -> Result<(), String> {
     let mut buffer = [0u8; READ_BATCH_BYTES];
     let mut filled = 0usize;
-    let mut pointer = PointerMotion::default();
-    let mut dropped = false;
+    let mut state = DeviceState::new(axes, resync);
     let mut last_time = 0;
     let result = loop {
         // An empty tail, not just an out-of-range one: `get_mut(len..)` yields
@@ -1077,9 +1350,7 @@ fn read_device<T: InputTarget>(
                 }
             };
             last_time = event.time;
-            if let Err(error) =
-                apply_device_event(target, event, device, bindings, &mut pointer, &mut dropped)
-            {
+            if let Err(error) = apply_device_event(target, event, device, bindings, &mut state) {
                 failure = Some(error);
                 break;
             }
@@ -1118,6 +1389,28 @@ fn read_device<T: InputTarget>(
     }
 }
 
+/// Ask a device whether it reports an absolute position, and over what span.
+///
+/// Asked at open, and again only at a recovery — after a dropped batch or a
+/// button overflow, which discard alike. The SPAN is a property
+/// of the device, so asking per frame would be a syscall per motion for an
+/// answer that cannot change; the `value` beside it is not, and a
+/// discarded report is the one moment it can have moved without a report saying
+/// so. Both callers hand it a real `File`, which `read_device` cannot: it
+/// takes an `impl Read` so its tests can drive it from a byte slice, and a
+/// slice has no descriptor to ask.
+///
+/// A device that refuses either axis is RELATIVE, not broken: an evdev node
+/// with no absinfo table at all answers `EINVAL`, which is what an ordinary
+/// mouse is and not worth a diagnostic. One that HAS the table answers for
+/// every axis, zeroed where the device has none — so the refusal is not the
+/// whole test, and `declared`'s span is what actually separates the two.
+fn absolute_axes(device: &File) -> Option<AbsoluteAxes> {
+    let x = sys::absolute_info(device, sys::AbsAxis::X).ok()?;
+    let y = sys::absolute_info(device, sys::AbsAxis::Y).ok()?;
+    AbsoluteAxes::declared(x, y)
+}
+
 pub fn start(
     input_dir: &Path,
     runtime: Arc<Mutex<Runtime>>,
@@ -1130,6 +1423,30 @@ pub fn start(
     for (device, path) in paths.iter().enumerate() {
         let mut file =
             File::open(path).map_err(|e| format!("open input {}: {e}", path.display()))?;
+        let axes = absolute_axes(&file);
+        // A second handle purely so a dropped batch can ask the device where
+        // it is now. The reader takes an `impl Read` so its tests can drive it
+        // from a byte slice, and a slice has no descriptor to ask.
+        //
+        // `try_clone` rather than opening the node again: it is `dup(2)`, so
+        // both handles are the same open file and the same evdev CLIENT. A
+        // second `open` would make a second client with a buffer of its own,
+        // and the kernel writes every event to every client — so the reader
+        // would be racing a queue nothing drains, which is what produces the
+        // dropped batches this exists to recover from.
+        let resync_handle = axes.and_then(|_| match file.try_clone() {
+            Ok(handle) => Some(handle),
+            // Reported rather than swallowed: the device still works, but a
+            // dropped batch can no longer be recovered from, and every other
+            // failure on this path says so.
+            Err(error) => {
+                eprintln!(
+                    "td-compositor: no resync handle for {}: {error}",
+                    path.display()
+                );
+                None
+            }
+        });
         let path = path.clone();
         let label = path.display().to_string();
         let target = Arc::clone(&target);
@@ -1142,9 +1459,16 @@ pub fn start(
                     .unwrap_or("event")
             ))
             .spawn(move || {
-                if let Err(error) =
-                    read_device(&path, &mut file, device, target.as_ref(), bindings.as_ref())
-                {
+                let mut resync = move || resync_handle.as_ref().and_then(absolute_axes);
+                if let Err(error) = read_device(
+                    &path,
+                    &mut file,
+                    device,
+                    target.as_ref(),
+                    bindings.as_ref(),
+                    axes,
+                    &mut resync,
+                ) {
                     eprintln!("td-compositor: {error}");
                 }
             })
@@ -1177,6 +1501,414 @@ mod tests {
         }
     }
 
+    /// One axis of QEMU's `usb-tablet`, which reports 0..=32767 and is the
+    /// device this exists for. `value` is where the kernel says it is now.
+    fn axis(value: i32, minimum: i32, maximum: i32) -> sys::AbsInfo {
+        sys::AbsInfo {
+            value,
+            minimum,
+            maximum,
+        }
+    }
+
+    fn tablet() -> AbsoluteAxes {
+        AbsoluteAxes {
+            x: axis(0, 0, 32767),
+            y: axis(0, 0, 32767),
+        }
+    }
+
+    /// The ratio a place crosses as. Written out at every assertion rather
+    /// than reduced, because the whole claim is that nothing rescales it.
+    fn over(numerator: u32, denominator: u32) -> Fraction {
+        Fraction {
+            numerator,
+            denominator,
+        }
+    }
+
+    fn abs(time: u32, code: u16, value: i32) -> Event {
+        Event {
+            time,
+            kind: EV_ABS,
+            code,
+            value,
+        }
+    }
+
+    fn syn(time: u32) -> Event {
+        Event {
+            time,
+            kind: EV_SYN,
+            code: SYN_REPORT,
+            value: 0,
+        }
+    }
+
+    #[test]
+    fn an_absolute_report_names_a_place_and_a_relative_one_a_distance() {
+        let even = Some(AbsoluteAxes {
+            x: axis(0, 0, 1000),
+            y: axis(0, 0, 1000),
+        });
+        let mut pointer = PointerMotion::default();
+        assert_eq!(pointer.feed(abs(1, ABS_X, 500), even), None);
+        assert_eq!(pointer.feed(abs(1, ABS_Y, 0), even), None);
+        let frame = pointer.feed(syn(1), even).unwrap();
+        // Halfway along, and hard against the near edge — as the device's own
+        // numbers, neither reduced nor rescaled.
+        assert_eq!(
+            frame.place,
+            PointerPlace::At {
+                x: over(500, 1000),
+                y: over(0, 1000)
+            }
+        );
+
+        // The far edge is reported EXACTLY, which is the whole complaint an
+        // absolute pointer answers: a relative one on a warped host cursor
+        // cannot be relied on to arrive at the last column.
+        let axes = Some(tablet());
+        let mut pointer = PointerMotion::default();
+        assert_eq!(pointer.feed(abs(2, ABS_X, 32767), axes), None);
+        assert_eq!(pointer.feed(abs(2, ABS_Y, 32767), axes), None);
+        let frame = pointer.feed(syn(2), axes).unwrap();
+        assert_eq!(
+            frame.place,
+            PointerPlace::At {
+                x: over(32767, 32767),
+                y: over(32767, 32767)
+            }
+        );
+
+        // The SAME events on a device that declared no range are not a
+        // position at all: without a span there is nothing to scale against,
+        // and a raw 32767 read as a pixel is thousands of columns off screen.
+        let mut relative = PointerMotion::default();
+        assert_eq!(relative.feed(abs(3, ABS_X, 32767), None), None);
+        assert_eq!(
+            relative.feed(syn(3), None),
+            None,
+            "an absolute report moved a device with no absolute axes"
+        );
+    }
+
+    #[test]
+    fn an_axis_a_report_leaves_out_is_where_that_device_last_was() {
+        // The kernel drops an axis whose value has not changed, so a stylus
+        // moved along one axis reports only that one. Answering the other from
+        // the CURSOR would be wrong the moment anything else moved it, which is
+        // why the reader holds the device's own position.
+        let axes = Some(tablet());
+        let mut pointer = PointerMotion::default();
+        pointer.feed(abs(1, ABS_X, 8000), axes);
+        pointer.feed(abs(1, ABS_Y, 4000), axes);
+        assert_eq!(
+            pointer.feed(syn(1), axes).unwrap().place,
+            PointerPlace::At {
+                x: over(8000, 32767),
+                y: over(4000, 32767)
+            }
+        );
+        // X alone, and the row is still the one the stylus is on.
+        pointer.feed(abs(2, ABS_X, 9000), axes);
+        assert_eq!(
+            pointer.feed(syn(2), axes).unwrap().place,
+            PointerPlace::At {
+                x: over(9000, 32767),
+                y: over(4000, 32767)
+            }
+        );
+        // Y alone, likewise.
+        pointer.feed(abs(3, ABS_Y, 5000), axes);
+        assert_eq!(
+            pointer.feed(syn(3), axes).unwrap().place,
+            PointerPlace::At {
+                x: over(9000, 32767),
+                y: over(5000, 32767)
+            }
+        );
+    }
+
+    #[test]
+    fn a_first_report_completes_itself_from_the_position_the_kernel_gave() {
+        // Before any report there is no held position, and `input_absinfo`'s
+        // `value` is the only account of where the device is. Without it a
+        // one-axis first report would place the other axis at the near edge,
+        // which is a corner of the screen the stylus is not in.
+        let axes = Some(AbsoluteAxes {
+            x: axis(1000, 0, 32767),
+            y: axis(24000, 0, 32767),
+        });
+        let mut pointer = PointerMotion::default();
+        pointer.feed(abs(1, ABS_X, 16000), axes);
+        assert_eq!(
+            pointer.feed(syn(1), axes).unwrap().place,
+            PointerPlace::At {
+                x: over(16000, 32767),
+                y: over(24000, 32767)
+            }
+        );
+
+        // The other way round, because the two arms are separate lines and
+        // one reading the OTHER axis's `value` would survive the case above.
+        // The seeds differ from each other and from both reported values.
+        let mut pointer = PointerMotion::default();
+        pointer.feed(abs(1, ABS_Y, 16000), axes);
+        assert_eq!(
+            pointer.feed(syn(1), axes).unwrap().place,
+            PointerPlace::At {
+                x: over(1000, 32767),
+                y: over(16000, 32767)
+            }
+        );
+
+        // And a device whose FIRST frame is a button alone — a stylus already
+        // resting where it was left, tapped without moving.
+        let mut pointer = PointerMotion::default();
+        pointer.feed(key(BTN_MOUSE, KEY_PRESS), axes);
+        assert_eq!(
+            pointer.feed(syn(1), axes).unwrap().place,
+            PointerPlace::At {
+                x: over(1000, 32767),
+                y: over(24000, 32767)
+            }
+        );
+    }
+
+    /// `absolute_axes` needs a real descriptor, so the gate can only ask it
+    /// about something that is not an evdev device. What that excludes is a
+    /// failed ioctl read as a POSITIVE span; a zeroed one `declared` refuses
+    /// anyway, so this is the outer half of a defence whose inner half is
+    /// `a_device_whose_axes_declare_no_span_is_relative`.
+    #[test]
+    fn a_file_that_is_not_an_evdev_device_declares_no_absolute_axes() {
+        let file = File::open("/dev/null").unwrap();
+        assert_eq!(absolute_axes(&file), None);
+    }
+
+    #[test]
+    fn a_position_wins_over_a_delta_in_the_same_report() {
+        // A device that sends both means the PLACE; the deltas are its own
+        // account of the way there, and adding them would move the pointer
+        // twice for one report.
+        let axes = Some(tablet());
+        let mut pointer = PointerMotion::default();
+        pointer.feed(
+            Event {
+                time: 4,
+                kind: EV_REL,
+                code: REL_X,
+                value: 40,
+            },
+            axes,
+        );
+        pointer.feed(abs(4, ABS_X, 8192), axes);
+        let frame = pointer.feed(syn(4), axes).unwrap();
+        assert_eq!(
+            frame.place,
+            PointerPlace::At {
+                x: over(8192, 32767),
+                y: over(0, 32767)
+            }
+        );
+    }
+
+    #[test]
+    fn an_absolute_value_outside_the_declared_range_is_the_edge_it_went_past() {
+        let axes = tablet();
+        assert_eq!(AbsoluteAxes::fraction(axes.x, -5), over(0, 32767));
+        assert_eq!(AbsoluteAxes::fraction(axes.x, 999_999), over(32767, 32767));
+        // A span of nothing cannot be scaled against, so it answers a zero
+        // DENOMINATOR — which `across` reads as the near edge rather than
+        // dividing by it. `declared` refuses such a device outright.
+        assert_eq!(AbsoluteAxes::fraction(axis(7, 7, 7), 7).denominator, 0);
+        assert_eq!(AbsoluteAxes::fraction(axis(5, 9, 1), 5).denominator, 0);
+    }
+
+    #[test]
+    fn a_range_that_does_not_start_at_zero_is_read_from_its_own_base() {
+        // A device may report over a window starting anywhere, and taking the
+        // value as it stands would offset every report by that base.
+        let shifted = axis(1000, 1000, 3000);
+        assert_eq!(AbsoluteAxes::fraction(shifted, 1000), over(0, 2000));
+        assert_eq!(AbsoluteAxes::fraction(shifted, 2000), over(1000, 2000));
+        assert_eq!(AbsoluteAxes::fraction(shifted, 3000), over(2000, 2000));
+        // Below the base is the near edge rather than a wrap.
+        assert_eq!(AbsoluteAxes::fraction(shifted, 0), over(0, 2000));
+    }
+
+    #[test]
+    fn each_axis_is_scaled_against_its_own_declared_range() {
+        // The two rarely share a range, and one report scaled against the
+        // other axis is a well-formed position somewhere else entirely.
+        let axes = Some(AbsoluteAxes {
+            x: axis(0, 0, 1000),
+            y: axis(0, 0, 4000),
+        });
+        let mut pointer = PointerMotion::default();
+        pointer.feed(abs(5, ABS_X, 500), axes);
+        pointer.feed(abs(5, ABS_Y, 500), axes);
+        let frame = pointer.feed(syn(5), axes).unwrap();
+        assert_eq!(
+            frame.place,
+            PointerPlace::At {
+                x: over(500, 1000),
+                y: over(500, 4000)
+            }
+        );
+    }
+
+    #[test]
+    fn a_device_whose_axes_declare_no_span_is_relative() {
+        // The admission asks `fraction`, so a device it lets in is one every
+        // later report can actually be placed against.
+        let flat = axis(7, 7, 7);
+        let real = axis(0, 0, 32767);
+        assert_eq!(AbsoluteAxes::declared(flat, real), None);
+        assert_eq!(AbsoluteAxes::declared(real, flat), None);
+        assert_eq!(AbsoluteAxes::declared(real, real), Some(tablet()));
+    }
+
+    #[test]
+    fn a_button_alone_from_an_absolute_device_lands_where_that_device_is() {
+        // Tapping twice in one spot sends NOTHING but the button: the kernel
+        // drops both axes as unchanged. Read as a zero delta, the second tap
+        // would click wherever another device last left the shared cursor.
+        let axes = Some(tablet());
+        let mut pointer = PointerMotion::default();
+        pointer.feed(abs(1, ABS_X, 8000), axes);
+        pointer.feed(abs(1, ABS_Y, 4000), axes);
+        pointer.feed(syn(1), axes);
+
+        pointer.feed(key(BTN_MOUSE, KEY_PRESS), axes);
+        let frame = pointer.feed(syn(2), axes).unwrap();
+        assert_eq!(
+            frame.place,
+            PointerPlace::At {
+                x: over(8000, 32767),
+                y: over(4000, 32767)
+            },
+            "a button-only frame was not placed where the device is"
+        );
+        assert_eq!(frame.buttons.len(), 1);
+
+        // The same frame from a RELATIVE device is still a zero delta: there
+        // is no position to place it at, and the shared cursor is the answer.
+        let mut mouse = PointerMotion::default();
+        mouse.feed_relative(key(BTN_MOUSE, KEY_PRESS));
+        assert_eq!(
+            mouse.feed_relative(syn(2)).unwrap().place,
+            PointerPlace::By { dx: 0, dy: 0 }
+        );
+    }
+
+    #[test]
+    fn a_recovery_asks_the_device_once_and_only_where_the_kernel_says_to() {
+        // Three properties one batch can prove, and each is a mutation the
+        // rest of the suite cannot see: a SECOND `SYN_DROPPED` must not end
+        // the discard window (nor may any other EV_SYN code), the device is
+        // asked exactly once per recovery rather than per report, and the
+        // frame that publishes the answer carries the recovery's own time.
+        let drop = |time| Event {
+            time,
+            kind: EV_SYN,
+            code: SYN_DROPPED,
+            value: 0,
+        };
+        let mut data = Vec::new();
+        for event in [
+            abs(1, ABS_X, 100),
+            abs(1, ABS_Y, 100),
+            syn(1),
+            drop(2),
+            // Inside the window: neither ends it, and the recovery below must
+            // still be the FIRST place anything is published.
+            drop(3),
+            Event {
+                time: 4,
+                kind: EV_SYN,
+                code: 1,
+                value: 0,
+            },
+            abs(5, ABS_X, 999),
+            syn(6),
+            // After it: an ordinary report, which must ask nothing.
+            abs(7, ABS_X, 7000),
+            syn(7),
+        ] {
+            data.extend_from_slice(&encode(event));
+        }
+        let moved = AbsoluteAxes {
+            x: axis(20000, 0, 32767),
+            y: axis(30000, 0, 40000),
+        };
+        let (target, result, asked) =
+            drain_counting(data.clone(), Vec::new(), Some(tablet()), Some(moved), None);
+        assert_eq!(result, Ok(()));
+        assert_eq!(asked, 1, "the device was asked {asked} times, not once");
+        assert_eq!(
+            target.pointer_places,
+            [
+                (1, over(100, 32767), over(100, 32767), Vec::new()),
+                // The recovery, at the time of the SYN_REPORT that ended the
+                // window — 6, not 3 or 4, which is what an over-eager guard
+                // would answer.
+                (6, over(20000, 32767), over(30000, 40000), Vec::new()),
+                // And on afterwards, the row still the one the resync gave.
+                (7, over(7000, 32767), over(30000, 40000), Vec::new()),
+            ]
+        );
+
+        // A refused delivery on the recovery path is the reader's failure,
+        // not something it carries on past. The batch starts AT the drop so
+        // the recovery frame is the first delivery there is: with a report
+        // before it, that one would consume the injected error and the
+        // assertion would hold whatever the recovery did with its own.
+        let mut alone = Vec::new();
+        for event in [drop(2), syn(6)] {
+            alone.extend_from_slice(&encode(event));
+        }
+        let (_, result, _) = drain_counting(
+            alone,
+            Vec::new(),
+            Some(tablet()),
+            Some(moved),
+            Some("paint refused".to_string()),
+        );
+        assert!(result.is_err(), "a refused recovery paint was swallowed");
+    }
+
+    #[test]
+    fn a_dropped_batch_forgets_the_frame_but_not_where_the_device_is() {
+        // `reset` is what a SYN_DROPPED and a button overflow both do. The
+        // half-built frame and the buttons go; the device's POSITION is not
+        // frame state, and losing it would send the next one-axis report back
+        // to wherever the device was when the compositor started.
+        let axes = Some(tablet());
+        let mut pointer = PointerMotion::default();
+        pointer.feed(abs(1, ABS_X, 8000), axes);
+        pointer.feed(abs(1, ABS_Y, 4000), axes);
+        pointer.feed(syn(1), axes);
+
+        pointer.feed(abs(2, ABS_X, 9000), axes);
+        pointer.feed(key(BTN_MOUSE, KEY_PRESS), axes);
+        pointer.reset();
+        assert!(pointer.buttons.is_empty());
+        assert!(pointer.pressed.is_empty());
+        assert_eq!(pointer.abs_x, None);
+        // The row the stylus is on survived, so an X-only report still names
+        // it rather than the 0 the range was opened at.
+        pointer.feed(abs(3, ABS_X, 12000), axes);
+        assert_eq!(
+            pointer.feed(syn(3), axes).unwrap().place,
+            PointerPlace::At {
+                x: over(12000, 32767),
+                y: over(4000, 32767)
+            }
+        );
+    }
+
     fn press(bindings: &mut KeyBindings, code: u16) -> Option<Command> {
         bindings.feed(key(code, KEY_PRESS)).command
     }
@@ -1193,6 +1925,10 @@ mod tests {
         Modifiers(ModifierState),
     }
 
+    /// What an absolute report reached the target as: the time, each axis as
+    /// a fraction of the device's own span, and the buttons that came with it.
+    type RecordedPlace = (u32, Fraction, Fraction, Vec<PointerButtonInput>);
+
     #[derive(Default)]
     struct RecordingTarget {
         commands: Vec<Command>,
@@ -1203,6 +1939,7 @@ mod tests {
         modifiers: Vec<ModifierState>,
         keyboard_calls: Vec<KeyboardCall>,
         pointer_frames: Vec<(u32, i32, i32, Vec<PointerButtonInput>)>,
+        pointer_places: Vec<RecordedPlace>,
         pointer_error: Option<String>,
         flushes: usize,
         flush_error: Option<String>,
@@ -1273,6 +2010,23 @@ mod tests {
             }
         }
 
+        fn pointer_frame_at(
+            &mut self,
+            time: u32,
+            x: Fraction,
+            y: Fraction,
+            buttons: &[PointerButtonInput],
+        ) -> Result<(), String> {
+            // Kept apart from the relative list on purpose: a test that
+            // asserted a tablet report as a delta would be reading the wrong
+            // question answered the wrong way.
+            self.pointer_places.push((time, x, y, buttons.to_vec()));
+            match self.pointer_error.take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+
         fn flush(&mut self) -> Result<(), String> {
             self.flushes = self.flushes.saturating_add(1);
             match self.flush_error.take() {
@@ -1333,6 +2087,16 @@ mod tests {
             self.recording.pointer_frame(time, dx, dy, buttons)
         }
 
+        fn pointer_frame_at(
+            &mut self,
+            time: u32,
+            x: Fraction,
+            y: Fraction,
+            buttons: &[PointerButtonInput],
+        ) -> Result<(), String> {
+            self.recording.pointer_frame_at(time, x, y, buttons)
+        }
+
         fn flush(&mut self) -> Result<(), String> {
             self.recording.flush()
         }
@@ -1346,6 +2110,152 @@ mod tests {
         bytes.extend_from_slice(&event.code.to_ne_bytes());
         bytes.extend_from_slice(&event.value.to_ne_bytes());
         bytes
+    }
+
+    #[test]
+    fn a_tablet_reaches_the_target_as_a_place_and_a_mouse_as_a_distance() {
+        // End to end through the reader, which is the join this feature is:
+        // the range comes from the device at open, the events come off the
+        // wire, and what the compositor is told has to be a POSITION.
+        let mut data = Vec::new();
+        for event in [abs(1, ABS_X, 32767), abs(1, ABS_Y, 0), syn(1)] {
+            data.extend_from_slice(&encode(event));
+        }
+        let (target, result) = drain_device(data.clone(), Vec::new(), Some(tablet()));
+        assert_eq!(result, Ok(()));
+        assert!(
+            target.pointer_frames.is_empty(),
+            "a tablet was reported as a delta"
+        );
+        assert_eq!(
+            target.pointer_places,
+            [(1, over(32767, 32767), over(0, 32767), Vec::new())]
+        );
+
+        // The same bytes from a device that answered no range reach nobody:
+        // there is nothing to scale against, and a raw value taken as a
+        // delta would fling the pointer across the screen.
+        let (target, result) = drain_device(data, Vec::new(), None);
+        assert_eq!(result, Ok(()));
+        assert!(target.pointer_places.is_empty());
+        assert!(target.pointer_frames.is_empty());
+
+        // A dropped batch re-asks the device, and the answer replaces the
+        // position rather than being merged with it. Only the device knows
+        // where it went while its reports were being discarded: the kernel
+        // compares an axis against the value IT last emitted, so one that
+        // moved inside the gap is never re-sent.
+        let mut data = Vec::new();
+        for event in [
+            abs(1, ABS_X, 100),
+            abs(1, ABS_Y, 100),
+            syn(1),
+            Event {
+                time: 2,
+                kind: EV_SYN,
+                code: SYN_DROPPED,
+                value: 0,
+            },
+            syn(2),
+            key(BTN_MOUSE, KEY_PRESS),
+            syn(3),
+        ] {
+            data.extend_from_slice(&encode(event));
+        }
+        // Deliberately DIFFERENT spans. The recovery composes its own pair of
+        // fractions, a second call site for the axis mapping, and one scaled
+        // against the other axis is a well-formed position somewhere else —
+        // which a fixture sharing one range cannot tell from the right answer.
+        let moved = AbsoluteAxes {
+            x: axis(20000, 0, 32767),
+            y: axis(30000, 0, 40000),
+        };
+
+        // The recovery PUBLISHES the fresh position rather than only caching
+        // it. This batch ends at the resynchronising SYN_REPORT, so nothing
+        // after it can consume the re-read: a device that moved during the gap
+        // and then stopped must still reach the screen.
+        let mut quiet = Vec::new();
+        for event in [
+            abs(1, ABS_X, 100),
+            abs(1, ABS_Y, 100),
+            syn(1),
+            Event {
+                time: 2,
+                kind: EV_SYN,
+                code: SYN_DROPPED,
+                value: 0,
+            },
+            syn(2),
+        ] {
+            quiet.extend_from_slice(&encode(event));
+        }
+        let (target, result) = drain_resyncing(quiet, Vec::new(), Some(tablet()), Some(moved));
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            target.pointer_places.last(),
+            Some(&(2, over(20000, 32767), over(30000, 40000), Vec::new())),
+            "a recovery re-read the device and told nobody"
+        );
+        let (target, result) =
+            drain_resyncing(data.clone(), Vec::new(), Some(tablet()), Some(moved));
+        assert_eq!(result, Ok(()));
+        let (_, x, y, buttons) = target.pointer_places.last().unwrap();
+        assert_eq!(
+            (*x, *y),
+            (over(20000, 32767), over(30000, 40000)),
+            "a recovered device was placed at where it used to be"
+        );
+        // The press rides the frame that placed it. Asserted because this is
+        // the only path that carries one: once a device declares axes, an
+        // absolute frame is the ONLY way a button of its reaches the target.
+        assert_eq!(
+            buttons,
+            &vec![PointerButtonInput {
+                button: u32::from(BTN_MOUSE),
+                state: PointerButtonState::Pressed,
+                time: 3,
+            }]
+        );
+
+        // A device that cannot be asked keeps what it last said, which beats
+        // the position it was opened at even though it may be stale. This is
+        // also what pins the RESET rather than `reset` itself: a recovery that
+        // rebuilt the whole `PointerMotion` would answer 0 here, the value the
+        // range was opened at, and no test of `reset` alone can see which of
+        // the two a call site made.
+        let (target, result) = drain_resyncing(data, Vec::new(), Some(tablet()), None);
+        assert_eq!(result, Ok(()));
+        let (_, x, y, _) = target.pointer_places.last().unwrap();
+        assert_eq!((*x, *y), (over(100, 32767), over(100, 32767)));
+
+        // And the other half of the name: an ORDINARY MOUSE over the same
+        // reader is a distance, on the list a tablet never reaches.
+        let mut data = Vec::new();
+        for event in [
+            Event {
+                time: 2,
+                kind: EV_REL,
+                code: REL_X,
+                value: 7,
+            },
+            Event {
+                time: 2,
+                kind: EV_REL,
+                code: REL_Y,
+                value: -3,
+            },
+            syn(2),
+        ] {
+            data.extend_from_slice(&encode(event));
+        }
+        let (target, result) = drain_device(data, Vec::new(), None);
+        assert_eq!(result, Ok(()));
+        assert!(
+            target.pointer_places.is_empty(),
+            "a mouse was reported as a place"
+        );
+        assert_eq!(target.pointer_frames, [(2, 7, -3, Vec::new())]);
     }
 
     fn motion(time: u32, dx: i32) -> Vec<u8> {
@@ -1400,15 +2310,67 @@ mod tests {
         data: Vec<u8>,
         chunks: Vec<std::io::Result<usize>>,
     ) -> (RecordingTarget, Result<(), String>) {
+        drain_device(data, chunks, None)
+    }
+
+    fn drain_device(
+        data: Vec<u8>,
+        chunks: Vec<std::io::Result<usize>>,
+        axes: Option<AbsoluteAxes>,
+    ) -> (RecordingTarget, Result<(), String>) {
+        drain_resyncing(data, chunks, axes, None)
+    }
+
+    /// `resync` is what a real device answers after a dropped batch. `None`
+    /// stands for a device that could not be asked, which is every reader
+    /// driven from a byte slice.
+    fn drain_resyncing(
+        data: Vec<u8>,
+        chunks: Vec<std::io::Result<usize>>,
+        axes: Option<AbsoluteAxes>,
+        resync: Option<AbsoluteAxes>,
+    ) -> (RecordingTarget, Result<(), String>) {
+        let (target, result, _) = drain_counting(data, chunks, axes, resync, None);
+        (target, result)
+    }
+
+    /// The same, counting how many times the device was asked — the property
+    /// `absolute_axes` claims and nothing else could check, since a closure
+    /// answering a constant looks the same whether it ran once or every frame.
+    fn drain_counting(
+        data: Vec<u8>,
+        chunks: Vec<std::io::Result<usize>>,
+        axes: Option<AbsoluteAxes>,
+        resync: Option<AbsoluteAxes>,
+        pointer_error: Option<String>,
+    ) -> (RecordingTarget, Result<(), String>, usize) {
         let target = Mutex::new(RecordingTarget::default());
+        target
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pointer_error = pointer_error;
         let bindings = Mutex::new(KeyBindings::default());
         let mut reader = ChunkedReader::new(data, chunks);
-        let result = read_device(Path::new("event-test"), &mut reader, 0, &target, &bindings);
+        let asked = std::cell::Cell::new(0usize);
+        let mut resync = || {
+            asked.set(asked.get().saturating_add(1));
+            resync
+        };
+        let result = read_device(
+            Path::new("event-test"),
+            &mut reader,
+            0,
+            &target,
+            &bindings,
+            axes,
+            &mut resync,
+        );
         (
             target
                 .into_inner()
                 .unwrap_or_else(|error| error.into_inner()),
             result,
+            asked.get(),
         )
     }
 
@@ -1480,7 +2442,15 @@ mod tests {
         });
         data.extend_from_slice(&motion(1, 2));
         let mut reader = ChunkedReader::new(data, Vec::new());
-        let result = read_device(Path::new("event-test"), &mut reader, 0, &target, &bindings);
+        let result = read_device(
+            Path::new("event-test"),
+            &mut reader,
+            0,
+            &target,
+            &bindings,
+            None,
+            &mut || None,
+        );
         assert_eq!(result, Err("paint refused".to_string()));
         assert!(bindings.lock().unwrap().pointer_pressed.is_empty());
         let target = target.into_inner().unwrap();
@@ -1907,13 +2877,13 @@ mod tests {
             key(KEY_SLASH, KEY_PRESS),
             key(KEY_SLASH, KEY_RELEASE),
         ] {
-            apply(&target, event, 0, &bindings, &mut pointer).unwrap();
+            apply(&target, event, 0, &bindings, &mut pointer, None).unwrap();
         }
         assert!(bindings.lock().unwrap().help_open);
         assert_eq!(target.lock().unwrap().help_actions, [HelpAction::Toggle]);
 
         for event in [key(KEY_T, KEY_PRESS), key(KEY_T, KEY_RELEASE)] {
-            apply(&target, event, 0, &bindings, &mut pointer).unwrap();
+            apply(&target, event, 0, &bindings, &mut pointer, None).unwrap();
         }
         assert!(!bindings.lock().unwrap().help_open);
         let target = target.lock().unwrap();
@@ -1987,7 +2957,7 @@ mod tests {
             key(KEY_T, KEY_PRESS),
             key(KEY_T, KEY_RELEASE),
         ] {
-            apply(&target, event, 0, &bindings, &mut pointer).unwrap();
+            apply(&target, event, 0, &bindings, &mut pointer, None).unwrap();
         }
         let target = target.lock().unwrap();
         assert_eq!(target.launched, [LaunchRequest::Terminal]);
@@ -2189,7 +3159,7 @@ mod tests {
     fn pointer_motion_is_coalesced_at_syn_report_and_saturates() {
         let mut pointer = PointerMotion::default();
         assert_eq!(
-            pointer.feed(Event {
+            pointer.feed_relative(Event {
                 time: 0,
                 kind: EV_REL,
                 code: REL_X,
@@ -2197,20 +3167,20 @@ mod tests {
             }),
             None
         );
-        pointer.feed(Event {
+        pointer.feed_relative(Event {
             time: 0,
             kind: EV_REL,
             code: REL_X,
             value: 2,
         });
-        pointer.feed(Event {
+        pointer.feed_relative(Event {
             time: 0,
             kind: EV_REL,
             code: REL_Y,
             value: -7,
         });
         assert_eq!(
-            pointer.feed(Event {
+            pointer.feed_relative(Event {
                 time: 9,
                 kind: EV_SYN,
                 code: SYN_REPORT,
@@ -2218,13 +3188,15 @@ mod tests {
             }),
             Some(PointerFrame {
                 time: 9,
-                dx: i32::MAX,
-                dy: -7,
+                place: PointerPlace::By {
+                    dx: i32::MAX,
+                    dy: -7
+                },
                 buttons: Vec::new(),
             })
         );
         assert_eq!(
-            pointer.feed(Event {
+            pointer.feed_relative(Event {
                 time: 0,
                 kind: EV_SYN,
                 code: SYN_REPORT,
@@ -2235,11 +3207,65 @@ mod tests {
     }
 
     #[test]
+    fn an_absolute_overflow_recovers_where_the_device_is_rather_than_where_it_was() {
+        // An overflow reaches the same recovery a dropped batch does, and for
+        // the same reason: the report it abandons took that report's own
+        // EV_ABS values with it, so the held position is stale in a way no
+        // later record announces. The sibling test below drives a RELATIVE
+        // device, so nothing else covers the absolute arm of that path.
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings::default());
+        let moved = AbsoluteAxes {
+            x: axis(20000, 0, 32767),
+            y: axis(30000, 0, 40000),
+        };
+        let asked = std::cell::Cell::new(0usize);
+        let mut resync = || {
+            asked.set(asked.get().saturating_add(1));
+            Some(moved)
+        };
+        let mut state = DeviceState::new(Some(tablet()), &mut resync);
+        // A place first, so the recovery has a stale position to replace
+        // rather than an absent one.
+        for event in [abs(1, ABS_X, 100), abs(1, ABS_Y, 100), syn(1)] {
+            apply_device_event(&target, event, 0, &bindings, &mut state).unwrap();
+        }
+        for index in 0..=MAX_POINTER_BUTTON_TRANSITIONS_PER_FRAME {
+            let value = if index % 2 == 0 {
+                KEY_PRESS
+            } else {
+                KEY_RELEASE
+            };
+            apply_device_event(&target, key(BTN_MOUSE, value), 0, &bindings, &mut state).unwrap();
+        }
+        assert!(state.dropped);
+        assert_eq!(
+            asked.get(),
+            0,
+            "the device was asked before the window ended"
+        );
+
+        apply_device_event(&target, syn(9), 0, &bindings, &mut state).unwrap();
+        assert!(!state.dropped);
+        assert_eq!(
+            asked.get(),
+            1,
+            "an overflow recovery asked {} times",
+            asked.get()
+        );
+        assert_eq!(
+            target.lock().unwrap().pointer_places.last(),
+            Some(&(9, over(20000, 32767), over(30000, 40000), Vec::new())),
+            "an overflow left the cursor where the device used to be"
+        );
+    }
+
+    #[test]
     fn oversized_pointer_report_is_dropped_and_recovers_at_next_sync() {
         let target = Mutex::new(RecordingTarget::default());
         let bindings = Mutex::new(KeyBindings::default());
-        let mut pointer = PointerMotion::default();
-        let mut dropped = false;
+        let mut resync = || None;
+        let mut state = DeviceState::new(None, &mut resync);
         for index in 0..=MAX_POINTER_BUTTON_TRANSITIONS_PER_FRAME {
             apply_device_event(
                 &target,
@@ -2253,13 +3279,12 @@ mod tests {
                 ),
                 0,
                 &bindings,
-                &mut pointer,
-                &mut dropped,
+                &mut state,
             )
             .unwrap();
         }
-        assert!(dropped);
-        assert!(pointer.buttons.is_empty());
+        assert!(state.dropped);
+        assert!(state.pointer.buttons.is_empty());
         assert!(target.lock().unwrap().pointer_frames.is_empty());
 
         for event in [
@@ -2288,7 +3313,7 @@ mod tests {
                 value: 0,
             },
         ] {
-            apply_device_event(&target, event, 0, &bindings, &mut pointer, &mut dropped).unwrap();
+            apply_device_event(&target, event, 0, &bindings, &mut state).unwrap();
         }
         assert_eq!(
             target.lock().unwrap().pointer_frames,
@@ -2345,7 +3370,7 @@ mod tests {
             ),
         ] {
             let pointer = if device == 0 { &mut first } else { &mut second };
-            apply(target.as_ref(), event, device, &bindings, pointer).unwrap();
+            apply(target.as_ref(), event, device, &bindings, pointer, None).unwrap();
         }
         assert_eq!(
             target.lock().unwrap().pointer_frames,
@@ -2380,7 +3405,7 @@ mod tests {
         let bindings = Mutex::new(KeyBindings::default());
         let mut pointer = PointerMotion::default();
         let apply_event = |event, pointer: &mut PointerMotion| {
-            apply(&target, event, 0, &bindings, pointer).unwrap();
+            apply(&target, event, 0, &bindings, pointer, None).unwrap();
         };
         apply_event(key(KEY_LEFTMETA, KEY_PRESS), &mut pointer);
         apply_event(key(KEY_ENTER, KEY_PRESS), &mut pointer);
@@ -2448,14 +3473,23 @@ mod tests {
             value: 0,
         };
 
-        apply(&target, key(BTN_MOUSE, KEY_PRESS), 0, &bindings, &mut first).unwrap();
-        apply(&target, syn(1), 0, &bindings, &mut first).unwrap();
+        apply(
+            &target,
+            key(BTN_MOUSE, KEY_PRESS),
+            0,
+            &bindings,
+            &mut first,
+            None,
+        )
+        .unwrap();
+        apply(&target, syn(1), 0, &bindings, &mut first, None).unwrap();
         apply(
             &target,
             key(BTN_MOUSE, KEY_RELEASE),
             0,
             &bindings,
             &mut first,
+            None,
         )
         .unwrap();
         apply(
@@ -2464,10 +3498,11 @@ mod tests {
             1,
             &bindings,
             &mut second,
+            None,
         )
         .unwrap();
-        apply(&target, syn(2), 1, &bindings, &mut second).unwrap();
-        apply(&target, syn(3), 0, &bindings, &mut first).unwrap();
+        apply(&target, syn(2), 1, &bindings, &mut second, None).unwrap();
+        apply(&target, syn(3), 0, &bindings, &mut first, None).unwrap();
         assert_eq!(target.lock().unwrap().pointer_frames.len(), 1);
 
         apply(
@@ -2476,9 +3511,10 @@ mod tests {
             1,
             &bindings,
             &mut second,
+            None,
         )
         .unwrap();
-        apply(&target, syn(4), 1, &bindings, &mut second).unwrap();
+        apply(&target, syn(4), 1, &bindings, &mut second, None).unwrap();
         assert_eq!(
             target.lock().unwrap().pointer_frames,
             [
@@ -2519,11 +3555,19 @@ mod tests {
             value: 0,
         };
 
-        apply(&target, key(BTN_MOUSE, KEY_PRESS), 0, &bindings, &mut first).unwrap();
-        apply(&target, syn(1), 1, &bindings, &mut second).unwrap();
+        apply(
+            &target,
+            key(BTN_MOUSE, KEY_PRESS),
+            0,
+            &bindings,
+            &mut first,
+            None,
+        )
+        .unwrap();
+        apply(&target, syn(1), 1, &bindings, &mut second, None).unwrap();
         assert!(target.lock().unwrap().pointer_frames.is_empty());
 
-        apply(&target, syn(2), 0, &bindings, &mut first).unwrap();
+        apply(&target, syn(2), 0, &bindings, &mut first, None).unwrap();
         assert_eq!(
             target.lock().unwrap().pointer_frames,
             [(
@@ -2566,7 +3610,7 @@ mod tests {
                 value: 0,
             },
         ] {
-            apply(target.as_ref(), event, 0, &bindings, &mut pointer).unwrap();
+            apply(target.as_ref(), event, 0, &bindings, &mut pointer, None).unwrap();
         }
         let target = target.lock().unwrap();
         assert_eq!(target.commands, [Command::Focus(Direction::Left)]);
@@ -2616,7 +3660,7 @@ mod tests {
             key(KEY_DOWN, KEY_RELEASE),
             key(KEY_ENTER, KEY_PRESS),
         ] {
-            apply(&target, event, 0, &bindings, &mut pointer).unwrap();
+            apply(&target, event, 0, &bindings, &mut pointer, None).unwrap();
         }
         assert_eq!(
             target.lock().unwrap().launcher_actions,
@@ -2645,7 +3689,7 @@ mod tests {
             key(KEY_BACKSPACE, KEY_PRESS),
             key(KEY_BACKSPACE, KEY_RELEASE),
         ] {
-            apply(&target, event, 0, &bindings, &mut pointer).unwrap();
+            apply(&target, event, 0, &bindings, &mut pointer, None).unwrap();
         }
         {
             let target = target.lock().unwrap();
@@ -2672,7 +3716,7 @@ mod tests {
         assert!(bindings.lock().unwrap().launcher_open);
 
         for event in [key(KEY_ENTER, KEY_PRESS), key(KEY_ENTER, KEY_RELEASE)] {
-            apply(&target, event, 0, &bindings, &mut pointer).unwrap();
+            apply(&target, event, 0, &bindings, &mut pointer, None).unwrap();
         }
         assert!(!target.lock().unwrap().launcher.visible());
         assert!(!bindings.lock().unwrap().launcher_open);
@@ -2708,6 +3752,7 @@ mod tests {
             0,
             &bindings,
             &mut pointer,
+            None,
         )
         .unwrap();
         runtime.lock().unwrap().fail_next_repaint();
@@ -2716,7 +3761,8 @@ mod tests {
             key(KEY_ENTER, KEY_PRESS),
             0,
             &bindings,
-            &mut pointer
+            &mut pointer,
+            None
         )
         .is_err());
         assert!(!runtime.lock().unwrap().launcher_visible());
@@ -2753,6 +3799,7 @@ mod tests {
             0,
             &bindings,
             &mut pointer,
+            None,
         )
         .unwrap();
         apply(
@@ -2766,6 +3813,7 @@ mod tests {
             0,
             &bindings,
             &mut pointer,
+            None,
         )
         .unwrap();
         runtime.lock().unwrap().fail_next_repaint();
@@ -2782,6 +3830,7 @@ mod tests {
             0,
             &bindings,
             &mut pointer,
+            None,
         )
         .unwrap();
         assert!(flush_target(&target).is_err());
@@ -2845,11 +3894,11 @@ mod tests {
             assert_eq!(decision.modifiers, None);
         }
         let mut pointer = PointerMotion::default();
-        assert_eq!(pointer.feed(key(BTN_MOUSE, KEY_PRESS)), None);
-        assert_eq!(pointer.feed(key(BTN_MOUSE, KEY_REPEAT)), None);
-        assert_eq!(pointer.feed(key(BTN_MOUSE, KEY_RELEASE)), None);
+        assert_eq!(pointer.feed_relative(key(BTN_MOUSE, KEY_PRESS)), None);
+        assert_eq!(pointer.feed_relative(key(BTN_MOUSE, KEY_REPEAT)), None);
+        assert_eq!(pointer.feed_relative(key(BTN_MOUSE, KEY_RELEASE)), None);
         assert_eq!(
-            pointer.feed(Event {
+            pointer.feed_relative(Event {
                 time: 9,
                 kind: EV_SYN,
                 code: SYN_REPORT,
@@ -2857,8 +3906,7 @@ mod tests {
             }),
             Some(PointerFrame {
                 time: 9,
-                dx: 0,
-                dy: 0,
+                place: PointerPlace::By { dx: 0, dy: 0 },
                 buttons: vec![
                     PointerButtonTransition {
                         code: BTN_MOUSE,
@@ -3046,7 +4094,7 @@ mod tests {
             } else {
                 &mut second_pointer
             };
-            apply(&target, event, device, &bindings, pointer).unwrap();
+            apply(&target, event, device, &bindings, pointer, None).unwrap();
         }
         release_device(&target, 1, &bindings, 77).unwrap();
 
@@ -3170,10 +4218,19 @@ mod tests {
             1,
             &bindings,
             &mut pointer,
+            None,
         )
         .unwrap();
         release_device(&target, 2, &bindings, 17).unwrap();
-        apply(&target, key(KEY_2, KEY_PRESS), 1, &bindings, &mut pointer).unwrap();
+        apply(
+            &target,
+            key(KEY_2, KEY_PRESS),
+            1,
+            &bindings,
+            &mut pointer,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             target.lock().unwrap().commands,
             [Command::SwitchWorkspace(2)]
@@ -3184,8 +4241,8 @@ mod tests {
     fn syn_dropped_releases_state_and_ignores_events_until_the_next_report() {
         let target = Mutex::new(RecordingTarget::default());
         let bindings = Mutex::new(KeyBindings::default());
-        let mut pointer = PointerMotion::default();
-        let mut dropped = false;
+        let mut resync = || None;
+        let mut state = DeviceState::new(None, &mut resync);
         for event in [
             key(KEY_LEFTMETA, KEY_PRESS),
             key(KEY_V, KEY_PRESS),
@@ -3216,7 +4273,7 @@ mod tests {
                 value: 0,
             },
         ] {
-            apply_device_event(&target, event, 5, &bindings, &mut pointer, &mut dropped).unwrap();
+            apply_device_event(&target, event, 5, &bindings, &mut state).unwrap();
         }
 
         let target = target.lock().unwrap();
@@ -3258,8 +4315,8 @@ mod tests {
     fn syn_dropped_discards_partial_pointer_data_and_releases_forwarded_buttons() {
         let target = Mutex::new(RecordingTarget::default());
         let bindings = Mutex::new(KeyBindings::default());
-        let mut pointer = PointerMotion::default();
-        let mut dropped = false;
+        let mut resync = || None;
+        let mut state = DeviceState::new(None, &mut resync);
         for event in [
             key(BTN_MOUSE, KEY_PRESS),
             Event {
@@ -3288,7 +4345,7 @@ mod tests {
                 value: 0,
             },
         ] {
-            apply_device_event(&target, event, 5, &bindings, &mut pointer, &mut dropped).unwrap();
+            apply_device_event(&target, event, 5, &bindings, &mut state).unwrap();
         }
         assert_eq!(
             target.lock().unwrap().pointer_frames,

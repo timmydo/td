@@ -18,6 +18,11 @@ const TIOCSPTLCK: usize = 0x4004_5431;
 const TIOCGPTPEER: usize = 0x5441;
 const TIOCSWINSZ: usize = 0x5414;
 const TIOCGWINSZ: usize = 0x5413;
+/// `EVIOCGABS(ABS_X)` and `EVIOCGABS(ABS_Y)`. The size field of an evdev
+/// request encodes `sizeof(struct input_absinfo)`, so these two numbers assert
+/// the 24-byte buffer below as much as `ABSINFO_WORDS` does.
+const EVIOCGABS_X: usize = 0x8018_4540;
+const EVIOCGABS_Y: usize = 0x8018_4541;
 
 /// `O_NOCTTY` — the terminal td-term creates belongs to the child it starts, so
 /// neither the peer descriptor nor its duplicate may acquire it by side effect.
@@ -114,12 +119,12 @@ fn close_raw(fd: RawFd) -> Result<(), String> {
 /// without amending both this list and the confinement tests that pin it.
 ///
 /// Unlike the two message wrappers this does not retry `EINTR`: none of the
-/// four requests sleeps interruptibly, so a retry loop here would be dead code
+/// six requests sleeps interruptibly, so a retry loop here would be dead code
 /// that reads like a live one.
 fn ioctl(fd: RawFd, request: usize, argument: usize, operation: &str) -> Result<usize, String> {
     if !matches!(
         request,
-        TIOCSPTLCK | TIOCGPTPEER | TIOCSWINSZ | TIOCGWINSZ
+        TIOCSPTLCK | TIOCGPTPEER | TIOCSWINSZ | TIOCGWINSZ | EVIOCGABS_X | EVIOCGABS_Y
     ) {
         return Err(format!(
             "{operation}: refusing unreviewed ioctl request {request:#x}"
@@ -222,6 +227,79 @@ pub fn window_size(terminal: &impl AsRawFd) -> Result<WindowSize, String> {
         "TIOCGWINSZ",
     )?;
     Ok(winsize_from_words(words))
+}
+
+/// Which axis of an absolute device to ask about. An ENUM rather than a
+/// request number at the call site, for `Disposition`'s reason in td-sh: the
+/// two requests differ in one nibble, they are the only evdev requests on this
+/// surface, and a caller that could name a number could name a third.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AbsAxis {
+    X,
+    Y,
+}
+
+impl AbsAxis {
+    fn request(self) -> (usize, &'static str) {
+        match self {
+            AbsAxis::X => (EVIOCGABS_X, "EVIOCGABS(ABS_X)"),
+            AbsAxis::Y => (EVIOCGABS_Y, "EVIOCGABS(ABS_Y)"),
+        }
+    }
+}
+
+/// What an absolute axis reports: where it is NOW, and the span that says what
+/// that number means. Only the three fields answering those two questions are
+/// carried out; `fuzz`, `flat` and `resolution` describe filtering and physical
+/// size, and a pointer being mapped to a screen wants neither.
+///
+/// `value` is the axis's position at the moment it was asked, which is the only
+/// way to know where a device is BEFORE it has reported anything: the kernel
+/// omits an axis whose value has not changed, so a device's first frame can
+/// name one axis and say nothing about the other.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AbsInfo {
+    pub value: i32,
+    pub minimum: i32,
+    pub maximum: i32,
+}
+
+/// The kernel's `struct input_absinfo`: six native-endian `i32` fields — value,
+/// minimum, maximum, fuzz, flat, resolution. Pinned because `EVIOCGABS` copies
+/// the smaller of the REQUEST NUMBER's own size field and this struct's size,
+/// so an oversized number is harmless but a buffer shortened without the number
+/// is 24 bytes written into less — an out-of-bounds kernel write from code the
+/// compiler reads as safe. Both numbers above encode that same 24.
+const ABSINFO_WORDS: usize = 6;
+
+/// Ask an absolute device where one of its axes is and what range it reports
+/// over.
+///
+/// `[i32; 6]` rather than a `#[repr(C)]` struct for `winsize`'s reason: the
+/// language guarantees this layout, which makes the field ORDER a tested
+/// function rather than an attribute nobody can observe. It matters more here
+/// than there — `value`, `minimum` and `maximum` are three adjacent words of
+/// the same type, so an index off by one is a well-formed range that maps every
+/// report to the wrong place on screen.
+pub fn absolute_info(device: &impl AsRawFd, axis: AbsAxis) -> Result<AbsInfo, String> {
+    let (request, name) = axis.request();
+    let mut words = [0i32; ABSINFO_WORDS];
+    ioctl(
+        device.as_raw_fd(),
+        request,
+        (&mut words as *mut [i32; ABSINFO_WORDS]) as usize,
+        name,
+    )?;
+    Ok(absinfo(words))
+}
+
+fn absinfo(words: [i32; ABSINFO_WORDS]) -> AbsInfo {
+    let [value, minimum, maximum, _fuzz, _flat, _resolution] = words;
+    AbsInfo {
+        value,
+        minimum,
+        maximum,
+    }
 }
 
 fn align_cmsg(value: usize) -> Result<usize, String> {
@@ -656,10 +734,60 @@ mod tests {
     fn an_unreviewed_ioctl_request_is_refused_before_the_syscall() {
         let error = ioctl(0, 0x5401, 0, "TCGETS").unwrap_err();
         assert!(error.contains("refusing unreviewed ioctl request 0x5401"), "{error}");
-        for request in [TIOCSPTLCK, TIOCGPTPEER, TIOCSWINSZ, TIOCGWINSZ] {
+        for request in [
+            TIOCSPTLCK,
+            TIOCGPTPEER,
+            TIOCSWINSZ,
+            TIOCGWINSZ,
+            EVIOCGABS_X,
+            EVIOCGABS_Y,
+        ] {
             let error = ioctl(-1, request, 0, "pinned").unwrap_err();
             assert!(error.contains("invalid descriptor -1"), "{error}");
         }
+    }
+
+    /// The three words this reads are adjacent and the same type, so nothing
+    /// about a wrong index is observable at runtime: it is a well-formed
+    /// position and range that puts every report somewhere else on the screen.
+    #[test]
+    fn an_absinfo_reads_its_place_and_range_from_the_first_three_words() {
+        assert_eq!(
+            absinfo([11, 22, 33, 44, 55, 66]),
+            AbsInfo {
+                value: 11,
+                minimum: 22,
+                maximum: 33
+            }
+        );
+        assert_eq!(std::mem::size_of::<[i32; ABSINFO_WORDS]>(), 24);
+        // The size field of an evdev request number IS that length, so the two
+        // pins agree or the kernel and this buffer disagree about the copy.
+        for request in [EVIOCGABS_X, EVIOCGABS_Y] {
+            assert_eq!((request >> 16) & 0x3fff, ABSINFO_WORDS * 4);
+        }
+        assert_eq!(AbsAxis::X.request().0, EVIOCGABS_X);
+        assert_eq!(AbsAxis::Y.request().0, EVIOCGABS_Y);
+    }
+
+    /// Issued for real, against a descriptor that is not an evdev device: the
+    /// gate has no absolute pointer, and every assertion above is about source
+    /// text that a wrapper returning a plausible range would satisfy too.
+    #[test]
+    fn the_absinfo_wrapper_reaches_the_kernel() {
+        let file = File::open("/dev/null").unwrap();
+        let error = absolute_info(&file, AbsAxis::X).unwrap_err();
+        assert!(
+            error.contains("EVIOCGABS(ABS_X)"),
+            "the failure is not the wrapper's: {error}"
+        );
+        // The entry point's own refusal names the operation too, so without
+        // this the test would pass just as well with the request struck off
+        // the roster and no syscall issued at all.
+        assert!(
+            !error.contains("refusing"),
+            "the request never reached the kernel: {error}"
+        );
     }
 
     #[test]

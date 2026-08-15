@@ -3,6 +3,7 @@ use crate::help::Help;
 use crate::launcher::{LaunchRequest, Launcher, LauncherAction};
 use crate::layout::{Axis, Command, DropKind, Layout, Placement, Rect, ViewLayout};
 use crate::ui;
+use crate::MAX_UI_DIMENSION;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -538,6 +539,23 @@ impl Scene {
         was != (self.pointer_x, self.pointer_y)
     }
 
+    /// Put the pointer where an ABSOLUTE device says it is. BOTH coordinates,
+    /// always: a device that named only one axis this frame is still somewhere
+    /// on the other, and the reader carries that position rather than leaving
+    /// the cursor's — which after a relative device moved it is nowhere the
+    /// absolute one is pointing.
+    ///
+    /// Answers whether the pointer moved, as `move_pointer` does and for a
+    /// sharper reason: an absolute device re-sends the position it already has
+    /// far more readily than a relative one sends a zero delta, and every one
+    /// of those would otherwise cost a paint and re-answer focus.
+    pub fn place_pointer(&mut self, x: Fraction, y: Fraction, width: usize, height: usize) -> bool {
+        let was = (self.pointer_x, self.pointer_y);
+        self.pointer_x = across(x, width);
+        self.pointer_y = across(y, height);
+        was != (self.pointer_x, self.pointer_y)
+    }
+
     #[cfg(test)]
     pub fn pointer_target(&self, width: usize, height: usize) -> Option<SurfacePoint> {
         let placements = self.tiled_placements(width, height);
@@ -952,6 +970,63 @@ impl Scene {
         self.help.paint(frame, width, height, stride);
         draw_pointer(frame, width, height, stride, self.pointer_x, self.pointer_y);
     }
+}
+
+/// Where along an axis an absolute device is pointing, as a fraction of its
+/// own span. This is the form a report crosses in, because neither end can do
+/// the arithmetic alone: the device's range is meaningless outside the reader
+/// that asked for it, and the output's size is unknown there.
+///
+/// It is the EXACT ratio — the device's offset over the device's span, neither
+/// reduced nor rescaled. A fixed-point intermediate would floor it once before
+/// `across` floors it again, and two floorings put a report as much as a pixel
+/// from where the operator was pointing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Fraction {
+    pub numerator: u32,
+    pub denominator: u32,
+}
+
+/// A fraction of an extent, in pixels. ROUNDED and then clamped to the last
+/// pixel, which is what makes both edges reachable — and it is the rounding
+/// that does the work rather than the clamp.
+///
+/// The device is not the only thing quantising. Under QEMU the host pointer is
+/// scaled onto `0..=0x7fff` by an integer division that FLOORS, so the
+/// rightmost column of an 800-wide surface arrives as 32726 rather than 32767,
+/// and every other column arrives a shade low too. Flooring again here would
+/// turn "a shade low" into a whole pixel low almost everywhere and put the far
+/// edge permanently out of reach; rounding recovers the column the operator is
+/// actually on, the last one included.
+///
+/// A zero denominator answers 0 rather than dividing: it means the device
+/// declared no span, and the near edge is the only defensible reading of a
+/// position that cannot have one.
+///
+/// Rounding recovers EVERY column rather than most of them, and that is a
+/// property of the output width as much as of the arithmetic: it holds for all
+/// of `0..w` exactly while `w <= 16384`. The bound below is where the two are
+/// tied, because widening the output is what would quietly break it — the
+/// resolutions any test samples would still pass.
+const _: () = assert!(
+    MAX_UI_DIMENSION <= 16384,
+    "a wider output loses columns to QEMU's flooring; see `across`"
+);
+
+fn across(fraction: Fraction, extent: usize) -> i32 {
+    if fraction.denominator == 0 {
+        return 0;
+    }
+    let extent = i64::try_from(extent).unwrap_or(i64::MAX);
+    let last = i32::try_from(extent.saturating_sub(1)).unwrap_or(i32::MAX);
+    let denominator = i64::from(fraction.denominator);
+    let scaled = i64::from(fraction.numerator)
+        .saturating_mul(extent)
+        .saturating_add(denominator / 2)
+        / denominator;
+    i32::try_from(scaled)
+        .unwrap_or(i32::MAX)
+        .clamp(0, last.max(0))
 }
 
 fn contains(rect: Rect, x: usize, y: usize) -> bool {
@@ -2375,6 +2450,84 @@ mod tests {
         assert!(!scene.move_pointer(0, 0, 10, 8));
         assert!(scene.move_pointer(1, 1, 0, 0));
         assert_eq!((scene.pointer_x, scene.pointer_y), (0, 0));
+    }
+
+    #[test]
+    fn an_absolute_pointer_reaches_both_edges_of_the_output() {
+        let mut scene = Scene::new();
+        let tablet = |numerator| Fraction {
+            numerator,
+            denominator: 32767,
+        };
+        // The far edge EXACTLY, which is what this exists for: a relative
+        // device on a host that warps its own cursor cannot be relied on to
+        // arrive at the last column, and the operator sees a strip of screen
+        // they cannot reach.
+        assert!(scene.place_pointer(tablet(32767), tablet(32767), 800, 600));
+        assert_eq!((scene.pointer_x, scene.pointer_y), (799, 599));
+        // And back to the near one.
+        assert!(scene.place_pointer(tablet(0), tablet(0), 800, 600));
+        assert_eq!((scene.pointer_x, scene.pointer_y), (0, 0));
+
+        // Halfway is halfway on both axes at once — the pair always arrives
+        // together, the reader having completed whichever the device left out.
+        assert!(scene.place_pointer(tablet(16384), tablet(16384), 800, 600));
+        assert_eq!((scene.pointer_x, scene.pointer_y), (400, 300));
+        // Reporting the position it already has is not a move — and an
+        // absolute device re-sends one far more readily than a relative one
+        // sends a zero delta, so this is the common case rather than a
+        // curiosity.
+        assert!(!scene.place_pointer(tablet(16384), tablet(16384), 800, 600));
+
+        // Degenerate inputs answer the near edge rather than dividing or
+        // running off: no output to be anywhere on, and no span to be
+        // anywhere along.
+        assert_eq!(across(tablet(32767), 0), 0);
+        assert_eq!(
+            across(
+                Fraction {
+                    numerator: 5,
+                    denominator: 0
+                },
+                800
+            ),
+            0
+        );
+        // Past the end is the end, not past the screen.
+        assert_eq!(across(tablet(999_999), 800), 799);
+    }
+
+    /// The composed claim, and the one that decides whether the operator can
+    /// reach the right-hand column at all. QEMU scales the host pointer onto
+    /// `0..=0x7fff` with an integer division that FLOORS, so it never emits
+    /// 0x7fff and every column arrives a shade low. Flooring a second time here
+    /// would cost a pixel almost everywhere and the last column entirely, which
+    /// is the bug this whole increment is about — so every host column must
+    /// come back as itself.
+    #[test]
+    fn every_host_column_survives_qemus_own_scaling() {
+        // These five are SAMPLES of a property that is total over the
+        // supported range: the round trip returns every column exactly while
+        // the width is at most 16384, which is `MAX_UI_DIMENSION`. That bound
+        // is asserted beside `across` at compile time rather than here,
+        // because raising it would cost a column at widths no sample names.
+        for extent in [640usize, 800, 1024, 1920, 3840] {
+            for column in 0..extent {
+                let value = u32::try_from(column as u64 * 32767 / extent as u64).unwrap();
+                let landed = across(
+                    Fraction {
+                        numerator: value,
+                        denominator: 32767,
+                    },
+                    extent,
+                );
+                assert_eq!(
+                    landed,
+                    i32::try_from(column).unwrap(),
+                    "column {column} of {extent} left as {value} and came back as {landed}"
+                );
+            }
+        }
     }
 
     #[test]

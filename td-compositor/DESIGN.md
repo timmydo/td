@@ -197,7 +197,7 @@ wireless, ethernet and temperature fields of the i3status config this is
 modelled on. All three are additions rather than changes to what is above.
 
 Input is QEMU's PS/2 keyboard and pointer through evdev. The compositor
-supports EV_KEY, EV_REL, and EV_SYN. It has a fixed US key map. Every
+supports EV_KEY, EV_REL, EV_ABS, and EV_SYN. It has a fixed US key map. Every
 binding is ONE chord on `Super`:
 
 - the arrow keys focus left, right, up, and down;
@@ -278,6 +278,142 @@ consumes both the press and release of its command key. Its modifier
 transitions still reach the focused client, as do ordinary keys and their
 releases. Arbitrary keymaps, touch, calibration, gestures, and real GPUs
 are later increments.
+
+A pointer device reports one of two different things, and the compositor
+accepts both. A RELATIVE device (EV_REL) reports a distance to add to
+wherever the cursor already is; an ABSOLUTE one (EV_ABS) reports a PLACE in
+its own units, which is what a tablet, a touchscreen and QEMU's
+`-device usb-tablet` are. Only the second can be trusted to arrive at an
+edge. A relative pointer inside a VM is integrating deltas the host stops
+sending the moment the host's own cursor leaves the guest window, so the
+guest cursor and the host cursor drift apart and the last column of the
+output becomes somewhere the operator cannot point — the compositor has no
+way to tell that from a mouse simply not being pushed further. Nothing in
+the guest fixes that, because the missing motion never happened; an absolute
+device does not have the problem to fix, since each report says where rather
+than how far. QEMU's default PS/2 mouse is relative, so an image wanting the
+edges wants `-device usb-tablet` in its invocation.
+
+Absolute axes are declared per device rather than per report, so each node is
+asked when it is opened — and only then, bar the recoveries below — for where
+ABS_X and ABS_Y are and what they
+report over; a device that refuses is relative, which is the ordinary case and
+not an error. A report is then mapped in two steps that keep evdev's units out
+of the scene: `input.rs` turns a raw value into a `Fraction` of that declared
+range, and the scene turns a fraction into a column or a row of the output.
+The fraction is an exact rational — the device's own offset over the device's
+own span, neither reduced nor rescaled — because the device is not the only
+thing quantising, and each quantisation costs a pixel.
+
+The second one is QEMU's. It scales the host pointer onto `0..=0x7fff` with an
+integer division that FLOORS, so the rightmost column of an 800-wide surface
+arrives as 32726 rather than 32767 and every other column arrives a shade low
+too. Under a mapping that floors a second time, that shade becomes a whole
+pixel almost everywhere and the far edge becomes unreachable — which is the
+original complaint, arrived at from the other direction. So the scene ROUNDS
+and then clamps, and `every_host_column_survives_qemus_own_scaling` holds
+every column of five resolutions to coming back as itself. A fixed-point
+intermediate between the two steps would have put a third flooring in the
+middle, which is why the fraction carries the raw pair.
+
+A value OUTSIDE the declared range is the edge it went past rather than an
+error: drivers do report past their own bounds, and the operator pointing off
+the end of the tablet means the end of the screen. Where a device reports
+both kinds in one frame the PLACE wins, since a delta is a correction to a
+position the device has just restated.
+
+A report reaches the scene with BOTH coordinates even though the kernel omits
+an axis whose value has not changed. The missing one is answered from where
+THAT DEVICE last was, held by its own reader — and before its first report,
+from the `value` field of the same `EVIOCGABS` that gave the range, which is
+the axis's position at the moment it was asked. Leaving the cursor's own
+coordinate in place would look right until anything else moved it: a mouse
+between two stylus reports would leave the axis the stylus did not mention
+wherever the MOUSE put it, which is nowhere the stylus is.
+
+The same argument decides a frame that names NO axis. An absolute device's
+frame is a place unless the only thing in it is a distance, so a BUTTON alone
+is placed too — a click that did not move is the ordinary case rather than a
+corner one, since the kernel drops both axes as unchanged when a tablet is
+tapped twice in one spot. Read as a zero delta it would click wherever the
+shared cursor happened to be. That makes the rule broader than "a position
+beats a delta": a button beats one as well, so a hybrid device sending a
+button and a delta together in one frame has its delta dropped. Nothing on
+this hardware profile is such a device, and the alternative — clicking at a
+place the delta has not been applied to — is worse than losing the motion.
+A dropped batch (`SYN_DROPPED`) and a button
+overflow both abandon the half-built frame and every button believed held,
+and both KEEP that position rather than reverting to the one the kernel gave
+at open — it is not frame state. Both then RECOVER by the same path, which
+is worth stating because only one of them is the kernel's doing: an overflow
+discards this crate's own half-built frame, `EV_ABS` values and all, and
+goes on discarding to the next `SYN_REPORT` exactly as a drop does, so the
+held position is stale in the same way and for the same reason.
+
+Keeping it is not enough on its own, though, and the recovery boundary is
+where the difference shows. The kernel compares an axis against the value IT
+last emitted, not the one that arrived, so an axis that moved while reports
+were being discarded is never re-sent: the held coordinate would be wrong
+until that axis happened to move again, and a click in between would land at
+the wrong place indefinitely. Only the device still knows, so the
+resynchronising `SYN_REPORT` re-reads both axes and the freshly declared
+`value` replaces the held position AND is published as a frame of its own.
+Publishing is the half that is easy to leave out and useless to omit: from the
+recovery onward the kernel sends only changes, so a device that moved during
+the gap and then stopped would leave the cursor wherever it was until it
+happened to move again. The reader cannot ask a device itself — it takes an
+`impl Read` so its tests can drive it from a byte slice — so it is handed a
+resync it can call, which production closes over a second handle to the same
+node and a test answers from a fixture. That handle is a `dup` rather than a
+second `open`: two opens of an evdev node are two CLIENTS, each with a buffer
+the kernel fills, and the one nothing drains is what produces dropped batches
+in the first place. A resync that fails leaves the held position standing,
+which is the best remaining answer rather than a jump back to open.
+
+What that answer CANNOT be is a position at the boundary, and it is recorded
+because it looks like an oversight and is not. `EVIOCGABS` reports where the
+device is NOW, while the reader is replaying records read earlier — up to a
+batch of them — and the kernel may hold more still. So a device that moved
+between the resynchronising `SYN_REPORT` and the ioctl answers with the later
+place, and a frame replayed from that batch carrying only a BUTTON is put
+there rather than where it was pressed. Reading one record at a time would
+not close it: the kernel's queue is ahead of the reader whatever the batch
+size, and the events reconciling the two are exactly the ones not yet
+delivered. Nor is discarding the rest of the batch a fix — those records are
+valid, and throwing a click away outright is worse than landing it a little
+late. The error is bounded by how far the device moved in one batch and ends
+at the next report for that axis, where the alternative — not publishing —
+is stale without bound and is the failure this recovery exists for. It is
+also self-limiting in the case that matters: a button-only frame is a device
+holding still, and a device holding still is one the snapshot agrees with.
+
+What this does NOT do: it does not calibrate (the declared range is taken as
+true), does not map to one output among several (there is one), does not
+change the WIRE — clients still receive surface-local coordinates from the
+cursor's position, and `wl_pointer` has no absolute motion to receive — and
+does not move the cursor for a device that has produced no events at all.
+Anything that device DOES produce places it, though, and from a position no
+report carried: the first frame, even one carrying nothing but a button, and
+the recovery frame after a dropped batch. Both are the seeded position above,
+and both are a jump by design rather than an exception to this.
+
+Nor does it ask what KIND of device declared those axes, and that is a stated
+limitation rather than an oversight. ANY node whose ABS_X and ABS_Y both
+declare a span is admitted, which is a wider class than a tablet and wider
+than the reading it is tempting to give it. A gamepad's left stick is
+ABS_X/ABS_Y, so moving it would take the cursor over. A laptop TOUCHPAD is
+the case that matters more, because it is the common one and it fails
+harder: it reports an absolute finger position and no `EV_REL` at all, so
+under this rule the cursor would teleport to wherever a finger lands rather
+than being dragged by it. An accelerometer node declares those axes too and
+would fly the cursor around with the tilt of the machine. The
+fix needs no new ioctl — `/sys/class/input/*/properties` carries the
+`INPUT_PROP_*` bitmap as an ordinary file, and `INPUT_PROP_POINTER` versus
+`INPUT_PROP_DIRECT` is the distinction wanted — but the property a QEMU
+tablet actually sets cannot be checked from here, and gating on the wrong
+bit would make the feature refuse the one device it exists for. The hardware
+profile above has none of them: it is a PS/2 keyboard, a PS/2 mouse, and
+(once the guest is given one) a tablet.
 
 Compositor commands act only on key presses. Evdev autorepeat records are
 ignored for both compositor and client delivery. A held `Super+v` therefore
@@ -1252,18 +1388,30 @@ connection closes all descriptors it owns.
   keymap descriptor;
 - close(2), to release a received descriptor after it has been safely
   duplicated through `/proc/self/fd/N`; and
-- ioctl(2), for the four pinned terminal-control requests in section 12.
+- ioctl(2), for the four pinned terminal-control requests in section 12 and
+  the two pinned `EVIOCGABS` requests that read an absolute pointer's
+  declared axis range.
 
-No framebuffer, input, socket, allocation, process, or filesystem operation
-passes through that surface. The crate denies unsafe globally; confinement
+No framebuffer, socket, allocation, process, or filesystem operation passes
+through that surface, and no input REPORT: every evdev record td acts on is
+read as bytes off an ordinary `File`. One POSITION does, and it is stated
+rather than glossed, because a resync is the one moment no record can answer
+for: `EVIOCGABS` returns `value` beside the bounds, and the frame published
+after a dropped batch carries it. That is a cursor move — and, through
+focus-follows-mouse, possibly a keyboard focus change — sourced from an
+ioctl rather than from a file. It is the only one, it happens only at a
+recovery, and §2 is where what it means is argued.
+
+The crate denies unsafe globally; confinement
 tests pin the allow count, assembly body, syscall numbers, callers, and the
 absence of unsafe from every other target source file. Each developer tool is
 a separate crate root that also denies unsafe. Adding a syscall or another
 scoped allow amends this document and the repository-wide unsafe inventory.
 
-The two surfaces behind that one body are disjoint and are pinned to disjoint
-modules: descriptor transport is reachable only from `client.rs`, `conn.rs`,
-and `server.rs`, terminal control only from `pty.rs`, and no other module
+The three surfaces behind that one body are disjoint and are pinned to
+disjoint modules: descriptor transport is reachable only from `client.rs`,
+`conn.rs`, and `server.rs`, terminal control only from `pty.rs`, the
+absolute-axis range only from `input.rs`, and no other module
 names `sys` at all. The extracted connection is crate-visible, so a module
 holding one reaches the transport without spelling `sys`: who may NAME `conn`
 is therefore pinned by the same confinement test as who may call the
@@ -1272,9 +1420,15 @@ two clients and the transport itself. A transport user is not thereby a
 syscall caller: `term_client.rs` names no `sys` and does not appear above.
 
 `ioctl(2)` is the request-carrying one, so its roster is the
-confinement: a request outside the four is refused before the syscall, and a
+confinement: a request outside the six is refused before the syscall, and a
 test pins each value, the single guard, the single entry point, and each
-wrapper's operand shape.
+wrapper's operand shape. Two of those values also pin a LENGTH. The size
+field of an evdev request number encodes `sizeof(struct input_absinfo)`, so
+`EVIOCGABS`'s 0x8018 prefix and the crate's own 24-byte buffer are two
+statements of one fact, and a test holds them to each other — the kernel copies
+the smaller of that size field and the struct's own size, so an oversized
+number is harmless while a buffer shortened without the number is an
+out-of-bounds write.
 
 ## 5. Boot and recovery
 
@@ -1402,6 +1556,24 @@ The landing must prove:
 - evdev tests prove relative motion and logical multi-device buttons flush
   only at `SYN_REPORT`, while EOF, `SYN_DROPPED`, and an oversized partial
   report cannot strand a delivered button;
+- an absolute device reaches the target as a PLACE where a relative one
+  reaches it as a distance, a place beats a delta within one report, a value
+  past the declared range is the edge it went past, each axis is scaled
+  against its own range, and an axis a report leaves out is where that device
+  last was — including on a FIRST report, where that is the position the
+  kernel gave at open, on a frame carrying nothing but a BUTTON, and across
+  the reset a dropped batch performs — where a device that can be re-asked is
+  placed at where it went during the gap even if nothing follows the recovery,
+  and one that cannot be asked keeps what it last said; the scene's half is
+  proved separately,
+  where the two
+  ends of a range land exactly on the first and last pixel of the output, and
+  the composed claim is proved over every column of five resolutions passed
+  through QEMU's own floor-scaling and required to come back as itself —
+  which is the reachable-edge claim itself, and the one that would have gone
+  unnoticed had either half been proved alone; the axis position and range
+  are proved to be read from the first three of `input_absinfo`'s six words,
+  three adjacent `__s32`s an index cannot distinguish at runtime;
 - a batch of 32 pointer reports delivers 32 frames and takes one paint, a lone
   report is painted without waiting for a second, a record split across two
   reads is carried rather than parsed short, an interrupted read resumes, and a
@@ -2069,8 +2241,9 @@ tty group WRITE, which is how anything reaches a terminal it does not own,
 where the devpts default would be 0600 owned by group root.
 
 Stable Rust does not expose the required PTY operations. The widening adds
-x86-64 `SYS_IOCTL=16` to the existing raw body. Its safe wrapper accepts
-exactly four request values:
+x86-64 `SYS_IOCTL=16` to the existing raw body. Four of the entry point's
+six permitted request values are this section's; the other two are §2's
+`EVIOCGABS` pair, which no module here may name:
 
 - `TIOCSPTLCK=0x40045431`, to unlock the slave;
 - `TIOCGPTPEER=0x5441`, to obtain the slave as a new owned descriptor;
@@ -2081,10 +2254,10 @@ exactly four request values:
 The confinement tests pin the `SYS_` constant count, raw-body call count,
 request values, and callers. This setter applies only to td-term's newly
 created PTY; it does not weaken the separate repository prohibition on
-resizing an operator's terminal. A request outside the four is refused by the
-one `ioctl` entry point before the syscall is issued, so a mistyped or newly
-invented number cannot reach the kernel without amending both the roster and
-the test that pins it.
+resizing an operator's terminal. A request outside the roster is refused by
+the one `ioctl` entry point before the syscall is issued, so a mistyped or
+newly invented number cannot reach the kernel without amending both the
+roster and the test that pins it.
 
 The wrappers use a four-byte native-endian `int` for `TIOCSPTLCK` and an
 eight-byte `[u16; 4]` of native-endian rows, columns, and the two pixel fields
