@@ -276,10 +276,19 @@ same diff (catches blind spots one model shares with its own
 subagent). Which three reviewer identities apply depends on which model
 is the acting agent:
 
-- **Acting agent is Claude:** subagent review at Opus 4.8, plus a
-  Codex CLI review and an Agy (Antigravity) CLI review.
-- **Acting agent is Codex:** subagent review at gpt-5.6-sol, plus a
-  Claude CLI review and an Agy CLI review.
+- **Acting agent is Claude:** subagent review at the latest Opus, plus
+  a Codex CLI review and an Agy (Antigravity) CLI review.
+- **Acting agent is Codex:** subagent review at the latest Codex
+  model, plus a Claude CLI review and an Agy CLI review.
+
+Those rows name a TIER rather than a version, and deliberately: a
+version pinned here is a second place to update every time one ships,
+which nothing enforces and nobody remembers — this file does not run.
+Ask the CLI what its current model is instead of reading it off this
+page. `claude --model opus` is an alias for the newest Opus; `codex
+exec` with no `--model` takes the one pinned in `~/.codex/config.toml`
+and PRINTS it in the header it opens with; `agy models` lists the
+spellings Antigravity accepts.
 
 You know which you are. Inside Claude Code the subagent review is your
 own Agent tool (`/code-review`), never the `claude` CLI — that row is
@@ -299,33 +308,38 @@ output to a scratch file you do NOT commit; account for every finding
 verbatim dumps. That summary is the durable record the integrator reads
 before landing.
 
-Claude runs Codex (gpt-5.6-sol, xhigh):
+Claude runs Codex (its configured model, xhigh). Run it from inside the
+worktree: `codex exec` refuses a directory it has no trust entry for.
 
 ```
-git show HEAD | codex exec --model gpt-5.6-sol -c model_reasoning_effort="xhigh" -s read-only --ephemeral "Do a code review of the git commit on stdin. Do not edit files. Return prioritized findings with file/line references where possible." | tee /tmp/codex-review.md
+git show HEAD | codex exec -c model_reasoning_effort="xhigh" -s read-only --ephemeral "Do a code review of the git commit on stdin. Do not edit files. Return prioritized findings with file/line references where possible." | tee /tmp/codex-review.md
 ```
 
-Codex runs Claude (Opus 4.8, xhigh):
+Codex runs Claude (the latest Opus, xhigh):
 ```
 git show HEAD | claude -p --model opus --effort xhigh "Do a code review of the git commit on stdin. Do not edit files. Return prioritized findings with file/line references where possible." | tee /tmp/claude-review.md
 ``` 
 
-Either acting agent also runs Antigravity (Gemini 3.1 Pro High) as the
-third, shared cross-model reviewer:
+Either acting agent also runs Antigravity as the third, shared
+cross-model reviewer, at the top Pro tier. This one has no alias — the
+model is a display NAME, so it is spelled in full and checked against
+`agy models` when Antigravity moves. Read that list by TIER and not by
+number: its Flash entries carry higher version numbers than the Pro
+one and are the faster model, not the stronger one.
 
 ```
 git show HEAD | agy --model "Gemini 3.1 Pro (High)" --mode plan --print-timeout 10m --print "Do a code review of the git commit on stdin. Do not edit files. Return prioritized findings with file/line references where possible." | tee /tmp/agy-review.md
 ```
 
-Use `--model`/`--effort` for `claude` (effort level `xhigh`); `--model`
-+ `-c model_reasoning_effort=…` for `codex`; and `--model`/`--mode
-plan` for `agy`.
+Use `--model opus`/`--effort` for `claude` (effort level `xhigh`); `-c
+model_reasoning_effort=…` for `codex`, whose model comes from its own
+config; and `--model`/`--mode plan` for `agy`.
 
 **The record.** Trailers closing the message, one per reviewer, plus
 what you ran green:
 
 ```
-Reviewed-by: subagent/opus-4.8
+Reviewed-by: subagent/opus-5
 Reviewed-by: codex/gpt-5.6-sol
 Reviewed-by: agy/gemini-3.1-pro
 Checks: affected-checks --committed-only (green)
@@ -336,6 +350,15 @@ Checks: affected-checks --committed-only (green)
 of whichever model is not acting, and a non-empty `Checks:` — a
 docs-only commit included. The trailers are the machine-checkable half
 of the record; the prose summary above them is the half a human reads.
+
+The version IS written out there, which is not in tension with the tier
+above: a record says what HAPPENED, and staleness is a problem for a
+specification rather than for history. Name the model that actually
+looked — `opus-5`, never `latest` and not the bare family, since what
+makes the review auditable a year on is knowing which one it was.
+`ready` compares FAMILIES (opus/sonnet/haiku/fable/gpt/gemini), so
+everything after the family is free-form and a `latest` naming none is
+refused outright.
 
 The record must CLOSE the message — it is read as git reads trailers,
 from the last block — so nothing goes below it and no trailer is
