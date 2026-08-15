@@ -815,6 +815,11 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
         // makes `-c` print its zero.
         let sep = if grep.conf.null_data { 0u8 } else { b'\n' };
         let mut rec = Records::new(input, sep);
+        // `-a` is the one switch that turns the binary verdict off, and the
+        // zapping goes with it. Not gated on the counting modes: GNU suppresses
+        // OUTPUT for a binary file only when it is printing lines, but it zaps
+        // whatever it is doing, which is why `-c` sees the difference too.
+        rec.zap_nuls(!grep.conf.text);
         let mut read_failed = false;
         let hit = search_file(
             &grep,

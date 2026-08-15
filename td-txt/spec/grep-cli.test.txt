@@ -982,6 +982,143 @@ apple pie
 ## stdout-json: "foo\x00bar\n"
 ## status: 0
 
+# A binary buffer has its NULs replaced by the line separator before it is
+# searched (GNU's `zap_nuls`), so a NUL ENDS a line. That moves what matches,
+# which the counting modes are how you see it: they print no line content, so
+# they are not suppressed the way a printing run is. `-a` turns the verdict off
+# and the zapping with it, which is what each pair below holds apart.
+
+#### a NUL ends a line, so an anchor matches after it
+## argv: grep -c ^y b1
+## file-json b1: "x\x00y\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### -a leaves the NUL in the line, and the anchor does not match
+## argv: grep -a -c ^y b1
+## file-json b1: "x\x00y\n"
+## stdout-json: "0\n"
+## status: 1
+
+#### the same for a trailing anchor
+## argv: grep -c x$ b1
+## file-json b1: "x\x00y\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### -a, and the trailing anchor does not match either
+## argv: grep -a -c x$ b1
+## file-json b1: "x\x00y\n"
+## stdout-json: "0\n"
+## status: 1
+
+#### one line becomes two, so the count is two
+## argv: grep -c . b1
+## file-json b1: "x\x00y\n"
+## stdout-json: "2\n"
+## status: 0
+
+#### every NUL of a run becomes a separator, so a run leaves an empty line
+## argv: grep -c ^$ b1
+## file-json b1: "x\x00\x00y\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### the NUL itself is gone, so a pattern holding one cannot match
+## argv: grep -c -f pat b1
+## file-json pat: "\x00\n"
+## file-json b1: "x\x00y\n"
+## stdout-json: "0\n"
+## status: 1
+
+#### -a, and the pattern holding a NUL matches
+## argv: grep -a -c -f pat b1
+## file-json pat: "\x00\n"
+## file-json b1: "x\x00y\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### -z reaches no verdict at all, so nothing is zapped
+## argv: grep -z -c ^a b1
+## file-json b1: "\x00a\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### a printing run is still replaced by the notice, zapped or not
+## argv: grep ^y b1
+## file-json b1: "x\x00y\n"
+## stdout-json: ""
+## stderr-json: "grep: b1: binary file matches\n"
+## status: 0
+
+#### -a prints the line instead, and there is no match to print
+## argv: grep -a ^y b1
+## file-json b1: "x\x00y\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+# The four shapes the closed spec/README entries are written around, each in
+# the input its entry names. The first two end in a NUL, which is where the
+# zapping decides whether the LAST record is terminated at all.
+
+#### the -c entry's own input: a trailing NUL still ends a record
+## argv: grep -c a b1
+## file-json b1: "a\x00b\x00aa\x00"
+## stdout-json: "2\n"
+## status: 0
+
+#### -a, and it is one unterminated line holding two NULs
+## argv: grep -a -c a b1
+## file-json b1: "a\x00b\x00aa\x00"
+## stdout-json: "1\n"
+## status: 0
+
+#### the -x entry's own input, which was the uncharacterized one
+## argv: grep -x a b1
+## file-json b1: "a\x00b"
+## stdout-json: ""
+## stderr-json: "grep: b1: binary file matches\n"
+## status: 0
+
+#### -a, and the whole-line test sees `a\0b` and refuses it
+## argv: grep -a -x a b1
+## file-json b1: "a\x00b"
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### the record-terminator entry's general form, no anchor at all
+## argv: grep -c -v zzz b1
+## file-json b1: "ppp\x00qqq\nrrr\n"
+## stdout-json: "3\n"
+## status: 0
+
+#### -a, and the same input is two lines
+## argv: grep -a -c -v zzz b1
+## file-json b1: "ppp\x00qqq\nrrr\n"
+## stdout-json: "2\n"
+## status: 0
+
+#### the anchored form that the sweep turned up
+## argv: grep -c -e ^a b1
+## file-json b1: "\n\n\n\n\x00abaa"
+## stdout-json: "1\n"
+## status: 0
+
+#### -a, and the anchor has nothing to match after
+## argv: grep -a -c -e ^a b1
+## file-json b1: "\n\n\n\n\x00abaa"
+## stdout-json: "0\n"
+## status: 1
+
+#### the one-line form, where the empty line is what matches
+## argv: grep -n -o -C 1 -m 1 -e ^$ b1
+## file-json b1: "\x00ab"
+## stdout-json: ""
+## stderr-json: "grep: b1: binary file matches\n"
+## status: 0
+
 #### -x with an empty pattern selects only the empty line
 ## argv: grep -x ''
 ## stdin:

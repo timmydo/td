@@ -4944,7 +4944,6 @@ mod tests {
         let sep = separator_for(null_data);
         let mut script =
             compile_script(script.as_bytes(), Vec::new(), mode_with(ere), null_data).unwrap();
-        let nranges = script.cmds.len();
         let seed = seed_ranges(&script.cmds);
         let wfiles = std::mem::take(&mut script.wfiles);
         let mut sed = Sed {

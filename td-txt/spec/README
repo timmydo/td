@@ -1244,9 +1244,11 @@ td-txt-authored case files
     iteration runs once, to record participation, and never twice.
 
   - A file holding a NUL under `-c` and `-v`, where GNU zaps the NUL to a
-    record end and so counts more lines than td-txt does: `printf 'a\0b\0aa\0'`
-    is `2` in GNU and `1` here. The `-x` entry below is a different question
-    about the same byte and does not cover this. Pre-existing.
+    record end and so counts more lines than td-txt did: `printf 'a\0b\0aa\0'`
+    was `2` in GNU and `1` here. CLOSED, and it turned out to be the same
+    entry as the `-x` one below rather than a different question about the
+    same byte -- see the record-terminator entry there for the mechanism,
+    which this one had already named, and for its scope.
 
   - GNU's extra EMPTY span under `-o` with `-x` and `-w` together: `grep -o -w
     -x a` over `a/ab` is `a` and an empty line in GNU and just `a` here. It
@@ -1969,12 +1971,10 @@ td-txt-authored case files
     before the match -- a third instance of the same too-small fixture reached
     review inside this very landing.
 
-  - `-x` over a file holding a NUL, where GNU reports `binary file matches` at
-    exit 0 and td-txt selects nothing and exits 1. The whole-line test and the
-    binary rule interact somewhere td-txt does not follow -- with one line
-    `a\0b`, `-x a` matches nothing by the anchored reading, so GNU is finding
-    its match another way. Pre-existing and not characterized; it wants its own
-    probe before any fix.
+  - `-x` over a file holding a NUL, where GNU reported `binary file matches`
+    at exit 0 and td-txt selected nothing and exited 1. CLOSED, and it was
+    never about `-x`: it is the record-terminator entry below on a one-line
+    file, which that entry had already said. See it for the mechanism.
 
   - A CLOSED stdin, which GNU reports as `(standard input): Bad file descriptor`
     at exit 2 where td-txt prints `0` and exits 1. Not reachable as a bug in the
@@ -2065,31 +2065,106 @@ td-txt-authored case files
     reported, and on a pipe GNU's own boundaries are read-sized and timing-
     dependent for the same reason.
 
-    `-c`/`-l`/`-L`/`-q` print no line content and so were never affected by the
-    verdict in either program. Distinct from the `-x` NUL entry above, which is
-    a one-line file and about the anchored test rather than about how much was
-    looked at.
+    `-c`/`-l`/`-L`/`-q` print no line content and so are never SUPPRESSED by
+    the verdict in either program. That is not the same as being unaffected by
+    it: the verdict also zaps, which moves what matches, and the counting
+    modes are exactly where that shows -- see the record-terminator entry
+    below. Distinct from the `-x` NUL entry above, which is a one-line file
+    and about the anchored test rather than about how much was looked at.
 
-  - A NUL is a RECORD TERMINATOR to GNU in binary mode, which td-txt does not
-    reproduce. Found by a randomized sweep, and NOT a streaming matter.
+  - A NUL is a RECORD TERMINATOR to GNU in binary mode, which td-txt did not
+    reproduce. Found by a randomized sweep, and NOT a streaming matter. CLOSED.
 
     The general form, with no anchor in the pattern at all: over
-    `"ppp\0qqq\nrrr\n"`, `grep -c -v zzz` counts 3 in GNU and 2 here, because
-    GNU splits it into `ppp`, `qqq` and `rrr` where td-txt sees two lines.
+    `"ppp\0qqq\nrrr\n"`, `grep -c -v zzz` counted 3 in GNU and 2 here, because
+    GNU splits it into `ppp`, `qqq` and `rrr` where td-txt saw two lines.
     `-a` makes GNU agree (2), which is what identifies BINARY MODE rather than
     the pattern as the switch.
 
     The anchored cases are one symptom of that and not a rule of their own: `^`
     matches after the NUL because the NUL ended a record. So over
-    `"\n\n\n\n\0abaa"`, `grep -c -e '^a'` counts 1 in GNU and 0 here, and over
-    a one-line `"\0ab"`, `grep -n -o -C 1 -m 1 -e '^$'` says `binary file
+    `"\n\n\n\n\0abaa"`, `grep -c -e '^a'` counted 1 in GNU and 0 here, and over
+    a one-line `"\0ab"`, `grep -n -o -C 1 -m 1 -e '^$'` said `binary file
     matches` in GNU and nothing here. An earlier draft of this entry recorded
     the anchor as the CAUSE; it is the consequence.
 
-    Pre-existing and untouched by the streaming landing -- the parent build
-    answers identically on every case the sweep turned up, which is how these
-    were told apart from a regression. Related to the `-x` NUL entry, which is
-    the same rule seen on a one-line file.
+    The MECHANISM, which this entry had right in the general and left open:
+    GNU's `zap_nuls` replaces every NUL in a buffer it has judged binary with
+    the line separator BEFORE searching it. Its own reason is memory -- a long
+    run of zeros holds no separator, so it would otherwise be part of one
+    unbounded line, and grep.c's comment says exactly that. Termination is the
+    side effect, and it is the observable one. Every NUL of a run becomes its
+    own separator rather than the run becoming one, so `x\0\0y` holds an EMPTY
+    line; and the NUL is GONE, so a pattern carrying one cannot match and `.`
+    no longer spans it. Both were predicted from the rule and then measured.
+
+    Where it shows is narrower than it sounds, which is why a sweep over the
+    COUNTING modes is what found it: a printing run over a binary file emits
+    no lines either way, GNU replacing them with the `binary file matches`
+    notice. So the difference reaches `-c`/`-l`/`-L`/`-q`, the exit status,
+    and whether that notice appears at all. `-a` turns the verdict off and the
+    zapping with it; `-z` reaches no verdict in the first place, GNU guarding
+    the whole test on a non-zero end-of-line byte, so nothing is zapped there.
+
+    Zapping begins with the buffer the verdict TRIPS ON rather than the one
+    after it, and a record that began in an earlier buffer keeps the bytes it
+    already had -- GNU starts at `beg`, past the carried-over residue. That
+    inherits the buffer-boundary caveat of the streaming entry above: which
+    side of the flip a given byte falls on depends on where the boundaries
+    land, and td-txt reproduces the RULE rather than GNU's arithmetic.
+
+    What is NOT implemented is the OTHER half of the same GNU mechanism, and
+    it costs time rather than answers. Zapping turns a run of zeros into one
+    empty record PER BYTE, which is why GNU pairs `zap_nuls` with `skip_nuls`
+    (grep.c:1022): once the verdict is in, a read that is entirely zeros is
+    DISCARDED rather than split, and `totalnl` is credited so `-n` still
+    counts them. GNU enables that only when an empty line cannot be SELECTED
+    (`skip_empty_lines`, grep.c:2983 -- the pattern is run against an empty
+    line and the answer compared with `-v`), so it changes no output. td-txt
+    does the splitting and not the skipping. Measured on 64 MiB of NULs
+    followed by `hello\n`, all three agreeing on the answer:
+
+      grep -c hello    GNU 0.03s   parent 0.12s   this 3.07s
+      grep -q hello    GNU 0.03s   parent 0.12s   this 2.96s
+      grep -c '^$'     GNU 0.87s   parent exit 2  this 4.59s
+
+    The `-c '^$'` row is the shape of the whole trade: the parent could not
+    answer it at all -- one unbounded record, `out of memory` -- and GNU is
+    slow there too, because a pattern that selects an empty line is exactly
+    the one it may not skip. So this is a regression on NUL-DENSE input
+    against the parent (sparse images and core dumps are that shape) bought
+    with an answer where there was none. `skip_nuls` is the fix and is the
+    next increment; it needs no `unsafe` surface -- only GNU's further
+    `SEEK_DATA` jump over a hole would, and reading the zeros and dropping
+    them gets the bulk of it.
+
+    Two costs here are NOT that and stay: under `-z` the same run is one
+    empty record per NUL with no verdict involved, which the parent paid
+    equally (2.61s against GNU's 0.04s), so it is pre-existing rather than
+    introduced; and where GNU may not skip either it is still several times
+    faster per empty record (0.29s against 2.93s for `-v -c hello`), which is
+    a per-record cost of this reader and not about NULs at all.
+
+  - A SPARSE file is binary to GNU before any NUL has been read, and td-txt
+    does not follow. This is the SECOND door to the verdict above: GNU asks
+    the kernel for a hole (`lseek(fd, cur, SEEK_HOLE)`) on the first buffer of
+    a regular file, and a hole before end-of-file means the file must contain
+    NULs whether or not any have been seen. Measured on 270 KiB of ordinary
+    text followed by a 64 MiB hole -- the hole past the first 96 KiB buffer,
+    so only the seek can see it -- GNU prints nothing but the notice where
+    td-txt prints 196605 bytes of matching lines before its own verdict trips
+    in the buffer that reaches the hole. `-c` and `-l` agree anyway, both
+    files matching either way.
+
+    NOT closed, and the reason is a boundary rather than a difficulty: the
+    question is `SEEK_HOLE`, which `std::io::Seek` cannot spell -- it offers
+    Start/Current/End and nothing else -- so asking it needs a raw `lseek`,
+    an `unsafe` surface td-txt does not have and UNSAFE.md would have to gain.
+    The one safe proxy, `st_blocks * 512 < st_size`, is available and is NOT
+    the same question: it reports holes on a filesystem that merely COMPRESSES,
+    which would suppress the output of an ordinary text file. A wrong answer
+    there is silent and costs the reader every match in the file, so the
+    divergence is recorded rather than guessed at.
 
   - The `-v` short cut above under `-r`, which GNU takes before it expands
     operands and td-txt takes after: `grep -rcv -e '' /nosuchdir` is exit 1 and

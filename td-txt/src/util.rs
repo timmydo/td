@@ -341,6 +341,10 @@ pub struct Records<R> {
     sep: u8,
     eof: bool,
     binary: bool,
+    /// Replace every NUL in a binary buffer with `sep` before it is scanned, as
+    /// grep does. Off by default: sed reaches no binary verdict, so nothing may
+    /// rewrite the bytes it is about to hand out.
+    zap: bool,
     /// A read failure deferred until the bytes read before it were handed over.
     pending: Option<std::io::Error>,
     consumed: u64,
@@ -374,6 +378,7 @@ impl<R: std::io::Read> Records<R> {
             sep,
             eof: false,
             binary: false,
+            zap: false,
             pending: None,
             consumed: 0,
         }
@@ -381,6 +386,14 @@ impl<R: std::io::Read> Records<R> {
 
     pub fn binary(&self) -> bool {
         self.binary
+    }
+
+    /// Turn on grep's NUL zapping (`zap_nuls`). GNU's own reason is memory --
+    /// a run of zeros with no separator in it would otherwise be held as one
+    /// unbounded line -- and what it does to MATCHING comes with it, since the
+    /// separator it writes is a line boundary like any other.
+    pub fn zap_nuls(&mut self, on: bool) {
+        self.zap = on;
     }
 
     /// Bytes taken from the SOURCE so far, which is not what the caller has been
@@ -459,6 +472,16 @@ impl<R: std::io::Read> Records<R> {
         self.consumed = self.consumed.saturating_add(n as u64);
         if self.buf.get(..n).is_some_and(|s| s.contains(&0)) {
             self.binary = true;
+        }
+        // From the buffer the verdict trips ON, not the one after it: GNU zaps
+        // the same buffer it decided from, and every later one whether or not
+        // that one holds a NUL of its own. A separator of 0 (`grep -z`) is why
+        // GNU reaches no verdict at all there, so there is nothing to zap.
+        let sep = self.sep;
+        if self.zap && self.binary && sep != 0 {
+            if let Some(s) = self.buf.get_mut(..n) {
+                s.iter_mut().filter(|b| **b == 0).for_each(|b| *b = sep);
+            }
         }
         Ok(())
     }
@@ -1370,5 +1393,31 @@ mod tests {
         assert!(rec.binary(), "the buffer holding the NUL did not report binary");
         assert!(rec.next().unwrap());
         assert!(rec.binary(), "a later NUL-free buffer cleared the verdict");
+    }
+
+    /// The buffer the verdict trips ON is zapped, not just the ones after it.
+    /// The carry is NOT what this pins, though the record here spans one: a NUL
+    /// in an earlier buffer would have tripped the verdict THERE and been
+    /// zapped there, so a spill can never hold one and the "keeps its earlier
+    /// bytes" half has no failing case to write.
+    #[test]
+    fn zapping_starts_with_the_buffer_that_tripped_the_verdict() {
+        let src = Scripted(vec![Ok(b"a"), Ok(b"x\x00y\n")]);
+        let mut rec = Records::new(src, b'\n');
+        rec.zap_nuls(true);
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line(), b"ax", "the NUL did not end the record it landed in");
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line(), b"y", "the rest of that buffer is a record of its own");
+    }
+
+    /// Off unless asked, because sed reaches no binary verdict and must hand
+    /// over the bytes it was given.
+    #[test]
+    fn a_reader_that_was_not_asked_to_zap_hands_the_nul_over() {
+        let src = Scripted(vec![Ok(b"a"), Ok(b"x\x00y\n")]);
+        let mut rec = Records::new(src, b'\n');
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line(), b"ax\x00y");
     }
 }
