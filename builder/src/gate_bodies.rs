@@ -158,8 +158,7 @@ fn tb_out_env(
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let out = cmd
-        .output()
+    let out = crate::spawn::past_a_busy_program(|| cmd.output())
         .map_err(|e| format!("FAIL: {ctx}: cannot spawn td-builder: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
@@ -173,13 +172,18 @@ fn tb_out_env(
 
 /// True if `tb <args...>` exits zero (for the discrimination legs that expect
 /// a NON-zero exit — corruption/verify-fail). stdout+stderr discarded.
+///
+/// The busy retry matters MORE here than where an error is returned: this
+/// collapses every failure to `false`, which is the answer those legs are
+/// looking for, so a program that could not be exec'd would read as one that
+/// ran and refused.
 fn tb_ok(tb: &Path, args: &[&str]) -> bool {
-    Command::new(tb)
-        .args(args)
+    let mut cmd = Command::new(tb);
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::null());
+    crate::spawn::past_a_busy_program(|| cmd.status())
         .map(|s| s.success())
         .unwrap_or(false)
 }
@@ -204,8 +208,7 @@ fn run_out_env(
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let out = cmd
-        .output()
+    let out = crate::spawn::past_a_busy_program(|| cmd.output())
         .map_err(|e| format!("FAIL: {ctx}: cannot spawn {program}: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
@@ -1867,7 +1870,8 @@ fn run_recipe_check(
 ) -> Result<CheckOutcome, String> {
     use std::io::{BufRead, BufReader, Write};
     let index_s = index.to_string();
-    let mut child = Command::new(eval)
+    let mut command = Command::new(eval);
+    command
         .arg("check-run")
         .arg(spec)
         .arg(&index_s)
@@ -1875,8 +1879,8 @@ fn run_recipe_check(
         .env("TD_RECIPE_CHECK_SPEC", spec)
         .env("TD_RECIPE_CHECK_INDEX", &index_s)
         .env("TD_STAGE0_BASE", stage0_base)
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    let mut child = crate::spawn::past_a_busy_program(|| command.spawn())
         .map_err(|e| format!("FAIL: cannot spawn td-recipe-eval check-run {spec}: {e}"))?;
     let mut saw_sentinel = false;
     if let Some(err) = child.stderr.take() {
@@ -2084,10 +2088,9 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
     }
     println!("   ok: list/emit {first} produced JSON via the release binary");
 
-    let bad_build = Command::new(&eval)
-        .args(["build-run", "not-a-recipe"])
-        .stdin(Stdio::null())
-        .output()
+    let mut smoke = Command::new(&eval);
+    smoke.args(["build-run", "not-a-recipe"]).stdin(Stdio::null());
+    let bad_build = crate::spawn::past_a_busy_program(|| smoke.output())
         .map_err(|e| format!("FAIL: cannot spawn td-recipe-eval build-run smoke: {e}"))?;
     if bad_build.status.success() {
         return Err(
@@ -2790,12 +2793,13 @@ exit 0
     let mut reap_args: Vec<&str> = vec!["host-sandbox"];
     reap_args.extend_from_slice(&bind_flags);
     reap_args.extend_from_slice(&["--", &sh_exec_s, "-c", &inner]);
-    let mut child = Command::new(&tb)
+    let mut probe = Command::new(&tb);
+    probe
         .args(&reap_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    let mut child = crate::spawn::past_a_busy_program(|| probe.spawn())
         .map_err(|e| format!("FAIL: cannot spawn the host-sandbox reaping probe: {e}"))?;
     let top = i64::from(child.id());
 

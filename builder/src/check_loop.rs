@@ -330,9 +330,9 @@ fn provision_userland(root: &Path) -> Result<LoopUserland, CheckError> {
     for stem in LOOP_USERLAND_STEMS {
         cmd.arg(stem);
     }
-    let out = cmd
-        .current_dir(root)
-        .output()
+    cmd.current_dir(root);
+    // This same process cargo-built `eval` moments ago; see `crate::spawn`.
+    let out = crate::spawn::past_a_busy_program(|| cmd.output())
         .map_err(|e| fatal(&format!("could not run {eval} build-run: {e}")))?;
     if !out.status.success() {
         let tail: Vec<&str> = std::str::from_utf8(&out.stderr)
@@ -1901,7 +1901,15 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
     .current_dir(&root);
     // Replace this process, exactly as the shell helper's `exec` did.
     use std::os::unix::process::CommandExt as _;
-    let e = cmd.exec();
+    // `exec` returns ONLY on failure, so the attempt never yields `Ok` — which
+    // is what `Infallible` says here. ETXTBSY on `tb` (this binary, which cargo
+    // may be relinking) is waited out like any other spawn; see `crate::spawn`.
+    let e = match crate::spawn::past_a_busy_program(|| {
+        Err::<std::convert::Infallible, _>(cmd.exec())
+    }) {
+        Err(error) => error,
+        Ok(never) => match never {},
+    };
     Err(fatal(&format!(
         "check-rung: could not exec the sandbox: {e}"
     )))

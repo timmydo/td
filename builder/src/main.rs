@@ -41,6 +41,7 @@ mod oci;
 mod ready;
 mod sandbox;
 mod scan;
+mod spawn;
 mod stage0;
 mod store;
 mod store_db;
@@ -5761,9 +5762,9 @@ fn emit_recipe_json(pkg: &str) -> Result<String, String> {
         "TD_RECIPE_EVAL must point at td's td-recipe-eval binary (the Rust recipe catalog evaluator)"
             .to_string()
     })?;
-    let out = Command::new(&eval)
-        .args(["emit", pkg])
-        .output()
+    let mut cmd = Command::new(&eval);
+    cmd.args(["emit", pkg]);
+    let out = crate::spawn::past_a_busy_program(|| cmd.output())
         .map_err(|e| format!("spawn td-recipe-eval ({eval}): {e}"))?;
     if !out.status.success() {
         // Unknown stem (or any emit failure) ⇒ loud error, NOT a guix fallback. Keep the
@@ -5968,8 +5969,7 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
             .env("TD_RUST_STORE_CC", &native_env.cc)
             .env("TD_RUST_STORE_CXX", &native_env.cxx)
             .env("TD_RUST_STORE_INCLUDE", &native_env.include);
-        let out = build
-            .output()
+        let out = crate::spawn::past_a_busy_program(|| build.output())
             .map_err(|e| format!("build `{pkg}': spawn td-builder build-recipe: {e}"))?;
         if !out.status.success() {
             return Err(format!(
@@ -6087,9 +6087,9 @@ fn shell_recipe_source_pin(pkg: &str) -> Result<ShellSourcePin, String> {
     let eval = std::env::var("TD_RECIPE_EVAL").map_err(|_| {
         "TD_RECIPE_EVAL must point at td's td-recipe-eval binary (source pin lookup)".to_string()
     })?;
-    let out = Command::new(&eval)
-        .args(["source-pin", pkg])
-        .output()
+    let mut cmd = Command::new(&eval);
+    cmd.args(["source-pin", pkg]);
+    let out = crate::spawn::past_a_busy_program(|| cmd.output())
         .map_err(|e| format!("spawn td-recipe-eval ({eval}) for `{pkg}' source pin: {e}"))?;
     if !out.status.success() {
         return Err(format!(
@@ -8814,8 +8814,7 @@ fn main() -> ExitCode {
                 for (k, v) in &override_env {
                     cmd.env(k, v);
                 }
-                let out = cmd
-                    .output()
+                let out = crate::spawn::past_a_busy_program(|| cmd.output())
                     .map_err(|e| format!("spawn {sub} for {drv}: {e}"))?;
                 if !out.status.success() {
                     return Err(format!("{sub} failed for {drv} (see daemon log)"));

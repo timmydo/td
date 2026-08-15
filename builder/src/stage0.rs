@@ -1261,33 +1261,28 @@ mod tests {
     /// resolves in this environment (see `sh_shebang`), then PROVE it execs before
     /// handing it to the code under test.
     ///
-    /// The proof is not ceremony. Another test thread that forks while our write fd
-    /// is open inherits that fd, and until the child reaches `execve` the file has a
-    /// writer — so exec'ing it fails with ETXTBSY, "Text file busy". The window is
-    /// milliseconds and closes for good once those children exec (nothing else ever
-    /// opens these files for writing), but this binary spawns constantly and the
-    /// failure lands inside whatever production call the fixture was written for,
-    /// where it reads as a resolver bug: `spawn …/rustc: Text file busy` surfaced as
-    /// a Broken toolchain. Retrying belongs here rather than in `provision_rust`,
-    /// which would then carry a retry loop existing only for its tests. The probe
+    /// The proof is not ceremony — see `crate::spawn`, which owns the waiting and
+    /// the reason for it: a sibling thread forking while our write fd is open holds
+    /// that fd until its own exec, and the file has a writer for exactly that long.
+    /// What is particular to HERE is where the failure lands. It surfaces inside
+    /// whatever production call the fixture was written for, so it reads as a
+    /// resolver bug — `spawn …/rustc: Text file busy` reported as a Broken
+    /// toolchain — which is why the wait belongs at the fixture rather than in
+    /// `provision_rust`, which would then carry it only for its tests. The probe
     /// argument matches no `case` arm in any fixture body, so running one is inert.
     fn write_exec(p: &Path, body: &str) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, format!("{}{body}", sh_shebang())).unwrap();
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        for _ in 0..400 {
-            match Command::new(p)
-                .arg("--td-fixture-probe")
-                .stdin(Stdio::null())
-                .output()
-            {
-                Err(e) if e.raw_os_error() == Some(26) => {
-                    std::thread::sleep(std::time::Duration::from_millis(5))
-                }
-                _ => return,
-            }
+        let mut probe = Command::new(p);
+        probe.arg("--td-fixture-probe").stdin(Stdio::null());
+        if let Err(e) = crate::spawn::past_a_busy_program(|| probe.output()) {
+            assert!(
+                !crate::spawn::is_busy(&e),
+                "fixture {} never stopped being Text-file-busy",
+                p.display()
+            );
         }
-        panic!("fixture {} never stopped being Text-file-busy", p.display());
     }
 
     fn exec_file(p: &Path) {

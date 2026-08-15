@@ -1028,10 +1028,17 @@ fn run_gate(
         // every gate the moment that thread finished, reported as an ordinary
         // body failure (exit 137) with nothing naming the cause.
         crate::sandbox::die_with_parent(&mut cmd);
-        let mut child = match cmd.spawn() {
+        // A NATIVE gate execs this binary, which cargo may be relinking — see
+        // `crate::spawn`. The message below says "bash" for either kind, which
+        // is wrong for a native gate and was written when every gate was a
+        // shell one, so it names what was actually spawned now.
+        let spawned = crate::spawn::past_a_busy_program(|| cmd.spawn());
+        let what = if native { "the gate body" } else { "bash" };
+        let mut child = match spawned {
             Ok(c) => c,
             Err(e) => {
-                let _ = writeln!(logf, "gate-run: FAIL: gate {}: cannot spawn bash: {e}", g.name);
+                let _ =
+                    writeln!(logf, "gate-run: FAIL: gate {}: cannot spawn {what}: {e}", g.name);
                 timing_event(timing, &g.name, "END");
                 return Outcome::Failed;
             }

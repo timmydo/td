@@ -113,10 +113,9 @@ fn recipe_source_pins_output(repo_root: &Path) -> Result<Output, String> {
                 eval.display()
             ));
         }
-        return Command::new(&eval)
-            .arg("source-pins")
-            .current_dir(repo_root)
-            .output()
+        let mut cmd = Command::new(&eval);
+        cmd.arg("source-pins").current_dir(repo_root);
+        return crate::spawn::past_a_busy_program(|| cmd.output())
             .map_err(|e| format!("spawn {} source-pins: {e}", eval.display()));
     }
 
