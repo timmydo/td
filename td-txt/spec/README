@@ -794,8 +794,8 @@ td-txt-authored case files
   and is pinned in divergence.test.txt.
 
   That rule is what makes td-txt's REFUSALS visible from both sides. td-txt's
-  scan raises on options GNU accepts -- `-b`, `-D`, `--color` and the rest of
-  the deliberate omissions below -- so `grep --help -b` is a refusal at exit 2
+  scan raises on options GNU accepts -- `-b`, `--color` and the rest of the
+  deliberate omissions below -- so `grep --help -b` is a refusal at exit 2
   here where GNU prints its usage at exit 0. The refusal is the pinned decision
   and the deferral only decides WHEN it is reached; before it, the same command
   written the other way round (`grep -b --help`) already refused, so this makes
@@ -803,18 +803,111 @@ td-txt-authored case files
 
   `-r`'s WALK admits the ROOT and the tree below it by different rules. The root
   is FOLLOWED, so a symlinked directory named as an operand is descended and a
-  device named as one is read; below it nothing is followed and only REGULAR
-  files are collected, so a symlink the walk finds is skipped and so is a FIFO --
-  an open that would never return. `-` is stdin under `-r` as it is without it,
+  device named as one is read; below it nothing is followed, so a symlink the
+  walk finds is skipped and never reaches the search at all -- that is `fts`'s
+  FTS_PHYSICAL and no option turns it back on. Everything else the walk finds
+  DOES reach the search, devices included, and whether it is read is `-D`'s
+  answer below rather than the walk's. It used to be the walk's: only regular
+  files were collected, which reproduced the default by hard-coding it and left
+  `-D read` with nothing to act on. `-` is stdin under `-r` as it is without it,
   being neither a directory to descend nor a name to walk, and it does not name
   on its own -- but only as an OPERAND: a file the walk finds that happens to be
   called `-` is searched like any other.
 
   `-R` is the LOGICAL walk, and it is not `-r` with a longer name: EVERY symlink
-  is followed rather than only the operand, and the non-regular files `-r` skips
-  are READ, the two flags' `--devices` defaults being opposite. So `grep -R` over
-  a tree holding a FIFO blocks where `grep -r` finishes, and that is GNU's
-  behaviour rather than a defect in either.
+  is followed rather than only the operand, and -- the one consequence of `-R`
+  that is not about symlinks at all -- it FLIPS the device default (grep.c:3007),
+  so the devices `-r` passes by are read. `grep -R` over a tree holding a FIFO
+  therefore blocks where `grep -r` finishes, which is GNU's behaviour rather than
+  a defect in either. An explicit `-D` still wins, whichever order the two came
+  in, because the flip tests for the default alone.
+
+  - `-D`/`--devices` is `-d`'s neighbour in every way but the ones that matter,
+    and all three divergences run the same direction: the option that looks like
+    a matched pair with `-d` shares none of its machinery. GNU parses `-d` with
+    `XARGMATCH` and `-D` with plain `STREQ` (grep.c:2529), so `-d rec` resolves
+    to `recurse` while `-D rea` is an error; `-d`'s complaint quotes the value
+    and names the option (`invalid argument 'nope' for '--directories'`) where
+    `-D`'s does neither (`unknown devices method`); and `-d` exits 1 where `-D`
+    exits 2. None of the three is inferable from the others, and an empty
+    argument shows the first most sharply -- `-d ''` is AMBIGUOUS, the empty
+    string being a prefix of all three names, while `-D ''` is the same flat
+    refusal every other non-name gets.
+
+    Its DEFAULT is a third state neither spelling can ask for. GNU calls it
+    `READ_COMMAND_LINE_DEVICES`: a device NAMED as an operand is read, and the
+    same device found by the WALK is skipped without a word. That is why
+    `grep PAT fifo` waits for a writer while `grep -r PAT dir` passes the same
+    fifo by, and why the option's two values are both overrides rather than one
+    of them being the status quo. A device is four file types and not the two
+    the word suggests -- character, block, socket and FIFO (`is_device_mode`,
+    grep.c:612) -- so a regular file and a directory are the only things that
+    are not one. A DIRECTORY is therefore `-d`'s to answer and never `-D`'s;
+    the two skips compose. Stdin is exempt by DESCRIPTOR, as it is for `-d`, so
+    `grep -D skip PAT - <fifo` reads the fifo and a device merely NAMED `-`
+    cannot make `-D skip` pass over a pipe.
+
+    WHERE the question is asked differs between the two paths, which is not a
+    detail: a name found BELOW the walk's root is decided from a stat BEFORE
+    the open, and an OPERAND is opened first and decided from the descriptor.
+    GNU splits it the same way and says why -- `grepdirent` stats "since
+    opening might have side effects on a device" -- and a SOCKET makes the
+    difference observable rather than theoretical, because opening one fails
+    `ENXIO`. The same socket is silent when the walk finds it and loud when it
+    is named, and `-D skip` does NOT quiet the named one: the open fails before
+    any policy is consulted. Deciding the walk case after the open instead
+    produces a diagnostic GNU never prints, which is how the split was found.
+    The operand path still needs `O_NONBLOCK` (grep.c:1758) for the case the
+    stat does not cover, and only where skipping is possible: a FIFO opened to
+    be skipped must not wait for a writer, while under `-D read` that wait IS
+    the request. Its value is Linux's and is pinned against the KERNEL rather
+    than against the header it came from -- `/proc/self/fdinfo` reports the
+    flags an open really took -- because a wrong constant is a different flag
+    the kernel accepts, and `-D skip` would come to block on a fifo with every
+    other test still green.
+
+    The walk's ROOT is on the OPERAND side of that split, and it is the one
+    place "the walk produced this name" and "this name is not an operand" come
+    apart. GNU counts `fts_level == FTS_ROOTLEVEL` as a command-line name
+    however far the walk below it goes, so `grep -r PAT fifo` READS the fifo
+    where the same fifo one directory down is skipped -- and a socket named as
+    a walk root is OPENED, reporting its ENXIO, even under `-D skip`. Treating
+    every walk result alike makes `grep -rzam1 '^' /dev/zero` exit 1 where GNU
+    exits 0. `/dev/null` cannot show any of this: it reads as empty, so read
+    and skip are both exit 1 with nothing printed, which is exactly why the
+    drift axis for it came back green until `/dev/zero` replaced it.
+
+    The type each name turns out to be is carried FROM the walk rather than
+    asked again: the walk stats every entry moments before the search opens it,
+    and asking a second time cost about 28% of `grep -r` over a wide tree of
+    small files (a further 10% went on asking the descriptor as well, for names
+    the walk had already answered for).
+
+    NOT done here, and pre-existing rather than this option's: GNU opens every
+    search with `O_NOCTTY` (grep.c:1753) and td-txt opens with none, so
+    `grep PAT /dev/tty` from a session that has no controlling terminal could
+    ACQUIRE one. `--devices` widens the reach slightly, a walk-found character
+    device now being openable under `-R` or `-D read` where before the walk
+    dropped it, but the hole is as old as the search. Closing it means deciding
+    whether sed's reader shares the flag, which GNU sed does not set -- a
+    question about a different program, so it is its own landing.
+
+    What is NOT reproduced is the ambiguity POSSIBILITY ORDER, which `--devices`
+    makes reachable in more cells without causing it. GNU lists the candidates in
+    its own `long_options` order (`--devices` `--directories`
+    `--dereference-recursive`) and td-txt's table is alphabetical, so `--d=skip`
+    names the same three in a different sequence. It already diverged for `--d`
+    before this option existed, and `--de` is the one ambiguity `--devices` newly
+    creates, having resolved uniquely to `--dereference-recursive` before.
+
+    Matching it means reordering the whole table, and the size of that is worth
+    recording so the landing is not guessed at: exactly FOUR prefixes print a
+    different list, `--d` and `--de` in one cluster and `--f`/`--fi` in the
+    other. Every other ambiguous prefix names candidates the two orderings agree
+    on, and an EXACT name is never an ambiguity at all, so the rest of the table
+    is untouched either way. What it costs is that td-txt's table stops being
+    alphabetical -- GNU groups its own by purpose, which is why the orders differ
+    -- and that is the trade to weigh, not the message count.
 
   Following what the walk finds is the usual way a directory becomes reachable
   from inside itself, but NOT the only one -- a bind mount does it with no

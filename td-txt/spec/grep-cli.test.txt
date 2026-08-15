@@ -6263,5 +6263,48 @@ MATCH
 ## argv: grep "-\x80" x
 ## stdin-json: "a\n"
 ## stdout-json: ""
-## stderr-json: "grep: invalid option -- '\x80'\nusage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## stderr-json: "grep: invalid option -- '\x80'\nusage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
 ## status: 2
+
+#### -D skip does not reach stdin, which is exempt by descriptor
+## argv: grep -D skip a
+## stdin:
+a
+## END
+## stdout-json: "a\n"
+## status: 0
+
+#### --devices=read, the long spelling
+## argv: grep --devices=read a
+## stdin:
+a
+## END
+## stdout-json: "a\n"
+## status: 0
+
+#### -D takes its argument whole, unlike -d
+## argv: grep -D rea a
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: unknown devices method\n"
+
+#### an empty -D argument is that same refusal, not a prefix of everything
+## argv: grep -D '' a
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: unknown devices method\n"
+
+#### --devices names no option in its complaint, where --directories does
+## argv: grep --devices=nope a
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: unknown devices method\n"

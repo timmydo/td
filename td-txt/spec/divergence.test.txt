@@ -103,7 +103,7 @@ sed (td-txt) 0.1.0
 # include/exclude globs this applet refuses two cases below.
 ## argv: grep --help
 ## stdout:
-usage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
+usage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
 ## END
 ## stderr-json: ""
 ## status: 0
@@ -129,7 +129,7 @@ grep (td-txt) 0.1.0
 #### --help outranks what comes after the scan, a bad pattern included
 ## argv: grep --help -e [
 ## stdout:
-usage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
+usage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
 ## END
 ## stderr-json: ""
 ## status: 0
@@ -155,28 +155,6 @@ a
 ## stdout-json: ""
 ## status: 2
 ## stderr-contains: invalid option -- 'b'
-
-#### grep refuses -D rather than guessing which of its two actions was meant
-# GNU's -D ACTION is read/skip for a device, FIFO or socket operand, and it is
-# what makes -r and -R differ over them: -r's default is skip and -R's is read.
-# Both defaults are implemented; naming the override is not, so it is refused
-# rather than accepted as whichever default was already in force.
-## argv: grep -D skip a
-## stdin:
-a
-## END
-## stdout-json: ""
-## status: 2
-## stderr-contains: invalid option -- 'D'
-
-#### and --devices, its long spelling
-## argv: grep --devices=read a
-## stdin:
-a
-## END
-## stdout-json: ""
-## status: 2
-## stderr-contains: unrecognized option
 
 #### grep refuses --color rather than emitting or dropping escapes
 ## argv: grep --color=auto a

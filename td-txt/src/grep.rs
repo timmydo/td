@@ -16,15 +16,16 @@
 use crate::regex::{Filter, OnBudget, Options, Regex};
 use crate::util::{
     byte_in, errmsg, name_in, number, path_bytes, posixly_correct, print_line, read_input,
-    open_search, records, walk, Diag, Input, Out, Records, VERSION,
+    open_search, records, walk, DeviceRule, Diag, Input, Out, Records, VERSION,
 };
 
 /// How many significant digits `-NUM` takes before refusing the run. GNU's own
 /// scanner stops there; the `-A`/`-B`/`-C` argument has no such limit.
 const NUM_DIGIT_CAP: usize = 21;
 
-const USAGE: &str = "usage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-m NUM] [-A NUM] \
-                     [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...";
+const USAGE: &str = "usage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] \
+                     [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] \
+                     [PATTERN] [FILE]...";
 
 /// `-d`/`--directories`, which is also where `-r` and `-R` land: GNU spells the
 /// same setting three ways and the LAST one wins, so `grep -r -d skip a .` skips.
@@ -38,6 +39,46 @@ enum Dirs {
     Skip,
     /// Descend into it, which is what `-r` and `-R` also ask for.
     Recurse,
+}
+
+/// `-D`/`--devices`, whose DEFAULT is neither of the two spellings it accepts: a
+/// device named on the command line is read, one the walk found is skipped. GNU
+/// calls that `READ_COMMAND_LINE_DEVICES`, and it is why `grep PAT fifo` waits
+/// for a writer while `grep -r PAT dir` passes the same fifo by without a word.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Devices {
+    ReadCommandLine,
+    Read,
+    Skip,
+}
+
+impl Devices {
+    /// GNU's `skip_devices` (grep.c:618). `command_line` is false for a name the
+    /// WALK produced, which is the only thing the default distinguishes.
+    fn skips(self, command_line: bool) -> bool {
+        self == Self::Skip || (self == Self::ReadCommandLine && !command_line)
+    }
+}
+
+/// One thing to search. Three of its four fields would be the same bool in a
+/// simpler program and are not here: `from_walk` decides what `-` MEANS and how
+/// the input is named, `command_line` decides the device policy, and they part
+/// company at the walk's ROOT -- which the walk produced and which is still an
+/// operand. `device` is what the walk's stat already saw, so the policy need not
+/// look again.
+struct Operand {
+    name: Vec<u8>,
+    from_walk: bool,
+    command_line: bool,
+    device: bool,
+}
+
+impl Operand {
+    /// An operand as WRITTEN, which is every input that did not come from a walk.
+    /// Its type is not read here: an operand is opened before it is judged.
+    fn named(name: Vec<u8>) -> Self {
+        Self { name, from_walk: false, command_line: true, device: false }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -69,6 +110,7 @@ struct Conf {
     /// `None` until `-H`/`-h` or the file count decides it.
     with_filename: Option<bool>,
     dirs: Dirs,
+    devices: Devices,
     /// `-R`: follow every symlink the walk finds, not only the operand. Sticky
     /// rather than part of `dirs`, since `-R -d recurse` still follows them.
     logical: bool,
@@ -103,6 +145,7 @@ impl Default for Conf {
             line_number: false,
             with_filename: None,
             dirs: Dirs::Read,
+            devices: Devices::ReadCommandLine,
             logical: false,
             max_count: None,
             after: None,
@@ -596,6 +639,18 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                     let Some(action) = dirs_arg(&v) else { return 1 };
                     conf.dirs = action;
                 }
+                b'D' => {
+                    let Some(v) = value_of(&mut j, &mut i) else {
+                        errb(&byte_in("option requires an argument -- '", opt, "'"));
+                        eprintln!("{USAGE}");
+                        return 2;
+                    };
+                    let Some(action) = devices_arg(&v) else {
+                        err("unknown devices method");
+                        return 2;
+                    };
+                    conf.devices = action;
+                }
                 b'r' => conf.dirs = Dirs::Recurse,
                 b'R' => {
                     conf.dirs = Dirs::Recurse;
@@ -705,10 +760,17 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
     };
     let only_empty = !patterns.is_empty() && patterns.iter().all(Vec::is_empty);
 
+    // `-R` flips the device DEFAULT (grep.c:3007): following symlinks is a claim
+    // that what a link points AT should be read, and the default's whole content
+    // is that the walk skips what it finds -- so `-R PAT dir` reads a fifo that
+    // `-r PAT dir` passes by. Tested against the default alone, so an explicit
+    // `-D skip` still wins however the two were ordered.
+    if conf.logical && conf.devices == Devices::ReadCommandLine {
+        conf.devices = Devices::Read;
+    }
+
     // Recursion expands directories; a bare `grep -r pat` reads the working tree.
-    // The flag is "the walk produced this", which is what keeps a FILE named `-`
-    // found under the tree from being read as stdin -- GNU searches it.
-    let mut inputs: Vec<(Vec<u8>, bool)> = Vec::new();
+    let mut inputs: Vec<Operand> = Vec::new();
     let mut status_error = false;
     // Whether `-r` descended into a directory; with the operand count it decides
     // the NAME below. `walk` reports it rather than grep re-testing the operand.
@@ -725,7 +787,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
             // `-` is stdin under `-r` too; there is nothing to walk and no
             // directory, so it neither descends nor names on its own.
             if f == b"-" {
-                inputs.push((f.clone(), false));
+                inputs.push(Operand::named(f.clone()));
                 continue;
             }
             let found = walk(&crate::util::path_from_bytes(f), conf.logical);
@@ -739,7 +801,14 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                     false => b,
                 }
             };
-            inputs.extend(found.files.iter().map(|p| (shown(p), true)));
+            inputs.extend(found.files.iter().map(|f| Operand {
+                name: shown(&f.path),
+                from_walk: true,
+                // The walk's ROOT is a command-line name to the device policy,
+                // however far the walk below it goes -- GNU's FTS_ROOTLEVEL.
+                command_line: f.root,
+                device: f.device,
+            }));
             for (path, diag) in &found.diags {
                 let text = match diag {
                     // A cycle is a WARNING in GNU: reported, walked around, and the
@@ -756,9 +825,9 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
             }
         }
     } else if files.is_empty() {
-        inputs.push((b"-".to_vec(), false));
+        inputs.push(Operand::named(b"-".to_vec()));
     } else {
-        inputs = files.iter().map(|f| (f.clone(), false)).collect();
+        inputs = files.iter().cloned().map(Operand::named).collect();
     }
 
     // GNU decides the name from the OPERANDS, not from how many files the walk
@@ -785,7 +854,8 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
     // only empty records changes no answer. A pattern that fails to answer is
     // taken as selecting, which only costs speed.
     let skip_zero_fills = !grep.selects(b"").unwrap_or(true);
-    for (path, from_walk) in &inputs {
+    for op in &inputs {
+        let (path, from_walk) = (&op.name, op.from_walk);
         // Named before the read, because a failure names it too: GNU reports
         // `(standard input): Is a directory`, not `-: Is a directory`.
         let display: &[u8] = match path.as_slice() == b"-" && !from_walk {
@@ -798,7 +868,17 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
         if settled {
             continue;
         }
-        let input = match open_search(path, *from_walk, grep.conf.dirs == Dirs::Skip) {
+        // The default reads a device named as an operand and skips the same one
+        // found underfoot, so the policy is asked about THIS name's provenance;
+        // where it says skip, provenance decides again which side of the open
+        // the question falls.
+        let rule = match grep.conf.devices.skips(op.command_line) {
+            false => DeviceRule::Read,
+            true if op.command_line => DeviceRule::Descriptor,
+            true => DeviceRule::Walked(op.device),
+        };
+        let input =
+            match open_search(path, from_walk, grep.conf.dirs == Dirs::Skip, rule) {
             Ok(Some(input)) => input,
             // `-d skip` passes over a directory WITHOUT A WORD: no diagnostic
             // and no effect on the status, which is what distinguishes it from
@@ -911,6 +991,7 @@ const LONG_OPTIONS: &[(&[u8], Arg)] = &[
     (b"context", Arg::Required),
     (b"count", Arg::None),
     (b"dereference-recursive", Arg::None),
+    (b"devices", Arg::Required),
     (b"directories", Arg::Required),
     (b"extended-regexp", Arg::None),
     (b"file", Arg::Required),
@@ -1003,6 +1084,25 @@ fn argmatch<T: Copy>(value: &[u8], names: &[(&[u8], T)]) -> Result<T, NoMatch> {
     }
 }
 
+/// `-D`/`--devices`'s argument, which is NOT `-d`'s. The two options look like a
+/// matched pair and resolve nothing alike: GNU parses `-d` with `XARGMATCH` and
+/// `-D` with plain `STREQ` (grep.c:2529), so `-d rec` is `recurse` while `-D rea`
+/// is an error. The diagnostic differs with it -- it names no option and quotes
+/// no argument, where `-d`'s does both and says `for '--directories'` -- and so
+/// does the STATUS, 2 here against `-d`'s 1. Three divergences between adjacent
+/// letters, none of them inferable from the others.
+///
+/// Returned rather than reported, unlike `dirs_arg`: both callers say the same
+/// thing and differ only in how they leave, which is the shape `dirs_arg` cannot
+/// use because its message is built from the value.
+fn devices_arg(value: &[u8]) -> Option<Devices> {
+    match value {
+        b"read" => Some(Devices::Read),
+        b"skip" => Some(Devices::Skip),
+        _ => None,
+    }
+}
+
 /// `-d`/`--directories`'s argument. A failure is reported here rather than
 /// returned, because the two callers spell their exits differently and the
 /// message is the same either way -- and it exits 1, not the 2 every other usage
@@ -1081,6 +1181,14 @@ fn parse_long(
         b"directories" => {
             let v = need(value)?;
             conf.dirs = dirs_arg(&v).ok_or(LongErr::HandledWith(1))?;
+        }
+        b"devices" => {
+            let v = need(value)?;
+            let Some(action) = devices_arg(&v) else {
+                err("unknown devices method");
+                return Err(LongErr::Handled);
+            };
+            conf.devices = action;
         }
         b"recursive" => conf.dirs = Dirs::Recurse,
         b"dereference-recursive" => {

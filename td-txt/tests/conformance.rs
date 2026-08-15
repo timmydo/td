@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 2331;
+const CORPUS_FLOOR: usize = 2334;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -476,7 +476,9 @@ fn grep_in(dir: &TempDir, args: &[&str]) -> std::io::Result<std::process::Output
 /// forever where GNU skips it and finishes. `std` cannot make a FIFO, so the
 /// test uses the other non-regular file it CAN make; both are the same rule, and
 /// a socket fails the open loudly (`No such device or address`) where the FIFO
-/// fails silently by never returning.
+/// fails silently by never returning. The walk no longer drops them — that is
+/// `--devices`' answer now, and the DEFAULT is what this pins — so the silence
+/// below is also the proof that nothing opened the socket.
 #[test]
 fn grep_r_skips_a_non_regular_file_it_finds() -> Result<(), Box<dyn std::error::Error>> {
     let dir = TempDir::new("grep-r-socket")?;
@@ -493,8 +495,8 @@ fn grep_r_skips_a_non_regular_file_it_finds() -> Result<(), Box<dyn std::error::
 
 /// The root of the walk is FOLLOWED and everything under it is not, which is
 /// GNU's `-r`: a symlinked directory named as an OPERAND is descended, and one
-/// found by the walk is skipped. `-R` follows both, and is still a bare synonym
-/// for `-r` here (spec/README's walk gap).
+/// found by the walk is skipped. `-R` follows both, and is no longer a bare
+/// synonym for `-r`: it also flips the `--devices` default (grep.c:3007).
 #[test]
 fn grep_r_follows_a_symlinked_directory_operand_but_not_one_it_finds(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2806,6 +2808,279 @@ fn context_across_a_dropped_run_is_numbered_as_gnu_numbers_it()
         } else {
             assert_eq!(got, want, "{args:?}");
         }
+    }
+    Ok(())
+}
+
+/// `-D`'s ARGUMENT is not `-d`'s, which is the part of this pair no reading of
+/// either would predict. GNU parses `-d` with argmatch and `-D` with `STREQ`
+/// (grep.c:2529), so a prefix that resolves for one is an error for the other --
+/// and the diagnostic differs with it, naming no option and quoting no value
+/// where `-d`'s does both, and exiting 2 where `-d` exits 1. Three divergences
+/// between adjacent letters. Goldens from GNU grep 3.11 under LC_ALL=C.
+#[test]
+fn the_devices_argument_is_exact_where_the_directories_one_is_a_prefix()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("dev-arg")?;
+    std::fs::write(dir.join("f"), b"hello\n")?;
+    for (args, code, err) in [
+        (vec!["grep", "-D", "read", "hello", "f"], 0, ""),
+        (vec!["grep", "-D", "skip", "hello", "f"], 0, ""),
+        (vec!["grep", "-D", "rea", "hello", "f"], 2, "grep: unknown devices method\n"),
+        (vec!["grep", "-D", "r", "hello", "f"], 2, "grep: unknown devices method\n"),
+        (vec!["grep", "-D", "ski", "hello", "f"], 2, "grep: unknown devices method\n"),
+        (vec!["grep", "-D", "", "hello", "f"], 2, "grep: unknown devices method\n"),
+        (vec!["grep", "-D", "READ", "hello", "f"], 2, "grep: unknown devices method\n"),
+        (vec!["grep", "--devices=nope", "hello", "f"], 2, "grep: unknown devices method\n"),
+        (vec!["grep", "--devices=skip", "hello", "f"], 0, ""),
+        (vec!["grep", "--devices", "skip", "hello", "f"], 0, ""),
+    ] {
+        let out = std::process::Command::new(bin())
+            .args(&args)
+            .current_dir(&dir.0)
+            .env("LC_ALL", "C")
+            .output()?;
+        assert_eq!(String::from_utf8_lossy(&out.stderr), err, "{args:?}");
+        assert_eq!(out.status.code(), Some(code), "{args:?}");
+    }
+    // `-d`'s side of the contrast. Its FIRST LINE is what is compared: the rest
+    // is argmatch's list of valid arguments and the usage block, both already
+    // pinned by the corpus, and neither is what distinguishes the two options.
+    for (args, code, first) in [
+        (vec!["grep", "-d", "rec", "hello", "f"], 0, ""),
+        (
+            vec!["grep", "-d", "r", "hello", "f"],
+            1,
+            "grep: ambiguous argument 'r' for '--directories'",
+        ),
+        (
+            vec!["grep", "-d", "nope", "hello", "f"],
+            1,
+            "grep: invalid argument 'nope' for '--directories'",
+        ),
+    ] {
+        let out = std::process::Command::new(bin())
+            .args(&args)
+            .current_dir(&dir.0)
+            .env("LC_ALL", "C")
+            .output()?;
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        assert_eq!(err.lines().next().unwrap_or(""), first, "{args:?}");
+        assert_eq!(out.status.code(), Some(code), "{args:?}");
+    }
+    Ok(())
+}
+
+/// The device DEFAULT is neither spelling `-D` accepts: a device NAMED as an
+/// operand is read, and the same device found by the WALK is skipped without a
+/// word. Goldens from GNU grep 3.11.
+#[test]
+fn a_device_is_read_when_named_and_skipped_when_found()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("dev-default")?;
+    std::fs::create_dir(dir.join("d"))?;
+    std::fs::write(dir.join("d").join("plain"), b"hello\n")?;
+    let _sock = std::os::unix::net::UnixListener::bind(dir.join("d").join("s"))?;
+    for (args, code, want) in [
+        // Found by the walk: skipped by the default and by -D skip alike, and
+        // SILENTLY -- no diagnostic, no effect on the status.
+        (vec!["grep", "-r", "hello", "d"], 0, "d/plain:hello\n"),
+        (vec!["grep", "-r", "-D", "skip", "hello", "d"], 0, "d/plain:hello\n"),
+        // A device named as an operand is read unless asked otherwise, and
+        // /dev/null reads as empty rather than as a missing file.
+        (vec!["grep", "hello", "/dev/null"], 1, ""),
+        (vec!["grep", "-D", "skip", "hello", "/dev/null"], 1, ""),
+        // Skipping it does not disturb a real operand beside it.
+        (
+            vec!["grep", "-D", "skip", "-H", "hello", "/dev/null", "d/plain"],
+            0,
+            "d/plain:hello\n",
+        ),
+        // A DIRECTORY is not a device: -D skip leaves -d's answer alone, and the
+        // two skips compose rather than one standing in for the other.
+        (vec!["grep", "-D", "skip", "-d", "skip", "hello", "d"], 1, ""),
+    ] {
+        let out = std::process::Command::new(bin())
+            .args(&args)
+            .current_dir(&dir.0)
+            .env("LC_ALL", "C")
+            .output()?;
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want, "{args:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "", "{args:?}");
+        assert_eq!(out.status.code(), Some(code), "{args:?}");
+    }
+    Ok(())
+}
+
+/// WHERE the device question is asked differs between the two paths, and a
+/// socket is what makes that observable. A name the WALK produced is decided
+/// from a stat BEFORE the open -- GNU's `grepdirent` skips without opening,
+/// "since opening might have side effects on a device" -- while an OPERAND is
+/// opened first and decided from the descriptor. Opening a socket path fails
+/// `ENXIO`, so the split is directly visible: the same socket is silent when
+/// found and loud when named, and `-D skip` does NOT quiet the named one,
+/// because the open fails before any policy is consulted. Deciding the walk case
+/// after the open instead turns the first row into a diagnostic GNU never
+/// prints. Goldens from GNU grep 3.11.
+#[test]
+fn where_the_device_question_is_asked_differs_between_walk_and_operand()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("dev-where")?;
+    std::fs::create_dir(dir.join("t"))?;
+    std::fs::write(dir.join("t").join("f"), b"a\n")?;
+    let _sock = std::os::unix::net::UnixListener::bind(dir.join("t").join("s"))?;
+    let enxio = "grep: t/s: No such device or address\n";
+    for (args, code, out_want, err_want) in [
+        // Found by the walk and skipped: never opened, so never reported.
+        (vec!["grep", "-rl", "a", "t"], 0, "t/f\n", ""),
+        (vec!["grep", "-r", "-D", "skip", "-l", "a", "t"], 0, "t/f\n", ""),
+        // Found by the walk and READ: now it is opened, and the open fails.
+        (vec!["grep", "-r", "-D", "read", "-l", "a", "t"], 2, "t/f\n", enxio),
+        // Named as an operand: opened under every policy, so always reported.
+        (vec!["grep", "-l", "a", "t/s"], 2, "", enxio),
+        (vec!["grep", "-D", "skip", "-l", "a", "t/s"], 2, "", enxio),
+        (vec!["grep", "-D", "read", "-l", "a", "t/s"], 2, "", enxio),
+    ] {
+        let out = std::process::Command::new(bin())
+            .args(&args)
+            .current_dir(&dir.0)
+            .env("LC_ALL", "C")
+            .output()?;
+        assert_eq!(String::from_utf8_lossy(&out.stdout), out_want, "{args:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), err_want, "{args:?}");
+        assert_eq!(out.status.code(), Some(code), "{args:?}");
+    }
+    Ok(())
+}
+
+/// `-R` flips the device DEFAULT (grep.c:3007), which is the one consequence of
+/// `-R` that is not about symlinks at all: `-R PAT dir` opens a socket that
+/// `-r PAT dir` passes by, and the ENXIO that follows is how it shows. An
+/// explicit `-D skip` still wins, whichever order the two came in. Goldens from
+/// GNU grep 3.11.
+#[test]
+fn dereference_recursive_flips_the_device_default()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("dev-flip")?;
+    std::fs::create_dir(dir.join("t"))?;
+    std::fs::write(dir.join("t").join("f"), b"a\n")?;
+    let _sock = std::os::unix::net::UnixListener::bind(dir.join("t").join("s"))?;
+    let enxio = "grep: t/s: No such device or address\n";
+    for (args, code, err_want) in [
+        (vec!["grep", "-rl", "a", "t"], 0, ""),
+        (vec!["grep", "-Rl", "a", "t"], 2, enxio),
+        (vec!["grep", "-Rl", "-D", "skip", "a", "t"], 0, ""),
+        (vec!["grep", "-D", "skip", "-Rl", "a", "t"], 0, ""),
+        (vec!["grep", "-Rl", "-D", "read", "a", "t"], 2, enxio),
+    ] {
+        let out = std::process::Command::new(bin())
+            .args(&args)
+            .current_dir(&dir.0)
+            .env("LC_ALL", "C")
+            .output()?;
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "t/f\n", "{args:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), err_want, "{args:?}");
+        assert_eq!(out.status.code(), Some(code), "{args:?}");
+    }
+    Ok(())
+}
+
+
+/// A command-line device whose READ and SKIP are TOLD APART, which `/dev/null`
+/// cannot do: it reads as empty, so both answers are exit 1 with no output, and
+/// a drift axis that made the default skip argv-named devices came back green
+/// against it. `/dev/zero` under `-z -a -m1 '^'` matches one NUL-terminated
+/// record instead, so reading exits 0 and skipping exits 1.
+///
+/// The `-r` rows are the walk ROOT, which GNU counts as a command-line name
+/// however far the walk below it goes (`fts_level == FTS_ROOTLEVEL`). Marking
+/// every walk result as found-not-named made `grep -rzam1 '^' /dev/zero` exit 1
+/// where GNU exits 0 -- the same misreading would have let `-r -D skip` pass
+/// silently over a named socket instead of reporting its failed open. Goldens
+/// from GNU grep 3.11.
+#[test]
+fn a_named_device_is_read_and_the_walks_root_is_still_a_named_one()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (args, code) in [
+        (vec!["grep", "-zam1", "^", "/dev/zero"], 0),
+        (vec!["grep", "-zam1", "-D", "read", "^", "/dev/zero"], 0),
+        (vec!["grep", "-zam1", "-D", "skip", "^", "/dev/zero"], 1),
+        // The walk's root is an operand, so these answer as the rows above do.
+        (vec!["grep", "-rzam1", "^", "/dev/zero"], 0),
+        (vec!["grep", "-rzam1", "-D", "read", "^", "/dev/zero"], 0),
+        (vec!["grep", "-rzam1", "-D", "skip", "^", "/dev/zero"], 1),
+        (vec!["grep", "-Rzam1", "^", "/dev/zero"], 0),
+    ] {
+        let out = std::process::Command::new(bin())
+            .args(&args)
+            .env("LC_ALL", "C")
+            .output()?;
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "", "{args:?}");
+        assert_eq!(out.status.code(), Some(code), "{args:?}");
+    }
+    Ok(())
+}
+
+/// The walk's ROOT again, on the side where being wrong is loud rather than
+/// quiet: a socket NAMED as the root of a `-r` walk is opened, because an
+/// operand is, and the failed open is reported even under `-D skip`. The same
+/// socket one level down is silent. One file, two provenances, opposite answers.
+/// Goldens from GNU grep 3.11.
+#[test]
+fn a_socket_named_as_the_walk_root_is_opened_where_one_below_it_is_not()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("dev-root")?;
+    std::fs::create_dir(dir.join("t"))?;
+    std::fs::write(dir.join("t").join("f"), b"a\n")?;
+    let _sock = std::os::unix::net::UnixListener::bind(dir.join("t").join("s"))?;
+    let enxio = "grep: t/s: No such device or address\n";
+    for (args, code, out_want, err_want) in [
+        (vec!["grep", "-rl", "a", "t/s"], 2, "", enxio),
+        (vec!["grep", "-r", "-D", "skip", "-l", "a", "t/s"], 2, "", enxio),
+        (vec!["grep", "-rl", "a", "t"], 0, "t/f\n", ""),
+    ] {
+        let out = std::process::Command::new(bin())
+            .args(&args)
+            .current_dir(&dir.0)
+            .env("LC_ALL", "C")
+            .output()?;
+        assert_eq!(String::from_utf8_lossy(&out.stdout), out_want, "{args:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), err_want, "{args:?}");
+        assert_eq!(out.status.code(), Some(code), "{args:?}");
+    }
+    Ok(())
+}
+
+
+/// A DIRECTORY is not a device, so `-D` must not quietly take over what `-d`
+/// answers. The two compose: `-D skip` alone leaves a directory operand to `-d`'s
+/// default, which READS it and fails with `Is a directory`, and `-c` still prints
+/// its zero on the way. Widening `is_device` to cover directories turns all of
+/// that into a silent exit 1 — and no other test here notices, drift having found
+/// that axis green until this one existed. Goldens from GNU grep 3.11.
+#[test]
+fn a_directory_is_not_a_device() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("dev-dir")?;
+    std::fs::create_dir(dir.join("d"))?;
+    std::fs::write(dir.join("d").join("plain"), b"hello\n")?;
+    let isdir = "grep: d: Is a directory\n";
+    for (args, code, out_want, err_want) in [
+        (vec!["grep", "-D", "skip", "hello", "d"], 2, "", isdir),
+        (vec!["grep", "-D", "read", "hello", "d"], 2, "", isdir),
+        (vec!["grep", "hello", "d"], 2, "", isdir),
+        (vec!["grep", "-D", "skip", "-c", "hello", "d"], 2, "0\n", isdir),
+        // `-d` is what answers for a directory, and it still does.
+        (vec!["grep", "-D", "skip", "-d", "skip", "hello", "d"], 1, "", ""),
+        (vec!["grep", "-D", "skip", "-d", "recurse", "hello", "d"], 0, "d/plain:hello\n", ""),
+    ] {
+        let out = std::process::Command::new(bin())
+            .args(&args)
+            .current_dir(&dir.0)
+            .env("LC_ALL", "C")
+            .output()?;
+        assert_eq!(String::from_utf8_lossy(&out.stdout), out_want, "{args:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), err_want, "{args:?}");
+        assert_eq!(out.status.code(), Some(code), "{args:?}");
     }
     Ok(())
 }

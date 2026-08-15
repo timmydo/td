@@ -125,15 +125,44 @@ pub enum Input {
     File(std::fs::File),
 }
 
+/// `O_NONBLOCK`, pinned by value because it is passed as a raw flag word and not
+/// through any named `std` API. Opening a FIFO nobody writes BLOCKS until a
+/// writer arrives, so a device that is about to be SKIPPED has to be opened
+/// without waiting for one that may never come -- and the decision is made after
+/// the open, from the descriptor. GNU sets this flag on exactly that path
+/// (`skip_devices (command_line) ? O_NONBLOCK : 0`, grep.c:1758) and nowhere
+/// else, which is why it is a parameter here rather than always on: with
+/// `-D read` the wait IS the requested behaviour.
+///
+/// The value is LINUX's, which td targets; a test asks the kernel to confirm it
+/// took rather than trusting the header it was copied from.
+const O_NONBLOCK: i32 = 0o4000;
+
 impl Input {
     /// `dash_is_stdin` is false for a name grep's WALK produced -- those are always
     /// files, so `grep -r` over a directory holding one called `-` searches it --
     /// and for sed's `-i`, which rewrites a NAME and cannot rewrite a pipe.
     pub fn open(path: &[u8], dash_is_stdin: bool) -> std::io::Result<Self> {
+        Self::open_maybe_nonblock(path, dash_is_stdin, false)
+    }
+
+    /// `open` for a caller that may SKIP what it opens, and so must not block on
+    /// it: see `O_NONBLOCK`.
+    pub fn open_maybe_nonblock(
+        path: &[u8],
+        dash_is_stdin: bool,
+        nonblock: bool,
+    ) -> std::io::Result<Self> {
         if dash_is_stdin && path == b"-" {
             return Ok(Self::Stdin);
         }
-        Ok(Self::File(std::fs::File::open(path_from_bytes(path))?))
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        if nonblock {
+            opts.custom_flags(O_NONBLOCK);
+        }
+        Ok(Self::File(opts.open(path_from_bytes(path))?))
     }
 
     /// Whether the OPEN descriptor is a directory. Stdin is never one for this
@@ -145,6 +174,26 @@ impl Input {
         match self {
             Self::Stdin => false,
             Self::File(file) => file.metadata().is_ok_and(|m| m.is_dir()),
+        }
+    }
+
+    /// Whether the OPEN descriptor is what GNU calls a device, which is FOUR file
+    /// types and not the two the word suggests: character and block special, plus
+    /// sockets and FIFOs (`is_device_mode`, grep.c:612). A regular file and a
+    /// directory are the only things that are not one.
+    ///
+    /// Stdin is exempt for `is_dir`'s reason and by the same mechanism -- GNU
+    /// tests `desc != STDIN_FILENO` before it asks -- so `grep -D skip x - <fifo`
+    /// reads the fifo, and a device merely NAMED `-` cannot make `-D skip` pass
+    /// over a pipe.
+    pub fn is_device(&self) -> bool {
+        match self {
+            Self::Stdin => false,
+            Self::File(file) => file.metadata().is_ok_and(|m| {
+                use std::os::unix::fs::FileTypeExt;
+                let t = m.file_type();
+                t.is_char_device() || t.is_block_device() || t.is_socket() || t.is_fifo()
+            }),
         }
     }
 
@@ -282,16 +331,68 @@ pub fn read_input(path: &[u8]) -> std::io::Result<Vec<u8>> {
 /// name. A directory the process may not open is therefore still reported, and
 /// still exit 2; deciding from the name instead swallows that error silently.
 /// `Ok(None)` is the skip.
+///
+/// `devices` is `-D`'s half of the same question, resolved by the caller because
+/// only it knows where the name came from.
 pub fn open_search(
     path: &[u8],
     from_walk: bool,
     skip_dirs: bool,
+    devices: DeviceRule,
 ) -> Result<Option<Input>, std::io::Error> {
-    let input = Input::open(path, !from_walk)?;
+    // A name found BELOW the walk's root is decided before the open, which is the
+    // opposite of the rule above and is GNU's too: `grepdirent` reads the entry's
+    // own stat and skips without opening, "since opening might have side effects
+    // on a device". A SOCKET makes the difference observable rather than
+    // theoretical -- opening one fails ENXIO, so deciding after the open turns a
+    // silent skip into `No such device or address`. An OPERAND goes the other way
+    // and really is opened first, which is why `-D skip` on a named socket reports
+    // that error in GNU and here; the walk's ROOT is an operand for this purpose,
+    // however deep the walk below it goes.
+    //
+    // The answer comes from the walk's own stat rather than a fresh one: asking
+    // twice cost about 28% of `grep -r` over a wide tree of small files, every
+    // one of which is stat'd by the walk moments earlier. A stat that FAILED
+    // reports `false` and falls through to the open, so the error is reported by
+    // whoever reports every other one.
+    if matches!(devices, DeviceRule::Walked(true)) {
+        return Ok(None);
+    }
+    // Only the descriptor case can still block, the walked one having been
+    // answered above and `Read` being the request to wait.
+    let descriptor = matches!(devices, DeviceRule::Descriptor);
+    let input = Input::open_maybe_nonblock(path, !from_walk, descriptor)?;
     if skip_dirs && input.is_dir() {
         return Ok(None);
     }
+    if descriptor && input.is_device() {
+        return Ok(None);
+    }
     Ok(Some(input))
+}
+
+/// How a name's TYPE is to be judged, which depends on where the name came from
+/// and is therefore the caller's to say. The two arms that skip are the whole of
+/// the walk/operand split: one is answered before the open and one after it.
+pub enum DeviceRule {
+    /// Read whatever it turns out to be -- `-D read`, or the default for a name
+    /// the operand list held.
+    Read,
+    /// Judged ALREADY, from the walk's own stat, and `true` means it is a device.
+    /// Nothing opens it, which is what keeps a socket found by `grep -r` silent
+    /// rather than ENXIO, and what saves the second stat.
+    Walked(bool),
+    /// Judged from the descriptor, after opening. An operand, including the
+    /// walk's root: GNU opens those and asks `fstat`, so `-D skip` on a named
+    /// socket still reports the failed open rather than passing over it.
+    Descriptor,
+}
+
+/// `Input::is_device` asked of a `Metadata` the walk already had.
+fn is_device(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    let t = meta.file_type();
+    t.is_char_device() || t.is_block_device() || t.is_socket() || t.is_fifo()
 }
 
 impl std::io::Read for Input {
@@ -916,9 +1017,24 @@ pub enum Diag {
 }
 
 /// What a walk produced.
+/// One name the walk produced, carrying what the walk's OWN stat already said so
+/// that nothing downstream has to ask again.
+pub struct Found {
+    pub path: PathBuf,
+    /// Character, block, socket or FIFO. False where the stat failed, which
+    /// leaves the open to report it as it reports every other failure.
+    pub device: bool,
+    /// The ROOT of the walk, which GNU counts as a COMMAND-LINE name however far
+    /// the walk goes below it (`fts_level == FTS_ROOTLEVEL`). It is the one place
+    /// "the walk produced this" and "this is not an operand" come apart, and the
+    /// device default is what asks: `grep -r PAT fifo` READS it, where the same
+    /// fifo found under a directory is skipped.
+    pub root: bool,
+}
+
 pub struct Walked {
     /// Files to search, sorted.
-    pub files: Vec<PathBuf>,
+    pub files: Vec<Found>,
     /// In the order the walk MET them, both kinds in one list: GNU interleaves
     /// its errors and its cycle warnings, and two lists could only be drained one
     /// after the other.
@@ -933,10 +1049,13 @@ pub struct Walked {
 ///
 /// `logical` is `-R`. Without it the walk is PHYSICAL: the root is followed but
 /// nothing below it is, so a symlink named as an operand is descended and one
-/// found by the walk is skipped, and only REGULAR files are collected — a FIFO
-/// there would block the open forever, and GNU skips it. With it every symlink is
-/// followed and every non-directory is collected, devices included, which is GNU's
-/// `-R` and is why that flag CAN block where `-r` cannot. Following symlinks is the
+/// found by the walk is skipped — and a symlink is the ONLY thing this walk
+/// drops, that being `fts`'s FTS_PHYSICAL rather than a policy. Every other
+/// non-directory is collected, devices included; whether one is SEARCHED is the
+/// `--devices` policy's answer and not the walk's, which is why each is reported
+/// with what the stat said rather than filtered on it. With `logical` every
+/// symlink is followed, and `-R` also flips that policy's default, which is why
+/// that flag CAN block where `-r` cannot. Following symlinks is the
 /// usual way a directory becomes reachable from inside itself, but not the only one
 /// -- a bind mount does it without any symlink -- so BOTH walks carry the ancestor
 /// chain and refuse to re-enter one, as GNU's does.
@@ -970,14 +1089,20 @@ fn walk_from(
             // opens it must stay silent: `grep -rm0 a dangling` is GNU's exit 1
             // with nothing said. The open reports it in every other case.
             match std::fs::symlink_metadata(root).is_ok() {
-                true => out.files.push(root.to_path_buf()),
+                true => out.files.push(Found {
+                    path: root.to_path_buf(),
+                    device: false,
+                    root: true,
+                }),
                 false => out.diags.push((root.to_path_buf(), Diag::Failed(e))),
             }
             return false;
         }
     };
     if !meta.is_dir() {
-        out.files.push(root.to_path_buf());
+        // `follow` is true here, so this is the walk's ROOT: an operand that
+        // happened not to be a directory, and a command-line name to the policy.
+        out.files.push(Found { path: root.to_path_buf(), device: is_device(&meta), root: true });
         return false;
     }
     chain.push(ident(&meta));
@@ -1005,15 +1130,21 @@ fn walk_from(
                     walk_from(&path, false, logical, chain, out);
                 }
             },
-            // A symlink, FIFO, socket or device found by a PHYSICAL walk: GNU
-            // skips it. A logical walk reads them, having followed the link.
-            Ok(meta) if logical || meta.is_file() => out.files.push(path),
+            // A SYMLINK found by a physical walk is skipped and never reaches the
+            // search: that is `fts`'s FTS_PHYSICAL rather than any policy, so no
+            // option turns it back on. A logical walk resolved it before the test
+            // and so never sees one. Everything else goes through, fifos, sockets
+            // and device nodes included -- which of them is SEARCHED is the
+            // `--devices` policy's answer, and it is carried rather than re-asked.
+            Ok(meta) if logical || !meta.file_type().is_symlink() => {
+                out.files.push(Found { path, device: is_device(&meta), root: false });
+            }
             Ok(_) => {}
             // Only a logical walk gets here, on a link that does not resolve. Passed
             // on for the same reason the root is: the OPEN reports it, so a search
             // that never opens stays silent as GNU's does.
             Err(e) => match std::fs::symlink_metadata(&path).is_ok() {
-                true => out.files.push(path),
+                true => out.files.push(Found { path, device: false, root: false }),
                 false => out.diags.push((path, Diag::Failed(e))),
             },
         }
@@ -1542,6 +1673,39 @@ mod tests {
         assert!(rec.next().unwrap());
         assert_eq!(rec.line(), b"b");
         assert_eq!(rec.take_skipped().0, 0);
+    }
+
+    /// `O_NONBLOCK` is a raw flag word copied out of Linux's headers, and nothing
+    /// in the type system says it is the right one -- a wrong value is a
+    /// different flag the kernel accepts, which is how `-D skip` on a fifo would
+    /// come to block with every other test still green. So the KERNEL is asked:
+    /// `/proc/self/fdinfo/N` reports the flags an open actually took, and the bit
+    /// has to be present when asked for and absent when not.
+    #[test]
+    fn the_nonblock_flag_is_the_one_the_kernel_took() {
+        let dir =
+            std::env::temp_dir().join(format!("td-txt-oflag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f");
+        std::fs::write(&path, b"x").unwrap();
+        let name = path_bytes(&path);
+        for (asked, want) in [(false, false), (true, true)] {
+            let input = Input::open_maybe_nonblock(&name, false, asked).unwrap();
+            let Input::File(file) = &input else { panic!("not a file") };
+            use std::os::unix::io::AsRawFd;
+            let info = format!("/proc/self/fdinfo/{}", file.as_raw_fd());
+            // No /proc is not a failure of the flag: say nothing rather than red.
+            let Ok(text) = std::fs::read_to_string(&info) else { return };
+            let flags = text.lines().find_map(|l| l.strip_prefix("flags:"));
+            let Some(flags) = flags else { return };
+            let bits = u32::from_str_radix(flags.trim(), 8).unwrap();
+            assert_eq!(
+                bits & O_NONBLOCK as u32 != 0,
+                want,
+                "asked for nonblock={asked}, kernel reports flags {flags}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Off unless asked, because sed reaches no binary verdict and must hand
