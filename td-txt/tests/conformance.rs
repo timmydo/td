@@ -1534,6 +1534,225 @@ fn a_posix_w_of_dev_stdout_is_a_second_buffer_over_one_pipe()
     Ok(())
 }
 
+/// A CYCLE that keeps writing after the READER has gone away. GNU takes SIGPIPE
+/// and stops there; the Rust runtime ignores that signal before `main`, so `Out`
+/// takes EPIPE and LATCHES instead, and until the cycle asked, nothing stopped
+/// it -- `sed -z -n p /dev/zero | head` never returned.
+///
+/// Tested over a FINITE input so THIS regression is a wrong NUMBER rather than a
+/// hung gate -- the run that does not notice processes all million bytes, and the
+/// `w` target is what records how far it got, since the reader that would say so
+/// is exactly the one that went away. That only bounds the regressions it models,
+/// though, so the read and the wait carry deadlines besides.
+///
+/// The bound is 250_000 against a physical ceiling of about 69_700 -- the pipe's
+/// 65_536 plus the sink's 4096 plus a record -- and what the run actually leaves
+/// depends on who is reading: 8200 through this harness, 69_700 through a shell
+/// pipeline. GNU leaves 8192 most runs and 4096 in a few, the difference being
+/// which flushes beat the signal; the rest goes with its buffers.
+#[test]
+fn a_cycle_stops_once_the_reader_has_gone() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{Read as _, Seek as _};
+    let dir = TempDir::new("broken-sink-cycle")?;
+    let mut input = Vec::new();
+    let mut i = 0;
+    while input.len() < 1_000_000 {
+        input.extend_from_slice(format!("L{i:07}").as_bytes());
+        input.extend(std::iter::repeat_n(b'x', 91));
+        input.push(b'\n');
+        i += 1;
+    }
+    std::fs::write(dir.0.join("big"), &input)?;
+    // Two scripts, because the write that breaks the pipe can be in either of two
+    // places and a different check catches each. `p` writes INSIDE the cycle, so
+    // the cycle abandons the `w` after it and the record it was on is swallowed
+    // without being recorded; the auto-print writes AFTER the cycle returned, so
+    // the `w` has already run and the swallowed input matches the record exactly.
+    // Miss the between-cycles check and the second reads one more record before
+    // anything notices, which is the whole of the placement argument.
+    for (script, extra) in [(vec!["-n", "-e", "p", "-e", "w OUT"], 100u64), (vec!["-e", "w OUT"], 0)]
+    {
+        let _ = std::fs::remove_file(dir.0.join("OUT"));
+        // Through STDIN, and a `try_clone` of it kept here: the child shares that
+        // file DESCRIPTION, so its final offset is readable from this side and says
+        // exactly how much of the input the run swallowed.
+        let mut mine = std::fs::File::open(dir.0.join("big"))?;
+        let theirs = mine.try_clone()?;
+        let mut child = std::process::Command::new(bin())
+            .arg("sed")
+            .args(&script)
+            .current_dir(&dir.0)
+            .stdin(std::process::Stdio::from(theirs))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        close_the_reader(&mut child)?;
+        // Drained BEFORE the wait: stderr is a pipe, so a regression that filled
+        // it would block the child in a write while this blocked in `wait` -- the
+        // hung gate this test is shaped to avoid, arriving by the other door.
+        let mut err = Vec::new();
+        if let Some(mut e) = child.stderr.take() {
+            e.read_to_end(&mut err)?;
+        }
+        let status = wait_bounded(&mut child, 20)?.ok_or("the run never ended")?;
+        assert_eq!(status.code(), Some(0), "{script:?}: {}", String::from_utf8_lossy(&err));
+        assert!(err.is_empty(), "{script:?}: a closed reader is not a diagnostic: {err:?}");
+        let wrote = std::fs::metadata(dir.0.join("OUT"))?.len();
+        assert!(wrote < input.len() as u64, "{script:?}: did not stop at all: wrote {wrote}");
+        assert!(
+            wrote <= 250_000,
+            "{script:?}: kept going long past the closed reader: wrote {wrote} of {}",
+            input.len()
+        );
+        // And it swallowed exactly the records it processed, plus the one it was
+        // in the middle of where the write that broke the pipe was the cycle's
+        // own. GNU does that too, dying at that same write. Never TWO records,
+        // which is what asking before the read rather than after it buys.
+        let consumed = mine.stream_position()?;
+        assert_eq!(
+            consumed,
+            wrote + extra,
+            "{script:?}: the run swallowed input beyond the record the write failed on"
+        );
+        let mut rest = Vec::new();
+        mine.read_to_end(&mut rest)?;
+        assert_eq!(
+            rest.first(),
+            Some(&b'L'),
+            "{script:?}: the next reader was left in the middle of a record"
+        );
+        assert_eq!(
+            rest.len() as u64,
+            input.len() as u64 - consumed,
+            "{script:?}: the rest is the rest"
+        );
+    }
+    Ok(())
+}
+
+/// Read a few bytes from a child's stdout and then CLOSE that end, which is what
+/// makes its next write fail. On a thread with a deadline, as the neighbouring
+/// stream tests do it, because a read that never answers is one of the failures
+/// these are for.
+fn close_the_reader(child: &mut std::process::Child) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Read as _;
+    let mut out = child.stdout.take().ok_or("the child has no stdout")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut head = [0u8; 8];
+        let read = out.read_exact(&mut head).is_ok();
+        // The pipe closes HERE, which is the whole point of the thread.
+        drop(out);
+        let _ = tx.send(read);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("the run ended before it wrote anything to read".into()),
+        Err(_) => Err("the run never wrote anything".into()),
+    }
+}
+
+/// Wait for a child, but never forever: a hang is the failure being tested for
+/// here, and a test that waits for one is a gate that never finishes. `None` is
+/// the deadline passing, and the child is killed on the way out.
+fn wait_bounded(
+    child: &mut std::process::Child,
+    secs: u64,
+) -> Result<Option<std::process::ExitStatus>, Box<dyn std::error::Error>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        if let Some(done) = child.try_wait()? {
+            return Ok(Some(done));
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// A script that LOOPS without ending its cycle -- `b` back to a label -- never
+/// reaches the between-cycles check, so the closed reader has to be noticed
+/// inside the cycle too. `sed -n -e ':a' -e p -e 'b a' file | head -c 8` ran
+/// forever with only the outer check, which is what a cross-model review found.
+///
+/// Unbounded by construction (the loop never advances the input), so this one
+/// cannot be made finite the way the between-cycles test is; it gets a watchdog
+/// instead, and a regression is a killed child rather than a hung gate.
+#[test]
+fn a_script_loop_stops_once_the_reader_has_gone() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("broken-sink-loop")?;
+    std::fs::write(dir.0.join("one"), b"x\n")?;
+    for script in [
+        // `b` back to a label: the input never advances at all.
+        ":a;p;ba",
+        // `t`, which loops on the substitution having taken.
+        ":a;s/x/xy/;p;ta",
+        // And `D`, which restarts the script WITHOUT reading, so it re-enters
+        // the cycle by the third of the three doors.
+        "p;s/^/z\\n/;D",
+    ] {
+        let mut child = std::process::Command::new(bin())
+            .arg("sed")
+            .args(["-n", script, "one"])
+            .current_dir(&dir.0)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        close_the_reader(&mut child)?;
+        let done = wait_bounded(&mut child, 20)?;
+        let code = done.ok_or_else(|| format!("`{script}` never noticed the closed reader"))?;
+        assert_eq!(code.code(), Some(0), "`{script}`");
+    }
+    Ok(())
+}
+
+/// `-s` opens its operands one at a time, so a run that stops because the reader
+/// has gone must say so in a way the operand loop can tell from an ordinary end
+/// of file -- otherwise it opens the NEXT one. It reported a missing operand
+/// (exit 2, with a diagnostic) where GNU, dead of SIGPIPE, says nothing at all;
+/// a FIFO nobody opens for writing hung outright. The second is left out of the
+/// test for the reason it is a bug: it does not terminate when it regresses.
+#[test]
+fn a_separate_run_stops_at_the_operand_the_reader_broke_on()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Read as _;
+    let dir = TempDir::new("broken-sink-separate")?;
+    let mut input = Vec::new();
+    for i in 0..200_000u32 {
+        input.extend_from_slice(format!("L{i:06}\n").as_bytes());
+    }
+    std::fs::write(dir.0.join("big"), &input)?;
+    // Both places the stop can be decided, since each returns to the operand loop
+    // by its own route: `p` alone breaks between cycles, and `p` followed by
+    // another command breaks inside one.
+    for script in [vec!["-s", "-n", "p"], vec!["-s", "-n", "-e", "p", "-e", "w OUT"]] {
+        let mut child = std::process::Command::new(bin())
+            .arg("sed")
+            .args(&script)
+            .args(["big", "definitely-not-here"])
+            .current_dir(&dir.0)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        close_the_reader(&mut child)?;
+        let mut err = Vec::new();
+        if let Some(mut e) = child.stderr.take() {
+            e.read_to_end(&mut err)?;
+        }
+        let done = wait_bounded(&mut child, 20)?.ok_or("the run never ended")?;
+        assert!(
+            err.is_empty(),
+            "{script:?}: the operand after the broken one was opened: {}",
+            String::from_utf8_lossy(&err)
+        );
+        assert_eq!(done.code(), Some(0), "{script:?}: a closed reader is not an error");
+    }
+    Ok(())
+}
+
 /// `l` submits its listing in pieces because GNU's `do_list` writes it a BYTE at
 /// a time, and the piece must be one UNDER the buffer rather than equal to it: a
 /// `put` of exactly the capacity finds no room on the first write of a run --

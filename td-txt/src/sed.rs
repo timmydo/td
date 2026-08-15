@@ -4097,9 +4097,10 @@ fn open_source(path: &[u8], separator: u8) -> RFile {
 /// READ failure IS one, exit 4, and a DIRECTORY is how you get one.
 ///
 /// A CLOSED reader ends the dump. `Out` swallows the EPIPE and latches instead, so
-/// this is the only thing that stops `r /dev/zero | head` writing bytes nothing can
-/// receive -- GNU dies of SIGPIPE there, which a program the Rust runtime leaves
-/// ignoring it cannot. grep breaks its own loop on the same latch.
+/// this is what stops `r /dev/zero | head` writing bytes nothing can receive --
+/// GNU dies of SIGPIPE there, which a program the Rust runtime leaves ignoring it
+/// cannot. A dump is unbounded WITHIN one cycle, which is why it asks here as well
+/// as in `run_stream`; grep breaks its own loop on the same latch.
 fn copy_source(path: &[u8], sink: &mut Sink) -> Result<(), Vec<u8>> {
     // Before the OPEN, because opening a FIFO blocks until a writer appears: a
     // queued `r` reached after the reader has gone would hang there rather than
@@ -4341,6 +4342,22 @@ impl Sed {
     /// to exit with that status.
     fn run_stream(&mut self, stream: &mut Stream, sink: &mut Sink) -> Result<Option<i32>, Vec<u8>> {
         loop {
+            // A CLOSED reader ends the run, as it already ends an `r` dump. `Out`
+            // swallows the EPIPE and latches instead of failing, so without this
+            // nothing stops a cycle that writes: `sed -z -n p /dev/zero | head`
+            // never returned, where GNU takes SIGPIPE at once. Asked BEFORE the
+            // read, so the input stops where the last written record left it and
+            // `give_back` still owes the next reader an accurate position.
+            //
+            // Recorded as a QUIT rather than as this file's end, because those are
+            // the same answer to the caller and must not be: under `-s` an end
+            // means open the NEXT operand, so a broken sink went on to report a
+            // missing one (exit 2) or to block on a FIFO nobody opens. `q`'s own
+            // machinery already means end the whole run, and 0 is the status.
+            if sink.is_broken() {
+                self.quit = Some(0);
+                return Ok(self.quit);
+            }
             let Some(line) = stream.next_line(Opener::Reader) else {
                 return Ok(self.quit);
             };
@@ -4495,6 +4512,14 @@ impl Sed {
     fn run_cycle(&mut self, stream: &mut Stream, sink: &mut Sink) -> Result<Flow, Vec<u8>> {
         let mut pc = 0usize;
         while pc < self.script.cmds.len() {
+            // Here as well as in `run_stream`, because a script can loop WITHOUT
+            // ending its cycle: `sed -n -e ':a' -e p -e 'b a'` branches inside this
+            // one, so a check between cycles is a check it never reaches. Same
+            // answer, same reason, and the cost is a bool per command executed.
+            if sink.is_broken() {
+                self.quit = Some(0);
+                return Ok(Flow::Quit);
+            }
             if !self.addr_matches(pc, stream)? {
                 // A block whose address does not match is skipped whole.
                 if let Some(Cmd { kind: Kind::Block(end), .. }) = self.script.cmds.get(pc) {

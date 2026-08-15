@@ -1158,30 +1158,65 @@ td-txt-authored case files
     entries read alike: `r` wants the source COPIED to the sink, `R` wants one
     line handed over per cycle and the handle KEPT between them.
 
-  - A sed CYCLE that never notices the reader has gone away, which is the same
-    latch the `r` entry above consults and the half of it still open. `Out`
-    turns EPIPE into a latched flag rather than a failure, and nothing on the
-    ordinary output path reads that flag, so sed goes on reading its input and
-    writing bytes nothing can receive: `sed -z -n p /dev/zero | head -c 8`
-    never returns, where GNU dies of SIGPIPE at once and grep -- which breaks
-    its own loop on `Out::is_broken` -- returns exit 0 at once, `grep -z -a ''
-    /dev/zero | head -c 8` measured either way. It costs nothing for a FINITE
-    input, since the run ends when the input does; what it costs is an endless
-    one, and the shapes that reach it are `/dev/zero`, a FIFO nobody closes,
-    and `-u` on a pipe that stays open. Not merely `p`: `w /dev/stdout`, the
-    `=` command and an `l` dump were each measured hanging on the same stream
-    where GNU took SIGPIPE.
+  - A sed CYCLE that never noticed the reader had gone away, CLOSED as far as
+    the HANG goes, which was the whole of the cost. `Out` turns EPIPE into a
+    latched flag rather than a failure, and nothing on the ordinary output path
+    read that flag, so sed went on reading its input and writing bytes nothing
+    could receive: `sed -z -n p /dev/zero | head -c 8` never returned.
 
-    It is not only about stdout, either, and that half is the reason to close it
-    rather than to declare a closed pipe uninteresting: a run that does not DIE
-    goes on doing everything else it was told to. `sed -n -e 'r /dev/zero' -e 'w
-    OUT' f1` with the pipe closed leaves `OUT` empty under GNU, which never
-    reached the second command, and holding all three lines here. The fix
-    is the cycle asking after each write, as grep does; it belongs with the
-    give-back accounting, because a run that stops early still owes the next
-    reader an accurate stdin position. Pre-existing and unchanged by the `r`
-    landing -- measured identical on both builds -- and recorded there because
-    that landing is what made the latch load-bearing anywhere in sed.
+    The question is asked in THREE places, and the first alone was not enough.
+    BETWEEN cycles, before the read -- so `give_back` still owes the next
+    reader an accurate stdin position, which is why before the read rather
+    than after the write. INSIDE the cycle, at the top of the command
+    dispatch, because a script can loop without ever ending its cycle and a
+    check between cycles is then one nothing reaches: `:a;p;ba`,
+    `:a;s/x/xy/;p;ta` and `p;s/^/z\n/;D` each still ran forever with only the
+    outer one, `b`, `t` and `D` being the three doors back into a cycle. And
+    in `copy_source`, which asked already, a dump being unbounded within one
+    cycle too. Nine shapes were measured hanging and all nine now exit at
+    once: `-n p`, `=`, `-n l` and an extended `w /dev/stdout` over an endless
+    source, plus five loops -- those three and `:a;p;n;ba` and `:a;p;N;ba`,
+    which go round through `b` as well but consume input as they spin rather
+    than only writing. A `--posix w /dev/stdout` never hung, that target being
+    an ordinary file whose EPIPE is reported rather than latched.
+
+    Stopping is recorded as a QUIT rather than as this file's end, because to
+    the caller those are the same answer and must not be. Under `-s` an end
+    means OPEN THE NEXT OPERAND, so a broken sink went on to report a missing
+    one -- `sed -s -n p big /nonexistent` exiting 2 with a diagnostic, where
+    the run is otherwise the silent 0 below -- and blocked forever in
+    `open(2)` on a FIFO nobody writes. That is the argument `copy_source`
+    already made about opening a FIFO after the reader has gone, one function
+    away and not applied to the operand loop. `q`'s machinery already means
+    end the whole run, and 0 is its status.
+
+    A cycle that stops mid-dispatch abandons the commands after the write that
+    failed, so the record `p` broke the pipe on never reaches a later `w`.
+    That is GNU's behaviour rather than a cost of this one -- it dies at that
+    same write -- and it makes the input SWALLOWED exactly one record more
+    than the output records, which is what the test pins.
+
+    What is NOT closed is the STATUS, and the reference for it is not the GNU
+    one might expect. GNU dies of SIGPIPE; td-txt cannot, the Rust runtime
+    having ignored that signal before `main`, and restoring the disposition
+    needs `rt_sigaction` -- an `unsafe` surface this crate does not have and
+    that UNSAFE.md would have to gain. The honest comparison is therefore GNU
+    UNDER THE SAME DISPOSITION, and it was measured: `sed` exits 4 with
+    `couldn't write 1 item to stdout: Broken pipe`, and `grep` exits 2 with
+    `write error: Broken pipe`. td-txt exits 0 silently in both, which is what
+    grep already did and what sed now matches. Neither answer is free -- 0 is
+    a lie a `pipefail` shell can catch, while 4-with-a-diagnostic is noise on
+    every `sed | head` where GNU prints nothing -- and choosing between them
+    is a reviewed decision rather than a measurement, so the two are recorded
+    here and the quieter one is what ships.
+
+    The second half is smaller and remains: a run that does not DIE goes on
+    doing everything else it was told to in the cycle that broke the pipe.
+    `sed -n -e 'r /dev/zero' -e 'w OUT' f1` leaves `OUT` empty under GNU --
+    which never reached the second command, and lost its buffers to the signal
+    besides -- against all three lines before this and ONE line now. That last
+    line is the cycle in which the write failed, and removing it means dying
+    where GNU dies rather than asking one question later.
 
   - A `\c` with nothing to control eats an `a` text's own TERMINATOR: GNU
     accumulates the text WITH its trailing newline and decodes that whole buffer,
