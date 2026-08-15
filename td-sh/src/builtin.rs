@@ -1681,10 +1681,11 @@ fn unset(sh: &mut Shell, argv: &[String]) -> R<()> {
         // rejects only what it cannot parse as one -- so `unset b=c` unsets `b`,
         // but `unset 'a[1]'` is an error. `unset` is a special builtin, so that
         // error is fatal to a non-interactive shell rather than a status.
-        let end = arg.bytes().position(|b| b == b'=').unwrap_or(arg.len());
-        let name = arg.get(..end).unwrap_or("");
+        let name = arg.split_once('=').map_or(arg.as_str(), |(n, _)| n);
         if !ast::is_name(name) {
-            return special_usage_error(sh, &format!("unset: {arg}: bad variable name"));
+            // The parsed prefix, not the operand: `unsetvar` is `setvar(s, NULL,
+            // 0)` (ash.c:2525), which prints `%.*s` over `namelen` (ash.c:2492).
+            return special_usage_error(sh, &format!("unset: {name}: bad variable name"));
         }
         // No flag means the VARIABLE and nothing else: both references gate the
         // function on `-f` alone (`if (flag != 'f') { unsetvar(*ap); continue; }`,
@@ -7574,6 +7575,43 @@ mod tests {
         );
         assert_eq!(run_capturing("unset %; echo NOTREACHED").0, 2);
         assert_eq!(run_capturing("unset 'a[1]'; echo NOTREACHED").0, 2);
+        // The refusal names the parsed prefix, not the operand.
+        for (op, named) in [
+            ("'1b=c'", "1b"),
+            // Two `=` pin which one splits: the last would name `1b=c`.
+            ("'1b=c=d'", "1b"),
+            ("'=x'", ""),
+            ("'a-b=c'", "a-b"),
+            ("'='", ""),
+            ("'a[1]=v'", "a[1]"),
+            // The split is by BYTE: at a char index these land mid-character,
+            // and the prefix comes back a byte or two short of the name.
+            ("'aébé=1'", "aébé"),
+            ("'é=x'", "é"),
+            ("1bad", "1bad"),
+            ("'a-b'", "a-b"),
+            ("''", ""),
+        ] {
+            let (status, _, err) = run_capturing(&format!("unset {op}; echo NOTREACHED"));
+            assert_eq!(status, 2, "unset {op}");
+            assert_eq!(err, format!("unset: {named}: bad variable name\n"), "unset {op}");
+        }
+        // `-v` is the same path; `-f` judges no name at all, in either shell,
+        // so its stderr is asserted too -- silence is the property.
+        assert_eq!(
+            run_capturing("unset -v '1b=c'; echo NOTREACHED"),
+            (2, String::new(), "unset: 1b: bad variable name\n".into())
+        );
+        assert_eq!(
+            run_capturing("unset -f '1b=c'; echo rc=$?"),
+            (0, "rc=0\n".into(), String::new())
+        );
+        // The readonly refusal one line further on takes the same prefix, and
+        // could regress the same way, so it is pinned in the `=` form too.
+        assert_eq!(
+            run_capturing("readonly R=1; unset 'R=x'; echo NOTREACHED"),
+            (2, String::new(), "unset: R: is read only\n".into())
+        );
         // The last of `-f`/`-v` wins, as in dash's option loop.
         assert_eq!(
             run_capturing("x=var\nx() { echo func; }\nunset -f -v x\necho [$x]").1,
