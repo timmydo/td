@@ -254,6 +254,15 @@ upstream); anything unfinished replays on top. A landing is therefore
 invisible to you except that the branch gets shorter, and nothing needs
 you to notice it.
 
+**The push after a landing is a force-push, and it is authorized.**
+Landing replays your commits, so the copies on main have different SHAs
+from the ones the remote branch still holds and the next push is a
+non-fast-forward. Use `git push --force-with-lease` — the lease refuses
+when the remote moved since your fetch, which is the case where someone
+else's work is on the branch — and check `git patch-id --stable` on both
+copies first, since equal ids are what prove you are discarding the
+commits that landed rather than work.
+
 **Parking.** If you must stop mid-workstream, the resume point goes in
 the last commit message as a `Next:` block — in the body, ABOVE the
 review record, which has to close the message. Whoever picks the branch
