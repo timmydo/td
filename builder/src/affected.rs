@@ -1055,17 +1055,49 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 // Rendering — byte-for-byte with the shell's stdout.
 // ---------------------------------------------------------------------------
 
-fn preflight_cmd(name: &str) -> Option<&'static str> {
+fn preflight_cmd(name: &str, changed: &[String]) -> Option<String> {
     match name {
-        "shell-syntax" => Some("  bash -n start tests/*.sh ci/*.sh tools/*.sh"),
-        "heal-revert" => Some("  bash tests/heal-revert.sh"),
-        "cargo-test" => {
-            Some("  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-txt/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml + --manifest-path td-util/Cargo.toml + --manifest-path td-init/Cargo.toml + --manifest-path td-firstboot/Cargo.toml + --manifest-path td-login/Cargo.toml + --manifest-path td-svc/Cargo.toml + --manifest-path td-seatd/Cargo.toml + --manifest-path td-compositor/Cargo.toml + --manifest-path td-review/Cargo.toml -- --include-ignored")
-        }
-        "affected-self-test" => Some("  td-builder affected-checks --self-test"),
-        "local-source-digests" => Some("  td-recipe-eval local-source-digests"),
+        "shell-syntax" => Some("  bash -n start tests/*.sh ci/*.sh tools/*.sh".to_string()),
+        "heal-revert" => Some("  bash tests/heal-revert.sh".to_string()),
+        // Rendered from the SAME list that runs, so a scoped run cannot print a
+        // command it will not issue — the dry run is what a reader trusts.
+        "cargo-test" => Some(render_cargo_test(&cargo_test_cmds(changed))),
+        "affected-self-test" => Some("  td-builder affected-checks --self-test".to_string()),
+        "local-source-digests" => Some("  td-recipe-eval local-source-digests".to_string()),
         _ => None,
     }
+}
+
+/// The one-line summary of a cargo-test command set: the historical wording,
+/// with the manifests it will actually visit.
+fn render_cargo_test(cmds: &[&str]) -> String {
+    let workspace = cmds.iter().any(|c| c.contains("--workspace"));
+    let mut o = String::from("  cargo test + clippy --frozen");
+    if workspace {
+        o.push_str(" --workspace (builder/recipes/engine)");
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    for c in cmds {
+        if let Some(krate) = cmd_manifest_crate(c) {
+            if !seen.contains(&krate) {
+                seen.push(krate);
+                if workspace || seen.len() > 1 {
+                    o.push_str(" +");
+                }
+                o.push_str(" --manifest-path ");
+                o.push_str(krate);
+                o.push_str("/Cargo.toml");
+            }
+        }
+    }
+    // ANY, not all — as the full-table wording always was. The line is a
+    // summary of a command set, not a per-crate transcript, and the same
+    // approximation already covers `--all-targets`/`--bins` differing per
+    // entry.
+    if cmds.iter().any(|c| c.contains("--include-ignored")) {
+        o.push_str(" -- --include-ignored");
+    }
+    o
 }
 
 struct Header<'a> {
@@ -1098,8 +1130,8 @@ fn format_output(header: &Header, changed: &[String], sel: &Selection, run: bool
     } else {
         o.push_str("Selected checks:\n");
         for pre in &sel.preflights {
-            if let Some(cmd) = preflight_cmd(pre) {
-                o.push_str(cmd);
+            if let Some(cmd) = preflight_cmd(pre, changed) {
+                o.push_str(&cmd);
                 o.push('\n');
             }
         }
@@ -1820,17 +1852,6 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
 // CLI.
 // ---------------------------------------------------------------------------
 
-pub(crate) fn git_lines(root: &Path, args: &[&str]) -> Vec<String> {
-    let out = Command::new("git").args(args).current_dir(root).output();
-    match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .map(str::to_string)
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
 /// git's lines, or `None` if the command failed — for the queries whose empty
 /// answer would otherwise be indistinguishable from success with no results.
 fn git_lines_checked(root: &Path, args: &[&str]) -> Option<Vec<String>> {
@@ -1978,6 +1999,66 @@ const DEPENDENCY_FREE_LOCKS: [(&str, usize); 14] = [
     ("td-review/Cargo.lock", 1),
 ];
 
+/// Standalone crates that NO recipe embeds, and so the only ones whose diff
+/// cannot reach the engine workspace.
+///
+/// Every other td-* crate has its sources `include_str!`'d into its recipe
+/// (`recipes/src/recipes/<crate>.rs`) so the lintable crate and the shipped
+/// binary are one text — which makes `recipes`, and therefore `cargo test
+/// --workspace`, a READER of those files. Checked against the tree rather than
+/// trusted, in `unembedded_crates_are_really_unembedded`.
+const UNEMBEDDED_CRATES: [&str; 1] = ["td-review"];
+
+/// The subset of `CARGO_TEST_CMDS` a diff over `changed` can actually
+/// invalidate.
+///
+/// Narrow ONLY where it is provably sound: every changed path must sit inside
+/// an `UNEMBEDDED_CRATES` directory. Anything else — `builder/`, `recipes/`, a
+/// crate a recipe embeds, an unmapped file, an empty diff — takes the whole
+/// table, so every unknown fails safe.
+fn cargo_test_cmds(changed: &[String]) -> Vec<&'static str> {
+    let mut scoped: Vec<&'static str> = Vec::new();
+    for p in changed {
+        // A `..` is refused rather than resolved: `td-review/../td-sh/x.rs`
+        // starts with the crate and names another. git never emits one, so this
+        // is reachable only through `--path`.
+        if p.contains("..") {
+            return CARGO_TEST_CMDS.to_vec();
+        }
+        let owner = UNEMBEDDED_CRATES.iter().find(|c| {
+            // The separator matters: `td-reviewer/x` is not `td-review/x`.
+            p.starts_with(*c) && p.as_bytes().get(c.len()) == Some(&b'/')
+        });
+        match owner {
+            Some(c) if !scoped.contains(c) => scoped.push(c),
+            Some(_) => {}
+            None => return CARGO_TEST_CMDS.to_vec(),
+        }
+    }
+    if scoped.is_empty() {
+        return CARGO_TEST_CMDS.to_vec();
+    }
+    let narrowed: Vec<&'static str> = CARGO_TEST_CMDS
+        .iter()
+        .copied()
+        .filter(|cmd| cmd_manifest_crate(cmd).is_some_and(|c| scoped.contains(&c)))
+        .collect();
+    // An EMPTY narrowing must never be taken at face value: the preflight's
+    // loop over nothing exits 0 having run no cargo at all — a green that
+    // tested the crate not at all. `unembedded_crates_have_cargo_commands`
+    // keeps this unreachable; this is what happens if it ever is not.
+    match narrowed.is_empty() {
+        true => CARGO_TEST_CMDS.to_vec(),
+        false => narrowed,
+    }
+}
+
+/// The crate a `--manifest-path <crate>/Cargo.toml` command names; None for the
+/// `--workspace` ones, which belong to no single crate.
+fn cmd_manifest_crate(cmd: &str) -> Option<&str> {
+    Some(cmd.split_once("--manifest-path ")?.1.split_once('/')?.0)
+}
+
 /// What the `cargo-test` preflight runs, in order. A const so the lock roster
 /// above can be checked against it: a crate tested here whose lock is not
 /// guarded there would be dependency-free by assertion only.
@@ -2012,7 +2093,7 @@ const CARGO_TEST_CMDS: [&str; 28] = [
     "cargo clippy --frozen --manifest-path td-review/Cargo.toml --all-targets",
 ];
 
-fn run_preflight(root: &Path, name: &str) -> i32 {
+fn run_preflight(root: &Path, name: &str, changed: &[String]) -> i32 {
     match name {
         "shell-syntax" => run_shell(root, "bash -n start tests/*.sh ci/*.sh tools/*.sh"),
         "heal-revert" => run_shell(root, "bash tests/heal-revert.sh"),
@@ -2051,7 +2132,7 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
             // App-level tests drive a real git repo, are `#[ignore]`d so the
             // git-less sandbox gate stays honest, and run HERE via
             // --include-ignored — this preflight is their only tier.
-            for cmd in CARGO_TEST_CMDS {
+            for cmd in cargo_test_cmds(changed) {
                 let code = run_shell(root, cmd);
                 if code != 0 {
                     return code;
@@ -2202,21 +2283,42 @@ pub fn run(args: &[String]) -> u8 {
                 return 1;
             }
         }
-        // Checked, not `git_lines`: an empty answer from a FAILED diff would
-        // be "no changed paths" a few lines below, which exits 0 having run
-        // nothing — the same fail-open `ready` refuses on its own queries.
-        let Some(mut all) = git_lines_checked(&root, &["diff", "--name-only", &merge_base, "HEAD"])
-        else {
-            eprintln!("affected-checks: git diff --name-only {merge_base} HEAD failed");
+        // EVERY changed-path query is checked: an empty answer from a FAILED
+        // diff would be "no changed paths" a few lines below, which exits 0
+        // having run nothing — the same fail-open `ready` refuses on its own
+        // queries.
+        //
+        // `--no-renames` because `--name-only` reports only the DESTINATION of
+        // a detected rename, and the selection is a function of the paths it is
+        // given: `git mv builder/src/x.rs td-review/src/x.rs` would arrive as a
+        // td-review path alone, hiding the deletion that can red the workspace.
+        // Off, a rename is a delete plus an add and both sides are seen.
+        let Some(mut all) = git_lines_checked(
+            &root,
+            &["diff", "--no-renames", "--name-only", &merge_base, "HEAD"],
+        ) else {
+            eprintln!(
+                "affected-checks: git diff --no-renames --name-only {merge_base} HEAD failed"
+            );
             return 1;
         };
         if !committed_only {
-            all.extend(git_lines(&root, &["diff", "--name-only"]));
-            all.extend(git_lines(&root, &["diff", "--cached", "--name-only"]));
-            all.extend(git_lines(
-                &root,
-                &["ls-files", "--others", "--exclude-standard"],
-            ));
+            // Checked for the same reason the committed query is, and the
+            // narrowing below is why it can no longer be left: a swallowed
+            // failure here used to mis-size the check TARGETS, and now also
+            // hides the dirty `builder/` path that is the difference between
+            // two cargo commands and twenty-eight.
+            for q in [
+                &["diff", "--no-renames", "--name-only"][..],
+                &["diff", "--cached", "--no-renames", "--name-only"][..],
+                &["ls-files", "--others", "--exclude-standard"][..],
+            ] {
+                let Some(lines) = git_lines_checked(&root, q) else {
+                    eprintln!("affected-checks: git {} failed", q.join(" "));
+                    return 1;
+                };
+                all.extend(lines);
+            }
         }
         sort_unique(all)
     };
@@ -2240,7 +2342,7 @@ pub fn run(args: &[String]) -> u8 {
 
     // --- execute ---
     for pre in &sel.preflights {
-        let code = run_preflight(&root, pre);
+        let code = run_preflight(&root, pre, &changed);
         if code != 0 {
             return code as u8;
         }
@@ -2329,6 +2431,32 @@ mod tests {
         );
     }
 
+    /// Every `.rs` under `dir`, recursively — the recipes crate nests its
+    /// modules, so a flat read would miss the file that matters.
+    ///
+    /// Unwraps rather than skipping an unreadable entry: its caller asserts the
+    /// ABSENCE of a string, so a directory silently not walked is a guard that
+    /// passes because it looked at nothing.
+    fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let e = e.unwrap();
+            // The entry's OWN type, which does not follow a symlink: `is_dir()`
+            // on the path would, and a link cycle would recurse until the stack
+            // ran out rather than fail. A symlink is REFUSED rather than
+            // skipped, since either way of skipping one is this scan looking at
+            // less than it reports — a link to a directory would drop a whole
+            // subtree, and one to a file would drop the file.
+            let ty = e.file_type().unwrap();
+            let p = e.path();
+            assert!(!ty.is_symlink(), "{p:?}: symlink in a scanned source tree");
+            if ty.is_dir() {
+                collect_rs_files(&p, out);
+            } else if ty.is_file() && p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+
     #[test]
     fn glob_basics() {
         assert!(glob_match("builder/src/*", "builder/src/a/b.rs")); // '*' spans '/'
@@ -2391,6 +2519,227 @@ mod tests {
             gen.contains("name.starts_with('.')"),
             "build.rs no longer skips dot names the way gate_files does"
         );
+    }
+
+    /// The premise the cargo-test narrowing rests on, checked against the tree
+    /// rather than trusted: no workspace member reads these crates' files, so
+    /// `cargo test --workspace` cannot be redded by one.
+    ///
+    /// Three legs, because the workspace has three ways to become a reader: a
+    /// recipe embedding the sources, a manifest depending on the crate, and a
+    /// workspace source opening one of its files. Each is the change that would
+    /// make the narrowing unsound, and each reds HERE rather than by quietly
+    /// skipping a suite that had started to matter.
+    ///
+    /// It is TEXTUAL, and so bounded: a path assembled at compile time by
+    /// `concat!` would defeat all three. What it defends is the ordinary way a
+    /// crate comes to be read, which is the way every embedded crate is read
+    /// today.
+    #[test]
+    fn unembedded_crates_are_really_unembedded() {
+        // Gated on what this test READS, not a repo-wide sentinel.
+        let dir = repo_root().join("recipes/src");
+        if !dir.is_dir() {
+            eprintln!("SKIP: {dir:?} absent (builder-only sandbox)");
+            return;
+        }
+        let mut sources = Vec::new();
+        collect_rs_files(&dir, &mut sources);
+        assert!(!sources.is_empty(), "no recipe sources found under {dir:?}");
+        let texts: Vec<(PathBuf, String)> = sources
+            .into_iter()
+            .map(|f| {
+                let t = std::fs::read_to_string(&f).unwrap();
+                (f, t)
+            })
+            .collect();
+        // POSITIVE CONTROL. Without one the scan can go vacuous — if recipes
+        // ever stop naming their crates the way they do now, every entry below
+        // passes because nothing matches anything.
+        assert!(
+            texts.iter().any(|(_, t)| t.contains("td-sh")),
+            "the scan found no mention of td-sh, which IS embedded — it is \
+             looking at the wrong thing and would pass any roster"
+        );
+        // The NAME, not one spelling of a relative path: a nested module needs
+        // a fourth `../`, and `concat!` would spell it no way this could
+        // predict. A recipe crate that so much as NAMES one of these is the
+        // signal, and today it names none.
+        for krate in UNEMBEDDED_CRATES {
+            for (f, text) in &texts {
+                assert!(
+                    !text.contains(krate),
+                    "{krate} is named by {f:?}, so the recipes crate may read it \
+                     and the cargo-test narrowing for it is no longer sound"
+                );
+            }
+        }
+        // …and no workspace member may depend on one as a crate, which would
+        // make the workspace suite a reader without naming a path at all.
+        for manifest in [
+            "builder/Cargo.toml",
+            "recipes/Cargo.toml",
+            "engine/Cargo.toml",
+        ] {
+            let text = std::fs::read_to_string(repo_root().join(manifest)).unwrap();
+            for krate in UNEMBEDDED_CRATES {
+                assert!(
+                    !text.contains(krate),
+                    "{manifest} names {krate}, so the workspace depends on it"
+                );
+            }
+        }
+        // …and no OTHER workspace member may read one's files either. `recipes`
+        // is held to naming the crate at all, which `builder` cannot be — it
+        // legitimately spells `td-review/Cargo.toml` in the very table this
+        // narrowing filters. So the bar there is a READ: the crate name on a
+        // line that also opens something. That is how a workspace member would
+        // actually come to read the crate — `builder/src/ready.rs` already
+        // records that its `parse_cases` is mirrored in td-review's
+        // `record.rs`, and a test that read that file to compare the two is
+        // exactly the change this must red on.
+        const READERS: [&str; 5] = [
+            "include_str!",
+            "include_bytes!",
+            "read_to_string",
+            "File::open",
+            "#[path",
+        ];
+        for dir in ["builder/src", "engine/src"] {
+            let d = repo_root().join(dir);
+            if !d.is_dir() {
+                continue;
+            }
+            let mut srcs = Vec::new();
+            collect_rs_files(&d, &mut srcs);
+            assert!(!srcs.is_empty(), "no sources under {d:?}");
+            for f in srcs {
+                let text = std::fs::read_to_string(&f).unwrap();
+                for line in text.lines() {
+                    for krate in UNEMBEDDED_CRATES {
+                        assert!(
+                            !(line.contains(krate) && READERS.iter().any(|r| line.contains(r))),
+                            "{f:?} reads {krate}: {line:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every roster entry must HAVE commands in the table. Without this the
+    /// filter yields an empty list for it, and a preflight that loops over
+    /// nothing exits 0 having run no cargo at all.
+    #[test]
+    fn unembedded_crates_have_cargo_commands() {
+        for krate in UNEMBEDDED_CRATES {
+            let mine: Vec<&str> = CARGO_TEST_CMDS
+                .iter()
+                .copied()
+                .filter(|c| cmd_manifest_crate(c) == Some(krate))
+                .collect();
+            // Both KINDS, not merely two commands: `render_cargo_test` prints
+            // the words "cargo test + clippy" unconditionally, so a crate that
+            // had lost its test line would advertise a run it no longer does.
+            for want in ["cargo test ", "cargo clippy "] {
+                assert!(
+                    mine.iter().any(|c| c.starts_with(want)),
+                    "{krate} has no `{want}` command: {mine:?}"
+                );
+            }
+        }
+    }
+
+    /// `cmd_manifest_crate` is the whole of what decides which suites a
+    /// narrowed run keeps, and it reads ONE spelling. `--manifest-path=<p>`
+    /// (which cargo accepts) parses as None, i.e. as a workspace command, and
+    /// so would be dropped from every narrowed set silently; a nested manifest
+    /// would name the wrong crate. Neither is reachable with today's table —
+    /// this is what keeps it that way.
+    #[test]
+    fn every_cargo_command_has_the_shape_the_parser_assumes() {
+        for cmd in CARGO_TEST_CMDS {
+            if cmd.contains("--workspace") {
+                assert_eq!(cmd_manifest_crate(cmd), None, "{cmd:?}");
+                continue;
+            }
+            let krate = cmd_manifest_crate(cmd).unwrap_or_else(|| panic!("{cmd:?}: unparsed"));
+            assert!(
+                cmd.contains(&format!("--manifest-path {krate}/Cargo.toml")),
+                "{cmd:?} is not `--manifest-path <crate>/Cargo.toml`"
+            );
+        }
+    }
+
+    /// The narrowing itself, in both directions. The unsound direction is the
+    /// one that matters: anything the rule does not recognise must take the
+    /// whole table, so a new crate or an unmapped path fails safe.
+    #[test]
+    fn cargo_commands_narrow_only_for_unembedded_crates() {
+        let all = CARGO_TEST_CMDS.len();
+        let one = |p: &str| cargo_test_cmds(&[p.to_string()]);
+        // td-review alone: its own manifest and nothing else — no --workspace,
+        // which is where the seed-recipe builds and tarball decoding live.
+        let scoped = one("td-review/src/land.rs");
+        assert_eq!(scoped.len(), 2, "test + clippy for one crate: {scoped:?}");
+        assert!(scoped.iter().all(|c| c.contains("td-review/Cargo.toml")));
+        assert!(!scoped.iter().any(|c| c.contains("--workspace")));
+        // A crate a recipe embeds must NOT narrow.
+        assert_eq!(one("td-sh/src/main.rs").len(), all);
+        assert_eq!(one("td-compositor/src/pty.rs").len(), all);
+        // Neither may the engine, an unmapped path, or an empty diff.
+        assert_eq!(one("builder/src/affected.rs").len(), all);
+        assert_eq!(one("recipes/src/recipes/td-sh.rs").len(), all);
+        assert_eq!(one("who/knows.rs").len(), all);
+        assert_eq!(cargo_test_cmds(&[]).len(), all);
+        // A prefix is not a directory: `td-reviewer/` is a different crate.
+        assert_eq!(one("td-reviewer/src/main.rs").len(), all);
+        // Nor may a `..` that starts with the crate and names another.
+        assert_eq!(one("td-review/../td-sh/src/main.rs").len(), all);
+        // One narrowable path does not license the OTHERS in the same diff.
+        assert_eq!(
+            cargo_test_cmds(&[
+                "td-review/src/land.rs".to_string(),
+                "builder/src/gates.rs".to_string(),
+            ])
+            .len(),
+            all,
+            "a mixed diff must take the whole table"
+        );
+    }
+
+    /// The rendered line and the executed list come from one call, so the dry
+    /// run cannot advertise a command the run will not issue.
+    #[test]
+    fn the_printed_cargo_line_matches_what_would_run() {
+        let changed = vec!["td-review/src/land.rs".to_string()];
+        let line = preflight_cmd("cargo-test", &changed).unwrap_or_default();
+        let running: Vec<&str> = cargo_test_cmds(&changed)
+            .iter()
+            .filter_map(|c| cmd_manifest_crate(c))
+            .collect();
+        assert!(!running.is_empty(), "nothing would run: {line:?}");
+        // Both directions, over EVERY crate the full table names. The "names
+        // each one that runs" half is vacuous on its own: a render that printed
+        // all thirteen manifests would satisfy it, and printing a command the
+        // preflight will not run is exactly the lie this test exists to catch.
+        for cmd in CARGO_TEST_CMDS {
+            let Some(krate) = cmd_manifest_crate(cmd) else {
+                continue;
+            };
+            let manifest = format!("--manifest-path {krate}/Cargo.toml");
+            assert_eq!(
+                line.contains(&manifest),
+                running.contains(&krate),
+                "{line:?} disagrees with what would run about {krate}"
+            );
+        }
+        assert!(!line.contains("--workspace"), "{line:?}");
+        // …and the unnarrowed line is unchanged from what it always printed.
+        let full =
+            preflight_cmd("cargo-test", &["builder/src/main.rs".to_string()]).unwrap_or_default();
+        assert!(full.starts_with("  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml"));
+        assert!(full.ends_with("--manifest-path td-review/Cargo.toml -- --include-ignored"));
     }
 
     /// A listing error must RED rather than come back short: the caller's loop
@@ -2538,11 +2887,12 @@ mod tests {
             ])
         );
 
-        // td-review → the cargo-test preflight and NOTHING else: the only
-        // selection with no `td-builder check` line at all. Pinned as exact
-        // output because that absence is the whole point of the arm, and a
-        // stray target added later would restore an hour of bootstrap builds
-        // for a crate none of it reads.
+        // td-review → the cargo-test preflight, scoped to td-review's OWN
+        // manifest, and NOTHING else: the only selection with no `td-builder
+        // check` line at all. Pinned as exact output because both absences are
+        // the point — a stray target would restore an hour of bootstrap builds,
+        // and a stray manifest would restore the workspace suite, for a crate
+        // none of it reads.
         assert_eq!(
             path_output(&root, "td-review/src/land.rs"),
             expect(&[
@@ -2552,7 +2902,7 @@ mod tests {
                 "  td-review/src/land.rs",
                 "",
                 "Selected checks:",
-                "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-txt/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml + --manifest-path td-util/Cargo.toml + --manifest-path td-init/Cargo.toml + --manifest-path td-firstboot/Cargo.toml + --manifest-path td-login/Cargo.toml + --manifest-path td-svc/Cargo.toml + --manifest-path td-seatd/Cargo.toml + --manifest-path td-compositor/Cargo.toml + --manifest-path td-review/Cargo.toml -- --include-ignored",
+                "  cargo test + clippy --frozen --manifest-path td-review/Cargo.toml -- --include-ignored",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
                 "Branch-mode policy for these paths: the full check would be waived",
