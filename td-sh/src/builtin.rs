@@ -1994,12 +1994,6 @@ fn getopts(sh: &mut Shell, argv: &[String]) -> R<()> {
     getopts_store(sh, name, optind, &letter.to_string())?;
     sh.getopts_optind = optind;
     sh.getopts_off = off;
-    // An unusable variable name still leaves OPTIND/OPTARG updated (dash does the
-    // parse first, then fails on the assignment).
-    if !ast::is_name(name) {
-        err_line(sh, &format!("getopts: {name}: not a valid identifier"));
-        return status(sh, 2);
-    }
     ok(sh)
 }
 
@@ -2045,13 +2039,25 @@ fn getopts_unset_optarg(sh: &mut Shell) -> R<()> {
     Err(sh.readonly_fatal("OPTARG"))
 }
 
-// Publish OPTIND and the option letter, skipping a name that is not an identifier.
+// Publish OPTIND and then the option letter, in that order: ash's destination
+// write is its LAST (ash.c:11754), which is what leaves OPTIND and OPTARG
+// updated when the destination is the thing that fails.
 fn getopts_store(sh: &mut Shell, name: &str, optind: i64, letter: &str) -> R<()> {
     getopts_write(sh, "OPTIND", &optind.to_string())?;
-    if ast::is_name(name) {
-        getopts_write(sh, name, letter)?;
+    // ash hands the destination straight to `setvar`, which splits it at the
+    // FIRST `=` and keeps what precedes it -- so `getopts ab a=b` stores through
+    // `a` and discards the tail, and a bad prefix is reported without one. That
+    // makes the prefix the whole of the name, so `=x` names nothing at all.
+    let name = name.split_once('=').map_or(name, |(n, _)| n);
+    // A bad destination RAISES there rather than being skipped, so it restarts
+    // the scan like any other refused write and reports 2 on every path -- the
+    // end-of-options one included, which never reached a name check before.
+    if !ast::is_name(name) {
+        sh.getopts_optind = 1;
+        sh.getopts_off = -1;
+        return Err(sh.fatal(&format!("getopts: {name}: bad variable name"), 2));
     }
-    Ok(())
+    getopts_write(sh, name, letter)
 }
 
 // Whether `c` is in `optstring`, and if so whether it takes an argument. The
@@ -4309,6 +4315,122 @@ mod tests {
     #[test]
     fn shift_drops_leading_params() {
         assert_eq!(run_capturing("set -- a b c d; shift 2; echo $# $1").1, "2 c\n");
+    }
+
+    #[test]
+    fn a_bad_getopts_destination_raises_and_restarts() {
+        // ash's destination write is its LAST (ash.c:11754) and it RAISES on a
+        // bad name, from the one `setvar` site every builtin shares
+        // (ash.c:2492) -- which is why the phrase matches `read`/`unset`/
+        // `export`/`readonly`/`local` rather than being getopts' own.
+        // `$?` rather than the script's status, which is the trailing `echo`'s:
+        // the raise ends the COMMAND, so the line runs on and 2 stands.
+        // The NAME is asserted, not just the phrase: ash computes that half from
+        // the operand and it is where the `=` shapes below diverged.
+        for (bad, named) in [
+            ("1bad", "1bad"),
+            ("a-b", "a-b"),
+            ("'a b'", "a b"),
+            ("''", ""),
+            ("a.b", "a.b"),
+            ("'a[1]'", "a[1]"),
+            ("'a$b'", "a$b"),
+        ] {
+            let (status, out, err) =
+                run_capturing(&format!("set -- -a -b; getopts ab {bad}; echo \"rc=$?\""));
+            assert_eq!((status, out.as_str()), (0, "rc=2\n"), "getopts ab {bad}");
+            assert_eq!(err, format!("getopts: {named}: bad variable name\n"), "{bad}");
+        }
+        // A good name is untouched in every respect, which needs the letter and
+        // the cursor asserted and not merely the absence of a complaint.
+        for ok in ["_ok", "A1", "x9_"] {
+            let (status, out, err) = run_capturing(&format!(
+                "set -- -a -b; getopts ab {ok}; echo \"${ok}/$OPTIND\""
+            ));
+            assert_eq!((status, out.as_str(), err.as_str()), (0, "a/2\n", ""), "{ok}");
+        }
+        // Status 2 on EVERY path: the end-of-options one reached no name check
+        // at all before, and reported 1.
+        for src in ["set -- x", "set --", "set -- --"] {
+            let (status, out, _) =
+                run_capturing(&format!("{src}; getopts ab 1bad; echo \"rc=$?\""));
+            assert_eq!((status, out.as_str()), (0, "rc=2\n"), "{src}");
+        }
+        // Raising restarts the scan, as a refused write does -- twice over, so a
+        // cursor that merely failed to advance would still read `b` the second
+        // time.
+        assert_eq!(
+            run_capturing("set -- -a -b; getopts ab 1bad; getopts ab X; echo \"$X/$OPTIND\"").1,
+            "a/2\n"
+        );
+        assert_eq!(
+            run_capturing(
+                "set -- -a -b; getopts ab 1bad; getopts ab 1bad; getopts ab X; \
+                 echo \"$X/$OPTIND\""
+            )
+            .1,
+            "a/2\n"
+        );
+        // Failing on a LATER call is what separates a restart from a cursor
+        // merely left where it stood: parking would resume at `-b`. ash parks
+        // its sentinel on ENTRY (ash.c:11680), so what survives a raise is -1
+        // and not the previous position, and the scan starts over.
+        assert_eq!(
+            run_capturing(
+                "set -- -a -b; getopts ab ok; getopts ab 1bad; getopts ab X; \
+                 echo \"$X/$OPTIND\""
+            )
+            .1,
+            "a/2\n"
+        );
+        assert_eq!(
+            run_capturing(
+                "set -- -a -b -c; getopts abc o1; getopts abc o2; getopts abc 1bad; \
+                 getopts abc X; echo \"$X/$OPTIND\""
+            )
+            .1,
+            "a/2\n"
+        );
+        // The destination is split at the FIRST `=` before any of that, since
+        // ash reaches `setvar` with the whole operand: the letter goes to the
+        // prefix, the tail is discarded, and a bad prefix is named on its own.
+        for (dest, want) in [("a=b", "[a]\n"), ("a=", "[a]\n"), ("a=b=c", "[a]\n")] {
+            assert_eq!(
+                run_capturing(&format!("set -- -a; getopts ab {dest}; echo \"[$a]\"")).1,
+                want,
+                "getopts ab {dest}"
+            );
+        }
+        for (dest, named) in [("=x", ""), ("a-b=c", "a-b"), ("1bad=x", "1bad")] {
+            let (_, out, err) =
+                run_capturing(&format!("set -- -a; getopts ab {dest}; echo \"rc=$?\""));
+            assert_eq!(out, "rc=2\n", "getopts ab {dest}");
+            assert!(
+                err.contains(&format!("getopts: {named}: bad variable name")),
+                "getopts ab {dest}: {err:?}"
+            );
+        }
+        // Silent mode reaches it too -- the destination write is past the option
+        // scan, so an illegal option that sets OPTARG still raises on the name.
+        assert_eq!(
+            run_capturing("set -- -z; getopts :ab 1bad; echo \"rc=$? [$OPTARG]\"").1,
+            "rc=2 [z]\n"
+        );
+        // A function body is not a subshell, and the raise ends the COMMAND: the
+        // rest of the body runs, and so does the caller.
+        assert_eq!(
+            run_capturing("f() { getopts ab 1bad; echo A; }; f -a -b; echo B").1,
+            "A\nB\n"
+        );
+        // OPTIND and OPTARG are written BEFORE the destination, so they stand.
+        assert_eq!(
+            run_capturing("set -- -a -b; getopts ab 1bad; echo \"OPTIND=$OPTIND\"").1,
+            "OPTIND=2\n"
+        );
+        assert_eq!(
+            run_capturing("OPTARG=old; set -- -c v; getopts \"c:\" 1bad; echo \"[$OPTARG]\"").1,
+            "[v]\n"
+        );
     }
 
     #[test]
