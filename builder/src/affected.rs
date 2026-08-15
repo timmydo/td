@@ -752,6 +752,22 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return; // docs — no checks
     }
 
+    // td-boot's protocol.rs is the deployment contract, `#[path]`-included by
+    // three OTHER trees: two recipes (system-x86-64, qemu_boot) and — since the
+    // manifest header and size bound moved into it — the host-side td-net, whose
+    // `td-deploy` signs what td-boot verifies. The td-boot rule below covers the
+    // first two through recipe-checks but compiles no net, and no gate builds
+    // td-net from source: the WARM does, which is a chain target. So this file
+    // takes the td-boot rule plus those, or a change here that breaks only the
+    // signer runs nothing.
+    if p == "td-boot/src/protocol.rs" {
+        sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
+        add_chain_targets(sel);
+        return;
+    }
+
     // The target guest crates compile offline in the cargo-test preflight. Their
     // sources are embedded into target-static recipes, whose link/behavior tests
     // live in the recipe-owned checks.
@@ -1642,6 +1658,34 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-boot/src/main.rs", "recipe-checks");
     assert_target!("td-boot/Cargo.toml", "check");
     assert_target!("td-boot/Cargo.toml", "recipe-checks");
+    // protocol.rs is the deployment contract three OTHER trees compile: two
+    // recipes and — since the manifest header and bound moved into it — td-net.
+    // What distinguishes it from the rest of td-boot is the chain targets: no
+    // gate builds td-net from source, the recipe-graph WARM does, so a break
+    // that only reaches the signer runs nothing without them. `td-boot/src/
+    // main.rs` selecting none of the three is the other half of the pin — the
+    // rule has to be about this file and not about the crate.
+    assert_target!("td-boot/src/protocol.rs", "check");
+    assert_target!("td-boot/src/protocol.rs", "recipe-checks");
+    assert_target!(
+        "td-boot/src/protocol.rs",
+        "bootstrap-x86_64-toolchain-store-native"
+    );
+    assert_target!(
+        "td-boot/src/protocol.rs",
+        "bootstrap-x86_64-native-gcc-store-native"
+    );
+    assert_target!("td-boot/src/protocol.rs", "bootstrap-x86_64-self-gcc-store-native");
+    assert_preflight!("td-boot/src/protocol.rs", "cargo-test");
+    assert_no_target!(
+        "td-boot/src/main.rs",
+        "bootstrap-x86_64-toolchain-store-native"
+    );
+    assert_no_target!(
+        "td-boot/src/main.rs",
+        "bootstrap-x86_64-native-gcc-store-native"
+    );
+    assert_no_target!("td-boot/src/main.rs", "bootstrap-x86_64-self-gcc-store-native");
     // Nothing builds td-review as a target artifact, so no -test recipe links
     // it — and it selects no check target at all, so these assert what RUNS
     // rather than only what is recorded: `cargo-test` is the whole selection,

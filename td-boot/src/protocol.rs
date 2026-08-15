@@ -5,6 +5,18 @@ pub const BOOKKEEPING_UNAVAILABLE_MARKER: &str = "TD-BOOT-BOOKKEEPING-UNAVAILABL
 pub const BOOKKEEPING_UNAVAILABLE_CMDLINE_TOKEN: &str = "td.boot-bookkeeping-unavailable=1";
 pub const SELECTED_CURRENT_MARKER: &str = "TD-BOOT-SELECTED-CURRENT";
 pub const SELECTED_PREVIOUS_MARKER: &str = "TD-BOOT-SELECTED-PREVIOUS";
+// The manifest contract, shared because BOTH halves of a deployment must agree
+// about it: td-boot reads and verifies, and the host-side `td-deploy` signs. A
+// bound stated twice is a bound that can disagree with itself — a signer that
+// accepted 8192 would emit signatures no machine could ever check, and the
+// failure would surface at boot rather than at signing.
+pub const MANIFEST_HEADER: &[u8] = b"td-deployment-v1";
+pub const MANIFEST_NAME: &str = "manifest";
+pub const MAX_MANIFEST_BYTES: u64 = 4096;
+// Detached, beside the manifest: the deployment id stays sha256(manifest), so
+// re-signing under a new key does not rename the deployment.
+#[allow(dead_code)]
+pub const MANIFEST_SIG_NAME: &str = "manifest.sig";
 pub const BOOT_DIR: &str = "td/boot";
 pub const ATTEMPTS_DIR: &str = "td/boot/attempts";
 pub const DEPLOYMENTS_DIR: &str = "td/deployments";

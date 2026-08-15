@@ -30,10 +30,22 @@
 // binary on demand; the td-subst name is provided by a substitute stash
 // and by operators per tools/resolve-toolchain.sh. Invoking a bare
 // `td-net` with no applet selector is a usage error (exit 2) by design.
+mod deploy;
 mod feed;
 mod fetch;
 mod http;
+mod sig;
 mod subst;
+
+// The deployment protocol td-boot READS, included from the crate that defines
+// it rather than restated here: `td-deploy` signs a manifest td-boot must
+// accept, so the header it requires and the size bound it enforces are one
+// copy. Unlike the engine sources below this is in the SHIPPED build — the
+// signer consults it on every `sign`. Only the manifest constants are used;
+// the rest of the file is the layout the one-bundle-writer landing shares.
+#[allow(dead_code)]
+#[path = "../../td-boot/src/protocol.rs"]
+mod protocol;
 
 // The TARGET-side verifier, compiled into the test build only. td signs here
 // with `ring` and verifies on the target with the engine's dependency-free
@@ -66,6 +78,7 @@ fn main() {
         "td-fetch" => fetch::run(&args),
         "td-feed" => feed::run(&args),
         "td-subst" => subst::run(&args),
+        "td-deploy" => deploy::run(&args),
         // Umbrella name (or an unknown link): the first real arg selects the applet.
         // Rebuild argv as the applet's own link would present it — argv[0] = the applet
         // name so each applet's basename/output is unchanged — then dispatch.
@@ -74,10 +87,12 @@ fn main() {
                 Some("fetch") => "td-fetch",
                 Some("feed") => "td-feed",
                 Some("subst") => "td-subst",
+                Some("deploy") => "td-deploy",
                 _ => {
                     eprintln!(
-                        "usage: td-net <fetch|feed|subst> ...\n  \
-                         (or invoke via the td-fetch / td-feed / td-subst applet links)"
+                        "usage: td-net <fetch|feed|subst|deploy> ...\n  \
+                         (or invoke via the td-fetch / td-feed / td-subst / td-deploy \
+                         applet links)"
                     );
                     std::process::exit(2);
                 }
@@ -88,6 +103,7 @@ fn main() {
             match applet {
                 "td-fetch" => fetch::run(&argv),
                 "td-feed" => feed::run(&argv),
+                "td-deploy" => deploy::run(&argv),
                 _ => subst::run(&argv),
             }
         }

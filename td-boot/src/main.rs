@@ -30,10 +30,7 @@ const TD_LOSETUP: &str = "/bin/losetup";
 const TD_KEXEC: &str = "/bin/td-kexec";
 // root-loop requires procfs so losetup reopens the verified inode, not its path.
 const STDIN_PATH: &str = "/proc/self/fd/0";
-const MANIFEST_HEADER: &[u8] = b"td-deployment-v1";
-const MANIFEST_NAME: &str = "manifest";
 const ATTEMPT_HEADER: &[u8] = b"td-boot-attempt-v1";
-const MAX_MANIFEST_BYTES: u64 = 4096;
 const MAX_ATTEMPT_BYTES: u64 = 64;
 const MAX_CMDLINE_BYTES: usize = 2048;
 const MAX_MOUNTINFO_BYTES: u64 = 1024 * 1024;
@@ -342,7 +339,7 @@ fn parse_manifest(bytes: &[u8]) -> io::Result<Manifest> {
     let terminator = lines
         .next()
         .ok_or_else(|| invalid("deployment manifest lacks a trailing newline"))?;
-    if header != MANIFEST_HEADER || !terminator.is_empty() || lines.next().is_some() {
+    if header != protocol::MANIFEST_HEADER || !terminator.is_empty() || lines.next().is_some() {
         return Err(invalid(
             "deployment manifest must have the exact td-deployment-v1 four-line form",
         ));
@@ -399,9 +396,9 @@ fn verify_payload(directory: &Path, name: &str, expected: &str) -> io::Result<Fi
 fn open_bundle(directory: &Path) -> io::Result<VerifiedBundle> {
     require_absolute(directory, "deployment directory")?;
     require_real_directory(directory, "deployment directory")?;
-    let manifest_path = directory.join(MANIFEST_NAME);
+    let manifest_path = directory.join(protocol::MANIFEST_NAME);
     let manifest =
-        read_bounded_real_file(&manifest_path, "deployment manifest", MAX_MANIFEST_BYTES)?;
+        read_bounded_real_file(&manifest_path, "deployment manifest", protocol::MAX_MANIFEST_BYTES)?;
     let parsed = parse_manifest(&manifest)?;
     let id = sha256::hex_digest(&manifest);
     let kernel = verify_payload(directory, "bzImage", &parsed.kernel)?;
@@ -795,7 +792,7 @@ fn publish_bundle(root: &Path, mut bundle: VerifiedBundle) -> io::Result<String>
     copy_verified_payload(&mut bundle.kernel, &staging.join("bzImage"))?;
     copy_verified_payload(&mut bundle.initramfs, &staging.join("initramfs.cpio"))?;
     copy_verified_payload(&mut bundle.root, &staging.join("root.erofs"))?;
-    write_synced_file(&staging.join(MANIFEST_NAME), &bundle.manifest)?;
+    write_synced_file(&staging.join(protocol::MANIFEST_NAME), &bundle.manifest)?;
     sync_directory(&staging)?;
 
     let staged = open_bundle(&staging)?;
@@ -1039,9 +1036,9 @@ fn verified_manifest(root: &Path, id: &str) -> io::Result<(PathBuf, Manifest)> {
 
     let directory = root.join(protocol::DEPLOYMENTS_DIR).join(id);
     require_real_directory(&directory, "deployment")?;
-    let manifest_path = directory.join(MANIFEST_NAME);
+    let manifest_path = directory.join(protocol::MANIFEST_NAME);
     let manifest_bytes =
-        read_bounded_real_file(&manifest_path, "deployment manifest", MAX_MANIFEST_BYTES)?;
+        read_bounded_real_file(&manifest_path, "deployment manifest", protocol::MAX_MANIFEST_BYTES)?;
     let manifest_id = sha256::hex_digest(&manifest_bytes);
     if manifest_id.as_str() != id {
         return Err(invalid(format!(

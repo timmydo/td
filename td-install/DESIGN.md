@@ -235,26 +235,127 @@ may boot". Sharing one key would mean a compromise of the substituter's
 signing key is also a compromise of every machine's boot chain, and the two
 have different lifetimes and different exposure.
 
-Generation reuses the existing tool — `td-subst keygen PRIV PUB` produces a
-pkcs8 private half and a raw 32-byte public half. The private half is
-**never committed**. `tests/td-deploy.pub` is the committed default public
-key, and it is exactly that: a default for development and for the crate's
-own tests.
+Signing is host-side in `td-net`, where `ring` already signs: **`td-deploy`**,
+its own applet rather than a verb on `td-subst`, because the two are the
+different trust domains named above and one tool serving both invites one key
+serving both. `td-deploy sign MANIFEST PRIV OUT` signs the manifest's exact
+bytes — no canonicalisation, since the verifier hashes that same file to
+derive the id — and writes the detached signature (D3, D4).
 
-**td-boot's pinned public key is a declared build input**, not a constant in
-its source. The recipe takes it and pins it into the binary at build time.
-That is what makes the trust root a *build* parameter: rotating it is a
-rebuild rather than a source edit, a release build can pin a key that never
-appears in the repository, and — the property that pays for the extra recipe
-parameter — the boot oracle can pin a key it generated seconds earlier.
+What it will sign is bounded by td-boot's OWN contract rather than by a
+restatement of it: `MANIFEST_HEADER`, `MANIFEST_NAME`, `MAX_MANIFEST_BYTES`
+and `MANIFEST_SIG_NAME` live in `td-boot/src/protocol.rs`, which `td-net`
+`#[path]`-includes exactly as the recipes do. So the signer refuses a
+manifest larger than the verifier will read, and one that does not carry the
+verifier's header — a signature that could never be checked fails on the
+builder rather than on a machine. The header check is also the only thing
+separating the two signing domains at the *message* level, since neither tool
+tags what it signs; without it a deployment key would sign any blob handed to
+it. It reads the manifest the way td-boot does, too — `symlink_metadata`
+first, then an open whose device and inode must still match — because a
+signer that accepts what the target refuses produces a bundle that fails at
+boot instead of at signing.
+
+`td-deploy keygen PRIV PUB` produces a pkcs8 private half and a raw 32-byte
+public half. The private half is created **`0600` and exclusively**: a
+signing key any local reader can copy forges whatever it authorises, and a
+second `keygen` over an existing path must be an error rather than silently
+destroying a key machines are still pinned to. **No private key is ever
+committed**, which is the repository's existing practice: `tests/td-subst.pub`
+is committed and its private half never was.
 
 Verification is `engine/src/ed25519.rs`, which is verify-only and strict: it
 refuses `S >= L`, non-canonical encodings, keys outside the prime-order
 subgroup, and small-order `R`. It reaches SHA-512 as `crate::sha512`, so a
 consumer must declare **both** modules at its crate root; they are a pair.
 
-Signing is host-side in `td-net`, where `ring` already signs, and emits
-`manifest.sig` beside the manifest (D3, D4).
+### Where the trusted public key lives — OPEN
+
+This is not settled, and it is recorded here rather than decided quietly
+because a first answer turned out to be unbuildable.
+
+The intent was that td-boot's key be pinned at build time. It cannot be a key
+the test harness generates: every recipe embeds its sources with
+`include_str!`, which Rust resolves when *td-recipe-eval itself* compiles, and
+recipes are content-addressed targets with no per-run parameter. So a
+build-time pin can only carry a key that exists before the build — and since
+no private key may be committed, nothing at test time holds the matching half
+to sign a bundle with. **Build-pinning and "no committed private key" cannot
+both hold.** The manifest changes with every system build, so its signature
+must be produced per build; a committed *fixture* signature cannot stand in.
+
+What follows is that the trusted key is read at runtime. The important part
+is WHERE, and the distinction is not "compiled in vs. read from a file":
+
+- A key on the **Btrfs volume**, beside the deployments it authorises, is a
+  real weakening. Anyone who can write a forged deployment can write the
+  matching public key next to it, and the signature degrades to an integrity
+  check the manifest hashes already provide. Do not put it there.
+- A key travelling in the **same artifact as td-boot** — the initramfs the
+  firmware loads — moves the trust boundary hardly at all. Substituting it
+  requires writing that artifact, which is what patching a compiled-in
+  constant would require too.
+
+Three differences survive even then, and each is a thing to get right rather
+than a reason to prefer the constant: something must WRITE the key, and any
+path that writes a trust root can be induced to write the wrong one; a
+missing key becomes a runtime branch, where the tempting branch is the
+fail-open D2 forbids, so absence must be a refusal; and the trust root
+becomes per-machine state that the reproducible artifact does not record.
+
+Against the threat this signature exists for — a hostile or compromised
+update source — the two are equivalent: that attacker supplies bytes and
+touches neither the ESP nor the key. Against a local-disk attacker td has no
+defence either way today (§9: no Secure Boot, no TPM, no encryption), so
+"pinned at build time" buys less here than the phrase suggests.
+
+The mechanism that makes a per-run key workable is verified: Linux accepts
+**concatenated cpio archives** for initramfs, so a harness can append a
+one-file archive carrying that run's public key without any recipe being
+parameterized. Checked against the pinned tree, `linux-7.1.4`,
+`init/initramfs.c` — `unpack_to_rootfs`'s driver loop restarts the state
+machine at `Start` on each `070701` magic and skips NUL padding between
+archives, and the compressed path does the same in `flush_buffer`. Two
+consequences: the appended archive must begin **4-byte aligned** (the branch
+is guarded by `!(this_header & 3)`, and a misaligned appendix is a boot-time
+`invalid magic` panic, not a silent skip), and a later archive's file
+replaces an earlier one's (`clean_path` plus `O_TRUNC`), which is what lets a
+key be appended rather than reserved.
+
+One tension in the list above is worth naming rather than leaving to be
+noticed: D5 calls the ESP the least trustworthy surface on the disk —
+firmware writes it, other OS installers write it, nothing checksums it — and
+the second bullet nonetheless prefers it to the Btrfs volume. Both hold. D5
+is about the ESP relative to a volume td controls and verifies, and the
+bullet is about the ESP relative to a *compiled-in constant in a binary that
+already lives on the ESP*. An attacker who can rewrite the key file there can
+rewrite td-boot itself, so pinning buys nothing against them. What D5 does
+rule out is treating the ESP as a place where a key could be *safely* left
+for something else to trust; the key is only as good as the binary beside it,
+and that is the whole of the claim.
+
+### The signature file
+
+`manifest.sig`, beside `manifest` in the deployment directory
+(`MANIFEST_SIG_NAME` in `td-boot/src/protocol.rs`). Its contents are the
+detached ed25519 signature as **lowercase hex with a trailing newline** — 129
+bytes. The verifier must tolerate the newline; `from_hex` trims. This is
+recorded because it is the wire format between the two halves, and a format
+that lives only in the signer's code is one the verifier can disagree with.
+
+### What the publish path must gain — NOT YET DONE
+
+Two things in `td-boot install` block a signature reaching a machine, and
+both belong to the target-side landing rather than to the host signer:
+
+- `publish_bundle` copies exactly `bzImage`, `initramfs.cpio`, `root.erofs`
+  and `manifest` into the staged directory. A `manifest.sig` beside the
+  manifest is **silently dropped** today.
+- `publish_bundle` early-returns when `existing_bundle_matches`, which
+  compares deployment ids only. Since re-signing deliberately does not change
+  the id (D3), rotating a key can never update an installed signature: the
+  machine keeps the old one. The id comparison is right; what it needs is for
+  the signature to be part of what "matches" means.
 
 ## 7. Engine sources compiled into target binaries
 
@@ -303,6 +404,20 @@ visible at the routing decision, and closing it belongs to td-net.
 
 A target consumer whose source is *missing* from the table is the failure
 that matters: a target binary whose engine sources nothing checks.
+
+### The other shared source: `td-boot/src/protocol.rs`
+
+Not an engine source, and so not in the table, but the same shape: it is
+`#[path]`-included by `recipes/src/recipes/system-x86-64.rs`,
+`recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs` and — since the manifest
+header and size bound moved into it — `net/src/main.rs`. It gets its own
+routing arm ahead of the `td-boot/*` glob, because the glob selects nothing
+that compiles td-net: no gate builds td-net from source, the recipe-graph
+warm does, and that is a chain target. The arm is `cargo-test` + `check` +
+`recipe-checks` + the chain, and what pins it is the contrast — the
+assertions require `td-boot/src/main.rs` to select none of the three
+bootstrap targets, so the rule has to be about this FILE rather than about
+the crate.
 
 ## 8. Oracles
 
@@ -356,12 +471,19 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
 1. **This file.** Docs-only.
 2. **The `affected.rs` routing table** (§7). Mechanism only; no behaviour
    change, and the entries land with it.
-3. **Signing, host-side and target-side, in one landing** (§6, D2): `td-net`
-   emits `manifest.sig`; `td-boot` verifies fail-closed against a build-input
-   public key; the system oracle signs the bundle it stages and gains the
-   wrong-key negative control. Nothing installs yet, and nothing needs to for
-   this to be tested.
-4. **`td-install`**, a standalone crate outside the workspace (D9): GPT +
+3. **Signing, host-side** (§6, D2, D3, D4): `td-deploy sign` emits a detached
+   `manifest.sig`. Nothing consumes it yet — the same shape `aa347e60` used
+   to land the verifier, and it is what lets the target half land against a
+   signer that already exists.
+4. **Verification, target-side, fail-closed** (§6, D2): `td-boot` refuses a
+   deployment whose manifest does not verify, and the system oracle signs the
+   bundle it stages and gains a wrong-key negative control. This is the
+   increment that decides the OPEN question in §6 — where the trusted key
+   lives — because it is the first one that has to read a key at all. It was
+   scoped with item 3 as a single landing and split when that question turned
+   out to be unsettled; the host half needs no answer to it, and the target
+   half cannot proceed without one.
+5. **`td-install`**, a standalone crate outside the workspace (D9): GPT +
    FAT32 ESP + Btrfs volume onto a device or a regular file,
    `#[path]`-including `gpt.rs`/`fat.rs`/`crc32.rs` and `protocol.rs`, and
    delegating the publish to `td-boot install` (D1). Carries the
@@ -370,15 +492,15 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    `Cargo.lock` assertion plus its clippy and test lines
    (`builder/src/gate_defs/325-cargo-test.rs`), a route and assertions in
    `builder/src/affected.rs`, and the workspace `exclude` list.
-5. **The EFI-stub kernel** (§5): `CONFIG_EFI`, `CONFIG_EFI_STUB`,
+6. **The EFI-stub kernel** (§5): `CONFIG_EFI`, `CONFIG_EFI_STUB`,
    `CONFIG_CMDLINE` in `linux-x86-64.rs`, having first confirmed what
    `CONFIG_EFI` drags in on the pinned tree.
-6. **The OVMF oracle** (§8), beside the `-kernel` one, not replacing it.
-7. **`td-update` and its local channel**: fetch a signed bundle, verify it,
+7. **The OVMF oracle** (§8), beside the `-kernel` one, not replacing it.
+8. **`td-update` and its local channel**: fetch a signed bundle, verify it,
    delegate the publish (D1 again), and roll back on a failed boot. This is
    where the update channel that was its own workstream rejoins this one.
 
-Items 5 and 6 depend on nothing above them and may land whenever they fit.
+Items 6 and 7 depend on nothing above them and may land whenever they fit.
 
 ## 11. Validation
 

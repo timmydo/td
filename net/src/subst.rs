@@ -11,7 +11,11 @@
 // PINNED public key, then re-checks the fetched nar's sha256 against the signed NarHash.
 //
 //   td-subst keygen PRIV PUB      Generate an ed25519 keypair: PRIV = pkcs8 (publisher
-//                                 secret, never committed), PUB = hex public key (pinned).
+//                                 secret, never committed, created 0600), PUB = hex public
+//                                 key (pinned). Both are created EXCLUSIVELY: an existing
+//                                 path is an error, not a replacement, because silently
+//                                 truncating a signing key leaves nothing matching what
+//                                 consumers have pinned.
 //   td-subst sign DIR PRIV        Append `Sig: <hex>` to every <…>.narinfo in DIR, signed
 //                                 over the narinfo body (everything before the Sig line).
 //   td-subst serve DIR ADDR       Static, traversal-safe HTTP server for the export dir
@@ -25,8 +29,7 @@
 //                                 back + verify. Also asserts the guards are load-bearing:
 //                                 a tampered narinfo reds (signature), a corrupted nar reds
 //                                 (NarHash), and a wrong public key reds (signature).
-use ring::rand::SystemRandom;
-use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
+use crate::sig::{from_hex, keygen, sign_msg, to_hex, verify_msg, write_keypair};
 use sha2::{Digest, Sha256};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -40,36 +43,6 @@ fn die(msg: String) -> ! {
 
 fn hex_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
-fn from_hex(s: &str) -> Result<Vec<u8>, String> {
-    let s = s.trim();
-    if s.len() % 2 != 0 {
-        return Err("odd-length hex".into());
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| format!("bad hex: {e}")))
-        .collect()
-}
-
-// ---- ed25519 (ring) ----
-
-fn sign_msg(pkcs8: &[u8], msg: &[u8]) -> Result<Vec<u8>, String> {
-    let kp = Ed25519KeyPair::from_pkcs8(pkcs8).map_err(|e| format!("bad private key: {e}"))?;
-    Ok(kp.sign(msg).as_ref().to_vec())
-}
-
-fn verify_msg(pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool {
-    UnparsedPublicKey::new(&ED25519, pubkey).verify(msg, sig).is_ok()
 }
 
 // ---- narinfo ----
@@ -224,16 +197,9 @@ fn fetch(baseurl: &str, name: &str, outdir: &Path, pubkey: &[u8]) -> Result<Stri
     Ok(store_path)
 }
 
-fn keygen() -> (Vec<u8>, Vec<u8>) {
-    let rng = SystemRandom::new();
-    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("generate ed25519 key");
-    let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse generated key");
-    (pkcs8.as_ref().to_vec(), kp.public_key().as_ref().to_vec())
-}
-
 fn selftest() {
     // 1. A keypair (publisher secret + pinned-style public key).
-    let (pkcs8, pubkey) = keygen();
+    let (pkcs8, pubkey) = keygen().unwrap_or_else(|e| die(e));
 
     // 2. Build a one-entry export dir (the "nar" is opaque bytes here — the subst layer
     //    moves + verifies bytes; that the nar RESTORES to a store path is td-builder's
@@ -305,7 +271,7 @@ fn selftest() {
 
     // 8. SELF-DISCRIMINATION (wrong key): a DIFFERENT public key must reject the signature.
     {
-        let (_other_priv, other_pub) = keygen();
+        let (_other_priv, other_pub) = keygen().unwrap_or_else(|e| die(e));
         if fetch(&url, base, &out, &other_pub).is_ok() {
             die("fetch ACCEPTED a narinfo under the WRONG public key — verification is not load-bearing".into());
         }
@@ -327,11 +293,12 @@ pub fn run(a: &[String]) {
     match a.get(1).map(String::as_str) {
         Some("keygen") if a.len() == 4 => {
             let (priv_path, pub_path) = (&a[2], &a[3]);
-            let (pkcs8, pubkey) = keygen();
-            std::fs::write(priv_path, &pkcs8).unwrap_or_else(|e| die(format!("write {priv_path}: {e}")));
-            std::fs::write(pub_path, format!("{}\n", to_hex(&pubkey)))
-                .unwrap_or_else(|e| die(format!("write {pub_path}: {e}")));
-            println!("td-subst: keygen OK — private (pkcs8) -> {priv_path}, public (hex) -> {pub_path}");
+            let (pkcs8, pubkey) = keygen().unwrap_or_else(|e| die(e));
+            write_keypair(priv_path, &pkcs8, pub_path, &pubkey).unwrap_or_else(|e| die(e));
+            println!(
+                "td-subst: keygen OK — private (pkcs8, 0600) -> {priv_path}, \
+                 public (hex) -> {pub_path}"
+            );
         }
         Some("sign") if a.len() == 4 => {
             let (dir, priv_path) = (PathBuf::from(&a[2]), &a[3]);
