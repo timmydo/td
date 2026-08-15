@@ -171,16 +171,27 @@ impl Selection {
 
 /// Sorted absolute paths of `builder/src/gate_defs/*.rs` (one file per gate —
 /// the paths the diff mapping routes on).
-fn gate_files(root: &Path) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = std::fs::read_dir(root.join("builder/src/gate_defs"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().map(|e| e == "rs").unwrap_or(false))
-        .collect();
+fn gate_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let dir = root.join("builder/src/gate_defs");
+    // Errors are returned, not flattened away: the caller asserts every gate
+    // file maps, so a listing that silently came back short is that assertion
+    // passing over the files it did not see.
+    let rd = std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut v: Vec<PathBuf> = Vec::new();
+    for e in rd {
+        let p = e.map_err(|err| format!("{}: {err}", dir.display()))?.path();
+        // Mirrors `builder/build.rs`'s skip: a dropping like `.005-x.rs` is a
+        // `.rs` to `extension()` and is not a gate to the generator, so keeping
+        // it here would red the self-test over a file nothing registers.
+        let dotted = p
+            .file_name()
+            .is_some_and(|n| n.as_encoded_bytes().first() == Some(&b'.'));
+        if p.extension().is_some_and(|x| x == "rs") && !dotted {
+            v.push(p);
+        }
+    }
     v.sort();
-    v
+    Ok(v)
 }
 
 /// The registry def whose file stem (`<NNN>-<gate>`) matches.
@@ -1315,14 +1326,22 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     }
 
     // Every gate file maps (via the builder/src/gate_defs/*.rs arm) to its own gate target.
-    for f in gate_files(root) {
-        let rel = format!(
-            "builder/src/gate_defs/{}",
-            f.file_name().unwrap().to_string_lossy()
-        );
-        match target_from_gate_file(&f) {
-            Some(gate) if !gate.is_empty() => assert_target!(&rel, &gate),
-            _ => fail(format!("{rel}: no gate registration found")),
+    match gate_files(root) {
+        Err(e) => fail(format!("gate defs unreadable: {e}")),
+        // Zero files is the vacuous pass this whole loop would otherwise be.
+        Ok(fs) if fs.is_empty() => fail("gate defs: none found to check".into()),
+        Ok(fs) => {
+            for f in fs {
+                let Some(name) = f.file_name() else {
+                    fail(format!("{}: no file name", f.display()));
+                    continue;
+                };
+                let rel = format!("builder/src/gate_defs/{}", name.to_string_lossy());
+                match target_from_gate_file(&f) {
+                    Some(gate) if !gate.is_empty() => assert_target!(&rel, &gate),
+                    _ => fail(format!("{rel}: no gate registration found")),
+                }
+            }
         }
     }
 
@@ -2336,6 +2355,54 @@ mod tests {
         require_gate_defs(&root);
         let failures = run_self_test(&root);
         assert!(failures.is_empty(), "self-test failures: {failures:#?}");
+    }
+
+    /// The self-test walks `gate_files` and reds on any entry no gate
+    /// registers, so it has to see the same files the GENERATOR does. An
+    /// editor dropping is a `.rs` to `extension()` and is skipped by
+    /// `builder/build.rs`, which is a real working tree failing a test over a
+    /// file that is not a gate.
+    #[test]
+    fn a_gate_dir_dropping_is_skipped_as_the_generator_skips_it() {
+        let root = std::env::temp_dir().join(format!("td-gate-files-{}", std::process::id()));
+        let defs = root.join("builder/src/gate_defs");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&defs).unwrap();
+        // `.#100-real.rs` is the one the dot-skip is for — an emacs lock whose
+        // extension IS `rs`. The `.swp` and the `.txt` ride the pre-existing
+        // extension filter, and are here so dropping that filter also reds.
+        for n in ["100-real.rs", ".100-real.rs.swp", ".#100-real.rs", "notes.txt"] {
+            std::fs::write(defs.join(n), "").unwrap();
+        }
+        let got: Vec<String> = gate_files(&root)
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(got, vec!["100-real.rs".to_string()]);
+        // The MIRROR, pinned against the generator's own source: nothing else
+        // ties the two rules together, so a build.rs that later skipped `~`
+        // backups too would diverge from this one silently — and the divergence
+        // presents as the self-test redding a working tree, which is the
+        // failure this test exists for.
+        let gen = std::fs::read_to_string(repo_root().join("builder/build.rs")).unwrap();
+        assert!(
+            gen.contains("name.starts_with('.')"),
+            "build.rs no longer skips dot names the way gate_files does"
+        );
+    }
+
+    /// A listing error must RED rather than come back short: the caller's loop
+    /// asserts every gate file maps, and over an empty list it asserts nothing.
+    #[test]
+    fn an_unreadable_gate_dir_is_an_error_not_an_empty_list() {
+        let root = std::env::temp_dir().join(format!("td-gate-none-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        let got = gate_files(&root);
+        std::fs::remove_dir_all(&root).ok();
+        assert!(got.is_err(), "a missing gate dir must be an error: {got:?}");
     }
 
     /// Gate 325 asserts these lock shapes and does not run (re #469), so this
