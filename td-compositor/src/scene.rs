@@ -1,7 +1,7 @@
 use crate::bar::{self, BAR_HEIGHT};
 use crate::help::Help;
 use crate::launcher::{LaunchRequest, Launcher, LauncherAction};
-use crate::layout::{Axis, Command, DropKind, Layout, Placement, Rect, ViewLayout};
+use crate::layout::{Axis, Command, DropKind, Layout, Placement, Presentation, Rect, ViewLayout};
 use crate::ui;
 use crate::MAX_UI_DIMENSION;
 use std::collections::BTreeMap;
@@ -115,6 +115,182 @@ impl InputRegion {
 const TITLE_FOCUSED: [u8; 4] = [0x50, 0x28, 0x60, 0];
 const TITLE_UNFOCUSED: [u8; 4] = [0x38, 0x34, 0x3c, 0];
 const TITLE_TEXT: [u8; 4] = [0xf0, 0xe8, 0xf8, 0];
+/// The presentation buttons at a band's right end, and the ink they draw in.
+/// `ON` marks the presentation the container is ALREADY in, so the band says
+/// which of the three it is as well as offering the other two.
+const BUTTON_WIDTH: usize = 16;
+const BUTTON_INSET: usize = 3;
+const BUTTON_INK: [u8; 4] = [0xc8, 0xc0, 0xd0, 0];
+const BUTTON_INK_ON: [u8; 4] = [0x60, 0xd0, 0x60, 0];
+/// Three marks and the two gaps between them, which is the least an icon can
+/// be drawn in — the stack is the tallest of the three and needs every one.
+const BUTTON_ICON_LEAST: usize = 5;
+
+/// What a bare press on a title band landed on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BandPress {
+    /// One of the presentation buttons, and the window whose band carries it.
+    /// The window comes with it because the command acts on the container the
+    /// FOCUSED leaf is in: a button pressed on an unfocused band has to move
+    /// focus there first, or it would present some other container entirely.
+    Button(SurfaceKey, Presentation),
+    /// The band itself, which is the drag handle.
+    Handle(SurfaceKey),
+}
+
+/// What a band's buttons do, left to right. Ordered so the two GROUPED
+/// presentations sit together and the ungrouped one is LAST, nearest the
+/// band's end, which is where a pointer travelling right lands soonest and
+/// undoing is the commoner ask.
+pub(crate) const BUTTONS: [Presentation; 3] = [
+    Presentation::Stacked,
+    Presentation::Tabbed,
+    Presentation::Split,
+];
+
+/// A button's icon: what the container would LOOK like in that presentation,
+/// drawn from the same rectangles the layout would use. A stack is bands down,
+/// tabs are one row divided across with a body under it, and a split is two
+/// tiles side by side. Nothing here is a glyph — a letter would name the chord
+/// rather than the arrangement, and the chords are already on the help sheet.
+fn draw_button(
+    frame: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    slot: Rect,
+    shows: Presentation,
+    ink: [u8; 4],
+) {
+    // The icon is inset from the slot on every side, so adjacent buttons have a
+    // gap between their marks without the slots themselves overlapping — the
+    // slots are what the hit test uses, and a gap in THOSE would be a press
+    // that lands on nothing between two buttons.
+    let pad = BUTTON_INSET;
+    let Some(icon) = inset(slot, pad) else {
+        return;
+    };
+    let mut mark = |x: usize, y: usize, w: usize, h: usize| {
+        ui::fill(frame, width, height, stride, (x, y, w, h), ink);
+    };
+    match shows {
+        // Three bars down, which is a stack's run. Three bars and the two gaps
+        // between them is FIVE of the same thickness, so that is what the
+        // height divides by: dividing by less leaves the third bar wanting the
+        // pixels the gaps took, and the icon that says STACK draws two.
+        // `band_buttons` refuses a band too short to hold all five.
+        Presentation::Stacked => {
+            let bar = (icon.height / BUTTON_ICON_LEAST).max(1);
+            let span = bar.saturating_mul(BUTTON_ICON_LEAST);
+            let top = icon.y.saturating_add(icon.height.saturating_sub(span) / 2);
+            for row in 0usize..3 {
+                mark(
+                    icon.x,
+                    top.saturating_add(row.saturating_mul(bar.saturating_mul(2))),
+                    icon.width,
+                    bar,
+                );
+            }
+        }
+        // One row divided across, and the body it leaves below.
+        Presentation::Tabbed => {
+            let strip = icon.height / 3;
+            let tab = icon.width.saturating_sub(1) / 2;
+            mark(icon.x, icon.y, tab, strip);
+            mark(
+                icon.x.saturating_add(tab).saturating_add(1),
+                icon.y,
+                icon.width.saturating_sub(tab).saturating_sub(1),
+                strip,
+            );
+            mark(
+                icon.x,
+                icon.y.saturating_add(strip).saturating_add(1),
+                icon.width,
+                icon.height.saturating_sub(strip).saturating_sub(1),
+            );
+        }
+        // Two tiles side by side: the arrangement with no run at all.
+        Presentation::Split => {
+            let tile = icon.width.saturating_sub(1) / 2;
+            mark(icon.x, icon.y, tile, icon.height);
+            mark(
+                icon.x.saturating_add(tile).saturating_add(1),
+                icon.y,
+                icon.width.saturating_sub(tile).saturating_sub(1),
+                icon.height,
+            );
+        }
+    }
+}
+
+/// `rect` shrunk by `pad` on every side, or `None` when that leaves nothing.
+fn inset(rect: Rect, pad: usize) -> Option<Rect> {
+    let width = rect.width.checked_sub(pad.saturating_mul(2))?;
+    let height = rect.height.checked_sub(pad.saturating_mul(2))?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(Rect {
+        x: rect.x.saturating_add(pad),
+        y: rect.y.saturating_add(pad),
+        width,
+        height,
+    })
+}
+
+/// Where the buttons sit in `band`, in `BUTTONS` order, or `None` when the band
+/// is too narrow to hold them beside a readable name.
+///
+/// Narrow rather than merely small: a tabbed run divides ONE strip between its
+/// leaves, so a column of eight gives each tab a few dozen pixels, and buttons
+/// drawn there would be the whole tab with the title squeezed out. Answering
+/// `None` is what keeps that band a title; the keys still reach every
+/// presentation, and one wider band elsewhere still carries the buttons.
+///
+/// Too SHORT counts as too narrow, and for a sharper reason than tidiness: a
+/// tile clipped down to a sliver keeps a band and loses its client, and an icon
+/// that cannot be drawn in it would leave the band's last 48 pixels answering a
+/// press with nothing on screen to say they would.
+///
+/// One function rather than two, because the painter and the hit test must
+/// agree exactly: a button drawn where nothing answers is a button that does
+/// nothing when pressed, and there is nothing on screen to say so.
+pub(crate) fn band_buttons(band: Rect) -> Option<[Rect; BUTTONS.len()]> {
+    let strip = BUTTON_WIDTH.saturating_mul(BUTTONS.len());
+    // Room for the buttons AND a name beside them. `TITLE_TEXT_LEFT` is where
+    // the text starts; one CELL past it is the least that reads as a title
+    // rather than as a clipped smear — a cell being a glyph at the scale the
+    // titles are actually drawn, not at 1x, or the reserve is half of what it
+    // was meant to be and the smear is what the band shows.
+    let cell = ui::GLYPH_ADVANCE.saturating_mul(TITLE_SCALE);
+    let least = strip.saturating_add(TITLE_TEXT_LEFT).saturating_add(cell);
+    // The same height `draw_button` needs, asked HERE so the two cannot
+    // disagree about whether this band has buttons at all.
+    let tall_enough = band
+        .height
+        .checked_sub(BUTTON_INSET.saturating_mul(2))
+        .is_some_and(|icon| icon >= BUTTON_ICON_LEAST);
+    if band.width < least || !tall_enough {
+        return None;
+    }
+    let left = band.x.saturating_add(band.width).saturating_sub(strip);
+    let mut rects = [Rect {
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+    }; BUTTONS.len()];
+    for (index, slot) in rects.iter_mut().enumerate() {
+        *slot = Rect {
+            x: left.saturating_add(index.saturating_mul(BUTTON_WIDTH)),
+            y: band.y,
+            width: BUTTON_WIDTH,
+            height: band.height,
+        };
+    }
+    Some(rects)
+}
 
 /// The rectangle a border wraps: the client's area and its band together. Only
 /// decoration reads this — a border around the client area alone would leave a
@@ -798,18 +974,65 @@ impl Scene {
         ))
     }
 
-    /// The window whose TITLE BAND the pointer is over, which is the handle a
-    /// bare drag takes. A band reaches no client — the hit test above knows
-    /// only client areas — so this is a question only the compositor answers,
-    /// and the seam that makes a band draggable without a client seeing it.
-    pub fn band_at_pointer(&self, width: usize, height: usize) -> Option<SurfaceKey> {
+    /// What a bare press on a TITLE BAND lands on: one of the presentation
+    /// buttons at its right end, or the band itself, which is the handle a
+    /// drag takes. A band reaches no client — the hit test above knows only
+    /// client areas — so this is a question only the compositor answers, and
+    /// the seam that makes a band draggable without a client seeing it.
+    ///
+    /// One lookup rather than two, and the ORDER is the answer's shape rather
+    /// than a rule the caller has to remember: both gestures open with a press
+    /// on the same strip, so a caller that asked about the handle first would
+    /// make every button a drag handle that never fires.
+    pub fn band_press_at_pointer(&self, width: usize, height: usize) -> Option<BandPress> {
         let placements = self.tiled_placements(width, height);
-        let x = usize::try_from(self.pointer_x).ok()?;
-        let y = usize::try_from(self.pointer_y).ok()?;
+        let (x, y) = self.pointer_at_usize()?;
         let index = placements
             .iter()
             .position(|placement| contains(placement.band, x, y))?;
-        Some(placements.get(index)?.key)
+        let placement = placements.get(index)?;
+        if let Some((rects, _)) = self.band_buttons_of(placement, placements.len()) {
+            if let Some(at) = rects.iter().position(|slot| contains(*slot, x, y)) {
+                return Some(BandPress::Button(placement.key, *BUTTONS.get(at)?));
+            }
+        }
+        Some(BandPress::Handle(placement.key))
+    }
+
+    /// The buttons a band actually carries, with the presentation its container
+    /// is already in. `None` where it carries none — a band with no room for
+    /// them, or a LONE window, which is in no container and whose buttons would
+    /// every one of them do nothing.
+    ///
+    /// The painter and the hit test both come through here rather than each
+    /// asking `band_buttons`: a button drawn where nothing answers is a button
+    /// that does nothing when pressed, with nothing on screen to say so.
+    ///
+    /// The presentation is READ OFF the placement rather than walked out of the
+    /// tree. `run` is the direction the container's bands travel and only a
+    /// grouped one has it, so the two grouped presentations are exactly its two
+    /// values — the same container produced both. Asking the layout per band
+    /// instead would search the tree once for every window on every repaint,
+    /// which is quadratic in a flat row of them, and would be a SECOND reading
+    /// of the rule `presented_mut` owns: a band could then mark one container
+    /// while its buttons changed another.
+    ///
+    /// `tiled` is how many placements the workspace has, which is the whole of
+    /// what distinguishes an ungrouped container from NO container: a workspace
+    /// with two or more leaves has a root split, so every leaf in it has a
+    /// parent, and a workspace with one has a bare leaf for a root.
+    fn band_buttons_of(
+        &self,
+        placement: &Placement,
+        tiled: usize,
+    ) -> Option<([Rect; BUTTONS.len()], Presentation)> {
+        let current = match placement.run {
+            Some(Axis::Vertical) => Presentation::Stacked,
+            Some(Axis::Horizontal) => Presentation::Tabbed,
+            None if tiled > 1 => Presentation::Split,
+            None => return None,
+        };
+        Some((band_buttons(placement.band)?, current))
     }
 
     /// Where a drop lands: the window under the pointer, and what landing
@@ -953,6 +1176,7 @@ impl Scene {
         height: usize,
         stride: usize,
         placement: &Placement,
+        tiled: usize,
     ) {
         let band = placement.band;
         if band.width == 0 || band.height == 0 {
@@ -965,8 +1189,28 @@ impl Scene {
             TITLE_UNFOCUSED
         };
         ui::fill(frame, width, height, stride, rect, fill);
+        // Before the name and independently of it: a window that set no title
+        // still sits in a container, and its band is the only handle the
+        // pointer has on one.
+        let buttons = self.band_buttons_of(placement, tiled);
+        if let Some((rects, current)) = buttons {
+            for (slot, wanted) in rects.iter().zip(BUTTONS) {
+                let ink = if wanted == current {
+                    BUTTON_INK_ON
+                } else {
+                    BUTTON_INK
+                };
+                draw_button(frame, width, height, stride, *slot, wanted, ink);
+            }
+        }
         let Some(title) = self.titles.get(&placement.key) else {
             return;
+        };
+        // The name is clipped to what the buttons leave, not to the band: a
+        // title running under them would read as part of an icon.
+        let text_clip = match buttons.as_ref().and_then(|(rects, _)| rects.first()) {
+            Some(first) => (band.x, band.y, first.x.saturating_sub(band.x), band.height),
+            None => rect,
         };
         ui::draw_text_clipped(
             frame,
@@ -978,7 +1222,7 @@ impl Scene {
             TITLE_SCALE,
             title,
             TITLE_TEXT,
-            rect,
+            text_clip,
         );
     }
 
@@ -1011,7 +1255,7 @@ impl Scene {
             }
             // Whether or not the client is shown: a leaf stacked away behind a
             // sibling draws nothing else, and its band says it is there.
-            self.draw_title(frame, width, height, stride, placement);
+            self.draw_title(frame, width, height, stride, placement, placements.len());
         }
         for placement in &placements {
             if !self.surfaces.contains_key(&placement.key) || !placement.visible {
@@ -2241,7 +2485,7 @@ mod tests {
         // The desktop is neither: a release there is a cancelled drag.
         go(&mut scene, 0, height - 1);
         assert_eq!(scene.drop_target(width, height), None);
-        assert_eq!(scene.band_at_pointer(width, height), None);
+        assert_eq!(scene.band_press_at_pointer(width, height), None);
     }
 
     #[test]
@@ -2421,6 +2665,313 @@ mod tests {
             height,
         };
         assert_eq!(count_color(&frame, stride, whole, TITLE_TEXT), inside);
+    }
+
+    #[test]
+    fn a_bands_buttons_sit_at_its_right_end_and_answer_only_there() {
+        let mut scene = Scene::new();
+        let key = |object| SurfaceKey { client: 1, object };
+        for object in 1..=2 {
+            scene
+                .commit(key(object), surface([1, 1, 1, 0], 8, 8))
+                .unwrap();
+        }
+        let (width, height) = (600, least_output_height(8));
+        let band = tile(&scene, width, height, 1).band;
+        let rects = band_buttons(band).expect("a full-width band carries buttons");
+
+        // Flush to the band's right edge, adjacent, and inside it.
+        assert_eq!(
+            rects.last().map(|slot| slot.x.saturating_add(slot.width)),
+            Some(band.x.saturating_add(band.width))
+        );
+        for pair in rects.windows(2) {
+            let (left, right) = (pair.first().unwrap(), pair.get(1).unwrap());
+            assert_eq!(
+                left.x.saturating_add(left.width),
+                right.x,
+                "a gap or overlap"
+            );
+        }
+        // A whole title CELL beside them, not merely a nonzero gap — which
+        // clearing the threshold at all would guarantee, and so would prove
+        // nothing. `a_bands_least_width_...` pins the threshold itself.
+        assert!(
+            rects.first().unwrap().x.saturating_sub(band.x)
+                >= TITLE_TEXT_LEFT + ui::GLYPH_ADVANCE * TITLE_SCALE,
+            "no room left for a name"
+        );
+
+        // Each button answers over its own slot and nothing answers left of
+        // the first — that part of the band is still a drag handle.
+        for (index, slot) in rects.iter().enumerate() {
+            scene.pointer_x = i32::try_from(slot.x + slot.width / 2).unwrap();
+            scene.pointer_y = i32::try_from(slot.y + slot.height / 2).unwrap();
+            assert_eq!(
+                scene.band_press_at_pointer(width, height),
+                Some(BandPress::Button(key(1), *BUTTONS.get(index).unwrap())),
+                "button {index}"
+            );
+        }
+        scene.pointer_x = i32::try_from(rects.first().unwrap().x.saturating_sub(1)).unwrap();
+        assert_eq!(
+            scene.band_press_at_pointer(width, height),
+            Some(BandPress::Handle(key(1))),
+            "the strip's left stopped being a drag handle"
+        );
+    }
+
+    #[test]
+    fn a_band_with_no_container_and_a_band_with_no_room_carry_no_buttons() {
+        // A LONE window is in no container, so every button would change
+        // nothing; a narrow one has no room for them beside a name. Both
+        // answer `None`, and the painter and the hit test come through the
+        // same gate, so neither draws one either.
+        let mut scene = Scene::new();
+        let key = |object| SurfaceKey { client: 1, object };
+        scene.commit(key(1), surface([1, 1, 1, 0], 8, 8)).unwrap();
+        let (width, height) = (600, least_output_height(8));
+        let alone = tile(&scene, width, height, 1);
+        assert!(
+            band_buttons(alone.band).is_some(),
+            "the band is too narrow to tell the two refusals apart"
+        );
+        assert_eq!(scene.tiled_placements(width, height).len(), 1);
+        assert!(scene.band_buttons_of(&alone, 1).is_none());
+
+        // Now a column of six tabs across a narrow output: each tab is a
+        // fraction of one strip, and buttons there would be the whole tab.
+        for object in 2..=7 {
+            scene
+                .commit(key(object), surface([1, 1, 1, 0], 8, 8))
+                .unwrap();
+            if object == 3 {
+                scene.command(Command::Move(crate::layout::Direction::Down));
+            }
+        }
+        scene.command(Command::SetPresentation(
+            crate::layout::Presentation::Tabbed,
+        ));
+        let narrow = 240;
+        let tab = tile(&scene, narrow, height, 4);
+        assert_eq!(tab.run, Some(Axis::Horizontal), "the column did not tab");
+        assert!(band_buttons(tab.band).is_none(), "a tab found room");
+        assert!(scene
+            .band_buttons_of(&tab, scene.tiled_placements(narrow, height).len())
+            .is_none());
+        scene.pointer_x = i32::try_from(tab.band.x + tab.band.width - 1).unwrap();
+        scene.pointer_y = i32::try_from(tab.band.y + 1).unwrap();
+        assert_eq!(
+            scene.band_press_at_pointer(narrow, height),
+            Some(BandPress::Handle(key(4))),
+            "a narrow tab answered a button instead of a handle"
+        );
+    }
+
+    #[test]
+    fn the_stack_button_draws_three_bars_at_every_height_that_carries_one() {
+        // Three bars are the whole of what tells this icon from the other two,
+        // and the arithmetic that draws them has to hold at the band height
+        // the compositor actually uses as well as at the edges. Counting RUNS
+        // of ink down the middle rather than pixels: a bar that merged with
+        // its neighbour would still colour the same rows, and would read as
+        // one thicker mark on screen.
+        for height in [TITLE_HEIGHT, BUTTON_ICON_LEAST + BUTTON_INSET * 2, 40] {
+            let slot = Rect {
+                x: 0,
+                y: 0,
+                width: BUTTON_WIDTH,
+                height,
+            };
+            let (width, stride) = (BUTTON_WIDTH, BUTTON_WIDTH * 4);
+            let mut frame = vec![0u8; stride * height];
+            draw_button(
+                &mut frame,
+                width,
+                height,
+                stride,
+                slot,
+                Presentation::Stacked,
+                BUTTON_INK,
+            );
+            let inked = |y: usize| {
+                let row = Rect {
+                    x: 0,
+                    y,
+                    width,
+                    height: 1,
+                };
+                count_color(&frame, stride, row, BUTTON_INK) > 0
+            };
+            let mut runs = 0;
+            for y in 0..height {
+                if inked(y) && (y == 0 || !inked(y - 1)) {
+                    runs += 1;
+                }
+            }
+            assert_eq!(runs, 3, "the stack icon is not three bars at {height}");
+        }
+    }
+
+    #[test]
+    fn a_band_too_short_to_draw_an_icon_carries_no_buttons_either() {
+        // The refusal has to be the SAME question the painter asks, or the
+        // band's last 48 pixels answer a press with nothing drawn there — a
+        // short tile keeps its band and loses its client, so this is reachable
+        // rather than theoretical.
+        let wide = 600;
+        let least = BUTTON_ICON_LEAST + BUTTON_INSET * 2;
+        let draws = |height: usize, shows| {
+            let stride = wide * 4;
+            let mut frame = vec![0u8; stride * height.max(1)];
+            draw_button(
+                &mut frame,
+                wide,
+                height.max(1),
+                stride,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: BUTTON_WIDTH,
+                    height,
+                },
+                shows,
+                BUTTON_INK,
+            );
+            frame.chunks(4).any(|pixel| pixel == BUTTON_INK)
+        };
+        // Whenever the band answers, all THREE icons have something to draw —
+        // the implication that matters, since `draw_button` is only ever
+        // reached through this gate.
+        for height in 0..=(least + 8) {
+            let band = Rect {
+                x: 0,
+                y: 0,
+                width: wide,
+                height,
+            };
+            if band_buttons(band).is_none() {
+                continue;
+            }
+            for shows in BUTTONS {
+                assert!(
+                    draws(height, shows),
+                    "height {height} answers but draws nothing for {shows:?}"
+                );
+            }
+        }
+        // And the threshold is where it is: one pixel shorter refuses.
+        let band = |height| Rect {
+            x: 0,
+            y: 0,
+            width: wide,
+            height,
+        };
+        assert!(
+            band_buttons(band(least)).is_some(),
+            "the least height refuses"
+        );
+        assert!(
+            band_buttons(band(least - 1)).is_none(),
+            "a band one pixel short still carries buttons"
+        );
+    }
+
+    #[test]
+    fn a_bands_least_width_leaves_a_whole_title_cell_beside_the_buttons() {
+        // The reserve is a glyph at the scale titles are DRAWN at. Reserving an
+        // unscaled one leaves half a cell, which is the clipped smear the
+        // threshold exists to prevent.
+        let cell = ui::GLYPH_ADVANCE * TITLE_SCALE;
+        let least = BUTTON_WIDTH * BUTTONS.len() + TITLE_TEXT_LEFT + cell;
+        let band = |width| Rect {
+            x: 0,
+            y: 0,
+            width,
+            height: TITLE_HEIGHT,
+        };
+        assert!(
+            band_buttons(band(least)).is_some(),
+            "the least width refuses"
+        );
+        assert!(
+            band_buttons(band(least - 1)).is_none(),
+            "a band one pixel short still carries buttons"
+        );
+        // The gap the title gets at that width is a whole cell, not part of one.
+        let rects = band_buttons(band(least)).unwrap();
+        let text = rects.first().unwrap().x - TITLE_TEXT_LEFT;
+        assert!(text >= cell, "the name has less than one cell to sit in");
+    }
+
+    #[test]
+    fn a_bands_buttons_mark_the_presentation_its_container_is_in() {
+        let mut scene = Scene::new();
+        let key = |object| SurfaceKey { client: 1, object };
+        for object in 1..=2 {
+            scene
+                .commit(key(object), surface([1, 1, 1, 0], 8, 8))
+                .unwrap();
+        }
+        let (width, height) = (600, least_output_height(8));
+        let lit = |scene: &Scene| {
+            let frame = painted(scene, width, height);
+            let band = tile(scene, width, height, 1).band;
+            band_buttons(band)
+                .unwrap()
+                .iter()
+                .map(|slot| count_color(&frame, width * 4, *slot, BUTTON_INK_ON) > 0)
+                .collect::<Vec<_>>()
+        };
+        // Exactly one is marked, and it moves with the presentation — the
+        // band says which of the three the container is in as well as
+        // offering the other two.
+        assert_eq!(lit(&scene), [false, false, true], "split is not marked");
+        scene.command(Command::SetPresentation(
+            crate::layout::Presentation::Stacked,
+        ));
+        assert_eq!(lit(&scene), [true, false, false], "stacked is not marked");
+        scene.command(Command::SetPresentation(
+            crate::layout::Presentation::Tabbed,
+        ));
+        assert_eq!(lit(&scene), [false, true, false], "tabbed is not marked");
+    }
+
+    #[test]
+    fn a_title_stops_before_the_buttons_rather_than_running_under_them() {
+        let mut scene = Scene::new();
+        let key = |object| SurfaceKey { client: 1, object };
+        for object in 1..=2 {
+            scene
+                .commit(key(object), surface([1, 1, 1, 0], 8, 8))
+                .unwrap();
+        }
+        // Long enough to reach the strip and past it.
+        assert!(scene.set_title(key(1), "AB".repeat(60)));
+        let (width, height) = (600, least_output_height(8));
+        scene.pointer_x = 0;
+        scene.pointer_y = i32::try_from(height - 1).unwrap();
+        let frame = painted(&scene, width, height);
+        let band = tile(&scene, width, height, 1).band;
+        let rects = band_buttons(band).unwrap();
+        let strip = Rect {
+            x: rects.first().unwrap().x,
+            y: band.y,
+            width: band
+                .x
+                .saturating_add(band.width)
+                .saturating_sub(rects.first().unwrap().x),
+            height: band.height,
+        };
+        assert!(
+            count_color(&frame, width * 4, band, TITLE_TEXT) > 0,
+            "the title never reached its band"
+        );
+        assert_eq!(
+            count_color(&frame, width * 4, strip, TITLE_TEXT),
+            0,
+            "the title ran under the buttons"
+        );
     }
 
     #[test]

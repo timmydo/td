@@ -440,9 +440,14 @@ impl Node {
     /// leaf is displayed in, whatever they say. Descending past it would change
     /// a container nothing can see, and would leave a group undoable only from
     /// the leaves that happen to be its DIRECT children: in `H{grouped}[V[1,
-    /// 3], 2]` the chord works from 2 and not from 1 or 3, though the run shows
-    /// all three and the operator cannot see the difference. With no such
+    /// 3], 2]` the chord would work from 2 and not from 1 or 3, though the run
+    /// shows all three and the operator cannot see the difference. With no such
     /// ancestor it is the leaf's own parent.
+    ///
+    /// Nothing READS this rule from the tree. What a band's buttons mark is
+    /// derived from the placement instead, which already carries the run this
+    /// same container produced — so there is no second walk to disagree with
+    /// this one, and no per-band descent on the paint path.
     fn presented_mut(&mut self, key: SurfaceKey) -> Option<&mut Presentation> {
         let Node::Split {
             children,

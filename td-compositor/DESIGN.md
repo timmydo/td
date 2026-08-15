@@ -209,7 +209,9 @@ binding is ONE chord on `Super`:
 - `Super+v` STACKS the container the focused window sits in and `Super+h`
   TABS it — the two presentations a group can take — while `Super+s` groups
   an ungrouped container or ungroups a grouped one, and `Super+f` toggles
-  fullscreen;
+  fullscreen. The three presentations are also buttons at the right end of
+  every title band wide enough to hold them, which is the pointer's route to
+  the same commands and needs no chord to arrive;
 - `Super+t` starts a terminal, which is the one registry entry anybody opens
   repeatedly;
 - `Super+?` shows this table on screen. `?` is Shift+`/` here and Shift is
@@ -894,6 +896,50 @@ handle that exists without a modifier, so a window can be moved with the mouse
 alone; the modifier is what makes the whole window one, so a window whose band
 is a sliver in a crowded stack is still draggable. A bare press on a client
 area remains that client's.
+
+A band's right end is BUTTONS rather than handle, and they answer BEFORE the
+band does. Three of them, one per presentation: stack the container, tab it,
+or split it — the same three `Super+v`/`h`/`s` reach, by pointer. The order of
+precedence is the whole of the wiring: both gestures open identically, with a
+press on the same strip, so a band that picked the window up first would leave
+every button a drag handle that never fires. An ALT press is the exception and
+keeps the whole window, buttons included, because that gesture exists for
+moving a window from anywhere in it.
+
+A button acts on the container the FOCUSED leaf is in, so the press moves
+focus to the band it landed on before running the command; without that,
+pressing a button on an unfocused window would present some other container
+entirely. The button marked in a lit ink is the one the container is already
+in, so the band SAYS which of the three it is as well as offering the other
+two — and each button draws the arrangement rather than a letter, bands down
+for a stack, one divided row over a body for tabs, two tiles for a split.
+A letter would name the chord, and the chords are already on the help sheet.
+
+Three bands carry NO buttons, and the painter and the hit test decide it in
+one place, because a button drawn where nothing answers is a button that does
+nothing when pressed with nothing on screen to say so. A LONE window is in no
+container, so all three would change nothing. A band too NARROW to hold them
+beside a name gets none: a tabbed run divides ONE strip between its leaves, so
+a column of eight gives each tab a few dozen pixels, and buttons there would
+be the whole tab with the title squeezed out — the room reserved for the name
+is a glyph at the scale titles are DRAWN at rather than at 1x, or the reserve
+is half a cell and the smear is what the band shows. And a band too SHORT to
+draw an icon in gets none either, which is the same rule seen the other way: a
+tile clipped to a sliver keeps its band and loses its client, and the run's
+last band is clipped to whatever the container has left, so this is reachable
+rather than theoretical. The keys still reach every presentation, and any
+larger band on the workspace still carries them.
+
+Which presentation a band MARKS is read off the placement rather than walked
+out of the tree. A placement's `run` is the direction its container's bands
+travel and only a grouped container has one, so the two grouped presentations
+are exactly its two values — the same container produced both — and the count
+of placements is the whole of what separates an ungrouped container from NO
+container, since a workspace with two or more leaves has a root split. Asking
+the layout per band instead would search the tree once for every window on
+every repaint, which is quadratic in a flat row of them, and would be a SECOND
+reading of the rule that picks the container a leaf is displayed in: a band
+could then mark one container while its buttons changed another.
 
 An Alt PRESS is withheld from the client. It is what starts the gesture, so
 handing it on would leave the client acting on a click the operator aimed at
@@ -1638,6 +1684,23 @@ The landing must prove:
   a tabbed column does not step to the tab the tree happens to put above it;
   and an overlong title is clipped to its own tab rather than into the name
   beside it;
+- a band's presentation buttons are proved where they are, where they are
+  NOT, and in the order they take a press: the three slots are adjacent and
+  flush to the band's right edge with room left for a name, each answers over
+  its own slot while the strip's left stays a drag handle, exactly one is lit
+  and it follows the presentation, a long title stops before them rather than
+  running under them, and none of a lone window's band, a tab too narrow for
+  them, or a band too short to draw one carries any — the last two pinned at
+  the threshold and one pixel under it, and the short case as the implication
+  that matters, that a band which ANSWERS has all three icons to draw. The
+  stack icon is counted as three separate runs of ink at every height a band
+  carries buttons at, since two bars merged would colour the same rows and
+  read as one thicker mark. The press is driven through the runtime, where it
+  both presents the container and takes focus to the band, and leaves NO drag
+  live — verified red with the interception removed and again with the press
+  allowed to fall through to the band — while an ALT press over the same
+  pixels picks the window up instead and runs no command, which is the one
+  contract that rested on a single token no test covered;
 - a tile's five drop zones are proved as a function — each zone by a point,
   the middle ninth by the points just outside it, the nearest edge by a wide
   short tile where pixels and proportion disagree, and a sweep of the whole

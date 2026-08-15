@@ -9,7 +9,7 @@ use crate::pointer::{
     PointerButtonInput, PointerButtonState, PointerSnapshot, PointerState, PointerTarget,
     RoutedPointerFrame,
 };
-use crate::scene::{Fraction, Scene, SharedInputRegion, Surface, SurfaceKey};
+use crate::scene::{BandPress, Fraction, Scene, SharedInputRegion, Surface, SurfaceKey};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -688,12 +688,38 @@ impl Runtime {
                     // no grab held: such a press was DELIVERED to the grabbing
                     // surface, so taking it would make one button both the
                     // window's and the compositor's.
+                    //
+                    // A band press asks ONE question and the answer says which
+                    // it was, so the button case cannot be reordered behind the
+                    // handle case by accident — both open identically, and a
+                    // handle answered first would leave every button a drag
+                    // handle that never fires. ALT never reaches that question:
+                    // that gesture takes the whole window, buttons and all,
+                    // because it exists for moving a window from anywhere in it.
                     let picked = if alt_press {
                         self.scene.draggable_at_pointer(width, height)
                     } else if self.pointer.grab_surface().is_some() {
                         continue;
                     } else {
-                        self.scene.band_at_pointer(width, height)
+                        match self.scene.band_press_at_pointer(width, height) {
+                            Some(BandPress::Button(key, wanted)) => {
+                                self.cancel_drag()?;
+                                // Focus first: the command acts on the container
+                                // the FOCUSED leaf is in, so a button pressed on
+                                // an unfocused band would present another one.
+                                self.focus_surface(key)?;
+                                self.scene.command(Command::SetPresentation(wanted));
+                                // `Runtime::command`'s `framebuffer.resend()` is
+                                // deliberately NOT taken: that is the repair for
+                                // pixels the compositor did not write, reached
+                                // for when the screen looks wrong, and a click is
+                                // not. Same reason `focus_surface` declines it.
+                                self.settle(true)?;
+                                continue;
+                            }
+                            Some(BandPress::Handle(key)) => Some(key),
+                            None => None,
+                        }
                     };
                     // A press ENDS whatever was live, whether or not it picks
                     // something up. Picking nothing would strand a block on
@@ -1844,6 +1870,165 @@ mod tests {
             "the band drop did not reorder the stack"
         );
         assert_eq!(stacked(&runtime), 2, "the drop unstacked the pair");
+        runtime.scene.layout().check_invariants().unwrap();
+    }
+
+    #[test]
+    fn an_alt_press_over_a_button_still_picks_the_window_up() {
+        // The buttons take a BARE press, and ALT is the exception: that
+        // gesture exists for moving a window from ANYWHERE in it, so the
+        // right end of a band must not become the one part of a window that
+        // alt-drag cannot start from. The whole contract rests on one `!` in
+        // the press arm, and without this test deleting it changes nothing
+        // any other test can see.
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-alt-button-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let (width, height) = (600, 600);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, width, height, width * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let key = |object| SurfaceKey { client: 1, object };
+        for object in 1..=2 {
+            runtime.commit(key(object), surface([1, 2, 3, 0])).unwrap();
+        }
+        let placements = runtime.scene.tiled_placements(width, height);
+        let index = placements
+            .iter()
+            .position(|placement| placement.key == key(1))
+            .unwrap();
+        let band = placements.get(index).unwrap().band;
+        let run = placements.get(index).unwrap().run;
+        let slot = *crate::scene::band_buttons(band).unwrap().first().unwrap();
+
+        let alt = |runtime: &mut Runtime, down: bool| {
+            runtime
+                .modifiers(ModifierState {
+                    depressed: if down { TEST_MOD_ALT } else { 0 },
+                    ..ModifierState::default()
+                })
+                .unwrap();
+        };
+        let goto = |runtime: &mut Runtime, x: usize, y: usize, buttons: &[PointerButtonInput]| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            let (dx, dy) = (
+                i32::try_from(x).unwrap() - at_x,
+                i32::try_from(y).unwrap() - at_y,
+            );
+            runtime.pointer_frame(1, dx, dy, buttons).unwrap()
+        };
+        let press = PointerButtonInput {
+            time: 2,
+            button: 272,
+            state: PointerButtonState::Pressed,
+        };
+
+        alt(&mut runtime, true);
+        goto(
+            &mut runtime,
+            slot.x + slot.width / 2,
+            slot.y + slot.height / 2,
+            &[press],
+        );
+
+        assert!(
+            runtime.dragging.is_some(),
+            "an ALT press on a button did not pick the window up"
+        );
+        // And it did NOT press the button: the container is as it was.
+        assert_eq!(
+            runtime
+                .scene
+                .tiled_placements(width, height)
+                .get(index)
+                .and_then(|placement| placement.run),
+            run,
+            "the ALT press ran the button's command as well"
+        );
+        runtime.scene.layout().check_invariants().unwrap();
+    }
+
+    #[test]
+    fn pressing_a_band_button_presents_that_container_and_starts_no_drag() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-band-button-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let (width, height) = (600, 600);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, width, height, width * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let key = |object| SurfaceKey { client: 1, object };
+        for object in 1..=2 {
+            runtime.commit(key(object), surface([1, 2, 3, 0])).unwrap();
+        }
+        // Focus is on 2, so the press has to MOVE it: a button acts on the
+        // container the focused leaf is in, and pressing one on 1's band while
+        // 2 was focused would otherwise present 2's.
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(key(2)));
+
+        let band = |runtime: &Runtime| {
+            let placements = runtime.scene.tiled_placements(width, height);
+            let at = placements
+                .iter()
+                .position(|placement| placement.key == key(1))
+                .unwrap();
+            placements.get(at).unwrap().band
+        };
+        let press = |time| PointerButtonInput {
+            time,
+            button: 272,
+            state: PointerButtonState::Pressed,
+        };
+        let goto = |runtime: &mut Runtime, x: usize, y: usize, buttons: &[PointerButtonInput]| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            let (dx, dy) = (
+                i32::try_from(x).unwrap() - at_x,
+                i32::try_from(y).unwrap() - at_y,
+            );
+            runtime.pointer_frame(1, dx, dy, buttons).unwrap()
+        };
+
+        let slots = crate::scene::band_buttons(band(&runtime)).unwrap();
+        // The TABBED button, which is neither what the pair is in nor what
+        // `ToggleGrouped` would reach for — so nothing but this press could
+        // have produced the result.
+        let tab = slots.get(1).copied().unwrap();
+        assert_eq!(
+            crate::scene::BUTTONS.get(1).copied(),
+            Some(Presentation::Tabbed)
+        );
+        goto(
+            &mut runtime,
+            tab.x + tab.width / 2,
+            tab.y + tab.height / 2,
+            &[press(2)],
+        );
+
+        // Read off the placement, which is where the buttons read it too: a
+        // tabbed container is the one whose bands run across.
+        assert_eq!(
+            runtime
+                .scene
+                .tiled_placements(width, height)
+                .first()
+                .and_then(|placement| placement.run),
+            Some(crate::layout::Axis::Horizontal),
+            "the press did not tab the container"
+        );
+        assert_eq!(
+            runtime.keyboard_snapshot().focus,
+            Some(key(1)),
+            "the press did not take focus to the band it was on"
+        );
+        // And no drag is live: a release elsewhere must not move a window.
+        assert!(
+            runtime.dragging.is_none(),
+            "the button press picked the window up as well"
+        );
         runtime.scene.layout().check_invariants().unwrap();
     }
 
