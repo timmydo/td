@@ -562,7 +562,6 @@ impl Scene {
         self.pointer_target_from(&placements)
     }
 
-    #[cfg(test)]
     pub(crate) fn pointer_at(&self) -> (i32, i32) {
         (self.pointer_x, self.pointer_y)
     }
@@ -582,18 +581,14 @@ impl Scene {
     /// the very motion aiming at it, and a target that moves when approached
     /// can oscillate between two answers over one pixel.
     ///
-    /// The window that was picked up is a DEAD ZONE, or a press alone would
-    /// move it. Answers whether the screen would differ, so a pointer moving
-    /// inside one half costs no repaint.
+    /// A press alone must not move the window; that is the CALLER's threshold
+    /// from the press point, not a region here. Answers whether the screen
+    /// would differ, so a pointer moving inside one half costs no repaint.
     pub fn preview_drop(&mut self, dragged: SurfaceKey, width: usize, height: usize) -> bool {
         let mut preview = self.layout.clone();
-        // Read out of `layout` rather than the preview, so the dead zone is
-        // fixed for the whole gesture.
-        if !self.pointer_on_dragged(dragged, width, height) {
-            let base = self.aim_layout(dragged);
-            if let Some((target, drop)) = self.drop_target_in(&base, width, height) {
-                preview.drop_onto(dragged, target, drop);
-            }
+        let base = self.aim_layout(dragged);
+        if let Some((target, drop)) = self.drop_target_in(&base, width, height) {
+            preview.drop_onto(dragged, target, drop);
         }
         let changed = self.arrangement() != &preview;
         self.preview = (preview != self.layout).then_some(preview);
@@ -625,13 +620,6 @@ impl Scene {
     /// whether the screen moves, by the same invariant `commit_preview` reads.
     pub fn clear_preview(&mut self) -> bool {
         self.preview.take().is_some()
-    }
-
-    fn pointer_on_dragged(&self, key: SurfaceKey, width: usize, height: usize) -> bool {
-        let placements = self.placements_of(&self.layout, width, height);
-        self.pointer_at_usize()
-            .and_then(|(x, y)| placements.get(tile_at(&placements, x, y)?))
-            .is_some_and(|placement| placement.key == key)
     }
 
     /// The window under the pointer, band or client area. `None` over the
@@ -1846,11 +1834,11 @@ mod tests {
         // Left of the band and BELOW its middle, so the two readings give
         // opposite answers and only one of them can be right.
         //
-        // The LEFT point is asked of this function alone: in a real gesture
-        // it lies inside the dragged window's own tile on screen, which the
-        // dead zone refuses. That is the cost recorded in DESIGN.md — the
-        // half "before this neighbour" is unreachable — and it is why the
-        // half has to be pinned here rather than through a whole drag.
+        // The LEFT point lies inside the dragged window's own tile on screen,
+        // which a whole drag now reaches: `a_drag_aims_once_it_leaves_the_
+        // press_point_and_keeps_aiming` is that gesture. This asks the
+        // function directly because what it pins is the READING — two points
+        // in one band answering opposite halves.
         for (x, before) in [
             (band.x + 1, true),
             (band.x + band.width.saturating_sub(2), false),
@@ -2683,6 +2671,22 @@ mod tests {
         scene
     }
 
+    /// `H[1, 2, 3, 4]` — a row of four, which is what it takes for the
+    /// neighbour that grows into a dragged window's place to lie almost
+    /// entirely underneath it.
+    fn a_row_of_four() -> Scene {
+        let mut scene = Scene::new();
+        for object in 1..=4 {
+            scene
+                .commit(
+                    SurfaceKey { client: 1, object },
+                    surface([1, 1, 1, 0], 8, 8),
+                )
+                .unwrap();
+        }
+        scene
+    }
+
     fn tile_order(scene: &Scene, width: usize, height: usize) -> Vec<u32> {
         scene
             .tiled_placements(width, height)
@@ -2760,62 +2764,51 @@ mod tests {
     }
 
     #[test]
-    fn the_window_a_drag_was_picked_up_by_previews_nothing() {
-        // A click on a title bar has to stay a click. With the dragged window
-        // taken out of the arrangement the target is measured against, the
-        // pixel under a press belongs to whichever neighbour grew into it, so
-        // without the dead zone a press ALONE would move the window.
+    fn a_window_can_be_traded_with_the_neighbour_that_grew_into_its_place() {
+        // The dead zone this replaces was the dragged window's whole SCREEN
+        // tile, while the target is read in the AIM geometry, and the two do
+        // not correspond: with that window taken out, the neighbour that grows
+        // into its place lies mostly UNDER it. So the zone swallowed the
+        // neighbour's live drop points along with the window's own. Swept
+        // across a 1600-wide output, 2's middle ninth kept 271 columns of 517
+        // at two windows, 8 of 255 at three, and none at all from four on —
+        // 1 could not be traded with 2, nor dropped to its left.
         //
-        // The zone is the whole window rather than its band, which is what an
-        // Alt press needs — that one lands anywhere on a window, so a band-
-        // sized zone would leave a press on a client area moving it. It also
-        // reads better for the band: dragging DOWN into the window's own body
-        // used to re-parent it beside whichever neighbour had grown into that
-        // space, which is a jump nobody asked for.
-        let mut scene = a_window_beside_a_column();
-        let (width, height) = (240, 600);
+        // "A press alone must not move it" is a THRESHOLD from the press point
+        // now, which belongs to the caller; nothing here refuses an aim.
+        let mut scene = a_row_of_four();
+        let (width, height) = (1600, 600);
         let dragged = SurfaceKey {
             client: 1,
             object: 1,
         };
-        let handle = tile(&scene, width, height, 1).band;
-        let body = tile(&scene, width, height, 1).rect;
-        let undragged = scene.tiled_placements(width, height);
-        for (x, y) in [
-            (handle.x, handle.y),
-            (handle.x + handle.width / 2, handle.y + handle.height / 2),
-            (
-                handle.x + handle.width - 1,
-                handle.y + handle.height.saturating_sub(1),
-            ),
-            (body.x + 1, body.y),
-            (body.x + body.width / 2, body.y + body.height / 2),
-            (
-                body.x + body.width - 1,
-                body.y + body.height.saturating_sub(1),
-            ),
-        ] {
-            scene.pointer_x = i32::try_from(x).unwrap();
-            scene.pointer_y = i32::try_from(y).unwrap();
-            assert!(
-                !scene.preview_drop(dragged, width, height),
-                "the window previewed a drop at {x},{y}"
-            );
-            assert!(!scene.commit_preview(), "a press alone moved the window");
-            assert_eq!(scene.tiled_placements(width, height), undragged);
-        }
-
-        // On a DIFFERENT window the drag is live — without which the
-        // assertions above would hold for a dead zone that had swallowed the
-        // whole screen. Compared as GEOMETRY rather than as an order: this
-        // drop lands 1 first in the column it was beside, so the tiles come
-        // out in the same sequence and only their rectangles say the
-        // arrangement moved at all.
-        let onto = tile(&scene, width, height, 2).rect;
-        scene.pointer_x = i32::try_from(onto.x + 2).unwrap();
-        scene.pointer_y = i32::try_from(onto.y + 2).unwrap();
-        assert!(scene.preview_drop(dragged, width, height));
-        assert_ne!(scene.tiled_placements(width, height), undragged);
+        let own = tile(&scene, width, height, 1).rect;
+        let onto = {
+            let placements = scene.aim_placements(dragged, width, height);
+            let at = placements
+                .iter()
+                .position(|placement| placement.key.object == 2)
+                .unwrap();
+            placements.get(at).unwrap().rect
+        };
+        // The middle ninth is the TRADE zone, and its overlap with the dragged
+        // window's own tile on screen is exactly what used to be refused.
+        let third = onto.width / 3;
+        let start = (onto.x + third).max(own.x);
+        let end = (onto.x + third * 2).min(own.x + own.width);
+        assert!(
+            start + 2 < end,
+            "the aim and screen geometries no longer overlap: nothing to test"
+        );
+        scene.pointer_x = i32::try_from(start + 2).unwrap();
+        scene.pointer_y = i32::try_from(onto.y + onto.height / 2).unwrap();
+        assert!(
+            scene.preview_drop(dragged, width, height),
+            "the trade previewed nothing"
+        );
+        assert!(scene.commit_preview());
+        assert_eq!(tile_order(&scene, width, height), [2, 1, 3, 4]);
+        scene.layout.check_invariants().unwrap();
     }
 
     #[test]
@@ -2823,10 +2816,9 @@ mod tests {
         // Why the target is measured against the arrangement with the dragged
         // window REMOVED rather than against the picture. The picture
         // re-flows around the drop, so a pointer that has not moved would be
-        // over a different tile on the next frame — over the dragged window
-        // itself, which refuses its own drop, so the preview would fall back
-        // to the arrangement and the frame after that would put it back. A
-        // picture alternating between two answers while the mouse is still.
+        // over a different tile on the next frame, and the frame after that
+        // over the first one again: a picture alternating between two answers
+        // with the mouse held still.
         let mut scene = a_window_beside_a_column();
         let (width, height) = (240, 600);
         let dragged = SurfaceKey {

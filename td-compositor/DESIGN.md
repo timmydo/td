@@ -862,10 +862,7 @@ from the outside: the drop is computed against the arrangement with the
 DRAGGED window taken out, which is not the geometry on screen. Its tiles are
 bigger and in different places. That is deliberate, and the two-arrangements
 paragraph below says why; here it means only that a point chosen off the
-SCREEN is answering a different question than the drag asks. The dead zone
-below is the other half of the same seam: a point can be a good aim in one
-geometry and inside the dragged window's own tile in the other, and then the
-drop is refused.
+SCREEN is answering a different question than the drag asks.
 
 The dragged window is DETACHED rather than removed, and that is the whole of
 this operation's correctness. A removal collapses the container the leaf came
@@ -993,49 +990,55 @@ TWO arrangements are in play during a drag and they are deliberately
 different. What is DRAWN is the result: the layout with the dragged window
 moved to where the pointer says. What the pointer is measured AGAINST is the
 layout with that window taken OUT. Aiming at the picture would let a tile be
-pushed away by the very motion aiming at it — worse, the pointer would come to
-rest over the dragged window, which refuses its own drop, so the next frame
-would fall back to the arrangement and the one after that would move it again:
-a picture alternating between two answers with the mouse held still. Removing
+pushed away by the very motion aiming at it: the pointer would come to rest
+over a different tile on the next frame, and over the first one again on the
+frame after — a picture alternating between two answers with the mouse held
+still, and a drop that depends on which frame the button was let go in. Removing
 it once, up front, is what makes the target stable, and it is also what the
 picture would look like anyway with the window lifted off.
 
-The window that was picked up is a DEAD ZONE. With it taken out, the pixel
-under the press belongs to whichever neighbour grew into it, so without the
-dead zone a press alone would move the window and a click on a title bar would
-stop being a click. The zone is the whole window rather than its band, which
-is what an Alt press needs — that one lands anywhere on a window, so a
-band-sized zone would leave a press on a client area moving it — and it reads
-better for the band too: dragging DOWN into a window's own body used to
-re-parent it beside whichever neighbour had grown into that space. It is the
-window's band and its client area asked SEPARATELY rather than as one
-rectangle, since in a stack other windows' bands lie between them. And it is
-read out of the arrangement rather than the preview, so it is fixed for the
-whole gesture and returning the pointer to it puts the window back.
+A press alone must not move a window, and a click on a title bar has to stay a
+click. That is said as a THRESHOLD from the press point: a drag aims at
+nothing until the pointer has left where the button went down by more than
+eight pixels on either axis, and once it has it goes on aiming for the rest of
+the gesture. Eight is GTK's `gtk-dnd-drag-threshold` default, and per axis
+rather than by true distance is GTK's shape too — no multiply, so no overflow
+to reason about.
 
-Widening it costs something inside a STACK, and the cost is worth writing
-down: for the leaf a stack is showing, the zone is now its band plus the whole
-shared content rect, so the live drop targets left within that stack are the
-other leaves' bands alone — the same slivers this gesture exists to avoid
-needing. Dropping ELSEWHERE is unaffected, and a stack of two is unaffected
-either way, so this is a rough edge rather than a hole; closing it wants a
-drop zone inside a stack that is not a band, which is its own change.
+It LATCHES because not aiming FREEZES the picture rather than clearing it: the
+preview is rebuilt only on the frames a drag aims, so one that un-aimed on the
+way back would leave the last preview standing and the release would commit
+it. Before the latch nothing has been previewed, which is what makes skipping
+safe at all.
 
-It costs something OUTSIDE a stack too, and five zones sharpen it. The dead
-zone is read in the SCREEN geometry while the target is read in the AIM one,
-and the two do not correspond: the neighbour that grows into the dragged
-window's place has much of its own tile underneath the dead one. So a window
-can be dropped to the RIGHT of that neighbour, above it or below it, but not
-to its LEFT and — past a point — not traded with it either. Swept pixel by
-pixel across a 1600-wide output, `H[1, 2]` through `H[1 … 5]` all have 2's
-left third entirely dead; its middle ninth keeps 270 columns of 517 at two
-windows, 7 of 255 at three, and none at all from four on. The left third is
-therefore an OLD edge, unreachable since the two-zone drop, and the middle
-ninth is a new casualty of it that arrives at four windows and survives three
-only as a seven-pixel sliver. The answer is to stop expressing "a press alone
-must not move it" as a REGION — a threshold measured from the press point
-says the same thing without covering a neighbour — and that is its own
-change.
+What this replaces was a REGION — the dragged window's whole tile was a dead
+zone and every aim inside it was refused — and the trouble with a region is
+that it was read in the SCREEN geometry while the target is read in the AIM
+one. The two do not correspond: with the dragged window taken out, the
+neighbour that grows into its place lies mostly underneath it, so the zone
+covered that neighbour's live drop points along with the window's own. Swept
+pixel by pixel across a 1600-wide output, `H[1, 2]` through `H[1 … 5]` all had
+2's left third entirely dead; its middle ninth kept 271 columns of 517 at two
+windows, 8 of 255 at three, and none at all from four on. A window could be
+dropped to the RIGHT of that neighbour, above it or below it, but not to its
+LEFT, and past three in a row not traded with it either. A threshold says the
+same thing about the press without covering a neighbour.
+
+One thing the region did that a threshold does not is worth writing down,
+because it is a real behaviour change rather than only a cost removed:
+dragging DOWN into a window's own body re-parents it beside whichever
+neighbour grew into that space. Press a band in `H[1, 2, 3, 4]`, pull straight
+down 300 pixels without ever leaving that window's own tile, and the release
+trades it with 2. That is the same seam from the other side — the pointer is
+over the dragged window on SCREEN and over its neighbour in the AIM geometry —
+and it is a drop the operator can see coming, since the preview now follows
+the pointer the whole way instead of refusing. Under the region the same
+gesture landed nothing at all.
+
+It costs a STACK nothing either, where the region cost something real: for the
+leaf a stack was showing, the zone was its band plus the whole shared content
+rect, which left the other leaves' bands as the only live targets inside that
+stack — the same slivers this gesture exists to avoid needing.
 
 The preview is DERIVED, never a second source of truth: it is rebuilt from the
 arrangement on every pointer frame and dropped by every change to it, so a
@@ -1060,8 +1063,8 @@ that chose the drop and the release that takes it, so a release brings it up
 to date first — but only when that frame MOVED. On a still pointer there is
 nothing new to account for, and computing an answer anyway is how a release
 after an invalidated preview would commit one the operator never saw; the
-reflow can also move the dead zone under a motionless pointer, so a title-bar
-click would move the window.
+reflow also moves tiles under a motionless pointer, so the drop it computed
+would be aimed at whatever slid beneath them.
 
 STACKING is the second arrangement a container can take, toggled by
 `Super+s`. Its leaves' bands run down its top, one after another, and ONE of

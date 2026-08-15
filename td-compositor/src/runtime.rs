@@ -166,11 +166,41 @@ pub struct Runtime {
     dragging: Option<Drag>,
 }
 
+/// How far the pointer must leave the press point, on either axis, before a
+/// drag aims at anything. A press alone must not move a window and a click on
+/// a title bar must stay a click; eight pixels is what a hand does holding a
+/// button down, and it is GTK's `gtk-dnd-drag-threshold` default.
+const DRAG_THRESHOLD: i32 = 8;
+
 /// A drag in progress, and what holds it open: a band drag by the BUTTON
 /// alone, an Alt drag by the modifier as well.
 struct Drag {
     key: SurfaceKey,
     held_by_alt: bool,
+    /// Where the button went down, and whether the pointer has since left
+    /// `DRAG_THRESHOLD` of it.
+    press: (i32, i32),
+    escaped: bool,
+}
+
+impl Drag {
+    /// The window this drag aims, once the pointer has left the press point far
+    /// enough to mean it. `None` until then, which is what keeps a click a
+    /// click.
+    ///
+    /// LATCHED, because not aiming FREEZES the picture rather than clearing
+    /// it: the preview is only rebuilt where this answers, so a drag that
+    /// un-aimed on the way home would leave the last one standing and the
+    /// release would commit it. Before the latch nothing has been previewed,
+    /// which is what makes skipping safe at all.
+    ///
+    /// Per AXIS rather than by true distance, as GTK is: no multiply, so no
+    /// overflow to reason about.
+    fn aiming_from(&mut self, at: (i32, i32)) -> Option<SurfaceKey> {
+        let left = |now: i32, then: i32| now.abs_diff(then) > DRAG_THRESHOLD.unsigned_abs();
+        self.escaped = self.escaped || left(at.0, self.press.0) || left(at.1, self.press.1);
+        self.escaped.then_some(self.key)
+    }
 }
 
 impl Runtime {
@@ -599,9 +629,11 @@ impl Runtime {
         Err(failures.join("; "))
     }
 
-    /// The drag. A press picks a window up and focuses it; from the first
-    /// motion off that window the screen shows the drop itself, and the
-    /// release keeps it. Two presses start one: a BARE press on a title band,
+    /// The drag. A press picks a window up and focuses it; once the pointer
+    /// has left the press point by more than `DRAG_THRESHOLD` the screen shows
+    /// the drop itself — over that window's own tile as readily as anywhere
+    /// else — and the release keeps it. Two presses start one: a BARE press on
+    /// a title band,
     /// and an ALT press anywhere on a window — the band is the handle that
     /// exists without a modifier, and the modifier is what makes the whole
     /// window one.
@@ -649,14 +681,22 @@ impl Runtime {
                     } else {
                         self.scene.band_at_pointer(width, height)
                     };
-                    // A press that picks nothing up ENDS whatever was live: a
-                    // picture with no drag to commit or clear it would strand
-                    // the screen on an arrangement the layout never took.
+                    // A press ENDS whatever was live, whether or not it picks
+                    // something up. Picking nothing would strand the screen on
+                    // an arrangement the layout never took, with no drag left
+                    // to commit or clear it; picking something is the same
+                    // hazard one step on, since the new drag does not aim
+                    // until it leaves its OWN press point, so an inherited
+                    // preview would freeze there with nothing rebuilding it
+                    // and the release would commit the PREVIOUS drag's drop.
                     match picked {
                         Some(key) => {
+                            self.cancel_drag()?;
                             self.dragging = Some(Drag {
                                 key,
                                 held_by_alt: alt_press,
+                                press: self.scene.pointer_at(),
+                                escaped: false,
                             });
                             self.focus_surface(key)?;
                         }
@@ -664,7 +704,7 @@ impl Runtime {
                     }
                 }
                 PointerButtonState::Released => {
-                    let Some(Drag { key: dragged, .. }) = self.dragging.take() else {
+                    let Some(mut drag) = self.dragging.take() else {
                         continue;
                     };
                     // The reader coalesces a batch, so the motion that chose
@@ -674,11 +714,18 @@ impl Runtime {
                     // still pointer there is nothing new to account for, and
                     // computing one anyway would commit an answer the
                     // operator never saw — which is exactly a release that
-                    // follows a window mapping the preview away.
-                    let settled = if moved && self.scene.preview_drop(dragged, width, height) {
-                        self.settle(true)
-                    } else {
-                        Ok(())
+                    // follows a window mapping the preview away. A frame can
+                    // MOVE without the drag having left the press point, so
+                    // the threshold is asked here too: otherwise a click with
+                    // a pixel of shake in it would land a drop.
+                    let aimed = drag.aiming_from(self.scene.pointer_at());
+                    let settled = match aimed {
+                        Some(dragged)
+                            if moved && self.scene.preview_drop(dragged, width, height) =>
+                        {
+                            self.settle(true)
+                        }
+                        _ => Ok(()),
                     };
                     // Nothing is decided here: the drop went into the picture
                     // when the pointer reached it, so the release only KEEPS
@@ -691,7 +738,8 @@ impl Runtime {
                 }
             }
         }
-        if let Some(dragged) = self.dragging.as_ref().map(|drag| drag.key) {
+        let at = self.scene.pointer_at();
+        if let Some(dragged) = self.dragging.as_mut().and_then(|drag| drag.aiming_from(at)) {
             if self.scene.preview_drop(dragged, width, height) {
                 self.settle(true)?;
             }
@@ -966,6 +1014,22 @@ mod tests {
             height: 100,
             pixels: color.repeat(10_000),
             format: SHM_XRGB8888,
+        }
+    }
+
+    fn press(time: u32) -> PointerButtonInput {
+        PointerButtonInput {
+            time,
+            button: POINTER_BUTTON_LEFT,
+            state: PointerButtonState::Pressed,
+        }
+    }
+
+    fn release(time: u32) -> PointerButtonInput {
+        PointerButtonInput {
+            time,
+            button: POINTER_BUTTON_LEFT,
+            state: PointerButtonState::Released,
         }
     }
 
@@ -2066,6 +2130,375 @@ mod tests {
         runtime.scene.layout().check_invariants().unwrap();
     }
 
+    /// A row of `count` windows on a 1600-wide output — wide enough that a
+    /// tile is far bigger than `DRAG_THRESHOLD`, so leaving the press point
+    /// and leaving the TILE are different things.
+    fn a_row(cleanup: &Cleanup, count: u32) -> (Runtime, usize) {
+        let height = 600;
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 1600, height, 1600 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        for object in 1..=count {
+            runtime
+                .commit(SurfaceKey { client: 1, object }, surface([1, 2, 3, 0]))
+                .unwrap();
+        }
+        (runtime, height)
+    }
+
+    /// A press point on window 1's own band from which a drop WOULD land
+    /// somewhere: past the middle of 2's band in the aim geometry, so the run
+    /// drop puts 1 after 2 rather than back where it already was.
+    ///
+    /// Choosing it is the whole difficulty in testing a threshold. Over most
+    /// of 1's band the aim is a no-op, and there a drag that ignored the
+    /// threshold entirely would look exactly like one that honoured it.
+    fn a_press_point_that_aims(
+        runtime: &Runtime,
+        height: usize,
+    ) -> ((i32, i32), crate::layout::Rect) {
+        let of = |placements: &[crate::layout::Placement], object: u32| {
+            let at = placements
+                .iter()
+                .position(|placement| placement.key.object == object)
+                .unwrap();
+            *placements.get(at).unwrap()
+        };
+        let screen = runtime.scene.tiled_placements(1600, height);
+        let own = of(&screen, 1);
+        let dragged = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        let onto = of(&runtime.scene.aim_placements(dragged, 1600, height), 2);
+        let after = onto.band.x + onto.band.width / 2;
+        let x = (after + own.band.x + own.band.width) / 2;
+        let reach = usize::try_from(DRAG_THRESHOLD).unwrap() + 1;
+        assert!(
+            after < x && x + reach < own.band.x + own.band.width,
+            "the probe points do not fit across the band they press"
+        );
+        // Both axes, since a probe that left the band vertically would be
+        // aiming at a client area rather than at the run.
+        let y = own.band.y + own.band.height / 2;
+        assert!(
+            own.band.y + reach <= y && y + reach < own.band.y + own.band.height,
+            "the probe points do not fit down the band they press"
+        );
+        (
+            (i32::try_from(x).unwrap(), i32::try_from(y).unwrap()),
+            own.rect,
+        )
+    }
+
+    #[test]
+    fn a_press_that_does_not_leave_its_own_point_is_still_a_click() {
+        // Half of what replaced the dead zone, and the half that zone existed
+        // for: a click on a title bar has to stay a click. A press is not a
+        // drop, and neither is a press with a pixel of hand-shake in it —
+        // which matters more than it sounds, since the aim geometry has the
+        // dragged window taken out, so the pixel under the press belongs to
+        // whichever neighbour grew into it and IS a live target.
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-drag-click-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let (mut runtime, height) = a_row(&cleanup, 4);
+        let order = |runtime: &Runtime| {
+            runtime
+                .scene
+                .tiled_placements(1600, height)
+                .iter()
+                .map(|placement| placement.key.object)
+                .collect::<Vec<_>>()
+        };
+        let goto = |runtime: &mut Runtime, x: i32, y: i32, buttons: &[PointerButtonInput]| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            runtime
+                .pointer_frame(1, x - at_x, y - at_y, buttons)
+                .unwrap()
+        };
+        let ((at_x, at_y), _) = a_press_point_that_aims(&runtime, height);
+        let settled = order(&runtime);
+
+        // Every offset the threshold is meant to absorb, INCLUDING the
+        // diagonal: per axis is what a true-distance check would pass here,
+        // since the corner is eleven pixels from the press point.
+        for (dx, dy) in [
+            (0, 0),
+            (DRAG_THRESHOLD, 0),
+            (0, -DRAG_THRESHOLD),
+            (DRAG_THRESHOLD, DRAG_THRESHOLD),
+        ] {
+            goto(&mut runtime, at_x, at_y, &[press(2)]);
+            goto(&mut runtime, at_x + dx, at_y + dy, &[]);
+            assert_eq!(
+                order(&runtime),
+                settled,
+                "a press that moved {dx},{dy} previewed a drop"
+            );
+            goto(&mut runtime, at_x + dx, at_y + dy, &[release(3)]);
+            assert_eq!(
+                order(&runtime),
+                settled,
+                "a click that moved {dx},{dy} moved a window"
+            );
+        }
+
+        // A frame carrying MOTION and the release together, which is how the
+        // reader coalesces one and the only way to reach the threshold on the
+        // release path at all: with the pointer already where it was, `moved`
+        // is false and that guard alone suppresses the drop.
+        goto(&mut runtime, at_x, at_y, &[press(6)]);
+        goto(&mut runtime, at_x + DRAG_THRESHOLD, at_y, &[release(7)]);
+        assert_eq!(
+            order(&runtime),
+            settled,
+            "a release frame that moved inside the threshold dropped a window"
+        );
+
+        // The positive control, and it is not optional: over most of a band
+        // the drop lands the window back where it started, and there every
+        // assertion above would hold with no threshold at all.
+        goto(&mut runtime, at_x, at_y, &[press(8)]);
+        goto(&mut runtime, at_x + DRAG_THRESHOLD + 1, at_y, &[]);
+        assert_ne!(
+            order(&runtime),
+            settled,
+            "this press point aims at nothing, so it proves nothing"
+        );
+        goto(&mut runtime, at_x, at_y, &[release(9)]);
+        runtime.scene.layout().check_invariants().unwrap();
+    }
+
+    #[test]
+    fn the_threshold_is_measured_down_as_well_as_across() {
+        // An X-only probe cannot tell a per-axis threshold from one that
+        // watches X alone, so the vertical crossing gets its own gesture.
+        // Inside the band still — a probe that left it would be aiming at a
+        // client area, and then the drop rather than the threshold would be
+        // what the assertion turned on.
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-drag-down-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let (mut runtime, height) = a_row(&cleanup, 4);
+        let order = |runtime: &Runtime| {
+            runtime
+                .scene
+                .tiled_placements(1600, height)
+                .iter()
+                .map(|placement| placement.key.object)
+                .collect::<Vec<_>>()
+        };
+        let goto = |runtime: &mut Runtime, x: i32, y: i32, buttons: &[PointerButtonInput]| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            runtime
+                .pointer_frame(1, x - at_x, y - at_y, buttons)
+                .unwrap()
+        };
+        let ((at_x, at_y), _) = a_press_point_that_aims(&runtime, height);
+        goto(&mut runtime, at_x, at_y, &[press(2)]);
+        goto(&mut runtime, at_x, at_y + DRAG_THRESHOLD, &[]);
+        assert_eq!(
+            order(&runtime),
+            [1, 2, 3, 4],
+            "the threshold was crossed a pixel early going down"
+        );
+        goto(&mut runtime, at_x, at_y + DRAG_THRESHOLD + 1, &[]);
+        assert_eq!(
+            order(&runtime),
+            [2, 1, 3, 4],
+            "a pixel past the threshold going down previewed nothing"
+        );
+        goto(&mut runtime, at_x, at_y + DRAG_THRESHOLD + 1, &[release(3)]);
+        runtime.scene.layout().check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_press_that_picks_a_window_up_ends_the_drag_before_it() {
+        // A batch can carry two presses with no release between them — one
+        // that overflows its transition limit is reset, and the release in it
+        // is what goes. The second press installs a new drag, which does not
+        // aim until it leaves its OWN press point; a preview left standing
+        // would therefore freeze on screen with nothing rebuilding it, and the
+        // release would commit the drop the PREVIOUS drag had chosen. A click
+        // on one window's band moving a different window.
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-drag-restart-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let (mut runtime, height) = a_row(&cleanup, 4);
+        let order = |runtime: &Runtime| {
+            runtime
+                .scene
+                .tiled_placements(1600, height)
+                .iter()
+                .map(|placement| placement.key.object)
+                .collect::<Vec<_>>()
+        };
+        let goto = |runtime: &mut Runtime, x: i32, y: i32, buttons: &[PointerButtonInput]| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            runtime
+                .pointer_frame(1, x - at_x, y - at_y, buttons)
+                .unwrap()
+        };
+        let settled = order(&runtime);
+        let ((at_x, at_y), _) = a_press_point_that_aims(&runtime, height);
+
+        // Pick 1 up and aim it somewhere that MOVES it, so there is a preview
+        // to inherit.
+        goto(&mut runtime, at_x, at_y, &[press(2)]);
+        let elsewhere = {
+            let placements = runtime.scene.aim_placements(
+                SurfaceKey {
+                    client: 1,
+                    object: 1,
+                },
+                1600,
+                height,
+            );
+            let at = placements
+                .iter()
+                .position(|placement| placement.key.object == 4)
+                .unwrap();
+            placements.get(at).unwrap().rect
+        };
+        goto(
+            &mut runtime,
+            i32::try_from(elsewhere.x + elsewhere.width / 2).unwrap(),
+            i32::try_from(elsewhere.y + elsewhere.height / 2).unwrap(),
+            &[],
+        );
+        assert_ne!(order(&runtime), settled, "there is no preview to inherit");
+
+        // A second press with no release between, onto a band of the picture
+        // as it now stands.
+        let next = {
+            let placements = runtime.scene.tiled_placements(1600, height);
+            let first = placements.first().unwrap();
+            (
+                i32::try_from(first.band.x + first.band.width / 2).unwrap(),
+                i32::try_from(first.band.y + first.band.height / 2).unwrap(),
+            )
+        };
+        goto(&mut runtime, next.0, next.1, &[press(3)]);
+        assert_eq!(
+            order(&runtime),
+            settled,
+            "the new drag inherited the previous one's preview"
+        );
+        goto(&mut runtime, next.0 + 1, next.1, &[]);
+        goto(&mut runtime, next.0 + 1, next.1, &[release(4)]);
+        assert_eq!(
+            order(&runtime),
+            settled,
+            "a click on one band committed another window's drop"
+        );
+        runtime.scene.layout().check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_drag_aims_once_it_leaves_the_press_point_and_keeps_aiming() {
+        // The other half. One pixel past the threshold the drag is live, and
+        // it is live over the dragged window's OWN tile — the region the dead
+        // zone refused, which at four windows in a row was the whole of the
+        // neighbour's trade zone.
+        //
+        // And it LATCHES: coming back inside the threshold must not un-aim a
+        // gesture that has begun, or a window dragged across the screen and
+        // brought home again would stop previewing exactly where it started.
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-drag-threshold-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let (mut runtime, height) = a_row(&cleanup, 4);
+        let order = |runtime: &Runtime| {
+            runtime
+                .scene
+                .tiled_placements(1600, height)
+                .iter()
+                .map(|placement| placement.key.object)
+                .collect::<Vec<_>>()
+        };
+        let goto = |runtime: &mut Runtime, x: i32, y: i32, buttons: &[PointerButtonInput]| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            runtime
+                .pointer_frame(1, x - at_x, y - at_y, buttons)
+                .unwrap()
+        };
+        assert_eq!(order(&runtime), [1, 2, 3, 4]);
+        let ((at_x, at_y), own) = a_press_point_that_aims(&runtime, height);
+        // Both probe points are on 1's own band — inside the dead zone this
+        // replaces, where every aim used to be refused. One pixel is the only
+        // difference between them.
+        let crossed = at_x + DRAG_THRESHOLD + 1;
+        assert!(
+            usize::try_from(crossed).unwrap() < own.x + own.width,
+            "the probe left the dragged window's own tile, which is the point"
+        );
+
+        goto(&mut runtime, at_x, at_y, &[press(2)]);
+        goto(&mut runtime, at_x + DRAG_THRESHOLD, at_y, &[]);
+        assert_eq!(
+            order(&runtime),
+            [1, 2, 3, 4],
+            "the threshold was crossed a pixel early"
+        );
+        goto(&mut runtime, crossed, at_y, &[]);
+        assert_eq!(
+            order(&runtime),
+            [2, 1, 3, 4],
+            "a pixel past the threshold previewed nothing"
+        );
+
+        // Latched, which takes a detour to SEE: skipping the preview leaves
+        // the last one standing rather than clearing it, so a drag that
+        // un-aimed on the way home would look identical from the press point
+        // alone. Aim somewhere else first, and the two answers separate — the
+        // picture either follows the pointer back or freezes where it last
+        // was, which is a picture the release would then commit.
+        let elsewhere = {
+            let placements = runtime.scene.aim_placements(
+                SurfaceKey {
+                    client: 1,
+                    object: 1,
+                },
+                1600,
+                height,
+            );
+            let at = placements
+                .iter()
+                .position(|placement| placement.key.object == 3)
+                .unwrap();
+            placements.get(at).unwrap().rect
+        };
+        goto(
+            &mut runtime,
+            i32::try_from(elsewhere.x + elsewhere.width / 2).unwrap(),
+            i32::try_from(elsewhere.y + elsewhere.height / 2).unwrap(),
+            &[],
+        );
+        let detour = order(&runtime);
+        assert_ne!(detour, [2, 1, 3, 4], "the detour aimed at the same drop");
+        goto(&mut runtime, at_x, at_y, &[]);
+        assert_eq!(
+            order(&runtime),
+            [2, 1, 3, 4],
+            "returning to the press point un-aimed a drag that had begun"
+        );
+        goto(&mut runtime, at_x, at_y, &[release(3)]);
+        assert_eq!(order(&runtime), [2, 1, 3, 4], "the release dropped nothing");
+        runtime.scene.layout().check_invariants().unwrap();
+    }
+
     #[test]
     fn a_drag_shows_its_drop_before_the_button_is_released() {
         // The drag as an operator performs it, in the frames it actually
@@ -2114,8 +2547,8 @@ mod tests {
         // The tile a drop is AIMED at rather than the one drawn. Every point
         // below that asserts WHERE a drop landed comes from here; the ones
         // that only assert that SOMETHING was previewed may use the screen,
-        // since a screen point falling in the dead zone previews nothing and
-        // their own assertion is what catches it.
+        // since their own assertion is what catches a point that landed
+        // somewhere other than the tile it was read off.
         let aim = |runtime: &Runtime, dragged: SurfaceKey, object: u32| {
             let placements = runtime.scene.aim_placements(dragged, 240, height);
             let at = placements
@@ -2143,9 +2576,9 @@ mod tests {
             state: PointerButtonState::Released,
         };
 
-        // Picking 1 up moves nothing yet: the pointer has not left its band.
-        // Geometry rather than whole placements, since the press legitimately
-        // takes focus and focus is one of their fields.
+        // Picking 1 up moves nothing yet: the pointer has not left the press
+        // point. Geometry rather than whole placements, since the press
+        // legitimately takes focus and focus is one of their fields.
         let geometry = |runtime: &Runtime| {
             tiles(runtime)
                 .iter()
@@ -2236,9 +2669,6 @@ mod tests {
         // Read off the AIM geometry rather than the screen: the drop is
         // computed against the arrangement with the dragged window taken out,
         // where that tile is bigger and higher up than the one being drawn.
-        // The two must be reconciled by hand here, because the near end of
-        // that tile is over the DRAGGED window's own on screen, and that is
-        // the dead zone a press alone must not move anything through.
         let onto = {
             let dragging = runtime.dragging.as_ref().map(|drag| drag.key).unwrap();
             let placements = runtime.scene.aim_placements(dragging, 240, height);
@@ -2258,11 +2688,6 @@ mod tests {
             onto.x + onto.width / 2,
             onto.y + onto.height.saturating_mul(3) / 4,
         );
-        let own = band(&runtime, dragged).rect;
-        assert!(
-            aim.1 > own.y.saturating_add(own.height),
-            "the aim point is inside the dragged window's own tile"
-        );
         goto(&mut runtime, aim.0, aim.1, &[release(7), press(8)]);
         assert_eq!(
             order(&runtime),
@@ -2278,9 +2703,9 @@ mod tests {
 
         // A release that arrives with the pointer STILL, after something
         // invalidated the preview, lands nothing. Recomputing one on a still
-        // pointer would commit an answer the operator never saw — and the
-        // reflow can move the dead zone under them, so it could move a window
-        // for a title-bar click that never moved the mouse.
+        // pointer would commit an answer the operator never saw — the reflow
+        // moves tiles under a motionless pointer, so the drop it computed
+        // would be aimed at whatever slid beneath them.
         let settled = geometry(&runtime);
         let handle = band(&runtime, *order(&runtime).first().unwrap()).band;
         goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(10)]);
