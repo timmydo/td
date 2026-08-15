@@ -151,10 +151,12 @@ fn lex(text: &str) -> Result<Vec<Tk>, String> {
             }
             // It binds, so it is an operator over a name and is displaced like a
             // unary sign -- PENDING, not applied, so the name stays reachable
-            // until something displaces it. Binding BACKWARD also completes an
-            // operand, which is what makes the next `+`/`-` binary.
+            // until something displaces it. Whether it COMPLETES an operand is
+            // decided by what came BEFORE it and not by the name it binds: a
+            // pair after a value is a postfix and is one, a pair that followed
+            // an operator became a prefix and is not (math.c:847-865). So
+            // `ends_operand` carries through untouched either way.
             toks.push(Tk::Op(if c == '+' { "++" } else { "--" }));
-            ends_operand = operand_is_name;
             pending.push(PREC_UNARY);
             i += 2;
             continue;
@@ -705,15 +707,22 @@ impl Arith {
                 self.pos += 1;
                 self.expr_unary(sh)
             }
-            // The lexer only emits this token where it BINDS, and a backward
-            // binding is consumed as a postfix by `expr_primary`, so reaching
-            // here means a name follows. The arm is still fallible rather than
-            // asserting: nothing in the type system says so.
+            // A FORWARD-bound pair has its name as the very next token, so
+            // the loop never runs for one. This arm is reached by the
+            // BACKWARD-bound pair `expr_primary` did not take, after which
+            // ANYTHING may follow: `n*++1` and `n*++-n` arrive here with no
+            // name in the expression at all, which is why it stays fallible.
+            // Only the unary plus is skipped, being discarded rather than
+            // stacked (math.c:855-859) -- never a token ash steps over.
             Some(o @ ("++" | "--")) => {
-                let Some(Tk::Name(name)) = self.toks.get(self.pos + 1).cloned() else {
+                let mut at = self.pos + 1;
+                while self.toks.get(at) == Some(&Tk::Op("+")) {
+                    at += 1;
+                }
+                let Some(Tk::Name(name)) = self.toks.get(at).cloned() else {
                     return Err(format!("expected a name after `{o}`"));
                 };
-                self.pos += 2;
+                self.pos = at + 1;
                 Ok(self.step(sh, &name, o == "++")?.1)
             }
             Some("!") => {
@@ -997,6 +1006,59 @@ mod tests {
         assert_eq!(sh.get_var("i").as_deref(), Some("8"));
         // An unset name is zero.
         assert_eq!(eval(&mut sh, "nope + 1").map_err(|_| "eval")?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_prefix_pair_steps_the_name_behind_a_discarded_plus() -> Result<(), String> {
+        let ev = |src: &str| -> Result<(i64, String, String), String> {
+            let mut sh = Shell::new_for_test();
+            sh.set_var("n", "2").map_err(|_| "set failed".to_string())?;
+            sh.set_var("m", "5").map_err(|_| "set failed".to_string())?;
+            let v = eval(&mut sh, src).map_err(|_| format!("eval {src}"))?;
+            Ok((
+                v,
+                sh.get_var("n").unwrap_or_default(),
+                sh.get_var("m").unwrap_or_default(),
+            ))
+        };
+        // A unary plus is DISCARDED rather than stacked, so a prefix pair steps
+        // the name behind any number of them. Every row here has a name and a
+        // PENDING operator to its left, which is the only place the pair
+        // survives as a prefix: with nothing to bind backward to it splits
+        // instead, and the last two rows are that case and must not move.
+        assert_eq!(ev("n*++ +n")?, (6, "3".into(), "5".into()));
+        assert_eq!(ev("n*+++n")?, (6, "3".into(), "5".into()));
+        assert_eq!(ev("n*+++m")?, (12, "2".into(), "6".into()));
+        assert_eq!(ev("n*++ + +m")?, (12, "2".into(), "6".into()));
+        assert_eq!(ev("n*--+n")?, (2, "1".into(), "5".into()));
+        assert_eq!(ev("n-+++n")?, (-1, "3".into(), "5".into()));
+        assert_eq!(ev("n,+++n")?, (3, "3".into(), "5".into()));
+        assert_eq!(ev("n=+++n")?, (3, "3".into(), "5".into()));
+        // ONLY a `+` is skipped. Every other unary stacks, so the pair lands on
+        // a value rather than a name -- as it does on a number, a parenthesis
+        // or a second pair, none of which is one. The state is asserted beside
+        // the refusal because a skip that reached one of these would step the
+        // name and THEN fail, which `is_err` alone cannot tell from this.
+        // The last two are the ones that need a pair, then a LONE `+`, then a
+        // second pair: the lone one is binary only if the first pair completed
+        // an operand, and a prefix pair does not. Get that wrong and the second
+        // pair splits, the skip walks the halves, and this steps `n` and
+        // answers 6 -- the shortest shape that tells the two rules apart.
+        for src in [
+            "n*++-n", "n*--    -n", "n*++!n", "n*++~n", "n*++ ++n", "n*++++n",
+            "n*++ +1", "n*++(n)", "n*+++ ++ +n", "n*-- + ++ +n",
+        ] {
+            let mut sh = Shell::new_for_test();
+            sh.set_var("n", "2").map_err(|_| "set failed".to_string())?;
+            assert!(eval(&mut sh, src).is_err(), "{src}");
+            assert_eq!(sh.get_var("n").as_deref(), Some("2"), "{src}");
+        }
+        // Where the pair can split it still does, and a split one steps
+        // NOTHING: the plus-skipping must not reach past a lexer that already
+        // decided. `1*` is the same shape with a number, which is not a name.
+        assert_eq!(ev("++ +n")?, (2, "2".into(), "5".into()));
+        assert_eq!(ev("1*++ +n")?, (2, "2".into(), "5".into()));
         Ok(())
     }
 
