@@ -80,9 +80,11 @@ What is **missing**, and what this workstream is:
   can write the volume can write a manifest that matches their own payloads.
 - No update channel.
 
-Two pieces landed toward it and are not yet consumed by anything:
-`engine/src/gpt.rs` + `engine/src/fat.rs` (with `engine/src/crc32.rs`), and
-`engine/src/ed25519.rs` + `engine/src/sha512.rs` (verify-only, `aa347e60`).
+`engine/src/gpt.rs` + `engine/src/fat.rs` (with `engine/src/crc32.rs`)
+landed toward it and are not yet consumed by anything.
+`engine/src/ed25519.rs` + `engine/src/sha512.rs` (verify-only, `aa347e60`)
+were in that list until §10 item 5: td-boot compiles them in now, though
+nothing on the boot path calls them until item 6 flips the policy.
 
 ## 3. Hard invariants
 
@@ -405,14 +407,13 @@ it from the reader.
 
 `engine/src/ed25519.rs` exposes `verify` and no signer — only that
 function plus `PUBLIC_KEY_LEN` and `SIGNATURE_LEN`. There is no signing in
-THAT FILE and there must not be: the verifying boot shim will
-`#[path]`-include it (§10 item 5), so anything added there lands in the
-boot binary, whose job is to refuse what does not verify. A signer on the
-boot path would be a crypto surface serving no boot-time purpose. Stated
-in the future tense deliberately — **today td-boot includes no ed25519 at
-all**, its only `#[path]` include being `sha256.rs` — because the rule is
-about what the split is FOR, and it is cheaper to hold before the include
-lands than to discover afterwards that a signer came with it.
+THAT FILE and there must not be: **td-boot `#[path]`-includes it** (§10
+item 5), so anything added there lands in the boot binary, whose job is to
+refuse what does not verify. A signer on the boot path would be a crypto
+surface serving no boot-time purpose. This paragraph stood in the future
+tense for exactly one commit — the rule was written down before the
+include landed, on the grounds that afterwards the cost of having got it
+wrong is a boot binary carrying a signer.
 
 `engine/src/ed25519_sign.rs` is therefore a SEPARATE module, and the
 separation is the whole design: td-boot does not include it, so it cannot
@@ -464,9 +465,14 @@ The consequence lands on tests. td-boot's own tests **cannot produce a
 signature**, so the positive path is exercised with committed fixtures — a
 public key, a canonical manifest, and its detached signature, generated once
 by `td-deploy`. No private key is committed, exactly as `tests/td-subst.pub`
-already establishes. The fixture manifest names the digests of fixture
-payload bytes the test writes, which is what makes the triple self-
-consistent.
+already establishes.
+
+What makes the triple self-consistent is the SIGNATURE over the manifest
+bytes, and nothing else. An earlier draft of this paragraph said the fixture
+manifest names the digests of payload bytes the test writes; it does not,
+and it does not need to — authenticity is decided over the manifest's bytes
+and the digests it names are never resolved on this path. `td-boot/tests/README`
+is the normative note on the fixtures and says so.
 
 Every NEGATIVE assertion — wrong key, tampered manifest, absent signature,
 truncated signature, signature over a different manifest — needs no signer
@@ -605,16 +611,37 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    already-published deployment as an update rather than a no-op. Still
    nothing that verifies — this is the half that makes a signature able to
    REACH a machine, and it needs no answer to the open question below.
-5. **Verification, target-side, fail-closed** (§6, D2): `td-boot` refuses a
+5. **The verifier reaches the target** (§6): td-boot `#[path]`-includes
+   `ed25519.rs` and `sha512.rs`, its recipe stages them, and it gains a hex
+   decoder, a trusted-key reader, and `authenticate_manifest` — reached by
+   one new verb, `td-boot authenticate <deployment-directory>
+   <trusted-key>`, which answers authenticity and nothing else. The BOOT
+   path is untouched, which is the shape items 3 and 4 landed in; what this
+   settles is that the target-static build carries those sources, separately
+   from the boot-path change that depends on it.
+
+   The verb is what makes that true rather than a convenience. rustc drops
+   dead code, so declaring the modules and calling nothing compiles the
+   verifier and then discards it: measured on the recipe's own layout, the
+   binary was 24576 bytes SMALLER with the functions unreferenced. A
+   `#[path]` include with no caller proves the sources TYPE-CHECK and
+   nothing more.
+
+   The positive case is a committed fixture triple (`td-boot/tests/`), since
+   td-boot has the verifier and deliberately not the signer; every negative
+   needs no signer at all.
+6. **Verification, target-side, fail-closed** (§6, D2): `td-boot` refuses a
    deployment whose manifest does not verify, and the system oracle signs the
    bundle it stages and gains a wrong-key negative control. This is the
    increment that decides the OPEN question in §6 — where the trusted key
-   lives — because it is the first one that has to read a key at all. It was
-   scoped with item 3 as a single landing and split twice as that question
-   turned out to be unsettled and as carrying the file turned out to be its
-   own increment; each earlier half needs no answer to it, and this one
-   cannot proceed without one.
-6. **`td-install`**, a standalone crate outside the workspace (D9): GPT +
+   lives — because it is the first one whose ANSWER has to reach a running
+   machine. It was scoped with item 3 as a single landing and split three
+   times: as that question turned out to be unsettled, as carrying the file
+   turned out to be its own increment, and as getting the verifier into the
+   target binary turned out to be separable from deciding what it trusts.
+   Each earlier half needs no answer to the question; this one cannot
+   proceed without one.
+7. **`td-install`**, a standalone crate outside the workspace (D9): GPT +
    FAT32 ESP + Btrfs volume onto a device or a regular file,
    `#[path]`-including `gpt.rs`/`fat.rs`/`crc32.rs` and `protocol.rs`, and
    delegating the publish to `td-boot install` (D1). Carries the
@@ -623,15 +650,15 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    `Cargo.lock` assertion plus its clippy and test lines
    (`builder/src/gate_defs/325-cargo-test.rs`), a route and assertions in
    `builder/src/affected.rs`, and the workspace `exclude` list.
-7. **The EFI-stub kernel** (§5): `CONFIG_EFI`, `CONFIG_EFI_STUB`,
+8. **The EFI-stub kernel** (§5): `CONFIG_EFI`, `CONFIG_EFI_STUB`,
    `CONFIG_CMDLINE` in `linux-x86-64.rs`, having first confirmed what
    `CONFIG_EFI` drags in on the pinned tree.
-8. **The OVMF oracle** (§8), beside the `-kernel` one, not replacing it.
-9. **`td-update` and its local channel**: fetch a signed bundle, verify it,
+9. **The OVMF oracle** (§8), beside the `-kernel` one, not replacing it.
+10. **`td-update` and its local channel**: fetch a signed bundle, verify it,
    delegate the publish (D1 again), and roll back on a failed boot. This is
    where the update channel that was its own workstream rejoins this one.
 
-Items 7 and 8 depend on nothing above them and may land whenever they fit.
+Items 8 and 9 depend on nothing above them and may land whenever they fit.
 
 ## 11. Validation
 

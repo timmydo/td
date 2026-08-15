@@ -7,6 +7,21 @@ mod protocol;
 #[path = "../../engine/src/sha256.rs"]
 #[allow(dead_code)]
 mod sha256;
+// The authenticity half, which hashes cannot give: ed25519 VERIFICATION.
+// Declared as a PAIR at the crate root because `ed25519.rs` reaches its hash as
+// `crate::sha512` — the spelling that resolves identically inside the engine
+// lib, inside td-net's test build, and here.
+//
+// `ed25519_sign.rs` is deliberately absent and must stay so: this binary
+// verifies and never signs, since a signer here would be a crypto surface
+// serving no boot-time purpose. That is not left to a comment —
+// `builder/src/affected.rs` refuses any file under `td-boot/src` that names it.
+#[path = "../../engine/src/sha512.rs"]
+#[allow(dead_code)]
+mod sha512;
+#[path = "../../engine/src/ed25519.rs"]
+#[allow(dead_code)]
+mod ed25519;
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions, TryLockError};
@@ -63,6 +78,18 @@ enum Mode {
         device: PathBuf,
         mountpoint: PathBuf,
         deployment_id: String,
+    },
+    /// Check a staged deployment's detached signature against a trusted key,
+    /// and report ONLY that. Deliberately separate from `verify`, which is
+    /// about integrity and selection: this verb decides authenticity and
+    /// nothing else, so a caller — an operator, or the system oracle checking
+    /// that what it signed is what a machine would accept — gets one answer to
+    /// one question. When the boot path itself refuses unsigned deployments
+    /// this becomes the same check reached a second way, which is why it takes
+    /// a directory rather than a volume root and slot.
+    Authenticate {
+        directory: PathBuf,
+        trusted_key: PathBuf,
     },
 }
 
@@ -138,7 +165,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory>\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>",
+        "usage: td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory>\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> <trusted-key>",
     )
 }
 
@@ -162,6 +189,17 @@ fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
             }
             Ok(Mode::Verify {
                 root: PathBuf::from(root),
+            })
+        }
+        Some(mode) if mode == OsStr::new("authenticate") => {
+            let directory = args.next().ok_or_else(usage_error)?;
+            let trusted_key = args.next().ok_or_else(usage_error)?;
+            if args.next().is_some() {
+                return Err(usage_error());
+            }
+            Ok(Mode::Authenticate {
+                directory: PathBuf::from(directory),
+                trusted_key: PathBuf::from(trusted_key),
             })
         }
         Some(mode) if mode == OsStr::new("root-loop") => {
@@ -443,6 +481,112 @@ fn read_optional_signature(directory: &Path) -> io::Result<Option<Vec<u8>>> {
         )
         .map(Some),
     }
+}
+
+/// Decode exactly `N` bytes of hex, tolerating surrounding ASCII whitespace —
+/// `td-deploy` writes a trailing newline after both the signature and the key,
+/// and `tests/td-subst.pub` established that shape for every committed public
+/// half.
+///
+/// Over BYTES rather than `&str`, and pairs taken by pattern rather than by
+/// slicing, because this parses files an attacker supplies: `manifest.sig`
+/// comes off a volume anyone who can write the disk can write. The same decoder
+/// written over `&str` with `&s[i..i + 2]` panicked on a multi-byte character
+/// in exactly this position — that was a live remote-reachable panic in
+/// `net/src/sig.rs`, reached from a fetched narinfo's `Sig:` field BEFORE
+/// anything was verified, and it is not going to be reintroduced here.
+fn decode_hex<const N: usize>(text: &[u8], label: &str) -> io::Result<[u8; N]> {
+    let trimmed = text.trim_ascii();
+    // `checked_mul`, not `saturating_mul`: saturation would leave the expected
+    // length at `usize::MAX`, which is ODD, and an odd expected length is one
+    // `chunks_exact` below would silently drop a byte from. Unreachable for the
+    // two callers (N is 32 and 64), and refused rather than reasoned about.
+    let Some(expected) = N.checked_mul(2) else {
+        return Err(invalid(format!("{label}: absurd expected length")));
+    };
+    if trimmed.len() != expected {
+        return Err(invalid(format!(
+            "{label} must be exactly {expected} hexadecimal characters, got {}",
+            trimmed.len()
+        )));
+    }
+    let nibble = |c: u8| -> io::Result<u8> {
+        match c {
+            b'0'..=b'9' => Ok(c - b'0'),
+            b'a'..=b'f' => Ok(c - b'a' + 10),
+            b'A'..=b'F' => Ok(c - b'A' + 10),
+            _ => Err(invalid(format!("{label} is not hexadecimal"))),
+        }
+    };
+    // `as_chunks` so each pair arrives as `[u8; 2]` and destructures without a
+    // fallible branch. `td-netd/src/ip_list` avoids it on the grounds that the
+    // pinned bootstrap toolchain may not have it — that caution does not apply
+    // here and is checkable rather than arguable: `engine/src/sha256.rs` calls
+    // `as_chunks::<64>()` and has been staged by THIS recipe since the boot shim
+    // first landed, and `ed25519.rs` — staged beside it — calls it six times,
+    // once inside `verify` itself. A toolchain that could not compile it could
+    // not build td-boot at all.
+    //
+    // The remainder is provably empty after the length check above and is
+    // checked anyway, since "provably" is doing the work of a bounds check.
+    let (pairs, rest) = trimmed.as_chunks::<2>();
+    if !rest.is_empty() {
+        return Err(invalid(format!("{label} is not hexadecimal")));
+    }
+    let mut out = [0u8; N];
+    for (slot, [high, low]) in out.iter_mut().zip(pairs) {
+        *slot = (nibble(*high)? << 4) | nibble(*low)?;
+    }
+    Ok(out)
+}
+
+/// The trusted deployment key, read from a file holding its 32 bytes as hex.
+///
+/// Read at RUNTIME rather than compiled in, which DESIGN.md §6 argues at
+/// length and which is forced rather than chosen: a recipe embeds its sources
+/// with `include_str!` resolved when td-recipe-eval itself compiles, and
+/// recipes are content-addressed with no per-run parameter — so a build-time
+/// pin could only carry a key that existed before the build, and since no
+/// private key is committed, nothing at test time would hold the half needed to
+/// sign for it. `tests/td-subst.pub` is the same shape for the same reason.
+fn read_trusted_key(path: &Path) -> io::Result<[u8; ed25519::PUBLIC_KEY_LEN]> {
+    let text = read_bounded_real_file(
+        path,
+        "trusted deployment key",
+        protocol::MAX_PUBLIC_KEY_BYTES,
+    )?;
+    decode_hex(&text, "trusted deployment key")
+}
+
+/// Does `signature` — the bytes of `manifest.sig`, hex — authenticate
+/// `manifest` under `key`?
+///
+/// `Ok(())` is the ONLY way this reports authenticity, and every other outcome
+/// is an `Err` naming which one it was. That shape is deliberate: D2 is
+/// fail-closed, so a caller must not be able to reach a "not really a failure"
+/// branch, and an error is what `?` refuses on. The reasons stay distinct
+/// because an operator reading a refused boot needs to tell a truncated file
+/// from a wrong key.
+fn authenticate_manifest(
+    manifest: &[u8],
+    signature: &[u8],
+    key: &[u8; ed25519::PUBLIC_KEY_LEN],
+) -> io::Result<()> {
+    let signature = decode_hex::<{ ed25519::SIGNATURE_LEN }>(signature, "deployment signature")?;
+    if ed25519::verify(key, manifest, &signature) {
+        return Ok(());
+    }
+    // Phrased so it does not blame the signature, because at this point td-boot
+    // CANNOT tell which side is at fault: `verify` folds "wrong signature",
+    // "signature over other bytes" and "trusted key is well-formed hex but not a
+    // valid curve point" into one `false`. Naming the signature would send an
+    // operator to the wrong file. Distinguishing them properly needs a key check
+    // that duplicates `verify`'s own subgroup policy, which is a worse trade
+    // than a precise sentence.
+    Err(invalid(
+        "manifest does not authenticate: the signature, the manifest bytes and \
+         the trusted key do not agree",
+    ))
 }
 
 fn sync_directory(path: &Path) -> io::Result<()> {
@@ -2227,6 +2371,32 @@ fn run_success(device: &Path, mountpoint: &Path, deployment_id: &str) -> io::Res
     writeln!(io::stdout(), "{id}")
 }
 
+/// `td-boot authenticate <deployment-directory> <trusted-key>`.
+///
+/// Prints the deployment id — `sha256(manifest)`, the same identity every other
+/// verb uses — on success, and refuses with a reason otherwise. An ABSENT
+/// signature is a refusal here, not a `None`: this verb's entire question is
+/// authenticity, so "there is nothing to check" is the answer no. That differs
+/// from `read_optional_signature`'s tolerance on the publish path, where an
+/// unsigned bundle is still installable, and the difference is the point.
+fn run_authenticate(directory: &Path, trusted_key: &Path) -> io::Result<()> {
+    require_real_directory(directory, "deployment")?;
+    let key = read_trusted_key(trusted_key)?;
+    let manifest = read_bounded_real_file(
+        &directory.join(protocol::MANIFEST_NAME),
+        "deployment manifest",
+        protocol::MAX_MANIFEST_BYTES,
+    )?;
+    let signature = read_optional_signature(directory)?
+        .ok_or_else(|| invalid("deployment carries no signature to authenticate"))?;
+    authenticate_manifest(&manifest, &signature, &key)?;
+    // Parsed only AFTER the signature holds, so nothing about an unauthenticated
+    // manifest's shape can be reported: the id is the one fact worth printing,
+    // and it is a fact about bytes that were signed.
+    parse_manifest(&manifest)?;
+    writeln!(io::stdout(), "{}", sha256::hex_digest(&manifest))
+}
+
 fn run() -> io::Result<()> {
     match parse_args(std::env::args_os().skip(1))? {
         Mode::Verify { root } => run_verify(&root),
@@ -2251,6 +2421,10 @@ fn run() -> io::Result<()> {
             mountpoint,
             deployment_id,
         } => run_success(&device, &mountpoint, &deployment_id),
+        Mode::Authenticate {
+            directory,
+            trusted_key,
+        } => run_authenticate(&directory, &trusted_key),
     }
 }
 
@@ -3632,5 +3806,299 @@ mod tests {
                 OsStr::new(STDIN_PATH),
             ]
         );
+    }
+
+    // ---- authenticity: the ed25519 half ----
+    //
+    // td-boot cannot SIGN — it has the verifier and deliberately not the signer
+    // — so the positive case is a committed triple generated once by
+    // `td-deploy`: a manifest, its detached signature, and the public half of
+    // the key that made it. The private half was never committed and does not
+    // exist any more, which is exactly why the triple is committed rather than
+    // regenerated. See `td-boot/tests/README`.
+    //
+    // The negatives need no signer at all, and they are the ones that matter:
+    // D2 is fail-closed, so what has to be true is that everything which is not
+    // a good signature is refused.
+
+    const FIXTURE_MANIFEST: &[u8] = include_bytes!("../tests/deployment.manifest");
+    const FIXTURE_SIGNATURE: &[u8] = include_bytes!("../tests/deployment.manifest.sig");
+    const FIXTURE_KEY: &[u8] = include_bytes!("../tests/deployment.pub");
+    const FIXTURE_OTHER_KEY: &[u8] = include_bytes!("../tests/deployment-other.pub");
+
+    fn fixture_key() -> [u8; ed25519::PUBLIC_KEY_LEN] {
+        decode_hex(FIXTURE_KEY, "fixture key").expect("the committed key is 64 hex characters")
+    }
+
+    #[test]
+    fn the_committed_signature_authenticates_its_manifest() {
+        assert!(
+            authenticate_manifest(FIXTURE_MANIFEST, FIXTURE_SIGNATURE, &fixture_key()).is_ok(),
+            "the committed triple must agree, or every negative below proves nothing"
+        );
+        // And the triple is a DEPLOYMENT, not just bytes: the manifest carries
+        // the header the protocol requires and parses, so this is the same
+        // shape a machine would be asked to boot.
+        assert!(FIXTURE_MANIFEST.starts_with(protocol::MANIFEST_HEADER));
+        assert!(parse_manifest(FIXTURE_MANIFEST).is_ok());
+    }
+
+    #[test]
+    fn a_signature_under_another_key_is_refused() {
+        let other: [u8; ed25519::PUBLIC_KEY_LEN] =
+            decode_hex(FIXTURE_OTHER_KEY, "other key").expect("64 hex characters");
+        assert_ne!(other, fixture_key(), "the two fixture keys must differ");
+        assert!(authenticate_manifest(FIXTURE_MANIFEST, FIXTURE_SIGNATURE, &other).is_err());
+    }
+
+    #[test]
+    fn a_tampered_manifest_is_refused() {
+        // Every byte in turn, so this cannot pass by tampering somewhere the
+        // signature does not cover — there is no such place, and that is the
+        // claim being made.
+        for i in 0..FIXTURE_MANIFEST.len() {
+            let mut tampered = FIXTURE_MANIFEST.to_vec();
+            if let Some(byte) = tampered.get_mut(i) {
+                *byte ^= 1;
+            }
+            assert!(
+                authenticate_manifest(&tampered, FIXTURE_SIGNATURE, &fixture_key()).is_err(),
+                "manifest byte {i} must not be free to move"
+            );
+        }
+    }
+
+    #[test]
+    fn every_bit_of_the_signature_matters() {
+        let good: [u8; ed25519::SIGNATURE_LEN] =
+            decode_hex(FIXTURE_SIGNATURE, "signature").expect("128 hex characters");
+        for byte in 0..ed25519::SIGNATURE_LEN {
+            for bit in 0..8u32 {
+                let mut broken = good;
+                if let Some(slot) = broken.get_mut(byte) {
+                    *slot ^= 1u8 << bit;
+                }
+                let hex = broken.iter().fold(String::new(), |mut s, b| {
+                    s.push_str(&format!("{b:02x}"));
+                    s
+                });
+                assert!(
+                    authenticate_manifest(FIXTURE_MANIFEST, hex.as_bytes(), &fixture_key())
+                        .is_err(),
+                    "signature byte {byte} bit {bit} must not be free to move"
+                );
+            }
+        }
+    }
+
+    /// A signature file is read off a volume anyone who can write the disk can
+    /// write, so every malformed shape must be a refusal and NONE of them may
+    /// be fatal. The multi-byte cases are the ones that matter: the same
+    /// decoder written over `&str` panicked on exactly these.
+    #[test]
+    fn a_malformed_signature_is_refused_and_never_fatal() {
+        let key = fixture_key();
+        let good = String::from_utf8_lossy(FIXTURE_SIGNATURE).trim().to_string();
+        let mut cases: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"\n".to_vec(),
+            b"zz".to_vec(),
+            b"+f".to_vec(),
+            good.as_bytes().get(..127).unwrap_or_default().to_vec(),
+            format!("{good}00").into_bytes(),
+            format!("{good}x").into_bytes(),
+            "\u{20ac}".repeat(64).into_bytes(),
+            format!("{}\u{00e9}", good.get(..126).unwrap_or_default()).into_bytes(),
+            // Exactly 128 BYTES with a two-byte character STRADDLING an even
+            // offset (1 + 2 + 125), so it survives the length check and lands
+            // mid-character in the pair loop. That is the only shape which
+            // actually reaches the panic a `&str`-slicing decoder had — the
+            // two cases above are refused for their length before they get
+            // there, which a verify-red probe caught. Without this the "never
+            // fatal" in this test's name would be untested for signatures.
+            format!("a\u{00e9}{}", "0".repeat(125)).into_bytes(),
+        ];
+        // A signature of the right LENGTH but entirely absent structure.
+        cases.push(vec![b'0'; 128]);
+        for case in cases {
+            assert!(
+                authenticate_manifest(FIXTURE_MANIFEST, &case, &key).is_err(),
+                "malformed signature {:?} must be refused",
+                String::from_utf8_lossy(&case)
+            );
+        }
+    }
+
+    #[test]
+    fn a_signature_may_be_written_with_or_without_a_trailing_newline() {
+        let key = fixture_key();
+        let trimmed = String::from_utf8_lossy(FIXTURE_SIGNATURE).trim().to_string();
+        for spelling in [
+            trimmed.clone(),
+            format!("{trimmed}\n"),
+            format!("{trimmed}\r\n"),
+            format!("  {trimmed}  "),
+            trimmed.to_uppercase(),
+        ] {
+            assert!(
+                authenticate_manifest(FIXTURE_MANIFEST, spelling.as_bytes(), &key).is_ok(),
+                "{spelling:?} is the same signature"
+            );
+        }
+    }
+
+    #[test]
+    fn the_trusted_key_is_read_from_a_file_and_malformed_ones_are_refused() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("deployment.pub");
+
+        fs::write(&path, FIXTURE_KEY).unwrap();
+        assert_eq!(read_trusted_key(&path).unwrap(), fixture_key());
+
+        // Absent is an error, never a default key and never "unsigned": §6
+        // names the fail-open branch as the tempting one, so it is the one
+        // pinned here.
+        let missing = fixture.root.join("absent.pub");
+        assert!(read_trusted_key(&missing).is_err());
+
+        for bad in [
+            &b""[..],
+            &b"not hex at all, not even close\n"[..],
+            &b"00\n"[..],
+            &[0xffu8; 64][..],
+        ] {
+            fs::write(&path, bad).unwrap();
+            assert!(
+                read_trusted_key(&path).is_err(),
+                "{:?} is not a key",
+                String::from_utf8_lossy(bad)
+            );
+        }
+
+        // And a file too large to be a key is refused BY THE BOUND rather than
+        // read, which is what stops a "key" being a payload. The error text is
+        // what distinguishes the two: a huge file is refused for its length by
+        // the decoder as well, so an `is_err()` here passes with the bound
+        // removed entirely — which a verify-red probe caught it doing.
+        fs::write(&path, vec![b'a'; 4096]).unwrap();
+        let refused = read_trusted_key(&path).unwrap_err().to_string();
+        // The whole phrase, not `contains("96")` beside it: the message embeds
+        // the fixture path, which carries a pid, and a pid containing 96 would
+        // satisfy a bare digit check whatever the bound was.
+        assert!(
+            refused.contains(&format!("exceeds {} bytes", protocol::MAX_PUBLIC_KEY_BYTES)),
+            "a key must be refused by its bound before it is read, got {refused:?}"
+        );
+        assert_eq!(protocol::MAX_PUBLIC_KEY_BYTES, 96, "the bound this pins");
+    }
+
+    /// A directory or a symlink where the key should be is a refusal, not a
+    /// read — the same rule every other file td-boot opens off a volume obeys.
+    #[test]
+    fn a_trusted_key_that_is_not_a_real_file_is_refused() {
+        let fixture = Fixture::new();
+        let directory = fixture.root.join("key-dir");
+        fs::create_dir(&directory).unwrap();
+        assert!(read_trusted_key(&directory).is_err());
+
+        let target = fixture.root.join("real.pub");
+        fs::write(&target, FIXTURE_KEY).unwrap();
+        let link = fixture.root.join("link.pub");
+        symlink(&target, &link).unwrap();
+        assert!(read_trusted_key(&link).is_err(), "a symlinked key is refused");
+    }
+
+    /// The verb exists so the verifier is REACHABLE, which is not a stylistic
+    /// point: rustc drops dead code, so declaring the modules and never calling
+    /// them compiles ed25519 and SHA-512 and then discards them. Measured on the
+    /// recipe's own layout, the shipped binary was 24576 bytes SMALLER with the
+    /// functions unreferenced — so "the verifier is in the target binary" was
+    /// false until something called it.
+    #[test]
+    fn authenticate_accepts_a_signed_deployment_and_refuses_everything_else() {
+        let fixture = Fixture::new();
+        let directory = fixture.root.join("bundle");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join(protocol::MANIFEST_NAME), FIXTURE_MANIFEST).unwrap();
+        fs::write(
+            directory.join(protocol::MANIFEST_SIG_NAME),
+            FIXTURE_SIGNATURE,
+        )
+        .unwrap();
+        let key = fixture.root.join("trusted.pub");
+        fs::write(&key, FIXTURE_KEY).unwrap();
+
+        assert!(run_authenticate(&directory, &key).is_ok());
+        // The id it reports is the deployment id every other verb uses.
+        assert_eq!(
+            sha256::hex_digest(FIXTURE_MANIFEST),
+            "93f336004695ce2d19e1dbb793e2784f8842dd74c29a5cd30e2d782fb18fde3f"
+        );
+
+        // The wrong key.
+        let other = fixture.root.join("other.pub");
+        fs::write(&other, FIXTURE_OTHER_KEY).unwrap();
+        assert!(run_authenticate(&directory, &other).is_err());
+
+        // An ABSENT signature is a refusal here, unlike on the publish path.
+        fs::remove_file(directory.join(protocol::MANIFEST_SIG_NAME)).unwrap();
+        assert!(run_authenticate(&directory, &key).is_err());
+
+        // A signature over a DIFFERENT manifest: the bytes are a real signature,
+        // just not of these bytes, which is the substitution the check exists for.
+        fs::write(
+            directory.join(protocol::MANIFEST_SIG_NAME),
+            FIXTURE_SIGNATURE,
+        )
+        .unwrap();
+        let mut tampered = FIXTURE_MANIFEST.to_vec();
+        if let Some(byte) = tampered.last_mut() {
+            *byte = b'\n';
+        }
+        if let Some(byte) = tampered.get_mut(20) {
+            *byte ^= 1;
+        }
+        fs::write(directory.join(protocol::MANIFEST_NAME), &tampered).unwrap();
+        assert!(run_authenticate(&directory, &key).is_err());
+
+        // And a directory that is not a deployment at all.
+        assert!(run_authenticate(&fixture.root.join("absent"), &key).is_err());
+    }
+
+    #[test]
+    fn authenticate_parses_its_arguments_exactly() {
+        let parsed = parse_args(
+            [
+                OsString::from("authenticate"),
+                OsString::from("/bundle"),
+                OsString::from("/key.pub"),
+            ]
+            .into_iter(),
+        );
+        assert!(matches!(parsed, Ok(Mode::Authenticate { .. })));
+        // Too few and too many are both usage errors, as every other verb's are.
+        assert!(parse_args([OsString::from("authenticate")].into_iter()).is_err());
+        assert!(parse_args(
+            [
+                OsString::from("authenticate"),
+                OsString::from("/bundle"),
+                OsString::from("/key.pub"),
+                OsString::from("extra"),
+            ]
+            .into_iter()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn decode_hex_is_exact_about_length_and_alphabet() {
+        assert_eq!(decode_hex::<2>(b"00ff", "x").unwrap(), [0x00, 0xff]);
+        assert_eq!(decode_hex::<2>(b"00FF\n", "x").unwrap(), [0x00, 0xff]);
+        assert!(decode_hex::<2>(b"00f", "x").is_err(), "odd length");
+        assert!(decode_hex::<2>(b"00ff00", "x").is_err(), "too long");
+        assert!(decode_hex::<2>(b"00 ff", "x").is_err(), "inner space");
+        assert!(decode_hex::<2>(b"00g0", "x").is_err(), "not hex");
+        // `from_str_radix` accepted a sign; a key parser must not.
+        assert!(decode_hex::<1>(b"+f", "x").is_err(), "a signed nibble is not hex");
     }
 }

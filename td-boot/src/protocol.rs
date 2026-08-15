@@ -21,6 +21,12 @@ pub const MANIFEST_SIG_NAME: &str = "manifest.sig";
 // nothing like a payload: this file is read off a volume anyone who can write
 // the disk can write, so it is bounded before it is read, as the manifest is.
 pub const MAX_SIGNATURE_BYTES: u64 = 160;
+// The trusted deployment key: 32 bytes as 64 hex characters and a newline, the
+// shape `td-deploy keygen` writes and `tests/td-subst.pub` already established
+// for a committed public half. Bounded before it is read for the signature's
+// reason — whatever supplies it, td-boot reads it as a file and a file can be
+// any size.
+pub const MAX_PUBLIC_KEY_BYTES: u64 = 96;
 pub const BOOT_DIR: &str = "td/boot";
 pub const ATTEMPTS_DIR: &str = "td/boot/attempts";
 pub const DEPLOYMENTS_DIR: &str = "td/deployments";

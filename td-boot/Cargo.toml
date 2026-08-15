@@ -21,7 +21,7 @@ path = "src/main.rs"
 
 # td-boot is a TARGET-built guest program outside the control-plane workspace.
 # It has zero external dependencies. The target recipe compiles this source and
-# the shared engine SHA-256 implementation directly with rustc.
+# the shared engine SHA-256, SHA-512 and ed25519 sources directly with rustc.
 
 [lints.rust]
 unsafe_code = "forbid"

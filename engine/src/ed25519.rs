@@ -23,11 +23,11 @@
 //! Dependency-free for the reason the rest of the engine is: its INTENDED
 //! consumer is `td-boot`, which runs in the boot shim before any store exists,
 //! and no shipped td crate outside the network tools carries an external
-//! crate. Nothing includes it yet — the `#[path]` include lands with the
-//! verifying boot shim — and when it does it must declare BOTH this module and
-//! `sha512` at its crate root, since `crate::sha512` is how this one reaches
-//! the hash and that spelling resolves identically inside the engine lib and
-//! inside an including binary. `net`'s test build already does exactly that.
+//! crate. `td-boot` now includes it, and any consumer must declare BOTH this
+//! module and `sha512` at its crate root, since `crate::sha512` is how this one
+//! reaches the hash and that spelling resolves identically inside the engine
+//! lib and inside an including binary. `net`'s test build and td-boot both do
+//! exactly that, and `recipes/src/recipes/td-boot.rs` stages the pair.
 //!
 //! Correctness is pinned three ways, because a verifier that is merely
 //! SLIGHTLY wrong still accepts every genuine signature and so is discovered

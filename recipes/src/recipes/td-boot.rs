@@ -1,10 +1,15 @@
 use crate::types::{Recipe, Step};
 
 // Target-built static deployment verifier and kexec boot shim. The shipped
-// source reuses the engine's dependency-free SHA-256 implementation.
+// source reuses the engine's dependency-free SHA-256 implementation, and its
+// ed25519 VERIFIER — which reaches its hash as `crate::sha512`, so the two
+// arrive as a pair or the build does not link. `ed25519_sign.rs` is NOT here
+// and must not be: this binary verifies and never signs.
 const MAIN_RS: &str = include_str!("../../../td-boot/src/main.rs");
 const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
 const SHA256_RS: &str = include_str!("../../../engine/src/sha256.rs");
+const SHA512_RS: &str = include_str!("../../../engine/src/sha512.rs");
+const ED25519_RS: &str = include_str!("../../../engine/src/ed25519.rs");
 
 pub fn recipe() -> Recipe {
     let rustc = "{in:rust-toolchain}/bin/rustc";
@@ -44,6 +49,16 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/engine/src/sha256.rs".into(),
             content: SHA256_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/engine/src/sha512.rs".into(),
+            content: SHA512_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/engine/src/ed25519.rs".into(),
+            content: ED25519_RS.into(),
             exec: false,
         },
         Step::MkDir {

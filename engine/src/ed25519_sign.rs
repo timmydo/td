@@ -1,16 +1,13 @@
 // ed25519 SIGNING, deliberately in its own file.
 //
-// `ed25519.rs` is verify-only and stays that way: the verifying boot shim will
-// `#[path]`-include THAT file (DESIGN.md §10 item 5), so anything added to it
-// lands in the boot binary. Today td-boot includes no ed25519 at all — the rule
-// is about what the split is FOR rather than about a dependency that already
-// exists, and it is worth writing down before the include lands rather than
-// after, since afterwards the cost of having got it wrong is a boot binary
-// carrying a signer. This module is not on that path — the boot path's job is
-// to refuse what does not verify, and a signer there would be a crypto surface
-// serving no boot-time purpose. It exists for ONE caller: the recipe-check
-// oracle, which must sign a manifest whose digests change with every build and
-// so cannot use a committed fixture signature.
+// `ed25519.rs` is verify-only and stays that way: td-boot `#[path]`-includes
+// THAT file, so anything added to it lands in the boot binary. That was written
+// here in the future tense one commit before it became true, and it is now
+// simply true (DESIGN.md §10 item 5). This module is not on that path — the
+// boot path's job is to refuse what does not verify, and a signer there would
+// be a crypto surface serving no boot-time purpose. It exists for ONE caller:
+// the recipe-check oracle, which must sign a manifest whose digests change with
+// every build and so cannot use a committed fixture signature.
 //
 // Neither half of that is enforced by the compiler, so both are asserted
 // against the tree in `builder/src/affected.rs`: td-boot may name no path to

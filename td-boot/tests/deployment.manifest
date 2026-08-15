@@ -1,0 +1,4 @@
+td-deployment-v1
+f8a3c3e24646d3bfd204fb0f086ec8faad8910e9e4dfd72fd4301197c04198f5  bzImage
+9b0a5e62dff229dfdd5a93f91de12eed25c0b376335c65e39a4146229efa6685  initramfs.cpio
+9f13ab247e0f513f590e09e1aca6652dbab4e72dddf1351a5107ae13374f8bd6  root.erofs

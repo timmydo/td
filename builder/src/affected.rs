@@ -319,6 +319,65 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     ),
 ];
 
+/// ASCII double quote, as a BYTE and not as a char literal. `mod tests`'s
+/// `unlexable` refuses a quote char literal anywhere in the shipped half of a
+/// file that carries a git query — this one does — because it desynchronises
+/// the sibling stripper's string state. Two shipped sites here want a quote,
+/// so they share one name rather than each explaining itself.
+const DQUOTE: u8 = 0x22;
+
+/// `text` with `//` line comments removed, so a source scan sees CODE.
+///
+/// The confinement scans below look for tokens that must not appear, and the
+/// files they scan are the files most likely to DISCUSS those tokens: td-boot's
+/// header explains at length why it does not include the signer, and naming it
+/// there is worth more than the scan's convenience. Without this, that comment
+/// alone red the gate — which is how this came to exist.
+///
+/// A `//` inside a STRING LITERAL is not a comment, and cutting there would
+/// discard the rest of a real line — `let u = "http://x"; mod ed25519_sign;`
+/// would strip the declaration and hide it from the scan. So a cut only happens
+/// where the quotes before it are balanced. That is a heuristic and not a lexer
+/// (it knows nothing of escapes or raw strings), which is sound in the
+/// conservative direction: an unbalanced count means NO cut, so the scan sees
+/// MORE text rather than less, and the failure mode is a false positive that
+/// someone must look at rather than a token that slipped past.
+///
+/// Line comments only. A `/* */` between two tokens would defeat it, which is
+/// why the scanned set is small and hand-written rather than a glob.
+///
+/// `mod tests` carries a SECOND stripper, `strip_comments`, and the two are
+/// deliberately not one. That one also cuts block comments and so must carry
+/// depth ACROSS lines, which desynchronises on a hashed raw string — its own
+/// `unlexable` exists to refuse a file holding one. The files THIS scan reads
+/// are full of them, and a desync here fails the other way: text mis-stripped
+/// is a token that slipped past.
+fn strip_line_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let mut quotes = 0usize;
+        let mut cut = None;
+        let bytes = line.as_bytes();
+        for (i, byte) in bytes.iter().enumerate() {
+            if *byte == DQUOTE {
+                quotes = quotes.saturating_add(1);
+            } else if quotes % 2 == 0
+                && *byte == b'/'
+                && bytes.get(i.saturating_add(1)) == Some(&b'/')
+            {
+                cut = Some(i);
+                break;
+            }
+        }
+        match cut {
+            Some(at) => out.push_str(line.get(..at).unwrap_or_default()),
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// Does `text` declare a function named exactly `name`?
 ///
 /// A plain `contains("fn sign")` is what a first draft used, and it matched the
@@ -1544,7 +1603,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     }
     // The ed25519 SPLIT, asserted against the tree because the compiler cannot
     // see it and the note above is only a note. `ed25519.rs` is the file the
-    // verifying boot shim will `#[path]`-include, so a signer reaching it puts
+    // verifying boot shim `#[path]`-includes, so a signer reaching it puts
     // one in the boot binary; the whole reason `ed25519_sign.rs` is a separate
     // file is that neither half of that is otherwise enforced. Two ways in, so
     // both are shut: td-boot naming a path to the signer, and the signer's own
@@ -1556,12 +1615,21 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // a key from a secret whatever its functions are named. The two function
     // needles check an identifier BOUNDARY — the first draft's plain substring
     // matched the test helper `fn signature_of` and red against a clean tree.
+    // RECURSIVE, because a non-recursive read would never look inside
+    // `td-boot/src/<dir>/mod.rs` — a module tree this crate does not have today
+    // and which nothing stops it growing.
     let boot_sources = root.join("td-boot/src");
     let mut boot_files = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&boot_sources) {
+    let mut pending = vec![boot_sources.clone()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|e| e == "rs") {
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
                 boot_files.push(path);
             }
         }
@@ -1574,16 +1642,56 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
             fail(format!("cannot read {}", path.display()));
             continue;
         };
-        if text.contains("ed25519_sign") {
+        if strip_line_comments(&text).contains("ed25519_sign") {
             fail(format!(
-                "{} names ed25519_sign: the signer must not reach the boot binary \
+                "{} names ed25519_sign in CODE: the signer must not reach the boot binary \
                  (engine/src/ed25519_sign.rs, td-install/DESIGN.md §6)",
                 path.display()
             ));
         }
     }
+    // Every engine source td-boot `#[path]`-includes must ALSO be staged by its
+    // recipe, which builds from a hand-written file list rather than from cargo.
+    // Those two lists are edited in different files and nothing related them: an
+    // include added without its `WriteFile` compiles here and fails only inside
+    // recipe-checks, an hour away. That is precisely the loop the landing which
+    // added this was splitting itself in two to avoid, so the correspondence is
+    // asserted rather than remembered.
+    match std::fs::read_to_string(root.join("recipes/src/recipes/td-boot.rs")) {
+        Ok(recipe) => {
+            for path in &boot_files {
+                let Ok(text) = std::fs::read_to_string(path) else {
+                    continue;
+                };
+                for line in strip_line_comments(&text).lines() {
+                    let Some(rest) = line.split_once("#[path = \"").map(|(_, r)| r) else {
+                        continue;
+                    };
+                    let Some((included, _)) = rest.split_once(DQUOTE as char) else {
+                        continue;
+                    };
+                    let Some(file) = included.rsplit('/').next() else {
+                        continue;
+                    };
+                    if !included.contains("engine/src/") {
+                        continue;
+                    }
+                    if !recipe.contains(file) {
+                        fail(format!(
+                            "{} #[path]-includes engine/src/{file}, which \
+                             recipes/src/recipes/td-boot.rs does not stage — the \
+                             target build would fail in recipe-checks, not here",
+                            path.display()
+                        ));
+                    }
+                }
+            }
+        }
+        Err(e) => fail(format!("cannot read recipes/src/recipes/td-boot.rs: {e}")),
+    }
     match std::fs::read_to_string(root.join("engine/src/ed25519.rs")) {
         Ok(verifier) => {
+            let verifier = strip_line_comments(&verifier);
             for name in ["sign", "public_key"] {
                 if declares_fn(&verifier, name) {
                     fail(format!(
@@ -2577,6 +2685,45 @@ mod tests {
                 out.push(p);
             }
         }
+    }
+
+    /// The ed25519 confinement scan reads CODE, so the comment strip it reads
+    /// through has to keep code and drop prose — and its dangerous failure is
+    /// the silent one, a strip that removes too much and blinds the scan
+    /// without failing anything.
+    #[test]
+    fn the_comment_strip_keeps_code_and_drops_prose() {
+        // The shape that made this necessary: td-boot's header names the
+        // signer in order to say it is absent.
+        assert!(!strip_line_comments("// ed25519_sign.rs is deliberately absent")
+            .contains("ed25519_sign"));
+        assert!(!strip_line_comments("    //! reaches ed25519_sign").contains("ed25519_sign"));
+        // Code survives, including code with a comment after it — the case a
+        // naive "drop any line containing //" would lose.
+        assert!(strip_line_comments("mod ed25519_sign; // the signer")
+            .contains("mod ed25519_sign;"));
+        assert!(strip_line_comments("let x = 1;\nlet y = 2;").contains("let y = 2;"));
+        // And the strip must not join lines: two declarations on separate lines
+        // stay on separate lines, or a needle could straddle the seam.
+        assert_eq!(strip_line_comments("a // x\nb").lines().count(), 2);
+        // A `//` inside a string literal is not a comment. Cutting there would
+        // discard the rest of a real line and HIDE what follows from the scan,
+        // which is the one direction this must not fail in.
+        assert!(
+            strip_line_comments(r#"let u = "http://x"; mod ed25519_sign;"#)
+                .contains("mod ed25519_sign;"),
+            "a URL must not swallow the declaration after it"
+        );
+        // Balanced quotes then a real comment still cuts.
+        assert!(!strip_line_comments(r#"let u = "x"; // ed25519_sign"#).contains("ed25519_sign"));
+        // The evasion a reviewer proposed against the first draft: a DOUBLED
+        // SLASH inside a path string. `src//ed25519_sign.rs` is the same file to
+        // Linux, so a stripper that cut there would let the include through.
+        assert!(
+            strip_line_comments(r#"#[path = "../../engine/src//ed25519_sign.rs"] mod signing;"#)
+                .contains("ed25519_sign"),
+            "a doubled slash inside a path string must not hide the include"
+        );
     }
 
     #[test]

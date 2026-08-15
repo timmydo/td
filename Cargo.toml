@@ -16,7 +16,8 @@
 #   td-netd/        — a target-side network bring-up daemon, likewise outside the
 #                     engine trust boundary (its own confined single-ioctl unsafe).
 #   td-boot/        — the target-side verified deployment selector and boot
-#                     shim; pure std and sharing the engine SHA-256 source.
+#                     shim; pure std, sharing the engine SHA-256, SHA-512
+#                     and ed25519 sources.
 #   td-txt/         — the target-built static TEXT multicall (grep, sed): the
 #                     two applets uutils does not provide and busybox still
 #                     owns on the image, plus the host-side conformance harness

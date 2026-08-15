@@ -1,0 +1,26 @@
+Authenticity fixtures for td-boot's ed25519 verifier.
+
+td-boot has the verifier and deliberately not the signer, so it cannot produce
+a signature in its own tests. The positive case is therefore this committed
+triple, generated once by `td-deploy`:
+
+    deployment.manifest      a canonical td-deployment-v1 manifest
+    deployment.manifest.sig  its detached signature, hex + newline
+    deployment.pub           the public half of the key that signed it
+    deployment-other.pub     an unrelated public half, for the wrong-key case
+
+NO PRIVATE KEY IS COMMITTED, and the private halves that made these no longer
+exist. That is the point rather than an oversight: `td-install/DESIGN.md` §6
+records why build-pinning a key and "no committed private key" cannot both
+hold, and `tests/td-subst.pub` already establishes the practice of committing
+a public half alone.
+
+The consequence is that these files cannot be regenerated to sign a DIFFERENT
+manifest — a new manifest needs a new keypair and a new signature, from
+`td-deploy keygen` then `td-deploy sign`, with the private half discarded
+afterwards. Nothing here has to match the payload bytes any test writes: the
+manifest is verified as bytes, and the digests it names are never resolved.
+
+Every NEGATIVE case (wrong key, tampered manifest, malformed or truncated
+signature, absent key) needs no signer, which is why those are exhaustive and
+this is not.
