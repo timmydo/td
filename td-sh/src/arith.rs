@@ -45,14 +45,55 @@ enum Tk {
 /// Multi-character operators, longest first so `<<=` beats `<<` beats `<`.
 const OPS: &[&str] = &[
     "<<=", ">>=", "&&", "||", "<<", ">>", "<=", ">=", "==", "!=", "+=", "-=", "*=", "/=", "%=",
-    "&=", "^=", "|=", "+", "-", "*", "/", "%", "<", ">", "!", "~", "&", "^", "|", "?", ":", "(",
-    ")", "=", ",",
+    "&=", "^=", "|=", "+", "-", "*", "/", "%", "<", ">", "!", "~", "&", "^", "|", "?",
+    ":", "(", ")", "=", ",",
 ];
+
+const PREC_UNARY: u8 = 14;
+
+/// The one right-associative level, and where a COMPLETED conditional waits.
+const PREC_ASSIGN: u8 = 2;
+
+/// Marks a region nothing inside may displace out of: a `(`, and a `?`, whose
+/// middle expression busybox brackets with an implicit parenthesis.
+const BARRIER: u8 = 0;
+
+/// Binding power, mirroring this file's descent so the lexer can tell which
+/// pending operators an incoming one displaces. Assignment is the one
+/// right-associative level, which is what keeps `a = b = c` unreduced.
+fn prec(op: &str) -> u8 {
+    match op {
+        "," => 1,
+        "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "<<=" | ">>=" | "&=" | "^=" | "|=" => PREC_ASSIGN,
+        "?" | ":" => 3,
+        "||" => 4,
+        "&&" => 5,
+        "|" => 6,
+        "^" => 7,
+        "&" => 8,
+        "==" | "!=" => 9,
+        "<" | "<=" | ">" | ">=" => 10,
+        "<<" | ">>" => 11,
+        "+" | "-" => 12,
+        "*" | "/" | "%" => 13,
+        _ => PREC_UNARY,
+    }
+}
 
 fn lex(text: &str) -> Result<Vec<Tk>, String> {
     let chars: Vec<char> = text.chars().collect();
     let mut toks = Vec::new();
     let mut i = 0usize;
+    // Whether the numstack TOP is a variable, which is what busybox asks before
+    // splitting a pair (math.c:791) -- not "the last token was a name":
+    // `var_name` survives a PENDING operator and dies when one is APPLIED
+    // (math.c:498). Knowing which pending ones an operator applies is the whole
+    // reason `prec` is mirrored here.
+    let mut operand_is_name = false;
+    // Whether the last token COMPLETED an operand, which is what makes the next
+    // `+`/`-` binary. A postfix pair completes one; a prefix pair does not.
+    let mut ends_operand = false;
+    let mut pending: Vec<u8> = Vec::new();
     while let Some(&c) = chars.get(i) {
         if c.is_whitespace() {
             i += 1;
@@ -61,6 +102,8 @@ fn lex(text: &str) -> Result<Vec<Tk>, String> {
         if c.is_ascii_digit() {
             let (value, next) = lex_number(&chars, i)?;
             toks.push(Tk::Num(value));
+            operand_is_name = false;
+            ends_operand = true;
             i = next;
             continue;
         }
@@ -74,6 +117,37 @@ fn lex(text: &str) -> Result<Vec<Tk>, String> {
                 i += 1;
             }
             toks.push(Tk::Name(name));
+            operand_is_name = true;
+            ends_operand = true;
+            continue;
+        }
+        // An adjacent `++`/`--` is ONE token only where it binds -- backward to a
+        // name already lexed, or forward to one after it. Otherwise a single
+        // character is emitted and the scan resumes at the SECOND, which may
+        // itself begin a binding pair (math.c:780-801). It has to happen here:
+        // by parse time the pair is one token and the re-scan is gone.
+        if (c == '+' || c == '-') && chars.get(i + 1) == Some(&c) {
+            let mut k = i + 2;
+            while chars.get(k).is_some_and(|n| n.is_whitespace()) {
+                k += 1;
+            }
+            let fwd = chars
+                .get(k)
+                .is_some_and(|n| n.is_ascii_alphabetic() || *n == '_');
+            if !operand_is_name && !fwd {
+                toks.push(Tk::Op(if c == '+' { "+" } else { "-" }));
+                ends_operand = false;
+                i += 1;
+                continue;
+            }
+            // It binds, so it is an operator over a name and is displaced like a
+            // unary sign -- PENDING, not applied, so the name stays reachable
+            // until something displaces it. Binding BACKWARD also completes an
+            // operand, which is what makes the next `+`/`-` binary.
+            toks.push(Tk::Op(if c == '+' { "++" } else { "--" }));
+            ends_operand = operand_is_name;
+            pending.push(PREC_UNARY);
+            i += 2;
             continue;
         }
         // Longest-match over OPS by comparing each candidate directly against the
@@ -93,6 +167,53 @@ fn lex(text: &str) -> Result<Vec<Tk>, String> {
         let Some(op) = matched else {
             return Err(format!("unexpected character {c:?}"));
         };
+        match op {
+            "(" => {
+                pending.push(BARRIER);
+                ends_operand = false;
+            }
+            // `:` closes the conditional's implicit parenthesis, which busybox
+            // synthesizes as a real RPAREN (math.c:840-842). Two things then
+            // differ from `)`: the conditional itself stays PENDING, so only a
+            // `,` is low enough to reduce it, and it still WANTS an operand,
+            // which is what keeps a sign after it unary.
+            ")" | ":" => {
+                while pending.last().is_some_and(|p| *p != BARRIER) {
+                    pending.pop();
+                }
+                pending.pop();
+                operand_is_name = false;
+                if op == ":" {
+                    pending.push(PREC_ASSIGN);
+                }
+                ends_operand = op == ")";
+            }
+            _ => {
+                // A unary sign takes no operand from the stack, so it displaces
+                // nothing; `-a` still leaves `a` reachable until `+` arrives.
+                let unary = matches!(op, "+" | "-" | "!" | "~") && !ends_operand;
+                let p = prec(op);
+                let right = p == PREC_ASSIGN;
+                if !unary {
+                    while pending
+                        .last()
+                        .is_some_and(|q| *q != BARRIER && (*q > p || (*q == p && !right)))
+                    {
+                        pending.pop();
+                        operand_is_name = false;
+                    }
+                }
+                if op == "?" {
+                    pending.push(BARRIER);
+                } else if !(unary && op == "+") {
+                    // busybox DISCARDS a unary plus rather than stacking it, so
+                    // nothing later can apply it: `+a+--1` still holds `a` and is
+                    // refused, where `-a+--1`, whose sign IS applied, splits.
+                    pending.push(if unary { PREC_UNARY } else { p });
+                }
+                ends_operand = false;
+            }
+        }
         toks.push(Tk::Op(op));
         i += op.chars().count();
     }
@@ -230,15 +351,19 @@ impl Arith {
             );
             if compound {
                 self.pos += 2;
-                self.enter()?;
-                let rhs = self.expr_assign(sh);
-                self.leave();
-                let rhs = rhs?;
+                // The lvalue is read BEFORE the right-hand side, as ash does:
+                // an rhs that assigns or steps the same name must not be the
+                // value this operator accumulates onto. `=` never reads it, so
+                // an unset or non-numeric name stays assignable.
                 let cur = if op == "=" {
                     0
                 } else {
                     self.name_value(sh, &name)?
                 };
+                self.enter()?;
+                let rhs = self.expr_assign(sh);
+                self.leave();
+                let rhs = rhs?;
                 let live = self.live;
                 let value = match op {
                     "=" => rhs,
@@ -436,15 +561,22 @@ impl Arith {
             Some("-") => {
                 self.pos += 1;
                 let v = self.expr_unary(sh)?;
-                match v.checked_neg() {
-                    Some(n) => Ok(n),
-                    None if !self.live => Ok(0),
-                    None => Err("integer overflow".into()),
-                }
+                self.negate(v)
             }
             Some("+") => {
                 self.pos += 1;
                 self.expr_unary(sh)
+            }
+            // The lexer only emits this token where it BINDS, and a backward
+            // binding is consumed as a postfix by `expr_primary`, so reaching
+            // here means a name follows. The arm is still fallible rather than
+            // asserting: nothing in the type system says so.
+            Some(o @ ("++" | "--")) => {
+                let Some(Tk::Name(name)) = self.toks.get(self.pos + 1).cloned() else {
+                    return Err(format!("expected a name after `{o}`"));
+                };
+                self.pos += 2;
+                Ok(self.step(sh, &name, o == "++")?.1)
             }
             Some("!") => {
                 self.pos += 1;
@@ -466,7 +598,18 @@ impl Arith {
             }
             Some(Tk::Name(name)) => {
                 self.pos += 1;
-                self.name_value(sh, &name)
+                // A postfix `++`/`--` applies ONLY directly after a name: after a
+                // number or a `)` the same token is a binary operator followed by
+                // a unary one, which is why `$((1--1))` is 2 and `$(((n)--1))` is
+                // n+1 while `$((n--1))` is a syntax error.
+                match self.peek_op() {
+                    Some(o @ ("++" | "--")) => {
+                        let up = o == "++";
+                        self.pos += 1;
+                        Ok(self.step(sh, &name, up)?.0)
+                    }
+                    _ => self.name_value(sh, &name),
+                }
             }
             Some(Tk::Op("(")) => {
                 self.pos += 1;
@@ -479,6 +622,27 @@ impl Arith {
             Some(Tk::Op(o)) => Err(format!("unexpected operator `{o}`")),
             None => Err("unexpected end of expression".into()),
         }
+    }
+
+    fn negate(&self, v: i64) -> A<i64> {
+        match v.checked_neg() {
+            Some(n) => Ok(n),
+            None if !self.live => Ok(0),
+            None => Err("integer overflow".into()),
+        }
+    }
+
+    /// One `++`/`--` step, returning the value before and after it. Wrapping,
+    /// not checked as the rest of this file is: ash steps past i64's bounds
+    /// silently.
+    fn step(&mut self, sh: &mut Shell, name: &str, up: bool) -> A<(i64, i64)> {
+        let cur = self.name_value(sh, name)?;
+        let new = if up { cur.wrapping_add(1) } else { cur.wrapping_sub(1) };
+        if self.live {
+            sh.set_var(name, &new.to_string())
+                .map_err(|_| format!("{name}: is read only"))?;
+        }
+        Ok((cur, new))
     }
 
     /// A variable's value as a number. An unset or empty variable is 0; anything
@@ -655,6 +819,308 @@ mod tests {
         assert_eq!(sh.get_var("i").as_deref(), Some("8"));
         // An unset name is zero.
         assert_eq!(eval(&mut sh, "nope + 1").map_err(|_| "eval")?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn increment_binds_to_a_name_and_to_nothing_else() -> Result<(), String> {
+        let ev = |src: &str, start: &str| -> Result<(i64, String), String> {
+            let mut sh = Shell::new_for_test();
+            sh.set_var("n", start).map_err(|_| "set failed".to_string())?;
+            let v = eval(&mut sh, src).map_err(|_| format!("eval {src}"))?;
+            Ok((v, sh.get_var("n").unwrap_or_default()))
+        };
+        // The four forms: the value differs before/after, the store does not.
+        assert_eq!(ev("n++", "1")?, (1, "2".into()));
+        assert_eq!(ev("++n", "1")?, (2, "2".into()));
+        assert_eq!(ev("n--", "5")?, (5, "4".into()));
+        assert_eq!(ev("--n", "5")?, (4, "4".into()));
+        // With no NAME to bind to they are simply two unary operators, which is
+        // the half that made `++n` answer `n` before any of this existed.
+        assert_eq!(ev("++5", "1")?, (5, "1".into()));
+        assert_eq!(ev("++(n)", "1")?, (1, "1".into()));
+        assert_eq!(ev("1++1", "1")?, (2, "1".into()));
+        assert_eq!(ev("1--1", "1")?, (2, "1".into()));
+        assert_eq!(ev("(n)--1", "5")?, (6, "5".into()));
+        // After a name the token IS taken, so what follows has no operator.
+        assert!(eval(&mut Shell::new_for_test(), "n--1").is_err());
+        // A pair that binds neither way contributes ONE character and the scan
+        // resumes at the second, which may itself begin a binding pair. So a run
+        // of three is an operator followed by a prefix step, not the other way
+        // round -- busybox spells this out at math.c:780-786.
+        assert_eq!(ev("7+++n", "1")?, (9, "2".into()));
+        assert_eq!(ev("+++n", "1")?, (2, "2".into()));
+        assert_eq!(ev("---n", "1")?, (0, "0".into()));
+        assert_eq!(ev("1+++n", "1")?, (3, "2".into()));
+        assert_eq!(ev("1---n", "1")?, (1, "0".into()));
+        assert_eq!(ev("-----n", "1")?, (0, "0".into()));
+        assert_eq!(ev("+++++n", "1")?, (2, "2".into()));
+        assert_eq!(ev("++++n", "1")?, (2, "2".into()));
+        // With no name anywhere the run is just unary operators.
+        assert_eq!(ev("--7", "1")?, (7, "1".into()));
+        // Binding BACKWARD wins over splitting, and it is the last OPERAND that
+        // decides rather than the last token: after `n +` the operand is still
+        // `n`, so this binds and leaves `1` with no operator before it.
+        assert!(eval(&mut Shell::new_for_test(), "n+--1").is_err());
+        // And binding FORWARD to a name beats reading the token as a binary
+        // operator, which leaves the binary position empty. `1 ++ b` is a
+        // syntax error rather than `1 + (+b)`, and b is not stepped.
+        // The gap before the name is skipped WHOLE, so two spaces bind as one.
+        for src in ["1 ++ b", "1 ++  b", "1++b", "1 -- b", "1--b", "0--n", "(n)--m", "n----n"] {
+            let mut sh = Shell::new_for_test();
+            sh.set_var("b", "3").map_err(|_| "set failed".to_string())?;
+            sh.set_var("m", "2").map_err(|_| "set failed".to_string())?;
+            sh.set_var("n", "5").map_err(|_| "set failed".to_string())?;
+            assert!(eval(&mut sh, src).is_err(), "{src}");
+            assert_eq!(sh.get_var("b").as_deref(), Some("3"), "{src}");
+        }
+        // A `(` is not a name, so there the token still decomposes.
+        assert_eq!(ev("1--(n)", "5")?, (6, "5".into()));
+        assert_eq!(ev("1++(n)", "5")?, (6, "5".into()));
+        // But an OPEN paren does not clear the name under it -- only a closed
+        // `(EXPR)` does (math.c:913) -- so this binds backward across the paren
+        // and leaves a prefix pair with a number after it.
+        for src in ["n*(--1)", "n*(++1)"] {
+            let mut sh = Shell::new_for_test();
+            sh.set_var("n", "1").map_err(|_| "set failed".to_string())?;
+            assert!(eval(&mut sh, src).is_err(), "{src}");
+        }
+        // A NUMBER does clear it, so a pair after one splits.
+        assert_eq!(ev("n*2--1", "1")?, (3, "1".into()));
+        assert_eq!(ev("n-2--1", "1")?, (0, "1".into()));
+        // A name may begin with `_`, which the forward test has to accept or
+        // the pair splits and the step is silently lost.
+        let mut sh = Shell::new_for_test();
+        sh.set_var("_x", "5").map_err(|_| "set failed".to_string())?;
+        assert_eq!(eval(&mut sh, "1+++_x").map_err(|_| "eval")?, 7);
+        assert_eq!(sh.get_var("_x").as_deref(), Some("6"));
+        // Precedence: the step happens before the surrounding unary applies.
+        assert_eq!(ev("-n++", "1")?, (-1, "2".into()));
+        assert_eq!(ev("!n++", "1")?, (0, "2".into()));
+        assert_eq!(ev("n++ + n++", "1")?, (3, "3".into()));
+        assert_eq!(ev("++n + n++", "1")?, (4, "3".into()));
+        assert_eq!(ev("n+++1", "1")?, (2, "2".into()));
+        assert_eq!(ev("++ ++n", "1")?, (2, "2".into()));
+        // ash WRAPS here where every other operator in this file is checked.
+        assert_eq!(ev("n++", "9223372036854775807")?, (i64::MAX, i64::MIN.to_string()));
+        assert_eq!(ev("n--", "-9223372036854775808")?, (i64::MIN, i64::MAX.to_string()));
+        // An unset name steps from zero rather than refusing.
+        let mut sh = Shell::new_for_test();
+        assert_eq!(eval(&mut sh, "x++").map_err(|_| "eval")?, 0);
+        assert_eq!(sh.get_var("x").as_deref(), Some("1"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_split_pair_keeps_ordinary_unary_precedence() -> Result<(), String> {
+        // Splitting in the LEXER is what buys this: `1--(n)/2` becomes the same
+        // tokens as `1 - -(n)/2`, so the minus binds tighter than `/` for free.
+        // Deciding it in the parser instead gave `1 - (-(n/2))`, which agrees on
+        // every value but the bound -- only i64::MIN tells the two apart.
+        let mut sh = Shell::new_for_test();
+        sh.set_var("n", &i64::MIN.to_string()).map_err(|_| "set failed".to_string())?;
+        assert!(eval(&mut sh, "1--(n)/2").is_err());
+        assert!(eval(&mut sh, "1 - -(n)/2").is_err());
+        // Away from the bound the two spellings agree, which is what makes the
+        // pair above a statement about parsing rather than about overflow.
+        sh.set_var("n", "8").map_err(|_| "set failed".to_string())?;
+        assert_eq!(eval(&mut sh, "1--(n)/2").map_err(|_| "eval")?, 5);
+        assert_eq!(eval(&mut sh, "1 - -(n)/2").map_err(|_| "eval")?, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn an_applied_operator_clears_the_name_a_pair_could_bind_to() -> Result<(), String> {
+        // busybox asks whether its numstack TOP is a name, and applying an
+        // operator replaces that top with a value. A merely PENDING operator
+        // does not, so the two sides of this differ by whether a reduction has
+        // happened yet -- which is why the lexer has to mirror precedence.
+        let ev = |src: &str| -> Result<Option<i64>, String> {
+            let mut sh = Shell::new_for_test();
+            for (k, v) in [("a", "2"), ("b", "3"), ("n", "1")] {
+                sh.set_var(k, v).map_err(|_| "set failed".to_string())?;
+            }
+            Ok(eval(&mut sh, src).ok())
+        };
+        // Reduced, so the pair splits into two unary signs.
+        assert_eq!(ev("a+b+--1")?, Some(6), "a+b+--1");
+        assert_eq!(ev("a*b+--1")?, Some(7), "a*b+--1");
+        assert_eq!(ev("-a+--1")?, Some(-1), "-a+--1");
+        assert_eq!(ev("1?a:--1")?, Some(2), "1?a:--1");
+        assert_eq!(ev("a+b+c+--1")?, Some(6), "a+b+c+--1");
+        // NOT reduced -- one operand, or a higher-precedence operator still
+        // pending -- so the name is still on top and the pair binds to it.
+        for src in ["n+--1", "a+b*--1", "a,--1"] {
+            assert_eq!(ev(src)?, None, "{src}");
+        }
+        Ok(())
+    }
+
+    fn arith_fixture(src: &str) -> Result<Option<i64>, String> {
+        let mut sh = Shell::new_for_test();
+        for (k, v) in [("a", "2"), ("b", "3"), ("m", "4"), ("n", "1")] {
+            sh.set_var(k, v).map_err(|_| "set failed".to_string())?;
+        }
+        Ok(eval(&mut sh, src).ok())
+    }
+
+    #[test]
+    fn a_conditional_brackets_its_middle_expression() -> Result<(), String> {
+        // busybox brackets the middle with an implicit parenthesis and
+        // synthesizes the closing one at `:` (math.c:840-842). So nothing in the
+        // middle reduces what is pending outside it -- `b` is still the
+        // assignment's lvalue when `--` arrives, and the pair binds to it --
+        // while `:` reduces the middle exactly as `)` does.
+        for src in ["a?b=--1:0", "a?b+--1:0", "a?b?--1:0:0"] {
+            assert_eq!(arith_fixture(src)?, None, "{src}");
+        }
+        // Past the `:` the middle has reduced, so the same pair splits. The
+        // third arm still WANTS an operand, which is what keeps a sign after
+        // `:` unary where one after `)` would be binary.
+        assert_eq!(arith_fixture("1?a:--1")?, Some(2), "1?a:--1");
+        assert_eq!(arith_fixture("1?a:++1")?, Some(2), "1?a:++1");
+        assert_eq!(arith_fixture("0?a:--1")?, Some(1), "0?a:--1");
+        // A COMPLETED conditional is still pending, at the right-associative
+        // assignment level -- so a `,` reduces it and the pair after that
+        // splits, while an assignment or a tighter operator does not and the
+        // third arm's name is still on top. Only `,` is low enough.
+        assert_eq!(arith_fixture("1?a:b,--1")?, Some(1), "1?a:b,--1");
+        assert_eq!(arith_fixture("0?a:b,--1")?, Some(1), "0?a:b,--1");
+        for src in ["0?a:b=--1", "0?a:b||--1", "0?a:b?--1:0"] {
+            assert_eq!(arith_fixture(src)?, None, "{src}");
+        }
+        // Binding forward reaches past the lvalue and steps.
+        let mut sh = Shell::new_for_test();
+        for (k, v) in [("b", "3"), ("n", "1")] {
+            sh.set_var(k, v).map_err(|_| "set failed".to_string())?;
+        }
+        assert_eq!(eval(&mut sh, "1?b=--n:0").map_err(|_| "eval")?, 0);
+        assert_eq!(sh.get_var("n").as_deref(), Some("0"));
+        assert_eq!(sh.get_var("b").as_deref(), Some("0"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_unary_plus_is_discarded_rather_than_stacked() -> Result<(), String> {
+        // busybox drops a unary plus instead of stacking it, so there is nothing
+        // for a later operator to apply and the name stays on top: `+a+--1` is
+        // refused where `-a+--1`, whose sign really is applied, answers. Only
+        // `+` is dropped -- the other three unary operators all reduce.
+        for src in ["+a+--1", "+a*--1"] {
+            assert_eq!(arith_fixture(src)?, None, "{src}");
+        }
+        for (src, want) in [("-a+--1", -1), ("!a+--1", 1), ("~a+--1", -2)] {
+            assert_eq!(arith_fixture(src)?, Some(want), "{src}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_precedence_mirror_is_pinned_level_by_level() -> Result<(), String> {
+        // The mirror decides which pending operators an incoming one applies,
+        // and applying any of them clears the name a pair could bind to. So each
+        // LEVEL is observable: a row splits where the operator to its left has
+        // been reduced and binds backward where it has not. Without these the
+        // table is unpinned -- every one of these rows was reachable by a
+        // one-token edit that the rest of the suite passed.
+        assert_eq!(arith_fixture("a,b,--1")?, Some(1), "`,` below assignment");
+        assert_eq!(arith_fixture("a&&b||--1")?, Some(1), "`||` below `&&`");
+        // A unary must sit above the TIGHTEST binary level, not merely above
+        // `+`: only an operator that binds tighter than `+` can tell 14 from 12,
+        // and nothing distinguishes 14 from 13, since no binary level is 14.
+        assert_eq!(arith_fixture("-a*--1")?, Some(-2), "unary above `*`");
+        // A pending operator BELOW `?` is reduced by it, and a postfix pair
+        // completes an operand where a prefix one does not -- both observable
+        // only through what the pair after them does.
+        assert_eq!(arith_fixture("a<b?--1:0")?, Some(1), "`?` reduces `<`");
+        assert_eq!(arith_fixture("a+++--1")?, Some(3), "a postfix ends an operand");
+        assert_eq!(arith_fixture("a---++1")?, Some(1), "and so does a postfix `--`");
+        for (src, why) in [
+            ("a+b*+--1", "an operator does not end one"),
+            ("a=b=--1", "assignment is right-associative"),
+            ("a,b=--1", "assignment above `,`"),
+            ("a=b?--1:0", "`?` above assignment"),
+            ("a?b||--1:0", "`?` opens a region `||` cannot leave"),
+            ("a|b^--1", "`^` above `|`"),
+            ("a==b<--1", "relational above equality"),
+            ("a<<b+--1", "additive above shift"),
+            ("a*b++--1", "a bound pair displaces nothing"),
+        ] {
+            assert_eq!(arith_fixture(src)?, None, "{src}: {why}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_compound_assignment_reads_its_lvalue_first() -> Result<(), String> {
+        // ash captures the lvalue BEFORE evaluating the right-hand side, so an
+        // rhs that steps or assigns the same name is not what the operator
+        // accumulates onto. Reading it afterwards made `b+=b++` answer 7 where
+        // ash answers 6 -- a wrong VALUE rather than a refusal, and one this
+        // shell could not even express until `++` existed. The last row is the
+        // same defect without an increment, which is why it is a fix here and
+        // not a consequence of the rest of this commit.
+        for (src, want, after) in [
+            ("b+=b++", 6, "6"),
+            ("b|=b++", 3, "3"),
+            ("b-=b--", 0, "0"),
+            ("b=b++", 3, "3"),
+            ("b+=(b=1)", 4, "4"),
+        ] {
+            let mut sh = Shell::new_for_test();
+            sh.set_var("b", "3").map_err(|_| "set failed".to_string())?;
+            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, want, "{src}");
+            assert_eq!(sh.get_var("b").as_deref(), Some(after), "{src}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_dead_conditional_arm_is_parsed_like_a_live_one() -> Result<(), String> {
+        // A DELIBERATE divergence, and one rule seen from both sides: a name
+        // pushed while evaluation is disabled carries no `var_name` in busybox
+        // (math.c:748), so inside an untaken arm its pairs can only bind
+        // forward. That makes ash accept the first two rows and refuse the
+        // third; this shell parses both arms alike and does the opposite of ash
+        // on each. Copying it would mean copying the refusal too, since they are
+        // the same rule -- and the value of an untaken arm is discarded, so all
+        // that is at stake is whether it parses.
+        for src in ["1?0:m--1", "0?m--1:0", "1?0:b+--1", "0?b=--1:0", "1?0:m--(n)"] {
+            assert_eq!(arith_fixture(src)?, None, "{src}");
+        }
+        for src in ["1?0:m++", "0?m--:0"] {
+            assert_eq!(arith_fixture(src)?, Some(0), "{src}");
+        }
+        // The same shapes in a LIVE arm, where the two shells agree on every one
+        // measured -- which is what makes the rows above about deadness alone.
+        for src in ["0?0:m--1", "1?m--1:0", "0?0:b+--1", "1?b=--1:0"] {
+            assert_eq!(arith_fixture(src)?, None, "{src}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_dead_branch_does_not_step() -> Result<(), String> {
+        // The untaken `?:` arm must not store: `live` is what stops it, and the
+        // read is a side effect of its own for a dynamic name. The start value
+        // is 5 rather than 1 because a dead READ answers 0, so a dead step would
+        // store 1 -- which from 1 is indistinguishable from not storing at all.
+        for (src, want, after) in [("n ? 0 : n++", 0, "5"), ("0 ? ++n : 7", 7, "5")] {
+            let mut sh = Shell::new_for_test();
+            sh.set_var("n", "5").map_err(|_| "set failed".to_string())?;
+            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, want);
+            assert_eq!(sh.get_var("n").as_deref(), Some(after), "{src}");
+        }
+        // `&&`/`||` short-circuit through `live` ALONE -- `ternary_dead` stays
+        // false there, so a guard keyed on the other flag passes every row above
+        // and still steps here. (ash steps in both; not short-circuiting side
+        // effects at all is its behaviour, and this shell's divergence.)
+        for (src, want) in [("0 && n++", 0), ("1 || n++", 1)] {
+            let mut sh = Shell::new_for_test();
+            sh.set_var("n", "5").map_err(|_| "set failed".to_string())?;
+            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, want);
+            assert_eq!(sh.get_var("n").as_deref(), Some("5"), "{src}");
+        }
         Ok(())
     }
 
