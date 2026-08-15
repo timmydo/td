@@ -313,7 +313,31 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
         "engine/src/sha512.rs",
         "target-static td-boot (paired with ed25519.rs, which reaches its hash as crate::sha512) and td-net's cfg(test) ring differential; neither control-plane bin uses it",
     ),
+    (
+        "engine/src/ed25519_sign.rs",
+        "td-net's cfg(test) ring differential ONLY — never td-boot, which is the point of it being a separate file from ed25519.rs; neither control-plane bin uses it",
+    ),
 ];
+
+/// Does `text` declare a function named exactly `name`?
+///
+/// A plain `contains("fn sign")` is what a first draft used, and it matched the
+/// test helper `fn signature_of` — so the boundary is checked rather than
+/// assumed. Both `fn name(` and `fn name<` count; anything continuing the
+/// identifier does not.
+fn declares_fn(text: &str, name: &str) -> bool {
+    let needle = format!("fn {name}");
+    let mut from = 0usize;
+    while let Some(at) = text.get(from..).and_then(|rest| rest.find(&needle)) {
+        let end = from.saturating_add(at).saturating_add(needle.len());
+        let next = text.get(end..).and_then(|rest| rest.chars().next());
+        if !next.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
 
 /// The consumer list for a target-included engine source, or `None` for an
 /// engine source that reaches only the control-plane bins.
@@ -1480,6 +1504,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_contains!("engine/src/fat.rs", "target-static td-install");
     assert_contains!("engine/src/ed25519.rs", "target-static td-boot");
     assert_contains!("engine/src/sha512.rs", "target-static td-boot");
+    assert_contains!("engine/src/ed25519_sign.rs", "never td-boot");
     // The other half. Without it a table that matched EVERY engine source would
     // satisfy every line above, and the note would claim a target consumer for
     // control-plane-only code.
@@ -1496,6 +1521,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "engine/src/fat.rs",
         "engine/src/ed25519.rs",
         "engine/src/sha512.rs",
+        "engine/src/ed25519_sign.rs",
     ];
     let actual_target_included: Vec<&str> = TARGET_INCLUDED_ENGINE_SOURCES
         .iter()
@@ -1515,6 +1541,69 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         if !root.join(src).is_file() {
             fail(format!("{src} is in TARGET_INCLUDED_ENGINE_SOURCES but does not exist"));
         }
+    }
+    // The ed25519 SPLIT, asserted against the tree because the compiler cannot
+    // see it and the note above is only a note. `ed25519.rs` is the file the
+    // verifying boot shim will `#[path]`-include, so a signer reaching it puts
+    // one in the boot binary; the whole reason `ed25519_sign.rs` is a separate
+    // file is that neither half of that is otherwise enforced. Two ways in, so
+    // both are shut: td-boot naming a path to the signer, and the signer's own
+    // entry points migrating into the file td-boot does include.
+    //
+    // The needles are what a signer NEEDS rather than what one is called: a
+    // secret seed to expand (`SEED_LEN`) and something to expand it with
+    // (`fn sign`, `fn public_key`). A file with none of the three cannot derive
+    // a key from a secret whatever its functions are named. The two function
+    // needles check an identifier BOUNDARY — the first draft's plain substring
+    // matched the test helper `fn signature_of` and red against a clean tree.
+    let boot_sources = root.join("td-boot/src");
+    let mut boot_files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&boot_sources) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "rs") {
+                boot_files.push(path);
+            }
+        }
+    }
+    if boot_files.is_empty() {
+        fail("td-boot/src has no .rs files to scan for the ed25519 split".to_string());
+    }
+    for path in &boot_files {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            fail(format!("cannot read {}", path.display()));
+            continue;
+        };
+        if text.contains("ed25519_sign") {
+            fail(format!(
+                "{} names ed25519_sign: the signer must not reach the boot binary \
+                 (engine/src/ed25519_sign.rs, td-install/DESIGN.md §6)",
+                path.display()
+            ));
+        }
+    }
+    match std::fs::read_to_string(root.join("engine/src/ed25519.rs")) {
+        Ok(verifier) => {
+            for name in ["sign", "public_key"] {
+                if declares_fn(&verifier, name) {
+                    fail(format!(
+                        "engine/src/ed25519.rs declares `fn {name}`: it is verify-only, and \
+                         the boot shim includes it — a signer belongs in ed25519_sign.rs"
+                    ));
+                }
+            }
+            // Substring is right for this one: nothing in a verify-only file has
+            // a reason to spell SEED_LEN at all, so there is no boundary case to
+            // get wrong and the loose direction is a loud failure, not a pass.
+            if verifier.contains("SEED_LEN") {
+                fail(
+                    "engine/src/ed25519.rs names SEED_LEN: a seed is the secret half, and \
+                     this is the file the boot shim includes"
+                        .to_string(),
+                );
+            }
+        }
+        Err(e) => fail(format!("cannot read engine/src/ed25519.rs: {e}")),
     }
     assert_target!("engine/Cargo.toml", "check-engine");
     assert_target!("engine/Cargo.toml", "recipe-rs");

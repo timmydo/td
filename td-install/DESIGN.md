@@ -405,9 +405,60 @@ it from the reader.
 
 `engine/src/ed25519.rs` exposes `verify` and no signer — only that
 function plus `PUBLIC_KEY_LEN` and `SIGNATURE_LEN`. There is no signing in
-the engine and there should not be: td-boot's job is to refuse
-what does not verify, and a signer in that crate would be a second crypto
-surface on the boot path serving no boot-time purpose.
+THAT FILE and there must not be: the verifying boot shim will
+`#[path]`-include it (§10 item 5), so anything added there lands in the
+boot binary, whose job is to refuse what does not verify. A signer on the
+boot path would be a crypto surface serving no boot-time purpose. Stated
+in the future tense deliberately — **today td-boot includes no ed25519 at
+all**, its only `#[path]` include being `sha256.rs` — because the rule is
+about what the split is FOR, and it is cheaper to hold before the include
+lands than to discover afterwards that a signer came with it.
+
+`engine/src/ed25519_sign.rs` is therefore a SEPARATE module, and the
+separation is the whole design: td-boot does not include it, so it cannot
+reach the boot path. It has exactly one caller — the recipe-check oracle,
+which must sign a manifest whose digests change with every build and so
+cannot use a committed fixture signature. It is hand-rolled rather than
+`ring` because the check crate may carry no external dependency and the
+host signer is unreachable from a gate: no recipe builds td-net, and
+nothing puts it on a check's PATH.
+
+Neither half of the split is enforced by the compiler, so both are
+asserted against the tree by `builder/src/affected.rs`'s table test — the
+same place `TARGET_INCLUDED_ENGINE_SOURCES` membership is written out by
+hand. No file under `td-boot/src` may name `ed25519_sign`, and
+`ed25519.rs` may contain none of `fn sign`, `fn public_key` or `SEED_LEN`
+— what a signer needs rather than what one might be called. Without that,
+a later "just reuse the verifier's file, it already has `Point`" refactor
+lands a signer in the boot binary with every gate green.
+
+That is a new crypto surface and is recorded as one. It signs THROWAWAY
+per-run test keys only; `td-deploy` remains the signer for anything that
+authorises a real deployment. Its nonce is RFC 8032's deterministic one,
+so there is no RNG to misuse, and it makes no side-channel claim — note
+that it drives `ed25519.rs`'s deliberately variable-time `scalar_mul` with
+a SECRET scalar, the one caller for which that function's "every input is
+public" does not hold. Acceptable here because the keys are throwaway and
+the sandbox is the attacker's absence, and recorded at both ends.
+
+Correctness is pinned three ways, because a signer cannot check its own
+work — and **where each runs differs**, which matters more than the count:
+
+| pin | runs in the gate? |
+|---|---|
+| RFC 8032 §7.1's five vectors (the standard's own) | yes — `cargo test --workspace` |
+| round-trip through `ed25519::verify` | yes — same |
+| differential against `ring` (`net/src/ed25519_cross.rs`) | **no** |
+
+The differential is the one that matters most — a signer agreeing with
+td's own verifier and with nothing else would pass every test in the
+engine and still emit signatures no other implementation accepts — and it
+is precisely the one no gate runs, because nothing builds td-net from
+source (§7). It is a developer and prep-time check, run with
+`CC=<cc> cargo test --manifest-path net/Cargo.toml`. The RFC vectors are
+the standard's own and carry the gated half on their own, which is why
+this is a stated gap rather than a blocker; the same gap already applies
+to the verifier and is recorded in §7.
 
 The consequence lands on tests. td-boot's own tests **cannot produce a
 signature**, so the positive path is exercised with committed fixtures — a
@@ -420,8 +471,11 @@ consistent.
 Every NEGATIVE assertion — wrong key, tampered manifest, absent signature,
 truncated signature, signature over a different manifest — needs no signer
 at all, and those are the fail-closed ones that matter. The oracle is the
-other half and has `td-deploy` available, so it signs per run with a
-throwaway key rather than a fixture.
+other half: it signs per run with a throwaway key rather than a fixture,
+using `ed25519_sign.rs` above. (An earlier draft of this section said the
+oracle "has `td-deploy` available". It does not, and that is the whole
+reason the module above exists — no recipe builds td-net and nothing puts
+it on a check's PATH.)
 
 ## 7. Engine sources compiled into target binaries
 
@@ -438,9 +492,14 @@ which ones is written down in `TARGET_INCLUDED_ENGINE_SOURCES`:
 | `fat.rs` | td-install |
 | `ed25519.rs` | td-boot, td-net's `cfg(test)` ring differential |
 | `sha512.rs` | td-boot (pair with ed25519), td-net's ring differential |
+| `ed25519_sign.rs` | td-net's `cfg(test)` ring differential ONLY — never td-boot |
 
 Each entry stores the full consumer list the router prints in its note; the
-column above shows only the target half that distinguishes these six.
+column above shows only the target half that distinguishes these seven.
+
+The last row is the one that is a declaration in both directions: being in
+this table records that a `#[path]` include exists, and its note records
+where the include may NOT go. §6 has the assertion that holds it shut.
 
 **The table is a declaration, not what selects a gate.** `recipe-checks` is
 itself a build gate and the engine rule adds every build gate, so *all* of

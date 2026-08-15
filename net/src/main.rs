@@ -64,6 +64,13 @@ mod sha512;
 #[cfg(test)]
 #[path = "../../engine/src/ed25519.rs"]
 mod ed25519;
+// The engine's SIGNER, test-only here for one purpose: `ed25519_cross.rs`
+// checks it against `ring` in both directions. It is not part of td-net's
+// shipped build — `ring` is the signer this crate uses — and td-boot includes
+// neither this file nor anything that reaches it.
+#[cfg(test)]
+#[path = "../../engine/src/ed25519_sign.rs"]
+mod ed25519_sign;
 #[cfg(test)]
 mod ed25519_cross;
 

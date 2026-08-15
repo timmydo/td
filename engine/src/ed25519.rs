@@ -1,13 +1,24 @@
 //! Ed25519 signature VERIFICATION (RFC 8032), pure `std` — the authenticity
 //! half of a td deployment, and the one thing hashes cannot give it.
 //!
-//! Verify only, and that is the point rather than a limitation. Nothing here
-//! generates a key, derives a public key, or produces a signature, so no
-//! secret ever reaches this code and there is no constant-time obligation to
-//! meet: every input is public (a pinned public key, a signature and a
-//! manifest that ship together in the clear), and the code branches on them
-//! freely. SIGNING stays host-side in `td-net`, where `ring` already does it
-//! for narinfos, and a signing key never enters the target at all.
+//! Verify only, and that is the point rather than a limitation. Nothing in
+//! THIS file generates a key, derives a public key, or produces a signature,
+//! and on the boot path that is the whole story: the verifying boot shim
+//! includes this file and not `ed25519_sign.rs`, so no secret reaches this
+//! code there, every input is public (a pinned public key, a signature and a
+//! manifest that ship together in the clear), and the code may branch on them
+//! freely. SIGNING for anything that authorises a real deployment stays
+//! host-side in `td-net`, where `ring` already does it for narinfos, and a
+//! signing key never enters the target at all.
+//!
+//! Inside the ENGINE LIB the roster is one longer, and it is recorded here
+//! rather than only next to the caller: `ed25519_sign.rs` drives `scalar_mul`
+//! below with the CLAMPED SECRET SCALAR, which is the one caller for which
+//! "every input is public" does not hold. See that function's own note. The
+//! exposure is accepted rather than absent — it signs throwaway per-run test
+//! keys inside a build sandbox. What stays true unconditionally is the SHIPPED
+//! side of it: `net` pulls the signer in too, but only under `cfg(test)` for
+//! the ring differential, and the boot shim never does at all.
 //!
 //! Dependency-free for the reason the rest of the engine is: its INTENDED
 //! consumer is `td-boot`, which runs in the boot shim before any store exists,
@@ -119,7 +130,7 @@ const L: [u64; 4] = [
 /// hand-entered coordinates: it is decompressed through the same path a public
 /// key takes, so the encoder/decoder pair is exercised on a point whose
 /// coordinates are known before it is ever asked about one that is not.
-const BASE_POINT: [u8; 32] = [
+pub(crate) const BASE_POINT: [u8; 32] = [
     0x58, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
     0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
 ];
@@ -342,7 +353,7 @@ fn bit(bytes: &[u8], i: usize) -> u8 {
 /// A curve point in extended coordinates (X:Y:Z:T), where x = X/Z, y = Y/Z and
 /// T = XY/Z.
 #[derive(Clone, Copy)]
-struct Point {
+pub(crate) struct Point {
     x: Fe,
     y: Fe,
     z: Fe,
@@ -409,10 +420,17 @@ impl Point {
     /// [scalar]self, double-and-add, most significant bit first.
     ///
     /// Deliberately NOT constant time: it branches on the scalar's bits. Both
-    /// scalars a verification multiplies by are public — one is the signature's
-    /// own S, the other the hash of data that travels with it — so there is no
-    /// secret for the timing to leak.
-    fn scalar_mul(&self, scalar: &[u8; 32]) -> Point {
+    /// scalars a VERIFICATION multiplies by are public — one is the signature's
+    /// own S, the other the hash of data that travels with it — so on the boot
+    /// path there is no secret for the timing to leak.
+    ///
+    /// One caller breaks that, and it is named here rather than left to be
+    /// found: `ed25519_sign.rs` passes the clamped SECRET scalar, so every bit
+    /// of a private key steers a branch. It is not on the boot path and it
+    /// signs only throwaway per-run test keys, which is the whole of why that
+    /// is acceptable — a caller wanting this for a key it must keep needs a
+    /// constant-time ladder, not this one.
+    pub(crate) fn scalar_mul(&self, scalar: &[u8; 32]) -> Point {
         let mut acc = Point::IDENTITY;
         for i in (0..256).rev() {
             acc = acc.double();
@@ -424,7 +442,7 @@ impl Point {
     }
 
     /// The 32-byte encoding: y with x's sign in the top bit.
-    fn compress(&self) -> [u8; 32] {
+    pub(crate) fn compress(&self) -> [u8; 32] {
         let zinv = self.z.invert();
         let x = self.x.mul(&zinv);
         let y = self.y.mul(&zinv);
@@ -441,7 +459,7 @@ impl Point {
     /// point through different bytes), a y for which no x exists, and the one
     /// x = 0 case where the sign bit would carry information the point does
     /// not have.
-    fn decompress(bytes: &[u8; 32]) -> Option<Point> {
+    pub(crate) fn decompress(bytes: &[u8; 32]) -> Option<Point> {
         let sign = bytes.last().map_or(0, |b| b >> 7);
         let mut without_sign = *bytes;
         if let Some(top) = without_sign.last_mut() {
@@ -512,7 +530,7 @@ impl Point {
 
 // ---- scalars mod L ----
 
-fn load_words(bytes: &[u8; 32]) -> [u64; 4] {
+pub(crate) fn load_words(bytes: &[u8; 32]) -> [u64; 4] {
     let (chunks, _) = bytes.as_chunks::<8>();
     let word = |i: usize| {
         chunks
@@ -523,7 +541,7 @@ fn load_words(bytes: &[u8; 32]) -> [u64; 4] {
     [word(0), word(1), word(2), word(3)]
 }
 
-fn store_words(words: [u64; 4]) -> [u8; 32] {
+pub(crate) fn store_words(words: [u64; 4]) -> [u8; 32] {
     let mut out = [0u8; 32];
     let (chunks, _) = out.as_chunks_mut::<8>();
     for (dst, word) in chunks.iter_mut().zip(words.iter()) {
@@ -533,7 +551,7 @@ fn store_words(words: [u64; 4]) -> [u8; 32] {
 }
 
 /// Whether `value >= L`, comparing from the most significant word down.
-fn at_least_l(value: [u64; 4]) -> bool {
+pub(crate) fn at_least_l(value: [u64; 4]) -> bool {
     for (v, l) in value.iter().rev().zip(L.iter().rev()) {
         if v != l {
             return v > l;
@@ -542,7 +560,7 @@ fn at_least_l(value: [u64; 4]) -> bool {
     true // equal to L
 }
 
-fn sub_l(value: [u64; 4]) -> [u64; 4] {
+pub(crate) fn sub_l(value: [u64; 4]) -> [u64; 4] {
     let mut out = [0u64; 4];
     let mut borrow = 0u64;
     for ((slot, v), l) in out.iter_mut().zip(value.iter()).zip(L.iter()) {
@@ -568,7 +586,7 @@ fn is_canonical_scalar(bytes: &[u8; 32]) -> bool {
 /// below 2L. The reference implementations use a Barrett-style reduction over
 /// packed 21-bit limbs that is far faster and essentially unreviewable; this
 /// runs 512 times per verification and takes microseconds.
-fn reduce_wide(hash: &[u8; 64]) -> [u8; 32] {
+pub(crate) fn reduce_wide(hash: &[u8; 64]) -> [u8; 32] {
     let mut r = [0u64; 4];
     for byte in hash.iter().rev() {
         for shift in (0..8).rev() {

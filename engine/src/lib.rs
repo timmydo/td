@@ -28,6 +28,10 @@
 //! `crate::sha512`, so a consumer `#[path]`-includes BOTH at its crate root.
 pub mod crc32;
 pub mod ed25519;
+// SIGNING is a separate module because td-boot `#[path]`-includes `ed25519.rs`
+// and nothing else: keeping the signer out of that file is what keeps it off
+// the boot path. Its one caller is the recipe-check oracle.
+pub mod ed25519_sign;
 pub mod exit;
 pub mod fat;
 pub mod gpt;

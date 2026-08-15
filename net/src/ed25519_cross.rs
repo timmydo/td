@@ -226,3 +226,126 @@ fn a_small_order_public_key_is_refused() {
     // The all-zero key is the identity point, likewise small order.
     assert!(!crate::ed25519::verify(&[0u8; 32], b"anything", &[0u8; 64]));
 }
+
+// ---- the engine's own SIGNER, against ring ----
+//
+// `engine/src/ed25519_sign.rs` exists for the recipe-check oracle, which must
+// sign a per-build manifest and cannot reach `ring` (the check crate carries no
+// external dependency) or `td-deploy` (no recipe builds td-net). It is
+// hand-rolled, so it is checked against an independent implementation here in
+// BOTH directions — the RFC 8032 vectors in the module itself pin it against
+// the standard, and these pin it against a real one.
+//
+// This is the stronger of the two directions to get wrong quietly. A signer
+// that agreed with td's own verifier and with nothing else would pass every
+// test in the engine and still produce signatures no other implementation
+// accepts.
+
+/// The seed `ring` derives a key from is the same 32 bytes the engine signer
+/// takes, so the two can be pointed at one key and compared byte for byte.
+fn ring_keypair(seed: &[u8; 32]) -> Ed25519KeyPair {
+    Ed25519KeyPair::from_seed_unchecked(seed).expect("a 32-byte seed is a valid ed25519 key")
+}
+
+/// A random seed makes a failure unreproducible unless the failure says which
+/// seed. These are throwaway test keys generated in-process, so printing one is
+/// not a disclosure — and without it a red here could not be re-run.
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// Fresh seeds, for this file's stated reason — agreement over a distribution
+/// rather than over points somebody once recorded — plus the three extremes a
+/// random draw will never produce, since those are where a clamp or a carry
+/// goes wrong. The signer is the side with the NEW hand-rolled arithmetic, so
+/// it wants the distribution at least as much as the verifier does.
+fn cross_seeds() -> Vec<[u8; 32]> {
+    use ring::rand::SecureRandom;
+    let rng = SystemRandom::new();
+    let mut seeds = vec![[0u8; 32], [0xffu8; 32], {
+        let mut counting = [0u8; 32];
+        for (i, slot) in counting.iter_mut().enumerate() {
+            *slot = i as u8;
+        }
+        counting
+    }];
+    for _ in 0..8 {
+        let mut seed = [0u8; 32];
+        rng.fill(&mut seed).expect("system randomness");
+        seeds.push(seed);
+    }
+    seeds
+}
+
+#[test]
+fn the_engine_signer_produces_exactly_what_ring_produces() {
+    // ed25519 signing is deterministic (RFC 8032 derives the nonce from the
+    // key and message), so this is byte equality and not merely "both verify".
+    for (i, seed) in cross_seeds().iter().enumerate() {
+        let seed = *seed;
+        let ring_key = ring_keypair(&seed);
+        let ring_public: [u8; 32] = ring_key
+            .public_key()
+            .as_ref()
+            .try_into()
+            .expect("ed25519 public keys are 32 bytes");
+        assert_eq!(
+            crate::ed25519_sign::public_key(&seed).expect("the base point decompresses"),
+            ring_public,
+            "public key for seed {i} ({})", hex(&seed)
+        );
+        for len in [0usize, 1, 32, 63, 64, 65, 127, 128, 300] {
+            let msg = message(len);
+            let ring_sig: [u8; 64] = ring_key
+                .sign(&msg)
+                .as_ref()
+                .try_into()
+                .expect("ed25519 signatures are 64 bytes");
+            let engine_sig =
+                crate::ed25519_sign::sign(&seed, &msg).expect("the base point decompresses");
+            assert_eq!(
+                engine_sig, ring_sig,
+                "signature for seed {i} ({}), message length {len}", hex(&seed)
+            );
+        }
+    }
+}
+
+#[test]
+fn ring_accepts_what_the_engine_signer_produces() {
+    use ring::signature::{UnparsedPublicKey, ED25519};
+    // The direction byte-equality above already implies, asserted separately
+    // because it is the property that actually matters and would survive a
+    // future change to either side's encoding conventions.
+    for seed in cross_seeds() {
+        let public =
+            crate::ed25519_sign::public_key(&seed).expect("the base point decompresses");
+        for len in [0usize, 17, 64, 129] {
+            let msg = message(len);
+            let sig = crate::ed25519_sign::sign(&seed, &msg).expect("base point");
+            assert!(
+                UnparsedPublicKey::new(&ED25519, &public[..])
+                    .verify(&msg, &sig[..])
+                    .is_ok(),
+                "ring must accept the engine signature for seed {} length {len}",
+                hex(&seed)
+            );
+            // And the rejection half, so this cannot pass against a verifier
+            // that accepts everything.
+            let mut broken = sig;
+            if let Some(byte) = broken.first_mut() {
+                *byte ^= 1;
+            }
+            assert!(
+                UnparsedPublicKey::new(&ED25519, &public[..])
+                    .verify(&msg, &broken[..])
+                    .is_err(),
+                "ring must reject a mangled engine signature"
+            );
+        }
+    }
+}
