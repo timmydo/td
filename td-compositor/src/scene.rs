@@ -143,6 +143,118 @@ fn tile_at(placements: &[Placement], x: usize, y: usize) -> Option<usize> {
     })
 }
 
+/// What a release would do, and the block that says so. Held for the whole
+/// gesture so the release applies exactly what was drawn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DropHint {
+    target: SurfaceKey,
+    kind: DropKind,
+    area: Rect,
+}
+
+/// How thick the bar is for a drop that lands BETWEEN two windows rather than
+/// over one. A run drop has no area of its own — it names a position in a list
+/// — so the block marks the edge it would go in at.
+const HINT_BAR: usize = 12;
+
+/// The half of `frame` a `Beside` drop would take.
+fn hint_half(frame: Rect, axis: Axis, before: bool) -> Rect {
+    let half = |whole: usize| whole.saturating_add(1) / 2;
+    match (axis, before) {
+        (Axis::Horizontal, true) => Rect {
+            width: half(frame.width),
+            ..frame
+        },
+        (Axis::Horizontal, false) => {
+            let width = half(frame.width);
+            Rect {
+                x: frame.x.saturating_add(frame.width.saturating_sub(width)),
+                width,
+                ..frame
+            }
+        }
+        (Axis::Vertical, true) => Rect {
+            height: half(frame.height),
+            ..frame
+        },
+        (Axis::Vertical, false) => {
+            let height = half(frame.height);
+            Rect {
+                y: frame.y.saturating_add(frame.height.saturating_sub(height)),
+                height,
+                ..frame
+            }
+        }
+    }
+}
+
+/// The bar marking the edge of `frame` a leaf would slide in at, drawn along
+/// the direction the run actually travels rather than along the container.
+fn hint_bar(frame: Rect, run: Axis, before: bool) -> Rect {
+    match run {
+        Axis::Horizontal => {
+            let width = HINT_BAR.min(frame.width);
+            Rect {
+                x: if before {
+                    frame.x
+                } else {
+                    frame.x.saturating_add(frame.width.saturating_sub(width))
+                },
+                width,
+                ..frame
+            }
+        }
+        Axis::Vertical => {
+            let height = HINT_BAR.min(frame.height);
+            Rect {
+                y: if before {
+                    frame.y
+                } else {
+                    frame.y.saturating_add(frame.height.saturating_sub(height))
+                },
+                height,
+                ..frame
+            }
+        }
+    }
+}
+
+/// The block a drop kind promises over the target, given the direction that
+/// target's own run travels.
+///
+/// A swap covers the target's whole frame: the two windows trade places, so the
+/// dragged one really does end up there. Everything else is one of two shapes,
+/// and which one is decided by the TREE rather than by the zone that was aimed,
+/// because `insert_beside` only SPLITS where the asked-for axis differs from
+/// the target's own container and the target is not in a stack. Anywhere else
+/// it is a plain insert into a run, where the dragged window takes a whole slot
+/// and every sibling shrinks — so promising the half the pointer was over would
+/// be a picture the release cannot keep. A split gets that half; an insert gets
+/// a bar on the edge it goes in at.
+///
+/// A STACKED target then differs once more in WHERE the bar goes. Its leaves
+/// all share one content rectangle, which `frame_rect` hands back, while the
+/// run itself is the column of BANDS at the container's top — so a bar on the
+/// content rectangle would mark a place the new band does not appear. It is
+/// drawn on the target's own band instead. The swap stays the exception in the
+/// tree too, keeping the content rectangle it really does take.
+fn hint_area(placement: &Placement, kind: DropKind, run: Option<Axis>) -> Rect {
+    let frame = frame_rect(placement);
+    let bar = |before| {
+        if placement.stacked {
+            hint_bar(placement.band, Axis::Vertical, before)
+        } else {
+            hint_bar(frame, run.unwrap_or(Axis::Vertical), before)
+        }
+    };
+    match kind {
+        DropKind::Swap => frame,
+        DropKind::InRun { before } => bar(before),
+        DropKind::Beside { axis, before } if placement.stacked || run == Some(axis) => bar(before),
+        DropKind::Beside { axis, before } => hint_half(frame, axis, before),
+    }
+}
+
 /// A tile's five zones. The middle NINTH is the swap, and outside it the
 /// nearest edge picks the side — so every point in the tile answers, and the
 /// answer changes only at a boundary rather than at a distance from one.
@@ -249,7 +361,7 @@ pub struct Scene {
     /// truth: it is derived from `layout` on every pointer frame and dropped
     /// by every mutation of it, so nothing here can outlive what it was
     /// computed from.
-    preview: Option<Layout>,
+    hint: Option<DropHint>,
     launcher: Launcher,
     help: Help,
     status: String,
@@ -265,7 +377,7 @@ impl Scene {
             pointer_x: 0,
             pointer_y: 0,
             surface_bytes: 0,
-            preview: None,
+            hint: None,
             launcher: Launcher::new(),
             help: Help::default(),
             status: String::new(),
@@ -295,7 +407,7 @@ impl Scene {
         self.surface_bytes = next;
         if is_new {
             self.layout.map(key);
-            self.preview = None;
+            self.hint = None;
         }
         Ok(is_new)
     }
@@ -378,11 +490,13 @@ impl Scene {
         let layout_changed = self.layout.contains(key);
         self.discard_pixels(key);
         self.layout.unmap(key);
-        // Dropping a drag's preview moves the screen even when the unmap
-        // itself did not — an already-unmapped surface detaching is the case
-        // — and the map published to clients was the previewed one, so it
-        // counts as a layout change or those two are left disagreeing.
-        self.clear_preview() || layout_changed
+        // A block is drawn over the arrangement rather than replacing it, so
+        // one dropped here owes a repaint and nothing else. Every caller
+        // repaints unconditionally, which is why this reports the LAYOUT alone
+        // — saying otherwise would ask for a round of configures for pixels no
+        // client was ever told about.
+        self.clear_hint();
+        layout_changed
     }
 
     pub fn remove(&mut self, key: SurfaceKey) -> bool {
@@ -390,7 +504,8 @@ impl Scene {
         self.discard_pixels(key);
         self.titles.remove(&key);
         self.layout.forget(key);
-        self.clear_preview() || layout_changed
+        self.clear_hint();
+        layout_changed
     }
 
     pub fn remove_client(&mut self, client: u64) -> bool {
@@ -407,12 +522,13 @@ impl Scene {
         self.titles.retain(|key, _| key.client != client);
         self.surface_bytes = self.surface_bytes.saturating_sub(removed);
         self.layout.unmap_client(client);
-        self.clear_preview() || layout_changed
+        self.clear_hint();
+        layout_changed
     }
 
     pub fn command(&mut self, command: Command) {
         self.layout.apply(command);
-        self.preview = None;
+        self.hint = None;
     }
 
     pub fn focus_key(&mut self, key: SurfaceKey) -> bool {
@@ -455,9 +571,9 @@ impl Scene {
     }
 
     pub fn views(&self, width: usize, height: usize) -> Vec<ViewLayout> {
-        let mut views =
-            self.arrangement()
-                .views(width, self.tiled_height(height), GAP, TITLE_HEIGHT);
+        let mut views = self
+            .layout
+            .views(width, self.tiled_height(height), GAP, TITLE_HEIGHT);
         for view in &mut views {
             view.rect.y = view.rect.y.saturating_add(BAR_HEIGHT);
         }
@@ -473,25 +589,14 @@ impl Scene {
         height.saturating_sub(BAR_HEIGHT)
     }
 
+    /// Every tile on screen, the bar's height already added. There is one
+    /// arrangement to ask about since a drag draws a block instead of
+    /// re-flowing, so this takes no tree: it used to, for a second geometry
+    /// that no longer exists.
     pub(crate) fn tiled_placements(&self, width: usize, height: usize) -> Vec<Placement> {
-        self.placements_of(self.arrangement(), width, height)
-    }
-
-    /// The arrangement to DRAW and to report: a drag's preview while one is
-    /// up, the layout itself otherwise. Every consumer of tiling geometry
-    /// reads this, for the reason `tiled_height` gives — two of them
-    /// disagreeing mid-drag is a click landing on a different tile than the
-    /// one under the cursor.
-    fn arrangement(&self) -> &Layout {
-        self.preview.as_ref().unwrap_or(&self.layout)
-    }
-
-    /// The same geometry for an arbitrary arrangement rather than the one on
-    /// screen. A drag needs both at once: what is DRAWN is the result of the
-    /// drop, and what the drop is aimed at is computed against the arrangement
-    /// with the dragged window taken out.
-    fn placements_of(&self, layout: &Layout, width: usize, height: usize) -> Vec<Placement> {
-        let mut placements = layout.placements(width, self.tiled_height(height), GAP, TITLE_HEIGHT);
+        let mut placements =
+            self.layout
+                .placements(width, self.tiled_height(height), GAP, TITLE_HEIGHT);
         for placement in &mut placements {
             placement.rect.y = placement.rect.y.saturating_add(BAR_HEIGHT);
             placement.band.y = placement.band.y.saturating_add(BAR_HEIGHT);
@@ -511,13 +616,8 @@ impl Scene {
         Some(std::mem::replace(&mut self.status, status))
     }
 
-    /// Read off the ARRANGEMENT rather than the layout, as the geometry is:
-    /// a preview carries its own focus — the drop focuses what it moved — and
-    /// the map published to clients marks that window active. Answering from
-    /// the layout instead would aim the keyboard at one window while telling
-    /// every client another was activated.
     pub fn focused(&self) -> Option<SurfaceKey> {
-        self.arrangement().focused()
+        self.layout.focused()
     }
 
     #[cfg(test)]
@@ -571,55 +671,74 @@ impl Scene {
         &self.layout
     }
 
-    /// Draw the drop a release would perform, rather than an outline of it.
+    /// Work out where a release would land the dragged window and hold the
+    /// block that says so. The arrangement does NOT move while a drag is in
+    /// flight: an operator aiming at a tile that slid out from under the
+    /// pointer as they approached it could not hit anything, which is what a
+    /// live re-flow did. The screen stays put and the answer is drawn ON it.
     ///
-    /// TWO arrangements are in play and they are deliberately different. What
-    /// is DRAWN is the result — the layout with the dragged window moved to
-    /// where the pointer says. What the pointer is measured AGAINST is the
-    /// layout with that window taken OUT, which does not re-flow as the
-    /// preview does: aiming at the picture would let a tile be pushed away by
-    /// the very motion aiming at it, and a target that moves when approached
-    /// can oscillate between two answers over one pixel.
+    /// Read off the SCREEN geometry, which is now the only geometry there is.
+    /// The aim used to be computed against the layout with the dragged window
+    /// taken out, and that existed solely so the picture could not push its own
+    /// target away; with nothing re-flowing, aiming at what the operator can
+    /// see is both simpler and what they mean.
     ///
     /// A press alone must not move the window; that is the CALLER's threshold
-    /// from the press point, not a region here. Answers whether the screen
-    /// would differ, so a pointer moving inside one half costs no repaint.
-    pub fn preview_drop(&mut self, dragged: SurfaceKey, width: usize, height: usize) -> bool {
-        let mut preview = self.layout.clone();
-        let base = self.aim_layout(dragged);
-        if let Some((target, drop)) = self.drop_target_in(&base, width, height) {
-            preview.drop_onto(dragged, target, drop);
-        }
-        let changed = self.arrangement() != &preview;
-        self.preview = (preview != self.layout).then_some(preview);
+    /// from the press point, not a region here. Answers whether the BLOCK
+    /// moved, so a pointer crossing no boundary costs no repaint.
+    pub fn aim_drop(&mut self, dragged: SurfaceKey, width: usize, height: usize) -> bool {
+        let hint = self.drop_hint(dragged, width, height);
+        let changed = self.hint != hint;
+        self.hint = hint;
         changed
     }
 
-    /// Whether a preview is up, which is the same question as the arrangement
-    /// differing from the layout: one is only ever held while it does.
+    fn drop_hint(&self, dragged: SurfaceKey, width: usize, height: usize) -> Option<DropHint> {
+        let placements = self.tiled_placements(width, height);
+        let (placement, kind) = self.drop_target_in(&placements)?;
+        // Its own tile lands nothing — a window cannot be moved beside itself
+        // — so there is no block to promise one. This is also why no dead zone
+        // is needed any more: with the picture static, a window's own tile is
+        // its own tile rather than a neighbour's grown into its place.
+        let target = placement.key;
+        if target == dragged {
+            return None;
+        }
+        let area = hint_area(placement, kind, self.layout.run_direction(target));
+        Some(DropHint { target, kind, area })
+    }
+
     #[cfg(test)]
-    pub fn preview_is_live(&self) -> bool {
-        self.preview.is_some()
+    pub fn hint_is_live(&self) -> bool {
+        self.hint.is_some()
     }
 
-    /// Take the preview as the arrangement itself. The drop is applied by
-    /// KEEPING what was drawn rather than by computing it a second time,
-    /// which is the whole of what the preview promises: there is no other
-    /// answer for the release to disagree with.
-    pub fn commit_preview(&mut self) -> bool {
-        // A preview is only ever held while it DIFFERS from the layout, so
-        // holding one and changing the arrangement are the same question.
-        let Some(preview) = self.preview.take() else {
-            return false;
-        };
-        self.layout = preview;
-        true
+    #[cfg(test)]
+    pub(crate) fn hint_area(&self) -> Option<Rect> {
+        self.hint.map(|hint| hint.area)
     }
 
-    /// Drop the preview and go back to the arrangement itself. Answers
-    /// whether the screen moves, by the same invariant `commit_preview` reads.
-    pub fn clear_preview(&mut self) -> bool {
-        self.preview.take().is_some()
+    /// Apply the drop the block was promising. Computed ONCE, when the block
+    /// was drawn, and kept: a release that re-derived it could answer
+    /// differently from what the operator was looking at.
+    ///
+    /// `None` when there was no block; otherwise whether the ARRANGEMENT
+    /// moved. Those are two answers rather than one because they buy different
+    /// things: a block that came down owes a repaint whatever the drop did,
+    /// and only a drop that moved something owes the clients their configures.
+    /// Folding them into one bool stranded the block for a drop that landed
+    /// where the window already was — the commonest gesture there is — since
+    /// the caller then had nothing left to clear and no reason to paint.
+    pub fn commit_drop(&mut self, dragged: SurfaceKey) -> Option<bool> {
+        let hint = self.hint.take()?;
+        Some(self.layout.drop_onto(dragged, hint.target, hint.kind))
+    }
+
+    /// Take the block down. Answers whether the screen moves, which it does
+    /// whenever one was up — but no client is owed a configure, since the
+    /// arrangement underneath never changed.
+    pub fn clear_hint(&mut self) -> bool {
+        self.hint.take().is_some()
     }
 
     /// The window under the pointer, band or client area. `None` over the
@@ -673,42 +792,7 @@ impl Scene {
     }
 
     /// Where a drop lands: the window under the pointer, and what landing
-    /// there means.
-    #[cfg(test)]
-    fn drop_target(&self, width: usize, height: usize) -> Option<(SurfaceKey, DropKind)> {
-        self.drop_target_in(self.arrangement(), width, height)
-    }
-
-    /// The arrangement a drop is AIMED at: the layout with the dragged window
-    /// taken OUT. One derivation for the drag and for the tests that pick
-    /// points out of it, or the geometry a test aims into drifts from the
-    /// geometry the drag measures and neither says so.
-    fn aim_layout(&self, dragged: SurfaceKey) -> Layout {
-        let mut base = self.layout.clone();
-        base.unmap(dragged);
-        base
-    }
-
-    /// The geometry a drag's drop is AIMED at, which is not the geometry on
-    /// screen: the dragged window is taken out of it, so its tiles are bigger
-    /// and in different places than the ones being drawn. A test that picks
-    /// an aim point off the screen is asking a different question than the
-    /// drag does, and got away with it only while a tile had two zones.
-    #[cfg(test)]
-    pub(crate) fn aim_placements(
-        &self,
-        dragged: SurfaceKey,
-        width: usize,
-        height: usize,
-    ) -> Vec<Placement> {
-        self.placements_of(&self.aim_layout(dragged), width, height)
-    }
-
-    /// Where a drop aimed at `layout` would land. A drag passes the
-    /// arrangement with the dragged window REMOVED, which is constant for the
-    /// whole gesture: aiming at what is on screen instead would let the
-    /// preview re-flow the very tile the pointer is over, so moving toward a
-    /// slot could push that slot away.
+    /// there means. Read off the screen, which a drag no longer disturbs.
     ///
     /// A tile has FIVE zones. Over the middle the two windows trade places;
     /// over an edge the dragged one lands on that side, in a column for the
@@ -722,37 +806,29 @@ impl Scene {
     /// part of. Five will not fit in a strip a line of text tall, and the run
     /// is a list rather than an area: the only thing a drop onto one can
     /// sensibly mean is a position in it.
-    ///
-    /// `layout` is only HALF the input, which the band branch below makes
-    /// unavoidable: the geometry comes from the argument and the run's
-    /// direction from `self.layout`, because the two questions are asked of
-    /// different trees on purpose. So this is not a pure function of what it
-    /// is passed, and passing an arrangement that is not the aim one — the
-    /// live PREVIEW, say — mixes two answers rather than asking a third.
-    pub fn drop_target_in(
-        &self,
-        layout: &Layout,
-        width: usize,
-        height: usize,
-    ) -> Option<(SurfaceKey, DropKind)> {
-        let placements = self.placements_of(layout, width, height);
+    #[cfg(test)]
+    pub fn drop_target(&self, width: usize, height: usize) -> Option<(SurfaceKey, DropKind)> {
+        let placements = self.tiled_placements(width, height);
+        self.drop_target_in(&placements)
+            .map(|(placement, kind)| (placement.key, kind))
+    }
+
+    /// The same over placements already in hand, which is how the aim asks:
+    /// it wants the target's own rectangle as well as the kind, and building
+    /// the arrangement twice a frame to get them separately is a per-motion
+    /// allocation for an answer one pass already has.
+    fn drop_target_in<'a>(&self, placements: &'a [Placement]) -> Option<(&'a Placement, DropKind)> {
         let (x, y) = self.pointer_at_usize()?;
-        let placement = placements.get(tile_at(&placements, x, y)?)?;
+        let placement = placements.get(tile_at(placements, x, y)?)?;
         if contains(placement.band, x, y) {
             let band = placement.band;
-            // Asked of the tree the drop will be APPLIED to rather than of
-            // `layout`, which is the aim geometry with the dragged window
-            // taken out: a container of two collapses there and answers
-            // nothing, and a stack that collapses answers as its own axis
-            // rather than as a run. Both would read the half along the wrong
-            // side of the band.
             let before = match self.layout.run_direction(placement.key) {
                 Some(Axis::Horizontal) => x < band.x.saturating_add(band.width / 2),
                 Some(Axis::Vertical) | None => y < band.y.saturating_add(band.height / 2),
             };
-            return Some((placement.key, DropKind::InRun { before }));
+            return Some((placement, DropKind::InRun { before }));
         }
-        Some((placement.key, zone_of(placement.rect, x, y)))
+        Some((placement, zone_of(placement.rect, x, y)))
     }
 
     fn pointer_target_from(&self, placements: &[Placement]) -> Option<SurfacePoint> {
@@ -953,6 +1029,12 @@ impl Scene {
             };
             draw_surface(frame, width, height, stride, placement.rect, surface);
         }
+        // Over the windows and under everything that is not one: the block
+        // says where a release would land, and a bar or an overlay it hid
+        // would be a worse lie than the one it answers.
+        if let Some(hint) = self.hint {
+            draw_hint(frame, width, height, stride, hint.area);
+        }
         bar::paint(frame, width, height, stride, &self.status);
         self.launcher.paint(frame, width, height, stride);
         self.help.paint(frame, width, height, stride);
@@ -1022,6 +1104,42 @@ fn contains(rect: Rect, x: usize, y: usize) -> bool {
         && y >= rect.y
         && x < rect.x.saturating_add(rect.width)
         && y < rect.y.saturating_add(rect.height)
+}
+
+/// The drop block: sway's translucent blue, mixed into whatever is already
+/// there rather than replacing it, so the window underneath stays readable and
+/// the block reads as an overlay instead of as a hole in the screen.
+///
+/// Blended in integer thirds — two parts what is there, one part blue. There
+/// is no alpha channel in this framebuffer to carry it, and mixing at draw
+/// time is the whole of what "semi-transparent" can mean for a surface that
+/// gets composited once.
+fn draw_hint(frame: &mut [u8], width: usize, height: usize, stride: usize, area: Rect) {
+    // B, G, R — the framebuffer is XRGB8888 and little-endian, so this is
+    // blue rather than the orange the bytes read as.
+    const HINT: [u8; 3] = [0xf0, 0x90, 0x30];
+    let last_row = area.y.saturating_add(area.height).min(height);
+    let last_column = area.x.saturating_add(area.width).min(width);
+    for row in area.y..last_row {
+        let Some(line) = frame.get_mut(row.saturating_mul(stride)..) else {
+            continue;
+        };
+        let Some(pixels) = line.get_mut(..width.saturating_mul(4).min(line.len())) else {
+            continue;
+        };
+        for column in area.x..last_column {
+            let at = column.saturating_mul(4);
+            let Some(pixel) = pixels.get_mut(at..at.saturating_add(3)) else {
+                continue;
+            };
+            for (channel, tint) in pixel.iter_mut().zip(HINT.iter()) {
+                *channel = (u16::from(*channel)
+                    .saturating_mul(2)
+                    .saturating_add(u16::from(*tint))
+                    / 3) as u8;
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1797,13 +1915,17 @@ mod tests {
     }
 
     #[test]
-    fn a_bands_half_is_read_where_the_drop_lands_not_where_it_aims() {
-        // The two geometries a drag has in play disagree about more than
-        // pixels. A ROW of two: take one out and the row is gone, so the aim
-        // tree says the target is in no container at all and its band would
-        // be halved top-to-bottom — down a strip twenty pixels tall, where
-        // one side of the row can never be asked for. The tree the drop
-        // LANDS in still has the row, and that is the one to ask.
+    fn a_bands_half_is_read_along_the_run_it_would_join() {
+        // A band drop names a POSITION in a list, so which half of the band
+        // the pointer is on has to be read along the direction that list
+        // actually runs — across for a row, down for a stack. Reading it the
+        // other way round makes one side of the row unaskable.
+        //
+        // This used to be a test about two geometries disagreeing: the drop
+        // was aimed at the layout with the dragged window taken OUT, where a
+        // row of two collapses and the target is in no container at all. With
+        // the picture no longer re-flowing under a drag there is one geometry
+        // and the question is simply the run's.
         let mut scene = Scene::new();
         for object in 1..=2 {
             scene
@@ -1816,29 +1938,11 @@ mod tests {
         let (width, height) = (240, 600);
         let key = |object| SurfaceKey { client: 1, object };
         assert_eq!(scene.layout.run_direction(key(2)), Some(Axis::Horizontal));
-        let mut base = scene.layout.clone();
-        base.unmap(key(1));
-        assert_eq!(base.run_direction(key(2)), None, "the row survived");
+        let band = tile(&scene, width, height, 2).band;
+        assert!(band.width > band.height, "the band does not run across");
 
-        // The band as the AIM geometry has it, which is where the pointer is
-        // hit-tested — the whole width, not the right half it is drawn as.
-        let band = {
-            let placements = scene.placements_of(&base, width, height);
-            let at = placements
-                .iter()
-                .position(|placement| placement.key == key(2))
-                .unwrap();
-            placements.get(at).unwrap().band
-        };
-
-        // Left of the band and BELOW its middle, so the two readings give
-        // opposite answers and only one of them can be right.
-        //
-        // The LEFT point lies inside the dragged window's own tile on screen,
-        // which a whole drag now reaches: `a_drag_aims_once_it_leaves_the_
-        // press_point_and_keeps_aiming` is that gesture. This asks the
-        // function directly because what it pins is the READING — two points
-        // in one band answering opposite halves.
+        // Left and right of the band's middle, BELOW its own middle so a
+        // reading taken down the band would answer the same for both.
         for (x, before) in [
             (band.x + 1, true),
             (band.x + band.width.saturating_sub(2), false),
@@ -1846,7 +1950,7 @@ mod tests {
             scene.pointer_x = i32::try_from(x).unwrap();
             scene.pointer_y = i32::try_from(band.y + band.height - 1).unwrap();
             assert_eq!(
-                scene.drop_target_in(&base, width, height),
+                scene.drop_target(width, height),
                 Some((key(2), DropKind::InRun { before })),
                 "band at x={x}"
             );
@@ -2711,12 +2815,15 @@ mod tests {
     }
 
     #[test]
-    fn a_drag_preview_is_the_pixels_the_release_leaves() {
-        // The whole of what the preview promises, asserted where the operator
-        // reads it: the FRAME. Dropping is not "apply what was computed" but
-        // "keep what was drawn", so the release cannot move a pixel — and the
-        // clients are owed nothing further either, since the map published to
-        // them was the previewed one all along.
+    fn a_drag_draws_a_block_and_moves_nothing_until_the_release() {
+        // The whole of the new drag, asserted where the operator reads it: the
+        // FRAME. Aiming paints a block over the arrangement and changes
+        // NOTHING underneath — not the tiles, not the map the clients are
+        // configured for — and the release is what moves the window.
+        //
+        // The previous drag re-flowed the arrangement live and committed
+        // whatever was drawn. That is what this replaces: an operator aiming
+        // at a tile could push it out from under the pointer on the way.
         let mut scene = a_window_beside_a_column();
         let (width, height) = (240, 600);
         let dragged = SurfaceKey {
@@ -2729,121 +2836,291 @@ mod tests {
         );
         let undragged = painted(&scene, width, height);
         let undragged_views = scene.views(width, height);
+        let undragged_order = tile_order(&scene, width, height);
 
         // The bottom half of 3, which in a COLUMN means below it.
         let target = tile(&scene, width, height, 3).rect;
         scene.pointer_x = i32::try_from(target.x + 2).unwrap();
         scene.pointer_y = i32::try_from(target.y + target.height - 2).unwrap();
-        assert!(scene.preview_drop(dragged, width, height));
-        let previewed = painted(&scene, width, height);
-        let previewed_views = scene.views(width, height);
-        assert_ne!(
-            previewed_views, undragged_views,
-            "the clients were never told the window had moved"
+        assert!(scene.aim_drop(dragged, width, height), "no block went up");
+        let aiming = painted(&scene, width, height);
+        assert_ne!(aiming, undragged, "the block never reached the screen");
+        assert_eq!(
+            tile_order(&scene, width, height),
+            undragged_order,
+            "aiming moved a window"
         );
-        assert_eq!(tile_order(&scene, width, height), [2, 3, 1]);
-        // Without this the two frames below could agree by both being the
-        // undragged one, and the test would pass having previewed nothing.
-        assert_ne!(
-            previewed, undragged,
-            "the preview did not change the screen"
+        assert_eq!(
+            scene.views(width, height),
+            undragged_views,
+            "aiming told the clients something"
         );
 
-        assert!(scene.commit_preview());
-        assert_eq!(
-            painted(&scene, width, height),
-            previewed,
-            "the release moved pixels the preview had promised"
+        // The release, which is the first thing here that moves anything.
+        assert_eq!(scene.commit_drop(dragged), Some(true));
+        assert_eq!(tile_order(&scene, width, height), [2, 3, 1]);
+        assert_ne!(
+            scene.views(width, height),
+            undragged_views,
+            "the drop never reached the clients"
         );
-        assert_eq!(scene.views(width, height), previewed_views);
-        assert_eq!(tile_order(&scene, width, height), [2, 3, 1]);
-        // And the picture is now the layout's own, not an overlay on it.
-        assert!(scene.preview.is_none());
-        assert_eq!(tile_order(&scene, width, height), [2, 3, 1]);
+        // And the block is down: what is drawn now is the arrangement itself.
+        assert!(!scene.hint_is_live());
+        assert_ne!(painted(&scene, width, height), aiming);
         scene.layout.check_invariants().unwrap();
     }
 
     #[test]
-    fn a_window_can_be_traded_with_the_neighbour_that_grew_into_its_place() {
-        // The dead zone this replaces was the dragged window's whole SCREEN
-        // tile, while the target is read in the AIM geometry, and the two do
-        // not correspond: with that window taken out, the neighbour that grows
-        // into its place lies mostly UNDER it. So the zone swallowed the
-        // neighbour's live drop points along with the window's own. Swept
-        // across a 1600-wide output, 2's middle ninth kept 271 columns of 517
-        // at two windows, 8 of 255 at three, and none at all from four on —
-        // 1 could not be traded with 2, nor dropped to its left.
-        //
-        // "A press alone must not move it" is a THRESHOLD from the press point
-        // now, which belongs to the caller; nothing here refuses an aim.
+    fn a_window_trades_with_the_neighbour_under_the_pointer() {
+        // The middle ninth of a tile is the TRADE zone, and with the picture
+        // static it is simply the tile the operator can see. This used to be
+        // the hard case: the aim was computed with the dragged window taken
+        // out, so the neighbour that grew into its place lay under it and a
+        // dead zone over the dragged window's own tile swallowed most of the
+        // neighbour's trade zone — measured across a 1600-wide output, all of
+        // it from four windows on. Neither the aim geometry nor the dead zone
+        // exists now.
         let mut scene = a_row_of_four();
         let (width, height) = (1600, 600);
         let dragged = SurfaceKey {
             client: 1,
             object: 1,
         };
-        let own = tile(&scene, width, height, 1).rect;
-        let onto = {
-            let placements = scene.aim_placements(dragged, width, height);
-            let at = placements
-                .iter()
-                .position(|placement| placement.key.object == 2)
-                .unwrap();
-            placements.get(at).unwrap().rect
-        };
-        // The middle ninth is the TRADE zone, and its overlap with the dragged
-        // window's own tile on screen is exactly what used to be refused.
-        let third = onto.width / 3;
-        let start = (onto.x + third).max(own.x);
-        let end = (onto.x + third * 2).min(own.x + own.width);
-        assert!(
-            start + 2 < end,
-            "the aim and screen geometries no longer overlap: nothing to test"
-        );
-        scene.pointer_x = i32::try_from(start + 2).unwrap();
+        let onto = tile(&scene, width, height, 2).rect;
+        scene.pointer_x = i32::try_from(onto.x + onto.width / 2).unwrap();
         scene.pointer_y = i32::try_from(onto.y + onto.height / 2).unwrap();
-        assert!(
-            scene.preview_drop(dragged, width, height),
-            "the trade previewed nothing"
+        assert!(scene.aim_drop(dragged, width, height), "no block went up");
+        assert_eq!(
+            scene.hint_area(),
+            Some(frame_rect(&tile(&scene, width, height, 2))),
+            "a trade promises the whole tile it trades with"
         );
-        assert!(scene.commit_preview());
+        assert_eq!(scene.commit_drop(dragged), Some(true));
         assert_eq!(tile_order(&scene, width, height), [2, 1, 3, 4]);
         scene.layout.check_invariants().unwrap();
     }
 
     #[test]
-    fn a_preview_does_not_move_the_target_it_is_aimed_at() {
-        // Why the target is measured against the arrangement with the dragged
-        // window REMOVED rather than against the picture. The picture
-        // re-flows around the drop, so a pointer that has not moved would be
-        // over a different tile on the next frame, and the frame after that
-        // over the first one again: a picture alternating between two answers
-        // with the mouse held still.
+    fn a_drop_into_a_stack_marks_the_band_it_would_go_in_at() {
+        // A stack's container is a LIST, so `insert_beside` refuses the axis
+        // inside one and every drop but a swap becomes a plain insert into the
+        // run. The block has to say the same thing the tree does: the new band
+        // appears in the RUN, not in the content rectangle every leaf shares.
+        //
+        // Drawn on the content rect it would be doubly wrong — a `Beside`
+        // promising half an area the window is not going to take, and an
+        // `InRun` bar marking an edge of a rectangle nowhere near the band the
+        // operator is pointing at. Measured on the stack below: aiming at the
+        // top of leaf 3's band put the bar at y=128 rather than y=88, and
+        // aiming at the bottom of it put the bar at the foot of the content
+        // rectangle, most of the output away.
+        let mut scene = a_row_of_four();
+        let (width, height) = (1600, 600);
+        scene.command(Command::ToggleStacked);
+        let dragged = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        // Leaf 3's band, which is a stacked-AWAY one: it is not the leaf
+        // showing the content, so the two rectangles cannot be confused.
+        let onto = tile(&scene, width, height, 3);
+        assert!(onto.stacked, "the column did not stack");
+        assert!(
+            onto.band.y + onto.band.height <= onto.rect.y,
+            "the band and the content rect overlap"
+        );
+        for (dy, before) in [(1, true), (onto.band.height - 1, false)] {
+            scene.pointer_x = i32::try_from(onto.band.x + onto.band.width / 2).unwrap();
+            scene.pointer_y = i32::try_from(onto.band.y + dy).unwrap();
+            assert!(scene.aim_drop(dragged, width, height), "no block went up");
+            assert_eq!(
+                scene.hint_area(),
+                Some(hint_bar(onto.band, Axis::Vertical, before)),
+                "the block for a drop into a stack is not on its band"
+            );
+            // The bar is INSIDE the band it was aimed at, which is the
+            // property an operator reads and the one the content rect fails.
+            let block = scene.hint_area().unwrap();
+            assert!(
+                block.y >= onto.band.y && block.y + block.height <= onto.band.y + onto.band.height,
+                "the block left the band"
+            );
+        }
+
+        // And the swap keeps the content rect, since it really does put the
+        // dragged window in that slot. Read off the leaf the stack is SHOWING,
+        // the only one whose content rect answers the pointer.
+        let shown = scene
+            .tiled_placements(width, height)
+            .iter()
+            .position(|placement| placement.visible)
+            .and_then(|at| scene.tiled_placements(width, height).get(at).copied())
+            .unwrap();
+        scene.pointer_x = i32::try_from(shown.rect.x + shown.rect.width / 2).unwrap();
+        scene.pointer_y = i32::try_from(shown.rect.y + shown.rect.height / 2).unwrap();
+        assert!(scene.aim_drop(dragged, width, height));
+        assert_eq!(
+            scene.hint_area(),
+            Some(shown.rect),
+            "a trade with a stacked leaf promises the content it would take"
+        );
+        scene.layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn the_block_is_two_parts_screen_to_one_part_blue_inside_its_own_rect() {
+        // The block's PIXELS, which nothing else looks at: every other test
+        // asks only whether the frame changed, so a swapped channel order, a
+        // wrong ratio, or an off-by-one at the rect's edge would ship green.
+        // Expected values are computed from the frame underneath rather than
+        // written down, so this stays a statement about the blend rather than
+        // about what happens to be behind it.
+        let mut scene = a_row_of_four();
+        let (width, height) = (1600, 600);
+        let stride: usize = width * 4;
+        let dragged = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        let onto = tile(&scene, width, height, 3);
+        scene.pointer_x = i32::try_from(onto.rect.x + onto.rect.width / 2).unwrap();
+        scene.pointer_y = i32::try_from(onto.rect.y + onto.rect.height / 2).unwrap();
+        let before = painted(&scene, width, height);
+        assert!(scene.aim_drop(dragged, width, height), "no block went up");
+        let area = scene.hint_area().expect("no block to read");
+        let after = painted(&scene, width, height);
+
+        let blend = |was: [u8; 4]| {
+            let mut want = was;
+            for (channel, tint) in want.iter_mut().zip([0xf0u16, 0x90, 0x30].iter()) {
+                *channel =
+                    u8::try_from((u16::from(*channel).saturating_mul(2).saturating_add(*tint)) / 3)
+                        .unwrap();
+            }
+            want
+        };
+        // Inside, and at both extreme corners of the rect rather than only in
+        // the middle: an off-by-one shows at the edge and nowhere else.
+        for (x, y) in [
+            (area.x + area.width / 2, area.y + area.height / 2),
+            (area.x, area.y),
+            (area.x + area.width - 1, area.y + area.height - 1),
+        ] {
+            assert_eq!(
+                pixel(&after, stride, x, y),
+                blend(pixel(&before, stride, x, y)),
+                "the block did not blend at {x},{y}"
+            );
+        }
+        // And just outside each of those corners, which is what says the rect
+        // is the rect rather than one pixel bigger.
+        for (x, y) in [
+            (area.x.saturating_sub(1), area.y),
+            (area.x, area.y.saturating_sub(1)),
+            (area.x + area.width, area.y),
+            (area.x, area.y + area.height),
+        ] {
+            assert_eq!(
+                pixel(&after, stride, x, y),
+                pixel(&before, stride, x, y),
+                "the block leaked past its rect at {x},{y}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_drop_along_the_target_s_own_axis_marks_the_edge_rather_than_a_half() {
+        // `insert_beside` splits only where the asked-for axis DIFFERS from
+        // the target's own container: dropping "to the right of" a window in
+        // a ROW is a plain insert into that row, so the dragged window takes
+        // a whole slot and every sibling shrinks. It never occupies the half
+        // the pointer was over, so promising that half is a picture the
+        // release cannot keep.
+        let mut scene = a_row_of_four();
+        let (width, height) = (1600, 600);
+        let dragged = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        let onto = tile(&scene, width, height, 3);
+        let frame = frame_rect(&onto);
+
+        // The right edge of 3, along the row's OWN axis: an insert, and the
+        // bar marks the side it goes in at.
+        scene.pointer_x = i32::try_from(frame.x + frame.width - 2).unwrap();
+        scene.pointer_y = i32::try_from(frame.y + frame.height / 2).unwrap();
+        assert!(scene.aim_drop(dragged, width, height), "no block went up");
+        assert_eq!(
+            scene.hint_area(),
+            Some(hint_bar(frame, Axis::Horizontal, false)),
+            "a same-axis drop promised a half it cannot take"
+        );
+
+        // The CONTROL, and what keeps this a statement about the AXIS rather
+        // than about edges: the top third of the same tile asks for a Vertical
+        // split inside a Horizontal row, which really does halve that tile.
+        // Read off the CLIENT area, since the band above it has two zones
+        // rather than five and would answer `InRun` whatever the axis.
+        scene.pointer_x = i32::try_from(onto.rect.x + onto.rect.width / 2).unwrap();
+        scene.pointer_y = i32::try_from(onto.rect.y + onto.rect.height / 6).unwrap();
+        assert!(scene.aim_drop(dragged, width, height));
+        assert_eq!(
+            scene.hint_area(),
+            Some(hint_half(frame, Axis::Vertical, true)),
+            "a cross-axis drop promised a bar where it splits the tile"
+        );
+
+        // And the tree agrees with the first of those: the row gains a member
+        // rather than 3 gaining a sibling inside its own slot.
+        scene.pointer_x = i32::try_from(frame.x + frame.width - 2).unwrap();
+        scene.pointer_y = i32::try_from(frame.y + frame.height / 2).unwrap();
+        assert!(scene.aim_drop(dragged, width, height));
+        assert!(scene.commit_drop(dragged).is_some_and(|moved| moved));
+        assert_eq!(tile_order(&scene, width, height), [2, 3, 1, 4]);
+        assert_eq!(
+            scene.layout.parent_axis(dragged),
+            Some(Axis::Horizontal),
+            "the drop made a container instead of joining the row"
+        );
+        scene.layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn an_aim_held_still_keeps_answering_the_same_block() {
+        // The arrangement does not move while a drag is in flight, so a
+        // pointer that has not moved cannot be over a different tile on the
+        // next frame. That used to take a second geometry to promise: the
+        // picture re-flowed around the drop, so aiming at it would push the
+        // target away and the answer could alternate between two tiles with
+        // the mouse held still. Now it is a property of doing nothing.
         let mut scene = a_window_beside_a_column();
         let (width, height) = (240, 600);
         let dragged = SurfaceKey {
             client: 1,
             object: 1,
         };
+        let settled = tile_order(&scene, width, height);
         let target = tile(&scene, width, height, 3).rect;
         scene.pointer_x = i32::try_from(target.x + 2).unwrap();
         scene.pointer_y = i32::try_from(target.y + 2).unwrap();
-        assert!(scene.preview_drop(dragged, width, height));
-        assert_eq!(tile_order(&scene, width, height), [2, 1, 3]);
+        assert!(scene.aim_drop(dragged, width, height));
+        let block = scene.hint_area();
+        assert!(block.is_some(), "no block went up");
         for again in 0..4 {
             assert!(
-                !scene.preview_drop(dragged, width, height),
-                "the preview changed on frame {again} with the pointer still"
+                !scene.aim_drop(dragged, width, height),
+                "the block moved on frame {again} with the pointer still"
             );
-            assert_eq!(tile_order(&scene, width, height), [2, 1, 3]);
+            assert_eq!(scene.hint_area(), block);
+            assert_eq!(tile_order(&scene, width, height), settled);
         }
     }
 
     #[test]
-    fn a_window_arriving_or_leaving_under_a_drag_drops_the_preview() {
-        // The preview is derived from the arrangement, so it may not outlive
-        // a change to it: a stale one would keep drawing a window that has
-        // gone, or lay out around one that has arrived.
+    fn a_window_arriving_or_leaving_under_a_drag_drops_the_block() {
+        // The block is derived from the arrangement, so it may not outlive a
+        // change to it: a stale one would promise a landing beside a window
+        // that has gone, or sit over a tile that has since moved.
         let (width, height) = (240, 600);
         let dragged = SurfaceKey {
             client: 1,
@@ -2853,7 +3130,7 @@ mod tests {
             let target = tile(scene, width, height, 3).rect;
             scene.pointer_x = i32::try_from(target.x + 2).unwrap();
             scene.pointer_y = i32::try_from(target.y + 2).unwrap();
-            assert!(scene.preview_drop(dragged, width, height));
+            assert!(scene.aim_drop(dragged, width, height));
         };
 
         let mut scene = a_window_beside_a_column();
@@ -2862,7 +3139,7 @@ mod tests {
             client: 1,
             object: 2
         }));
-        assert!(scene.preview.is_none(), "the preview outlived an unmap");
+        assert!(!scene.hint_is_live(), "the block outlived an unmap");
 
         let mut scene = a_window_beside_a_column();
         aim(&mut scene);
@@ -2875,21 +3152,26 @@ mod tests {
                 surface([1, 1, 1, 0], 8, 8),
             )
             .unwrap();
-        assert!(scene.preview.is_none(), "the preview outlived a new window");
+        assert!(!scene.hint_is_live(), "the block outlived a new window");
 
         let mut scene = a_window_beside_a_column();
         aim(&mut scene);
         scene.command(Command::Focus(crate::layout::Direction::Up));
-        assert!(scene.preview.is_none(), "the preview outlived a command");
+        assert!(!scene.hint_is_live(), "the block outlived a command");
     }
 
     #[test]
-    fn a_preview_carries_the_focus_its_drop_would_leave() {
-        // Focus is read off the ARRANGEMENT for the reason its geometry is.
-        // A drop focuses what it moved, and the map published to clients
-        // marks that window active; answering from the layout underneath
-        // would aim the keyboard at one window while telling every client
-        // another had been activated.
+    fn an_aim_leaves_the_focus_alone_and_the_drop_takes_it() {
+        // Focus follows the ARRANGEMENT, and the arrangement does not move
+        // while a block is up — so aiming changes nothing about what the
+        // keyboard is pointed at, and a drag abandoned mid-flight leaves the
+        // operator exactly where they were.
+        //
+        // The preview this replaces had to carry its own focus, because the
+        // map published to clients was the previewed one and marking a
+        // different window active would have aimed the keyboard at one window
+        // while telling every client about another. Nothing is published until
+        // the release now, so there is no second answer to keep in step.
         let mut scene = a_window_beside_a_column();
         let (width, height) = (240, 600);
         let dragged = SurfaceKey {
@@ -2897,7 +3179,7 @@ mod tests {
             object: 1,
         };
         // 3 was mapped last and so is focused; move focus off it, or the
-        // preview's own focus and the layout's would agree by accident.
+        // assertions below would hold by accident.
         let elsewhere = SurfaceKey {
             client: 1,
             object: 2,
@@ -2908,26 +3190,31 @@ mod tests {
         let target = tile(&scene, width, height, 2).rect;
         scene.pointer_x = i32::try_from(target.x + 2).unwrap();
         scene.pointer_y = i32::try_from(target.y + 2).unwrap();
-        assert!(scene.preview_drop(dragged, width, height));
+        assert!(scene.aim_drop(dragged, width, height));
         assert_eq!(
             scene.focused(),
-            Some(dragged),
-            "the picture and the keyboard disagree about what is focused"
+            Some(elsewhere),
+            "aiming moved the keyboard"
         );
-        // And the layout underneath is untouched, so a cancelled drag hands
-        // focus back rather than keeping the drop's.
-        assert_eq!(scene.layout.focused(), Some(elsewhere));
-        assert!(scene.clear_preview());
+        // Abandoned: the block goes and nothing else moved.
+        assert!(scene.clear_hint());
         assert_eq!(scene.focused(), Some(elsewhere));
+
+        // Taken: the drop focuses what it moved, as every other way of moving
+        // a window does.
+        assert!(scene.aim_drop(dragged, width, height));
+        assert_eq!(scene.commit_drop(dragged), Some(true));
+        assert_eq!(scene.focused(), Some(dragged));
     }
 
     #[test]
-    fn dropping_a_preview_counts_as_a_layout_change() {
-        // A mutation that changes nothing about the layout can still move the
-        // screen, by dropping the preview drawn over it. Its caller repaints
-        // and republishes on that answer, so reporting the layout's own
-        // change alone leaves the map published to clients holding previewed
-        // geometry the screen no longer shows.
+    fn dropping_a_block_is_not_a_layout_change() {
+        // These answer whether the LAYOUT moved, which is what gates the round
+        // of configures their one caller sends; it repaints either way. A
+        // block is drawn over the arrangement rather than replacing it, so
+        // taking one down owes that repaint and nothing else — reporting it as
+        // a layout change would reconfigure every client for a rectangle none
+        // of them was ever told about.
         let (width, height) = (240, 600);
         let dragged = SurfaceKey {
             client: 1,
@@ -2941,25 +3228,29 @@ mod tests {
             let target = tile(scene, width, height, 3).rect;
             scene.pointer_x = i32::try_from(target.x + 2).unwrap();
             scene.pointer_y = i32::try_from(target.y + 2).unwrap();
-            assert!(scene.preview_drop(dragged, width, height));
+            assert!(scene.aim_drop(dragged, width, height));
         };
 
-        // A surface that is not in the layout at all: without the preview
-        // this unmap is a no-op and says so.
-        let mut scene = a_window_beside_a_column();
-        assert!(!scene.unmap(stranger), "the stranger was in the layout");
-        aim(&mut scene);
-        assert!(scene.unmap(stranger), "a dropped preview went unreported");
-
-        let mut scene = a_window_beside_a_column();
-        assert!(!scene.remove(stranger));
-        aim(&mut scene);
-        assert!(scene.remove(stranger), "a dropped preview went unreported");
-
-        let mut scene = a_window_beside_a_column();
-        assert!(!scene.remove_client(9));
-        aim(&mut scene);
-        assert!(scene.remove_client(9), "a dropped preview went unreported");
+        // A surface that is not in the layout at all, so the mutation itself
+        // moves nothing and the block is the only thing that changes.
+        for mutate in [
+            (|scene: &mut Scene, key: SurfaceKey| scene.unmap(key))
+                as fn(&mut Scene, SurfaceKey) -> bool,
+            |scene: &mut Scene, key: SurfaceKey| scene.remove(key),
+            |scene: &mut Scene, key: SurfaceKey| scene.remove_client(key.client),
+        ] {
+            let mut scene = a_window_beside_a_column();
+            assert!(
+                !mutate(&mut scene, stranger),
+                "the stranger was in the layout"
+            );
+            aim(&mut scene);
+            assert!(
+                !mutate(&mut scene, stranger),
+                "a dropped block asked for configures"
+            );
+            assert!(!scene.hint_is_live(), "the block outlived its base");
+        }
     }
 
     #[test]

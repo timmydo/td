@@ -75,9 +75,9 @@ pub enum DropKind {
     },
     /// A place in the target's own container, whatever that container is —
     /// what a drop onto a title BAND means. It names no axis deliberately:
-    /// the aim is computed against the arrangement with the dragged window
-    /// taken OUT, where the target's container may have collapsed to nothing
-    /// at all, so an axis read there could turn a column into a row.
+    /// a run is a list, and a position in it is the only thing a drop onto
+    /// one can mean, so resolving an axis here would be a second answer to a
+    /// question `insert_beside` already has one for.
     InRun {
         before: bool,
     },
@@ -591,9 +591,9 @@ impl Layout {
     /// KIND says what landing on it means.
     ///
     /// Answers whether the tree CHANGED — exactly that, and not whether the
-    /// call was made. The one shipped caller previews the drop and compares
-    /// arrangements instead, so nothing reads this today; it is the contract
-    /// the layout-side tests are written against.
+    /// call was made. A drop that lands the window where it already was is the
+    /// commonest gesture there is, and reporting it as a move would cost a
+    /// round of configures for an identical arrangement.
     pub fn drop_onto(&mut self, dragged: SurfaceKey, target: SurfaceKey, drop: DropKind) -> bool {
         if dragged == target {
             return false;

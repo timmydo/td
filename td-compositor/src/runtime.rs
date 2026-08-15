@@ -188,11 +188,11 @@ impl Drag {
     /// enough to mean it. `None` until then, which is what keeps a click a
     /// click.
     ///
-    /// LATCHED, because not aiming FREEZES the picture rather than clearing
-    /// it: the preview is only rebuilt where this answers, so a drag that
-    /// un-aimed on the way home would leave the last one standing and the
-    /// release would commit it. Before the latch nothing has been previewed,
-    /// which is what makes skipping safe at all.
+    /// LATCHED, because not aiming leaves the last block STANDING rather than
+    /// clearing it: a block is recomputed only where this answers, so a drag
+    /// that un-aimed on the way home would promise a landing the pointer had
+    /// left and the release would take it. Before the latch nothing has been
+    /// promised, which is what makes skipping safe at all.
     ///
     /// Per AXIS rather than by true distance, as GTK is: no multiply, so no
     /// overflow to reason about.
@@ -382,9 +382,7 @@ impl Runtime {
         // was put back to is the clients' business and nothing below owes it
         // to them; the rollback restores only the overlay, which no tiling
         // geometry reads, so it cannot invalidate this.
-        if self.cancel_drag_under_overlay() && self.refresh_layout() {
-            self.publish_layout();
-        }
+        self.cancel_drag_under_overlay();
         if let Err(error) = self.repaint() {
             self.scene.restore_launcher(checkpoint);
             return Err(error);
@@ -409,23 +407,25 @@ impl Runtime {
     /// aiming at.
     ///
     /// Folded into the paint the overlay already owes rather than settling on
-    /// its own: a failure here would otherwise be the one path through these
-    /// two that returns without restoring what it changed. Answers whether
-    /// putting the arrangement back moved the screen, which is a round of
-    /// configures the caller owes its clients.
-    fn cancel_drag_under_overlay(&mut self) -> bool {
+    /// its own, and answers nothing: a block is pixels over the arrangement,
+    /// so taking one down owes that paint and no round of configures. Ordered
+    /// BEFORE the paint that can fail, or a failure would strand the block
+    /// with no drag left to commit or clear it.
+    fn cancel_drag_under_overlay(&mut self) {
         if !self.scene.modal() {
-            return false;
+            return;
         }
         self.dragging = None;
-        self.scene.clear_preview()
+        self.scene.clear_hint();
     }
 
-    /// Put the window back down where it was picked up and end the drag.
+    /// End the drag and take its block down. A repaint and no more: the
+    /// arrangement never moved while the block was up, so there is nothing
+    /// the clients were told that has to be taken back.
     fn cancel_drag(&mut self) -> Result<(), String> {
         self.dragging = None;
-        if self.scene.clear_preview() {
-            self.settle(true)?;
+        if self.scene.clear_hint() {
+            self.settle(false)?;
         }
         Ok(())
     }
@@ -458,9 +458,7 @@ impl Runtime {
         if self.scene.set_help(action.target(before)) == before {
             return Ok(before);
         }
-        if self.cancel_drag_under_overlay() && self.refresh_layout() {
-            self.publish_layout();
-        }
+        self.cancel_drag_under_overlay();
         if let Err(error) = self.repaint() {
             return Err(self.restore_help(before, error));
         }
@@ -630,13 +628,12 @@ impl Runtime {
     }
 
     /// The drag. A press picks a window up and focuses it; once the pointer
-    /// has left the press point by more than `DRAG_THRESHOLD` the screen shows
-    /// the drop itself — over that window's own tile as readily as anywhere
-    /// else — and the release keeps it. Two presses start one: a BARE press on
-    /// a title band,
-    /// and an ALT press anywhere on a window — the band is the handle that
-    /// exists without a modifier, and the modifier is what makes the whole
-    /// window one.
+    /// has left the press point by more than `DRAG_THRESHOLD` a BLOCK marks
+    /// where the window would land — everywhere but over that window's own
+    /// tile, which lands nothing — and the release is what moves it. Two
+    /// presses start one: a BARE press on a title band, and an ALT press
+    /// anywhere on a window — the band is the handle that exists without a
+    /// modifier, and the modifier is what makes the whole window one.
     ///
     /// Entirely outside the pointer model, and it has to be: a band belongs to
     /// no client, so a press on one establishes no grab and delivers nothing.
@@ -682,13 +679,13 @@ impl Runtime {
                         self.scene.band_at_pointer(width, height)
                     };
                     // A press ENDS whatever was live, whether or not it picks
-                    // something up. Picking nothing would strand the screen on
-                    // an arrangement the layout never took, with no drag left
-                    // to commit or clear it; picking something is the same
-                    // hazard one step on, since the new drag does not aim
-                    // until it leaves its OWN press point, so an inherited
-                    // preview would freeze there with nothing rebuilding it
-                    // and the release would commit the PREVIOUS drag's drop.
+                    // something up. Picking nothing would strand a block on
+                    // screen with no drag left to commit or clear it; picking
+                    // something is the same hazard one step on, since the new
+                    // drag does not aim until it leaves its OWN press point,
+                    // so an inherited block would stand there with nothing
+                    // recomputing it and the release would land the PREVIOUS
+                    // drag's drop.
                     match picked {
                         Some(key) => {
                             self.cancel_drag()?;
@@ -708,40 +705,47 @@ impl Runtime {
                         continue;
                     };
                     // The reader coalesces a batch, so the motion that chose
-                    // the drop and the release that takes it commonly arrive
-                    // together and the picture is a frame behind the pointer.
+                    // the block and the release that takes it commonly arrive
+                    // together and the block is a frame behind the pointer.
                     // Brought up to date only when this frame MOVED: on a
                     // still pointer there is nothing new to account for, and
-                    // computing one anyway would commit an answer the
-                    // operator never saw — which is exactly a release that
-                    // follows a window mapping the preview away. A frame can
-                    // MOVE without the drag having left the press point, so
-                    // the threshold is asked here too: otherwise a click with
-                    // a pixel of shake in it would land a drop.
-                    let aimed = drag.aiming_from(self.scene.pointer_at());
-                    let settled = match aimed {
-                        Some(dragged)
-                            if moved && self.scene.preview_drop(dragged, width, height) =>
-                        {
-                            self.settle(true)
+                    // re-aiming anyway would land a drop the operator never
+                    // saw a block for. A frame can MOVE without the drag
+                    // having left the press point, so the threshold is asked
+                    // here too: otherwise a click with a pixel of shake in it
+                    // would land a drop.
+                    if let Some(dragged) = drag.aiming_from(self.scene.pointer_at()) {
+                        if moved {
+                            self.scene.aim_drop(dragged, width, height);
                         }
-                        _ => Ok(()),
-                    };
-                    // Nothing is decided here: the drop went into the picture
-                    // when the pointer reached it, so the release only KEEPS
-                    // it, owing neither a paint nor a round of configures.
-                    // Run whatever the settle did — the drag is already taken,
-                    // so skipping it would strand the picture with nothing
-                    // able to commit or clear it.
-                    self.scene.commit_preview();
-                    settled?;
+                        // The drop is what the BLOCK promised, applied rather
+                        // than recomputed. A block that came down owes a
+                        // repaint whatever it landed, and only a drop that
+                        // MOVED something owes the clients their configures —
+                        // which is why this answers those separately. A drop
+                        // that lands where the window already was is the
+                        // commonest gesture there is.
+                        if let Some(moved) = self.scene.commit_drop(dragged) {
+                            self.settle(moved)?;
+                            continue;
+                        }
+                    }
+                    // No drop: any block still up has to come down, and that
+                    // is a repaint alone — the arrangement never moved, so no
+                    // client was told anything that needs undoing.
+                    if self.scene.clear_hint() {
+                        self.settle(false)?;
+                    }
                 }
             }
         }
         let at = self.scene.pointer_at();
         if let Some(dragged) = self.dragging.as_mut().and_then(|drag| drag.aiming_from(at)) {
-            if self.scene.preview_drop(dragged, width, height) {
-                self.settle(true)?;
+            // A repaint, never a round of configures: the block moves, the
+            // arrangement does not, so no client is told anything until the
+            // release.
+            if self.scene.aim_drop(dragged, width, height) {
+                self.settle(false)?;
             }
         }
         Ok(())
@@ -769,7 +773,7 @@ impl Runtime {
             self.publish_keyboard_event(event);
         }
         // The modifier is half of what holds an Alt gesture open, so letting
-        // it go abandons the drag and the picture with it — which is the
+        // it go abandons the drag and the block with it — which is the
         // whole of the revert, the layout underneath never having moved.
         if self
             .dragging
@@ -1675,13 +1679,10 @@ mod tests {
         };
         goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(2)]);
 
-        // The middle of 3's tile, read off the AIM geometry: the drop is
-        // computed against the arrangement with 1 taken out, where that tile
-        // is somewhere else than the one on screen.
+        // The middle of 3's tile, which is the TRADE zone. Read off the
+        // screen, which is the only geometry a drag has now.
         let onto = {
-            let placements = runtime
-                .scene
-                .aim_placements(*keys.first().unwrap(), 240, height);
+            let placements = runtime.scene.tiled_placements(240, height);
             let at = placements
                 .iter()
                 .position(|placement| placement.key.object == 3)
@@ -1694,23 +1695,24 @@ mod tests {
             onto.y + onto.height / 2,
             &[],
         );
-        // Shown BEFORE the release, which is what the preview promises.
-        assert_eq!(order(&runtime), [3, 2, 1], "the trade was not previewed");
-        assert_eq!(
-            geometry(&runtime),
-            settled,
-            "a swap moved the tiles instead of what is in them"
-        );
+        // PROMISED before the release and not taken: the block covers the
+        // whole of 3's frame, because a trade really does put the dragged
+        // window there — and nothing has moved yet.
+        assert!(block(&runtime).is_some(), "the trade promised nothing");
+        assert_eq!(order(&runtime), [1, 2, 3], "the block moved a window");
 
-        let previewed = order(&runtime);
         goto(
             &mut runtime,
             onto.x + onto.width / 2,
             onto.y + onto.height / 2,
             &[release(3)],
         );
-        assert_eq!(order(&runtime), previewed);
-        assert_eq!(geometry(&runtime), settled);
+        assert_eq!(order(&runtime), [3, 2, 1], "the release did not trade");
+        assert_eq!(
+            geometry(&runtime),
+            settled,
+            "a swap moved the tiles instead of what is in them"
+        );
         assert_eq!(
             runtime.keyboard_snapshot().focus,
             keys.first().copied(),
@@ -1776,14 +1778,6 @@ mod tests {
                 .unwrap();
             list.get(at).unwrap().band
         };
-        let aim_band = |runtime: &Runtime, dragged: SurfaceKey, object: u32| {
-            let list = runtime.scene.aim_placements(dragged, 240, height);
-            let at = list
-                .iter()
-                .position(|placement| placement.key.object == object)
-                .unwrap();
-            list.get(at).unwrap().band
-        };
         let press = |time| PointerButtonInput {
             time,
             button: 272,
@@ -1808,7 +1802,7 @@ mod tests {
         // tile because the stack collapsed when 3 came out of it.
         let handle = band_of(&runtime, 3);
         goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(2)]);
-        let target = aim_band(&runtime, *keys.get(2).unwrap(), 2);
+        let target = band_of(&runtime, 2);
         // The right-hand quarter of that band and the TOP of it, so the two
         // halves disagree: a run read as the collapsed aim tree's ROW answers
         // "after" where the stack it actually lands in answers "before".
@@ -1888,18 +1882,6 @@ mod tests {
                 .unwrap();
             *placements.get(at).unwrap()
         };
-        // The tile a drop is AIMED at, which is not the one on screen: the
-        // dragged window is taken out of the arrangement first, so the rest
-        // are bigger and elsewhere. A point picked off the screen asks a
-        // different question than the drag does.
-        let aim = |runtime: &Runtime, dragged: SurfaceKey, object: u32| {
-            let placements = runtime.scene.aim_placements(dragged, 240, height);
-            let at = placements
-                .iter()
-                .position(|placement| placement.key.object == object)
-                .unwrap();
-            *placements.get(at).unwrap()
-        };
         let press = |time| PointerButtonInput {
             time,
             button: 272,
@@ -1931,7 +1913,7 @@ mod tests {
         // focus publishes a layout of its own, so a snapshot from before it
         // would be moved by the press rather than by the drop.
         let published = runtime.layout_snapshot();
-        let target = aim(&runtime, *keys.first().unwrap(), 3).rect;
+        let target = band(&runtime, 3).rect;
         goto(
             &mut runtime,
             target.x + target.width / 2,
@@ -1954,7 +1936,7 @@ mod tests {
         // The BOTTOM third of the same tile puts it below instead.
         let handle = band(&runtime, 1).band;
         goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(4)]);
-        let target = aim(&runtime, *keys.first().unwrap(), 3).rect;
+        let target = band(&runtime, 3).rect;
         goto(
             &mut runtime,
             target.x + target.width / 2,
@@ -2130,10 +2112,18 @@ mod tests {
         runtime.scene.layout().check_invariants().unwrap();
     }
 
-    /// A row of `count` windows on a 1600-wide output — wide enough that a
-    /// tile is far bigger than `DRAG_THRESHOLD`, so leaving the press point
-    /// and leaving the TILE are different things.
-    fn a_row(cleanup: &Cleanup, count: u32) -> (Runtime, usize) {
+    /// A STACKED column of `count` windows, and the press point on the first
+    /// leaf's band from which the threshold is observable: one pixel past it
+    /// is the NEXT leaf's band.
+    ///
+    /// It has to be a stack, and that is the whole difficulty of testing a
+    /// threshold now. Anywhere else a gap sits between two tiles, so a pointer
+    /// that has just crossed the threshold is over no window at all — and with
+    /// the picture static a drag shows nothing until the pointer is over
+    /// ANOTHER window, so both sides of the boundary would answer the same. A
+    /// stack's bands abut, which is what makes the two pixels either side of
+    /// the threshold say different things.
+    fn a_stack(cleanup: &Cleanup, count: u32) -> (Runtime, usize, (i32, i32), (i32, i32)) {
         let height = 600;
         let framebuffer = Framebuffer::test_file(&cleanup.0, 1600, height, 1600 * 4).unwrap();
         let mut runtime = Runtime::new(framebuffer);
@@ -2142,69 +2132,116 @@ mod tests {
                 .commit(SurfaceKey { client: 1, object }, surface([1, 2, 3, 0]))
                 .unwrap();
         }
-        (runtime, height)
+        runtime.command(Command::ToggleStacked).unwrap();
+        let band = runtime
+            .scene
+            .tiled_placements(1600, height)
+            .iter()
+            .position(|placement| placement.key.object == 1)
+            .and_then(|at| {
+                runtime
+                    .scene
+                    .tiled_placements(1600, height)
+                    .get(at)
+                    .copied()
+            })
+            .map(|placement| placement.band)
+            .unwrap();
+        let reach = usize::try_from(DRAG_THRESHOLD).unwrap() + 1;
+        assert!(
+            band.height > reach,
+            "a band is too short to hold the threshold"
+        );
+        let at = (
+            i32::try_from(band.x + band.width / 2).unwrap(),
+            i32::try_from(band.y + band.height - reach).unwrap(),
+        );
+        // A point that MOVES the pressed window, which the pixel past the
+        // threshold does not: that one is the top half of the next leaf's
+        // band, and inserting 1 before 2 leaves the run exactly as it was.
+        // The bottom half of the LAST band puts it at the end instead.
+        let last = runtime
+            .scene
+            .tiled_placements(1600, height)
+            .last()
+            .map(|placement| placement.band)
+            .unwrap();
+        let lands = (
+            i32::try_from(last.x + last.width / 2).unwrap(),
+            i32::try_from(last.y + last.height - 1).unwrap(),
+        );
+        (runtime, height, at, lands)
     }
 
-    /// A press point on window 1's own band from which a drop WOULD land
-    /// somewhere: past the middle of 2's band in the aim geometry, so the run
-    /// drop puts 1 after 2 rather than back where it already was.
-    ///
-    /// Choosing it is the whole difficulty in testing a threshold. Over most
-    /// of 1's band the aim is a no-op, and there a drag that ignored the
-    /// threshold entirely would look exactly like one that honoured it.
-    fn a_press_point_that_aims(
-        runtime: &Runtime,
-        height: usize,
-    ) -> ((i32, i32), crate::layout::Rect) {
-        let of = |placements: &[crate::layout::Placement], object: u32| {
-            let at = placements
-                .iter()
-                .position(|placement| placement.key.object == object)
-                .unwrap();
-            *placements.get(at).unwrap()
-        };
-        let screen = runtime.scene.tiled_placements(1600, height);
-        let own = of(&screen, 1);
-        let dragged = SurfaceKey {
+    /// The block a drag is promising, if any.
+    fn block(runtime: &Runtime) -> Option<crate::layout::Rect> {
+        runtime.scene.hint_area()
+    }
+
+    #[test]
+    fn the_threshold_measures_both_axes_from_the_press_point() {
+        // The threshold itself, asked directly. Through a gesture only one
+        // axis is reachable — a stack's bands abut vertically and span their
+        // container horizontally — so the other would go untested, and a
+        // per-axis rule is exactly the kind a single-axis probe cannot tell
+        // from a one-axis one.
+        let key = SurfaceKey {
             client: 1,
             object: 1,
         };
-        let onto = of(&runtime.scene.aim_placements(dragged, 1600, height), 2);
-        let after = onto.band.x + onto.band.width / 2;
-        let x = (after + own.band.x + own.band.width) / 2;
-        let reach = usize::try_from(DRAG_THRESHOLD).unwrap() + 1;
-        assert!(
-            after < x && x + reach < own.band.x + own.band.width,
-            "the probe points do not fit across the band they press"
-        );
-        // Both axes, since a probe that left the band vertically would be
-        // aiming at a client area rather than at the run.
-        let y = own.band.y + own.band.height / 2;
-        assert!(
-            own.band.y + reach <= y && y + reach < own.band.y + own.band.height,
-            "the probe points do not fit down the band they press"
-        );
-        (
-            (i32::try_from(x).unwrap(), i32::try_from(y).unwrap()),
-            own.rect,
-        )
+        let press = (100, 100);
+        let fresh = || Drag {
+            key,
+            held_by_alt: false,
+            press,
+            escaped: false,
+        };
+        for (dx, dy) in [
+            (0, 0),
+            (DRAG_THRESHOLD, 0),
+            (-DRAG_THRESHOLD, 0),
+            (0, DRAG_THRESHOLD),
+            (0, -DRAG_THRESHOLD),
+            // The corner, eleven pixels away: a true-distance rule would let
+            // this one through, which is what makes per-axis a decision
+            // rather than an implementation detail.
+            (DRAG_THRESHOLD, DRAG_THRESHOLD),
+        ] {
+            let mut drag = fresh();
+            assert!(
+                drag.aiming_from((press.0 + dx, press.1 + dy)).is_none(),
+                "{dx},{dy} escaped the threshold"
+            );
+        }
+        for (dx, dy) in [
+            (DRAG_THRESHOLD + 1, 0),
+            (-DRAG_THRESHOLD - 1, 0),
+            (0, DRAG_THRESHOLD + 1),
+            (0, -DRAG_THRESHOLD - 1),
+        ] {
+            let mut drag = fresh();
+            assert_eq!(
+                drag.aiming_from((press.0 + dx, press.1 + dy)),
+                Some(key),
+                "{dx},{dy} did not escape the threshold"
+            );
+            // Latched: back on the press point it still aims, which is what
+            // keeps the block answering the pointer all the way home.
+            assert_eq!(drag.aiming_from(press), Some(key));
+        }
     }
 
     #[test]
     fn a_press_that_does_not_leave_its_own_point_is_still_a_click() {
         // Half of what replaced the dead zone, and the half that zone existed
-        // for: a click on a title bar has to stay a click. A press is not a
-        // drop, and neither is a press with a pixel of hand-shake in it —
-        // which matters more than it sounds, since the aim geometry has the
-        // dragged window taken out, so the pixel under the press belongs to
-        // whichever neighbour grew into it and IS a live target.
+        // for: a click on a title bar has to stay a click.
         let path = std::env::temp_dir().join(format!(
             "td-runtime-drag-click-{}-{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let cleanup = Cleanup(path);
-        let (mut runtime, height) = a_row(&cleanup, 4);
+        let (mut runtime, height, (at_x, at_y), lands) = a_stack(&cleanup, 4);
         let order = |runtime: &Runtime| {
             runtime
                 .scene
@@ -2219,73 +2256,63 @@ mod tests {
                 .pointer_frame(1, x - at_x, y - at_y, buttons)
                 .unwrap()
         };
-        let ((at_x, at_y), _) = a_press_point_that_aims(&runtime, height);
         let settled = order(&runtime);
 
-        // Every offset the threshold is meant to absorb, INCLUDING the
-        // diagonal: per axis is what a true-distance check would pass here,
-        // since the corner is eleven pixels from the press point.
-        for (dx, dy) in [
-            (0, 0),
-            (DRAG_THRESHOLD, 0),
-            (0, -DRAG_THRESHOLD),
-            (DRAG_THRESHOLD, DRAG_THRESHOLD),
-        ] {
+        for dy in [0, DRAG_THRESHOLD] {
             goto(&mut runtime, at_x, at_y, &[press(2)]);
-            goto(&mut runtime, at_x + dx, at_y + dy, &[]);
-            assert_eq!(
-                order(&runtime),
-                settled,
-                "a press that moved {dx},{dy} previewed a drop"
-            );
-            goto(&mut runtime, at_x + dx, at_y + dy, &[release(3)]);
-            assert_eq!(
-                order(&runtime),
-                settled,
-                "a click that moved {dx},{dy} moved a window"
-            );
+            goto(&mut runtime, at_x, at_y + dy, &[]);
+            assert!(block(&runtime).is_none(), "a click of {dy} promised a drop");
+            goto(&mut runtime, at_x, at_y + dy, &[release(3)]);
+            assert_eq!(order(&runtime), settled, "a click of {dy} moved a window");
         }
 
         // A frame carrying MOTION and the release together, which is how the
         // reader coalesces one and the only way to reach the threshold on the
-        // release path at all: with the pointer already where it was, `moved`
-        // is false and that guard alone suppresses the drop.
-        goto(&mut runtime, at_x, at_y, &[press(6)]);
-        goto(&mut runtime, at_x + DRAG_THRESHOLD, at_y, &[release(7)]);
-        assert_eq!(
-            order(&runtime),
-            settled,
-            "a release frame that moved inside the threshold dropped a window"
-        );
+        // release path: with the pointer already where it was, `moved` is
+        // false and that guard alone suppresses the drop.
+        goto(&mut runtime, at_x, at_y, &[press(4)]);
+        goto(&mut runtime, at_x, at_y + DRAG_THRESHOLD, &[release(5)]);
+        assert_eq!(order(&runtime), settled, "a release frame dropped a window");
 
-        // The positive control, and it is not optional: over most of a band
-        // the drop lands the window back where it started, and there every
-        // assertion above would hold with no threshold at all.
-        goto(&mut runtime, at_x, at_y, &[press(8)]);
-        goto(&mut runtime, at_x + DRAG_THRESHOLD + 1, at_y, &[]);
-        assert_ne!(
-            order(&runtime),
-            settled,
-            "this press point aims at nothing, so it proves nothing"
+        // The positive control: the same press point, dragged far enough to
+        // land somewhere, DOES move a window — so the assertions above are
+        // about the threshold rather than about a gesture that could never
+        // have moved anything.
+        goto(&mut runtime, at_x, at_y, &[press(6)]);
+        goto(&mut runtime, at_x, at_y + DRAG_THRESHOLD + 1, &[]);
+        assert!(
+            block(&runtime).is_some(),
+            "this press point promises nothing"
         );
-        goto(&mut runtime, at_x, at_y, &[release(9)]);
+        goto(&mut runtime, lands.0, lands.1, &[]);
+        goto(&mut runtime, lands.0, lands.1, &[release(7)]);
+        assert_ne!(order(&runtime), settled, "the drop landed nothing");
         runtime.scene.layout().check_invariants().unwrap();
     }
 
     #[test]
-    fn the_threshold_is_measured_down_as_well_as_across() {
-        // An X-only probe cannot tell a per-axis threshold from one that
-        // watches X alone, so the vertical crossing gets its own gesture.
-        // Inside the band still — a probe that left it would be aiming at a
-        // client area, and then the drop rather than the threshold would be
-        // what the assertion turned on.
+    fn a_drop_that_moves_nothing_still_takes_its_block_off_the_screen() {
+        // A drop can land exactly where the window already is: the pixel past
+        // the threshold is the top half of the NEXT leaf's band, and inserting
+        // 1 before 2 leaves the run as it was. The LAYOUT is right to report
+        // no change — that is what stops the commonest gesture there is
+        // costing a round of configures — but the SCREEN still has a block on
+        // it, and reporting "nothing happened" for both leaves a blue
+        // rectangle standing until something unrelated repaints.
+        //
+        // Read off the FRAMEBUFFER rather than off the hint, because the hint
+        // is gone either way: the drop consumed it. What the bug loses is the
+        // paint that would have taken it off the screen — so the comparison
+        // is against the frame that HAD the block, taken with the pointer
+        // already where the release happens. A baseline from before the
+        // gesture would differ by the cursor as well as by the block.
         let path = std::env::temp_dir().join(format!(
-            "td-runtime-drag-down-{}-{}",
+            "td-runtime-noop-drop-{}-{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let cleanup = Cleanup(path);
-        let (mut runtime, height) = a_row(&cleanup, 4);
+        let (mut runtime, height, (at_x, at_y), _) = a_stack(&cleanup, 4);
         let order = |runtime: &Runtime| {
             runtime
                 .scene
@@ -2300,21 +2327,92 @@ mod tests {
                 .pointer_frame(1, x - at_x, y - at_y, buttons)
                 .unwrap()
         };
-        let ((at_x, at_y), _) = a_press_point_that_aims(&runtime, height);
+        runtime.flush_paint().unwrap();
+        let settled_order = order(&runtime);
+
+        goto(&mut runtime, at_x, at_y, &[press(2)]);
+        let held = fs::read(&cleanup.0).unwrap();
+        let crossed = at_y + DRAG_THRESHOLD + 1;
+        goto(&mut runtime, at_x, crossed, &[]);
+        assert!(block(&runtime).is_some(), "no block went up");
+        let aiming = fs::read(&cleanup.0).unwrap();
+        assert_ne!(aiming, held, "the block was never painted");
+
+        goto(&mut runtime, at_x, crossed, &[release(3)]);
+        assert_eq!(
+            order(&runtime),
+            settled_order,
+            "this drop was supposed to move nothing"
+        );
+        assert_ne!(
+            fs::read(&cleanup.0).unwrap(),
+            aiming,
+            "a drop that moved nothing stranded its block on the screen"
+        );
+        assert!(block(&runtime).is_none(), "the block outlived the release");
+        runtime.scene.layout().check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_drag_shows_a_block_over_the_window_it_would_land_on() {
+        // The drag as an operator sees it now: nothing moves while the button
+        // is down, a block says where the window would go, and the release is
+        // what moves it.
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-drag-block-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let (mut runtime, height, (at_x, at_y), lands) = a_stack(&cleanup, 4);
+        let order = |runtime: &Runtime| {
+            runtime
+                .scene
+                .tiled_placements(1600, height)
+                .iter()
+                .map(|placement| placement.key.object)
+                .collect::<Vec<_>>()
+        };
+        let goto = |runtime: &mut Runtime, x: i32, y: i32, buttons: &[PointerButtonInput]| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            runtime
+                .pointer_frame(1, x - at_x, y - at_y, buttons)
+                .unwrap()
+        };
+        let settled = order(&runtime);
+        let crossed = at_y + DRAG_THRESHOLD + 1;
+
         goto(&mut runtime, at_x, at_y, &[press(2)]);
         goto(&mut runtime, at_x, at_y + DRAG_THRESHOLD, &[]);
-        assert_eq!(
-            order(&runtime),
-            [1, 2, 3, 4],
-            "the threshold was crossed a pixel early going down"
+        assert!(block(&runtime).is_none(), "the threshold was crossed early");
+        goto(&mut runtime, at_x, crossed, &[]);
+        let promised = block(&runtime).expect("a pixel past the threshold promised nothing");
+        assert_eq!(order(&runtime), settled, "the block moved a window");
+
+        // Latched, and the observable is that coming home RE-AIMS rather than
+        // freezing: over its own band there is nothing to land on, so the
+        // block goes. A drag that stopped aiming would leave the stale one up
+        // and the release would take it.
+        goto(&mut runtime, at_x, at_y, &[]);
+        assert!(
+            block(&runtime).is_none(),
+            "the block outlived the aim that put it up"
         );
-        goto(&mut runtime, at_x, at_y + DRAG_THRESHOLD + 1, &[]);
-        assert_eq!(
-            order(&runtime),
-            [2, 1, 3, 4],
-            "a pixel past the threshold going down previewed nothing"
-        );
-        goto(&mut runtime, at_x, at_y + DRAG_THRESHOLD + 1, &[release(3)]);
+        assert_eq!(order(&runtime), settled);
+
+        // And back out again, to the same promise.
+        goto(&mut runtime, at_x, crossed, &[]);
+        assert_eq!(block(&runtime), Some(promised));
+
+        // Then on to a point that MOVES it — the pixel past the threshold is
+        // the top half of the next band, and inserting 1 before 2 leaves the
+        // run as it was — and the release takes exactly what was promised.
+        goto(&mut runtime, lands.0, lands.1, &[]);
+        let taken = block(&runtime).expect("the landing point promised nothing");
+        assert_ne!(taken, promised, "the landing point is the same promise");
+        goto(&mut runtime, lands.0, lands.1, &[release(3)]);
+        assert_ne!(order(&runtime), settled, "the release landed nothing");
+        assert!(block(&runtime).is_none(), "the block outlived the release");
         runtime.scene.layout().check_invariants().unwrap();
     }
 
@@ -2323,17 +2421,17 @@ mod tests {
         // A batch can carry two presses with no release between them — one
         // that overflows its transition limit is reset, and the release in it
         // is what goes. The second press installs a new drag, which does not
-        // aim until it leaves its OWN press point; a preview left standing
-        // would therefore freeze on screen with nothing rebuilding it, and the
-        // release would commit the drop the PREVIOUS drag had chosen. A click
-        // on one window's band moving a different window.
+        // aim until it leaves its OWN press point; a block left standing would
+        // therefore sit on screen with nothing rebuilding it, and the release
+        // would land the drop the PREVIOUS drag had chosen. A click on one
+        // window's band moving a different window.
         let path = std::env::temp_dir().join(format!(
             "td-runtime-drag-restart-{}-{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let cleanup = Cleanup(path);
-        let (mut runtime, height) = a_row(&cleanup, 4);
+        let (mut runtime, height, (at_x, at_y), _) = a_stack(&cleanup, 4);
         let order = |runtime: &Runtime| {
             runtime
                 .scene
@@ -2349,153 +2447,26 @@ mod tests {
                 .unwrap()
         };
         let settled = order(&runtime);
-        let ((at_x, at_y), _) = a_press_point_that_aims(&runtime, height);
 
-        // Pick 1 up and aim it somewhere that MOVES it, so there is a preview
-        // to inherit.
+        // Pick 1 up and aim it at a band that is not its own, so there is a
+        // block to inherit.
         goto(&mut runtime, at_x, at_y, &[press(2)]);
-        let elsewhere = {
-            let placements = runtime.scene.aim_placements(
-                SurfaceKey {
-                    client: 1,
-                    object: 1,
-                },
-                1600,
-                height,
-            );
-            let at = placements
-                .iter()
-                .position(|placement| placement.key.object == 4)
-                .unwrap();
-            placements.get(at).unwrap().rect
-        };
-        goto(
-            &mut runtime,
-            i32::try_from(elsewhere.x + elsewhere.width / 2).unwrap(),
-            i32::try_from(elsewhere.y + elsewhere.height / 2).unwrap(),
-            &[],
-        );
-        assert_ne!(order(&runtime), settled, "there is no preview to inherit");
+        goto(&mut runtime, at_x, at_y + DRAG_THRESHOLD + 1, &[]);
+        assert!(block(&runtime).is_some(), "there is no block to inherit");
 
-        // A second press with no release between, onto a band of the picture
-        // as it now stands.
-        let next = {
-            let placements = runtime.scene.tiled_placements(1600, height);
-            let first = placements.first().unwrap();
-            (
-                i32::try_from(first.band.x + first.band.width / 2).unwrap(),
-                i32::try_from(first.band.y + first.band.height / 2).unwrap(),
-            )
-        };
-        goto(&mut runtime, next.0, next.1, &[press(3)]);
-        assert_eq!(
-            order(&runtime),
-            settled,
-            "the new drag inherited the previous one's preview"
-        );
-        goto(&mut runtime, next.0 + 1, next.1, &[]);
-        goto(&mut runtime, next.0 + 1, next.1, &[release(4)]);
-        assert_eq!(
-            order(&runtime),
-            settled,
-            "a click on one band committed another window's drop"
-        );
-        runtime.scene.layout().check_invariants().unwrap();
-    }
-
-    #[test]
-    fn a_drag_aims_once_it_leaves_the_press_point_and_keeps_aiming() {
-        // The other half. One pixel past the threshold the drag is live, and
-        // it is live over the dragged window's OWN tile — the region the dead
-        // zone refused, which at four windows in a row was the whole of the
-        // neighbour's trade zone.
-        //
-        // And it LATCHES: coming back inside the threshold must not un-aim a
-        // gesture that has begun, or a window dragged across the screen and
-        // brought home again would stop previewing exactly where it started.
-        let path = std::env::temp_dir().join(format!(
-            "td-runtime-drag-threshold-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let cleanup = Cleanup(path);
-        let (mut runtime, height) = a_row(&cleanup, 4);
-        let order = |runtime: &Runtime| {
-            runtime
-                .scene
-                .tiled_placements(1600, height)
-                .iter()
-                .map(|placement| placement.key.object)
-                .collect::<Vec<_>>()
-        };
-        let goto = |runtime: &mut Runtime, x: i32, y: i32, buttons: &[PointerButtonInput]| {
-            let (at_x, at_y) = runtime.scene.pointer_at();
-            runtime
-                .pointer_frame(1, x - at_x, y - at_y, buttons)
-                .unwrap()
-        };
-        assert_eq!(order(&runtime), [1, 2, 3, 4]);
-        let ((at_x, at_y), own) = a_press_point_that_aims(&runtime, height);
-        // Both probe points are on 1's own band — inside the dead zone this
-        // replaces, where every aim used to be refused. One pixel is the only
-        // difference between them.
-        let crossed = at_x + DRAG_THRESHOLD + 1;
+        // A second press with no release between.
+        goto(&mut runtime, at_x, at_y, &[press(3)]);
         assert!(
-            usize::try_from(crossed).unwrap() < own.x + own.width,
-            "the probe left the dragged window's own tile, which is the point"
+            block(&runtime).is_none(),
+            "the new drag inherited the previous one's block"
         );
-
-        goto(&mut runtime, at_x, at_y, &[press(2)]);
-        goto(&mut runtime, at_x + DRAG_THRESHOLD, at_y, &[]);
+        goto(&mut runtime, at_x + 1, at_y, &[]);
+        goto(&mut runtime, at_x + 1, at_y, &[release(4)]);
         assert_eq!(
             order(&runtime),
-            [1, 2, 3, 4],
-            "the threshold was crossed a pixel early"
+            settled,
+            "a click on one band landed another window's drop"
         );
-        goto(&mut runtime, crossed, at_y, &[]);
-        assert_eq!(
-            order(&runtime),
-            [2, 1, 3, 4],
-            "a pixel past the threshold previewed nothing"
-        );
-
-        // Latched, which takes a detour to SEE: skipping the preview leaves
-        // the last one standing rather than clearing it, so a drag that
-        // un-aimed on the way home would look identical from the press point
-        // alone. Aim somewhere else first, and the two answers separate — the
-        // picture either follows the pointer back or freezes where it last
-        // was, which is a picture the release would then commit.
-        let elsewhere = {
-            let placements = runtime.scene.aim_placements(
-                SurfaceKey {
-                    client: 1,
-                    object: 1,
-                },
-                1600,
-                height,
-            );
-            let at = placements
-                .iter()
-                .position(|placement| placement.key.object == 3)
-                .unwrap();
-            placements.get(at).unwrap().rect
-        };
-        goto(
-            &mut runtime,
-            i32::try_from(elsewhere.x + elsewhere.width / 2).unwrap(),
-            i32::try_from(elsewhere.y + elsewhere.height / 2).unwrap(),
-            &[],
-        );
-        let detour = order(&runtime);
-        assert_ne!(detour, [2, 1, 3, 4], "the detour aimed at the same drop");
-        goto(&mut runtime, at_x, at_y, &[]);
-        assert_eq!(
-            order(&runtime),
-            [2, 1, 3, 4],
-            "returning to the press point un-aimed a drag that had begun"
-        );
-        goto(&mut runtime, at_x, at_y, &[release(3)]);
-        assert_eq!(order(&runtime), [2, 1, 3, 4], "the release dropped nothing");
         runtime.scene.layout().check_invariants().unwrap();
     }
 
@@ -2507,7 +2478,7 @@ mod tests {
         // said where the window would land. Now the motion frame IS the
         // landing, and the release keeps it.
         let path = std::env::temp_dir().join(format!(
-            "td-runtime-drag-preview-{}-{}",
+            "td-runtime-drag-block-frames-{}-{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
@@ -2538,19 +2509,6 @@ mod tests {
         assert_eq!(order(&runtime), [1, 2, 3]);
         let band = |runtime: &Runtime, object: u32| {
             let placements = tiles(runtime);
-            let at = placements
-                .iter()
-                .position(|placement| placement.key.object == object)
-                .unwrap();
-            *placements.get(at).unwrap()
-        };
-        // The tile a drop is AIMED at rather than the one drawn. Every point
-        // below that asserts WHERE a drop landed comes from here; the ones
-        // that only assert that SOMETHING was previewed may use the screen,
-        // since their own assertion is what catches a point that landed
-        // somewhere other than the tile it was read off.
-        let aim = |runtime: &Runtime, dragged: SurfaceKey, object: u32| {
-            let placements = runtime.scene.aim_placements(dragged, 240, height);
             let at = placements
                 .iter()
                 .position(|placement| placement.key.object == object)
@@ -2596,43 +2554,45 @@ mod tests {
         let picked_up = runtime.layout_snapshot();
 
         // The motion frame, with the button still down and no release in it.
-        // The bottom third of 3's AIM tile, horizontally centred so the
-        // nearest edge is the bottom by half a tile rather than by the two
-        // pixels an inset corner leaves.
-        let target = aim(&runtime, *keys.first().unwrap(), 3).rect;
+        // The bottom of 3's tile, horizontally centred so the nearest edge is
+        // the bottom by half a tile rather than by the two pixels an inset
+        // corner leaves.
+        let target = band(&runtime, 3).rect;
         let aimed = (target.x + target.width / 2, target.y + target.height - 3);
         goto(&mut runtime, aimed.0, aimed.1, &[]);
-        assert_eq!(
-            order(&runtime),
-            [2, 3, 1],
-            "the drop was not on screen before the release"
+        assert!(
+            block(&runtime).is_some(),
+            "the drop was not promised before the release"
         );
-        let previewed = tiles(&runtime);
-        let published = runtime.layout_snapshot();
-        // Clients are configured for the preview, or the picture is a lie the
-        // moment any of them redraws into it.
-        assert_ne!(published, picked_up, "the preview published no layout");
-        // And the KEYBOARD is aimed at what the picture says is active. These
-        // come from different sources — one the arrangement's own focus, the
-        // other the published map's activation — so a preview read off the
-        // layout underneath would aim them at different windows.
+        assert_eq!(order(&runtime), [1, 2, 3], "the block moved a window");
+        // Clients are told NOTHING until the release. The block is drawn over
+        // the arrangement rather than replacing it, so a client that redrew
+        // mid-drag is still drawing the tile it actually has.
+        assert_eq!(
+            runtime.layout_snapshot(),
+            picked_up,
+            "aiming published a layout"
+        );
         assert_eq!(
             runtime.keyboard_snapshot().focus,
             keys.first().copied(),
-            "the keyboard and the picture disagree about what is focused"
+            "aiming moved the keyboard"
         );
 
-        // The release. It has nothing left to decide, so it owes no paint and
-        // no round of configures — and the map published to clients must come
-        // out byte-identical, which a release that recomputed the drop could
-        // not promise.
+        // The release, which is where everything happens: the drop lands, the
+        // clients are configured for it, and the block comes down.
         goto(&mut runtime, aimed.0, aimed.1, &[release(3)]);
         assert_eq!(
-            tiles(&runtime),
-            previewed,
-            "the release moved what the preview had promised"
+            order(&runtime),
+            [2, 3, 1],
+            "the release did not land the drop"
         );
-        assert_eq!(runtime.layout_snapshot(), published);
+        assert_ne!(
+            runtime.layout_snapshot(),
+            picked_up,
+            "the drop never reached the clients"
+        );
+        assert!(block(&runtime).is_none(), "the block outlived the release");
         runtime.scene.layout().check_invariants().unwrap();
 
         // Aiming somewhere and then leaving every tile puts the arrangement
@@ -2643,13 +2603,14 @@ mod tests {
         goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(4)]);
         let target = band(&runtime, 1).rect;
         goto(&mut runtime, target.x + 2, target.y + 2, &[]);
-        assert_ne!(geometry(&runtime), settled, "the drag previewed nothing");
+        assert!(block(&runtime).is_some(), "the drag promised nothing");
+        assert_eq!(geometry(&runtime), settled, "the block moved a window");
         goto(&mut runtime, 0, height - 1, &[]);
-        assert_eq!(
-            geometry(&runtime),
-            settled,
-            "leaving every tile did not put the arrangement back"
+        assert!(
+            block(&runtime).is_none(),
+            "leaving every tile left a block promising a landing"
         );
+        assert_eq!(geometry(&runtime), settled);
         goto(&mut runtime, 0, height - 1, &[release(5)]);
         assert_eq!(geometry(&runtime), settled);
         runtime.scene.layout().check_invariants().unwrap();
@@ -2663,30 +2624,26 @@ mod tests {
         let dragged = *start.first().unwrap();
         let handle = band(&runtime, dragged).band;
         goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(6)]);
-        // The BOTTOM of the next window's tile, so the drop lands under it
-        // and the order comes out different from the one it started in.
-        //
-        // Read off the AIM geometry rather than the screen: the drop is
-        // computed against the arrangement with the dragged window taken out,
-        // where that tile is bigger and higher up than the one being drawn.
-        let onto = {
-            let dragging = runtime.dragging.as_ref().map(|drag| drag.key).unwrap();
-            let placements = runtime.scene.aim_placements(dragging, 240, height);
-            let at = placements
-                .iter()
-                .position(|placement| placement.key.object == *start.get(1).unwrap())
-                .unwrap();
-            placements.get(at).unwrap().rect
-        };
+        // The BOTTOM half of the next window's BAND, which puts the dragged
+        // window after it in the run.
         //
         // Both halves of the frame want something from that one point: the
         // release needs a drop that MOVES something, and the press needs a
         // BAND to pick the next window up by — in the arrangement the release
-        // just committed, which is a third geometry again. The first is
-        // asserted here and the second by `dragging` below.
+        // just committed, which is a second geometry again. A band is the one
+        // kind of point that can be both, since the drop lands in the run the
+        // band belongs to and a band is what a bare press takes.
+        let onto = {
+            let placements = runtime.scene.tiled_placements(240, height);
+            let at = placements
+                .iter()
+                .position(|placement| placement.key.object == *start.get(1).unwrap())
+                .unwrap();
+            placements.get(at).unwrap().band
+        };
         let aim = (
             onto.x + onto.width / 2,
-            onto.y + onto.height.saturating_mul(3) / 4,
+            onto.y + onto.height.saturating_sub(1),
         );
         goto(&mut runtime, aim.0, aim.1, &[release(7), press(8)]);
         assert_eq!(
@@ -2702,85 +2659,99 @@ mod tests {
         runtime.scene.layout().check_invariants().unwrap();
 
         // A release that arrives with the pointer STILL, after something
-        // invalidated the preview, lands nothing. Recomputing one on a still
-        // pointer would commit an answer the operator never saw — the reflow
-        // moves tiles under a motionless pointer, so the drop it computed
-        // would be aimed at whatever slid beneath them.
+        // invalidated the block, lands nothing. Recomputing one on a still
+        // pointer would commit an answer the operator never saw a block for:
+        // a mutation moves tiles under a motionless pointer, so the drop it
+        // computed would be aimed at whatever slid beneath them.
         let settled = geometry(&runtime);
         let handle = band(&runtime, *order(&runtime).first().unwrap()).band;
         goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(10)]);
         let onto = band(&runtime, *order(&runtime).get(1).unwrap()).rect;
         goto(&mut runtime, onto.x + 2, onto.y + 2, &[]);
-        assert_ne!(geometry(&runtime), settled, "the drag previewed nothing");
-        // A mutation that changes NOTHING itself still drops the picture, and
-        // owes the clients the round of configures that puts them back: a
-        // surface that was never in the layout detaching is the case, and its
-        // own answer is "no change".
-        let previewed = runtime.layout_snapshot();
+        assert!(block(&runtime).is_some(), "the drag promised nothing");
+        // A mutation that changes NOTHING itself still drops the block, since
+        // the block names a tile in an arrangement the mutation may have
+        // moved: a surface that was never in the layout detaching is the
+        // case, and its own answer is "no change". The clients are owed
+        // nothing by it, which is the whole difference from the preview this
+        // replaced: they were never told the block in the first place.
+        let held = runtime.layout_snapshot();
         runtime
             .remove(SurfaceKey {
                 client: 8,
                 object: 8,
             })
             .unwrap();
-        assert_eq!(geometry(&runtime), settled, "the picture outlived its base");
-        assert_ne!(
+        assert!(block(&runtime).is_none(), "the block outlived its base");
+        assert_eq!(geometry(&runtime), settled, "the block moved a window");
+        assert_eq!(
             runtime.layout_snapshot(),
-            previewed,
-            "the clients were left holding previewed geometry"
+            held,
+            "a block coming down reconfigured the clients"
         );
-        goto(&mut runtime, 0, height - 1, &[release(13)]);
+        goto(&mut runtime, onto.x + 2, onto.y + 2, &[release(13)]);
+        assert_eq!(
+            geometry(&runtime),
+            settled,
+            "a still release after an invalidated block moved a window"
+        );
 
         // A press that picks NOTHING up ends whatever was live rather than
-        // leaving its picture standing with nothing able to commit or clear
-        // it. Not reachable while every release arrives — a second press of a
+        // leaving a block standing with nothing able to commit or clear it.
+        // Not reachable while every release arrives — a second press of a
         // held button is not forwarded — but a batch that overflows its
         // transition limit is reset, and the release in it is what goes.
         let handle = band(&runtime, *order(&runtime).first().unwrap()).band;
         goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(14)]);
         let onto = band(&runtime, *order(&runtime).get(1).unwrap()).rect;
         goto(&mut runtime, onto.x + 2, onto.y + 2, &[]);
-        assert_ne!(geometry(&runtime), settled, "the drag previewed nothing");
-        goto(&mut runtime, 0, height - 1, &[press(15)]);
+        assert!(block(&runtime).is_some(), "the drag promised nothing");
+        // From the SAME point, so the press is the only thing that could have
+        // taken the block down: a pointer moving off every tile would clear
+        // it on its own and the assertion would hold either way.
+        goto(&mut runtime, onto.x + 2, onto.y + 2, &[press(15)]);
         assert!(runtime.dragging.is_none(), "the drag outlived a lost press");
-        assert_eq!(
-            geometry(&runtime),
-            settled,
-            "a press that picked nothing up stranded the picture"
+        assert!(
+            block(&runtime).is_none(),
+            "a press that picked nothing up stranded the block"
         );
-        goto(&mut runtime, 0, height - 1, &[release(16)]);
+        goto(&mut runtime, onto.x + 2, onto.y + 2, &[release(16)]);
+        assert_eq!(geometry(&runtime), settled);
 
-        // A window arriving drops the picture too, since it is derived from
-        // an arrangement that no longer holds.
+        // A window ARRIVING drops the block too, which is the same
+        // invalidation over a real layout change rather than over a mutation
+        // that moved nothing.
         let handle = band(&runtime, *order(&runtime).first().unwrap()).band;
         goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(12)]);
         let onto = band(&runtime, *order(&runtime).get(1).unwrap()).rect;
         goto(&mut runtime, onto.x + 2, onto.y + 2, &[]);
-        assert_ne!(geometry(&runtime), settled, "the drag previewed nothing");
+        assert!(block(&runtime).is_some(), "the drag promised nothing");
         let guest = SurfaceKey {
             client: 3,
             object: 1,
         };
         runtime.commit(guest, surface([5, 5, 5, 0])).unwrap();
+        assert!(block(&runtime).is_none(), "the block outlived a new window");
         let arrived = geometry(&runtime);
         goto(&mut runtime, onto.x + 2, onto.y + 2, &[release(11)]);
         assert_eq!(
             geometry(&runtime),
             arrived,
-            "a still release after an invalidated preview moved a window"
+            "a still release after an invalidated block moved a window"
         );
         runtime.remove(guest).unwrap();
         runtime.scene.layout().check_invariants().unwrap();
     }
 
     #[test]
-    fn an_alt_press_drags_a_window_and_letting_alt_go_puts_it_back() {
+    fn an_alt_press_drags_a_window_and_letting_alt_go_abandons_it() {
         // The second way to pick a window up: ALT and the left button, from
         // anywhere on it rather than from its title band alone. The band is
         // the handle that exists without a modifier; the modifier is what
         // makes the whole window one. Letting ALT go before the button
-        // abandons the gesture — the modifier is half of what holds it open —
-        // where letting the BUTTON go completes it.
+        // abandons the gesture — the modifier is half of what holds it open,
+        // and the block it was promising comes down with it — where letting
+        // the BUTTON go completes it.
         let path = std::env::temp_dir().join(format!(
             "td-runtime-alt-drag-{}-{}",
             std::process::id(),
@@ -2927,23 +2898,16 @@ mod tests {
             "the press alone moved a window"
         );
 
-        // It drags like any other: the picture is the drop before the button
-        // comes up, and the release keeps it.
+        // It drags like any other: a block says where it would land, nothing
+        // moves while the button is down, and the release is what moves it.
         let onto = at(&runtime, 3).rect;
-        goto(&mut runtime, onto.x + 2, onto.y + onto.height - 2, &[]);
-        assert_eq!(order(&runtime), [2, 3, 1], "the alt drag previewed nothing");
-        let previewed = geometry(&runtime);
-        goto(
-            &mut runtime,
-            onto.x + 2,
-            onto.y + onto.height - 2,
-            &[release(5)],
-        );
-        assert_eq!(
-            geometry(&runtime),
-            previewed,
-            "the release moved the picture"
-        );
+        let aimed = (onto.x + onto.width / 2, onto.y + onto.height - 3);
+        goto(&mut runtime, aimed.0, aimed.1, &[]);
+        assert!(block(&runtime).is_some(), "the alt drag promised nothing");
+        assert_eq!(geometry(&runtime), settled, "the block moved a window");
+        goto(&mut runtime, aimed.0, aimed.1, &[release(5)]);
+        assert_eq!(order(&runtime), [2, 3, 1], "the release landed nothing");
+        assert!(block(&runtime).is_none(), "the block outlived the release");
         assert!(runtime.dragging.is_none());
         assert_eq!(
             buttons_seen(&events),
@@ -2952,7 +2916,7 @@ mod tests {
         );
         runtime.scene.layout().check_invariants().unwrap();
 
-        // Letting ALT go first puts the window back, and the release that
+        // Letting ALT go first takes the block down, and the release that
         // follows still reaches no client: the press it belongs to was never
         // delivered, whatever became of the drag in between.
         let settled = geometry(&runtime);
@@ -2960,24 +2924,21 @@ mod tests {
         goto(&mut runtime, body.x + 2, body.y + 2, &[press(6)]);
         let onto = at(&runtime, *order(&runtime).get(2).unwrap()).rect;
         goto(&mut runtime, onto.x + 2, onto.y + 2, &[]);
-        assert_ne!(
-            geometry(&runtime),
-            settled,
-            "the alt drag previewed nothing"
-        );
+        assert!(block(&runtime).is_some(), "the alt drag promised nothing");
         alt(&mut runtime, false);
-        assert_eq!(
-            geometry(&runtime),
-            settled,
-            "letting alt go did not put the window back"
+        assert!(
+            block(&runtime).is_none(),
+            "letting alt go left a block promising a landing"
         );
+        assert_eq!(geometry(&runtime), settled, "letting alt go moved a window");
         assert!(runtime.dragging.is_none(), "the alt drag outlived alt");
 
-        // Moving on with the button still down previews nothing, since the
+        // Moving on with the button still down promises nothing, since the
         // gesture is over rather than merely paused.
         let elsewhere = at(&runtime, *order(&runtime).get(1).unwrap()).rect;
         goto(&mut runtime, elsewhere.x + 2, elsewhere.y + 2, &[]);
-        assert_eq!(geometry(&runtime), settled, "an abandoned drag came back");
+        assert!(block(&runtime).is_none(), "an abandoned drag came back");
+        assert_eq!(geometry(&runtime), settled);
         goto(
             &mut runtime,
             elsewhere.x + 2,
@@ -3001,32 +2962,30 @@ mod tests {
         goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(8)]);
         let onto = at(&runtime, *order(&runtime).get(2).unwrap()).rect;
         goto(&mut runtime, onto.x + 2, onto.y + 2, &[]);
-        assert_ne!(
-            geometry(&runtime),
-            settled,
-            "the band drag previewed nothing"
-        );
+        assert!(block(&runtime).is_some(), "the band drag promised nothing");
         alt(&mut runtime, false);
-        assert_eq!(
-            geometry(&runtime),
-            settled,
+        assert!(
+            block(&runtime).is_none(),
             "a band pressed under alt was not held by it"
         );
+        assert_eq!(geometry(&runtime), settled);
         goto(&mut runtime, onto.x + 2, onto.y + 2, &[release(9)]);
 
         // And one pressed WITHOUT it is not: the modifier going up and down
-        // during that drag changes nothing, and the drop lands exactly the
-        // picture that was on screen.
+        // during that drag changes nothing, and the release lands exactly the
+        // block that was on screen.
         let handle = at(&runtime, *order(&runtime).first().unwrap()).band;
         goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(22)]);
         alt(&mut runtime, true);
         alt(&mut runtime, false);
         let onto = at(&runtime, *order(&runtime).get(2).unwrap()).rect;
         goto(&mut runtime, onto.x + 2, onto.y + 2, &[]);
-        let previewed = geometry(&runtime);
-        assert_ne!(previewed, settled, "a band drag was abandoned with alt");
+        assert!(
+            block(&runtime).is_some(),
+            "a band drag was abandoned with alt"
+        );
         goto(&mut runtime, onto.x + 2, onto.y + 2, &[release(23)]);
-        assert_eq!(geometry(&runtime), previewed, "the drop moved the picture");
+        assert_ne!(geometry(&runtime), settled, "the release landed nothing");
         runtime.scene.layout().check_invariants().unwrap();
 
         // A client already holding a grab keeps its button, ALT or not. Such
@@ -3321,12 +3280,13 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_paint_keeps_the_clients_in_step_with_a_drag() {
-        // The drag's own three settles: the motion that puts a picture up, the
-        // release that keeps it, and the Alt release that takes it away again.
-        // Each publishes what the screen is showing, so a failed paint must not
-        // cost it — the clients would then be configured for an arrangement
-        // nobody is looking at, in one direction or the other.
+    fn a_failed_paint_leaves_a_drag_able_to_finish() {
+        // The drag's own three settles: the motion that puts a block up, the
+        // release that lands it, and the Alt release that takes it down again.
+        // Only the middle one owes the clients anything — a block is drawn over
+        // the arrangement rather than replacing it — so what a failed paint
+        // must not cost is that round of configures, or the drag's own state,
+        // which is what the next paint would draw from.
         let path = std::env::temp_dir().join(format!(
             "td-runtime-failed-drag-{}-{}",
             std::process::id(),
@@ -3392,49 +3352,48 @@ mod tests {
         };
 
         // The MOTION's settle: pick 1 up by its band and move onto 3 in a frame
-        // of its own, so the picture goes up with no release to promote it.
+        // of its own, so the block goes up with no release to land it. The
+        // clients are told nothing here whether the paint works or not; what a
+        // failed one must not cost is the block itself, which is recorded
+        // before the settle and is what the next paint draws.
         let handle = at(&runtime, 1).band;
         goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(2)]).unwrap();
         let settled = published(&runtime);
         let target = at(&runtime, 3).rect;
+        let aimed = (target.x + target.width / 2, target.y + target.height - 3);
         runtime.fail_next_repaint();
         assert!(
-            goto(
-                &mut runtime,
-                target.x + 2,
-                target.y + target.height - 2,
-                &[]
-            )
-            .is_err(),
+            goto(&mut runtime, aimed.0, aimed.1, &[]).is_err(),
             "the paint was supposed to fail"
         );
-        let previewed = published(&runtime);
-        assert_ne!(
-            previewed, settled,
-            "a failed paint left the clients on the arrangement the drag had left"
+        assert_eq!(published(&runtime), settled, "aiming published a layout");
+        assert!(
+            runtime.scene.hint_is_live(),
+            "a failed paint cost the drag its block"
         );
         runtime.clear_repaint_failure();
         runtime.flush_paint().unwrap();
 
-        // The RELEASE's settle. Its frame must carry a motion that lands
-        // SOMEWHERE ELSE — a pointer moving inside one half re-derives the same
-        // drop, which is deliberately no repaint and so no settle to fail.
+        // The RELEASE's settle, which is the one that owes configures: the
+        // drop lands whatever the screen did, or the clients are left sized
+        // for an arrangement the layout no longer has.
         runtime.fail_next_repaint();
         assert!(
-            goto(&mut runtime, target.x + 2, target.y + 2, &[release(3)]).is_err(),
+            goto(&mut runtime, aimed.0, aimed.1, &[release(3)]).is_err(),
             "the paint was supposed to fail"
         );
-        let dropped = published(&runtime);
         assert_ne!(
-            dropped, previewed,
+            published(&runtime),
+            settled,
             "a failed paint cost the drop its own configures"
         );
-        assert!(!runtime.scene.clear_preview(), "the drop was stranded");
+        assert!(!runtime.scene.clear_hint(), "the block was stranded");
         runtime.clear_repaint_failure();
         runtime.flush_paint().unwrap();
 
-        // And `cancel_drag`, which is the Alt gesture's revert: the picture
-        // comes down and the clients are owed the arrangement underneath it.
+        // And `cancel_drag`, which is the Alt gesture's revert: the block comes
+        // down and the clients, never having been told about it, are owed
+        // nothing by its going.
         alt(&mut runtime, true).unwrap();
         let before = published(&runtime);
         let body = at(&runtime, 2).rect;
@@ -3447,17 +3406,20 @@ mod tests {
         .unwrap();
         let away = at(&runtime, 1).rect;
         goto(&mut runtime, away.x + 2, away.y + away.height - 2, &[]).unwrap();
-        assert_ne!(
-            published(&runtime),
-            before,
-            "the Alt drag previewed nothing"
+        assert!(
+            runtime.scene.hint_is_live(),
+            "the Alt drag promised nothing"
         );
         runtime.fail_next_repaint();
         assert!(alt(&mut runtime, false).is_err(), "the paint was to fail");
+        assert!(
+            !runtime.scene.hint_is_live(),
+            "a failed paint stranded the block a cancelled drag left"
+        );
         assert_eq!(
             published(&runtime),
             before,
-            "a failed paint left the clients on a reverted preview"
+            "a cancelled drag reconfigured the clients"
         );
         runtime.clear_repaint_failure();
         runtime.flush_paint().unwrap();
@@ -3467,9 +3429,9 @@ mod tests {
     #[test]
     fn a_failed_paint_does_not_strand_a_drop_that_was_already_drawn() {
         // The release takes the drag before it settles, so a settle that gave
-        // up on a failed paint left the picture standing with nothing able to
-        // commit or clear it — the screen and the clients holding an
-        // arrangement the layout never took, and no drag left to promote it.
+        // up on a failed paint left the block standing with nothing able to
+        // commit or clear it — a rectangle on screen promising a landing, and
+        // no drag left to make it.
         let path = std::env::temp_dir().join(format!(
             "td-runtime-failed-drop-{}-{}",
             std::process::id(),
@@ -3519,7 +3481,7 @@ mod tests {
         assert_eq!(order(&runtime), [1, 2, 3]);
 
         // Pick 1 up and release it over 3 with the motion in the SAME frame,
-        // which is what makes the release re-derive the picture and settle.
+        // which is what makes the release re-aim before it lands and settles.
         let handle = at(&runtime, 1).band;
         goto(
             &mut runtime,
@@ -3546,11 +3508,11 @@ mod tests {
         );
         assert!(dropped.is_err(), "the paint was supposed to fail");
 
-        // The drop is the LAYOUT's now, not a picture over it: nothing is left
-        // to clear, and the arrangement is what the operator was shown.
+        // The release APPLIES the block rather than leaving one up: nothing
+        // is left to clear, and the arrangement is where the block was.
         assert!(
-            !runtime.scene.clear_preview(),
-            "the drop was stranded as a preview"
+            !runtime.scene.clear_hint(),
+            "the drop was stranded as a block"
         );
         assert_eq!(order(&runtime), [2, 3, 1], "the drop was lost");
         assert!(runtime.dragging.is_none());
@@ -3560,12 +3522,13 @@ mod tests {
     }
 
     #[test]
-    fn an_overlay_publishes_the_drag_it_cancelled_even_when_its_paint_fails() {
-        // The overlay's own rollback restores the overlay and nothing else, so
-        // the arrangement a cancelled drag was put back to is published BEFORE
-        // the paint that can fail. Published after it, a failed paint would
-        // leave every client configured for a preview the screen no longer
-        // shows and the layout never took.
+    fn an_overlay_takes_down_the_block_a_drag_was_promising() {
+        // An overlay going up ends the drag underneath it, and the block has
+        // to go with it: the drag is what commits or clears one, so a block
+        // left standing would be drawn over the overlay by the next paint,
+        // promising a landing nothing can ever make. The overlay's own
+        // rollback restores the overlay and nothing else, so this is taken
+        // BEFORE the paint that can fail rather than after it.
         let path = std::env::temp_dir().join(format!(
             "td-runtime-overlay-cancel-{}-{}",
             std::process::id(),
@@ -3631,7 +3594,7 @@ mod tests {
             );
             let target = at(&runtime, 3).rect;
             goto(&mut runtime, target.x + 2, target.y + 2, &[]);
-            assert_ne!(published(&runtime), settled, "the drag previewed nothing");
+            assert!(runtime.scene.hint_is_live(), "the drag promised nothing");
 
             // The overlay goes up, drops the drag — and its paint fails.
             runtime.fail_next_repaint();
@@ -3640,10 +3603,15 @@ mod tests {
             } else {
                 assert!(runtime.launcher(LauncherAction::Open).is_err());
             }
+            assert!(
+                !runtime.scene.hint_is_live(),
+                "a failed overlay paint stranded the block"
+            );
+            assert!(runtime.dragging.is_none(), "the drag outlived the overlay");
             assert_eq!(
                 published(&runtime),
                 settled,
-                "a failed overlay paint left the clients on the cancelled preview"
+                "a drag the overlay cancelled reconfigured the clients"
             );
             runtime.clear_repaint_failure();
             runtime.flush_paint().unwrap();
@@ -4341,10 +4309,7 @@ mod tests {
             over.y + over.height.saturating_sub(2),
             &[],
         );
-        assert!(
-            runtime.scene.preview_is_live(),
-            "no preview to be fooled by"
-        );
+        assert!(runtime.scene.hint_is_live(), "no preview to be fooled by");
         assert_eq!(runtime.scene.layout().focused(), Some(first));
     }
 

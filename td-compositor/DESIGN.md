@@ -531,7 +531,7 @@ shape — a window visibly the wrong size with nothing in the log and no further
 event coming to correct it. Publishing cannot itself fail, so running it after
 a failure costs nothing and risks nothing. The same reasoning orders an
 overlay's cancelled drag BEFORE the paint that may fail, and promotes a drop
-the release has already taken out of the drag's hands: a picture left standing
+the release has already taken out of the drag's hands: a block left standing
 with nothing able to commit or clear it is the same loss seen from the scene's
 side. The paint debt is a weaker backstop here than elsewhere, which is part of
 why none of this may lean on it: an error out of a device's `apply` ends that
@@ -807,22 +807,31 @@ since it is the one the operator was acting on.
 
 DRAGGING a window is the same move with the destination named by the pointer
 instead of by a direction. A press on a title BAND picks the window up and
-focuses it; from there the screen shows the drop ITSELF, and the release
-keeps what is on it.
+focuses it; from there a semi-transparent BLOCK is drawn over the region the
+window would land in, and the release is what moves it. Nothing in the
+arrangement moves while the button is down.
 
 A tile has FIVE zones and the one the pointer is in says what landing there
 MEANS. Over the middle the two windows trade places, keeping their
 containers and their neighbours. Over an edge the dragged window lands on
 that side — in a column for the top and bottom edges, in a row for the left
-and right — whatever the target's own container runs as, because the drop
-names its axis and the insert MAKES the container it needs. That last part
-is what the five zones buy over a two-sided drop: "put it below this window"
-over a window in a row reaches an arrangement the keyboard only gets to as a
-sequence of commands, and the two-sided drop could not express at all.
+and right — and the drop NAMES that axis rather than reading one off the
+target's container, so the insert can make the container it needs. That last
+part is what the five zones buy over a two-sided drop: "put it below this
+window" over a window in a row reaches an arrangement the keyboard only gets
+to as a sequence of commands, and the two-sided drop could not express at
+all.
 
-A STACKED container refuses that axis and takes the leaf into its run
-instead. It draws one band per LEAF beneath it, so a split among its
-children is a container it never shows: the operator sees the window join
+It only MAKES one where the named axis differs from the container the target
+is already in. Asking for "below" inside a column, or "right" inside a row,
+is asking for a place in a run that already goes that way, so the leaf is
+inserted into it rather than wrapped in a redundant container of its own.
+That is the ordinary case rather than a corner, and it is why the block for
+one is a bar on an edge rather than a half.
+
+A STACKED container refuses the axis outright and takes the leaf into its
+run whatever was asked. It draws one band per LEAF beneath it, so a split
+among its children is a container it never shows: the operator sees it join
 the run exactly as it would have anyway, and finds a row waiting for them
 the moment they unstack. What a stack presents is a list, so a drop into one
 is a place in that list however it was aimed — the same answer its own bands
@@ -845,24 +854,14 @@ for a row, where each leaf carries its own band at the top of its own tile,
 and down for a column. A STACKED container is down whatever its own axis is,
 since its bands are a list at its top rather than one per tile.
 
-Both of those are asked of the tree the drop will be APPLIED to, never of
-the aim geometry, and that is not a detail. Take one window out of a row of
-two and the row is gone: the aim tree says the target sits in no container,
-which would halve a twenty-pixel strip top-to-bottom and leave one side of
-the row unreachable, and would name an axis that turns the column it lands
-in into a row. Naming no axis at all is what makes the second impossible
-rather than merely unlikely.
+Both of those are asked of the tree the drop will be APPLIED to, which is
+the one on screen and the only one there is. That was worth saying while a
+second, dragged-window-removed tree existed to get it wrong from; it is now
+a property of there being nothing else to ask.
 
 The zone is read within whichever rectangle the pointer is in rather than
 over the tile as a whole, because a stacked leaf's band and its client area
 are far apart and a point between them is in neither.
-
-One thing about the aim is worth stating because it is easy to get wrong
-from the outside: the drop is computed against the arrangement with the
-DRAGGED window taken out, which is not the geometry on screen. Its tiles are
-bigger and in different places. That is deliberate, and the two-arrangements
-paragraph below says why; here it means only that a point chosen off the
-SCREEN is answering a different question than the drag asks.
 
 The dragged window is DETACHED rather than removed, and that is the whole of
 this operation's correctness. A removal collapses the container the leaf came
@@ -950,7 +949,7 @@ and is the same window — so a drag that survived it would come back to life
 and move that window under a button pressed before it ever vanished.
 
 A press that picks NOTHING up ends whatever was live, rather than leaving a
-picture standing with no drag able to commit or clear it. That is not
+block standing with no drag able to commit or clear it. That is not
 reachable while every release arrives, since a second press of a held button
 is not forwarded, but a batch that overflows its transition limit is reset and
 the release in it is what goes.
@@ -967,35 +966,65 @@ without restoring what it changed.
 
 A drop reports whether the ARRANGEMENT changed rather than whether it was
 asked for, so putting a window back exactly where it came from — the
-commonest gesture there is — costs no repaint and no round of configures.
+commonest gesture there is — costs no round of configures. It still costs a
+REPAINT, and those are two answers rather than one for exactly that reason: a
+block came down whatever the drop landed, so a release that reported "nothing
+happened" to both would leave a blue rectangle standing with the drag already
+over and nothing left to clear it.
 
-The drag INDICATOR is the drop, drawn. Rather than an outline following the
-pointer, the compositor lays out the arrangement a release would leave and
-puts THAT on screen, so what the operator sees is what they get: the release
-does not apply a computation, it keeps the picture. There is no second answer
-for it to disagree with, and a release on a STILL pointer owes nothing — no
-paint and no round of configures — because the screen and the map published to
-clients have both been reading the preview since it went up. Clients are
-configured for it too, or the picture would be a lie the moment one of them
-redrew into it.
+The drag INDICATOR is a BLOCK over the region a release would land in, drawn
+ON the arrangement rather than in place of it. It is blended in integer
+thirds, two parts what is already there to one part blue: this framebuffer
+has no alpha channel to carry transparency, and mixing at draw time is the
+whole of what "semi-transparent" can mean for a surface that gets composited
+once.
 
-FOCUS is read off the arrangement as the geometry is, because a preview
-carries its own: the drop focuses what it moved, and the map published to
-clients marks that window active. Answering from the layout underneath would
-aim the keyboard at one window while telling every client another had been
-activated. The layout's own focus is left alone, so a cancelled drag hands it
-back rather than keeping the drop's.
+A swap covers the target's whole frame — the dragged window really does end
+up there. Everything else is one of two shapes, and which one is decided by
+the TREE rather than by the zone that was aimed, because `insert_beside` only
+SPLITS where the asked-for axis differs from the target's own container and
+the target is not in a stack. Anywhere else the drop degenerates to a plain
+insert into a run, where the dragged window takes a whole slot and every
+sibling shrinks. A split therefore gets the HALF it would leave; an insert
+gets a twelve-pixel bar on the edge it goes in at, running the way that run
+travels. Promising the half for an insert would be a picture the release
+cannot keep — dropping "to the right of" a window in a ROW is an insert, not
+a split, and that is the ordinary case rather than a corner.
 
-TWO arrangements are in play during a drag and they are deliberately
-different. What is DRAWN is the result: the layout with the dragged window
-moved to where the pointer says. What the pointer is measured AGAINST is the
-layout with that window taken OUT. Aiming at the picture would let a tile be
-pushed away by the very motion aiming at it: the pointer would come to rest
-over a different tile on the next frame, and over the first one again on the
-frame after — a picture alternating between two answers with the mouse held
-still, and a drop that depends on which frame the button was let go in. Removing
-it once, up front, is what makes the target stable, and it is also what the
-picture would look like anyway with the window lifted off.
+A STACKED target then differs once more in WHERE the bar goes. Its leaves all
+share one content rectangle, while the run itself is the column of BANDS at
+the container's top — so a bar on the content rectangle would mark a place
+the new band does not appear. It is drawn on the target's own band instead,
+where the run is and where the operator was pointing. The swap stays the
+exception in the tree too, keeping the content rectangle it really does take.
+
+The dragged window's OWN tile promises nothing, because a window cannot be
+moved beside itself, so a gesture that never leaves it lands nothing on
+release.
+
+CLIENTS are told nothing until that release. A block is pixels over the
+arrangement, so a client redrawing mid-drag is still drawing the tile it
+actually has, and an abandoned gesture has no round of configures to undo —
+which is what makes every cancel (an overlay going up, Alt released, the
+pointer leaving every tile) cost a repaint alone. A mutation that takes a
+block down therefore reports its OWN change and not the block's: every caller
+repaints unconditionally, and answering otherwise would reconfigure every
+client for a rectangle none of them was ever told about.
+
+FOCUS moves at the PRESS and at the DROP and nowhere between. Picking a
+window up focuses it, as clicking it would, and the drop focuses what it
+moved, as every other way of moving a window does. Aiming touches neither.
+
+ONE arrangement is in play, and that is what replaced two. The drop used to
+be DRAWN — the layout re-flowed with the dragged window already moved to
+where the pointer said — and aimed at a third geometry, the layout with that
+window taken OUT, which existed so the picture could not push its own target
+away. It was coherent and it was hard to use: tiles slid out from under the
+pointer as the operator approached them, and the answer was computed against
+a geometry that was on no screen, so a point read off the screen asked a
+different question than the drag did. Holding the picture still and drawing
+the answer on it makes the target stable without a second geometry to be
+right about.
 
 A press alone must not move a window, and a click on a title bar has to stay a
 click. That is said as a THRESHOLD from the press point: a drag aims at
@@ -1005,51 +1034,44 @@ the gesture. Eight is GTK's `gtk-dnd-drag-threshold` default, and per axis
 rather than by true distance is GTK's shape too — no multiply, so no overflow
 to reason about.
 
-It LATCHES because not aiming FREEZES the picture rather than clearing it: the
-preview is rebuilt only on the frames a drag aims, so one that un-aimed on the
-way back would leave the last preview standing and the release would commit
-it. Before the latch nothing has been previewed, which is what makes skipping
-safe at all.
+It LATCHES because not aiming leaves the last block STANDING rather than
+clearing it: a block is recomputed only on the frames a drag aims, so one
+that un-aimed on the way back would promise a landing the pointer had left
+and the release would take it. Before the latch nothing has been promised,
+which is what makes skipping safe at all.
 
-What this replaces was a REGION — the dragged window's whole tile was a dead
-zone and every aim inside it was refused — and the trouble with a region is
-that it was read in the SCREEN geometry while the target is read in the AIM
-one. The two do not correspond: with the dragged window taken out, the
-neighbour that grows into its place lies mostly underneath it, so the zone
-covered that neighbour's live drop points along with the window's own. Swept
-pixel by pixel across a 1600-wide output, `H[1, 2]` through `H[1 … 5]` all had
-2's left third entirely dead; its middle ninth kept 271 columns of 517 at two
-windows, 8 of 255 at three, and none at all from four on. A window could be
-dropped to the RIGHT of that neighbour, above it or below it, but not to its
-LEFT, and past three in a row not traded with it either. A threshold says the
-same thing about the press without covering a neighbour.
+What the threshold replaced was a REGION — the dragged window's whole tile
+was a dead zone and every aim inside it was refused. The trouble with the
+region was that it was read in the SCREEN geometry while the target was read
+in the AIM one, and the two did not correspond: with the dragged window taken
+out, the neighbour that grew into its place lay mostly underneath it, so the
+zone covered that neighbour's live drop points along with the window's own.
+Swept pixel by pixel across a 1600-wide output, `H[1, 2]` through `H[1 … 5]`
+all had 2's left third entirely dead; its middle ninth kept 271 columns of
+517 at two windows, 8 of 255 at three, and none at all from four on. That
+defect went with the second geometry rather than with the region, and the
+threshold remains what a region could never be: the thing that tells a click
+from a drag.
 
-One thing the region did that a threshold does not is worth writing down,
-because it is a real behaviour change rather than only a cost removed:
-dragging DOWN into a window's own body re-parents it beside whichever
-neighbour grew into that space. Press a band in `H[1, 2, 3, 4]`, pull straight
-down 300 pixels without ever leaving that window's own tile, and the release
-trades it with 2. That is the same seam from the other side — the pointer is
-over the dragged window on SCREEN and over its neighbour in the AIM geometry —
-and it is a drop the operator can see coming, since the preview now follows
-the pointer the whole way instead of refusing. Under the region the same
-gesture landed nothing at all.
+The region and the block refuse the same gesture, and the period between them
+is where they differed — which is a real behaviour change and not only a cost
+removed. Under the two geometries, pressing a band in `H[1, 2, 3, 4]` and
+pulling straight down 300 pixels without ever leaving that window's own tile
+traded it with 2, because the pointer was over the dragged window on SCREEN
+and over its neighbour in the AIM one. With one geometry the pointer is over
+the dragged window, full stop, and the release lands nothing. It also costs a
+STACK nothing, where the region cost something real: for the leaf a stack was
+showing, the zone was its band plus the whole shared content rect, which left
+the other leaves' bands as the only live targets inside that stack.
 
-It costs a STACK nothing either, where the region cost something real: for the
-leaf a stack was showing, the zone was its band plus the whole shared content
-rect, which left the other leaves' bands as the only live targets inside that
-stack — the same slivers this gesture exists to avoid needing.
-
-The preview is DERIVED, never a second source of truth: it is rebuilt from the
-arrangement on every pointer frame and dropped by every change to it, so a
-window arriving or leaving mid-drag cannot leave a stale picture standing. The
-drag itself survives that and re-previews on the next motion; a release in the
-window between them lands nothing, which is the honest answer when the
-arrangement the drop was aimed at no longer exists. Dropping a preview COUNTS
-as a layout change to whatever mutation dropped it, even one that changed
-nothing itself: the screen moves, and the map published to clients was the
-previewed one, so a mutation reporting only its own change would leave those
-two disagreeing.
+The block is DERIVED, never a second source of truth: it is recomputed on
+every frame a drag aims and DROPPED by every change to the arrangement, so a
+window arriving or leaving mid-drag cannot leave one promising a landing in a
+tree that no longer has it. The drag itself survives that and re-aims on the
+next motion; a release in the window between them lands nothing, which is the
+honest answer when the arrangement the drop was aimed at is gone. The release
+APPLIES the block rather than recomputing one, so what lands is exactly what
+was on screen.
 
 Button transitions are handled in the ORDER they happened, one pass over the
 frame. A frame can carry several — evdev keeps every transition up to its
@@ -1058,13 +1080,13 @@ next picked up in a single batch. Handling all the presses first would let the
 new drag consume the old one's release: the old drop lost and the new drag
 ended where it began.
 
-The picture is a frame behind the pointer when a batch carries both the motion
-that chose the drop and the release that takes it, so a release brings it up
-to date first — but only when that frame MOVED. On a still pointer there is
+The block is a frame behind the pointer when a batch carries both the motion
+that chose it and the release that takes it, so a release brings it up to
+date first — but only when that frame MOVED. On a still pointer there is
 nothing new to account for, and computing an answer anyway is how a release
-after an invalidated preview would commit one the operator never saw; the
-reflow also moves tiles under a motionless pointer, so the drop it computed
-would be aimed at whatever slid beneath them.
+after an INVALIDATED block would land one the operator never saw. A still
+release over a block that is still up does land it: what the guard skips is
+the re-aim, not the drop.
 
 STACKING is the second arrangement a container can take, toggled by
 `Super+s`. Its leaves' bands run down its top, one after another, and ONE of
