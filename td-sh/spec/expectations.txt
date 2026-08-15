@@ -122,7 +122,6 @@ xfail arith-context.test.sh::Multiple right brackets inside expression
 xfail arith-context.test.sh::Quadruple parens should be disambiguated
 xfail arith-context.test.sh::Triple parens should be disambiguated
 xfail arith.test.sh::Comma operator (borrowed from C)
-xfail arith.test.sh::Negative numbers with bit shift
 xfail arith.test.sh::Postincrement
 xfail arith.test.sh::Preincrement
 xfail arith.test.sh::unary assignment with dynamic var name
@@ -569,7 +568,6 @@ xfail builtin-misc.test.sh::time pipeline
 xfail builtin-printf.test.sh::Invalid UTF-8
 xfail builtin-printf.test.sh::Too large
 xfail builtin-printf.test.sh::printf octal backslash escapes
-xfail builtin-printf.test.sh::unsigned / octal / hex big
 xfail builtin-process.test.sh::arg that would overflow 64 bits is detected
 xfail builtin-process.test.sh::exec -- 2>&1
 xfail builtin-process.test.sh::exec builtin

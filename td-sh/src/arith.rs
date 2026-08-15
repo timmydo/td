@@ -259,9 +259,19 @@ fn lex_number(chars: &[char], start: usize) -> Result<(i64, usize), String> {
     if digits.is_empty() {
         return Err("expected a digit".into());
     }
-    i64::from_str_radix(&digits, radix)
-        .map(|v| (v, i))
-        .map_err(|_| format!("invalid number {digits:?} in base {radix}"))
+    // Out of range WRAPS, which is the only way `-9223372036854775808` can be
+    // written: the bound is unreachable as a positive literal. A digit the base
+    // lacks is still an error, which keeps `08` from lexing as 8.
+    let mut value: u64 = 0;
+    for c in digits.chars() {
+        let Some(d) = c.to_digit(radix) else {
+            return Err(format!("invalid number {digits:?} in base {radix}"));
+        };
+        value = value
+            .wrapping_mul(u64::from(radix))
+            .wrapping_add(u64::from(d));
+    }
+    Ok((value as i64, i))
 }
 
 struct Arith {
@@ -272,7 +282,7 @@ struct Arith {
     pdepth: u32,
     /// False while parsing the unevaluated side of `&&`, `||` or `?:`. The
     /// tokens still have to be consumed, so the walk continues — it just must
-    /// not assign, divide by zero or overflow on the way through.
+    /// not assign or divide by zero on the way through.
     live: bool,
     /// The untaken side of a `?:` specifically. ash does not evaluate that one
     /// AT ALL, where it DOES evaluate the dead side of `&&`/`||` for effect --
@@ -367,13 +377,13 @@ impl Arith {
                 let live = self.live;
                 let value = match op {
                     "=" => rhs,
-                    "+=" => arith2(live, cur, rhs, i64::checked_add)?,
-                    "-=" => arith2(live, cur, rhs, i64::checked_sub)?,
-                    "*=" => arith2(live, cur, rhs, i64::checked_mul)?,
-                    "/=" => checked_div(live, cur, rhs)?,
-                    "%=" => checked_rem(live, cur, rhs)?,
-                    "<<=" => shift_left(live, cur, rhs)?,
-                    ">>=" => shift_right(live, cur, rhs)?,
+                    "+=" => cur.wrapping_add(rhs),
+                    "-=" => cur.wrapping_sub(rhs),
+                    "*=" => cur.wrapping_mul(rhs),
+                    "/=" => divide(live, cur, rhs)?,
+                    "%=" => remainder(live, cur, rhs)?,
+                    "<<=" => cur.wrapping_shl(shift_count(rhs)),
+                    ">>=" => cur.wrapping_shr(shift_count(rhs)),
                     "&=" => cur & rhs,
                     "^=" => cur ^ rhs,
                     _ => cur | rhs,
@@ -506,9 +516,9 @@ impl Arith {
             self.pos += 1;
             let rhs = self.expr_add(sh)?;
             v = if op == "<<" {
-                shift_left(self.live, v, rhs)?
+                v.wrapping_shl(shift_count(rhs))
             } else {
-                shift_right(self.live, v, rhs)?
+                v.wrapping_shr(shift_count(rhs))
             };
         }
     }
@@ -523,9 +533,9 @@ impl Arith {
             self.pos += 1;
             let rhs = self.expr_mul(sh)?;
             v = if op == "+" {
-                arith2(self.live, v, rhs, i64::checked_add)?
+                v.wrapping_add(rhs)
             } else {
-                arith2(self.live, v, rhs, i64::checked_sub)?
+                v.wrapping_sub(rhs)
             };
         }
     }
@@ -540,9 +550,9 @@ impl Arith {
             self.pos += 1;
             let rhs = self.expr_unary(sh)?;
             v = match op {
-                "*" => arith2(self.live, v, rhs, i64::checked_mul)?,
-                "/" => checked_div(self.live, v, rhs)?,
-                _ => checked_rem(self.live, v, rhs)?,
+                "*" => v.wrapping_mul(rhs),
+                "/" => divide(self.live, v, rhs)?,
+                _ => remainder(self.live, v, rhs)?,
             };
         }
     }
@@ -561,7 +571,7 @@ impl Arith {
             Some("-") => {
                 self.pos += 1;
                 let v = self.expr_unary(sh)?;
-                self.negate(v)
+                Ok(v.wrapping_neg())
             }
             Some("+") => {
                 self.pos += 1;
@@ -624,17 +634,7 @@ impl Arith {
         }
     }
 
-    fn negate(&self, v: i64) -> A<i64> {
-        match v.checked_neg() {
-            Some(n) => Ok(n),
-            None if !self.live => Ok(0),
-            None => Err("integer overflow".into()),
-        }
-    }
-
-    /// One `++`/`--` step, returning the value before and after it. Wrapping,
-    /// not checked as the rest of this file is: ash steps past i64's bounds
-    /// silently.
+    /// One `++`/`--` step, returning the value before and after it.
     fn step(&mut self, sh: &mut Shell, name: &str, up: bool) -> A<(i64, i64)> {
         let cur = self.name_value(sh, name)?;
         let new = if up { cur.wrapping_add(1) } else { cur.wrapping_sub(1) };
@@ -723,17 +723,10 @@ fn strtoimax(text: &str) -> Option<i64> {
     i64::try_from(magnitude).ok()?.checked_neg()
 }
 
-/// Apply a checked binary operator, folding to 0 on the unevaluated side of a
-/// short-circuit rather than reporting an error the shell would never have hit.
-fn arith2(live: bool, a: i64, b: i64, f: fn(i64, i64) -> Option<i64>) -> A<i64> {
-    match f(a, b) {
-        Some(v) => Ok(v),
-        None if !live => Ok(0),
-        None => Err("integer overflow".into()),
-    }
-}
-
-fn checked_div(live: bool, a: i64, b: i64) -> A<i64> {
+/// The only operators that can still FAIL, and only on a zero divisor -- folded
+/// to 0 on a short-circuit's dead side rather than reporting an error the shell
+/// would never have hit. `i64::MIN / -1` wraps rather than trapping.
+fn divide(live: bool, a: i64, b: i64) -> A<i64> {
     if b == 0 {
         return if live {
             Err("division by zero".into())
@@ -741,10 +734,10 @@ fn checked_div(live: bool, a: i64, b: i64) -> A<i64> {
             Ok(0)
         };
     }
-    arith2(live, a, b, i64::checked_div)
+    Ok(a.wrapping_div(b))
 }
 
-fn checked_rem(live: bool, a: i64, b: i64) -> A<i64> {
+fn remainder(live: bool, a: i64, b: i64) -> A<i64> {
     if b == 0 {
         return if live {
             Err("division by zero".into())
@@ -752,23 +745,14 @@ fn checked_rem(live: bool, a: i64, b: i64) -> A<i64> {
             Ok(0)
         };
     }
-    arith2(live, a, b, i64::checked_rem)
+    Ok(a.wrapping_rem(b))
 }
 
-fn shift_left(live: bool, a: i64, b: i64) -> A<i64> {
-    match u32::try_from(b).ok().and_then(|n| a.checked_shl(n)) {
-        Some(v) => Ok(v),
-        None if !live => Ok(0),
-        None => Err("invalid shift count".into()),
-    }
-}
-
-fn shift_right(live: bool, a: i64, b: i64) -> A<i64> {
-    match u32::try_from(b).ok().and_then(|n| a.checked_shr(n)) {
-        Some(v) => Ok(v),
-        None if !live => Ok(0),
-        None => Err("invalid shift count".into()),
-    }
+/// ash masks the shift COUNT rather than rejecting it, so `1<<64` is 1 and a
+/// negative count is its low bits: `1<<-1` is `1<<63`. Masking first is what
+/// makes that true of a NEGATIVE `b`, whose sign bit `& 63` clears.
+fn shift_count(b: i64) -> u32 {
+    (b & 63) as u32
 }
 
 #[cfg(test)]
@@ -901,7 +885,7 @@ mod tests {
         assert_eq!(ev("++n + n++", "1")?, (4, "3".into()));
         assert_eq!(ev("n+++1", "1")?, (2, "2".into()));
         assert_eq!(ev("++ ++n", "1")?, (2, "2".into()));
-        // ash WRAPS here where every other operator in this file is checked.
+        // Stepping past the bound wraps, as every operator here does.
         assert_eq!(ev("n++", "9223372036854775807")?, (i64::MAX, i64::MIN.to_string()));
         assert_eq!(ev("n--", "-9223372036854775808")?, (i64::MIN, i64::MAX.to_string()));
         // An unset name steps from zero rather than refusing.
@@ -916,11 +900,14 @@ mod tests {
         // Splitting in the LEXER is what buys this: `1--(n)/2` becomes the same
         // tokens as `1 - -(n)/2`, so the minus binds tighter than `/` for free.
         // Deciding it in the parser instead gave `1 - (-(n/2))`, which agrees on
-        // every value but the bound -- only i64::MIN tells the two apart.
+        // every value but the bound -- only i64::MIN tells the two apart, and
+        // since arithmetic wraps it tells them apart by ANSWER rather than by
+        // which of them overflows.
         let mut sh = Shell::new_for_test();
         sh.set_var("n", &i64::MIN.to_string()).map_err(|_| "set failed".to_string())?;
-        assert!(eval(&mut sh, "1--(n)/2").is_err());
-        assert!(eval(&mut sh, "1 - -(n)/2").is_err());
+        assert_eq!(eval(&mut sh, "1--(n)/2").map_err(|_| "eval")?, 4611686018427387905);
+        assert_eq!(eval(&mut sh, "1 - -(n)/2").map_err(|_| "eval")?, 4611686018427387905);
+        assert_eq!(eval(&mut sh, "1 - (-(n/2))").map_err(|_| "eval")?, -4611686018427387903);
         // Away from the bound the two spellings agree, which is what makes the
         // pair above a statement about parsing rather than about overflow.
         sh.set_var("n", "8").map_err(|_| "set failed".to_string())?;
@@ -1157,12 +1144,74 @@ mod tests {
     }
 
     #[test]
+    fn arithmetic_wraps_where_ash_wraps() -> Result<(), String> {
+        // ash's arithmetic is C's on a 64-bit int: everything wraps and only a
+        // zero divisor fails. Checking instead made expressions ash answers into
+        // fatal errors, and made `-9223372036854775808` unwritable, since the
+        // bound is unreachable as a positive literal.
+        for (src, want) in [
+            ("9223372036854775807 + 1", i64::MIN),
+            ("9223372036854775807 * 2", -2),
+            ("-9223372036854775808 - 1", i64::MAX),
+            ("-9223372036854775808 * -1", i64::MIN),
+            ("-(-9223372036854775808)", i64::MIN),
+            // A literal out of range is its low 64 bits, which is the only way
+            // the bound itself can be written.
+            ("9223372036854775808", i64::MIN),
+            ("18446744073709551615", -1),
+            ("18446744073709551616", 0),
+            ("0xFFFFFFFFFFFFFFFF", -1),
+            // `i64::MIN / -1` overflows rather than trapping.
+            ("-9223372036854775808 / -1", i64::MIN),
+            ("-9223372036854775808 % -1", 0),
+            // The shift COUNT is masked to six bits, so it never rejects.
+            ("1 << 63", i64::MIN),
+            ("1 << 64", 1),
+            ("1 << 65", 2),
+            ("1 << -1", i64::MIN),
+            ("1 >> -1", 0),
+            ("-9223372036854775808 >> 1", -4611686018427387904),
+        ] {
+            assert_eq!(ev(src), Ok(want), "{src}");
+        }
+        // What still fails: a zero divisor, and a digit the base does not have.
+        for src in ["1 / 0", "1 % 0", "08", "0x"] {
+            assert!(ev(src).is_err(), "{src}");
+        }
+        // The literal that needs the ACCUMULATOR to wrap, not just the result:
+        // a saturating multiply answers -1 here.
+        assert_eq!(ev("0x10000000000000000"), Ok(0));
+        // And all of it reaches the compound assignments, which share the
+        // operators but had no bound test of their own -- `<<=` and `>>=` had
+        // no test anywhere, so swapping the two was invisible.
+        for (init, src, want) in [
+            (1, "n <<= 4", 16),
+            (16, "n >>= 2", 4),
+            (-8, "n >>= 1", -4),
+            (-1, "n >>= 1", -1),
+            (1, "n <<= 64", 1),
+            (1, "n <<= -1", i64::MIN),
+            (i64::MAX, "n *= 2", -2),
+            (i64::MIN, "n -= 1", i64::MAX),
+            (i64::MAX, "n += 1", i64::MIN),
+        ] {
+            let mut sh = Shell::new_for_test();
+            sh.set_var("n", &init.to_string())
+                .map_err(|_| "set failed".to_string())?;
+            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, want, "{src}");
+            assert_eq!(sh.get_var("n").as_deref(), Some(&want.to_string()[..]), "{src}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn errors_are_reported_not_panicked() {
         assert!(ev("1 / 0").is_err());
         assert!(ev("1 +").is_err());
         assert!(ev("1 @ 2").is_err());
         assert!(ev("(1").is_err());
-        assert!(ev("9223372036854775807 + 1").is_err());
+        // Overflow is NOT in that list any more: it wraps, as ash's does.
+        assert_eq!(ev("9223372036854775807 + 1"), Ok(i64::MIN));
     }
 
     #[test]
