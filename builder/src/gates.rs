@@ -558,6 +558,60 @@ pub(crate) fn parse_duration_table(text: &str) -> HashMap<String, f64> {
     out
 }
 
+/// TD_CHECK_GATE_TIMEOUT's default: the wall-clock floor under which no gate is
+/// ever killed.
+const DEFAULT_GATE_TIMEOUT_SECS: u64 = 4 * 3600;
+
+/// TD_CHECK_GATE_TIMEOUT_FACTOR's default — how many times its own measured span
+/// a gate may take before the runner calls it hung.
+const DEFAULT_GATE_TIMEOUT_FACTOR: u64 = 10;
+
+/// TD_CHECK_GATE_TIMEOUT_MAX's default: the ceiling no scaled budget may pass.
+const DEFAULT_GATE_TIMEOUT_MAX_SECS: u64 = 24 * 3600;
+
+/// A gate's wall-clock budget in seconds: the floor, or `factor` times what the
+/// gate was last MEASURED at, whichever is larger, capped by the ceiling.
+/// 0 = unbudgeted.
+///
+/// Data-driven because no single constant fits both ends of this table — gates
+/// span half a second to half an hour, so a budget tight enough to catch a hung
+/// SHORT gate would kill a healthy long one. The floor is deliberately far above
+/// every measured gate: this is a runaway backstop, not a latency SLA, and a
+/// budget that reds a slow-but-working gate is worse than the runaway it would
+/// have caught. A gate with no measurement gets the floor, which is also how the
+/// LPT order treats one (assumed long until measured).
+///
+/// The CEILING is what stops the budget teaching itself to be useless. A gate
+/// killed at its budget still emits its END event, and a tolerated failure —
+/// `recipe-checks` is `non_blocking` — still leaves the run green, so the
+/// timing report writes that span and the next run would scale from the TIMEOUT
+/// rather than from a real duration: 4h becomes 40h becomes 400h. Capping the
+/// scaled term bounds that ratchet at one step.
+fn gate_timeout_budget(
+    floor_secs: u64,
+    factor: u64,
+    ceiling_secs: u64,
+    measured_secs: Option<f64>,
+) -> u64 {
+    if floor_secs == 0 {
+        return 0;
+    }
+    let scaled = match measured_secs {
+        // Saturating rather than wrapping, and rounding UP: a corrupt or absurd
+        // table row must never produce a SMALL budget, which would red every
+        // gate that read it, and truncating would put the budget under the
+        // factor this promises.
+        Some(d) if d.is_finite() && d > 0.0 => match (d * factor as f64).ceil() {
+            s if s >= u64::MAX as f64 => u64::MAX,
+            s => s as u64,
+        },
+        _ => 0,
+    };
+    // The ceiling never drops below the floor: a misconfigured pair must not be
+    // able to produce a budget tighter than the floor promises.
+    floor_secs.max(scaled).min(ceiling_secs.max(floor_secs))
+}
+
 // ---------------------------------------------------------------------------
 // The machine-wide slot pool.
 
@@ -879,6 +933,7 @@ fn run_gate(
     goal_words: &str,
     mem_mib: u64,
     tree_mem_mib: u64,
+    timeout_secs: u64,
     cgroup_dir: Option<&Path>,
 ) -> Outcome {
     let mut logf = match std::fs::File::create(log_path) {
@@ -973,22 +1028,75 @@ fn run_gate(
         let pgid = child.id();
         let stop = std::sync::atomic::AtomicBool::new(false);
         let breached = std::sync::atomic::AtomicBool::new(false);
+        let timed_out = std::sync::atomic::AtomicBool::new(false);
+        // RSS is sampled from /proc only on the undelegated host — under a
+        // delegated cgroup the kernel enforces memory.max instead. The CLOCK is
+        // watched either way: a cgroup bounds how much a gate may allocate, not
+        // how long it may spin.
+        let watch_rss = tree_mem_mib > 0 && gate_cg.is_none();
         let status = std::thread::scope(|ws| {
-            if tree_mem_mib > 0 && gate_cg.is_none() {
+            let watchdog = (watch_rss || timeout_secs > 0).then(|| {
                 ws.spawn(|| {
                     let budget = tree_mem_mib.saturating_mul(1024 * 1024);
+                    // Held as a DURATION compared against `elapsed`, not as an
+                    // Instant: `Instant + Duration` panics when the sum is
+                    // unrepresentable, and this crate may not panic — a watchdog
+                    // that died there would leave `child.wait()` blocking on the
+                    // very hang it exists to end.
+                    let started = std::time::Instant::now();
+                    let limit = match timeout_secs {
+                        0 => None,
+                        n => Some(Duration::from_secs(n)),
+                    };
+                    // RSS keeps its 500ms cadence while the STOP flag is read
+                    // five times as often, and the wait is a PARK rather than a
+                    // sleep: the scope joins this thread, so whatever is left of
+                    // an un-woken interval is added to every gate's measured
+                    // span — and that span feeds the LPT order and the budget
+                    // above. Unparked below the instant the child is waited on,
+                    // so nothing is added at all.
+                    let mut tick: u32 = 0;
                     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        if pgroup_rss_bytes(pgid) > budget {
+                        if watch_rss && tick % 5 == 0 && pgroup_rss_bytes(pgid) > budget {
                             breached.store(true, std::sync::atomic::Ordering::Relaxed);
                             let _ = crate::sys::kill_process_group(pgid, crate::sys::SIGKILL);
                             return;
                         }
-                        std::thread::sleep(Duration::from_millis(500));
+                        // The GROUP, not the child: a hang is usually in a
+                        // grandchild (a test binary under cargo under sh), which
+                        // shares the pgid the spawn gave the gate.
+                        //
+                        // `stop` is re-read immediately before the kill, which
+                        // NARROWS a real hazard without closing it: the flag is
+                        // set by `child.wait` RETURNING, and the wait has already
+                        // reaped the pid by then, so a gate exiting on its
+                        // deadline can still be signalled after the kernel is
+                        // free to reuse the pgid — if this thread is scheduled
+                        // between that reap and the store. Closing it needs a
+                        // handle a reap cannot invalidate (pidfd, or WNOWAIT),
+                        // which is a new control-plane syscall and its own
+                        // increment. The RSS arm needs no guard at all: a reaped
+                        // group reads zero RSS, so it cannot fire late.
+                        if limit.is_some_and(|l| started.elapsed() >= l)
+                            && !stop.load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
+                            let _ = crate::sys::kill_process_group(pgid, crate::sys::SIGKILL);
+                            return;
+                        }
+                        tick = tick.wrapping_add(1);
+                        std::thread::park_timeout(Duration::from_millis(100));
                     }
-                });
-            }
+                })
+            });
             let st = child.wait();
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Wake it now rather than letting the scope wait out its interval.
+            // An unpark before the park is not lost — it leaves a token the next
+            // park consumes — so this cannot deadlock the join.
+            if let Some(h) = &watchdog {
+                h.thread().unpark();
+            }
             st
         });
         if let Some(cg) = &gate_cg {
@@ -1018,13 +1126,37 @@ fn run_gate(
                 g.name
             );
         }
+        // A process the watchdog killed cannot also have exited 0, so a
+        // SUCCESSFUL status means the flag was set in the instant AFTER the body
+        // finished and the kill reached a group that was already gone. Believe
+        // the status: reporting a gate that ran to completion as a timeout would
+        // red a green branch on nothing but scheduling. (The RSS flag needs no
+        // such reading — a reaped group reads zero, so it never fires late.)
+        let timed_out = timed_out.load(std::sync::atomic::Ordering::Relaxed)
+            && !matches!(&status, Ok(st) if st.success());
+        if timed_out {
+            // Every term is named, not just the floor: when the SCALED term wins
+            // the printed number is not TD_CHECK_GATE_TIMEOUT's value, and an
+            // operator who raised that knob to match it would see nothing change.
+            let _ = writeln!(
+                logf,
+                "gate-run: FAIL: gate {} — exceeded its {timeout_secs}s wall-clock budget \
+                 (the larger of TD_CHECK_GATE_TIMEOUT and TD_CHECK_GATE_TIMEOUT_FACTOR x this \
+                 gate's last measured span, capped by TD_CHECK_GATE_TIMEOUT_MAX); the whole \
+                 process group was killed",
+                g.name
+            );
+        }
         match status {
             Ok(st) if st.success() && !breached.load(std::sync::atomic::Ordering::Relaxed) => {
                 Outcome::Passed
             }
             Ok(st) => {
-                let breached = breached.load(std::sync::atomic::Ordering::Relaxed);
-                // Exit 69 (EX_UNAVAILABLE), NOT an OOM/RSS kill, AND the gate log
+                // Either budget's kill lands as a SIGKILL exit, so both suppress
+                // the status-derived reporting below: the budget message above
+                // already said what happened, and 137 is a consequence of it.
+                let breached = breached.load(std::sync::atomic::Ordering::Relaxed) || timed_out;
+                // Exit 69 (EX_UNAVAILABLE), NOT a budget kill, AND the gate log
                 // carries the sentinel td's own provisioning path prints: the body
                 // could not provision a toolchain in this jail (re #469). Tolerated
                 // as Unprovisioned, not a red — the host preflight is the
@@ -1148,6 +1280,15 @@ struct RunCfg {
     /// --resume: skip gates journaled green for THIS tree key (issue #320).
     /// Opt-in, interactive iteration only — an automated run never passes it.
     resume: bool,
+    /// TD_CHECK_GATE_TIMEOUT: the wall-clock FLOOR of a gate's budget, in
+    /// seconds (0 = unbudgeted). The effective budget is this or a multiple of
+    /// the gate's measured span, whichever is larger — see gate_timeout_budget.
+    gate_timeout_secs: u64,
+    /// TD_CHECK_GATE_TIMEOUT_FACTOR: that multiple.
+    gate_timeout_factor: u64,
+    /// TD_CHECK_GATE_TIMEOUT_MAX: the ceiling on the scaled term, which bounds
+    /// the ratchet a timed-out gate's own recorded span would otherwise start.
+    gate_timeout_max_secs: u64,
     /// The delegated per-run cgroup dir (TD_CHECK_CGROUP, issue #328). When
     /// present, each gate runs in its own child cgroup with memory.max set to
     /// the tree budget (kernel-enforced, escape-proof — a setsid() child stays
@@ -1347,6 +1488,12 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                     &cfg.goal_words,
                     cfg.gate_mem_mib,
                     cfg.gate_tree_mem_mib,
+                    gate_timeout_budget(
+                        cfg.gate_timeout_secs,
+                        cfg.gate_timeout_factor,
+                        cfg.gate_timeout_max_secs,
+                        durations.get(&g.name).copied(),
+                    ),
                     cfg.cgroup_dir.as_deref(),
                 );
                 print_gate_output(
@@ -1636,6 +1783,54 @@ pub fn cli(args: &[String]) -> ExitCode {
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(16384);
+    // TD_CHECK_GATE_TIMEOUT: the per-gate wall-clock floor (timeout(1) suffixes
+    // s/m/h/d accepted; 0 disables). Four hours is far above every gate this
+    // table has ever measured — the longest is under half an hour — because the
+    // failure it exists for is a gate spinning for DAYS, and killing a healthy
+    // long gate would be worse than the runaway it caught. An unparseable value
+    // warns and takes the default rather than silently disabling the backstop.
+    let gate_timeout_secs: u64 = match std::env::var("TD_CHECK_GATE_TIMEOUT") {
+        Err(_) => DEFAULT_GATE_TIMEOUT_SECS,
+        Ok(raw) => match crate::check_loop::parse_timeout_secs(raw.trim()) {
+            Some(n) => n,
+            None => {
+                eprintln!(
+                    "gate-run: TD_CHECK_GATE_TIMEOUT `{raw}` is not a duration (integer, \
+                     s/m/h/d suffix ok) — using the {DEFAULT_GATE_TIMEOUT_SECS}s default"
+                );
+                DEFAULT_GATE_TIMEOUT_SECS
+            }
+        },
+    };
+    // Every term warns rather than defaulting in silence, for the reason the
+    // floor does: each one alone decides the budget, so a typo in any of them
+    // is a backstop that is not the one anybody configured.
+    let gate_timeout_factor: u64 = match std::env::var("TD_CHECK_GATE_TIMEOUT_FACTOR") {
+        Err(_) => DEFAULT_GATE_TIMEOUT_FACTOR,
+        Ok(raw) => match raw.trim().parse() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!(
+                    "gate-run: TD_CHECK_GATE_TIMEOUT_FACTOR `{raw}` is not a whole number — \
+                     using the {DEFAULT_GATE_TIMEOUT_FACTOR}x default"
+                );
+                DEFAULT_GATE_TIMEOUT_FACTOR
+            }
+        },
+    };
+    let gate_timeout_max_secs: u64 = match std::env::var("TD_CHECK_GATE_TIMEOUT_MAX") {
+        Err(_) => DEFAULT_GATE_TIMEOUT_MAX_SECS,
+        Ok(raw) => match crate::check_loop::parse_timeout_secs(raw.trim()) {
+            Some(n) => n,
+            None => {
+                eprintln!(
+                    "gate-run: TD_CHECK_GATE_TIMEOUT_MAX `{raw}` is not a duration (integer, \
+                     s/m/h/d suffix ok) — using the {DEFAULT_GATE_TIMEOUT_MAX_SECS}s default"
+                );
+                DEFAULT_GATE_TIMEOUT_MAX_SECS
+            }
+        },
+    };
     let cfg = RunCfg {
         root: root.clone(),
         jobs,
@@ -1646,6 +1841,9 @@ pub fn cli(args: &[String]) -> ExitCode {
         resume,
         gate_mem_mib,
         gate_tree_mem_mib,
+        gate_timeout_secs,
+        gate_timeout_factor,
+        gate_timeout_max_secs,
         goal_words: goals.join(" "),
         explicit_goals: explicit_goal_indices(&set, &goals),
         cgroup_dir: std::env::var("TD_CHECK_CGROUP")
@@ -1927,6 +2125,11 @@ mod tests {
             resume: false,
             gate_mem_mib: 0,
             gate_tree_mem_mib: 0,
+            // Unbudgeted by default so a slow test host cannot red the rest of
+            // this module; the timeout tests set their own.
+            gate_timeout_secs: 0,
+            gate_timeout_factor: DEFAULT_GATE_TIMEOUT_FACTOR,
+            gate_timeout_max_secs: DEFAULT_GATE_TIMEOUT_MAX_SECS,
             goal_words: String::new(),
             explicit_goals: HashSet::new(),
             cgroup_dir: None,
@@ -2442,4 +2645,97 @@ mod tests {
         assert!(expand_goals(&set, &["not-a-gate".to_string()]).is_err());
     }
 
+    /// The budget policy. Every arm is about the SAME failure: a budget smaller
+    /// than the gate's honest runtime reds a working build, which is worse than
+    /// the runaway the budget exists to catch. So the floor is a floor —
+    /// nothing below it, whatever the table says.
+    #[test]
+    fn a_gate_budget_is_never_below_its_floor() {
+        const CAP: u64 = DEFAULT_GATE_TIMEOUT_MAX_SECS;
+        // Disabled stays disabled, whatever was measured.
+        assert_eq!(gate_timeout_budget(0, 10, CAP, None), 0);
+        assert_eq!(gate_timeout_budget(0, 10, CAP, Some(1e9)), 0);
+        // Unmeasured (a new gate) gets the floor.
+        assert_eq!(gate_timeout_budget(3600, 10, CAP, None), 3600);
+        // A short gate is covered by the floor, not by its own tiny span:
+        // 10 x 0.5s would be a five-second budget.
+        assert_eq!(gate_timeout_budget(3600, 10, CAP, Some(0.5)), 3600);
+        // A long gate scales past the floor.
+        assert_eq!(gate_timeout_budget(3600, 10, CAP, Some(1000.0)), 10_000);
+        // Rounding is UP: truncating would put the budget under the factor.
+        assert_eq!(gate_timeout_budget(1, 10, CAP, Some(1.99)), 20);
+        // factor 0 degrades to the floor rather than to zero — "no scaling",
+        // never "no budget".
+        assert_eq!(gate_timeout_budget(3600, 0, CAP, Some(1000.0)), 3600);
+        // A corrupt table row must not produce a SMALL budget.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0] {
+            assert_eq!(
+                gate_timeout_budget(3600, 10, CAP, Some(bad)),
+                3600,
+                "a {bad} span must fall back to the floor"
+            );
+        }
+        // …nor may a huge one wrap to something tiny. Asserted as the CEILING
+        // rather than as ">= floor": the loose form passed while this returned
+        // u64::MAX, which was the one value that made the watchdog's deadline
+        // arithmetic unrepresentable — the test blessed the crashing case.
+        assert_eq!(gate_timeout_budget(3600, 10, CAP, Some(f64::MAX)), CAP);
+        assert_eq!(gate_timeout_budget(3600, u64::MAX, CAP, Some(1000.0)), CAP);
+
+        // The ceiling bounds the ratchet: a gate killed at a 4h budget records
+        // that span, and scaling from it would ask for 40h next run.
+        assert_eq!(gate_timeout_budget(4 * 3600, 10, CAP, Some(4.0 * 3600.0)), CAP);
+        // It is a cap on the SCALED term, never a cut below the floor: a
+        // ceiling misconfigured under the floor must not tighten the budget.
+        assert_eq!(gate_timeout_budget(3600, 10, 60, Some(1000.0)), 3600);
+        assert_eq!(gate_timeout_budget(3600, 10, 60, None), 3600);
+    }
+
+    /// The gap this closes: before it, the runner watched a gate's MEMORY and
+    /// not its clock, so a hung body blocked `child.wait()` forever. Eight
+    /// `spec_helpers` test binaries spun for three days behind exactly that.
+    ///
+    /// A sleeping body rather than a busy loop, so a broken watchdog shows up as
+    /// this test waiting rather than as a test that pins a core — and 30s rather
+    /// than the 300 first written, which bounds what a REGRESSION costs the
+    /// suite. The budget is 1s, so the headroom is still thirty-fold.
+    #[test]
+    fn a_gate_that_overruns_its_wall_clock_budget_is_killed() {
+        let d = tmpdir("timeout");
+        let set = synth(&d, &[("hang", Pool::Cheap, "sleep 30", &[])]);
+        let sel = expand_goals(&set, &["check-fast".to_string()]).unwrap();
+        let mut c = cfg(&d, 1, None);
+        c.gate_timeout_secs = 1;
+        let started = std::time::Instant::now();
+        // The run is RED: a killed gate is a failed gate, not a tolerated skip.
+        assert!(!run_selected(&set, &sel, &c).unwrap());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(60),
+            "the watchdog must kill the gate near its budget, not at the body's own end (took {elapsed:?})"
+        );
+        // The log must SAY it was the clock: a bare "exited 137" would send the
+        // next reader hunting for a crash that never happened.
+        let log = std::fs::read_to_string(d.join("logs/hang.log")).unwrap();
+        assert!(
+            log.contains("wall-clock budget") && log.contains("TD_CHECK_GATE_TIMEOUT"),
+            "the timeout must name itself and its knob; got:\n{log}"
+        );
+        assert!(
+            !log.contains("body exited"),
+            "a budget kill must not also report the SIGKILL as the body's own exit; got:\n{log}"
+        );
+    }
+
+    /// The other half, and the one that matters for false positives: with no
+    /// budget set, nothing about the watchdog may touch a gate that finishes.
+    #[test]
+    fn an_unbudgeted_gate_is_left_alone() {
+        let d = tmpdir("timeout-off");
+        let set = synth(&d, &[("slow", Pool::Cheap, "sleep 2; touch {D}/slow.ran", &[])]);
+        let sel = expand_goals(&set, &["check-fast".to_string()]).unwrap();
+        let c = cfg(&d, 1, None); // gate_timeout_secs = 0
+        assert!(run_selected(&set, &sel, &c).unwrap());
+        assert!(d.join("slow.ran").exists(), "an unbudgeted gate must run to completion");
+    }
 }

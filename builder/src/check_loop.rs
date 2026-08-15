@@ -607,7 +607,9 @@ fn loop_path_with_native_applets(root: &Path, tb: &str, toolchain: &str) -> Resu
 
 /// A timeout(1)-style duration: bare integer seconds or an integer with an
 /// s/m/h/d suffix. None on anything else (fractions are out of scope).
-fn parse_timeout_secs(v: &str) -> Option<u64> {
+/// Shared with the gate runner's TD_CHECK_GATE_TIMEOUT so a duration means one
+/// thing across the crate.
+pub(crate) fn parse_timeout_secs(v: &str) -> Option<u64> {
     let (num, mult) = match v.chars().last() {
         Some('s') => (v.get(..v.len() - 1)?, 1),
         Some('m') => (v.get(..v.len() - 1)?, 60),
