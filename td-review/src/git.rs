@@ -346,6 +346,12 @@ impl Git {
             "--reverse",
             "--format=%x1e%H%x1f%P%x1f%B%x1f",
             "--name-only",
+            // `--no-renames` because `--name-only` reports only the DESTINATION
+            // of a detected rename, and `record::problems` judges the
+            // `docs-only` waiver on these paths: `git mv src/x.rs notes.md`
+            // reports `notes.md` alone, so every path ends in `.md` and a
+            // commit that DELETED a source waives all three reviews.
+            "--no-renames",
             range,
             "--",
         ])?;
@@ -925,6 +931,72 @@ mod tests {
 
     fn names(branches: &[Branch]) -> Vec<&str> {
         branches.iter().map(|b| b.refname.as_str()).collect()
+    }
+
+    /// A rename must not launder a source file into a `docs-only` waiver.
+    ///
+    /// This is the INTEGRATOR's half of that check — `td-builder ready` is run
+    /// by the same agent that wrote the commit, and this is the one a human
+    /// reads — so it is pinned here as well as there, against a real commit
+    /// rather than a pinned argv.
+    #[test]
+    fn a_rename_cannot_hide_a_source_file_from_the_docs_only_waiver() {
+        let root = std::env::temp_dir().join(format!("td-review-rename-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        // No inherited git config: a global `commit.gpgsign` or hook path would
+        // decide whether this passes, and a global `diff.renames=false` would
+        // make it pass having exercised nothing.
+        let git = |args: &[&str]| {
+            let o = Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git {args:?} failed:\n{}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "diff.renames", "true"]);
+        std::fs::write(root.join("code.rs"), "fn main() {}\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "seed"]);
+        git(&["mv", "code.rs", "notes.md"]);
+        let msg = "moved\n\nReview-waiver: docs-only\nChecks: none needed\n";
+        git(&["commit", "-qm", msg]);
+
+        // POSITIVE CONTROL: the hazard must be real here before the fix can be
+        // shown to close it, since `--no-renames` lists the source whether or
+        // not detection was ever on.
+        let detected = git(&["show", "--name-only", "--format=", "HEAD"]);
+        let detected: Vec<&str> = detected.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(detected, vec!["notes.md"], "rename detection did not hide it");
+
+        let recs = Git::new(root.clone()).commit_records("HEAD~1..HEAD");
+        std::fs::remove_dir_all(&root).ok();
+        let recs = recs.unwrap();
+        let last = recs.last().unwrap();
+        assert!(
+            last.paths.iter().any(|p| p == "code.rs"),
+            "the renamed-away source must be in the record scan: {:?}",
+            last.paths
+        );
+        let p = record::problems(&last.message, &last.paths);
+        assert!(
+            p.iter().any(|s| s.contains("code.rs")),
+            "the waiver must red on it: {p:?}"
+        );
     }
 
     /// `git remote add foo/bar` is accepted, and a delete that guessed the

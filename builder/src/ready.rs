@@ -342,6 +342,29 @@ fn git_out(root: &Path, args: &[&str]) -> String {
     git_try(root, args).unwrap_or_default()
 }
 
+/// The paths a commit touches, as the `docs-only` waiver must see them.
+///
+/// `--no-renames` because `--name-only` reports only the DESTINATION of a
+/// detected rename, and this list is the one place the gate checks reality
+/// rather than believing the message: `git mv builder/src/nar.rs notes.md`
+/// reports `notes.md` alone, so every path ends in `.md` and a commit that
+/// DELETED a Rust source waives all three reviews. Off, a rename is a delete
+/// plus an add and both sides are seen.
+fn commit_paths(root: &Path, oid: &str) -> Vec<String> {
+    git_try(
+        root,
+        &["show", "--no-renames", "--name-only", "--format=", oid],
+    )
+    .map(|o| {
+        o.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<String>>()
+    })
+    .unwrap_or_default()
+}
+
 fn current_branch(root: &Path) -> String {
     let b = git_out(root, &["rev-parse", "--abbrev-ref", "HEAD"])
         .trim()
@@ -473,15 +496,7 @@ pub fn main(args: &[String]) -> ExitCode {
             println!("  {short}  (could not be read)");
             continue;
         };
-        let paths = git_try(&root, &["show", "--name-only", "--format=", oid])
-            .map(|o| {
-                o.lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty())
-                    .map(str::to_string)
-                    .collect::<Vec<String>>()
-            })
-            .unwrap_or_default();
+        let paths = commit_paths(&root, oid);
         let subject = message.lines().next().unwrap_or_default();
         let mut probs = problems(message, &paths);
         if parents.split_whitespace().count() > 1 {
@@ -756,6 +771,80 @@ Checks: affected-checks --committed-only (green)
         let p = problems(m, &code(&["AGENTS.md", "builder/src/ready.rs"]));
         assert_eq!(p.len(), 1);
         assert!(p.first().is_some_and(|s| s.contains("builder/src/ready.rs")));
+    }
+
+    /// A rename must not launder a source file into a docs-only waiver.
+    ///
+    /// Driven against a REAL commit rather than a pinned argv, because what is
+    /// being asserted is git's behaviour: with rename detection on, the source
+    /// path is simply absent from the listing, and every path the gate then
+    /// judges ends in `.md`.
+    #[test]
+    fn a_rename_cannot_hide_a_source_file_from_the_docs_only_waiver() {
+        let root = std::env::temp_dir().join(format!("td-ready-rename-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        // The fixture must not inherit the developer's git config, as
+        // td-review's do not: a global `commit.gpgsign`, hook path or
+        // `init.templateDir` would otherwise decide whether this passes, and
+        // a global `diff.renames=false` would make it pass having exercised
+        // nothing.
+        let git = |args: &[&str]| {
+            let o = Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git {args:?} failed:\n{}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        // Pinned rather than inherited, and pinned ON: this test's whole
+        // subject is what happens when git DOES pair the move.
+        git(&["config", "diff.renames", "true"]);
+        std::fs::write(root.join("code.rs"), "fn main() {}\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "seed"]);
+        // An exact move: diffcore pairs it by blob OID, so no similarity
+        // scoring is involved and the file's size is irrelevant.
+        git(&["mv", "code.rs", "notes.md"]);
+        git(&["commit", "-qm", "moved"]);
+
+        // POSITIVE CONTROL: the hazard has to be real on this machine before
+        // the fix can be shown to close it. `--no-renames` puts `code.rs` in
+        // the listing unconditionally, so without this the assertion below
+        // cannot tell "the flag works" from "rename detection was never on".
+        let detected = git(&["show", "--name-only", "--format=", "HEAD"]);
+        let detected: Vec<&str> = detected.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            detected,
+            vec!["notes.md"],
+            "rename detection did not hide the source, so this proves nothing"
+        );
+
+        let paths = commit_paths(&root, "HEAD");
+        let m = "s\n\nReview-waiver: docs-only\nChecks: none needed\n";
+        let p = problems(m, &paths);
+        // Cleaned BEFORE the assertions, so the run that catches a regression
+        // is not the one that strands a repo in the temp dir.
+        std::fs::remove_dir_all(&root).ok();
+        assert!(
+            paths.iter().any(|q| q == "code.rs"),
+            "the renamed-away source must be in the listing: {paths:?}"
+        );
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p.first().is_some_and(|s| s.contains("code.rs")), "{p:?}");
     }
 
     /// No paths is not "no code": a merge shows none, and so does a failed
