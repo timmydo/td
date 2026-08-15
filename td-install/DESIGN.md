@@ -343,19 +343,85 @@ bytes. The verifier must tolerate the newline; `from_hex` trims. This is
 recorded because it is the wire format between the two halves, and a format
 that lives only in the signer's code is one the verifier can disagree with.
 
-### What the publish path must gain — NOT YET DONE
+### What the publish path carries
 
-Two things in `td-boot install` block a signature reaching a machine, and
-both belong to the target-side landing rather than to the host signer:
+`td-boot install` carries the detached signature. Two things used to stop it
+reaching a machine at all, and both are closed:
 
-- `publish_bundle` copies exactly `bzImage`, `initramfs.cpio`, `root.erofs`
-  and `manifest` into the staged directory. A `manifest.sig` beside the
-  manifest is **silently dropped** today.
-- `publish_bundle` early-returns when `existing_bundle_matches`, which
-  compares deployment ids only. Since re-signing deliberately does not change
-  the id (D3), rotating a key can never update an installed signature: the
-  machine keeps the old one. The id comparison is right; what it needs is for
-  the signature to be part of what "matches" means.
+- `publish_bundle` copied exactly `bzImage`, `initramfs.cpio`, `root.erofs`
+  and `manifest`, so a `manifest.sig` beside the manifest was silently
+  dropped. It is staged with the rest now, and the staged directory is read
+  back for it — the id is the manifest's hash and is structurally blind to a
+  detached file.
+- Publishing early-returned when the destination's deployment id matched.
+  Since re-signing deliberately does not change the id (D3), a rotated key
+  could never update an installed signature. The id still says the PAYLOADS
+  agree — it is the hash of the manifest naming their digests — so the
+  signature is what is left to compare, and an already-published deployment
+  is now one of four things:
+
+  | destination | source | outcome |
+  |---|---|---|
+  | same id, same signature | signed | no-op, as before |
+  | same id, no signature | signed | signature added |
+  | same id, different signature | signed | signature replaced in place |
+  | same id, signed | unsigned | **refused** |
+  | different id | — | refused, as before |
+
+  Five rows for five inputs, spelled out rather than folded: adding a
+  signature to an already-installed unsigned deployment is what a first
+  signed release does to a running machine, and it has its own test.
+
+  Replacing in place is sound only because the ids match, which means the
+  manifest bytes match, which means the payloads just verified are the same
+  contents; nothing changes but which key vouches for the deployment. It goes
+  through a temporary and a rename, because a truncated signature verifies as
+  nothing and would strand a machine on a deployment it cannot authenticate.
+
+  The withdrawal case is refused rather than performed because removing a
+  signature is a downgrade, and quietly doing nothing would ignore what the
+  caller asked for. Neither is a decision an installer should make silently.
+
+  Its cost is worth stating rather than discovering: the refusal comes from
+  `publish_bundle`, which `install_deployment` calls BEFORE any selector
+  work, so it fails the whole activation and not just the signature carry.
+  An operator holding an unsigned but byte-identical copy of an installed
+  signed deployment cannot use it to re-point `current`; the recovery is to
+  obtain the signature or remove the deployment directory. Note the
+  asymmetry with the row above it, which silently ADDS a signature and
+  proceeds. Both are deliberate — one direction gains authenticity and the
+  other loses it — but only one of them takes an unrelated operation down
+  with it.
+
+The signature is **optional** at this stage: nothing verifies it yet, so
+requiring one would make every existing bundle uninstallable for no gain.
+What is NOT optional is a signature that exists and is malformed — a
+symlink, a directory, or larger than `MAX_SIGNATURE_BYTES` is a refusal, not
+a bundle read as unsigned. Downgrading a bad signature to "no signature" is
+precisely the fail-open D2 forbids, and the verifying half must not inherit
+it from the reader.
+
+### Signing cannot be done by the verifier — what tests may assume
+
+`engine/src/ed25519.rs` exposes `verify` and no signer — only that
+function plus `PUBLIC_KEY_LEN` and `SIGNATURE_LEN`. There is no signing in
+the engine and there should not be: td-boot's job is to refuse
+what does not verify, and a signer in that crate would be a second crypto
+surface on the boot path serving no boot-time purpose.
+
+The consequence lands on tests. td-boot's own tests **cannot produce a
+signature**, so the positive path is exercised with committed fixtures — a
+public key, a canonical manifest, and its detached signature, generated once
+by `td-deploy`. No private key is committed, exactly as `tests/td-subst.pub`
+already establishes. The fixture manifest names the digests of fixture
+payload bytes the test writes, which is what makes the triple self-
+consistent.
+
+Every NEGATIVE assertion — wrong key, tampered manifest, absent signature,
+truncated signature, signature over a different manifest — needs no signer
+at all, and those are the fail-closed ones that matter. The oracle is the
+other half and has `td-deploy` available, so it signs per run with a
+throwaway key rather than a fixture.
 
 ## 7. Engine sources compiled into target binaries
 
@@ -475,15 +541,21 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    `manifest.sig`. Nothing consumes it yet — the same shape `aa347e60` used
    to land the verifier, and it is what lets the target half land against a
    signer that already exists.
-4. **Verification, target-side, fail-closed** (§6, D2): `td-boot` refuses a
+4. **Publishing carries the signature** (D1, D3): `td-boot install` stages a
+   `manifest.sig` beside the manifest and treats a changed signature on an
+   already-published deployment as an update rather than a no-op. Still
+   nothing that verifies — this is the half that makes a signature able to
+   REACH a machine, and it needs no answer to the open question below.
+5. **Verification, target-side, fail-closed** (§6, D2): `td-boot` refuses a
    deployment whose manifest does not verify, and the system oracle signs the
    bundle it stages and gains a wrong-key negative control. This is the
    increment that decides the OPEN question in §6 — where the trusted key
    lives — because it is the first one that has to read a key at all. It was
-   scoped with item 3 as a single landing and split when that question turned
-   out to be unsettled; the host half needs no answer to it, and the target
-   half cannot proceed without one.
-5. **`td-install`**, a standalone crate outside the workspace (D9): GPT +
+   scoped with item 3 as a single landing and split twice as that question
+   turned out to be unsettled and as carrying the file turned out to be its
+   own increment; each earlier half needs no answer to it, and this one
+   cannot proceed without one.
+6. **`td-install`**, a standalone crate outside the workspace (D9): GPT +
    FAT32 ESP + Btrfs volume onto a device or a regular file,
    `#[path]`-including `gpt.rs`/`fat.rs`/`crc32.rs` and `protocol.rs`, and
    delegating the publish to `td-boot install` (D1). Carries the
@@ -492,15 +564,15 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    `Cargo.lock` assertion plus its clippy and test lines
    (`builder/src/gate_defs/325-cargo-test.rs`), a route and assertions in
    `builder/src/affected.rs`, and the workspace `exclude` list.
-6. **The EFI-stub kernel** (§5): `CONFIG_EFI`, `CONFIG_EFI_STUB`,
+7. **The EFI-stub kernel** (§5): `CONFIG_EFI`, `CONFIG_EFI_STUB`,
    `CONFIG_CMDLINE` in `linux-x86-64.rs`, having first confirmed what
    `CONFIG_EFI` drags in on the pinned tree.
-7. **The OVMF oracle** (§8), beside the `-kernel` one, not replacing it.
-8. **`td-update` and its local channel**: fetch a signed bundle, verify it,
+8. **The OVMF oracle** (§8), beside the `-kernel` one, not replacing it.
+9. **`td-update` and its local channel**: fetch a signed bundle, verify it,
    delegate the publish (D1 again), and roll back on a failed boot. This is
    where the update channel that was its own workstream rejoins this one.
 
-Items 6 and 7 depend on nothing above them and may land whenever they fit.
+Items 7 and 8 depend on nothing above them and may land whenever they fit.
 
 ## 11. Validation
 

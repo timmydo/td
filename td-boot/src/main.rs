@@ -97,6 +97,11 @@ struct BootDecision {
 struct VerifiedBundle {
     id: String,
     manifest: Vec<u8>,
+    // Detached and OPTIONAL here, because nothing verifies it yet. What this
+    // landing owes it is only that publishing carries it: `publish_bundle` used
+    // to copy four literal names, so a signature beside a manifest was dropped
+    // without a word and no machine could ever have one.
+    signature: Option<Vec<u8>>,
     kernel: File,
     initramfs: File,
     root: File,
@@ -401,16 +406,43 @@ fn open_bundle(directory: &Path) -> io::Result<VerifiedBundle> {
         read_bounded_real_file(&manifest_path, "deployment manifest", protocol::MAX_MANIFEST_BYTES)?;
     let parsed = parse_manifest(&manifest)?;
     let id = sha256::hex_digest(&manifest);
+    let signature = read_optional_signature(directory)?;
     let kernel = verify_payload(directory, "bzImage", &parsed.kernel)?;
     let initramfs = verify_payload(directory, "initramfs.cpio", &parsed.initramfs)?;
     let root = verify_payload(directory, "root.erofs", &parsed.root)?;
     Ok(VerifiedBundle {
         id,
         manifest,
+        signature,
         kernel,
         initramfs,
         root,
     })
+}
+
+/// The detached signature beside the manifest, if the bundle carries one.
+///
+/// Absent is `None` rather than an error: nothing verifies it yet, so requiring
+/// it would make every existing bundle uninstallable for no gain. Every OTHER
+/// failure is still an error — a signature that exists but is a symlink, a
+/// directory, or too large is a bundle to refuse rather than one to treat as
+/// unsigned, since silently downgrading to "no signature" is exactly the
+/// fail-open the verifying half must not inherit.
+fn read_optional_signature(directory: &Path) -> io::Result<Option<Vec<u8>>> {
+    let path = directory.join(protocol::MANIFEST_SIG_NAME);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("deployment signature {}: {error}", path.display()),
+        )),
+        Ok(_) => read_bounded_real_file(
+            &path,
+            "deployment signature",
+            protocol::MAX_SIGNATURE_BYTES,
+        )
+        .map(Some),
+    }
 }
 
 fn sync_directory(path: &Path) -> io::Result<()> {
@@ -761,8 +793,120 @@ fn write_synced_file(destination: &Path, bytes: &[u8]) -> io::Result<()> {
     output.sync_all()
 }
 
-fn existing_bundle_matches(directory: &Path, id: &str) -> io::Result<bool> {
-    open_bundle(directory).map(|bundle| bundle.id == id)
+/// What an already-published deployment at the destination is, relative to the
+/// one being installed.
+///
+/// The id alone used to answer this, and that made key rotation unreachable:
+/// re-signing deliberately does NOT change the id (D3), so a bundle carrying a
+/// fresh signature looked identical to the installed one and the publish
+/// early-returned without writing it. The id is still what says the PAYLOADS
+/// agree — it is the hash of the manifest that names their digests — so the
+/// signature is the only thing left to compare.
+enum Existing {
+    /// Same id, same signature: publishing is a no-op, as it always was.
+    Same,
+    /// Same id, different signature. The payloads are already verified
+    /// identical, so only the signature file needs replacing.
+    Resigned(Vec<u8>),
+    /// Same id, but the source dropped a signature the destination has.
+    /// Refused rather than performed: removing a signature is a downgrade, and
+    /// doing nothing would silently ignore what the caller asked for.
+    SignatureWithdrawn,
+    /// A different deployment entirely.
+    Different,
+}
+
+fn existing_bundle(directory: &Path, want: &VerifiedBundle) -> io::Result<Existing> {
+    let found = open_bundle(directory)?;
+    if found.id != want.id {
+        return Ok(Existing::Different);
+    }
+    // Spelled exhaustively rather than with a `_` arm: this classifies for a
+    // fail-CLOSED caller, and a catch-all would send any future fifth state to
+    // the no-op by default instead of to a refusal.
+    Ok(match (&want.signature, found.signature) {
+        (Some(new), Some(old)) if *new == old => Existing::Same,
+        (Some(new), Some(_)) => Existing::Resigned(new.clone()),
+        (Some(new), None) => Existing::Resigned(new.clone()),
+        (None, Some(_)) => Existing::SignatureWithdrawn,
+        (None, None) => Existing::Same,
+    })
+}
+
+/// Replace a published deployment's detached signature in place.
+///
+/// Sound only because the caller has established the ids match, which means the
+/// manifest bytes match, which means the payload digests it names — and so the
+/// payloads `open_bundle` just verified — are the same file contents. Nothing
+/// about the deployment changes but which key vouches for it.
+/// Stage the new signature under a name no other writer can be using.
+///
+/// A FIXED temporary name was wrong twice over, because `write_synced_file`
+/// creates with `create_new`. A write that failed partway — or a crash between
+/// the create and the rename — left the file behind, and since nothing reaps
+/// inside a deployment directory (`reap_install_temporaries` sweeps `.install-`
+/// entries in the deployments directory only), every later rotation then failed
+/// `AlreadyExists`: signing was wedged permanently by one interrupted write.
+/// And two publishers rotating the same deployment at once collided on it, so
+/// one failed for a reason that has nothing to do with what it was asked to do.
+/// The pid-and-attempt shape is the one `create_install_directory` already uses.
+fn write_signature_temporary(
+    directory: &Path,
+    signature: &[u8],
+) -> io::Result<(PathBuf, RemoveFile)> {
+    for attempt in 0..1024u32 {
+        let path = directory.join(format!(
+            ".{}-{}-{attempt}",
+            protocol::MANIFEST_SIG_NAME,
+            std::process::id()
+        ));
+        // Armed BEFORE the write, so a write that fails after `create_new`
+        // succeeded removes what it made rather than leaving the wedge above.
+        let mut cleanup = RemoveFile {
+            path: Some(path.clone()),
+        };
+        match write_synced_file(&path, signature) {
+            Ok(()) => return Ok((path, cleanup)),
+            // Someone else's file — a dead process with this pid, or a thread
+            // racing us. Take the next name, and do NOT delete what is not ours.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => cleanup.path = None,
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("stage deployment signature {}: {error}", path.display()),
+                ));
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "could not create a unique signature temporary below {}",
+            directory.display()
+        ),
+    ))
+}
+
+fn replace_signature(directory: &Path, signature: &[u8]) -> io::Result<()> {
+    let destination = directory.join(protocol::MANIFEST_SIG_NAME);
+    // A crash must leave the old signature or the new one, never a half-written
+    // file: a truncated signature verifies as nothing and would strand a
+    // machine on a deployment it can no longer authenticate.
+    let (staging, mut cleanup) = write_signature_temporary(directory, signature)?;
+    match fs::rename(&staging, &destination) {
+        Ok(()) => {
+            cleanup.path = None;
+            sync_directory(directory)
+        }
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!(
+                "publish signature {} -> {}: {error}",
+                staging.display(),
+                destination.display()
+            ),
+        )),
+    }
 }
 
 fn publish_bundle(root: &Path, mut bundle: VerifiedBundle) -> io::Result<String> {
@@ -771,15 +915,26 @@ fn publish_bundle(root: &Path, mut bundle: VerifiedBundle) -> io::Result<String>
     let destination = deployments.join(&bundle.id);
     match fs::symlink_metadata(&destination) {
         Ok(_) => {
-            if existing_bundle_matches(&destination, &bundle.id)? {
-                sync_directory(&deployments)?;
-                return Ok(bundle.id);
+            match existing_bundle(&destination, &bundle)? {
+                Existing::Same => {}
+                Existing::Resigned(signature) => replace_signature(&destination, &signature)?,
+                Existing::SignatureWithdrawn => {
+                    return Err(invalid(format!(
+                        "deployment {} is already published WITH a signature and the source \
+                         carries none; refusing to remove it",
+                        bundle.id
+                    )));
+                }
+                Existing::Different => {
+                    return Err(invalid(format!(
+                        "existing deployment {} does not verify as {}",
+                        destination.display(),
+                        bundle.id
+                    )));
+                }
             }
-            return Err(invalid(format!(
-                "existing deployment {} does not verify as {}",
-                destination.display(),
-                bundle.id
-            )));
+            sync_directory(&deployments)?;
+            return Ok(bundle.id);
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
@@ -793,6 +948,9 @@ fn publish_bundle(root: &Path, mut bundle: VerifiedBundle) -> io::Result<String>
     copy_verified_payload(&mut bundle.initramfs, &staging.join("initramfs.cpio"))?;
     copy_verified_payload(&mut bundle.root, &staging.join("root.erofs"))?;
     write_synced_file(&staging.join(protocol::MANIFEST_NAME), &bundle.manifest)?;
+    if let Some(signature) = &bundle.signature {
+        write_synced_file(&staging.join(protocol::MANIFEST_SIG_NAME), signature)?;
+    }
     sync_directory(&staging)?;
 
     let staged = open_bundle(&staging)?;
@@ -802,16 +960,56 @@ fn publish_bundle(root: &Path, mut bundle: VerifiedBundle) -> io::Result<String>
             staged.id, bundle.id
         )));
     }
+    // The id is the manifest's hash, so it says nothing about the DETACHED
+    // signature: a staging directory missing it reads as a perfectly good
+    // deployment. Read it back for the reason the rest of this tree does —
+    // nothing observable distinguishes a signature that was never written from
+    // one the source never had.
+    if staged.signature != bundle.signature {
+        return Err(invalid(format!(
+            "staged deployment {} did not carry the source's signature",
+            bundle.id
+        )));
+    }
 
     match fs::rename(&staging, &destination) {
         Ok(()) => cleanup.path = None,
         Err(rename_error) => {
-            match existing_bundle_matches(&destination, &bundle.id) {
-                Ok(true) => {
+            // A concurrent publisher won the rename. Its bundle is the same
+            // deployment if the id agrees; a signature difference is still
+            // ours to apply, since the two publishers may hold different keys
+            // and the later one is the one the caller asked for.
+            match existing_bundle(&destination, &bundle) {
+                Ok(Existing::Same) => {
                     sync_directory(&deployments)?;
                     return Ok(bundle.id);
                 }
-                Ok(false) => {}
+                Ok(Existing::Resigned(signature)) => {
+                    // Compose both, as the sibling arm below does: on its own
+                    // a signature error here reads as a rotation failure and
+                    // says nothing about the rename that led to it.
+                    replace_signature(&destination, &signature).map_err(|signature_error| {
+                        io::Error::new(
+                            signature_error.kind(),
+                            format!(
+                                "publish deployment {} -> {}: {rename_error}; concurrent \
+                                 destination re-signing failed: {signature_error}",
+                                staging.display(),
+                                destination.display()
+                            ),
+                        )
+                    })?;
+                    sync_directory(&deployments)?;
+                    return Ok(bundle.id);
+                }
+                Ok(Existing::SignatureWithdrawn) => {
+                    return Err(invalid(format!(
+                        "deployment {} was published concurrently WITH a signature and this \
+                         source carries none; refusing to remove it",
+                        bundle.id
+                    )));
+                }
+                Ok(Existing::Different) => {}
                 Err(existing_error) => {
                     return Err(io::Error::new(
                         rename_error.kind(),
@@ -2130,6 +2328,28 @@ mod tests {
             (directory, id)
         }
 
+        /// Put a detached signature beside a source bundle's manifest.
+        ///
+        /// Opaque bytes on purpose: nothing verifies them in this landing, and
+        /// the property under test is that publishing CARRIES the file rather
+        /// than anything about what it contains.
+        fn sign_source(&self, directory: &Path, signature: &str) {
+            fs::write(
+                directory.join(protocol::MANIFEST_SIG_NAME),
+                format!("{signature}\n"),
+            )
+            .unwrap();
+        }
+
+        fn published_signature(&self, id: &str) -> Option<Vec<u8>> {
+            let path = self
+                .root
+                .join(protocol::DEPLOYMENTS_DIR)
+                .join(id)
+                .join(protocol::MANIFEST_SIG_NAME);
+            fs::read(path).ok()
+        }
+
         fn selector(&self, slot: &str, id: &str) {
             symlink(
                 format!("../deployments/{id}"),
@@ -2260,6 +2480,276 @@ mod tests {
         assert!(entries
             .iter()
             .all(|name| !name.as_bytes().starts_with(b".install-")));
+    }
+
+    /// The gap this landing exists for: `publish_bundle` copied four literal
+    /// names, so a detached signature beside the manifest was dropped without a
+    /// word and no machine could ever have one to verify.
+    #[test]
+    fn publishing_carries_the_detached_signature() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        fixture.sign_source(&source, "aa11");
+
+        assert_eq!(
+            install_deployment(&fixture.root, &source).unwrap(),
+            candidate
+        );
+        assert_eq!(
+            fixture.published_signature(&candidate).as_deref(),
+            Some(&b"aa11\n"[..]),
+            "the signature must reach the deployment directory"
+        );
+    }
+
+    /// An unsigned bundle still installs, because nothing verifies a signature
+    /// yet and requiring one would make every existing bundle uninstallable.
+    #[test]
+    fn an_unsigned_bundle_still_publishes() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+
+        assert_eq!(
+            install_deployment(&fixture.root, &source).unwrap(),
+            candidate
+        );
+        assert_eq!(fixture.published_signature(&candidate), None);
+    }
+
+    /// D3's whole point, made reachable: re-signing does not change the id, so
+    /// an id-only comparison made the publish a no-op and a rotated key could
+    /// never reach a machine. The payloads are already verified identical, so
+    /// only the signature is replaced.
+    #[test]
+    fn re_signing_an_installed_deployment_updates_the_signature_in_place() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        fixture.sign_source(&source, "aa11");
+        install_deployment(&fixture.root, &source).unwrap();
+
+        // Same bundle, new key. The id is unchanged by construction.
+        fixture.sign_source(&source, "bb22");
+        assert_eq!(
+            install_deployment(&fixture.root, &source).unwrap(),
+            candidate,
+            "the deployment keeps its id across a re-signing"
+        );
+        assert_eq!(
+            fixture.published_signature(&candidate).as_deref(),
+            Some(&b"bb22\n"[..]),
+            "the installed signature must be the one just supplied"
+        );
+        // And nothing is left over from the in-place replacement.
+        let entries = fs::read_dir(fixture.root.join(protocol::DEPLOYMENTS_DIR).join(&candidate))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert!(
+            entries.iter().all(|name| !name.as_bytes().starts_with(b".")),
+            "no staging temporary survives: {entries:?}"
+        );
+    }
+
+    /// The property the fixed temporary name did not have. `write_synced_file`
+    /// creates with `create_new`, so ONE name means a second staging — a
+    /// concurrent publisher, or a rotation after a crash left the name taken —
+    /// fails `AlreadyExists`. Nothing reaps inside a deployment directory
+    /// (`reap_install_temporaries` sweeps `.install-` entries in the
+    /// deployments directory alone), so that failure was permanent.
+    ///
+    /// Asserted on the staging function directly rather than through two
+    /// threads: the overlap a thread pair needs to demonstrate this is timing,
+    /// and a boot-critical gate should not carry a test that depends on it.
+    #[test]
+    fn a_taken_signature_temporary_does_not_block_the_next_one() {
+        let fixture = Fixture::new();
+        let directory = fixture.root.join("staging");
+        fs::create_dir(&directory).unwrap();
+
+        let (first, keep_first) = write_signature_temporary(&directory, b"aa11\n").unwrap();
+        // Held, so the first name is still taken when the second is staged.
+        let (second, keep_second) = write_signature_temporary(&directory, b"bb22\n").unwrap();
+        assert_ne!(first, second, "a second staging must not reuse the name");
+        assert_eq!(fs::read(&first).unwrap(), b"aa11\n", "and must not clobber it");
+        assert_eq!(fs::read(&second).unwrap(), b"bb22\n");
+
+        // Both are still this function's own to remove.
+        drop(keep_first);
+        drop(keep_second);
+        assert!(!first.exists() && !second.exists(), "the guards remove both");
+    }
+
+    /// A rotation that cannot rename must not leave its temporary behind, or
+    /// the failure it reports becomes permanent for every later attempt.
+    #[test]
+    fn a_failed_rotation_leaves_no_temporary() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        fixture.sign_source(&source, "aa11");
+        install_deployment(&fixture.root, &source).unwrap();
+
+        // A directory at the destination makes the rename fail with the
+        // temporary already written.
+        let published = fixture.root.join(protocol::DEPLOYMENTS_DIR).join(&candidate);
+        fs::remove_file(published.join(protocol::MANIFEST_SIG_NAME)).unwrap();
+        fs::create_dir(published.join(protocol::MANIFEST_SIG_NAME)).unwrap();
+        assert!(replace_signature(&published, b"bb22\n").is_err());
+
+        let leftovers = fs::read_dir(&published)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.as_bytes().starts_with(b".manifest.sig"))
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "a failed rotation left {leftovers:?}");
+    }
+
+    /// Re-installing an IDENTICAL signed bundle must be a true no-op. Asserted
+    /// on the inode, because rewriting the same bytes is invisible in the
+    /// contents: a classifier that sent `(Some(x), Some(x))` down the resign
+    /// path would rename a fresh file over the old one and stay green on every
+    /// other assertion here.
+    #[test]
+    fn re_installing_an_identical_signed_bundle_rewrites_nothing() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        fixture.sign_source(&source, "aa11");
+        install_deployment(&fixture.root, &source).unwrap();
+
+        let path = fixture
+            .root
+            .join(protocol::DEPLOYMENTS_DIR)
+            .join(&candidate)
+            .join(protocol::MANIFEST_SIG_NAME);
+        let before = fs::symlink_metadata(&path).unwrap().ino();
+        install_deployment(&fixture.root, &source).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&path).unwrap().ino(),
+            before,
+            "an unchanged signature must not be rewritten"
+        );
+    }
+
+    /// The bound is a read limit, not a taste: exactly `MAX_SIGNATURE_BYTES` is
+    /// accepted, and only one byte more is refused.
+    #[test]
+    fn a_signature_of_exactly_the_bound_is_accepted() {
+        let fixture = Fixture::new();
+        let (source, _) = fixture.source_bundle("candidate", "next");
+        let path = source.join(protocol::MANIFEST_SIG_NAME);
+
+        // Pinned by LITERAL, not by the constant: a fixture sized from the
+        // constant shrinks with it, so lowering the bound would leave this
+        // green while refusing signatures td-deploy actually writes.
+        assert_eq!(
+            protocol::MAX_SIGNATURE_BYTES,
+            160,
+            "128 hex characters and a newline, with slack for a trailing CRLF"
+        );
+        fs::write(&path, vec![b'a'; 160]).unwrap();
+        let bundle = open_bundle(&source).unwrap();
+        assert_eq!(
+            bundle.signature.as_deref(),
+            Some(&vec![b'a'; 160][..]),
+            "exactly at the bound must be read, not refused"
+        );
+        // And one byte more is not.
+        fs::write(&path, vec![b'a'; 161]).unwrap();
+        assert!(open_bundle(&source).map(|_| ()).is_err(), "one past the bound");
+    }
+
+    /// Upgrading an already-installed unsigned deployment to a signed one is
+    /// the same path, and is what a first signed release does to a machine
+    /// running an unsigned bundle.
+    #[test]
+    fn signing_an_already_installed_unsigned_deployment_adds_the_signature() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        install_deployment(&fixture.root, &source).unwrap();
+        assert_eq!(fixture.published_signature(&candidate), None);
+
+        fixture.sign_source(&source, "cc33");
+        install_deployment(&fixture.root, &source).unwrap();
+        assert_eq!(
+            fixture.published_signature(&candidate).as_deref(),
+            Some(&b"cc33\n"[..])
+        );
+    }
+
+    /// The one direction that is refused. Removing a signature is a downgrade,
+    /// and doing nothing would silently ignore what the caller asked for — so
+    /// neither is done, and the installed signature is left exactly as it was.
+    #[test]
+    fn withdrawing_a_signature_is_refused_rather_than_performed() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        fixture.sign_source(&source, "dd44");
+        install_deployment(&fixture.root, &source).unwrap();
+
+        fs::remove_file(source.join(protocol::MANIFEST_SIG_NAME)).unwrap();
+        let error = install_deployment(&fixture.root, &source).unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to remove it"),
+            "refused, but for {error}"
+        );
+        assert_eq!(
+            fixture.published_signature(&candidate).as_deref(),
+            Some(&b"dd44\n"[..]),
+            "the installed signature must survive the refusal"
+        );
+    }
+
+    /// A signature that EXISTS but is not a readable regular file of bounded
+    /// size is a bundle to refuse, not one to treat as unsigned — silently
+    /// downgrading to "no signature" is the fail-open the verifying half must
+    /// not inherit.
+    #[test]
+    fn a_malformed_signature_is_refused_rather_than_read_as_absent() {
+        let fixture = Fixture::new();
+        let (source, _) = fixture.source_bundle("candidate", "next");
+        let path = source.join(protocol::MANIFEST_SIG_NAME);
+        // `VerifiedBundle` holds open files and is deliberately not `Debug`.
+        let refusal = |r: io::Result<VerifiedBundle>| r.map(|_| ()).unwrap_err();
+
+        fs::write(&path, vec![b'a'; (protocol::MAX_SIGNATURE_BYTES + 1) as usize]).unwrap();
+        let error = refusal(open_bundle(&source));
+        assert!(error.to_string().contains("deployment signature"), "{error}");
+
+        fs::remove_file(&path).unwrap();
+        symlink("manifest", &path).unwrap();
+        let error = refusal(open_bundle(&source));
+        assert!(
+            error.to_string().contains("must be a real regular file"),
+            "a symlinked signature must be refused, got {error}"
+        );
+
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let error = refusal(open_bundle(&source));
+        assert!(
+            error.to_string().contains("must be a real regular file"),
+            "a directory must be refused, got {error}"
+        );
     }
 
     #[test]

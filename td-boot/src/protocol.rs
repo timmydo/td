@@ -15,8 +15,12 @@ pub const MANIFEST_NAME: &str = "manifest";
 pub const MAX_MANIFEST_BYTES: u64 = 4096;
 // Detached, beside the manifest: the deployment id stays sha256(manifest), so
 // re-signing under a new key does not rename the deployment.
-#[allow(dead_code)]
 pub const MANIFEST_SIG_NAME: &str = "manifest.sig";
+// An ed25519 signature is 64 bytes, which `td-deploy` writes as 128 hex
+// characters and a newline. The bound is slack enough for a trailing CRLF and
+// nothing like a payload: this file is read off a volume anyone who can write
+// the disk can write, so it is bounded before it is read, as the manifest is.
+pub const MAX_SIGNATURE_BYTES: u64 = 160;
 pub const BOOT_DIR: &str = "td/boot";
 pub const ATTEMPTS_DIR: &str = "td/boot/attempts";
 pub const DEPLOYMENTS_DIR: &str = "td/deployments";
