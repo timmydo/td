@@ -7,10 +7,58 @@ const INITIAL_WORKSPACE: u8 = 1;
 const FINAL_WORKSPACE: u8 = 9;
 const VIRTUAL_EXTENT: usize = 65_536;
 
+/// Which way the FIRST split on a workspace goes — the only insertion a tree
+/// with one leaf cannot answer for itself, since a lone window is in no
+/// container. Horizontal, so the second window opens as a second COLUMN:
+/// columns are the arrangement this compositor is built around, and every
+/// later window joins whatever container it opens in.
+///
+/// There is deliberately no command to change it. `Super+v`/`Super+h` used to
+/// set a per-workspace split axis, and they now choose a column's
+/// PRESENTATION — a thing the operator can see, rather than a mode that only
+/// shows up when the next window opens. Getting a second window into one
+/// column is `Super+Shift+Down` or a drop onto its band, both of which say so
+/// at the moment they are used.
+const FIRST_SPLIT: Axis = Axis::Horizontal;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Axis {
     Horizontal,
     Vertical,
+}
+
+/// How a container presents its children. `Split` tiles them along its axis;
+/// the other two GROUP them, giving every leaf beneath a title band in a run
+/// and one leaf the whole area below it.
+///
+/// The two grouped modes differ only in which way that run travels, and that
+/// is why they are one enum rather than a flag beside a bool: every rule that
+/// cares — the band geometry, which arrow keys walk the run, where a drop's
+/// block goes — asks for the run's AXIS, and a mode that could not answer
+/// would have to be handled at each of those sites separately.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Presentation {
+    Split,
+    /// Bands down the container's top, one per leaf.
+    Stacked,
+    /// Bands across the container's top, side by side.
+    Tabbed,
+}
+
+impl Presentation {
+    /// The direction this presentation's band run travels, or `None` when it
+    /// draws no run at all.
+    pub fn run(self) -> Option<Axis> {
+        match self {
+            Presentation::Split => None,
+            Presentation::Stacked => Some(Axis::Vertical),
+            Presentation::Tabbed => Some(Axis::Horizontal),
+        }
+    }
+
+    fn grouped(self) -> bool {
+        self.run().is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,8 +101,11 @@ enum Moved {
 pub enum Command {
     Focus(Direction),
     Move(Direction),
-    SetSplit(Axis),
-    ToggleStacked,
+    /// Group the container the focused leaf is DISPLAYED in, and say which way
+    /// its bands run. `Presentation::Split` ungroups it.
+    SetPresentation(Presentation),
+    /// Group that container if it is not, and ungroup it if it is.
+    ToggleGrouped,
     SwitchWorkspace(u8),
     MoveToWorkspace(u8),
     ToggleFullscreen,
@@ -105,12 +156,15 @@ pub struct Placement {
     /// band across the top of it is not fullscreen.
     pub band: Rect,
     pub focused: bool,
-    /// Whether this leaf is presented by a STACKED container. The renderer
-    /// asks because a border wraps a window's band together with its client
-    /// area, and a stack is the one arrangement where it must not: the run's
-    /// LAST band abuts the content exactly as an ordinary band does, so
-    /// adjacency cannot tell the two apart.
-    pub stacked: bool,
+    /// The direction the band run travels for the container presenting this
+    /// leaf, or `None` for an ordinary tile. Carried rather than derived from
+    /// the tree because every reader wants the AXIS and not the fact: the
+    /// renderer asks because a border wraps a window's band together with its
+    /// client area and a grouped container is where it must not — a band
+    /// abuts the content exactly as an ordinary band does, so adjacency cannot
+    /// tell the two apart — and the drop asks because a block along the run
+    /// goes on the edge the run runs to.
+    pub run: Option<Axis>,
     /// Whether the CLIENT's pixels are shown. A leaf stacked away keeps the
     /// `rect` it WOULD have rather than an empty one, so this cannot be
     /// inferred from the rectangle: five sites ask instead — the border pass,
@@ -134,11 +188,15 @@ enum Node {
     Split {
         axis: Axis,
         children: Vec<Node>,
-        /// STACKED presentation: every leaf beneath this container gets a
-        /// title band in a run at its top, and the focused one gets all the
-        /// space below the run. Per container rather than per workspace, so a
-        /// nested column stacks without the rest of the screen following it.
-        stacked: bool,
+        /// How this container shows its children. GROUPED — stacked or tabbed
+        /// — gives every leaf beneath it a title band in a run at its top and
+        /// the focused one all the space below that run. Per container rather
+        /// than per workspace, so a nested column groups without the rest of
+        /// the screen following it.
+        ///
+        /// Independent of `axis`, which stays the arrangement the container
+        /// would tile as and is what it returns to when ungrouped.
+        presentation: Presentation,
     },
 }
 
@@ -161,33 +219,43 @@ impl Node {
         }
     }
 
-    fn insert_after(&mut self, focused: SurfaceKey, key: SurfaceKey, axis: Axis) -> bool {
+    /// Put a leaf immediately after the focused one, in the container that
+    /// holds it DIRECTLY. There is no axis to choose: that container already
+    /// has one, and the only case with no container — a workspace whose whole
+    /// root is the focused leaf — is the `FIRST_SPLIT` a first window makes.
+    ///
+    /// The direct parent rather than the first ancestor running some asked-for
+    /// way, because same-axis nesting is reachable — a drop leaves a container
+    /// holding one child and the collapse lifts it into a parent that may run
+    /// the same way — and an ancestor taking the insert puts the new window
+    /// beside the container instead of in it. Where that container is GROUPED
+    /// the difference is on screen: the window the operator just opened is not
+    /// in the run they are looking at.
+    fn insert_after(&mut self, focused: SurfaceKey, key: SurfaceKey) -> bool {
         match self {
             Node::Leaf(current) if *current == focused => {
                 *self = Node::Split {
-                    axis,
+                    axis: FIRST_SPLIT,
                     children: vec![Node::Leaf(*current), Node::Leaf(key)],
-                    stacked: false,
+                    presentation: Presentation::Split,
                 };
                 true
             }
             Node::Leaf(_) => false,
-            Node::Split {
-                axis: current_axis,
-                children,
-                ..
-            } => {
+            Node::Split { children, .. } => {
+                let own = children.iter().position(
+                    |child| matches!(child, Node::Leaf(candidate) if *candidate == focused),
+                );
+                if let Some(index) = own {
+                    children.insert(index.saturating_add(1), Node::Leaf(key));
+                    return true;
+                }
                 let Some(index) = children.iter().position(|child| child.contains(focused)) else {
                     return false;
                 };
-                if *current_axis == axis {
-                    children.insert(index.saturating_add(1), Node::Leaf(key));
-                    true
-                } else {
-                    children
-                        .get_mut(index)
-                        .is_some_and(|child| child.insert_after(focused, key, axis))
-                }
+                children
+                    .get_mut(index)
+                    .is_some_and(|child| child.insert_after(focused, key))
             }
         }
     }
@@ -204,7 +272,7 @@ impl Node {
     /// something over a window in a row, where nothing in the tree runs
     /// vertically yet.
     ///
-    /// A STACKED container refuses that second case. `place_stack` draws one
+    /// A GROUPED container refuses that second case. `place_group` draws one
     /// band per LEAF beneath it, so a split among its children is a container
     /// nothing presents and whose leaves join the run anyway — an arrangement
     /// that says one thing and shows another, and that reappears the moment
@@ -229,13 +297,13 @@ impl Node {
         let Node::Split {
             axis: own,
             children,
-            stacked,
+            presentation,
         } = self
         else {
             return false;
         };
         let own = *own;
-        let in_stack = in_stack || *stacked;
+        let in_stack = in_stack || presentation.grouped();
         let beside = children
             .iter()
             .position(|child| matches!(child, Node::Leaf(candidate) if *candidate == target));
@@ -362,41 +430,38 @@ impl Node {
         Moved::Done
     }
 
-    /// Toggle the presentation of the container a leaf is DISPLAYED in. The
-    /// answer is how the recursion below reports having found it; a lone
-    /// window is its workspace's whole root, with no container to stack, and
-    /// every arm says false.
+    /// The presentation of the container a leaf is DISPLAYED in, to change.
+    /// `None` for a lone window, which is its workspace's whole root and has
+    /// no container to present it.
     ///
-    /// Unstacking looks at the OUTERMOST stacked ancestor rather than the
-    /// leaf's own parent, because a stack runs every leaf BENEATH it and so
-    /// hides whatever the containers under it are doing — that ancestor is
-    /// what the leaf is displayed in, whatever they say. Descending past it
-    /// would toggle a container nothing can see, and a stack whose direct
-    /// children have all since become splits could then never be undone from
-    /// the keyboard: no leaf in it is a child of it any more. Stacking, with
-    /// no such ancestor, is still the leaf's own parent.
-    fn toggle_stacked(&mut self, key: SurfaceKey) -> bool {
+    /// An already-GROUPED ancestor wins over the leaf's own parent, and the
+    /// OUTERMOST such, because a group runs every leaf BENEATH it and so hides
+    /// whatever the containers under it are doing — that ancestor is what the
+    /// leaf is displayed in, whatever they say. Descending past it would change
+    /// a container nothing can see, and would leave a group undoable only from
+    /// the leaves that happen to be its DIRECT children: in `H{grouped}[V[1,
+    /// 3], 2]` the chord works from 2 and not from 1 or 3, though the run shows
+    /// all three and the operator cannot see the difference. With no such
+    /// ancestor it is the leaf's own parent.
+    fn presented_mut(&mut self, key: SurfaceKey) -> Option<&mut Presentation> {
         let Node::Split {
-            children, stacked, ..
+            children,
+            presentation,
+            ..
         } = self
         else {
-            return false;
+            return None;
         };
-        if !children.iter().any(|child| child.contains(key)) {
-            return false;
+        // A key is in exactly one child, so the child that CONTAINS it is a
+        // leaf only when it IS it — no second search for the leaf itself.
+        let index = children.iter().position(|child| child.contains(key))?;
+        let own = children
+            .get(index)
+            .is_some_and(|child| matches!(child, Node::Leaf(_)));
+        if presentation.grouped() || own {
+            return Some(presentation);
         }
-        if *stacked {
-            *stacked = false;
-            return true;
-        }
-        if children
-            .iter()
-            .any(|child| matches!(child, Node::Leaf(candidate) if *candidate == key))
-        {
-            *stacked = true;
-            return true;
-        }
-        children.iter_mut().any(|child| child.toggle_stacked(key))
+        children.get_mut(index)?.presented_mut(key)
     }
 
     #[cfg(test)]
@@ -427,7 +492,6 @@ impl Node {
 struct Workspace {
     root: Option<Node>,
     focused: Option<SurfaceKey>,
-    pending_axis: Axis,
     fullscreen: Option<SurfaceKey>,
     /// Every mapped leaf, most-recently-focused first. A stack shows the one
     /// of its own leaves that comes first here, so it keeps showing what it
@@ -442,7 +506,6 @@ impl Workspace {
         Workspace {
             root: None,
             focused: None,
-            pending_axis: Axis::Horizontal,
             fullscreen: None,
             recent: Vec::new(),
         }
@@ -476,13 +539,17 @@ impl Workspace {
             root.leaves(&mut keys);
             keys.first().copied()
         });
-        let inserted =
-            focused.is_some_and(|current| root.insert_after(current, key, self.pending_axis));
+        // A new window JOINS the container the focused one is in, so opening
+        // one in a column extends that column and opening one in the root row
+        // adds a column. No axis is chosen here at all: the container that
+        // already holds the focused leaf has one, and `FIRST_SPLIT` is only
+        // what a workspace of ONE window splits along, having no container yet.
+        let inserted = focused.is_some_and(|current| root.insert_after(current, key));
         if !inserted {
             root = Node::Split {
-                axis: self.pending_axis,
+                axis: FIRST_SPLIT,
                 children: vec![root, Node::Leaf(key)],
-                stacked: false,
+                presentation: Presentation::Split,
             };
         }
         self.root = Some(root);
@@ -559,14 +626,15 @@ impl Layout {
     }
 
     /// The direction this leaf's title BANDS run, which is what a drop onto
-    /// one measures its half along. A stack's bands run DOWN its top whatever
-    /// its container's axis is, so one answers Vertical; otherwise the
-    /// container's own axis, since each leaf carries its own band at the top
-    /// of its own tile. A lone window has neither.
+    /// one measures its half along. A GROUPED container's bands run the way
+    /// its presentation says whatever its container's axis is — down for a
+    /// stack, across for tabs — and otherwise the container's own axis, since
+    /// each leaf then carries its own band at the top of its own tile. A lone
+    /// window has neither.
     pub fn run_direction(&self, key: SurfaceKey) -> Option<Axis> {
         let root = self.workspaces.get(&self.active)?.root.as_ref()?;
-        if stack_run(root, key).is_some() {
-            return Some(Axis::Vertical);
+        if let Some((_, run)) = stack_run(root, key) {
+            return Some(run);
         }
         parent_axis(root, key)
     }
@@ -651,7 +719,7 @@ impl Layout {
             rest = Node::Split {
                 axis: axis.unwrap_or(Axis::Horizontal),
                 children: vec![rest, Node::Leaf(dragged)],
-                stacked: false,
+                presentation: Presentation::Split,
             };
         }
         let rebuilt = collapsed(rest);
@@ -762,7 +830,6 @@ impl Layout {
         match command {
             Command::Focus(direction) => self.focus_direction(direction),
             Command::Move(direction) => self.move_direction(direction),
-            Command::SetSplit(axis) => self.workspace_mut(self.active).pending_axis = axis,
             Command::SwitchWorkspace(number) if valid_workspace(number) => {
                 self.active = number;
                 self.workspace_mut(number);
@@ -770,7 +837,7 @@ impl Layout {
             Command::MoveToWorkspace(number) if valid_workspace(number) => {
                 self.move_to_workspace(number)
             }
-            Command::ToggleStacked => {
+            Command::SetPresentation(_) | Command::ToggleGrouped => {
                 let Some(focused) = self.focused() else {
                     return;
                 };
@@ -784,8 +851,22 @@ impl Layout {
                 {
                     return;
                 }
-                if let Some(root) = self.workspace_mut(self.active).root.as_mut() {
-                    root.toggle_stacked(focused);
+                if let Some(slot) = self
+                    .workspace_mut(self.active)
+                    .root
+                    .as_mut()
+                    .and_then(|root| root.presented_mut(focused))
+                {
+                    *slot = match command {
+                        // Grouping picks STACKED, and ungrouping forgets which
+                        // mode was in use: a container remembers its axis, not
+                        // its presentation, and a mode nobody can see is a
+                        // second thing to keep in step with the tree.
+                        Command::ToggleGrouped if slot.grouped() => Presentation::Split,
+                        Command::ToggleGrouped => Presentation::Stacked,
+                        Command::SetPresentation(wanted) => wanted,
+                        _ => *slot,
+                    };
                 }
             }
             Command::ToggleFullscreen => {
@@ -974,14 +1055,30 @@ impl Layout {
                 return;
             }
         }
-        let placements = unstacked_placements(workspace, VIRTUAL_EXTENT, VIRTUAL_EXTENT, 0);
+        let mut placements = unstacked_placements(workspace, VIRTUAL_EXTENT, VIRTUAL_EXTENT, 0);
+        // Past the run, a group is ONE tile. These placements ignore grouping,
+        // so a group's leaves lie where the tree puts them, and ranking against
+        // them would walk the run a second way: a tabbed column is a vertical
+        // split, so `Up` — which its bands do not run along, and which
+        // `stack_neighbour` therefore declined — would step to the tab above in
+        // the TREE, one the screen shows beside it. Dropping the group's other
+        // leaves leaves both pairs of directions with one meaning each: along
+        // the run above, and out of the group entirely here.
+        if let Some((run, _)) = workspace
+            .root
+            .as_ref()
+            .and_then(|root| stack_run(root, focused))
+        {
+            placements
+                .retain(|placement| placement.key == focused || !run.contains(&placement.key));
+        }
         let Some(target) = directional_target(&placements, focused, direction) else {
             return;
         };
         let target = workspace
             .root
             .as_ref()
-            .and_then(|root| leaf_entering_stack(root, focused, target, &workspace.recent))
+            .and_then(|root| leaf_entering_stack(root, target, &workspace.recent))
             .unwrap_or(target);
         self.workspace_mut(self.active).focus(target);
     }
@@ -1022,7 +1119,7 @@ impl Layout {
                     } else {
                         vec![Node::Leaf(focused), rest]
                     },
-                    stacked: false,
+                    presentation: Presentation::Split,
                 }),
                 // The only window on the workspace: nothing to move it past.
                 None => Some(Node::Leaf(focused)),
@@ -1077,7 +1174,7 @@ fn visible_placements(
                 height: 0,
             },
             focused: workspace.focused == Some(fullscreen),
-            stacked: false,
+            run: None,
             visible: true,
         }];
     }
@@ -1172,7 +1269,7 @@ fn split_of(axis: Axis, key: SurfaceKey, target: SurfaceKey, before: bool) -> No
     Node::Split {
         axis,
         children,
-        stacked: false,
+        presentation: Presentation::Split,
     }
 }
 
@@ -1186,7 +1283,7 @@ fn detach(node: Node, key: SurfaceKey) -> Option<Node> {
         Node::Split {
             axis,
             children,
-            stacked,
+            presentation,
         } => {
             let retained: Vec<Node> = children
                 .into_iter()
@@ -1198,30 +1295,39 @@ fn detach(node: Node, key: SurfaceKey) -> Option<Node> {
             Some(Node::Split {
                 axis,
                 children: retained,
-                stacked,
+                presentation,
             })
         }
     }
 }
 
-/// The leaf `direction` reaches from `key` WITHIN the stack presenting it, or
-/// `None` when there is no stack or the step would leave it.
+/// The leaf `direction` reaches from `key` WITHIN the group presenting it, or
+/// `None` when there is no group, the direction does not run along it, or the
+/// step would leave it.
 ///
-/// The OUTERMOST stacked ancestor is the one that presents `key`, because
-/// that is where the renderer stops: `place_node` hands the first stacked
-/// container it meets to `place_stack`, which draws one band per LEAF beneath
-/// it. A stack nested inside another is therefore not shown at all, and
-/// walking its run would step through bands nobody can see. Same container
-/// `toggle_stacked` unstacks, for the same reason. Only `Up`/`Down` walk it,
-/// because that is the direction the bands run — `Left`/`Right` keep their
-/// geometric meaning so a stacked column can still be left for its neighbour.
+/// The OUTERMOST grouped ancestor is the one that presents `key`, because that
+/// is where the renderer stops: `place_node` hands the first grouped container
+/// it meets to `place_group`, which draws one band per LEAF beneath it. A group
+/// nested inside another is therefore not shown at all, and walking its run
+/// would step through bands nobody can see. Same container `presented_mut`
+/// finds, for the same reason.
+///
+/// Only the pair ALONG the run walks it — `Up`/`Down` for a stack, whose bands
+/// go down, and `Left`/`Right` for tabs, whose bands go across. Answering
+/// `None` for the other pair sends it to the geometry, which leaves the group
+/// WHOLE rather than walking it a second way: `focus_direction` drops the
+/// group's own leaves before ranking. So a stacked column can be left for its
+/// neighbour and a tabbed one stepped out of downwards. Which pair is which is
+/// now visible on screen, where under a single stacked mode it was not: a
+/// stacked ROW and a stacked COLUMN drew identically and answered
+/// `Left`/`Right` differently.
 fn stack_neighbour(node: &Node, key: SurfaceKey, direction: Direction) -> Option<SurfaceKey> {
-    let step: isize = match direction {
-        Direction::Up => -1,
-        Direction::Down => 1,
-        Direction::Left | Direction::Right => return None,
+    let (run, axis) = stack_run(node, key)?;
+    let step: isize = match (axis, direction) {
+        (Axis::Vertical, Direction::Up) | (Axis::Horizontal, Direction::Left) => -1,
+        (Axis::Vertical, Direction::Down) | (Axis::Horizontal, Direction::Right) => 1,
+        _ => return None,
     };
-    let run = stack_run(node, key)?;
     let at = run.iter().position(|candidate| *candidate == key)?;
     let next = isize::try_from(at).ok()?.checked_add(step)?;
     run.get(usize::try_from(next).ok()?).copied()
@@ -1247,41 +1353,43 @@ fn shown_index(run: &[SurfaceKey], recent: &[SurfaceKey]) -> usize {
         .unwrap_or(0)
 }
 
-/// The leaf a directional step ENTERING a stack lands on: the one it shows.
+/// The leaf a directional step ENTERING a group lands on: the one it shows.
 ///
-/// The ranking below runs over the UNSTACKED geometry, where a stack's leaves
-/// hold a fraction of the container each, and nothing about those fractions is
-/// on screen — the stack draws one leaf. `None` for a step INSIDE one stack,
-/// where the geometry IS the answer: that is how Left/Right walk a stack made
-/// from a row.
+/// The ranking that produced `target` runs over the UNGROUPED geometry, where a
+/// group's leaves hold a fraction of the container each, and nothing about
+/// those fractions is on screen — the group draws one leaf. `None` where the
+/// target is in no group and the ranking's answer stands.
+///
+/// Every step that reaches here comes from OUTSIDE the group it lands in, so
+/// there is no same-group case to exclude: `focus_direction` drops the leaves
+/// of the focused leaf's own group before ranking, and a group holding the
+/// focused leaf would be that group or nested in it.
 fn leaf_entering_stack(
     root: &Node,
-    focused: SurfaceKey,
     target: SurfaceKey,
     recent: &[SurfaceKey],
 ) -> Option<SurfaceKey> {
-    let run = stack_run(root, target)?;
-    if run.contains(&focused) {
-        return None;
-    }
+    let (run, _) = stack_run(root, target)?;
     run.get(shown_index(&run, recent)).copied()
 }
 
-/// Every leaf the outermost stacked ancestor of `key` presents, in band order
-/// — which is `leaves` exactly, since `place_stack` builds its run the same
-/// way.
-fn stack_run(node: &Node, key: SurfaceKey) -> Option<Vec<SurfaceKey>> {
+/// Every leaf the outermost GROUPED ancestor of `key` presents, in band order
+/// — which is `leaves` exactly, since `place_group` builds its run the same
+/// way — together with the direction that run travels.
+fn stack_run(node: &Node, key: SurfaceKey) -> Option<(Vec<SurfaceKey>, Axis)> {
     let Node::Split {
-        children, stacked, ..
+        children,
+        presentation,
+        ..
     } = node
     else {
         return None;
     };
     let index = children.iter().position(|child| child.contains(key))?;
-    if *stacked {
+    if let Some(run) = presentation.run() {
         let mut keys = Vec::new();
         node.leaves(&mut keys);
-        return Some(keys);
+        return Some((keys, run));
     }
     stack_run(children.get(index)?, key)
 }
@@ -1307,13 +1415,13 @@ fn remove_node(node: Node, key: SurfaceKey) -> Option<Node> {
         Node::Split {
             axis,
             children,
-            stacked,
+            presentation,
         } => {
             let retained: Vec<Node> = children
                 .into_iter()
                 .filter_map(|child| remove_node(child, key))
                 .collect();
-            rebuilt(axis, retained, stacked)
+            rebuilt(axis, retained, presentation)
         }
     }
 }
@@ -1326,15 +1434,15 @@ fn collapsed(node: Node) -> Option<Node> {
         Node::Split {
             axis,
             children,
-            stacked,
+            presentation,
         } => {
             let retained: Vec<Node> = children.into_iter().filter_map(collapsed).collect();
-            rebuilt(axis, retained, stacked)
+            rebuilt(axis, retained, presentation)
         }
     }
 }
 
-fn rebuilt(axis: Axis, mut children: Vec<Node>, stacked: bool) -> Option<Node> {
+fn rebuilt(axis: Axis, mut children: Vec<Node>, presentation: Presentation) -> Option<Node> {
     match children.len() {
         0 => None,
         // A container that collapses to one child is gone, and its
@@ -1343,7 +1451,7 @@ fn rebuilt(axis: Axis, mut children: Vec<Node>, stacked: bool) -> Option<Node> {
         _ => Some(Node::Split {
             axis,
             children,
-            stacked,
+            presentation,
         }),
     }
 }
@@ -1371,17 +1479,17 @@ fn place_node(node: &Node, rect: Rect, pass: &Pass, placements: &mut Vec<Placeme
                     height: taken,
                 },
                 focused: pass.focused == Some(*key),
-                stacked: false,
+                run: None,
                 visible: true,
             });
         }
         Node::Split {
             axis,
             children,
-            stacked,
+            presentation,
         } => {
-            if *stacked && pass.honour_stacking {
-                place_stack(children, rect, pass, placements);
+            if let Some(run) = presentation.run().filter(|_| pass.honour_stacking) {
+                place_group(children, rect, run, pass, placements);
                 return;
             }
             let rects = split_rects(rect, *axis, children.len(), pass.gap);
@@ -1392,51 +1500,97 @@ fn place_node(node: &Node, rect: Rect, pass: &Pass, placements: &mut Vec<Placeme
     }
 }
 
-/// A stacked container: one band per LEAF beneath it, in a run at the top, and
+/// A GROUPED container: one band per LEAF beneath it, in a run at the top, and
 /// the whole area below the run to whichever leaf is focused.
 ///
 /// Per leaf rather than per CHILD, which is where this diverges from i3: td
 /// has no container titles, so a split child's band would have to borrow some
 /// leaf's name. A nested split's arrangement is therefore not shown while its
-/// container is stacked, and unstacking restores it untouched.
-fn place_stack(children: &[Node], rect: Rect, pass: &Pass, placements: &mut Vec<Placement>) {
+/// container is grouped, and ungrouping restores it untouched.
+///
+/// `run` is the whole of the difference between the two grouped modes. A
+/// STACKED run travels down, so it costs one band of height per leaf and the
+/// content starts below all of them; a TABBED run travels across, so it costs
+/// one band of height however many there are and the bands divide that strip
+/// between them. The clipping differs with it: a stack too short for its run
+/// is all band and no content, where tabs too narrow simply get thinner and
+/// the content is untouched.
+fn place_group(
+    children: &[Node],
+    rect: Rect,
+    run: Axis,
+    pass: &Pass,
+    placements: &mut Vec<Placement>,
+) {
     let band = pass.band;
     let mut keys = Vec::new();
     for child in children {
         child.leaves(&mut keys);
     }
-    let bottom = rect.y.saturating_add(rect.height);
-    let run = band.saturating_mul(keys.len()).min(rect.height);
+    // How much HEIGHT the run costs, which is the one number the two modes
+    // disagree about: a band each going down, one band shared going across.
+    let taken = match run {
+        Axis::Vertical => band.saturating_mul(keys.len()),
+        Axis::Horizontal => band,
+    }
+    .min(rect.height);
     let content = Rect {
         x: rect.x,
-        y: rect.y.saturating_add(run),
+        y: rect.y.saturating_add(taken),
         width: rect.width,
-        height: rect.height.saturating_sub(run),
+        height: rect.height.saturating_sub(taken),
     };
-    // The stack's own MOST RECENTLY FOCUSED leaf gets the content, which is
-    // the focused one whenever focus is in the stack at all, since focusing is
+    let bands = match run {
+        Axis::Vertical => {
+            let bottom = rect.y.saturating_add(rect.height);
+            (0..keys.len())
+                .map(|index| {
+                    let top = rect
+                        .y
+                        .saturating_add(index.saturating_mul(band))
+                        .min(bottom);
+                    Rect {
+                        x: rect.x,
+                        y: top,
+                        width: rect.width,
+                        height: top.saturating_add(band).min(bottom).saturating_sub(top),
+                    }
+                })
+                .collect()
+        }
+        // No gap, for the reason bands in a stack have none: they are a run
+        // rather than tiles, and a border between them would read as a
+        // separation the arrangement does not have.
+        Axis::Horizontal => split_rects(
+            Rect {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: taken,
+            },
+            Axis::Horizontal,
+            keys.len(),
+            0,
+        ),
+    };
+    // The group's own MOST RECENTLY FOCUSED leaf gets the content, which is
+    // the focused one whenever focus is in the group at all, since focusing is
     // what puts a leaf at the front of that record. Focus alone would answer
-    // only for the stack the operator is in and snap every other one back to
+    // only for the group the operator is in and snap every other one back to
     // its first leaf. Both fallbacks are for a leaf the record does not name,
     // which `check_invariants` forbids and no expressible key sequence
     // reaches; the record cannot say "must be present" without a panic.
     let shown = shown_index(&keys, pass.recent);
     for (index, key) in keys.iter().enumerate() {
-        let top = rect
-            .y
-            .saturating_add(index.saturating_mul(band))
-            .min(bottom);
+        let Some(own) = bands.get(index) else {
+            continue;
+        };
         placements.push(Placement {
             key: *key,
             rect: content,
-            band: Rect {
-                x: rect.x,
-                y: top,
-                width: rect.width,
-                height: top.saturating_add(band).min(bottom).saturating_sub(top),
-            },
+            band: *own,
             focused: pass.focused == Some(*key),
-            stacked: true,
+            run: Some(run),
             visible: index == shown,
         });
     }
@@ -1589,6 +1743,50 @@ mod tests {
         SurfaceKey { client: 1, object }
     }
 
+    /// Open `object` BELOW whatever is focused, splitting that window's tile
+    /// rather than joining its container — which is what `SetSplit(Vertical)`
+    /// followed by a map used to do in one step. Performed as the drop an
+    /// operator makes on a window's bottom edge, so the arrangement it
+    /// produces is one the running compositor can be driven into.
+    fn map_below(layout: &mut Layout, object: u32) {
+        let over = layout.focused().expect("nothing focused to open below");
+        layout.map(key(object));
+        assert!(
+            layout.drop_onto(key(object), over, beside(Axis::Vertical, false)),
+            "the drop that opens a window below another moved nothing"
+        );
+    }
+
+    /// Open `object` BESIDE whatever is focused, splitting that window's tile
+    /// horizontally — the mirror of `map_below`, and the way to put a ROW
+    /// inside a column now that a new window joins the container it opens in.
+    fn map_beside(layout: &mut Layout, object: u32) {
+        let over = layout.focused().expect("nothing focused to open beside");
+        layout.map(key(object));
+        assert!(
+            layout.drop_onto(key(object), over, beside(Axis::Horizontal, false)),
+            "the drop that opens a window beside another moved nothing"
+        );
+    }
+
+    /// Map `objects` as one COLUMN, the way an operator reaches one: windows
+    /// open as a row of columns, and moving the second DOWN is what makes a
+    /// column at all — after which every later window joins it, since a new
+    /// window joins the container the focused one is in.
+    ///
+    /// This replaced `SetSplit(Axis::Vertical)`, which chose the axis of the
+    /// next split before it happened. The sequence is longer and it is the
+    /// one a person performs, so a test built this way cannot pass on a rule
+    /// no key sequence can reach.
+    fn column(layout: &mut Layout, objects: &[u32]) {
+        for (index, object) in objects.iter().enumerate() {
+            layout.map(key(*object));
+            if index == 1 {
+                layout.apply(Command::Move(Direction::Down));
+            }
+        }
+    }
+
     fn rect(layout: &Layout, object: u32) -> Rect {
         let placements = layout.placements(100, 100, 0, 0);
         let index = placements
@@ -1604,10 +1802,7 @@ mod tests {
     #[test]
     fn a_stacked_column_runs_its_bands_and_gives_the_focused_leaf_the_rest() {
         let mut layout = Layout::new();
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(1));
-        layout.map(key(2));
-        layout.map(key(3));
+        column(&mut layout, &[1, 2, 3]);
 
         // Unstacked first, so the SAME arrangement is measured both ways and
         // the difference is the presentation rather than the tree.
@@ -1619,7 +1814,7 @@ mod tests {
             [0, 100, 200]
         );
 
-        layout.apply(Command::ToggleStacked);
+        layout.apply(Command::ToggleGrouped);
         let stacked = layout.placements(100, 300, 0, 20);
         assert_eq!(stacked.len(), 3);
         // Every band in a run at the top, one per LEAF and in tree order.
@@ -1665,12 +1860,12 @@ mod tests {
 
         // And toggling back restores the split exactly: nothing about the
         // tree changed, only how it is presented.
-        layout.apply(Command::ToggleStacked);
+        layout.apply(Command::ToggleGrouped);
         let restored = layout.placements(100, 300, 0, 20);
         let geometry = |placements: &[Placement]| {
             placements
                 .iter()
-                .map(|p| (p.key, p.rect, p.band, p.stacked, p.visible))
+                .map(|p| (p.key, p.rect, p.band, p.run.is_some(), p.visible))
                 .collect::<Vec<_>>()
         };
         assert_eq!(geometry(&restored), geometry(&split));
@@ -1687,6 +1882,164 @@ mod tests {
     }
 
     #[test]
+    fn a_new_window_joins_its_neighbours_own_container_not_a_grandparent() {
+        // `H[H[1, 3], 2]` — same-axis nesting, which a drop and the collapse
+        // after it really do build: 3 is dropped beside 1 across the column
+        // it was in, leaving that column holding one child.
+        let mut layout = Layout::new();
+        for object in 1..=3 {
+            layout.map(key(object));
+        }
+        assert!(layout.drop_onto(
+            key(3),
+            key(1),
+            DropKind::Beside {
+                axis: Axis::Vertical,
+                before: false,
+            }
+        ));
+        assert!(layout.drop_onto(
+            key(3),
+            key(1),
+            DropKind::Beside {
+                axis: Axis::Horizontal,
+                before: false,
+            }
+        ));
+        assert!(layout.focus_key(key(1)));
+        layout.apply(Command::SetPresentation(Presentation::Tabbed));
+        let grouped = |layout: &Layout, object: u32| {
+            layout
+                .placements(120, 300, 0, 20)
+                .into_iter()
+                .position(|placement| placement.key == key(object) && placement.run.is_some())
+        };
+        assert!(
+            grouped(&layout, 1).is_some(),
+            "the inner pair is not a group"
+        );
+        assert!(grouped(&layout, 2).is_none(), "2 is inside the group");
+
+        // Opening a window with 1 focused must land it in 1's OWN container —
+        // the one drawn as a strip of tabs — rather than in the root, which
+        // runs the same way and would otherwise take the insert. Landing it
+        // outside is landing it somewhere the operator is not looking.
+        layout.map(key(4));
+        assert!(grouped(&layout, 4).is_some(), "4 landed outside the group");
+        assert_eq!(layout.focused(), Some(key(4)));
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_tabbed_column_runs_its_bands_across_and_costs_one_bands_height() {
+        let mut layout = Layout::new();
+        column(&mut layout, &[1, 2, 3]);
+        layout.apply(Command::SetPresentation(Presentation::Tabbed));
+
+        let tabbed = layout.placements(100, 300, 0, 20);
+        assert_eq!(tabbed.len(), 3);
+        // The bands divide ONE strip across the top rather than running down
+        // it: same row, side by side, in tree order.
+        assert_eq!(
+            tabbed
+                .iter()
+                .map(|p| (p.band.x, p.band.width))
+                .collect::<Vec<_>>(),
+            [(0, 34), (34, 33), (67, 33)]
+        );
+        assert!(tabbed.iter().all(|p| p.band.y == 0 && p.band.height == 20));
+        // So the run costs one band of height, not three — which is the whole
+        // difference between the two modes and what a tab is FOR.
+        for placement in &tabbed {
+            assert_eq!(
+                placement.rect,
+                Rect {
+                    x: 0,
+                    y: 20,
+                    width: 100,
+                    height: 280
+                }
+            );
+        }
+        assert_eq!(
+            tabbed.iter().map(|p| p.visible).collect::<Vec<_>>(),
+            [false, false, true]
+        );
+        assert!(tabbed.iter().all(|p| p.run == Some(Axis::Horizontal)));
+
+        // Switching to stacked is a change of PRESENTATION and nothing else:
+        // the same three leaves in the same order, laid out the other way.
+        layout.apply(Command::SetPresentation(Presentation::Stacked));
+        let stacked = layout.placements(100, 300, 0, 20);
+        assert_eq!(
+            stacked.iter().map(|p| p.key).collect::<Vec<_>>(),
+            tabbed.iter().map(|p| p.key).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            stacked
+                .iter()
+                .map(|p| (p.band.y, p.band.height))
+                .collect::<Vec<_>>(),
+            [(0, 20), (20, 20), (40, 20)]
+        );
+        assert!(stacked.iter().all(|p| p.run == Some(Axis::Vertical)));
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_tabbed_run_walks_across_where_a_stacked_one_walks_down() {
+        let mut layout = Layout::new();
+        column(&mut layout, &[1, 2, 3]);
+        layout.apply(Command::SetPresentation(Presentation::Stacked));
+        assert_eq!(layout.focused(), Some(key(3)));
+
+        // A stacked run answers to Up/Down and ignores Left/Right, since its
+        // bands are what the direction names.
+        layout.apply(Command::Focus(Direction::Up));
+        assert_eq!(layout.focused(), Some(key(2)));
+        layout.apply(Command::Focus(Direction::Left));
+        assert_eq!(layout.focused(), Some(key(2)));
+
+        // Tabbed is the same run seen the other way round, so the pair of
+        // directions that walks it swaps with the pair that does not.
+        layout.apply(Command::SetPresentation(Presentation::Tabbed));
+        layout.apply(Command::Focus(Direction::Up));
+        assert_eq!(layout.focused(), Some(key(2)));
+        layout.apply(Command::Focus(Direction::Right));
+        assert_eq!(layout.focused(), Some(key(3)));
+        layout.apply(Command::Focus(Direction::Left));
+        layout.apply(Command::Focus(Direction::Left));
+        assert_eq!(layout.focused(), Some(key(1)));
+        // And the ends hold rather than wrapping, as the stacked run's do.
+        layout.apply(Command::Focus(Direction::Left));
+        assert_eq!(layout.focused(), Some(key(1)));
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn ungrouping_a_tabbed_column_and_grouping_it_again_gives_a_stack() {
+        let mut layout = Layout::new();
+        column(&mut layout, &[1, 2]);
+        layout.apply(Command::SetPresentation(Presentation::Tabbed));
+        let grouped = |layout: &Layout| {
+            layout
+                .placements(100, 300, 0, 20)
+                .first()
+                .and_then(|placement| placement.run)
+        };
+        assert_eq!(grouped(&layout), Some(Axis::Horizontal));
+
+        // A split container records no former presentation, so the toggle has
+        // nothing to restore and picks the one it always did. Choosing the
+        // other back is what Super+h is for.
+        layout.apply(Command::ToggleGrouped);
+        assert_eq!(grouped(&layout), None);
+        layout.apply(Command::ToggleGrouped);
+        assert_eq!(grouped(&layout), Some(Axis::Vertical));
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
     fn stacking_toggles_the_focused_leafs_own_container_and_a_lone_window_has_none() {
         let mut layout = Layout::new();
         layout.map(key(1));
@@ -1695,16 +2048,15 @@ mod tests {
         // the whole placement has to say so, since `visible` is a constant
         // for an unstacked leaf and could not have reported otherwise.
         let alone = layout.placements(100, 300, 0, 20);
-        layout.apply(Command::ToggleStacked);
+        layout.apply(Command::ToggleGrouped);
         assert_eq!(layout.placements(100, 300, 0, 20), alone);
 
         // A column nested inside a row: stacking from inside it takes THAT
         // container, so the row beside it keeps its own arrangement.
         layout.map(key(2));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(3));
+        map_below(&mut layout, 3);
         assert_eq!(layout.focused(), Some(key(3)));
-        layout.apply(Command::ToggleStacked);
+        layout.apply(Command::ToggleGrouped);
         let placements = layout.placements(200, 300, 0, 20);
         let shown: Vec<bool> = placements.iter().map(|p| p.visible).collect();
         assert_eq!(shown, [true, false, true], "the outer row was stacked too");
@@ -1726,45 +2078,54 @@ mod tests {
     }
 
     #[test]
-    fn a_stack_unstacks_from_any_leaf_once_none_of_them_is_a_child_of_it() {
-        // A stacked ROW, then both of its children split into columns. It now
-        // holds no leaf directly, while still running every leaf beneath it —
-        // so `Mod+S` has to reach it by walking DOWN to the leaf rather than
-        // up from the leaf's own parent, or nothing on screen can undo it.
+    fn a_group_undoes_from_a_leaf_that_is_no_child_of_it() {
+        // A row holding a COLUMN and a leaf, stacked from the leaf — which is
+        // the only way to group a container that holds a split, since
+        // grouping always takes the innermost container the focused leaf is a
+        // direct child of. From 1 or 3 that would be the column; from 2 it is
+        // the row.
+        //
+        // Undoing it then has to work from 1 as well, and 1 is no child of
+        // that row: `Mod+S` reaches it by walking DOWN to the leaf and taking
+        // the OUTERMOST grouped ancestor, rather than up from the leaf's own
+        // parent. Without that the row could never be undone from a window it
+        // is showing.
         let mut layout = Layout::new();
         layout.map(key(1));
         layout.map(key(2));
-        layout.apply(Command::ToggleStacked);
         assert!(layout.focus_key(key(1)));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(3));
+        map_below(&mut layout, 3);
         assert!(layout.focus_key(key(2)));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(4));
+        layout.apply(Command::ToggleGrouped);
 
-        // All four run in the one stack, sharing the one content rectangle.
+        // All three run in the one stack, sharing the one content rectangle:
+        // the column inside it is a container the stack never shows.
         let stacked = layout.placements(200, 400, 0, 20);
-        assert_eq!(stacked.len(), 4);
+        assert_eq!(stacked.len(), 3);
         let content = stacked.first().unwrap().rect;
-        assert!(stacked.iter().all(|p| p.rect == content && p.stacked));
+        assert!(stacked
+            .iter()
+            .all(|p| p.rect == content && p.run == Some(Axis::Vertical)));
         assert_eq!(
             stacked.iter().map(|p| p.band.y).collect::<Vec<_>>(),
-            [0, 20, 40, 60]
+            [0, 20, 40]
         );
 
-        layout.apply(Command::ToggleStacked);
+        assert!(layout.focus_key(key(1)));
+        layout.apply(Command::ToggleGrouped);
         let split = layout.placements(200, 400, 0, 20);
         assert!(
-            split.iter().all(|p| p.visible && !p.stacked),
+            split.iter().all(|p| p.visible && p.run.is_none()),
             "a leaf that is no child of the stack could not unstack it"
         );
-        // Two columns of two, which is what the tree said all along.
+        // A column of two beside a lone window, which is what the tree said
+        // all along.
         assert_eq!(
             split
                 .iter()
                 .map(|p| (p.band.x, p.band.y))
                 .collect::<Vec<_>>(),
-            [(0, 0), (0, 200), (100, 0), (100, 200)]
+            [(0, 0), (0, 200), (100, 0)]
         );
         layout.check_invariants().unwrap();
     }
@@ -1772,11 +2133,8 @@ mod tests {
     #[test]
     fn a_stack_survives_an_unmap_and_loses_its_presentation_only_when_it_collapses() {
         let mut layout = Layout::new();
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(1));
-        layout.map(key(2));
-        layout.map(key(3));
-        layout.apply(Command::ToggleStacked);
+        column(&mut layout, &[1, 2, 3]);
+        layout.apply(Command::ToggleGrouped);
 
         // Closing one window of three leaves a stack of two. `remove_node`
         // rebuilds the container, so its presentation has to be carried over
@@ -1784,7 +2142,7 @@ mod tests {
         layout.unmap(key(2));
         let two = layout.placements(100, 300, 0, 20);
         assert_eq!(two.len(), 2);
-        assert!(two.iter().all(|p| p.stacked));
+        assert!(two.iter().all(|p| p.run.is_some()));
         assert_eq!(two.iter().map(|p| p.band.y).collect::<Vec<_>>(), [0, 20]);
 
         // Closing a second collapses the container into its survivor, and a
@@ -1792,7 +2150,7 @@ mod tests {
         layout.unmap(key(1));
         let one = layout.placements(100, 300, 0, 20);
         assert_eq!(one.len(), 1);
-        assert!(one.iter().all(|p| !p.stacked && p.visible));
+        assert!(one.iter().all(|p| p.run.is_none() && p.visible));
         assert_eq!(one.first().unwrap().band.y, 0);
         layout.check_invariants().unwrap();
     }
@@ -1800,10 +2158,8 @@ mod tests {
     #[test]
     fn a_stacked_away_leaf_is_published_hidden_at_the_size_it_would_have() {
         let mut layout = Layout::new();
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(1));
-        layout.map(key(2));
-        layout.apply(Command::ToggleStacked);
+        column(&mut layout, &[1, 2]);
+        layout.apply(Command::ToggleGrouped);
 
         // What the CLIENT is told, which is the one consumer of `visible`
         // outside the renderer: not visible, but sized for the content area
@@ -1836,17 +2192,15 @@ mod tests {
     #[test]
     fn fullscreen_refuses_to_stack_as_it_refuses_to_focus_and_move() {
         let mut layout = Layout::new();
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(1));
-        layout.map(key(2));
+        column(&mut layout, &[1, 2]);
         layout.apply(Command::ToggleFullscreen);
 
         // Nothing on screen could report the change, so the operator would
         // leave fullscreen into an arrangement they never asked for.
-        layout.apply(Command::ToggleStacked);
+        layout.apply(Command::ToggleGrouped);
         layout.apply(Command::ToggleFullscreen);
         let placements = layout.placements(100, 300, 0, 20);
-        assert!(placements.iter().all(|p| !p.stacked && p.visible));
+        assert!(placements.iter().all(|p| p.run.is_none() && p.visible));
         assert_eq!(
             placements.iter().map(|p| p.band.y).collect::<Vec<_>>(),
             [0, 150]
@@ -1857,11 +2211,8 @@ mod tests {
     #[test]
     fn moving_inside_a_stack_reorders_the_run_and_the_shown_leaf_with_it() {
         let mut layout = Layout::new();
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(1));
-        layout.map(key(2));
-        layout.map(key(3));
-        layout.apply(Command::ToggleStacked);
+        column(&mut layout, &[1, 2, 3]);
+        layout.apply(Command::ToggleGrouped);
         assert_eq!(layout.focused(), Some(key(3)));
 
         // Move walks the UNSTACKED arrangement, so it reaches the leaf above
@@ -1895,10 +2246,9 @@ mod tests {
         let mut layout = Layout::new();
         layout.map(key(1));
         layout.map(key(2));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(3));
+        map_below(&mut layout, 3);
         layout.map(key(4));
-        layout.apply(Command::ToggleStacked);
+        layout.apply(Command::ToggleGrouped);
 
         assert!(layout.focus_key(key(3)));
         let inside = layout.placements(200, 300, 0, 20);
@@ -1934,11 +2284,8 @@ mod tests {
     #[test]
     fn a_stack_taller_than_its_container_clips_its_run_and_keeps_no_content() {
         let mut layout = Layout::new();
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(1));
-        layout.map(key(2));
-        layout.map(key(3));
-        layout.apply(Command::ToggleStacked);
+        column(&mut layout, &[1, 2, 3]);
+        layout.apply(Command::ToggleGrouped);
 
         // Three 20-row bands want 60 rows and the container has 50. The run
         // is clipped to the container rather than overhanging it, the last
@@ -1988,8 +2335,7 @@ mod tests {
         let mut layout = Layout::new();
         layout.map(key(1));
         layout.map(key(2));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(3));
+        map_below(&mut layout, 3);
 
         assert_eq!(
             layout.placements(100, 100, 0, 0),
@@ -2004,7 +2350,7 @@ mod tests {
                     },
                     band: band_at(0, 0, 50),
                     focused: false,
-                    stacked: false,
+                    run: None,
                     visible: true
                 },
                 Placement {
@@ -2017,7 +2363,7 @@ mod tests {
                     },
                     band: band_at(50, 0, 50),
                     focused: false,
-                    stacked: false,
+                    run: None,
                     visible: true
                 },
                 Placement {
@@ -2030,7 +2376,7 @@ mod tests {
                     },
                     band: band_at(50, 50, 50),
                     focused: true,
-                    stacked: false,
+                    run: None,
                     visible: true
                 }
             ]
@@ -2042,8 +2388,7 @@ mod tests {
     fn focus_key_takes_a_visible_leaf_and_refuses_everything_else() {
         let mut layout = Layout::new();
         layout.map(key(1));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(2));
+        map_below(&mut layout, 2);
         assert_eq!(layout.focused(), Some(key(2)));
 
         assert!(layout.focus_key(key(1)));
@@ -2078,15 +2423,14 @@ mod tests {
         // Leaving a stack and coming back has to be a round trip. It was not:
         // the ranking runs over the UNSTACKED geometry, where 2 and 3 have a
         // half of the column each, so a step in from the left landed on 2 —
-        // and since focusing re-fronts the record `place_stack` reads, the
+        // and since focusing re-fronts the record `place_group` reads, the
         // stack came back SHOWING 2 as well. The operator left 3 and returned
         // to a different window with a different one drawn.
         let mut layout = Layout::new();
         layout.map(key(1));
         layout.map(key(2));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(3));
-        layout.apply(Command::ToggleStacked);
+        map_below(&mut layout, 3);
+        layout.apply(Command::ToggleGrouped);
         assert_eq!(layout.focused(), Some(key(3)));
         // `visible`, not the rectangle: a leaf stacked away keeps the `rect`
         // it WOULD have, so the two say different things here.
@@ -2148,7 +2492,7 @@ mod tests {
             layout.map(key(object));
         }
         assert_eq!(layout.parent_axis(key(3)), Some(Axis::Horizontal));
-        layout.apply(Command::ToggleStacked);
+        layout.apply(Command::ToggleGrouped);
         assert_eq!(layout.focused(), Some(key(3)));
 
         for expected in [2, 1] {
@@ -2165,12 +2509,12 @@ mod tests {
         layout.apply(Command::Focus(Direction::Down));
         assert_eq!(layout.focused(), Some(key(3)));
 
-        // Left/Right are UNCHANGED, and for this stack they still walk it:
-        // the run expands back into the row it was made from, which is why
-        // they worked here while Up/Down — the direction the bands actually
-        // run — did not.
+        // Left/Right do not walk it, though this stack was made FROM a row and
+        // the tree beneath still is one. The bands run down, so the pair that
+        // runs across leaves the group — and there is nothing outside this one
+        // to leave for.
         layout.apply(Command::Focus(Direction::Left));
-        assert_eq!(layout.focused(), Some(key(2)));
+        assert_eq!(layout.focused(), Some(key(3)));
         layout.check_invariants().unwrap();
     }
 
@@ -2184,10 +2528,9 @@ mod tests {
         let mut layout = Layout::new();
         layout.map(key(1));
         layout.map(key(2));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(3));
+        map_below(&mut layout, 3);
         assert_eq!(layout.parent_axis(key(3)), Some(Axis::Vertical));
-        layout.apply(Command::ToggleStacked);
+        layout.apply(Command::ToggleGrouped);
         assert_eq!(layout.focused(), Some(key(3)));
 
         layout.apply(Command::Focus(Direction::Left));
@@ -2213,15 +2556,14 @@ mod tests {
         let mut layout = Layout::new();
         layout.map(key(1));
         layout.map(key(2));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(3));
-        layout.apply(Command::ToggleStacked);
+        map_below(&mut layout, 3);
+        layout.apply(Command::ToggleGrouped);
         assert_eq!(layout.focused(), Some(key(3)));
         // Now stack the outer row as well, from a leaf that is its child.
         layout.focus_key(key(1));
-        layout.apply(Command::ToggleStacked);
+        layout.apply(Command::ToggleGrouped);
         let bands = layout.placements(200, 400, 0, 20);
-        assert!(bands.iter().all(|placement| placement.stacked));
+        assert!(bands.iter().all(|placement| placement.run.is_some()));
         assert_eq!(
             bands
                 .iter()
@@ -2250,16 +2592,14 @@ mod tests {
         // next leaf and the geometry answers with the window underneath.
         let mut layout = Layout::new();
         layout.map(key(1));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(2));
-        layout.focus_key(key(1));
-        layout.apply(Command::SetSplit(Axis::Horizontal));
-        layout.map(key(3));
-        layout.apply(Command::ToggleStacked);
+        map_below(&mut layout, 2);
+        assert!(layout.focus_key(key(1)));
+        map_beside(&mut layout, 3);
+        layout.apply(Command::ToggleGrouped);
         let run: Vec<u32> = layout
             .placements(200, 400, 0, 20)
             .iter()
-            .filter(|placement| placement.stacked)
+            .filter(|placement| placement.run.is_some())
             .map(|placement| placement.key.object)
             .collect();
         assert_eq!(run, [1, 3], "the stack is the top half, not the root");
@@ -2277,36 +2617,34 @@ mod tests {
 
     #[test]
     fn a_stack_of_splits_walks_every_band_it_draws() {
-        // `Hstacked[V[1, 3], V[2, 4]]`. td draws one band per LEAF beneath a
-        // stack rather than one per child — `place_stack` says so — so the run
-        // is all four. Walking per CHILD would step 1 to 2 and skip the band
-        // for 3 that is drawn between them.
-        // Stacked FIRST, then its children split: `ToggleStacked` stacks the
-        // container a leaf is a direct child of, so splitting first would
-        // stack an inner column instead of the row.
+        // `Hstacked[V[1, 3], 2]`. td draws one band per LEAF beneath a stack
+        // rather than one per child — `place_group` says so — so the run is
+        // all three. Walking per CHILD would step 1 to 2 and skip the band for
+        // 3 that is drawn between them.
+        //
+        // The column is made FIRST and the row grouped from 2, the leaf still
+        // directly in it: grouping takes the innermost container the focused
+        // leaf is a direct child of, so doing it from 1 would take the column.
         let mut layout = Layout::new();
         layout.map(key(1));
         layout.map(key(2));
-        layout.apply(Command::ToggleStacked);
-        layout.focus_key(key(1));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(3));
-        layout.focus_key(key(2));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(4));
+        assert!(layout.focus_key(key(1)));
+        map_below(&mut layout, 3);
+        assert!(layout.focus_key(key(2)));
+        layout.apply(Command::ToggleGrouped);
         let placements = layout.placements(200, 400, 0, 20);
         assert!(
-            placements.iter().all(|placement| placement.stacked),
-            "the ROW is the stack, and it presents all four"
+            placements.iter().all(|placement| placement.run.is_some()),
+            "the ROW is the stack, and it presents all three"
         );
         let run: Vec<u32> = placements
             .iter()
             .map(|placement| placement.key.object)
             .collect();
-        assert_eq!(run, [1, 3, 2, 4], "the drawn band order");
-        layout.focus_key(key(1));
+        assert_eq!(run, [1, 3, 2], "the drawn band order");
+        assert!(layout.focus_key(key(1)));
 
-        for expected in [3, 2, 4] {
+        for expected in [3, 2] {
             layout.apply(Command::Focus(Direction::Down));
             assert_eq!(layout.focused(), Some(key(expected)), "down to {expected}");
         }
@@ -2318,8 +2656,7 @@ mod tests {
         let mut layout = Layout::new();
         layout.map(key(1));
         layout.map(key(2));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(3));
+        map_below(&mut layout, 3);
 
         for (direction, expected) in [(Direction::Up, 2), (Direction::Left, 1)] {
             layout.apply(Command::Focus(direction));
@@ -2370,8 +2707,7 @@ mod tests {
             let mut layout = Layout::new();
             layout.map(key(1));
             layout.map(key(2));
-            layout.apply(Command::SetSplit(Axis::Vertical));
-            layout.map(key(3));
+            map_below(&mut layout, 3);
             if let Some(direction) = prepare {
                 layout.apply(Command::Focus(direction));
             }
@@ -2401,8 +2737,7 @@ mod tests {
         let mut layout = Layout::new();
         layout.map(key(1));
         layout.map(key(2));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(3));
+        map_below(&mut layout, 3);
         assert!(layout.focus_key(key(1)));
 
         let before = layout.placements(100, 100, 0, 0);
@@ -2434,8 +2769,7 @@ mod tests {
         let mut layout = Layout::new();
         layout.map(key(1));
         layout.map(key(2));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(3));
+        map_below(&mut layout, 3);
 
         assert!(layout.drop_onto(key(1), key(3), beside(Axis::Vertical, true)));
         assert_eq!(
@@ -2509,9 +2843,11 @@ mod tests {
         // to something and turn this column into a row.
         for axis in [Axis::Horizontal, Axis::Vertical] {
             let mut layout = Layout::new();
-            layout.apply(Command::SetSplit(axis));
             layout.map(key(1));
-            layout.map(key(2));
+            match axis {
+                Axis::Horizontal => layout.map(key(2)),
+                Axis::Vertical => map_below(&mut layout, 2),
+            }
             assert_eq!(layout.parent_axis(key(1)), Some(axis), "{axis:?}");
 
             assert!(layout.drop_onto(key(1), key(2), DropKind::InRun { before: false }));
@@ -2538,8 +2874,7 @@ mod tests {
         let mut layout = Layout::new();
         layout.map(key(1));
         layout.map(key(2));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(3));
+        map_below(&mut layout, 3);
         assert!(layout.drop_onto(key(2), key(3), DropKind::InRun { before: false }));
         let placements = layout.placements(100, 100, 0, 0);
         assert_eq!(
@@ -2563,8 +2898,7 @@ mod tests {
         let mut layout = Layout::new();
         layout.map(key(1));
         layout.map(key(2));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(3));
+        map_below(&mut layout, 3);
         let before = layout.placements(100, 100, 0, 0);
         assert_eq!(
             before.iter().map(|p| p.key.object).collect::<Vec<_>>(),
@@ -2610,9 +2944,8 @@ mod tests {
         let mut layout = Layout::new();
         layout.map(key(1));
         layout.map(key(2));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(3));
-        layout.apply(Command::ToggleStacked);
+        map_below(&mut layout, 3);
+        layout.apply(Command::ToggleGrouped);
         assert_eq!(
             layout
                 .placements(100, 300, 0, 20)
@@ -2625,7 +2958,7 @@ mod tests {
             .placements(100, 300, 0, 20)
             .iter()
             .filter(|p| p.key.object != 1)
-            .all(|p| p.stacked));
+            .all(|p| p.run.is_some()));
 
         assert!(layout.drop_onto(key(1), key(3), DropKind::Swap));
         let placements = layout.placements(100, 300, 0, 20);
@@ -2637,14 +2970,14 @@ mod tests {
             placements
                 .iter()
                 .filter(|p| p.key.object != 3)
-                .all(|p| p.stacked),
+                .all(|p| p.run.is_some()),
             "the swap unstacked the container it landed in"
         );
         // Focused, so the stack shows the window that just arrived rather
         // than leaving the operator looking at the one it replaced.
         let shown = placements
             .iter()
-            .filter(|p| p.stacked && p.visible)
+            .filter(|p| p.run.is_some() && p.visible)
             .map(|p| p.key.object)
             .collect::<Vec<_>>();
         assert_eq!(shown, [1]);
@@ -2725,8 +3058,7 @@ mod tests {
         let mut layout = Layout::new();
         layout.map(key(1));
         layout.map(key(2));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(3));
+        map_below(&mut layout, 3);
 
         assert!(layout.drop_onto(key(2), key(3), beside(Axis::Vertical, false)));
         let placements = layout.placements(100, 100, 0, 0);
@@ -2749,11 +3081,12 @@ mod tests {
         // removal destroys it and its presentation with it — and the operator
         // asked to reorder a stack, not to unstack one.
         let mut layout = Layout::new();
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(1));
-        layout.map(key(2));
-        layout.apply(Command::ToggleStacked);
-        assert!(layout.placements(100, 300, 0, 20).iter().all(|p| p.stacked));
+        column(&mut layout, &[1, 2]);
+        layout.apply(Command::ToggleGrouped);
+        assert!(layout
+            .placements(100, 300, 0, 20)
+            .iter()
+            .all(|p| p.run.is_some()));
 
         // A drop onto the stack's own axis, which is what an edge of a tile
         // inside one answers.
@@ -2764,7 +3097,7 @@ mod tests {
             [2, 1]
         );
         assert!(
-            placements.iter().all(|p| p.stacked),
+            placements.iter().all(|p| p.run.is_some()),
             "reordering a stack unstacked it"
         );
         assert_eq!(
@@ -2783,7 +3116,7 @@ mod tests {
             [1, 2]
         );
         assert!(
-            placements.iter().all(|p| p.stacked),
+            placements.iter().all(|p| p.run.is_some()),
             "a band drop unstacked the pair"
         );
         layout.check_invariants().unwrap();
@@ -2796,12 +3129,12 @@ mod tests {
         // leaf join the run either way, and meet a row waiting for them when
         // they later unstacked. The axis is refused inside a stack instead.
         let mut layout = Layout::new();
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(1));
-        layout.map(key(2));
-        layout.map(key(3));
-        layout.apply(Command::ToggleStacked);
-        assert!(layout.placements(100, 300, 0, 20).iter().all(|p| p.stacked));
+        column(&mut layout, &[1, 2, 3]);
+        layout.apply(Command::ToggleGrouped);
+        assert!(layout
+            .placements(100, 300, 0, 20)
+            .iter()
+            .all(|p| p.run.is_some()));
 
         // "1 to the RIGHT of 2", across a column that presents as a list.
         assert!(layout.drop_onto(key(1), key(2), beside(Axis::Horizontal, false)));
@@ -2811,7 +3144,7 @@ mod tests {
             [2, 1, 3]
         );
         assert!(
-            placements.iter().all(|p| p.stacked),
+            placements.iter().all(|p| p.run.is_some()),
             "the drop unstacked the run"
         );
         assert_eq!(
@@ -2829,7 +3162,7 @@ mod tests {
         // The same drop with the stack UNDONE does build the row, which is
         // what makes the refusal above about the presentation rather than
         // about the axis being ignored everywhere.
-        layout.apply(Command::ToggleStacked);
+        layout.apply(Command::ToggleGrouped);
         assert!(layout.drop_onto(key(1), key(3), beside(Axis::Horizontal, false)));
         assert_eq!(
             layout.parent_axis(key(1)),
@@ -2841,28 +3174,29 @@ mod tests {
 
     #[test]
     fn a_stack_refuses_the_axis_for_a_leaf_below_a_split_too() {
-        // The refusal is about the outermost stacked ANCESTOR, not about the
-        // container the leaf sits in. A stack already holding a split shows
+        // The refusal is about the outermost grouped ANCESTOR, not about the
+        // container the leaf sits in. A group already holding a split shows
         // the leaves under it flattened all the same, so a second split one
         // level further down would be exactly as invisible as the first.
-        // `V{stacked}[1, 2, H[3, 4]]`, built the only way it can be: opening a
-        // window while the pending axis crosses the stack's. That route is
-        // its own defect and its own increment — see this commit's message.
-        // Here it is only the shape.
+        // `V{stacked}[1, 2, H[3, 4]]`, built the way one is now reached: the
+        // split is made while the column is SEPARATE, since a drop into a
+        // group joins its run whatever axis it names, and the column is
+        // grouped afterwards from a leaf that is still a direct child of it.
         let shape = || {
             let mut layout = Layout::new();
-            layout.apply(Command::SetSplit(Axis::Vertical));
-            layout.map(key(1));
-            layout.map(key(2));
-            layout.map(key(3));
-            layout.apply(Command::ToggleStacked);
-            layout.apply(Command::SetSplit(Axis::Horizontal));
+            column(&mut layout, &[1, 2, 3]);
             layout.map(key(4));
+            assert!(layout.drop_onto(key(4), key(3), beside(Axis::Horizontal, false)));
+            assert!(layout.focus_key(key(1)));
+            layout.apply(Command::ToggleGrouped);
             layout
         };
         let mut layout = shape();
         assert_eq!(layout.parent_axis(key(4)), Some(Axis::Horizontal));
-        assert!(layout.placements(100, 400, 0, 20).iter().all(|p| p.stacked));
+        assert!(layout
+            .placements(100, 400, 0, 20)
+            .iter()
+            .all(|p| p.run.is_some()));
 
         assert!(layout.drop_onto(key(1), key(3), beside(Axis::Vertical, true)));
         assert_eq!(
@@ -2876,7 +3210,7 @@ mod tests {
             [2, 1, 3, 4]
         );
         assert!(
-            placements.iter().all(|p| p.stacked),
+            placements.iter().all(|p| p.run.is_some()),
             "the drop unstacked the run"
         );
         layout.check_invariants().unwrap();
@@ -2893,7 +3227,7 @@ mod tests {
             placements.iter().map(|p| p.key.object).collect::<Vec<_>>(),
             [2, 1, 3, 4]
         );
-        assert!(placements.iter().all(|p| p.stacked));
+        assert!(placements.iter().all(|p| p.run.is_some()));
         assert_eq!(layout.parent_axis(key(1)), Some(Axis::Horizontal));
         layout.check_invariants().unwrap();
     }
@@ -2936,9 +3270,8 @@ mod tests {
         layout.map(key(1));
         layout.map(key(2));
         assert!(layout.focus_key(key(1)));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(3));
-        layout.apply(Command::ToggleStacked);
+        map_below(&mut layout, 3);
+        layout.apply(Command::ToggleGrouped);
 
         // The axis is the container's own, not the workspace's: 2 sits in the
         // row and 1 in the stacked column, so a drop measures a different
@@ -2952,7 +3285,7 @@ mod tests {
             placements.iter().map(|p| p.key.object).collect::<Vec<_>>(),
             [1, 3, 2]
         );
-        assert!(placements.iter().all(|p| p.stacked));
+        assert!(placements.iter().all(|p| p.run.is_some()));
         // The arrival is focused, so it is the leaf the stack shows.
         assert_eq!(
             placements.iter().map(|p| p.visible).collect::<Vec<_>>(),
@@ -2979,8 +3312,7 @@ mod tests {
         layout.map(key(1));
         layout.map(key(2));
         assert!(layout.focus_key(key(1)));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(3));
+        map_below(&mut layout, 3);
         assert!(layout.focus_key(key(2)));
 
         layout.apply(Command::Move(Direction::Left));
@@ -3002,10 +3334,9 @@ mod tests {
         layout.map(key(1));
         layout.map(key(2));
         assert!(layout.focus_key(key(1)));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(3));
+        map_below(&mut layout, 3);
         layout.map(key(4));
-        layout.apply(Command::ToggleStacked);
+        layout.apply(Command::ToggleGrouped);
         assert!(layout.focus_key(key(2)));
 
         layout.apply(Command::Move(Direction::Left));
@@ -3014,7 +3345,7 @@ mod tests {
             entered.iter().map(|p| p.key.object).collect::<Vec<_>>(),
             [1, 3, 4, 2]
         );
-        assert!(entered.iter().all(|p| p.stacked));
+        assert!(entered.iter().all(|p| p.run.is_some()));
         assert_eq!(
             entered.iter().map(|p| p.visible).collect::<Vec<_>>(),
             [false, false, false, true]
@@ -3028,7 +3359,7 @@ mod tests {
             [1, 3, 4, 2]
         );
         assert_eq!(
-            left.iter().map(|p| p.stacked).collect::<Vec<_>>(),
+            left.iter().map(|p| p.run.is_some()).collect::<Vec<_>>(),
             [true, true, true, false]
         );
         layout.check_invariants().unwrap();
@@ -3043,11 +3374,13 @@ mod tests {
         let mut layout = Layout::new();
         layout.map(key(1));
         layout.map(key(2));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(3));
+        map_below(&mut layout, 3);
         assert!(layout.focus_key(key(1)));
-        layout.apply(Command::ToggleStacked);
-        assert!(layout.placements(100, 300, 0, 20).iter().all(|p| p.stacked));
+        layout.apply(Command::ToggleGrouped);
+        assert!(layout
+            .placements(100, 300, 0, 20)
+            .iter()
+            .all(|p| p.run.is_some()));
 
         layout.apply(Command::Move(Direction::Right));
         let placements = layout.placements(100, 300, 0, 20);
@@ -3056,7 +3389,7 @@ mod tests {
             [1, 2, 3]
         );
         assert!(
-            placements.iter().all(|p| !p.stacked && p.visible),
+            placements.iter().all(|p| p.run.is_none() && p.visible),
             "the collapsed row left its stacking behind"
         );
         layout.check_invariants().unwrap();
@@ -3072,8 +3405,7 @@ mod tests {
             layout.map(key(1));
             layout.map(key(2));
             assert!(layout.focus_key(key(1)));
-            layout.apply(Command::SetSplit(Axis::Vertical));
-            layout.map(key(3));
+            map_below(&mut layout, 3);
             assert!(layout.focus_key(key(1)));
 
             layout.apply(Command::Move(direction));
@@ -3166,15 +3498,12 @@ mod tests {
         // an unstacked container around a stacked one, so the run the operator
         // is looking at would come apart under a chord that does nothing.
         let mut layout = Layout::new();
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(1));
-        layout.map(key(2));
-        layout.map(key(3));
-        layout.apply(Command::ToggleStacked);
+        column(&mut layout, &[1, 2, 3]);
+        layout.apply(Command::ToggleGrouped);
         assert!(layout.focus_key(key(1)));
 
         let stack = layout.placements(100, 300, 0, 20);
-        assert!(stack.iter().all(|p| p.stacked));
+        assert!(stack.iter().all(|p| p.run.is_some()));
         layout.apply(Command::Move(Direction::Up));
         assert_eq!(layout.placements(100, 300, 0, 20), stack);
         layout.check_invariants().unwrap();
@@ -3350,7 +3679,7 @@ mod tests {
                 // one across the top of it is not fullscreen.
                 band: band_at(0, 0, 80),
                 focused: true,
-                stacked: false,
+                run: None,
                 visible: true
             }]
         );
@@ -3383,8 +3712,7 @@ mod tests {
         let mut layout = Layout::new();
         layout.map(key(1));
         layout.map(key(2));
-        layout.apply(Command::SetSplit(Axis::Vertical));
-        layout.map(key(3));
+        map_below(&mut layout, 3);
 
         layout.unmap(key(2));
         assert_eq!(layout.focused(), Some(key(3)));
@@ -3523,10 +3851,11 @@ mod tests {
     }
 
     #[test]
-    fn selected_axis_applies_on_an_empty_workspace_and_one_tile_keeps_a_pixel() {
+    fn a_lone_tile_keeps_a_pixel_and_the_window_below_it_halves_the_output() {
+        // On a workspace of its own, so the map path is exercised from empty
+        // rather than from whatever another test left.
         let mut layout = Layout::new();
         layout.apply(Command::SwitchWorkspace(2));
-        layout.apply(Command::SetSplit(Axis::Vertical));
         layout.map(key(1));
         assert_eq!(
             layout.placements(1, 1, 24, 0),
@@ -3540,11 +3869,11 @@ mod tests {
                 },
                 band: band_at(0, 0, 1),
                 focused: true,
-                stacked: false,
+                run: None,
                 visible: true
             }]
         );
-        layout.map(key(2));
+        map_below(&mut layout, 2);
         assert_eq!(rect(&layout, 1).y, 0);
         assert_eq!(rect(&layout, 2).y, 50);
         layout.check_invariants().unwrap();
@@ -3566,8 +3895,11 @@ mod tests {
             Command::Move(Direction::Right),
             Command::Move(Direction::Up),
             Command::Move(Direction::Down),
-            Command::SetSplit(Axis::Vertical),
-            Command::SetSplit(Axis::Horizontal),
+            Command::SetPresentation(Presentation::Stacked),
+            Command::SetPresentation(Presentation::Tabbed),
+            Command::SetPresentation(Presentation::Split),
+            Command::ToggleGrouped,
+            Command::ToggleGrouped,
             Command::ToggleFullscreen,
             Command::ToggleFullscreen,
             Command::MoveToWorkspace(9),

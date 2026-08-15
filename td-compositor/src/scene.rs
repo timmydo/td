@@ -226,31 +226,36 @@ fn hint_bar(frame: Rect, run: Axis, before: bool) -> Rect {
 /// dragged one really does end up there. Everything else is one of two shapes,
 /// and which one is decided by the TREE rather than by the zone that was aimed,
 /// because `insert_beside` only SPLITS where the asked-for axis differs from
-/// the target's own container and the target is not in a stack. Anywhere else
+/// the target's own container and the target is not in a group. Anywhere else
 /// it is a plain insert into a run, where the dragged window takes a whole slot
 /// and every sibling shrinks — so promising the half the pointer was over would
 /// be a picture the release cannot keep. A split gets that half; an insert gets
 /// a bar on the edge it goes in at.
 ///
-/// A STACKED target then differs once more in WHERE the bar goes. Its leaves
+/// A GROUPED target then differs once more in WHERE the bar goes. Its leaves
 /// all share one content rectangle, which `frame_rect` hands back, while the
-/// run itself is the column of BANDS at the container's top — so a bar on the
-/// content rectangle would mark a place the new band does not appear. It is
-/// drawn on the target's own band instead. The swap stays the exception in the
-/// tree too, keeping the content rectangle it really does take.
+/// run itself is the BANDS at the container's top — down them for a stack,
+/// across them for tabs — so a bar on the content rectangle would mark a place
+/// the new band does not appear. It is drawn on the target's own band instead,
+/// along the direction the placement says its run travels. The swap stays the
+/// exception in the tree too, keeping the content rectangle it really does
+/// take.
 fn hint_area(placement: &Placement, kind: DropKind, run: Option<Axis>) -> Rect {
     let frame = frame_rect(placement);
-    let bar = |before| {
-        if placement.stacked {
-            hint_bar(placement.band, Axis::Vertical, before)
-        } else {
-            hint_bar(frame, run.unwrap_or(Axis::Vertical), before)
-        }
+    let bar = |before| match placement.run {
+        Some(along) => hint_bar(placement.band, along, before),
+        None => hint_bar(frame, run.unwrap_or(Axis::Vertical), before),
     };
     match kind {
         DropKind::Swap => frame,
         DropKind::InRun { before } => bar(before),
-        DropKind::Beside { axis, before } if placement.stacked || run == Some(axis) => bar(before),
+        // A grouped target DISCARDS the drop's axis, which is what the tree
+        // does: `insert_beside` refuses the cross-axis split inside a group,
+        // so every edge drop onto one joins the run and the bar goes the way
+        // the run does, not the way the pointer asked.
+        DropKind::Beside { axis, before } if placement.run.is_some() || run == Some(axis) => {
+            bar(before)
+        }
         DropKind::Beside { axis, before } => hint_half(frame, axis, before),
     }
 }
@@ -325,7 +330,7 @@ fn zone_of(rect: Rect, x: usize, y: usize) -> DropKind {
 }
 
 fn frame_rect(placement: &Placement) -> Rect {
-    if placement.stacked {
+    if placement.run.is_some() {
         return placement.rect;
     }
     Rect {
@@ -669,6 +674,22 @@ impl Scene {
     #[cfg(test)]
     pub(crate) fn layout(&self) -> &Layout {
         &self.layout
+    }
+
+    /// Open a window BELOW another, which is the drop an operator makes on a
+    /// bottom edge. Test-only, and it exists because a new window now JOINS
+    /// the container it opens in: there is no mode to set beforehand, so a
+    /// test that wants a column says so at the moment it makes one.
+    #[cfg(test)]
+    pub(crate) fn drop_below(&mut self, moved: SurfaceKey, over: SurfaceKey) -> bool {
+        self.layout.drop_onto(
+            moved,
+            over,
+            DropKind::Beside {
+                axis: Axis::Vertical,
+                before: false,
+            },
+        )
     }
 
     /// Work out where a release would land the dragged window and hold the
@@ -1649,7 +1670,6 @@ mod tests {
                 )
                 .unwrap();
         }
-        scene.command(Command::SetSplit(crate::layout::Axis::Horizontal));
         scene
             .commit(
                 SurfaceKey {
@@ -1728,7 +1748,6 @@ mod tests {
                 )
                 .unwrap();
         }
-        scene.command(Command::SetSplit(crate::layout::Axis::Vertical));
         scene
             .commit(
                 SurfaceKey {
@@ -1738,6 +1757,7 @@ mod tests {
                 surface([4, 5, 6, 0], 8, 8),
             )
             .unwrap();
+        below(&mut scene, 4);
         // The last is a tile SHORTER than a band: 60 tiling rows less the two
         // GAP insets is 12, so that arrangement is all band and no client and
         // the partition below has to hold there too.
@@ -1958,6 +1978,72 @@ mod tests {
     }
 
     #[test]
+    fn a_tabs_half_is_read_across_its_own_share_and_its_block_stands_on_that_edge() {
+        // The tabbed half of the rule above, and the case where reading it the
+        // wrong way is worst: a stacked band spans the container, so a reading
+        // taken across still varies with the pointer, while a tab is one Nth of
+        // one strip and a reading taken DOWN answers the same for every point
+        // in it — one half of the tab unreachable, silently.
+        let mut scene = Scene::new();
+        let key = |object| SurfaceKey { client: 1, object };
+        for object in 1..=3 {
+            scene
+                .commit(key(object), surface([1, 1, 1, 0], 8, 8))
+                .unwrap();
+            if object == 2 {
+                scene.command(Command::Move(crate::layout::Direction::Down));
+            }
+        }
+        scene.command(Command::SetPresentation(
+            crate::layout::Presentation::Tabbed,
+        ));
+        let (width, height) = (240, 600);
+        assert_eq!(
+            scene.layout.run_direction(key(2)),
+            Some(Axis::Horizontal),
+            "a tabbed leaf's run does not travel across"
+        );
+
+        let band = tile(&scene, width, height, 2).band;
+        assert!(band.width < width, "the tab is the whole strip");
+        // Both aimed BELOW the tab's own middle, so a reading taken down it
+        // would answer `before: false` for the two of them.
+        for (x, before) in [
+            (band.x + 1, true),
+            (band.x + band.width.saturating_sub(2), false),
+        ] {
+            scene.pointer_x = i32::try_from(x).unwrap();
+            scene.pointer_y = i32::try_from(band.y + band.height - 1).unwrap();
+            assert_eq!(
+                scene.drop_target(width, height),
+                Some((key(2), DropKind::InRun { before })),
+                "tab at x={x}"
+            );
+            // And the block promising it stands on the edge the run runs to —
+            // a bar down the tab's side, not across its top.
+            let area = hint_area(
+                &tile(&scene, width, height, 2),
+                DropKind::InRun { before },
+                Some(Axis::Horizontal),
+            );
+            assert_eq!(
+                area.height, band.height,
+                "the block is not the tab's height"
+            );
+            assert!(area.width < band.width, "the block spans the whole tab");
+            assert_eq!(
+                area.x,
+                if before {
+                    band.x
+                } else {
+                    band.x + band.width - area.width
+                },
+                "the block is on the wrong side of the tab"
+            );
+        }
+    }
+
+    #[test]
     fn a_drop_reads_five_zones_in_a_tile_and_two_along_a_band() {
         // A row of two and a column of two in one arrangement:
         // `H[1, V[2, 3]]`.
@@ -1970,7 +2056,6 @@ mod tests {
                 )
                 .unwrap();
         }
-        scene.command(Command::SetSplit(crate::layout::Axis::Vertical));
         scene
             .commit(
                 SurfaceKey {
@@ -1980,6 +2065,7 @@ mod tests {
                 surface([1, 1, 1, 0], 8, 8),
             )
             .unwrap();
+        below(&mut scene, 3);
         // Tall enough that the COLUMN's two tiles each keep a real client
         // area. `least_output_height` reserves rows for one tile, and with two
         // the client comes out shorter than its own band — which makes a tile
@@ -2099,9 +2185,9 @@ mod tests {
         // A STACKED row: its bands run DOWN the container's top even though
         // the container itself is horizontal, so the half is read that way.
         scene.command(Command::Focus(crate::layout::Direction::Left));
-        scene.command(Command::ToggleStacked);
+        scene.command(Command::ToggleGrouped);
         let stacked = scene.tiled_placements(width, height);
-        assert!(stacked.iter().all(|placement| placement.stacked));
+        assert!(stacked.iter().all(|placement| placement.run.is_some()));
         let run = stacked.first().unwrap().band;
         for (y, before) in [(run.y + 1, true), (run.y + run.height - 1, false)] {
             go(&mut scene, run.x + run.width - 2, y);
@@ -2117,7 +2203,7 @@ mod tests {
         // cover the very same pixels, so without that guard a hidden one
         // would claim them. The shown leaf must not be the first, or a hit
         // test that ignored visibility would agree with this anyway.
-        scene.command(Command::Focus(crate::layout::Direction::Right));
+        scene.command(Command::Focus(crate::layout::Direction::Down));
         let stacked = scene.tiled_placements(width, height);
         let shown = stacked
             .iter()
@@ -2161,13 +2247,17 @@ mod tests {
     #[test]
     fn a_stacked_column_draws_every_band_but_only_the_focused_client() {
         let mut scene = Scene::new();
-        scene.command(Command::SetSplit(crate::layout::Axis::Vertical));
         let colors = [[1, 2, 3, 0], [4, 5, 6, 0], [7, 8, 9, 0]];
         for (index, color) in colors.iter().enumerate() {
             let object = u32::try_from(index).unwrap().saturating_add(1);
             scene
                 .commit(SurfaceKey { client: 1, object }, surface(*color, 400, 400))
                 .unwrap();
+            // Only the SECOND makes the column; every later one joins it,
+            // since a new window opens in the container the focused one is in.
+            if index == 1 {
+                below(&mut scene, object);
+            }
         }
         let (width, height) = (320, least_output_height(200));
         let stride = width * 4;
@@ -2175,7 +2265,7 @@ mod tests {
         scene.pointer_x = 0;
         scene.pointer_y = i32::try_from(height - 1).unwrap();
 
-        scene.command(Command::ToggleStacked);
+        scene.command(Command::ToggleGrouped);
 
         // EVERY position in the stack, not just the one that happens to be
         // focused. All three leaves share the one content rectangle, so with
@@ -2324,6 +2414,60 @@ mod tests {
         // overlong title inside the band, and the untitled window's band is
         // bare rather than carrying a placeholder. One count answers both,
         // and a band drawn with no `draw_text_clipped` clip argument fails it.
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        assert_eq!(count_color(&frame, stride, whole, TITLE_TEXT), inside);
+    }
+
+    #[test]
+    fn a_tabs_title_is_clipped_to_its_share_of_the_strip() {
+        // The clip that holds an overlong title inside a full-width band is
+        // the same call for a tab, and a tab is where it MATTERS: the bands
+        // are adjacent along the direction the text runs, so a title that
+        // overflowed would land in the neighbouring tab's name rather than in
+        // a gap. The other two are left untitled so one count answers it.
+        let mut scene = Scene::new();
+        let mut keys = Vec::new();
+        for object in 1..=3 {
+            let key = SurfaceKey { client: 1, object };
+            scene.commit(key, surface([1, 2, 3, 0], 8, 8)).unwrap();
+            if object == 2 {
+                scene.command(Command::Move(crate::layout::Direction::Down));
+            }
+            keys.push(key);
+        }
+        let named = *keys.first().unwrap();
+        assert!(scene.set_title(named, "AB".repeat(40)));
+        scene.command(Command::SetPresentation(
+            crate::layout::Presentation::Tabbed,
+        ));
+
+        let (width, height) = (320, least_output_height(8));
+        let stride = width * 4;
+        let mut frame = vec![0u8; stride * height];
+        scene.pointer_x = 0;
+        scene.pointer_y = i32::try_from(height - 1).unwrap();
+        scene.render(&mut frame, width, height, stride);
+
+        let placements = scene.tiled_placements(width, height);
+        let index = placements
+            .iter()
+            .position(|placement| placement.key == named)
+            .unwrap();
+        let band = placements.get(index).unwrap().band;
+        assert!(
+            placements
+                .iter()
+                .all(|placement| placement.run == Some(Axis::Horizontal)),
+            "the column did not tab, so this proves nothing"
+        );
+        assert!(band.width < width, "the tab is the whole strip");
+        let inside = count_color(&frame, stride, band, TITLE_TEXT);
+        assert!(inside > 0, "the title never reached its tab");
         let whole = Rect {
             x: 0,
             y: 0,
@@ -2762,7 +2906,6 @@ mod tests {
                 )
                 .unwrap();
         }
-        scene.command(Command::SetSplit(crate::layout::Axis::Vertical));
         scene
             .commit(
                 SurfaceKey {
@@ -2772,6 +2915,7 @@ mod tests {
                 surface([1, 1, 1, 0], 8, 8),
             )
             .unwrap();
+        below(&mut scene, 3);
         scene
     }
 
@@ -2797,6 +2941,30 @@ mod tests {
             .iter()
             .map(|placement| placement.key.object)
             .collect()
+    }
+
+    /// Put the window just committed BELOW the one that was focused before it,
+    /// splitting that window's tile rather than joining its container — the
+    /// drop an operator makes on a bottom edge. `SetSplit(Axis::Vertical)`
+    /// before a commit used to do this, and there is no such mode now: a new
+    /// window joins whatever container it opens in.
+    fn below(scene: &mut Scene, object: u32) {
+        let moved = SurfaceKey { client: 1, object };
+        let over = SurfaceKey {
+            client: 1,
+            object: object.saturating_sub(1),
+        };
+        assert!(
+            scene.layout.drop_onto(
+                moved,
+                over,
+                DropKind::Beside {
+                    axis: Axis::Vertical,
+                    before: false,
+                },
+            ),
+            "the drop that opens a window below another moved nothing"
+        );
     }
 
     fn tile(scene: &Scene, width: usize, height: usize, object: u32) -> Placement {
@@ -2916,7 +3084,7 @@ mod tests {
         // rectangle, most of the output away.
         let mut scene = a_row_of_four();
         let (width, height) = (1600, 600);
-        scene.command(Command::ToggleStacked);
+        scene.command(Command::ToggleGrouped);
         let dragged = SurfaceKey {
             client: 1,
             object: 1,
@@ -2924,7 +3092,7 @@ mod tests {
         // Leaf 3's band, which is a stacked-AWAY one: it is not the leaf
         // showing the content, so the two rectangles cannot be confused.
         let onto = tile(&scene, width, height, 3);
-        assert!(onto.stacked, "the column did not stack");
+        assert!(onto.run.is_some(), "the column did not stack");
         assert!(
             onto.band.y + onto.band.height <= onto.rect.y,
             "the band and the content rect overlap"

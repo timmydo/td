@@ -258,6 +258,23 @@ impl Runtime {
         self.framebuffer.take_writes()
     }
 
+    /// Open a window BELOW another, settling as every other mutation does.
+    /// Test-only: a new window JOINS the container the focused one is in, so
+    /// a test that wants a column makes one the way an operator does — with
+    /// the drop onto a bottom edge — rather than by setting a mode first.
+    ///
+    /// On `Runtime` rather than reaching into the scene, because the scene's
+    /// own drop publishes nothing: a test that moved the tree behind the
+    /// runtime's back would then compare against a stale snapshot.
+    #[cfg(test)]
+    pub fn drop_below(&mut self, moved: SurfaceKey, over: SurfaceKey) -> Result<(), String> {
+        assert!(
+            self.scene.drop_below(moved, over),
+            "the drop that opens a window below another moved nothing"
+        );
+        self.settle(true)
+    }
+
     #[cfg(test)]
     pub fn commit(&mut self, key: SurfaceKey, surface: Surface) -> Result<(), String> {
         let layout_changed = self.scene.commit(key, surface)?;
@@ -994,7 +1011,7 @@ mod tests {
     use super::*;
     use crate::keyboard::MOD_ALT as TEST_MOD_ALT;
     use crate::keyboard::{KeyState, KeyboardEvent, MOD_SHIFT};
-    use crate::layout::{Axis, Direction};
+    use crate::layout::{Direction, Presentation};
     use crate::pointer::{PointerButtonState, PointerEvent};
     use crate::scene::SHM_XRGB8888;
     use std::fs;
@@ -1319,7 +1336,12 @@ mod tests {
 
         let tiled = runtime.layout_snapshot();
         assert!(Arc::ptr_eq(&tiled, &runtime.layout_snapshot()));
-        runtime.command(Command::SetSplit(Axis::Vertical)).unwrap();
+        // A command that changes nothing about the arrangement: these two are
+        // already side by side in a split container, so asking for that again
+        // must not republish.
+        runtime
+            .command(Command::SetPresentation(Presentation::Split))
+            .unwrap();
         assert!(Arc::ptr_eq(&tiled, &runtime.layout_snapshot()));
         assert!(receiver.try_recv().is_err());
         runtime.command(Command::ToggleFullscreen).unwrap();
@@ -1626,9 +1648,11 @@ mod tests {
         runtime
             .commit(*keys.get(1).unwrap(), surface([4, 5, 6, 0]))
             .unwrap();
-        runtime.command(Command::SetSplit(Axis::Vertical)).unwrap();
         runtime
             .commit(*keys.get(2).unwrap(), surface([7, 8, 9, 0]))
+            .unwrap();
+        runtime
+            .drop_below(*keys.get(2).unwrap(), *keys.get(1).unwrap())
             .unwrap();
         let order = |runtime: &Runtime| {
             runtime
@@ -1748,11 +1772,13 @@ mod tests {
         runtime
             .commit(*keys.get(1).unwrap(), surface([4, 5, 6, 0]))
             .unwrap();
-        runtime.command(Command::SetSplit(Axis::Vertical)).unwrap();
         runtime
             .commit(*keys.get(2).unwrap(), surface([7, 8, 9, 0]))
             .unwrap();
-        runtime.command(Command::ToggleStacked).unwrap();
+        runtime
+            .drop_below(*keys.get(2).unwrap(), *keys.get(1).unwrap())
+            .unwrap();
+        runtime.command(Command::ToggleGrouped).unwrap();
         // `H[1, V{stacked}[2, 3]]`: a window beside a stacked pair.
         let placements = |runtime: &Runtime| runtime.scene.tiled_placements(240, height);
         let order = |runtime: &Runtime| {
@@ -1764,7 +1790,7 @@ mod tests {
         let stacked = |runtime: &Runtime| {
             placements(runtime)
                 .iter()
-                .filter(|placement| placement.stacked)
+                .filter(|placement| placement.run.is_some())
                 .count()
         };
         assert_eq!(order(&runtime), [1, 2, 3]);
@@ -1846,9 +1872,11 @@ mod tests {
         runtime
             .commit(*keys.get(1).unwrap(), surface([4, 5, 6, 0]))
             .unwrap();
-        runtime.command(Command::SetSplit(Axis::Vertical)).unwrap();
         runtime
             .commit(*keys.get(2).unwrap(), surface([7, 8, 9, 0]))
+            .unwrap();
+        runtime
+            .drop_below(*keys.get(2).unwrap(), *keys.get(1).unwrap())
             .unwrap();
         // `H[1, V[2, 3]]`: a window beside a column of two.
         let order = |runtime: &Runtime| {
@@ -2132,7 +2160,7 @@ mod tests {
                 .commit(SurfaceKey { client: 1, object }, surface([1, 2, 3, 0]))
                 .unwrap();
         }
-        runtime.command(Command::ToggleStacked).unwrap();
+        runtime.command(Command::ToggleGrouped).unwrap();
         let band = runtime
             .scene
             .tiled_placements(1600, height)
@@ -2495,9 +2523,11 @@ mod tests {
         runtime
             .commit(*keys.get(1).unwrap(), surface([4, 5, 6, 0]))
             .unwrap();
-        runtime.command(Command::SetSplit(Axis::Vertical)).unwrap();
         runtime
             .commit(*keys.get(2).unwrap(), surface([7, 8, 9, 0]))
+            .unwrap();
+        runtime
+            .drop_below(*keys.get(2).unwrap(), *keys.get(1).unwrap())
             .unwrap();
         let tiles = |runtime: &Runtime| runtime.scene.tiled_placements(240, height);
         let order = |runtime: &Runtime| {
@@ -2770,9 +2800,11 @@ mod tests {
         runtime
             .commit(*keys.get(1).unwrap(), surface([4, 5, 6, 0]))
             .unwrap();
-        runtime.command(Command::SetSplit(Axis::Vertical)).unwrap();
         runtime
             .commit(*keys.get(2).unwrap(), surface([7, 8, 9, 0]))
+            .unwrap();
+        runtime
+            .drop_below(*keys.get(2).unwrap(), *keys.get(1).unwrap())
             .unwrap();
         let tiles = |runtime: &Runtime| runtime.scene.tiled_placements(240, height);
         let order = |runtime: &Runtime| {
@@ -3241,8 +3273,8 @@ mod tests {
             runtime.commit_with_input_region(key(1, 4), surface([7, 8, 9, 0]), None)
         );
         under_failed_paint!("commit", runtime.commit(key(1, 5), surface([9, 9, 9, 0])));
-        // A tiling command. `Move` rather than `SetSplit`, which only arms the
-        // next split and so moves no tile at all.
+        // A tiling command. `Move` rather than a presentation chord, which
+        // changes how a container is DRAWN and so moves no tile at all.
         under_failed_paint!("command", runtime.command(Command::Move(Direction::Down)));
         // Click to focus, which republishes the activation every client reads.
         // A press on a client AREA, so it establishes a grab and takes focus
@@ -3305,9 +3337,11 @@ mod tests {
         runtime
             .commit(*keys.get(1).unwrap(), surface([4, 5, 6, 0]))
             .unwrap();
-        runtime.command(Command::SetSplit(Axis::Vertical)).unwrap();
         runtime
             .commit(*keys.get(2).unwrap(), surface([7, 8, 9, 0]))
+            .unwrap();
+        runtime
+            .drop_below(*keys.get(2).unwrap(), *keys.get(1).unwrap())
             .unwrap();
         let at = |runtime: &Runtime, object: u32| {
             let placements = runtime.scene.tiled_placements(240, height);
@@ -3450,9 +3484,11 @@ mod tests {
         runtime
             .commit(*keys.get(1).unwrap(), surface([4, 5, 6, 0]))
             .unwrap();
-        runtime.command(Command::SetSplit(Axis::Vertical)).unwrap();
         runtime
             .commit(*keys.get(2).unwrap(), surface([7, 8, 9, 0]))
+            .unwrap();
+        runtime
+            .drop_below(*keys.get(2).unwrap(), *keys.get(1).unwrap())
             .unwrap();
         let order = |runtime: &Runtime| {
             runtime
@@ -3547,9 +3583,11 @@ mod tests {
         runtime
             .commit(*keys.get(1).unwrap(), surface([4, 5, 6, 0]))
             .unwrap();
-        runtime.command(Command::SetSplit(Axis::Vertical)).unwrap();
         runtime
             .commit(*keys.get(2).unwrap(), surface([7, 8, 9, 0]))
+            .unwrap();
+        runtime
+            .drop_below(*keys.get(2).unwrap(), *keys.get(1).unwrap())
             .unwrap();
         let at = |runtime: &Runtime, object: u32| {
             let placements = runtime.scene.tiled_placements(240, height);
@@ -4121,7 +4159,7 @@ mod tests {
                 .commit(*key, surface([shade, shade, shade, 0]))
                 .unwrap();
         }
-        runtime.command(Command::ToggleStacked).unwrap();
+        runtime.command(Command::ToggleGrouped).unwrap();
         let shown = |runtime: &Runtime| {
             runtime
                 .scene

@@ -206,9 +206,10 @@ binding is ONE chord on `Super`:
   re-parenting it rather than trading places (see below);
 - `Super+1` through `Super+9` switch workspaces, and adding Shift moves the
   focused tile to that workspace;
-- `Super+v` selects a vertical split for the next toplevel, `Super+h` selects
-  a horizontal split, `Super+f` toggles fullscreen, and `Super+s` toggles
-  stacking on the container the focused window sits in;
+- `Super+v` STACKS the container the focused window sits in and `Super+h`
+  TABS it — the two presentations a group can take — while `Super+s` groups
+  an ungrouped container or ungroups a grouped one, and `Super+f` toggles
+  fullscreen;
 - `Super+t` starts a terminal, which is the one registry entry anybody opens
   repeatedly;
 - `Super+?` shows this table on screen. `?` is Shift+`/` here and Shift is
@@ -660,10 +661,21 @@ compositor pid, so that residual path cannot block a later compositor.
 
 The one supported output owns workspaces 1 through 9. Each workspace owns an
 n-ary split tree whose leaves are mapped XDG toplevels. A new toplevel is
-inserted after the focused leaf using the selected split axis and becomes
-focused. Directional focus chooses the closest cross-axis-aligned tile with a
-stable surface-key tie break. Directional move swaps two leaves while focus
-stays with the moved toplevel. Unmapping a leaf collapses one-child
+inserted after the focused leaf, in the container that DIRECTLY holds it,
+and becomes focused. Directly, rather than in the nearest ancestor running
+some chosen way: same-axis nesting is reachable — a drop can leave a
+container holding one child, and the collapse lifts it into a parent that
+may run the same way — and an ancestor taking the insert would put the new
+window beside its neighbour's container instead of in it, which for a
+grouped container means outside the run on screen. There is no separately
+selected axis to insert along:
+`Super+v`/`Super+h` name a PRESENTATION now, so the only axis a new window
+could join by is its neighbour's, and joining an existing column or row is
+what "open it next to this one" means. `Super+Shift+Arrow` is how a window
+leaves the container it landed in, making the perpendicular one where none
+runs that way. Directional focus chooses the closest cross-axis-aligned tile
+with a stable surface-key tie break. Directional move swaps two leaves while
+focus stays with the moved toplevel. Unmapping a leaf collapses one-child
 containers. A transient buffer detach remembers the toplevel's workspace and
 reinserts it there on remap; destroying its wl_surface or disconnecting the
 client forgets that assignment. A new mapping exits fullscreen so focus never
@@ -729,7 +741,7 @@ client's own area beneath it, and a PLACEMENT carries both as separate
 rectangles: the layout decides where each goes, and the band's height is
 passed in beside the gap rather than known there, because how tall a band is
 belongs to whatever draws one. Two rectangles rather than one derived from the
-other because the two need not touch — a stacked container puts its children's
+other because the two need not touch — a grouped container puts its children's
 bands in a run at its top and gives the content below all of them.
 
 The client rectangle is what the blit covers, what the pointer hit test asks
@@ -851,8 +863,9 @@ rather than an area: a position in it is the only thing a drop onto one can
 mean. It therefore names NO axis — the target's own container, whatever that
 is — and the half is read along the direction that run actually goes: across
 for a row, where each leaf carries its own band at the top of its own tile,
-and down for a column. A STACKED container is down whatever its own axis is,
-since its bands are a list at its top rather than one per tile.
+and down for a column. A GROUPED container answers from its presentation
+rather than from its axis, since its bands are a list rather than one per
+tile: down for a stack, across for tabs, whatever axis the tree beneath has.
 
 Both of those are asked of the tree the drop will be APPLIED to, which is
 the one on screen and the only one there is. That was worth saying while a
@@ -860,7 +873,7 @@ second, dragged-window-removed tree existed to get it wrong from; it is now
 a property of there being nothing else to ask.
 
 The zone is read within whichever rectangle the pointer is in rather than
-over the tile as a whole, because a stacked leaf's band and its client area
+over the tile as a whole, because a grouped leaf's band and its client area
 are far apart and a point between them is in neither.
 
 The dragged window is DETACHED rather than removed, and that is the whole of
@@ -1088,13 +1101,25 @@ after an INVALIDATED block would land one the operator never saw. A still
 release over a block that is still up does land it: what the guard skips is
 the re-aim, not the drop.
 
-STACKING is the second arrangement a container can take, toggled by
-`Super+s`. Its leaves' bands run down its top, one after another, and ONE of
-them gets everything below the run; the rest are a band alone. The run is
-clipped to the container, so one too short to hold every band is all band and
-no content rather than the two overlapping — the short-tile rule again, one
-level up. A lone window is in no container of its own, so there is nothing to
-stack and the binding does nothing rather than stacking the whole workspace.
+GROUPING is what a container does instead of splitting, and it takes two
+forms. A STACKED container runs its leaves' bands DOWN its top, one after
+another; a TABBED one divides a single band-high strip ACROSS it, one tab per
+leaf. Either way ONE leaf gets everything below the run and the rest are a
+band alone. `Super+v` stacks the focused leaf's container, `Super+h` tabs it,
+and `Super+s` groups an ungrouped one or ungroups a grouped one.
+
+The run is clipped to the container, so one too short to hold every band is
+all band and no content rather than the two overlapping — the short-tile rule
+again, one level up. That clipping is why the two forms are not one mode with
+a flag rather than a presentation each: a stack's run costs a band PER LEAF,
+so a column of twelve on a short output is all run and no window, while tabs
+cost ONE band however many leaves there are and leave the same content height
+for twenty as for two. What tabs give up for it is the titles: a stack shows
+every name in full, and a tab shows a name in its share of one strip, which
+past a handful of leaves is a few characters.
+
+A lone window is in no container of its own, so there is nothing to group and
+all three bindings do nothing rather than grouping the whole workspace.
 
 Which leaf is shown is the container's own most recently focused, which is
 the focused one whenever focus is in the stack at all. Focus alone cannot
@@ -1105,13 +1130,20 @@ the first of its own that appears in it. A workspace never yet visited has no
 record and shows its first leaf, which is what makes a hidden stack publish
 the sizes it will have when it is shown.
 
-`Super+s` STACKS the focused leaf's own parent, and UNSTACKS the outermost
-stacked ancestor. The asymmetry is not one: a stack runs every leaf beneath
-it, so it hides what the containers under it are doing, and that ancestor is
-what the leaf is displayed in whatever they say. Descending past it would
-toggle a container nothing can see — and a stack whose direct children have
-all since become splits could then never be undone from the keyboard, since
-no leaf in it is a child of it any more.
+All three chords GROUP the focused leaf's own parent, and reach the outermost
+GROUPED ancestor when there is one. The asymmetry is not one: a group runs
+every leaf beneath it, so it hides what the containers under it are doing,
+and that ancestor is what the leaf is displayed in whatever they say.
+Descending past it would present a container nothing can see — and a group
+whose direct children have all since become splits could then never be undone
+from the keyboard, since no leaf in it is a child of it any more.
+
+A split container records no former presentation, so `Super+s` on one always
+groups it as a STACK, including one that was tabbed a moment earlier.
+`Super+h` is how the other is asked for, and the pair of set chords is why
+that is a simplification rather than a gap: the operator who wants tabs back
+names them, and a third state on `Presentation::Split` would exist only to
+remember something two other chords already say.
 
 Bands in a run are NOT separated by a border, and adjacent unfocused ones
 therefore read as one block distinguished only by their titles. That is a
@@ -1119,93 +1151,106 @@ limitation rather than a decision deferred: the border is 4 pixels against a
 20-pixel band whose text already occupies rows 3 to 16, so a border per band
 would draw over the name it was meant to delimit.
 
-Where this diverges from i3 is WHAT is stacked: i3 stacks a container's
-CHILDREN, so a nested split shows as one title, and td stacks its LEAVES, so
-every window in the container has a band of its own. A stack is a way to see
+Where this diverges from i3 is WHAT is presented: i3 groups a container's
+CHILDREN, so a nested split shows as one title, and td groups its LEAVES, so
+every window in the container has a band of its own. A group is a way to see
 what is in a column without giving each window a share of it, and a title
 naming a container rather than a window answers a question nobody asked.
 
-A stacked-away leaf keeps the SIZE of the content area rather than being
+A grouped-away leaf keeps the SIZE of the content area rather than being
 zeroed, so a client does not resize its buffer down and back across a
 toggle. That is why "shown" cannot be read off the rectangle — a hidden
 leaf's rectangle is exactly the shown one's — and a placement carries an
 explicit flag instead. Five sites read it: the border pass, the blit, the
 pointer hit test, the GRAB — which answers nothing for a leaf that is not
 shown, the way it already answers nothing for one on another workspace — and
-`views`, which is what the CLIENT is told, a stacked-away toplevel being
+`views`, which is what the CLIENT is told, a grouped-away toplevel being
 published NOT visible at the size it would have so it holds a buffer ready
 for the moment it is shown. The band pass is the one that deliberately does
 not ask: a band is drawn whether or not its client is.
 
 Bands are drawn in a pass of their own, before any border rather than beside
-each one. The two are separate rectangles that OVERLAP in a stack — the shown
+each one. The two are separate rectangles that OVERLAP in a group — the shown
 leaf's border rides four pixels up into the run's last band — so interleaving
 them lets a band belonging to a later placement erase a border already drawn,
 and only when the shown leaf is not the last of its run. That is the same
 argument one level down from decoration preceding client pixels.
 
-`Super+s` is refused under fullscreen, as directional focus and move already
-are: nothing on screen would report the change, and leaving fullscreen would
-land the operator in an arrangement they never asked for.
+All three presentation chords are refused under fullscreen, as directional
+focus and move already are: nothing on screen would report the change, and
+leaving fullscreen would land the operator in an arrangement they never asked
+for.
 
 Directional focus and movement ask for the arrangement the container would
-have UNSTACKED, because in a stack every leaf shares the one content
-rectangle and there is no geometry to rank them by. Stacking is about what
-is DRAWN, and the tree a chord walks is otherwise the same either way.
+have UNGROUPED, because in a group every leaf shares the one content
+rectangle and there is no geometry to rank them by. Presentation is about
+what is DRAWN, and the tree a chord walks is otherwise the same either way.
 
 Directional FOCUS is the exception, and movement is not: `Super+Shift+Down`
-still reads the unstacked arrangement, so on a stacked row it carries the
-window OUT of the container rather than down the band list — the chord that
+still reads the ungrouped arrangement, so on a tabbed column it carries the
+window OUT of the container rather than along the tab strip — the chord that
 walks the bands and the chord that carries a window along them are
 perpendicular there. Recorded rather than fixed, and the reason to be wary of
 fixing it by symmetry: a move that reordered the run would have to mean
-something different again on a stacked column.
+something different again in the other presentation.
 
-`Super+Up`/`Down` are that exception, and they are the one direction that can
-be answered without geometry: a stack runs its bands top to bottom whatever
-axis the container has, so those two walk the RUN — the leaves the OUTERMOST
-stacked ancestor presents, in band order. Outermost because that is where the
-renderer stops: the first stacked container met from the root is handed to
-`place_stack`, which draws one band per leaf beneath it, so a stack nested in
-another is not presented at all and its run is bands nobody can see. Without
-any of this a stack made from a ROW answered only Left/Right, for bands the
-operator could see running vertically. The run is consulted first and only
-steps INSIDE it; a step off either end falls through to the geometry, which
-is what lets the same chord leave the stack rather than trapping focus in it.
+The pair ALONG THE RUN is that exception, and it is the one that can be
+answered without geometry: a stack runs its bands top to bottom and tabs run
+theirs left to right, whatever axis the container beneath has, so
+`Super+Up`/`Down` walk a stack's run and `Super+Left`/`Right` walk a tabbed
+one's — the leaves the OUTERMOST grouped ancestor presents, in band order.
+Outermost because that is where the renderer stops: the first grouped
+container met from the root is handed to `place_group`, which draws one band
+per leaf beneath it, so a group nested in another is not presented at all and
+its run is bands nobody can see.
 
-Coming BACK to a stack lands on the leaf it is SHOWING, which is a step the
-geometry cannot take. The ranking runs over the UNSTACKED arrangement, where a
-stack's leaves hold a fraction of the container each, and a step in from
-outside ranks those fractions — none of which is on screen, since the stack
+WHICH pair walks the run is now a property of what is on screen rather than
+of the tree, and that is what an explicit tabbed presentation buys beyond its
+geometry. Under a single stacked mode the answer came from the container's
+hidden axis: a stack made from a row and one made from a column drew
+identically and answered opposite chords, the same keystroke meaning
+different things for two arrangements the operator cannot tell apart. Now the
+bands say it — they run the way the chord that walks them points.
+
+The OTHER pair leaves the group, and leaves it WHOLE. Those steps rank the
+ungrouped arrangement, where a group's leaves each hold a fraction of the
+container, so ranking against the group's OWN leaves would walk the run a
+second way and by the wrong rule: `Up` inside a tabbed column — which is a
+vertical split — would step to the tab above it in the TREE, one the screen
+shows beside it. The group's other leaves are therefore dropped from the
+ranking before the step, which leaves each pair of directions with exactly
+one meaning, along the run or out of the group. A step off either END of the
+run falls through to that same ranking, which is what lets the walking pair
+leave as well rather than trapping focus in the group.
+
+Coming BACK to a group lands on the leaf it is SHOWING, which is a step the
+geometry cannot take. The ranking runs over the UNGROUPED arrangement, where a
+group's leaves hold a fraction of the container each, and a step in from
+outside ranks those fractions — none of which is on screen, since the group
 draws one leaf. Ties go to the lowest key, and for the common shape they ARE
 tied: leaves split evenly about their container are equidistant from a
 neighbour's centre, so `H[1, Vstacked[2, 3]]` answers 2 whichever leaf is
 drawn. Worse, it did not come back: focusing the leaf the ranking picked also
-puts THAT leaf at the front of the record `place_stack` reads, so `Left` then
+puts THAT leaf at the front of the record `place_group` reads, so `Left` then
 `Right` returned to a different window with a different one drawn. Only a step
-arriving from OUTSIDE is redirected; within one stack the geometry IS the
-answer, which is how Left/Right walk a stack made from a row.
+arriving from OUTSIDE is redirected, since a step within a group is the run
+walk above and never reaches the ranking at all.
 
-Two consequences are recorded rather than fixed. Left/Right are untouched
-WITHIN a stack, so they still read the unstacked arrangement there: a stacked
-COLUMN is left for its neighbour, while in a stacked ROW they walk the run as
-`Down` does — the same chord meaning different things for arrangements that
-look identical, since a stack hides which axis made it. The fall-through
-search also starts from the focused leaf's unstacked fraction rather than the
-stack's whole area, so a window below another part of a stacked row can be
-missed; that is how directional focus has always left a stack and is not
-introduced here.
+One consequence is recorded rather than fixed: the fall-through search starts
+from the focused leaf's ungrouped fraction rather than from the group's whole
+area, so a window beside another part of a wide group can be missed. That is
+how directional focus has always left a group and is not introduced here.
 
-And the OTHER round trip — INTO a stack from outside, then straight back out —
+And the OTHER round trip — INTO a group from outside, then straight back out —
 gets worse, which is the price of this one and is paid knowingly. The step
 back is measured from the fraction of whichever leaf was landed on, so
 redirecting to the shown leaf moves where it starts from. Swept over 4096
-generated five-leaf shapes: the trip this section IS about, leaving a stack
+generated five-leaf shapes: the trip this section IS about, leaving a group
 and returning, goes from 1048 of 1602 broken to NONE, and from 1048 whose
 drawn leaf changed to none; the entering trip goes from 246 of 682 broken to
 296. Fifty steps worse against a thousand fixed, on a trip that was already
 failing more often than not. Closing that one needs the search to measure from
-the stack's whole area rather than from a leaf's fraction, which is the same
+the group's whole area rather than from a leaf's fraction, which is the same
 fall-through limit the paragraph above records.
 
 Client-side decoration negotiation, clipboard, drag-and-drop, subsurfaces,
@@ -1316,7 +1361,7 @@ a press focuses nothing and a hover focuses the tile.
 Anywhere belonging to no window — the status bar, a gap, a border — KEEPS
 the focus that was there rather than clearing it, so crossing a gap on the
 way between two tiles does not leave the keyboard aimed at nothing. A
-stacked-away leaf answers for its own BAND alone: every leaf of a stack
+grouped-away leaf answers for its own BAND alone: every leaf of a group
 shares one content rectangle, so that rectangle belongs to the leaf being
 SHOWN, and the hit test's visibility guard is what keeps a hidden one from
 claiming it.
@@ -1584,21 +1629,33 @@ The landing must prove:
 - every tiling command, split geometry edge case, workspace transition, tree
   collapse, fullscreen transition, and Super chord is a deterministic host
   test;
+- a group's two presentations are proved against each OTHER over one tree,
+  which is what makes them a presentation rather than an arrangement: the
+  stack's bands run down and cost a band per leaf, the tabs' divide one strip
+  across and cost one band whatever the count, and switching between them
+  moves no leaf and changes no key order; the pair of directions that walks a
+  run swaps with them while the other pair leaves the group WHOLE, so `Up` in
+  a tabbed column does not step to the tab the tree happens to put above it;
+  and an overlong title is clipped to its own tab rather than into the name
+  beside it;
 - a tile's five drop zones are proved as a function — each zone by a point,
   the middle ninth by the points just outside it, the nearest edge by a wide
   short tile where pixels and proportion disagree, and a sweep of the whole
   rect reaching all five — then again through the scene, where a band answers
-  two along its run, across for a row and down for a column or a stack, and a
-  stacked leaf answers for its shared content rect only while it is the one
-  shown; a row of two proves the run's direction is read from the tree the
-  drop LANDS in rather than the one it aims at, where that row has collapsed,
-  and a whole gesture over a stacked pair proves the same seam end to end,
-  aimed where the two geometries give opposite halves; and the layout's side
-  proves that a swap trades two windows without moving a tile or unstacking
-  the container it lands in, that it is its own inverse, that a band drop
-  keeps its container's axis whichever that is, that a drop across the axis
-  MAKES the column a row did not have, and that a stack takes that same drop
-  into its run instead while the unstacked column still builds the row;
+  two along its run — across for a row, down for a column or a stack, and
+  across its own share of the strip for a TAB, where a reading taken the other
+  way would answer the same for every point in it and leave half of each tab
+  unreachable — and a grouped leaf answers for its shared content rect only
+  while it is the one shown; a row of two proves the run's direction is read
+  from the tree the drop LANDS in rather than the one it aims at, where that
+  row has collapsed, and a whole gesture over a stacked pair proves the same
+  seam end to end, aimed where the two geometries give opposite halves; and
+  the layout's side proves that a swap trades two windows without moving a
+  tile or ungrouping the container it lands in, that it is its own inverse,
+  that a band drop keeps its container's axis whichever that is, that a drop
+  across the axis MAKES the column a row did not have, and that a group takes
+  that same drop into its run instead while the ungrouped column still builds
+  the row;
 - parsed key chords and complete pointer frames cross the evdev adapter into
   a recording target, while the runtime integration test proves a layout
   command repaints a file-backed framebuffer;
@@ -1704,7 +1761,7 @@ The landing must prove:
 
 The keyboard-driven tiling shell is a pure policy layer. Workspaces own
 split-container trees, and leaf containers own mapped XDG toplevels. Layout,
-focus, move, split, fullscreen, stacking, and workspace operations are all
+focus, move, split, fullscreen, presentation, and workspace operations are all
 deterministic
 state transitions over ordinary Rust data. They do not read devices, sockets,
 clocks, or global process state. Geometry calculation consumes explicit

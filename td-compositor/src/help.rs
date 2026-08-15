@@ -38,11 +38,11 @@ pub const ROWS: &[Row] = &[
     },
     Row {
         keys: "SUPER+V",
-        action: "SPLIT VERTICAL",
+        action: "STACK A COLUMN",
     },
     Row {
         keys: "SUPER+H",
-        action: "SPLIT HORIZONTAL",
+        action: "TAB A COLUMN",
     },
     Row {
         keys: "SUPER+F",
@@ -50,7 +50,7 @@ pub const ROWS: &[Row] = &[
     },
     Row {
         keys: "SUPER+S",
-        action: "STACK A COLUMN",
+        action: "GROUP A COLUMN",
     },
     Row {
         keys: "SUPER+T",

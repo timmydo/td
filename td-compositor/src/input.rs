@@ -3,7 +3,7 @@ use crate::keyboard::{
     KeyInput, KeyState, ModifierState, MOD_ALT, MOD_CAPS, MOD_CONTROL, MOD_LOGO, MOD_NUM, MOD_SHIFT,
 };
 use crate::launcher::{LaunchOptions, LaunchProcesses, LaunchRequest, LauncherAction};
-use crate::layout::{Axis, Command, Direction};
+use crate::layout::{Command, Direction, Presentation};
 use crate::pointer::{
     PointerButtonInput, PointerButtonState, MAX_POINTER_BUTTON_TRANSITIONS_PER_FRAME,
 };
@@ -247,9 +247,11 @@ impl KeyBindings {
         // from what is held at this press.
         let chord = match event.code {
             KEY_F => Some(Command::ToggleFullscreen),
-            KEY_S => Some(Command::ToggleStacked),
-            KEY_V => Some(Command::SetSplit(Axis::Vertical)),
-            KEY_H => Some(Command::SetSplit(Axis::Horizontal)),
+            KEY_S => Some(Command::ToggleGrouped),
+            // V and H name the direction the BANDS run, not the container's
+            // axis: stacked bands go down the column, tabs across it.
+            KEY_V => Some(Command::SetPresentation(Presentation::Stacked)),
+            KEY_H => Some(Command::SetPresentation(Presentation::Tabbed)),
             _ => None,
         };
         if let Some(command) = chord {
@@ -2615,8 +2617,8 @@ mod tests {
     fn super_chords_select_fullscreen_and_both_split_axes() {
         for (code, expected) in [
             (KEY_F, Command::ToggleFullscreen),
-            (KEY_V, Command::SetSplit(Axis::Vertical)),
-            (KEY_H, Command::SetSplit(Axis::Horizontal)),
+            (KEY_V, Command::SetPresentation(Presentation::Stacked)),
+            (KEY_H, Command::SetPresentation(Presentation::Tabbed)),
         ] {
             let mut bindings = KeyBindings::default();
             // Bare, the key is the client's text: only the modifier makes it
@@ -2655,10 +2657,14 @@ mod tests {
                 Bound::Command(Command::Move(_)) => "MOVE A TILE",
                 Bound::Command(Command::SwitchWorkspace(_)) => "SWITCH WORKSPACE",
                 Bound::Command(Command::MoveToWorkspace(_)) => "MOVE TO WORKSPACE",
-                Bound::Command(Command::SetSplit(Axis::Vertical)) => "SPLIT VERTICAL",
-                Bound::Command(Command::SetSplit(Axis::Horizontal)) => "SPLIT HORIZONTAL",
+                Bound::Command(Command::SetPresentation(Presentation::Stacked)) => "STACK A COLUMN",
+                Bound::Command(Command::SetPresentation(Presentation::Tabbed)) => "TAB A COLUMN",
+                // Not bound to a chord: `Super+s` ungroups, and a second way
+                // to say the same thing is a second row on the help sheet
+                // nobody can reach.
+                Bound::Command(Command::SetPresentation(Presentation::Split)) => "UNGROUP",
                 Bound::Command(Command::ToggleFullscreen) => "TOGGLE FULLSCREEN",
-                Bound::Command(Command::ToggleStacked) => "STACK A COLUMN",
+                Bound::Command(Command::ToggleGrouped) => "GROUP A COLUMN",
                 Bound::Launch(LaunchRequest::Terminal) => "NEW TERMINAL",
                 Bound::Launch(LaunchRequest::UiDemo) => "NEW INPUT MONITOR",
                 Bound::Launcher(_) => "OPEN LAUNCHER",
@@ -2722,12 +2728,12 @@ mod tests {
             (
                 &[KEY_LEFTMETA],
                 KEY_V,
-                Bound::Command(Command::SetSplit(Axis::Vertical)),
+                Bound::Command(Command::SetPresentation(Presentation::Stacked)),
             ),
             (
                 &[KEY_LEFTMETA],
                 KEY_H,
-                Bound::Command(Command::SetSplit(Axis::Horizontal)),
+                Bound::Command(Command::SetPresentation(Presentation::Tabbed)),
             ),
             (
                 &[KEY_LEFTMETA],
@@ -2737,7 +2743,7 @@ mod tests {
             (
                 &[KEY_LEFTMETA],
                 KEY_S,
-                Bound::Command(Command::ToggleStacked),
+                Bound::Command(Command::ToggleGrouped),
             ),
             (
                 &[KEY_LEFTMETA],
@@ -3140,7 +3146,7 @@ mod tests {
         press(&mut bindings, KEY_LEFTMETA);
         assert_eq!(
             tap(&mut bindings, KEY_V),
-            Some(Command::SetSplit(Axis::Vertical))
+            Some(Command::SetPresentation(Presentation::Stacked))
         );
         bindings.feed(key(KEY_LEFTMETA, KEY_RELEASE));
         // With Super up the same key is the client's to type: nothing
@@ -3161,13 +3167,13 @@ mod tests {
         assert_eq!(bindings.feed(key(KEY_V, KEY_REPEAT)).command, None);
         assert_eq!(
             press(&mut bindings, KEY_V),
-            Some(Command::SetSplit(Axis::Vertical))
+            Some(Command::SetPresentation(Presentation::Stacked))
         );
         assert_eq!(bindings.feed(key(KEY_V, KEY_REPEAT)).command, None);
         bindings.feed(key(KEY_V, KEY_RELEASE));
         assert_eq!(
             tap(&mut bindings, KEY_V),
-            Some(Command::SetSplit(Axis::Vertical))
+            Some(Command::SetPresentation(Presentation::Stacked))
         );
     }
 
@@ -4293,7 +4299,10 @@ mod tests {
         }
 
         let target = target.lock().unwrap();
-        assert_eq!(target.commands, [Command::SetSplit(Axis::Vertical)]);
+        assert_eq!(
+            target.commands,
+            [Command::SetPresentation(Presentation::Stacked)]
+        );
         assert_eq!(
             target.keys,
             [
