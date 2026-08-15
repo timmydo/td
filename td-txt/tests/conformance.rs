@@ -2642,3 +2642,170 @@ fn a_run_that_dies_still_gives_back_what_it_did_not_read(
     }
     Ok(())
 }
+
+/// A run of NULs longer than the read buffer is DROPPED rather than turned into
+/// one empty record per byte, and the records it stood for still occupy line
+/// numbers. `-z` is what makes that visible: there is no binary verdict under
+/// it, so nothing suppresses the output the numbers are printed on. The corpus
+/// cannot carry this -- the run has to outlast a 96 KiB buffer to be dropped at
+/// all, which is not a `file-json` literal anybody should read.
+#[test]
+fn a_skipped_run_of_nuls_still_counts_its_lines() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("skip-nuls")?;
+    let run = 300 * 1024;
+    let mut data = vec![0u8; run];
+    data.extend_from_slice(b"hello\x00world\x00");
+    std::fs::write(dir.0.join("z"), &data)?;
+    // Goldens measured from GNU grep 3.11 under LC_ALL=C.
+    for (args, want) in [
+        (vec!["grep", "-z", "-n", "hello", "z"], format!("{}:hello\0", run + 1)),
+        (vec!["grep", "-z", "-n", "world", "z"], format!("{}:world\0", run + 2)),
+        (vec!["grep", "-z", "-c", "hello", "z"], "1\n".to_string()),
+        (
+            vec!["grep", "-z", "-n", "-A", "1", "hello", "z"],
+            format!("{}:hello\0{}-world\0", run + 1, run + 2),
+        ),
+        // And the three where an empty record IS selected, so nothing may be
+        // dropped at all: the count is the proof it was not.
+        (vec!["grep", "-z", "-c", "^$", "z"], format!("{run}\n")),
+        (vec!["grep", "-z", "-c", "^", "z"], format!("{}\n", run + 2)),
+        (vec!["grep", "-z", "-v", "-c", "hello", "z"], format!("{}\n", run + 1)),
+    ] {
+        let out = std::process::Command::new(bin())
+            .args(&args)
+            .current_dir(&dir.0)
+            .env("LC_ALL", "C")
+            .output()?;
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            want,
+            "{args:?}: a dropped run did not keep its line numbers"
+        );
+    }
+
+    // And with `-a` and no `-z` the verdict never trips, so the NULs are
+    // ORDINARY BYTES of one long line rather than separators -- nothing may be
+    // dropped, and the anchor is what says so: `^hello` must not match a line
+    // that opens with a quarter-megabyte of NULs. Dropping those reads would
+    // leave the line `hello`. Only that combination: under `-z -a` skipping IS
+    // enabled, since GNU gates it on the separator (`skip_empty_lines && !eol`)
+    // and not on the verdict at all there.
+    // A WHOLE number of read buffers, so every NUL lands in a fill that could
+    // be dropped and `hello` opens a fresh one. At a length that is not a
+    // multiple, the last fill carries NULs of its own and the anchor fails
+    // whether or not the earlier fills were wrongly dropped -- which is how
+    // the first version of this test passed against the bug it was for.
+    let flat_run = 3 * 96 * 1024;
+    let mut flat = vec![0u8; flat_run];
+    flat.extend_from_slice(b"hello\n");
+    std::fs::write(dir.0.join("a"), &flat)?;
+    for (args, want) in [
+        (vec!["grep", "-a", "-c", "^hello", "a"], "0\n"),
+        (vec!["grep", "-a", "-c", "hello", "a"], "1\n"),
+        (vec!["grep", "-a", "-c", "^", "a"], "1\n"),
+    ] {
+        let out = std::process::Command::new(bin())
+            .args(&args)
+            .current_dir(&dir.0)
+            .env("LC_ALL", "C")
+            .output()?;
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            want,
+            "{args:?}: a run of NULs was dropped where it is not a separator"
+        );
+    }
+    Ok(())
+}
+
+/// A dropped run of NULs JOINS an open record to whatever follows it, because
+/// the separators that would have ended the record were in the read that went
+/// away. That is GNU's behaviour and it is observable: the joined record is
+/// selected by a pattern spanning the gap, and neither half stands as a record
+/// of its own. Found by review, after a first version of this landing declined
+/// to skip while a record was open -- which read as the safer choice and was a
+/// divergence. Goldens measured from GNU grep 3.11 under LC_ALL=C.
+#[test]
+fn a_dropped_run_joins_an_open_record_as_gnu_does() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("skip-join")?;
+    // The carry must fill a whole read buffer so the NUL run starts exactly at
+    // the next one -- otherwise the run shares a fill with the carry, no fill is
+    // all zeros, and nothing is dropped at all.
+    let buf = 96 * 1024;
+    let mut data = b"foo".to_vec();
+    data.extend(std::iter::repeat_n(b'x', buf - 3));
+    data.extend(std::iter::repeat_n(0u8, 2 * buf));
+    data.extend_from_slice(b"bar\x00");
+    std::fs::write(dir.0.join("j"), &data)?;
+    for (args, want, code) in [
+        // The join exists...
+        (vec!["grep", "-z", "-c", "^foo.*bar$", "j"], "1\n", 0),
+        (vec!["grep", "-z", "-c", "^foo", "j"], "1\n", 0),
+        // ...and the far half is not a record on its own.
+        (vec!["grep", "-z", "-c", "^bar$", "j"], "0\n", 1),
+    ] {
+        let out = std::process::Command::new(bin())
+            .args(&args)
+            .current_dir(&dir.0)
+            .env("LC_ALL", "C")
+            .output()?;
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want, "{args:?}");
+        assert_eq!(out.status.code(), Some(code), "{args:?}");
+    }
+    Ok(())
+}
+
+/// `-B` context across a dropped run. The dropped records are empty and
+/// consecutive, so the window has to be told about them -- otherwise it offers
+/// a record from BEFORE the run as this one's neighbour, carrying the line
+/// number it had then. Where the run was JOINED into an open record instead
+/// there are no such records, and replaying them would be context GNU does not
+/// print. Both halves are here. Goldens from GNU grep 3.11.
+#[test]
+fn context_across_a_dropped_run_is_numbered_as_gnu_numbers_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("skip-ctx")?;
+    let buf = 96 * 1024;
+    // Nothing open when the whole-zero fills arrive: they stand as empty records.
+    let mut standalone = b"a\x00".to_vec();
+    standalone.extend(std::iter::repeat_n(0u8, 2 * buf));
+    standalone.extend_from_slice(b"hello\x00");
+    std::fs::write(dir.0.join("s"), &standalone)?;
+    // A record IS open when they arrive: the gap joins into it and leaves none.
+    let mut joined = vec![b'y'; buf];
+    joined.extend(std::iter::repeat_n(0u8, 2 * buf));
+    joined.extend_from_slice(b"hello\x00");
+    std::fs::write(dir.0.join("j"), &joined)?;
+    let n = 2 * buf as u64;
+    for (args, want) in [
+        (
+            vec!["grep", "-z", "-n", "-B", "1", "hello", "s"],
+            format!("{}-\0{}:hello\0", n + 1, n + 2),
+        ),
+        (
+            vec!["grep", "-z", "-n", "-B", "3", "hello", "s"],
+            format!("{}-\0{}-\0{}-\0{}:hello\0", n - 1, n, n + 1, n + 2),
+        ),
+        // Joined: one record, numbered past the gap, and nothing before it.
+        (vec!["grep", "-z", "-n", "-B", "1", "hello", "j"], String::new()),
+    ] {
+        let out = std::process::Command::new(bin())
+            .args(&args)
+            .current_dir(&dir.0)
+            .env("LC_ALL", "C")
+            .output()?;
+        let got = String::from_utf8_lossy(&out.stdout).to_string();
+        if want.is_empty() {
+            assert!(
+                got.starts_with(&format!("{}:", n + 1)),
+                "{args:?}: a joined gap was given context: {:?}",
+                got.get(..60)
+            );
+            assert_eq!(got.matches('\0').count(), 1, "{args:?}: more than one record out");
+        } else {
+            assert_eq!(got, want, "{args:?}");
+        }
+    }
+    Ok(())
+}

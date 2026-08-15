@@ -134,6 +134,34 @@ td-txt-authored case files
   Its findings are committed instead — as cases with goldens captured from the
   oracle, which is what the gate can actually check.
 
+  DRIFT campaigns are the other uncommitted tool, and the same reasoning applies:
+  a drift run mutates one decision in a copy of the crate and re-runs the suite,
+  asserting the mutation applied and expecting RED. A green axis is a coverage
+  hole rather than a pass. Because it deliberately runs BROKEN builds, it needs
+  three guards that an ordinary test run does not, and every one of them was
+  learned by losing a filesystem to it:
+
+    - CAP THE FILE SIZE. `StdioBuf::flush` and `direct` are `while` loops that
+      end only by advancing through the bytes, and the unit tests write to real
+      files, so a mutation that stops the advance writes until the disk is gone.
+      That is not hypothetical: it filled a 1.9 TB root twice, ~700 GB in two
+      abandoned files. Launch each run through `bash -c 'ulimit -f N; exec cargo
+      test …'`. The cap is the KERNEL's, needs no `unsafe`, and turns a runaway
+      into an immediate SIGXFSZ (signal 25) — verified by mutating the drain out
+      of `flush` and watching the write die at exactly the cap.
+    - REDIRECT `TMPDIR` into the run's own sandbox. The tests reach for
+      `std::env::temp_dir()`, so by default their scratch lands in a shared
+      `/tmp` where it is nobody's and outlives the run; pointed at the sandbox it
+      is removed with it.
+    - KILL THE PROCESS GROUP on timeout, via `start_new_session=True` and
+      `killpg`. Killing the `cargo` child alone leaves the test BINARY running,
+      orphaned and still writing — which is why the abandoned files belonged to
+      PIDs that no longer existed.
+
+  A disk-space floor checked between axes is worth having on top: an axis that
+  cannot finish is better than one that fills the last of the disk for everyone
+  else on the machine.
+
   What the fuzzer did NOT reach is worth knowing too. Its grammar never emits an
   EMPTY pattern, and an empty pattern short-circuited the regex engine entirely,
   so the whole empty-pattern short cut was outside the search space — and the
@@ -2113,37 +2141,96 @@ td-txt-authored case files
     side of the flip a given byte falls on depends on where the boundaries
     land, and td-txt reproduces the RULE rather than GNU's arithmetic.
 
-    What is NOT implemented is the OTHER half of the same GNU mechanism, and
-    it costs time rather than answers. Zapping turns a run of zeros into one
-    empty record PER BYTE, which is why GNU pairs `zap_nuls` with `skip_nuls`
-    (grep.c:1022): once the verdict is in, a read that is entirely zeros is
+    The OTHER half of the same GNU mechanism is `skip_nuls`, and it is here
+    too. Zapping turns a run of zeros into one empty record PER BYTE, which is
+    why GNU pairs them (grep.c:1022): a read that is entirely zeros is
     DISCARDED rather than split, and `totalnl` is credited so `-n` still
-    counts them. GNU enables that only when an empty line cannot be SELECTED
-    (`skip_empty_lines`, grep.c:2983 -- the pattern is run against an empty
-    line and the answer compared with `-v`), so it changes no output. td-txt
-    does the splitting and not the skipping. Measured on 64 MiB of NULs
-    followed by `hello\n`, all three agreeing on the answer:
+    counts what was dropped. GNU enables it only where an empty line cannot be
+    SELECTED (`skip_empty_lines`, grep.c:2983 -- the pattern is run against an
+    empty line and the answer compared with `-v`), which is what makes it
+    change no output; td-txt asks the same question once, as `!selects(b"")`.
+    GNU turns it on at TWO points and so does this: under `-z` from the start,
+    where NULs are separators and no verdict is involved, and again when the
+    binary verdict trips. Measured on 64 MiB of NULs followed by `hello\n`,
+    every row agreeing on the ANSWER:
 
-      grep -c hello    GNU 0.03s   parent 0.12s   this 3.07s
-      grep -q hello    GNU 0.03s   parent 0.12s   this 2.96s
-      grep -c '^$'     GNU 0.87s   parent exit 2  this 4.59s
+      grep -c hello     GNU 0.03s  before zapping 0.12s  zapping 3.07s  now 0.03s
+      grep -q hello     GNU 0.03s  before zapping 0.12s  zapping 2.96s  now 0.03s
+      grep -z -c hello  GNU 0.04s  before zapping 2.61s  zapping 2.93s  now 0.03s
+      grep -c '^$'      GNU 0.89s  before zapping exit 2 zapping 4.59s  now 4.91s
 
-    The `-c '^$'` row is the shape of the whole trade: the parent could not
-    answer it at all -- one unbounded record, `out of memory` -- and GNU is
-    slow there too, because a pattern that selects an empty line is exactly
-    the one it may not skip. So this is a regression on NUL-DENSE input
-    against the parent (sparse images and core dumps are that shape) bought
-    with an answer where there was none. `skip_nuls` is the fix and is the
-    next increment; it needs no `unsafe` surface -- only GNU's further
-    `SEEK_DATA` jump over a hole would, and reading the zeros and dropping
-    them gets the bulk of it.
+    The last two rows are the shape of it. `-z` was ALREADY paying that cost
+    before zapping existed -- NULs are separators there whatever the verdict --
+    so skipping closes a pre-existing gap as well as the one zapping opened.
+    And `-c '^$'` is the case nobody may skip, because a pattern that selects
+    an empty line is exactly the one the drop would change; GNU is slow there
+    too. What remains in that row is a per-record cost of this reader rather
+    than anything about NULs: GNU is several times faster per empty record
+    wherever neither may skip (0.30s against 2.89s for `-v -c hello`).
 
-    Two costs here are NOT that and stay: under `-z` the same run is one
-    empty record per NUL with no verdict involved, which the parent paid
-    equally (2.61s against GNU's 0.04s), so it is pre-existing rather than
-    introduced; and where GNU may not skip either it is still several times
-    faster per empty record (0.29s against 2.93s for `-v -c hello`), which is
-    a per-record cost of this reader and not about NULs at all.
+    One decision in it is td-txt's rather than GNU's: GNU's further `SEEK_DATA`
+    jump over a hole is NOT taken -- it needs a raw `lseek`, the same `unsafe`
+    boundary as the sparse entry below -- so a hole is read and dropped rather
+    than seeked past, which is the bulk of the win without the syscall.
+
+    A SECOND decision was made and then RETRACTED, and it is written down
+    because the retraction is the interesting part. GNU discards only the fresh
+    read and keeps the carry, so an unterminated record JOINS across the gap to
+    whatever follows -- becoming a record the unskipped reading never had. That
+    looked like a GNU accident worth declining, and a sweep of 80 alignments of
+    the run's start offset produced the joined record in none of them, which
+    read as confirmation. The sweep was wrong: every cell in it used a
+    newline separator and a three-byte carry, so the run never began on a fill
+    boundary and no fill was ever entirely zeros. Under `-z`, with a carry that
+    fills a whole buffer, GNU joins and it is plainly observable --
+    `^foo.*bar$` selects the joined record, and `^bar$` does not select a
+    record at all. So td-txt joins too. The lesson is about the sweep rather
+    than the rule: a sweep that cannot REACH the mechanism reports absence with
+    the same face as a sweep that ruled it out.
+
+    WHEN skipping starts is the other half of that, and it is an ordering GNU
+    never states. `skip_nuls` is set in the loop BODY, after `fillbuf` has
+    already delivered the buffer the verdict trips on, so under a newline
+    separator that buffer is always kept and zapped -- which is what ends a
+    record open at the head of a run instead of joining it. Only later reads
+    are dropped. Under `-z` there is no verdict to wait for and the first read
+    can go. Enabling it one read early is not a subtle difference: the widened
+    sweep put 133 cells of 4900 wrong, all of them the non-`-z` half, where
+    td-txt joined records GNU splits.
+
+    What is LEFT after all that is arithmetic rather than rule, and it is four
+    cells of the same 4900. GNU GROWS its read buffer to hold the longest line,
+    so once a buffer-sized residue is carried its reads are bigger and a run of
+    fixed length may no longer fill one entirely -- no read is all zeros,
+    nothing is dropped, no join. td-txt's buffer is fixed, so it joins. GNU's
+    own answer there is not stable under the run's LENGTH: over
+    `p*BUF + NUL*n + q*BUF + NUL*n + end`, `grep -c .` alternates 3, 2, 3, 2, 3
+    as n doubles from 2*BUF to 32*BUF, while td-txt answers 2 throughout. An
+    answer that flips with the size of a hole is a poor thing to reproduce, and
+    reproducing it would mean reproducing GNU's growth heuristic rather than
+    its rule -- the same trade the streaming entry already declines.
+
+    What the join costs elsewhere is `-B` context, and the two halves differ.
+    Where the dropped reads stood as empty records of their own, they sit
+    between the match and whatever the window still holds, so the window is
+    replayed with the last `before_cap` of them -- otherwise a record from
+    BEFORE the run is offered as the match's neighbour, carrying the line
+    number it had then. Where the gap was JOINED into an open record there are
+    no such records, and replaying any would be context GNU does not print.
+    Both are pinned, and so is the numbering: the dropped records occupy
+    `lineno + 1 ..= lineno + dropped`, so the replayed tail starts one past the
+    subtraction, which is an off-by-one a test caught rather than a reading.
+
+  - GNU's `-b` is WRONG across a run of NULs it skipped, which is recorded
+    here rather than reproduced because td-txt does not implement `-b` at all
+    (`invalid option -- 'b'`, exit 2). GNU credits the LINE count for a
+    discarded read (grep.c:1024) and nothing for the byte count, so the offset
+    it prints is the one within the last read it kept: over 4 MiB of NULs
+    followed by `hello`, `grep -z -b hello` says `65536:hello` where the
+    offset is 4194304, while `-n` on the same run is right. Noted because a
+    future `-b` has to choose between GNU's answer and the true one, and that
+    is a decision rather than an oversight -- everything else in this file is
+    scored byte-for-byte against GNU.
 
   - A SPARSE file is binary to GNU before any NUL has been read, and td-txt
     does not follow. This is the SECOND door to the verdict above: GNU asks

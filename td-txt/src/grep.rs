@@ -780,6 +780,11 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
     // operands, so a nonexistent one is not an error either. `-L` is the
     // exception — it must still report the file, so it still stats it.
     let settled = grep.settled() && !grep.conf.files_without;
+    // Asked ONCE, of the pattern, as GNU asks it before it opens anything: may
+    // an empty record be selected? Where it cannot, dropping a read that holds
+    // only empty records changes no answer. A pattern that fails to answer is
+    // taken as selecting, which only costs speed.
+    let skip_zero_fills = !grep.selects(b"").unwrap_or(true);
     for (path, from_walk) in &inputs {
         // Named before the read, because a failure names it too: GNU reports
         // `(standard input): Is a directory`, not `-: Is a directory`.
@@ -820,6 +825,11 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
         // OUTPUT for a binary file only when it is printing lines, but it zaps
         // whatever it is doing, which is why `-c` sees the difference too.
         rec.zap_nuls(!grep.conf.text);
+        // The other half: a read that is nothing but zeros is dropped rather
+        // than split into one empty record per byte. Sound only where an empty
+        // record cannot be SELECTED, which is a question about the pattern and
+        // so is asked once, before any operand -- GNU asks it once too.
+        rec.skip_zero_fills(skip_zero_fills);
         let mut read_failed = false;
         let hit = search_file(
             &grep,
@@ -1451,7 +1461,30 @@ fn search_file(
                 break;
             }
         }
-        lineno = lineno.saturating_add(1);
+        // Empty records the reader dropped before this one still occupy line
+        // numbers -- GNU credits `totalnl` for exactly this, and `grep -z -n`
+        // over a megabyte of NULs is where it shows.
+        let (dropped, joined) = rec.take_skipped();
+        if dropped > 0 && keep_window && !joined {
+            // They also sit BETWEEN this record and whatever the window still
+            // holds, so leaving that untouched would offer a record from before
+            // the run as this one's neighbour. Every dropped record is empty and
+            // they are consecutive, so replaying the last `before_cap` of them
+            // is the whole of the repair -- and bounded, however long the run.
+            // Not when the gap was JOINED into this record, though: then it left
+            // no records at all and a replay would invent context.
+            let replay = dropped.min(before_cap as u64);
+            // They occupy `lineno + 1 ..= lineno + dropped`, so the tail of that
+            // range starts one PAST the subtraction.
+            let first =
+                lineno.saturating_add(dropped).saturating_sub(replay).saturating_add(1);
+            for i in 0..replay {
+                if window.push(b"", true, first.saturating_add(i)).is_err() {
+                    return Err("out of memory".to_string());
+                }
+            }
+        }
+        lineno = lineno.saturating_add(dropped).saturating_add(1);
         let line = rec.line();
         // The binary verdict is asked HERE rather than once per file: it is the
         // buffer this record arrived in that decides, and a NUL in a later

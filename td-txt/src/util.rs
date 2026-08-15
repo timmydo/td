@@ -345,6 +345,16 @@ pub struct Records<R> {
     /// grep does. Off by default: sed reaches no binary verdict, so nothing may
     /// rewrite the bytes it is about to hand out.
     zap: bool,
+    /// Discard a read that is ENTIRELY zeros rather than turning it into one
+    /// empty record per byte. Only sound where an empty record cannot be
+    /// selected, which is the caller's question, so this is the caller's flag.
+    skip: bool,
+    /// Empty records dropped by that, owed to whoever numbers lines.
+    skipped: u64,
+    /// Whether any of those went into an OPEN record rather than standing as
+    /// empty records of their own. GNU numbers past them either way, but a
+    /// joined gap leaves no records for `-B` to show.
+    skipped_joined: bool,
     /// A read failure deferred until the bytes read before it were handed over.
     pending: Option<std::io::Error>,
     consumed: u64,
@@ -379,6 +389,9 @@ impl<R: std::io::Read> Records<R> {
             eof: false,
             binary: false,
             zap: false,
+            skip: false,
+            skipped: 0,
+            skipped_joined: false,
             pending: None,
             consumed: 0,
         }
@@ -394,6 +407,23 @@ impl<R: std::io::Read> Records<R> {
     /// separator it writes is a line boundary like any other.
     pub fn zap_nuls(&mut self, on: bool) {
         self.zap = on;
+    }
+
+    /// Turn on GNU's `skip_nuls`, the other half of that: zapping makes a run
+    /// of zeros one empty record PER BYTE, and a read that holds nothing else
+    /// is discarded instead. Pass whether an empty record is unselectable --
+    /// GNU asks the same question once, of the pattern, before it reads.
+    pub fn skip_zero_fills(&mut self, on: bool) {
+        self.skip = on;
+    }
+
+    /// Empty records dropped since this was last asked. Added to a line number
+    /// so a run that was skipped still counts: GNU credits `totalnl` for the
+    /// same reason, and `grep -z -n` over a megabyte of NULs shows it.
+    /// The count, and whether any of it was absorbed by an open record rather
+    /// than standing as empty records `-B` could show.
+    pub fn take_skipped(&mut self) -> (u64, bool) {
+        (std::mem::take(&mut self.skipped), std::mem::take(&mut self.skipped_joined))
     }
 
     /// Bytes taken from the SOURCE so far, which is not what the caller has been
@@ -434,6 +464,8 @@ impl<R: std::io::Read> Records<R> {
         self.eof = false;
         self.pending = None;
         self.binary = false;
+        self.skipped = 0;
+        self.skipped_joined = false;
         self.consumed = 0;
     }
 
@@ -450,40 +482,66 @@ impl<R: std::io::Read> Records<R> {
 
     /// ONE `read` per fill, which is `fillbuf`'s shape: looping until the buffer
     /// was full would make a pipe wait for 96 KiB before the first match could
-    /// be reported.
+    /// be reported. The loop here is not that -- it only retries reads that were
+    /// DISCARDED whole, which deliver no record and so cannot delay one.
     fn fill(&mut self) -> std::io::Result<()> {
-        self.len = 0;
-        self.pos = 0;
-        // `Interrupted` is not a read failure, it is a signal that arrived
-        // mid-call; `read_to_end` retried it and so must this, or a `SIGWINCH`
-        // during a long search becomes `grep: f: Interrupted system call`.
-        let n = loop {
-            match self.src.read(&mut self.buf) {
-                Ok(n) => break n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
+        loop {
+            self.len = 0;
+            self.pos = 0;
+            // `Interrupted` is not a read failure, it is a signal that arrived
+            // mid-call; `read_to_end` retried it and so must this, or a `SIGWINCH`
+            // during a long search becomes `grep: f: Interrupted system call`.
+            let n = loop {
+                match self.src.read(&mut self.buf) {
+                    Ok(n) => break n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            };
+            if n == 0 {
+                self.eof = true;
+                return Ok(());
             }
-        };
-        if n == 0 {
-            self.eof = true;
+            self.len = n;
+            self.consumed = self.consumed.saturating_add(n as u64);
+            // The verdict as it stood BEFORE this read, which is what decides
+            // whether this read may be skipped: GNU sets `skip_nuls` in the loop
+            // body, after `fillbuf` has already delivered the buffer the verdict
+            // trips on, so that buffer is always kept and zapped and only later
+            // ones are dropped. Under `-z` there is no verdict to wait for.
+            let was_binary = self.binary;
+            if self.buf.get(..n).is_some_and(|s| s.contains(&0)) {
+                self.binary = true;
+            }
+            // From the buffer the verdict trips ON, not the one after it: GNU zaps
+            // the same buffer it decided from, and every later one whether or not
+            // that one holds a NUL of its own. A separator of 0 (`grep -z`) is why
+            // GNU reaches no verdict at all there, so there is nothing to zap.
+            let sep = self.sep;
+            let zapping = self.zap && self.binary && sep != 0;
+            // A record still OPEN is not a reason to keep the read. GNU discards
+            // it and keeps the carry, so an unterminated record joins across the
+            // gap to whatever follows -- a record the unskipped reading never
+            // had, and observably GNU's: `^foo.*bar$` selects it there.
+            if self.skip
+                && ((self.zap && was_binary && sep != 0) || sep == 0)
+                && self.buf.get(..n).is_some_and(|s| s.iter().all(|b| *b == 0))
+            {
+                // One empty record per byte is what was dropped, and the count is
+                // owed to whoever numbers lines. With a record OPEN there are no
+                // records to owe -- the gap joins into it -- but GNU numbers past
+                // it just the same, so only the `-B` replay is told apart.
+                self.skipped = self.skipped.saturating_add(n as u64);
+                self.skipped_joined |= self.spilled;
+                continue;
+            }
+            if zapping {
+                if let Some(s) = self.buf.get_mut(..n) {
+                    s.iter_mut().filter(|b| **b == 0).for_each(|b| *b = sep);
+                }
+            }
             return Ok(());
         }
-        self.len = n;
-        self.consumed = self.consumed.saturating_add(n as u64);
-        if self.buf.get(..n).is_some_and(|s| s.contains(&0)) {
-            self.binary = true;
-        }
-        // From the buffer the verdict trips ON, not the one after it: GNU zaps
-        // the same buffer it decided from, and every later one whether or not
-        // that one holds a NUL of its own. A separator of 0 (`grep -z`) is why
-        // GNU reaches no verdict at all there, so there is nothing to zap.
-        let sep = self.sep;
-        if self.zap && self.binary && sep != 0 {
-            if let Some(s) = self.buf.get_mut(..n) {
-                s.iter_mut().filter(|b| **b == 0).for_each(|b| *b = sep);
-            }
-        }
-        Ok(())
     }
 
     /// Advance to the next record. `false` is end of input.
@@ -1409,6 +1467,81 @@ mod tests {
         assert_eq!(rec.line(), b"ax", "the NUL did not end the record it landed in");
         assert!(rec.next().unwrap());
         assert_eq!(rec.line(), b"y", "the rest of that buffer is a record of its own");
+    }
+
+    /// A fill that is nothing but zeros is DROPPED rather than handed over as
+    /// one empty record per byte, and the count it owes comes back.
+    #[test]
+    fn an_all_zero_fill_is_dropped_and_its_records_counted() {
+        // The first read carries the NUL that trips the verdict, so the all-zero
+        // read AFTER it is the one that may be dropped -- see the ordering test
+        // below for why it cannot be the tripping read itself.
+        let src = Scripted(vec![Ok(b"a\x00"), Ok(b"\x00\x00\x00\x00"), Ok(b"b\n")]);
+        let mut rec = Records::with_buffer(src, b'\n', 4);
+        rec.zap_nuls(true);
+        rec.skip_zero_fills(true);
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line(), b"a");
+        assert_eq!(rec.take_skipped().0, 0);
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line(), b"b", "the all-zero fill was handed over rather than dropped");
+        assert_eq!(rec.take_skipped().0, 4, "the dropped records were not counted");
+        // And the debt is owed once: asking again after taking it reports none.
+        assert_eq!(rec.take_skipped().0, 0);
+    }
+
+    /// A record still OPEN is JOINED across the dropped fill, which is GNU's
+    /// behaviour and not an accident of it: the separators that would have
+    /// ended `ab` were in the read that went away, so `ab` runs on into `c`.
+    /// Measured against GNU 3.11, where `^foo.*bar$` selects such a record.
+    #[test]
+    fn an_open_record_is_joined_across_a_dropped_fill() {
+        let src =
+            Scripted(vec![Ok(b"a\x00"), Ok(b"ab"), Ok(b"\x00\x00\x00\x00"), Ok(b"c\n")]);
+        let mut rec = Records::with_buffer(src, b'\n', 4);
+        rec.zap_nuls(true);
+        rec.skip_zero_fills(true);
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line(), b"a");
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line(), b"abc", "the open record was split by a dropped fill");
+        assert_eq!(rec.take_skipped().0, 4, "the dropped records were not counted");
+    }
+
+    /// The read that TRIPS the verdict is never dropped, only later ones. GNU
+    /// sets `skip_nuls` in the loop body, after `fillbuf` has already delivered
+    /// that buffer, so it is kept and zapped -- which is what terminates a
+    /// record still open at the head of a run rather than joining it. Under a
+    /// newline separator this is the whole difference between GNU splitting and
+    /// GNU joining, and a sweep of 4900 cells found it: 133 of them diverged
+    /// while the tripping read was being dropped too.
+    #[test]
+    fn the_read_that_trips_the_verdict_is_never_dropped() {
+        // `ab` is open, and the NEXT read is both all zeros and the first NUL
+        // seen -- so it trips the verdict, is kept, and ends `ab` there.
+        let src = Scripted(vec![Ok(b"ab"), Ok(b"\x00\x00\x00\x00"), Ok(b"c\n")]);
+        let mut rec = Records::with_buffer(src, b'\n', 4);
+        rec.zap_nuls(true);
+        rec.skip_zero_fills(true);
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line(), b"ab", "the read that tripped the verdict was dropped");
+        assert_eq!(rec.take_skipped().0, 0);
+    }
+
+    /// Off unless asked, so sed and `grep -a` see every empty record the bytes
+    /// really hold.
+    #[test]
+    fn a_reader_that_was_not_asked_to_skip_keeps_the_empty_records() {
+        let src = Scripted(vec![Ok(b"\x00\x00\x00\x00"), Ok(b"b\n")]);
+        let mut rec = Records::with_buffer(src, b'\n', 4);
+        rec.zap_nuls(true);
+        for _ in 0..4 {
+            assert!(rec.next().unwrap());
+            assert_eq!(rec.line(), b"", "a zapped NUL is an empty record");
+        }
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line(), b"b");
+        assert_eq!(rec.take_skipped().0, 0);
     }
 
     /// Off unless asked, because sed reaches no binary verdict and must hand
