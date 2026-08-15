@@ -179,7 +179,7 @@ fn lex(text: &str) -> Result<Vec<Tk>, String> {
             }
         }
         let Some(op) = matched else {
-            return Err(format!("unexpected character {c:?}"));
+            return Err(SYNTAX.into());
         };
         let mut discard = false;
         match op {
@@ -254,6 +254,17 @@ fn op_at(chars: &[char], i: usize, op: &str) -> bool {
     true
 }
 
+/// ash's catch-all: EVERY arithmetic parse failure is this one string
+/// (math.c:501, 1000), whatever actually went wrong.
+const SYNTAX: &str = "arithmetic syntax error";
+
+/// A `:` APPLIED with no `?` pending (math.c:342, 945) -- `$((1:2))`. NOT a
+/// `:` where a value was expected: `$((:2))` is the catch-all, and so is
+/// `$((1:))`, whose colon never gets a right operand to be applied to.
+/// math.c:350 is the mirror -- a `?` forced to apply without its colon,
+/// `$(((1?2)))` -- and `stopped_at` does not serve it; see there.
+const MALFORMED_TERNARY: &str = "malformed ?: operator";
+
 /// A digit's value in an explicit base, or None where busybox's loop BREAKS
 /// (math.c:551-595). The mapping is `| 0x20` arithmetic on the byte rather than
 /// a table, because which characters are digits is a consequence of it: above
@@ -304,7 +315,7 @@ fn lex_with_base(chars: &[char], start: usize, base: u32) -> Result<(i64, usize)
     // it is also how a digit the base lacks surfaces: the run stops before the
     // first one, so `2#7` reaches here having consumed nothing.
     if i == start {
-        return Err(format!("expected a digit in base {base}"));
+        return Err(SYNTAX.into());
     }
     Ok((value as i64, i))
 }
@@ -359,7 +370,7 @@ fn lex_number(chars: &[char], start: usize) -> Result<(i64, usize), String> {
         }
     }
     if digits.is_empty() {
-        return Err("expected a digit".into());
+        return Err(SYNTAX.into());
     }
     // Out of range WRAPS, which is the only way `-9223372036854775808` can be
     // written: the bound is unreachable as a positive literal. A digit the base
@@ -367,7 +378,7 @@ fn lex_number(chars: &[char], start: usize) -> Result<(i64, usize), String> {
     let mut value: u64 = 0;
     for c in digits.chars() {
         let Some(d) = c.to_digit(radix) else {
-            return Err(format!("invalid number {digits:?} in base {radix}"));
+            return Err(SYNTAX.into());
         };
         value = value
             .wrapping_mul(u64::from(radix))
@@ -407,6 +418,40 @@ type A<T> = Result<T, String>;
 impl Arith {
     fn peek(&self) -> Option<&Tk> {
         self.toks.get(self.pos)
+    }
+
+    /// Which of ash's two parse messages a stop point earns. ash's `:` is a
+    /// binary operator, so it says `malformed ?: operator` where the colon was
+    /// APPLIED -- a value either side and no `?` pending. Where it never got a
+    /// right operand (`$((1:))`) the expression simply ended badly and it is
+    /// the catch-all, as it is for a colon sitting where a value was expected
+    /// -- that one never reaches here, being refused as a primary.
+    ///
+    /// An APPROXIMATION of ash, and knowingly. ash reduces a shunting yard, so
+    /// which message it reaches is an evaluation ORDER; this descends, and can
+    /// only ask what the tokens look like. Three shapes therefore still differ
+    /// and the commit message enumerates them: a `?` forced to apply without
+    /// its colon, two juxtaposed values before one, and a right-hand side whose
+    /// own error ash reports first (`$((1:1/0))` is `divide by zero` there).
+    fn stopped_at(&self) -> String {
+        if !matches!(self.peek(), Some(Tk::Op(":"))) {
+            return SYNTAX.into();
+        }
+        // "A token follows" is not the question -- `$((1:*))` has one and ash
+        // still says the catch-all, because `*` cannot BEGIN the right operand
+        // and so the colon is never applied. A prefix run either reaches a
+        // value or it does not: `1:+2` is applied where `1:+` is not, so the
+        // unary operators are stepped over rather than counted. Asked of the
+        // TOKENS, never by parsing: `$((1:n=5))` would assign on the way to
+        // deciding which message to print.
+        let mut i = self.pos + 1;
+        while matches!(self.toks.get(i), Some(Tk::Op("-" | "+" | "!" | "~" | "++" | "--"))) {
+            i += 1;
+        }
+        match self.toks.get(i) {
+            Some(Tk::Num(_) | Tk::Name(_) | Tk::Op("(")) => MALFORMED_TERNARY.into(),
+            _ => SYNTAX.into(),
+        }
     }
 
     fn eat_op(&mut self, op: &str) -> bool {
@@ -464,7 +509,7 @@ impl Arith {
         let saved_pos = std::mem::replace(&mut self.pos, 0);
         let value = self.expr_comma(sh).and_then(|v| {
             if self.peek().is_some() {
-                return Err(format!("unexpected trailing input in {text:?}"));
+                return Err(self.stopped_at());
             }
             Ok(v)
         });
@@ -546,7 +591,7 @@ impl Arith {
         let then = self.expr_assign(sh)?;
         self.live = outer;
         if !self.eat_op(":") {
-            return Err("expected `:` in `?:`".into());
+            return Err(SYNTAX.into());
         }
         self.live = outer && cond == 0;
         self.enter()?;
@@ -723,7 +768,7 @@ impl Arith {
             // not a token at all, so `n*++ +n` needs nothing special here.
             Some(o @ ("++" | "--")) => {
                 let Some(Tk::Name(name)) = self.toks.get(self.pos + 1).cloned() else {
-                    return Err(format!("expected a name after `{o}`"));
+                    return Err(SYNTAX.into());
                 };
                 self.pos += 2;
                 Ok(self.step(sh, &name, o == "++")?.1)
@@ -765,12 +810,12 @@ impl Arith {
                 self.pos += 1;
                 let v = self.expr_comma(sh)?;
                 if !self.eat_op(")") {
-                    return Err("expected `)`".into());
+                    return Err(self.stopped_at());
                 }
                 Ok(v)
             }
-            Some(Tk::Op(o)) => Err(format!("unexpected operator `{o}`")),
-            None => Err("unexpected end of expression".into()),
+            Some(Tk::Op(_)) => Err(SYNTAX.into()),
+            None => Err(SYNTAX.into()),
         }
     }
 
@@ -872,7 +917,7 @@ fn power(live: bool, base: i64, exp: i64) -> A<i64> {
 fn divide(live: bool, a: i64, b: i64) -> A<i64> {
     if b == 0 {
         return if live {
-            Err("division by zero".into())
+            Err("divide by zero".into())
         } else {
             Ok(0)
         };
@@ -883,7 +928,7 @@ fn divide(live: bool, a: i64, b: i64) -> A<i64> {
 fn remainder(live: bool, a: i64, b: i64) -> A<i64> {
     if b == 0 {
         return if live {
-            Err("division by zero".into())
+            Err("divide by zero".into())
         } else {
             Ok(0)
         };
@@ -905,6 +950,13 @@ mod tests {
     fn ev(src: &str) -> Result<i64, String> {
         let mut sh = Shell::new_for_test();
         eval(&mut sh, src).map_err(|_| format!("evaluation of {src:?} failed"))
+    }
+
+    /// `ev` throws the message away; this keeps it. Which words a failure
+    /// carries is the whole of what ash is being matched on below.
+    fn ev_msg(src: &str) -> Result<i64, String> {
+        let mut sh = Shell::new_for_test();
+        try_eval(&mut sh, src)
     }
 
     #[test]
@@ -1843,6 +1895,52 @@ mod tests {
         assert!(ev("(1").is_err());
         // Overflow is NOT in that list any more: it wraps, as ash's does.
         assert_eq!(ev("9223372036854775807 + 1"), Ok(i64::MIN));
+    }
+
+    /// ash has FIVE arithmetic diagnostics and no more (math.c): the catch-all,
+    /// `divide by zero`, `exponent less than 0`, `malformed ?: operator` and
+    /// `expression recursion loop detected`. Whatever a parse got wrong, it is
+    /// the catch-all -- measured against busybox ash 1.37.0 over every row here.
+    #[test]
+    fn a_parse_failure_takes_ashs_one_word_for_it() {
+        for src in [
+            "1+", "1?", "*", "1 2", "0x", "2#", "2#9", "1+*2", "a b", "++", "1++",
+            "$", "#", "1@2", "~~", "!", "1?2", "1?2?3", "[", "..", "0b12", "99#1",
+            // A colon that never got a right operand, and one where a value was
+            // expected: neither is APPLIED, so neither is ash's ternary message.
+            "1:", ":", ":2", "1?2::3", "1??2:3",
+            // A token DOES follow the colon in each of these, and ash still
+            // says the catch-all: none of them can begin the right operand, so
+            // the colon is never applied. `1:+` is the sharp one -- a prefix
+            // run that reaches no value is not a value.
+            "1:*", "(1:)", "1:,", "1::", "1:?", "1:/", "1:%", "1:=", "1:&&", "1:+",
+        ] {
+            assert_eq!(ev_msg(src), Err(SYNTAX.to_string()), "{src}");
+        }
+        // Applied with a value either side and no `?` pending -- ash's other
+        // parse message, and the only thing that distinguishes it from the row
+        // above is whether the colon got its second operand.
+        for src in [
+            "1:2", "1+1:2", "(1:2)", "1,2:3", "1?2:3:4",
+            // A prefix run that DOES reach a value, which is what separates
+            // these from `1:+` above.
+            "1:n", "1:(2)", "1:-2", "1:!2", "1:~2", "1:+2",
+        ] {
+            assert_eq!(ev_msg(src), Err(MALFORMED_TERNARY.to_string()), "{src}");
+        }
+        // Against LITERALS once each, because every other row here compares a
+        // constant with itself: renaming either one leaves the whole suite
+        // green, and the words are the behaviour this commit is about.
+        assert_eq!(ev_msg("1+"), Err("arithmetic syntax error".to_string()));
+        assert_eq!(ev_msg("1:2"), Err("malformed ?: operator".to_string()));
+        // The three that are not parse failures keep their own words.
+        assert_eq!(ev_msg("1/0"), Err("divide by zero".to_string()));
+        assert_eq!(ev_msg("1%0"), Err("divide by zero".to_string()));
+        assert_eq!(ev_msg("2**-1"), Err("exponent less than 0".to_string()));
+        // ...and a well-formed ternary is untouched by any of it.
+        assert_eq!(ev("1?2:3"), Ok(2));
+        assert_eq!(ev("0?2:3"), Ok(3));
+        assert_eq!(ev("1?2:3?4:5"), Ok(2));
     }
 
     #[test]

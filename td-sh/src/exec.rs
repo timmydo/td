@@ -2560,7 +2560,7 @@ mod tests {
         let (st, out, err) = run("[[ 1+ -eq 2 ]]; echo after");
         assert_eq!(out, "after\n", "the shell did not survive the expression");
         assert_eq!(st, 0);
-        assert_eq!(err, "td-sh: [[: unexpected end of expression\n");
+        assert_eq!(err, "td-sh: [[: arithmetic syntax error\n");
         // The conditional's own status is bash's 1, not the 2 a malformed
         // EXPRESSION gets.
         assert_eq!(run("[[ 1+ -eq 2 ]]").0, 1);
