@@ -451,6 +451,21 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    if HOST_ONLY_ENGINE_SOURCES.contains(&p) {
+        // Host-side branch tooling that lives in the engine crate but is not
+        // the engine: reachable only from its own subcommand, and reading
+        // nothing a recipe, a store operation or a sandbox touches. The
+        // from-source rungs therefore cannot observe a change here, so the
+        // ~2-min smoke (which still compiles it into td-builder) is the whole
+        // behavioural signal and the full check is not owed.
+        sel.add_preflight("cargo-test");
+        sel.add_target("check-engine");
+        sel.add_note(&format!(
+            "{p} is host-side branch tooling, not the build engine: the check-engine smoke covers it and the from-source rungs cannot reach it (they never invoke its subcommand)."
+        ));
+        return;
+    }
+
     if pattern_matches("builder/Cargo.toml|builder/src/*", p) {
         // The ~2-min check-engine SMOKE tier (cargo-test: compile + unit tests) is
         // the FAST signal, but the engine is what the from-source rungs exercise, so
@@ -2009,6 +2024,24 @@ const DEPENDENCY_FREE_LOCKS: [(&str, usize); 14] = [
 /// trusted, in `unembedded_crates_are_really_unembedded`.
 const UNEMBEDDED_CRATES: [&str; 1] = ["td-review"];
 
+/// Files under `builder/src` that are NOT the build engine, and so do not owe
+/// the from-source behavioural tier the rest of that directory does.
+///
+/// `builder/src/*` is otherwise one blanket rule, correctly: `sandbox.rs`,
+/// `nar.rs`, the store and recipe evaluation are exactly what the from-source
+/// rungs exercise. `ready.rs` is a branch gate — it parses commit messages and
+/// shells out to git, is reached only from `td-builder ready`, and imports one
+/// engine module. Nothing a rung runs can observe it.
+///
+/// `affected.rs` is deliberately NOT here, though the same could be said of its
+/// dependencies: it DECIDES which checks run, so exempting it would let the
+/// dispatcher narrow its own coverage with the tier that would have caught it
+/// switched off.
+///
+/// Checked against the tree rather than trusted, in
+/// `host_only_sources_are_not_reachable_from_the_engine`.
+const HOST_ONLY_ENGINE_SOURCES: [&str; 1] = ["builder/src/ready.rs"];
+
 /// The subset of `CARGO_TEST_CMDS` a diff over `changed` can actually
 /// invalidate.
 ///
@@ -2624,6 +2657,165 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Every module reached through a `crate::`/`super::` path, however it is
+    /// spelled — a `use` line, a `pub use`, an alias, or an inline call in a
+    /// function body. Parsing `use crate::` lines alone missed all but the
+    /// first, and `affected.rs` itself reaches `crate::gates` that way.
+    ///
+    /// A braced list (`use crate::{a, b}`) names no single module and is
+    /// recorded as `{`, so it is REFUSED rather than silently skipped.
+    fn crate_paths_named(text: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for prefix in ["crate::", "super::"] {
+            let mut rest = text;
+            while let Some(at) = rest.find(prefix) {
+                let tail = rest.get(at.saturating_add(prefix.len())..).unwrap_or("");
+                let ident: String = tail
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                let name = match ident.is_empty() {
+                    true => tail.chars().next().map(String::from).unwrap_or_default(),
+                    false => ident,
+                };
+                if !name.is_empty() && !out.contains(&name) {
+                    out.push(name);
+                }
+                rest = tail;
+            }
+        }
+        out
+    }
+
+    /// Source with `//` comments cut away. These scans are described in prose
+    /// that necessarily NAMES what they look for, so without this the module
+    /// defining them reds itself. Line-based, as the crate's other source
+    /// scans are; a `//` inside a string literal cuts the rest of that line,
+    /// which can only make the scan see less on a line no engine path hides in.
+    fn strip_line_comments(text: &str) -> String {
+        text.lines()
+            .map(|l| l.split_once("//").map_or(l, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `needle` at an identifier boundary. A bare `contains` for a module name
+    /// followed by `::` matches `already::` too — fail-safe, but it reds on
+    /// the wrong file.
+    fn names_at_boundary(text: &str, needle: &str) -> bool {
+        let mut from = 0usize;
+        while let Some(at) = text.get(from..).and_then(|t| t.find(needle)) {
+            let abs = from.saturating_add(at);
+            let before = text.get(..abs).and_then(|t| t.chars().next_back());
+            if !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return true;
+            }
+            from = abs.saturating_add(needle.len());
+        }
+        false
+    }
+
+    /// The premise `HOST_ONLY_ENGINE_SOURCES` rests on, checked rather than
+    /// trusted, plus the mapping actually taking effect.
+    ///
+    /// The IN direction is the SOUNDNESS argument: the exemption says the
+    /// from-source tier cannot catch a regression introduced by editing this
+    /// file, which holds exactly when nothing that tier runs calls into it.
+    /// The OUT direction is a bound on what the file may BECOME — it is not
+    /// transitive and deliberately not asserted to be: `affected.rs` reaches
+    /// `crate::gates` and `crate::check_loop`, so a closure assertion would be
+    /// false today and the exemption does not rest on one.
+    ///
+    /// Both scans are TEXTUAL and n=1-shaped: a second roster entry would need
+    /// the permitted-import set widened and the IN scan taught that two
+    /// host-only modules may name each other.
+    #[test]
+    fn host_only_sources_are_not_reachable_from_the_engine() {
+        let root = repo_root();
+        let mut sources = Vec::new();
+        collect_rs_files(&root.join("builder/src"), &mut sources);
+
+        for rel in HOST_ONLY_ENGINE_SOURCES {
+            let Some(stem) = rel
+                .strip_prefix("builder/src/")
+                .and_then(|f| f.strip_suffix(".rs"))
+            else {
+                panic!("{rel} is not a builder/src module path");
+            };
+
+            // The exemption must TAKE. This arm sits after five that claim
+            // paths first, so an entry one of those already routes would be a
+            // dead roster: exempt in the author's head and heavy in fact.
+            let targets = last_check_targets(&path_output(&root, rel));
+            assert!(
+                targets.iter().any(|t| t == "check-engine"),
+                "{rel} does not select check-engine: {targets:?}"
+            );
+            assert!(
+                !targets.iter().any(|t| t == "check"),
+                "{rel} still selects the full check, so its entry is dead: {targets:?}"
+            );
+
+            // OUT: the module reaches no engine module but the one it is
+            // routed by. An inline `crate::store::…` here would widen what a
+            // store change could break in it.
+            //
+            // Over the SHIPPED half only. `super::` is the crate root from a
+            // top-level module — which is what makes `use super::store` worth
+            // scanning for — but inside `mod tests` it is the module itself,
+            // so `use super::*;` would read as a crate path. Test code is not
+            // what the from-source tier runs either way.
+            let whole = strip_line_comments(&std::fs::read_to_string(root.join(rel)).unwrap());
+            let text = whole.split("#[cfg(test)]").next().unwrap_or_default();
+            assert!(
+                text.len() < whole.len(),
+                "{rel} has no #[cfg(test)] module — the split is not doing what \
+                 this scan assumes"
+            );
+            let named = crate_paths_named(text);
+            // POSITIVE CONTROL, for the reason the IN scan has one: a scan
+            // that finds nothing passes any roster.
+            assert!(
+                !named.is_empty(),
+                "{rel} names no crate:: path at all — the scan is looking for \
+                 the wrong thing"
+            );
+            for m in &named {
+                assert_eq!(m, "affected", "{rel} reaches crate::{m}");
+            }
+
+            // IN: nothing but `main.rs` names it. A module the engine's own
+            // code called would BE engine code, whatever this roster says.
+            let mut named_by_main = false;
+            for f in &sources {
+                let body = strip_line_comments(&std::fs::read_to_string(f).unwrap());
+                // Both spellings: `main.rs` declares the module and calls
+                // `ready::main`, while another module would need
+                // `crate::ready` — including through `use crate::ready as r`,
+                // which names no `ready::` anywhere.
+                let names = names_at_boundary(&body, &format!("{stem}::"))
+                    || crate_paths_named(&body).iter().any(|m| m == stem);
+                if f.ends_with(rel) {
+                    continue;
+                }
+                if f.ends_with("builder/src/main.rs") {
+                    named_by_main |= names;
+                    continue;
+                }
+                assert!(
+                    !names,
+                    "{f:?} reaches {stem}, so it is not called only from the \
+                     subcommand dispatch"
+                );
+            }
+            assert!(
+                named_by_main,
+                "main.rs never names {stem} — the scan is looking for the \
+                 wrong thing and would pass any roster"
+            );
         }
     }
 
