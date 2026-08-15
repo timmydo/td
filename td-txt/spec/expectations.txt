@@ -55,5 +55,5 @@ xfail sed-cli.test.txt::POSIXLY_CORRECT also selects a POSIX mode, which td-txt 
 xfail sed-cli.test.txt::N;P;D under the variable, the other half of that same rule
 xfail sed-cli.test.txt::POSIX mode makes an unmatched ) ordinary in an ERE, so GNU compiles this
 xfail sed-cli.test.txt::--posix: a bracket AFTER a closed sub-expression keeps suppressing
-xfail sed-cli.test.txt::but that GROUPING is buffering, and -u takes it away in GNU
+xfail sed-cli.test.txt::and WITHOUT it that r sees an empty file, because GNU's w target is buffered
 xfail sed-cli.test.txt::the compile half, which td-txt does not model: xfail with GNU's golden

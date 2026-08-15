@@ -542,11 +542,32 @@ pub fn print_line(text: &str) -> std::io::Result<()> {
 pub struct Out {
     inner: std::io::BufWriter<std::io::Stdout>,
     broken: bool,
+    /// Flush after every write, for sed's `-u`. What that buys is ORDER against
+    /// another stream on the same descriptor -- a `w /dev/stdout` the special-file
+    /// table did not alias is a separate unbuffered `File`, and which of the two
+    /// lands first is otherwise a question about buffer sizes.
+    unbuffered: bool,
 }
 
 impl Out {
     pub fn new() -> Self {
-        Self { inner: std::io::BufWriter::new(std::io::stdout()), broken: false }
+        Self { inner: std::io::BufWriter::new(std::io::stdout()), broken: false, unbuffered: false }
+    }
+
+    /// Write through from here on, which is what `-u` asks for.
+    pub fn unbuffer(&mut self) {
+        self.unbuffered = true;
+    }
+
+    /// A complete line has been written. Flushes only under `-u`, and per LINE
+    /// rather than per write because that is where GNU flushes (`output_line`):
+    /// flushing each write would put a line's text and its separator in separate
+    /// `write(2)`s, which a concurrent reader can tell apart.
+    pub fn end_line(&mut self) -> std::io::Result<()> {
+        match self.unbuffered {
+            true => self.flush(),
+            false => Ok(()),
+        }
     }
 
     pub fn is_broken(&self) -> bool {

@@ -1331,10 +1331,12 @@ td-txt-authored case files
     same question: GNU opens the NAME there rather than sharing the stream, so
     it dumps whatever is left in the descriptor and re-reads a regular file
     from its start every cycle. td-txt does the same and agrees on every shape
-    measured -- except under `-u`, where GNU reads a byte at a time and so
-    leaves the descriptor a line on, which is the read-granularity entry above
-    and not this one. `sed -n -u -e 'r /dev/stdin' - -` over `x\ny` is `y`
-    there and empty here, identically on both builds either side of this.
+    measured. The one cell that used to differ was under `-u`, where GNU leaves
+    the descriptor a record on and so has something left to dump: `sed -n -u -e
+    'r /dev/stdin' - -` over a PIPE carrying `x\ny` was `y` there and empty
+    here. That followed from the read granularity rather than from anything
+    about `r`, and the `-u` entry below closing that half closed this with it --
+    both are `y` now, and both are empty without the flag.
 
   - A COMPILE-TIME flag is POSITIONAL, and used not to be here. GNU compiles each
     `-e`/`-f` inside its own getopt loop, so such a flag governs the parts scanned
@@ -1487,31 +1489,143 @@ td-txt-authored case files
     what is left through a `try_clone` of it -- a second `File::open` would be
     an independent offset that could not observe the child at all.
 
-  - `-u` is accepted and IGNORED, which is content-neutral for one stream and
-    stopped being so once two of them share a descriptor. GNU's `-u` flushes
-    every output after every line (`flush_output`, execute.c:415), so it ORDERS
-    a `--posix` `w /dev/stdout` against auto-print: `sed --posix -u -n -e p -e
-    s/^/W/ -e 'w /dev/stdout' h` interleaves in GNU and comes out in two groups
-    here, and the same holds when standard output is a terminal. Without `-u`
-    GNU's stdout is block-buffered and the two GROUP, which is the cell td-txt
-    now gets right -- the `w` target being an unbuffered `File` and the sink
-    buffered whatever the flag says. So this is a cell the special-file table's
-    posixicity gate TRADED rather than one it broke: before it, `--posix` was
-    aliased here and matched GNU under `-u` and on a terminal while missing the
-    default, and now it is the other way round. The default is the common case,
-    which is why the trade was taken; the two it costs are pinned as an xfail
-    with GNU's golden. Closing it wants a real `-u`, which is a flush policy for
-    every output rather than anything about this table.
+  - `-u` was accepted and IGNORED, and it is CLOSED on both halves -- which took
+    two mechanisms rather than one flag, since the halves meet nowhere in the
+    code: a record-sized read at the front, a flush per output operation at the
+    back.
 
-    `-u` has a READ half too, and the incremental reader narrowed the gap
-    without closing it: GNU under `-u` reads one RECORD at a time, so it leaves
-    even more of a pipe behind than its 4 KiB block does. Measured with a second
-    reader on the pipe, GNU `sed -u 1q` against GNU `sed 1q`: 4104 fed leaves
-    4096 rather than 8, 8192 leaves 8184 rather than 4096, and 20000 leaves
-    19992 rather than 15904. td-txt takes its block whatever the flag says, so
-    it now matches GNU's UNFLAGGED numbers everywhere and GNU's `-u` numbers
-    nowhere -- where before it left 0 in every cell of both. A real `-u` is one
-    landing for both halves: read a record at a time, flush after every line.
+    The WRITE half is GNU's `flush_output` (execute.c:413), which ORDERS two
+    streams sharing a descriptor. `sed --posix -u -n -e p -e s/^/W/ -e 'w
+    /dev/stdout' h` interleaves here as it does in GNU, where it used to come
+    out in two groups; that case was the xfail this landing promotes. Without
+    the flag the two still GROUP, which td-txt already had right -- the sink
+    buffered and the `w` target an unbuffered `File`. So the cell the special-
+    file table's posixicity gate TRADED is bought back rather than swapped
+    again: both sides of it agree now.
+
+    WHERE that flush goes is the whole of the write half, and GNU's answer is
+    not "every write" or "every line" but a list of five: `flush_output` is
+    called from `output_line` (execute.c:433), from `dump_append` after the
+    WHOLE queue (505), from `do_list` for `l` (959), and from `=` (1627) and `F`
+    (1635). Read off the pinned 4.9 tarball rather than remembered, after a
+    reviewer asked what the citation this entry used to carry was pointing at.
+
+    All three wrong neighbours were built and measured before that list was
+    read, and they fail in two different ways -- one reorders bytes, two only
+    rechunk them.
+    Flushing every write splits a line's text from its separator into two
+    `write(2)`s: identical bytes, and a chunking a concurrent reader can still
+    tell apart, which is the one thing this flag is for. Flushing only at the
+    end of a LINE leaves `=`, `l` and an append sitting in the buffer, which the
+    corpus did not notice and a 3,200-case sweep did in 17 cells -- so those are
+    cases now, six of them, each with its unflagged grouping beside it. The
+    queue is the third: flushing per ITEM rather than once makes `a\X` followed
+    by `r f` two `write(2)`s where GNU issues one, which no case can see because
+    the bytes agree. Under strace the shapes measured issue byte-identical
+    `write(2)` sequences to GNU's: three whole lines for `-u -n p`, six for
+    `=;p`, an `r` dump arriving as one call, and a two-item queue as one. That
+    parity is over the shapes measured and not a general property: the entry
+    below records the one thing that still splits a flush in two, and it splits
+    the same way without the flag.
+
+    The IMMEDIATE `0r` is the exception on that list, and it is an absence
+    rather than an entry: GNU's zero-address read calls `print_file` with no
+    `flush_output` after it (execute.c:1520), so its bytes ride the next flush
+    point. `sed -u -e '0r sub' h` is `S\n1\n` in ONE write there and here.
+    Nothing dependency-free can hold that: `0r` is refused under `--posix`, and
+    without `--posix` a `w /dev/stdout` is aliased to the same sink, so there is
+    no second descriptor to order it against. It is written down because it
+    looks like an oversight beside the other four -- a review of this landing
+    proposed adding the flush -- and the source and strace agree it is not.
+
+    The READ half is that GNU under `-u` consumes one RECORD, so the next
+    program on a shared descriptor gets the rest. `Stream::block` is 1 under the
+    flag, and a byte-sized READ is what produces a record-sized CONSUMPTION: a
+    reader cannot find a separator without having read past it, so leaving the
+    rest for somebody else means asking for a byte at a time. Measured with a
+    second reader on the pipe, `sed -u -n 1q` against `sed -n 1q`, td-txt now
+    matches GNU in all twelve cells: 4104 fed leaves 4096 rather than 8, 8192
+    leaves 8184 rather than 4096, and 20000 leaves 19992 rather than 15904, for
+    8- and 80-byte lines alike. No CASE can show that, for the reason the
+    give-back entry above gives -- the harness runs ONE child -- so the test is
+    a Rust one that clones the pipe's read end and reads what the stream did
+    not. One shape does reach a case, and it is the only one that pins the
+    DESCRIPTOR-0 reader's block rather than an operand's: `sed -n -u -e 'r
+    /dev/stdin' - -` over a pipe carrying `x\ny` prints `y`, because the
+    lowercase `r` reopens the name and dumps whatever the reader left. That cell
+    was empty here before and is the one the `r /dev/stdin` entry above records.
+
+    Those twelve cells are the MAIN input stream, and GNU's flag reaches no
+    other. `R` opens its source as a stream of ITS OWN, which stays block-
+    buffered under `-u` -- so `R /dev/stdin` still swallows the pipe there.
+    Measured with a second reader: `sed -u -n -e 'R /dev/stdin' -e p IN` over 20
+    fed lines leaves GNU's pipe EMPTY and leaves s4-s20 here. Where a `-`
+    operand follows the `R`, GNU has already dropped what that operand was going
+    to read and stops early -- `sed -u -n -e 'R /dev/stdin' -e p IN -` prints
+    through s3 in GNU and everything here. Mixed with the `$` lookahead, whose
+    peek comes off the same pipe a byte at a time, GNU can also SPLIT a record
+    between the two streams: `sed -n -u -e '$=;R /dev/stdin' IN -` prints `s1
+    s2 3`, where `3` is the tail of `s3` whose `s` the peek took. td-txt has one
+    reader for that descriptor by construction, so the flag changes how MUCH is
+    read and never which record reaches whom -- its `-u` answers here are the
+    answers both programs give without the flag. Not matched, deliberately, and
+    it is the same choice as the swallowed byte below: every cell where GNU
+    differs is one where GNU has lost or split a record. Bounded by sweep rather
+    than by argument -- 2,400 cases over `R`/`r` on `/dev/stdin` crossed with
+    operand lists, where every remaining GNU divergence is under `-u` and every
+    one is identical on the build before this landing.
+
+    What the flag does NOT change is where a SEEKABLE stdin is left: the
+    give-back is computed from the reader rather than from the block, so every
+    row of `sed_leaves_a_seekable_stdin_after_the_last_record_it_read` comes out
+    at the same offset either way. GNU agrees on all of them but one, and that
+    one it LOSES A BYTE on. `sed -u -n -e '1{$!p}' -e 1q` over a seekable stdin
+    leaves GNU at offset 4 and td-txt at 3, so GNU's next reader gets
+    `2\nl3\nl4\n` where this one gets `l2\nl3\nl4\n`. The `$` lookahead is a
+    pushback, and glibc does not return a pushed-back byte to the file offset
+    when the stream is unbuffered -- so the byte is swallowed. Measured over
+    five shapes: every one where the lookahead fired and the run quit before
+    consuming that record loses exactly one byte, and a `1q` with no lookahead
+    loses none. Deliberately NOT matched, for the reason the paragraph above
+    gives: reproducing it means mis-positioning a shared descriptor by one byte
+    on purpose, which is the harm the whole give-back exists to avoid. Those two
+    are the whole of where this landing chooses against GNU, and both are cells
+    where GNU has lost part of somebody else's input.
+
+  - A FLUSH CAN SPLIT IN TWO on the way out, which bounds the `write(2)` parity
+    claimed above and is not about `-u` at all. `Out` is a `BufWriter` over
+    `std::io::Stdout`, and that is itself a `LineWriter`: flushing a buffer
+    whose LAST byte is not a separator splits at the last one it does contain.
+    So `printf '1\n2\n3' | sed -u p` ends `"3" "\n" "3"` here against GNU's
+    `"3" "\n3"`, and `sed -z -e G h` is two calls here against one there --
+    UNFLAGGED, which is what says the cause is the double buffering rather than
+    the flag. Found by a review of the `-u` landing, which is why it is written
+    beside it; the six shapes that landing measured all end their buffer on a
+    separator, which is why they came out identical.
+
+    The obvious repair is a `BufWriter` over a DUP of descriptor 1 rather than
+    over `Stdout` -- safe, `try_clone_to_owned` needs no `unsafe` -- and it is a
+    separate landing because a second writer shares that buffer: the `--posix`
+    `w /dev/stdout` target writes through `std::io::stdout()` too
+    (sed.rs `WDest::Stdout`), and it is the ONE global `LineWriter` underneath
+    both that orders the two streams against each other. Dup for one and not the
+    other and the ordering this entry's neighbour above just bought is gone. So
+    the fix is "move both", with the `-u` cases as its evidence, and it also
+    touches grep, which shares `Out`.
+
+  - A `w` TARGET is buffered in GNU and is not here, which `-u` above makes
+    visible rather than causes. GNU block-buffers a `w` file like any other
+    stdio stream and flushes it at the end of the run; td-txt writes each line
+    through an unbuffered `File`. That is observable inside ONE process, no
+    second reader needed, because `r` re-opens its source every cycle: `sed -e
+    'w wf' -e 'r wf' h` over `1\n2\n3\n` is `1\n2\n3\n` in GNU, whose `r` finds
+    an empty file every time, against `1\n1\n2\n1\n2\n3\n1\n2\n3\n` here. Under
+    `-u` GNU flushes per line and both give the interleaved answer, which is why
+    this is an xfail on the UNFLAGGED case with GNU's golden beside a passing
+    flagged one. Closing it wants a buffer per `w` target with GNU's flush
+    points, which is a third mechanism rather than either half of `-u` -- and it
+    has a cost the other two did not: a line written and not yet flushed is a
+    line a crash loses, where today's target has it on disk.
 
   - An AMBIGUOUS long-option abbreviation lists a different SET of
     possibilities for grep. `grep --c` is `'--context' '--color' '--colour'

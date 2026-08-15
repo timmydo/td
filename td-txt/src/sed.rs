@@ -39,7 +39,7 @@ use crate::util::{
 };
 
 const USAGE: &str =
-    "usage: sed [-nrEsz] [-i[SUFFIX]] [-l N] [-e SCRIPT] [-f FILE] [SCRIPT] [FILE]...";
+    "usage: sed [-nrEszu] [-i[SUFFIX]] [-l N] [-e SCRIPT] [-f FILE] [SCRIPT] [FILE]...";
 
 /// What a bare `l` folds at when NEITHER input to the fallback width said
 /// otherwise — `COLS` seeds it and `-l` overrides it. GNU's own constant.
@@ -1769,6 +1769,11 @@ struct Stream {
     /// /dev/stdin' -e 's/^/P:/' -e p -` over four lines prints `P:o1 o2 P:o3 o4`
     /// there -- and two readers cannot produce that however they are positioned.
     fd0: Option<Fd0>,
+    /// How much a fill may take off the descriptor. `Self::BLOCK` normally, and
+    /// ONE under `-u`, which is how GNU consumes exactly a record there: a reader
+    /// cannot RECOGNISE a separator without having read past it, so leaving the
+    /// rest of a pipe for the next program means asking for a byte at a time.
+    block: usize,
     /// Whether the OPEN operand is descriptor 0, which is what says WHICH reader
     /// the cycle takes records from.
     on_stdin: bool,
@@ -1829,7 +1834,9 @@ enum Src {
     /// which is a `BufReader`: a 4 KiB request takes 8 KiB off the descriptor, so
     /// what a `q` leaves in a pipe would be std's buffer size rather than
     /// `BLOCK`. Measured before this existed -- `sed 1q` over 20000 bytes left
-    /// 11808 where GNU leaves 15904, one whole block too few.
+    /// 11808 where GNU leaves 15904, one whole block too few. Where the duplicate
+    /// cannot be had, `-u`'s block of ONE is defeated the same way and for the
+    /// same reason -- which is the case the give-back already declines in.
     Raw(std::fs::File),
 }
 
@@ -1880,7 +1887,7 @@ impl Stream {
     /// comes IN because that path makes a `Stream` per operand while there is one
     /// standard input for the run: under `-s`, `R /dev/stdin` goes on where the
     /// previous operand left it rather than starting again.
-    fn over(path: &[u8], input: Input, separator: u8, fd0: Option<Fd0>) -> Self {
+    fn over(path: &[u8], input: Input, separator: u8, block: usize, fd0: Option<Fd0>) -> Self {
         let err_name = input.error_name(path);
         let mut stream = Self {
             pending: Vec::new().into_iter(),
@@ -1888,6 +1895,7 @@ impl Stream {
             name: path.to_vec(),
             src: None,
             err_name,
+            block,
             fd0,
             on_stdin: false,
             delivered: 0,
@@ -1901,13 +1909,14 @@ impl Stream {
 
     /// Every operand, none of them read yet. Taken BY VALUE: nothing revisits an
     /// operand, so nothing needs a copy of one.
-    fn of_operands(paths: Vec<Vec<u8>>, separator: u8) -> Self {
+    fn of_operands(paths: Vec<Vec<u8>>, separator: u8, block: usize) -> Self {
         Self {
             pending: paths.into_iter(),
             separator,
             name: b"-".to_vec(),
             src: None,
             err_name: b"-".to_vec(),
+            block,
             fd0: None,
             on_stdin: false,
             delivered: 0,
@@ -1928,7 +1937,7 @@ impl Stream {
         self.delivered = 0;
         if !input.is_stdin() {
             self.on_stdin = false;
-            self.src = Some(Records::with_buffer(Src::Open(input), self.separator, Self::BLOCK));
+            self.src = Some(Records::with_buffer(Src::Open(input), self.separator, self.block));
             return;
         }
         self.open_fd0(input);
@@ -1943,7 +1952,7 @@ impl Stream {
             return;
         }
         let (src, raw) = source_of(input);
-        let rec = Records::with_buffer(src, self.separator, Self::BLOCK);
+        let rec = Records::with_buffer(src, self.separator, self.block);
         self.fd0 = Some(Fd0 { rec, delivered: 0, raw });
     }
 
@@ -2226,7 +2235,17 @@ impl<'a> Sink<'a> {
     }
 
     /// Write, paying any separator the previous line left owed.
+    /// One whole output operation -- `l`, `=`, `F` -- separator and all, which is
+    /// the unit `-u` flushes after.
     fn write(&mut self, bytes: &[u8]) -> Result<(), Vec<u8>> {
+        self.queued(bytes)?;
+        self.end_line()
+    }
+
+    /// The same write from INSIDE the append queue, which does not flush: GNU
+    /// dumps the whole queue and flushes once at the end of it (`dump_append`,
+    /// execute.c:505), so a queue holding two items is one `write(2)` there.
+    fn queued(&mut self, bytes: &[u8]) -> Result<(), Vec<u8>> {
         self.pay(Chan::Main)?;
         self.put(bytes)
     }
@@ -2235,7 +2254,7 @@ impl<'a> Sink<'a> {
     /// (the append queue dumps the text as parsed), where `i`/`c` follow the
     /// record separator.
     fn write_text(&mut self, bytes: &[u8]) -> Result<(), Vec<u8>> {
-        self.write(bytes)?;
+        self.queued(bytes)?;
         self.put(b"\n")
     }
 
@@ -2246,10 +2265,22 @@ impl<'a> Sink<'a> {
         self.put(bytes)?;
         if terminated {
             let sep = self.separator;
-            return self.put(&[sep]);
+            self.put(&[sep])?;
+        } else {
+            *self.debt(chan) = true;
         }
-        *self.debt(chan) = true;
-        Ok(())
+        self.end_line()
+    }
+
+    /// Where `-u`'s flush lands. An UNTERMINATED line is one too: GNU flushes at
+    /// the end of `output_line` whether or not it wrote a separator.
+    fn end_line(&mut self) -> Result<(), Vec<u8>> {
+        match &mut self.dest {
+            Dest::Stdout(out) => {
+                out.end_line().map_err(|e| format!("write error: {}", errmsg(&e)).into_bytes())
+            }
+            Dest::Buffer(_) => Ok(()),
+        }
     }
 
     fn write_line(&mut self, bytes: &[u8], terminated: bool) -> Result<(), Vec<u8>> {
@@ -2921,6 +2952,10 @@ struct Conf {
     null_data: bool,
     in_place: Option<Vec<u8>>,
     posix: bool,
+    /// `-u`: read a RECORD at a time rather than a block, and flush every output
+    /// after every line. Both halves are one flag because both are what "do not
+    /// buffer" means from either end -- see spec/README.
+    unbuffered: bool,
     /// The width a bare `l` folds at: `COLS` seeds it, `-l N` overrides it, and
     /// with neither it is 70.
     line_wrap: usize,
@@ -3088,6 +3123,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
         // different switches in GNU, and `conf.posix` is `--posix`'s. See the
         // POSIXLY_CORRECT gap in spec/README.
         posix: false,
+        unbuffered: false,
         // Read BEFORE the options, as GNU reads it, so `-l` overrides it and not
         // the other way round.
         line_wrap: std::env::var_os("COLS")
@@ -3179,12 +3215,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                 b"null-data" | b"zero-terminated" => conf.null_data = true,
                 b"posix" => conf.posix = true,
                 b"sandbox" => conf.sandbox = true,
-                // Accepted and ignored. That is content-neutral for ONE stream,
-                // and stopped being so where two share a descriptor: GNU's `-u`
-                // flushes every output after every line (execute.c:415), which
-                // ORDERS a `--posix` `w /dev/stdout` against auto-print. See
-                // spec/README's `-u` gap.
-                b"unbuffered" => {}
+                b"unbuffered" => conf.unbuffered = true,
                 // Accepted and ignored for a DIFFERENT reason: GNU's `--binary`
                 // chooses binary I/O, which exists only where a text mode does,
                 // so on every platform td targets it already does nothing. That
@@ -3283,7 +3314,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                 b'r' | b'E' => conf.ere = true,
                 b's' => conf.separate = true,
                 b'z' => conf.null_data = true,
-                b'u' => {}
+                b'u' => conf.unbuffered = true,
                 // `--binary`'s short spelling: GNU's SHORTOPTS is
                 // `"bsnrzuEe:f:l:i::V:"` (sed.c:191) and both reach the same arm.
                 // Ignored for the same reason, and taking one without the other
@@ -3438,7 +3469,16 @@ fn compile_and_run(
         return Ok(4);
     }
     let inputs: Vec<Vec<u8>> = if files.is_empty() { vec![b"-".to_vec()] } else { files };
+    // `-u` is one flag over both ends: a record at a time IN, a flush after every
+    // line OUT. GNU's is `unbuffered_output` plus an unbuffered input stream.
+    let block = match conf.unbuffered {
+        true => 1,
+        false => Stream::BLOCK,
+    };
     let mut out = Out::new();
+    if conf.unbuffered {
+        out.unbuffer();
+    }
     let mut status = 0;
 
     if conf.separate || conf.in_place.is_some() {
@@ -3484,7 +3524,7 @@ fn compile_and_run(
                     return Ok(4);
                 }
             }
-            let mut stream = Stream::over(path, input, separator, fd0.take());
+            let mut stream = Stream::over(path, input, separator, block, fd0.take());
             // Line numbers, range state, the HOLD SPACE and every REWINDABLE `R`
             // read position restart per file under -s / -i. The output streams and
             // their owed separators do not: those belong to the whole run. GNU
@@ -3574,7 +3614,7 @@ fn compile_and_run(
         // are opened one at a time, so a failure is only suffered where GNU
         // suffers it — reading every one up front reported files a `q` had
         // already quit before, and reported them as SUCCESS.
-        let mut stream = Stream::of_operands(inputs, separator);
+        let mut stream = Stream::of_operands(inputs, separator, block);
         let mut sink = Sink::stdout(&mut out, separator);
         // Held rather than propagated, because the give-back has to happen
         // whatever the run did: GNU leaves the offset after the records it
@@ -3928,6 +3968,9 @@ fn open_source(path: &[u8], separator: u8) -> RFile {
         return RFile { src: RSource::Spent, rewindable: false };
     };
     let rewindable = file.seek(std::io::SeekFrom::Start(0)).is_ok();
+    // A block whatever `-u` says: GNU's flag unbuffers the MAIN input stream, and
+    // an `R` source it opens by name keeps its own buffering. The one `R` source
+    // that shares the run's reader is `/dev/stdin`, which never reaches here.
     let src = RSource::Stream(Records::with_buffer(file, separator, Stream::BLOCK));
     RFile { src, rewindable }
 }
@@ -4283,7 +4326,7 @@ impl Sed {
                 // a positional one: they pay when they have text, and GNU's
                 // `output_line` returns before paying when they have none.
                 Append::Text(Some(text)) => sink.write_text(&text)?,
-                Append::Text(None) => sink.write(&[])?,
+                Append::Text(None) => sink.queued(&[])?,
                 // A missing file is not an error for `r`/`R`, as in GNU sed — but
                 // GNU pays the owed separator BEFORE it finds out, so `printf x |
                 // sed 'r /nonexistent'` still ends with one. Writing the empty
@@ -4293,14 +4336,15 @@ impl Sed {
                     // The owed separator is paid BEFORE the file's fate is known, so
                     // `printf x | sed 'r /nonexistent'` still ends with one -- and so
                     // does `r` over a directory, which then fails with exit 4.
-                    sink.write(&[])?;
+                    sink.queued(&[])?;
                     copy_source(&path, sink)?;
                 }
                 // `R` resolved its line when the command RAN — see `queue_line`.
-                Append::Line(bytes) => sink.write(&bytes)?,
+                Append::Line(bytes) => sink.queued(&bytes)?,
             }
         }
-        Ok(())
+        // The queue is ONE flush, wherever `-u` left the sink: see `queued`.
+        sink.end_line()
     }
 
     fn write_to_file(
@@ -4527,7 +4571,9 @@ impl Sed {
                 Some(Kind::PrependFile(path)) => {
                     // `put`, not `write`: GNU's immediate read goes straight at the
                     // output and does NOT pay an owed separator, so an unterminated
-                    // previous line still owes one AFTER the prepended bytes.
+                    // previous line still owes one AFTER the prepended bytes. It
+                    // does not flush under `-u` either (execute.c:1520 has no
+                    // `flush_output`), so these bytes ride the next flush point.
                     copy_source(path, sink)?;
                 }
                 Some(Kind::ReadLine(path)) => {
@@ -4708,7 +4754,39 @@ mod tests {
         writer.write_all(data).unwrap();
         drop(writer);
         let file = std::fs::File::from(std::os::fd::OwnedFd::from(reader));
-        Stream::over(b"-", Input::File(file), separator, None)
+        Stream::over(b"-", Input::File(file), separator, Stream::BLOCK, None)
+    }
+
+    /// What a run LEAVES on a shared pipe is the whole of `-u`'s read half, and it
+    /// is invisible to the corpus harness: seeing it needs a second reader on the
+    /// same pipe, which a `## argv:` case has no way to hold. A pipe has one
+    /// buffer, so a clone of the read end reads exactly what the stream did not.
+    fn left_on_the_pipe(block: usize, data: &[u8]) -> usize {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(data).unwrap();
+        drop(writer);
+        let rest = reader.try_clone().unwrap();
+        let file = std::fs::File::from(std::os::fd::OwnedFd::from(reader));
+        let mut stream = Stream::over(b"-", Input::File(file), b'\n', block, None);
+        let line = stream.next_line(Opener::Reader).unwrap();
+        assert_eq!(line.text, b"1234567", "one record, whatever the block");
+        drop(stream);
+        let mut tail = Vec::new();
+        let mut rest = std::fs::File::from(std::os::fd::OwnedFd::from(rest));
+        rest.read_to_end(&mut tail).unwrap();
+        tail.len()
+    }
+
+    /// `-u` reads a RECORD at a time, which is what lets the next program on a
+    /// shared descriptor have the rest: of 4104 bytes GNU leaves 8 without the
+    /// flag and 4096 with it -- one 8-byte line DELIVERED either way, and a
+    /// 4096-byte buffer taken only without.
+    #[test]
+    fn unbuffered_takes_one_record_off_a_shared_pipe() {
+        let data = b"1234567\n".repeat(513);
+        assert_eq!(data.len(), 4104);
+        assert_eq!(left_on_the_pipe(1, &data), 4096, "-u leaves all but the record");
+        assert_eq!(left_on_the_pipe(Stream::BLOCK, &data), 8, "buffered takes a block");
     }
 
     /// Run a script over `input` and return what it wrote.

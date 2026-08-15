@@ -8074,17 +8074,155 @@ a
 
 
 #### but that GROUPING is buffering, and -u takes it away in GNU
-# The two streams are separate under the flag either way; what orders them is
-# that GNU block-buffers its stdout while the `w' file flushes first. `-u' makes
-# GNU flush every output after every line (execute.c:415) and the two interleave
-# again. td-txt accepts `-u' and ignores it -- its `w' target is an unbuffered
-# `File' and its auto-print sink is buffered whatever the flag says -- so it
-# groups here regardless. The same holds when stdout is a terminal. xfail with
-# GNU's golden; see spec/README's `-u' gap.
+# The two streams are separate under `--posix' either way; what ORDERS them is
+# that GNU block-buffers its stdout while the `w' file does not. `-u' makes GNU
+# flush every output after every line (execute.c:415) and the two interleave
+# again -- which is what td-txt does too now: the flag unbuffers the auto-print
+# sink, so the `w' target no longer outruns it. Without the flag they group,
+# which is the case above.
 ## argv: sed --posix -u -n -e p -e s/^/W/ -e 'w /dev/stdout' h
 ## file-json h: "1\n2\n3\n"
 ## stdin-json: ""
 ## stdout-json: "1\nW1\n2\nW2\n3\nW3\n"
+## stderr-json: ""
+## status: 0
+
+#### the long spelling is the same flag
+## argv: sed --posix --unbuffered -n -e p -e s/^/W/ -e 'w /dev/stdout' h
+## file-json h: "1\n2\n3\n"
+## stdin-json: ""
+## stdout-json: "1\nW1\n2\nW2\n3\nW3\n"
+## stderr-json: ""
+## status: 0
+
+#### and it clusters, since it takes no value
+## argv: sed --posix -nu -e p -e s/^/W/ -e 'w /dev/stdout' h
+## file-json h: "1\n2\n3\n"
+## stdin-json: ""
+## stdout-json: "1\nW1\n2\nW2\n3\nW3\n"
+## stderr-json: ""
+## status: 0
+
+#### the long one takes no value either
+## argv: sed --unbuffered=3 -n 2p
+## stdin-json: "a\nb\n"
+## stdout-json: ""
+## status: 1
+## stderr-contains: option '--unbuffered' doesn't allow an argument
+
+#### the flush is after every output OPERATION, not only after a line
+# GNU flushes at the end of `output_line', and also after `=', `l' and an append
+# dump -- so each of those orders against a `--posix' `w /dev/stdout' the same
+# way an auto-print does. Eight cases in four PAIRS -- `=', `l', `a', `r', each
+# flagged shape with its unflagged grouping beside it -- because a flush point
+# that exists only for LINES passes every other `-u' case in this file and reds
+# only these.
+## argv: sed --posix -u -n -e '=;w /dev/stdout' h
+## file-json h: "1\n2\n3\n"
+## stdin-json: ""
+## stdout-json: "1\n1\n2\n2\n3\n3\n"
+## stderr-json: ""
+## status: 0
+
+#### and without the flag = groups behind the w target as everything else does
+## argv: sed --posix -n -e '=;w /dev/stdout' h
+## file-json h: "1\n2\n3\n"
+## stdin-json: ""
+## stdout-json: "1\n2\n3\n1\n2\n3\n"
+## stderr-json: ""
+## status: 0
+
+#### l is the same operation and takes the same flush
+## argv: sed --posix -u -n -e 'l;w /dev/stdout' h
+## file-json h: "1\n2\n3\n"
+## stdin-json: ""
+## stdout-json: "1$\n1\n2$\n2\n3$\n3\n"
+## stderr-json: ""
+## status: 0
+
+#### and without the flag l groups too
+## argv: sed --posix -n -e 'l;w /dev/stdout' h
+## file-json h: "1\n2\n3\n"
+## stdin-json: ""
+## stdout-json: "1\n2\n3\n1$\n2$\n3$\n"
+## stderr-json: ""
+## status: 0
+
+#### an a text is dumped at the end of the cycle and flushed there
+## argv: sed --posix -u -e 'a\X' -e 'w /dev/stdout' h
+## file-json h: "1\n2\n3\n"
+## stdin-json: ""
+## stdout-json: "1\n1\nX\n2\n2\nX\n3\n3\nX\n"
+## stderr-json: ""
+## status: 0
+
+#### and without the flag it groups
+## argv: sed --posix -e 'a\X' -e 'w /dev/stdout' h
+## file-json h: "1\n2\n3\n"
+## stdin-json: ""
+## stdout-json: "1\n2\n3\n1\nX\n2\nX\n3\nX\n"
+## stderr-json: ""
+## status: 0
+
+#### an r dump is ONE operation, so the flush is after the whole file
+## argv: sed --posix -u -e 'r sub' -e 'w /dev/stdout' h
+## file-json h: "1\n2\n3\n"
+## file-json sub: "S\n"
+## stdin-json: ""
+## stdout-json: "1\n1\nS\n2\n2\nS\n3\n3\nS\n"
+## stderr-json: ""
+## status: 0
+
+#### and without the flag it groups too
+## argv: sed --posix -e 'r sub' -e 'w /dev/stdout' h
+## file-json h: "1\n2\n3\n"
+## file-json sub: "S\n"
+## stdin-json: ""
+## stdout-json: "1\n2\n3\n1\nS\n2\nS\n3\nS\n"
+## stderr-json: ""
+## status: 0
+
+#### -u is visible on a PIPE through a lowercase r, which reopens the descriptor
+# `r /dev/stdin' opens the NAME rather than sharing the run's reader, so what it
+# dumps is whatever that reader has not taken. Under `-u' the reader has taken
+# one record and `y' is still there; with a block it has taken everything. This
+# is the one shape that pins the descriptor-0 reader's own block size from a
+# case, since the harness runs a single child and cannot watch a second reader.
+## argv: sed -n -u -e 'r /dev/stdin' - -
+## stdin-json: "x\ny"
+## stdout-json: "y"
+## stderr-json: ""
+## status: 0
+
+#### and without it the reader's block has already taken the lot
+## argv: sed -n -e 'r /dev/stdin' - -
+## stdin-json: "x\ny"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### -u is observable inside ONE run, through a w file an r reads back
+# The flag's write half is not only about ordering two descriptors: a `w' target
+# flushed after every line is a file whose content an `r' of the same name sees
+# in the SAME cycle. `r' re-opens per cycle, so the dump grows by a line each
+# time.
+## argv: sed -u -e 'w wf' -e 'r wf' h
+## file-json h: "1\n2\n3\n"
+## stdin-json: ""
+## stdout-json: "1\n1\n2\n1\n2\n3\n1\n2\n3\n"
+## file-after-json wf: "1\n2\n3\n"
+## stderr-json: ""
+## status: 0
+
+#### and WITHOUT it that r sees an empty file, because GNU's w target is buffered
+# td-txt's `w' target is an unbuffered `File' whatever the flag says, so it gives
+# the interleaved answer here as well and this is the case that says so. xfail
+# with GNU's golden; see spec/README's `w'-buffering gap.
+## argv: sed -e 'w wf' -e 'r wf' h
+## file-json h: "1\n2\n3\n"
+## stdin-json: ""
+## stdout-json: "1\n2\n3\n"
+## file-after-json wf: "1\n2\n3\n"
 ## stderr-json: ""
 ## status: 0
 
@@ -12649,7 +12787,7 @@ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
 ## argv: sed "-\x80"
 ## stdin-json: "a\n"
 ## stdout-json: ""
-## stderr-json: "sed: invalid option -- '\x80'\nusage: sed [-nrEsz] [-i[SUFFIX]] [-l N] [-e SCRIPT] [-f FILE] [SCRIPT] [FILE]...\n"
+## stderr-json: "sed: invalid option -- '\x80'\nusage: sed [-nrEszu] [-i[SUFFIX]] [-l N] [-e SCRIPT] [-f FILE] [SCRIPT] [FILE]...\n"
 ## status: 1
 
 #### the LONG spelling of -f names an unopenable script raw as well

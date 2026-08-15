@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 2282;
+const CORPUS_FLOOR: usize = 2297;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -2127,11 +2127,34 @@ fn sed_leaves_a_seekable_stdin_after_the_last_record_it_read(
         // why the give-back is the run's too: repositioning between operands would
         // rewind a descriptor whose buffered records the next operand still reads.
         ("four", &["-s", "-n", "-e", "R /dev/stdin", "-e", "p", "one", "one"], b"ONE\nl1\nONE\nl2\n", b"l3\nl4\n"),
+        // `-u` reads a RECORD at a time instead of a block, so there is nothing
+        // to give back -- and the descriptor must still come out in the same
+        // place, since the count is the reader's rather than the block's.
+        ("four", &["-u", "-n", "1q"], b"", b"l2\nl3\nl4\n"),
+        ("four", &["-u", "-n", "-e", "N;q"], b"", b"l3\nl4\n"),
+        ("unterm", &["-u", "-n", "2q"], b"", b"u3"),
+        ("four", &["-u", "-s", "-n", "1q"], b"", b"l2\nl3\nl4\n"),
+        ("four", &["-u", "-n", "-e", "R /dev/stdin", "-e", "p", "one"], b"ONE\nl1\n", b"l2\nl3\nl4\n"),
+        // The two rows that are NOT GNU's answer, deliberately. The `$' lookahead
+        // is a pushback, and glibc does not return a pushed-back byte to the file
+        // offset on an unbuffered stream, so GNU leaves each of these ONE BYTE
+        // further on and its next reader loses that byte. Matching it would mean
+        // mis-positioning a shared descriptor on purpose. Both shapes are here
+        // because they lose a byte from different places: the first from the
+        // record the lookahead opened `-' to peek at, the second from the one the
+        // `q' was about to leave behind.
+        // GNU offset 1, this 0 -- GNU's next reader gets `1\nl2\nl3\nl4\n'.
+        ("four", &["-u", "-n", "-e", "1{$!p}", "-e", "1q", "one", "-"], b"ONE\n", b"l1\nl2\nl3\nl4\n"),
+        // GNU offset 4, this 3 -- GNU's next reader gets `2\nl3\nl4\n'. Unflagged
+        // both leave 3, which is the row below it.
+        ("four", &["-u", "-n", "-e", "1{$!p}", "-e", "1q"], b"l1\n", b"l2\nl3\nl4\n"),
+        ("four", &["-n", "-e", "1{$!p}", "-e", "1q"], b"l1\n", b"l2\nl3\nl4\n"),
         // The controls. A script that reads to the end leaves nothing, which is
         // what says the rewind is not unconditional; and no `q` at all is the
         // same.
         ("four", &["-n", "$q"], b"", b""),
         ("four", &["-n", "p"], b"l1\nl2\nl3\nl4\n", b""),
+        ("four", &["-u", "-n", "p"], b"l1\nl2\nl3\nl4\n", b""),
     ];
     for (file, args, want_out, want_rest) in rows {
         let (stdout, rest, code) = rest_after(file, args)?;
