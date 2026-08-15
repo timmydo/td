@@ -157,9 +157,24 @@ fn answer(path: &Path, deadline: Duration) -> Result<String, String> {
                 path.display()
             ));
         }
-        let count = stream
-            .read(room)
-            .map_err(|e| format!("read readiness socket {}: {e}", path.display()))?;
+        // A read that ends at `SO_RCVTIMEO` IS the deadline expiring, and it is
+        // the path a silent terminal actually takes — the check at the top of
+        // this loop only fires when the clock ran out before a read was even
+        // attempted. Reported as itself, because an operator runs this probe by
+        // hand to decide whether the terminal is up: "Resource temporarily
+        // unavailable" says nothing about a terminal that never answered. Both
+        // spellings are matched because `set_read_timeout` documents either;
+        // Linux gives the first.
+        let count = stream.read(room).map_err(|e| {
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) {
+                format!("readiness socket {} did not answer in time", path.display())
+            } else {
+                format!("read readiness socket {}: {e}", path.display())
+            }
+        })?;
         if count == 0 {
             return Err(format!(
                 "readiness socket {} answered no complete line",
@@ -208,6 +223,16 @@ mod tests {
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
+    /// The deadline the tests below hand the probe, deliberately NOT
+    /// `PROBE_TIMEOUT`: what they assert is what the probe READS BACK, so
+    /// borrowing a number that exists for an operator's patience made each a
+    /// four-second race against whatever else this gate runs beside.
+    ///
+    /// It is also what BOUNDS them — none goes through `within` — so it is how
+    /// long a stalled publisher takes to redden, and it must stay well under
+    /// `within`'s thirty seconds for the tests that use both.
+    const TEST_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
     /// `cargo test` has no per-test timeout, so a probe that stopped bounding
     /// its wait would hang the gate rather than redden it.
     fn within<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
@@ -242,7 +267,7 @@ mod tests {
         let path = directory.join("td-term-ready");
         let ready = publish(&path, u16::MAX, u16::MAX).unwrap();
         let mut printed = Vec::new();
-        probe_to(&path, PROBE_TIMEOUT, &mut printed).unwrap();
+        probe_to(&path, TEST_PROBE_TIMEOUT, &mut printed).unwrap();
         assert_eq!(printed, marker(u16::MAX, u16::MAX).into_bytes());
         drop(ready);
         fs::remove_dir(&directory).unwrap();
@@ -308,7 +333,7 @@ mod tests {
         // PRINTS is the terminal's own line, byte for byte, since that is what
         // §12 compares against the diagnostic.
         let mut printed = Vec::new();
-        probe_to(&path, PROBE_TIMEOUT, &mut printed).unwrap();
+        probe_to(&path, TEST_PROBE_TIMEOUT, &mut printed).unwrap();
         assert_eq!(printed, marker(24, 80).into_bytes());
 
         drop(ready);
@@ -325,7 +350,7 @@ mod tests {
         assert!(publish(&path, 12, 40).is_err());
         // The first is still the one serving.
         let mut printed = Vec::new();
-        probe_to(&path, PROBE_TIMEOUT, &mut printed).unwrap();
+        probe_to(&path, TEST_PROBE_TIMEOUT, &mut printed).unwrap();
         assert_eq!(printed, marker(24, 80).into_bytes());
 
         // A socket nobody answers is stale, and gets replaced.
@@ -333,7 +358,7 @@ mod tests {
         UnixListener::bind(&path).unwrap();
         let _second = publish(&path, 12, 40).unwrap();
         let mut printed = Vec::new();
-        probe_to(&path, PROBE_TIMEOUT, &mut printed).unwrap();
+        probe_to(&path, TEST_PROBE_TIMEOUT, &mut printed).unwrap();
         assert_eq!(printed, marker(12, 40).into_bytes());
 
         // Anything that is not a socket is not something to replace at all.
@@ -342,6 +367,61 @@ mod tests {
         assert!(publish(&occupied, 24, 80).is_err());
         assert!(occupied.exists(), "a refused publication ate a real file");
         fs::remove_file(&occupied).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&directory).unwrap();
+    }
+
+    /// The deadline is a real bound, and nothing else here covers it: every
+    /// other probe answers at once, so a `deadline` argument that was ignored
+    /// — or a loop that renewed it per read instead of spending it — would
+    /// leave all of them green.
+    ///
+    /// This one passes a SHORT deadline on purpose, and a short one cannot
+    /// flake in the direction that matters: a loaded machine only makes a
+    /// probe more likely to run out of time, never less.
+    ///
+    /// It runs through `within` because the regression it exists to catch is
+    /// a deadline that stopped bounding anything, and a probe run inline
+    /// would then never return — hanging the gate instead of reddening it,
+    /// which is the worst possible failure for this particular test.
+    #[test]
+    fn a_socket_that_never_answers_runs_out_of_time() {
+        let directory = scratch("deadline");
+        let path = directory.join("td-term-ready");
+        // Bound and never accepted: the connect succeeds into the backlog, and
+        // the read then has nothing to return.
+        let listener = UnixListener::bind(&path).unwrap();
+        let deadline = Duration::from_millis(200);
+        let asked = path.clone();
+        let (outcome, printed, waited) = within(move || {
+            let started = Instant::now();
+            let mut printed = Vec::new();
+            let outcome = probe_to(&asked, deadline, &mut printed);
+            (outcome, printed, started.elapsed())
+        })
+        .expect("the probe never returned: its deadline bounds nothing");
+        let reported = outcome.expect_err("a silent socket answered");
+        assert!(
+            reported.contains("did not answer in time"),
+            "the probe failed for another reason: {reported}"
+        );
+        assert!(printed.is_empty(), "a failed probe printed something");
+        // Not an exact `>= deadline`: this is measured on `Instant`, while the
+        // wait it is measuring is a jiffy-rounded socket timeout, and the two
+        // clocks need not agree at the edge. The assertion that matters is
+        // that the probe waited at ALL rather than returning as soon as it
+        // found nothing, and a bound this close still fails a probe that did.
+        let floor = deadline.saturating_sub(Duration::from_millis(10));
+        assert!(waited >= floor, "the probe gave up after only {waited:?}");
+        // And an upper bound, because `within` alone would pass a probe that
+        // ignored this deadline and used some OTHER one: anything under its
+        // thirty seconds looks like a return. Far enough above 200ms that only
+        // a different constant reaches it, not a busy machine.
+        assert!(
+            waited < Duration::from_secs(5),
+            "the probe waited {waited:?}, which is not the deadline it was given"
+        );
+        drop(listener);
         fs::remove_file(&path).unwrap();
         fs::remove_dir(&directory).unwrap();
     }
