@@ -303,6 +303,30 @@ pub const TD_UI_CLIENT_RUNTIME_MARKER: &str = "TD-UI-CLIENT-READY";
 /// DUPLICATED as `MARKER` in td-compositor/src/ready.rs and pinned by its recipe.
 pub const TD_TERM_RUNTIME_MARKER: &str = "TD-TERM-READY";
 
+/// Printed by the compositor for each input device that ANSWERED `EVIOCGABS`
+/// with a span on both axes — QEMU's virtio tablet, on the image the oracle
+/// boots.
+///
+/// It is the one property in that path a unit test cannot hold up: the gate
+/// machine has no absolute device, so a compositor that never asked, or that
+/// asked and discarded the answer, passes every test in `input.rs`. This is
+/// where a real device answering becomes observable, and it carries the SPAN
+/// because the span is what the mapping divides by and a wrong one is
+/// invisible everywhere else: only a span of ZERO is refused, so `0..1` is
+/// admitted and maps every report to one of two positions. Nothing parses the
+/// numbers — this is latched as a substring — so they are for a person reading
+/// a console, the only thing that can tell a plausible range from the device's
+/// real one.
+///
+/// It is emitted from the reader, off the value the mapping itself uses, and
+/// not beside the `EVIOCGABS` that produced it: an answer dropped between the
+/// ask and the use would otherwise leave this line printed over a device read
+/// as relative.
+///
+/// DUPLICATED as the literal in td-compositor/src/input.rs. The compositor
+/// recipe pins the source emit to this value.
+pub const TD_POINTER_ABSOLUTE_MARKER: &str = "TD-POINTER-ABSOLUTE";
+
 /// Kernel-cmdline token the headless `qemu-boot-system` oracle appends so the greeter
 /// waits for the root-owned health/update transaction and then exits. `tty-session`
 /// turns that exit into a clean VM poweroff. Without it, the greeter is interactive.

@@ -390,7 +390,13 @@ fn boot_interactive(
     command
         .args(["-m", "512", "-no-reboot"])
         .args(["-no-user-config", "-nic", "none", "-vga", "none"])
-        .args(["-device", "virtio-vga"]);
+        .args(["-device", "virtio-vga"])
+        // An ABSOLUTE pointer, and here it is the point rather than a proof: an
+        // operator sitting in front of this one has a host cursor, and QEMU's
+        // PS/2 mouse gives the guest deltas it accumulates — which leaves the
+        // right and bottom edges of the screen unreachable no matter how far
+        // the mouse is pushed. The tablet reports where the cursor IS.
+        .args(["-device", "virtio-tablet-pci"]);
     if !host_display_available() {
         command.args(["-display", "none"]);
     }

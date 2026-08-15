@@ -1316,6 +1316,21 @@ fn read_device<T: InputTarget>(
 ) -> Result<(), String> {
     let mut buffer = [0u8; READ_BATCH_BYTES];
     let mut filled = 0usize;
+    // The boot oracle's only evidence that a real device answered, since the
+    // gate machine has none to ask. Printed off the argument `state` is built
+    // from rather than beside the `EVIOCGABS` in `start`: being ASKED is not
+    // the property, being USED is, and an answer dropped between the two would
+    // leave this line printed over a device read as relative.
+    if let Some(axes) = axes {
+        eprintln!(
+            "TD-POINTER-ABSOLUTE device={} x={}..{} y={}..{}",
+            path.display(),
+            axes.x.minimum,
+            axes.x.maximum,
+            axes.y.minimum,
+            axes.y.maximum
+        );
+    }
     let mut state = DeviceState::new(axes, resync);
     let mut last_time = 0;
     let result = loop {
@@ -1501,8 +1516,9 @@ mod tests {
         }
     }
 
-    /// One axis of QEMU's `usb-tablet`, which reports 0..=32767 and is the
-    /// device this exists for. `value` is where the kernel says it is now.
+    /// One axis of QEMU's `virtio-tablet-pci`, which reports 0..=32767 and is
+    /// the device the image attaches. `value` is where the kernel says it is
+    /// now.
     fn axis(value: i32, minimum: i32, maximum: i32) -> sys::AbsInfo {
         sys::AbsInfo {
             value,

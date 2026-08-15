@@ -101,6 +101,12 @@ const TD_INIT_RUNTIME_MARKER: &str = td_recipe::ladder::TD_INIT_RUNTIME_MARKER;
 const TD_LOGIN_RUNTIME_MARKER: &str = td_recipe::ladder::TD_LOGIN_RUNTIME_MARKER;
 /// Printed after the unprivileged software compositor paints and listens.
 const TD_WAYLAND_RUNTIME_MARKER: &str = td_recipe::ladder::TD_WAYLAND_RUNTIME_MARKER;
+
+/// Printed by the compositor for a device that answered `EVIOCGABS` with a span
+/// on both axes. Attached headless the tablet delivers no motion, so what this
+/// proves is enumeration and the ANSWER — which is the half no unit test can
+/// reach, the gate machine having no absolute device.
+const TD_POINTER_ABSOLUTE_MARKER: &str = td_recipe::ladder::TD_POINTER_ABSOLUTE_MARKER;
 /// Printed by the FIRST client the machine now starts: the terminal, after a frame
 /// at a compositor-chosen size and a PTY the kernel agrees is that grid.
 const TD_TERM_RUNTIME_MARKER: &str = td_recipe::ladder::TD_TERM_RUNTIME_MARKER;
@@ -235,6 +241,7 @@ struct ConsoleEvidence {
     td_init_runtime: bool,
     td_login_runtime: bool,
     td_wayland_runtime: bool,
+    td_pointer_absolute: bool,
     td_term_runtime: bool,
     persist_write: bool,
     persist_read: bool,
@@ -791,6 +798,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          td-login credential switch the switched process read back and confirmed \
          ({TD_LOGIN_RUNTIME_MARKER}), then assigned the single-user graphical seat and brought \
          the software Wayland socket up on virtio-gpu ({TD_WAYLAND_RUNTIME_MARKER}), \
+         read an absolute position and its span off the virtio tablet \
+         ({TD_POINTER_ABSOLUTE_MARKER}), \
          presented the td-native wl_shm TERMINAL and received its first frame callback \
          ({TD_TERM_RUNTIME_MARKER}), \
          and unmounted state \
@@ -1176,6 +1185,23 @@ fn validate_system_boot(
              /dev/fb0 and the evdev seat to uid 1000, the unprivileged compositor could not \
              paint the virtio-gpu framebuffer, or its mode-0600 Wayland socket never began \
              listening. The serial greeter remains the recovery path. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_pointer_absolute {
+        return Err(format!(
+            "the compositor came up, but no input device reported an absolute position \
+             ({TD_POINTER_ABSOLUTE_MARKER:?} was absent) — the guest kernel has no \
+             VIRTIO_INPUT driver, this runner's argv no longer carries \
+             -device virtio-tablet-pci, the compositor's EVIOCGABS was refused, or its \
+             answer was dropped before the reader that maps with it. Those four are what \
+             REACHES here: a qemu that cannot attach the device fails at startup, and a \
+             seat the compositor cannot open kills it before it announces, so the \
+             graphical marker above catches that one. Nothing else notices this: the \
+             compositor still runs, the PS/2 mouse still moves a cursor, and it simply \
+             cannot be pushed to the right or bottom edge of the screen. This is the ONLY \
+             check that a real device answered — the unit gate has no absolute device to \
+             ask. Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -2250,6 +2276,12 @@ fn boot(
     //   tty/stdio games (unlike -nographic, which wants a terminal on stdin).
     // -display none / -monitor none: fully headless. The attached virtio-vga still
     //   exercises fbdev and the software compositor; only its host display is hidden.
+    // -device virtio-tablet-pci: an ABSOLUTE pointer. Headless it delivers no motion
+    //   — there is no host cursor to follow — but it still ENUMERATES, and that is
+    //   the half this proves: the guest binds it, evdev publishes the node, and the
+    //   compositor's EVIOCGABS gets a span back. The oracle latches the marker that
+    //   answer produces, which is the only place a real device answering is visible
+    //   (the unit gate has no absolute device to ask).
     // Networking is attached conditionally below (a user-mode NIC for qemu-boot-net,
     // else `-nic none`) — qemu's default is an implicit user-mode NIC, so every mode
     // sets one explicitly.
@@ -2283,6 +2315,7 @@ fn boot(
         .args(["-display", "none", "-monitor", "none"])
         .args(["-no-user-config", "-vga", "none"])
         .args(["-device", "virtio-vga"])
+        .args(["-device", "virtio-tablet-pci"])
         .args(["-serial", &serial])
         .arg("-kernel")
         .arg(bzimage)
@@ -2592,6 +2625,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_INIT_RUNTIME_MARKER.len(),
         TD_LOGIN_RUNTIME_MARKER.len(),
         TD_WAYLAND_RUNTIME_MARKER.len(),
+        TD_POINTER_ABSOLUTE_MARKER.len(),
         TD_TERM_RUNTIME_MARKER.len(),
         SYSTEM_PERSIST_WRITE_MARKER.len(),
         SYSTEM_PERSIST_READ_MARKER.len(),
@@ -2726,6 +2760,11 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         &mut evidence.td_wayland_runtime,
         buf,
         TD_WAYLAND_RUNTIME_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.td_pointer_absolute,
+        buf,
+        TD_POINTER_ABSOLUTE_MARKER.as_bytes(),
     );
     latch_marker(
         &mut evidence.td_term_runtime,
@@ -3191,7 +3230,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 33] {
+    fn all_console_markers() -> [&'static str; 34] {
         [
             MARKER,
             EROFS_MARKER,
@@ -3225,6 +3264,7 @@ mod tests {
             TD_INIT_RUNTIME_MARKER,
             TD_LOGIN_RUNTIME_MARKER,
             TD_WAYLAND_RUNTIME_MARKER,
+            TD_POINTER_ABSOLUTE_MARKER,
             TD_TERM_RUNTIME_MARKER,
         ]
     }

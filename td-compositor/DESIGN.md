@@ -196,7 +196,8 @@ Deliberately not here: disk free, which needs `statfs(2)` and so an
 wireless, ethernet and temperature fields of the i3status config this is
 modelled on. All three are additions rather than changes to what is above.
 
-Input is QEMU's PS/2 keyboard and pointer through evdev. The compositor
+Input is QEMU's PS/2 keyboard and pointer plus its virtio tablet, all through
+evdev. The compositor
 supports EV_KEY, EV_REL, EV_ABS, and EV_SYN. It has a fixed US key map. Every
 binding is ONE chord on `Super`:
 
@@ -283,7 +284,7 @@ A pointer device reports one of two different things, and the compositor
 accepts both. A RELATIVE device (EV_REL) reports a distance to add to
 wherever the cursor already is; an ABSOLUTE one (EV_ABS) reports a PLACE in
 its own units, which is what a tablet, a touchscreen and QEMU's
-`-device usb-tablet` are. Only the second can be trusted to arrive at an
+`-device virtio-tablet-pci` are. Only the second can be trusted to arrive at an
 edge. A relative pointer inside a VM is integrating deltas the host stops
 sending the moment the host's own cursor leaves the guest window, so the
 guest cursor and the host cursor drift apart and the last column of the
@@ -292,7 +293,55 @@ way to tell that from a mouse simply not being pushed further. Nothing in
 the guest fixes that, because the missing motion never happened; an absolute
 device does not have the problem to fix, since each report says where rather
 than how far. QEMU's default PS/2 mouse is relative, so an image wanting the
-edges wants `-device usb-tablet` in its invocation.
+edges needs an absolute device attached, and this one attaches
+`-device virtio-tablet-pci`. Virtio rather than the more familiar
+`-device usb-tablet`: the USB tablet would want a host controller and the
+guest's whole USB and HID stack built in for one device, where the virtio
+tablet rides the VIRTIO_PCI transport already carrying the disk and the GPU
+and costs one Kconfig symbol under a menuconfig parent the erofs root
+already pins. The PS/2 mouse stays attached beside it, since a relative
+device is still what an ordinary machine has and the compositor must keep
+serving one.
+
+That a device is ATTACHED is not the same as a device ANSWERING, and only
+the second is worth a check. So the compositor prints `TD-POINTER-ABSOLUTE`
+with the node and the span for each device that returned one, and the
+headless boot oracle latches that line. Headless there is no host cursor and
+so no motion at all; what the boot proves is enumeration and the answer,
+which is exactly the half no unit test can hold up. The gate machine has no
+absolute device, so a compositor that never asked — or that asked and
+dropped the answer — passes every test in `input.rs` and still reaches an
+image whose pointer cannot cross the screen. The span rides along because it
+is what the mapping divides by, and a WRONG one is invisible everywhere
+else: `declared` refuses only a span of zero, so `0..1` is admitted and maps
+every report to one of two positions. Nothing parses the numbers — the
+oracle latches the substring — so they are there to be read by a person
+looking at a console, which is the only thing that can tell a plausible
+range from the device's real one.
+
+WHERE it is printed is the load-bearing part, and it is not beside the
+`EVIOCGABS`. The line comes off the argument the reader is about to build
+its `DeviceState` from, because the property is not that an answer was
+ASKED FOR but that it is USED. Printed at the ask, an answer dropped
+between the two — the reader handed `None` — would leave the marker and
+the whole unit gate green while every report on that device was read as
+relative motion of zero, which is the same dead pointer by a different
+route.
+
+Only the HEADLESS invocation is covered that way. The interactive runner
+attaches the same device and nothing tests its argv, which is where an
+operator would meet the failure — and is also why it is left: that runner
+has a person in front of it, and a tablet missing from it presents as the
+cursor not reaching the right edge, which is the complaint this whole
+mechanism came from.
+
+And "covered" means by the deployment boot proof rather than by the
+branch gate, which is a weaker guarantee than the rest of this document
+describes. `system-x86-64` owns no gated check, so the oracle that latches
+this marker runs only in a full image build; `td-builder ready` goes green
+over a commit that broke the pointer entirely. Every claim above about
+what the marker catches is therefore a claim about `qemu-boot-system`, and
+whoever changes this path should run it rather than trusting the gate.
 
 Absolute axes are declared per device rather than per report, so each node is
 asked when it is opened — and only then, bar the recoveries below — for where
@@ -412,8 +461,8 @@ fix needs no new ioctl — `/sys/class/input/*/properties` carries the
 `INPUT_PROP_DIRECT` is the distinction wanted — but the property a QEMU
 tablet actually sets cannot be checked from here, and gating on the wrong
 bit would make the feature refuse the one device it exists for. The hardware
-profile above has none of them: it is a PS/2 keyboard, a PS/2 mouse, and
-(once the guest is given one) a tablet.
+profile above has none of them: it is a PS/2 keyboard, a PS/2 mouse, and a
+virtio tablet.
 
 Compositor commands act only on key presses. Evdev autorepeat records are
 ignored for both compositor and client delivery. A held `Super+v` therefore
@@ -1306,7 +1355,10 @@ incompatible role uses `wl_pointer.error.role`. Cursor buffers are immediately
 released and never enter the tiling scene. The first renderer continues to
 draw its fixed software cursor and deliberately ignores the requested image
 and hotspot; themed client cursors are a later rendering increment. There are
-no axis events in the PS/2 profile.
+no axis events: this compositor emits no `wl_pointer.axis` at all, so nothing
+a device declares as a wheel reaches a client. Written as a property of the
+compositor rather than of the profile, which used to be PS/2 alone and now
+carries the tablet too.
 
 Keyboard and pointer deliveries share one bounded per-client seat queue.
 Each event serial is shared by all matching resources, and a resource bound
@@ -1469,7 +1521,7 @@ demo's alone and is proved from the launcher rather than at boot.
 
 The landing must prove:
 
-- the kernel pins fbdev, virtio-gpu, PS/2, and evdev built in;
+- the kernel pins fbdev, virtio-gpu, PS/2, virtio-input, and evdev built in;
 - interactive QEMU attaches virtio-vga and preserves ttyS0 on stdio;
 - the seat and compositor multicall artifacts are static ELF64 ET_EXEC files,
   and the demo entry point is a relative symlink to that static multicall;

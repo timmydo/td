@@ -384,6 +384,16 @@ pub fn recipe() -> Recipe {
     //    SOFTWARE UI: the first graphical profile writes XRGB8888 through the
     //    virtio-gpu driver's fbdev client and reads QEMU's PS/2 devices through
     //    evdev. Every driver is built in because modules remain forbidden.
+    //    VIRTIO_INPUT is the pointer that can reach the edges: QEMU's PS/2 mouse
+    //    reports MOTION, and a host cursor at the last column of the window sends
+    //    a delta the guest accumulates to somewhere short of it — so the right
+    //    and bottom edges are unreachable however far the mouse is pushed. The
+    //    virtio tablet reports a PLACE instead, over a span the compositor asks
+    //    for with EVIOCGABS. It sits under the VIRTIO_MENU parent already pinned
+    //    for the erofs root, and its two dependencies — VIRTIO and INPUT — are
+    //    both pinned and guarded above, so it needs no new menuconfig parent and
+    //    nothing new below it. PS/2 stays on beside it, since a relative device
+    //    is still what an ordinary machine has.
     //    DRM_CLIENT_SELECTION is selected by DRM_VIRTIO_GPU; the explicit pins
     //    on its fbdev client and default keep /dev/fb0 from depending on a
     //    Kconfig default. The VT/fbcon path leaves a visible recovery console
@@ -463,6 +473,7 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_KEYBOARD_ATKBD[ =]/d; \
                   /^#? *CONFIG_INPUT_MOUSE[ =]/d; \
                   /^#? *CONFIG_MOUSE_PS2[ =]/d; \
+                  /^#? *CONFIG_VIRTIO_INPUT[ =]/d; \
                   /^#? *CONFIG_SERIO[ =]/d; \
                   /^#? *CONFIG_SERIO_I8042[ =]/d; \
                   /^#? *CONFIG_VT[ =]/d; \
@@ -531,6 +542,7 @@ pub fn recipe() -> Recipe {
                    'CONFIG_KEYBOARD_ATKBD=y' \
                    'CONFIG_INPUT_MOUSE=y' \
                    'CONFIG_MOUSE_PS2=y' \
+                   'CONFIG_VIRTIO_INPUT=y' \
                    'CONFIG_SERIO=y' \
                    'CONFIG_SERIO_I8042=y' \
                    'CONFIG_VT=y' \
@@ -595,6 +607,7 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_INPUT_EVDEV=y' .config || { echo 'INPUT_EVDEV off — td-compositor cannot read /dev/input/eventN' >&2; exit 1; }; \
                  grep -q '^CONFIG_KEYBOARD_ATKBD=y' .config || { echo 'KEYBOARD_ATKBD off — the qemu PS/2 keyboard would not appear' >&2; exit 1; }; \
                  grep -q '^CONFIG_MOUSE_PS2=y' .config || { echo 'MOUSE_PS2 off — the qemu PS/2 pointer would not appear' >&2; exit 1; }; \
+                 grep -q '^CONFIG_VIRTIO_INPUT=y' .config || { echo 'VIRTIO_INPUT off — the qemu virtio tablet would not appear, so the pointer could not reach the far edges of the screen' >&2; exit 1; }; \
                  grep -q '^CONFIG_SERIO_I8042=y' .config || { echo 'SERIO_I8042 off — qemu PS/2 input has no controller' >&2; exit 1; }; \
                  grep -q '^CONFIG_VT_CONSOLE=y' .config || { echo 'VT_CONSOLE off — the framebuffer recovery console is unavailable' >&2; exit 1; }; \
                  grep -q '^CONFIG_FRAMEBUFFER_CONSOLE=y' .config || { echo 'FRAMEBUFFER_CONSOLE off — virtio fbdev cannot host the recovery console' >&2; exit 1; }; \

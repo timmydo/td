@@ -216,7 +216,8 @@ pub fn recipe() -> Recipe {
 mod tests {
     use super::*;
     use crate::ladder::{
-        TD_TERM_RUNTIME_MARKER, TD_UI_CLIENT_RUNTIME_MARKER, TD_WAYLAND_RUNTIME_MARKER,
+        TD_POINTER_ABSOLUTE_MARKER, TD_TERM_RUNTIME_MARKER, TD_UI_CLIENT_RUNTIME_MARKER,
+        TD_WAYLAND_RUNTIME_MARKER,
     };
 
     #[test]
@@ -252,6 +253,32 @@ mod tests {
         assert!(ready.contains(&format!(
             "pub const MARKER: &str = \"{TD_TERM_RUNTIME_MARKER}\";"
         )));
+        // The absolute-pointer marker is the only evidence that a real device
+        // answered `EVIOCGABS`, and the whole CALL is pinned as the three
+        // above are — a literal alone would be satisfied by a `const` nothing
+        // prints. Every argument is in it because their order is the part no
+        // runtime check on this gate can see: `minimum` and `maximum` are two
+        // fields of one type, so a crossed pair prints a reversed range that
+        // latches exactly the same.
+        let input = MODULES
+            .iter()
+            .find_map(|(name, source)| (*name == "input").then_some(*source))
+            .expect("input source");
+        let emit = [
+            "        eprintln!(".to_string(),
+            format!(
+                "            \"{TD_POINTER_ABSOLUTE_MARKER} device={{}} \
+                 x={{}}..{{}} y={{}}..{{}}\","
+            ),
+            "            path.display(),".to_string(),
+            "            axes.x.minimum,".to_string(),
+            "            axes.x.maximum,".to_string(),
+            "            axes.y.minimum,".to_string(),
+            "            axes.y.maximum".to_string(),
+            "        );".to_string(),
+        ]
+        .join("\n");
+        assert!(input.contains(&emit), "input.rs no longer emits the marker");
     }
 
     /// One artifact, three names. The symlink is what makes the terminal
