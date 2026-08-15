@@ -1017,6 +1017,17 @@ fn run_gate(
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
+        // …and the gate dies with the runner. The watchdog above only protects a
+        // run whose runner is alive to fire it; a runner that is KILLED would
+        // otherwise leave the gate reparented to init, spinning with nothing
+        // waiting on it.
+        //
+        // INVARIANT: whichever thread spawns here must be the one that waits
+        // below. PDEATHSIG watches the parent THREAD, so spawning from the
+        // watchdog thread — or handing the `Child` to another — would SIGKILL
+        // every gate the moment that thread finished, reported as an ordinary
+        // body failure (exit 137) with nothing naming the cause.
+        crate::sandbox::die_with_parent(&mut cmd);
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -2737,5 +2748,106 @@ mod tests {
         let c = cfg(&d, 1, None); // gate_timeout_secs = 0
         assert!(run_selected(&set, &sel, &c).unwrap());
         assert!(d.join("slow.ran").exists(), "an unbudgeted gate must run to completion");
+    }
+
+    /// A gate must not outlive the runner that spawned it. The incident this
+    /// guards left eight test binaries reparented to init, still spinning three
+    /// days later, because nothing tied their lives to the run's.
+    ///
+    /// Driven through a re-exec of this binary because the property is about the
+    /// SPAWNER dying, and the test process cannot be the one to die: the child
+    /// role spawns a sleeper and exits at once, and the grader then requires the
+    /// sleeper to be gone. The control arm — the same spawn UNARMED — is what
+    /// keeps it from passing vacuously, since a sleeper that died for any other
+    /// reason would satisfy the armed half alone.
+    ///
+    /// What it does NOT observe is thread-vs-process: libtest runs this on a
+    /// spawned thread, so the armed sleeper dies when that THREAD exits either
+    /// way. The production invariant that makes the difference — spawn and wait
+    /// on one thread — is documented at the call site, not asserted here.
+    #[test]
+    fn a_gate_child_does_not_outlive_the_runner() {
+        const ROLE: &str = "TD_TEST_PDEATHSIG_ROLE";
+        const NAME: &str = "gates::tests::a_gate_child_does_not_outlive_the_runner";
+
+        // The re-exec'd half: spawn a sleeper, print its pid, exit immediately.
+        // Nothing here asserts — the grader reads the outcome out of /proc.
+        if let Ok(role) = std::env::var(ROLE) {
+            let mut cmd = std::process::Command::new("sleep");
+            // NULL stdio, or the sleeper inherits the pipes `output()` is
+            // reading and the grader cannot see EOF until the sleep ENDS —
+            // which made the control arm block its full 30s and then grade an
+            // already-exited process. Measured: 30.02s and a lost race with
+            // inherited pipes, 23ms and a live sleeper without them.
+            cmd.arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            if role == "armed" {
+                crate::sandbox::die_with_parent(&mut cmd);
+            }
+            if let Ok(child) = cmd.spawn() {
+                println!("PID {}", child.id());
+            }
+            return;
+        }
+
+        // A zombie keeps its /proc entry, so a pathname test alone would read a
+        // killed sleeper as alive — and an exited control as surviving, which is
+        // the vacuity the control arm exists to prevent. These are grandchildren
+        // and cannot be reaped here, so the state field is the only honest
+        // answer; it follows the LAST ')', a comm being able to contain both
+        // spaces and parentheses.
+        let alive = |pid: u32| -> bool {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return false;
+            };
+            match stat.rsplit_once(')') {
+                Some((_, rest)) => !matches!(rest.split_whitespace().next(), Some("Z") | None),
+                None => false,
+            }
+        };
+        // Run one role and hand back the sleeper's pid.
+        let spawn_role = |role: &str| -> Option<u32> {
+            let exe = std::env::current_exe().ok()?;
+            let out = std::process::Command::new(exe)
+                .args(["--exact", NAME, "--nocapture"])
+                .env(ROLE, role)
+                .output()
+                .ok()?;
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .find_map(|l| l.strip_prefix("PID ")?.trim().parse::<u32>().ok())
+        };
+
+        let armed = spawn_role("armed").expect("the armed role must report a pid");
+        let mut leaked: Vec<u32> = vec![armed];
+        // `output()` has already reaped the spawner, so the kernel has delivered
+        // the signal; poll rather than assume the target has been scheduled.
+        let mut gone = false;
+        for _ in 0..100 {
+            if !alive(armed) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let bare = spawn_role("bare");
+        let bare_survived = bare.is_some_and(alive);
+        // SIGNALLED, not reaped: these are grandchildren, so this process cannot
+        // wait on them — the kill is only what stops a 30s sleeper outliving the
+        // test. Both go before either assert, and an `alive` check guards each,
+        // so a failing run neither leaks a sleeper nor signals a recycled pid.
+        leaked.extend(bare);
+        for pid in leaked {
+            if alive(pid) {
+                let _ = crate::sys::kill_pid(i64::from(pid), crate::sys::SIGKILL);
+            }
+        }
+        assert!(gone, "an armed child must die with the process that spawned it");
+        assert!(
+            bare_survived,
+            "the control must OUTLIVE its spawner, or the armed half proves nothing"
+        );
     }
 }

@@ -237,6 +237,47 @@ pub fn cap_child_data_rlimit(cmd: &mut Command, bytes: u64) {
     }
 }
 
+/// Arm `cmd`'s child to die with the process that spawned it:
+/// PR_SET_PDEATHSIG(SIGKILL) between fork and exec. A gate runner that is
+/// killed rather than exiting — a cancelled agent session, Ctrl-C, an OOM —
+/// otherwise leaves its gate reparented to init, where it keeps running with
+/// nobody waiting on it; eight such test binaries once spun for three days.
+///
+/// This reaches the DIRECT child only: the flag is cleared across fork(2), so a
+/// body's own descendants do not inherit it. While the runner LIVES they are
+/// still covered, by the watchdog's process-GROUP kill (gates.rs). When the
+/// runner is KILLED they are not: the watchdog dies with it, and a cgroup does
+/// not kill its members when the runner exits either. So this narrows the
+/// orphan window to a gate's grandchildren rather than closing it — closing it
+/// needs a PID namespace or a cgroup.kill, neither of which is here.
+pub fn die_with_parent(cmd: &mut Command) {
+    /// ESRCH, "no such process" — the errno the bail path reports. Spelled here
+    /// rather than taken from libc: this workspace carries zero dependencies.
+    const ESRCH: i32 = 3;
+
+    // Captured HERE, in the parent, rather than read once the fork has happened:
+    // a getppid taken in the child cannot tell "my parent" from "the reaper that
+    // already adopted me", so a parent dying anywhere in the fork→pre_exec path
+    // would leave both reads agreeing and PDEATHSIG armed against the reaper —
+    // the child running on orphaned, which is the case this exists to prevent.
+    let parent = i64::from(std::process::id());
+    // Post-fork safe: set_pdeathsig/getppid are raw syscalls, and
+    // from_raw_os_error packs an errno without allocating.
+    unsafe {
+        cmd.pre_exec(move || {
+            sys::set_pdeathsig(sys::SIGKILL)?;
+            if sys::getppid() != parent {
+                // Fail the SPAWN rather than exiting 0: std reads a clean child
+                // exit here as "exec succeeded", so the gate would wait(0),
+                // report Passed and be JOURNALLED GREEN for --resume having
+                // never run its body.
+                return Err(io::Error::from_raw_os_error(ESRCH));
+            }
+            Ok(())
+        });
+    }
+}
+
 /// WHO issued the authority for a staged input's hash — its provenance CLASS
 /// (re #469). Integrity and provenance are distinct: integrity is "the bytes
 /// match a recorded hash"; provenance is "the authority that recorded that
