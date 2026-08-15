@@ -73,7 +73,9 @@ const MAX_NAME_COL: usize = 48;
 /// carry a branch's ahead count, which is unbounded, and a cell that overruns
 /// shifts every column right of it on that row alone — a misaligned table
 /// rather than a long word.
-const READY_COL: usize = 6;
+/// Six because `landed` and `!merge` are, and `--list` — which cannot measure
+/// its rows without holding them all — pads to this same floor.
+pub const READY_COL: usize = 6;
 const COUNTS_COL: usize = 7;
 
 struct Reviewing {
@@ -95,12 +97,11 @@ pub struct App {
     /// Per-branch review-record status, aligned with `branches` — whether every
     /// commit a landing would replay carries the record AGENTS.md requires.
     readiness: Vec<record::Readiness>,
-    /// Per-branch, aligned with `branches`: landing it would produce NOTHING,
-    /// the base already carrying its whole tree. A landing rewrites the oids,
-    /// so the branch's own copies survive on the remote until its agent
-    /// rebases, and ancestry — which is all `%(ahead-behind:)` counts — goes on
-    /// reporting them as commits to land.
-    nothing_to_land: Vec<bool>,
+    /// Per-branch, aligned with `branches`: what a landing would find there. A
+    /// landing rewrites the oids, so the branch's own copies survive on the
+    /// remote until its agent rebases, and ancestry — which is all
+    /// `%(ahead-behind:)` counts — goes on reporting them as commits to land.
+    prospects: Vec<git::Prospect>,
     view: Vec<usize>,
     sel: usize,
     top: usize,
@@ -138,7 +139,7 @@ impl App {
             base,
             branches: Vec::new(),
             readiness: Vec::new(),
-            nothing_to_land: Vec::new(),
+            prospects: Vec::new(),
             view: Vec::new(),
             sel: 0,
             top: 0,
@@ -190,52 +191,15 @@ impl App {
 
     pub fn reload(&mut self) -> io::Result<()> {
         self.branches = self.git.branches(&self.base)?;
-        // One log per branch. A branch whose commits cannot be read stays
-        // Unknown rather than Ready: the column may never invent a record.
-        self.readiness = self
-            .branches
-            .iter()
-            // Fully qualified, like every other range here: a TAG named after the
-            // branch would otherwise resolve first, and the count cross-check
-            // below would then compare two different ranges.
-            .map(|b| match self.git.commit_records(&format!(
-                "refs/heads/{}..refs/remotes/{}",
-                self.base, b.refname
-            )) {
-                // Cross-checked against the count for-each-ref reported, which
-                // is free and comes from a different query: a batch that lost a
-                // commit to a separator in someone's message must not read as
-                // ready. Without counts (pre-2.41 git) there is nothing to
-                // compare, and the scan stands on its own parse.
-                Ok(commits) => match b.counts {
-                    Some((ahead, _)) => record::readiness_for(ahead as usize, &commits),
-                    None => record::readiness(&commits),
-                },
-                Err(_) => record::Readiness::Unknown,
-            })
-            .collect();
-        // One merge per branch that has anything ahead at all — a branch at zero
-        // already reads as empty. Measured on this repo's own remotes it costs
-        // what the record scan above does, both around 8ms a branch.
-        //
-        // A failed query leaves the row saying what its record says. That is the
-        // conservative direction here, unlike every fail-closed query in this
-        // crate: those refuse an ACTION, and the worst this can do is show a
-        // branch worth opening. Claiming "landed" on an unanswered question
-        // would hide one.
+        self.readiness =
+            self.branches.iter().map(|b| readiness_of(&self.git, &self.base, b)).collect();
+        // One merge per branch that has anything ahead at all. Measured on this
+        // repo's own remotes it costs what the record scan does, both around
+        // 8ms a branch; the patch count behind a conflicted merge is a second
+        // process, on the few branches that reach it.
         let base_tree = self.git.resolve_base(&self.base).ok();
-        self.nothing_to_land = self
-            .branches
-            .iter()
-            .map(|b| {
-                !b.nothing_ahead()
-                    && base_tree.as_ref().is_some_and(|base| {
-                        self.git
-                            .lands_nothing(base, &format!("refs/remotes/{}", b.refname))
-                            .unwrap_or(false)
-                    })
-            })
-            .collect();
+        self.prospects =
+            self.branches.iter().map(|b| self.git.prospect_of(base_tree.as_ref(), b)).collect();
         self.base_stale = self.git.base_behind_upstream(&self.base).unwrap_or(None);
         self.now = now_unix();
         self.apply_filter();
@@ -371,7 +335,7 @@ impl App {
                 Some(b) => ready_cell(
                     b,
                     self.readiness.get(i),
-                    self.nothing_to_land.get(i).copied().unwrap_or(false),
+                    self.prospects.get(i).copied().unwrap_or(git::Prospect::Outstanding),
                 ),
                 None => (record::Readiness::Unknown.label(), false),
             })
@@ -1424,6 +1388,25 @@ fn help_lines() -> Vec<Line> {
             ("q", "quit"),
         ],
     );
+    // The column's whole vocabulary, because two of these cells are answers to
+    // a question the operator did not ask — what a LANDING would find, which no
+    // key spells out until one is pressed. Titled as CELLS because `?` is also
+    // a key above, and the two columns of this sheet look alike.
+    section(
+        "READY column (cells, not keys)",
+        &[
+            ("ok", "every commit carries the record AGENTS.md requires"),
+            ("n/m!", "n of its m commits do not"),
+            ("?", "the records could not be read"),
+            ("-", "no commits over the base"),
+            ("landed", "nothing left to land: the base carries this work"),
+            ("", "already, under its own oids after a landing replayed"),
+            ("", "them — rebase the branch and it empties"),
+            ("!merge", "does not merge onto the base, so neither s nor r"),
+            ("", "can take it as it stands; rebase it, unless it shares"),
+            ("", "no history with the base at all, which nothing lands"),
+        ],
+    );
     section(
         "review",
         &[
@@ -1494,6 +1477,31 @@ fn fitted<'a>(cells: impl Iterator<Item = &'a str>, floor: usize) -> usize {
     cells.map(|c| c.chars().count()).chain([floor]).max().unwrap_or(floor)
 }
 
+/// Whether every commit a landing would replay carries the record AGENTS.md
+/// requires — the other half of the READY cell, shared with `--list` for the
+/// reason [`git::Git::prospect_of`] is: two scans of the same commits are two
+/// answers that can differ.
+///
+/// One log per branch. A branch whose commits cannot be read stays `Unknown`
+/// rather than `Ready`: the column may never invent a record.
+pub fn readiness_of(git: &Git, base: &str, b: &Branch) -> record::Readiness {
+    // Fully qualified, like every other range here: a TAG named after the
+    // branch would otherwise resolve first, and the count cross-check below
+    // would then compare two different ranges.
+    match git.commit_records(&format!("refs/heads/{base}..refs/remotes/{}", b.refname)) {
+        // Cross-checked against the count for-each-ref reported, which is free
+        // and comes from a different query: a batch that lost a commit to a
+        // separator in someone's message must not read as ready. Without counts
+        // (pre-2.41 git) there is nothing to compare, and the scan stands on
+        // its own parse.
+        Ok(commits) => match b.counts {
+            Some((ahead, _)) => record::readiness_for(ahead as usize, &commits),
+            None => record::readiness(&commits),
+        },
+        Err(_) => record::Readiness::Unknown,
+    }
+}
+
 /// A row's READY cell and whether it is de-emphasised — pure, so the rule is
 /// testable without a terminal or a repo, as `worktrees::decide` is.
 ///
@@ -1508,15 +1516,40 @@ fn fitted<'a>(cells: impl Iterator<Item = &'a str>, floor: usize) -> usize {
 /// landed anything, and it is asked the question at all only where git reports
 /// no ahead-behind counts (pre-2.41), where the merge of an ancestor branch
 /// answers yes.
-fn ready_cell(b: &Branch, readiness: Option<&record::Readiness>, landed: bool) -> (String, bool) {
+///
+/// `!merge` is the same failure as `landed` one step further out: a branch that
+/// does not merge onto the base cannot be landed by either key — a squash stops
+/// at the conflict, a replay refuses for want of a reviewed tree — and `ok` is
+/// again the cell that reads as an invitation. It replaces the record's label
+/// only where that label is `ok`, because one cell holds one reason and every
+/// other label already says "not ready": a branch owing records owes them
+/// whether or not it merges, and how MANY is a thing no conflict can report.
+/// It does not dim — unlike `landed` and `-`, there IS something here.
+///
+/// `landed` outranks `!merge` where a branch is BOTH, which is the reported row
+/// itself: it does not merge, and it has nothing left to land. Worth stating,
+/// because the cell that wins is the less alarming one and it is not the whole
+/// truth — `s` on such a row still stops in a conflicted work tree. It is the
+/// right call anyway: the column answers "is there anything here for me", the
+/// answer is no, and a dimmed row says so where `!merge` would send its agent
+/// to rebase work that is already upstream. `landed` therefore means "the base
+/// carries this branch's WORK", not "the base carries its tree".
+pub fn ready_cell(
+    b: &Branch,
+    readiness: Option<&record::Readiness>,
+    prospect: git::Prospect,
+) -> (String, bool) {
     let label = readiness.map_or_else(|| "?".to_string(), record::Readiness::label);
     if matches!(readiness, Some(record::Readiness::Empty)) {
         return (label, true);
     }
-    if landed {
-        return ("landed".to_string(), true);
+    match prospect {
+        git::Prospect::Nothing => ("landed".to_string(), true),
+        git::Prospect::Conflicted if matches!(readiness, Some(record::Readiness::Ready)) => {
+            ("!merge".to_string(), false)
+        }
+        git::Prospect::Conflicted | git::Prospect::Outstanding => (label, b.nothing_ahead()),
     }
-    (label, b.nothing_ahead())
 }
 
 /// Clip to `max` display COLUMNS with an ellipsis, returning the text and the
@@ -1776,6 +1809,12 @@ mod tests {
             .unwrap();
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
+
+    /// A complete review record, for the tests that need a commit whose READY
+    /// cell reads `ok` — the rest leave it owing reviews, which most of them do
+    /// not care about.
+    const RECORD: &str = "Reviewed-by: subagent/opus-5\nReviewed-by: codex/gpt-5.6-sol\n\
+                          Reviewed-by: agy/gemini-3.1-pro\nChecks: green";
 
     /// A work tree on `main` with one branch published to `origin`, present
     /// locally only as a remote-tracking ref.
@@ -2755,7 +2794,7 @@ mod tests {
             record::Readiness::Missing { missing: 10, total: 100 },
             record::Readiness::Empty,
         ];
-        app.nothing_to_land = vec![false; 3];
+        app.prospects = vec![git::Prospect::Outstanding; 3];
         app.now = 1_700_000_600;
         app.apply_filter();
 
@@ -2797,7 +2836,7 @@ mod tests {
         app.readiness = (0..40)
             .map(|missing| record::Readiness::Missing { missing, total: 40 })
             .collect();
-        app.nothing_to_land = vec![false; 40];
+        app.prospects = vec![git::Prospect::Outstanding; 40];
         app.now = 1_700_000_600;
         app.apply_filter();
 
@@ -2825,12 +2864,12 @@ mod tests {
         }
     }
 
-    /// What the list reports for one branch: nothing to land, or not.
-    fn spent(app: &App, name: &str) -> Option<bool> {
+    /// What the list reports for one branch: what a landing would find there.
+    fn prospect_of(app: &App, name: &str) -> Option<git::Prospect> {
         app.branches
             .iter()
             .position(|b| b.refname == name)
-            .and_then(|i| app.nothing_to_land.get(i).copied())
+            .and_then(|i| app.prospects.get(i).copied())
     }
 
     /// The query half, over a real repo in the state that produced the report:
@@ -2858,8 +2897,16 @@ mod tests {
         git_in(&work, &["cherry-pick", "origin/work-0001-feature"]);
 
         let app = app_on(&work);
-        assert_eq!(spent(&app, "origin/work-0001-feature"), Some(true), "its patch is on main");
-        assert_eq!(spent(&app, "origin/work-0002-open"), Some(false), "still outstanding");
+        assert_eq!(
+            prospect_of(&app, "origin/work-0001-feature"),
+            Some(git::Prospect::Nothing),
+            "its patch is on main"
+        );
+        assert_eq!(
+            prospect_of(&app, "origin/work-0002-open"),
+            Some(git::Prospect::Outstanding),
+            "still outstanding"
+        );
         // Ancestry still counts the landed branch a commit ahead — the number
         // the column showed, and the reason it could not be the answer.
         let counts = app
@@ -2896,7 +2943,11 @@ mod tests {
         git_in(&work, &["commit", "-m", "squash-landed"]);
 
         let app = app_on(&work);
-        assert_eq!(spent(&app, "origin/work-0003-two"), Some(true), "the base carries its tree");
+        assert_eq!(
+            prospect_of(&app, "origin/work-0003-two"),
+            Some(git::Prospect::Nothing),
+            "the base carries its tree"
+        );
         // The check this replaced, run over the same repo: a replay selection
         // sees two outstanding commits here, which is what put `ok` on the row.
         let picks = app
@@ -2942,20 +2993,158 @@ mod tests {
 
         let app = app_on(&work);
         assert_eq!(
-            spent(&app, "origin/work-0004-merged"),
-            Some(false),
+            prospect_of(&app, "origin/work-0004-merged"),
+            Some(git::Prospect::Outstanding),
             "the merge's own content is on no commit main has"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The fail-open half, at the layer that decides it, over BOTH arms that
+    /// The reported row, rebuilt. A branch landed by replay whose base then
+    /// moved onto the SAME LINES: its patches are upstream, and the tip they
+    /// sit on no longer merges — so the tree question that answers `landed` for
+    /// every quieter version of this cannot answer at all, and the row went
+    /// back to reading `ok`, an invitation to a landing `r` refuses outright.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn a_landed_branch_the_base_has_moved_past_still_reads_landed() {
+        // No "landed" in the tag: the title bar carries this path, and the
+        // frame assertion below counts the word.
+        let (root, work) = repo("replayed-then-conflicting");
+        // Landed the way `r` lands: the base moves first, so the replay rewrites
+        // the oid rather than fast-forwarding onto it.
+        git_in(&work, &["commit", "--allow-empty", "-m", "main moves on"]);
+        git_in(&work, &["cherry-pick", "origin/work-0001-feature"]);
+        // And then past it, on the one line the branch also changed.
+        std::fs::write(work.join("f"), "three\n").unwrap();
+        git_in(&work, &["commit", "-am", "main: the same line again"]);
+
+        let git = Git::discover(&work).unwrap();
+        // The merge really is unanswerable here, so nothing below can pass for
+        // the reason the quieter tests pass.
+        assert!(
+            matches!(
+                git.merge_tree(
+                    &git.rev_parse("refs/heads/main").unwrap(),
+                    "refs/remotes/origin/work-0001-feature"
+                ),
+                Ok(git::MergeResult::Conflicted)
+            ),
+            "the base has to have moved onto the branch's own lines"
+        );
+
+        let mut app = app_on(&work);
+        assert_eq!(
+            prospect_of(&app, "origin/work-0001-feature"),
+            Some(git::Prospect::Nothing),
+            "every commit it carries is already on main by patch"
+        );
+        let mut ui = FakeUi::new();
+        app.redraw(&mut ui).unwrap();
+        assert_eq!(ui.last().matches("landed").count(), 1, "{}", ui.last());
+
+        // What the cell was inviting: `r` on this row lands nothing and says so,
+        // which is the disagreement the row must not have advertised.
+        let before = git_in(&work, &["rev-parse", "main"]).trim().to_string();
+        app.handle(Key::Enter, &mut ui).unwrap();
+        app.handle(Key::Char('r'), &mut ui).unwrap();
+        assert_eq!(git_in(&work, &["rev-parse", "main"]).trim(), before, "nothing may land");
+        app.redraw(&mut ui).unwrap();
+        assert!(ui.last().contains("does not merge cleanly"), "{}", ui.last());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other half of the conflicted arm, on one repo so each branch is held
+    /// to a DIFFERENCE rather than to a constant: two branches that both fail to
+    /// merge, one carrying nothing main lacks and one carrying work that has
+    /// never landed. Reading them the same way is what the old answer did.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn a_conflicting_branch_with_work_left_is_not_read_as_landed() {
+        let (root, work) = repo("conflicting-open");
+        // Branched before main moves, and changing the same line, so this one
+        // conflicts too — the two rows differ only in what they still carry.
+        git_in(&work, &["checkout", "-b", "work-0002-open"]);
+        std::fs::write(work.join("f"), "open\n").unwrap();
+        // With a COMPLETE record, because `ok` is the only cell `!merge`
+        // replaces — the reported row had one, and without it this branch would
+        // read as owing reviews and never reach the new word.
+        git_in(&work, &["commit", "-am", &format!("open: step\n\n{RECORD}")]);
+        git_in(&work, &["push", "origin", "work-0002-open"]);
+        git_in(&work, &["checkout", "main"]);
+        git_in(&work, &["branch", "-D", "work-0002-open"]);
+        git_in(&work, &["commit", "--allow-empty", "-m", "main moves on"]);
+        git_in(&work, &["cherry-pick", "origin/work-0001-feature"]);
+        std::fs::write(work.join("f"), "three\n").unwrap();
+        git_in(&work, &["commit", "-am", "main: the same line again"]);
+
+        let app = app_on(&work);
+        assert_eq!(
+            prospect_of(&app, "origin/work-0001-feature"),
+            Some(git::Prospect::Nothing),
+            "landed, and the conflict is only the base having moved past it"
+        );
+        assert_eq!(
+            prospect_of(&app, "origin/work-0002-open"),
+            Some(git::Prospect::Conflicted),
+            "its one commit is on no commit main has"
+        );
+        let mut ui = FakeUi::new();
+        app.redraw(&mut ui).unwrap();
+        assert_eq!(ui.last().matches("landed").count(), 1, "{}", ui.last());
+        assert_eq!(ui.last().matches("!merge").count(), 1, "{}", ui.last());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Why the patch count behind a conflicted merge does NOT exclude merges,
+    /// unlike the selection `land.rs` replays: a merge commit carrying content
+    /// of its own has no patch id that a base could match, so skipping it would
+    /// count a branch whose work exists nowhere else as fully landed — the one
+    /// direction this answer must never be wrong in.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn a_conflicting_branch_whose_merge_carries_content_is_not_read_as_landed() {
+        let (root, work) = repo("conflicting-evil-merge");
+        git_in(&work, &["checkout", "-b", "side", "main"]);
+        std::fs::write(work.join("h"), "h\n").unwrap();
+        git_in(&work, &["add", "h"]);
+        git_in(&work, &["commit", "-m", "side: step"]);
+        git_in(&work, &["checkout", "-b", "work-0004-merged", "origin/work-0001-feature"]);
+        git_in(&work, &["merge", "--no-commit", "--no-ff", "side"]);
+        std::fs::write(work.join("evil"), "resolved\n").unwrap();
+        git_in(&work, &["add", "evil"]);
+        git_in(&work, &["commit", "-m", "merge side, resolved"]);
+        git_in(&work, &["push", "origin", "work-0004-merged"]);
+        git_in(&work, &["checkout", "main"]);
+        git_in(&work, &["branch", "-D", "work-0004-merged"]);
+        // Both ordinary commits land by patch, and then main moves onto the line
+        // one of them touched, so the merge cannot answer for the branch either.
+        // The empty commit first, or the replay keeps the branch's own oids and
+        // the merge base is the branch itself — a clean merge, and no conflict
+        // to reach the count this test is about.
+        git_in(&work, &["commit", "--allow-empty", "-m", "main moves on"]);
+        git_in(&work, &["cherry-pick", "origin/work-0001-feature"]);
+        git_in(&work, &["cherry-pick", "side"]);
+        std::fs::write(work.join("f"), "three\n").unwrap();
+        git_in(&work, &["commit", "-am", "main: the same line again"]);
+
+        let app = app_on(&work);
+        assert_eq!(
+            prospect_of(&app, "origin/work-0004-merged"),
+            Some(git::Prospect::Conflicted),
+            "the merge's own content is on no commit main has"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The unanswerable half, at the layer that decides it, over BOTH arms that
     /// reach it — they are different git outcomes and only one of them is a
     /// conflict. A ref that does not resolve exits 1, which `merge_tree` reads
     /// as `Conflicted`; unrelated histories exit 128 and are `Unavailable`.
-    /// Either way the answer must be "not landed": the row then says what its
-    /// record says, which at worst shows a branch worth opening, where a wrong
-    /// `landed` would hide one.
+    /// Neither may answer "nothing to land", where a wrong `landed` would hide
+    /// a branch worth opening — and a branch sharing NO history may not answer
+    /// `ok` either, since `preview` and both landing modes stop without a merge
+    /// base, so that row cannot even be opened.
     #[test]
     #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
     fn a_merge_git_cannot_compute_is_not_reported_as_landed() {
@@ -2976,19 +3165,28 @@ mod tests {
         let git = Git::discover(&work).unwrap();
         let base = git.resolve_base("main").unwrap();
         assert_eq!(
-            git.lands_nothing(&base, "refs/remotes/origin/work-0001-feature").ok(),
-            Some(true),
+            git.prospect(&base, "refs/remotes/origin/work-0001-feature").ok(),
+            Some(git::Prospect::Nothing),
             "main carries its tree"
         );
+        // The patch count behind the conflicted arm cannot answer for a ref
+        // that does not resolve either, and an unreadable count must not become
+        // an answer of nothing.
         assert_eq!(
-            git.lands_nothing(&base, "refs/remotes/origin/no-such-branch").ok(),
-            Some(false),
+            git.prospect(&base, "refs/remotes/origin/no-such-branch").ok(),
+            Some(git::Prospect::Conflicted),
             "a ref that does not resolve is not an answer of nothing to land"
         );
         assert_eq!(
-            git.lands_nothing(&base, "refs/remotes/origin/alien").ok(),
-            Some(false),
-            "a merge git refuses outright is not an answer of nothing to land"
+            git.prospect(&base, "refs/remotes/origin/alien").ok(),
+            Some(git::Prospect::Conflicted),
+            "a branch with no merge base is one no landing can take"
+        );
+        // The claim above rests on that: `preview` asks for a merge base before
+        // anything else, so the row `ok` would have invited cannot be opened.
+        assert!(
+            land::preview(&git, "main", "origin/alien").is_err(),
+            "an alien branch must be unopenable, or `ok` was not the wrong cell"
         );
         // The two really are distinct outcomes, so this test covers two arms
         // rather than one twice.
@@ -3023,14 +3221,46 @@ mod tests {
         let b = listed(Some((3, 8)));
         // A COMPLETE record: what made the row read as three commits waiting.
         assert_eq!(
-            ready_cell(&b, Some(&record::Readiness::Ready), true),
+            ready_cell(&b, Some(&record::Readiness::Ready), git::Prospect::Nothing),
             ("landed".to_string(), true)
         );
         // The same branch with its patches genuinely outstanding is untouched —
         // the record is the answer while there is still something to land.
         assert_eq!(
-            ready_cell(&b, Some(&record::Readiness::Ready), false),
+            ready_cell(&b, Some(&record::Readiness::Ready), git::Prospect::Outstanding),
             ("ok".to_string(), false)
+        );
+    }
+
+    /// A branch that does not merge cannot be landed by either key, so `ok` is
+    /// as much an invitation there as it is on a landed one — but only `ok` is
+    /// replaced. A record that already complains keeps its own words: it says
+    /// how many commits are missing one, which no conflict can report, and it
+    /// reads as "not ready" either way.
+    #[test]
+    fn a_branch_that_does_not_merge_does_not_read_ok() {
+        let b = listed(Some((2, 18)));
+        assert_eq!(
+            ready_cell(&b, Some(&record::Readiness::Ready), git::Prospect::Conflicted),
+            ("!merge".to_string(), false),
+            "not dimmed: there is something here, and it needs a rebase"
+        );
+        for verdict in [
+            record::Readiness::Missing { missing: 1, total: 2 },
+            record::Readiness::Unknown,
+        ] {
+            assert_eq!(
+                ready_cell(&b, Some(&verdict), git::Prospect::Conflicted),
+                (verdict.label(), false),
+                "a record that already complains is the more specific answer"
+            );
+        }
+        // No record read at all is the same rule one step further: `?` already
+        // says "open this", so the conflict does not need the cell.
+        assert_eq!(
+            ready_cell(&b, None, git::Prospect::Conflicted),
+            ("?".to_string(), false),
+            "an unread record is not replaced either"
         );
     }
 
@@ -3040,11 +3270,15 @@ mod tests {
     #[test]
     fn an_empty_branch_and_a_landed_one_are_not_spelt_the_same() {
         assert_eq!(
-            ready_cell(&listed(Some((0, 4))), Some(&record::Readiness::Empty), false),
+            ready_cell(
+                &listed(Some((0, 4))),
+                Some(&record::Readiness::Empty),
+                git::Prospect::Outstanding
+            ),
             ("-".to_string(), true)
         );
         assert_eq!(
-            ready_cell(&listed(Some((3, 8))), Some(&record::Readiness::Ready), true),
+            ready_cell(&listed(Some((3, 8))), Some(&record::Readiness::Ready), git::Prospect::Nothing),
             ("landed".to_string(), true)
         );
     }
@@ -3056,7 +3290,7 @@ mod tests {
     #[test]
     fn a_branch_with_no_commits_says_so_rather_than_claiming_it_landed() {
         assert_eq!(
-            ready_cell(&listed(None), Some(&record::Readiness::Empty), true),
+            ready_cell(&listed(None), Some(&record::Readiness::Empty), git::Prospect::Nothing),
             ("-".to_string(), true),
             "no commits over the base is not a landing"
         );
@@ -3068,10 +3302,17 @@ mod tests {
     #[test]
     fn an_unreadable_record_shows_a_question_mark_and_is_not_dimmed() {
         assert_eq!(
-            ready_cell(&listed(Some((3, 8))), Some(&record::Readiness::Unknown), false),
+            ready_cell(
+                &listed(Some((3, 8))),
+                Some(&record::Readiness::Unknown),
+                git::Prospect::Outstanding
+            ),
             ("?".to_string(), false)
         );
-        assert_eq!(ready_cell(&listed(None), None, false), ("?".to_string(), false));
+        assert_eq!(
+            ready_cell(&listed(None), None, git::Prospect::Outstanding),
+            ("?".to_string(), false)
+        );
     }
 
     /// The column is sized to its verdicts rather than the verdicts to the
@@ -3090,8 +3331,9 @@ mod tests {
             record::Readiness::Missing { missing: 10, total: 100 },
         ];
         let mut labels: Vec<String> =
-            verdicts.iter().map(|v| ready_cell(&b, Some(v), false).0).collect();
-        labels.push(ready_cell(&b, None, true).0);
+            verdicts.iter().map(|v| ready_cell(&b, Some(v), git::Prospect::Outstanding).0).collect();
+        labels.push(ready_cell(&b, None, git::Prospect::Nothing).0);
+        labels.push(ready_cell(&b, Some(&record::Readiness::Ready), git::Prospect::Conflicted).0);
 
         let width = fitted(labels.iter().map(String::as_str), READY_COL);
         for label in &labels {
@@ -3108,6 +3350,7 @@ mod tests {
         assert_eq!(fitted(["ok", "-"].into_iter(), READY_COL), READY_COL);
         assert_eq!(fitted([].into_iter(), READY_COL), READY_COL);
         assert_eq!(fitted(["landed"].into_iter(), READY_COL), READY_COL);
+        assert_eq!(fitted(["!merge"].into_iter(), READY_COL), READY_COL);
     }
 
     /// A/B is the other unbounded cell and was left fixed at seven while READY

@@ -234,30 +234,37 @@ fn run(args: Args) -> io::Result<ExitCode> {
 
 fn list_branches(git: &Git, base: &str) -> io::Result<()> {
     let branches = git.branches(base)?;
+    // Resolved once for the whole run, as the TUI does: a base that moved
+    // mid-listing would leave two rows describing different bases.
+    let base_tree = git.resolve_base(base).ok();
     let now = now_unix();
     let stdout = io::stdout();
     let mut out = stdout.lock();
     for b in &branches {
-        let ready = match git.commit_records(&format!(
-            "refs/heads/{base}..refs/remotes/{}",
-            b.refname
-        )) {
-            Ok(commits) => match b.counts {
-                Some((ahead, _)) => record::readiness_for(ahead as usize, &commits),
-                None => record::readiness(&commits),
-            },
-            Err(_) => record::Readiness::Unknown,
-        };
+        // Both halves of the verdict from the same two functions the TUI's rows
+        // use — this column showing a record where the TUI showed what a
+        // LANDING would find is how a branch already on the base came to read
+        // `ok` in one of them. Per ROW rather than per run, so the listing
+        // still streams: the merge behind each is a process, and a run of them
+        // up front is a silent pause before the first line.
+        let ready = app::readiness_of(git, base, b);
+        let prospect = git.prospect_of(base_tree.as_ref(), b);
         // Refnames and subjects are untrusted; --list prints straight to a
         // terminal, so neutralise them here as the TUI's frame does.
+        //
+        // The TUI's floor width, not a hand-typed copy of it. Unlike the TUI
+        // this cannot GROW to an outsized verdict (that needs every row first,
+        // which is the pause above): `10/100!` overruns it and shifts its own
+        // row, as it did when this column was narrower still.
         writeln!(
             out,
-            "{:>5}  {:>7}  {:<5}  {}\t{}",
+            "{:>5}  {:>7}  {:<ready$}  {}\t{}",
             b.age(now),
             b.counts_label(),
-            ready.label(),
+            app::ready_cell(b, Some(&ready), prospect).0,
             scrub(&b.refname),
-            scrub(&b.subject)
+            scrub(&b.subject),
+            ready = app::READY_COL,
         )?;
     }
     Ok(())

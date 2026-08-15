@@ -100,6 +100,25 @@ pub enum MergeResult {
     Unavailable(String),
 }
 
+/// What a landing would find on a branch, as far as a query can tell without
+/// running one. The list's READY cell is drawn from this, so its three arms are
+/// the three things that cell may say about a branch the base has moved past.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prospect {
+    /// A landing takes nothing: the merge is the base's own tree, or every
+    /// commit the branch carries is already on the base by patch.
+    Nothing,
+    /// Something to land, but the branch does not merge onto the base — a
+    /// squash stops at the conflict and a replay refuses outright. Also where a
+    /// question that could not be ANSWERED lands, since a branch git cannot
+    /// report on is not one to invite a landing on.
+    Conflicted,
+    /// Something to land — or no answer, which the list reads the same way,
+    /// since the worst a wrong `Outstanding` does is show a branch worth
+    /// opening where a wrong `Nothing` hides one.
+    Outstanding,
+}
+
 /// What the endpoints of a remote claim about one branch's `HEAD`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum HeadClaim {
@@ -130,7 +149,7 @@ pub enum DefaultRemote {
     Ambiguous,
 }
 
-/// A base resolved once for a run of [`Git::lands_nothing`] questions: the
+/// A base resolved once for a run of [`Git::prospect`] questions: the
 /// commit and the tree it points at, resolved together. The OID rather than the
 /// ref NAME, so a base that moves mid-reload cannot leave the merge and the
 /// comparison describing different bases. Hoisting both out of the caller's
@@ -356,33 +375,107 @@ impl Git {
         self.rev_parse(&format!("{rev}^{{tree}}"))
     }
 
-    /// Resolve a base once for a run of [`Git::lands_nothing`] questions.
+    /// Resolve a base once for a run of [`Git::prospect`] questions.
     pub fn resolve_base(&self, base: &str) -> io::Result<BaseTree> {
         let oid = self.rev_parse(&format!("refs/heads/{base}"))?;
         let tree = self.tree_of(&oid)?;
         Ok(BaseTree { oid, tree })
     }
 
-    /// Whether landing `branch` onto the base would produce nothing: the merge
-    /// of the two is the base's own tree. This is the question `land.rs` asks
-    /// first and refuses on ("nothing to replay"), and the one the review pane
-    /// answers with an empty diffstat.
-    ///
-    /// Asked of the TREE rather than of the commits deliberately. A replay
-    /// selection (`--cherry-pick --right-only`) answers only for a replay
-    /// landing: it reports every commit of a SQUASH-landed branch as
-    /// outstanding, none of their patch ids matching the one commit that
-    /// carries them, and it passes over what a merge commit contributed,
-    /// having to skip merges to say anything at all. The merge result has
-    /// neither blind spot — it is the branch TIP against the base, whatever
-    /// route the content took to either.
-    pub fn lands_nothing(&self, base: &BaseTree, branch: &str) -> io::Result<bool> {
-        match self.merge_tree(&base.oid, branch)? {
-            MergeResult::Clean(tree) => Ok(tree == base.tree),
-            // A branch that will not merge, or that git declined to merge, has
-            // something to answer for rather than nothing to land.
-            MergeResult::Conflicted | MergeResult::Unavailable(_) => Ok(false),
+    /// What a landing would find on one listed branch — [`Git::prospect`] with
+    /// the two answers that need no query at all. A branch with nothing ahead
+    /// already reads as empty, and a base that would not resolve leaves every
+    /// row saying what its record says.
+    pub fn prospect_of(&self, base: Option<&BaseTree>, b: &Branch) -> Prospect {
+        if b.nothing_ahead() {
+            return Prospect::Outstanding;
         }
+        base.and_then(|base| self.prospect(base, &format!("refs/remotes/{}", b.refname)).ok())
+            .unwrap_or(Prospect::Outstanding)
+    }
+
+    /// What a landing would find on `branch`: nothing, a conflict, or work.
+    /// [`Prospect::Nothing`] is the question `land.rs` asks first and refuses on
+    /// ("nothing to replay"), and the one the review pane answers with an empty
+    /// diffstat.
+    ///
+    /// Asked of the TREE first, deliberately. A replay selection
+    /// (`--cherry-pick --right-only`) answers only for a replay landing: it
+    /// reports every commit of a SQUASH-landed branch as outstanding, none of
+    /// their patch ids matching the one commit that carries them. While the
+    /// merge is CLEAN it has no such blind spot — it is the branch TIP against
+    /// the base, whatever route the content took to either.
+    ///
+    /// But a merge that CONFLICTS answers neither question: it is not the
+    /// base's tree, and it is not work outstanding either. That is the state a
+    /// replay-landed branch reaches once the base moves on and touches the same
+    /// lines — its patches are upstream, and the tip they sit on no longer
+    /// merges. So the patches are asked there, and the answer is then the
+    /// REPLAY's, blind spot and all: a SQUASH-landed branch the base has moved
+    /// past counts its own commits as outstanding and reads `!merge` rather
+    /// than `landed`. That is the honest answer for the cell rather than a
+    /// wrong one — neither key can take such a branch either — but it is not
+    /// the tree's answer, and the tree cannot be had here. Merges are NOT
+    /// excluded from the count, so a branch whose merge commit carries content
+    /// of its own — which no patch id covers — stays outstanding.
+    ///
+    /// A branch sharing NO HISTORY with the base is refused by `merge-tree`
+    /// outright rather than conflicting, and lands in the same cell without the
+    /// count: `preview` and both landing modes ask for a merge base before
+    /// anything else and stop without one, so nothing can take that branch and
+    /// no patch id changes it. Skipping the count there is also what keeps this
+    /// bounded — with no merge base `A...B` is the union of BOTH histories, so
+    /// asking would patch-id the whole repository, on every reload.
+    pub fn prospect(&self, base: &BaseTree, branch: &str) -> io::Result<Prospect> {
+        match self.merge_tree(&base.oid, branch)? {
+            MergeResult::Clean(tree) if tree == base.tree => Ok(Prospect::Nothing),
+            MergeResult::Clean(_) => Ok(Prospect::Outstanding),
+            MergeResult::Conflicted => Ok(match self.unlanded_by_patch(&base.oid, branch) {
+                Ok(0) => Prospect::Nothing,
+                // A count git could not produce is not an answer of nothing:
+                // the merge already said this branch does not apply, and that
+                // much is reportable on its own.
+                Ok(_) | Err(_) => Prospect::Conflicted,
+            }),
+            // Git declined to compute a merge at all. Two different states
+            // arrive here and only one of them is about the BRANCH: a git too
+            // old for `merge-tree --write-tree` cannot answer for ANY branch,
+            // and its rows fall back to their records as they always did, while
+            // a branch with no merge base is one nothing can land. Only the
+            // second is the branch's own problem, and the merge base is what
+            // tells them apart.
+            MergeResult::Unavailable(_) => Ok(match self.merge_base(&base.oid, branch) {
+                Ok(_) => Prospect::Outstanding,
+                Err(_) => Prospect::Conflicted,
+            }),
+        }
+    }
+
+    /// Commits on `branch` whose patch the base does not already carry — the
+    /// same `--cherry-pick --right-only` selection a replay landing makes at
+    /// `land.rs`'s `rebase`, so the list cannot call a branch landable that a
+    /// replay would drop every commit of. The two spellings differ in one
+    /// deliberate place (that one takes `--no-merges`, because it REPLAYS what
+    /// it selects and a merge cannot be replayed; this one counts, and a merge
+    /// left out of the count is content nothing has landed reading as landed)
+    /// and must not drift anywhere else.
+    ///
+    /// Reaching that selection is not what makes the two agree, and the
+    /// agreement is about the OUTCOME rather than the message: on a conflicted
+    /// merge `r` stops earlier still, for want of a reviewed tree, so a branch
+    /// this counts to zero is one both landing modes decline whichever check
+    /// they reach first.
+    ///
+    /// The base by OID, matching [`BaseTree`]'s reason: a base that moves
+    /// mid-reload must not leave the merge and this count describing different
+    /// bases.
+    fn unlanded_by_patch(&self, base_oid: &str, branch: &str) -> io::Result<usize> {
+        let range = format!("{base_oid}...{branch}");
+        let argv = ["rev-list", "--count", "--cherry-pick", "--right-only", &range, "--"];
+        let out = self.run_ok(&argv)?;
+        out.trim()
+            .parse()
+            .map_err(|_| io::Error::other(format!("unreadable commit count: {out:?}")))
     }
 
     /// Commits on `branch` with no equivalent on `base`. `git cherry` compares

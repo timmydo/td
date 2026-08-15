@@ -114,6 +114,11 @@ fn git_bytes(dir: &Path, args: &[&str]) -> Res<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// A complete review record, for a commit whose READY cell has to read `ok` —
+/// the only cell `!merge` replaces.
+const RECORD: &str = "Reviewed-by: subagent/opus-5\nReviewed-by: codex/gpt-5.6-sol\n\
+                      Reviewed-by: agy/gemini-3.1-pro\nChecks: green";
+
 fn commit(dir: &Path, file: &str, body: &str, message: &str, when: &str) -> Res<()> {
     fs::write(dir.join(file), body)?;
     git(dir, &["add", file])?;
@@ -1427,6 +1432,73 @@ fn a_remote_head_symref_is_not_offered_as_a_branch() -> Res<()> {
         assert_ne!(name, "origin/HEAD", "the HEAD symref must not be listed:\n{listed}");
     }
     assert!(listed.contains("origin/work-0001-feature"), "real branches still listed:\n{listed}");
+    Ok(())
+}
+
+/// The reported row, through the shipped binary. `--list` printed the review
+/// record and nothing else, so a branch whose commits main already carries read
+/// `ok` — a cell that means "ready to land" beside a landing that refuses it.
+/// Its tip no longer merges (the base moved onto a file it also added), which
+/// is what stops the tree question answering and what left this row saying `ok`
+/// after the TUI's had learnt to say `landed`.
+#[test]
+fn list_says_landed_for_a_branch_the_base_carries_and_no_longer_merges() -> Res<()> {
+    let s = scenario("list-carried")?;
+    // The base moves first, so the replay rewrites the oids rather than
+    // fast-forwarding onto them — without this the branch is simply an
+    // ancestor and the plain tree question answers.
+    commit(&s.work, "c.txt", "gamma\n", "base: moves on", "2024-01-04T00:00:00 +0000")?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--yes"])?;
+    assert!(ok, "the replay landing should succeed:\n{output}");
+    // And then onto a file the branch also adds, so its tip cannot merge.
+    commit(&s.work, "a.txt", "gamma\n", "base: the same file again", "2024-01-05T00:00:00 +0000")?;
+
+    let (ok, listed) = review(&s.work, &["--list"])?;
+    assert!(ok, "{listed}");
+    let row = listed
+        .lines()
+        .find(|l| l.contains("origin/work-0001-feature"))
+        .unwrap_or_default()
+        .to_string();
+    assert!(row.contains("landed"), "the row must say there is nothing here:\n{listed}");
+    assert!(!row.contains(" ok "), "and must not read as ready to land:\n{listed}");
+    Ok(())
+}
+
+/// The other cell of the shared rule, also through the shipped binary: a branch
+/// that still carries work and no longer merges. Nothing but this covers
+/// `!merge` on the `--list` side, and the column's width was widened for it.
+#[test]
+fn list_says_merge_for_a_branch_that_still_has_work_and_does_not_merge() -> Res<()> {
+    let s = scenario("list-conflicting")?;
+    // A second branch, forked before the base moves and touching the same file,
+    // with a COMPLETE record — `!merge` replaces `ok` and nothing else.
+    git(&s.work, &["checkout", "-b", "work-0002-open", "main"])?;
+    commit(
+        &s.work,
+        "a.txt",
+        "open\n",
+        &format!("open: step\n\n{RECORD}"),
+        "2024-01-04T00:00:00 +0000",
+    )?;
+    git(&s.work, &["push", "origin", "work-0002-open"])?;
+    git(&s.work, &["checkout", "main"])?;
+    git(&s.work, &["branch", "-D", "work-0002-open"])?;
+    // The base takes that file to a third value, so the branch cannot merge.
+    commit(&s.work, "a.txt", "gamma\n", "base: the same file", "2024-01-05T00:00:00 +0000")?;
+
+    let (ok, listed) = review(&s.work, &["--list"])?;
+    assert!(ok, "{listed}");
+    let row = listed
+        .lines()
+        .find(|l| l.contains("origin/work-0002-open"))
+        .unwrap_or_default()
+        .to_string();
+    assert!(row.contains("!merge"), "a branch that will not merge must say so:\n{listed}");
+    assert!(!row.contains(" ok "), "and must not read as ready to land:\n{listed}");
+    // The cell is padded, not run into the branch name: the width this needed
+    // is the one `--list` was widened to.
+    assert!(row.contains("!merge  origin/work-0002-open"), "column not padded:\n{row}");
     Ok(())
 }
 
