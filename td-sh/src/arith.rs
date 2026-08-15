@@ -40,14 +40,19 @@ enum Tk {
 
 /// Multi-character operators, longest first so `<<=` beats `<<` beats `<`.
 const OPS: &[&str] = &[
-    "<<=", ">>=", "&&", "||", "<<", ">>", "<=", ">=", "==", "!=", "+=", "-=", "*=", "/=", "%=",
-    "&=", "^=", "|=", "+", "-", "*", "/", "%", "<", ">", "!", "~", "&", "^", "|", "?",
-    ":", "(", ")", "=", ",",
+    "<<=", ">>=", "**", "&&", "||", "<<", ">>", "<=", ">=", "==", "!=", "+=", "-=",
+    "*=", "/=", "%=", "&=", "^=", "|=", "+", "-", "*", "/", "%", "<", ">", "!", "~",
+    "&", "^", "|", "?", ":", "(", ")", "=", ",",
 ];
 
-const PREC_UNARY: u8 = 14;
+const PREC_UNARY: u8 = 15;
 
-/// The one right-associative level, and where a COMPLETED conditional waits.
+/// `**` binds TIGHTER than `*` and LOOSER than a unary sign, which is why the
+/// scale needs a level between them: ash reads `-2**2` as `(-2)**2` -- 4, where
+/// Python reads `-(2**2)` and gives -4. Right-associative, so `2**3**2` is 512.
+const PREC_EXPONENT: u8 = 14;
+
+/// Where a COMPLETED conditional waits. Right-associative, as `**` is.
 const PREC_ASSIGN: u8 = 2;
 
 /// Marks a region nothing inside may displace out of: a `(`, and a `?`, whose
@@ -55,8 +60,8 @@ const PREC_ASSIGN: u8 = 2;
 const BARRIER: u8 = 0;
 
 /// Binding power, mirroring this file's descent so the lexer can tell which
-/// pending operators an incoming one displaces. Assignment is the one
-/// right-associative level, which is what keeps `a = b = c` unreduced.
+/// pending operators an incoming one displaces. Assignment and `**` are the
+/// right-associative levels, which is what keeps `a = b = c` unreduced.
 fn prec(op: &str) -> u8 {
     match op {
         "," => 1,
@@ -72,6 +77,7 @@ fn prec(op: &str) -> u8 {
         "<<" | ">>" => 11,
         "+" | "-" => 12,
         "*" | "/" | "%" => 13,
+        "**" => PREC_EXPONENT,
         _ => PREC_UNARY,
     }
 }
@@ -196,7 +202,7 @@ fn lex(text: &str) -> Result<Vec<Tk>, String> {
                 // nothing; `-a` still leaves `a` reachable until `+` arrives.
                 let unary = matches!(op, "+" | "-" | "!" | "~") && !ends_operand;
                 let p = prec(op);
-                let right = p == PREC_ASSIGN;
+                let right = p == PREC_ASSIGN || p == PREC_EXPONENT;
                 if !unary {
                     while pending
                         .last()
@@ -566,20 +572,36 @@ impl Arith {
     }
 
     fn expr_mul(&mut self, sh: &mut Shell) -> A<i64> {
-        let mut v = self.expr_unary(sh)?;
+        let mut v = self.expr_exponent(sh)?;
         loop {
             let op = match self.peek_op() {
                 Some(o @ ("*" | "/" | "%")) => o,
                 _ => return Ok(v),
             };
             self.pos += 1;
-            let rhs = self.expr_unary(sh)?;
+            let rhs = self.expr_exponent(sh)?;
             v = match op {
                 "*" => v.wrapping_mul(rhs),
                 "/" => divide(self.live, v, rhs)?,
                 _ => remainder(self.live, v, rhs)?,
             };
         }
+    }
+
+    /// Right-associative, so the recursion is on the RIGHT: `2**3**2` is
+    /// `2**(3**2)`. Its left operand is a unary chain rather than another
+    /// exponent, which is what makes `-2**2` the square of `-2`.
+    fn expr_exponent(&mut self, sh: &mut Shell) -> A<i64> {
+        let base = self.expr_unary(sh)?;
+        if self.peek_op() != Some("**") {
+            return Ok(base);
+        }
+        self.pos += 1;
+        self.enter()?;
+        let exp = self.expr_exponent(sh);
+        self.leave();
+        let exp = exp?;
+        power(self.live, base, exp)
     }
 
     fn expr_unary(&mut self, sh: &mut Shell) -> A<i64> {
@@ -723,10 +745,37 @@ fn plain_decimal(text: &str) -> Option<i64> {
     Some(if negative { -value } else { value })
 }
 
-/// The only operators that can still FAIL, and only on a zero divisor -- folded
-/// to 0 inside an untaken `?:` arm, the one region ash leaves unevaluated,
-/// rather than reporting an error the shell would never have hit. `i64::MIN /
-/// -1` wraps rather than trapping.
+/// `**`. The loop is busybox's own (math.c:420-438) and not `pow`, because it
+/// must WRAP at every step the same way -- `2**63` is `i64::MIN` and `2**64` is
+/// 0 -- and because halving the exponent is what stops `3**999999999999999999`
+/// running forever. A negative exponent is refused as ash refuses it, and that
+/// guard also TERMINATES this loop: halving a negative and decrementing it
+/// returns where it started, so `exp` would alternate between -1 and -2.
+fn power(live: bool, base: i64, exp: i64) -> A<i64> {
+    if exp < 0 {
+        return if live {
+            Err("exponent less than 0".into())
+        } else {
+            Ok(0)
+        };
+    }
+    let (mut base, mut exp, mut acc) = (base, exp, 1i64);
+    while exp != 0 {
+        if exp & 1 == 0 {
+            base = base.wrapping_mul(base);
+            exp >>= 1;
+        }
+        acc = acc.wrapping_mul(base);
+        exp -= 1;
+    }
+    Ok(acc)
+}
+
+/// The two that fail on a zero divisor -- `power` above is the third fallible
+/// operator and refuses for its own reason. All three fold to 0 inside an
+/// untaken `?:` arm, the one region ash leaves unevaluated, rather than
+/// reporting an error the shell would never have hit. `i64::MIN / -1` wraps
+/// rather than trapping.
 fn divide(live: bool, a: i64, b: i64) -> A<i64> {
     if b == 0 {
         return if live {
@@ -1014,9 +1063,12 @@ mod tests {
         assert_eq!(arith_fixture("a,b,--1")?, Some(1), "`,` below assignment");
         assert_eq!(arith_fixture("a&&b||--1")?, Some(1), "`||` below `&&`");
         // A unary must sit above the TIGHTEST binary level, not merely above
-        // `+`: only an operator that binds tighter than `+` can tell 14 from 12,
-        // and nothing distinguishes 14 from 13, since no binary level is 14.
+        // `+`: only an operator binding tighter than `+` can tell it from `+`'s
+        // level. `*` alone is no longer enough, since `**` sits between `*` and
+        // unary -- the second row is what pins unary ABOVE `**` rather than
+        // level with it, and it is the only one of the two that can.
         assert_eq!(arith_fixture("-a*--1")?, Some(-2), "unary above `*`");
+        assert_eq!(arith_fixture("-a**--1")?, Some(-2), "unary above `**`");
         // A pending operator BELOW `?` is reduced by it, and a postfix pair
         // completes an operand where a prefix one does not -- both observable
         // only through what the pair after them does.
@@ -1099,6 +1151,86 @@ mod tests {
             assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, want);
             assert_eq!(sh.get_var("n").as_deref(), Some(after), "{src}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn exponentiation_binds_tighter_than_multiply_and_looser_than_a_sign()
+    -> Result<(), String> {
+        let mut sh = Shell::new_for_test();
+        let ev = |sh: &mut Shell, src: &str| {
+            try_eval(sh, src).map_err(|e| format!("eval {src}: {e}"))
+        };
+        for (src, want) in [
+            ("2**3", 8),
+            ("2**0", 1),
+            ("0**0", 1),
+            // Right-associative, so the RIGHT pair reduces first.
+            ("2**3**2", 512),
+            ("(2**3)**2", 64),
+            ("2**2**2**2", 65_536),
+            ("2**2**0", 2),
+            // Tighter than `*`, either side of it.
+            ("2*3**2", 18),
+            ("3**2*2", 18),
+            // Looser than every unary, which is where ash parts from C and
+            // Python: the sign is part of the BASE, so this is `(-2)**2`.
+            ("-2**2", 4),
+            ("-(2**2)", -4),
+            ("~2**2", 9),
+            ("!0**2", 1),
+            ("2**+2", 4),
+            ("(-2)**3", -8),
+            // Every step wraps, so the bound is reachable and passable.
+            ("2**62", 4_611_686_018_427_387_904),
+            ("2**63", i64::MIN),
+            ("2**64", 0),
+            ("3**40", -6_289_078_614_652_622_815),
+            ("10**19", -8_446_744_073_709_551_616),
+            // Halving the exponent is what makes these return at all.
+            ("3**999999999999999999", 2_657_844_495_946_263_211),
+            ("7**9223372036854775807", 7_905_747_460_161_236_407),
+            ("2**1000000", 0),
+        ] {
+            assert_eq!(ev(&mut sh, src)?, want, "{src}");
+        }
+        // A negative exponent is refused rather than rounded to zero, and the
+        // refusal is the operator's own rather than a parse failure.
+        for src in ["2**-1", "2**-2", "0**-1", "1**-2", "2**(1-2)"] {
+            let e = try_eval(&mut sh, src).err().ok_or(format!("{src} evaluated"))?;
+            assert!(e.contains("exponent less than 0"), "{src}: {e}");
+        }
+        // Inside the arm the conditional disables, that refusal is not raised,
+        // which is the rule the zero divisor follows. A `&&`/`||` operand is
+        // NOT such an arm, so the refusal stands there.
+        for (src, want) in [("0 ? 2**-1 : 3", 3), ("1 ? 3 : 2**-1", 3)] {
+            assert_eq!(ev(&mut sh, src)?, want, "{src}");
+        }
+        for src in ["0 && 2**-1", "1 || 2**-1"] {
+            assert!(try_eval(&mut sh, src).is_err(), "{src}");
+        }
+        // `**` is one token where it binds and nothing where it does not; ash
+        // has no `**=`, so that spelling stays a parse error.
+        for src in ["2***3", "2**", "**2", "n**=2", "2*(*3)"] {
+            assert!(try_eval(&mut sh, src).is_err(), "{src}");
+        }
+        // Blanks around it, and a value that holds one.
+        assert_eq!(ev(&mut sh, "2** 3")?, 8);
+        assert_eq!(ev(&mut sh, "2 **3")?, 8);
+        // The lexer's own precedence MIRROR needs `**`'s level and its
+        // right-associativity, and neither is reachable through a value: the
+        // mirror decides whether an adjacent `++` BINDS. Two `**` in a row
+        // displace nothing, so the name is still on top and the pair binds --
+        // and is then refused, since `1` is not a name. Two `*` do displace it,
+        // so the same characters split into `+` and `+1` and the answer is 4.
+        // The pair must not be followed by a name or the forward rule decides
+        // instead and both spellings agree.
+        let mut sh = shell_with(&[("n", "2")])?;
+        assert!(try_eval(&mut sh, "n**n**++1").is_err());
+        assert_eq!(ev(&mut sh, "n*n*++1")?, 4);
+        assert_eq!(ev(&mut sh, "n/n/++1")?, 1);
+        let mut sh = shell_with(&[("v", "2**3")])?;
+        assert_eq!(eval(&mut sh, "v+1").map_err(|_| "eval v")?, 9);
         Ok(())
     }
 
@@ -1468,14 +1600,16 @@ mod tests {
     fn deeply_nested_exprs_error_instead_of_overflowing() {
         // Past MAX_EXPR_DEPTH the parser errors rather than recursing into a stack
         // overflow. Every recursion site is covered: parentheses and unary chains
-        // (via expr_unary), right-associative assignment (`a=a=…=1`), and
-        // right-nested ternary (`0?1:0?1:…`) — the last two recurse in expr_assign/
-        // expr_ternary, NOT through expr_unary, so they need their own brackets.
+        // (via expr_unary), right-associative assignment (`a=a=…=1`), right-nested
+        // ternary (`0?1:0?1:…`), and `**`, which is right-associative too — the
+        // last three recurse in expr_assign/expr_ternary/expr_exponent, NOT
+        // through expr_unary, so they need their own brackets.
         assert!(ev(&("(".repeat(1000) + "1" + &")".repeat(1000))).is_err());
         assert!(ev(&("!".repeat(1000) + "1")).is_err());
         assert!(ev(&("-".repeat(1000) + "1")).is_err());
         assert!(ev(&("a=".repeat(1000) + "1")).is_err());
         assert!(ev(&("0?1:".repeat(1000) + "1")).is_err());
+        assert!(ev(&("1**".repeat(1000) + "1")).is_err());
     }
 
     #[test]
