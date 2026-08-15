@@ -26,11 +26,16 @@
 //! deployment is installed and booted, by a program that cannot depend on a
 //! crate at all. They are a pair, since the verifier reaches its hash as
 //! `crate::sha512`, so a consumer `#[path]`-includes BOTH at its crate root.
+// `cpio` writes the one-file archive a harness APPENDS to an initramfs, which
+// is how a per-run trusted key reaches td-boot without any recipe being
+// parameterized (DESIGN.md §6). Host-side only: it produces bytes for a check
+// to write, and no target binary includes it.
+pub mod cpio;
 pub mod crc32;
 pub mod ed25519;
-// SIGNING is a separate module because td-boot `#[path]`-includes `ed25519.rs`
-// and nothing else: keeping the signer out of that file is what keeps it off
-// the boot path. Its one caller is the recipe-check oracle.
+// SIGNING is a separate module because, of the two ed25519 files, td-boot
+// `#[path]`-includes only the VERIFIER: keeping the signer out of that file is
+// what keeps it off the boot path. Its one caller is the recipe-check oracle.
 pub mod ed25519_sign;
 pub mod exit;
 pub mod fat;

@@ -319,10 +319,27 @@ parameterized. Checked against the pinned tree, `linux-7.1.4`,
 machine at `Start` on each `070701` magic and skips NUL padding between
 archives, and the compressed path does the same in `flush_buffer`. Two
 consequences: the appended archive must begin **4-byte aligned** (the branch
-is guarded by `!(this_header & 3)`, and a misaligned appendix is a boot-time
-`invalid magic` panic, not a silent skip), and a later archive's file
-replaces an earlier one's (`clean_path` plus `O_TRUNC`), which is what lets a
-key be appended rather than reserved.
+is guarded by `!(this_header & 3)`), and a later archive's file replaces an
+earlier one's (`clean_path` plus `O_TRUNC`), which is what lets a key be
+appended rather than reserved.
+
+What a *misaligned* appendix costs was stated wrongly here at first, and the
+correction matters because the whole appeal of the mechanism was that the
+kernel would catch the mistake loudly. It does not, twice over. `do_reset`
+eats the NUL run and errors `broken padding` (`:324-331`) — not `invalid
+magic`, which is unreachable here, because that error sets `message` and the
+driver loop is `while (!message && len)`. And td's deployment initramfs is an
+**initrd** (`CONFIG_INITRAMFS_SOURCE=""`, qemu `-initrd`), so it takes
+`:726-733` rather than the `panic_show_mem` the built-in archive gets at
+`:714-716`; with `CONFIG_BLK_DEV_RAM` off — allnoconfig leaves it off and the
+recipe's delta list does not add it — that arm is one
+`printk(KERN_EMERG "Initramfs unpacking failed: %s\n")` and **the boot
+continues**, base archive extracted and the key absent. That is precisely the
+"a missing key becomes a runtime branch" hazard named three paragraphs above
+— whose tempting branch is the fail-open D2 forbids — arriving through the
+very mechanism meant to avoid it. So the harness's own padding is the entire
+defence, and item 6's fail-closed flip is what turns a keyless boot from a
+silent one into a refusal.
 
 One tension in the list above is worth naming rather than leaving to be
 noticed: D5 calls the ESP the least trustworthy surface on the disk —
