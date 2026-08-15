@@ -43,7 +43,7 @@ tests/*/target/
 # Persistent content-addressed build-recipe cache (skip-if-already-realized).
 .td-build-cache
 
-# Ad-hoc captured ./check.sh run logs (e.g. a backgrounded full-loop run). Transient
+# Ad-hoc captured `td-builder check` run logs (e.g. a backgrounded full-loop run). Transient
 # host-local output, never versioned.
 .check-*.log
 

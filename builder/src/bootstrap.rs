@@ -61,7 +61,8 @@ pub(crate) fn shared_sources_dir() -> PathBuf {
 }
 
 /// Where a recipe finds its warmed-source cache (`$HOME/.td/sources/`, populated by
-/// `td-feed warm sources` in check.sh's HOST prelude — the offline loop never egresses).
+/// `td-feed warm sources` in `td-builder check`'s HOST prelude — the offline loop
+/// never egresses).
 pub struct Ctx {
     pub sources_dir: PathBuf,
     source_pins: Vec<SourcePin>,
@@ -355,7 +356,7 @@ fn verified_source_tarball<'a>(
     let tarball = cx.sources_dir.join(&pin.file);
     if !tarball.exists() {
         return Err(format!(
-            "the pinned tarball is not warm ({}) — run 'td-feed warm sources' to td-fetch {} (needs network); check.sh's prelude does this",
+            "the pinned tarball is not warm ({}) — run 'td-feed warm sources' to td-fetch {} (needs network); the 'td-builder check' warm prelude does this",
             tarball.display(),
             pin.url
         ));

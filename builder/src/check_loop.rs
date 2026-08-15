@@ -1,8 +1,8 @@
 //! check_loop.rs — `td-builder check`: the loop's HOST PRELUDE, ported from the
-//! old shell check.sh so that check.sh shrinks to a guix-free cargo bootstrap
-//! shim (human direction 2026-07-03: "I don't want guix anywhere near check.sh" —
-//! the host rust toolchain is the part the user brings; everything after
-//! `cargo build` is td's own code).
+//! old shell check.sh, which shrank to a guix-free cargo bootstrap shim before
+//! being retired outright (human direction 2026-07-03: "I don't want guix
+//! anywhere near check.sh" — the host rust toolchain is the part the user
+//! brings; everything after `cargo build` is td's own code).
 //!
 //! What runs here, in order (the exact sequence the shell prelude ran; the
 //! rationale comments live with each step):
@@ -1692,8 +1692,8 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     })?;
 
     let mut child_envs: Vec<(String, String)> = vec![(s("PATH"), toolchain)];
-    // The runner's knobs must cross the sandbox boundary (host-sandbox
-    // preserves the TD_CHECK_ prefix): without this, TD_CHECK_SLOTS=… ./check.sh
+    // The runner's knobs must cross the sandbox boundary (host-sandbox preserves
+    // the TD_CHECK_ prefix): without this, `TD_CHECK_SLOTS=… td-builder check`
     // would be silently dead and gate-run would always default to nproc.
     // TD_CHECK_DISABLE forwards the gate-disable list (gate names / `pool:<name>`
     // tokens) so `TD_CHECK_DISABLE=… td-builder check` reaches the in-sandbox runner.

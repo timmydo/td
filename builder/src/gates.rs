@@ -1,6 +1,6 @@
 //! gates.rs — td's OWN gate runner: `td-builder gate-run`, the loop scheduler that
-//! replaced `make` + the `Makefile` on the spine (`./check.sh` reaches it via
-//! `td-builder check`, which execs it inside the loop sandbox).
+//! replaced `make` + the `Makefile` on the spine (`td-builder check` execs it
+//! inside the loop sandbox).
 //!
 //! The Makefile used make for exactly four things: the gate-fragment registry, the
 //! ordering graph (cheap serial-first, heavy after the last cheap gate, BUILD_GATES
@@ -83,7 +83,7 @@ pub(crate) fn pool_in_full_check(p: Pool) -> bool {
 /// One gate, declared as compiled Rust data in `src/gate_defs/<NNN>-<name>.rs`.
 /// The registry (`build.rs`) collects every file's `gate()` into `all()`.
 pub struct GateDef {
-    /// The goal name (`./check.sh <name>` runs it) — must equal the defining
+    /// The goal name (`td-builder check <name>` runs it) — must equal the defining
     /// file's stem minus its `<NNN>-` prefix (checked by `load`).
     pub name: &'static str,
     /// Self-registration into the check tiers.

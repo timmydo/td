@@ -627,12 +627,12 @@ fn cargo_proxy_selftest() {
 // warm <action> — the STRUCTURED host-PREP orchestration that consolidates the former
 // tools/warm-{cargo-proxy,cargo-proxy-local,bootstrap-sources,kernel-headers{,-x86_64}}.sh
 // shell scripts into one typed, in-process subcommand (move-off-shell). These run on the
-// HOST during check.sh's network-permitted prelude (the offline loop has no egress) and are
-// BEST-EFFORT by design: a runner without cargo/make/network warns to stderr and skips
-// (exit 0) — the heavy `rust-*` / `bootstrap-*` gates that CONSUME the warmed outputs fail
-// loudly if they actually run cold. The crown-jewel win over the shell: the cargo-proxy is
-// bound IN-PROCESS, so we know its loopback address immediately — no background process, no
-// log-file scrape, no `sed` parse, no sleep-poll.
+// HOST during `td-builder check`'s network-permitted prelude (the offline loop has no
+// egress) and are BEST-EFFORT by design: a runner without cargo/make/network warns to
+// stderr and skips (exit 0) — the heavy `rust-*` / `bootstrap-*` gates that CONSUME the
+// warmed outputs fail loudly if they actually run cold. The crown-jewel win over the
+// shell: the cargo-proxy is bound IN-PROCESS, so we know its loopback address immediately
+// — no background process, no log-file scrape, no `sed` parse, no sleep-poll.
 //
 // Paths resolve relative to the repo root (the prelude's CWD); TD_ROOT overrides it.
 

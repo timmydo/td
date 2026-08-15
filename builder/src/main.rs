@@ -13,7 +13,8 @@
 //!     the daemon's recorded hash (the rung's S2 leg diffs them);
 //!   • S3 — an ATerm `.drv` parser + a userns build sandbox + store
 //!     registration;
-//!   • S4 — the daemon-vs-td-builder store differential, as a check.sh rung.
+//!   • S4 — the daemon-vs-td-builder store differential, as a
+//!     `td-builder check` rung.
 
 mod affected;
 mod bootstrap;
@@ -6771,9 +6772,9 @@ fn main() -> ExitCode {
         Some("gate-body") if args.len() == 3 => gate_bodies::cli(&args[2]),
         // check [GOAL...] — the loop's HOST PRELUDE (the old shell check.sh,
         // ported): guards, stage0 + toolchain provisioning, warms, the shared
-        // daemon, then the sandboxed gate-run. check.sh is now a guix-free cargo
-        // bootstrap shim that execs this. (The drv reproducibility double-build
-        // that used to share this verb is `check-drv` now — no argument sniffing.)
+        // daemon, then the sandboxed gate-run. (The drv reproducibility
+        // double-build that used to share this verb is `check-drv` now — no
+        // argument sniffing.)
         Some("check") => check_loop::cli(args.get(2..).unwrap_or(&[])),
         // check-rung HARNESS [ARGS...] — dev-iteration helper: run a cached-chain
         // bootstrap harness inside the loop sandbox (was tools/check-rung.sh).

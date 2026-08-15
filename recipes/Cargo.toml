@@ -14,7 +14,7 @@ name = "td-recipe-eval"
 path = "src/bin/td-recipe-eval.rs"
 
 # DEPENDENCY-FREE on purpose (the builder/ discipline): the crate compiles OFFLINE
-# in the check.sh sandbox with nothing fetched. The JSON value/parser/canonical
+# in the loop sandbox with nothing fetched. The JSON value/parser/canonical
 # writer and SHA-256 are hand-rolled — now in the in-repo, std-only td-engine
 # (path member of this workspace, itself zero-dependency), shared with td-builder
 # rather than pulling serde. This is the whole point of moving the recipe surface
