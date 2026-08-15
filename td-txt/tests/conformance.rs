@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 2275;
+const CORPUS_FLOOR: usize = 2282;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -1300,6 +1300,49 @@ fn sed_answers_from_a_stream_that_has_not_ended() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+/// `R /dev/stdin` answers from a stream that has not ended, which is the half of
+/// the shared reader the corpus cannot ask for: every case there writes stdin whole
+/// and closes it, so a source read whole passes them all. The write end stays OPEN
+/// across the assertion — a run that swallowed standard input first would still be
+/// blocked in that read when the deadline passed, which is what it did before the
+/// one reader existed.
+#[test]
+fn r_upper_stdin_answers_before_the_stream_ends() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{Read, Write};
+    let dir = TempDir::new("r-stdin-stream")?;
+    std::fs::write(dir.0.join("IN"), b"a\nb\n")?;
+    let mut child = std::process::Command::new(bin())
+        .arg("sed")
+        .args(["-n", "-e", "R /dev/stdin", "-e", "p", "IN"])
+        .current_dir(&dir.0)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let mut sink = child.stdin.take().ok_or("no stdin pipe")?;
+    let mut out = child.stdout.take().ok_or("no stdout pipe")?;
+    sink.write_all(b"s1\ns2\n")?;
+    sink.flush()?;
+
+    // On a thread, because a read that never answers is exactly the failure: the
+    // deadline is the parent's, and killing the child is what releases it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 10];
+        let _ = tx.send(out.read_exact(&mut buf).map(|()| buf));
+    });
+    let got = rx.recv_timeout(std::time::Duration::from_secs(20));
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(sink);
+    let buf = got.map_err(|_| "R /dev/stdin answered nothing while its stream was open")??;
+    // Interleaved, one source line per cycle: the operand's line, then stdin's.
+    // Exactly what the two cycles produce, so the read cannot wait on a byte that
+    // only a closed pipe would bring.
+    assert_eq!(&buf, b"a\ns1\nb\ns2\n");
+    Ok(())
+}
+
 /// `r` dumps its source as it READS it, and the two halves of that are what this
 /// asserts. Bytes come OUT of an ENDLESS source, which a reader that swallowed the
 /// whole source first could never manage; and closing the pipe ENDS the run, which
@@ -1938,6 +1981,65 @@ fn a_special_stream_refuses_by_direction_not_by_descriptor(
     Ok(())
 }
 
+/// A run that DIES repositions standard input too, and exactly ONCE. Each way out
+/// of the `-s`/`-i` loop is its own exit -- a fatal read, a refused in-place
+/// operand -- and the reader is the RUN's now, so every one of them owes the
+/// position back. Once, because the count is computed from the reader and a seek
+/// does not change it: a second call moves the descriptor again by the same
+/// amount, which is a stray `can't reposition stdin` when the result is negative
+/// and a silent over-rewind when it is not.
+///
+/// Both shapes need a REGULAR file on descriptor 0 and a second handle onto the
+/// same description, which is why they are here and not in the corpus; the `-i`
+/// one also checks the file it DID edit, since the run is meant to die after it.
+#[test]
+fn a_dying_run_repositions_standard_input_once() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Read;
+    let dir = TempDir::new("sed-stdin-dies")?;
+    std::fs::write(dir.0.join("four"), b"l1\nl2\nl3\nl4\n")?;
+    std::fs::write(dir.0.join("one"), b"ONE\n")?;
+    // Opening a directory succeeds and the first READ of it fails, which is how a
+    // run is made to die having already taken a line off descriptor 0.
+    std::fs::create_dir_all(dir.0.join("D"))?;
+
+    let rows: &[(&[&str], &[u8], &[u8])] = &[
+        // A fatal read under `-s`: `R` took `l1`, so `l2`..`l4` are owed back.
+        (
+            &["-s", "-n", "-e", "R /dev/stdin", "-e", "p", "one", "D"],
+            b"sed: read error on D: Is a directory\n",
+            b"l2\nl3\nl4\n",
+        ),
+        // A refused `-i` operand, which gives up on the whole run from a third
+        // place: the first operand was edited and the second cannot be.
+        (
+            &["-i", "-e", "R /dev/stdin", "A", "D"],
+            b"sed: couldn't edit D: not a regular file\n",
+            b"l2\nl3\nl4\n",
+        ),
+    ];
+    for (args, want_err, want_rest) in rows {
+        std::fs::write(dir.0.join("A"), b"a\n")?;
+        let given = std::fs::File::open(dir.0.join("four"))?;
+        let mut mine = given.try_clone()?;
+        let out = std::process::Command::new(bin())
+            .arg("sed")
+            .args(*args)
+            .current_dir(&dir.0)
+            .stdin(std::process::Stdio::from(given))
+            .output()?;
+        let mut rest = Vec::new();
+        mine.read_to_end(&mut rest)?;
+        // EXACTLY the one diagnostic: a second give-back would add its own.
+        assert_eq!(out.stderr, want_err.to_vec(), "{args:?}: stderr");
+        assert_eq!(out.status.code(), Some(4), "{args:?}");
+        assert_eq!(rest, want_rest.to_vec(), "{args:?}: what was left on descriptor 0");
+    }
+    // The operand the `-i` run DID edit keeps what `R` gave it, which is what says
+    // the run got that far.
+    assert_eq!(std::fs::read(dir.0.join("A"))?, b"a\nl1\n".to_vec());
+    Ok(())
+}
+
 /// A seekable standard input is left positioned after the last record sed
 /// CONSUMED, not at end of file: POSIX's "shall not consume more input than it
 /// needs", and what makes `{ sed 1q; cat; } < f` — read a header, hand the rest
@@ -2009,6 +2111,22 @@ fn sed_leaves_a_seekable_stdin_after_the_last_record_it_read(
         // Two dashes: the second open reads 0 bytes at end of file and must not
         // overwrite what the first one is owed.
         ("four", &["-n", "2q", "-", "-"], b"", b"l3\nl4\n"),
+        // `R /dev/stdin` reads the SAME descriptor, so what it takes is delivered
+        // as much as a cycle's record is -- it was printed -- and handing it back
+        // would repeat it to whoever reads next. Before the one shared reader
+        // these left NOTHING: `R` swallowed standard input to end of file.
+        ("four", &["-n", "-e", "R /dev/stdin", "-e", "p", "one"], b"ONE\nl1\n", b"l2\nl3\nl4\n"),
+        ("four", &["-n", "-e", "R /dev/stdin", "-e", "R /dev/stdin", "-e", "p", "one"], b"ONE\nl1\nl2\n", b"l3\nl4\n"),
+        // A `q` before the source is spent owes back the rest, as it does for a
+        // record the cycle read.
+        ("four", &["-n", "-e", "R /dev/stdin", "-e", "p", "-e", "q", "one"], b"ONE\nl1\n", b"l2\nl3\nl4\n"),
+        // Both roles on one descriptor: the `-` operand goes on from where `R`
+        // left it, so between them they reach the end and nothing is owed.
+        ("four", &["-n", "-e", "R /dev/stdin", "-e", "p", "one", "-"], b"ONE\nl1\nl2\nl3\nl4\n", b""),
+        // `-s` makes a stream per operand while the reader is the RUN's, which is
+        // why the give-back is the run's too: repositioning between operands would
+        // rewind a descriptor whose buffered records the next operand still reads.
+        ("four", &["-s", "-n", "-e", "R /dev/stdin", "-e", "p", "one", "one"], b"ONE\nl1\nONE\nl2\n", b"l3\nl4\n"),
         // The controls. A script that reads to the end leaves nothing, which is
         // what says the rewind is not unconditional; and no `q` at all is the
         // same.

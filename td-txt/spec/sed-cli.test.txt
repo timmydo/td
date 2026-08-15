@@ -3694,15 +3694,76 @@ sed: couldn't open file /nosuchdir/out: No such file or directory
 ## status: 0
 
 #### R /dev/stdin when standard input is ALSO the input shares its cursor
-# GNU takes ONE line per `R', off the very stream its input reader is walking, so
-# the two share a position and alternate lines go to the append queue. td-txt
-# reads each input whole before the first cycle, so the `R' finds nothing left.
-# That is the read-whole gap spec/README records, and this is the one shape of it
-# that changes BYTES rather than only when they arrive -- which is why it is a
-# case with GNU's golden and not a paragraph. xfail.
+# ONE line per `R', off the very stream the input reader is walking, so the two
+# share a position and alternate lines go to the append queue. The interleaving
+# is not arranged: there is one reader over descriptor 0 for the whole run, and
+# both roles take records from it.
 ## argv: sed -n -e 'R /dev/stdin' -e s/^/P/ -e p
 ## stdin-json: "A\nB\nC\n"
 ## stdout-json: "PA\nB\nPC\n"
+## stderr-json: ""
+## status: 0
+
+# And the position is the RUN's, not an operand's: it carries from a file operand
+# to a `-` one, past the end of a file, and across the per-operand reset `-s`
+# makes -- standard input is the one `R` source that cannot be rewound, so `-s`
+# leaves it where it stands.
+
+#### R /dev/stdin and a `-` operand later in the list share one position
+## argv: sed -n -e 'R /dev/stdin' -e 's/^/P:/' -e p f1 -
+## file-json f1: "a\nb\n"
+## stdin-json: "s1\ns2\ns3\ns4\ns5\ns6\n"
+## stdout-json: "P:a\ns1\nP:b\ns2\nP:s3\ns4\nP:s5\ns6\n"
+## stderr-json: ""
+## status: 0
+
+#### -s does not restart that position: standard input cannot be rewound
+## argv: sed -s -n -e 'R /dev/stdin' -e 's/^/P:/' -e p f1 -
+## file-json f1: "a\nb\n"
+## stdin-json: "s1\ns2\ns3\ns4\ns5\ns6\n"
+## stdout-json: "P:a\ns1\nP:b\ns2\nP:s3\ns4\nP:s5\ns6\n"
+## stderr-json: ""
+## status: 0
+
+#### two R /dev/stdin in one cycle take two lines, in order
+## argv: sed -n -e 'R /dev/stdin' -e 'R /dev/stdin' -e p f1
+## file-json f1: "a\nb\nc\n"
+## stdin-json: "s1\ns2\ns3\ns4\n"
+## stdout-json: "a\ns1\ns2\nb\ns3\ns4\nc\n"
+## stderr-json: ""
+## status: 0
+
+#### R /dev/stdin before a `-` operand leaves it the REST
+## argv: sed -n -e '1R /dev/stdin' -e 's/^/P:/' -e p -
+## stdin-json: "o1\no2\no3\n"
+## stdout-json: "P:o1\no2\nP:o3\n"
+## stderr-json: ""
+## status: 0
+
+# The `$` LOOKAHEAD is the one thing that can hold a record of that reader back.
+# GNU's `$` test peeks a CHARACTER and ungets it, so nothing is ever kept from
+# `R`; a whole record held here would give `R` the line AFTER the one it is owed
+# and the next cycle the one before it. Two reviewers found this independently.
+
+#### a $ lookahead holds a record of that reader, and R must have THAT one
+## argv: sed -n -e '$!p' -e 'R /dev/stdin' -e p
+## stdin-json: "o1\no2\no3\no4\n"
+## stdout-json: "o1\no1\no2\no3\no3\no4\n"
+## stderr-json: ""
+## status: 0
+
+#### the same with = , whose address is the only thing that looked
+## argv: sed -n -e '$=' -e 'R /dev/stdin' -e p
+## stdin-json: "o1\no2\no3\no4\n"
+## stdout-json: "o1\no2\no3\no4\n"
+## stderr-json: ""
+## status: 0
+
+#### and with a file operand, where the held record is NOT the shared reader's
+## argv: sed -n -e '$!p' -e 'R /dev/stdin' -e p f1
+## file-json f1: "a\nb\n"
+## stdin-json: "o1\no2\no3\n"
+## stdout-json: "a\na\no1\nb\no2\n"
 ## stderr-json: ""
 ## status: 0
 

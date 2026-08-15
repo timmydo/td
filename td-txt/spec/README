@@ -1281,51 +1281,60 @@ td-txt-authored case files
     removed before the first `R` still yields its lines in GNU and none here.
     Pre-existing in both builds either side of this landing.
 
-    `R /dev/stdin` is what is left, and it is the one source that cannot simply
-    take the same reader. It is the INPUT's own descriptor: the operand reader
-    holds a duplicate of fd 0 and hands back its over-read with a RELATIVE seek,
-    and a second reader over-reading the same descriptor between those reads
-    makes that seek land somewhere else entirely. Two readers cannot each be
-    right about a relative seek. GNU has no such problem because it has no
-    second reader -- `R /dev/stdin` and the input share ONE stream, which is
-    also what produces the alternate-lines behaviour below. Sharing one reader
-    is therefore the fix, and it is a landing of its own rather than a corner
-    of this one.
+    `R /dev/stdin` was what was left, and it is CLOSED: it is the one source
+    that could not simply take a reader of its own. It is the INPUT's own
+    descriptor, and two readers over one descriptor cannot each be right about
+    a RELATIVE seek -- the operand reader hands back its over-read that way, and
+    a second reader taking bytes between those reads sends the seek somewhere
+    else entirely. GNU has no such problem because it has no second reader:
+    `R /dev/stdin` and the input share ONE stream. So does this now. The run
+    holds one reader over descriptor 0, made at most once, and both roles take
+    records from it -- an operand naming standard input, and `R`.
 
-    Where the source is the INPUT's own stream the bytes differ too, because
-    GNU's `R` and its input reader then share one cursor and take alternate
-    lines: `printf 'A\nB\nC\n' | sed -n -e 'R /dev/stdin' -e s/^/P/ -e p` is
-    `PA B PC` in GNU and `PA PB PC` here, the `R` finding the stream already
-    drained. That half IS caseable and is pinned as an xfail with GNU's golden;
-    the timing half is not.
-    "Read whole" undersells the third face, which is a COST this landing paid
-    rather than one it found: `R /dev/stdin` now CONSUMES the operator's
-    standard input to end of file, where GNU leaves it one line on. With a
-    regular file on fd 0, `( sed -n -e 'R /dev/stdin' -e p A; cat ) < EIGHT`
-    leaves `cat` nothing here and lines 3-8 in GNU -- and the build BEFORE the
-    special-file table left all eight, because reopening the name gave it an
-    offset of its own. So the table made this cell worse while making the fifo
-    cell work at all, and consuming SOMETHING is right in kind where consuming
-    nothing was an artifact. It is a descriptor another program owns, which is
-    the shape of harm `w /dev/stdin` truncating it was. Reading one line
-    instead needs an UNBUFFERED read of fd 0, and this entry USED to say safe
-    Rust has none -- `std::io::Stdin` is a `BufReader`, so a line-at-a-time
-    reader still takes up to 8 KiB off the shared descriptor, and going under
-    it looked like a descriptor adoption this crate has no `unsafe` for. That
-    was wrong, and the entry below is what caught it:
-    `stdin().as_fd().try_clone_to_owned()` is safe std and yields an `OwnedFd`,
-    hence a `File` -- unbuffered, and sharing the file description, so it reads
-    and seeks the very offset fd 0 has. td-sh already relies on it
-    (`stdin_raw` in td-sh/src/process.rs). What stands between here and a
-    one-line read is therefore the streaming reader below, not a missing
-    primitive.
-    Pre-existing in both halves, and what is LEFT of the class the special-file
-    table closed (its cases are in sed-cli.test.txt): that table stopped `R
-    /dev/stdin` reopening a NAME, which was a permanent hang on a fifo whose
-    writer had already gone, and this was the same hang from the other end --
-    reading to an EOF that never comes rather than opening something that never
-    opens. For a NAMED source that is now closed; for `/dev/stdin` it is not,
-    and what it waits for is the one shared reader above.
+    Three faces closed together, which is why they were one landing. The BYTES:
+    sharing a cursor means alternate lines, so `printf 'A\nB\nC\n' | sed -n -e
+    'R /dev/stdin' -e s/^/P/ -e p` is `PA B PC` in both now, where td-txt read
+    each input whole and its `R` found nothing left. That was an xfail with
+    GNU's golden and is promoted, with four cases beside it for the shapes the
+    one position spans: a file operand then `-`, `-s` (which restarts every
+    REWINDABLE `R` source per operand and must not restart this one, since
+    standard input cannot be rewound), two `R`s in one cycle, and an `R` before
+    a `-` operand.
+
+    The `$` LOOKAHEAD is the one thing that can hold a record of that reader
+    back, and it hands it over. `Stream` keeps one record ahead because `$`
+    cannot be answered without having looked; GNU's `$` test peeks a CHARACTER
+    and ungets it, so nothing is ever kept from `R`. Reading past a held record
+    gives `R` the line AFTER the one it is owed and the next cycle the one
+    before it -- `sed -n -e '$!p' -e 'R /dev/stdin' -e p` over four lines is
+    `o1 o1 o2 o3 o3 o4` in GNU and was `o1 o1 o3 o2 o2 o4` here. Three cases
+    cover it, and a record carries WHERE IT CAME FROM so the question can be
+    asked at all.
+
+    The TIMING: the source is read a block at a time like any other, so
+    `R /dev/stdin` answers from a stream that has not ended. Measured with a
+    pipe fed a line every 150ms, GNU and td-txt now both emit all six lines
+    within the first second, where td-txt emitted nothing until the writer
+    closed.
+
+    And the CONSUMPTION, which was a cost the special-file table paid rather
+    than one it found: `R /dev/stdin` used to swallow the operator's standard
+    input to end of file. `( sed -n -e 'R /dev/stdin' -e p A; cat ) < EIGHT`
+    left `cat` NOTHING, against GNU's lines 3-8; it now leaves exactly 3-8 as
+    well. That follows from the accounting rather than from a rule of its own:
+    what `R` takes is DELIVERED, as a cycle's record is -- it was printed --
+    so the give-back subtracts it and hands back only what the block read
+    over-read. It is a descriptor another program owns, which is the shape of
+    harm `w /dev/stdin` truncating it was.
+
+    What that leaves is `r /dev/stdin`, the LOWERCASE one, and it is not the
+    same question: GNU opens the NAME there rather than sharing the stream, so
+    it dumps whatever is left in the descriptor and re-reads a regular file
+    from its start every cycle. td-txt does the same and agrees on every shape
+    measured -- except under `-u`, where GNU reads a byte at a time and so
+    leaves the descriptor a line on, which is the read-granularity entry above
+    and not this one. `sed -n -u -e 'r /dev/stdin' - -` over `x\ny` is `y`
+    there and empty here, identically on both builds either side of this.
 
   - A COMPILE-TIME flag is POSITIONAL, and used not to be here. GNU compiles each
     `-e`/`-f` inside its own getopt loop, so such a flag governs the parts scanned
@@ -1462,12 +1471,14 @@ td-txt-authored case files
     artifact of block size. td-txt now does both too: the seek half was already
     landed, and this is the read half.
 
-    `R /dev/stdin` is NOT closed by this and is a separate reader: an earlier
-    draft of this entry said one fix would close both, and that was wrong.
-    `( sed -n -e 'R /dev/stdin' -e p A; cat ) < EIGHT` still leaves `e3`..`e8`
-    in GNU and nothing here, because `R` reads its source through the `rfiles`
-    table rather than through the input stream this landing accounts for. It
-    wants the same streaming reader the pipe half does.
+    `R /dev/stdin` was NOT closed by this and was a separate reader: an earlier
+    draft of this entry said one fix would close both, and that was wrong --
+    `( sed -n -e 'R /dev/stdin' -e p A; cat ) < EIGHT` left `e3`..`e8` in GNU
+    and nothing here, because `R` read its source through the `rfiles` table
+    rather than through the input stream this landing accounts for. It wanted
+    the same reader, which is a later landing and closed it: `R /dev/stdin` is
+    served from the run's one descriptor-0 reader now, so what it takes counts
+    as delivered and the seek above is right about it.
 
     No CASE can show any of this, for a reason that is not about pipes: the
     harness runs ONE child and captures its output, so nothing else ever reads

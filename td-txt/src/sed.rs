@@ -16,9 +16,12 @@
 //! what keeps the give-back to descriptor 0 honest. `-s` and `-i` open each
 //! operand themselves, to decide whether it may be rewritten, and stream it
 //! through that same reader, and so does a NAMED `R` source; `r` COPIES its
-//! source to the sink a block at a time rather than holding it. SCRIPTS (`-f`)
-//! are still read whole, as is `R /dev/stdin` -- the one source that shares its
-//! descriptor with the operand reader; see spec/README.
+//! source to the sink a block at a time rather than holding it. `R /dev/stdin`
+//! takes its line from the run's ONE reader over descriptor 0 -- the same one an
+//! operand naming standard input reads -- because two readers over that
+//! descriptor cannot each be right about the give-back's relative seek, and
+//! because GNU shares one stream between them and so takes alternate lines.
+//! SCRIPTS (`-f`) are what is left reading whole; see spec/README.
 //!
 //! Every compiled regex in a script lives in one table, and an address or `s///`
 //! holds an index into it. That is what makes the empty regex (`//`, `s//x/`)
@@ -1759,10 +1762,16 @@ struct Stream {
     /// How a READ failure names the open operand, captured at open because the
     /// `Input` itself is inside the reader by the time one can happen.
     err_name: Vec<u8>,
-    /// Whether the open operand is descriptor 0 AND is being read through the raw
-    /// duplicate of it -- which is exactly when the over-read can be counted, and
-    /// so the only case that may be handed back. See `source_of`.
-    owed_stdin: bool,
+    /// The run's ONE reader over descriptor 0, made at most once and outliving the
+    /// operand that first needed it. Both roles read from it: an operand naming
+    /// standard input, and `R /dev/stdin`. GNU shares one `FILE*` between them, so
+    /// its `R` takes the line AFTER the one the cycle read -- `sed -n -e 'R
+    /// /dev/stdin' -e 's/^/P:/' -e p -` over four lines prints `P:o1 o2 P:o3 o4`
+    /// there -- and two readers cannot produce that however they are positioned.
+    fd0: Option<Fd0>,
+    /// Whether the OPEN operand is descriptor 0, which is what says WHICH reader
+    /// the cycle takes records from.
+    on_stdin: bool,
     /// Bytes of the open operand already handed to the evaluator. With the
     /// reader's `consumed()` this is the whole of the give-back accounting.
     delivered: u64,
@@ -1770,7 +1779,7 @@ struct Stream {
     /// the record that answered it is the next one the cycle gets -- so it is
     /// held here rather than re-read, and it is NOT counted as delivered until
     /// it is handed out.
-    ahead: Option<Line>,
+    ahead: Option<(Line, bool)>,
     /// A read failure already suffered. It outranks a quit code, and because
     /// operands open lazily it can only describe a file the run actually reached.
     bad: bool,
@@ -1778,6 +1787,38 @@ struct Stream {
     /// The diagnostic is printed where it happens, ahead of the buffered output,
     /// so it lands beside the other operand diagnostics as GNU's does.
     fatal: bool,
+}
+
+/// The run's reader over descriptor 0, and the accounting that has to travel with
+/// it once it outlives an operand.
+struct Fd0 {
+    rec: Records<Src>,
+    /// Bytes handed out of THIS reader, to a cycle or to `R`, across every operand
+    /// it has served. `consumed()` counts from the reader's creation, so the
+    /// give-back needs a delivered count of the same span -- where `Stream`'s own
+    /// is per operand, for the torn-read test.
+    delivered: u64,
+    /// Whether it is the raw duplicate. A fallback through `std::io::Stdin` reads
+    /// 8 KiB for a 4 KiB request, so what it over-read cannot be counted and
+    /// nothing may be handed back. See `source_of`.
+    raw: bool,
+}
+
+impl Fd0 {
+    /// Bytes taken from standard input and never handed out as a record, which is
+    /// what a `q` leaves behind. `records` partitions the buffer exactly -- every
+    /// byte is in some record or is the separator its `terminated` flag counts --
+    /// so subtracting what was delivered is the whole of what was over-read.
+    fn unconsumed(&self) -> Option<u64> {
+        if !self.raw {
+            return None;
+        }
+        // A spent reader owes nothing: it is spent because a read returned end of
+        // input, so everything it took has been handed out. That now includes what
+        // `R /dev/stdin` took, which is delivered as much as a cycle's record is --
+        // it was printed -- and handing it back would repeat it to the next reader.
+        Some(self.rec.consumed().saturating_sub(self.delivered))
+    }
 }
 
 /// What a `Stream` reads from: an operand, opened either by the stream itself or
@@ -1835,22 +1876,27 @@ enum Opener {
 impl Stream {
     /// One operand the `-s`/`-i` caller has already OPENED -- that path opens each
     /// file itself to decide whether it may be rewritten -- and streams from here
-    /// exactly as the single-stream path streams its own.
-    fn over(path: &[u8], input: Input, separator: u8) -> Self {
+    /// exactly as the single-stream path streams its own. The descriptor-0 reader
+    /// comes IN because that path makes a `Stream` per operand while there is one
+    /// standard input for the run: under `-s`, `R /dev/stdin` goes on where the
+    /// previous operand left it rather than starting again.
+    fn over(path: &[u8], input: Input, separator: u8, fd0: Option<Fd0>) -> Self {
         let err_name = input.error_name(path);
-        let (src, owed_stdin) = source_of(input);
-        Self {
+        let mut stream = Self {
             pending: Vec::new().into_iter(),
             separator,
             name: path.to_vec(),
-            src: Some(Records::with_buffer(src, separator, Self::BLOCK)),
+            src: None,
             err_name,
-            owed_stdin,
+            fd0,
+            on_stdin: false,
             delivered: 0,
             ahead: None,
             bad: false,
             fatal: false,
-        }
+        };
+        stream.open(input);
+        stream
     }
 
     /// Every operand, none of them read yet. Taken BY VALUE: nothing revisits an
@@ -1862,12 +1908,104 @@ impl Stream {
             name: b"-".to_vec(),
             src: None,
             err_name: b"-".to_vec(),
-            owed_stdin: false,
+            fd0: None,
+            on_stdin: false,
             delivered: 0,
             ahead: None,
             bad: false,
             fatal: false,
         }
+    }
+
+    /// Take the descriptor-0 reader, for the caller that makes the NEXT `Stream`.
+    fn take_fd0(&mut self) -> Option<Fd0> {
+        self.fd0.take()
+    }
+
+    /// Start reading an opened operand. Standard input goes through the run's one
+    /// reader; anything else gets its own, per operand as before.
+    fn open(&mut self, input: Input) {
+        self.delivered = 0;
+        if !input.is_stdin() {
+            self.on_stdin = false;
+            self.src = Some(Records::with_buffer(Src::Open(input), self.separator, Self::BLOCK));
+            return;
+        }
+        self.open_fd0(input);
+        self.on_stdin = true;
+    }
+
+    /// The reader over descriptor 0, made once per RUN. A second operand naming it
+    /// -- or an `R /dev/stdin` before one -- continues through the same buffer,
+    /// which is what keeps one position between them.
+    fn open_fd0(&mut self, input: Input) {
+        if self.fd0.is_some() {
+            return;
+        }
+        let (src, raw) = source_of(input);
+        let rec = Records::with_buffer(src, self.separator, Self::BLOCK);
+        self.fd0 = Some(Fd0 { rec, delivered: 0, raw });
+    }
+
+    /// Count a record as handed out of descriptor 0's reader, which is what the
+    /// give-back subtracts. A record `R` took is delivered as much as a cycle's is:
+    /// it was printed, so handing it back would repeat it to the next reader.
+    fn count_fd0(&mut self, line: &Line) {
+        let took = (line.text.len() as u64).saturating_add(u64::from(line.terminated));
+        if let Some(fd0) = self.fd0.as_mut() {
+            fd0.delivered = fd0.delivered.saturating_add(took);
+        }
+    }
+
+    /// The reader the CYCLE takes records from.
+    fn reader(&mut self) -> Option<&mut Records<Src>> {
+        match self.on_stdin {
+            true => self.fd0.as_mut().map(|fd0| &mut fd0.rec),
+            false => self.src.as_mut(),
+        }
+    }
+
+    /// End the OPEN operand. Descriptor 0's reader is KEPT even then: `R
+    /// /dev/stdin` may still ask, and what it must see is the end of input the
+    /// cycle just saw rather than a fresh buffer over the same descriptor.
+    fn close_current(&mut self) {
+        match self.on_stdin {
+            true => self.on_stdin = false,
+            false => self.src = None,
+        }
+    }
+
+    /// One record from descriptor 0 for `R /dev/stdin`, off the run's own reader --
+    /// the same one an operand reads when it names standard input. GNU's
+    /// interleaving then FOLLOWS from there being one position rather than being
+    /// arranged, and so does what a later `-` operand sees.
+    ///
+    /// A read failure is the run's, exit 4, and names the STREAM rather than the
+    /// path the script spelled -- `sed -n -e 'R /dev/stdin' -e p IN < DIR` is
+    /// `read error on stdin: Is a directory` in GNU, with nothing printed, because
+    /// `R` runs before the cycle's own output does.
+    fn stdin_record(&mut self) -> Result<Option<Line>, Vec<u8>> {
+        // Peeked BEFORE taken: `take` on a record the lookahead holds for an
+        // OPERAND would drop it, and that operand's line is then never delivered.
+        if matches!(self.ahead, Some((_, true))) {
+            if let Some((line, _)) = self.ahead.take() {
+                self.count_fd0(&line);
+                return Ok(Some(line));
+            }
+        }
+        if self.fd0.is_none() {
+            self.open_fd0(Input::Stdin);
+        }
+        let Some(fd0) = self.fd0.as_mut() else {
+            return Ok(None);
+        };
+        let line = match fd0.rec.next() {
+            Ok(true) => Line { text: fd0.rec.line().to_vec(), terminated: fd0.rec.terminated() },
+            Ok(false) => return Ok(None),
+            Err(e) => return Err(read_error(Special::In.name().as_bytes(), &e)),
+        };
+        self.count_fd0(&line);
+        Ok(Some(line))
     }
 
     /// GNU sed's read block, and what it buys is what a `q` LEAVES BEHIND: GNU
@@ -1886,23 +2024,25 @@ impl Stream {
     ///
     /// This does NOT count what it returns as delivered; `next_line` does, because
     /// a record pulled to answer `$` has been read and not yet used.
-    fn pull(&mut self, opener: Opener) -> Option<Line> {
+    fn pull(&mut self, opener: Opener) -> Option<(Line, bool)> {
         loop {
-            if let Some(src) = self.src.as_mut() {
+            let from_fd0 = self.on_stdin;
+            if let Some(src) = self.reader() {
                 match src.next() {
                     Ok(true) => {
-                        return Some(Line {
+                        let line = Line {
                             text: src.line().to_vec(),
                             terminated: src.terminated(),
-                        })
+                        };
+                        return Some((line, from_fd0));
                     }
-                    Ok(false) => self.src = None,
+                    Ok(false) => self.close_current(),
                     // The bytes a failed read DID deliver are handed over first --
                     // the reader defers the failure for exactly that -- so by here
                     // there is nothing left of this operand but the error. GNU
                     // panics at it rather than processing further.
                     Err(e) => {
-                        self.src = None;
+                        self.close_current();
                         // A LOOKAHEAD is silent only about an operand that has
                         // given nothing: to a peek, one that cannot be read at all
                         // is indistinguishable from an empty one, which is what
@@ -1930,12 +2070,10 @@ impl Stream {
             match Input::open(&self.name, true) {
                 Ok(input) => {
                     self.err_name = input.error_name(&self.name);
-                    // Per operand, as the whole-file reader's accounting was: it
-                    // replaced its line vector on every open.
-                    self.delivered = 0;
-                    let (src, owed_stdin) = source_of(input);
-                    self.owed_stdin = owed_stdin;
-                    self.src = Some(Records::with_buffer(src, self.separator, Self::BLOCK));
+                    // `open` resets the per-operand delivered count, as the
+                    // whole-file reader's accounting did: it replaced its line
+                    // vector on every open.
+                    self.open(input);
                 }
                 Err(e) => {
                     diag(&crate::util::name_in(
@@ -1955,34 +2093,24 @@ impl Stream {
         &self.name
     }
 
-    /// Bytes taken from standard input and never handed out as a record, which is
-    /// what a `q` leaves behind. `records` partitions the buffer exactly -- every
-    /// byte is in some record or is the separator its `terminated` flag counts --
-    /// so subtracting what was delivered is the whole of what was over-read.
-    fn stdin_unconsumed(&self) -> Option<u64> {
-        if !self.owed_stdin {
-            return None;
-        }
-        // A spent source owes nothing: it is spent because a read returned end of
-        // input, so everything it took has been handed out.
-        Some(self.src.as_ref()?.consumed().saturating_sub(self.delivered))
-    }
-
     /// The next line, or `None` at end of input. WHO is asking decides what an
     /// unreadable operand means, which is why the caller says: the cycle reads,
     /// and `n`/`N` reach input through GNU's `test_eof` first, so a read failure
     /// there is the peek's silent end-of-file rather than the reader's panic.
     fn next_line(&mut self, opener: Opener) -> Option<Line> {
-        let line = match self.ahead.take() {
-            Some(line) => line,
+        let (line, from_fd0) = match self.ahead.take() {
+            Some(held) => held,
             None => self.pull(opener)?,
         };
         // Counted HERE and not in `pull`, so a record read to answer `$` and never
         // used is still owed back to descriptor 0.
-        self.delivered = self
-            .delivered
-            .saturating_add(line.text.len() as u64)
-            .saturating_add(u64::from(line.terminated));
+        let took = (line.text.len() as u64).saturating_add(u64::from(line.terminated));
+        self.delivered = self.delivered.saturating_add(took);
+        // The descriptor-0 count is the one the give-back subtracts, and it spans
+        // every operand the reader has served rather than this one.
+        if from_fd0 {
+            self.count_fd0(&line);
+        }
         Some(line)
     }
 
@@ -3314,6 +3442,11 @@ fn compile_and_run(
     let mut status = 0;
 
     if conf.separate || conf.in_place.is_some() {
+        // The run's descriptor-0 reader, handed from one operand's `Stream` to the
+        // next: `-s` restarts a rewindable `R` source per operand, and standard
+        // input is the one that cannot be restarted -- GNU reads on from where the
+        // last operand left it, which needs the reader itself to survive.
+        let mut fd0: Option<Fd0> = None;
         // ONE stdout sink for every operand: `-s` restarts line numbers and range
         // state per file, but stdout is still one stream, so a separator the last
         // record of one file left owed is paid by the first write of the next.
@@ -3343,11 +3476,15 @@ fn compile_and_run(
             if conf.in_place.is_some() {
                 if let Some(why) = input.in_place_refusal() {
                     diag(&crate::util::name_in("couldn't edit ", path, &format!(": {why}")));
+                    // This gives up on the whole run, so it is one of the exits
+                    // that owes descriptor 0 its position back -- an earlier
+                    // operand's `R /dev/stdin` may have over-read it.
+                    give_back(fd0.as_mut())?;
                     sink.flush().map_err(Fatal::runtime_msg)?;
                     return Ok(4);
                 }
             }
-            let mut stream = Stream::over(path, input, separator);
+            let mut stream = Stream::over(path, input, separator, fd0.take());
             // Line numbers, range state, the HOLD SPACE and every REWINDABLE `R`
             // read position restart per file under -s / -i. The output streams and
             // their owed separators do not: those belong to the whole run. GNU
@@ -3363,39 +3500,58 @@ fn compile_and_run(
                 rfile.rewind();
             }
             let quit = match &conf.in_place {
-                // No give-back here, and none needed: `-i` opened this operand as
-                // a NAME (`dash_is_stdin` false above), so it cannot be standard
-                // input and nothing is ever owed back.
+                // `-i` opens its operand as a NAME (`dash_is_stdin` false above), so
+                // the CYCLE never reads standard input here -- but `R /dev/stdin`
+                // still can, and then this arm owes the position back like any
+                // other.
                 Some(suffix) => {
                     let mut buf = Sink::buffer(separator);
-                    let quit = sed.run_stream(&mut stream, &mut buf).map_err(Fatal::runtime_msg)?;
+                    let ran = sed.run_stream(&mut stream, &mut buf).map_err(Fatal::runtime_msg);
                     // A read that failed part way leaves a buffer holding only what
                     // came BEFORE it, and writing that would rewrite the operand
                     // truncated — where GNU's own failure path unlinks its temp
                     // file and leaves the original alone.
-                    if !stream.fatal {
-                        write_in_place(path, suffix, &buf.into_buffer())?;
+                    let wrote = match ran.is_ok() && !stream.fatal {
+                        true => write_in_place(path, suffix, &buf.into_buffer()),
+                        false => Ok(()),
+                    };
+                    fd0 = stream.take_fd0();
+                    // `-i` never READS standard input as an operand, but `R
+                    // /dev/stdin` still can, so a run that dies here owes the same
+                    // repositioning the other arm does.
+                    if ran.is_err() || wrote.is_err() {
+                        give_back(fd0.as_mut())?;
                     }
+                    let quit = ran?;
+                    wrote?;
                     quit
                 }
                 // Held rather than propagated, for the reason the other path
                 // holds it: a run that DIES still owes back what it did not read.
                 _ => {
                     let ran = sed.run_stream(&mut stream, &mut sink);
-                    let back = give_back(&mut stream);
-                    let quit = ran.map_err(Fatal::runtime_msg)?;
-                    back?;
-                    quit
+                    let quit = ran.map_err(Fatal::runtime_msg);
+                    fd0 = stream.take_fd0();
+                    // The run's, not this operand's: held rather than propagated,
+                    // for the reason the other path holds it -- a run that DIES
+                    // still owes back what it did not read.
+                    if quit.is_err() {
+                        give_back(fd0.as_mut())?;
+                    }
+                    quit?
                 }
             };
+
             // A read that failed ends the run at 4 here as it does on the other
             // path, and outranks the operands not yet reached: GNU's reader panics,
             // so nothing after it happens.
             if stream.fatal {
+                give_back(fd0.as_mut())?;
                 sink.flush().map_err(Fatal::runtime_msg)?;
                 return Ok(4);
             }
             if let Some(code) = quit {
+                give_back(fd0.as_mut())?;
                 sink.flush().map_err(Fatal::runtime_msg)?;
                 // A read failure that has ALREADY happened outranks the quit code,
                 // whatever it is: `sed -s -n Q7 /nosuch A` is 2 in GNU, not 7, while
@@ -3409,6 +3565,10 @@ fn compile_and_run(
                 });
             }
         }
+        // Once, after the LAST operand: whatever the run over-read of descriptor 0
+        // is owed to whoever reads it next, and only here is there nothing left of
+        // this run to read it first.
+        give_back(fd0.as_mut())?;
     } else {
         // One logical stream: line numbers and `$` span every input. The operands
         // are opened one at a time, so a failure is only suffered where GNU
@@ -3423,7 +3583,7 @@ fn compile_and_run(
         // outranks a failure to reposition -- that is the one that says what
         // went wrong.
         let ran = sed.run_stream(&mut stream, &mut sink);
-        let back = give_back(&mut stream);
+        let back = give_back(stream.fd0.as_mut());
         let quit = ran.map_err(Fatal::runtime_msg)?;
         back?;
         // A read that failed outranks everything else, including a `bad` operand
@@ -3886,18 +4046,21 @@ fn to_lines(data: &[u8], separator: u8) -> Vec<Line> {
 /// otherwise invisible until some later program reads the wrong bytes; and with
 /// the nothing-to-return case answered before any syscall is made, what is left
 /// to fail is the descriptor itself.
-fn give_back(stream: &mut Stream) -> Result<(), Fatal> {
-    let Some(unread) = stream.stdin_unconsumed() else {
+fn give_back(fd0: Option<&mut Fd0>) -> Result<(), Fatal> {
+    let Some(fd0) = fd0 else {
+        return Ok(());
+    };
+    let Some(unread) = fd0.unconsumed() else {
         return Ok(());
     };
     // Through the reader's OWN duplicate of descriptor 0: it shares the file
     // description, so seeking it moves fd 0, and there is no second dup to fail
-    // under descriptor pressure. `owed_stdin` is exactly the case where that
-    // duplicate exists, which is why the `else` here cannot happen.
-    let Some(Src::Raw(fd0)) = stream.src.as_mut().map(|src| src.source_mut()) else {
+    // under descriptor pressure. `raw` is exactly the case where that duplicate
+    // exists, which is why the `else` here cannot happen.
+    let Src::Raw(file) = fd0.rec.source_mut() else {
         return Ok(());
     };
-    crate::util::give_back_stdin(fd0, unread)
+    crate::util::give_back_stdin(file, unread)
         .map_err(|e| Fatal::runtime(format!("can't reposition stdin: {}", errmsg(&e))))
 }
 
@@ -4073,16 +4236,25 @@ impl Sed {
     /// Take `R`'s next line from `path` and queue the bytes. GNU reads it when the
     /// command runs, not when the queue is flushed, so `R` over a directory fails
     /// BEFORE the cycle prints while `r` over one fails after.
-    fn queue_line(&mut self, target: &FileTarget) -> Result<(), Vec<u8>> {
+    fn queue_line(&mut self, target: &FileTarget, stream: &mut Stream) -> Result<(), Vec<u8>> {
         let separator = self.separator;
-        let entry = match self.rfiles.get_mut(target) {
-            Some(e) => e,
-            None => {
-                let opened = open_r_source(target, separator)?;
-                self.rfiles.entry(target.clone()).or_insert(opened)
-            }
+        // Standard input is not one of the sources this caches: it is the run's
+        // own reader, held by the stream so an operand naming it and this share
+        // one position. Nothing to rewind under `-s` either, which is what GNU
+        // does -- the position carries across operands there.
+        let line = if matches!(target.special, Some(Special::In)) {
+            stream.stdin_record()?
+        } else {
+            let entry = match self.rfiles.get_mut(target) {
+                Some(e) => e,
+                None => {
+                    let opened = open_r_source(target, separator)?;
+                    self.rfiles.entry(target.clone()).or_insert(opened)
+                }
+            };
+            entry.next(target.name())?
         };
-        let Some(line) = entry.next(target.name())? else {
+        let Some(line) = line else {
             return Ok(());
         };
         // `R` writes the line as it found it and owes NOTHING of its own: over a
@@ -4360,7 +4532,7 @@ impl Sed {
                 }
                 Some(Kind::ReadLine(path)) => {
                     let path = path.clone();
-                    self.queue_line(&path)?;
+                    self.queue_line(&path, stream)?;
                 }
                 Some(Kind::Write(path)) => {
                     let path = path.clone();
@@ -4536,7 +4708,7 @@ mod tests {
         writer.write_all(data).unwrap();
         drop(writer);
         let file = std::fs::File::from(std::os::fd::OwnedFd::from(reader));
-        Stream::over(b"-", Input::File(file), separator)
+        Stream::over(b"-", Input::File(file), separator, None)
     }
 
     /// Run a script over `input` and return what it wrote.
