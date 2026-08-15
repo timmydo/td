@@ -560,7 +560,7 @@ fn rebase(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Lan
             ))
         }
     };
-    let base_tree = match git.rev_parse(&format!("{head_before}^{{tree}}")) {
+    let base_tree = match git.tree_of(&head_before) {
         Ok(tree) => tree,
         Err(e) => return Ok(blocked(log, e.to_string())),
     };

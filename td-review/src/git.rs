@@ -130,6 +130,17 @@ pub enum DefaultRemote {
     Ambiguous,
 }
 
+/// A base resolved once for a run of [`Git::lands_nothing`] questions: the
+/// commit and the tree it points at, resolved together. The OID rather than the
+/// ref NAME, so a base that moves mid-reload cannot leave the merge and the
+/// comparison describing different bases. Hoisting both out of the caller's
+/// loop is what keeps the per-branch cost one merge rather than a merge and a
+/// `rev-parse`.
+pub struct BaseTree {
+    oid: String,
+    tree: String,
+}
+
 /// One remote-tracking branch as shown in the list.
 pub struct Branch {
     pub refname: String,
@@ -336,6 +347,42 @@ impl Git {
             .run_ok(&["-C", path, "status", "--porcelain", "--untracked-files=all"])?
             .trim()
             .is_empty())
+    }
+
+    /// The tree a commit-ish points at. One spelling, because `land.rs` and the
+    /// list compare against it and a `^{tree}` written twice is a comparison
+    /// that can silently be against something else.
+    pub fn tree_of(&self, rev: &str) -> io::Result<String> {
+        self.rev_parse(&format!("{rev}^{{tree}}"))
+    }
+
+    /// Resolve a base once for a run of [`Git::lands_nothing`] questions.
+    pub fn resolve_base(&self, base: &str) -> io::Result<BaseTree> {
+        let oid = self.rev_parse(&format!("refs/heads/{base}"))?;
+        let tree = self.tree_of(&oid)?;
+        Ok(BaseTree { oid, tree })
+    }
+
+    /// Whether landing `branch` onto the base would produce nothing: the merge
+    /// of the two is the base's own tree. This is the question `land.rs` asks
+    /// first and refuses on ("nothing to replay"), and the one the review pane
+    /// answers with an empty diffstat.
+    ///
+    /// Asked of the TREE rather than of the commits deliberately. A replay
+    /// selection (`--cherry-pick --right-only`) answers only for a replay
+    /// landing: it reports every commit of a SQUASH-landed branch as
+    /// outstanding, none of their patch ids matching the one commit that
+    /// carries them, and it passes over what a merge commit contributed,
+    /// having to skip merges to say anything at all. The merge result has
+    /// neither blind spot — it is the branch TIP against the base, whatever
+    /// route the content took to either.
+    pub fn lands_nothing(&self, base: &BaseTree, branch: &str) -> io::Result<bool> {
+        match self.merge_tree(&base.oid, branch)? {
+            MergeResult::Clean(tree) => Ok(tree == base.tree),
+            // A branch that will not merge, or that git declined to merge, has
+            // something to answer for rather than nothing to land.
+            MergeResult::Conflicted | MergeResult::Unavailable(_) => Ok(false),
+        }
     }
 
     /// Commits on `branch` with no equivalent on `base`. `git cherry` compares

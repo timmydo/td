@@ -69,6 +69,13 @@ const SHOWN_COMMITS: usize = 10;
 /// Widest the branch-name column may grow, however long the longest name is.
 const MAX_NAME_COL: usize = 48;
 
+/// Usual widths of the two counted columns. Floors rather than widths: both
+/// carry a branch's ahead count, which is unbounded, and a cell that overruns
+/// shifts every column right of it on that row alone — a misaligned table
+/// rather than a long word.
+const READY_COL: usize = 6;
+const COUNTS_COL: usize = 7;
+
 struct Reviewing {
     refname: String,
     /// The tip the pane was rendered from. The landing refuses if the ref has
@@ -88,6 +95,12 @@ pub struct App {
     /// Per-branch review-record status, aligned with `branches` — whether every
     /// commit a landing would replay carries the record AGENTS.md requires.
     readiness: Vec<record::Readiness>,
+    /// Per-branch, aligned with `branches`: landing it would produce NOTHING,
+    /// the base already carrying its whole tree. A landing rewrites the oids,
+    /// so the branch's own copies survive on the remote until its agent
+    /// rebases, and ancestry — which is all `%(ahead-behind:)` counts — goes on
+    /// reporting them as commits to land.
+    nothing_to_land: Vec<bool>,
     view: Vec<usize>,
     sel: usize,
     top: usize,
@@ -125,6 +138,7 @@ impl App {
             base,
             branches: Vec::new(),
             readiness: Vec::new(),
+            nothing_to_land: Vec::new(),
             view: Vec::new(),
             sel: 0,
             top: 0,
@@ -198,6 +212,28 @@ impl App {
                     None => record::readiness(&commits),
                 },
                 Err(_) => record::Readiness::Unknown,
+            })
+            .collect();
+        // One merge per branch that has anything ahead at all — a branch at zero
+        // already reads as empty. Measured on this repo's own remotes it costs
+        // what the record scan above does, both around 8ms a branch.
+        //
+        // A failed query leaves the row saying what its record says. That is the
+        // conservative direction here, unlike every fail-closed query in this
+        // crate: those refuse an ACTION, and the worst this can do is show a
+        // branch worth opening. Claiming "landed" on an unanswered question
+        // would hide one.
+        let base_tree = self.git.resolve_base(&self.base).ok();
+        self.nothing_to_land = self
+            .branches
+            .iter()
+            .map(|b| {
+                !b.nothing_ahead()
+                    && base_tree.as_ref().is_some_and(|base| {
+                        self.git
+                            .lands_nothing(base, &format!("refs/remotes/{}", b.refname))
+                            .unwrap_or(false)
+                    })
             })
             .collect();
         self.base_stale = self.git.base_behind_upstream(&self.base).unwrap_or(None);
@@ -325,15 +361,45 @@ impl App {
 
         let name_width =
             name_column(self.view.iter().filter_map(|&i| self.branches.get(i)).map(|b| &b.refname));
+        // One cell per VIEW row, in view order — the order the loop below draws
+        // them in, and what lets it read a verdict by position rather than
+        // recomputing one.
+        let cells: Vec<(String, bool)> = self
+            .view
+            .iter()
+            .map(|&i| match self.branches.get(i) {
+                Some(b) => ready_cell(
+                    b,
+                    self.readiness.get(i),
+                    self.nothing_to_land.get(i).copied().unwrap_or(false),
+                ),
+                None => (record::Readiness::Unknown.label(), false),
+            })
+            .collect();
+        // Both measured over the whole view, like the name column beside them,
+        // so the width does not change as rows scroll past. Both carry a
+        // branch's ahead count, which is unbounded — `10/100!` and `100/1000`
+        // are real cells at seven and eight — and a fixed width does not
+        // truncate, it shifts every column right of it on that row alone.
+        let ready_width = fitted(cells.iter().map(|(label, _)| label.as_str()), READY_COL);
+        let counts: Vec<String> = self
+            .view
+            .iter()
+            .filter_map(|&i| self.branches.get(i))
+            .map(Branch::counts_label)
+            .collect();
+        let counts_width = fitted(counts.iter().map(String::as_str), COUNTS_COL);
 
         f.push_text(
             &format!(
-                "  {:>4}  {:<7}  {:<6}  {:<width$}  {}",
+                "  {:>4}  {:<ab$}  {:<ready$}  {:<width$}  {}",
                 "AGE",
                 "A/B",
                 "READY",
                 "BRANCH",
                 "SUBJECT",
+                ab = counts_width,
+                ready = ready_width,
                 width = name_width
             ),
             Style::dim(),
@@ -351,21 +417,27 @@ impl App {
             // Padded by measured columns: `{:<width$}` counts chars, so a
             // double-width name would shift the subject column right.
             let (name, cols) = clip_cols(&b.refname, name_width);
+            // `cells` was built from `view` in this order, so the miss is only
+            // reachable if that stopped being true.
+            let (ready, spent) = match cells.get(row) {
+                Some((label, spent)) => (label.as_str(), *spent),
+                None => ("", false),
+            };
             let text = format!(
-                "{} {:>4}  {:<7}  {:<6}  {name}{:pad$}  {}",
+                "{} {:>4}  {:<ab$}  {:<ready_w$}  {name}{:pad$}  {}",
                 if selected { ">" } else { " " },
                 b.age(self.now),
                 b.counts_label(),
-                self.readiness
-                    .get(idx)
-                    .map_or_else(|| "?".to_string(), record::Readiness::label),
+                ready,
                 "",
                 b.subject,
+                ab = counts_width,
+                ready_w = ready_width,
                 pad = name_width.saturating_sub(cols)
             );
             let style = if selected {
                 Style::PLAIN.with_invert()
-            } else if b.nothing_ahead() {
+            } else if spent {
                 Style::dim()
             } else {
                 Style::PLAIN
@@ -1404,6 +1476,47 @@ fn name_column<'a>(names: impl Iterator<Item = &'a String>) -> usize {
         .max()
         .unwrap_or(20)
         .clamp(12, MAX_NAME_COL)
+}
+
+/// How wide a fixed-vocabulary column has to be for these cells, `floor` being
+/// its usual width — so the common table does not jitter as branches come and
+/// go, and an unbounded cell still gets the room it needs.
+///
+/// Chars, not the display columns the branch name beside it is measured in:
+/// these cells are this crate's own ASCII, where a name comes from the world. A
+/// test holds every verdict to that. DELIBERATELY unclamped, where the name
+/// column stops at `MAX_NAME_COL`: a name clipped with an ellipsis is still
+/// that name, while `10/100!` clipped to six is `10/100`, a verdict that reads
+/// as agreement. One outlier branch therefore costs every row some SUBJECT,
+/// which the frame's own clip bounds — a row is sanitized to the terminal
+/// width like any other, so nothing but that subject is lost.
+fn fitted<'a>(cells: impl Iterator<Item = &'a str>, floor: usize) -> usize {
+    cells.map(|c| c.chars().count()).chain([floor]).max().unwrap_or(floor)
+}
+
+/// A row's READY cell and whether it is de-emphasised — pure, so the rule is
+/// testable without a terminal or a repo, as `worktrees::decide` is.
+///
+/// `landed` outranks the record because the column answers "is there anything
+/// here for me", and a record is only an answer while something is left to
+/// land. A branch the base already carries shows `ok` on ancestry alone, which
+/// reads as commits waiting — for a landing that would refuse them with
+/// "nothing to replay". Both spellings of contributing nothing dim, so `landed`
+/// is the WORD for a state the list already had a colour for.
+///
+/// `-` outranks `landed` in turn: a branch with no commits over the base never
+/// landed anything, and it is asked the question at all only where git reports
+/// no ahead-behind counts (pre-2.41), where the merge of an ancestor branch
+/// answers yes.
+fn ready_cell(b: &Branch, readiness: Option<&record::Readiness>, landed: bool) -> (String, bool) {
+    let label = readiness.map_or_else(|| "?".to_string(), record::Readiness::label);
+    if matches!(readiness, Some(record::Readiness::Empty)) {
+        return (label, true);
+    }
+    if landed {
+        return ("landed".to_string(), true);
+    }
+    (label, b.nothing_ahead())
 }
 
 /// Clip to `max` display COLUMNS with an ellipsis, returning the text and the
@@ -2596,6 +2709,420 @@ mod tests {
         assert_eq!(diff_style("-removed"), Style::fg(RED));
         assert_eq!(diff_style("@@ -1,2 +1,3 @@"), Style::fg(CYAN));
         assert_eq!(diff_style(" context"), Style::PLAIN);
+    }
+
+    /// A frame line with its escape sequences removed, so a column can be
+    /// located by offset: rows carry different styles, and a dim row's `\x1b[2m`
+    /// would otherwise put its text two bytes further along than a plain one's.
+    fn unstyled(line: &str) -> String {
+        let mut out = String::new();
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                out.push(c);
+                continue;
+            }
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Both counted columns are sized to the view, so ONE branch's wide numbers
+    /// must not shift that branch's row alone. Asserted where it is visible —
+    /// every drawn name starting in the same place — because a width computed
+    /// and then not used by the row format looks right in a unit test.
+    #[test]
+    fn a_branch_far_ahead_does_not_shift_its_own_row() {
+        let mut app = App::new(Git::new(PathBuf::from("/nonexistent")), "main".to_string());
+        app.branches = [(3u32, 8u32), (100, 1000), (0, 4)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, counts)| Branch {
+                refname: format!("origin/b{i}"),
+                commit: "1".repeat(40),
+                committed_unix: 1_700_000_000,
+                author: "a".to_string(),
+                subject: "s".to_string(),
+                counts: Some(counts),
+            })
+            .collect();
+        app.readiness = vec![
+            record::Readiness::Ready,
+            record::Readiness::Missing { missing: 10, total: 100 },
+            record::Readiness::Empty,
+        ];
+        app.nothing_to_land = vec![false; 3];
+        app.now = 1_700_000_600;
+        app.apply_filter();
+
+        let frame = app.render(24, 100);
+        let offsets: Vec<usize> = frame
+            .lines()
+            .map(unstyled)
+            .filter_map(|l| l.find("origin/b"))
+            .collect();
+        assert_eq!(offsets.len(), 3, "all three rows drawn");
+        assert!(
+            offsets.windows(2).all(|w| w.first() == w.last()),
+            "a wide cell shifted its own row: {offsets:?}"
+        );
+    }
+
+    /// The one mechanical risk in reading a verdict by POSITION: `cells` is
+    /// indexed by the VIEW index, and the draw loop enumerates before it skips,
+    /// so a scrolled row must still be handed its own branch's cell. Nothing
+    /// else in this suite scrolls a list — every other frame test fits on one
+    /// screen — so an off-by-`top` would draw every visible row with a verdict
+    /// belonging to a branch further up, and nothing would say so.
+    #[test]
+    fn a_scrolled_row_shows_its_own_branch_verdict() {
+        // No repo is touched: the render path asks git nothing.
+        let mut app = App::new(Git::new(PathBuf::from("/nonexistent")), "main".to_string());
+        app.branches = (0..40)
+            .map(|i| Branch {
+                refname: format!("origin/b{i:02}"),
+                commit: "1".repeat(40),
+                committed_unix: 1_700_000_000,
+                author: "a".to_string(),
+                subject: "s".to_string(),
+                counts: Some((1, 0)),
+            })
+            .collect();
+        // A verdict unique to each branch, so a row pairing the two wrongly
+        // cannot look right.
+        app.readiness = (0..40)
+            .map(|missing| record::Readiness::Missing { missing, total: 40 })
+            .collect();
+        app.nothing_to_land = vec![false; 40];
+        app.now = 1_700_000_600;
+        app.apply_filter();
+
+        for sel in [0usize, 10, 25, 39] {
+            app.sel = sel;
+            let frame = app.render(24, 100);
+            let mut rows = 0usize;
+            for line in frame.lines() {
+                let Some(at) = line.find("origin/b") else { continue };
+                let n: usize = match line
+                    .get(at.saturating_add(8)..at.saturating_add(10))
+                    .and_then(|d| d.parse().ok())
+                {
+                    Some(n) => n,
+                    None => continue,
+                };
+                rows = rows.saturating_add(1);
+                // Leading space so `4/40!` cannot match inside `14/40!`.
+                assert!(
+                    line.contains(&format!(" {n}/40!")),
+                    "origin/b{n:02} carries another branch's verdict at sel={sel}: {line}"
+                );
+            }
+            assert!(rows > 1, "nothing was drawn to check at sel={sel}");
+        }
+    }
+
+    /// What the list reports for one branch: nothing to land, or not.
+    fn spent(app: &App, name: &str) -> Option<bool> {
+        app.branches
+            .iter()
+            .position(|b| b.refname == name)
+            .and_then(|i| app.nothing_to_land.get(i).copied())
+    }
+
+    /// The query half, over a real repo in the state that produced the report:
+    /// a branch landed by REPLAY, so the base carries its patches under new oids
+    /// while the remote still carries the originals.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn a_branch_landed_under_new_oids_is_read_as_having_nothing_to_land() {
+        // No "landed" in the tag: the title bar carries this path, and the frame
+        // assertion below counts the word.
+        let (root, work) = repo("replayed-oids");
+        // A second branch, genuinely outstanding, to hold the first to a
+        // DIFFERENCE rather than to a constant.
+        git_in(&work, &["checkout", "-b", "work-0002-open"]);
+        std::fs::write(work.join("g"), "g\n").unwrap();
+        git_in(&work, &["add", "g"]);
+        git_in(&work, &["commit", "-m", "open: step"]);
+        git_in(&work, &["push", "origin", "work-0002-open"]);
+        git_in(&work, &["checkout", "main"]);
+        git_in(&work, &["branch", "-D", "work-0002-open"]);
+        // Land the first the way `r` does. The base moves on FIRST, so the
+        // replay rewrites the oid instead of fast-forwarding onto it — without
+        // that commit the cherry-pick keeps the oid and there is nothing to see.
+        git_in(&work, &["commit", "--allow-empty", "-m", "main moves on"]);
+        git_in(&work, &["cherry-pick", "origin/work-0001-feature"]);
+
+        let app = app_on(&work);
+        assert_eq!(spent(&app, "origin/work-0001-feature"), Some(true), "its patch is on main");
+        assert_eq!(spent(&app, "origin/work-0002-open"), Some(false), "still outstanding");
+        // Ancestry still counts the landed branch a commit ahead — the number
+        // the column showed, and the reason it could not be the answer.
+        let counts = app
+            .branches
+            .iter()
+            .find(|b| b.refname == "origin/work-0001-feature")
+            .and_then(|b| b.counts);
+        assert_eq!(counts, Some((1, 2)), "ahead by ancestry, carried by main");
+
+        let mut ui = FakeUi::new();
+        app.redraw(&mut ui).unwrap();
+        assert_eq!(ui.last().matches("landed").count(), 1, "{}", ui.last());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A SQUASH landing carries a branch's commits as ONE, so not one of their
+    /// patch ids has a match on the base: a replay selection calls every one of
+    /// them outstanding, on a branch whose diffstat against the base is empty
+    /// and which `r` refuses. Asking the TREE is what covers both landing modes
+    /// with one question.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn a_branch_landed_as_one_squash_commit_is_read_the_same_way() {
+        let (root, work) = repo("squashed-flat");
+        // Two commits, so the squash really is a different shape from the branch.
+        git_in(&work, &["checkout", "-b", "work-0003-two", "origin/work-0001-feature"]);
+        std::fs::write(work.join("g"), "g\n").unwrap();
+        git_in(&work, &["add", "g"]);
+        git_in(&work, &["commit", "-m", "second step"]);
+        git_in(&work, &["push", "origin", "work-0003-two"]);
+        git_in(&work, &["checkout", "main"]);
+        git_in(&work, &["branch", "-D", "work-0003-two"]);
+        git_in(&work, &["merge", "--squash", "origin/work-0003-two"]);
+        git_in(&work, &["commit", "-m", "squash-landed"]);
+
+        let app = app_on(&work);
+        assert_eq!(spent(&app, "origin/work-0003-two"), Some(true), "the base carries its tree");
+        // The check this replaced, run over the same repo: a replay selection
+        // sees two outstanding commits here, which is what put `ok` on the row.
+        let picks = app
+            .git
+            .run_ok(&[
+                "rev-list",
+                "--count",
+                "--no-merges",
+                "--cherry-pick",
+                "--right-only",
+                "refs/heads/main...refs/remotes/origin/work-0003-two",
+                "--",
+            ])
+            .unwrap();
+        assert_eq!(picks.trim(), "2", "patch ids cannot see a squash");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every ORDINARY commit landed and the merge joining them carrying content
+    /// of its own — the shape a conflict resolution takes. A replay selection
+    /// has to skip merges to say anything at all, so it reports nothing
+    /// outstanding and would dim a branch whose work is still only on the branch.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn a_merge_carrying_its_own_content_is_not_read_as_landed() {
+        let (root, work) = repo("evil-merge");
+        git_in(&work, &["checkout", "-b", "side", "main"]);
+        std::fs::write(work.join("h"), "h\n").unwrap();
+        git_in(&work, &["add", "h"]);
+        git_in(&work, &["commit", "-m", "side: step"]);
+        // A merge that adds a file NEITHER parent has.
+        git_in(&work, &["checkout", "-b", "work-0004-merged", "origin/work-0001-feature"]);
+        git_in(&work, &["merge", "--no-commit", "--no-ff", "side"]);
+        std::fs::write(work.join("evil"), "resolved\n").unwrap();
+        git_in(&work, &["add", "evil"]);
+        git_in(&work, &["commit", "-m", "merge side, resolved"]);
+        git_in(&work, &["push", "origin", "work-0004-merged"]);
+        git_in(&work, &["checkout", "main"]);
+        git_in(&work, &["branch", "-D", "work-0004-merged"]);
+        // Both ordinary commits land by patch; the merge's own content does not.
+        git_in(&work, &["cherry-pick", "origin/work-0001-feature"]);
+        git_in(&work, &["cherry-pick", "side"]);
+
+        let app = app_on(&work);
+        assert_eq!(
+            spent(&app, "origin/work-0004-merged"),
+            Some(false),
+            "the merge's own content is on no commit main has"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The fail-open half, at the layer that decides it, over BOTH arms that
+    /// reach it — they are different git outcomes and only one of them is a
+    /// conflict. A ref that does not resolve exits 1, which `merge_tree` reads
+    /// as `Conflicted`; unrelated histories exit 128 and are `Unavailable`.
+    /// Either way the answer must be "not landed": the row then says what its
+    /// record says, which at worst shows a branch worth opening, where a wrong
+    /// `landed` would hide one.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn a_merge_git_cannot_compute_is_not_reported_as_landed() {
+        let (root, work) = repo("unanswerable");
+        // A second root, so one branch shares no history with the base at all.
+        git_in(&work, &["checkout", "--orphan", "alien"]);
+        git_in(&work, &["rm", "-rf", "."]);
+        std::fs::write(work.join("a"), "alien\n").unwrap();
+        git_in(&work, &["add", "a"]);
+        git_in(&work, &["commit", "-m", "alien root"]);
+        git_in(&work, &["push", "origin", "alien"]);
+        git_in(&work, &["checkout", "-f", "main"]);
+        git_in(&work, &["branch", "-D", "alien"]);
+        // Land the real branch, so the answerable question here answers YES and
+        // the unanswerable one is held to a difference rather than a constant.
+        git_in(&work, &["commit", "--allow-empty", "-m", "main moves on"]);
+        git_in(&work, &["cherry-pick", "origin/work-0001-feature"]);
+        let git = Git::discover(&work).unwrap();
+        let base = git.resolve_base("main").unwrap();
+        assert_eq!(
+            git.lands_nothing(&base, "refs/remotes/origin/work-0001-feature").ok(),
+            Some(true),
+            "main carries its tree"
+        );
+        assert_eq!(
+            git.lands_nothing(&base, "refs/remotes/origin/no-such-branch").ok(),
+            Some(false),
+            "a ref that does not resolve is not an answer of nothing to land"
+        );
+        assert_eq!(
+            git.lands_nothing(&base, "refs/remotes/origin/alien").ok(),
+            Some(false),
+            "a merge git refuses outright is not an answer of nothing to land"
+        );
+        // The two really are distinct outcomes, so this test covers two arms
+        // rather than one twice.
+        assert!(
+            matches!(
+                git.merge_tree(&git.rev_parse("refs/heads/main").unwrap(), "refs/remotes/origin/alien"),
+                Ok(git::MergeResult::Unavailable(_))
+            ),
+            "unrelated histories are refused, not merged with conflicts"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn listed(counts: Option<(u32, u32)>) -> Branch {
+        Branch {
+            refname: "origin/td-sh-rolling".to_string(),
+            commit: "1111111111111111111111111111111111111111".to_string(),
+            committed_unix: 1_700_000_000,
+            author: "a".to_string(),
+            subject: "s".to_string(),
+            counts,
+        }
+    }
+
+    /// The row this whole change exists for. A landing rewrites the oids, so the
+    /// branch's own copies sit on the remote until its agent rebases, and
+    /// `%(ahead-behind:)` — pure ancestry — goes on counting them: `3/8 ok`, on a
+    /// branch whose whole tree main already carries and which `r` would refuse
+    /// with "nothing to replay". `ok` is the cell that reads as an invitation.
+    #[test]
+    fn a_branch_the_base_already_carries_reads_landed_not_ok() {
+        let b = listed(Some((3, 8)));
+        // A COMPLETE record: what made the row read as three commits waiting.
+        assert_eq!(
+            ready_cell(&b, Some(&record::Readiness::Ready), true),
+            ("landed".to_string(), true)
+        );
+        // The same branch with its patches genuinely outstanding is untouched —
+        // the record is the answer while there is still something to land.
+        assert_eq!(
+            ready_cell(&b, Some(&record::Readiness::Ready), false),
+            ("ok".to_string(), false)
+        );
+    }
+
+    /// Landed is not the pre-existing empty: `-` is a branch with no commits at
+    /// all over the base, and both dim, but the A/B column is the only thing
+    /// that tells them apart — so the words must not be shared.
+    #[test]
+    fn an_empty_branch_and_a_landed_one_are_not_spelt_the_same() {
+        assert_eq!(
+            ready_cell(&listed(Some((0, 4))), Some(&record::Readiness::Empty), false),
+            ("-".to_string(), true)
+        );
+        assert_eq!(
+            ready_cell(&listed(Some((3, 8))), Some(&record::Readiness::Ready), true),
+            ("landed".to_string(), true)
+        );
+    }
+
+    /// Where git reports no ahead-behind counts (pre-2.41), the tree question is
+    /// asked of every branch — and an ANCESTOR of the base answers yes to it,
+    /// having nothing over the base to have landed. `-` is the honest cell
+    /// there, and it must win over the one the query offers.
+    #[test]
+    fn a_branch_with_no_commits_says_so_rather_than_claiming_it_landed() {
+        assert_eq!(
+            ready_cell(&listed(None), Some(&record::Readiness::Empty), true),
+            ("-".to_string(), true),
+            "no commits over the base is not a landing"
+        );
+    }
+
+    /// A record that could not be read shows `?` and is NOT dimmed: an
+    /// unreadable branch is the one most worth opening, and dim is this list's
+    /// word for the opposite.
+    #[test]
+    fn an_unreadable_record_shows_a_question_mark_and_is_not_dimmed() {
+        assert_eq!(
+            ready_cell(&listed(Some((3, 8))), Some(&record::Readiness::Unknown), false),
+            ("?".to_string(), false)
+        );
+        assert_eq!(ready_cell(&listed(None), None, false), ("?".to_string(), false));
+    }
+
+    /// The column is sized to its verdicts rather than the verdicts to the
+    /// column. `Missing` carries the branch's ahead count, which is unbounded,
+    /// so `10/100!` is a real verdict and a fixed six shifts BRANCH and SUBJECT
+    /// right on that row alone. Clipping is not the alternative: `10/100!` cut
+    /// to six is `10/100`, a verdict that reads as agreement.
+    #[test]
+    fn the_ready_column_grows_to_the_verdict_it_has_to_show() {
+        let b = listed(Some((3, 8)));
+        let verdicts = [
+            record::Readiness::Ready,
+            record::Readiness::Empty,
+            record::Readiness::Unknown,
+            record::Readiness::Missing { missing: 10, total: 12 },
+            record::Readiness::Missing { missing: 10, total: 100 },
+        ];
+        let mut labels: Vec<String> =
+            verdicts.iter().map(|v| ready_cell(&b, Some(v), false).0).collect();
+        labels.push(ready_cell(&b, None, true).0);
+
+        let width = fitted(labels.iter().map(String::as_str), READY_COL);
+        for label in &labels {
+            assert!(label.chars().count() <= width, "{label} overruns a {width}-wide READY");
+        }
+        assert_eq!(width, 7, "widened for 10/100!");
+        // `fitted` counts CHARS, so a verdict that was not ASCII would be
+        // measured narrower than it draws and shift the columns right of it.
+        for label in &labels {
+            assert!(label.is_ascii(), "{label} is measured in chars, so it must be ASCII");
+        }
+        // The floor holds when nothing needs the room, so the common table does
+        // not jitter as branches come and go.
+        assert_eq!(fitted(["ok", "-"].into_iter(), READY_COL), READY_COL);
+        assert_eq!(fitted([].into_iter(), READY_COL), READY_COL);
+        assert_eq!(fitted(["landed"].into_iter(), READY_COL), READY_COL);
+    }
+
+    /// A/B is the other unbounded cell and was left fixed at seven while READY
+    /// was sized — the same misalignment one column over, and reachable by the
+    /// same branch, since `Missing`'s total IS the ahead count: 100 ahead and
+    /// 1000 behind is `100/1000`, eight wide.
+    #[test]
+    fn the_counts_column_grows_with_the_counts() {
+        assert_eq!(fitted(["3/8", "0/12"].into_iter(), COUNTS_COL), COUNTS_COL);
+        assert_eq!(fitted(["100/1000"].into_iter(), COUNTS_COL), 8);
+        assert_eq!(
+            fitted([listed(Some((100, 1000))).counts_label().as_str()].into_iter(), COUNTS_COL),
+            8,
+            "the label a branch that far ahead actually renders"
+        );
     }
 
     /// No test can assert a colour is legible, but it can assert the pane never
