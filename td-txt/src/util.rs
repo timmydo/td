@@ -531,16 +531,208 @@ pub fn oom() -> std::io::Error {
 /// errors differently (grep 2, sed 4), and picking one for them would be wrong for
 /// the other.
 pub fn print_line(text: &str) -> std::io::Result<()> {
-    let mut out = Out::new();
+    let mut out = Out::new()?;
     out.write(text.as_bytes())?;
     out.write(b"\n")?;
     out.flush()
 }
 
+/// C stdio's buffer, which is the one every stream td-txt writes has to use: both
+/// programs are scored against GNU's, and GNU's streams are stdio's. Both of its
+/// choices are asked of the DESCRIPTOR rather than assumed
+/// (`_IO_file_doallocate`): the capacity is its `st_blksize`, and a TERMINAL is
+/// line-buffered instead of block-buffered.
+///
+/// What blocks fill to is CAPACITY before writing anything, rather than flushing
+/// early to make room: 4000 bytes buffered then a 100-byte line leaves exactly
+/// 4096 written, where a `BufWriter` -- which writes the 4000 to make room, then
+/// buffers the 100 -- leaves 4000. And a full buffer is not itself a reason to
+/// write; having more to put and nowhere to put it is, so a write that exactly
+/// fills leaves it sitting there. A second reader of the same file sees both
+/// differences, which is why the fill is copied rather than delegated.
+pub struct StdioBuf {
+    file: std::fs::File,
+    held: Vec<u8>,
+    cap: usize,
+    /// A terminal flushes through the last newline rather than when it fills, and
+    /// on `\n` whatever `-z` made the RECORD separator: this is stdio's rule, not
+    /// sed's.
+    line: bool,
+    /// stdio's buffer does not exist until the first overflow, so the FIRST write
+    /// finds no room at all and takes the block path whole. That is not a detail
+    /// of the allocation: it is why one 8193-byte record written first reaches
+    /// the descriptor as 8192 then 1, and the same record written second as
+    /// 4096, 4096.
+    allocated: bool,
+}
+
+impl StdioBuf {
+    /// stdio's own default, and what a descriptor's answer must BEAT to be used.
+    const BUFSIZ: usize = 8192;
+    /// Stdio's own threshold for block-aligning a direct write rather than
+    /// writing the whole of it.
+    const ALIGN: usize = 128;
+
+    /// The capacity is not simply `st_blksize`: `_IO_file_doallocate` starts at
+    /// `BUFSIZ` and takes the descriptor's answer only when it is positive AND
+    /// SMALLER, so a filesystem reporting 64 KiB gets stdio's 8192 and not its
+    /// own number. Every `st_blksize` this platform hands out is 4096, so the
+    /// difference is invisible here and would be a divergence on NFS or ZFS --
+    /// and on the sink specifically it would be a NEW one, `BufWriter::new`
+    /// having been 8192 already.
+    pub fn over(file: std::fs::File) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        let cap = match file.metadata().map(|m| usize::try_from(m.blksize())) {
+            Ok(Ok(block)) if block > 0 && block < Self::BUFSIZ => block,
+            _ => Self::BUFSIZ,
+        };
+        let line = file.is_terminal();
+        Self { file, held: Vec::with_capacity(cap), cap, line, allocated: false }
+    }
+
+    /// The most a caller may hand over in one `put` and still get the boundaries
+    /// a stream of SMALL writes would have produced. One byte under the capacity,
+    /// not the capacity: a `put` of exactly `cap` finds no room at all on the
+    /// first write of a run -- the buffer not existing yet -- and so goes
+    /// straight to the descriptor, ahead of anything else sharing it.
+    pub fn piece(&self) -> usize {
+        self.cap.saturating_sub(1).max(1)
+    }
+
+    /// Zero until the first overflow has been through, as stdio's is.
+    fn room(&self) -> usize {
+        match self.allocated {
+            true => self.cap.saturating_sub(self.held.len()),
+            false => 0,
+        }
+    }
+
+    /// A duplicate of descriptor 1, which is what standard output is written
+    /// through rather than `std::io::Stdout` -- that is a `LineWriter`, and a
+    /// buffer flushed on anything but a newline splits at the last one it holds,
+    /// so a record and its separator reach a concurrent reader as two writes.
+    /// Safe: `try_clone_to_owned` needs no `unsafe`.
+    pub fn over_stdout() -> std::io::Result<Self> {
+        Ok(Self::over(std::fs::File::from(std::io::stdout().as_fd().try_clone_to_owned()?)))
+    }
+
+    /// stdio scans for the newline only when the write FITS in what is left of
+    /// the buffer; a longer one takes the block path below whether or not it
+    /// holds one, so a terminal is not a promise that every record is written
+    /// when it ends.
+    pub fn put(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        if self.line && bytes.len() <= self.room() {
+            if let Some(i) = bytes.iter().rposition(|b| *b == b'\n') {
+                self.held.extend_from_slice(bytes.get(..=i).unwrap_or_default());
+                self.flush()?;
+                return self.fill(bytes.get(i + 1..).unwrap_or_default());
+            }
+        }
+        self.fill(bytes)
+    }
+
+    /// Fill what room is left, and if that was not enough, flush and hand the
+    /// kernel every WHOLE block DIRECTLY rather than pumping each through the
+    /// buffer: stdio's `do_write = to_do - to_do % block_size`. Only the
+    /// sub-block tail is buffered, which is why one 8193-byte record reaches the
+    /// descriptor as 8192 then 1 rather than as 4096, 4096, 1.
+    fn fill(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let take = self.room().min(bytes.len());
+        self.held.extend_from_slice(bytes.get(..take).unwrap_or_default());
+        let rest = bytes.get(take..).unwrap_or_default();
+        // An exact fill is not a reason to write: stdio flushes because it has
+        // more to put and nowhere to put it, which is this test and not a full
+        // buffer.
+        if rest.is_empty() {
+            return Ok(());
+        }
+        self.allocated = true;
+        self.flush()?;
+        // Under 128 bytes stdio does not bother aligning and writes the lot.
+        let tail = match self.cap >= Self::ALIGN {
+            true => rest.len() % self.cap,
+            false => 0,
+        };
+        let whole = rest.len().saturating_sub(tail);
+        self.direct(rest.get(..whole).unwrap_or_default())?;
+        // What is left is shorter than the buffer, which is empty, so it fits
+        // whatever happens below. A line-buffered stream does NOT get the
+        // last-newline treatment here, though: stdio hands this remainder to
+        // `_IO_default_xsputn`, which for a line buffer has no room to copy into
+        // and so goes a byte at a time through `__overflow` -- writing at EVERY
+        // newline rather than once at the final one.
+        let mut left = rest.get(whole..).unwrap_or_default();
+        if self.line {
+            while let Some(i) = left.iter().position(|b| *b == b'\n') {
+                self.held.extend_from_slice(left.get(..=i).unwrap_or_default());
+                self.flush()?;
+                left = left.get(i + 1..).unwrap_or_default();
+            }
+        }
+        self.held.extend_from_slice(left);
+        Ok(())
+    }
+
+    /// Past the buffer rather than through it. Partial writes are resumed from
+    /// where the descriptor stopped, as stdio's own write loop does.
+    fn direct(&mut self, mut bytes: &[u8]) -> std::io::Result<()> {
+        while !bytes.is_empty() {
+            match self.file.write(bytes) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(n) => bytes = bytes.get(n..).unwrap_or_default(),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Keeps only what did NOT reach the descriptor, so a failure part way
+    /// through leaves the tail rather than the whole -- a retry follows, and
+    /// `write_all` would hand it back bytes the descriptor already took.
+    pub fn flush(&mut self) -> std::io::Result<()> {
+        while !self.held.is_empty() {
+            match self.file.write(&self.held) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(n) => {
+                    self.held.drain(..n.min(self.held.len()));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// stdio's own teardown, which `exit` runs over every open stream: it writes
+/// what it can and reports nothing. That is what carries the buffered output of
+/// a run that ends by `?`-ing out of the middle of itself, where no explicit
+/// flush is reached -- and, dropping in declaration order, what makes a `w`
+/// target reach its file before the sink reaches descriptor 1.
+impl Drop for StdioBuf {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
+impl std::fmt::Debug for StdioBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `held` is shown by LENGTH and `allocated` at all, those two being what
+        // decide whether the next `put` buffers or goes to the descriptor.
+        f.debug_struct("StdioBuf")
+            .field("cap", &self.cap)
+            .field("held", &self.held.len())
+            .field("line", &self.line)
+            .field("allocated", &self.allocated)
+            .finish()
+    }
+}
+
 /// Buffered stdout. `broken` latches once the reader has gone away so a caller
 /// can stop early instead of reporting an I/O failure per line.
 pub struct Out {
-    inner: std::io::BufWriter<std::io::Stdout>,
+    inner: StdioBuf,
     broken: bool,
     /// Flush after every write, for sed's `-u`. What that buys is ORDER against
     /// another stream on the same descriptor -- a `w /dev/stdout` the special-file
@@ -550,13 +742,22 @@ pub struct Out {
 }
 
 impl Out {
-    pub fn new() -> Self {
-        Self { inner: std::io::BufWriter::new(std::io::stdout()), broken: false, unbuffered: false }
+    /// Fallible because it DUPLICATES descriptor 1 (see `StdioBuf::over_stdout`).
+    /// The dup can only fail on a closed or exhausted descriptor table, which is
+    /// exactly when a silent fallback to a second buffering layer would be worst.
+    pub fn new() -> std::io::Result<Self> {
+        Ok(Self { inner: StdioBuf::over_stdout()?, broken: false, unbuffered: false })
     }
 
     /// Write through from here on, which is what `-u` asks for.
     pub fn unbuffer(&mut self) {
         self.unbuffered = true;
+    }
+
+    /// The most a caller may hand over at once and still get stdio's write
+    /// boundaries -- see `StdioBuf::piece`.
+    pub fn piece(&self) -> usize {
+        self.inner.piece()
     }
 
     /// A complete line has been written. Flushes only under `-u`, and per LINE
@@ -578,7 +779,7 @@ impl Out {
         if self.broken {
             return Ok(());
         }
-        match self.inner.write_all(bytes) {
+        match self.inner.put(bytes) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
                 self.broken = true;
@@ -600,12 +801,6 @@ impl Out {
             }
             Err(e) => Err(e),
         }
-    }
-}
-
-impl Default for Out {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -783,6 +978,130 @@ pub fn number(n: u64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The LINE-buffered arm, which no corpus case can reach: stdio picks it for
+    /// a terminal and the harness hands its children pipes. The rule is stdio's
+    /// -- everything through the LAST newline goes out and the tail waits -- and
+    /// it is `\n` rather than sed's record separator, which is why `-z` cannot be
+    /// used to test it either.
+    #[test]
+    fn a_line_buffered_stream_writes_through_its_last_newline() {
+        // Per-process: two builds of this crate under test at once -- a drift run
+        // beside an ordinary one -- would otherwise read each other's files.
+        let dir = std::env::temp_dir().join(format!("td-txt-stdiobuf-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let path = dir.join("t");
+        let mut buf = StdioBuf {
+            file: std::fs::File::create(&path).unwrap(),
+            held: Vec::new(),
+            cap: 4096,
+            line: true,
+            allocated: false,
+        };
+        // No newline: nothing leaves, however much is written.
+        buf.put(b"abc").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        // A newline takes the held bytes with it, and only up to the last one.
+        buf.put(b"de\nfg\nhi").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"abcde\nfg\n");
+        // The tail is still held, and the explicit flush is what ends it.
+        buf.flush().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"abcde\nfg\nhi");
+
+        // A write LONGER than the room is not scanned for a newline at all --
+        // it fills, flushes and blocks out like any other -- so a terminal is
+        // no promise that a record is written when it ends.
+        let path = dir.join("l");
+        let mut buf = StdioBuf {
+            file: std::fs::File::create(&path).unwrap(),
+            held: Vec::new(),
+            cap: 4096,
+            line: true,
+            allocated: true,
+        };
+        let mut long = vec![b'x'; 10];
+        long.push(b'\n');
+        long.extend(std::iter::repeat(b'y').take(5000));
+        buf.put(&long).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap().len(),
+            4096,
+            "the newline at 10 did not cut the write short"
+        );
+
+        // A NUL is not a newline to stdio, whatever `-z` made the separator.
+        let path = dir.join("z");
+        let mut buf = StdioBuf {
+            file: std::fs::File::create(&path).unwrap(),
+            held: Vec::new(),
+            cap: 4096,
+            line: true,
+            allocated: false,
+        };
+        buf.put(b"a\0b\0").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+
+        // WHOLE BLOCKS go to the kernel directly rather than through the buffer,
+        // and the first write of all finds no buffer to fill: 1000 bytes over a
+        // 256-byte block write three blocks at once and hold the tail.
+        let path = dir.join("b");
+        let mut buf = StdioBuf {
+            file: std::fs::File::create(&path).unwrap(),
+            held: Vec::new(),
+            cap: 256,
+            line: false,
+            allocated: false,
+        };
+        let first: Vec<u8> = b"0123456789".iter().copied().cycle().take(1000).collect();
+        buf.put(&first).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap().as_slice(), first.get(..768).unwrap());
+        // An EXACT fill still leaves it held: stdio overflows rather than tops up.
+        buf.put(&[b'z'; 24]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap().len(), 768, "an exact fill does not write");
+        // Having more to put and nowhere to put it is what writes.
+        buf.put(b"!").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap().len(), 1024);
+        buf.flush().unwrap();
+        let mut want = first.clone();
+        want.extend_from_slice(&[b'z'; 24]);
+        want.push(b'!');
+        assert_eq!(std::fs::read(&path).unwrap(), want);
+
+        // Under 128 bytes stdio does not align at all and writes the lot, which
+        // is why the arithmetic above is not simply a count of whole blocks.
+        let path = dir.join("s");
+        let mut buf = StdioBuf {
+            file: std::fs::File::create(&path).unwrap(),
+            held: Vec::new(),
+            cap: 8,
+            line: false,
+            allocated: false,
+        };
+        buf.put(b"ab\ncd\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"ab\ncd\n");
+
+        // Capacity and mode come from the DESCRIPTOR, not from constants -- but
+        // the descriptor only gets to LOWER it: stdio starts at BUFSIZ and takes
+        // `st_blksize` when that is positive and smaller. Every `st_blksize` on
+        // this platform is 4096, so what this can tell apart is the wiring being
+        // replaced by some other number; the BUFSIZ ceiling itself is unreachable
+        // here and is asserted by arithmetic instead.
+        use std::os::unix::fs::MetadataExt as _;
+        let file = std::fs::File::create(dir.join("c")).unwrap();
+        let block = usize::try_from(file.metadata().unwrap().blksize()).unwrap();
+        let want = match block > 0 && block < StdioBuf::BUFSIZ {
+            true => block,
+            false => StdioBuf::BUFSIZ,
+        };
+        let sized = StdioBuf::over(file);
+        assert_eq!(sized.cap, want);
+        assert!(sized.cap <= StdioBuf::BUFSIZ, "a descriptor may only lower it");
+        assert!(!sized.line, "a regular file is not a terminal");
+
+        drop((buf, sized));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The corpus harness always PIPES stdin, so no case can make a read on it
     /// fail; the rule is pinned here instead and checked by hand against GNU.

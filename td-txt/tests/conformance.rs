@@ -1492,6 +1492,91 @@ fn a_w_target_flushes_on_the_buffer_boundary() -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+/// Under `--posix` the special-file table is not consulted, so `w /dev/stdout`
+/// is an ORDINARY open of that path -- a SECOND stdio buffer over the same pipe.
+/// Which of the two reaches it first is then settled by which FILLS first, and
+/// the sink takes two records per input record (the `p` and the auto-print)
+/// where the `w` target takes one. So the run opens with 4096 bytes of the
+/// sink's stream, which is GNU sed 4.9's own answer; a sink buffered any other
+/// way opens with the `w` target's block instead, which is what a `BufWriter`
+/// over `std::io::stdout()` did. This is the only byte-observable consequence of
+/// the SINK's buffer size -- the flushed TOTAL is `floor(n / 4096) * 4096` for
+/// any scheme that fills before it writes, so nothing else here can see it.
+#[test]
+fn a_posix_w_of_dev_stdout_is_a_second_buffer_over_one_pipe()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("posix-stdout-buffer")?;
+    // 41 records of 100 bytes: enough that the sink crosses 4096 and the `w`
+    // target, at half the volume, does not.
+    let (mut input, mut doubled) = (Vec::new(), Vec::new());
+    for i in 0..41 {
+        let mut rec = format!("L{i:03}").into_bytes();
+        rec.extend(std::iter::repeat_n(b'x', 95));
+        rec.push(b'\n');
+        input.extend_from_slice(&rec);
+        doubled.extend_from_slice(&rec);
+        doubled.extend_from_slice(&rec);
+    }
+    assert_eq!(input.len(), 4100, "the input is not the length this test needs");
+    std::fs::write(dir.0.join("h"), &input)?;
+    let out = std::process::Command::new(bin())
+        .arg("sed")
+        .args(["--posix", "-e", "p", "-e", "w /dev/stdout", "h"])
+        .current_dir(&dir.0)
+        .output()?;
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.stdout.len(), input.len() * 3, "the p, the auto-print and the w target");
+    assert_eq!(
+        out.stdout.get(..4096),
+        doubled.get(..4096),
+        "the run opens with the sink's block, not the w target's"
+    );
+    Ok(())
+}
+
+/// `l` submits its listing in pieces because GNU's `do_list` writes it a BYTE at
+/// a time, and the piece must be one UNDER the buffer rather than equal to it: a
+/// `put` of exactly the capacity finds no room on the first write of a run --
+/// stdio's buffer not existing until its first overflow -- and so goes straight
+/// to the descriptor, ahead of anything else sharing it. Both cross-model reviews
+/// of that landing found the equal-to case independently, and nothing in this
+/// crate would have.
+///
+/// Visible only where a second stream shares the descriptor, so stdout and stderr
+/// are handed ONE file description here (a `try_clone` dup, which shares the
+/// offset as `2>&1` does; two opens of a path would not). The numbers are GNU sed
+/// 4.9's. The 4094 row is the piece size: it moves to 4094 when the piece is the
+/// whole capacity. The 8190 row is the submission itself: it moves to 8190 when
+/// the listing goes over whole, which is what the build before it did.
+#[test]
+fn a_listing_is_submitted_in_pieces_the_buffer_can_hold() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = TempDir::new("l-pieces")?;
+    for (record, total, marker) in [(4094usize, 8191usize, 8189usize), (8190, 16383, 16381)] {
+        let mut input = vec![b'0'; record];
+        input.push(b'\n');
+        std::fs::write(dir.0.join("L"), &input)?;
+        let file = std::fs::File::create(dir.0.join("both"))?;
+        let shared = file.try_clone()?;
+        let status = std::process::Command::new(bin())
+            .arg("sed")
+            .args(["-n", "-e", "l 0", "-e", "w /dev/stderr", "L"])
+            .current_dir(&dir.0)
+            .stdout(std::process::Stdio::from(file))
+            .stderr(std::process::Stdio::from(shared))
+            .status()?;
+        assert_eq!(status.code(), Some(0), "record of {record}");
+        let body = std::fs::read(dir.0.join("both"))?;
+        assert_eq!(body.len(), total, "record of {record}");
+        assert_eq!(
+            body.iter().position(|b| *b == b'$'),
+            Some(marker),
+            "record of {record}: the listing reached the descriptor at the wrong point"
+        );
+    }
+    Ok(())
+}
+
 /// An `r` source bigger than one read block, for the half the endless test cannot
 /// reach: that the copy LOOPS. A `copy_source` writing its first block and
 /// returning satisfies every other test in this crate while truncating every `r`

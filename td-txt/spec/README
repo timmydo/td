@@ -1641,47 +1641,94 @@ td-txt-authored case files
     are the whole of where this landing chooses against GNU, and both are cells
     where GNU has lost part of somebody else's input.
 
-  - A FLUSH CAN SPLIT IN TWO on the way out, which bounds the `write(2)` parity
-    claimed above and is not about `-u` at all. `Out` is a `BufWriter` over
-    `std::io::Stdout`, and that is itself a `LineWriter`: flushing a buffer
-    whose LAST byte is not a separator splits at the last one it does contain.
-    So `printf '1\n2\n3' | sed -u p` ends `"3" "\n" "3"` here against GNU's
-    `"3" "\n3"`, and `sed -z -e G h` is two calls here against one there --
-    UNFLAGGED, which is what says the cause is the double buffering rather than
-    the flag. Found by a review of the `-u` landing, which is why it is written
-    beside it; the six shapes that landing measured all end their buffer on a
-    separator, which is why they came out identical.
+  - A FLUSH CAN SPLIT IN TWO on the way out, CLOSED, which bounded the
+    `write(2)` parity claimed above and was not about `-u` at all. `Out` was a
+    `BufWriter` over `std::io::Stdout`, and that is itself a `LineWriter`:
+    flushing a buffer whose LAST byte is not a separator splits at the last one
+    it does contain. So `printf '1\n2\n3' | sed -u p` ended `"3" "\n" "3"`
+    against GNU's `"3" "\n3"`, and `sed -z -e G h` was two calls here against
+    one there -- UNFLAGGED, which is what says the cause was the double
+    buffering rather than the flag. Found by a review of the `-u` landing, which
+    is why it is written beside it; the six shapes that landing measured all end
+    their buffer on a separator, which is why they came out identical.
 
-    The obvious repair is a `BufWriter` over a DUP of descriptor 1 rather than
-    over `Stdout` -- safe, `try_clone_to_owned` needs no `unsafe` -- and it is a
-    separate landing because a second writer shares that buffer: the `--posix`
-    `w /dev/stdout` target writes through `std::io::stdout()` too
-    (sed.rs `WDest::Stdout`), and it is the ONE global `LineWriter` underneath
-    both that orders the two streams against each other. Dup for one and not the
-    other and the ordering this entry's neighbour above just bought is gone. So
-    the fix is "move both", with the `-u` cases as its evidence, and it also
-    touches grep, which shares `Out`.
+    Both are one write now, because the sink is the same `StdioBuf` a `w` target
+    is, over a DUP of descriptor 1 rather than over `Stdout` -- safe,
+    `try_clone_to_owned` needs no `unsafe`. It had to move for grep too, which
+    shares `Out`, and `Out::new` became fallible in the doing: the dup can fail
+    only on a closed or exhausted descriptor table, which is exactly when a
+    silent fallback to a second buffering layer would be worst.
 
-    The sink's buffer SIZE belongs to that same landing and is the other half of
-    the same divergence, found while measuring the `w` target's. `Out` is a
-    `BufWriter::new`, so 8192, where GNU's stdout takes the pipe's `st_blksize`
-    and gets 4096 -- which nothing can see until two streams share the
-    descriptor and each flushes when ITS buffer fills. Under `--posix`, where
-    `w /dev/stdout` is a second stream rather than an alias, 200 lines of 100
+    The sink's buffer SIZE was the other half of the same divergence, found
+    while measuring the `w` target's, and it closed with it: `BufWriter::new` is
+    8192 where GNU's stdout takes the pipe's `st_blksize` and gets 4096. Nothing
+    can see that until two streams share the descriptor and each flushes when
+    ITS buffer fills. Under `--posix` -- where `special()` is not consulted at
+    all, so `w /dev/stdout` is an ORDINARY open of that path and a second stdio
+    buffer rather than the alias an extended run makes it -- 200 lines of 100
     bytes through `sed --posix -n -e p -e 's/^/W/' -e 'w /dev/stdout'` comes out
-    of GNU in runs of 41 L, 40 W, 41 L, 81 W, ... -- two 4096 buffers filling at
-    nearly the same rate, stdout crossing first because `p` runs before `w`
-    within a cycle. It is 41 W, 80 L, 81 W, 80 L here: the `w` runs are GNU's
-    length now and the sink's are twice it, and the FIRST run is W because the
-    4096 target fills at line 41 while the 8192 sink waits until 82. This is a
-    pre-existing divergence rather than one the `w` buffer introduced, and the
-    buffer halved it: the same shape on the parent build is 81 W, 81 L, 81 W,
-    81 L -- an unbuffered `w` outrunning the sink entirely. Not closed here
-    because the remaining half is the sink, not the target, and `Out` is grep's
-    too. The three orderings are three different byte streams, so a case would
-    catch it -- but only with 20 KB of input, which the corpus writes inline and
-    cannot hold, exactly as the buffer-boundary rows above cannot be cases
-    either.
+    of GNU in runs of 41 L, 40 W, 41 L, 81 W, 41 L, 41 W, 41 L, 37 W, 37 L: two
+    4096 buffers filling at nearly the same rate, stdout crossing first because
+    `p` runs before `w` within a cycle. td-txt reproduces that sequence exactly;
+    the build before it gave 41 W, 81 L, 81 W, 81 L, 78 W, 38 L, the first run
+    being W because the 4096 target filled at line 41 while the 8192 sink waited
+    until 82. `a_posix_w_of_dev_stdout_is_a_second_buffer_over_one_pipe` holds
+    the smallest version of that -- 41 records, where the sink crosses and the
+    target does not, so the run must OPEN with the sink's 4096 -- outside the
+    corpus, whose files are written inline.
+
+    Two of stdio's rules past the buffer arrived with the sink and apply to
+    every `StdioBuf`, both from `_IO_new_file_xsputn` and neither reachable by a
+    `BufWriter`. A write that does not fit does NOT go through the buffer a
+    block at a time: what is left after the fill is flushed is handed to the
+    kernel DIRECTLY, rounded down to whole blocks (`do_write = to_do - to_do %
+    block_size`, and no rounding at all below 128), with only the sub-block tail
+    buffered. And the buffer does not EXIST until the first overflow, so the
+    first write of all finds no room and takes that path whole. Together they
+    are why one 8193-byte record is `8192` then `1` where a fill-and-flush loop
+    gives `4096, 4096, 1`, and why the same record written second is `4096,
+    4096`: `sed -n p` over two such lines is `8192, 4096, 4096, 2` in GNU and
+    here. A line-buffered stream is bound by them too -- stdio scans for the
+    newline only when the write FITS in the room -- so a terminal is no promise
+    that every record is written when it ends.
+
+    grep is where the same question is still OPEN, and it is `l`'s exactly:
+    GNU's grep writes a matched line and its separator in ONE `fwrite`, so a
+    12288-byte record reaches the descriptor as a single write, where td-txt
+    writes the line and the separator separately and gets 8192 then 4096. Both
+    the bytes and their order are identical; only the boundaries differ, and
+    only for a record longer than the buffer. PRE-EXISTING -- the build before
+    the sink answers differently again (12287 then 1) -- and not closed with
+    `l` because the separator is not part of the slice grep holds and a final
+    line may carry none at all, so joining them is a copy on the hot path
+    rather than a re-slice. Two cells of the sink sweep, and the only two it
+    still reports.
+
+    Neither rule can be seen from the byte harness, and that is arithmetic
+    rather than a missing case: every scheme that fills before it writes flushes
+    exactly `floor(total / cap) * cap`, so the `r`-of-a-`w` trick above answers
+    identically for all of them. Only a syscall trace tells them apart. They are
+    pinned by a unit test on `StdioBuf`, which reads the file back after each
+    `put` and so sees the direct write as it happens, and measured by a
+    differential strace sweep of 143 sed and grep shapes against GNU -- write
+    lengths in order, which is the only differential in this crate that compares
+    something other than bytes.
+
+    `l` is the one COMMAND those rules reached, and it moved to meet them: GNU's
+    `do_list` writes its listing ONE BYTE at a time (`ck_fwrite (o, 1, 1, fp)`),
+    so a listing never takes the direct path, where td-txt submitted the whole
+    escaped buffer and did. It now submits in pieces one byte UNDER the buffer,
+    which cannot overflow it and so gives the byte's boundaries at four
+    thousandths of the calls -- per byte was written first and measured 4x
+    slower than the parent over a 20 MB listing, and per wrapped LINE would
+    agree at the default width and not at `l 0`, which wraps nowhere. Under the
+    buffer rather than equal to it because a piece of exactly the capacity finds
+    NO room on the first write of a run, the buffer not existing yet, and so
+    goes to the descriptor ahead of anything sharing it: `sed --posix -n -e 'l
+    0' -e 'w /dev/stdout'` over a 4094-byte record put the listing first where
+    GNU puts the `w` record first. Both cross-model reviews of the landing found
+    that independently, and it is why the accessor is `piece()` and not the
+    capacity.
 
   - A `w` TARGET is buffered, which is CLOSED and was the third mechanism `-u`
     above left standing. It is the same divergence the `r`-of-a-`w` entry
@@ -1721,24 +1768,29 @@ td-txt-authored case files
     message there and was two here.
 
     Two of stdio's choices are the DESCRIPTOR's rather than constants
-    (`_IO_file_doallocate`), so both are asked of it: the capacity is
-    `st_blksize`, which is 4096 for every target on this platform and is why the
-    rows above are what they are; and a target that is a TERMINAL is
+    (`_IO_file_doallocate`), so both are asked of it: the capacity starts at
+    `BUFSIZ` and takes `st_blksize` only where that is positive AND SMALLER, so
+    4096 for every target on this platform -- which is why the rows above are
+    what they are -- and 8192 rather than its own number on a filesystem
+    reporting 64 KiB, which is a divergence this platform cannot show and two
+    reviews of the sink landing caught by reading; and a target that is a
+    TERMINAL is
     LINE-buffered instead, flushing through the last `\n` -- stdio's newline and
     not sed's record separator, so `-z` does not move it. Missing the terminal
     half was a REGRESSION rather than a gap: with two `w` targets on one PTY,
     `sed --posix -n -e 'w /dev/stdout' -e 's/^/E/' -e 'w /dev/stderr'` interleaves
     `1 E1 2 E2 3 E3` in GNU and in the build before this, and a block-buffered
     target grouped it. A corpus case cannot carry it, the harness handing its
-    children pipes, so the rule is pinned by a unit test on `WBuf` instead and
-    the isatty DECISION is untested.
+    children pipes, so the rule is pinned by a unit test on `StdioBuf` instead --
+    the buffer the sink now shares, which is why the entry below closed.
 
-    The SINK on a terminal is the same divergence one layer out and is NOT closed
-    here: GNU line-buffers its stdout onto a PTY where `Out` block-buffers, so
-    `sed --posix -n -e p -e 's/^/W/' -e 'w /dev/stdout'` is `1 W1 2 W2 3 W3` there
-    and groups here. Pre-existing -- the parent build groups it identically -- and
-    it goes with the buffer-size entry beside the split-flush one, since both are
-    `Out` and grep shares it.
+    The SINK on a terminal was the same divergence one layer out and closed with
+    the entry below it: GNU line-buffers its stdout onto a PTY where `Out`
+    block-buffered, so `sed --posix -n -e p -e 's/^/W/' -e 'w /dev/stdout'` is
+    `1 W1 2 W2 3 W3` there and grouped as `W1 W2 W3 1 2 3` here. Both orders
+    agree now, measured over a real PTY, since the sink asks the descriptor the
+    same two questions a `w` target does. The isatty DECISION is still untested:
+    the harness hands its children pipes, so no case in this crate reaches it.
 
     WHICH target goes first is that same walk read carefully, and it is LAST
     OPENED FIRST: `get_openfile` PREPENDS to `file_write` (compile.c:425), so the

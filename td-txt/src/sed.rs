@@ -914,17 +914,15 @@ impl ScriptParser<'_> {
         }
         let path = &target.path;
         let dest = match target.special {
-            Some(Special::Out) => WDest::Stdout,
+            Some(Special::Out) => WDest::Stdout(None),
             Some(Special::Err) => WDest::Stderr,
             // Opened as a stream nobody may write to, and not as a PATH: creating
             // `/dev/stdin` truncates whatever the operator's standard input is.
             Some(Special::In) => WDest::Stdin,
-            None => {
-                let file = std::fs::File::create(crate::util::path_from_bytes(path))
-                    .map_err(|e| Fatal::runtime_msg(cant_open(path, &e)))?;
-                let buf = WBuf::for_file(&file);
-                WDest::File(file, buf)
-            }
+            None => WDest::File(crate::util::StdioBuf::over(
+                std::fs::File::create(crate::util::path_from_bytes(path))
+                    .map_err(|e| Fatal::runtime_msg(cant_open(path, &e)))?,
+            )),
         };
         let opened = self.wfiles.len();
         self.wfiles.insert(target.clone(), WFile { dest, owed: false, opened });
@@ -2194,6 +2192,17 @@ impl<'a> Sink<'a> {
         Self { dest: Dest::Buffer(Vec::new()), separator, owed: false, owed_wfile: false }
     }
 
+    /// The most one write may carry and still land on stdio's boundaries. An
+    /// in-place run's replacement buffer has none, so it takes the lot -- a
+    /// saturated value, safe only because its one consumer is `chunks`, which
+    /// needs a non-zero length and nothing else.
+    fn piece(&self) -> usize {
+        match &self.dest {
+            Dest::Stdout(out) => out.piece(),
+            Dest::Buffer(_) => usize::MAX,
+        }
+    }
+
     fn debt(&mut self, chan: Chan) -> &mut bool {
         match chan {
             Chan::Main => &mut self.owed,
@@ -2326,99 +2335,22 @@ struct WFile {
     opened: usize,
 }
 
-/// A `w` target's buffer. GNU's is stdio's, so both of stdio's choices are asked
-/// of the DESCRIPTOR rather than assumed (`_IO_file_doallocate`): the capacity is
-/// its `st_blksize`, and a terminal is LINE-buffered instead of block-buffered.
-///
-/// What blocks fill to is CAPACITY before writing anything, rather than flushing
-/// early to make room: 4000 bytes buffered then a 100-byte line leaves exactly
-/// 4096 on disk, where a `BufWriter` -- which writes the 4000 to make room, then
-/// buffers the 100 -- leaves 4000. An `r` of the same file in the same run sees
-/// that difference, so the fill is copied rather than delegated.
-#[derive(Debug)]
-struct WBuf {
-    held: Vec<u8>,
-    cap: usize,
-    /// A terminal flushes through the last newline instead of when it fills, and
-    /// on `\n` whatever `-z` made the RECORD separator, since this is stdio's
-    /// rule and not sed's.
-    line: bool,
-}
-
-impl WBuf {
-    /// What every `st_blksize` on this platform answers, and the fallback for a
-    /// descriptor that will not say.
-    const BLOCK: usize = 4096;
-    /// A blksize is a filesystem's word, so it is not trusted to be sane; nothing
-    /// observable rides on the clamp, since a target that big never fills.
-    const MAX: usize = 1 << 20;
-
-    fn for_file(file: &std::fs::File) -> Self {
-        use std::os::unix::fs::MetadataExt as _;
-        let cap = match file.metadata() {
-            Ok(m) => usize::try_from(m.blksize()).unwrap_or(Self::BLOCK).clamp(1, Self::MAX),
-            Err(_) => Self::BLOCK,
-        };
-        Self { held: Vec::with_capacity(cap), cap, line: std::io::IsTerminal::is_terminal(file) }
-    }
-
-    fn put(&mut self, bytes: &[u8], file: &mut std::fs::File) -> std::io::Result<()> {
-        let through = match self.line {
-            true => bytes.iter().rposition(|b| *b == b'\n').map(|i| i + 1),
-            false => None,
-        };
-        let Some(at) = through else {
-            return self.fill(bytes, file);
-        };
-        self.held.extend_from_slice(bytes.get(..at).unwrap_or_default());
-        self.flush(file)?;
-        self.fill(bytes.get(at..).unwrap_or_default(), file)
-    }
-
-    fn fill(&mut self, mut bytes: &[u8], file: &mut std::fs::File) -> std::io::Result<()> {
-        while !bytes.is_empty() {
-            // A FULL buffer is not a reason to write; having more to put and
-            // nowhere to put it is. stdio overflows rather than topping up, so a
-            // write that exactly fills the buffer leaves it sitting there --
-            // `w` of one 4096-byte record shows an `r` nothing at all, where
-            // flushing at capacity would show it everything.
-            let room = self.cap.saturating_sub(self.held.len());
-            if room == 0 {
-                self.flush(file)?;
-                continue;
-            }
-            let take = room.min(bytes.len());
-            self.held.extend_from_slice(bytes.get(..take).unwrap_or_default());
-            bytes = bytes.get(take..).unwrap_or_default();
-        }
-        Ok(())
-    }
-
-    /// Keeps only what did NOT reach the file, so a failure part way through
-    /// leaves the tail rather than the whole -- `Drop` retries this, and
-    /// `write_all` would hand it back bytes the descriptor already took.
-    fn flush(&mut self, file: &mut std::fs::File) -> std::io::Result<()> {
-        use std::io::Write as _;
-        while !self.held.is_empty() {
-            match file.write(&self.held) {
-                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
-                Ok(n) => {
-                    self.held.drain(..n.min(self.held.len()));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug)]
 enum WDest {
-    File(std::fs::File, WBuf),
+    File(crate::util::StdioBuf),
     Stderr,
-    /// `/dev/stdout` under `-i` only; otherwise it rides the auto-print sink.
-    Stdout,
+    /// `/dev/stdout` under `-i` only; otherwise it rides the auto-print sink. It
+    /// takes stdio's buffer over a DUPLICATE of descriptor 1 rather than writing
+    /// through `std::io::stdout()`, which is a `LineWriter`: GNU's is the ordinary
+    /// block-buffered `stdout`, so `sed -i -n -e 'w /dev/stdout' -e 's/^/E/' -e
+    /// 'w /dev/stderr'` grouped there and interleaved here, and 300 lines cost
+    /// 300 `write(2)`s here against GNU's two.
+    /// Empty until something actually writes here, which under anything but `-i`
+    /// never happens -- `write_to_file` sends those to the sink instead. Duping
+    /// at compile time would hold a descriptor for the whole run and could fail a
+    /// script that never needed it, and asking `in_place` HERE as well as at the
+    /// write would be two places deciding one thing.
+    Stdout(Option<crate::util::StdioBuf>),
     /// `/dev/stdin`, which every write refuses.
     Stdin,
 }
@@ -2427,12 +2359,16 @@ impl WFile {
     fn put(&mut self, bytes: &[u8]) -> Result<(), Vec<u8>> {
         use std::io::Write as _;
         let wrote = match &mut self.dest {
-            WDest::File(f, buf) => buf.put(bytes, f),
+            WDest::File(buf) => buf.put(bytes),
+            WDest::Stdout(slot) => match slot {
+                Some(buf) => buf.put(bytes),
+                None => crate::util::StdioBuf::over_stdout()
+                    .and_then(|buf| slot.insert(buf).put(bytes)),
+            },
             // Unbuffered on purpose: this arm is C's `stderr`, which is. Under
             // `--posix` the name is an ordinary path and takes the `File` arm
             // above, where GNU's `fopen` buffers it too.
             WDest::Stderr => std::io::stderr().write_all(bytes),
-            WDest::Stdout => std::io::stdout().write_all(bytes),
             WDest::Stdin => return refuse_write(bytes.len()),
         };
         wrote.map_err(|e| format!("write error: {}", errmsg(&e)).into_bytes())
@@ -2446,8 +2382,9 @@ impl WFile {
     /// stdio teardown writes what it can.
     fn flush(&mut self) -> Result<(), Vec<u8>> {
         let flushed = match &mut self.dest {
-            WDest::File(f, buf) => buf.flush(f),
-            WDest::Stderr | WDest::Stdout | WDest::Stdin => return Ok(()),
+            WDest::File(buf) | WDest::Stdout(Some(buf)) => buf.flush(),
+            // Never written to, so there is nothing to push and no dup to make.
+            WDest::Stdout(None) | WDest::Stderr | WDest::Stdin => return Ok(()),
         };
         flushed.map_err(|e| format!("write error: {}", errmsg(&e)).into_bytes())
     }
@@ -2500,16 +2437,6 @@ impl Sed {
             Some(e) => Err(e),
             None => Ok(()),
         }
-    }
-}
-
-/// What makes the order right where nothing flushed explicitly: `out` is declared
-/// before `sed`, so these run first and the sink's own drop follows. What it
-/// cannot do is REPORT, which is why the exits that flush the sink flush these
-/// first rather than leaving it here.
-impl Drop for WFile {
-    fn drop(&mut self) {
-        let _ = self.flush();
     }
 }
 
@@ -3604,7 +3531,7 @@ fn compile_and_run(
     // cannot report; ordering no longer depends on anyone remembering them, and
     // an exit nobody enumerated -- a `?` from anywhere in here -- comes out right
     // anyway.
-    let mut out = Out::new();
+    let mut out = Out::new().map_err(|e| Fatal::runtime(format!("write error: {}", errmsg(&e))))?;
     if conf.unbuffered {
         out.unbuffer();
     }
@@ -3804,7 +3731,7 @@ fn compile_and_run(
         // A read that failed outranks everything else, including a `bad` operand
         // opened earlier: GNU's reader panics there, so nothing after it happened.
         // The flush is for its ERROR — what was written survives either way, since
-        // dropping the `BufWriter` writes it, but silently.
+        // dropping the buffer writes it, but silently.
         if stream.fatal {
             // Same as the `-s` path: the read failure is the one report.
             let _ = sed.flush_wfiles();
@@ -4542,7 +4469,7 @@ impl Sed {
         // final flags: the table is read under the posixicity of the part naming
         // it, so `-e 'w /dev/stdout' --posix` aliases and re-deriving here would
         // decide the opposite, giving one `w` two answers.
-        if matches!(self.wfiles.get(target).map(|w| &w.dest), Some(WDest::Stdout)) && !self.in_place {
+        if matches!(self.wfiles.get(target).map(|w| &w.dest), Some(WDest::Stdout(_))) && !self.in_place {
             return sink.write_line_on(Chan::WFile, bytes, terminated);
         }
         let separator = self.separator;
@@ -4676,7 +4603,16 @@ impl Sed {
                     let width = width.unwrap_or(self.line_wrap);
                     let mut buf = Vec::new();
                     escape_for_l(&self.pattern, width, self.separator, &mut buf);
-                    sink.write(&buf)?;
+                    // Never more than the sink can BUFFER at once. GNU's
+                    // `do_list` writes a BYTE at a time, so a listing never
+                    // takes stdio's block path; submitted whole it would, and
+                    // `l 0` -- which wraps nowhere -- would make that every
+                    // listing. Any piece that cannot overflow the buffer gives
+                    // the same boundaries as a byte does, at four thousandths of
+                    // the calls.
+                    for chunk in buf.chunks(sink.piece()) {
+                        sink.write(chunk)?;
+                    }
                 }
                 Some(Kind::Next) => {
                     if !self.suppress {
@@ -4926,57 +4862,6 @@ mod tests {
     /// `EXTENDED` with the one flag a test varies.
     fn mode_with(ere: bool) -> Mode {
         Mode { ere, ..EXTENDED }
-    }
-
-    /// The LINE-buffered arm of a `w` target, which no corpus case can reach:
-    /// stdio picks it for a terminal and the harness hands its children pipes.
-    /// The rule is stdio's -- everything through the LAST newline goes out and
-    /// the tail waits -- and it is `\n` rather than the record separator, which
-    /// is why `-z` cannot be used to test it either.
-    #[test]
-    fn a_line_buffered_w_target_writes_through_its_last_newline() {
-        let dir = std::env::temp_dir().join("td-txt-wbuf-line");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("t");
-        let mut file = std::fs::File::create(&path).unwrap();
-        let mut buf = WBuf { held: Vec::new(), cap: 4096, line: true };
-
-        // No newline: nothing leaves, however much is written.
-        buf.put(b"abc", &mut file).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"");
-        // A newline takes the held bytes with it, and only up to the last one.
-        buf.put(b"de\nfg\nhi", &mut file).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"abcde\nfg\n");
-        // The tail is still held, and the explicit flush is what ends it.
-        buf.flush(&mut file).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"abcde\nfg\nhi");
-
-        // A NUL is not a newline to stdio, whatever `-z` made the separator.
-        let path = dir.join("z");
-        let mut file = std::fs::File::create(&path).unwrap();
-        let mut buf = WBuf { held: Vec::new(), cap: 4096, line: true };
-        buf.put(b"a\0b\0", &mut file).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"");
-
-        // And the block arm still fills to capacity rather than on a newline.
-        let path = dir.join("b");
-        let mut file = std::fs::File::create(&path).unwrap();
-        let mut buf = WBuf { held: Vec::new(), cap: 8, line: false };
-        buf.put(b"ab\ncd\n", &mut file).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"");
-        buf.put(b"ef\n", &mut file).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"ab\ncd\nef");
-
-        // The capacity comes from the DESCRIPTOR, not from a constant. Every
-        // `st_blksize` on this platform is 4096, so this cannot tell the two
-        // apart today -- what it does catch is the wiring being replaced by some
-        // OTHER number, and a platform whose answer differs.
-        use std::os::unix::fs::MetadataExt as _;
-        let file = std::fs::File::create(dir.join("c")).unwrap();
-        let want = usize::try_from(file.metadata().unwrap().blksize()).unwrap();
-        let sized = WBuf::for_file(&file);
-        assert_eq!(sized.cap, want);
-        assert!(!sized.line, "a regular file is not a terminal");
     }
 
     /// A `Stream` over bytes. `Stream` reads a DESCRIPTOR now, so the bytes go

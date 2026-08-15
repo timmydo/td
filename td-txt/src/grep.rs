@@ -765,7 +765,14 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
     // turned them into.
     let show_name = conf.with_filename.unwrap_or(files.len() > 1 || descended);
     let grep = Grep { conf, pats, only_empty };
-    let mut out = Out::new();
+    // Fallible because the sink DUPLICATES descriptor 1; grep's own error status.
+    let mut out = match Out::new() {
+        Ok(out) => out,
+        Err(e) => {
+            err(&format!("write error: {}", crate::util::errmsg(&e)));
+            return 2;
+        }
+    };
     let mut any_match = false;
     let mut printed_groups = false;
 
