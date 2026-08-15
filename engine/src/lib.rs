@@ -10,13 +10,14 @@
 //! builder's streaming file helper. `exit` is the third shared thing: the
 //! status codes the two bins exchange when one runs the other.
 //!
-//! `crc32` and `gpt` arrived with real-hardware boot. The
+//! `crc32`, `gpt` and `fat` arrived with real-hardware boot. The
 //! CRC-32 is here rather than beside either of its callers because two
 //! unrelated formats want it — the xz decoder's stream checksums and the GPT
 //! header and entry-array checksums — and a private copy per format is the
 //! divergence this crate exists to prevent. `gpt` computes partition-table
-//! bytes and performs no I/O, so the target-side installer `#[path]`-includes
-//! it (together with `crc32`) exactly as td-boot includes `sha256`.
+//! bytes and `fat` an ESP's, both performing no I/O, so the target-side
+//! installer `#[path]`-includes them (together with `crc32`) exactly as
+//! td-boot includes `sha256`. Neither bin uses `gpt` or `fat`.
 //!
 //! `sha512` and `ed25519` arrive with AUTHENTICATED deployments, and are
 //! target-side in that same way — which is why the crate's first line no

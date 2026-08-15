@@ -256,6 +256,62 @@ fn add_build_gate_targets(root: &Path, sel: &mut Selection) {
     }
 }
 
+/// The engine sources a TARGET binary compiles in through a `#[path]` include,
+/// and the full consumer list each one's note should name. Everything else
+/// under `engine/src/` reaches only the two control-plane bins.
+///
+/// This is a DECLARATION, not the thing that adds a gate: `recipe-checks` is a
+/// build gate, so `add_build_gate_targets` already selects it for every engine
+/// source, target-included or not. What the table buys is that the set is
+/// written down once — named in the router's note, pinned per entry by a test,
+/// and re-asserted below independently of `recipe-checks` staying a build gate.
+///
+/// An entry whose consumer has not landed yet costs NOTHING, which follows from
+/// the paragraph above rather than being a separate claim: `add_target` dedups
+/// and `recipe-checks` is already selected for every engine source, so a table
+/// path and a non-table path render the same target SET — only the order
+/// differs. A `#[path]` include whose source is MISSING here is the direction
+/// that matters.
+///
+/// Being in this table does NOT mean a gate builds that consumer. Nothing
+/// builds td-net from source (recorded in aa347e60), so a change to
+/// ed25519.rs/sha512.rs still runs its ring differential nowhere; naming the
+/// consumer here at least makes that gap visible at the routing decision.
+const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
+    (
+        "engine/src/sha256.rs",
+        "td-builder, td-recipe-eval, target-static td-boot, and the td-compositor terminal corpus verifier/importer",
+    ),
+    (
+        "engine/src/crc32.rs",
+        "td-builder's xz and gzip decoders, and target-static td-install (through gpt.rs)",
+    ),
+    (
+        "engine/src/gpt.rs",
+        "target-static td-install; neither control-plane bin uses it",
+    ),
+    (
+        "engine/src/fat.rs",
+        "target-static td-install; neither control-plane bin uses it",
+    ),
+    (
+        "engine/src/ed25519.rs",
+        "target-static td-boot and td-net's cfg(test) ring differential; neither control-plane bin uses it",
+    ),
+    (
+        "engine/src/sha512.rs",
+        "target-static td-boot (paired with ed25519.rs, which reaches its hash as crate::sha512) and td-net's cfg(test) ring differential; neither control-plane bin uses it",
+    ),
+];
+
+/// The consumer list for a target-included engine source, or `None` for an
+/// engine source that reaches only the control-plane bins.
+fn target_included_consumers(p: &str) -> Option<&'static str> {
+    TARGET_INCLUDED_ENGINE_SOURCES
+        .iter()
+        .find_map(|&(src, consumers)| (src == p).then_some(consumers))
+}
+
 fn add_recipe_graph_targets(sel: &mut Selection) {
     sel.add_target("bootstrap-x86_64-toolchain-store-native");
     sel.add_target("bootstrap-x86_64-native-gcc-store-native");
@@ -416,16 +472,18 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_preflight("cargo-test");
         sel.add_target("check-engine");
         sel.add_target("recipe-rs");
-        if p == "engine/src/sha256.rs" {
-            // td-boot compiles this exact source into its target static binary.
+        let consumers = if let Some(consumers) = target_included_consumers(p) {
+            // Redundant TODAY — `add_build_gate_targets` below adds recipe-checks
+            // for every engine source, because it is a build gate. Stated anyway:
+            // a target-included source needs the gate that BUILDS the target
+            // crate, and that requirement should not rest on recipe-checks
+            // happening to stay in the build-gate set.
             sel.add_target("recipe-checks");
-        }
-        add_build_gate_targets(root, sel);
-        let consumers = if p == "engine/src/sha256.rs" {
-            "td-builder, td-recipe-eval, target-static td-boot, and the td-compositor terminal corpus verifier/importer"
+            consumers
         } else {
             "td-builder and td-recipe-eval"
         };
+        add_build_gate_targets(root, sel);
         sel.add_note(&format!(
             "{p} is shared engine/workspace code compiled into {consumers}: validated by check-engine (compile + unit tests) and the recipe/package build gates."
         ));
@@ -1148,10 +1206,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     macro_rules! assert_target {
         ($path:expr, $target:expr) => {
             if !has_target($path, $target) {
-                fail(format!(
-                    "{}: expected ./check.sh target '{}'",
-                    $path, $target
-                ));
+                fail(format!("{}: expected check target '{}'", $path, $target));
             }
         };
     }
@@ -1184,6 +1239,14 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
             let out = path_output(root, $path);
             if !out.contains($needle) {
                 fail(format!("{}: missing '{}'", $path, $needle));
+            }
+        }};
+    }
+    macro_rules! assert_not_contains {
+        ($path:expr, $needle:expr) => {{
+            let out = path_output(root, $path);
+            if out.contains($needle) {
+                fail(format!("{}: must not mention '{}'", $path, $needle));
             }
         }};
     }
@@ -1312,8 +1375,65 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // side) AND recipe-rs + the package build gates (recipe side).
     assert_target!("engine/src/json.rs", "check-engine");
     assert_target!("engine/src/json.rs", "recipe-rs");
+    // The premise the table rests on, pinned rather than asserted in a comment:
+    // json.rs is target-included by NOTHING and still selects recipe-checks,
+    // because it is a build gate. If that ever stops being true this line reds,
+    // and the explicit selection beside the table stops being redundant.
+    assert_target!("engine/src/json.rs", "recipe-checks");
+    // One line per TARGET_INCLUDED_ENGINE_SOURCES entry, and deliberately NOT a
+    // loop over that table: an assertion generated from the table compares the
+    // code with itself and passes however the table is edited — which the first
+    // draft of this did, and a verify-red probe caught. These needles are
+    // written out by hand, so deleting an entry reds the line naming it.
+    //
+    // The NOTE is what they check, because it is the only rendered thing that
+    // distinguishes a target-included source. `recipe-checks` is a build gate,
+    // so the target assertions below hold for engine/src/json.rs too: they
+    // guard that the gate is selected AT ALL, not that the table selected it.
     assert_target!("engine/src/sha256.rs", "check-engine");
     assert_target!("engine/src/sha256.rs", "recipe-checks");
+    assert_contains!("engine/src/sha256.rs", "target-static td-boot");
+    assert_contains!("engine/src/crc32.rs", "target-static td-install");
+    assert_contains!("engine/src/gpt.rs", "target-static td-install");
+    assert_contains!("engine/src/fat.rs", "target-static td-install");
+    assert_contains!("engine/src/ed25519.rs", "target-static td-boot");
+    assert_contains!("engine/src/sha512.rs", "target-static td-boot");
+    // The other half. Without it a table that matched EVERY engine source would
+    // satisfy every line above, and the note would claim a target consumer for
+    // control-plane-only code.
+    assert_not_contains!("engine/src/json.rs", "target-static");
+    // And the membership itself, written out independently of the table so the
+    // two must be edited together. The lines above only catch an entry REMOVED,
+    // or a table grown to match everything; this also catches one added quietly,
+    // which for a routing table is the direction that decides which gate a
+    // target binary's sources get.
+    let expected_target_included = [
+        "engine/src/sha256.rs",
+        "engine/src/crc32.rs",
+        "engine/src/gpt.rs",
+        "engine/src/fat.rs",
+        "engine/src/ed25519.rs",
+        "engine/src/sha512.rs",
+    ];
+    let actual_target_included: Vec<&str> = TARGET_INCLUDED_ENGINE_SOURCES
+        .iter()
+        .map(|(src, _)| *src)
+        .collect();
+    if actual_target_included != expected_target_included {
+        fail(format!(
+            "TARGET_INCLUDED_ENGINE_SOURCES membership changed: {actual_target_included:?}"
+        ));
+    }
+    // And that each names a file that EXISTS. `map_path` never stats an engine
+    // source, so a renamed or mistyped entry would quietly stop matching and
+    // route its file as control-plane-only — the failure this table exists to
+    // prevent, reached by typo. Comparing the table to the filesystem is not
+    // the self-comparison the note assertions had to avoid.
+    for (src, _) in TARGET_INCLUDED_ENGINE_SOURCES {
+        if !root.join(src).is_file() {
+            fail(format!("{src} is in TARGET_INCLUDED_ENGINE_SOURCES but does not exist"));
+        }
+    }
     assert_target!("engine/Cargo.toml", "check-engine");
     assert_target!("engine/Cargo.toml", "recipe-rs");
     assert_target!("Cargo.toml", "check-engine");
@@ -2107,14 +2227,43 @@ mod tests {
             .to_path_buf()
     }
 
-    /// The repo fixtures the self-test reads (`tests/` + the gate-def files) are present only
-    /// when cargo runs from the full checkout — the `cargo-test` GATE and the required
-    /// CI `cargo-test` job, both on every PR. The `td-builder` GUIX package build runs
-    /// `cargo test` too, but its source is `local-file "../builder"` — ONLY the crate,
-    /// no `tests/` or check.sh — so the self-test skips there (not a weakening: the gate
-    /// + CI still run it fully every PR). Markers must be repo files OUTSIDE `builder/`.
-    fn repo_tree_present(root: &Path) -> bool {
-        root.join("builder/src/gate_defs").is_dir() && root.join("check.sh").is_file()
+    /// The fixtures these two tests read, asserted rather than used to SKIP.
+    ///
+    /// There was one marker for both, and it required `check.sh` — which
+    /// 578b4ef5 retired, stranding it. The `cargo test` copy of both tests has
+    /// been skipping ever since: an `eprintln!` + `return` inside a `#[test]`
+    /// is captured, so it read as green. (The suite itself kept running through
+    /// its other two entry points, the `--self-test` verb and the
+    /// `affected-self-test` preflight, neither of which consults a marker.)
+    ///
+    /// Both halves are now hard failures, because the environment the skip
+    /// defended does not exist in this tree: it was justified by a package build
+    /// whose source is `builder/` alone, and no recipe builds `builder`. A tree
+    /// missing these should RED — a test that decides for itself not to run is
+    /// the failure mode that produced the stranding above.
+    ///
+    /// They are separate because the two tests read different things:
+    /// `run_self_test`'s only filesystem read is `builder/src/gate_defs`,
+    /// through `gate_files`, while the lock roster reads the SIBLING crates'
+    /// locks. The lock half is asked of the roster's own first entry, so a
+    /// renamed lock moves the check with it instead of stranding it again.
+    fn require_gate_defs(root: &Path) {
+        assert!(
+            root.join("builder/src/gate_defs").is_dir(),
+            "builder/src/gate_defs absent at {} — the self-test's only fixture",
+            root.display()
+        );
+    }
+
+    fn require_sibling_locks(root: &Path) {
+        let Some((first, _)) = DEPENDENCY_FREE_LOCKS.first() else {
+            panic!("DEPENDENCY_FREE_LOCKS is empty");
+        };
+        assert!(
+            root.join(first).is_file(),
+            "{first} absent at {} — the lock roster's own first entry",
+            root.display()
+        );
     }
 
     #[test]
@@ -2140,13 +2289,7 @@ mod tests {
     #[test]
     fn self_test_passes_against_repo() {
         let root = repo_root();
-        if !repo_tree_present(&root) {
-            eprintln!(
-                "SKIP self-test: repo tree absent at {} (builder-only sandbox)",
-                root.display()
-            );
-            return;
-        }
+        require_gate_defs(&root);
         let failures = run_self_test(&root);
         assert!(failures.is_empty(), "self-test failures: {failures:#?}");
     }
@@ -2180,22 +2323,22 @@ mod tests {
         assert!(dependency_free("Cargo.lock", three, 3).is_ok());
         assert!(dependency_free("Cargo.lock", three, 1).is_err());
 
-        // Every roster entry against the real guard, including the read — but
-        // only from the full checkout: the td-builder package build ships
-        // `builder/` alone and has no sibling crates to read.
+        // Every roster entry against the real guard, including the read. This
+        // is the enforcement of AGENTS.md's dependency-free rule over every td
+        // crate's committed lock, and it shared the stranded marker above — so
+        // its `cargo test` copy was skipping for the same six weeks.
         let root = repo_root();
-        if repo_tree_present(&root) {
-            for (lock, packages) in DEPENDENCY_FREE_LOCKS {
-                assert!(
-                    assert_dependency_free(&root, lock, packages).is_ok(),
-                    "the committed {lock} must pass its own guard"
-                );
-            }
+        require_sibling_locks(&root);
+        for (lock, packages) in DEPENDENCY_FREE_LOCKS {
             assert!(
-                assert_dependency_free(&root, "td-review/nope.lock", 1).is_err(),
-                "an unreadable lock reds rather than passing"
+                assert_dependency_free(&root, lock, packages).is_ok(),
+                "the committed {lock} must pass its own guard"
             );
         }
+        assert!(
+            assert_dependency_free(&root, "td-review/nope.lock", 1).is_err(),
+            "an unreadable lock reds rather than passing"
+        );
     }
 
     /// The roster and the command list are two hand-written copies of the same

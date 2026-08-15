@@ -259,16 +259,9 @@ Signing is host-side in `td-net`, where `ring` already signs, and emits
 ## 7. Engine sources compiled into target binaries
 
 `builder/src/affected.rs` routes a changed file to the checks that can catch
-a break in it. Most `engine/src/*` sources compile only into the two
-control-plane bins, and route to `check-engine` + `recipe-rs`. A few compile
-into **target** binaries as well, through `#[path]` includes, and those must
-additionally route to `recipe-checks` — the gate that actually builds the
-target crate.
-
-That set was `engine/src/sha256.rs`, hardcoded as a string equality in two
-places. It is now six files across three consumers, so the equality becomes a
-**table** of target-included engine sources, each entry naming its consumers,
-with one `assert_target!` pair per entry:
+a break in it. Most `engine/src/*` sources reach only the two control-plane
+bins. A few are `#[path]`-included into **target** binaries as well, and
+which ones is written down in `TARGET_INCLUDED_ENGINE_SOURCES`:
 
 | source | target consumer |
 |---|---|
@@ -276,19 +269,40 @@ with one `assert_target!` pair per entry:
 | `crc32.rs` | td-install (via gpt) |
 | `gpt.rs` | td-install |
 | `fat.rs` | td-install |
-| `ed25519.rs` | td-boot |
-| `sha512.rs` | td-boot (pair with ed25519) |
+| `ed25519.rs` | td-boot, td-net's `cfg(test)` ring differential |
+| `sha512.rs` | td-boot (pair with ed25519), td-net's ring differential |
 
-One landing, not two. The alternative — adding an entry as each consumer
-appears — means editing `affected.rs` in three separate increments, which is
-precisely the coordination point the single-owner change exists to dissolve.
-The cost of populating it ahead of the consumers is that those sources route
-to `recipe-checks` slightly early; that is a conservative superset, which is
-already the stated policy of the surrounding rule.
+Each entry stores the full consumer list the router prints in its note; the
+column above shows only the target half that distinguishes these six.
 
-A source in this table with no target consumer is a slow gate. A target
-consumer whose source is *missing* from it is a target binary nothing
-compiles in CI, which is the failure that matters.
+**The table is a declaration, not what selects a gate.** `recipe-checks` is
+itself a build gate and the engine rule adds every build gate, so *all* of
+`engine/src/*` already routes to it — `engine/src/json.rs` included. The
+`p == "engine/src/sha256.rs"` equality this replaces was therefore dead for
+routing and live only for the explanatory note, and the assertion that
+claimed to pin it (`assert_target!("engine/src/sha256.rs", "recipe-checks")`)
+passed for any engine source at all. What the table buys is that the set is
+written down once, named in the note, and pinned per entry — against the
+note, which is the only rendered thing that distinguishes a target-included
+source, and against the filesystem, so a renamed entry cannot quietly stop
+matching. The explicit `recipe-checks` selection stays beside it so the
+requirement does not rest on `recipe-checks` remaining a build gate.
+
+It follows that populating the table ahead of its consumers costs **nothing**
+— `add_target` dedups, and a table path and a non-table path render the same
+target set, differing only in order. That is why all six land at once rather
+than one per increment: the alternative is editing `affected.rs` in three
+later landings, which is the coordination point the single-owner change
+exists to dissolve.
+
+What being in the table does NOT mean is that some gate builds the consumer.
+Nothing builds td-net from source (`aa347e60`), so a change to `ed25519.rs`
+runs its ring differential — the primary correctness pin for that verifier —
+**nowhere**. Naming td-net in the note does not close that; it makes it
+visible at the routing decision, and closing it belongs to td-net.
+
+A target consumer whose source is *missing* from the table is the failure
+that matters: a target binary whose engine sources nothing checks.
 
 ## 8. Oracles
 
