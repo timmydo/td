@@ -770,7 +770,7 @@ fn sed_script_stdin_seekability_is_a_stat_not_a_reopen()
     // second by picking a different link, so what it matches is now the segment
     // they all share. There is no longer an exception to carve out: `R`'s source
     // reaches fd 0 through the special-file table, so no line NAMES fd 0 and
-    // opens something. `read_source` still opens whatever name it is handed, and
+    // opens something. `copy_source` still opens whatever name it is handed, and
     // outside POSIXLY_EXTENDED that name can be `/dev/stdin` again — which is
     // what GNU does there too, hang and all.
     for line in src.lines() {
@@ -975,7 +975,7 @@ fn a_diagnostic_names_a_file_in_raw_bytes() -> Result<(), Box<dyn std::error::Er
             b"sed: read error on d\xffir: Is a directory",
             4,
         ),
-        // `r` names its file through `read_source`, a third such site.
+        // `r` names its file through `copy_source`, a third such site.
         row(
             "sed",
             vec![rcmd, b"IN".to_vec()],
@@ -1297,6 +1297,103 @@ fn sed_answers_from_a_stream_that_has_not_ended() -> Result<(), Box<dyn std::err
         drop(sink);
         let _ = child.wait();
     }
+    Ok(())
+}
+
+/// `r` dumps its source as it READS it, and the two halves of that are what this
+/// asserts. Bytes come OUT of an ENDLESS source, which a reader that swallowed the
+/// whole source first could never manage; and closing the pipe ENDS the run, which
+/// is the only end an endless dump has — `Out` swallows the EPIPE and latches, so a
+/// copy that never consulted the latch would write into a closed pipe for ever.
+/// GNU dies of SIGPIPE there, which a program the Rust runtime leaves ignoring it
+/// cannot; exit 0 is this crate's answer to a reader that left, as it is grep's,
+/// so that is what is required rather than GNU's status. The corpus cannot ask for
+/// any of this: every case there waits for an exit status, and this one has to
+/// close a descriptor to get one.
+#[test]
+fn r_dumps_a_source_that_never_ends() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Read;
+    let dir = TempDir::new("r-endless")?;
+    std::fs::write(dir.0.join("IN"), b"a\n")?;
+    // A SECOND queued `r` behind the endless one, and a third whose source cannot
+    // be read at all: reached after the pipe closes, neither may read, hang or
+    // report. A directory is the reachable read failure, exit 4 -- which nobody is
+    // there to see, and which is the wrong answer to a reader that left.
+    std::fs::create_dir(dir.0.join("DIR"))?;
+    let mut child = std::process::Command::new(bin())
+        .arg("sed")
+        .args(["-n", "-e", "r /dev/zero", "-e", "r DIR", "-e", "r /dev/zero", "-e", "p", "IN"])
+        .current_dir(&dir.0)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let mut out = child.stdout.take().ok_or("no stdout pipe")?;
+    // On a thread, because the read is what may never return: the thread's end is
+    // what closes the pipe, and killing the child is what releases it if not.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 16];
+        let _ = tx.send(out.read_exact(&mut buf).map(|()| buf));
+    });
+    let got = rx.recv_timeout(std::time::Duration::from_secs(20));
+    let buf = match got {
+        Ok(buf) => buf,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("sed wrote nothing from an endless `r` source in 20s".into());
+        }
+    }?;
+    // The line `p` printed first, then the source's own bytes.
+    assert_eq!(buf.get(..2), Some(b"a\n".as_slice()));
+    assert_eq!(buf.get(2..), Some([0u8; 14].as_slice()), "the dump is /dev/zero's bytes");
+
+    let mut waited = 0;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if waited >= 20_000 {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("sed kept dumping an endless `r` source into a CLOSED pipe".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    };
+    assert!(status.success(), "a closed reader is not a failure: {status:?}");
+    Ok(())
+}
+
+/// An `r` source bigger than one read block, for the half the endless test cannot
+/// reach: that the copy LOOPS. A `copy_source` writing its first block and
+/// returning satisfies every other test in this crate while truncating every `r`
+/// source over 4 KiB, since the corpus writes its files inline and none of them is
+/// that big. The bytes are compared whole rather than counted, so a block dropped
+/// or repeated in the middle fails too.
+#[test]
+fn an_r_source_crosses_read_blocks() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("r-blocks-dump")?;
+    // Two blocks and a bit, and every line distinct, so a repeat is not a match.
+    let source: Vec<u8> = (0..1200u32).flat_map(|i| format!("s{i:06}\n").into_bytes()).collect();
+    assert!(source.len() > 2 * 4096, "the source has to span blocks");
+    std::fs::write(dir.0.join("SRC"), &source)?;
+    std::fs::write(dir.0.join("IN"), b"a\nb\n")?;
+
+    let out = std::process::Command::new(bin())
+        .arg("sed")
+        .args(["-n", "-e", "r SRC", "-e", "p", "IN"])
+        .current_dir(&dir.0)
+        .output()?;
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // `r` dumps the WHOLE source once per cycle, after that cycle's own line.
+    let mut want = Vec::new();
+    for line in [b"a\n".as_slice(), b"b\n".as_slice()] {
+        want.extend_from_slice(line);
+        want.extend_from_slice(&source);
+    }
+    assert_eq!(out.stdout.len(), want.len(), "the dump is not the source's length");
+    assert_eq!(out.stdout, want);
     Ok(())
 }
 

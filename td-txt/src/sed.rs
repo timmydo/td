@@ -15,8 +15,9 @@
 //! and that record is not counted as delivered until it is handed out, which is
 //! what keeps the give-back to descriptor 0 honest. `-s` and `-i` open each
 //! operand themselves, to decide whether it may be rewritten, and stream it
-//! through that same reader, and so does a NAMED `R` source. SCRIPTS (`-f`) are
-//! still read whole, as is `R /dev/stdin` -- the one source that shares its
+//! through that same reader, and so does a NAMED `R` source; `r` COPIES its
+//! source to the sink a block at a time rather than holding it. SCRIPTS (`-f`)
+//! are still read whole, as is `R /dev/stdin` -- the one source that shares its
 //! descriptor with the operand reader; see spec/README.
 //!
 //! Every compiled regex in a script lives in one table, and an address or `s///`
@@ -2063,10 +2064,26 @@ impl<'a> Sink<'a> {
     fn put(&mut self, bytes: &[u8]) -> Result<(), Vec<u8>> {
         match &mut self.dest {
             Dest::Stdout(out) => out.write(bytes).map_err(|e| format!("write error: {}", errmsg(&e)).into_bytes()),
-            Dest::Buffer(buf) => {
-                buf.extend_from_slice(bytes);
-                Ok(())
-            }
+            // `-i` holds the whole edited file, so a source `r` dumps into it is a
+            // reachable allocation failure: diagnosed, exit 4, rather than the
+            // abort a bare `extend_from_slice` gives.
+            Dest::Buffer(buf) => match buf.try_reserve(bytes.len()) {
+                Ok(()) => {
+                    buf.extend_from_slice(bytes);
+                    Ok(())
+                }
+                Err(_) => Err(format!("write error: {}", errmsg(&crate::util::oom())).into_bytes()),
+            },
+        }
+    }
+
+    /// Has the READER gone away? Only a stdout sink can answer yes — `-i`'s buffer
+    /// has no reader to lose — and `Out` swallows the EPIPE, so a loop that writes
+    /// without returning has to ask.
+    fn is_broken(&self) -> bool {
+        match &self.dest {
+            Dest::Stdout(out) => out.is_broken(),
+            Dest::Buffer(_) => false,
         }
     }
 
@@ -3755,24 +3772,51 @@ fn open_source(path: &[u8], separator: u8) -> RFile {
     RFile { src, rewindable }
 }
 
-/// Read a file named by `r`, which dumps the WHOLE of it. GNU dumps the whole of
-/// it too but STREAMS while doing so, through a fixed buffer, so it needs no
-/// memory for the size of the source where this needs all of it -- `r` over a
-/// 600 MB file under a 700 MB address-space limit succeeds there and is `out of
-/// memory` here, and over `/dev/zero` GNU writes bytes for ever where this writes
-/// none. Neither returns, so only the memory differs; spec/README carries it.
+/// Copy a file named by `r` to `sink`, a BLOCK at a time. `r` dumps the WHOLE of
+/// it either way -- neither this nor GNU returns from `r /dev/zero` -- so what
+/// streaming buys is not an answer but the MEMORY: GNU copies through a fixed
+/// buffer and needs none for the source's size, where reading it whole first
+/// needed all of it. Measured before this: 600 MB under a 700 MB address-space
+/// limit was `read error on BIG: out of memory` at exit 4 here and exit 0 there.
+///
+/// The bytes read BEFORE a failed read are written, which is what copying as you
+/// read means and what GNU does; reading whole discarded them. `put` rather than
+/// `write` because the CALLER decides about the owed separator: `r` pays it before
+/// the file's fate is known, and the immediate read deliberately never pays it.
 ///
 /// An OPEN failure is not an error, which is what makes `r /nonexistent` silent; a
 /// READ failure IS one, exit 4, and a DIRECTORY is how you get one.
-fn read_source(path: &[u8]) -> Result<Vec<u8>, Vec<u8>> {
-    let mut data = Vec::new();
-    let Ok(mut file) = std::fs::File::open(crate::util::path_from_bytes(path)) else {
-        return Ok(data);
-    };
-    if let Err(e) = file.read_to_end(&mut data) {
-        return Err(read_error(path, &e));
+///
+/// A CLOSED reader ends the dump. `Out` swallows the EPIPE and latches instead, so
+/// this is the only thing that stops `r /dev/zero | head` writing bytes nothing can
+/// receive -- GNU dies of SIGPIPE there, which a program the Rust runtime leaves
+/// ignoring it cannot. grep breaks its own loop on the same latch.
+fn copy_source(path: &[u8], sink: &mut Sink) -> Result<(), Vec<u8>> {
+    // Before the OPEN, because opening a FIFO blocks until a writer appears: a
+    // queued `r` reached after the reader has gone would hang there rather than
+    // on a read nothing wants.
+    if sink.is_broken() {
+        return Ok(());
     }
-    Ok(data)
+    let Ok(mut file) = std::fs::File::open(crate::util::path_from_bytes(path)) else {
+        return Ok(());
+    };
+    // On the stack rather than allocated per call: `r` runs once per CYCLE.
+    let mut buf = [0u8; Stream::BLOCK];
+    loop {
+        // And before each read, which is what ENDS an endless dump.
+        if sink.is_broken() {
+            return Ok(());
+        }
+        match file.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => sink.put(buf.get(..n).unwrap_or_default())?,
+            // A signal arrived mid-call, not a read failure; `read_to_end` retried
+            // it and so must this.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(read_error(path, &e)),
+        }
+    }
 }
 
 /// Is `want` newer than the GNU sed level td-txt implements? GNU's `v` runs glibc's
@@ -4078,8 +4122,7 @@ impl Sed {
                     // `printf x | sed 'r /nonexistent'` still ends with one -- and so
                     // does `r` over a directory, which then fails with exit 4.
                     sink.write(&[])?;
-                    let data = read_source(&path)?;
-                    sink.write(&data)?;
+                    copy_source(&path, sink)?;
                 }
                 // `R` resolved its line when the command RAN — see `queue_line`.
                 Append::Line(bytes) => sink.write(&bytes)?,
@@ -4313,8 +4356,7 @@ impl Sed {
                     // `put`, not `write`: GNU's immediate read goes straight at the
                     // output and does NOT pay an owed separator, so an unterminated
                     // previous line still owes one AFTER the prepended bytes.
-                    let data = read_source(path)?;
-                    sink.put(&data)?;
+                    copy_source(path, sink)?;
                 }
                 Some(Kind::ReadLine(path)) => {
                     let path = path.clone();

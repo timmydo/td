@@ -518,7 +518,8 @@ impl<R: std::io::Read> Records<R> {
 
 /// What `read_to_end` reports when an allocation fails, so an operand too big to
 /// hold is a diagnosed `out of memory` and the applet carries on to the next.
-fn oom() -> std::io::Error {
+/// td-txt's ONE spelling of that error: sed's `-i` buffer refuses the same way.
+pub fn oom() -> std::io::Error {
     std::io::Error::from(std::io::ErrorKind::OutOfMemory)
 }
 

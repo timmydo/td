@@ -1080,19 +1080,61 @@ td-txt-authored case files
     answer: it is td-txt's write-through `w` being visible, not `R` reading
     wrongly, and matching it means buffering `w` the way stdio does.
 
-  - An `r` SOURCE read whole, which is a MEMORY divergence rather than a
-    behavioural one. `r` dumps the entire file by definition, so neither program
-    returns from `r /dev/zero` and the bytes agree wherever the source ends -- but
-    GNU streams while it dumps, through a fixed buffer, where td-txt holds the
-    whole source in memory first. Measured: `sed -n -e 'r BIG' -e p A` over a
-    600 MB source under a 700 MB address-space limit is exit 0 in GNU and `read
-    error on BIG: out of memory`, exit 4, here; and over `/dev/zero` GNU writes
-    bytes for ever while td-txt writes none and grows. It is the same shape the
-    `R` entry above closed, and it needs the same fix in a different place -- `r`
-    wants the source COPIED to the sink a block at a time rather than a line
-    handed over per cycle, so it is a separate landing rather than a corner of
-    that one. Pre-existing; recorded when a review of the `R` landing pointed out
-    that its own comment claimed GNU read `r` whole, which GNU does not.
+  - An `r` SOURCE read whole, CLOSED, and it was a MEMORY divergence rather than
+    a behavioural one. `r` dumps the entire file by definition, so neither
+    program returns from `r /dev/zero` and the bytes always agreed wherever the
+    source ended -- but GNU streams WHILE it dumps, through a fixed buffer, where
+    td-txt held the whole source in memory first. `sed -n -e 'r BIG' -e p A` over
+    a 600 MB source under a 700 MB address-space limit was `read error on BIG:
+    out of memory`, exit 4, against GNU's exit 0; and over `/dev/zero` GNU wrote
+    bytes for ever while td-txt wrote none and grew. `copy_source` now copies to
+    the sink a block at a time, and to the STDOUT sink the two agree: exit 0 at
+    600 MB, and bytes out of `/dev/zero` in either.
+
+    Under `-i` they still do not, because the sink is a BUFFER holding the whole
+    edited file rather than GNU's temporary file, which the source's size is now
+    the largest contributor to: the same 600 MB under the same limit is GNU exit
+    0 and `write error: out of memory`, exit 4, here. That is the `-i` design
+    rather than this one, and it is a diagnosed error rather than the ABORT the
+    first copy gave, which is what `try_reserve` in the buffer sink is for --
+    reported by two reviewers of that landing, since holding what you read is
+    exactly the thing it set out to stop doing and `-i` was where it survived.
+
+    Three things follow that are worth having written down. The bytes read
+    BEFORE a failed read are now WRITTEN rather than discarded, which is what
+    copying as you read means and what GNU does -- unreachable in practice,
+    since the failure a source can actually be made to give (a directory) comes
+    on the first read. A CLOSED reader ends the dump, which is the only end an
+    endless one has: `Out` swallows the EPIPE and latches instead, so `r
+    /dev/zero | head` needs the copy to ASK, where GNU is simply killed by
+    SIGPIPE. And it is a different fix from the `R` entry above even though the
+    entries read alike: `r` wants the source COPIED to the sink, `R` wants one
+    line handed over per cycle and the handle KEPT between them.
+
+  - A sed CYCLE that never notices the reader has gone away, which is the same
+    latch the `r` entry above consults and the half of it still open. `Out`
+    turns EPIPE into a latched flag rather than a failure, and nothing on the
+    ordinary output path reads that flag, so sed goes on reading its input and
+    writing bytes nothing can receive: `sed -z -n p /dev/zero | head -c 8`
+    never returns, where GNU dies of SIGPIPE at once and grep -- which breaks
+    its own loop on `Out::is_broken` -- returns exit 0 at once, `grep -z -a ''
+    /dev/zero | head -c 8` measured either way. It costs nothing for a FINITE
+    input, since the run ends when the input does; what it costs is an endless
+    one, and the shapes that reach it are `/dev/zero`, a FIFO nobody closes,
+    and `-u` on a pipe that stays open. Not merely `p`: `w /dev/stdout`, the
+    `=` command and an `l` dump were each measured hanging on the same stream
+    where GNU took SIGPIPE.
+
+    It is not only about stdout, either, and that half is the reason to close it
+    rather than to declare a closed pipe uninteresting: a run that does not DIE
+    goes on doing everything else it was told to. `sed -n -e 'r /dev/zero' -e 'w
+    OUT' f1` with the pipe closed leaves `OUT` empty under GNU, which never
+    reached the second command, and holding all three lines here. The fix
+    is the cycle asking after each write, as grep does; it belongs with the
+    give-back accounting, because a run that stops early still owes the next
+    reader an accurate stdin position. Pre-existing and unchanged by the `r`
+    landing -- measured identical on both builds -- and recorded there because
+    that landing is what made the latch load-bearing anywhere in sed.
 
   - A `\c` with nothing to control eats an `a` text's own TERMINATOR: GNU
     accumulates the text WITH its trailing newline and decodes that whole buffer,
