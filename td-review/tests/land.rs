@@ -1462,6 +1462,14 @@ fn list_says_landed_for_a_branch_the_base_carries_and_no_longer_merges() -> Res<
         .to_string();
     assert!(row.contains("landed"), "the row must say there is nothing here:\n{listed}");
     assert!(!row.contains(" ok "), "and must not read as ready to land:\n{listed}");
+    // The A/B cell is the second field, and it answers the same question the
+    // word does: nothing to take. Pinned HERE because this column has already
+    // drifted between the two paths once, which is what `--list` sharing the
+    // TUI's own two functions is for.
+    assert!(
+        row.split_whitespace().nth(1).is_some_and(|c| c.starts_with("0/")),
+        "the ahead count must be the landing's, not ancestry's:\n{listed}"
+    );
     Ok(())
 }
 

@@ -260,7 +260,7 @@ fn list_branches(git: &Git, base: &str) -> io::Result<()> {
             out,
             "{:>5}  {:>7}  {:<ready$}  {}\t{}",
             b.age(now),
-            b.counts_label(),
+            app::counts_cell(b, prospect),
             app::ready_cell(b, Some(&ready), prospect).0,
             scrub(&b.refname),
             scrub(&b.subject),

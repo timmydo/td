@@ -346,11 +346,18 @@ impl App {
         // are real cells at seven and eight — and a fixed width does not
         // truncate, it shifts every column right of it on that row alone.
         let ready_width = fitted(cells.iter().map(|(label, _)| label.as_str()), READY_COL);
+        // One cell per VIEW row, like `cells` beside it and read the same way:
+        // by position, so a row cannot be drawn with another branch's numbers.
         let counts: Vec<String> = self
             .view
             .iter()
-            .filter_map(|&i| self.branches.get(i))
-            .map(Branch::counts_label)
+            .map(|&i| match self.branches.get(i) {
+                Some(b) => counts_cell(
+                    b,
+                    self.prospects.get(i).copied().unwrap_or(git::Prospect::Outstanding),
+                ),
+                None => "?/?".to_string(),
+            })
             .collect();
         let counts_width = fitted(counts.iter().map(String::as_str), COUNTS_COL);
 
@@ -391,7 +398,7 @@ impl App {
                 "{} {:>4}  {:<ab$}  {:<ready_w$}  {name}{:pad$}  {}",
                 if selected { ">" } else { " " },
                 b.age(self.now),
-                b.counts_label(),
+                counts.get(row).map_or("?/?", String::as_str),
                 ready,
                 "",
                 b.subject,
@@ -1392,6 +1399,17 @@ fn help_lines() -> Vec<Line> {
     // a question the operator did not ask — what a LANDING would find, which no
     // key spells out until one is pressed. Titled as CELLS because `?` is also
     // a key above, and the two columns of this sheet look alike.
+    // Its two halves answer different questions now, which was self-evident
+    // while the whole cell was `%(ahead-behind:)` and is not any more.
+    section(
+        "A/B column (cells, not keys)",
+        &[
+            ("A", "commits a landing would take — none on a landed row,"),
+            ("", "however many of its own the branch still carries"),
+            ("B", "commits the base has that the branch does not, by"),
+            ("", "ancestry: how far behind it has fallen"),
+        ],
+    );
     section(
         "READY column (cells, not keys)",
         &[
@@ -1499,6 +1517,33 @@ pub fn readiness_of(git: &Git, base: &str, b: &Branch) -> record::Readiness {
             None => record::readiness(&commits),
         },
         Err(_) => record::Readiness::Unknown,
+    }
+}
+
+/// A row's A/B cell. The behind half is ancestry and stays so; the AHEAD half
+/// says how many commits a LANDING would take, which on a row that reads
+/// `landed` is none.
+///
+/// `%(ahead-behind:)` counts by ancestry alone, and a landing REWRITES the oids
+/// it replays, so the branch's own copies survive on the remote and go on being
+/// counted: the reported row was `10/34 landed` — a cell answering "ten commits
+/// waiting" beside one answering "nothing here", about the same branch. The
+/// number was never wrong about ancestry, but nothing on this screen is about
+/// ancestry: every other column answers what a landing would do, and the READY
+/// cell had already been taught to.
+///
+/// Only the count a query PROVED is zero is replaced. A partially landed branch
+/// — some commits upstream by patch, some not — still shows its ancestry count
+/// and so overstates what `r` would replay (`r` says which it skipped when it
+/// runs). Closing that needs the patch count on every branch rather than on the
+/// few whose merge conflicts, which is a per-branch process this deliberately
+/// does not spend.
+pub fn counts_cell(b: &Branch, prospect: git::Prospect) -> String {
+    match (prospect, b.counts) {
+        (git::Prospect::Nothing, Some((_, behind))) => format!("0/{behind}"),
+        // No counts at all (pre-2.41 git): the landing's half is still known.
+        (git::Prospect::Nothing, None) => "0/?".to_string(),
+        _ => b.counts_label(),
     }
 }
 
@@ -2828,7 +2873,12 @@ mod tests {
                 committed_unix: 1_700_000_000,
                 author: "a".to_string(),
                 subject: "s".to_string(),
-                counts: Some((1, 0)),
+                // Counts unique to each branch, for the verdict's reason below
+                // and now load-bearing in the same way: the A/B cell became a
+                // lookup BY POSITION with this change, where it used to be
+                // recomputed from the row's own branch, and forty identical
+                // cells cannot tell a mispaired one from a right one.
+                counts: Some((i, 0)),
             })
             .collect();
         // A verdict unique to each branch, so a row pairing the two wrongly
@@ -2858,6 +2908,12 @@ mod tests {
                 assert!(
                     line.contains(&format!(" {n}/40!")),
                     "origin/b{n:02} carries another branch's verdict at sel={sel}: {line}"
+                );
+                // Bounded on BOTH sides: `4/0` sits inside `14/0` at the left,
+                // and the cell is padded to the column width at the right.
+                assert!(
+                    line.contains(&format!(" {n}/0 ")),
+                    "origin/b{n:02} carries another branch's counts at sel={sel}: {line}"
                 );
             }
             assert!(rows > 1, "nothing was drawn to check at sel={sel}");
@@ -2908,7 +2964,7 @@ mod tests {
             "still outstanding"
         );
         // Ancestry still counts the landed branch a commit ahead — the number
-        // the column showed, and the reason it could not be the answer.
+        // the QUERY reports, and the reason it could not be the answer.
         let counts = app
             .branches
             .iter()
@@ -2919,6 +2975,18 @@ mod tests {
         let mut ui = FakeUi::new();
         app.redraw(&mut ui).unwrap();
         assert_eq!(ui.last().matches("landed").count(), 1, "{}", ui.last());
+        // And the DRAWN row does not repeat that ancestry count beside the word
+        // for having nothing to land — the two cells describe one branch.
+        let row = ui
+            .last()
+            .lines()
+            .find(|l| l.contains("origin/work-0001-feature"))
+            .unwrap_or_default()
+            .to_string();
+        // Bounded, or a fixture that grew to `10/2` would satisfy `0/2` while
+        // showing the very ancestry count this is about.
+        assert!(row.contains(" 0/2 "), "a landed row takes nothing: {row}");
+        assert!(!row.contains(" 1/2 "), "the ancestry count must not stand: {row}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3265,22 +3333,43 @@ mod tests {
     }
 
     /// Landed is not the pre-existing empty: `-` is a branch with no commits at
-    /// all over the base, and both dim, but the A/B column is the only thing
-    /// that tells them apart — so the words must not be shared.
+    /// all over the base, and both dim. The A/B column used to be what told
+    /// them apart, and since the ahead half became what a LANDING would take it
+    /// reads `0` for both — so the WORD is now the only thing that does, which
+    /// makes not sharing it load-bearing rather than tidy.
     #[test]
     fn an_empty_branch_and_a_landed_one_are_not_spelt_the_same() {
+        let empty = listed(Some((0, 4)));
+        let landed = listed(Some((3, 8)));
         assert_eq!(
-            ready_cell(
-                &listed(Some((0, 4))),
-                Some(&record::Readiness::Empty),
-                git::Prospect::Outstanding
-            ),
+            ready_cell(&empty, Some(&record::Readiness::Empty), git::Prospect::Outstanding),
             ("-".to_string(), true)
         );
         assert_eq!(
-            ready_cell(&listed(Some((3, 8))), Some(&record::Readiness::Ready), git::Prospect::Nothing),
+            ready_cell(&landed, Some(&record::Readiness::Ready), git::Prospect::Nothing),
             ("landed".to_string(), true)
         );
+        assert_eq!(counts_cell(&empty, git::Prospect::Outstanding), "0/4");
+        assert_eq!(counts_cell(&landed, git::Prospect::Nothing), "0/8");
+    }
+
+    /// The ahead half is the landing's, the behind half is ancestry's, and only
+    /// a count a query PROVED is zero is replaced — an outstanding branch keeps
+    /// the number `%(ahead-behind:)` gave, conflicted or not.
+    #[test]
+    fn the_ahead_count_is_what_a_landing_would_take() {
+        let b = listed(Some((10, 34)));
+        assert_eq!(counts_cell(&b, git::Prospect::Nothing), "0/34", "landed takes nothing");
+        assert_eq!(counts_cell(&b, git::Prospect::Outstanding), "10/34");
+        assert_eq!(
+            counts_cell(&b, git::Prospect::Conflicted),
+            "10/34",
+            "a branch that will not merge still has its commits to answer for"
+        );
+        // Pre-2.41 git reports no counts, and the landing's half is knowable
+        // without them: `?/?` was never wrong, but `0/?` is more.
+        assert_eq!(counts_cell(&listed(None), git::Prospect::Nothing), "0/?");
+        assert_eq!(counts_cell(&listed(None), git::Prospect::Outstanding), "?/?");
     }
 
     /// Where git reports no ahead-behind counts (pre-2.41), the tree question is
