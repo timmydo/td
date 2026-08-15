@@ -1518,9 +1518,9 @@ fn cond_is_set(sh: &Shell, name: &str) -> bool {
 /// One side of an `-eq`-family comparison. A BLANK operand is zero, which is
 /// bash's answer for `[[ "" -eq 0 ]]` and the reason this is not a bare
 /// `arith::eval`: an unset variable is the commonest way to reach here, and
-/// erroring would turn a false comparison into a diagnostic. Deliberately NOT
-/// `arith` answers a null expression with 0 itself now, so what is left here is
-/// the operand `trim` calls blank and arithmetic does not -- a Unicode space.
+/// erroring would turn a false comparison into a diagnostic. `arith` answers a
+/// null expression with 0 itself now, so what is left here is the operand
+/// `trim` calls blank and arithmetic does not -- a Unicode space.
 /// Reported rather than FATAL, which is the difference between this and
 /// `$(( ))`: bash answers `[[ 1+ -eq 2 ]]` with a diagnostic and a false result
 /// and carries on, where `arith::eval` would end a non-interactive shell at the

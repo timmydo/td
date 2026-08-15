@@ -242,8 +242,89 @@ fn op_at(chars: &[char], i: usize, op: &str) -> bool {
     true
 }
 
-/// `0x` hex, leading-`0` octal, else decimal — the C conventions POSIX inherits.
+/// A digit's value in an explicit base, or None where busybox's loop BREAKS
+/// (math.c:551-595). The mapping is `| 0x20` arithmetic on the byte rather than
+/// a table, because which characters are digits is a consequence of it: above
+/// base 36 the letters split into `a-z` at 10-35 and `A-Z` at 36-61, so `64#z`
+/// is 35 and `64#Z` is 61, and only `@` and `_` are named outright.
+fn base_digit(c: char, base: u32) -> Option<u32> {
+    let ch = u32::from(c);
+    // Below `'0'` C's unsigned subtraction wraps past every base, which is how a
+    // `+` or a blank ends the run rather than being read as a digit.
+    let mut digit = ch.checked_sub(u32::from('0'))?;
+    if digit >= 10 {
+        if digit > u32::from('z') - u32::from('0') {
+            return None;
+        }
+        digit = (ch | 0x20).checked_sub(u32::from('a') - 10)?;
+        if base > 36 && ch <= u32::from('_') {
+            digit = match c {
+                '_' => 63,
+                '@' => 62,
+                _ if digit < 36 => digit + (36 - 10),
+                // `[\]^`, which land between `Z` and `_` and name nothing.
+                _ => return None,
+            };
+        }
+        // What arrives here below 10 is `` ` ``, and `@` in the bases that did
+        // not just name it 62. `:;<=>?` never reach it at all: the fold above
+        // lands under `'a' - 10` for them and returns.
+        if digit < 10 {
+            return None;
+        }
+    }
+    if digit >= base { None } else { Some(digit) }
+}
+
+/// `BASE#DIGITS` once the base is known. Out of range WRAPS, as everywhere else
+/// here: busybox does not check, so `16#ffffffffffffffff` is -1.
+fn lex_with_base(chars: &[char], start: usize, base: u32) -> Result<(i64, usize), String> {
+    let mut i = start;
+    let mut value: u64 = 0;
+    while let Some(&c) = chars.get(i) {
+        let Some(d) = base_digit(c, base) else { break };
+        value = value
+            .wrapping_mul(u64::from(base))
+            .wrapping_add(u64::from(d));
+        i += 1;
+    }
+    // A base with no digits after it is the error bash 5.2 made of `64#`, and
+    // it is also how a digit the base lacks surfaces: the run stops before the
+    // first one, so `2#7` reaches here having consumed nothing.
+    if i == start {
+        return Err(format!("expected a digit in base {base}"));
+    }
+    Ok((value as i64, i))
+}
+
+/// The explicit base of a `BASE#` prefix, and where its digits start. One or two
+/// digits only, and NOT a leading `0`, which stays the octal prefix -- ash reads
+/// the base off `nptr[0]`, so `0#1` never reaches this at all (math.c:597-635).
+/// A base outside 2..=64 is None rather than an error: ash falls back to reading
+/// the digits as decimal (math.c:634), which leaves the `#` as trailing input,
+/// so `1#1` and `65#1` are refused a step later instead.
+fn explicit_base(chars: &[char], start: usize) -> Option<(u32, usize)> {
+    let d0 = chars.get(start)?.to_digit(10)?;
+    if d0 == 0 {
+        return None;
+    }
+    if chars.get(start + 1) == Some(&'#') {
+        return if d0 > 1 { Some((d0, start + 2)) } else { None };
+    }
+    let d1 = chars.get(start + 1)?.to_digit(10)?;
+    if chars.get(start + 2) != Some(&'#') {
+        return None;
+    }
+    let base = d0 * 10 + d1;
+    if base <= 64 { Some((base, start + 3)) } else { None }
+}
+
+/// `BASE#DIGITS`, `0x` hex, leading-`0` octal, else decimal — the C conventions
+/// POSIX inherits, plus ash's explicit base.
 fn lex_number(chars: &[char], start: usize) -> Result<(i64, usize), String> {
+    if let Some((base, at)) = explicit_base(chars, start) {
+        return lex_with_base(chars, at, base);
+    }
     let mut i = start;
     let (radix, skip) = match (chars.get(i), chars.get(i + 1)) {
         // `0x` with no hex digit after it is not a hex constant: it falls through
@@ -838,6 +919,69 @@ mod tests {
         assert_eq!(ev("010")?, 8);
         assert_eq!(ev("10")?, 10);
         assert_eq!(ev("0")?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn an_explicit_base_reads_its_own_digits() -> Result<(), String> {
+        assert_eq!(ev("2#101")?, 5);
+        assert_eq!(ev("16#ff")?, 255);
+        assert_eq!(ev("64#1")?, 1);
+        // An explicit base makes a leading zero an ordinary digit, where the
+        // same characters bare would take it as the octal prefix.
+        assert_eq!(ev("10#017")?, 17);
+        // To 36 the letters are case-INSENSITIVE. Above it they split into two
+        // ranges, so `z` stays 35 while `Z` becomes 61, and `@`/`_` are the two
+        // digits that are nobody's other case. 36 and 37 are the boundary.
+        assert_eq!(ev("36#z")?, 35);
+        assert_eq!(ev("36#Z")?, 35);
+        assert_eq!(ev("36#A")?, 10);
+        assert_eq!(ev("37#A")?, 36);
+        assert_eq!(ev("64#a")?, 10);
+        assert_eq!(ev("64#z")?, 35);
+        assert_eq!(ev("64#A")?, 36);
+        assert_eq!(ev("64#Z")?, 61);
+        assert_eq!(ev("64#@")?, 62);
+        assert_eq!(ev("64#_")?, 63);
+        assert_eq!(ev("64#__")?, 4095);
+        // The run ends at the first character the base has no digit for, so a
+        // literal COMPOSES rather than swallowing the operator after it.
+        assert_eq!(ev("16#ff+1")?, 256);
+        assert_eq!(ev("2#1+1")?, 2);
+        // Out of range wraps, as every other literal here does.
+        assert_eq!(ev("16#ffffffffffffffff")?, -1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_base_with_no_digit_of_its_own_is_refused() -> Result<(), String> {
+        // A digit the base LACKS ends the run before consuming anything, so
+        // these have no digits at all rather than a truncated value. `63#_` and
+        // `62#@` are that rule reaching the two named digits, and `64#[` is the
+        // gap between `Z` and `_`, which names nothing in any base.
+        //
+        // `36#@`, `64#{` and `64#:` are the three ways a character can reach the
+        // digit machinery and still not be one, and each is a different exit:
+        // `@` folds to 9, below where the letters start; `{` is past `z`, so the
+        // fold is never applied; and `:` is the boundary itself, the one
+        // character whose RAW value is exactly 10 and whose fold underflows.
+        // Each is a value rather than an error if its guard goes.
+        for src in [
+            "2#2", "8#8", "35#z", "63#_", "62#@", "64#[", "36#@", "64#{", "64#:", "2#+1", "2# 1",
+            "2#",
+        ] {
+            assert!(ev(src).is_err(), "{src}");
+        }
+        // Only 2..=64 is a base. Outside it ash reads the digits as DECIMAL
+        // instead and the `#` is left over, so the refusal comes a step later:
+        // that is why `1#0` is an error rather than 0, and `05#4` is not 4 --
+        // a leading `0` is the octal prefix and never a base. `1a#5` is the
+        // same fallback reached the other way: a two-digit base's second slot
+        // must be a DECIMAL digit, so `a` is not one and `1a` is read as a
+        // number rather than as base 26.
+        for src in ["1#0", "1#1", "65#10", "66#1", "0#0", "05#4", "01#1", "1a#5", "1F#5"] {
+            assert!(ev(src).is_err(), "{src}");
+        }
         Ok(())
     }
 
