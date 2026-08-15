@@ -987,7 +987,7 @@ impl Shell {
     /// Report `msg` on stderr and unwind with `status` — used for the expansion
     /// errors POSIX makes fatal in a non-interactive shell (`set -u`, `${x:?}`).
     pub fn fatal(&self, msg: &str, status: i32) -> Sig {
-        let _ = exec::write_stderr(self, msg);
+        let _ = exec::diag(self, msg);
         Sig::Abort(status)
     }
 

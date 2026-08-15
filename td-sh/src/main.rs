@@ -66,7 +66,13 @@ fn main() -> ExitCode {
     let code = match run(&args) {
         Ok(code) => code,
         Err(msg) => {
-            let _ = writeln!(std::io::stderr(), "td-sh: {msg}");
+            // Almost everything here is raised before `run` built a shell, so
+            // the name is the argv[0] it would have taken `$0` from
+            // (ash.c:14589). A script that opens and then fails to READ is the
+            // exception -- `$0` is the script by then -- and it stays argv[0]
+            // because that message already names the file.
+            let name = args.first().map_or("td-sh", String::as_str);
+            let _ = writeln!(std::io::stderr(), "{name}: {msg}");
             2
         }
     };
@@ -135,8 +141,10 @@ fn run(args: &[String]) -> Result<i32, String> {
                         } else if !builtin::apply_named_option(&mut sh, name, on) {
                             // Not a typo: `ash_msg` sets no status and `procargs`
                             // unwinds on the non-zero return (ash.c:14595).
-                            let _ =
-                                writeln!(std::io::stderr(), "td-sh: illegal option {sign}o {name}");
+                            let _ = exec::diag(
+                                &sh,
+                                &format!("illegal option {sign}o {name}"),
+                            );
                             return Ok(0);
                         }
                         consumed += 1;
@@ -380,7 +388,7 @@ fn stdin_script(sh: &mut Shell) -> i32 {
         // parse outcome because sealing the source on failure also makes the
         // half-read unit a syntax error, and the read is the truer report.
         if let Some(e) = units.source_error() {
-            let _ = exec::write_stderr(sh, &format!("td-sh: stdin: {e}"));
+            let _ = exec::diag(sh, &format!("stdin: {e}"));
             sh.set_status(2);
             return 2;
         }
@@ -401,7 +409,7 @@ fn stdin_script(sh: &mut Shell) -> i32 {
                 // Through the shell's own fd 2, as `run_source` reported a parse
                 // error before this, so a script that redirected it still sees
                 // the message where it sent everything else.
-                let _ = exec::write_stderr(sh, &format!("td-sh: {e}"));
+                let _ = exec::diag(sh, &e);
                 sh.set_status(2);
                 return 2;
             }
@@ -445,7 +453,7 @@ fn repl(sh: &mut Shell) -> i32 {
                     }
                 }
                 Err(e) => {
-                    let _ = writeln!(std::io::stderr(), "td-sh: {e}");
+                    let _ = exec::diag(sh, &e);
                     sh.set_status(2);
                 }
             }
@@ -616,6 +624,26 @@ mod confinement {
             .iter()
             .map(|(_, t)| code_only(t).matches(needle).count())
             .sum()
+    }
+
+    /// `write_stderr` is the one write that skips the `$0` every diagnostic
+    /// carries, so its CALLERS are the whole of the exception: `diag`, which
+    /// puts the name on, and `err_raw`, which is the four messages busybox
+    /// writes with a bare `fprintf` (ash.c:3564, 3588, 11714, 11736). A third
+    /// caller would drop the prefix SILENTLY -- those four are worded
+    /// identically either way, so nothing but a comparison against ash sees it
+    /// -- which is the failure one sink exists to prevent and no compiler
+    /// checks. Three mentions in all: the definition and those two.
+    #[test]
+    fn the_diagnostic_sink_has_exactly_two_callers() {
+        let needle = concat!("write_", "stderr(");
+        assert_eq!(count_code(needle), 3, "a new caller of {needle} would bypass `$0`");
+        assert_eq!(count_code(concat!("pub fn write_", "stderr(")), 1);
+        // Named whole, so a third caller cannot arrive by REPLACING one.
+        let diag = concat!("write_", "stderr(sh, &format!(\"{}: {msg}\", sh.arg0))");
+        assert_eq!(code_only(source("exec.rs")).matches(diag).count(), 1);
+        let raw = concat!("exec::write_", "stderr(sh, msg)");
+        assert_eq!(code_only(source("builtin.rs")).matches(raw).count(), 1);
     }
 
     /// A module missing from SOURCES is a module none of the scans below can

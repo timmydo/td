@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-/// Lex/parse errors are plain messages; the caller adds the `td-sh:` prefix.
+/// Lex/parse errors are plain messages; the caller adds the `$0: ` prefix.
 pub type Syn<T> = Result<T, String>;
 
 /// The marker a syntax error carries when the input simply ended early. The

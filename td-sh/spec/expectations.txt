@@ -67,7 +67,9 @@
 #               `getcwd()`s OSH makes, which is an implementation detail no other
 #               shell can be held to even with `strace` staged. Withheld, it is a
 #               FALSE PASS rather than a failure -- `wc -l err.txt` counts the single
-#               line `td-sh: strace: not found`, and the golden is `1 err.txt`. That
+#               line `ash: strace: not found` -- the corpus stages the shell under
+#               the identity it compares against, and a diagnostic names `$0` --
+#               and the golden is `1 err.txt`. That
 #               kind of pass turns on the wording of a diagnostic, so it would red as
 #               a REGRESSION in a `cd` test the day the wording changed.
 #               (b), (c) and (d) are decided from the CODE and so are applied BEFORE
@@ -380,7 +382,6 @@ xfail assign.test.sh::local a=loc $var c=loc
 xfail assign.test.sh::redirect after assignment builtin (eval redirects after evaluating arguments)
 xfail assign.test.sh::redirect after command sub (like case above but without assignment builtin)
 xfail assign.test.sh::static assignment doesn't split
-xfail ble-idioms.test.sh::Issue #1069 [56] BUG: declare -p unset does not print any error message
 xfail ble-idioms.test.sh::recursive arith: short circuit ?:
 xfail ble-idioms.test.sh::recursive arith: side effects
 xfail blog-other1.test.sh::Blog Post Example

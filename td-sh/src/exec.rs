@@ -993,14 +993,14 @@ pub fn run_exit_trap(sh: &mut Shell, status: i32) -> i32 {
 /// Run `src` one top-level unit at a time, as dash reads a script: a command is
 /// parsed only once everything before it has run. That is what makes an `alias`
 /// visible to the next line but not to the rest of its own line. A syntax error
-/// stops the run with status 2, reported as `td-sh: {what}{error}`.
+/// stops the run with status 2, reported as `$0: {what}{error}`.
 pub fn run_source(sh: &mut Shell, src: &str, what: &str) -> R<()> {
     let mut units = parser::Units::new(src);
     loop {
         match units.next_unit(&sh.aliases) {
             None => return Ok(()),
             Some(Err(e)) => {
-                let _ = write_stderr(sh, &format!("td-sh: {what}{e}"));
+                let _ = diag(sh, &format!("{what}{e}"));
                 sh.set_status(2);
                 // Abandons the enclosing list, as `eval 'if'; echo` shows in both
                 // references: reporting and returning Ok ran the rest of it.
@@ -1028,7 +1028,7 @@ pub fn run_list(sh: &mut Shell, list: &List) -> R<()> {
                 // moving it to an id nothing is running under would make the
                 // `wait` that follows answer for the wrong job.
                 Err(e) => {
-                    let _ = write_stderr(sh, &format!("td-sh: cannot start job: {e}"));
+                    let _ = diag(sh, &format!("cannot start job: {e}"));
                     sh.set_status(1);
                 }
                 // The job is already RUNNING, so an exhausted id table is not a
@@ -1041,7 +1041,7 @@ pub fn run_list(sh: &mut Shell, list: &List) -> R<()> {
                         sh.set_status(0);
                     }
                     None => {
-                        let _ = write_stderr(sh, "td-sh: too many jobs to name this one");
+                        let _ = diag(sh, "too many jobs to name this one");
                         sh.set_status(0);
                     }
                 },
@@ -1373,7 +1373,7 @@ fn run_cond(sh: &mut Shell, expr: &CondExpr) -> R<()> {
         Ok(false) => sh.set_status(1),
         Err(CondError { msg, status }) => {
             // `write_stderr` supplies the newline.
-            let _ = write_stderr(sh, &format!("td-sh: [[: {msg}"));
+            let _ = diag(sh, &format!("[[: {msg}"));
             sh.set_status(status);
         }
     }
@@ -2163,6 +2163,17 @@ pub fn write_stderr(sh: &Shell, msg: &str) -> std::io::Result<()> {
     note_epipe(sh, process::write_fd(sh, 2, format!("{msg}\n").as_bytes()))
 }
 
+/// Report a diagnostic: the shell's own name, then the message.
+///
+/// ash writes that name before every diagnostic it issues (`ash_vmsg`,
+/// ash.c:1419) and it is `$0` rather than a constant (ash.c:423), so a
+/// script's failures are attributed to the script and `-c CMD NAME` to NAME.
+/// Naming it in ONE place is the point: a prefix repeated at each call site
+/// is one a site can forget, which is how most of them came to lack it.
+pub fn diag(sh: &Shell, msg: &str) -> std::io::Result<()> {
+    write_stderr(sh, &format!("{}: {msg}", sh.arg0))
+}
+
 /// Record a broken pipe on the shell's diagnostic descriptor, passing the result
 /// through untouched.
 ///
@@ -2549,7 +2560,7 @@ mod tests {
         let (st, out, err) = run("[[ 1+ -eq 2 ]]; echo after");
         assert_eq!(out, "after\n", "the shell did not survive the expression");
         assert_eq!(st, 0);
-        assert!(err.contains("arithmetic"), "no diagnostic: {err:?}");
+        assert_eq!(err, "td-sh: [[: unexpected end of expression\n");
         // The conditional's own status is bash's 1, not the 2 a malformed
         // EXPRESSION gets.
         assert_eq!(run("[[ 1+ -eq 2 ]]").0, 1);
@@ -3029,7 +3040,7 @@ mod tests {
             // The status is the child dying, so the diagnostic must still be the
             // redirection's -- a fatal path that reported 2 and said nothing
             // would be indistinguishable from one that failed for another reason.
-            assert_eq!(err, "can't open /no/such/td-e: no such file\n", "src: {src}");
+            assert_eq!(err, "td-sh: can't open /no/such/td-e: no such file\n", "src: {src}");
         }
         // The contrast, at the same three shapes: everything that is NOT a
         // subshell goes through the equivalent of `redirectsafe` and answers 1.
@@ -3235,11 +3246,11 @@ mod tests {
             ("PATH=./pdir", "./pdir/target.sh"),
         ] {
             let (_s, _o, err) = run(&format!("cd {}; {dir_word}; . target.sh", dir.display()));
-            assert_eq!(err, format!(".: can't open '{want}': Permission denied\n"));
+            assert_eq!(err, format!("td-sh: .: can't open '{want}': Permission denied\n"));
         }
         // An empty entry is the cwd and contributes NO prefix.
         let (_s, _o, err) = run(&format!("cd {}; PATH=; . target.sh", sub.display()));
-        assert_eq!(err, ".: can't open 'target.sh': Permission denied\n");
+        assert_eq!(err, "td-sh: .: can't open 'target.sh': Permission denied\n");
         let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3381,9 +3392,9 @@ mod tests {
         for op in ["<", ">", ">>", "<>", ">|"] {
             let (_s, _o, err) = run(&format!(": {op} {p}"));
             let want = if op == "<" {
-                format!("can't open {p}: no such file\n")
+                format!("td-sh: can't open {p}: no such file\n")
             } else {
-                format!("can't create {p}: nonexistent directory\n")
+                format!("td-sh: can't create {p}: nonexistent directory\n")
             };
             assert_eq!(err, want, "op: {op}");
         }
@@ -3392,7 +3403,7 @@ mod tests {
         // reach the same place, so all three are asked.
         for src in [format!("echo x >&{p}"), format!("echo x &>{p}"), format!("echo x 1<&{p}")] {
             let (_s, _o, err) = run(&src);
-            assert_eq!(err, format!("can't create {p}: nonexistent directory\n"), "src: {src}");
+            assert_eq!(err, format!("td-sh: can't create {p}: nonexistent directory\n"), "src: {src}");
         }
         // `set -C` opens through `noclobber_open` instead, whose OWN two open
         // arms carry the word -- and neither is reached by the loop above,
@@ -3402,10 +3413,10 @@ mod tests {
         let _ = std::fs::create_dir_all(&adir);
         let ad = adir.display();
         for (src, want) in [
-            (format!("set -C; : > {p}"), format!("can't create {p}: nonexistent directory\n")),
-            (format!("set -C; echo x >&{p}"), format!("can't create {p}: nonexistent directory\n")),
-            (format!("set -C; : > {ad}"), format!("can't create {ad}: Is a directory\n")),
-            (format!("set -C; echo x >&{ad}"), format!("can't create {ad}: Is a directory\n")),
+            (format!("set -C; : > {p}"), format!("td-sh: can't create {p}: nonexistent directory\n")),
+            (format!("set -C; echo x >&{p}"), format!("td-sh: can't create {p}: nonexistent directory\n")),
+            (format!("set -C; : > {ad}"), format!("td-sh: can't create {ad}: Is a directory\n")),
+            (format!("set -C; echo x >&{ad}"), format!("td-sh: can't create {ad}: Is a directory\n")),
         ] {
             let (_s, _o, err) = run(&src);
             assert_eq!(err, want, "src: {src}");
@@ -3423,19 +3434,63 @@ mod tests {
         let d = dir.display();
         // Missing, and NOT `no such file`: that word is the redirection's.
         let (_s, _o, err) = run(&format!("cd {d}/nope"));
-        assert_eq!(err, format!("cd: can't cd to {d}/nope: No such file or directory\n"));
+        assert_eq!(err, format!("td-sh: cd: can't cd to {d}/nope: No such file or directory\n"));
         // Resolves and is not a directory -- the arm no syscall answers, since
         // this shell's cwd is a variable and there is no `chdir` to fail.
         let (_s, _o, err) = run(&format!("cd {d}/f"));
-        assert_eq!(err, format!("cd: can't cd to {d}/f: Not a directory\n"));
+        assert_eq!(err, format!("td-sh: cd: can't cd to {d}/f: Not a directory\n"));
         // `.` quotes the name, which nothing else in the shell does, and both
         // spellings of the word name themselves.
         for word in ["source", "."] {
             let (_s, _o, err) = run(&format!("{word} {d}/nope.sh"));
-            let want = format!("{word}: can't open '{d}/nope.sh': No such file or directory\n");
+            let want = format!("td-sh: {word}: can't open '{d}/nope.sh': No such file or directory\n");
             assert_eq!(err, want);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A diagnostic names the shell whichever sink it came out of: ash writes
+    /// `arg0` before all but the four below (`ash_vmsg`, ash.c:1419). The cases
+    /// here reach four distinct `diag` call sites -- a builtin's `err_line`, a
+    /// redirection, `Shell::fatal` (which arithmetic shares with expansion),
+    /// and the not-found path -- each of which used to decide the prefix for
+    /// itself, which is how most came to lack it.
+    #[test]
+    fn every_diagnostic_names_the_shell() {
+        for src in [
+            "cd /nonexistent/dir",
+            "unset -z x",
+            "cat < /nonexistent/x",
+            ": ${undefined_here?msg}",
+            "echo $((1/0))",
+            "no_such_command_at_all_xyz",
+            "readonly r=1; r=2",
+        ] {
+            let (_s, _o, err) = run(src);
+            assert!(err.starts_with("td-sh: "), "{src}: {err:?}");
+            // Once, not twice: a sink that kept its own literal would double it,
+            // which is the shape this change had to remove from five call sites.
+            assert!(!err.starts_with("td-sh: td-sh: "), "{src}: {err:?}");
+        }
+        // xtrace shares fd 2 and is NOT a diagnostic, so it takes no name. It is
+        // the boundary a prefix moved into the wrong sink would corrupt, and the
+        // corpus asserts these bytes in fifteen places.
+        let (_s, _o, err) = run("set -x; :");
+        assert_eq!(err, "+ :\n");
+        // Four messages are the other exception, and the one this change first
+        // got wrong: busybox writes these with a bare `fprintf` rather than
+        // through `ash_vmsg`, so they take no name. The wording is identical
+        // either way, so only a comparison against ash -- or this -- catches a
+        // prefix arriving on them.
+        for (src, want) in [
+            ("set -- -Z; getopts a: o", "Illegal option -Z\n"),
+            ("set -- -a; getopts a: o", "No arg for -a option\n"),
+            ("alias nosuchalias", "alias: nosuchalias not found\n"),
+            ("unalias nosuchalias", "unalias: nosuchalias not found\n"),
+        ] {
+            let (_s, _o, err) = run(src);
+            assert_eq!(err, want, "{src}");
+        }
     }
 
     #[test]
@@ -3448,13 +3503,13 @@ mod tests {
         assert_eq!(out, "after\n");
         // Whole messages, because this target is exactly where the read and
         // create wordings differ: one ENOENT, two answers.
-        assert_eq!(err, "can't open : no such file\n");
+        assert_eq!(err, "td-sh: can't open : no such file\n");
         let (_status, _out, err) = run("e=; echo x >\"$e\"");
-        assert_eq!(err, "can't create : nonexistent directory\n");
+        assert_eq!(err, "td-sh: can't create : nonexistent directory\n");
         // A target that really IS a directory keeps the SYSTEM's answer, which
         // is the half of `errmsg` that does not substitute.
         let (_status, _out, err) = run("echo x >/");
-        assert_eq!(err, "can't create /: Is a directory\n");
+        assert_eq!(err, "td-sh: can't create /: Is a directory\n");
     }
 
     #[test]
@@ -3654,7 +3709,7 @@ mod tests {
             panic!("fixture");
         };
         let (_s, _o, err) = run(&format!("{both}set -C; sh_o >&'{}'", kept.display()));
-        assert_eq!(err, format!("can't create {}: File exists\n", kept.display()));
+        assert_eq!(err, format!("td-sh: can't create {}: File exists\n", kept.display()));
         assert_eq!(std::fs::read(&kept).ok(), Some(b"KEEP".to_vec()));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3719,7 +3774,7 @@ mod tests {
             // The NAME is asserted, not just the refusal: this test exists for
             // which path the check consulted, and a message naming another one
             // would otherwise pass.
-            let want = format!("can't create {n}: File exists\n");
+            let want = format!("td-sh: can't create {n}: File exists\n");
             assert_eq!(err, want, "op: {op}");
             let after = std::fs::read(&kept).ok();
             assert_eq!(after, Some(b"KEEP".to_vec()), "op: {op}");

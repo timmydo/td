@@ -116,7 +116,9 @@ const HEADER: &str = "\
 #               `getcwd()`s OSH makes, which is an implementation detail no other
 #               shell can be held to even with `strace` staged. Withheld, it is a
 #               FALSE PASS rather than a failure -- `wc -l err.txt` counts the single
-#               line `td-sh: strace: not found`, and the golden is `1 err.txt`. That
+#               line `ash: strace: not found` -- the corpus stages the shell under
+#               the identity it compares against, and a diagnostic names `$0` --
+#               and the golden is `1 err.txt`. That
 #               kind of pass turns on the wording of a diagnostic, so it would red as
 #               a REGRESSION in a `cd` test the day the wording changed.
 #               (b), (c) and (d) are decided from the CODE and so are applied BEFORE
@@ -188,8 +190,9 @@ fn depends_on_shared_tmp(code: &str) -> bool {
 // golden counts the getcwd()s OSH makes, so even a staged `strace` would grade
 // an implementation detail rather than any behaviour POSIX describes. Withheld,
 // the case degenerates into a false pass instead -- `wc -l err.txt` counts the
-// one line `td-sh: strace: not found`, which is the golden `1 err.txt` by
-// coincidence. One live use, and the four others are inside comments this sees
+// one line `ash: strace: not found` -- the corpus stages the shell under the
+// identity it compares against, and a diagnostic names `$0` -- which is the
+// golden `1 err.txt` by coincidence. One live use, and the four others are inside comments this sees
 // stripped. Matched on the dependency rather than the verdict, as the two above
 // are: a pass that turns on the wording of a diagnostic would red as a
 // regression the day that wording changes, in a test about `cd`.

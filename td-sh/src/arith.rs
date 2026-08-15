@@ -28,7 +28,7 @@ pub fn try_eval(sh: &mut Shell, text: &str) -> Result<i64, String> {
         live: true,
         resolving: Vec::new(),
     };
-    p.eval_string(sh, text).map_err(|e| format!("arithmetic: {e}"))
+    p.eval_string(sh, text)
 }
 
 #[derive(Clone, Debug)]

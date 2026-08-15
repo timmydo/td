@@ -606,7 +606,7 @@ fn open_planned(sh: &mut Shell, plan: &Plan) -> R<Result<Opened, ()>> {
         // time, inside the `redirectsafe` that catches it.
         Plan::From(n) => match sh.fds.get(*n) {
             Some(Fd::Closed) | None => {
-                let _ = exec::write_stderr(sh, &format!("{n}: bad file descriptor"));
+                let _ = exec::diag(sh, &format!("{n}: bad file descriptor"));
                 Ok(Err(()))
             }
             Some(fd) => Ok(Ok(Opened::To(fd.clone()))),
@@ -691,7 +691,7 @@ fn classify_dup(sh: &mut Shell, dest: u32, target: String, closes: bool) -> R<Pl
     // one: `3>&+3` would read as `3>&3` and succeed on a closed fd 3.
     if target.bytes().all(|b| b.is_ascii_digit()) {
         let Some(n) = target.parse::<u32>().ok().filter(|n| *n <= MAX_FD) else {
-            let _ = exec::write_stderr(sh, "syntax error: bad fd number");
+            let _ = exec::diag(sh, "syntax error: bad fd number");
             return Err(Sig::Abort(BAD_FD_NUMBER));
         };
         return Ok(if n == dest { Plan::Same } else { Plan::From(n) });
@@ -712,7 +712,7 @@ fn classify_dup(sh: &mut Shell, dest: u32, target: String, closes: bool) -> R<Pl
     // Not a descriptor and not on fd 1, so there is nothing it can name: ash
     // raises this from `expredir`, before `redirectsafe` and before any
     // redirection is applied, so it is fatal rather than a status.
-    let _ = exec::write_stderr(sh, &format!("{target}: ambiguous redirect"));
+    let _ = exec::diag(sh, &format!("{target}: ambiguous redirect"));
     Err(Sig::Abort(FATAL_REDIR_ERROR))
 }
 
@@ -724,7 +724,7 @@ fn open_failed(
     kind: OpenKind,
     e: &std::io::Error,
 ) -> Result<Opened, ()> {
-    let _ = exec::write_stderr(sh, &open_error(name, kind, e));
+    let _ = exec::diag(sh, &open_error(name, kind, e));
     Err(())
 }
 
@@ -944,7 +944,7 @@ pub fn run_pipeline(sh: &mut Shell, cmds: &[Stage]) -> R<()> {
     let mut unstarted = false;
     for outcome in &outcomes {
         if let Err(StageError::Unstarted(e)) = outcome {
-            let _ = exec::write_stderr(sh, &format!("td-sh: pipeline stage did not start: {e}"));
+            let _ = exec::diag(sh, &format!("pipeline stage did not start: {e}"));
             unstarted = true;
         }
     }
@@ -1679,7 +1679,7 @@ pub fn exec_replace(sh: &mut Shell, argv: &[String], arg0: Option<&str>) -> R<()
         Ok(p) => p,
         Err(seen) => {
             let (why, code) = seen.as_exec();
-            let _ = exec::write_stderr(sh, &format!("td-sh: exec: {program}: {why}"));
+            let _ = exec::diag(sh, &format!("exec: {program}: {why}"));
             return failed_exec(sh, code);
         }
     };
@@ -1728,7 +1728,7 @@ pub fn exec_replace(sh: &mut Shell, argv: &[String], arg0: Option<&str>) -> R<()
     // Safe: `CommandExt::exec` returns the error rather than trapping it.
     let e = cmd.exec();
     let (why, code) = exec_failure(&e);
-    let _ = exec::write_stderr(sh, &format!("td-sh: exec: {program}: {why}"));
+    let _ = exec::diag(sh, &format!("exec: {program}: {why}"));
     failed_exec(sh, code)
 }
 
@@ -1768,7 +1768,7 @@ pub fn exec_external(
         Ok(p) => p,
         Err(seen) => {
             let (why, code) = seen.as_command();
-            let _ = exec::write_stderr(sh, &format!("td-sh: {label}{program}: {why}"));
+            let _ = exec::diag(sh, &format!("{label}{program}: {why}"));
             sh.set_status(code);
             return Ok(());
         }
@@ -1828,7 +1828,7 @@ pub fn exec_external(
         Ok(c) => c,
         Err(e) => {
             let (why, code) = exec_failure(&e);
-            let _ = exec::write_stderr(sh, &format!("td-sh: {label}{program}: {why}"));
+            let _ = exec::diag(sh, &format!("{label}{program}: {why}"));
             sh.set_status(code);
             return Ok(());
         }
@@ -1927,7 +1927,7 @@ pub fn exec_external(
         }
         Err(e) => {
             let (why, code) = exec_failure(&e);
-            let _ = exec::write_stderr(sh, &format!("td-sh: {label}{program}: {why}"));
+            let _ = exec::diag(sh, &format!("{label}{program}: {why}"));
             sh.set_status(code);
             Ok(())
         }

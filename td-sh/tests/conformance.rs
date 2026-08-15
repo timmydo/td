@@ -1055,15 +1055,19 @@ fn the_command_lines_own_option_refusal_splits_the_way_sets_does()
 -> Result<(), Box<dyn std::error::Error>> {
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
     // The command never runs in EITHER case -- what differs is the status.
+    // A diagnostic names the shell by `$0`, which for a spawned binary is the
+    // path it was invoked by. Building the expectation from that path rather
+    // than hard-coding a name is what pins the prefix to argv[0].
+    let me = shell.display().to_string();
     let args: [(&[&str], &str, i32); 4] = [
-        (&["-z", "-c", "echo ALIVE"], "td-sh: illegal option -z\n", 2),
-        (&["+z", "-c", "echo ALIVE"], "td-sh: illegal option +z\n", 2),
-        (&["-o", "bogus", "-c", "echo ALIVE"], "td-sh: illegal option -o bogus\n", 0),
-        (&["+o", "bogus", "-c", "echo ALIVE"], "td-sh: illegal option +o bogus\n", 0),
+        (&["-z", "-c", "echo ALIVE"], "illegal option -z\n", 2),
+        (&["+z", "-c", "echo ALIVE"], "illegal option +z\n", 2),
+        (&["-o", "bogus", "-c", "echo ALIVE"], "illegal option -o bogus\n", 0),
+        (&["+o", "bogus", "-c", "echo ALIVE"], "illegal option +o bogus\n", 0),
     ];
     for (args, err, code) in args {
         let out = std::process::Command::new(&shell).args(args).output()?;
-        assert_eq!(String::from_utf8_lossy(&out.stderr), err, "{args:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), format!("{me}: {err}"), "{args:?}");
         assert_eq!(out.stdout, b"", "{args:?}");
         assert_eq!(out.status.code(), Some(code), "{args:?}");
     }
@@ -1093,7 +1097,11 @@ fn a_missing_script_operand_is_reported_the_way_ash_reports_it()
     let err = String::from_utf8_lossy(&out.stderr).into_owned();
     assert_eq!(
         err,
-        format!("td-sh: can't open '{}': No such file or directory\n", missing.display())
+        format!(
+            "{}: can't open '{}': No such file or directory\n",
+            shell.display(),
+            missing.display()
+        )
     );
     assert_eq!(out.status.code(), Some(2));
     let _ = std::fs::remove_dir_all(&dir);
@@ -1115,9 +1123,10 @@ fn a_spawn_failure_with_real_stdio_gives_the_systems_reason()
     // A slash in the name, so the execute bit is the KERNEL's to object to.
     std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644))?;
     let p = f.display();
+    let me = shell.display().to_string();
     for (src, want) in [
-        (format!("{p}"), format!("td-sh: {p}: Permission denied\n")),
-        (format!("exec {p}"), format!("td-sh: exec: {p}: Permission denied\n")),
+        (format!("{p}"), format!("{me}: {p}: Permission denied\n")),
+        (format!("exec {p}"), format!("{me}: exec: {p}: Permission denied\n")),
     ] {
         let out = std::process::Command::new(&shell).arg("-c").arg(&src).output()?;
         assert_eq!(String::from_utf8_lossy(&out.stderr), want, "src: {src}");
@@ -3837,13 +3846,14 @@ fn a_broken_profile_is_not_a_failed_login() -> Result<(), Box<dyn std::error::Er
         let (out, err, ok) = run("echo NOT-REACHED-EITHER")?;
         assert!(!ok, "a fatal profile error did not end a non-interactive login");
         assert_eq!(out, host_out, "the login ran on past a fatal profile error: {out:?}");
-        // ...and it is reported against the file it is in -- `td-sh: <path>: ...`,
+        // ...and it is reported against the file it is in -- `$0: <path>: ...`,
         // the shape `.` gives a sourced file, because a diagnostic naming no file
-        // is one an operator cannot act on.
+        // is one an operator cannot act on. `$0` is this login shell's own `-sh`,
+        // which is the argv[0] the run helper above hands it.
         let added = err.strip_prefix(host_err.as_str()).unwrap_or(&err);
         assert!(
-            added.starts_with(&format!("td-sh: {}/.profile: ", home.display()))
-                || added.starts_with("missing: "),
+            added.starts_with(&format!("-sh: {}/.profile: ", home.display()))
+                || added.starts_with("-sh: missing: "),
             "the error did not name the profile: {added:?}"
         );
     }
