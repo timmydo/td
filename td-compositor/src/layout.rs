@@ -60,6 +60,29 @@ pub enum Command {
     ToggleFullscreen,
 }
 
+/// What landing on a window MEANS, which the five zones of a tile answer.
+/// A drop is not one gesture with a side to it any more: over the middle the
+/// two windows trade places, and over an edge the dragged one lands on that
+/// side — along an axis the drop NAMES rather than one read off the target's
+/// container, since "above" over a window in a row has to make the column it
+/// needs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DropKind {
+    Swap,
+    Beside {
+        axis: Axis,
+        before: bool,
+    },
+    /// A place in the target's own container, whatever that container is —
+    /// what a drop onto a title BAND means. It names no axis deliberately:
+    /// the aim is computed against the arrangement with the dragged window
+    /// taken OUT, where the target's container may have collapsed to nothing
+    /// at all, so an axis read there could turn a column into a row.
+    InRun {
+        before: bool,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Rect {
     pub x: usize,
@@ -169,19 +192,61 @@ impl Node {
         }
     }
 
-    /// Put a leaf immediately before or after a NAMED one, in whatever
-    /// container that one sits in. This is the drop half of a drag, where the
-    /// destination is a window the pointer is over rather than a direction,
-    /// so there is no walk and no axis to match — the target's own container
-    /// is the answer by construction.
-    fn insert_beside(&mut self, target: SurfaceKey, key: SurfaceKey, before: bool) -> bool {
-        let Node::Split { children, .. } = self else {
+    /// Put a leaf immediately before or after a NAMED one. This is the drop
+    /// half of a drag, where the destination is a window the pointer is over
+    /// rather than a direction, so there is no walk.
+    ///
+    /// `axis` is the one the drop NAMED. Where the target's own container
+    /// already runs that way this is an ordinary sibling insert, which is
+    /// what keeps a drop into a column a reorder of that column. Where it
+    /// does not, the target leaf is REPLACED by a split of the asked-for axis
+    /// holding the two of them: that is what makes "above" and "below" mean
+    /// something over a window in a row, where nothing in the tree runs
+    /// vertically yet.
+    ///
+    /// A STACKED container refuses that second case. `place_stack` draws one
+    /// band per LEAF beneath it, so a split among its children is a container
+    /// nothing presents and whose leaves join the run anyway — an arrangement
+    /// that says one thing and shows another, and that reappears the moment
+    /// the stack is undone. A drop into a stack is therefore a place in its
+    /// run whatever axis it named, which is what the stack already looks like.
+    ///
+    /// `in_stack` carries that down the walk rather than reading it here,
+    /// because the refusal is about the outermost stacked ANCESTOR: a stack
+    /// already holding a split presents the leaves under it flattened, so a
+    /// second split built one level further down would be just as invisible.
+    ///
+    /// `None` asks for the target's own container whatever it is, which is
+    /// what a drop onto a title BAND means — a place in that run.
+    fn insert_beside(
+        &mut self,
+        target: SurfaceKey,
+        key: SurfaceKey,
+        axis: Option<Axis>,
+        before: bool,
+        in_stack: bool,
+    ) -> bool {
+        let Node::Split {
+            axis: own,
+            children,
+            stacked,
+        } = self
+        else {
             return false;
         };
+        let own = *own;
+        let in_stack = in_stack || *stacked;
         let beside = children
             .iter()
             .position(|child| matches!(child, Node::Leaf(candidate) if *candidate == target));
         if let Some(index) = beside {
+            if let Some(axis) = axis.filter(|axis| *axis != own && !in_stack) {
+                let Some(slot) = children.get_mut(index) else {
+                    return false;
+                };
+                *slot = split_of(axis, key, target, before);
+                return true;
+            }
             let at = if before {
                 index
             } else {
@@ -195,7 +260,23 @@ impl Node {
         };
         children
             .get_mut(index)
-            .is_some_and(|child| child.insert_beside(target, key, before))
+            .is_some_and(|child| child.insert_beside(target, key, axis, before, in_stack))
+    }
+
+    /// Exchange two leaves in place, leaving every container standing.
+    /// Answers nothing: the caller has already established that both are in
+    /// this tree, and a walk that found neither would be the same no-op.
+    fn swap(&mut self, one: SurfaceKey, other: SurfaceKey) {
+        match self {
+            Node::Leaf(key) if *key == one => *key = other,
+            Node::Leaf(key) if *key == other => *key = one,
+            Node::Leaf(_) => {}
+            Node::Split { children, .. } => {
+                for child in children {
+                    child.swap(one, other);
+                }
+            }
+        }
     }
 
     /// Move a leaf one step along `axis`, i3's way: the nearest ancestor that
@@ -463,21 +544,33 @@ impl Layout {
             .and_then(|workspace| workspace.focused)
     }
 
-    /// The axis of the container a leaf sits DIRECTLY in, which is what says
-    /// whether "the half the pointer is in" should be measured top-to-bottom
-    /// or left-to-right. A lone window is in no container and answers None.
+    /// The axis of the container a leaf sits DIRECTLY in. A lone window is in
+    /// no container and answers None.
+    ///
+    /// Test-only: the drop reads `run_direction` instead, since a band's run
+    /// and its container's axis are the same thing only outside a stack, and
+    /// `drop_onto` resolves its own from the tree it is about to change. What
+    /// this remains is the assertion the tree-shape tests are written on —
+    /// which container each leaf ended up in is otherwise only observable as
+    /// geometry.
+    #[cfg(test)]
     pub fn parent_axis(&self, key: SurfaceKey) -> Option<Axis> {
         parent_axis(self.workspaces.get(&self.active)?.root.as_ref()?, key)
     }
 
-    /// Drop a dragged window beside a target one — the pointer half of a
-    /// move, where the destination is a window rather than a direction.
-    ///
-    /// `before` is which side of the target it lands, read along the target's
-    /// own container: in a column that is above or below, which is what a
-    /// drop onto the top or bottom half of a tile means, and in a row it is
-    /// left or right. Answers whether the tree changed, so a caller can skip
-    /// the repaint a drop onto the dragged window itself does not owe.
+    /// The direction this leaf's title BANDS run, which is what a drop onto
+    /// one measures its half along. A stack's bands run DOWN its top whatever
+    /// its container's axis is, so one answers Vertical; otherwise the
+    /// container's own axis, since each leaf carries its own band at the top
+    /// of its own tile. A lone window has neither.
+    pub fn run_direction(&self, key: SurfaceKey) -> Option<Axis> {
+        let root = self.workspaces.get(&self.active)?.root.as_ref()?;
+        if stack_run(root, key).is_some() {
+            return Some(Axis::Vertical);
+        }
+        parent_axis(root, key)
+    }
+
     /// Whether dragging this window could reach anywhere at all: a workspace
     /// that is not fullscreen, and a second window to land beside. Asked
     /// BEFORE a gesture takes a button, since one that cannot move anything
@@ -493,7 +586,15 @@ impl Layout {
         leaves.len() > 1 && leaves.contains(&key)
     }
 
-    pub fn drop_beside(&mut self, dragged: SurfaceKey, target: SurfaceKey, before: bool) -> bool {
+    /// Drop a dragged window onto a target one — the pointer half of a move,
+    /// where the destination is a window rather than a direction, and the
+    /// KIND says what landing on it means.
+    ///
+    /// Answers whether the tree CHANGED — exactly that, and not whether the
+    /// call was made. The one shipped caller previews the drop and compares
+    /// arrangements instead, so nothing reads this today; it is the contract
+    /// the layout-side tests are written against.
+    pub fn drop_onto(&mut self, dragged: SurfaceKey, target: SurfaceKey, drop: DropKind) -> bool {
         if dragged == target {
             return false;
         }
@@ -509,6 +610,16 @@ impl Layout {
         if !root.contains(dragged) || !root.contains(target) {
             return false;
         }
+        let (axis, before) = match drop {
+            DropKind::Swap => return self.swap_leaves(dragged, target),
+            DropKind::Beside { axis, before } => (Some(axis), before),
+            // No axis, which is what `InRun` means all the way down:
+            // `insert_beside` walks to the target's own container and puts
+            // the leaf in it. Resolving one HERE would be a second answer to
+            // a question that already has one, read off a tree the insert
+            // does not walk.
+            DropKind::InRun { before } => (None, before),
+        };
         let Some(root) = self.workspace_mut(self.active).root.take() else {
             return false;
         };
@@ -533,12 +644,12 @@ impl Layout {
             self.workspace_mut(self.active).root = Some(unchanged);
             return false;
         };
-        if !rest.insert_beside(target, dragged, before) {
+        if !rest.insert_beside(target, dragged, axis, before, false) {
             // Unreachable: the target was in the tree above and detaching a
             // DIFFERENT leaf cannot remove it. Kept so that no path can end
             // with the dragged window in neither the tree nor anywhere else.
             rest = Node::Split {
-                axis: Axis::Horizontal,
+                axis: axis.unwrap_or(Axis::Horizontal),
                 children: vec![rest, Node::Leaf(dragged)],
                 stacked: false,
             };
@@ -549,6 +660,20 @@ impl Layout {
             return false;
         }
         self.workspace_mut(self.active).root = rebuilt;
+        self.workspace_mut(self.active).focus(dragged);
+        true
+    }
+
+    /// Exchange two leaves where they stand. Deliberately NOT detach and
+    /// reinsert: both windows keep their neighbours, their containers and
+    /// those containers' presentation, which is the whole of what a swap
+    /// means and what a detach would destroy — dropping into the middle of a
+    /// stacked column would silently unstack it.
+    fn swap_leaves(&mut self, dragged: SurfaceKey, target: SurfaceKey) -> bool {
+        let Some(root) = self.workspace_mut(self.active).root.as_mut() else {
+            return false;
+        };
+        root.swap(dragged, target);
         self.workspace_mut(self.active).focus(dragged);
         true
     }
@@ -1030,6 +1155,21 @@ fn valid_workspace(number: u8) -> bool {
     (INITIAL_WORKSPACE..=FINAL_WORKSPACE).contains(&number)
 }
 
+/// The two-child container a drop makes when the target's own runs the other
+/// way, with `before` choosing which of them comes first.
+fn split_of(axis: Axis, key: SurfaceKey, target: SurfaceKey, before: bool) -> Node {
+    let children = if before {
+        vec![Node::Leaf(key), Node::Leaf(target)]
+    } else {
+        vec![Node::Leaf(target), Node::Leaf(key)]
+    };
+    Node::Split {
+        axis,
+        children,
+        stacked: false,
+    }
+}
+
 /// Take a leaf out WITHOUT collapsing what it leaves behind, so a container
 /// reduced to one child survives long enough for a drop to put the leaf back
 /// into it. `collapsed` tidies up afterwards.
@@ -1401,6 +1541,12 @@ mod tests {
             width,
             height: 0,
         }
+    }
+
+    /// The drop every test below used to spell as a bare `before`, now that
+    /// a drop names the axis it lands along.
+    fn beside(axis: Axis, before: bool) -> DropKind {
+        DropKind::Beside { axis, before }
     }
 
     fn key(object: u32) -> SurfaceKey {
@@ -2193,7 +2339,7 @@ mod tests {
         layout.apply(Command::SetSplit(Axis::Vertical));
         layout.map(key(3));
 
-        assert!(layout.drop_beside(key(1), key(3), true));
+        assert!(layout.drop_onto(key(1), key(3), beside(Axis::Vertical, true)));
         assert_eq!(
             layout
                 .placements(100, 100, 0, 0)
@@ -2208,7 +2354,7 @@ mod tests {
 
         // And the other half puts it below: 1 is above 3 now, so dropping it
         // BELOW 3 has somewhere to go and the order changes again.
-        assert!(layout.drop_beside(key(1), key(3), false));
+        assert!(layout.drop_onto(key(1), key(3), beside(Axis::Vertical, false)));
         assert_eq!(
             layout
                 .placements(100, 100, 0, 0)
@@ -2222,7 +2368,7 @@ mod tests {
         // Dropping it back exactly where it already is CHANGES nothing, and
         // says so: the answer is about the arrangement, not about the call.
         let settled = layout.placements(100, 100, 0, 0);
-        assert!(!layout.drop_beside(key(1), key(3), false));
+        assert!(!layout.drop_onto(key(1), key(3), beside(Axis::Vertical, false)));
         assert_eq!(layout.placements(100, 100, 0, 0), settled);
         layout.check_invariants().unwrap();
     }
@@ -2241,7 +2387,10 @@ mod tests {
             layout.map(key(2));
             assert_eq!(layout.parent_axis(key(1)), Some(Axis::Horizontal));
 
-            assert_eq!(layout.drop_beside(key(2), key(1), before), before);
+            assert_eq!(
+                layout.drop_onto(key(2), key(1), beside(Axis::Horizontal, before)),
+                before
+            );
             let placements = layout.placements(100, 100, 0, 0);
             assert_eq!(
                 placements.iter().map(|p| p.key.object).collect::<Vec<_>>(),
@@ -2252,6 +2401,221 @@ mod tests {
             assert!(placements.iter().all(|p| p.rect.width == 50), "{before}");
             layout.check_invariants().unwrap();
         }
+    }
+
+    #[test]
+    fn a_band_drop_keeps_the_container_it_lands_in_whatever_that_is() {
+        // `InRun` names no axis, and that is the point. The aim geometry has
+        // the dragged window taken OUT, so a container of two collapses there
+        // and can answer nothing at all — an axis read from it would default
+        // to something and turn this column into a row.
+        for axis in [Axis::Horizontal, Axis::Vertical] {
+            let mut layout = Layout::new();
+            layout.apply(Command::SetSplit(axis));
+            layout.map(key(1));
+            layout.map(key(2));
+            assert_eq!(layout.parent_axis(key(1)), Some(axis), "{axis:?}");
+
+            assert!(layout.drop_onto(key(1), key(2), DropKind::InRun { before: false }));
+            assert_eq!(
+                layout
+                    .placements(100, 100, 0, 0)
+                    .iter()
+                    .map(|p| p.key.object)
+                    .collect::<Vec<_>>(),
+                [2, 1],
+                "{axis:?}"
+            );
+            assert_eq!(
+                layout.parent_axis(key(1)),
+                Some(axis),
+                "the drop changed the container's axis: {axis:?}"
+            );
+            layout.check_invariants().unwrap();
+        }
+
+        // And a NESTED container answers for itself rather than for the
+        // workspace: `H[1, V[2, 3]]`, where a band drop onto 3 is a reorder
+        // of the column and never a third tile in the row.
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.map(key(2));
+        layout.apply(Command::SetSplit(Axis::Vertical));
+        layout.map(key(3));
+        assert!(layout.drop_onto(key(2), key(3), DropKind::InRun { before: false }));
+        let placements = layout.placements(100, 100, 0, 0);
+        assert_eq!(
+            placements.iter().map(|p| p.key.object).collect::<Vec<_>>(),
+            [1, 3, 2]
+        );
+        assert_eq!(
+            placements.iter().map(|p| p.rect.width).collect::<Vec<_>>(),
+            [50, 50, 50],
+            "the column became part of the row"
+        );
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_drop_on_the_middle_trades_two_windows_where_they_stand() {
+        // `H[1, V[2, 3]]`, and 1 is swapped with 3 — one in the row and one
+        // in the column, so a swap that went through detach-and-reinsert
+        // would have to destroy a container to do it. Both keep the place
+        // the OTHER had, and the column is still a column.
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.map(key(2));
+        layout.apply(Command::SetSplit(Axis::Vertical));
+        layout.map(key(3));
+        let before = layout.placements(100, 100, 0, 0);
+        assert_eq!(
+            before.iter().map(|p| p.key.object).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+
+        assert!(layout.drop_onto(key(1), key(3), DropKind::Swap));
+        let after = layout.placements(100, 100, 0, 0);
+        assert_eq!(
+            after.iter().map(|p| p.key.object).collect::<Vec<_>>(),
+            [3, 2, 1]
+        );
+        // The GEOMETRY is untouched — only which window sits in each slot.
+        assert_eq!(
+            after.iter().map(|p| p.rect).collect::<Vec<_>>(),
+            before.iter().map(|p| p.rect).collect::<Vec<_>>()
+        );
+        assert_eq!(layout.parent_axis(key(1)), Some(Axis::Vertical));
+        assert_eq!(layout.parent_axis(key(3)), Some(Axis::Horizontal));
+        // The window that was dragged is the focused one, as for every drop.
+        assert_eq!(layout.focused(), Some(key(1)));
+        layout.check_invariants().unwrap();
+
+        // And it is its own inverse: swapping the pair back puts every window
+        // in the slot it started in. FOCUS is not part of that — each drop
+        // focuses what was dragged, so two swaps leave it on the window that
+        // moved rather than on whatever held it before.
+        assert!(layout.drop_onto(key(1), key(3), DropKind::Swap));
+        let back = layout.placements(100, 100, 0, 0);
+        assert_eq!(
+            back.iter().map(|p| (p.key, p.rect)).collect::<Vec<_>>(),
+            before.iter().map(|p| (p.key, p.rect)).collect::<Vec<_>>()
+        );
+        assert_eq!(layout.focused(), Some(key(1)));
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_swap_into_a_stack_keeps_it_stacked_and_shows_the_arrival() {
+        // The container a swap lands in keeps its presentation, which is the
+        // reason a swap is done in place: a detach takes the container's
+        // `stacked` bit with it whenever the removal empties it.
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.map(key(2));
+        layout.apply(Command::SetSplit(Axis::Vertical));
+        layout.map(key(3));
+        layout.apply(Command::ToggleStacked);
+        assert_eq!(
+            layout
+                .placements(100, 300, 0, 20)
+                .iter()
+                .map(|p| p.key.object)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert!(layout
+            .placements(100, 300, 0, 20)
+            .iter()
+            .filter(|p| p.key.object != 1)
+            .all(|p| p.stacked));
+
+        assert!(layout.drop_onto(key(1), key(3), DropKind::Swap));
+        let placements = layout.placements(100, 300, 0, 20);
+        assert_eq!(
+            placements.iter().map(|p| p.key.object).collect::<Vec<_>>(),
+            [3, 2, 1]
+        );
+        assert!(
+            placements
+                .iter()
+                .filter(|p| p.key.object != 3)
+                .all(|p| p.stacked),
+            "the swap unstacked the container it landed in"
+        );
+        // Focused, so the stack shows the window that just arrived rather
+        // than leaving the operator looking at the one it replaced.
+        let shown = placements
+            .iter()
+            .filter(|p| p.stacked && p.visible)
+            .map(|p| p.key.object)
+            .collect::<Vec<_>>();
+        assert_eq!(shown, [1]);
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_swap_refuses_itself_and_a_stranger() {
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.map(key(2));
+        let before = layout.placements(100, 100, 0, 0);
+        assert!(!layout.drop_onto(key(1), key(1), DropKind::Swap));
+        assert!(!layout.drop_onto(key(1), key(9), DropKind::Swap));
+        assert!(!layout.drop_onto(key(9), key(1), DropKind::Swap));
+        layout.apply(Command::ToggleFullscreen);
+        assert!(!layout.drop_onto(key(2), key(1), DropKind::Swap));
+        layout.apply(Command::ToggleFullscreen);
+        assert_eq!(layout.placements(100, 100, 0, 0), before);
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_drop_across_the_axis_makes_the_container_it_needs() {
+        // `H[1, 2, 3]` and 1 is dropped BELOW 2. Nothing in the tree runs
+        // vertically where 2 sits — its container is the row — so the drop
+        // has to make the column it is asking for, in 2's place, rather than
+        // fall back to the row's own axis and land beside it. This is the
+        // whole of what the top and bottom zones buy: an arrangement the
+        // two-zone drop could not reach at all.
+        let mut layout = Layout::new();
+        for object in 1..=3 {
+            layout.map(key(object));
+        }
+        assert_eq!(
+            layout
+                .placements(100, 100, 0, 0)
+                .iter()
+                .map(|p| p.key.object)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(layout.parent_axis(key(2)), Some(Axis::Horizontal));
+
+        assert!(layout.drop_onto(key(1), key(2), beside(Axis::Vertical, false)));
+        assert_eq!(
+            layout
+                .placements(100, 100, 0, 0)
+                .iter()
+                .map(|p| p.key.object)
+                .collect::<Vec<_>>(),
+            [2, 1, 3]
+        );
+        assert_eq!(layout.parent_axis(key(1)), Some(Axis::Vertical));
+        assert_eq!(layout.parent_axis(key(2)), Some(Axis::Vertical));
+        // The pair share a column of their own, so they are one above the
+        // other and NOT the full width of what the row gave them.
+        let placements = layout.placements(100, 100, 0, 0);
+        let of = |object: u32| {
+            let at = placements
+                .iter()
+                .position(|p| p.key.object == object)
+                .unwrap();
+            *placements.get(at).unwrap()
+        };
+        assert_eq!(of(1).rect.x, of(2).rect.x);
+        assert_eq!(of(1).rect.width, of(2).rect.width);
+        assert_ne!(of(1).rect.y, of(2).rect.y);
+        layout.check_invariants().unwrap();
     }
 
     #[test]
@@ -2266,7 +2630,7 @@ mod tests {
         layout.apply(Command::SetSplit(Axis::Vertical));
         layout.map(key(3));
 
-        assert!(layout.drop_beside(key(2), key(3), false));
+        assert!(layout.drop_onto(key(2), key(3), beside(Axis::Vertical, false)));
         let placements = layout.placements(100, 100, 0, 0);
         assert_eq!(
             placements.iter().map(|p| p.key.object).collect::<Vec<_>>(),
@@ -2293,7 +2657,9 @@ mod tests {
         layout.apply(Command::ToggleStacked);
         assert!(layout.placements(100, 300, 0, 20).iter().all(|p| p.stacked));
 
-        assert!(layout.drop_beside(key(2), key(1), true));
+        // A drop onto the stack's own axis, which is what an edge of a tile
+        // inside one answers.
+        assert!(layout.drop_onto(key(2), key(1), beside(Axis::Vertical, true)));
         let placements = layout.placements(100, 300, 0, 20);
         assert_eq!(
             placements.iter().map(|p| p.key.object).collect::<Vec<_>>(),
@@ -2308,6 +2674,130 @@ mod tests {
             [0, 20]
         );
         layout.check_invariants().unwrap();
+
+        // And the gesture this is named for, which names no axis at all: a
+        // drop onto a title BAND. The two reach the same container by
+        // different routes, so both are asked here.
+        assert!(layout.drop_onto(key(1), key(2), DropKind::InRun { before: true }));
+        let placements = layout.placements(100, 300, 0, 20);
+        assert_eq!(
+            placements.iter().map(|p| p.key.object).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(
+            placements.iter().all(|p| p.stacked),
+            "a band drop unstacked the pair"
+        );
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_cross_axis_drop_into_a_stack_joins_its_run_rather_than_splitting_it() {
+        // A stack draws one band per LEAF beneath it, so a split among its
+        // children is a container it never shows: the operator would see the
+        // leaf join the run either way, and meet a row waiting for them when
+        // they later unstacked. The axis is refused inside a stack instead.
+        let mut layout = Layout::new();
+        layout.apply(Command::SetSplit(Axis::Vertical));
+        layout.map(key(1));
+        layout.map(key(2));
+        layout.map(key(3));
+        layout.apply(Command::ToggleStacked);
+        assert!(layout.placements(100, 300, 0, 20).iter().all(|p| p.stacked));
+
+        // "1 to the RIGHT of 2", across a column that presents as a list.
+        assert!(layout.drop_onto(key(1), key(2), beside(Axis::Horizontal, false)));
+        let placements = layout.placements(100, 300, 0, 20);
+        assert_eq!(
+            placements.iter().map(|p| p.key.object).collect::<Vec<_>>(),
+            [2, 1, 3]
+        );
+        assert!(
+            placements.iter().all(|p| p.stacked),
+            "the drop unstacked the run"
+        );
+        assert_eq!(
+            layout.parent_axis(key(1)),
+            Some(Axis::Vertical),
+            "the drop built a row inside the stack"
+        );
+        assert_eq!(
+            placements.iter().map(|p| p.band.y).collect::<Vec<_>>(),
+            [0, 20, 40],
+            "the run is not three bands"
+        );
+        layout.check_invariants().unwrap();
+
+        // The same drop with the stack UNDONE does build the row, which is
+        // what makes the refusal above about the presentation rather than
+        // about the axis being ignored everywhere.
+        layout.apply(Command::ToggleStacked);
+        assert!(layout.drop_onto(key(1), key(3), beside(Axis::Horizontal, false)));
+        assert_eq!(
+            layout.parent_axis(key(1)),
+            Some(Axis::Horizontal),
+            "an unstacked column refused the axis too"
+        );
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_stack_refuses_the_axis_for_a_leaf_below_a_split_too() {
+        // The refusal is about the outermost stacked ANCESTOR, not about the
+        // container the leaf sits in. A stack already holding a split shows
+        // the leaves under it flattened all the same, so a second split one
+        // level further down would be exactly as invisible as the first.
+        // `V{stacked}[1, 2, H[3, 4]]`, built the only way it can be: opening a
+        // window while the pending axis crosses the stack's. That route is
+        // its own defect and its own increment — see this commit's message.
+        // Here it is only the shape.
+        let shape = || {
+            let mut layout = Layout::new();
+            layout.apply(Command::SetSplit(Axis::Vertical));
+            layout.map(key(1));
+            layout.map(key(2));
+            layout.map(key(3));
+            layout.apply(Command::ToggleStacked);
+            layout.apply(Command::SetSplit(Axis::Horizontal));
+            layout.map(key(4));
+            layout
+        };
+        let mut layout = shape();
+        assert_eq!(layout.parent_axis(key(4)), Some(Axis::Horizontal));
+        assert!(layout.placements(100, 400, 0, 20).iter().all(|p| p.stacked));
+
+        assert!(layout.drop_onto(key(1), key(3), beside(Axis::Vertical, true)));
+        assert_eq!(
+            layout.parent_axis(key(1)),
+            Some(Axis::Horizontal),
+            "the drop built a column below the stack's split child"
+        );
+        let placements = layout.placements(100, 400, 0, 20);
+        assert_eq!(
+            placements.iter().map(|p| p.key.object).collect::<Vec<_>>(),
+            [2, 1, 3, 4]
+        );
+        assert!(
+            placements.iter().all(|p| p.stacked),
+            "the drop unstacked the run"
+        );
+        layout.check_invariants().unwrap();
+
+        // The band drop into the same shape, which names no axis to refuse,
+        // reaches the same position in the run. It lands INSIDE that row
+        // rather than among the stack's own children — the row's doing
+        // rather than the drop's, and harmless to what the operator sees,
+        // since a split's leaves are contiguous in the run either way.
+        let mut layout = shape();
+        assert!(layout.drop_onto(key(1), key(3), DropKind::InRun { before: true }));
+        let placements = layout.placements(100, 400, 0, 20);
+        assert_eq!(
+            placements.iter().map(|p| p.key.object).collect::<Vec<_>>(),
+            [2, 1, 3, 4]
+        );
+        assert!(placements.iter().all(|p| p.stacked));
+        assert_eq!(layout.parent_axis(key(1)), Some(Axis::Horizontal));
+        layout.check_invariants().unwrap();
     }
 
     #[test]
@@ -2318,10 +2808,10 @@ mod tests {
         let before = layout.placements(100, 100, 0, 0);
 
         // Onto itself: the pointer never left the window it picked up.
-        assert!(!layout.drop_beside(key(1), key(1), true));
+        assert!(!layout.drop_onto(key(1), key(1), beside(Axis::Horizontal, true)));
         // A window that does not exist at all.
-        assert!(!layout.drop_beside(key(1), key(9), true));
-        assert!(!layout.drop_beside(key(9), key(1), true));
+        assert!(!layout.drop_onto(key(1), key(9), beside(Axis::Horizontal, true)));
+        assert!(!layout.drop_onto(key(9), key(1), beside(Axis::Horizontal, true)));
         assert_eq!(layout.placements(100, 100, 0, 0), before);
 
         // And one that exists on ANOTHER workspace, which is on no screen the
@@ -2330,13 +2820,13 @@ mod tests {
         layout.apply(Command::SwitchWorkspace(2));
         layout.map(key(3));
         layout.apply(Command::SwitchWorkspace(1));
-        assert!(!layout.drop_beside(key(1), key(3), true));
-        assert!(!layout.drop_beside(key(3), key(1), true));
+        assert!(!layout.drop_onto(key(1), key(3), beside(Axis::Horizontal, true)));
+        assert!(!layout.drop_onto(key(3), key(1), beside(Axis::Horizontal, true)));
         assert_eq!(layout.placements(100, 100, 0, 0), before);
 
         // Under fullscreen, as every other rearranging command is refused.
         layout.apply(Command::ToggleFullscreen);
-        assert!(!layout.drop_beside(key(2), key(1), true));
+        assert!(!layout.drop_onto(key(2), key(1), beside(Axis::Horizontal, true)));
         layout.apply(Command::ToggleFullscreen);
         assert_eq!(layout.placements(100, 100, 0, 0), before);
         layout.check_invariants().unwrap();
@@ -2358,7 +2848,7 @@ mod tests {
         assert_eq!(layout.parent_axis(key(2)), Some(Axis::Horizontal));
         assert_eq!(layout.parent_axis(key(1)), Some(Axis::Vertical));
 
-        assert!(layout.drop_beside(key(2), key(3), false));
+        assert!(layout.drop_onto(key(2), key(3), beside(Axis::Vertical, false)));
         let placements = layout.placements(100, 300, 0, 20);
         assert_eq!(
             placements.iter().map(|p| p.key.object).collect::<Vec<_>>(),

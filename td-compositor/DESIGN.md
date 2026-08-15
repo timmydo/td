@@ -623,15 +623,64 @@ since it is the one the operator was acting on.
 DRAGGING a window is the same move with the destination named by the pointer
 instead of by a direction. A press on a title BAND picks the window up and
 focuses it; from there the screen shows the drop ITSELF, and the release
-keeps what is on it. The side the window lands on is the side the pointer is
-in. Which side is read along the TARGET's own
-container — top or bottom in a column, left or right in a row — since that is
-the direction its neighbours actually lie in, and within whichever rectangle
-the pointer is in rather than over the tile as a whole, because a stacked
-leaf's band and its client area are far apart and a midpoint between them is
-in neither. A STACKED container is the exception that proves it: its bands
-run DOWN its top whatever its own axis is, so the neighbours lie above and
-below even in a row, and the half is read that way.
+keeps what is on it.
+
+A tile has FIVE zones and the one the pointer is in says what landing there
+MEANS. Over the middle the two windows trade places, keeping their
+containers and their neighbours. Over an edge the dragged window lands on
+that side — in a column for the top and bottom edges, in a row for the left
+and right — whatever the target's own container runs as, because the drop
+names its axis and the insert MAKES the container it needs. That last part
+is what the five zones buy over a two-sided drop: "put it below this window"
+over a window in a row reaches an arrangement the keyboard only gets to as a
+sequence of commands, and the two-sided drop could not express at all.
+
+A STACKED container refuses that axis and takes the leaf into its run
+instead. It draws one band per LEAF beneath it, so a split among its
+children is a container it never shows: the operator sees the window join
+the run exactly as it would have anyway, and finds a row waiting for them
+the moment they unstack. What a stack presents is a list, so a drop into one
+is a place in that list however it was aimed — the same answer its own bands
+give. Leaving a stack sideways is `Move` from the keyboard, or a drop onto a
+window outside it.
+
+The middle is the middle NINTH, and outside it the NEAREST edge picks the
+side, judged in proportion to the tile rather than in pixels — or a wide
+short one would answer top or bottom almost everywhere. The edges get the
+bulk of the tile because they are what an operator aims at; a swap is the
+one drop with a deliberate target to hit. Every point in a tile answers, and
+a tile with no area answers Swap, having no edges to be nearer one of.
+
+A title BAND is the exception and keeps TWO zones along the run it is part
+of. Five will not fit in a strip a line of text tall, and a run is a list
+rather than an area: a position in it is the only thing a drop onto one can
+mean. It therefore names NO axis — the target's own container, whatever that
+is — and the half is read along the direction that run actually goes: across
+for a row, where each leaf carries its own band at the top of its own tile,
+and down for a column. A STACKED container is down whatever its own axis is,
+since its bands are a list at its top rather than one per tile.
+
+Both of those are asked of the tree the drop will be APPLIED to, never of
+the aim geometry, and that is not a detail. Take one window out of a row of
+two and the row is gone: the aim tree says the target sits in no container,
+which would halve a twenty-pixel strip top-to-bottom and leave one side of
+the row unreachable, and would name an axis that turns the column it lands
+in into a row. Naming no axis at all is what makes the second impossible
+rather than merely unlikely.
+
+The zone is read within whichever rectangle the pointer is in rather than
+over the tile as a whole, because a stacked leaf's band and its client area
+are far apart and a point between them is in neither.
+
+One thing about the aim is worth stating because it is easy to get wrong
+from the outside: the drop is computed against the arrangement with the
+DRAGGED window taken out, which is not the geometry on screen. Its tiles are
+bigger and in different places. That is deliberate, and the two-arrangements
+paragraph below says why; here it means only that a point chosen off the
+SCREEN is answering a different question than the drag asks. The dead zone
+below is the other half of the same seam: a point can be a good aim in one
+geometry and inside the dragged window's own tile in the other, and then the
+drop is refused.
 
 The dragged window is DETACHED rather than removed, and that is the whole of
 this operation's correctness. A removal collapses the container the leaf came
@@ -786,6 +835,22 @@ other leaves' bands alone — the same slivers this gesture exists to avoid
 needing. Dropping ELSEWHERE is unaffected, and a stack of two is unaffected
 either way, so this is a rough edge rather than a hole; closing it wants a
 drop zone inside a stack that is not a band, which is its own change.
+
+It costs something OUTSIDE a stack too, and five zones sharpen it. The dead
+zone is read in the SCREEN geometry while the target is read in the AIM one,
+and the two do not correspond: the neighbour that grows into the dragged
+window's place has much of its own tile underneath the dead one. So a window
+can be dropped to the RIGHT of that neighbour, above it or below it, but not
+to its LEFT and — past a point — not traded with it either. Swept pixel by
+pixel across a 1600-wide output, `H[1, 2]` through `H[1 … 5]` all have 2's
+left third entirely dead; its middle ninth keeps 270 columns of 517 at two
+windows, 7 of 255 at three, and none at all from four on. The left third is
+therefore an OLD edge, unreachable since the two-zone drop, and the middle
+ninth is a new casualty of it that arrives at four windows and survives three
+only as a seven-pixel sliver. The answer is to stop expressing "a press alone
+must not move it" as a REGION — a threshold measured from the press point
+says the same thing without covering a neighbour — and that is its own
+change.
 
 The preview is DERIVED, never a second source of truth: it is rebuilt from the
 arrangement on every pointer frame and dropped by every change to it, so a
@@ -1266,6 +1331,21 @@ The landing must prove:
 - every tiling command, split geometry edge case, workspace transition, tree
   collapse, fullscreen transition, and Super chord is a deterministic host
   test;
+- a tile's five drop zones are proved as a function — each zone by a point,
+  the middle ninth by the points just outside it, the nearest edge by a wide
+  short tile where pixels and proportion disagree, and a sweep of the whole
+  rect reaching all five — then again through the scene, where a band answers
+  two along its run, across for a row and down for a column or a stack, and a
+  stacked leaf answers for its shared content rect only while it is the one
+  shown; a row of two proves the run's direction is read from the tree the
+  drop LANDS in rather than the one it aims at, where that row has collapsed,
+  and a whole gesture over a stacked pair proves the same seam end to end,
+  aimed where the two geometries give opposite halves; and the layout's side
+  proves that a swap trades two windows without moving a tile or unstacking
+  the container it lands in, that it is its own inverse, that a band drop
+  keeps its container's axis whichever that is, that a drop across the axis
+  MAKES the column a row did not have, and that a stack takes that same drop
+  into its run instead while the unstacked column still builds the row;
 - parsed key chords and complete pointer frames cross the evdev adapter into
   a recording target, while the runtime integration test proves a layout
   command repaints a file-backed framebuffer;

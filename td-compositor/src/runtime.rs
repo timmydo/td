@@ -1504,6 +1504,235 @@ mod tests {
     }
 
     #[test]
+    fn a_drag_released_over_a_middle_trades_the_two_windows() {
+        // The gesture end to end, in the frames it arrives in: press a band,
+        // move to the MIDDLE of another window, release. What the operator
+        // sees before letting go is the trade already made, and the release
+        // keeps it.
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-drop-swap-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let height = 600;
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, height, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let keys: Vec<SurfaceKey> = (1..=3)
+            .map(|object| SurfaceKey { client: 1, object })
+            .collect();
+        runtime
+            .commit(*keys.first().unwrap(), surface([1, 2, 3, 0]))
+            .unwrap();
+        runtime
+            .commit(*keys.get(1).unwrap(), surface([4, 5, 6, 0]))
+            .unwrap();
+        runtime.command(Command::SetSplit(Axis::Vertical)).unwrap();
+        runtime
+            .commit(*keys.get(2).unwrap(), surface([7, 8, 9, 0]))
+            .unwrap();
+        let order = |runtime: &Runtime| {
+            runtime
+                .scene
+                .tiled_placements(240, height)
+                .iter()
+                .map(|placement| placement.key.object)
+                .collect::<Vec<_>>()
+        };
+        let geometry = |runtime: &Runtime| {
+            runtime
+                .scene
+                .tiled_placements(240, height)
+                .iter()
+                .map(|placement| placement.rect)
+                .collect::<Vec<_>>()
+        };
+        // `H[1, V[2, 3]]`: the pair being traded are in different containers,
+        // so a swap that went through a detach would destroy one of them.
+        assert_eq!(order(&runtime), [1, 2, 3]);
+        let settled = geometry(&runtime);
+        let goto = |runtime: &mut Runtime, x: usize, y: usize, buttons: &[PointerButtonInput]| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            let (dx, dy) = (
+                i32::try_from(x).unwrap() - at_x,
+                i32::try_from(y).unwrap() - at_y,
+            );
+            runtime.pointer_frame(1, dx, dy, buttons).unwrap();
+        };
+        let press = |time| PointerButtonInput {
+            time,
+            button: 272,
+            state: PointerButtonState::Pressed,
+        };
+        let release = |time| PointerButtonInput {
+            time,
+            button: 272,
+            state: PointerButtonState::Released,
+        };
+
+        let handle = {
+            let placements = runtime.scene.tiled_placements(240, height);
+            let at = placements
+                .iter()
+                .position(|placement| placement.key.object == 1)
+                .unwrap();
+            placements.get(at).unwrap().band
+        };
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(2)]);
+
+        // The middle of 3's tile, read off the AIM geometry: the drop is
+        // computed against the arrangement with 1 taken out, where that tile
+        // is somewhere else than the one on screen.
+        let onto = {
+            let placements = runtime
+                .scene
+                .aim_placements(*keys.first().unwrap(), 240, height);
+            let at = placements
+                .iter()
+                .position(|placement| placement.key.object == 3)
+                .unwrap();
+            placements.get(at).unwrap().rect
+        };
+        goto(
+            &mut runtime,
+            onto.x + onto.width / 2,
+            onto.y + onto.height / 2,
+            &[],
+        );
+        // Shown BEFORE the release, which is what the preview promises.
+        assert_eq!(order(&runtime), [3, 2, 1], "the trade was not previewed");
+        assert_eq!(
+            geometry(&runtime),
+            settled,
+            "a swap moved the tiles instead of what is in them"
+        );
+
+        let previewed = order(&runtime);
+        goto(
+            &mut runtime,
+            onto.x + onto.width / 2,
+            onto.y + onto.height / 2,
+            &[release(3)],
+        );
+        assert_eq!(order(&runtime), previewed);
+        assert_eq!(geometry(&runtime), settled);
+        assert_eq!(
+            runtime.keyboard_snapshot().focus,
+            keys.first().copied(),
+            "the window that was dragged is the one focused"
+        );
+        runtime.scene.layout().check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_band_dragged_inside_a_stack_reorders_it_and_leaves_it_stacked() {
+        // The seam a scene test cannot reach on its own. A band drop reads
+        // its half along the run the band is PART of, and a stack's bands run
+        // downward whatever its container does — but the geometry the drop is
+        // AIMED at has the dragged window taken out, and taking one out of a
+        // stacked pair collapses the stack entirely. So the run has to be read
+        // from the tree the drop LANDS in, and only a whole gesture puts the
+        // two geometries on either side of the same question.
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-stack-drag-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let height = 600;
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, height, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let keys: Vec<SurfaceKey> = (1..=3)
+            .map(|object| SurfaceKey { client: 1, object })
+            .collect();
+        runtime
+            .commit(*keys.first().unwrap(), surface([1, 2, 3, 0]))
+            .unwrap();
+        runtime
+            .commit(*keys.get(1).unwrap(), surface([4, 5, 6, 0]))
+            .unwrap();
+        runtime.command(Command::SetSplit(Axis::Vertical)).unwrap();
+        runtime
+            .commit(*keys.get(2).unwrap(), surface([7, 8, 9, 0]))
+            .unwrap();
+        runtime.command(Command::ToggleStacked).unwrap();
+        // `H[1, V{stacked}[2, 3]]`: a window beside a stacked pair.
+        let placements = |runtime: &Runtime| runtime.scene.tiled_placements(240, height);
+        let order = |runtime: &Runtime| {
+            placements(runtime)
+                .iter()
+                .map(|placement| placement.key.object)
+                .collect::<Vec<_>>()
+        };
+        let stacked = |runtime: &Runtime| {
+            placements(runtime)
+                .iter()
+                .filter(|placement| placement.stacked)
+                .count()
+        };
+        assert_eq!(order(&runtime), [1, 2, 3]);
+        assert_eq!(stacked(&runtime), 2, "the pair did not stack");
+
+        let band_of = |runtime: &Runtime, object: u32| {
+            let list = placements(runtime);
+            let at = list
+                .iter()
+                .position(|placement| placement.key.object == object)
+                .unwrap();
+            list.get(at).unwrap().band
+        };
+        let aim_band = |runtime: &Runtime, dragged: SurfaceKey, object: u32| {
+            let list = runtime.scene.aim_placements(dragged, 240, height);
+            let at = list
+                .iter()
+                .position(|placement| placement.key.object == object)
+                .unwrap();
+            list.get(at).unwrap().band
+        };
+        let press = |time| PointerButtonInput {
+            time,
+            button: 272,
+            state: PointerButtonState::Pressed,
+        };
+        let release = |time| PointerButtonInput {
+            time,
+            button: 272,
+            state: PointerButtonState::Released,
+        };
+        let goto = |runtime: &mut Runtime, x: usize, y: usize, buttons: &[PointerButtonInput]| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            let (dx, dy) = (
+                i32::try_from(x).unwrap() - at_x,
+                i32::try_from(y).unwrap() - at_y,
+            );
+            runtime.pointer_frame(1, dx, dy, buttons).unwrap()
+        };
+
+        // Pick 3 up by its own band — the second in the run — and drop it on
+        // 2's, whose aim geometry is the whole top strip of the right-hand
+        // tile because the stack collapsed when 3 came out of it.
+        let handle = band_of(&runtime, 3);
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(2)]);
+        let target = aim_band(&runtime, *keys.get(2).unwrap(), 2);
+        // The right-hand quarter of that band and the TOP of it, so the two
+        // halves disagree: a run read as the collapsed aim tree's ROW answers
+        // "after" where the stack it actually lands in answers "before".
+        goto(
+            &mut runtime,
+            target.x + target.width * 3 / 4,
+            target.y + 2,
+            &[release(3)],
+        );
+        assert_eq!(
+            order(&runtime),
+            [1, 3, 2],
+            "the band drop did not reorder the stack"
+        );
+        assert_eq!(stacked(&runtime), 2, "the drop unstacked the pair");
+        runtime.scene.layout().check_invariants().unwrap();
+    }
+
+    #[test]
     fn dragging_a_title_band_drops_the_window_beside_where_it_was_released() {
         let path = std::env::temp_dir().join(format!(
             "td-runtime-band-drag-{}-{}",
@@ -1564,6 +1793,18 @@ mod tests {
                 .unwrap();
             *placements.get(at).unwrap()
         };
+        // The tile a drop is AIMED at, which is not the one on screen: the
+        // dragged window is taken out of the arrangement first, so the rest
+        // are bigger and elsewhere. A point picked off the screen asks a
+        // different question than the drag does.
+        let aim = |runtime: &Runtime, dragged: SurfaceKey, object: u32| {
+            let placements = runtime.scene.aim_placements(dragged, 240, height);
+            let at = placements
+                .iter()
+                .position(|placement| placement.key.object == object)
+                .unwrap();
+            *placements.get(at).unwrap()
+        };
         let press = |time| PointerButtonInput {
             time,
             button: 272,
@@ -1583,7 +1824,11 @@ mod tests {
             runtime.pointer_frame(1, dx, dy, buttons).unwrap()
         };
 
-        // Pick 1 up by its band and drop it on the TOP half of 3's client.
+        // Pick 1 up by its band and drop it on the TOP THIRD of 3's tile.
+        // Horizontally CENTRED, so the top is the nearest edge by half a tile
+        // rather than by the couple of pixels an inset corner would leave —
+        // the zone is decided by proportion, and a corner is a coin toss the
+        // tile's own shape settles.
         let handle = band(&runtime, 1).band;
         goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(2)]);
         assert_eq!(runtime.keyboard_snapshot().focus, keys.first().copied());
@@ -1591,8 +1836,13 @@ mod tests {
         // focus publishes a layout of its own, so a snapshot from before it
         // would be moved by the press rather than by the drop.
         let published = runtime.layout_snapshot();
-        let target = band(&runtime, 3).rect;
-        goto(&mut runtime, target.x + 2, target.y + 2, &[release(3)]);
+        let target = aim(&runtime, *keys.first().unwrap(), 3).rect;
+        goto(
+            &mut runtime,
+            target.x + target.width / 2,
+            target.y + 2,
+            &[release(3)],
+        );
         assert_eq!(order(&runtime), [2, 1, 3], "the drop did not land above 3");
         assert!(clients_are_real(&runtime));
         // A drop that rearranges the tree owes the CLIENTS a round of
@@ -1606,14 +1856,14 @@ mod tests {
         );
         runtime.scene.layout().check_invariants().unwrap();
 
-        // Bottom half of the same window puts it below instead.
+        // The BOTTOM third of the same tile puts it below instead.
         let handle = band(&runtime, 1).band;
         goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(4)]);
-        let target = band(&runtime, 3).rect;
+        let target = aim(&runtime, *keys.first().unwrap(), 3).rect;
         goto(
             &mut runtime,
-            target.x + 2,
-            target.y + target.height - 2,
+            target.x + target.width / 2,
+            target.y + target.height - 3,
             &[release(5)],
         );
         assert_eq!(order(&runtime), [2, 3, 1], "the drop did not land below 3");
@@ -1830,6 +2080,19 @@ mod tests {
                 .unwrap();
             *placements.get(at).unwrap()
         };
+        // The tile a drop is AIMED at rather than the one drawn. Every point
+        // below that asserts WHERE a drop landed comes from here; the ones
+        // that only assert that SOMETHING was previewed may use the screen,
+        // since a screen point falling in the dead zone previews nothing and
+        // their own assertion is what catches it.
+        let aim = |runtime: &Runtime, dragged: SurfaceKey, object: u32| {
+            let placements = runtime.scene.aim_placements(dragged, 240, height);
+            let at = placements
+                .iter()
+                .position(|placement| placement.key.object == object)
+                .unwrap();
+            *placements.get(at).unwrap()
+        };
         let goto = |runtime: &mut Runtime, x: usize, y: usize, buttons: &[PointerButtonInput]| {
             let (at_x, at_y) = runtime.scene.pointer_at();
             let (dx, dy) = (
@@ -1869,13 +2132,12 @@ mod tests {
         let picked_up = runtime.layout_snapshot();
 
         // The motion frame, with the button still down and no release in it.
-        let target = band(&runtime, 3).rect;
-        goto(
-            &mut runtime,
-            target.x + 2,
-            target.y + target.height - 2,
-            &[],
-        );
+        // The bottom third of 3's AIM tile, horizontally centred so the
+        // nearest edge is the bottom by half a tile rather than by the two
+        // pixels an inset corner leaves.
+        let target = aim(&runtime, *keys.first().unwrap(), 3).rect;
+        let aimed = (target.x + target.width / 2, target.y + target.height - 3);
+        goto(&mut runtime, aimed.0, aimed.1, &[]);
         assert_eq!(
             order(&runtime),
             [2, 3, 1],
@@ -1900,12 +2162,7 @@ mod tests {
         // no round of configures — and the map published to clients must come
         // out byte-identical, which a release that recomputed the drop could
         // not promise.
-        goto(
-            &mut runtime,
-            target.x + 2,
-            target.y + target.height - 2,
-            &[release(3)],
-        );
+        goto(&mut runtime, aimed.0, aimed.1, &[release(3)]);
         assert_eq!(
             tiles(&runtime),
             previewed,
@@ -1942,15 +2199,40 @@ mod tests {
         let dragged = *start.first().unwrap();
         let handle = band(&runtime, dragged).band;
         goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(6)]);
-        // The BOTTOM half of the topmost band, so the drop lands after it and
-        // the order comes out different from the one it started in.
-        let onto = band(&runtime, *start.get(1).unwrap()).band;
-        goto(
-            &mut runtime,
-            onto.x + 2,
-            onto.y + onto.height - 2,
-            &[release(7), press(8)],
+        // The BOTTOM of the next window's tile, so the drop lands under it
+        // and the order comes out different from the one it started in.
+        //
+        // Read off the AIM geometry rather than the screen: the drop is
+        // computed against the arrangement with the dragged window taken out,
+        // where that tile is bigger and higher up than the one being drawn.
+        // The two must be reconciled by hand here, because the near end of
+        // that tile is over the DRAGGED window's own on screen, and that is
+        // the dead zone a press alone must not move anything through.
+        let onto = {
+            let dragging = runtime.dragging.as_ref().map(|drag| drag.key).unwrap();
+            let placements = runtime.scene.aim_placements(dragging, 240, height);
+            let at = placements
+                .iter()
+                .position(|placement| placement.key.object == *start.get(1).unwrap())
+                .unwrap();
+            placements.get(at).unwrap().rect
+        };
+        //
+        // Both halves of the frame want something from that one point: the
+        // release needs a drop that MOVES something, and the press needs a
+        // BAND to pick the next window up by — in the arrangement the release
+        // just committed, which is a third geometry again. The first is
+        // asserted here and the second by `dragging` below.
+        let aim = (
+            onto.x + onto.width / 2,
+            onto.y + onto.height.saturating_mul(3) / 4,
         );
+        let own = band(&runtime, dragged).rect;
+        assert!(
+            aim.1 > own.y.saturating_add(own.height),
+            "the aim point is inside the dragged window's own tile"
+        );
+        goto(&mut runtime, aim.0, aim.1, &[release(7), press(8)]);
         assert_eq!(
             order(&runtime),
             [*start.get(1).unwrap(), dragged, *start.get(2).unwrap()],

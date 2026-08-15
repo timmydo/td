@@ -1,7 +1,7 @@
 use crate::bar::{self, BAR_HEIGHT};
 use crate::help::Help;
 use crate::launcher::{LaunchRequest, Launcher, LauncherAction};
-use crate::layout::{Axis, Command, Layout, Placement, Rect, ViewLayout};
+use crate::layout::{Axis, Command, DropKind, Layout, Placement, Rect, ViewLayout};
 use crate::ui;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -140,6 +140,75 @@ fn tile_at(placements: &[Placement], x: usize, y: usize) -> Option<usize> {
     placements.iter().position(|placement| {
         contains(placement.band, x, y) || (placement.visible && contains(placement.rect, x, y))
     })
+}
+
+/// A tile's five zones. The middle NINTH is the swap, and outside it the
+/// nearest edge picks the side — so every point in the tile answers, and the
+/// answer changes only at a boundary rather than at a distance from one.
+///
+/// A ninth rather than a half-sized centre because the edges are what the
+/// operator aims at: a drop that means "put it below this" wants most of the
+/// bottom of the tile to say so, and a swap is the one gesture with a
+/// deliberate target to hit. Ties go to the earlier edge in the order left,
+/// right, top, bottom. Distances are scaled by the tile's own size, so the
+/// tie locus is that tile's DIAGONALS whatever its proportions rather than a
+/// square one's, and a tie has to go somewhere.
+///
+/// Degenerate tiles answer `Swap`: a rect with no width or height has no
+/// edges to be nearer one of, and a swap is the drop that needs no room.
+fn zone_of(rect: Rect, x: usize, y: usize) -> DropKind {
+    if rect.width == 0 || rect.height == 0 {
+        return DropKind::Swap;
+    }
+    // Thirds by multiplication rather than division, so a tile whose width is
+    // not divisible by three still splits at the same two boundaries the
+    // comparisons below use.
+    let dx = x.saturating_sub(rect.x);
+    let dy = y.saturating_sub(rect.y);
+    let left = dx.saturating_mul(3) < rect.width;
+    let right = dx.saturating_mul(3) >= rect.width.saturating_mul(2);
+    let top = dy.saturating_mul(3) < rect.height;
+    let bottom = dy.saturating_mul(3) >= rect.height.saturating_mul(2);
+    if !left && !right && !top && !bottom {
+        return DropKind::Swap;
+    }
+    // Scaled to the tile's own size before comparing, or the nearest edge of
+    // a wide short tile would always be one of the tall pair.
+    let to_left = dx.saturating_mul(rect.height);
+    let to_right = rect
+        .width
+        .saturating_sub(1)
+        .saturating_sub(dx.min(rect.width.saturating_sub(1)))
+        .saturating_mul(rect.height);
+    let to_top = dy.saturating_mul(rect.width);
+    let to_bottom = rect
+        .height
+        .saturating_sub(1)
+        .saturating_sub(dy.min(rect.height.saturating_sub(1)))
+        .saturating_mul(rect.width);
+    let nearest = to_left.min(to_right).min(to_top).min(to_bottom);
+    if to_left == nearest {
+        return DropKind::Beside {
+            axis: Axis::Horizontal,
+            before: true,
+        };
+    }
+    if to_right == nearest {
+        return DropKind::Beside {
+            axis: Axis::Horizontal,
+            before: false,
+        };
+    }
+    if to_top == nearest {
+        return DropKind::Beside {
+            axis: Axis::Vertical,
+            before: true,
+        };
+    }
+    DropKind::Beside {
+        axis: Axis::Vertical,
+        before: false,
+    }
 }
 
 fn frame_rect(placement: &Placement) -> Rect {
@@ -503,10 +572,9 @@ impl Scene {
         // Read out of `layout` rather than the preview, so the dead zone is
         // fixed for the whole gesture.
         if !self.pointer_on_dragged(dragged, width, height) {
-            let mut base = self.layout.clone();
-            base.unmap(dragged);
-            if let Some((target, before)) = self.drop_target_in(&base, width, height) {
-                preview.drop_beside(dragged, target, before);
+            let base = self.aim_layout(dragged);
+            if let Some((target, drop)) = self.drop_target_in(&base, width, height) {
+                preview.drop_onto(dragged, target, drop);
             }
         }
         let changed = self.arrangement() != &preview;
@@ -598,17 +666,36 @@ impl Scene {
         Some(placements.get(index)?.key)
     }
 
-    /// Where a drop lands: the window under the pointer, and whether the
-    /// pointer is in the FIRST half of it. Measured along the target's own
-    /// container — top-to-bottom in a column, left-to-right in a row — since
-    /// that is the direction the two neighbours actually lie in.
-    ///
-    /// Within whichever rectangle the pointer is in rather than over the tile
-    /// as a whole, because in a stack a leaf's band and its client area are
-    /// far apart and a midpoint between them is in neither.
+    /// Where a drop lands: the window under the pointer, and what landing
+    /// there means.
     #[cfg(test)]
-    fn drop_target(&self, width: usize, height: usize) -> Option<(SurfaceKey, bool)> {
+    fn drop_target(&self, width: usize, height: usize) -> Option<(SurfaceKey, DropKind)> {
         self.drop_target_in(self.arrangement(), width, height)
+    }
+
+    /// The arrangement a drop is AIMED at: the layout with the dragged window
+    /// taken OUT. One derivation for the drag and for the tests that pick
+    /// points out of it, or the geometry a test aims into drifts from the
+    /// geometry the drag measures and neither says so.
+    fn aim_layout(&self, dragged: SurfaceKey) -> Layout {
+        let mut base = self.layout.clone();
+        base.unmap(dragged);
+        base
+    }
+
+    /// The geometry a drag's drop is AIMED at, which is not the geometry on
+    /// screen: the dragged window is taken out of it, so its tiles are bigger
+    /// and in different places than the ones being drawn. A test that picks
+    /// an aim point off the screen is asking a different question than the
+    /// drag does, and got away with it only while a tile had two zones.
+    #[cfg(test)]
+    pub(crate) fn aim_placements(
+        &self,
+        dragged: SurfaceKey,
+        width: usize,
+        height: usize,
+    ) -> Vec<Placement> {
+        self.placements_of(&self.aim_layout(dragged), width, height)
     }
 
     /// Where a drop aimed at `layout` would land. A drag passes the
@@ -616,34 +703,50 @@ impl Scene {
     /// whole gesture: aiming at what is on screen instead would let the
     /// preview re-flow the very tile the pointer is over, so moving toward a
     /// slot could push that slot away.
+    ///
+    /// A tile has FIVE zones. Over the middle the two windows trade places;
+    /// over an edge the dragged one lands on that side, in a column for the
+    /// top and bottom edges and in a row for the left and right — whatever
+    /// the target's own container runs as, since the drop names its axis and
+    /// `insert_beside` makes the container it needs. Inside a STACK it does
+    /// not: that container presents a list, so `insert_beside` puts the leaf
+    /// in the list rather than building a container the stack would not draw.
+    ///
+    /// A title BAND is the exception and keeps two zones along the run it is
+    /// part of. Five will not fit in a strip a line of text tall, and the run
+    /// is a list rather than an area: the only thing a drop onto one can
+    /// sensibly mean is a position in it.
+    ///
+    /// `layout` is only HALF the input, which the band branch below makes
+    /// unavoidable: the geometry comes from the argument and the run's
+    /// direction from `self.layout`, because the two questions are asked of
+    /// different trees on purpose. So this is not a pure function of what it
+    /// is passed, and passing an arrangement that is not the aim one — the
+    /// live PREVIEW, say — mixes two answers rather than asking a third.
     pub fn drop_target_in(
         &self,
         layout: &Layout,
         width: usize,
         height: usize,
-    ) -> Option<(SurfaceKey, bool)> {
+    ) -> Option<(SurfaceKey, DropKind)> {
         let placements = self.placements_of(layout, width, height);
         let (x, y) = self.pointer_at_usize()?;
         let placement = placements.get(tile_at(&placements, x, y)?)?;
-        let zone = if contains(placement.band, x, y) {
-            placement.band
-        } else {
-            placement.rect
-        };
-        let before = if placement.stacked {
-            // A stack runs its bands DOWN the container's top whatever axis
-            // the container itself has, so the neighbours a drop lands between
-            // are above and below even when the container is a row.
-            y < zone.y.saturating_add(zone.height / 2)
-        } else {
-            match layout.parent_axis(placement.key) {
-                Some(Axis::Horizontal) => x < zone.x.saturating_add(zone.width / 2),
-                // `None` is a lone window, which cannot be a drop target: the
-                // only thing that could be dropped on it is itself.
-                Some(Axis::Vertical) | None => y < zone.y.saturating_add(zone.height / 2),
-            }
-        };
-        Some((placement.key, before))
+        if contains(placement.band, x, y) {
+            let band = placement.band;
+            // Asked of the tree the drop will be APPLIED to rather than of
+            // `layout`, which is the aim geometry with the dragged window
+            // taken out: a container of two collapses there and answers
+            // nothing, and a stack that collapses answers as its own axis
+            // rather than as a run. Both would read the half along the wrong
+            // side of the band.
+            let before = match self.layout.run_direction(placement.key) {
+                Some(Axis::Horizontal) => x < band.x.saturating_add(band.width / 2),
+                Some(Axis::Vertical) | None => y < band.y.saturating_add(band.height / 2),
+            };
+            return Some((placement.key, DropKind::InRun { before }));
+        }
+        Some((placement.key, zone_of(placement.rect, x, y)))
     }
 
     fn pointer_target_from(&self, placements: &[Placement]) -> Option<SurfacePoint> {
@@ -1523,10 +1626,174 @@ mod tests {
     }
 
     #[test]
-    fn a_drop_reads_its_half_along_the_targets_own_container() {
-        // A row of two and a column of two, so both axes are present in one
-        // arrangement: `H[1, V[2, 3]]`. 1's neighbours lie left-and-right, so
-        // its halves are left and right; 2's lie above and below.
+    fn the_five_zones_of_a_tile_answer_swap_and_the_four_sides() {
+        // A tile at an offset, so a zone read from the point's ABSOLUTE
+        // coordinates rather than its position within the rect is caught.
+        let rect = Rect {
+            x: 10,
+            y: 10,
+            width: 90,
+            height: 90,
+        };
+        let left = DropKind::Beside {
+            axis: Axis::Horizontal,
+            before: true,
+        };
+        let right = DropKind::Beside {
+            axis: Axis::Horizontal,
+            before: false,
+        };
+        let above = DropKind::Beside {
+            axis: Axis::Vertical,
+            before: true,
+        };
+        let below = DropKind::Beside {
+            axis: Axis::Vertical,
+            before: false,
+        };
+        for (x, y, expected) in [
+            (55, 55, DropKind::Swap),
+            (40, 40, DropKind::Swap),
+            (69, 69, DropKind::Swap),
+            (55, 12, above),
+            (55, 98, below),
+            (12, 55, left),
+            (98, 55, right),
+            // The middle NINTH, so a point just outside it is a side even
+            // though it is nowhere near an edge.
+            (55, 39, above),
+            (55, 70, below),
+            (39, 55, left),
+            (70, 55, right),
+        ] {
+            assert_eq!(zone_of(rect, x, y), expected, "at {x},{y}");
+        }
+
+        // Every point in the tile answers, and every zone is REACHABLE — a
+        // sweep of the whole rect finds all five. Not that it finds nothing
+        // else: `DropKind` has five inhabitants and a sixth is not
+        // expressible, so the count is the reachability claim alone.
+        let mut seen = Vec::new();
+        for y in rect.y..rect.y + rect.height {
+            for x in rect.x..rect.x + rect.width {
+                let zone = zone_of(rect, x, y);
+                if !seen.contains(&zone) {
+                    seen.push(zone);
+                }
+            }
+        }
+        assert_eq!(seen.len(), 5, "{seen:?}");
+
+        // The nearest edge is judged in PROPORTION to the tile, or a wide
+        // short one would answer top or bottom almost everywhere: this point
+        // is 5 pixels from the left of 300 and 1 from the top of 30, which is
+        // nearer the left as a fraction and nearer the top in pixels.
+        let wide = Rect {
+            x: 0,
+            y: 0,
+            width: 300,
+            height: 30,
+        };
+        assert_eq!(zone_of(wide, 5, 1), left);
+        // And the other way: 30 of 300 across is a tenth, 1 of 30 down is a
+        // thirtieth, so this one really is nearest the top.
+        assert_eq!(zone_of(wide, 30, 1), above);
+
+        // A TALL narrow tile, where the same rule bites the other way round —
+        // the pair that pixels favour here is left and right, and proportion
+        // has to overrule them. Two of 30 across is a fifteenth, five of 300
+        // down is a sixtieth: nearer the top as a fraction, nearer the left
+        // in pixels.
+        let tall = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 300,
+        };
+        assert_eq!(zone_of(tall, 2, 5), above);
+        assert_eq!(zone_of(tall, 1, 40), left);
+
+        // A tile with no area has no edges to be nearer one of, and a swap is
+        // the drop that needs no room.
+        for degenerate in [
+            Rect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 10,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 0,
+            },
+        ] {
+            assert_eq!(zone_of(degenerate, 0, 0), DropKind::Swap);
+        }
+    }
+
+    #[test]
+    fn a_bands_half_is_read_where_the_drop_lands_not_where_it_aims() {
+        // The two geometries a drag has in play disagree about more than
+        // pixels. A ROW of two: take one out and the row is gone, so the aim
+        // tree says the target is in no container at all and its band would
+        // be halved top-to-bottom — down a strip twenty pixels tall, where
+        // one side of the row can never be asked for. The tree the drop
+        // LANDS in still has the row, and that is the one to ask.
+        let mut scene = Scene::new();
+        for object in 1..=2 {
+            scene
+                .commit(
+                    SurfaceKey { client: 1, object },
+                    surface([1, 1, 1, 0], 8, 8),
+                )
+                .unwrap();
+        }
+        let (width, height) = (240, 600);
+        let key = |object| SurfaceKey { client: 1, object };
+        assert_eq!(scene.layout.run_direction(key(2)), Some(Axis::Horizontal));
+        let mut base = scene.layout.clone();
+        base.unmap(key(1));
+        assert_eq!(base.run_direction(key(2)), None, "the row survived");
+
+        // The band as the AIM geometry has it, which is where the pointer is
+        // hit-tested — the whole width, not the right half it is drawn as.
+        let band = {
+            let placements = scene.placements_of(&base, width, height);
+            let at = placements
+                .iter()
+                .position(|placement| placement.key == key(2))
+                .unwrap();
+            placements.get(at).unwrap().band
+        };
+
+        // Left of the band and BELOW its middle, so the two readings give
+        // opposite answers and only one of them can be right.
+        //
+        // The LEFT point is asked of this function alone: in a real gesture
+        // it lies inside the dragged window's own tile on screen, which the
+        // dead zone refuses. That is the cost recorded in DESIGN.md — the
+        // half "before this neighbour" is unreachable — and it is why the
+        // half has to be pinned here rather than through a whole drag.
+        for (x, before) in [
+            (band.x + 1, true),
+            (band.x + band.width.saturating_sub(2), false),
+        ] {
+            scene.pointer_x = i32::try_from(x).unwrap();
+            scene.pointer_y = i32::try_from(band.y + band.height - 1).unwrap();
+            assert_eq!(
+                scene.drop_target_in(&base, width, height),
+                Some((key(2), DropKind::InRun { before })),
+                "band at x={x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_drop_reads_five_zones_in_a_tile_and_two_along_a_band() {
+        // A row of two and a column of two in one arrangement:
+        // `H[1, V[2, 3]]`.
         let mut scene = Scene::new();
         for object in 1..=2 {
             scene
@@ -1551,8 +1818,7 @@ mod tests {
         // the client comes out shorter than its own band — which makes a tile
         // and its band nearly the same rectangle, so a drop measured over the
         // whole tile agrees with one measured over the band and the two stop
-        // being distinguishable. The same rot as the runtime test's, one
-        // commit later, so it is guarded here as well.
+        // being distinguishable.
         let (width, height) = (240, 600);
         let placements = scene.tiled_placements(width, height);
         assert!(
@@ -1568,108 +1834,122 @@ mod tests {
                 .unwrap();
             *placements.get(index).unwrap()
         };
-
-        // 1 sits in the ROW, so its halves run left to right and its vertical
-        // midpoint decides nothing.
-        let row = at(1).rect;
-        for (x, y, before) in [
-            (row.x + 1, row.y + 1, true),
-            (row.x + row.width - 2, row.y + 1, false),
-            (row.x + 1, row.y + row.height - 2, true),
-        ] {
+        let key = |object| SurfaceKey { client: 1, object };
+        let go = |scene: &mut Scene, x: usize, y: usize| {
             scene.pointer_x = i32::try_from(x).unwrap();
             scene.pointer_y = i32::try_from(y).unwrap();
-            assert_eq!(
-                scene.drop_target(width, height),
-                Some((
-                    SurfaceKey {
-                        client: 1,
-                        object: 1
-                    },
-                    before
-                )),
-                "row at {x},{y}"
-            );
-        }
+        };
 
-        // 2 sits in the COLUMN, so its halves run top to bottom.
-        let column = at(2).rect;
-        for (x, y, before) in [
-            (column.x + 1, column.y + 1, true),
-            (column.x + 1, column.y + column.height - 2, false),
-            (column.x + column.width - 2, column.y + 1, true),
-        ] {
-            scene.pointer_x = i32::try_from(x).unwrap();
-            scene.pointer_y = i32::try_from(y).unwrap();
-            assert_eq!(
-                scene.drop_target(width, height),
-                Some((
-                    SurfaceKey {
-                        client: 1,
-                        object: 2
-                    },
-                    before
-                )),
-                "column at {x},{y}"
-            );
-        }
-
-        // A BAND is a drop zone too, and its own halves, so a stacked leaf
-        // whose client is nowhere near its band can still be dropped onto.
-        let band = at(2).band;
-        scene.pointer_x = i32::try_from(band.x + 1).unwrap();
-        scene.pointer_y = i32::try_from(band.y + 1).unwrap();
-        assert_eq!(
-            scene.drop_target(width, height),
-            Some((
-                SurfaceKey {
-                    client: 1,
-                    object: 2
+        // The tile's own five zones reach the layout unchanged, and they do
+        // NOT depend on the target's container: 1 sits in the ROW and still
+        // answers above and below, which is the whole of what this commit
+        // adds — a drop that makes the column it needs.
+        let tile = at(1).rect;
+        let middle = (tile.x + tile.width / 2, tile.y + tile.height / 2);
+        for (x, y, expected) in [
+            (middle.0, middle.1, DropKind::Swap),
+            (
+                middle.0,
+                tile.y + 1,
+                DropKind::Beside {
+                    axis: Axis::Vertical,
+                    before: true,
                 },
-                true
-            ))
-        );
-        assert_eq!(
-            scene.band_at_pointer(width, height),
-            Some(SurfaceKey {
-                client: 1,
-                object: 2
-            })
-        );
+            ),
+            (
+                middle.0,
+                tile.y + tile.height - 2,
+                DropKind::Beside {
+                    axis: Axis::Vertical,
+                    before: false,
+                },
+            ),
+            (
+                tile.x + 1,
+                middle.1,
+                DropKind::Beside {
+                    axis: Axis::Horizontal,
+                    before: true,
+                },
+            ),
+            (
+                tile.x + tile.width - 2,
+                middle.1,
+                DropKind::Beside {
+                    axis: Axis::Horizontal,
+                    before: false,
+                },
+            ),
+        ] {
+            go(&mut scene, x, y);
+            assert_eq!(
+                scene.drop_target(width, height),
+                Some((key(1), expected)),
+                "tile at {x},{y}"
+            );
+        }
 
-        // A stacked leaf's CONTENT area is a drop zone too, and only for the
-        // leaf that is shown: the others' rectangles cover the very same
-        // pixels, so without that guard a hidden one would claim them.
-        // (Set up below, where the stack exists.)
+        // A BAND keeps TWO zones along the run it is part of, because a strip
+        // a line of text tall has no room for five and a run is a list rather
+        // than an area. It names no axis at all — a place in the target's own
+        // container, whatever that is.
+        //
+        // 2 sits in the COLUMN, so its band's run goes top to bottom and its
+        // own top and bottom halves decide; its left and right do not.
+        let band = at(2).band;
+        for (x, y, before) in [
+            (band.x + band.width / 2, band.y + 1, true),
+            (band.x + band.width / 2, band.y + band.height - 1, false),
+            (band.x + 1, band.y + 1, true),
+            (band.x + band.width - 2, band.y + 1, true),
+        ] {
+            go(&mut scene, x, y);
+            assert_eq!(
+                scene.drop_target(width, height),
+                Some((key(2), DropKind::InRun { before })),
+                "column band at {x},{y}"
+            );
+        }
+
+        // 1 sits in the ROW, where each leaf carries its own band at the top
+        // of its own tile — so that run goes LEFT TO RIGHT and the half is
+        // read across. Reading a band's height for this would make one side
+        // of a row unreachable, every point in a 20-pixel strip answering the
+        // same way.
+        let row_band = at(1).band;
+        for (x, before) in [
+            (row_band.x + 1, true),
+            (row_band.x + row_band.width - 2, false),
+        ] {
+            go(&mut scene, x, row_band.y + 1);
+            assert_eq!(
+                scene.drop_target(width, height),
+                Some((key(1), DropKind::InRun { before })),
+                "row band at x={x}"
+            );
+        }
 
         // A STACKED row: its bands run DOWN the container's top even though
-        // the container itself is horizontal, so the neighbours a drop lands
-        // between are above and below and the half must be read that way.
-        // Reading the container's own axis here would ask for a left-or-right
-        // gesture against a run that goes up and down.
+        // the container itself is horizontal, so the half is read that way.
         scene.command(Command::Focus(crate::layout::Direction::Left));
         scene.command(Command::ToggleStacked);
         let stacked = scene.tiled_placements(width, height);
         assert!(stacked.iter().all(|placement| placement.stacked));
         let run = stacked.first().unwrap().band;
         for (y, before) in [(run.y + 1, true), (run.y + run.height - 1, false)] {
-            scene.pointer_x = i32::try_from(run.x + run.width - 2).unwrap();
-            scene.pointer_y = i32::try_from(y).unwrap();
+            go(&mut scene, run.x + run.width - 2, y);
             assert_eq!(
-                scene.drop_target(width, height).map(|(_, before)| before),
-                Some(before),
+                scene.drop_target(width, height),
+                Some((key(1), DropKind::InRun { before })),
                 "stacked band at y={y}"
             );
         }
 
-        // The band and the CONTENT area of a stacked leaf are far apart, and
-        // the half is read within whichever the pointer is in — so a band's
-        // own top and bottom decide, and the content area's own do too rather
-        // than both answering from one rectangle spanning the pair.
-        // The shown leaf must NOT be the first, or a hit test that ignored
-        // visibility would match the hidden one at the same rectangle and
-        // agree with this anyway — the stack's leaves all share one content
-        // area, so `position` returning the first is the whole hazard.
+        // A stacked leaf's CONTENT area is a drop zone too, with the tile's
+        // five, and only for the leaf that is SHOWN: the others' rectangles
+        // cover the very same pixels, so without that guard a hidden one
+        // would claim them. The shown leaf must not be the first, or a hit
+        // test that ignored visibility would agree with this anyway.
         scene.command(Command::Focus(crate::layout::Direction::Right));
         let stacked = scene.tiled_placements(width, height);
         let shown = stacked
@@ -1677,24 +1957,36 @@ mod tests {
             .position(|placement| placement.visible)
             .unwrap();
         assert!(shown > 0, "the shown leaf is first, so this proves nothing");
+        let shown_key = stacked.get(shown).unwrap().key;
         let content = stacked.get(shown).unwrap().rect;
         assert!(content.height > 0);
-        for (y, before) in [
-            (content.y + 1, true),
-            (content.y + content.height - 2, false),
+        for (y, expected) in [
+            (
+                content.y + 1,
+                DropKind::Beside {
+                    axis: Axis::Vertical,
+                    before: true,
+                },
+            ),
+            (content.y + content.height / 2, DropKind::Swap),
+            (
+                content.y + content.height - 2,
+                DropKind::Beside {
+                    axis: Axis::Vertical,
+                    before: false,
+                },
+            ),
         ] {
-            scene.pointer_x = i32::try_from(content.x + 2).unwrap();
-            scene.pointer_y = i32::try_from(y).unwrap();
+            go(&mut scene, content.x + content.width / 2, y);
             assert_eq!(
                 scene.drop_target(width, height),
-                Some((stacked.get(shown).unwrap().key, before)),
+                Some((shown_key, expected)),
                 "stacked content at y={y}"
             );
         }
 
         // The desktop is neither: a release there is a cancelled drag.
-        scene.pointer_x = 0;
-        scene.pointer_y = i32::try_from(height - 1).unwrap();
+        go(&mut scene, 0, height - 1);
         assert_eq!(scene.drop_target(width, height), None);
         assert_eq!(scene.band_at_pointer(width, height), None);
     }
