@@ -32,9 +32,13 @@ tests/*/target/
 
 .store-backend-scratch/
 
-# Store-gate commit-lock files (store-backend/store-verify): sibling `.commit.lock`
-# files to the scratch dirs above, written during a gate run. Host-local, never versioned.
-.store-*-scratch.commit.lock
+# Gate commit-lock files: a sibling `.commit.lock` to whatever scratch dir a gate
+# points a store db at, written during a gate run. Matched on the SUFFIX rather than
+# a per-gate prefix — `store-backend`/`store-verify` were not the only gates that
+# leave one (`toolchain-input-addressed` does too), and a prefix list is a file that
+# gets committed by accident the first time a new gate appears. Host-local, never
+# versioned.
+.*-scratch.commit.lock
 
 # Persistent content-addressed build-recipe cache (skip-if-already-realized).
 .td-build-cache

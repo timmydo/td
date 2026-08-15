@@ -754,6 +754,24 @@ pub(crate) fn nproc() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
+/// Hold one machine-wide slot for the duration of `f`.
+///
+/// For a gate that runs several heavy builds CONCURRENTLY inside itself
+/// (`recipe-checks`): without this its inner builds would all run under the one
+/// slot the gate holds, and the pool's memory admission — the binding safety
+/// limit, since the pool is deliberately over-provisioned — would never see
+/// them. Taking a slot each puts them under the same admission and PSI ceiling
+/// every other gate contends on, so inner width throttles itself under memory
+/// pressure instead of racing the box to an OOM.
+///
+/// Never aborts: the caller has already decided to run this work, so a pool
+/// that cannot be opened degrades to unpooled exactly as `gate-run` does.
+pub(crate) fn with_gate_slot<T>(f: impl FnOnce() -> T) -> T {
+    let pool = slot_pool_from_env();
+    let _grant = pool.acquire(&|| false);
+    f()
+}
+
 /// Build the slot pool from the environment. TD_CHECK_SLOTS sizes it (default
 /// 2×nproc — deliberately OVER-PROVISIONED, issue #319: most heavy gates are
 /// single-threaded or daemon/IO-blocked for long stretches, so slot=gate at
