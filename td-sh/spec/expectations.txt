@@ -374,7 +374,6 @@ xfail assign.test.sh::redirect after assignment builtin (eval redirects after ev
 xfail assign.test.sh::redirect after command sub (like case above but without assignment builtin)
 xfail assign.test.sh::static assignment doesn't split
 xfail ble-idioms.test.sh::Issue #1069 [56] BUG: declare -p unset does not print any error message
-xfail ble-idioms.test.sh::recursive arith: short circuit &&, ||
 xfail ble-idioms.test.sh::recursive arith: short circuit ?:
 xfail ble-idioms.test.sh::recursive arith: side effects
 xfail blog-other1.test.sh::Blog Post Example

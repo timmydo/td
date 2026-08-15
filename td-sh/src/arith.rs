@@ -26,7 +26,6 @@ pub fn try_eval(sh: &mut Shell, text: &str) -> Result<i64, String> {
         pos: 0,
         pdepth: 0,
         live: true,
-        ternary_dead: false,
         resolving: Vec::new(),
     };
     p.eval_string(sh, text).map_err(|e| format!("arithmetic: {e}"))
@@ -284,15 +283,12 @@ struct Arith {
     /// Parenthesis-nesting depth, bounded so `((((…))))` errors instead of
     /// overflowing the recursive-descent stack.
     pdepth: u32,
-    /// False while parsing the unevaluated side of `&&`, `||` or `?:`. The
-    /// tokens still have to be consumed, so the walk continues — it just must
-    /// not assign or divide by zero on the way through.
+    /// False inside the untaken arm of a `?:`, which is the ONLY thing ash
+    /// leaves unevaluated -- busybox's `evaluation_disabled`, counted from the
+    /// conditional alone (math.c:951-991). The tokens are still consumed, so
+    /// the walk continues; it just reads no name, assigns nothing, and does not
+    /// divide by zero on the way through.
     live: bool,
-    /// The untaken side of a `?:` specifically. ash does not evaluate that one
-    /// AT ALL, where it DOES evaluate the dead side of `&&`/`||` for effect --
-    /// so this is the only place a DYNAMIC read must be skipped, drawing being
-    /// the side effect in question.
-    ternary_dead: bool,
     /// The names whose values are being evaluated, innermost last. A name that
     /// reaches itself is refused here rather than recursed into: `a=b; b=a` is
     /// otherwise unbounded, and the cycle can be any length.
@@ -444,33 +440,25 @@ impl Arith {
             return Ok(cond);
         }
         let outer = self.live;
-        let outer_dead = self.ternary_dead;
         self.live = outer && cond != 0;
-        self.ternary_dead = outer_dead || cond == 0;
         let then = self.expr_assign(sh)?;
         self.live = outer;
-        self.ternary_dead = outer_dead;
         if !self.eat_op(":") {
             return Err("expected `:` in `?:`".into());
         }
         self.live = outer && cond == 0;
-        self.ternary_dead = outer_dead || cond != 0;
         self.enter()?;
         let other = self.expr_ternary(sh);
         self.leave();
         let other = other?;
         self.live = outer;
-        self.ternary_dead = outer_dead;
         Ok(if cond != 0 { then } else { other })
     }
 
     fn expr_or(&mut self, sh: &mut Shell) -> A<i64> {
         let mut v = self.expr_and(sh)?;
         while self.eat_op("||") {
-            let outer = self.live;
-            self.live = outer && v == 0;
             let rhs = self.expr_and(sh)?;
-            self.live = outer;
             v = i64::from(v != 0 || rhs != 0);
         }
         Ok(v)
@@ -479,10 +467,7 @@ impl Arith {
     fn expr_and(&mut self, sh: &mut Shell) -> A<i64> {
         let mut v = self.expr_bitor(sh)?;
         while self.eat_op("&&") {
-            let outer = self.live;
-            self.live = outer && v != 0;
             let rhs = self.expr_bitor(sh)?;
-            self.live = outer;
             v = i64::from(v != 0 && rhs != 0);
         }
         Ok(v)
@@ -689,7 +674,7 @@ impl Arith {
     fn name_value(&mut self, sh: &mut Shell, name: &str) -> A<i64> {
         // The value is unused here and READING is a side effect for a dynamic
         // name, so the untaken `?:` branch must not reach the lookup at all.
-        if self.ternary_dead {
+        if !self.live {
             return Ok(0);
         }
         let Some(text) = crate::expand::var_value(sh, name) else {
@@ -739,8 +724,9 @@ fn plain_decimal(text: &str) -> Option<i64> {
 }
 
 /// The only operators that can still FAIL, and only on a zero divisor -- folded
-/// to 0 on a short-circuit's dead side rather than reporting an error the shell
-/// would never have hit. `i64::MIN / -1` wraps rather than trapping.
+/// to 0 inside an untaken `?:` arm, the one region ash leaves unevaluated,
+/// rather than reporting an error the shell would never have hit. `i64::MIN /
+/// -1` wraps rather than trapping.
 fn divide(live: bool, a: i64, b: i64) -> A<i64> {
     if b == 0 {
         return if live {
@@ -790,10 +776,10 @@ mod tests {
         assert_eq!(ev("1 << 4")?, 16);
         assert_eq!(ev("1 ? 10 : 20")?, 10);
         assert_eq!(ev("0 ? 10 : 20")?, 20);
-        // The unevaluated side of a short circuit must not raise its errors.
-        assert_eq!(ev("0 && 1/0")?, 0);
-        assert_eq!(ev("1 || 1/0")?, 1);
+        // Only the untaken `?:` arm is unevaluated, so only IT swallows the
+        // error its operand would raise -- see the logical-operator rows.
         assert_eq!(ev("1 ? 2 : 1/0")?, 2);
+        assert_eq!(ev("0 ? 1/0 : 2")?, 2);
         Ok(())
     }
 
@@ -1113,15 +1099,75 @@ mod tests {
             assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, want);
             assert_eq!(sh.get_var("n").as_deref(), Some(after), "{src}");
         }
-        // `&&`/`||` short-circuit through `live` ALONE -- `ternary_dead` stays
-        // false there, so a guard keyed on the other flag passes every row above
-        // and still steps here. (ash steps in both; not short-circuiting side
-        // effects at all is its behaviour, and this shell's divergence.)
-        for (src, want) in [("0 && n++", 0), ("1 || n++", 1)] {
+        Ok(())
+    }
+
+    #[test]
+    fn neither_side_of_a_logical_operator_is_skipped() -> Result<(), String> {
+        // ash evaluates BOTH sides of `&&` and `||`; the untaken `?:` arm is the
+        // only thing it leaves alone. The RESULT is the same boolean under
+        // either rule, so nothing but the effect tells them apart -- which is
+        // what every row here is: an assignment, a step, or an error.
+        for (src, want, m) in [
+            ("0 && (m=7)", 0, "7"),
+            ("1 || (m=7)", 1, "7"),
+            ("0 && (m=7) && (m=8)", 0, "8"),
+            // A dead side inside a LIVE conditional arm still runs.
+            ("1 ? (0 && (m=7)) : 9", 0, "7"),
+            ("0 ? 9 : (0 && (m=7))", 0, "7"),
+            // A conditional in the right operand is evaluated, condition first.
+            ("0 && ((m=1) ? 3 : 4)", 0, "1"),
+            // The RESULT needs BOTH operands, which every row above reaches
+            // from one alone: here the LEFT is true and the right decides.
+            ("1 && (m=0)", 0, "0"),
+            ("1 || (m=0)", 1, "0"),
+            // A chain has to keep looping, not stop after the first operator.
+            ("1 || (m=7) || (m=8)", 1, "8"),
+            ("0 && (m=7) && (m=8)", 0, "8"),
+        ] {
             let mut sh = Shell::new_for_test();
-            sh.set_var("n", "5").map_err(|_| "set failed".to_string())?;
-            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, want);
-            assert_eq!(sh.get_var("n").as_deref(), Some("5"), "{src}");
+            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, want, "{src}");
+            assert_eq!(sh.get_var("m").as_deref(), Some(m), "{src}");
+        }
+        // The error an operand raises is raised on either side, which is the
+        // half a short-circuiting shell swallows.
+        for src in ["0 && 1/0", "1 || 1/0", "0 && 1%0", "0 && (5/0) && 1"] {
+            let mut sh = Shell::new_for_test();
+            assert!(try_eval(&mut sh, src).is_err(), "{src}");
+        }
+        // All four zero-divisor sites are inside the arm the conditional
+        // disables, not just the bare `/` one: `%` and both compound forms.
+        for (src, want) in [("0 ? 1%0 : 3", 3), ("0 ? 1/0 : 3", 3)] {
+            let mut sh = Shell::new_for_test();
+            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, want, "{src}");
+        }
+        for src in ["0 ? (m/=0) : 3", "0 ? (m%=0) : 3"] {
+            let mut sh = Shell::new_for_test();
+            sh.set_var("m", "2").map_err(|_| "set failed".to_string())?;
+            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, 3, "{src}");
+            assert_eq!(sh.get_var("m").as_deref(), Some("2"), "{src}");
+        }
+        // The conditional still disables its untaken arm, both ways round.
+        for (src, want) in [("1 ? 2 : (0 && (m=7))", 2), ("0 ? (m=7) && 1 : 2", 2)] {
+            let mut sh = Shell::new_for_test();
+            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, want, "{src}");
+            assert_eq!(sh.get_var("m"), None, "{src}");
+        }
+        // Both operands of a logical operator step, so a repeated one steps
+        // twice -- the shape that distinguishes eager from lazy on its own.
+        for (src, want) in [("m++ && m++", 0), ("m++ || m++", 1)] {
+            let mut sh = Shell::new_for_test();
+            sh.set_var("m", "0").map_err(|_| "set failed".to_string())?;
+            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, want, "{src}");
+            assert_eq!(sh.get_var("m").as_deref(), Some("2"), "{src}");
+        }
+        // A step on either side of one now TAKES, where the untaken `?:` arm
+        // above skips it. Same operator, opposite answer.
+        for (src, want) in [("0 && m++", 0), ("1 || m++", 1)] {
+            let mut sh = Shell::new_for_test();
+            sh.set_var("m", "5").map_err(|_| "set failed".to_string())?;
+            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, want, "{src}");
+            assert_eq!(sh.get_var("m").as_deref(), Some("6"), "{src}");
         }
         Ok(())
     }

@@ -2434,6 +2434,12 @@ mod tests {
         // A bad expression is still REPORTED rather than fatal, which is the
         // whole reason this path is `try_eval` and not `eval`.
         assert_eq!(run("e=1+; [[ e -eq 3 ]]; echo after").1, "after\n");
+        // An operand is a WHOLE expression, so a logical operator inside one
+        // runs both its sides here as it does in `$(( ))`. bash short-circuits
+        // and ash calls the operand a bad number; sharing one evaluator is what
+        // this costs, and it is confined to operands whose text has `&&`/`||`.
+        assert_eq!(run("x='0 && (m=7)'; [[ x -eq 0 ]] && echo m=$m").1, "m=7\n");
+        assert_eq!(run("m=0; [[ 'm++ && m++' -eq 0 ]] && echo m=$m").1, "m=2\n");
     }
 
     /// `<`/`>` are STRING order inside `[[ ]]`, where outside they are
