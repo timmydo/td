@@ -307,8 +307,10 @@ fn push_expanded(out: &mut Vec<QChar>, text: &str, quoted: bool) {
 }
 
 /// A slice operand: expanded, then evaluated as arithmetic. An EMPTY one is 0,
-/// which is what makes `${v: :2}` and `${v::2}` the first two characters --
-/// `arith::eval` would call the empty expression an error.
+/// which is what makes `${v: :2}` and `${v::2}` the first two characters.
+/// `arith::eval` answers a null expression with 0 too, so this covers only what
+/// it does not call blank -- a Unicode space, which `trim` takes and arithmetic
+/// refuses.
 fn slice_arith(sh: &mut Shell, w: &Word) -> R<i64> {
     let text = QChar::text(&expand_chars(sh, w, false, false)?);
     if text.trim().is_empty() {
@@ -1275,8 +1277,7 @@ mod tests {
     }
 
     /// Both operands are ARITHMETIC, so they read variables and operators the
-    /// way `$(( ))` does. An EMPTY one is zero, which `arith::eval` alone would
-    /// call an error.
+    /// way `$(( ))` does, and an EMPTY one is zero.
     #[test]
     fn substring_operands_are_arithmetic() {
         let mut sh = sh_with(&[("v", "abcdef"), ("n", "2")]);

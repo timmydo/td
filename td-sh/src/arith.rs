@@ -1,9 +1,9 @@
 //! Arithmetic expansion: `$(( ... ))`.
 //!
 //! The full POSIX operator set over `i64`, including assignment and the ternary.
-//! A name's value must itself be a number: dash resolves it with `strtoimax` and
-//! errors on anything else, so `e=1+2; echo $((e+3))` is a fatal error rather
-//! than bash's 6 — the value is data, never a nested expression to evaluate.
+//! A name's value is itself an EXPRESSION, evaluated recursively as ash does, so
+//! `e=1+2; echo $((e+3))` is 6 and a name reached from its own value is refused
+//! rather than followed.
 
 use crate::exec::{Shell, R};
 
@@ -22,17 +22,14 @@ pub fn eval(sh: &mut Shell, text: &str) -> R<i64> {
 /// `eval` above kills a non-interactive shell at the first bad expression.
 pub fn try_eval(sh: &mut Shell, text: &str) -> Result<i64, String> {
     let mut p = Arith {
-        toks: lex(text).map_err(|e| format!("arithmetic: {e}"))?,
+        toks: Vec::new(),
         pos: 0,
         pdepth: 0,
         live: true,
         ternary_dead: false,
+        resolving: Vec::new(),
     };
-    let value = p.expr_comma(sh).map_err(|e| format!("arithmetic: {e}"))?;
-    if p.peek().is_some() {
-        return Err(format!("arithmetic: unexpected trailing input in {text:?}"));
-    }
-    Ok(value)
+    p.eval_string(sh, text).map_err(|e| format!("arithmetic: {e}"))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,6 +77,13 @@ fn prec(op: &str) -> u8 {
     }
 }
 
+/// C `isspace`, not `char::is_whitespace`: ash separates arithmetic tokens with
+/// the ASCII six and refuses an NBSP or EM SPACE outright, where Unicode's set
+/// would silently read `$((<NBSP>1))` as 1.
+fn is_blank(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\u{b}' | '\u{c}' | '\r')
+}
+
 fn lex(text: &str) -> Result<Vec<Tk>, String> {
     let chars: Vec<char> = text.chars().collect();
     let mut toks = Vec::new();
@@ -95,7 +99,7 @@ fn lex(text: &str) -> Result<Vec<Tk>, String> {
     let mut ends_operand = false;
     let mut pending: Vec<u8> = Vec::new();
     while let Some(&c) = chars.get(i) {
-        if c.is_whitespace() {
+        if is_blank(c) {
             i += 1;
             continue;
         }
@@ -128,7 +132,7 @@ fn lex(text: &str) -> Result<Vec<Tk>, String> {
         // by parse time the pair is one token and the re-scan is gone.
         if (c == '+' || c == '-') && chars.get(i + 1) == Some(&c) {
             let mut k = i + 2;
-            while chars.get(k).is_some_and(|n| n.is_whitespace()) {
+            while chars.get(k).is_some_and(|n| is_blank(*n)) {
                 k += 1;
             }
             let fwd = chars
@@ -289,6 +293,10 @@ struct Arith {
     /// so this is the only place a DYNAMIC read must be skipped, drawing being
     /// the side effect in question.
     ternary_dead: bool,
+    /// The names whose values are being evaluated, innermost last. A name that
+    /// reaches itself is refused here rather than recursed into: `a=b; b=a` is
+    /// otherwise unbounded, and the cycle can be any length.
+    resolving: Vec<String>,
 }
 
 /// Bound on operator/parenthesis nesting inside `$(( … ))`. Enforced via enter()/
@@ -333,6 +341,38 @@ impl Arith {
             return Err("expression nested too deeply".into());
         }
         Ok(())
+    }
+
+    /// One whole expression, over its own token list. The parse state is swapped
+    /// rather than a second parser built, so the depth bound and the
+    /// enabled/disabled flags carry inward as ash's shared `math_state` does.
+    fn eval_string(&mut self, sh: &mut Shell, text: &str) -> A<i64> {
+        // Here rather than at the lookup because a compound assignment reads its
+        // lvalue without descending through `expr_unary`.
+        self.enter()?;
+        let value = self.eval_string_inner(sh, text);
+        self.leave();
+        value
+    }
+
+    fn eval_string_inner(&mut self, sh: &mut Shell, text: &str) -> A<i64> {
+        let toks = lex(text)?;
+        // A null expression is 0, not a syntax error -- `$(( ))`, and the empty
+        // or all-blank value that motivates it.
+        if toks.is_empty() {
+            return Ok(0);
+        }
+        let saved_toks = std::mem::replace(&mut self.toks, toks);
+        let saved_pos = std::mem::replace(&mut self.pos, 0);
+        let value = self.expr_comma(sh).and_then(|v| {
+            if self.peek().is_some() {
+                return Err(format!("unexpected trailing input in {text:?}"));
+            }
+            Ok(v)
+        });
+        self.toks = saved_toks;
+        self.pos = saved_pos;
+        value
     }
 
     fn leave(&mut self) {
@@ -645,8 +685,7 @@ impl Arith {
         Ok((cur, new))
     }
 
-    /// A variable's value as a number. An unset or empty variable is 0; anything
-    /// else must BE a number, not an expression that evaluates to one.
+    /// A variable's value, evaluated as an expression in its own right.
     fn name_value(&mut self, sh: &mut Shell, name: &str) -> A<i64> {
         // The value is unused here and READING is a side effect for a dynamic
         // name, so the untaken `?:` branch must not reach the lookup at all.
@@ -656,71 +695,47 @@ impl Arith {
         let Some(text) = crate::expand::var_value(sh, name) else {
             return Ok(0);
         };
-        if let Some(n) = strtoimax(&text) {
+        // The guard is asked BEFORE the shortcut below, because a name can be
+        // reassigned to a plain number WHILE it is being resolved: `a=b;
+        // b="a=5,a"` reaches `a` again holding `5`, which the shortcut would
+        // answer for and ash reports the loop for.
+        if self.resolving.iter().any(|n| n == name) {
+            return Err("expression recursion loop detected".into());
+        }
+        if let Some(n) = plain_decimal(&text) {
             return Ok(n);
         }
-        // The dead side of a short circuit (`0 && x`, `1 || x`, the untaken `?:`
-        // branch) is never evaluated, so a junk value there cannot error.
-        if !self.live {
-            return Ok(0);
-        }
-        Err(format!("{name}: bad number"))
+        self.resolving.push(name.to_string());
+        let value = self.eval_string(sh, &text);
+        self.resolving.pop();
+        value
     }
 }
 
-/// C `strtoimax(value, &end, 0)` with dash's "the whole value or nothing" check:
-/// the base comes from the C prefix and any leftover input rejects the value.
-/// Blanks around the number are skipped and a value that is empty or all blanks
-/// is 0 — `a=' '; echo $((a))` prints 0 in dash, so the check cannot be
-/// strtoimax's literal `*end == '\0'`, which would convert nothing there.
-fn strtoimax(text: &str) -> Option<i64> {
-    // Bytes, not chars: every character this accepts is ASCII, so a non-ASCII
-    // byte can only end the digit run — and a name is read once per arithmetic
-    // operand, which `while [ $i -lt N ]; i=$((i+1))` makes an inner loop.
-    // C `isspace`, not `char::is_whitespace`: a value carries arbitrary UTF-8 and
-    // strtoimax converts nothing from a NBSP-prefixed one.
-    let text = text.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\u{b}' | '\u{c}' | '\r'));
-    let bytes = text.as_bytes();
-    if bytes.is_empty() {
-        return Some(0);
-    }
-    let mut i = 0usize;
-    let negative = match bytes.get(i) {
-        Some(b'-') => {
-            i += 1;
-            true
-        }
-        Some(b'+') => {
-            i += 1;
-            false
-        }
-        _ => false,
+/// A value that is a plain decimal integer, which the full evaluator reaches
+/// through a lex and a parse. An operand read is the inner loop of `while [ $i
+/// -lt N ]; do i=$((i+1)); done`, and every one of them allocated twice.
+///
+/// A leading zero is refused because it would be octal, a value outside `i64`
+/// because a literal that wide wraps and only the evaluator knows how, and
+/// anything else -- blanks, `0x`, an operator -- because the evaluator reads
+/// those. A sign is taken: ash applies unary minus and DISCARDS unary plus.
+/// `the_fast_path_agrees_with_the_evaluator` is what holds the two together.
+fn plain_decimal(text: &str) -> Option<i64> {
+    let (negative, digits) = match text.as_bytes() {
+        [b'-', rest @ ..] => (true, rest),
+        [b'+', rest @ ..] => (false, rest),
+        rest => (false, rest),
     };
-    let radix = match (bytes.get(i), bytes.get(i + 1)) {
-        (Some(b'0'), Some(b'x' | b'X')) if bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit) => {
-            i += 2;
-            16
-        }
-        (Some(b'0'), _) => 8, // a lone `0` is octal zero, which parses the same
-        _ => 10,
-    };
-    let start = i;
-    while bytes.get(i).is_some_and(|b| char::from(*b).is_digit(radix)) {
-        i += 1;
-    }
-    if i == start || i != bytes.len() {
+    if digits.is_empty() || (digits.len() > 1 && digits.first() == Some(&b'0')) {
         return None;
     }
-    // Magnitude first, then apply the sign: i64::MIN has no positive counterpart,
-    // so `-9223372036854775808` has to be recognised as the whole value it is.
-    let magnitude = u64::from_str_radix(text.get(start..i)?, radix).ok()?;
-    if !negative {
-        return i64::try_from(magnitude).ok();
+    let mut value: i64 = 0;
+    for b in digits {
+        let d = b.checked_sub(b'0').filter(|d| *d < 10)?;
+        value = value.checked_mul(10)?.checked_add(i64::from(d))?;
     }
-    if magnitude == i64::MIN.unsigned_abs() {
-        return Some(i64::MIN);
-    }
-    i64::try_from(magnitude).ok()?.checked_neg()
+    Some(if negative { -value } else { value })
 }
 
 /// The only operators that can still FAIL, and only on a zero divisor -- folded
@@ -1111,36 +1126,225 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn a_variables_value_must_be_a_number_not_an_expression() -> Result<(), String> {
+    /// A shell with the named variables set, for the value-as-expression rows.
+    fn shell_with(vars: &[(&str, &str)]) -> Result<Shell, String> {
         let mut sh = Shell::new_for_test();
-        for (name, value) in [("b", "5"), ("a", "b"), ("e", "1+2"), ("blank", " ")] {
+        for (name, value) in vars {
             sh.set_var(name, value)
-                .map_err(|_| "set failed".to_string())?;
+                .map_err(|_| format!("set {name} failed"))?;
         }
-        // `a` holds a name and `e` an expression; neither is evaluated further.
-        assert!(eval(&mut sh, "a").is_err());
-        assert!(eval(&mut sh, "e + 3").is_err());
-        assert_eq!(eval(&mut sh, "blank").map_err(|_| "eval")?, 0);
-        assert_eq!(eval(&mut sh, "b + 1").map_err(|_| "eval")?, 6);
+        Ok(sh)
+    }
+
+    #[test]
+    fn a_variables_value_is_an_expression_not_a_number() -> Result<(), String> {
+        // Every row is a value ash evaluates rather than converts: an operator,
+        // a chain of names, a parenthesis, a comma, a C prefix, and blanks.
+        for (vars, src, want) in [
+            (&[("e", "1+2")][..], "e", 3),
+            (&[("e", "1+2")][..], "e + 3", 6),
+            (&[("n", "m"), ("m", "5")][..], "n", 5),
+            (&[("n", "m+1"), ("m", "5")][..], "n*2", 12),
+            (&[("a", "b"), ("b", "c"), ("c", "d"), ("d", "7")][..], "a", 7),
+            (&[("n", " 1 + 2 ")][..], "n", 3),
+            (&[("n", "(1)")][..], "n", 1),
+            (&[("n", "1,2")][..], "n", 2),
+            (&[("n", "0x1f")][..], "n", 31),
+            (&[("n", "010")][..], "n", 8),
+            (&[("n", "-9223372036854775808")][..], "n", i64::MIN),
+            // A value naming an UNSET variable is 0, which is why ash answers
+            // `n=abc; echo $((n))` with 0 rather than complaining about `abc`.
+            (&[("n", "abc")][..], "n", 0),
+            (&[("n", "")][..], "n+1", 1),
+            (&[("n", "   ")][..], "n+1", 1),
+            // The name is popped after each lookup, so a repeat is not a cycle.
+            (&[("a", "b"), ("b", "1")][..], "a+a", 2),
+            (&[("x", "y"), ("y", "2")][..], "x*x", 4),
+        ] {
+            let mut sh = shell_with(vars)?;
+            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, want, "{src}");
+        }
+        // An error inside the value is the value's own error, not `bad number`.
+        for (vars, src) in [
+            (&[("n", "1+")][..], "n"),
+            (&[("n", "1 2")][..], "n"),
+            (&[("n", "1/0")][..], "n"),
+            (&[("n", "08")][..], "n"), // two numbers, as `08` lexes everywhere
+        ] {
+            let mut sh = shell_with(vars)?;
+            assert!(eval(&mut sh, src).is_err(), "{src}");
+        }
         Ok(())
     }
 
     #[test]
-    fn a_names_value_parses_with_the_c_prefix_rules() {
-        assert_eq!(strtoimax(""), Some(0));
-        assert_eq!(strtoimax("  "), Some(0));
-        assert_eq!(strtoimax("0"), Some(0));
-        assert_eq!(strtoimax(" \t 42 "), Some(42)); // blanks around it are skipped
-        assert_eq!(strtoimax("4 2"), None); // blanks inside it are not
-        assert_eq!(strtoimax("0x1f"), Some(31));
-        assert_eq!(strtoimax("-0x1f"), Some(-31));
-        assert_eq!(strtoimax("010"), Some(8));
-        assert_eq!(strtoimax("08"), None); // 8 is not an octal digit
-        assert_eq!(strtoimax("0x"), None); // the prefix alone converts nothing
-        assert_eq!(strtoimax("-9223372036854775808"), Some(i64::MIN));
-        assert_eq!(strtoimax("9223372036854775808"), None);
-        assert_eq!(strtoimax("1+2"), None);
+    fn a_value_that_reaches_its_own_name_is_refused() -> Result<(), String> {
+        for (vars, src) in [
+            (&[("n", "n")][..], "n"),
+            (&[("n", "n+1")][..], "n"),
+            (&[("n", "n++")][..], "n"),
+            (&[("a", "b"), ("b", "a")][..], "a"),
+            (&[("a", "b"), ("b", "c"), ("c", "a")][..], "a"),
+        ] {
+            let mut sh = shell_with(vars)?;
+            let err = try_eval(&mut sh, src).err().ok_or(format!("{src} evaluated"))?;
+            assert!(err.contains("recursion loop"), "{src}: {err}");
+        }
+        // A name reassigned to a plain number while it is being resolved is
+        // still that name, which is what puts the cycle guard ahead of the
+        // fast path -- `a` holds `5` by the time the inner read reaches it.
+        let mut sh = shell_with(&[("a", "b"), ("b", "a=5,a")])?;
+        let err = try_eval(&mut sh, "a").err().ok_or("reassigned cycle evaluated")?;
+        assert!(err.contains("recursion loop"), "{err}");
+        // The guard is exact-name, in BOTH directions, and neither value may be
+        // a plain decimal -- that answers before the guard is ever asked, which
+        // is what made an earlier spelling of this row vacuous.
+        for (vars, src) in [
+            (&[("a", "aa"), ("aa", "1+0")][..], "a"),
+            (&[("aa", "a+0"), ("a", "1+0")][..], "aa"),
+        ] {
+            let mut sh = shell_with(vars)?;
+            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, 1, "{src}");
+        }
+        // A name followed by `=` is never LOOKED UP, so assigning to the name
+        // being resolved terminates where `n+1` would not.
+        let mut sh = shell_with(&[("n", "n=5")])?;
+        assert_eq!(eval(&mut sh, "n").map_err(|_| "eval n")?, 5);
+        assert_eq!(sh.get_var("n").as_deref(), Some("5"));
+        // Nothing is looked up under the untaken `?:` arm, so a cycle there is
+        // never walked -- the same rule that keeps `$RANDOM` from being drawn.
+        let mut sh = shell_with(&[("a", "b"), ("b", "a")])?;
+        assert_eq!(eval(&mut sh, "1?7:a").map_err(|_| "eval ?:")?, 7);
+        Ok(())
+    }
+
+    #[test]
+    fn a_value_can_assign_and_step_as_ash_does() -> Result<(), String> {
+        let mut sh = shell_with(&[("n", "m=7")])?;
+        assert_eq!(eval(&mut sh, "n+1").map_err(|_| "eval")?, 8);
+        assert_eq!(sh.get_var("m").as_deref(), Some("7"));
+        let mut sh = shell_with(&[("n", "m++"), ("m", "3")])?;
+        assert_eq!(eval(&mut sh, "n").map_err(|_| "eval")?, 3);
+        assert_eq!(sh.get_var("m").as_deref(), Some("4"));
+        // The WRITE side stays direct: `=` never reads the name, so a value that
+        // is not a number is still assignable, and a compound reads it as one.
+        let mut sh = shell_with(&[("n", "1+2")])?;
+        assert_eq!(eval(&mut sh, "n=5").map_err(|_| "eval")?, 5);
+        let mut sh = shell_with(&[("n", "1+2")])?;
+        assert_eq!(eval(&mut sh, "n+=1").map_err(|_| "eval")?, 4);
+        assert_eq!(sh.get_var("n").as_deref(), Some("4"));
+        let mut sh = shell_with(&[("n", "1+2")])?;
+        assert_eq!(eval(&mut sh, "n++").map_err(|_| "eval")?, 3);
+        assert_eq!(sh.get_var("n").as_deref(), Some("4"));
+        Ok(())
+    }
+
+    #[test]
+    fn the_fast_path_agrees_with_the_evaluator() -> Result<(), String> {
+        let mut sh = Shell::new_for_test();
+        let mut texts: Vec<String> = [
+            "0", "1", "9", "10", "-0", "+0", "-1", "+7", "123456789",
+            "9223372036854775807", "-9223372036854775808", "1000000000000000000",
+            // Each of these the fast path must refuse, and the reason differs.
+            "01", "010", "08", "0x1f", "", " ", " 5 ", "5 ", "1+2", "-", "+", "--5",
+            "9223372036854775808", "99999999999999999999", "1e3", "5a", ".5", "0b1",
+            // The bytes just past `9`, which a digit test off by a few takes.
+            ":", "1:", "9;", "2<", "3=", "4>", "8?",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        // A spread of ordinary counter values, which is what the path is for.
+        for i in 0..400u32 {
+            texts.push(i.wrapping_mul(7_919).to_string());
+            texts.push(format!("-{}", i.wrapping_mul(104_729)));
+        }
+        let mut taken = 0usize;
+        for text in &texts {
+            let Some(fast) = plain_decimal(text) else {
+                continue;
+            };
+            taken += 1;
+            let slow = try_eval(&mut sh, text).map_err(|e| format!("{text:?}: {e}"))?;
+            assert_eq!(fast, slow, "{text:?}");
+        }
+        assert!(taken > 700, "fast path took only {taken}");
+        // The refusals are refusals of an ANSWER, not of a shape: each of these
+        // evaluates to something other than its digits read as decimal.
+        for (text, want) in [("010", 8), ("9223372036854775808", i64::MIN), ("", 0)] {
+            assert_eq!(plain_decimal(text), None, "{text:?}");
+            assert_eq!(try_eval(&mut sh, text).map_err(|_| "eval")?, want, "{text:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn only_the_c_blanks_separate_tokens() -> Result<(), String> {
+        let mut sh = Shell::new_for_test();
+        for text in [" 1 ", "\t1\t", "\r1\r", "\u{b}1\u{c}", "\n1\n", " 1 + 1 - 1 "] {
+            assert_eq!(try_eval(&mut sh, text).map_err(|e| e)?, 1, "{text:?}");
+        }
+        // ash refuses a Unicode space outright rather than skipping it, so a
+        // value or expression carrying one is an error and not a number.
+        for text in ["\u{a0}1", "1\u{a0}", "1\u{a0}+1", "\u{2003}1", "1 +\u{2003}1", "1\u{3000}"] {
+            assert!(try_eval(&mut sh, text).is_err(), "{text:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_null_expression_is_zero() -> Result<(), String> {
+        let mut sh = Shell::new_for_test();
+        for src in ["", " ", "\t\n"] {
+            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src:?}"))?, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_chain_of_values_is_bounded_rather_than_overflowing() -> Result<(), String> {
+        // A chain has no cycle for the name guard to catch, so the depth bound is
+        // what stops it -- with an error rather than a native stack overflow.
+        // Two levels per link: the value's own expression, and the operand frame
+        // it stands in for. `expr_unary`'s enter() is the second.
+        let chain = |n: u32| -> Vec<(String, String)> {
+            let mut v: Vec<(String, String)> = (0..n)
+                .map(|i| (format!("v{i}"), format!("v{}", i + 1)))
+                .collect();
+            v.push((format!("v{n}"), "9".into()));
+            v
+        };
+        // The boundary is pinned by VALUE, not relative to the constant, or a
+        // shrunken bound reads as passing.
+        for (links, deep) in [(49, false), (50, true)] {
+            let names = chain(links);
+            let refs: Vec<(&str, &str)> =
+                names.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let mut sh = shell_with(&refs)?;
+            match try_eval(&mut sh, "v0") {
+                Ok(v) => {
+                    assert!(!deep, "{links} links evaluated");
+                    assert_eq!(v, 9, "{links} links");
+                }
+                Err(e) => {
+                    assert!(deep, "{links} links: {e}");
+                    assert!(e.contains("too deeply"), "{links} links: {e}");
+                }
+            }
+        }
+        // A compound assignment reads its lvalue WITHOUT descending through
+        // `expr_unary`, so this chain is bounded only by the level `eval_string`
+        // takes. Long enough that losing that level overflows the native stack
+        // rather than merely answering.
+        let deep = 5_000u32;
+        let names: Vec<(String, String)> = (0..deep)
+            .map(|i| (format!("v{i}"), format!("v{}+=0", i + 1)))
+            .collect();
+        let refs: Vec<(&str, &str)> = names.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let mut sh = shell_with(&refs)?;
+        let e = try_eval(&mut sh, "v0").err().ok_or("lvalue chain evaluated")?;
+        assert!(e.contains("too deeply"), "{e}");
+        Ok(())
     }
 
     #[test]
@@ -1229,13 +1433,13 @@ mod tests {
     }
 
     #[test]
-    fn dead_short_circuit_branch_does_not_evaluate_variables() -> Result<(), String> {
-        let mut sh = Shell::new_for_test();
-        // A name whose value is not a number errors if evaluated; the dead side of
-        // `||`/`&&`/`?:` must skip it and contribute 0.
-        sh.set_var("x", "x").map_err(|_| "set failed".to_string())?;
-        assert_eq!(eval(&mut sh, "1 || x").map_err(|_| "eval")?, 1);
-        assert_eq!(eval(&mut sh, "0 && x").map_err(|_| "eval")?, 0);
+    fn only_the_untaken_conditional_arm_skips_the_lookup() -> Result<(), String> {
+        // Only the untaken `?:` arm skips the lookup. The dead side of `&&`/`||`
+        // still resolves the name, which a self-referential value proves: ash
+        // reports the loop for both of those and answers 2 for the conditional.
+        let mut sh = shell_with(&[("x", "x")])?;
+        assert!(try_eval(&mut sh, "1 || x").is_err());
+        assert!(try_eval(&mut sh, "0 && x").is_err());
         assert_eq!(eval(&mut sh, "1 ? 2 : x").map_err(|_| "eval")?, 2);
         Ok(())
     }

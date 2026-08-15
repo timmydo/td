@@ -1519,9 +1519,8 @@ fn cond_is_set(sh: &Shell, name: &str) -> bool {
 /// bash's answer for `[[ "" -eq 0 ]]` and the reason this is not a bare
 /// `arith::eval`: an unset variable is the commonest way to reach here, and
 /// erroring would turn a false comparison into a diagnostic. Deliberately NOT
-/// pushed down into `arith` itself -- td-sh's `$(( ))` reports an empty
-/// expression as an error today, and changing that is a separate decision about
-/// a different construct.
+/// `arith` answers a null expression with 0 itself now, so what is left here is
+/// the operand `trim` calls blank and arithmetic does not -- a Unicode space.
 /// Reported rather than FATAL, which is the difference between this and
 /// `$(( ))`: bash answers `[[ 1+ -eq 2 ]]` with a diagnostic and a false result
 /// and carries on, where `arith::eval` would end a non-interactive shell at the
@@ -2420,6 +2419,21 @@ mod tests {
         assert_eq!(run("[[ 'a*' == \"a*\" ]]").0, 0);
         assert_eq!(run("[[ abc == ?b? ]]").0, 0);
         assert_eq!(run("[[ abc != a* ]]").0, 1);
+    }
+
+    /// An `-eq` operand is a full arithmetic expression, so a name resolves
+    /// through its value and an assignment inside one TAKES. ash reads the
+    /// operand as a number instead and calls this one bad, which is a
+    /// divergence this construct inherits from `$(( ))` rather than chooses.
+    #[test]
+    fn a_conditional_arithmetic_operand_resolves_like_an_expression() {
+        assert_eq!(run("e=1+2; [[ e -eq 3 ]]").0, 0);
+        assert_eq!(run("e=1+2; [[ e -eq 4 ]]").0, 1);
+        assert_eq!(run("n=m; m=5; [[ n -eq 5 ]]").0, 0);
+        assert_eq!(run("x='(y=9)'; [[ x -eq 9 ]] && echo y=$y").1, "y=9\n");
+        // A bad expression is still REPORTED rather than fatal, which is the
+        // whole reason this path is `try_eval` and not `eval`.
+        assert_eq!(run("e=1+; [[ e -eq 3 ]]; echo after").1, "after\n");
     }
 
     /// `<`/`>` are STRING order inside `[[ ]]`, where outside they are
