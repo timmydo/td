@@ -975,9 +975,15 @@ impl Layout {
             }
         }
         let placements = unstacked_placements(workspace, VIRTUAL_EXTENT, VIRTUAL_EXTENT, 0);
-        if let Some(target) = directional_target(&placements, focused, direction) {
-            self.workspace_mut(self.active).focus(target);
-        }
+        let Some(target) = directional_target(&placements, focused, direction) else {
+            return;
+        };
+        let target = workspace
+            .root
+            .as_ref()
+            .and_then(|root| leaf_entering_stack(root, focused, target, &workspace.recent))
+            .unwrap_or(target);
+        self.workspace_mut(self.active).focus(target);
     }
 
     fn move_direction(&mut self, direction: Direction) {
@@ -1221,6 +1227,46 @@ fn stack_neighbour(node: &Node, key: SurfaceKey, direction: Direction) -> Option
     run.get(usize::try_from(next).ok()?).copied()
 }
 
+/// Where in a stack's run the leaf it SHOWS sits: its own most recently
+/// focused. Both the renderer and directional focus ask, and a second copy of
+/// the rule would let them disagree about which window is on screen.
+///
+/// A leaf the record does not name ranks last, and an empty run answers the
+/// first. Both are states `check_invariants` forbids and no key sequence
+/// reaches; the alternative to a fallback is a panic.
+fn shown_index(run: &[SurfaceKey], recent: &[SurfaceKey]) -> usize {
+    run.iter()
+        .enumerate()
+        .min_by_key(|(_, key)| {
+            recent
+                .iter()
+                .position(|candidate| candidate == *key)
+                .unwrap_or(usize::MAX)
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+/// The leaf a directional step ENTERING a stack lands on: the one it shows.
+///
+/// The ranking below runs over the UNSTACKED geometry, where a stack's leaves
+/// hold a fraction of the container each, and nothing about those fractions is
+/// on screen — the stack draws one leaf. `None` for a step INSIDE one stack,
+/// where the geometry IS the answer: that is how Left/Right walk a stack made
+/// from a row.
+fn leaf_entering_stack(
+    root: &Node,
+    focused: SurfaceKey,
+    target: SurfaceKey,
+    recent: &[SurfaceKey],
+) -> Option<SurfaceKey> {
+    let run = stack_run(root, target)?;
+    if run.contains(&focused) {
+        return None;
+    }
+    run.get(shown_index(&run, recent)).copied()
+}
+
 /// Every leaf the outermost stacked ancestor of `key` presents, in band order
 /// — which is `leaves` exactly, since `place_stack` builds its run the same
 /// way.
@@ -1374,17 +1420,7 @@ fn place_stack(children: &[Node], rect: Rect, pass: &Pass, placements: &mut Vec<
     // its first leaf. Both fallbacks are for a leaf the record does not name,
     // which `check_invariants` forbids and no expressible key sequence
     // reaches; the record cannot say "must be present" without a panic.
-    let shown = keys
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, key)| {
-            pass.recent
-                .iter()
-                .position(|candidate| candidate == *key)
-                .unwrap_or(usize::MAX)
-        })
-        .map(|(index, _)| index)
-        .unwrap_or(0);
+    let shown = shown_index(&keys, pass.recent);
     for (index, key) in keys.iter().enumerate() {
         let top = rect
             .y
@@ -2038,6 +2074,70 @@ mod tests {
     }
 
     #[test]
+    fn focus_entering_a_stack_lands_on_the_leaf_it_is_showing() {
+        // Leaving a stack and coming back has to be a round trip. It was not:
+        // the ranking runs over the UNSTACKED geometry, where 2 and 3 have a
+        // half of the column each, so a step in from the left landed on 2 —
+        // and since focusing re-fronts the record `place_stack` reads, the
+        // stack came back SHOWING 2 as well. The operator left 3 and returned
+        // to a different window with a different one drawn.
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.map(key(2));
+        layout.apply(Command::SetSplit(Axis::Vertical));
+        layout.map(key(3));
+        layout.apply(Command::ToggleStacked);
+        assert_eq!(layout.focused(), Some(key(3)));
+        // `visible`, not the rectangle: a leaf stacked away keeps the `rect`
+        // it WOULD have, so the two say different things here.
+        let shown = |layout: &Layout| {
+            layout
+                .placements(240, 600, 0, 20)
+                .iter()
+                .filter(|placement| placement.visible)
+                .map(|placement| placement.key)
+                .collect::<Vec<_>>()
+        };
+        let drawn = shown(&layout);
+        assert!(
+            drawn.contains(&key(3)) && !drawn.contains(&key(2)),
+            "the stack is not showing 3 to begin with: {drawn:?}"
+        );
+
+        layout.apply(Command::Focus(Direction::Left));
+        assert_eq!(layout.focused(), Some(key(1)), "the stack was not left");
+        layout.apply(Command::Focus(Direction::Right));
+        assert_eq!(
+            layout.focused(),
+            Some(key(3)),
+            "coming back landed on a leaf the stack was not showing"
+        );
+        assert_eq!(shown(&layout), drawn, "the round trip redrew the stack");
+
+        // Again with the run's FIRST leaf shown, which is what makes this
+        // about the RECORD rather than about a position in the run: 3 is the
+        // run's last as well as the shown one, so the trip above holds just as
+        // well for an answer that always took the last leaf.
+        layout.apply(Command::Focus(Direction::Up));
+        assert_eq!(layout.focused(), Some(key(2)));
+        let drawn = shown(&layout);
+        assert!(
+            drawn.contains(&key(2)) && !drawn.contains(&key(3)),
+            "the stack is not showing 2: {drawn:?}"
+        );
+        layout.apply(Command::Focus(Direction::Left));
+        assert_eq!(layout.focused(), Some(key(1)), "the stack was not left");
+        layout.apply(Command::Focus(Direction::Right));
+        assert_eq!(
+            layout.focused(),
+            Some(key(2)),
+            "coming back took a position in the run rather than the record"
+        );
+        assert_eq!(shown(&layout), drawn, "the round trip redrew the stack");
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
     fn up_and_down_walk_a_stack_whatever_axis_it_was_made_from() {
         // A stack shows its bands top to bottom whatever the container is, so
         // Up/Down follow that run. The ROW is the case that needs saying: its
@@ -2078,8 +2178,9 @@ mod tests {
     fn left_and_right_leave_a_stack_rather_than_walking_it() {
         // A stacked COLUMN beside another window is what tells the two apart:
         // in a stacked ROW the run and the geometry agree either way, so only
-        // this shape shows that Left/Right were left alone. Walking the run in
-        // every direction would trap the operator in the stack.
+        // this shape shows that Left LEAVES rather than walking. Walking the
+        // run in every direction would trap the operator in the stack. The
+        // `Right` back is the redirected step, not an untouched one.
         let mut layout = Layout::new();
         layout.map(key(1));
         layout.map(key(2));
@@ -2091,17 +2192,14 @@ mod tests {
 
         layout.apply(Command::Focus(Direction::Left));
         assert_eq!(layout.focused(), Some(key(1)), "Left must leave the stack");
-        // Coming BACK lands on neither the run's first leaf nor the one the
-        // stack is SHOWING, but on whichever the geometric tie-break picks —
-        // the lowest-keyed among equal ranks, every leaf in the stack sharing
-        // the rectangle being ranked. Here that happens to be the run's first
-        // too, so the shape cannot tell those apart; asserted as it is rather
-        // than as it should be, so the day it is fixed this test says so.
+        // Coming BACK lands on the leaf the stack is SHOWING, so the trip is
+        // a round one; `focus_entering_a_stack_lands_on_the_leaf_it_is_showing`
+        // is that property by itself.
         layout.apply(Command::Focus(Direction::Right));
-        assert_eq!(layout.focused(), Some(key(2)));
-        // Down still walks the run it is in.
-        layout.apply(Command::Focus(Direction::Down));
         assert_eq!(layout.focused(), Some(key(3)));
+        // Up still walks the run it is in.
+        layout.apply(Command::Focus(Direction::Up));
+        assert_eq!(layout.focused(), Some(key(2)));
         layout.check_invariants().unwrap();
     }
 

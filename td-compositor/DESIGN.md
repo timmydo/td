@@ -1151,18 +1151,40 @@ operator could see running vertically. The run is consulted first and only
 steps INSIDE it; a step off either end falls through to the geometry, which
 is what lets the same chord leave the stack rather than trapping focus in it.
 
-Two consequences are recorded rather than fixed. Left/Right are untouched, so
-they still read the unstacked arrangement: a stacked COLUMN is left for its
-neighbour, while in a stacked ROW they walk the run as `Down` does — the same
-chord meaning different things for arrangements that look identical, since a
-stack hides which axis made it. And coming BACK to a stack lands on neither
-the run's first leaf nor the one the stack is SHOWING, but on whichever leaf
-the geometric tie-break picks — the lowest-keyed among equal ranks, since
-every leaf in the stack shares the rectangle being ranked. The
-fall-through search also starts from the focused leaf's unstacked fraction
-rather than the stack's whole area, so a window below another part of a
-stacked row can be missed; that is how directional focus has always left a
-stack and is not introduced here.
+Coming BACK to a stack lands on the leaf it is SHOWING, which is a step the
+geometry cannot take. The ranking runs over the UNSTACKED arrangement, where a
+stack's leaves hold a fraction of the container each, and a step in from
+outside ranks those fractions — none of which is on screen, since the stack
+draws one leaf. Ties go to the lowest key, and for the common shape they ARE
+tied: leaves split evenly about their container are equidistant from a
+neighbour's centre, so `H[1, Vstacked[2, 3]]` answers 2 whichever leaf is
+drawn. Worse, it did not come back: focusing the leaf the ranking picked also
+puts THAT leaf at the front of the record `place_stack` reads, so `Left` then
+`Right` returned to a different window with a different one drawn. Only a step
+arriving from OUTSIDE is redirected; within one stack the geometry IS the
+answer, which is how Left/Right walk a stack made from a row.
+
+Two consequences are recorded rather than fixed. Left/Right are untouched
+WITHIN a stack, so they still read the unstacked arrangement there: a stacked
+COLUMN is left for its neighbour, while in a stacked ROW they walk the run as
+`Down` does — the same chord meaning different things for arrangements that
+look identical, since a stack hides which axis made it. The fall-through
+search also starts from the focused leaf's unstacked fraction rather than the
+stack's whole area, so a window below another part of a stacked row can be
+missed; that is how directional focus has always left a stack and is not
+introduced here.
+
+And the OTHER round trip — INTO a stack from outside, then straight back out —
+gets worse, which is the price of this one and is paid knowingly. The step
+back is measured from the fraction of whichever leaf was landed on, so
+redirecting to the shown leaf moves where it starts from. Swept over 4096
+generated five-leaf shapes: the trip this section IS about, leaving a stack
+and returning, goes from 1048 of 1602 broken to NONE, and from 1048 whose
+drawn leaf changed to none; the entering trip goes from 246 of 682 broken to
+296. Fifty steps worse against a thousand fixed, on a trip that was already
+failing more often than not. Closing that one needs the search to measure from
+the stack's whole area rather than from a leaf's fraction, which is the same
+fall-through limit the paragraph above records.
 
 Client-side decoration negotiation, clipboard, drag-and-drop, subsurfaces,
 popups, output reconfiguration, fractional scale, screen capture, data
