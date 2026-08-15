@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 2297;
+const CORPUS_FLOOR: usize = 2311;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -1405,6 +1405,90 @@ fn r_dumps_a_source_that_never_ends() -> Result<(), Box<dyn std::error::Error>> 
         waited += 20;
     };
     assert!(status.success(), "a closed reader is not a failure: {status:?}");
+    Ok(())
+}
+
+/// A `w` target is buffered as GNU's is, which is observable only through an `r`
+/// of the same file in the same run.
+#[test]
+fn a_w_target_flushes_on_the_buffer_boundary() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("w-buffer")?;
+    // Each row is GNU sed 4.9's own answer: how much of a `w` target an `r` of the
+    // same file can see, which is the only way the SIZE of that buffer is visible
+    // from outside. The corpus cannot hold these -- its files are written inline,
+    // and the smallest interesting one is 4100 bytes.
+    //
+    // Every answer past the first two is a multiple of 4096 and never the amount
+    // written, which is what says the buffer fills to CAPACITY before writing
+    // rather than flushing early to make room. A `BufWriter` of the same capacity
+    // was measured against these and answers 4000/4000/4000/8000/8000/16000 from
+    // the third row on, so every one of those six rows is a discriminator.
+    let rows: &[(usize, usize)] = &[
+        (1000, 0),
+        (4000, 0),
+        (4100, 4096),
+        (5000, 4096),
+        (8000, 4096),
+        (8300, 8192),
+        (12000, 8192),
+        (20000, 16384),
+    ];
+    for (total, want) in rows {
+        // 100-byte lines, so the totals are exact.
+        let mut input = Vec::new();
+        for i in 0..(total / 100) {
+            input.extend_from_slice(format!("L{i:03}").as_bytes());
+            input.extend(std::iter::repeat_n(b'x', 95));
+            input.push(b'\n');
+        }
+        assert_eq!(input.len(), *total, "the input is not the length the row says");
+        std::fs::write(dir.0.join("h"), &input)?;
+        let out = std::process::Command::new(bin())
+            .arg("sed")
+            .args(["-n", "-e", "w wf", "-e", "$r wf", "h"])
+            .current_dir(&dir.0)
+            .output()?;
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            out.stdout.len(),
+            *want,
+            "{total} bytes written to the w target: the r saw the wrong amount"
+        );
+        // What it saw must be the PREFIX of what was written, not merely its size.
+        assert_eq!(out.stdout, input.get(..*want).unwrap_or_default(), "at {total}");
+        // And the file itself is whole once the run ends.
+        assert_eq!(std::fs::read(dir.0.join("wf"))?.len(), *total, "at {total}");
+    }
+
+    // An EXACT fill is the case the rows above cannot reach, every one of them
+    // crossing the boundary mid-line. stdio OVERFLOWS rather than topping up: a
+    // full buffer is not a reason to write, having more to put and nowhere to put
+    // it is. So a `w` of one 4096-byte record leaves an `r` nothing, where
+    // flushing at capacity would show it all 4096. Each row is one record of
+    // `len` bytes including its separator, repeated `times`, and `want` is again
+    // GNU sed 4.9's own answer for what the `r` sees across the whole run.
+    let exact: &[(usize, usize, usize)] = &[
+        (4096, 1, 0),
+        (4095, 1, 0),
+        (4097, 1, 4096),
+        (4096, 2, 4096),
+    ];
+    for (len, times, want) in exact {
+        let mut input = Vec::new();
+        for _ in 0..*times {
+            input.extend(std::iter::repeat_n(b'A', len.saturating_sub(1)));
+            input.push(b'\n');
+        }
+        std::fs::write(dir.0.join("h"), &input)?;
+        let out = std::process::Command::new(bin())
+            .arg("sed")
+            .args(["-n", "-e", "w wf", "-e", "r wf", "h"])
+            .current_dir(&dir.0)
+            .output()?;
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.stdout.len(), *want, "{times} record(s) of {len} bytes");
+        assert_eq!(std::fs::read(dir.0.join("wf"))?, input, "{times} of {len}");
+    }
     Ok(())
 }
 

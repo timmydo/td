@@ -39,8 +39,9 @@ xfail grep-cli.test.txt::while GNU's own -o reads the dropped interval as text
 xfail grep-cli.test.txt::which it does with no group in the pattern at all
 xfail grep-cli.test.txt::a backreference in ANOTHER branch reads the whole pattern glibc's way
 xfail grep-cli.test.txt::where its -o, reading glibc, selects nothing in those same lines
-xfail sed-cli.test.txt::GNU's own r cannot see what its w has written, because the write is buffered
+xfail sed-cli.test.txt::an R compiled before the w that creates its source is dead for the run in GNU
 xfail sed-cli.test.txt::and a w naming the -f script truncates it before GNU reads it
+xfail sed-cli.test.txt::the compile half, which td-txt does not model: xfail with GNU's golden
 xfail sed-cli.test.txt::\c at the end of a text controls the text's own terminator
 xfail sed-cli.test.txt::where nothing before the dollar pins where a match may start, GNU's literal shows through
 xfail sed-cli.test.txt::a dot pins no byte either, so the same pattern past a branch start still does
@@ -55,5 +56,3 @@ xfail sed-cli.test.txt::POSIXLY_CORRECT also selects a POSIX mode, which td-txt 
 xfail sed-cli.test.txt::N;P;D under the variable, the other half of that same rule
 xfail sed-cli.test.txt::POSIX mode makes an unmatched ) ordinary in an ERE, so GNU compiles this
 xfail sed-cli.test.txt::--posix: a bracket AFTER a closed sub-expression keeps suppressing
-xfail sed-cli.test.txt::and WITHOUT it that r sees an empty file, because GNU's w target is buffered
-xfail sed-cli.test.txt::the compile half, which td-txt does not model: xfail with GNU's golden

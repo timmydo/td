@@ -3837,6 +3837,34 @@ sed: couldn't open file /nosuchdir/out: No such file or directory
 ## stderr-json: ""
 ## status: 0
 
+# WHEN an `R' source is opened is GNU's compile rather than its run, which only a
+# script that CREATES its own source can tell apart. `get_openfile (&file_read,
+# read_mode, false)' (compile.c:1217) passes `false', so unlike a `w' target a
+# source that will not open is no error -- it leaves a null `fp' and is dead for
+# the run, and `rewind_read_files' skips a null `fp' so `-s' cannot revive it.
+# td-txt opens when it runs. `-u' is here only to make the `w' visible one line at
+# a time rather than at 4096; the divergence is the open, not the buffer.
+
+#### an R compiled before the w that creates its source is dead for the run in GNU
+## argv: sed -s -u -e 'R wf' -e 'w wf' h h2
+## file-json h: "1\n2\n"
+## file-json h2: "3\n4\n"
+## file-after-json wf: "1\n2\n3\n4\n"
+## stdin-json: ""
+## stdout-json: "1\n2\n3\n4\n"
+## stderr-json: ""
+## status: 0
+
+#### and compiling the w FIRST makes the source exist, so both read it
+## argv: sed -s -u -e 'w wf' -e 'R wf' h h2
+## file-json h: "1\n2\n"
+## file-json h2: "3\n4\n"
+## file-after-json wf: "1\n2\n3\n4\n"
+## stdin-json: ""
+## stdout-json: "1\n1\n2\n2\n3\n1\n4\n2\n"
+## stderr-json: ""
+## status: 0
+
 #### -s keeps the emptied hold space's terminator, so one separator is owed
 ## argv: sed -s -n -e x;G;p f1 f2
 ## file-json f1: "a"
@@ -4292,9 +4320,10 @@ sed: couldn't open file /nosuchdir/out: No such file or directory
 ## status: 1
 
 # GNU's `w` output is stdio-BUFFERED, so an `r` of the same file in the same run
-# reads what has been flushed rather than what has been written. Recorded as a gap
-# rather than matched: the answer is a function of how many bytes have piled up,
-# not a rule -- see ../spec/README.
+# reads what has been FLUSHED rather than what has been written. That is matched
+# now: the "how many bytes have piled up" this used to be recorded as a gap for
+# is a 4096-byte buffer, measured rather than assumed, and the cases just below
+# `-u' hold the boundary either side of it.
 
 #### GNU's own r cannot see what its w has written, because the write is buffered
 ## argv: sed -n -e 'w out' -e 'r out'
@@ -8020,6 +8049,147 @@ a
 ## stderr-json: ""
 ## status: 0
 
+# That grouping is the only thing that can see WHERE a `w' target is flushed, so
+# the four cases below are the same shape on the four other ways a run can end: a
+# `q' and a fatal read, each on the merged path and the per-file `-s' one. Without
+# the flush the bytes still arrive -- a target is flushed when it is dropped -- but
+# AFTER the auto-print sink instead of before it, which is what these catch. Each
+# was verified to red by removing its own exit's flush and no other.
+
+#### a q flushes the w group ahead of the sink, as the end of a run does
+## argv: sed --posix -n -e p -e s/^/W/ -e 'w /dev/stdout' -e 2q h
+## file-json h: "1\n2\n3\n"
+## stdin-json: ""
+## stdout-json: "W1\nW2\n1\n2\n"
+## stderr-json: ""
+## status: 0
+
+#### and a q on the -s path, which ends the run from a different loop
+## argv: sed -s --posix -n -e p -e s/^/W/ -e 'w /dev/stdout' -e 2q h h2
+## file-json h: "1\n2\n3\n"
+## file-json h2: "4\n5\n"
+## stdin-json: ""
+## stdout-json: "W1\nW2\n1\n2\n"
+## stderr-json: ""
+## status: 0
+
+#### a fatal read flushes it too, so exit 4 still leaves the groups in order
+## argv: sed --posix -n -e p -e s/^/W/ -e 'w /dev/stdout' h d
+## file-json h: "1\n2\n3\n"
+## file-json d/keep: ""
+## stdin-json: ""
+## stdout-json: "W1\nW2\nW3\n1\n2\n3\n"
+## stderr-json: "sed: read error on d: Is a directory\n"
+## status: 4
+
+#### and the same fatal read on the -s path
+## argv: sed -s --posix -n -e p -e s/^/W/ -e 'w /dev/stdout' h d
+## file-json h: "1\n2\n3\n"
+## file-json d/keep: ""
+## stdin-json: ""
+## stdout-json: "W1\nW2\nW3\n1\n2\n3\n"
+## stderr-json: "sed: read error on d: Is a directory\n"
+## status: 4
+
+# A RUNTIME error is a seventh way out and goes through none of those six: an `r'
+# of a directory ends the run by PROPAGATING rather than by setting the
+# read-failure flag, and the flush is owed there too. Missed, the error leaves and
+# the sink's own drop runs before the targets', so the two groups come out
+# reversed -- which is what this case pins.
+
+#### a run ended by a propagating error still flushes its w group first
+## argv: sed --posix -n -e p -e s/^/W/ -e 'w /dev/stdout' -e 'r dir' h
+## file-json h: "1\n2\n"
+## file-json dir/keep: ""
+## stdin-json: ""
+## stdout-json: "W1\n1\n"
+## stderr-json: "sed: read error on dir: Is a directory\n"
+## status: 4
+
+# And one target failing to flush may not cost another its ORDER. `/dev/full'
+# accepts writes and refuses them at ENOSPC, and opened LAST it is flushed FIRST,
+# so abandoning the walk there would leave `/dev/stdout' to its drop -- after the
+# sink. GNU words the failure differently (`couldn't flush <unknown>'), so only
+# the shared half of the diagnostic is asserted; the ORDER and the status are
+# what this is for.
+
+#### a w target that cannot flush does not strand the ones behind it
+## argv: sed --posix -n -e p -e s/^/W/ -e 'w /dev/stdout' -e 'w /dev/full' h
+## file-json h: "1\n2\n"
+## stdin-json: ""
+## stdout-json: "W1\nW2\n1\n2\n"
+## stderr-contains: No space left on device
+## status: 4
+
+# REPORTING that failure is the other half of what the end-of-run flush buys --
+# the ORDER is structural, the sink outliving the targets it must follow, but a
+# drop cannot report. GNU reports it from `ck_fclose' and exits 4, so a `q' that
+# would have exited 0 exits 4 instead.
+
+#### a q reports a w target that could not be flushed, and exits 4 rather than 0
+## argv: sed --posix -n -e p -e s/^/W/ -e 'w /dev/full' -e 2q h
+## file-json h: "1\n2\n3\n"
+## stdin-json: ""
+## stdout-json: "1\n2\n"
+## stderr-contains: No space left on device
+## status: 4
+
+#### and the same from the -s loop's own quit
+## argv: sed -s --posix -n -e p -e s/^/W/ -e 'w /dev/full' -e 2q h h2
+## file-json h: "1\n2\n3\n"
+## file-json h2: "4\n5\n"
+## stdin-json: ""
+## stdout-json: "1\n2\n"
+## stderr-contains: No space left on device
+## status: 4
+
+# A FATAL READ is where that reverses: GNU's reader panics straight into `exit',
+# whose stdio teardown writes what it can and says nothing about what it cannot,
+# so the read error is the ONLY diagnostic even though a target also failed to
+# flush. These two pin the count at one.
+
+#### a fatal read is the only diagnostic, even when a w target also fails
+## argv: sed --posix -n -e p -e s/^/W/ -e 'w /dev/full' h d
+## file-json h: "1\n2\n3\n"
+## file-json d/keep: ""
+## stdin-json: ""
+## stdout-json: "1\n2\n3\n"
+## stderr-json: "sed: read error on d: Is a directory\n"
+## status: 4
+
+#### and the same on the -s path
+## argv: sed -s --posix -n -e p -e s/^/W/ -e 'w /dev/full' h d
+## file-json h: "1\n2\n3\n"
+## file-json d/keep: ""
+## stdin-json: ""
+## stdout-json: "1\n2\n3\n"
+## stderr-json: "sed: read error on d: Is a directory\n"
+## status: 4
+
+# WHICH target flushes first is GNU's open order REVERSED: `get_openfile'
+# prepends to `file_write' (compile.c:425), and `finish_program' walks it from the
+# head on the way out of `main' (sed.c:380). Two names that both reach
+# standard output are the only way to see it, `/dev/fd/1' being a second spelling
+# of the pipe that is a different target from `/dev/stdout' because targets are
+# keyed by NAME. The pair below is the same expected output from opposite open
+# orders, so neither alphabetical order nor insertion order can produce both.
+
+#### the LAST w target opened is the first flushed
+## argv: sed --posix -n -e p -e s/^/W/ -e 'w /dev/stdout' -e s/^/V/ -e 'w /dev/fd/1' h
+## file-json h: "1\n2\n"
+## stdin-json: ""
+## stdout-json: "VW1\nVW2\nW1\nW2\n1\n2\n"
+## stderr-json: ""
+## status: 0
+
+#### and swapping which name is opened first swaps which group leads
+## argv: sed --posix -n -e p -e s/^/W/ -e 'w /dev/fd/1' -e s/^/V/ -e 'w /dev/stdout' h
+## file-json h: "1\n2\n"
+## stdin-json: ""
+## stdout-json: "VW1\nVW2\nW1\nW2\n1\n2\n"
+## stderr-json: ""
+## status: 0
+
 #### and without it the two share one stream and interleave
 ## argv: sed -n -e p -e s/^/W/ -e 'w /dev/stdout' h
 ## file-json h: "1\n2\n3\n"
@@ -8074,12 +8244,15 @@ a
 
 
 #### but that GROUPING is buffering, and -u takes it away in GNU
-# The two streams are separate under `--posix' either way; what ORDERS them is
-# that GNU block-buffers its stdout while the `w' file does not. `-u' makes GNU
-# flush every output after every line (execute.c:415) and the two interleave
-# again -- which is what td-txt does too now: the flag unbuffers the auto-print
-# sink, so the `w' target no longer outruns it. Without the flag they group,
-# which is the case above.
+# The two streams are separate under `--posix' either way, and BOTH are block-
+# buffered -- an earlier draft of this comment had the `w' file unbuffered, which
+# measuring it disproved. What orders them is the CLOSE: `finish_program' walks
+# `file_write' (sed.c:380) and only then does `ck_fclose (NULL)' close stdout,
+# which it does LAST deliberately, so the `w' group is flushed first. `-u' makes
+# GNU flush every output after every line
+# (execute.c:415) and the two interleave again -- which is what td-txt does too,
+# the flag unbuffering the auto-print sink and the `w' target alike. Without the
+# flag they group, which is the case above.
 ## argv: sed --posix -u -n -e p -e s/^/W/ -e 'w /dev/stdout' h
 ## file-json h: "1\n2\n3\n"
 ## stdin-json: ""
@@ -8215,9 +8388,9 @@ a
 ## status: 0
 
 #### and WITHOUT it that r sees an empty file, because GNU's w target is buffered
-# td-txt's `w' target is an unbuffered `File' whatever the flag says, so it gives
-# the interleaved answer here as well and this is the case that says so. xfail
-# with GNU's golden; see spec/README's `w'-buffering gap.
+# The three lines are 6 bytes, well under the 4096 a `w' target buffers, so the
+# `r' finds nothing until the run ends. This was an xfail with GNU's golden when
+# `-u' landed and the buffer that closed it came next.
 ## argv: sed -e 'w wf' -e 'r wf' h
 ## file-json h: "1\n2\n3\n"
 ## stdin-json: ""

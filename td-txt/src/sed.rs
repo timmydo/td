@@ -919,12 +919,15 @@ impl ScriptParser<'_> {
             // Opened as a stream nobody may write to, and not as a PATH: creating
             // `/dev/stdin` truncates whatever the operator's standard input is.
             Some(Special::In) => WDest::Stdin,
-            None => WDest::File(
-                std::fs::File::create(crate::util::path_from_bytes(path))
-                    .map_err(|e| Fatal::runtime_msg(cant_open(path, &e)))?,
-            ),
+            None => {
+                let file = std::fs::File::create(crate::util::path_from_bytes(path))
+                    .map_err(|e| Fatal::runtime_msg(cant_open(path, &e)))?;
+                let buf = WBuf::for_file(&file);
+                WDest::File(file, buf)
+            }
         };
-        self.wfiles.insert(target.clone(), WFile { dest, owed: false });
+        let opened = self.wfiles.len();
+        self.wfiles.insert(target.clone(), WFile { dest, owed: false, opened });
         Ok(())
     }
 
@@ -2318,11 +2321,101 @@ impl<'a> Sink<'a> {
 struct WFile {
     dest: WDest,
     owed: bool,
+    /// Where this target came in the OPEN order, which is not the order the map
+    /// iterates in and is the order the end-of-run flush has to use.
+    opened: usize,
+}
+
+/// A `w` target's buffer. GNU's is stdio's, so both of stdio's choices are asked
+/// of the DESCRIPTOR rather than assumed (`_IO_file_doallocate`): the capacity is
+/// its `st_blksize`, and a terminal is LINE-buffered instead of block-buffered.
+///
+/// What blocks fill to is CAPACITY before writing anything, rather than flushing
+/// early to make room: 4000 bytes buffered then a 100-byte line leaves exactly
+/// 4096 on disk, where a `BufWriter` -- which writes the 4000 to make room, then
+/// buffers the 100 -- leaves 4000. An `r` of the same file in the same run sees
+/// that difference, so the fill is copied rather than delegated.
+#[derive(Debug)]
+struct WBuf {
+    held: Vec<u8>,
+    cap: usize,
+    /// A terminal flushes through the last newline instead of when it fills, and
+    /// on `\n` whatever `-z` made the RECORD separator, since this is stdio's
+    /// rule and not sed's.
+    line: bool,
+}
+
+impl WBuf {
+    /// What every `st_blksize` on this platform answers, and the fallback for a
+    /// descriptor that will not say.
+    const BLOCK: usize = 4096;
+    /// A blksize is a filesystem's word, so it is not trusted to be sane; nothing
+    /// observable rides on the clamp, since a target that big never fills.
+    const MAX: usize = 1 << 20;
+
+    fn for_file(file: &std::fs::File) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        let cap = match file.metadata() {
+            Ok(m) => usize::try_from(m.blksize()).unwrap_or(Self::BLOCK).clamp(1, Self::MAX),
+            Err(_) => Self::BLOCK,
+        };
+        Self { held: Vec::with_capacity(cap), cap, line: std::io::IsTerminal::is_terminal(file) }
+    }
+
+    fn put(&mut self, bytes: &[u8], file: &mut std::fs::File) -> std::io::Result<()> {
+        let through = match self.line {
+            true => bytes.iter().rposition(|b| *b == b'\n').map(|i| i + 1),
+            false => None,
+        };
+        let Some(at) = through else {
+            return self.fill(bytes, file);
+        };
+        self.held.extend_from_slice(bytes.get(..at).unwrap_or_default());
+        self.flush(file)?;
+        self.fill(bytes.get(at..).unwrap_or_default(), file)
+    }
+
+    fn fill(&mut self, mut bytes: &[u8], file: &mut std::fs::File) -> std::io::Result<()> {
+        while !bytes.is_empty() {
+            // A FULL buffer is not a reason to write; having more to put and
+            // nowhere to put it is. stdio overflows rather than topping up, so a
+            // write that exactly fills the buffer leaves it sitting there --
+            // `w` of one 4096-byte record shows an `r` nothing at all, where
+            // flushing at capacity would show it everything.
+            let room = self.cap.saturating_sub(self.held.len());
+            if room == 0 {
+                self.flush(file)?;
+                continue;
+            }
+            let take = room.min(bytes.len());
+            self.held.extend_from_slice(bytes.get(..take).unwrap_or_default());
+            bytes = bytes.get(take..).unwrap_or_default();
+        }
+        Ok(())
+    }
+
+    /// Keeps only what did NOT reach the file, so a failure part way through
+    /// leaves the tail rather than the whole -- `Drop` retries this, and
+    /// `write_all` would hand it back bytes the descriptor already took.
+    fn flush(&mut self, file: &mut std::fs::File) -> std::io::Result<()> {
+        use std::io::Write as _;
+        while !self.held.is_empty() {
+            match file.write(&self.held) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(n) => {
+                    self.held.drain(..n.min(self.held.len()));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
 enum WDest {
-    File(std::fs::File),
+    File(std::fs::File, WBuf),
     Stderr,
     /// `/dev/stdout` under `-i` only; otherwise it rides the auto-print sink.
     Stdout,
@@ -2334,12 +2427,29 @@ impl WFile {
     fn put(&mut self, bytes: &[u8]) -> Result<(), Vec<u8>> {
         use std::io::Write as _;
         let wrote = match &mut self.dest {
-            WDest::File(f) => f.write_all(bytes),
+            WDest::File(f, buf) => buf.put(bytes, f),
+            // Unbuffered on purpose: this arm is C's `stderr`, which is. Under
+            // `--posix` the name is an ordinary path and takes the `File` arm
+            // above, where GNU's `fopen` buffers it too.
             WDest::Stderr => std::io::stderr().write_all(bytes),
             WDest::Stdout => std::io::stdout().write_all(bytes),
             WDest::Stdin => return refuse_write(bytes.len()),
         };
         wrote.map_err(|e| format!("write error: {}", errmsg(&e)).into_bytes())
+    }
+
+    /// Push what the buffer holds. Called after every line under `-u`, and for
+    /// every target at the END of a run however that run ended. GNU reaches the
+    /// same bytes two ways: `finish_program` (sed.c:380) walks `file_write` and
+    /// closes each, which is the route a `q` takes too since `q` RETURNS rather
+    /// than exiting; and a fatal read instead `panic`s into plain `exit`, whose
+    /// stdio teardown writes what it can.
+    fn flush(&mut self) -> Result<(), Vec<u8>> {
+        let flushed = match &mut self.dest {
+            WDest::File(f, buf) => buf.flush(f),
+            WDest::Stderr | WDest::Stdout | WDest::Stdin => return Ok(()),
+        };
+        flushed.map_err(|e| format!("write error: {}", errmsg(&e)).into_bytes())
     }
 
     fn write_line(&mut self, bytes: &[u8], terminated: bool, separator: u8) -> Result<(), Vec<u8>> {
@@ -2353,6 +2463,53 @@ impl WFile {
         }
         self.owed = true;
         Ok(())
+    }
+}
+
+impl Sed {
+    /// Every `w` target's buffer, BEFORE the auto-print sink's own flush. That is
+    /// GNU's order twice over: `finish_program` closes `file_write` on the way out
+    /// of `main` (sed.c:380) and only then does `ck_fclose (NULL)` close stdout,
+    /// which it does last deliberately. It is what puts a `--posix`
+    /// `w /dev/stdout` ahead of auto-print.
+    ///
+    /// LAST-OPENED FIRST, because `get_openfile` PREPENDS to `file_write`
+    /// (compile.c:425) and the walk starts at the head. Two targets that both
+    /// reach standard output are what see it: this map iterates by path, so
+    /// `w /dev/fd/1` before `w /dev/stdout` would come out the opposite way.
+    ///
+    /// Only the exits that flush the SINK need call it, and they must do so
+    /// first. Everywhere else -- a `?` out of anywhere in the run -- the order is
+    /// structural: `out` outlives `sed`, so the drops already fall this way
+    /// round. What these calls add on top is the error a drop cannot report.
+    fn flush_wfiles(&mut self) -> Result<(), Vec<u8>> {
+        let mut order: Vec<&mut WFile> = self.wfiles.values_mut().collect();
+        order.sort_by_key(|w| std::cmp::Reverse(w.opened));
+        // EVERY target, not up to the first failure: GNU's walk closes them all
+        // and its panic exits through stdio's teardown, which flushes the rest.
+        // Stopping here would leave a later target to `Drop` -- that is, to AFTER
+        // the sink, which is the one thing this ordering exists to prevent, and a
+        // full disk on one target would silently reorder another.
+        let mut failed = None;
+        for w in order {
+            if let Err(e) = w.flush() {
+                failed = failed.or(Some(e));
+            }
+        }
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+/// What makes the order right where nothing flushed explicitly: `out` is declared
+/// before `sed`, so these run first and the sink's own drop follows. What it
+/// cannot do is REPORT, which is why the exits that flush the sink flush these
+/// first rather than leaving it here.
+impl Drop for WFile {
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }
 
@@ -2387,6 +2544,9 @@ struct Sed {
     /// `-i`. Only `w /dev/stdout` reads it: the auto-print stream is then the
     /// replacement buffer, and that write still has to reach standard output.
     in_place: bool,
+    /// `-u`, of which a `w` target owns a share: GNU flushes every output after
+    /// every line, and a `w` file is an output.
+    unbuffered: bool,
     terminated: bool,
     appends: Vec<Append>,
     replaced: bool,
@@ -3438,6 +3598,16 @@ fn compile_and_run(
     let mut script = compile_script(source, parts, mode, conf.null_data)?;
     let seed = seed_ranges(&script.cmds);
     let wfiles = std::mem::take(&mut script.wfiles);
+    // BEFORE `sed`, which is what makes the `w`-before-sink order structural: a
+    // local drops in reverse declaration order, so `sed`'s targets flush and then
+    // this does. The explicit flushes below are for their ERROR, which a drop
+    // cannot report; ordering no longer depends on anyone remembering them, and
+    // an exit nobody enumerated -- a `?` from anywhere in here -- comes out right
+    // anyway.
+    let mut out = Out::new();
+    if conf.unbuffered {
+        out.unbuffer();
+    }
     let mut sed = Sed {
         script,
         ranges: seed,
@@ -3450,6 +3620,7 @@ fn compile_and_run(
         hold_terminated: true,
         line_number: 0,
         in_place: conf.in_place.is_some(),
+        unbuffered: conf.unbuffered,
         terminated: true,
         appends: Vec::new(),
         replaced: false,
@@ -3475,10 +3646,6 @@ fn compile_and_run(
         true => 1,
         false => Stream::BLOCK,
     };
-    let mut out = Out::new();
-    if conf.unbuffered {
-        out.unbuffer();
-    }
     let mut status = 0;
 
     if conf.separate || conf.in_place.is_some() {
@@ -3520,6 +3687,7 @@ fn compile_and_run(
                     // that owes descriptor 0 its position back -- an earlier
                     // operand's `R /dev/stdin` may have over-read it.
                     give_back(fd0.as_mut())?;
+                    sed.flush_wfiles().map_err(Fatal::runtime_msg)?;
                     sink.flush().map_err(Fatal::runtime_msg)?;
                     return Ok(4);
                 }
@@ -3587,11 +3755,18 @@ fn compile_and_run(
             // so nothing after it happens.
             if stream.fatal {
                 give_back(fd0.as_mut())?;
+                // The READ failure is the report, and a flush that fails here adds
+                // no second one: GNU's reader panics straight into `exit`, whose
+                // stdio teardown writes what it can and says nothing about what it
+                // cannot. Measured -- a `/dev/full` target under a fatal read is
+                // one diagnostic there and was two here.
+                let _ = sed.flush_wfiles();
                 sink.flush().map_err(Fatal::runtime_msg)?;
                 return Ok(4);
             }
             if let Some(code) = quit {
                 give_back(fd0.as_mut())?;
+                sed.flush_wfiles().map_err(Fatal::runtime_msg)?;
                 sink.flush().map_err(Fatal::runtime_msg)?;
                 // A read failure that has ALREADY happened outranks the quit code,
                 // whatever it is: `sed -s -n Q7 /nosuch A` is 2 in GNU, not 7, while
@@ -3631,6 +3806,8 @@ fn compile_and_run(
         // The flush is for its ERROR — what was written survives either way, since
         // dropping the `BufWriter` writes it, but silently.
         if stream.fatal {
+            // Same as the `-s` path: the read failure is the one report.
+            let _ = sed.flush_wfiles();
             out.flush().map_err(|e| Fatal::runtime(format!("write error: {}", errmsg(&e))))?;
             return Ok(4);
         }
@@ -3638,6 +3815,7 @@ fn compile_and_run(
             status = 2;
         }
         if let Some(code) = quit {
+            sed.flush_wfiles().map_err(Fatal::runtime_msg)?;
             out.flush().map_err(|e| Fatal::runtime(format!("write error: {}", errmsg(&e))))?;
             // Same rule the `-s` path has always applied, and now sound here too:
             // a read failure ALREADY suffered outranks the quit code.
@@ -3647,6 +3825,7 @@ fn compile_and_run(
             });
         }
     }
+    sed.flush_wfiles().map_err(Fatal::runtime_msg)?;
     out.flush().map_err(|e| Fatal::runtime(format!("write error: {}", errmsg(&e))))?;
     Ok(status)
 }
@@ -4370,10 +4549,18 @@ impl Sed {
         // Every target was opened by the parser, so a miss is a command whose name
         // never reached `open_wfile` — not a filesystem failure, and saying so
         // would send the reader to the one place that is working.
+        let unbuffered = self.unbuffered;
         let Some(w) = self.wfiles.get_mut(target) else {
             return Err(crate::util::name_in("no output was opened for ", &target.path, ""));
         };
-        w.write_line(bytes, terminated, separator)
+        w.write_line(bytes, terminated, separator)?;
+        // `-u`'s write half reaches here too: a `w` target is one of the outputs
+        // GNU flushes after every line, which is what lets an `r` of the same file
+        // see what this cycle wrote to it.
+        match unbuffered {
+            true => w.flush(),
+            false => Ok(()),
+        }
     }
 
     /// One pass over the script for the current pattern space.
@@ -4741,6 +4928,57 @@ mod tests {
         Mode { ere, ..EXTENDED }
     }
 
+    /// The LINE-buffered arm of a `w` target, which no corpus case can reach:
+    /// stdio picks it for a terminal and the harness hands its children pipes.
+    /// The rule is stdio's -- everything through the LAST newline goes out and
+    /// the tail waits -- and it is `\n` rather than the record separator, which
+    /// is why `-z` cannot be used to test it either.
+    #[test]
+    fn a_line_buffered_w_target_writes_through_its_last_newline() {
+        let dir = std::env::temp_dir().join("td-txt-wbuf-line");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t");
+        let mut file = std::fs::File::create(&path).unwrap();
+        let mut buf = WBuf { held: Vec::new(), cap: 4096, line: true };
+
+        // No newline: nothing leaves, however much is written.
+        buf.put(b"abc", &mut file).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        // A newline takes the held bytes with it, and only up to the last one.
+        buf.put(b"de\nfg\nhi", &mut file).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"abcde\nfg\n");
+        // The tail is still held, and the explicit flush is what ends it.
+        buf.flush(&mut file).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"abcde\nfg\nhi");
+
+        // A NUL is not a newline to stdio, whatever `-z` made the separator.
+        let path = dir.join("z");
+        let mut file = std::fs::File::create(&path).unwrap();
+        let mut buf = WBuf { held: Vec::new(), cap: 4096, line: true };
+        buf.put(b"a\0b\0", &mut file).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+
+        // And the block arm still fills to capacity rather than on a newline.
+        let path = dir.join("b");
+        let mut file = std::fs::File::create(&path).unwrap();
+        let mut buf = WBuf { held: Vec::new(), cap: 8, line: false };
+        buf.put(b"ab\ncd\n", &mut file).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        buf.put(b"ef\n", &mut file).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"ab\ncd\nef");
+
+        // The capacity comes from the DESCRIPTOR, not from a constant. Every
+        // `st_blksize` on this platform is 4096, so this cannot tell the two
+        // apart today -- what it does catch is the wiring being replaced by some
+        // OTHER number, and a platform whose answer differs.
+        use std::os::unix::fs::MetadataExt as _;
+        let file = std::fs::File::create(dir.join("c")).unwrap();
+        let want = usize::try_from(file.metadata().unwrap().blksize()).unwrap();
+        let sized = WBuf::for_file(&file);
+        assert_eq!(sized.cap, want);
+        assert!(!sized.line, "a regular file is not a terminal");
+    }
+
     /// A `Stream` over bytes. `Stream` reads a DESCRIPTOR now, so the bytes go
     /// through a pipe rather than an in-memory arm of `Src`: a test-only variant
     /// would be a second test-gated item in this file, and the confinement scan
@@ -4811,6 +5049,7 @@ mod tests {
             hold_terminated: true,
             line_number: 0,
             in_place: false,
+            unbuffered: false,
             terminated: true,
             appends: Vec::new(),
             replaced: false,
