@@ -359,7 +359,7 @@ fn squash(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Lan
         // Only unmerged index entries are a conflict. A rejected merge with a
         // clean index (merge.ff=only, a bad ref, a locked index) is a plain
         // failure, and must not be offered a destructive "discard" remedy.
-        let unmerged = git.run(&["diff", "--name-only", "--diff-filter=U"])?;
+        let unmerged = git.run(&["diff", "--no-renames", "--name-only", "--diff-filter=U"])?;
         if unmerged.ok && unmerged.line().is_empty() {
             let why = merge.failure();
             log.push(err_line(format!("merge failed: {why}")));

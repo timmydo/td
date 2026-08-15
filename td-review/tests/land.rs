@@ -843,7 +843,7 @@ fn a_conflict_leaves_the_branch_message_in_squash_msg() -> Res<()> {
     assert!(output.contains("conflicts"), "output: {output}");
 
     // The index really is conflicted -- this is what separates Conflict from Failed.
-    let unmerged = git(&s.work, &["diff", "--name-only", "--diff-filter=U"])?;
+    let unmerged = git(&s.work, &["diff", "--no-renames", "--name-only", "--diff-filter=U"])?;
     assert_eq!(unmerged.trim(), "shared.txt");
 
     // The alias's key property: a hand-finished commit still gets the branch's

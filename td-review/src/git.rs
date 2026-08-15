@@ -523,8 +523,16 @@ impl Git {
             return Err(io::Error::other(list.failure()));
         }
         for commit in list.stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            let files =
-                self.run(&["--no-replace-objects", "diff-tree", "--no-commit-id", "--name-only", "-r", commit, "--"])?;
+            let files = self.run(&[
+                "--no-replace-objects",
+                "diff-tree",
+                "--no-commit-id",
+                "--no-renames",
+                "--name-only",
+                "-r",
+                commit,
+                "--",
+            ])?;
             if !files.ok {
                 return Err(io::Error::other(files.failure()));
             }
@@ -1135,7 +1143,9 @@ mod tests {
     /// This is the INTEGRATOR's half of that check — `td-builder ready` is run
     /// by the same agent that wrote the commit, and this is the one a human
     /// reads — so it is pinned here as well as there, against a real commit
-    /// rather than a pinned argv.
+    /// rather than a pinned argv. The source-text scan below cannot stand in
+    /// for it: that one proves the flag is SPELLED, this one proves the answer
+    /// it produces still reds the waiver.
     #[test]
     fn a_rename_cannot_hide_a_source_file_from_the_docs_only_waiver() {
         let root = std::env::temp_dir().join(format!("td-review-rename-{}", std::process::id()));
@@ -1194,6 +1204,351 @@ mod tests {
             p.iter().any(|s| s.contains("code.rs")),
             "the waiver must red on it: {p:?}"
         );
+    }
+
+    /// Every `.rs` under `dir`, recursively.
+    fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let e = e.unwrap();
+            // The entry's OWN type, which does not follow a symlink: `is_dir()`
+            // on the path would, and a link cycle would recurse until the stack
+            // ran out rather than fail. A symlink is REFUSED rather than
+            // skipped, since either way of skipping one is this scan looking at
+            // less than it reports — a link to a directory would drop a whole
+            // subtree, and one to a file would drop the file.
+            let ty = e.file_type().unwrap();
+            let p = e.path();
+            assert!(!ty.is_symlink(), "{p:?}: symlink in a scanned source tree");
+            if ty.is_dir() {
+                collect_rs_files(&p, out);
+            } else if ty.is_file() && p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// Source with COMMENTS cut away, STRING-AWARE and whole-text.
+    ///
+    /// String-aware because a `//` inside a literal is not a comment, and
+    /// cutting there deletes the rest of the line — including a `--name-only`
+    /// this scan exists to see; `git -c url.https://x.insteadOf=y ...` is the
+    /// shape that does it. String state is per LINE; a literal spanning lines
+    /// is therefore read wrong from its second line on, and that is a known
+    /// limit rather than an oversight — see the body for why whole-text is
+    /// worse here.
+    ///
+    /// BLOCK comments go too, and that is not tidiness: a comment is the one
+    /// place `--no-renames` can sit inside an argv without reaching git, so
+    /// `/* TODO: add --no-renames */` beside a bare query would satisfy the
+    /// rule outright. They NEST in Rust, so the depth is counted rather than
+    /// the first `*/` taken.
+    fn strip_comments(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut depth = 0usize;
+        for line in text.lines() {
+            // String state is PER LINE, and deliberately: tracking it whole-text
+            // desynchronises on the first `r#"…"#` — the test modules here are
+            // full of them — and then mis-strips the rest of the file, which
+            // reds a sibling scan that shares this helper. Block-comment DEPTH
+            // is the part that must cross lines, and it does.
+            let mut in_str = false;
+            let mut esc = false;
+            let mut kept = String::with_capacity(line.len());
+            let mut it = line.char_indices().peekable();
+            while let Some((i, c)) = it.next() {
+                let rest = line.get(i..).unwrap_or_default();
+                if depth > 0 {
+                    if rest.starts_with("/*") {
+                        depth = depth.saturating_add(1);
+                        it.next();
+                    } else if rest.starts_with("*/") {
+                        depth = depth.saturating_sub(1);
+                        it.next();
+                    }
+                    continue;
+                }
+                if in_str {
+                    kept.push(c);
+                    match c {
+                        _ if esc => esc = false,
+                        '\\' => esc = true,
+                        '"' => in_str = false,
+                        _ => {}
+                    }
+                    continue;
+                }
+                if rest.starts_with("//") {
+                    break;
+                }
+                if rest.starts_with("/*") {
+                    depth = 1;
+                    it.next();
+                    continue;
+                }
+                if c == '"' {
+                    in_str = true;
+                }
+                kept.push(c);
+            }
+            out.push_str(&kept);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The construct in `text` that `strip_comments` cannot lex, if any.
+    ///
+    /// Two desynchronise its ONE string state for the rest of the file, after
+    /// which a span belongs to a different argv than the one being judged: a
+    /// HASHED raw string, whose content may hold an unescaped `"`, and `'"'`,
+    /// which is a char literal and not a string opener. A hashless `r"…"` is
+    /// not among them — it cannot contain a quote, so the plain toggle reads
+    /// it exactly right, and `"-r"` would make a bare `r"` test false-positive
+    /// anyway.
+    ///
+    /// Asked only of a file that CARRIES a query, since a desync judges
+    /// nothing in a file with none, and answered by refusing to judge — the
+    /// same fail-safe direction `bare_name_only` takes for an unreadable span.
+    fn unlexable(text: &str) -> Option<&'static str> {
+        let b = text.as_bytes();
+        // Any hash count: `325-cargo-test.rs` opens its gate body `r##"`, and
+        // a check for `r#"` alone would walk straight past it.
+        for (i, _) in text.match_indices("r#") {
+            let mut j = i.saturating_add(1);
+            while b.get(j) == Some(&b'#') {
+                j = j.saturating_add(1);
+            }
+            if b.get(j) == Some(&b'"') {
+                return Some("a hashed raw string");
+            }
+        }
+        if text.contains("'\"'") {
+            return Some("a quote char literal");
+        }
+        None
+    }
+
+    /// `--no-renames` present as an ARGUMENT of `span` rather than anywhere in
+    /// its bytes. `&["diff", "--format=--no-renames", "--name-only"]` names the
+    /// flag without ever passing it, and a `contains` reads that as compliance.
+    fn passes_no_renames(span: &str) -> bool {
+        const FLAG: &str = "--no-renames";
+        let b = span.as_bytes();
+        let edge = |c: Option<&u8>| match c {
+            None => true,
+            Some(c) => *c == b'"' || *c == b'\'' || *c == b',' || c.is_ascii_whitespace(),
+        };
+        span.match_indices(FLAG).any(|(i, _)| {
+            edge(i.checked_sub(1).and_then(|p| b.get(p)))
+                && edge(b.get(i.saturating_add(FLAG.len())))
+        })
+    }
+
+    /// Byte ranges of every bracket group, STRING-AWARE: a `[` or `]` inside a
+    /// string literal is data, and counting it would desynchronise the depth
+    /// and hand back a span belonging to a different argv.
+    fn bracket_spans(text: &str) -> Vec<(usize, usize)> {
+        let mut spans = Vec::new();
+        let mut stack: Vec<usize> = Vec::new();
+        let mut in_str = false;
+        let mut esc = false;
+        for (i, c) in text.char_indices() {
+            if in_str {
+                match c {
+                    _ if esc => esc = false,
+                    '\\' => esc = true,
+                    '"' => in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '[' => stack.push(i),
+                ']' => {
+                    if let Some(s) = stack.pop() {
+                        spans.push((s, i.saturating_add(1)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        spans
+    }
+
+    /// The string literal containing byte `at`, if any — the fallback span for
+    /// a COMBINED command string (`run_shell(root, "git diff --name-only")`),
+    /// which is in no argv literal at all and would otherwise be invisible.
+    fn string_span(text: &str, at: usize) -> Option<(usize, usize)> {
+        let mut in_str = false;
+        let mut esc = false;
+        let mut start = 0usize;
+        for (i, c) in text.char_indices() {
+            if in_str {
+                match c {
+                    _ if esc => esc = false,
+                    '\\' => esc = true,
+                    '"' => {
+                        in_str = false;
+                        if start <= at && at < i {
+                            return Some((start, i));
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            if c == '"' {
+                in_str = true;
+                start = i.saturating_add(1);
+            }
+        }
+        None
+    }
+
+    /// The first place in `text` that asks git for `--name-only` without
+    /// `--no-renames` alongside it.
+    ///
+    /// The span is the smallest enclosing bracket group, or failing that the
+    /// enclosing string literal. Anything with neither yields an empty span and
+    /// so reds: a builder chain of `.arg(...)` calls cannot be judged by reading,
+    /// and refusing is the fail-safe direction.
+    fn bare_name_only(text: &str) -> Option<String> {
+        const NEEDLE: &str = "--name-only";
+        let spans = bracket_spans(text);
+        let mut from = 0usize;
+        while let Some(rel) = text.get(from..).and_then(|t| t.find(NEEDLE)) {
+            let at = from.saturating_add(rel);
+            let span = spans
+                .iter()
+                .copied()
+                .filter(|(s, e)| *s < at && at < *e)
+                .min_by_key(|(s, e)| e.saturating_sub(*s))
+                .or_else(|| string_span(text, at))
+                .and_then(|(s, e)| text.get(s..e))
+                .unwrap_or("");
+            if !passes_no_renames(span) {
+                return Some(span.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+            from = at.saturating_add(NEEDLE.len());
+        }
+        None
+    }
+
+    /// The span logic itself, on literals. Without this the whole mechanism is
+    /// unpinned: `checked` below is counted with `contains`, never through
+    /// `bare_name_only`, so a body that simply returned `None` would satisfy
+    /// every other assertion in both crates forever.
+    #[test]
+    fn the_name_only_scan_reads_a_span_rather_than_a_file() {
+        let bad = r#"g.run(&["diff", "--name-only"]);"#;
+        let good = r#"g.run(&["diff", "--no-renames", "--name-only"]);"#;
+        assert!(bare_name_only(bad).is_some(), "a bare argv must red");
+        assert_eq!(bare_name_only(good), None, "a flagged argv must pass");
+        // PER-ARGV, not per-file: a flagged query does not excuse a bare one
+        // sitting beside it.
+        assert!(
+            bare_name_only(&format!("{good}\n{bad}")).is_some(),
+            "a bare argv beside a flagged one must still red"
+        );
+        // The innermost group wins, so an outer array of argvs cannot lend its
+        // flag to an inner one.
+        let nested = r#"for a in [["diff", "--no-renames"], ["diff", "--name-only"]] {}"#;
+        assert!(bare_name_only(nested).is_some(), "{nested}");
+        // A COMBINED command string has no argv; the literal is the span.
+        assert!(bare_name_only(r#"run_shell(root, "git diff --name-only")"#).is_some());
+        assert_eq!(
+            bare_name_only(r#"run_shell(root, "git diff --no-renames --name-only")"#),
+            None
+        );
+        // A `//` inside a string is not a comment: the needle after it must
+        // still be seen.
+        let url = r#"g.run(&["-c", "url.https://x.insteadOf=y", "diff", "--name-only"]);"#;
+        assert!(
+            bare_name_only(&strip_comments(url)).is_some(),
+            "a string containing // must not hide the query"
+        );
+        // …and a real comment IS stripped, or this file reds itself.
+        assert_eq!(bare_name_only(&strip_comments("// mentions --name-only\n")), None);
+        // A bracket inside a string must not desynchronise the span.
+        let braced = r#"g.run(&["diff", "--no-renames", "--name-only", "--format=[x"]);"#;
+        assert_eq!(bare_name_only(braced), None, "{braced}");
+        // A BLOCK comment may not satisfy the rule: `--no-renames` written
+        // there never reaches git, so the query beside it is bare.
+        let blocked = "g.run(&[\"diff\", \"--name-only\", /* TODO: --no-renames */]);";
+        assert!(
+            bare_name_only(&strip_comments(blocked)).is_some(),
+            "a commented --no-renames must not pass the query beside it"
+        );
+        // Block comments NEST, so the inner close may not end the outer one.
+        let nested_block = "g.run(&[\"diff\", \"--name-only\", /* a /* b */ --no-renames */]);";
+        assert!(bare_name_only(&strip_comments(nested_block)).is_some(), "{nested_block}");
+        // The two constructs the stripper cannot lex are refused, not guessed.
+        assert_eq!(unlexable("let s = r#\"x\"#;"), Some("a hashed raw string"));
+        assert_eq!(unlexable("let c = '\"';"), Some("a quote char literal"));
+        // A hashless raw string holds no quote, so the plain toggle is right
+        // about it — and `"-r"` must not be mistaken for one.
+        assert_eq!(unlexable("let s = r\"x\";"), None);
+        assert_eq!(unlexable(r#"g.run(&["-r", "--no-renames", "--name-only"]);"#), None);
+        // Any hash count, or `325-cargo-test.rs`'s `r##"` gate body walks past.
+        assert_eq!(unlexable("let s = r##\"x\"##;"), Some("a hashed raw string"));
+        assert_eq!(unlexable("let s = r#type;"), None);
+        // The flag must be an ARGUMENT, not any occurrence in the span.
+        let faked = r#"g.run(&["diff", "--format=--no-renames", "--name-only"]);"#;
+        assert!(bare_name_only(faked).is_some(), "a flag named inside another must not pass");
+    }
+
+    /// `--name-only` reports only the DESTINATION of a detected rename, so any
+    /// decision made from its output silently stops seeing the source half of
+    /// a `git mv`. That produced two separate defects — a check selection that
+    /// missed the deletion a rename left behind, and a `docs-only` waiver that
+    /// let a commit deleting Rust source waive all three reviews — and FIVE
+    /// call sites had to be found by reading, because nothing said the rule.
+    ///
+    /// This is the rule. Every `--name-only` in shipped code carries
+    /// `--no-renames` in the same span; a site that genuinely wants rename
+    /// detection reds here and says so in its landing.
+    ///
+    /// Shipped half only, and split at the TEST MODULE rather than at the
+    /// first `#[cfg(test)]`: that attribute also gates single items —
+    /// `builder/src/main.rs` has one on a `mod` DECLARATION at line 30 — and
+    /// splitting there discarded the other 13 000 lines of that file while the
+    /// count below stayed satisfied by other files.
+    #[test]
+    fn no_shipped_name_only_query_lets_git_detect_renames() {
+        const TEST_MOD: &str = "#[cfg(test)]\nmod tests";
+        let mut sources = Vec::new();
+        collect_rs_files(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut sources);
+        assert!(!sources.is_empty(), "no sources to scan");
+        let mut checked = 0usize;
+        for f in &sources {
+            let raw = std::fs::read_to_string(f).unwrap();
+            // Split BEFORE stripping: the tests below must issue a bare
+            // `--name-only` as their positive control, and a rule that refused
+            // those would be a rule against demonstrating itself.
+            let shipped_raw = match raw.find(TEST_MOD) {
+                Some(at) => raw.get(..at).unwrap_or_default(),
+                None => raw.as_str(),
+            };
+            if !shipped_raw.contains("--name-only") {
+                continue;
+            }
+            assert_eq!(
+                unlexable(shipped_raw),
+                None,
+                "{f:?} carries a construct this scan cannot lex beside a git query — move the query or teach `strip_comments`"
+            );
+            let shipped = strip_comments(shipped_raw);
+            checked = checked.saturating_add(shipped.matches("--name-only").count());
+            assert_eq!(
+                bare_name_only(&shipped),
+                None,
+                "{f:?} asks git for --name-only without --no-renames"
+            );
+        }
+        // POSITIVE CONTROL over ARGVS, not files: a scan that reached no query
+        // would pass this crate however its git commands were written.
+        assert!(checked > 0, "no shipped --name-only found to check");
     }
 
     /// `git remote add foo/bar` is accepted, and a delete that guessed the
