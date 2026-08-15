@@ -1603,6 +1603,57 @@ b
 ## status: 2
 ## stderr-contains: option '--f=1' is ambiguous;
 
+#### where td-txt serves every candidate, the whole possibilities list is GNU's
+# `--d` prefixes three options td-txt has and none it lacks, so this pins the
+# ORDER as well as the names -- and the order is the table's, which is GNU's
+# `long_options[]` declaration rather than anything alphabetical. Alphabetical
+# would answer `--dereference-recursive` first; GNU answers it LAST, because it
+# declares that name beside `--recursive` rather than beside `--devices`.
+## argv: grep --d a f1
+## file f1:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: option '--d' is ambiguous; possibilities: '--devices' '--directories' '--dereference-recursive'\nusage: grep [-abEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
+#### and the same two, narrowed, keep that order
+## argv: grep --de a f1
+## file f1:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: option '--de' is ambiguous; possibilities: '--devices' '--dereference-recursive'\nusage: grep [-abEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
+#### an EMPTY prefix lists the whole table, so it shows the order most plainly
+# `--=` splits into an empty name and a value, and every option prefixes the
+# empty string -- so this one diagnostic is the table read out in order. Only
+# the HEAD is pinned: the full list is 33 names and would have to be re-recorded
+# by every landing that serves another option, where the head changes only if
+# the table's leading group does. Alphabetical put `--after-context` first;
+# GNU's declaration leads with the regexp-syntax group, and so does this.
+## argv: grep --= a f1
+## file f1:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: possibilities: '--basic-regexp' '--extended-regexp' '--fixed-strings' '--after-context'
+
+#### --r agreed under either order, and is here to stay agreeing
+# Not evidence of the reorder: `--recursive` precedes `--regexp` alphabetically
+# as well, so this case answered GNU exactly before the table moved. That is
+# what makes it worth pinning -- reordering a table is a chance to break the
+# cases that already agreed, and only the two above would report it.
+## argv: grep --r a f1
+## file f1:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: option '--r' is ambiguous; possibilities: '--recursive' '--regexp'\nusage: grep [-abEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
 #### --max-c=N takes an inline argument
 ## argv: grep --max-c=1 a f1
 ## file f1:

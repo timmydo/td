@@ -1982,27 +1982,69 @@ td-txt-authored case files
     The ORDER half of this was sed's and is closed: `sed --s` answered
     `'--sandbox' '--separate' '--silent'`, td-txt's alphabetical table order,
     where GNU walks `longopts[]` (sed.c:197) and answers `'--silent'
-    '--sandbox' '--separate'`. sed's table is that declaration now, arities
-    included. grep's stayed alphabetical because reordering it bought nothing
-    measurable, and that was a measurement rather than a guess. It is no longer
-    true, and what changed it is worth more than the number. Sweeping 2,268
-    spellings -- every one- and two-character prefix over `a-z` and `-`, bare
-    and with `=1` and `=` -- there are 48 where GNU and td-txt BOTH report an
-    ambiguity: 12 identical, 30 differing by the SET above, and SIX by ORDER
-    ALONE. Those six are two prefixes in three spellings each, `--d` and `--de`,
-    where td-txt answers `--dereference-recursive` first and GNU answers it
-    last.
+    '--sandbox' '--separate'`. sed's table is that declaration now -- its ORDER,
+    which is what a diagnostic shows; the flag beside each name is only whether
+    it takes a value at all, GNU's required/optional distinction being left to
+    the dispatch rather than encoded twice. grep's is that declaration too, as
+    of the reorder below.
 
-    That last count was NOT ONE when this was written, and the `-D` landing is
-    what moved it. Before `--devices` existed the two tools disagreed about
+    It stayed alphabetical for a long time because reordering bought nothing
+    measurable, and that was a measurement rather than a guess. What changed is
+    worth more than the number. Sweeping 2,268 spellings -- every one- and
+    two-character prefix over `a-z` and `-`, bare and with `=1` and `=` -- there
+    are 48 where GNU and td-txt BOTH report an ambiguity. Alphabetical answered
+    12 of them identically, 30 differed by the SET above, and SIX differed by
+    ORDER ALONE: `--d` and `--de`, in three spellings each, where td-txt put
+    `--dereference-recursive` first and GNU puts it last.
+
+    That last count was NOT ONE until the `-D` landing, and how it moved is the
+    part to keep. Before `--devices` existed the two tools disagreed about
     `--d`'s SET -- GNU had a candidate td-txt lacked -- and `--de` was not
     ambiguous here at all. Adding the option closed the set gap and UNCOVERED an
     order gap that had been hiding behind it: a landing that strictly reduced
     one divergence introduced another without touching the table's order. That
-    is the general shape to expect as options are served, rather than anything
-    about `-D`. Reordering grep's table now buys those six spellings where it
-    previously bought nothing; it is still a separate landing, and it is now one
-    with a reason.
+    is the general shape to expect as options are served, and it is why the
+    sweep is re-run rather than cited.
+
+    The table is now GNU's `long_options[]` (grep.c:504) with the unserved
+    options left out and the order intact, which takes those six to ZERO: 18
+    identical, 30 by SET, none by order. GNU's table is not alphabetical in
+    several places and TWO of them show, differently. `--dereference-recursive`
+    is declared beside `--recursive`, with seven names after it, rather than
+    among the `d`s where it would sort: that moves `--d` and `--de`, and
+    both become GNU byte for byte. The regexp-syntax group is hoisted to the
+    front, so `--fixed-strings` precedes `--file`: that moves `--f` and `--fi`
+    into GNU's arrangement without making them identical, the name in that first
+    slot being `--fixed-regexp` for GNU. A fifth listing changed and shows it
+    most plainly: `--=` splits into an EMPTY name and a value, every option
+    prefixes the empty string, so that one diagnostic is the whole table read
+    out in order. FIVE in all, and that is an enumeration rather than an
+    argument -- every proper prefix of every name served, 298 of them plus the
+    empty one, diffed against the previous build. The bucket counts above
+    answer a narrower question and cannot see `--f` improve at all, since it
+    was SET-divergent before and remains so.
+
+    Three inversions against alphabetical order is the whole of it, and the
+    third is inert: `--invert-match` is declared after `--regexp`, but `--i`
+    reaches `--ignore-case` first under either order, so no listing moves.
+    Nothing ELSE is out of sorted position -- `--silent` and `--version` sit
+    where their spelling puts them and are not departures at all, which is a
+    better reason for them not mattering than the one first written here.
+
+    `--d` and `--de` are pinned as corpus goldens, possibilities list and all,
+    along with `--r`, which agreed under either order and is there so that
+    reordering cannot quietly break what already matched. All three assert
+    EXACT stderr rather than a substring, because a substring passes equally
+    with another candidate appended after the ones named -- which is the whole
+    property being claimed. What is GNU's byte for byte is the DIAGNOSTIC LINE;
+    the exact assertion also covers the usage line under it, and that one is
+    td-txt's own (`usage: grep [-ab...]` against GNU's `Usage: grep [OPTION]...`
+    plus a `Try 'grep --help'` line), which is a divergence recorded in its own
+    right. `--=` is pinned too but only at the HEAD of its
+    list: 33 names would have to be re-recorded by every landing that serves
+    another option, where the head moves only if the leading group does.
+    `--f` and `--n` stay name-only, since what still differs there is the SET
+    and no order can fix that.
 
   - `-V` is an option GNU sed still TAKES, with an argument, and td-txt refuses.
     GNU's getopt string carries it (the obsolete `--version` spelling) but its

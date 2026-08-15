@@ -976,9 +976,6 @@ fn split_long(arg: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
     }
 }
 
-/// Every long option this applet knows, so an unambiguous PREFIX resolves the
-/// way GNU's `getopt_long` accepts one (`grep --ignore-c`, `sed --quie`). An
-/// exact name always wins over being a prefix of a longer one.
 /// A long option's argument policy, so `--max-count 1` works and `--count=1`
 /// is refused the way GNU's `getopt_long` refuses it.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -987,24 +984,30 @@ enum Arg {
     Required,
 }
 
+/// Every long option this applet knows, so an unambiguous PREFIX resolves the
+/// way GNU's `getopt_long` accepts one (`grep --ignore-c`), an exact name
+/// always winning over being a prefix of a longer one.
+///
+/// GNU's `long_options[]` (grep.c:504) with the unserved options left out and
+/// the order intact. This is the order an ambiguity lists its possibilities in,
+/// so the table is OUTPUT rather than housekeeping: sorted by name it answers
+/// `--d` with `--dereference-recursive` first, which GNU never prints.
 const LONG_OPTIONS: &[(&[u8], Arg)] = &[
-    (b"after-context", Arg::Required),
     (b"basic-regexp", Arg::None),
+    (b"extended-regexp", Arg::None),
+    (b"fixed-strings", Arg::None),
+    (b"after-context", Arg::Required),
     (b"before-context", Arg::Required),
     (b"byte-offset", Arg::None),
     (b"context", Arg::Required),
     (b"count", Arg::None),
-    (b"dereference-recursive", Arg::None),
     (b"devices", Arg::Required),
     (b"directories", Arg::Required),
-    (b"extended-regexp", Arg::None),
     (b"file", Arg::Required),
     (b"files-with-matches", Arg::None),
     (b"files-without-match", Arg::None),
-    (b"fixed-strings", Arg::None),
     (b"help", Arg::None),
     (b"ignore-case", Arg::None),
-    (b"invert-match", Arg::None),
     (b"line-number", Arg::None),
     (b"line-regexp", Arg::None),
     (b"max-count", Arg::Required),
@@ -1015,7 +1018,9 @@ const LONG_OPTIONS: &[(&[u8], Arg)] = &[
     (b"only-matching", Arg::None),
     (b"quiet", Arg::None),
     (b"recursive", Arg::None),
+    (b"dereference-recursive", Arg::None),
     (b"regexp", Arg::Required),
+    (b"invert-match", Arg::None),
     (b"silent", Arg::None),
     (b"text", Arg::None),
     (b"version", Arg::None),
