@@ -170,6 +170,26 @@ impl App {
         self.stale_typeahead
     }
 
+    /// Show the branch list again, and drop the rest of the read batch with it.
+    ///
+    /// `reload`'s own drop is not enough, and the gap is about which FRAME the
+    /// operator saw. A push and its sweep, a landing, a delete: each rebuilds
+    /// the list while the LOG pane is the thing being drawn, so the frame that
+    /// reveals where the rows now are is this keystroke, not the reload. Keys
+    /// behind it were aimed at a list last seen before any of that — and since
+    /// `D` can now delete without asking, one of them deletes a branch nobody
+    /// was looking at. The batch boundary is the operator's typing speed, not
+    /// anything this can reason about, so the reveal has to be the line.
+    ///
+    /// Every return to the list drops, including from help and the review pane
+    /// where no row can have moved. Knowing which reveals are safe would mean
+    /// tracking what the list looked like when it was last drawn, to save two
+    /// `stty` calls and a `q j` somebody has to press twice.
+    fn show_list(&mut self) {
+        self.screen = Screen::List;
+        self.stale_typeahead = true;
+    }
+
     /// Raise a confirmation. The pending typeahead is dropped by `settle_prompt`
     /// once the prompt is actually on screen.
     fn ask(&mut self, prompt: Prompt) {
@@ -189,7 +209,17 @@ impl App {
         term.drain_input()
     }
 
+    /// Re-read the branch list. Every row can move, so this is where the
+    /// typeahead drop belongs: keys still in the read batch were typed against
+    /// the OLD list, and `D` on a row that shifted under the cursor is an
+    /// irreversible delete of a branch nobody aimed at. `f`'s `--prune` is the
+    /// sharp case — it is the one operation that REMOVES rows, and it is a
+    /// network round trip, which is exactly how a batch comes to have keys in
+    /// it. Before `D` could delete unasked, a misaimed one raised a misaimed
+    /// prompt; the keystroke is what changed, so the drain has to cover every
+    /// way the rows move rather than the paths that happened to delete.
     pub fn reload(&mut self) -> io::Result<()> {
+        self.stale_typeahead = true;
         self.branches = self.git.branches(&self.base)?;
         self.readiness =
             self.branches.iter().map(|b| readiness_of(&self.git, &self.base, b)).collect();
@@ -486,7 +516,7 @@ impl App {
             Screen::Log => {
                 match key {
                     Key::Char('q') | Key::Esc | Key::Ctrl('c') => {
-                        self.screen = Screen::List;
+                        self.show_list();
                     }
                     _ => {
                         self.log_scroll =
@@ -497,7 +527,7 @@ impl App {
             }
             Screen::Help => {
                 if matches!(key, Key::Char('q') | Key::Esc | Key::Char('?')) {
-                    self.screen = Screen::List;
+                    self.show_list();
                 } else {
                     self.help_scroll =
                         scroll_by(self.help_scroll, key, help_lines().len(), term.size().0);
@@ -513,10 +543,19 @@ impl App {
             Key::Backspace => {
                 self.filter.pop();
             }
-            Key::Enter => self.editing_filter = false,
+            // Leaving the filter is the other way the rows move under the
+            // cursor — `Esc` most of all, which restores every row that was
+            // hidden. The drop goes HERE and not in `apply_filter`, which runs
+            // on each character typed: breaking the batch there would eat the
+            // rest of the filter somebody is still typing.
+            Key::Enter => {
+                self.editing_filter = false;
+                self.stale_typeahead = true;
+            }
             Key::Esc | Key::Ctrl('c') => {
                 self.filter.clear();
                 self.editing_filter = false;
+                self.stale_typeahead = true;
             }
             _ => return,
         }
@@ -557,7 +596,7 @@ impl App {
                     self.view.get(self.sel).and_then(|&i| self.branches.get(i)).map(|b| b.refname.clone())
                 {
                     self.log.clear();
-                    self.offer_delete(&refname, term);
+                    self.offer_delete(&refname, term)?;
                 }
             }
             Key::Char('w') => {
@@ -776,7 +815,7 @@ impl App {
         let rows = term.size().0;
         match key {
             Key::Char('q') | Key::Esc | Key::Char('h') | Key::Left => {
-                self.screen = Screen::List;
+                self.show_list();
             }
             Key::Ctrl('c') => return Ok(Flow::Quit),
             Key::Char('?') => self.screen = Screen::Help,
@@ -1203,42 +1242,225 @@ impl App {
         Ok((short.to_string(), targets, diverged))
     }
 
-    /// Raise the delete confirmation for the `D` key, naming the remotes that
-    /// actually carry `refname` — the remote its own row names, and no other.
-    /// Silent when none of them carry it. This branch's relation to anything
-    /// landed is unknown, which is why it is the one delete still confirmed.
-    fn offer_delete(&mut self, refname: &str, term: &mut dyn Ui) {
+    /// The `D` key: delete `refname` from the remotes that actually carry it —
+    /// the remote its own row names, and no other. Silent when none of them do.
+    ///
+    /// Confirmed only when the branch has something to lose: when the REMOTE
+    /// about to lose the ref already carries every commit that ref is carrying,
+    /// deleting it is the tidy-up after a landing, which is why the post-push
+    /// sweep does it unasked already. A branch with commits of its own still
+    /// asks, and so does one this cannot answer for — an unknown is read as
+    /// "there is something here", since the delete is irreversible for anyone
+    /// who has not fetched it.
+    ///
+    /// Every half of that is narrower than it could be, and deliberately. It is
+    /// asked of the OIDS a delete removes rather than of the A column it mostly
+    /// agrees with: `0` there means a LANDING would take nothing, which is also
+    /// true of a branch whose commits change nothing net, and those commits
+    /// exist on no other ref. It is asked of each remote's OWN copy of the base
+    /// rather than of the local one, because a landing that has not been pushed
+    /// yet leaves the local base carrying the work and every remote still
+    /// holding the branch as the only published copy of it — `run_push`'s rule
+    /// for the sweep this cites as its precedent, so it has to be this one's.
+    /// It is refused outright where a push would not reach the repository the
+    /// tracking refs describe, since then no ref read here says anything about
+    /// what the delete lands on, and refused before any of it where a graft
+    /// file or a shallow clone has rewritten the parents every one of these
+    /// answers is computed from. And the base it finally rests on is confirmed
+    /// with the REMOTE rather than with the ref recording what that remote last
+    /// said, because a lease covers the branch going away and nothing covers
+    /// the base — see `delete_takes_nothing`.
+    ///
+    /// So the cell can read `0` on a row that still stops to ask, and never the
+    /// other way about.
+    fn offer_delete(&mut self, refname: &str, term: &mut dyn Ui) -> io::Result<()> {
         let remotes = self.git.remote_names().unwrap_or_default();
         let (named, short) = git::split_remote(refname, &remotes);
         let short = short.to_string();
         if short.is_empty() {
-            return;
+            return Ok(());
         }
         if short == self.base {
             self.note("refusing to delete the base branch", Style::fg(RED));
-            return;
+            return Ok(());
         }
         let only = named.map(|n| vec![n.to_string()]);
         let (targets, _) = match land::delete_plan(&self.git, &short, only.as_deref(), None) {
             Ok(t) => t,
-            Err(e) => return self.note(format!("{e}"), Style::fg(RED)),
+            Err(e) => {
+                self.note(format!("{e}"), Style::fg(RED));
+                return Ok(());
+            }
         };
         if targets.is_empty() {
-            return self.note(format!("no pushable remote carries {short}"), Style::dim());
+            self.note(format!("no pushable remote carries {short}"), Style::dim());
+            return Ok(());
         }
-        // The prompt bar is one clipped row, so the pane must carry the record
-        // of what `y` will delete — and be the pane on screen.
+        // The row's own cell is the first conjunct, and it is the only one that
+        // is a promise to a PERSON rather than to git: a number in the A column
+        // means a prompt. It is local and as old as the last reload where the
+        // proof below is neither, so it is an extra condition rather than the
+        // rule — it can only ever ask more. What it catches is a landing
+        // published by somebody ELSE: the remote's base carries the branch and
+        // this repo's does not, so nothing would be lost, and a row reading
+        // `1/0` would still have vanished unasked.
+        //
+        // Then every target, because a delete reaches them all, and fail-closed:
+        // a question git declines is not a proof.
+        let cell_reads_zero = self
+            .view
+            .get(self.sel)
+            .and_then(|&i| self.branches.get(i).zip(self.prospects.get(i)))
+            .is_some_and(|(b, &p)| {
+                // The row's own TIP as well as its name. `targets` were re-read
+                // a line ago and the row is as old as the last reload, so on a
+                // repo several agents fetch in — one `.git`, shared refs — the
+                // cell can describe an oid that is no longer the one about to
+                // go. A refname match does not notice; this does.
+                b.refname == refname
+                    && takes_nothing(b, p)
+                    && targets.iter().all(|t| t.oid == b.commit)
+            });
         self.screen = Screen::Log;
         self.log_title = format!("delete {short}?");
-        self.log.push(Line::new(format!("will delete {short} from:"), Style::fg(CYAN)));
-        for t in &targets {
+        // The proof runs only where the row has not already settled the matter,
+        // and the pane says it is running only where it is: it ends in an
+        // `ls-remote`, and this used to be a local key, so with the previous
+        // frame still on screen an unreachable remote is a TUI that has
+        // stopped — raw mode has cleared `ISIG`, so there is not even a Ctrl-C
+        // out of it. Every other network step here says what it is doing
+        // first, and none of them says it when it is doing nothing.
+        //
+        // Each target's proof is then KEPT rather than recomputed for the
+        // record: it is the base oid this actually held against, and re-reading
+        // the ref to print it would name whatever it had become. Every refusal
+        // gets a line, because the alternative is a pane that announced a check
+        // and then explains none of what it found.
+        let mut proofs: Vec<String> = Vec::with_capacity(targets.len());
+        if cell_reads_zero {
+            self.log
+                .push(Line::new(format!("checking what deleting {short} takes…"), Style::dim()));
+            self.log_to_end(term);
+            self.redraw(term)?;
+            for t in &targets {
+                let refusal = match self.delete_takes_nothing(t) {
+                    Ok(Proof::Carried(base)) => {
+                        proofs.push(base);
+                        continue;
+                    }
+                    Ok(Proof::Refused(why)) => format!("  {}: {why}", t.remote),
+                    Err(e) => format!("  {}: could not be checked ({e})", t.remote),
+                };
+                self.log.push(Line::new(refusal, Style::fg(YELLOW)));
+                break;
+            }
+        } else {
+            // The cell's own veto says why too. It is the commonest reason
+            // there is a prompt at all — an ordinary unlanded branch — and
+            // saying nothing there would leave the pane explaining every
+            // refusal but the usual one.
+            let row = self
+                .view
+                .get(self.sel)
+                .and_then(|&i| self.branches.get(i).zip(self.prospects.get(i)));
+            let why = match row {
+                Some((b, _)) if b.refname != refname => "this row is not the branch that was aimed at",
+                Some((b, &p)) if !takes_nothing(b, p) => "this row still counts commits the base does not carry",
+                Some(_) => "this row describes a commit that is no longer the branch's tip",
+                None => "there is no row here to check it against",
+            };
+            self.log.push(Line::new(format!("  {why}"), Style::fg(YELLOW)));
+        }
+        let may_skip_prompt = cell_reads_zero && proofs.len() == targets.len();
+        // The prompt bar is one clipped row, so the pane must carry the record
+        // of what is deleted. Both paths write it; for the unconfirmed one it
+        // is the only record there will be, so it says what was deleted and
+        // why it was not asked.
+        self.log.push(Line::new(
+            if may_skip_prompt {
+                format!("{short} carries nothing already published — deleting from:")
+            } else {
+                format!("will delete {short} from:")
+            },
+            Style::fg(CYAN),
+        ));
+        // Indexed rather than zipped: `proofs` stops at the first target that
+        // could not be proved, and a zip would then drop the remaining targets
+        // from the plan — the half of the pane that says what is about to go.
+        for (i, t) in targets.iter().enumerate() {
+            let vouched = match proofs.get(i).map(String::as_str) {
+                Some(base) => {
+                    format!(", carried by {}/{} at {}", t.remote, self.base, land::short(base))
+                }
+                None => String::new(),
+            };
             self.log.push(Line::new(
-                format!("  {} at {}", t.remote, land::short(&t.oid)),
+                format!("  {} at {}{vouched}", t.remote, land::short(&t.oid)),
                 Style::dim(),
             ));
         }
         self.log_to_end(term);
-        self.ask(Prompt::Delete { short, targets })
+        if may_skip_prompt {
+            // The drain `ask` would have set is `run_delete`'s, which every
+            // path to a delete goes through.
+            return self.run_delete(&short, &targets, term);
+        }
+        self.ask(Prompt::Delete { short, targets });
+        Ok(())
+    }
+
+    /// Whether deleting `t` provably takes nothing from the remote it names —
+    /// the proof `offer_delete` may skip its confirmation on, per that doc.
+    ///
+    /// Ordered cheapest first, and the ordering is load-bearing rather than
+    /// tidy: the last question is a NETWORK round trip, so it is asked only
+    /// where everything local has already agreed the delete would go unasked.
+    /// A branch with work of its own costs no more than it did.
+    fn delete_takes_nothing(&self, t: &land::DeleteTarget) -> io::Result<Proof> {
+        // Before anything asks git about ancestry, whether git's answers are
+        // about the repository at all: a graft file or a shallow clone rewrites
+        // the parents every proof below is built on, and `--no-replace-objects`
+        // covers neither.
+        if self.git.graph_is_rewritten()? {
+            return Ok(Proof::Refused("this repository's history is grafted or shallow"));
+        }
+        if !self.git.push_reaches_fetch_url(&t.remote)? {
+            return Ok(Proof::Refused("a push would not reach the repository this read"));
+        }
+        let Some(tracked) = self.git.remote_branch_oid(&t.remote, &self.base)? else {
+            return Ok(Proof::Refused("no copy of the base here"));
+        };
+        if !self.git.carries_nothing_new(&tracked, &t.oid)? {
+            return Ok(Proof::Refused("it carries commits that base does not"));
+        }
+        // Everything above stands on a ref recording what the remote said at
+        // the last FETCH, and the delete's lease does not cover it: it pins
+        // the branch going away, never the base that has to carry its work
+        // instead. So the base is asked of the remote itself, and must be the
+        // very commit just proved against — rewound, replaced, gone, or merely
+        // moved ON all ask.
+        //
+        // Accepting a base that had moved FORWARD was written and taken out:
+        // `ls-remote` does not fetch what it names, so the ancestry check for
+        // it could almost never run, and an arm that never runs in the one
+        // function whose job is preventing data loss is worse than a rule with
+        // one. A fetch makes it the ordinary case again.
+        //
+        // This narrows a race rather than closing it. There is no leasing a
+        // ref that is not being written, so a base rewound between here and
+        // the push is still taken; what this buys is a window of one round
+        // trip where it was "since the last fetch".
+        let Some(live) = self.git.live_remote_branch_oid(&t.remote, &self.base)? else {
+            return Ok(Proof::Refused("the remote has no base branch"));
+        };
+        // The oid goes back to the caller rather than a bare yes, so the pane
+        // records the base this actually held against. Re-reading the ref to
+        // print it would name whatever it had become by then, which on a repo
+        // several agents fetch in is not the same question.
+        if live != tracked {
+            return Ok(Proof::Refused("the remote's base has moved since the last fetch"));
+        }
+        Ok(Proof::Carried(tracked))
     }
 
     /// Raise the worktree sweep (`w`): list every worktree with the reason it is
@@ -1320,6 +1542,14 @@ impl App {
         Ok(())
     }
 
+    /// Delete `short` from `targets` and record it on the pane. Every caller
+    /// reaches here having already decided; this is where it happens.
+    ///
+    /// The typeahead drop is at no caller of this, deliberately: every path
+    /// out of here that RETURNS reaches `refresh_quietly`, so `reload` sets it
+    /// — and `show_list` sets it again when the list is next revealed, which is
+    /// the keystroke that matters when a delete happened with the log pane up.
+    /// The two `?` returns end the TUI, so there is nothing left to mis-aim.
     fn run_delete(
         &mut self,
         short: &str,
@@ -1389,6 +1619,9 @@ fn help_lines() -> Vec<Line> {
             ("r", "re-read branches"),
             ("/", "filter by branch name (esc clears)"),
             ("D", "delete the selected branch from the remote its row names"),
+            ("", "— asked first, unless every check can prove the"),
+            ("", "delete takes nothing; the pane names the one that"),
+            ("", "could not, and then it asks"),
             ("w", "sweep worktrees whose branch has fully landed (clean,"),
             ("", "unpushed, not -rolling); every other one says why it stays"),
             ("?", "this help"),
@@ -1520,6 +1753,15 @@ pub fn readiness_of(git: &Git, base: &str, b: &Branch) -> record::Readiness {
     }
 }
 
+/// What one target's proof came to. `Refused` carries the reason rather than a
+/// bare no, because the pane it lands on is the only record an unconfirmed
+/// delete leaves — and the four refusals are four different things to be told.
+enum Proof {
+    /// The base oid the branch was proved against, as the remote holds it.
+    Carried(String),
+    Refused(&'static str),
+}
+
 /// A row's A/B cell. The behind half is ancestry and stays so; the AHEAD half
 /// says how many commits a LANDING would take, which on a row that reads
 /// `landed` is none.
@@ -1539,12 +1781,23 @@ pub fn readiness_of(git: &Git, base: &str, b: &Branch) -> record::Readiness {
 /// few whose merge conflicts, which is a per-branch process this deliberately
 /// does not spend.
 pub fn counts_cell(b: &Branch, prospect: git::Prospect) -> String {
-    match (prospect, b.counts) {
-        (git::Prospect::Nothing, Some((_, behind))) => format!("0/{behind}"),
+    match (takes_nothing(b, prospect), b.counts) {
+        (true, Some((_, behind))) => format!("0/{behind}"),
         // No counts at all (pre-2.41 git): the landing's half is still known.
-        (git::Prospect::Nothing, None) => "0/?".to_string(),
+        (true, None) => "0/?".to_string(),
         _ => b.counts_label(),
     }
+}
+
+/// Whether the ahead half of that cell is KNOWN to be zero — a branch carrying
+/// nothing the base does not already have, either because a query proved it or
+/// because ancestry counts none. Not knowing counts as ahead: `?/?` is a branch
+/// this cannot vouch for.
+///
+/// This is the CELL's rule and nothing else's. `D`'s skipped confirmation asks
+/// a stricter question of its own — see `offer_delete`.
+fn takes_nothing(b: &Branch, prospect: git::Prospect) -> bool {
+    matches!(prospect, git::Prospect::Nothing) || b.nothing_ahead()
 }
 
 /// A row's READY cell and whether it is de-emphasised — pure, so the rule is
@@ -2549,6 +2802,744 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// `D` on a branch the PUBLISHED base already carries deletes it on the
+    /// keystroke: the confirmation exists to protect work, and this row has
+    /// none to lose — the same tidy-up the post-push sweep does unasked. Held
+    /// to a DIFFERENCE rather than a constant by the branch beside it, whose
+    /// one commit is its own and which still stops to ask.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn d_deletes_a_branch_the_pushed_base_carries_without_asking() {
+        let (root, work) = repo("d-landed");
+        // A second branch that never lands, so the two rows differ only in
+        // whether the base carries what they hold.
+        git_in(&work, &["checkout", "-b", "work-0002-open"]);
+        std::fs::write(work.join("g"), "g\n").unwrap();
+        git_in(&work, &["add", "g"]);
+        git_in(&work, &["commit", "-m", "open: step"]);
+        git_in(&work, &["push", "origin", "work-0002-open"]);
+        git_in(&work, &["checkout", "main"]);
+        git_in(&work, &["branch", "-D", "work-0002-open"]);
+        // Landed by replay, so its remote copy survives under the old oids and
+        // ancestry still counts it a commit ahead — the row this is about.
+        git_in(&work, &["commit", "--allow-empty", "-m", "main moves on"]);
+        git_in(&work, &["cherry-pick", "origin/work-0001-feature"]);
+        // PUBLISHED, which is the half of the rule the local base cannot
+        // stand for: until this push, origin's branch is the only copy of
+        // that work origin has. Its own test is below.
+        git_in(&work, &["push", "origin", "main"]);
+
+        let mut app = app_on(&work);
+        let mut ui = FakeUi::new();
+        let row = |app: &App, name: &str| {
+            app.view.iter().position(|&i| {
+                app.branches.get(i).is_some_and(|b| b.refname == name)
+            })
+        };
+        app.sel = row(&app, "origin/work-0001-feature").unwrap();
+        app.handle(Key::Char('D'), &mut ui).unwrap();
+
+        assert!(app.prompt.is_none(), "a branch with nothing of its own must not ask");
+        let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
+        assert!(!refs.contains("work-0001-feature"), "it was not deleted: {refs}");
+        let log = app.log.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(log.contains("carries nothing already published"), "unrecorded delete:\n{log}");
+        // The proof is per remote, so the record names whose base vouched.
+        assert!(log.contains("carried by origin/main"), "unattributed delete:\n{log}");
+        assert!(log.contains("deleted work-0001-feature from 1 remote"), "{log}");
+
+        // The other row is untouched by the rule: it asks, and answering
+        // anything but yes keeps it. `q` first, because an unconfirmed delete
+        // leaves the log pane up exactly as a push does.
+        app.handle(Key::Char('q'), &mut ui).unwrap();
+        app.sel = row(&app, "origin/work-0002-open").unwrap();
+        app.handle(Key::Char('D'), &mut ui).unwrap();
+        assert!(app.prompt.is_some(), "a branch carrying its own commit must ask");
+        app.handle(Key::Char('n'), &mut ui).unwrap();
+        let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
+        assert!(refs.contains("work-0002-open"), "a kept branch was deleted: {refs}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The same branch as above with the last step left out: landed locally,
+    /// not yet pushed. The A column reads `0` — a landing really would take
+    /// nothing more — and origin's copy of the branch is still the only place
+    /// origin has that work. Deleting it there loses the published copy while
+    /// the base carrying it has not arrived anywhere, so this row asks.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn d_asks_where_the_landing_that_carries_the_branch_is_unpublished() {
+        let (root, work) = repo("d-unpushed-base");
+        git_in(&work, &["commit", "--allow-empty", "-m", "main moves on"]);
+        git_in(&work, &["cherry-pick", "origin/work-0001-feature"]);
+
+        let mut app = app_on(&work);
+        let i = app
+            .branches
+            .iter()
+            .position(|b| b.refname == "origin/work-0001-feature")
+            .unwrap();
+        // The cell reads 0, as it did in the pushed case: the difference this
+        // is about is invisible from the row, which is why the delete asks git
+        // rather than the row.
+        assert_eq!(app.prospects.get(i).copied(), Some(git::Prospect::Nothing));
+
+        app.sel = app.view.iter().position(|&v| v == i).unwrap();
+        let mut ui = FakeUi::new();
+        app.handle(Key::Char('D'), &mut ui).unwrap();
+
+        assert!(app.prompt.is_some(), "origin's only copy of that work went unasked");
+        app.handle(Key::Char('n'), &mut ui).unwrap();
+        let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
+        assert!(refs.contains("work-0001-feature"), "it was deleted anyway: {refs}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The half the missing prompt used to cover for free, and the same hazard
+    /// `r` takes its drain for. An unconfirmed delete replaces the list with
+    /// the log pane AND reloads it, so a batched `q D` arrives at a list whose
+    /// rows have shifted up and deletes a branch nobody aimed at.
+    ///
+    /// Both rows here are ones `D` would not stop to ask about — which is what
+    /// makes the second keystroke destructive rather than merely misaimed, and
+    /// is exactly the state this repo is in the day after a batch of landings.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn keys_typed_behind_an_unconfirmed_delete_do_not_delete_a_second_branch() {
+        let (root, work) = repo("d-typeahead");
+        git_in(&work, &["checkout", "-b", "work-0002-second"]);
+        std::fs::write(work.join("g"), "g\n").unwrap();
+        git_in(&work, &["add", "g"]);
+        git_in(&work, &["commit", "-m", "second: step"]);
+        git_in(&work, &["push", "origin", "work-0002-second"]);
+        git_in(&work, &["checkout", "main"]);
+        git_in(&work, &["branch", "-D", "work-0002-second"]);
+        // Both landed by replay and published, so both rows read 0 ahead.
+        git_in(&work, &["commit", "--allow-empty", "-m", "main moves on"]);
+        git_in(&work, &["cherry-pick", "origin/work-0001-feature"]);
+        git_in(&work, &["cherry-pick", "origin/work-0002-second"]);
+        git_in(&work, &["push", "origin", "main"]);
+
+        let mut app = app_on(&work);
+        let mut ui = FakeUi::new();
+        let aimed = "origin/work-0001-feature";
+        app.sel = app
+            .view
+            .iter()
+            .position(|&i| app.branches.get(i).is_some_and(|b| b.refname == aimed))
+            .unwrap();
+        app.feed(vec![Key::Char('D'), Key::Char('q'), Key::Char('D')], &mut ui).unwrap();
+
+        assert!(app.stale_typeahead(), "the keys typed before the delete must be dropped");
+        let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
+        assert!(!refs.contains("work-0001-feature"), "the aimed-at delete must still run: {refs}");
+        assert!(refs.contains("work-0002-second"), "a blind D reached a second branch: {refs}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// git hashes a commit's DIFF into its patch id, so every EMPTY commit
+    /// hashes the same empty input and `--cherry-pick` drops the branch's
+    /// against any empty commit the base happens to carry — a different commit
+    /// that is no copy of it. The branch here holds td's own parking commit,
+    /// the `Next:` block AGENTS.md puts a handover in, and the base carries an
+    /// unrelated empty one; nothing but this ref has that message.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn d_asks_about_a_branch_whose_only_commit_is_empty() {
+        let (root, work) = repo("d-empty-commit");
+        git_in(&work, &["checkout", "-b", "work-0004-parked"]);
+        git_in(&work, &["commit", "--allow-empty", "-m", "parked\n\nNext: pick up at the parser"]);
+        git_in(&work, &["push", "origin", "work-0004-parked"]);
+        git_in(&work, &["checkout", "main"]);
+        git_in(&work, &["branch", "-D", "work-0004-parked"]);
+        // The collision partner: an empty commit of the base's own, sharing the
+        // branch's patch id and nothing else.
+        git_in(&work, &["commit", "--allow-empty", "-m", "main: an unrelated empty commit"]);
+        git_in(&work, &["push", "origin", "main"]);
+
+        let git = Git::discover(&work).unwrap();
+        let base = git.rev_parse("refs/remotes/origin/main").unwrap();
+        let tip = git.rev_parse("refs/remotes/origin/work-0004-parked").unwrap();
+        assert!(
+            !git.carries_nothing_new(&base, &tip).unwrap(),
+            "an empty commit has no patch to be vouched for by"
+        );
+
+        let mut app = app_on(&work);
+        app.sel = app
+            .view
+            .iter()
+            .position(|&i| {
+                app.branches.get(i).is_some_and(|b| b.refname == "origin/work-0004-parked")
+            })
+            .unwrap();
+        let mut ui = FakeUi::new();
+        app.handle(Key::Char('D'), &mut ui).unwrap();
+
+        assert!(app.prompt.is_some(), "a parking commit that exists nowhere else went unasked");
+        app.handle(Key::Char('n'), &mut ui).unwrap();
+        let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
+        assert!(refs.contains("work-0004-parked"), "it was deleted anyway: {refs}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A graft file rewrites the PARENTS every proof here is built on, and
+    /// `--no-replace-objects` does not cover it — it disables `refs/replace/`
+    /// and grafts are loaded independently. Measured: a graft naming the
+    /// branch's tip as a parent of the base takes the patch count from 1 to 0
+    /// while the base's real tree holds none of it, which is the whole rule
+    /// saying "already landed" about a commit on no other ref.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn d_asks_where_a_graft_has_rewritten_the_history_it_would_prove_against() {
+        let (root, work) = repo("d-graft");
+        // The base needs a parent of its own for the graft to keep, so that
+        // the only thing the graft ADDS is the branch's tip.
+        git_in(&work, &["commit", "--allow-empty", "-m", "main moves on"]);
+        git_in(&work, &["push", "origin", "main"]);
+        let base = git_in(&work, &["rev-parse", "refs/remotes/origin/main"]).trim().to_string();
+        let tip =
+            git_in(&work, &["rev-parse", "refs/remotes/origin/work-0001-feature"]).trim().to_string();
+        let target = land::DeleteTarget { remote: "origin".to_string(), oid: tip.clone() };
+
+        let app = app_on(&work);
+        // Without the graft the branch is plainly unlanded, by the same count.
+        assert!(!app.git.carries_nothing_new(&base, &tip).unwrap());
+
+        // The graft claims the branch's tip is already a parent of the base.
+        let parent = git_in(&work, &["rev-parse", &format!("{base}^")]).trim().to_string();
+        let dir = work.join(".git").join("info");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("grafts"), format!("{base} {parent} {tip}\n")).unwrap();
+
+        // git now agrees the branch is landed — this is the hazard, not the fix.
+        assert!(
+            app.git.carries_nothing_new(&base, &tip).unwrap(),
+            "the graft must actually fool the patch count, or this proves nothing"
+        );
+        // …and the rule refuses on the shape rather than believing it.
+        assert!(app.git.graph_is_rewritten().unwrap(), "a graft file must be seen");
+        assert!(matches!(
+            app.delete_takes_nothing(&target).unwrap(),
+            Proof::Refused(why) if why.contains("grafted")
+        ));
+
+        let mut app = app_on(&work);
+        app.sel = app
+            .view
+            .iter()
+            .position(|&i| {
+                app.branches.get(i).is_some_and(|b| b.refname == "origin/work-0001-feature")
+            })
+            .unwrap();
+        let mut ui = FakeUi::new();
+        app.handle(Key::Char('D'), &mut ui).unwrap();
+        assert!(app.prompt.is_some(), "a grafted history vouched for a delete");
+        app.handle(Key::Char('n'), &mut ui).unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The filter's own drop, which is the third way rows move: `Esc` restores
+    /// every row the filter had hidden, so the cursor lands on a branch the
+    /// operator was not looking at — `f`'s prune hazard reached by typing
+    /// rather than by fetching.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn keys_typed_behind_a_cleared_filter_do_not_delete_the_row_it_restored() {
+        let (root, work) = repo("d-filter-typeahead");
+        git_in(&work, &["checkout", "-b", "work-0002-second"]);
+        std::fs::write(work.join("g"), "g\n").unwrap();
+        git_in(&work, &["add", "g"]);
+        git_in(&work, &["commit", "-m", "second: step"]);
+        git_in(&work, &["push", "origin", "work-0002-second"]);
+        git_in(&work, &["checkout", "main"]);
+        git_in(&work, &["branch", "-D", "work-0002-second"]);
+        git_in(&work, &["commit", "--allow-empty", "-m", "main moves on"]);
+        git_in(&work, &["cherry-pick", "origin/work-0001-feature"]);
+        git_in(&work, &["cherry-pick", "origin/work-0002-second"]);
+        git_in(&work, &["push", "origin", "main"]);
+
+        let mut app = app_on(&work);
+        let mut ui = FakeUi::new();
+        // Filter to one row, then clear it: every hidden row comes back and the
+        // cursor is left over a different branch than the one it was on.
+        app.feed(vec![Key::Char('/'), Key::Char('s'), Key::Char('e')], &mut ui).unwrap();
+        assert_eq!(app.view.len(), 1, "the filter must actually hide a row");
+        let before = git_in(&work, &["ls-remote", "--heads", "origin"]);
+        app.feed(vec![Key::Esc, Key::Char('D')], &mut ui).unwrap();
+
+        assert!(app.stale_typeahead(), "clearing a filter must drop what follows");
+        let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
+        assert_eq!(refs, before, "a blind D deleted a restored row: {refs}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The reload's drop is not enough on its own, because it fires while the
+    /// LOG is the pane being drawn: the operator never sees the list it
+    /// rebuilt. The keystroke that reveals it is the `q` afterwards, in
+    /// whatever batch the operator's typing puts it — here a SECOND one, which
+    /// is the likelier timing, since the push they were waiting on has
+    /// finished by the time they type again.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn keys_typed_after_a_sweep_do_not_delete_on_a_list_last_seen_before_it() {
+        let (root, work) = repo("d-reveal-typeahead");
+        git_in(&work, &["checkout", "-b", "work-0002-second"]);
+        std::fs::write(work.join("g"), "g\n").unwrap();
+        git_in(&work, &["add", "g"]);
+        git_in(&work, &["commit", "-m", "second: step"]);
+        git_in(&work, &["push", "origin", "work-0002-second"]);
+        git_in(&work, &["checkout", "main"]);
+        git_in(&work, &["branch", "-D", "work-0002-second"]);
+        git_in(&work, &["commit", "--allow-empty", "-m", "main moves on"]);
+        git_in(&work, &["cherry-pick", "origin/work-0002-second"]);
+        git_in(&work, &["push", "origin", "main"]);
+
+        let mut app = app_on(&work);
+        let mut ui = FakeUi::new();
+        app.sel = app
+            .view
+            .iter()
+            .position(|&i| {
+                app.branches.get(i).is_some_and(|b| b.refname == "origin/work-0001-feature")
+            })
+            .unwrap();
+        for key in [Key::Enter, Key::Char('r'), Key::Char('q')] {
+            app.handle(key, &mut ui).unwrap();
+        }
+        // One batch lands the push and its sweep, and ends on the log pane.
+        app.feed(vec![Key::Char('p')], &mut ui).unwrap();
+        // The operator, having watched that finish, now types `q D` — a batch
+        // of its own, against a list they last saw before any of it.
+        app.feed(vec![Key::Char('q'), Key::Char('D')], &mut ui).unwrap();
+
+        assert!(app.stale_typeahead(), "revealing the list must drop what follows");
+        let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
+        assert!(refs.contains("work-0002-second"), "a blind D reached a second branch: {refs}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The reload's half of the same hazard, and the sharpest shape of it: `f`
+    /// prunes, which is the one operation that REMOVES rows, and it is a
+    /// network round trip — which is how a batch comes to have keys in it.
+    /// No `q` is needed either, since the screen stays on the list, so `f D` is
+    /// a pair somebody really types. Before `D` could delete unasked that
+    /// misaimed one raised a misaimed prompt.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn keys_typed_behind_a_pruning_fetch_do_not_delete_the_row_that_moved_up() {
+        let (root, work) = repo("d-fetch-typeahead");
+        let origin = root.join("origin.git");
+        // A second landed-and-published branch, so whatever the blind `D`
+        // lands on would go unasked rather than merely misaimed.
+        git_in(&work, &["checkout", "-b", "work-0002-second"]);
+        std::fs::write(work.join("g"), "g\n").unwrap();
+        git_in(&work, &["add", "g"]);
+        git_in(&work, &["commit", "-m", "second: step"]);
+        git_in(&work, &["push", "origin", "work-0002-second"]);
+        git_in(&work, &["checkout", "main"]);
+        git_in(&work, &["branch", "-D", "work-0002-second"]);
+        git_in(&work, &["commit", "--allow-empty", "-m", "main moves on"]);
+        git_in(&work, &["cherry-pick", "origin/work-0001-feature"]);
+        git_in(&work, &["cherry-pick", "origin/work-0002-second"]);
+        git_in(&work, &["push", "origin", "main"]);
+
+        let mut app = app_on(&work);
+        let mut ui = FakeUi::new();
+        app.sel = app.view.len().saturating_sub(1);
+        let survivors: Vec<String> = app
+            .view
+            .iter()
+            .filter_map(|&i| app.branches.get(i))
+            .map(|b| b.refname.clone())
+            .collect();
+        // Somebody else deletes a branch; the next fetch prunes it and every
+        // row below it moves up under the cursor.
+        git_in(&origin, &["update-ref", "-d", "refs/heads/work-0001-feature"]);
+
+        app.feed(vec![Key::Char('f'), Key::Char('D')], &mut ui).unwrap();
+
+        assert!(app.stale_typeahead(), "keys typed behind a pruning fetch must be dropped");
+        let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
+        for name in survivors.iter().filter(|n| !n.ends_with("work-0001-feature")) {
+            let short = name.rsplit('/').next().unwrap_or_default();
+            assert!(refs.contains(short), "a blind D deleted {short}: {refs}");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The cell asks something the proofs do not: `merge_tree` against the
+    /// base's TIP, where a patch count is about diffs anywhere in its history.
+    /// So a row describing an oid that is no longer the tip drops that
+    /// conjunct — the refname still matches, and nothing else would notice.
+    ///
+    /// The branch here is a change whose patch the base carries, on a base that
+    /// went on to REVERT it. Deleting it would lose no CONTENT: the base's own
+    /// history holds the commit that made the same change, which is why this is
+    /// a test about the cell rather than about data. What it pins is that the
+    /// cell is a promise to a PERSON — a number in the A column means a prompt —
+    /// and that the promise is kept against the tip the row actually describes,
+    /// not against whatever another agent's fetch has since made it, since one
+    /// `.git` is shared.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn d_asks_where_the_row_describes_a_tip_that_has_since_moved() {
+        let (root, work) = repo("d-stale-tip");
+        let forked = git_in(&work, &["rev-parse", "HEAD"]).trim().to_string();
+        // The base takes a change and then REVERTS it: the patch stays in its
+        // history while the content leaves its tree.
+        std::fs::write(work.join("f"), "three\n").unwrap();
+        git_in(&work, &["commit", "-am", "base: change to three"]);
+        std::fs::write(work.join("f"), "one\n").unwrap();
+        git_in(&work, &["commit", "-am", "base: and back to one"]);
+        git_in(&work, &["push", "origin", "main"]);
+        // The branch makes that same change, from where the base was before it.
+        git_in(&work, &["checkout", "-b", "work-0003-tree", &forked]);
+        std::fs::write(work.join("f"), "three\n").unwrap();
+        git_in(&work, &["commit", "-am", "tree: the same change, on its own line"]);
+        git_in(&work, &["push", "origin", "work-0003-tree"]);
+        git_in(&work, &["checkout", "main"]);
+        git_in(&work, &["branch", "-D", "work-0003-tree"]);
+
+        let mut app = app_on(&work);
+        let i = app
+            .branches
+            .iter()
+            .position(|b| b.refname == "origin/work-0003-tree")
+            .unwrap();
+        let target = land::DeleteTarget {
+            remote: "origin".to_string(),
+            oid: app.git.remote_branch_oid("origin", "work-0003-tree").unwrap().unwrap(),
+        };
+        // The patch proof passes: this row is refused by the TREE alone.
+        assert!(
+            matches!(app.delete_takes_nothing(&target).unwrap(), Proof::Carried(_)),
+            "the patch count must be 0"
+        );
+        app.sel = app.view.iter().position(|&v| v == i).unwrap();
+
+        // Forge the staleness the reload window really produces: the row keeps
+        // its name and its old, landed-looking verdict while the tip moves on.
+        if let Some(b) = app.branches.get_mut(i) {
+            b.commit = "0".repeat(40);
+        }
+        if let Some(p) = app.prospects.get_mut(i) {
+            *p = git::Prospect::Nothing;
+        }
+        let mut ui = FakeUi::new();
+        app.handle(Key::Char('D'), &mut ui).unwrap();
+
+        assert!(app.prompt.is_some(), "a row describing another tip vouched for a delete");
+        app.handle(Key::Char('n'), &mut ui).unwrap();
+        let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
+        assert!(refs.contains("work-0003-tree"), "it was deleted anyway: {refs}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `D` deletes a landed ROLLING branch's remote copy unasked, where the
+    /// post-push sweep refuses the same branch. The message argues that
+    /// asymmetry at length, so it is pinned rather than left to be re-derived:
+    /// the sweep's refusal is for an unasked pass over branches nobody named,
+    /// and what `D` removes is the remote copy only.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn d_deletes_a_landed_rolling_branch_where_the_sweep_would_keep_it() {
+        let (root, work) = repo("d-rolling");
+        git_in(&work, &["checkout", "-b", "work-rolling"]);
+        std::fs::write(work.join("g"), "g\n").unwrap();
+        git_in(&work, &["add", "g"]);
+        git_in(&work, &["commit", "-m", "rolling: step"]);
+        git_in(&work, &["push", "origin", "work-rolling"]);
+        git_in(&work, &["checkout", "main"]);
+        git_in(&work, &["commit", "--allow-empty", "-m", "main moves on"]);
+        git_in(&work, &["cherry-pick", "origin/work-rolling"]);
+        git_in(&work, &["push", "origin", "main"]);
+        assert!(git::is_rolling("work-rolling"), "the fixture must be a rolling branch");
+
+        let mut app = app_on(&work);
+        app.sel = app
+            .view
+            .iter()
+            .position(|&i| app.branches.get(i).is_some_and(|b| b.refname == "origin/work-rolling"))
+            .unwrap();
+        let mut ui = FakeUi::new();
+        app.handle(Key::Char('D'), &mut ui).unwrap();
+
+        assert!(app.prompt.is_none(), "an explicit ask on a landed branch must not stop to ask");
+        let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
+        assert!(!refs.contains("work-rolling"), "the remote copy must go: {refs}");
+        // The local branch is untouched, which is what makes this safe to do to
+        // a workstream that is still going: its next push recreates the remote.
+        let local = git_in(&work, &["branch", "--list", "work-rolling"]);
+        assert!(local.contains("work-rolling"), "the local branch was taken too: {local:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The promise the A column makes to a person: a number there means a
+    /// prompt. A landing published by SOMEBODY ELSE is where the cell and the
+    /// proof part company — the remote's base carries the branch while this
+    /// repo's does not — and nothing would be lost by deleting, which is why
+    /// the cell is a condition on top of the proof rather than a replacement
+    /// for it. The row still says there is work here, so it is still asked
+    /// about.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn d_asks_about_a_row_whose_own_column_still_counts_the_work() {
+        let (root, work) = repo("d-landed-elsewhere");
+        // Somebody else's landing, arriving on the remote without this repo's
+        // base moving: pushed from a branch that is thrown away after.
+        git_in(&work, &["checkout", "-b", "tmp-land"]);
+        git_in(&work, &["commit", "--allow-empty", "-m", "main moves on"]);
+        git_in(&work, &["cherry-pick", "origin/work-0001-feature"]);
+        git_in(&work, &["push", "origin", "tmp-land:main"]);
+        git_in(&work, &["checkout", "main"]);
+        git_in(&work, &["branch", "-D", "tmp-land"]);
+
+        let mut app = app_on(&work);
+        let i = app
+            .branches
+            .iter()
+            .position(|b| b.refname == "origin/work-0001-feature")
+            .unwrap();
+        // The proof holds — origin's own base carries it — and the cell does
+        // not, which is the whole of this test.
+        let target = land::DeleteTarget {
+            remote: "origin".to_string(),
+            oid: app.git.remote_branch_oid("origin", "work-0001-feature").unwrap().unwrap(),
+        };
+        let Proof::Carried(proved) = app.delete_takes_nothing(&target).unwrap() else {
+            panic!("origin's base must carry it")
+        };
+        assert_eq!(
+            Some(proved),
+            app.git.remote_branch_oid("origin", "main").unwrap(),
+            "the proof must name the base it held against"
+        );
+        let cell = counts_cell(app.branches.get(i).unwrap(), *app.prospects.get(i).unwrap());
+        assert!(!cell.starts_with("0/"), "the column must still count the work: {cell}");
+
+        app.sel = app.view.iter().position(|&v| v == i).unwrap();
+        let mut ui = FakeUi::new();
+        app.handle(Key::Char('D'), &mut ui).unwrap();
+
+        assert!(app.prompt.is_some(), "a row reading {cell} vanished unasked");
+        // And the pane says WHY it is asking, which is what the help promises
+        // — this is the commonest refusal there is, so a silent one here would
+        // make that promise false for nearly every prompt.
+        assert!(
+            app.log.iter().any(|l| l.text.contains("still counts commits")),
+            "the pane must name the check that refused: {:?}",
+            app.log.iter().map(|l| l.text.as_str()).collect::<Vec<_>>()
+        );
+        app.handle(Key::Char('n'), &mut ui).unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The drain belongs to the DELETE, not to the keystroke that skipped a
+    /// prompt: `p`'s post-push sweep deletes and reloads with no prompt at all,
+    /// and it is the integrator's ordinary key. Before `D` could delete
+    /// unasked, a blind one behind a sweep opened a misaimed prompt; now it
+    /// would delete a misaimed branch.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn keys_typed_behind_a_swept_delete_do_not_delete_a_second_branch() {
+        let (root, work) = repo("d-sweep-typeahead");
+        git_in(&work, &["checkout", "-b", "work-0002-second"]);
+        std::fs::write(work.join("g"), "g\n").unwrap();
+        git_in(&work, &["add", "g"]);
+        git_in(&work, &["commit", "-m", "second: step"]);
+        git_in(&work, &["push", "origin", "work-0002-second"]);
+        git_in(&work, &["checkout", "main"]);
+        git_in(&work, &["branch", "-D", "work-0002-second"]);
+        // Landed and published, so `D` on it would go unasked — the row the
+        // blind keystroke lands on once the sweep has shortened the list.
+        git_in(&work, &["commit", "--allow-empty", "-m", "main moves on"]);
+        git_in(&work, &["cherry-pick", "origin/work-0002-second"]);
+        git_in(&work, &["push", "origin", "main"]);
+
+        let mut app = app_on(&work);
+        let mut ui = FakeUi::new();
+        // Land the OTHER branch and publish it, which sweeps its remote copy.
+        app.sel = app
+            .view
+            .iter()
+            .position(|&i| {
+                app.branches.get(i).is_some_and(|b| b.refname == "origin/work-0001-feature")
+            })
+            .unwrap();
+        for key in [Key::Enter, Key::Char('r'), Key::Char('q')] {
+            app.handle(key, &mut ui).unwrap();
+        }
+        app.feed(vec![Key::Char('p'), Key::Char('q'), Key::Char('D')], &mut ui).unwrap();
+
+        assert!(app.stale_typeahead(), "keys typed behind a swept delete must be dropped");
+        let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
+        assert!(refs.contains("work-0002-second"), "a blind D reached a second branch: {refs}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The proof rests on a base the tracking ref says the remote carries, and
+    /// the delete's lease pins the branch going away rather than that base. So
+    /// a remote whose base is rewound after the last fetch — here, back past
+    /// the landing that carried the branch — leaves a ref this would otherwise
+    /// vouch for and a remote that no longer has the work anywhere else.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn d_asks_where_the_remote_has_rewound_the_base_since_the_last_fetch() {
+        let (root, work) = repo("d-rewound");
+        let origin = root.join("origin.git");
+        let published = git_in(&work, &["rev-parse", "origin/main"]).trim().to_string();
+        git_in(&work, &["commit", "--allow-empty", "-m", "main moves on"]);
+        git_in(&work, &["cherry-pick", "origin/work-0001-feature"]);
+        git_in(&work, &["push", "origin", "main"]);
+        // Fetched, so the tracking ref records a base that carries the branch.
+        let tracked = git_in(&work, &["rev-parse", "origin/main"]).trim().to_string();
+        assert_ne!(tracked, published, "the landing must be on the tracking ref");
+        // …and then the remote goes back past it, behind this repo's back.
+        git_in(&origin, &["update-ref", "refs/heads/main", &published]);
+
+        let git = Git::discover(&work).unwrap();
+        assert_eq!(
+            git.live_remote_branch_oid("origin", "main").unwrap(),
+            Some(published),
+            "the remote's own answer must not come from the tracking ref"
+        );
+
+        let mut app = app_on(&work);
+        app.sel = app
+            .view
+            .iter()
+            .position(|&i| {
+                app.branches.get(i).is_some_and(|b| b.refname == "origin/work-0001-feature")
+            })
+            .unwrap();
+        let mut ui = FakeUi::new();
+        app.handle(Key::Char('D'), &mut ui).unwrap();
+
+        assert!(app.prompt.is_some(), "a base the remote no longer has vouched for a delete");
+        app.handle(Key::Char('n'), &mut ui).unwrap();
+        let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
+        assert!(refs.contains("work-0001-feature"), "it was deleted anyway: {refs}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `remote.<name>.pushurl` sends the delete somewhere the tracking refs
+    /// describe nothing about, so every ref this reads — the target oid, the
+    /// lease, the base that is supposed to carry the work — is about a
+    /// different repository than the one losing the branch. Nothing here can
+    /// prove anything about that one, so the skip is refused on the shape.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn d_asks_where_a_push_would_not_reach_the_repository_it_read() {
+        let (root, work) = repo("d-pushurl");
+        git_in(&work, &["commit", "--allow-empty", "-m", "main moves on"]);
+        git_in(&work, &["cherry-pick", "origin/work-0001-feature"]);
+        git_in(&work, &["push", "origin", "main"]);
+        // Everything above is the case that skips; this one line is the whole
+        // difference, and it is invisible to every ref the rule reads.
+        let elsewhere = root.join("elsewhere.git");
+        git_in(&root, &["init", "--bare", "-b", "main", &elsewhere.to_string_lossy()]);
+        git_in(&work, &["config", "remote.origin.pushurl", &elsewhere.to_string_lossy()]);
+
+        let git = Git::discover(&work).unwrap();
+        assert!(!git.push_reaches_fetch_url("origin").unwrap());
+        // The same hole through the other door: one URL, and a `receivepack`
+        // choosing what runs at the end of it. Asserted with the pushurl put
+        // back, so it is this config alone that refuses.
+        git_in(&work, &["config", "--unset", "remote.origin.pushurl"]);
+        assert!(git.push_reaches_fetch_url("origin").unwrap(), "the URLs must agree again");
+        git_in(&work, &["config", "remote.origin.receivepack", "git-receive-pack"]);
+        assert!(!git.push_reaches_fetch_url("origin").unwrap(), "a custom receivepack must refuse");
+        git_in(&work, &["config", "--unset", "remote.origin.receivepack"]);
+        git_in(&work, &["config", "remote.origin.uploadpack", "git-upload-pack"]);
+        assert!(!git.push_reaches_fetch_url("origin").unwrap(), "a custom uploadpack must refuse");
+        git_in(&work, &["config", "--unset", "remote.origin.uploadpack"]);
+        git_in(&work, &["config", "remote.origin.pushurl", &elsewhere.to_string_lossy()]);
+
+        let mut app = app_on(&work);
+        app.sel = app
+            .view
+            .iter()
+            .position(|&i| {
+                app.branches.get(i).is_some_and(|b| b.refname == "origin/work-0001-feature")
+            })
+            .unwrap();
+        let mut ui = FakeUi::new();
+        app.handle(Key::Char('D'), &mut ui).unwrap();
+
+        assert!(app.prompt.is_some(), "a delete aimed at an unread repository went unasked");
+        app.handle(Key::Char('n'), &mut ui).unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A branch whose commits change nothing NET reads `0` in the A column —
+    /// a landing really would take nothing from it — and must still be asked
+    /// about, because its commits, and the messages and records they carry, are
+    /// on no other ref. The delete's question is about the OIDs, not about that
+    /// cell, and this is the row where the two part company.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn d_asks_about_a_branch_whose_commits_are_upstream_nowhere() {
+        let (root, work) = repo("d-empty-net");
+        git_in(&work, &["checkout", "-b", "work-0003-net"]);
+        std::fs::write(work.join("x"), "x\n").unwrap();
+        git_in(&work, &["add", "x"]);
+        git_in(&work, &["commit", "-m", "net: add x"]);
+        std::fs::remove_file(work.join("x")).unwrap();
+        git_in(&work, &["commit", "-am", "net: and take it away"]);
+        git_in(&work, &["push", "origin", "work-0003-net"]);
+        git_in(&work, &["checkout", "main"]);
+        git_in(&work, &["branch", "-D", "work-0003-net"]);
+
+        let mut app = app_on(&work);
+        let i = app
+            .branches
+            .iter()
+            .position(|b| b.refname == "origin/work-0003-net")
+            .unwrap();
+        // The cell really does read 0 — the merge is main's own tree — so this
+        // is the disagreement and not some other branch.
+        assert_eq!(app.prospects.get(i).copied(), Some(git::Prospect::Nothing));
+        let cell = counts_cell(app.branches.get(i).unwrap(), git::Prospect::Nothing);
+        assert!(cell.starts_with("0/"), "the cell must read zero, or this is another row: {cell}");
+
+        app.sel = app.view.iter().position(|&v| v == i).unwrap();
+        let mut ui = FakeUi::new();
+        app.handle(Key::Char('D'), &mut ui).unwrap();
+
+        assert!(app.prompt.is_some(), "two commits that exist nowhere else went unasked");
+        app.handle(Key::Char('n'), &mut ui).unwrap();
+        let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
+        assert!(refs.contains("work-0003-net"), "it was deleted anyway: {refs}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The cell's own rule, which the delete no longer shares: a count PROVED
+    /// zero, or ancestry reporting none. An UNKNOWN count is not zero — `?/?`
+    /// is a branch nothing here can vouch for.
+    #[test]
+    fn the_ahead_cell_reads_zero_only_where_a_landing_takes_nothing() {
+        assert!(takes_nothing(&listed(Some((3, 8))), git::Prospect::Nothing), "landed");
+        assert!(takes_nothing(&listed(Some((0, 8))), git::Prospect::Outstanding), "none ahead");
+        assert!(!takes_nothing(&listed(Some((3, 8))), git::Prospect::Outstanding));
+        assert!(!takes_nothing(&listed(Some((3, 8))), git::Prospect::Conflicted));
+        assert!(!takes_nothing(&listed(None), git::Prospect::Outstanding), "unknown is not zero");
+        for (b, p) in [
+            (listed(Some((3, 8))), git::Prospect::Nothing),
+            (listed(Some((0, 8))), git::Prospect::Outstanding),
+            (listed(Some((3, 8))), git::Prospect::Outstanding),
+            (listed(None), git::Prospect::Outstanding),
+            (listed(None), git::Prospect::Nothing),
+        ] {
+            assert_eq!(
+                counts_cell(&b, p).starts_with("0/"),
+                takes_nothing(&b, p),
+                "cell {} disagrees with its own rule",
+                counts_cell(&b, p)
+            );
+        }
+    }
+
     /// The whole point of the flag: a batch that raises a prompt must not also
     /// answer it. `Dy` arriving in one read may not delete anything.
     #[test]
@@ -2718,9 +3709,18 @@ mod tests {
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
-        app.offer_delete("origin/main", &mut ui);
+        app.offer_delete("origin/main", &mut ui).unwrap();
         assert!(app.prompt.is_none(), "no confirmation may be offered for the base");
         assert!(app.status.contains("base branch"), "status was {:?}", app.status);
+        // The refusal is THIS one, not `land::delete_branch`'s. Both leave the
+        // ref standing and neither raises a prompt, so a surviving `main` and
+        // an unset prompt cannot tell them apart — what can is that the plan
+        // pane was never opened, which is only true if the early return ran
+        // before the rule below it.
+        assert!(matches!(app.screen, Screen::List), "a delete pane was opened for the base");
+        assert!(app.log.is_empty(), "the base reached the plan: {:?}", app.log.len());
+        let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
+        assert!(refs.contains("main"), "the base was deleted: {refs}");
         let _ = std::fs::remove_dir_all(root);
     }
 

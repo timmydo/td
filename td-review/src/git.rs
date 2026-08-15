@@ -457,6 +457,202 @@ impl Git {
         }
     }
 
+    /// Whether every commit `oid` carries beyond `base_oid` is already on the
+    /// base — by ancestry (nothing on the right side at all), or by a patch the
+    /// base carries AND that a patch can speak for.
+    ///
+    /// This is what a DELETE may be skipped on, and it is deliberately a
+    /// stricter question than [`Prospect::Nothing`], which also says yes to a
+    /// branch whose commits change nothing NET — an add and a revert. A landing
+    /// really does take nothing from such a branch, so the A column reads `0`
+    /// for it; but its commits exist on no other ref, and deleting that ref is
+    /// the one operation for which "nothing to land" is not the question.
+    ///
+    /// An EMPTY commit is that same case with the patch count agreeing rather
+    /// than disagreeing, which is why it needs its own question. git hashes a
+    /// commit's DIFF into its patch id, so a commit with no diff hashes the
+    /// same empty input as every other one, and `--cherry-pick` drops the
+    /// branch's against ANY empty commit the base happens to carry — a
+    /// different commit, with a different message, that is no copy of it. td's
+    /// own workflow parks a handover in exactly such a commit (AGENTS.md's
+    /// `Next:` block, which lives in a commit message because nothing untracked
+    /// survives a fresh worktree), and this repo's main already carries an empty
+    /// commit to collide with. So a patch id cannot vouch for one, and the
+    /// honest answer is that nothing here can.
+    ///
+    /// Both arguments are OIDs rather than branch NAMES, because the caller's
+    /// question is about particular refs at a particular moment: the oid a
+    /// delete would remove, and the base as the remote about to lose it holds
+    /// it. A name would answer about whatever those refs became.
+    ///
+    /// What a patch id does NOT prove is that the base carries the branch's
+    /// MESSAGE, or even its exact BYTES. It is deliberately fuzzy — git hashes
+    /// a diff with whitespace and line numbers ignored, which is what lets a
+    /// rebased copy at a different offset still match — so a commit somebody
+    /// wrote independently to the same message-less, whitespace-normalised
+    /// change matches too, and this calls that landed. Both are the same
+    /// limit seen twice, and it is the equivalence a REPLAY landing selects
+    /// with, so `r` would skip such a commit as already landed for the same
+    /// reason. Only two things are stronger: ancestry, which no replay-landed
+    /// branch has, and the merge TREE — which is not available everywhere it
+    /// looks like it should be. It stops being an answer exactly where the
+    /// base has moved past the branch AND touched the same lines: the merge
+    /// conflicts, and [`Self::prospect`] falls back to this same count to say
+    /// anything at all. So the two are not a stronger proof waiting to be
+    /// used; where they hold the cell already agrees, and where they do not
+    /// this is what is left.
+    pub fn carries_nothing_new(&self, base_oid: &str, oid: &str) -> io::Result<bool> {
+        if self.unlanded_by_patch(base_oid, oid)? != 0 {
+            return Ok(false);
+        }
+        Ok(!self.carries_an_empty_commit(base_oid, oid)?)
+    }
+
+    /// Whether any commit `oid` carries beyond `base_oid` changes nothing —
+    /// the commits a patch id cannot speak for, per [`Self::carries_nothing_new`].
+    ///
+    /// Asked only once that patch count is zero, so this walks a branch whose
+    /// commits are all accounted for and no further. A merge would report no
+    /// files here too, and answering "empty" for one is right by accident and
+    /// harmless: `--cherry-pick` never drops a merge, so a set holding one was
+    /// refused by the count before reaching this.
+    fn carries_an_empty_commit(&self, base_oid: &str, oid: &str) -> io::Result<bool> {
+        let range = format!("{base_oid}...{oid}");
+        let list = self.run(&["--no-replace-objects", "rev-list", "--right-only", &range, "--"])?;
+        if !list.ok {
+            return Err(io::Error::other(list.failure()));
+        }
+        for commit in list.stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let files =
+                self.run(&["--no-replace-objects", "diff-tree", "--no-commit-id", "--name-only", "-r", commit, "--"])?;
+            if !files.ok {
+                return Err(io::Error::other(files.failure()));
+            }
+            // Asked of the LINES, not of a trim: a file whose whole NAME is a
+            // space is a real change, and every spelling of trimming reads it
+            // as an empty commit. Fail-closed either way; this is the exact
+            // question, and it costs nothing to ask it exactly.
+            if !files.stdout.lines().any(|l| !l.is_empty()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether this repository's commit graph is REWRITTEN locally, so that
+    /// what git answers about ancestry is not what the remote holds.
+    ///
+    /// `--no-replace-objects` covers `refs/replace/` and nothing covers these.
+    /// A legacy `$GIT_DIR/info/grafts` is loaded independently of the replace
+    /// machinery — deprecated since 2.9 and still honoured in 2.54 — and it
+    /// rewrites PARENTS, which is the one thing every proof here is built on.
+    /// Measured: a graft naming a branch tip as a parent of the base takes
+    /// `rev-list --count --cherry-pick --right-only` from 1 to 0, with
+    /// `--no-replace-objects` passed and the real base's tree holding none of
+    /// it. That is the whole rule saying "already landed" about a commit on no
+    /// other ref. A SHALLOW clone is the same defect from the other end: its
+    /// history stops at a boundary git treats as a root, so commits beyond it
+    /// cannot be compared at all.
+    ///
+    /// Neither is a state the integrator's own clone is in, which is why this
+    /// refuses rather than trying to reason through it.
+    pub fn graph_is_rewritten(&self) -> io::Result<bool> {
+        // The graft file is asked for by NAME rather than composed from the
+        // git dir, because `GIT_GRAFT_FILE` moves it: a path built by hand
+        // would report no graft while the very next `rev-list` honoured one.
+        let path = self.run(&["rev-parse", "--git-path", "info/grafts"])?;
+        if !path.ok {
+            return Err(io::Error::other(path.failure()));
+        }
+        let file = PathBuf::from(path.line());
+        let file = if file.is_absolute() { file } else { self.repo.join(file) };
+        // `try_exists`, not `exists`: the latter reads an I/O error as "no
+        // graft", which is the one direction this function may not fail in.
+        if file.try_exists()? {
+            return Ok(true);
+        }
+        let shallow = self.run(&["rev-parse", "--is-shallow-repository"])?;
+        if !shallow.ok {
+            return Err(io::Error::other(shallow.failure()));
+        }
+        Ok(shallow.line() == "true")
+    }
+
+    /// Whether pushing to `remote` reaches the repository fetching from it
+    /// reads: one URL on each side, and the same one.
+    ///
+    /// `remote.<name>.pushurl` sends a push somewhere the tracking refs know
+    /// nothing about, and `git push` uses EVERY one configured — which is why
+    /// [`Self::remotes`] already asks with `--push --all`. A tracking ref is
+    /// then a claim about a DIFFERENT repository than the one a delete lands
+    /// on, and no lease closes that: `--force-with-lease` pins the branch being
+    /// deleted, never the base something has to carry instead. Safe only while
+    /// a person is asked first, so an unasked delete refuses the whole shape.
+    pub fn push_reaches_fetch_url(&self, remote: &str) -> io::Result<bool> {
+        let push = self.run(&["remote", "get-url", "--push", "--all", remote])?;
+        let fetch = self.run(&["remote", "get-url", "--all", remote])?;
+        // An Err rather than a `false`: `false` is the answer for a remote that
+        // ANSWERED and whose two sides differ, which the caller reports as an
+        // ordinary refusal. A question git declined is a different thing and
+        // has a line of its own on the pane.
+        if !push.ok {
+            return Err(io::Error::other(push.failure()));
+        }
+        if !fetch.ok {
+            return Err(io::Error::other(fetch.failure()));
+        }
+        // Not trimmed: `lines()` has taken the newline already, and trimming
+        // beyond it would equate " /srv/a.git" with "/srv/a.git" — two
+        // different directories, compared in the one direction that must not
+        // over-equate, since equal is what lets the delete go unasked.
+        fn urls(s: &str) -> Vec<&str> {
+            s.lines().filter(|l| !l.is_empty()).collect()
+        }
+        let (p, f) = (urls(&push.stdout), urls(&fetch.stdout));
+        if !(p.len() == 1 && p == f) {
+            return Ok(false);
+        }
+        // A URL is only half of an endpoint. `receivepack` and `uploadpack`
+        // choose the PROGRAM run at the far end, so one URL can serve a push
+        // out of a different repository than the reads described — the pushurl
+        // hole again, through a door a URL comparison cannot see. Refused
+        // rather than reasoned about, as the whole shape is.
+        //
+        // `url.<base>.pushInsteadOf` needs nothing here: it rewrites what `git
+        // remote get-url --push` reports, so a rewrite that sends the push
+        // elsewhere already reads as two different URLs above. Measured.
+        for key in ["receivepack", "uploadpack"] {
+            let cfg = self.run(&["config", "--get-all", &format!("remote.{remote}.{key}")])?;
+            if cfg.stdout.lines().any(|l| !l.is_empty()) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// The oid `remote` reports for branch `short` NOW, over the network, as
+    /// against [`Self::remote_branch_oid`]'s answer from the last fetch. `None`
+    /// when the remote carries no such branch.
+    ///
+    /// A tracking ref is the only thing a delete's `--force-with-lease` pins,
+    /// and it pins the branch being deleted rather than the base that has to
+    /// carry its work instead. So the base is the one ref in that proof with
+    /// nothing behind it, and the answer is asked of the remote rather than of
+    /// a ref recording what it once said. Only worth its round trip where a
+    /// delete is about to go unasked, so callers ask it last.
+    pub fn live_remote_branch_oid(&self, remote: &str, short: &str) -> io::Result<Option<String>> {
+        let refname = format!("refs/heads/{short}");
+        let run = self.run(&["ls-remote", "--end-of-options", remote, &refname])?;
+        if !run.ok {
+            return Err(io::Error::other(run.failure()));
+        }
+        Ok(run.stdout.lines().find_map(|l| {
+            let mut fields = l.split_whitespace();
+            let oid = fields.next()?;
+            (fields.next()? == refname).then(|| oid.to_string())
+        }))
+    }
+
     /// Commits on `branch` whose patch the base does not already carry — the
     /// same `--cherry-pick --right-only` selection a replay landing makes at
     /// `land.rs`'s `rebase`, so the list cannot call a branch landable that a
@@ -477,7 +673,8 @@ impl Git {
     /// bases.
     fn unlanded_by_patch(&self, base_oid: &str, branch: &str) -> io::Result<usize> {
         let range = format!("{base_oid}...{branch}");
-        let argv = ["rev-list", "--count", "--cherry-pick", "--right-only", &range, "--"];
+        let argv =
+            ["--no-replace-objects", "rev-list", "--count", "--cherry-pick", "--right-only", &range, "--"];
         let out = self.run_ok(&argv)?;
         out.trim()
             .parse()
