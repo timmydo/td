@@ -6892,7 +6892,7 @@ mod tests {
         // when a unit needs that text: the commands before it have already run.
         let (status, out, err) = run_capturing("echo hi\necho 'unterminated");
         assert_eq!((status, out.as_str()), (2, "hi\n"));
-        assert!(err.contains("unmatched"), "err: {err:?}");
+        assert!(err.contains("unterminated quoted string"), "err: {err:?}");
         // ... and the command the bad text belongs to does NOT run. The example
         // is an unterminated QUOTE because an unterminated here-document is no
         // longer one of these: the input ending ends its body and the command

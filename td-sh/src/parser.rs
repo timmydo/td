@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::ast::{
     is_name, AndOr, ArithCmp, Assign, CaseItem, Cmd, CondExpr, CondOp, Conn, IfArm, List, Pipeline, Redir,
-    RedirKind, Seg, Sep, Stage, Syn, SynErr, Word, INCOMPLETE,
+    RedirKind, Seg, Sep, Stage, Syn, SynErr, Word,
 };
 use crate::lexer::{tokenize, Op, Placed, Scan, Tok};
 
@@ -158,7 +158,7 @@ pub struct Units {
     /// What stopped the lexer, raised only once a parse needs the text there.
     pending: Option<SynErr>,
     /// Set when a fetch ran off the end of the tokens, which is how `pending`
-    /// becomes this unit's error rather than a bare "unexpected end of input".
+    /// becomes this unit's error rather than a bare end-of-file one.
     hit_end: bool,
     pos: usize,
     depth: u32,
@@ -472,7 +472,7 @@ impl Units {
         // parser as commands.
         if let Some(delim) = lexed.heredoc_ran_out {
             return Err(SynErr::from(format!(
-                "alias `{name}': {INCOMPLETE}: here-document delimited by `{delim}`"
+                "alias `{name}': syntax error: unexpected end of file (expecting {delim:?})"
             )));
         }
         let base = self.scan.push_heredocs(lexed.heredocs);
@@ -636,11 +636,17 @@ impl Units {
 
     fn unexpected_named(&mut self, expecting: Option<&str>, kw: bool) -> SynErr {
         let tok = self.tokname(kw);
-        match expecting {
+        let msg = match expecting {
             Some(want) => format!("syntax error: unexpected {tok} (expecting {want})"),
             None => format!("syntax error: unexpected {tok}"),
+        };
+        // `end of file` is the input running out, which another line completes;
+        // every other name is a token that arrived, which none does.
+        if self.at_eof() {
+            SynErr::incomplete(msg)
+        } else {
+            msg.into()
         }
-        .into()
     }
 
     fn describe(&mut self) -> String {
@@ -677,9 +683,6 @@ impl Units {
             self.bump();
             return Ok(());
         }
-        if self.at_eof() {
-            return Err(SynErr::incomplete(format!("expected `{}`", want.text())));
-        }
         let want = format!("\"{}\"", want.text());
         Err(self.unexpected_named(Some(&want), kw))
     }
@@ -688,9 +691,6 @@ impl Units {
         if self.peek_reserved() == Some(want) {
             self.bump();
             return Ok(());
-        }
-        if self.at_eof() {
-            return Err(SynErr::incomplete(format!("expected `{want}`")));
         }
         let want = format!("\"{want}\"");
         Err(self.unexpected(Some(&want)))
@@ -706,10 +706,9 @@ impl Units {
                 self.bump();
                 Ok(w)
             }
-            None | Some(Tok::Eof) => Err(SynErr::incomplete("expected a word")),
             // A word POSITION, so a reserved word would be named `word` --
-            // which nothing reaching this arm can be, the `Word` arm above
-            // having matched first.
+            // which nothing reaching here can be, the `Word` arm above having
+            // matched first. End of file names itself and needs no arm.
             _ => Err(self.unexpected_in_word(expecting)),
         }
     }
@@ -1022,7 +1021,10 @@ impl Units {
             Some(Tok::IoNumber(_)) => {
                 Err("syntax error: unexpected redirection inside `[[`".into())
             }
-            None | Some(Tok::Eof) => Err(SynErr::incomplete("expected `]]`")),
+            // NOT ash's `missing ]]`: there that is the test builtin at RUN
+            // time and the shell survives it, so borrowing the words would
+            // describe a parse error as something it is not.
+            None | Some(Tok::Eof) => Err(self.unexpected(Some("\"]]\""))),
             _ => Err(format!(
                 "syntax error: expected an operand inside `[[`, found {}",
                 self.describe()
@@ -1102,14 +1104,9 @@ impl Units {
             _ => None,
         };
         let Some((name, assignment)) = taken else {
-            // Only an input that ENDED is incomplete: that marker is the
-            // interactive reader's request for another line, and no line can
-            // rescue `function ;`.
-            return Err(if self.at_eof() {
-                SynErr::incomplete("expected a function name")
-            } else {
-                self.unexpected(Some("word"))
-            });
+            // ash passes TWORD whatever stopped it (ash.c:12095), so the
+            // expectation stands at end of file as well.
+            return Err(self.unexpected(Some("word")));
         };
         // ash files an assignment-shaped name as a VARIABLE, leaving `do_func`
         // (ash.c:12163) without the one argument it tests for.
@@ -1136,11 +1133,7 @@ impl Units {
             .peek_reserved()
             .is_some_and(|w| FUNCTION_BODY_OPENS.contains(&w))
         {
-            return Err(if self.at_eof() {
-                SynErr::incomplete("expected a function body")
-            } else {
-                self.unexpected(None)
-            });
+            return Err(self.unexpected(None));
         }
         self.func_body(name, line)
     }
@@ -1262,7 +1255,7 @@ impl Units {
                 break;
             }
             if self.at_eof() {
-                return Err(SynErr::incomplete("expected `esac`"));
+                return Err(self.unexpected(Some("\"esac\"")));
             }
             if self.peek_op() == Some(Op::LParen) {
                 self.bump();
@@ -1336,12 +1329,9 @@ impl Units {
         }
         if assigns.is_empty() && words.is_empty() && redirs.is_empty() {
             // Running out of input where a command was due is incomplete, not
-            // wrong: `f ()` on its own line still has its body coming.
-            return Err(if self.at_eof() {
-                SynErr::incomplete("expected a command")
-            } else {
-                self.unexpected(None)
-            });
+            // wrong -- `f ()` on its own line still has its body coming -- and
+            // `unexpected` reads that off the token it names.
+            return Err(self.unexpected(None));
         }
         Ok(Cmd::Simple {
             assigns,
@@ -1373,7 +1363,7 @@ impl Units {
 
     fn parse_redir(&mut self, fd: Option<u32>) -> Syn<Redir> {
         let Some(op) = self.peek_op() else {
-            return Err(SynErr::incomplete("expected a redirection"));
+            return Err(self.unexpected(None));
         };
         self.bump();
         if let Op::DLess(id) = op {
@@ -1595,15 +1585,36 @@ mod tests {
         let spliced = parse_probe("q\n", &aliases).unwrap_err();
         assert!(!spliced.is_incomplete(), "{spliced}");
         // Named, so this is the here-document refusal and not some other one,
-        // and carrying the phrase but not LEADING with it -- which is the only
-        // reason prefix-matching ever answered this correctly.
+        // and carrying the ENDED wording without being one -- a message and a
+        // flag saying different things, which is the whole point of the two
+        // being separate.
         assert!(spliced.msg.starts_with("alias `q':"), "{spliced}");
-        assert!(spliced.msg.contains("here-document delimited by `EOF`"), "{spliced}");
-        assert!(spliced.msg.contains(INCOMPLETE), "{spliced}");
-        assert!(!spliced.msg.starts_with(INCOMPLETE), "{spliced}");
+        assert!(spliced.msg.contains(r#"(expecting "EOF")"#), "{spliced}");
+        // A delimiter is an arbitrary WORD: one carrying the quote it is put
+        // inside has to come back escaped rather than closing it early.
+        let mut odd = Aliases::new();
+        odd.insert("q".to_string(), "cat <<'E\"F'".to_string());
+        let e = parse_probe("q\n", &odd).unwrap_err();
+        assert!(e.msg.contains(r#"(expecting "E\"F")"#), "{e}");
+        assert!(spliced.msg.contains("unexpected end of file"), "{spliced}");
     }
 
-    /// `INCOMPLETE` is the interactive reader's request for another line, so a
+    /// An assignment-shaped name is the shape where "ended" and "cannot be
+    /// repaired" come apart: at EOF the flag is set, because the token named
+    /// IS end of file and ash prompts there too. What the reader sees is the
+    /// probe of a line it has already ended, which stops on the NEWLINE and is
+    /// hard -- so no prompt waits for input that cannot arrive.
+    #[test]
+    fn a_name_that_no_line_can_repair_never_holds_the_prompt() {
+        let a = Aliases::new();
+        assert!(!parse_probe("function a=1\n", &a).unwrap_err().is_incomplete());
+        assert!(!parse_probe("function ;\n", &a).unwrap_err().is_incomplete());
+        // A construct that another line really does finish still asks, so this
+        // is about THIS shape rather than about newline-ended probes at large.
+        assert!(parse_probe("if :\n", &a).unwrap_err().is_incomplete());
+    }
+
+    /// The flag is the interactive reader's request for another line, so a
     /// token that is merely WRONG must not carry it -- `parse_probe` would go
     /// to PS2 and never come back.
     #[test]

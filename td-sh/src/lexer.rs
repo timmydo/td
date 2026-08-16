@@ -393,7 +393,7 @@ fn close_paren(lx: &mut Lexer) -> Syn<(usize, usize)> {
                     return Ok((before, lx.sc.pos));
                 }
             }
-            Tok::Eof => return Err(SynErr::incomplete("unmatched `$(`")),
+            Tok::Eof => return Err(SynErr::incomplete("syntax error: unexpected end of file (expecting \")\")")),
             _ => {}
         }
     }
@@ -1059,7 +1059,7 @@ impl Lexer {
             self.skip_blanks();
             let Some(c) = self.sc.peek() else {
                 if self.fold_wants_more() {
-                    return Err(SynErr::incomplete("line continuation"));
+                    return Err(SynErr::incomplete("syntax error: unexpected end of file"));
                 }
                 self.finish_heredocs()?;
                 return Ok(Tok::Eof);
@@ -1215,7 +1215,7 @@ impl Lexer {
 
     fn scan_op(&mut self) -> Syn<Op> {
         let Some(c) = self.sc.bump() else {
-            return Err(SynErr::incomplete("expected an operator"));
+            return Err(SynErr::incomplete("syntax error: unexpected end of file"));
         };
         let op = match c {
             ';' => {
@@ -1278,7 +1278,7 @@ impl Lexer {
         // the short one, which `pull` would take for a token boundary and never
         // wind back past.
         if self.fold_wants_more() {
-            return Err(SynErr::incomplete("line continuation"));
+            return Err(SynErr::incomplete("syntax error: unexpected end of file"));
         }
         Ok(op)
     }
@@ -1333,7 +1333,7 @@ impl Lexer {
                         self.heredoc_ran_out.get_or_insert_with(|| delim.clone());
                         break;
                     }
-                    return Err(SynErr::incomplete(format!("here-document delimited by `{delim}`")));
+                    return Err(SynErr::incomplete(format!("syntax error: unexpected end of file (expecting {delim:?})")));
                 };
                 let line = if strip_tabs {
                     raw.trim_start_matches('\t')
@@ -1390,7 +1390,7 @@ impl Lexer {
 
     fn finish_heredocs(&mut self) -> Syn<()> {
         if self.awaiting.is_some() {
-            return Err(SynErr::incomplete("expected a here-document delimiter"));
+            return Err(SynErr::incomplete("syntax error: unexpected end of file"));
         }
         if self.pending.is_empty() {
             return Ok(());
@@ -1449,7 +1449,7 @@ impl Lexer {
                         // Sealed, a trailing backslash is a literal one; unsealed
                         // it is half of a fold whose newline has not arrived.
                         None if !self.sealed => {
-                            return Err(SynErr::incomplete("line continuation"))
+                            return Err(SynErr::incomplete("syntax error: unexpected end of file"))
                         }
                         None => buf.push_quoted('\\'),
                         Some('\n') => {
@@ -1467,7 +1467,7 @@ impl Lexer {
                     let before = buf.segs.len();
                     loop {
                         match self.sc.bump() {
-                            None => return Err(SynErr::incomplete("unmatched `'`")),
+                            None => return Err(SynErr::incomplete("syntax error: unterminated quoted string")),
                             Some('\'') => break,
                             Some(ch) => buf.push_quoted(ch),
                         }
@@ -1502,7 +1502,7 @@ impl Lexer {
         // starting a new one, and ending it here would split `foo\<nl>bar` into
         // two words.
         if ran_out && !self.sealed {
-            return Err(SynErr::incomplete("line continuation"));
+            return Err(SynErr::incomplete("syntax error: unexpected end of file"));
         }
         Ok(buf.finish())
     }
@@ -1574,7 +1574,7 @@ impl Lexer {
     fn scan_double(&mut self, buf: &mut WordBuf) -> Syn<()> {
         loop {
             let Some(c) = self.sc.peek() else {
-                return Err(SynErr::incomplete("unmatched `\"`"));
+                return Err(SynErr::incomplete("syntax error: unterminated quoted string"));
             };
             match c {
                 '"' => {
@@ -1640,7 +1640,7 @@ impl Lexer {
         let mut body: Vec<char> = Vec::new();
         loop {
             let Some(c) = self.sc.bump() else {
-                return Err(SynErr::incomplete("unmatched `$'`"));
+                return Err(SynErr::incomplete("syntax error: unterminated quoted string"));
             };
             if c == '\'' {
                 break;
@@ -1648,7 +1648,7 @@ impl Lexer {
             body.push(c);
             if c == '\\' {
                 let Some(esc) = self.sc.bump() else {
-                    return Err(SynErr::incomplete("unmatched `$'`"));
+                    return Err(SynErr::incomplete("syntax error: unterminated quoted string"));
                 };
                 body.push(esc);
             }
@@ -1832,7 +1832,7 @@ impl Lexer {
         let mut depth = 1usize;
         loop {
             let Some(c) = self.sc.bump() else {
-                return Err(SynErr::incomplete("unmatched `${`"));
+                return Err(SynErr::incomplete("syntax error: missing '}'"));
             };
             match c {
                 '{' if !quotes_off => depth += 1,
@@ -1889,7 +1889,7 @@ impl Lexer {
                     out.push('`');
                     loop {
                         let Some(q) = self.sc.bump() else {
-                            return Err(SynErr::incomplete("unmatched `` ` ``"));
+                            return Err(SynErr::incomplete("syntax error: EOF in backquote substitution"));
                         };
                         out.push(q);
                         if q == '\\' {
@@ -1917,7 +1917,7 @@ impl Lexer {
                     self.sc.bump();
                     loop {
                         let Some(q) = self.sc.bump() else {
-                            return Err(SynErr::incomplete("unmatched `$'`"));
+                            return Err(SynErr::incomplete("syntax error: unterminated quoted string"));
                         };
                         out.push(q);
                         if q == '\\' {
@@ -1941,7 +1941,7 @@ impl Lexer {
                     // mistaken for the closing brace.
                     loop {
                         let Some(q) = self.sc.bump() else {
-                            return Err(SynErr::incomplete(format!("unmatched {c:?}")));
+                            return Err(SynErr::incomplete("syntax error: unterminated quoted string"));
                         };
                         out.push(q);
                         if q == '\\' && c == '"' {
@@ -2020,7 +2020,7 @@ impl Lexer {
         let mut depth = 1usize;
         loop {
             let Some(c) = self.sc.bump() else {
-                return Err(SynErr::incomplete("unmatched `$(`"));
+                return Err(SynErr::incomplete("syntax error: unexpected end of file (expecting \")\")"));
             };
             match c {
                 '(' => depth = depth.saturating_add(1),
@@ -2047,7 +2047,7 @@ impl Lexer {
                     self.sc.bump();
                     loop {
                         let Some(q) = self.sc.bump() else {
-                            return Err(SynErr::incomplete("unmatched `$'`"));
+                            return Err(SynErr::incomplete("syntax error: unterminated quoted string"));
                         };
                         out.push(q);
                         if q == '\\' {
@@ -2066,7 +2066,13 @@ impl Lexer {
                     out.push(c);
                     loop {
                         let Some(q) = self.sc.bump() else {
-                            return Err(SynErr::incomplete(format!("unmatched {c:?}")));
+                            // A backtick body is its own wording in ash; the two
+                            // quotes are not.
+                            return Err(SynErr::incomplete(if c == '`' {
+                                "syntax error: EOF in backquote substitution"
+                            } else {
+                                "syntax error: unterminated quoted string"
+                            }));
                         };
                         out.push(q);
                         if q == '\\' && c != '\'' {
@@ -2126,7 +2132,7 @@ impl Lexer {
         let mut depth = 1usize;
         loop {
             let Some(c) = self.sc.peek() else {
-                return Err(SynErr::incomplete("unmatched `$((`"));
+                return Err(SynErr::incomplete("syntax error: missing '))'"));
             };
             match c {
                 '(' => {
@@ -2145,7 +2151,7 @@ impl Lexer {
                         // and a fatal error refuses it where every other
                         // construct would have asked. `scan_op`'s argument.
                         if self.sc.peek().is_none() {
-                            return Err(SynErr::incomplete("unmatched `$((`"));
+                            return Err(SynErr::incomplete("syntax error: missing '))'"));
                         }
                         return Err("bad arithmetic expansion: expected `))`".into());
                     }
@@ -2167,7 +2173,7 @@ impl Lexer {
         let mut out = String::new();
         loop {
             let Some(c) = self.sc.bump() else {
-                return Err(SynErr::incomplete("unmatched `` ` ``"));
+                return Err(SynErr::incomplete("syntax error: EOF in backquote substitution"));
             };
             match c {
                 '`' => return Ok(out),

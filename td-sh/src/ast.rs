@@ -20,11 +20,11 @@ pub struct SynErr {
 }
 
 impl SynErr {
-    /// The input ran out where more of it was owed; `what` says what. A
-    /// message rather than anything printable, so a `SynErr` cannot be passed
-    /// in: that would double the marker and keep the flag.
-    pub fn incomplete(what: impl Into<String>) -> Self {
-        Self { msg: format!("{INCOMPLETE}: {}", what.into()), incomplete: true }
+    /// The input ran out where more of it was owed. The WHOLE message, since
+    /// ash spells this case several ways with no common opening, and a
+    /// `SynErr` cannot be passed in: that would keep the flag through a wrap.
+    pub fn incomplete(msg: impl Into<String>) -> Self {
+        Self { msg: msg.into(), incomplete: true }
     }
 
     pub fn is_incomplete(&self) -> bool {
@@ -54,9 +54,6 @@ impl std::fmt::Display for SynErr {
 }
 
 pub type Syn<T> = Result<T, SynErr>;
-
-/// What an incomplete input's message opens with.
-pub const INCOMPLETE: &str = "unexpected end of input";
 
 #[derive(Clone, Debug, Default)]
 pub struct Word(pub Vec<Seg>);

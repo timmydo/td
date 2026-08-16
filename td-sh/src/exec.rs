@@ -3809,7 +3809,7 @@ mod tests {
             assert_eq!((status, out.as_str()), (2, ""), "{src:?}");
             // The REASON, not merely that something failed: an unrelated error
             // reaching stderr would satisfy a non-empty check.
-            assert!(err.contains("unmatched `$(`"), "{src:?}: {err}");
+            assert!(err.contains(r#"end of file (expecting ")")"#), "{src:?}: {err}");
         }
         // A `.` script is the third text that owns its end, and takes a file to
         // be one. What it pins beyond the body is that the SOURCING script
@@ -3889,7 +3889,7 @@ mod tests {
         ] {
             let (status, out, err) = run(&src);
             assert_eq!((status, out.as_str()), (2, ""), "{src:?}");
-            assert!(err.contains("unmatched `$(`"), "{src:?}: {err}");
+            assert!(err.contains(r#"end of file (expecting ")")"#), "{src:?}: {err}");
         }
     }
 
@@ -3960,6 +3960,78 @@ mod tests {
             run("if false; then function f { :; }; fi; echo alive"),
             (0, "alive\n".to_string(), String::new())
         );
+    }
+
+    /// What an input that RAN OUT is called. ash spells this several ways with
+    /// no common opening -- four of its own (`unterminated quoted string`, `EOF
+    /// in backquote substitution`, `missing '))'`, `missing '}'`) and the
+    /// `unexpected end of file` the token namer produces, with the expectation
+    /// clause where the grammar was owed something. Which one is a fact about
+    /// the CONSTRUCT rather than about where the parse stopped, so this is a
+    /// table.
+    ///
+    /// Generated from ash's own output and byte-identical to it, bar the one
+    /// row marked below. This shell said `unexpected end of input: unmatched
+    /// `$((`` and the like until the marker stopped being the mechanism -- the
+    /// wording could not move while the reader matched it as a prefix.
+    #[test]
+    fn the_end_of_input_diagnostics_are_ashs_own() {
+        for (src, want) in [
+            ("echo 'abc", "syntax error: unterminated quoted string"),
+            ("echo \"abc", "syntax error: unterminated quoted string"),
+            ("echo $'ab", "syntax error: unterminated quoted string"),
+            ("echo `ec", "syntax error: EOF in backquote substitution"),
+            ("echo $(echo `a", "syntax error: EOF in backquote substitution"),
+            // The paren-COUNTING fallback, which a body the lexer cannot read
+            // at all falls back to: a hard failure inside `$( )` (`${}` is a
+            // bad substitution, `$((1)x` a bad expansion) sends the rest of
+            // that body to a scan that knows only how to count, and an
+            // unterminated quote or backtick after it is reported from there.
+            // Both of its arms, since they are one `if` apart.
+            ("echo $(echo ${} `foo", "syntax error: EOF in backquote substitution"),
+            ("echo $(echo $((1)x `foo", "syntax error: EOF in backquote substitution"),
+            ("echo $(echo ${} 'foo", "syntax error: unterminated quoted string"),
+            ("echo $(ec", "syntax error: unexpected end of file (expecting \")\")"),
+            ("echo $((1+", "syntax error: missing '))'"),
+            ("echo ${x", "syntax error: missing '}'"),
+            ("echo ${x:-", "syntax error: missing '}'"),
+            ("if :", "syntax error: unexpected end of file (expecting \"then\")"),
+            ("if :; then", "syntax error: unexpected end of file (expecting \"fi\")"),
+            ("while false", "syntax error: unexpected end of file (expecting \"do\")"),
+            ("while false; do", "syntax error: unexpected end of file (expecting \"done\")"),
+            ("until true; do", "syntax error: unexpected end of file (expecting \"done\")"),
+            ("for i in a; do", "syntax error: unexpected end of file (expecting \"done\")"),
+            ("{ :", "syntax error: unexpected end of file (expecting \"}\")"),
+            ("( :", "syntax error: unexpected end of file (expecting \")\")"),
+            ("f() {", "syntax error: unexpected end of file (expecting \"}\")"),
+            ("f()", "syntax error: unexpected end of file"),
+            ("function f", "syntax error: unexpected end of file"),
+            ("echo a &&", "syntax error: unexpected end of file"),
+            ("echo a |", "syntax error: unexpected end of file"),
+            ("cat <<", "syntax error: unexpected end of file"),
+            ("echo >", "syntax error: unexpected end of file"),
+            // NOT ash's, and the one row here that is not. ash ends the word
+            // list on the NEWLINE and owes `do` only once it has one, so with
+            // no trailing newline it raises with no expectation at all; this
+            // shell owes `do` either way. Where the list ENDS, not what the
+            // message calls it, so it is the `case` divergence's family and
+            // not this increment's.
+            ("for i in a", "syntax error: unexpected end of file (expecting \"do\")"),
+            // Nor are these, and for one reason: with constructs NESTED, ash
+            // picks its wording by a fixed precedence at `endword` -- arithmetic
+            // first, then any quote, then a braced parameter (ash.c:12692-12702)
+            // -- while this shell reports whichever scanner ran out. So ash
+            // calls the first `unterminated quoted string` and the second
+            // `missing '))'`. Neither shell is reading the input differently;
+            // they disagree about which unclosed thing to NAME, which is a
+            // fourth divergence and not this increment's wording table.
+            ("echo \"${x:-", "syntax error: missing '}'"),
+            ("echo ${x:-$((1+", "syntax error: missing '}'"),
+        ] {
+            let (status, out, err) = run(src);
+            assert_eq!((status, out.as_str()), (2, ""), "{src:?}");
+            assert!(err.trim_end().ends_with(want), "{src:?}: {err}");
+        }
     }
 
     /// ash NAMES the token a parse stopped on rather than quoting the source at
@@ -4126,21 +4198,22 @@ mod tests {
         ] {
             let (status, out, err) = run(src);
             assert_eq!((status, out.as_str()), (2, ""), "{src:?}");
-            // A HARD error, not the marker the interactive reader reads as a
-            // request for another line: no continuation rescues `function ;`,
-            // and PS2 would ask for one forever.
+            // A HARD error, not the input running out: no continuation
+            // rescues `function ;`, and PS2 would ask for one forever. What
+            // the reader tests is the flag rather than these words -- but the
+            // words are what an operator reads, so they are checked here.
             assert!(err.contains("syntax error"), "{src:?}: {err}");
-            assert!(!err.contains(crate::ast::INCOMPLETE), "{src:?}: {err}");
+            assert!(!err.contains("unexpected end of file"), "{src:?}: {err}");
         }
         // Only an input that ENDED is incomplete. A newline may follow
         // `function f` and complete it; after the bare word one may NOT, and
-        // the marker means only that the name has not arrived -- the
+        // the message means only that the name has not arrived -- the
         // interactive reader has appended the newline before it probes, so a
         // prompt takes the hard error above.
         for src in ["function", "function f"] {
             let (status, _, err) = run(src);
             assert_eq!(status, 2, "{src:?}");
-            assert!(err.contains(crate::ast::INCOMPLETE), "{src:?}: {err}");
+            assert!(err.contains("unexpected end of file"), "{src:?}: {err}");
         }
         // WITH the parentheses ash rejoins the ordinary path, so the two
         // spellings answer a body together -- including where this shell still
