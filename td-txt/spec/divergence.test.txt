@@ -123,7 +123,7 @@ sed (td-txt) 0.1.0
 # include/exclude globs this applet refuses two cases below.
 ## argv: grep --help
 ## stdout:
-usage: grep [-abEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
+usage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
 ## END
 ## stderr-json: ""
 ## status: 0
@@ -146,10 +146,93 @@ grep (td-txt) 0.1.0
 ## stderr-json: ""
 ## status: 0
 
+#### -V is --version's short spelling, and answers the same banner
+# GNU documents `-V, --version' and td-txt served only the long one, which made
+# the short spelling a REFUSAL of an option whose own synonym worked. Serving it
+# is a fix rather than a divergence; the case is here because what it prints is
+# td-txt's banner, exactly as `grep --version' above.
+## argv: grep -V
+## stdout:
+grep (td-txt) 0.1.0
+## END
+## stderr-json: ""
+## status: 0
+
+#### and inside a CLUSTER, which the long spelling cannot be
+# The reason the short form needs its own cases: `-iV' reaches the option
+# through the cluster loop rather than the long-option table, so nothing about
+# `--version' working says this does.
+## argv: grep -iV a
+## stdin:
+a
+## END
+## stdout:
+grep (td-txt) 0.1.0
+## END
+## stderr-json: ""
+## status: 0
+
+#### and leading the cluster, which the scan still reads to the end
+# `-V` records the request and does not stop the cluster, so `i` here is read
+# like any other letter -- it simply never changes an answer, because the
+# banner is what a clean scan returns. The case below is the half that shows
+# the reading really happens.
+## argv: grep -Vi a
+## stdin:
+a
+## END
+## stdout:
+grep (td-txt) 0.1.0
+## END
+## stderr-json: ""
+## status: 0
+
+#### a refused letter LATER in the same cluster still outranks -V
+# The one shape that separates "records the request" from "answers on sight":
+# were the `V` arm to stop the cluster, every other case here would stay green
+# while this printed the banner instead of refusing. GNU answers its banner,
+# accepting -P, so the divergence is the -P refusal rather than the ordering.
+## argv: grep -VP a
+## stdout-json: ""
+## stderr-contains: invalid option -- 'P'
+## status: 2
+
+#### -V outranks --help, whichever order they came in
+## argv: grep --help -V
+## stdout:
+grep (td-txt) 0.1.0
+## END
+## stderr-json: ""
+## status: 0
+
+#### and the other order
+## argv: grep -V --help
+## stdout:
+grep (td-txt) 0.1.0
+## END
+## stderr-json: ""
+## status: 0
+
+#### but an option td-txt REFUSES still outranks -V, as it does --help
+# The deferral is the whole reason `-V` sets a flag rather than answering where
+# it is read: an error the scan raises wins, whichever side of it was written.
+# GNU answers its banner for both of these, so this is the -P refusal reaching
+# one more caller rather than a new decision.
+## argv: grep -P -V a
+## stdout-json: ""
+## stderr-contains: invalid option -- 'P'
+## status: 2
+
+#### and on the other side of it
+## argv: grep -V -P a
+## stdout-json: ""
+## stderr-contains: invalid option -- 'P'
+## status: 2
+
 #### --help outranks what comes after the scan, a bad pattern included
 ## argv: grep --help -e [
 ## stdout:
-usage: grep [-abEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
+usage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
 ## END
 ## stderr-json: ""
 ## status: 0
@@ -184,6 +267,19 @@ a
 ## stdout-json: ""
 ## status: 2
 ## stderr-contains: unrecognized option '--include=*.c'
+
+#### and --exclude, its other half, which fails the OTHER way round
+# Ignoring `--exclude` searches more than was asked exactly as ignoring
+# `--include` does; it is pinned separately because the module doc claims BOTH
+# are refused, and a claim about two options that tests one is a claim about
+# one.
+## argv: grep -r --exclude=*.c a .
+## file x.txt:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: unrecognized option '--exclude=*.c'
 
 #### --version=x is GNU's arity error, but the usage that follows is td-txt's
 # The ERROR matches GNU exactly (`option '--version' doesn't allow an argument`,

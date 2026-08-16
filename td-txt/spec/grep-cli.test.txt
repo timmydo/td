@@ -1591,7 +1591,7 @@ c
 ## END
 ## stdout-json: ""
 ## status: 2
-## stderr-json: "grep: option '--f' is ambiguous; possibilities: '--fixed-regexp' '--file' '--files-with-matches' '--files-without-match'\nusage: grep [-abEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## stderr-json: "grep: option '--f' is ambiguous; possibilities: '--fixed-regexp' '--file' '--files-with-matches' '--files-without-match'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
 
 #### the ambiguity names the argv ELEMENT, value and all
 # `--f` and `--f=1` are the same ambiguity -- the `=` never gets as far as
@@ -1619,7 +1619,7 @@ a
 ## END
 ## stdout-json: ""
 ## status: 2
-## stderr-json: "grep: option '--d' is ambiguous; possibilities: '--devices' '--directories' '--dereference-recursive'\nusage: grep [-abEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## stderr-json: "grep: option '--d' is ambiguous; possibilities: '--devices' '--directories' '--dereference-recursive'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
 
 #### and the same two, narrowed, keep that order
 ## argv: grep --de a f1
@@ -1628,7 +1628,7 @@ a
 ## END
 ## stdout-json: ""
 ## status: 2
-## stderr-json: "grep: option '--de' is ambiguous; possibilities: '--devices' '--dereference-recursive'\nusage: grep [-abEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## stderr-json: "grep: option '--de' is ambiguous; possibilities: '--devices' '--dereference-recursive'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
 
 #### an EMPTY prefix lists the whole table, so it shows the order most plainly
 # `--=` splits into an empty name and a value, and every option prefixes the
@@ -1661,7 +1661,7 @@ a
 ## END
 ## stdout-json: ""
 ## status: 2
-## stderr-json: "grep: option '--r' is ambiguous; possibilities: '--recursive' '--regexp'\nusage: grep [-abEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## stderr-json: "grep: option '--r' is ambiguous; possibilities: '--recursive' '--regexp'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
 
 #### a prefix of BOTH spellings of -F resolves rather than being ambiguous
 # The collapse is not only about what a diagnostic lists: `--fixed` prefixes
@@ -1727,7 +1727,7 @@ axb
 ## END
 ## stdout-json: ""
 ## status: 2
-## stderr-json: "grep: option '--fixed-regexp' doesn't allow an argument\nusage: grep [-abEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## stderr-json: "grep: option '--fixed-regexp' doesn't allow an argument\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
 
 #### two spellings of one matcher are not conflicting matchers
 ## argv: grep --fixed-regexp --fixed-strings a.b f1
@@ -5099,6 +5099,36 @@ abc
 ## stderr-contains: conflicting matchers specified
 ## status: 2
 
+#### and a cluster led by -V conflicts the same way, GNU included
+# -V does not end the cluster in either grep: the E and F after it are read and
+# their conflict is raised, so the version is never reached. Scored against GNU
+# rather than pinned as a decision -- both refuse at exit 2 with this line.
+## argv: grep -VEF a
+## stdin-json: "a\nb\n"
+## stdout-json: ""
+## stderr-contains: conflicting matchers specified
+## status: 2
+
+#### and a cluster letter after -V that wants an ARGUMENT still wants one
+# A different half of the same rule: -e does not merely set a flag, it consumes
+# the next word, and there is none. Were -V to end the cluster this would print
+# the banner at exit 0 instead of refusing.
+## argv: grep -Ve
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: option requires an argument -- 'e'
+## status: 2
+
+#### and one whose ARGUMENT is the thing at fault, which exits 1 rather than 2
+# -d takes `a` and rejects it, so this is the third distinct status a cluster
+# after -V can reach -- 0 for the banner, 2 for a scan error, 1 for a bad
+# argument value -- and the banner reaches none of them.
+## argv: grep -Vd a
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: invalid argument 'a' for '--directories'
+## status: 1
+
 #### the same one twice is not a conflict
 ## argv: grep -EEc a
 ## stdin-json: "a\nb\n"
@@ -6411,7 +6441,7 @@ MATCH
 ## argv: grep "-\x80" x
 ## stdin-json: "a\n"
 ## stdout-json: ""
-## stderr-json: "grep: invalid option -- '\x80'\nusage: grep [-abEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## stderr-json: "grep: invalid option -- '\x80'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
 ## status: 2
 
 #### -D skip does not reach stdin, which is exempt by descriptor

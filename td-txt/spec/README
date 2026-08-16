@@ -793,6 +793,14 @@ td-txt-authored case files
   either order, answers `--version`. The TEXT of either answer is td-txt's own
   and is pinned in divergence.test.txt.
 
+  `-V` is `--version`'s short spelling and every sentence above holds for it,
+  because it sets the same flag rather than answering where it is read. It was
+  a REFUSAL until this was written down, which made td-txt reject an option
+  whose own synonym it served -- a gap rather than a decision, and the only
+  one of GNU's short options in that shape. It needs its own cases even so:
+  the cluster loop reaches it, not the long-option table, so `-iV` and `-Vi`
+  are paths `--version` never takes.
+
   That rule is what makes td-txt's REFUSALS visible from both sides. td-txt's
   scan raises on options GNU accepts -- `-P`, `--color` and the rest of the
   deliberate omissions below -- so `grep --help -P` is a refusal at exit 2
@@ -2759,11 +2767,14 @@ td-txt-authored case files
   oracle against a new case and confirm it does NOT match, comparing status,
   stdout AND stderr: for every refusal here the whole divergence is the
   diagnostic, so a check that reads only status and stdout reports agreement.
-  36 cases, of which 34 differ; the other TWO are counts GNU never finishes, so
+  42 cases, of which 40 differ; the other TWO are counts GNU never finishes, so
   they are not comparable by construction and their divergence is the
-  non-finishing itself. It was 32 until the `-f DIR` decision arrived from the
-  gap list above with FOUR, each confirmed against GNU sed 4.9 as this paragraph
-  requires. 32 was also the count when the `-NUM` decision landed, and that was
+  non-finishing itself. This number had gone STALE -- it read 36 while the file
+  held 33, five commits having touched the file without re-running it, which is
+  the failure the sentence at the end of this paragraph is written against. It
+  was 32 until the `-f DIR` decision arrived from the gap list above with FOUR,
+  each confirmed against GNU sed 4.9 as this paragraph requires. 32 was also
+  the count when the `-NUM` decision landed, and that was
   a DIFFERENT 32: `sed -l N` was retired when the option was
   implemented, which is the one way a case leaves this file -- td-txt stopped
   diverging -- and the usage line after a missing option argument replaced it.

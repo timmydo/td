@@ -9,9 +9,11 @@
 //! straddles a read boundary.
 //!
 //! Deliberate omissions: no `-P` (PCRE — a second regex engine), no `--color`,
-//! no `--include`/`--exclude` globs, and no `-b` byte offsets. Each is a
-//! diagnosed `invalid option`, never a silent no-op, and each is pinned in
-//! spec/divergence.test.txt.
+//! no `--include`/`--exclude` globs, and no `-u`, whose only subject is the
+//! `-b` it cannot change here. Each is DIAGNOSED and never a silent no-op —
+//! `invalid option` for the short spellings, `unrecognized option` for the
+//! long ones, which is getopt's own split and GNU's wording for both. Each is
+//! pinned in spec/divergence.test.txt.
 
 use crate::regex::{Filter, OnBudget, Options, Regex};
 use crate::util::{
@@ -23,7 +25,7 @@ use crate::util::{
 /// scanner stops there; the `-A`/`-B`/`-C` argument has no such limit.
 const NUM_DIGIT_CAP: usize = 21;
 
-const USAGE: &str = "usage: grep [-abEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] \
+const USAGE: &str = "usage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] \
                      [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] \
                      [PATTERN] [FILE]...";
 
@@ -633,6 +635,8 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                 b'b' => conf.byte_offset = true,
                 b'h' => conf.with_filename = Some(false),
                 b'H' => conf.with_filename = Some(true),
+                // The flag, not an answer: the cluster must keep being read.
+                b'V' => show_version = true,
                 b'd' => {
                     let Some(v) = value_of(&mut j, &mut i) else {
                         errb(&byte_in("option requires an argument -- '", opt, "'"));
