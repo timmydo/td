@@ -5109,6 +5109,73 @@ abc
 ## stderr-contains: conflicting matchers specified
 ## status: 2
 
+#### --binary-files=text is -a under another name
+# The operand is BINARY, which is the only way these two values differ:
+# over a text file both print the line and the case would assert nothing.
+## argv: grep --binary-files=text hit b
+## file-json b: "hit\x00more hit\n"
+## stdout-json: "hit\x00more hit\n"
+## stderr-json: ""
+## status: 0
+
+#### -a is the same answer, which is what makes them one mode
+## argv: grep -a hit b
+## file-json b: "hit\x00more hit\n"
+## stdout-json: "hit\x00more hit\n"
+## stderr-json: ""
+## status: 0
+
+#### --binary-files=binary is the default under another name
+## argv: grep --binary-files=binary hit b
+## file-json b: "hit\x00more hit\n"
+## stdout-json: ""
+## stderr-contains: binary file matches
+## status: 0
+
+#### and it UNDOES -a, which is the only way back from it
+# Last-wins is why `=binary' has to be SERVED rather than waved through as
+# a no-op: nothing else can turn -a off.
+## argv: grep -a --binary-files=binary hit b
+## file-json b: "hit\x00more hit\n"
+## stdout-json: ""
+## stderr-contains: binary file matches
+## status: 0
+
+#### and the other order, where -a wins instead
+## argv: grep --binary-files=binary -a hit b
+## file-json b: "hit\x00more hit\n"
+## stdout-json: "hit\x00more hit\n"
+## stderr-json: ""
+## status: 0
+
+#### its argument may be a separate word, as a required-argument option's may
+## argv: grep --binary-files text hit b
+## file-json b: "hit\x00more hit\n"
+## stdout-json: "hit\x00more hit\n"
+## stderr-json: ""
+## status: 0
+
+#### an unknown type is GNU's own message, to the byte
+# GNU says `unknown binary-files type' with no room for the value, exactly
+# as `-D bogus' says `unknown devices method'. Serving the option is what
+# lets this be scored against GNU rather than recorded as a refusal.
+## argv: grep --binary-files=bogus a
+## stdin:
+a
+## END
+## stdout-json: ""
+## stderr-json: "grep: unknown binary-files type\n"
+## status: 2
+
+#### and an EMPTY type is unknown too, not a missing argument
+## argv: grep --binary-files= a
+## stdin:
+a
+## END
+## stdout-json: ""
+## stderr-contains: unknown binary-files type
+## status: 2
+
 #### and a cluster letter after -V that wants an ARGUMENT still wants one
 # A different half of the same rule: -e does not merely set a flag, it consumes
 # the next word, and there is none. Were -V to end the cluster this would print
@@ -6495,7 +6562,7 @@ a
 ## stdout-json: "0:a\n"
 ## status: 0
 
-#### --byte-offset is the long spelling, and `--b` is ambiguous with two others
+#### --byte-offset is the long spelling; `--b` is ambiguous with four others
 ## argv: grep --byte-offset a
 ## stdin:
 a

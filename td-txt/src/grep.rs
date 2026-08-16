@@ -13,19 +13,21 @@
 //! * a second regex engine — `-P`, and `-X`, whose argument reaches the same
 //!   one (`-X perl` IS `-P`);
 //! * output this one does not produce — `--color`, `-T`/`--initial-tab`;
-//! * a file filter — `--include`/`--exclude`, and `-I`/`--binary-files`,
-//!   which is the third binary mode beside the default and `-a`'s;
-//! * nothing at all — `-u` and `-U`, whose second answer a POSIX system does
-//!   not have.
+//! * a file filter — `--include`/`--exclude`, and `-I`, which is
+//!   `--binary-files=without-match`: the one value of that option not served,
+//!   the other two being the default and `-a`'s;
+//! * nothing at all — `-u` and `-U`/`--binary`, whose second answer a POSIX
+//!   system does not have.
 //!
 //! Each is DIAGNOSED and never a silent no-op: `invalid option` for the short
-//! spellings, `unrecognized option` for the long ones, which is getopt's own
-//! split and GNU's wording for both. Each named above is pinned in
-//! spec/divergence.test.txt. The SHORT roster is complete — swept against
-//! grep.c:486 — but the long one is not: `--colour`, `--exclude-dir`,
-//! `--group-separator`, `--no-group-separator`, `--no-ignore-case`, `--label`
-//! and `--line-buffered` are refused too and have neither an entry here nor a
-//! case, which is a sweep still owed rather than a roster.
+//! spellings, `unrecognized option` for the long ones — getopt's own split and
+//! GNU's wording for both — except `--binary`, which is RESOLVED here (it must
+//! be, being a prefix of `--binary-files`) and so says `unsupported`. Each
+//! named above is pinned in spec/divergence.test.txt. The SHORT roster is
+//! complete, swept against grep.c:486; the long one is not — `--colour`,
+//! `--exclude-dir`, `--group-separator`, `--no-group-separator`,
+//! `--no-ignore-case`, `--label` and `--line-buffered` are refused too with
+//! neither an entry here nor a case, which is a sweep still owed.
 
 use crate::regex::{Filter, OnBudget, Options, Regex};
 use crate::util::{
@@ -1016,10 +1018,12 @@ fn synonymous(a: &[u8], b: &[u8]) -> bool {
 /// way GNU's `getopt_long` accepts one (`grep --ignore-c`), an exact name
 /// always winning over being a prefix of a longer one.
 ///
-/// GNU's `long_options[]` (grep.c:504) with the unserved options left out and
-/// the order intact. This is the order an ambiguity lists its possibilities in,
-/// so the table is OUTPUT rather than housekeeping: sorted by name it answers
-/// `--d` with `--dereference-recursive` first, which GNU never prints.
+/// GNU's `long_options[]` (grep.c:504), order intact. A name is here to be
+/// RESOLVED, which is not the same as being served; most unserved options are
+/// still absent, which spec/README's ambiguity entry records as a sweep owed.
+/// This is the order an ambiguity lists its possibilities in, so the table is
+/// OUTPUT rather than housekeeping: sorted by name it answers `--d` with
+/// `--dereference-recursive` first, which GNU never prints.
 const LONG_OPTIONS: &[(&[u8], Arg)] = &[
     (b"basic-regexp", Arg::None),
     (b"extended-regexp", Arg::None),
@@ -1027,6 +1031,7 @@ const LONG_OPTIONS: &[(&[u8], Arg)] = &[
     (b"fixed-strings", Arg::None),
     (b"after-context", Arg::Required),
     (b"before-context", Arg::Required),
+    (b"binary-files", Arg::Required),
     (b"byte-offset", Arg::None),
     (b"context", Arg::Required),
     (b"count", Arg::None),
@@ -1052,6 +1057,9 @@ const LONG_OPTIONS: &[(&[u8], Arg)] = &[
     (b"invert-match", Arg::None),
     (b"silent", Arg::None),
     (b"text", Arg::None),
+    // Resolved, not served: leaving it out makes it a silent prefix of
+    // `--binary-files`. Its arm refuses.
+    (b"binary", Arg::None),
     (b"version", Arg::None),
     (b"with-filename", Arg::None),
     (b"word-regexp", Arg::None),
@@ -1146,6 +1154,25 @@ fn devices_arg(value: &[u8]) -> Option<Devices> {
         b"read" => Some(Devices::Read),
         b"skip" => Some(Devices::Skip),
         _ => None,
+    }
+}
+
+/// `--binary-files`'s argument, as `conf.text`. Two of GNU's three modes are
+/// spellings of what this grep already does, so they are served and only
+/// `without-match` is refused -- and refused as a KNOWN type nothing here
+/// implements, which is not what GNU's own message for an unknown one says.
+fn binary_files_arg(value: &[u8]) -> Option<bool> {
+    match value {
+        b"binary" => Some(false),
+        b"text" => Some(true),
+        b"without-match" => {
+            err("unsupported binary-files type 'without-match'");
+            None
+        }
+        _ => {
+            err("unknown binary-files type");
+            None
+        }
     }
 }
 
@@ -1244,6 +1271,18 @@ fn parse_long(
         }
         b"null-data" => conf.null_data = true,
         b"text" => conf.text = true,
+        b"binary-files" => {
+            let v = need(value)?;
+            conf.text = binary_files_arg(&v).ok_or(LongErr::Handled)?;
+        }
+        // Resolvable but refused — see the table. The usage block goes with it
+        // because this is an OPTION error, where the value errors above are
+        // GNU's `die()` and print none.
+        b"binary" => {
+            err("unsupported option '--binary'");
+            eprintln!("{USAGE}");
+            return Err(LongErr::Handled);
+        }
         b"regexp" => {
             push_expr(patterns, &need(value)?);
             *pattern_seen = true;

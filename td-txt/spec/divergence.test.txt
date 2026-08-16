@@ -63,19 +63,18 @@ a
 # are still printed -- but from the verdict onward, and the STATUS is withheld.
 # td-txt serves the behaviour of the other two modes: the default (`binary file
 # matches' on stderr) and `text', which is what -a and --text do. So the
-# machinery exists and this refusal is the third mode. That is what makes ignoring the
-# option the tempting mistake, and it would be wrong twice over: on a matching
-# binary file GNU's `grep -I hit b' exits 1 where the default exits 0, AND it
-# prints nothing where the default writes `b: binary file matches' to stderr.
-# The status is the half a script branches on, which is why it leads here, but
-# the diagnostic goes too.
+# machinery exists and this refusal is the third mode. That is what makes
+# ignoring it the tempting mistake, and it would be wrong twice over: on a
+# matching binary file GNU's `grep -I hit b' exits 1 where the default does 0,
+# AND it prints nothing where the default writes `b: binary file matches'. The
+# status is the half a script branches on, which is why it leads here, but the
+# diagnostic goes too.
 #
-# `--binary-files=' refuses with it, and that part is NOT all decision: only
-# the `without-match' value is unimplemented here. Refusing the whole option
-# also refuses `=text' and `=binary', which name behaviour td-txt HAS under
-# other spellings -- `-a'/`--text' and the default. That half is a gap of
-# `-V's shape, found while writing this entry and left open by it; the case
-# below pins today's answer so closing it has to move a golden.
+# `--binary-files=' is SERVED for its other two values, so what is refused
+# here is the VALUE and not the option: `=text' and `=binary' are spellings of
+# `-a'/`--text' and of the default, and both answer as GNU does. Only
+# `without-match' is unimplemented, and it says so -- a known type this build
+# does not serve, which is not what GNU's message for an unknown one says.
 ## argv: grep -I a
 ## stdin:
 a
@@ -84,14 +83,17 @@ a
 ## status: 2
 ## stderr-contains: invalid option -- 'I'
 
-#### and --binary-files, the long option -I selects one mode of
-## argv: grep --binary-files=without-match a
-## stdin:
-a
-## END
+#### and --binary-files=without-match, the one value of it not served
+# The operand is BINARY because that is the only shape where the value does
+# anything: GNU withholds the match and exits 1, where the default exits 0
+# with `binary file matches' on stderr. td-txt exits 2 having refused, and
+# the diagnostic names the TYPE rather than the option, the option being
+# recognized now.
+## argv: grep --binary-files=without-match hit b
+## file-json b: "hit\x00more hit\n"
 ## stdout-json: ""
 ## status: 2
-## stderr-contains: unrecognized option '--binary-files=without-match'
+## stderr-contains: unsupported binary-files type 'without-match'
 
 #### grep refuses -T rather than dropping an alignment that WAS asked for
 # --initial-tab pads the prefix and puts a TAB before the line. Ignoring it
@@ -135,20 +137,59 @@ a
 ## status: 2
 ## stderr-contains: invalid option -- 'U'
 
-#### and --binary, its long spelling
+#### --b lists what GNU lists, which is what naming --binary bought
+# The resolver change is the substance of serving --binary-files, so it is
+# pinned EXACTLY rather than by a substring. GNU's own line is identical to
+# the first one below -- including the ORDER, which is the table's and so
+# GNU's declaration order, with `--binary' last because grep.c:552 declares
+# it there. Only the usage block under it is td-txt's, which is why these
+# are here rather than scored against GNU.
+## argv: grep --b a
+## stdin:
+a
+## END
+## stdout-json: ""
+## stderr-json: "grep: option '--b' is ambiguous; possibilities: '--basic-regexp' '--before-context' '--binary-files' '--byte-offset' '--binary'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## status: 2
+
+#### --bi is ambiguous between the two, where it used to be unrecognized
+## argv: grep --bi a
+## stdin:
+a
+## END
+## stdout-json: ""
+## stderr-json: "grep: option '--bi' is ambiguous; possibilities: '--binary-files' '--binary'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## status: 2
+
+#### and --bin, the last prefix before the two names part
+## argv: grep --bin a
+## stdin:
+a
+## END
+## stdout-json: ""
+## stderr-json: "grep: option '--bin' is ambiguous; possibilities: '--binary-files' '--binary'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## status: 2
+
+#### and --binary, its long spelling, which is RESOLVED here and then refused
+# `--binary' is a proper prefix of `--binary-files', so once that option was
+# served this name had to be in the table too -- left out, `grep --binary pat
+# f' would have become an ill-formed `--binary-files=pat' instead of a refusal.
+# It is therefore recognized, and the diagnostic says `unsupported' rather than
+# `unrecognized' because claiming otherwise would be false. Serving the name to
+# refuse it is also what makes `--b'/`--bi'/`--bin' list what GNU lists.
 ## argv: grep --binary a
 ## stdin:
 a
 ## END
 ## stdout-json: ""
 ## status: 2
-## stderr-contains: unrecognized option '--binary'
+## stderr-json: "grep: unsupported option '--binary'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
 
 #### grep refuses -X, because -X perl IS -P
 # -X names a MATCHER. `grep -X perl '\d'' matches a digit while `grep -X grep
 # '\d'' warns `stray \ before d' and does not, so the option reaches the PCRE
-# engine the -P entry below refuses; serving it would need that engine or a silent
-# downgrade to POSIX semantics, which is the same trap. It is also
+# engine the -P entry below refuses; serving it would need that engine or a
+# silent downgrade to POSIX semantics, which is the same trap. It is also
 # UNDOCUMENTED, absent from GNU's own --help, which is why a sweep of that help
 # text does not turn it up and why grep.rs's omission list names it with the
 # reason attached. This case is the one whose argument names an engine td-txt

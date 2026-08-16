@@ -2039,6 +2039,31 @@ td-txt-authored case files
     carry a name, so the list is now built as bytes) and a review asked what the
     rewrite was holding itself to.
 
+    The `--b` family is now CLOSED, and how it closed is the general answer to
+    the rest. Serving `--binary-files` put a fourth name under `--b` but left
+    `--binary` -- `-U`'s spelling, refused -- out, which was worse than the gap
+    it fixed: `--binary` is a proper PREFIX of `--binary-files`, so `grep
+    --binary pat f` stopped being a refusal and became an ill-formed
+    `--binary-files=pat`. So `--binary` sits in the table and its arm refuses,
+    and `--b`, `--bi` and `--bin` now print GNU's diagnostic line to the byte.
+    A name is therefore in that table to be RESOLVED, which is not the same as
+    being served -- the dispatch decides that, exactly as it already decided
+    `--binary-files=without-match` is refused while its siblings are not.
+    What would close the REST of this entry was counted rather than guessed,
+    because the obvious list is short. THIRTEEN names: `--color` and
+    `--colour`, `--exclude`, `--exclude-from`, `--exclude-dir`, `--include`,
+    `--initial-tab`, `--group-separator`, `--no-group-separator`,
+    `--no-ignore-case`, `--label`, `--line-buffered` and `--perl-regexp`. The
+    first draft of this sentence named eight and would have left five
+    divergences standing, `--c` -- this entry's own example -- among them,
+    since `--color` sits beside the `--colour` it named. And thirteen still
+    leaves TWO, `--col` and `--colo`: `color` and `colour` share a `val` and an
+    arity in GNU, so glibc collapses them the way it collapses
+    `--fixed-regexp`/`--fixed-strings`, which is a `SYNONYMS` entry rather than
+    a table row. None of it is done, and the reason is that a name in the table
+    is a refusal that has to say WHY, which is a per-option decision and not a
+    sweep.
+
     The ORDER half of this was sed's and is closed: `sed --s` answered
     `'--sandbox' '--separate' '--silent'`, td-txt's alphabetical table order,
     where GNU walks `longopts[]` (sed.c:197) and answers `'--silent'
@@ -2767,7 +2792,7 @@ td-txt-authored case files
   oracle against a new case and confirm it does NOT match, comparing status,
   stdout AND stderr: for every refusal here the whole divergence is the
   diagnostic, so a check that reads only status and stdout reports agreement.
-  51 cases, of which 49 differ; the other TWO are counts GNU never finishes, so
+  54 cases, of which 52 differ; the other TWO are counts GNU never finishes, so
   they are not comparable by construction and their divergence is the
   non-finishing itself. This number had gone STALE -- it read 36 while the file
   held 33, five commits having touched the file without re-running it, which is
