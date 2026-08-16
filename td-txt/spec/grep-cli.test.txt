@@ -4795,6 +4795,29 @@ abc
 ## stderr-contains: character class syntax is [[:space:]], not [:space:]
 ## status: 2
 
+#### and POSIXLY_CORRECT does NOT discard it, which is grep's difference from sed
+# sed suppresses this lint under the variable, because its `dfawarn' asks
+# `getenv' directly (sed/regexp.c:52) and sed never sets
+# `DFA_CONFUSING_BRACKETS_ERROR'. grep DOES set it, so dfa.c:1142 takes the
+# `dfaerror' arm and the variable cannot reach it. Without this case the
+# obvious wrong fix -- reusing sed's switch here -- leaves the whole corpus
+# green while grep silently accepts a pattern GNU refuses.
+## argv: grep '[:alpha:]'
+## stdin-json: "a\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: ""
+## stderr-contains: character class syntax is [[:space:]], not [:space:]
+## status: 2
+
+#### and an empty POSIXLY_CORRECT does not either
+## argv: grep 'a[:alpha:]'
+## stdin-json: "a\n"
+## env POSIXLY_CORRECT:
+## END
+## stdout-json: ""
+## stderr-contains: character class syntax is [[:space:]], not [:space:]
+## status: 2
+
 #### an EMPTY bracket body that runs out is a bad pattern, not an unmatched one
 ## argv: grep '['
 ## stdin-json: "a\n"

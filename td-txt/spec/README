@@ -1473,9 +1473,9 @@ td-txt-authored case files
     comparing.
 
   - `POSIXLY_CORRECT` selects a POSIX MODE in GNU sed, on top of the option
-    order it decides, and that mode is now SERVED but for two families named
-    in this entry, one pre-existing and one a reviewer found -- without td-txt
-    gaining a second flag, and without the variable being wired to `--posix`. The shape
+    order it decides, and that mode is now SERVED but for one pre-existing
+    family named at the end of this entry -- without td-txt gaining a second
+    flag, and without the variable being wired to `--posix`. The shape
     of the answer is GNU's rather than this reimplementation's. `posixicity`
     is THREE-valued (sed.h:86-90): `POSIXLY_EXTENDED` by default,
     `POSIXLY_CORRECT` under the variable, `POSIXLY_BASIC` under `--posix`.
@@ -1500,14 +1500,37 @@ td-txt-authored case files
     `getenv("POSIXLY_CORRECT")` directly (regexp.c:52), so the confusing-bracket
     lint -- `[:alpha:]` written without its outer bracket, GNU's one bare exit-4
     pattern error -- is DISCARDED whenever the variable is present, at any
-    level, `--posix` included, and a `v` cannot bring it back. td-txt refuses
-    regardless, so `POSIXLY_CORRECT=1 sed 's/[:alpha:]/Z/'` is exit 4 here and
-    prints in GNU: four xfails carry it. Recording the METHOD beside it, because
-    it is the reason this was missed rather than found: the roster above came
-    from grepping `posixicity`, and the complete net is
-    `grep POSIXLY_CORRECT sed/*.c` -- exactly two `getenv` sites, sed.c:245 for
-    the level and regexp.c:52 for this. A roster built from the wrong grep looks
-    finished.
+    level, `--posix` included, and a `v` cannot bring it back. Served, and by
+    the switch GNU uses rather than by the nearest one to hand: `Options`'
+    `confusing_bracket_ok`, set from the variable's PRESENCE, which reaches the
+    compiler through `Invocation` -- the struct for the compile inputs that are
+    properties of the run rather than of an `-e` part, and so cannot go in
+    `Mode`. Only the DIAGNOSTIC is conditional; `class_syntax` is a flag the
+    bracket parser raises and the error is built from it afterwards, so the
+    pattern parses identically either way and accepting one costs nothing but
+    the refusal. FIVE cases, four of them saying which switch it is: `--posix`
+    alone still lints, the variable suppresses even under `--posix`, an EMPTY
+    value suppresses (`getenv` answering non-NULL, as the option-permutation
+    half already has it), and the correctly-spelled class lints nowhere. Two
+    more in grep-cli.test.txt say it is SED's: grep sets
+    `DFA_CONFUSING_BRACKETS_ERROR`, so dfa.c:1142 takes the `dfaerror` arm
+    there and the variable cannot reach it. Those two exist because the wrong
+    fix is the obvious one -- reusing sed's switch in grep -- and it left the
+    whole corpus green until they landed.
+    Recording the METHOD beside it, because it is the reason this was missed
+    rather than found: the roster above came from grepping `posixicity`, and
+    the complete net is `grep POSIXLY_CORRECT sed/*.c` -- exactly two `getenv`
+    sites, sed.c:245 for the level and regexp.c:52 for this. A roster built
+    from the wrong grep looks finished. `dfawarn` has SIX callers in
+    `lib/dfa.c` and only this one can fire in sed, which is a GUARANTEE and
+    not an observation: `regexp.c:130` builds `dfaopts` as `0` or `DFA_EOL_NUL`
+    and nothing else, so `DFA_STAR_WARN`, `DFA_PLUS_WARN` and
+    `DFA_STRAY_BACKSLASH_WARN` are never set, and the five other sites are each
+    guarded by one of them. An earlier draft here said instead that sed's own
+    compiler refuses those patterns first, at every level. That is false as
+    well as weaker: `sed 's/*a/X/'` is exit 0 in both tools, a BRE taking the
+    leading `*` as a literal, and only `-E` refuses. A fix scoped from the call
+    count would have been five rules too wide.
 
     What is NOT shared stays with the flag: `RE_NO_GNU_OPS` (regexp.c:77) and
     `RE_LIMITED_OPS` are POSIXLY_BASIC's alone, so `\w`, `\<`, the BRE `\|`,
@@ -1526,7 +1549,8 @@ td-txt-authored case files
     both lower levels diverging on exactly three scripts -- the `[::]`, `[..]`
     and `[==]` closers followed by a bracket, which is the family the
     `--posix` bracket entry below already records. Another found `dfawarn`
-    above, which no sweep here had a `[:alpha:]` shape for at all. The variable
+    above, which no sweep here had a `[:alpha:]` shape for at all; that one is
+    served now, so the bracket carry is what is left. The variable
     INHERITS that gap by being routed through the same `copy_bracket`, so it
     is one defect with two spellings rather than a new one, and it is carried
     as an xfail under each. The lesson is the sweep's rather than the code's,

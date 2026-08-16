@@ -7715,12 +7715,15 @@ a
 ## status: 1
 
 #### POSIXLY_CORRECT discards the confusing-bracket lint, and it is not the level
-# XFAIL with GNU's golden, and the LAST POSIXLY_CORRECT divergence. This one
-# is not `posixicity' at all: `dfawarn' asks `getenv("POSIXLY_CORRECT")'
-# directly (regexp.c:52), so the lint GNU exits 4 for is DISCARDED whenever
-# the variable is present. td-txt gates it on nothing and still refuses.
-# Found by a reviewer, whose method is worth keeping: the roster for this
-# campaign came from grepping `posixicity', and the complete net is
+# The one POSIXLY_CORRECT rule that is not `posixicity' at all: `dfawarn' asks
+# `getenv("POSIXLY_CORRECT")' directly (regexp.c:52), so the lint GNU exits 4
+# for is DISCARDED whenever the variable is present. Landed as an xfail one
+# commit before it was served, which is why the five cases here read as a
+# proof rather than as one example: what has to be got right is WHICH switch,
+# and four of the five exist to say which one. Two more in grep-cli.test.txt
+# say it is SED's and not the engine's.
+# Found by a reviewer, whose method is worth keeping: the roster for the
+# posixicity campaign came from grepping `posixicity', and the complete net is
 # `grep POSIXLY_CORRECT sed/*.c' -- two getenv sites, of which that grep
 # sees one.
 ## argv: sed 's/[:alpha:]/Z/' h

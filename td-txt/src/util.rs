@@ -19,10 +19,13 @@ pub fn os_from_bytes(bytes: &[u8]) -> OsString {
 }
 
 /// Whether `POSIXLY_CORRECT` is set. GNU reads only whether it is THERE -- an
-/// empty value, `0` and `no` all count. GNU gives it two jobs; td-txt uses it
-/// for ONE, ending option parsing at the first operand. The other, sed's POSIX
-/// mode, is deliberately not driven from here -- see spec/README's gap entry,
-/// which measures why it is not the same switch as `--posix`.
+/// empty value, `0` and `no` all count. It has THREE jobs and this answers all
+/// three: ending option parsing at the first operand (both applets), selecting
+/// GNU sed's middle `posixicity` level, and -- the one that is not that level
+/// -- suppressing sed's confusing-bracket lint, which `dfawarn` gates on the
+/// same `getenv` rather than on the level (sed/regexp.c:52). What it must NOT
+/// do is set sed's `--posix`: that is a LOWER level than this one selects, and
+/// spec/README measures the 76 scripts the two spellings disagree on.
 pub fn posixly_correct() -> bool {
     std::env::var_os("POSIXLY_CORRECT").is_some()
 }

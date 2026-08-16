@@ -204,12 +204,8 @@ struct ScriptParser<'a> {
     /// so its compile flags. Not `pos`, which has already run to the command's
     /// end by the time most of those flags are read.
     cmd_start: usize,
-    /// `-z`, read by the `M` flag. NOT per-part, unlike the flags in `Mode`:
-    /// GNU reads the record separator at compile time AND again in
-    /// `match_regexp`, and for a pattern that is only `^` or `$` the RUN-time
-    /// read is what anchors it -- so a part-scoped answer is wrong for exactly
-    /// the patterns the option is most used with. See spec/README.
-    null_data: bool,
+    /// The compile inputs that are NOT per-part; see `Invocation`.
+    inv: Invocation,
     /// What the lookup answers when there are no parts to look in, which is the
     /// unit tests and nothing else: `run` always builds at least one, and
     /// `cmd_start` points at a byte of the script, so every real command lands
@@ -440,11 +436,13 @@ impl ScriptParser<'_> {
             strict_repeats: true,
             posix: self.posix(),
             unmatched_rparen_ordinary: !self.extended(),
+            // GNU's one POSIXLY_CORRECT rule that is not a posixicity read.
+            confusing_bracket_ok: self.inv.posixly,
             // sed has only glibc, which never satisfies a mid-branch `$`.
             glibc_engine: true,
             // sed lexes one regex at a time, and has no `-x`/`-w` to wrap it.
             lex_continues: false,
-            reg_newline: multiline.then_some(separator_for(self.null_data)),
+            reg_newline: multiline.then_some(separator_for(self.inv.null_data)),
         };
         let re = Regex::compile(&normalize_regex(raw, !self.extended())?, opts)
             .map_err(|e| e.msg)?;
@@ -1446,13 +1444,13 @@ fn parse_script(
     src: &[u8],
     parts: Vec<Part>,
     fallback: Mode,
-    null_data: bool,
+    inv: Invocation,
 ) -> Result<Script, Fatal> {
     let mut p = ScriptParser {
         src,
         pos: 0,
         cmd_start: 0,
-        null_data,
+        inv,
         fallback,
         v_promoted: false,
         saved: None,
@@ -3121,9 +3119,9 @@ fn compile_script(
     src: &[u8],
     parts: Vec<Part>,
     fallback: Mode,
-    null_data: bool,
+    inv: Invocation,
 ) -> Result<Script, Fatal> {
-    let mut script = parse_script(src, parts, fallback, null_data)?;
+    let mut script = parse_script(src, parts, fallback, inv)?;
     let labels = std::mem::take(&mut script.labels);
     resolve_labels(&mut script.cmds, &labels)
         .map_err(|msg| Fatal { msg, status: 4, locus: None })?;
@@ -3517,7 +3515,8 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
     // an `-e` it cannot be governed by a flag it precedes.
     let mode = mode_of(&conf, posixly);
     let separator = separator_for(conf.null_data);
-    compile_and_run(conf, mode, &source, parts, files, separator).map_err(|f| {
+    let inv = Invocation { null_data: conf.null_data, posixly };
+    compile_and_run(conf, mode, inv, &source, parts, files, separator).map_err(|f| {
         match (f.status, &f.locus) {
             (1, None) => Fatal { locus: script_end, ..f },
             _ => f,
@@ -3531,12 +3530,13 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
 fn compile_and_run(
     conf: Conf,
     mode: Mode,
+    inv: Invocation,
     source: &[u8],
     parts: Vec<Part>,
     files: Vec<Vec<u8>>,
     separator: u8,
 ) -> Result<i32, Fatal> {
-    let mut script = compile_script(source, parts, mode, conf.null_data)?;
+    let mut script = compile_script(source, parts, mode, inv)?;
     let seed = seed_ranges(&script.cmds);
     // GNU's `posixicity` at the moment the run starts: the option loop's FINAL
     // value plus a compiled `v`. Not a part's scan-time mode -- `--posix` after
@@ -3948,6 +3948,33 @@ struct Mode {
     /// target is opened, because refusing the command is GNU's answer whether or
     /// not the file could have been opened.
     sandbox: bool,
+}
+
+/// The two compile inputs that are properties of the INVOCATION rather than of
+/// an `-e` part, which is what keeps them out of `Mode`: every part sees the
+/// same pair, so a per-part answer could only ever be the same answer written
+/// once per part. Threaded as a struct for `Mode`'s reason -- two adjacent
+/// `bool` parameters of the same shape transpose silently.
+///
+/// `Conf` still carries `null_data`, since it is what the option loop WRITES;
+/// this is what the COMPILE reads, built once beside the separator that shares
+/// the bit. A handoff rather than a second source: nothing past `run` reads
+/// `conf.null_data`.
+#[derive(Clone, Copy, Debug)]
+struct Invocation {
+    /// `-z`, read by the `M` flag. GNU reads the record separator at compile
+    /// time AND again in `match_regexp`, and for a pattern that is only `^` or
+    /// `$` the RUN-time read is what anchors it -- so a part-scoped answer is
+    /// wrong for exactly the patterns the option is most used with. See
+    /// spec/README.
+    null_data: bool,
+    /// `POSIXLY_CORRECT` PRESENT in the environment, which is a THIRD thing
+    /// that variable does and the only one that is not `posixicity`: GNU's
+    /// `dfawarn` asks `getenv` directly (regexp.c:52), so the confusing-bracket
+    /// lint is discarded whenever it is set -- under `--posix` too, and no `v`
+    /// brings it back. Presence and not value, as the option-permutation half
+    /// already is.
+    posixly: bool,
 }
 
 impl Mode {
@@ -4924,6 +4951,9 @@ mod tests {
         Mode { ere, ..EXTENDED }
     }
 
+    /// What every test here compiles under: no `-z`, no `POSIXLY_CORRECT`.
+    const PLAIN: Invocation = Invocation { null_data: false, posixly: false };
+
     /// `Options` carries the two posixicity rules as separate bools because GNU
     /// separates them, but they are LEVELS and not axes: BASIC is below CORRECT,
     /// so `--posix` implies the paren rule and the pair `(posix, extended) =
@@ -5013,7 +5043,8 @@ mod tests {
         let null_data = opts.contains(&"-z");
         let sep = separator_for(null_data);
         let mode = mode_with(ere);
-        let mut script = compile_script(script.as_bytes(), Vec::new(), mode, null_data).unwrap();
+        let inv = Invocation { null_data, posixly: false };
+        let mut script = compile_script(script.as_bytes(), Vec::new(), mode, inv).unwrap();
         let seed = seed_ranges(&script.cmds);
         let script_extended = mode.extended_with_v(script.v_promoted);
         let wfiles = std::mem::take(&mut script.wfiles);
@@ -5352,7 +5383,7 @@ mod tests {
             (b"y/a\n/xy/", "unterminated `y' command"),
             (b"/a\nb/p", "unterminated address regex"),
         ] {
-            let err = compile_script(script, Vec::new(), EXTENDED, false).err();
+            let err = compile_script(script, Vec::new(), EXTENDED, PLAIN).err();
             assert_eq!(
                 err.map(|f| f.msg),
                 Some(msg.as_bytes().to_vec()),
@@ -5380,13 +5411,13 @@ mod tests {
         // closer overlapping it is missed and the parity shows.
         // An even name-length CLOSES, and is then rejected for its name.
         assert_eq!(
-            compile_script(b"s/[[....]]/X/", Vec::new(), EXTENDED, false)
+            compile_script(b"s/[[....]]/X/", Vec::new(), EXTENDED, PLAIN)
                 .err()
                 .map(|f| f.msg),
             Some(b"Invalid collation character".to_vec())
         );
         for script in [&b"s/[[...]]/X/"[..], b"s/[[.....]]/X/", b"s/[[:::]]/X/", b"s/[[===]]/X/"] {
-            let err = compile_script(script, Vec::new(), EXTENDED, false).err();
+            let err = compile_script(script, Vec::new(), EXTENDED, PLAIN).err();
             assert_eq!(
                 err.map(|f| f.msg),
                 Some(b"unterminated `s' command".to_vec()),
@@ -5397,7 +5428,7 @@ mod tests {
         // The closer must be the character that opened it, so these run off the
         // end of the script rather than closing a set.
         for script in [&b"s/[[:alpha:]/X/"[..], b"s/[[:alpha.]]/X/", b"s/[[:]]/X/"] {
-            let err = compile_script(script, Vec::new(), EXTENDED, false).err();
+            let err = compile_script(script, Vec::new(), EXTENDED, PLAIN).err();
             assert_eq!(
                 err.map(|f| f.msg),
                 Some(b"unterminated `s' command".to_vec()),
@@ -5411,10 +5442,10 @@ mod tests {
     /// exits 4, alone among pattern errors.
     #[test]
     fn the_bare_class_syntax_refusal_is_exit_4_where_other_pattern_errors_are_1() {
-        let f = compile_script(b"s@[:alpha:]@X@", Vec::new(), EXTENDED, false).err();
+        let f = compile_script(b"s@[:alpha:]@X@", Vec::new(), EXTENDED, PLAIN).err();
         assert_eq!(f.as_ref().map(|f| f.status), Some(4));
         assert_eq!(f.map(|f| f.msg), Some(crate::regex::CLASS_SYNTAX.as_bytes().to_vec()));
-        let f = compile_script(b"s@[[:a:]]@X@", Vec::new(), EXTENDED, false).err();
+        let f = compile_script(b"s@[[:a:]]@X@", Vec::new(), EXTENDED, PLAIN).err();
         assert_eq!(f.map(|f| f.status), Some(1));
     }
 
@@ -5423,11 +5454,11 @@ mod tests {
         // A bad script is status 1; an unresolvable branch is a RUNTIME error,
         // which GNU reports as 4.
         for bad in [&b"k"[..], b"s/a/b", b"{p"] {
-            let err = compile_script(bad, Vec::new(), EXTENDED, false).err().map(|f| f.status);
+            let err = compile_script(bad, Vec::new(), EXTENDED, PLAIN).err().map(|f| f.status);
             assert_eq!(err, Some(1), "{:?} must be a status-1 script error", bad);
         }
         assert_eq!(
-            compile_script(b"bnowhere", Vec::new(), EXTENDED, false).err().map(|f| f.status),
+            compile_script(b"bnowhere", Vec::new(), EXTENDED, PLAIN).err().map(|f| f.status),
             Some(4)
         );
     }
@@ -5445,7 +5476,7 @@ mod tests {
                 .map(|(i, e)| Part { end: *e, origin: Origin::Expression(i + 1), mode: EXTENDED })
                 .collect();
             parts.push(Part { end: src.len(), origin: Origin::Expression(parts.len() + 1), mode: EXTENDED });
-            compile_script(src, parts, EXTENDED, false).err().map(|f| f.status)
+            compile_script(src, parts, EXTENDED, PLAIN).err().map(|f| f.status)
         };
         // `sed a` and `sed -e a -e p`: nothing after the command in its own part.
         assert_eq!(compile(b"a", Vec::new()), Some(1));

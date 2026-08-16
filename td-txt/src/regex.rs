@@ -81,6 +81,21 @@ pub struct Options {
     /// which is where the pair comes from. It does NOT check the construction
     /// below it: only the corpus catches a site that builds the pair by hand.
     pub unmatched_rparen_ordinary: bool,
+    /// Whether a class written without its outer bracket (`[:alpha:]`) is
+    /// ACCEPTED as the ordinary bracket expression it looks like, rather than
+    /// refused with `CLASS_SYNTAX`.
+    ///
+    /// GNU's `dfawarn` (sed/regexp.c:52) asks `getenv("POSIXLY_CORRECT")`
+    /// DIRECTLY, so this is the one rule that variable drives without going
+    /// through `posixicity`: it is not `posix`, not the level, and no `v`
+    /// restores the lint. `false` is today's answer everywhere else -- grep
+    /// hands dfa `DFA_CONFUSING_BRACKETS_ERROR` whatever the environment says.
+    ///
+    /// Only the DIAGNOSTIC is conditional. The pattern parses identically
+    /// either way: `class_syntax` is a flag the bracket parser raises and the
+    /// error is built from it after the parse, so accepting one costs nothing
+    /// but the refusal.
+    pub confusing_bracket_ok: bool,
     /// Which of GNU's two engines reads the MID-BRANCH `$` that `stray_anchor`
     /// creates. grep's dfa satisfies one at a true end of line, so `grep 'x$|*'`
     /// selects a line `x`; glibc satisfies one never, so the branch is dead and
@@ -1317,7 +1332,7 @@ impl Regex {
         if p.paren_debt > 0 {
             return Err(Error::new("Unmatched ( or \\("));
         }
-        if p.class_syntax {
+        if p.class_syntax && !opts.confusing_bracket_ok {
             return Err(Error::new(CLASS_SYNTAX));
         }
         let first = first_bytes(&root);
@@ -2040,6 +2055,23 @@ mod tests {
                 "{bad}"
             );
         }
+        // `confusing_bracket_ok` drops the REFUSAL and nothing else: the pattern
+        // already parsed as the ordinary bracket expression GNU matches with, so
+        // this pins the SET. `[:alpha:]` is {:, a, l, p, h} -- the name is text,
+        // which is the whole reason GNU warns about the spelling.
+        let ok = Options { confusing_bracket_ok: true, ..Options::default() };
+        let re = Regex::compile(b"[:alpha:]", ok).unwrap();
+        for m in [":", "a", "l", "p", "h"] {
+            assert!(matched(&re, m), "{m} is a member");
+        }
+        for n in ["b", "z", "0", "-", "["] {
+            assert!(!matched(&re, n), "{n} is not");
+        }
+        // and the refusal is all that moves: a member error still outranks it.
+        assert_eq!(
+            Regex::compile(b"[:a-:]", ok).err().map(|e| e.msg),
+            Regex::compile(b"[:a-:]", Options::default()).err().map(|e| e.msg),
+        );
         // Only colons between the colons, or a range in the list, and it is an
         // ordinary set again -- both found by fuzzing, not by reading.
         assert!(matched(&bre("[:::]"), ":"));
