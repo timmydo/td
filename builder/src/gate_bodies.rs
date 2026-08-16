@@ -2480,52 +2480,93 @@ fn busybox_pkg_dir() -> Result<PathBuf, String> {
     Ok(bs)
 }
 
-/// Count the processes whose `/proc/<pid>/cmdline` carries `marker` (NULs read as
-/// spaces). A zombie's cmdline is empty, so a killed-but-unreaped parent is not
-/// counted — exactly why the reaping check can poll for zero without racing the
-/// wait. cmdline bytes are ASCII (argv paths + a decimal marker).
-fn scan_marker_procs(marker: &str) -> usize {
+/// `cmdline` bytes with NULs read as SPACES, or `None` for a zombie — whose
+/// cmdline is empty, so a killed-but-unreaped process is never counted, which
+/// is what lets the reaping check poll for zero without racing the wait.
+fn cook_cmdline(mut bytes: Vec<u8>) -> Option<Vec<u8>> {
+    if bytes.is_empty() {
+        return None;
+    }
+    for b in bytes.iter_mut() {
+        if *b == 0 {
+            *b = b' ';
+        }
+    }
+    Some(bytes)
+}
+
+/// Every live process as (pid, cooked cmdline). One place that knows `/proc`
+/// holds numeric directories; the four scans below would each carry a copy.
+fn proc_cmdlines() -> Vec<(i64, Vec<u8>)> {
     let Ok(rd) = std::fs::read_dir("/proc") else {
-        return 0;
+        return Vec::new();
     };
     rd.flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .filter_map(|e| {
+            let name = e.file_name();
+            let pid = name.to_str()?.parse::<i64>().ok()?;
+            cook_cmdline(std::fs::read(e.path().join("cmdline")).ok()?).map(|c| (pid, c))
         })
-        .filter(|e| proc_cmdline_has(&e.path().join("cmdline"), marker))
+        .collect()
+}
+
+/// True if `cmdline` carries `marker`. Compared as BYTES: a byte-as-`char`
+/// decode is Latin-1, under which a non-ASCII path never equals the `want`
+/// built from a Rust string — a silent permanent zero.
+fn has_marker(cmdline: &[u8], marker: &str) -> bool {
+    // `windows(0)` panics, and an empty marker would match every process.
+    !marker.is_empty() && cmdline.windows(marker.len()).any(|w| w == marker.as_bytes())
+}
+
+/// Count the processes whose cmdline carries `marker`.
+fn scan_marker_procs(marker: &str) -> usize {
+    proc_cmdlines()
+        .iter()
+        .filter(|(_, c)| has_marker(c, marker))
         .count()
+}
+
+/// Count the LEAF `sleep <marker>` processes, matched on the WHOLE argv rather
+/// than on a substring of it.
+///
+/// The marker is in the argv of the top `td-builder host-sandbox`, of the
+/// PID-namespace parent that waits on PID 1, and of the inner `sh` — all three
+/// carry the command string that names it. A readiness test counting anything
+/// that merely CONTAINS the marker is therefore satisfied before `sh` has
+/// forked either sleep. These two are the tree's leaves: when both exist, it
+/// is up.
+fn scan_sleep_procs(sleep_exec: &str, marker: &str) -> usize {
+    // The trailing space is load-bearing: cmdline NUL-TERMINATES every
+    // argument, so the cooked form ends with one.
+    let want = format!("{sleep_exec} {marker} ");
+    proc_cmdlines()
+        .iter()
+        .filter(|(_, c)| c.as_slice() == want.as_bytes())
+        .count()
+}
+
+/// Every marker-bearing cmdline, `pid: argv`. A COUNT cannot tell an orphan
+/// from a teardown still in flight, and reporting one as the other is what
+/// sent this check's reader to the wrong subsystem.
+fn marker_cmdlines(marker: &str) -> Vec<String> {
+    let mut out: Vec<String> = proc_cmdlines()
+        .into_iter()
+        .filter(|(_, c)| has_marker(c, marker))
+        .map(|(pid, c)| format!("{pid}: {}", String::from_utf8_lossy(&c).trim_end()))
+        .collect();
+    out.sort();
+    out
 }
 
 /// SIGKILL every process whose cmdline still carries `marker` — the failure-path
 /// sweep so a red reaping check never leaks a marker process into the shared PID
 /// namespace.
 fn sweep_marker_procs(marker: &str) {
-    let Ok(rd) = std::fs::read_dir("/proc") else {
-        return;
-    };
-    for e in rd.flatten() {
-        let name = e.file_name();
-        let Some(pid) = name.to_str().and_then(|s| s.parse::<i64>().ok()) else {
-            continue;
-        };
-        if proc_cmdline_has(&e.path().join("cmdline"), marker) {
+    for (pid, c) in proc_cmdlines() {
+        if has_marker(&c, marker) {
             let _ = crate::sys::kill_pid(pid, crate::sys::SIGKILL);
         }
     }
-}
-
-/// True if `cmdline` (NUL-separated argv) contains `marker` as a substring.
-fn proc_cmdline_has(cmdline: &Path, marker: &str) -> bool {
-    let Ok(bytes) = std::fs::read(cmdline) else {
-        return false;
-    };
-    let text: String = bytes
-        .iter()
-        .map(|&b| if b == 0 { ' ' } else { b as char })
-        .collect();
-    text.contains(marker)
 }
 
 // --- lock / source-pin parsing (unit-tested; #460) ---------------------------
@@ -3084,6 +3125,28 @@ exit 0
     // this process's pid (unique in this PID namespace, no RNG needed).
     let marker = (1_000_000u64 + u64::from(std::process::id()) % 1_000_000).to_string();
     let inner = format!("{sleep_exec_s} {marker} & {sleep_exec_s} {marker} & wait");
+    // Start from a clean slate. The marker is derived from a pid, and pids are
+    // small and RECYCLED inside the loop sandbox, so a previous run of this
+    // gate can have leaked a process carrying THIS run's marker — which makes
+    // the leaf count wrong in both directions. Sweeping is the answer rather
+    // than relaxing the readiness test to `>=`: taking the first two arrivals
+    // is exactly the weakness that had it killing mid-construction.
+    // Checked, NOT swept: the marker is matched as a substring, so an unrelated
+    // process whose cmdline merely contains those digits would be SIGKILLed by
+    // a sweep here. Naming it and refusing costs a red on a dirty slate; the
+    // sweep costs somebody else's process, and only the failure paths — where
+    // the tree is known to be ours — may pay that.
+    let poll = std::time::Duration::from_millis(100);
+    let stale = scan_marker_procs(&marker);
+    if stale != 0 {
+        for line in marker_cmdlines(&marker) {
+            println!("   pre-existing: {line}");
+        }
+        return Err(format!(
+            "FAIL: {stale} process(es) already carry marker={marker} — a reaping \
+             measurement taken from a dirty slate would mean nothing"
+        ));
+    }
     let mut reap_args: Vec<&str> = vec!["host-sandbox"];
     reap_args.extend_from_slice(&bind_flags);
     reap_args.extend_from_slice(&["--", &sh_exec_s, "-c", &inner]);
@@ -3097,21 +3160,35 @@ exit 0
         .map_err(|e| format!("FAIL: cannot spawn the host-sandbox reaping probe: {e}"))?;
     let top = i64::from(child.id());
 
-    let poll = std::time::Duration::from_millis(100);
+    // The tree is UP when both leaf sleeps exist. Three processes above them
+    // carry the marker in their own argv — the top td-builder, the PID-ns
+    // parent that waits on PID 1, and `sh` — so a count of marker-BEARING
+    // processes reaches 2 before `sh` has forked either leaf, and killing
+    // there tests the sandbox mid-construction rather than once it is up.
+    const LEAVES: usize = 2;
     for _ in 0..100 {
-        if scan_marker_procs(&marker) >= 2 {
+        if scan_sleep_procs(&sleep_exec_s, &marker) == LEAVES {
             break;
         }
         std::thread::sleep(poll);
     }
+    let leaves = scan_sleep_procs(&sleep_exec_s, &marker);
     let before = scan_marker_procs(&marker);
-    println!("   inner procs carrying the marker before kill: {before}");
-    if before < 2 {
+    println!("   inner procs carrying the marker before kill: {before} ({leaves} leaf sleeps)");
+    if leaves != LEAVES {
+        // Name what IS up and what was looked for: a leaf count stuck at zero
+        // is equally "nothing started" and "the matcher does not match", and
+        // the argv it wants is the only way to tell those apart.
+        println!("   wanted leaf argv: {sleep_exec_s} {marker} ");
+        for line in marker_cmdlines(&marker) {
+            println!("   up: {line}");
+        }
         let _ = crate::sys::kill_pid(top, crate::sys::SIGTERM);
         sweep_marker_procs(&marker);
         let _ = child.wait();
         return Err(format!(
-            "FAIL: the inner sandbox tree never started (marker={marker})"
+            "FAIL: the inner sandbox tree never started — {leaves} of {LEAVES} \
+             leaf sleeps after 10s (marker={marker})"
         ));
     }
 
@@ -3124,20 +3201,51 @@ exit 0
         let _ = child.wait();
         return Err(format!("FAIL: cannot SIGTERM the top td-builder ({top}): {e}"));
     }
+    // Reap the TOP before judging its descendants, and judge nothing at all
+    // while it is still up: a live top CARRIES the marker, so it would be
+    // counted among the survivors it is the reason for.
+    let mut top_exited = false;
+    for _ in 0..100 {
+        // Ok(Some(_)) reaps it, so no further wait is owed on this path.
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            top_exited = true;
+            break;
+        }
+        std::thread::sleep(poll);
+    }
+    if !top_exited {
+        for line in marker_cmdlines(&marker) {
+            println!("   still up: {line}");
+        }
+        // `wait` has no timeout: a td-builder that ignored SIGTERM would hang
+        // here for the gate's whole budget instead of failing it in ten
+        // seconds, and this diagnostic would never print.
+        let _ = child.kill();
+        let _ = child.wait();
+        sweep_marker_procs(&marker);
+        return Err(format!(
+            "FAIL: the top td-builder ({top}) was still alive 10s after SIGTERM — \
+             descendant reaping cannot be judged from here"
+        ));
+    }
     for _ in 0..100 {
         if scan_marker_procs(&marker) == 0 {
             break;
         }
         std::thread::sleep(poll);
     }
-    let after = scan_marker_procs(&marker);
-    let _ = child.wait();
+    // ONE scan for both the count and the names: two would let the number and
+    // the list disagree, which is the diagnosis this reports.
+    let survivors = marker_cmdlines(&marker);
+    let after = survivors.len();
     println!("   inner procs carrying the marker after killing td-builder ({top}): {after}");
     if after != 0 {
+        for line in &survivors {
+            println!("   surviving: {line}");
+        }
         sweep_marker_procs(&marker);
         return Err(format!(
-            "FAIL: {after} sandbox descendant(s) survived td-builder termination — orphaned \
-             (PR_SET_PDEATHSIG reaping broken)"
+            "FAIL: {after} sandbox descendant(s) survived td-builder termination"
         ));
     }
 
@@ -3491,6 +3599,37 @@ fn toolchain_x86_64_input_addressed(root: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The readiness test turns on matching a WHOLE argv, and on one byte of
+    /// it: `/proc/<pid>/cmdline` NUL-TERMINATES every argument, so cooked it
+    /// ends with a trailing space. A `want` built without one never equals
+    /// anything, the leaf count stays at zero, and the gate reports that the
+    /// tree never started rather than that its matcher is broken.
+    #[test]
+    fn a_cmdline_matches_whole_argv_rather_than_a_substring_of_it() {
+        let leaf = cook_cmdline(b"/bin/sleep\x001000050\x00".to_vec()).unwrap();
+        assert_eq!(leaf, b"/bin/sleep 1000050 ");
+        assert_ne!(leaf, b"/bin/sleep 1000050".to_vec());
+
+        // A whole-argv match is what separates a leaf from the `sh` and the
+        // two td-builder levels above it, all of which CARRY the marker.
+        let sh = cook_cmdline(b"/bin/sh\x00-c\x00/bin/sleep 1000050 & wait\x00".to_vec()).unwrap();
+        assert!(has_marker(&sh, "1000050"));
+        assert_ne!(sh, b"/bin/sleep 1000050 ".to_vec());
+
+        // Bytes, not a byte-as-char decode: that is Latin-1, so a non-ASCII
+        // path would never equal a `want` built from a Rust string.
+        let utf8 = cook_cmdline("/bin/slëep\u{0}1000050\u{0}".as_bytes().to_vec()).unwrap();
+        assert_eq!(utf8, "/bin/slëep 1000050 ".as_bytes());
+        assert!(has_marker(&utf8, "1000050"));
+
+        // An empty marker would match every process on the box; `windows(0)`
+        // would panic before it got the chance.
+        assert!(!has_marker(&leaf, ""));
+
+        // A zombie's cmdline is empty: not a live process, so not counted.
+        assert_eq!(cook_cmdline(Vec::new()), None);
+    }
 
     // Width never exceeds the work: a two-check run must not claim four slots from
     // the machine-wide pool and make three other agents' gates wait on grants it
