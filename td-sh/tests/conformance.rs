@@ -1633,6 +1633,15 @@ fn a_file_stdin_script_agrees_with_a_piped_one()
         // No trailing newline, so the last line ends at end of input rather
         // than at a byte the rewind can point past.
         ("read v\nDATA\necho \"end=[$v]\"".to_string(), "end=[DATA]\n"),
+        // A here-document the input ENDS inside. This reader gets there only by
+        // sealing mid-body -- the pulls before it rewind, the source answers
+        // `Eof`, and the re-pull ends the body -- where the whole-string reader
+        // had the whole of it from the start. No trailing newline either, so the
+        // last body line is the one that contributes none.
+        (
+            "while read x || [ -n \"$x\" ]; do echo \"[$x]\"; done <<E\none\ntwo".to_string(),
+            "[one]\n[two]\n",
+        ),
     ];
     let dir = std::env::temp_dir().join(format!("td-sh-stdin-{}", std::process::id()));
     // Fresh, so a leak from a previous failing run cannot feed this one.

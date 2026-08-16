@@ -431,6 +431,16 @@ impl Units {
         // Not incomplete input however it failed: no amount of further input can
         // complete a replacement, so the unit loop must stop rather than read on.
         let lexed = tokenize(value, line).map_err(|e| format!("alias `{name}': {e}"))?;
+        // A here-document the replacement OPENED but did not close is refused
+        // rather than run. ash reads that body from the enclosing input, this
+        // splices TOKENS and cannot; ending it here would give the alias an
+        // empty body and hand the script's here-document DATA back to the
+        // parser as commands.
+        if let Some(delim) = lexed.heredoc_ran_out {
+            return Err(format!(
+                "alias `{name}': {INCOMPLETE}: here-document delimited by `{delim}`"
+            ));
+        }
         let base = self.scan.push_heredocs(lexed.heredocs);
         let sub: Vec<Placed> = lexed
             .toks
@@ -1434,21 +1444,34 @@ mod tests {
         Ok(())
     }
 
-    /// A trailing `\<newline>` is the one construct the two parses of the same
-    /// buffer must answer differently. The reader's PROBE has a source it can
-    /// still ask, so it must report incomplete and prompt; the parse that
-    /// finally RUNS the text has not, so the fold is spent and `echo x \` runs
-    /// `echo x` -- which is what ash does at `-c`, at end of a script, and at
-    /// end of an interactive session alike.
+    /// Two constructs answer the two parses of one buffer differently, and by
+    /// one rule: text running out means "ask" to the reader's PROBE, which has a
+    /// source it can still ask, and "that was all" to the parse that finally
+    /// RUNS it. So a trailing `\<newline>` is spent and `echo x \` runs `echo
+    /// x`, and an unterminated here-document ends its body and the command runs
+    /// -- both what ash does at `-c`, at end of a script, and at end of an
+    /// interactive session alike.
     ///
     /// Without it the probe would report the line COMPLETE, and an operator
     /// typing a continuation would watch the shell run half of what they meant.
     /// This is the level it can be tested at: `repl` needs a terminal, since a
     /// shell whose stdin is not one reads it as a script however `-i` is set.
     #[test]
-    fn the_probe_asks_for_the_rest_of_a_folded_line_where_the_real_parse_runs_it() -> Syn<()> {
+    fn the_probe_asks_for_more_where_the_real_parse_takes_what_it_has() -> Syn<()> {
         let aliases = Aliases::new();
-        for src in ["echo x \\\n", "echo ab\\\n", "true &\\\n", "\\\n"] {
+        for src in [
+            "echo x \\\n",
+            "echo ab\\\n",
+            "true &\\\n",
+            "\\\n",
+            "cat <<E\n",
+            "cat <<E\nbody\n",
+            // A delimiter line no newline ended is the one a SNAPSHOT must not
+            // take: another keystroke could make it `EX`, where the finished
+            // text really does close the body there.
+            "cat <<E\nE",
+            "cat <<A\none\nA\ncat <<B\ntwo\n",
+        ] {
             match parse_probe(src, &aliases) {
                 Err(e) => assert!(e.starts_with(INCOMPLETE), "{src:?}: {e}"),
                 Ok(_) => return Err(format!("{src:?}: the probe must ask for more")),
@@ -1458,7 +1481,9 @@ mod tests {
         }
         // Everything else answers the same to both, because more input really
         // could finish it and the text really is unfinished.
-        for src in ["if true; then", "echo 'abc", "echo x |", "cat <<E"] {
+        // A `<<` whose DELIMITER never arrived is still unfinished to both: the
+        // body was never opened, and ash refuses `cat <<` at end of input too.
+        for src in ["if true; then", "echo 'abc", "echo x |", "cat <<"] {
             for got in [parse_probe(src, &aliases), parse_aliased_at(src, &aliases, 1)] {
                 match got {
                     Err(e) => assert!(e.starts_with(INCOMPLETE), "{src:?}: {e}"),

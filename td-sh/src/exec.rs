@@ -3694,6 +3694,138 @@ mod tests {
         }
     }
 
+    /// Input that ENDS ends a here-document body with it, and the command runs
+    /// with what was collected -- ash leaves its body read on PEOF (`case
+    /// CENDFILE`) and reports nothing at all. The body is the characters up to
+    /// the delimiter LINE, so a last line the input ran out on contributes no
+    /// newline. `read` returns non-zero on a line no newline ended, so the
+    /// plain loop below DROPS that last line where the guarded idiom keeps it:
+    /// that pair is the difference a script can see, and it is what pins the
+    /// byte. Every row measured against busybox ash 1.37.0.
+    #[test]
+    fn input_that_ends_ends_a_here_document_body_with_it() {
+        let plain = r#"while read x; do echo "[$x]"; done"#;
+        let kept = r#"while read x || [ -n "$x" ]; do echo "[$x]"; done"#;
+        for (loop_src, redir, out) in [
+            (plain, "<<E", ""),
+            (kept, "<<E", ""),
+            (plain, "<<E\none", ""),
+            (kept, "<<E\none", "[one]\n"),
+            (plain, "<<E\none\ntwo", "[one]\n"),
+            (kept, "<<E\none\ntwo", "[one]\n[two]\n"),
+            // A newline the body really HAS is still real; the delimited body,
+            // which both loops answer alike, is the pair's control.
+            (plain, "<<E\none\n", "[one]\n"),
+            (plain, "<<E\none\nE", "[one]\n"),
+            (kept, "<<E\none\nE", "[one]\n"),
+            // A quoted delimiter and `<<-`'s stripping reach the last line like
+            // any other, and an unquoted body expands to the end.
+            (kept, "<<'E'\n$y", "[$y]\n"),
+            (kept, "<<-E\n\tone", "[one]\n"),
+            (kept, "<<E\nv=$y", "[v=Y]\n"),
+            // Two bodies end at once, and the LAST redirect is the one read.
+            (kept, "<<A <<B\none", ""),
+            (kept, "<<A <<B\none\nA\ntwo", "[two]\n"),
+        ] {
+            let src = format!("y=Y; {loop_src} {redir}");
+            assert_eq!(run(&src), (0, out.to_string(), String::new()), "{src:?}");
+        }
+        // Only the LAST body runs off the end: one that found its delimiter is
+        // still bounded by it.
+        let two = format!("{plain} <<A\none\nA\n{kept} <<B\ntwo");
+        assert_eq!(run(&two), (0, "[one]\n[two]\n".to_string(), String::new()));
+        // The command's own status, not the reader's.
+        assert_eq!(run("false <<E\nbody").0, 1);
+        // A body that ended at EOF is still a body, so an unfinished construct
+        // inside it is a syntax error exactly as in a delimited one; so is a
+        // compound the body did not close, and a `<<` whose delimiter word never
+        // arrived was never a body at all. ash exits 2 for all eight.
+        //
+        // The parent exited 2 for all eight as well, so the STATUS alone pins
+        // nothing here -- what changed is which refusal it is. Each of these
+        // now reports the thing that is actually unfinished, where before the
+        // here-document swallowed the question and answered for it.
+        for src in [
+            "cat <<E\n${a",
+            "cat <<E\n$((1+2",
+            "cat <<E\n$(echo hi",
+            "cat <<E\n`echo hi",
+            "{ cat <<E\none",
+            "if true; then cat <<E\none",
+            "cat <<",
+            "cat <<-",
+        ] {
+            let (status, out, err) = run(src);
+            assert_eq!(status, 2, "{src:?}");
+            assert_eq!(out, "", "{src:?}");
+            assert!(!err.is_empty(), "{src:?}: the refusal is reported");
+            assert!(!err.contains("delimited by"), "{src:?}: {err}");
+        }
+    }
+
+    /// Where a body ends turns on whether the text OWNS its own end. `eval` and
+    /// a backquote body are each a complete text, so a body left open in one
+    /// ends with it -- ash agrees, reading a backquote body as a STRING before
+    /// re-lexing it (`PARSEBACKQOLD`) where it parses `$( )` inline with the
+    /// enclosing input.
+    ///
+    /// An alias replacement does NOT own its end: ash pushes it onto the input
+    /// and reads the body from the lines that follow. Splicing TOKENS cannot do
+    /// that, so an open body there is REFUSED rather than given an empty one --
+    /// otherwise the script's here-document DATA comes back as commands.
+    ///
+    /// `$( )` is where this shell still differs: ash refuses `$(cmd <<E` over a
+    /// body, its `)` having been eaten by that body, where this substitutes a
+    /// value. Closing it needs the substitution's SPELLING carried into the AST,
+    /// since ash's own two spellings disagree -- so it is pinned here rather
+    /// than left to be found, and lands as a deliberate change.
+    #[test]
+    fn only_a_text_that_owns_its_end_ends_a_here_document_body() {
+        let l = r#"while read x || [ -n "$x" ]; do echo [$x]; done"#;
+        for (src, want) in [
+            // Complete texts: the body ends with them, as ash has it.
+            (format!("eval '{l} <<E\none'"), "[one]\n"),
+            (format!("v=`{l} <<E\none`; echo \"v=[$v]\""), "v=[[one]]\n"),
+            (format!("v=`{l} <<E`; echo \"v=[$v]\""), "v=[]\n"),
+            // A substitution with no body LINE at all agrees with ash too: its
+            // body would start on a line the parens do not reach.
+            (format!("v=$({l} <<E); echo \"v=[$v]\""), "v=[]\n"),
+            // ... and one WITH a body is the divergence above; ash exits 2.
+            (format!("v=$({l} <<E\none); echo \"v=[$v]\""), "v=[[one]]\n"),
+            // Which reaches THROUGH an alias, a substitution being its own scan
+            // wherever it is written -- so the splice's refusal does not cover
+            // it, and this is the third shape that stops refusing. The
+            // backquote in that same position is the win beside it: ash agrees
+            // with this one and the parent refused both.
+            (format!("alias e='v=$({l} <<E\none); echo \"v=[$v]\"'\ne"), "v=[[one]]\n"),
+            (format!("alias e='v=`{l} <<E\none`; echo \"v=[$v]\"'\ne"), "v=[[one]]\n"),
+        ] {
+            assert_eq!(run(&src), (0, want.to_string(), String::new()), "{src:?}");
+        }
+        // A `.` script is the third text that owns its end, and takes a file to
+        // be one. What it pins beyond the body is that the SOURCING script
+        // carries on afterwards, which is ash's answer too.
+        let dir = std::env::temp_dir().join(format!("td-sh-heredoc-eof-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let script = dir.join("sourced.sh");
+        let _ = std::fs::write(&script, format!("{l} <<E\none"));
+        assert_eq!(
+            run(&format!(". {}\necho after", script.display())),
+            (0, "[one]\nafter\n".to_string(), String::new())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        // A splice keeps the refusal, whether or not the delimiter turns up on
+        // a later line: neither body is text that scan holds.
+        for src in [
+            format!("alias e='{l} <<E'\ne\none"),
+            format!("alias e='{l} <<E'\ne\none\nE\necho done"),
+        ] {
+            let (status, out, err) = run(&src);
+            assert_eq!((status, out.as_str()), (2, ""), "{src:?}");
+            assert!(err.contains("alias `e'"), "{src:?}: {err}");
+        }
+    }
+
     /// Only `<` reaches ash's `eopen`; `>`, `>>`, `<>`, `>|` and the `>&word`
     /// that writes both streams all reach `ecreate`. That is one choice made
     /// six times, so it is pinned as a table -- the same ENOENT, told apart

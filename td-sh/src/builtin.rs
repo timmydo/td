@@ -6893,8 +6893,11 @@ mod tests {
         let (status, out, err) = run_capturing("echo hi\necho 'unterminated");
         assert_eq!((status, out.as_str()), (2, "hi\n"));
         assert!(err.contains("unmatched"), "err: {err:?}");
-        // ... and the command the bad text belongs to does NOT run.
-        let (status, out, _) = run_capturing("echo before\necho VISIBLE <<EOF\nbody\n");
+        // ... and the command the bad text belongs to does NOT run. The example
+        // is an unterminated QUOTE because an unterminated here-document is no
+        // longer one of these: the input ending ends its body and the command
+        // runs, which `input_that_ends_ends_a_here_document_body_with_it` pins.
+        let (status, out, _) = run_capturing("echo before\necho VISIBLE 'x");
         assert_eq!((status, out.as_str()), (2, "before\n"));
     }
 

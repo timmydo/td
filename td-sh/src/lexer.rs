@@ -90,6 +90,12 @@ pub struct Lexed {
     /// replacement that trails off in a comment must swallow the rest of the
     /// line it was written on, which is text the replacement does not contain.
     pub ended_in_comment: bool,
+    /// The delimiter of a here-document whose body ran out with the input,
+    /// having ended there rather than at a delimiter line. Only alias
+    /// substitution cares, and for the reason `ended_in_comment` does: its text
+    /// is SPLICED into an input that continues, so a body that ran off the end
+    /// of the replacement belongs to lines this scan never held.
+    pub heredoc_ran_out: Option<String>,
     /// What stopped the scan, if anything. `toks` is then the valid prefix before
     /// it, which the parser runs before reporting: a shell lexes as it parses, so
     /// the commands ahead of a bad quote have already run when it is diagnosed.
@@ -479,6 +485,7 @@ pub fn tokenize_prefix(src: &str, line: u32) -> Lexed {
         toks: chunk.toks,
         heredocs: scan.take_heredocs(),
         ended_in_comment: scan.ended_in_comment(),
+        heredoc_ran_out: scan.lx.heredoc_ran_out.take(),
         error: chunk.error,
     }
 }
@@ -532,6 +539,7 @@ impl Scan {
                 ended_in_comment: false,
                 sealed: false,
                 resumable: false,
+                heredoc_ran_out: None,
                 owed_newline: false,
                 committed: false,
                 fatal: false,
@@ -721,6 +729,7 @@ fn lexer_over(text: &str, depth: u32, line: u32) -> Syn<Lexer> {
     Ok(Lexer {
         sealed: true,
         resumable: false,
+        heredoc_ran_out: None,
         owed_newline: false,
         committed: false,
         fatal: false,
@@ -752,10 +761,14 @@ struct Lexer {
     sealed: bool,
     /// The text is a SNAPSHOT whose source can still be asked for more, even
     /// though the snapshot itself is sealed. Only the interactive reader sets
-    /// it, and only the trailing-fold question consults it: `sealed` is a fact
-    /// about the string, this is a fact about where the string came from, and
-    /// a fold at the end is the one place the two answers differ.
+    /// it, and only `more_can_arrive` consults it: `sealed` is a fact about the
+    /// string, this is a fact about where the string came from, and they differ
+    /// exactly where running out has to mean "ask" rather than "that was all".
     resumable: bool,
+    /// Set when a body ended because the input did; see `Lexed::heredoc_ran_out`.
+    /// Recorded rather than acted on -- ending the body is right for text that
+    /// owns its own end, and only a caller knows whether this text does.
+    heredoc_ran_out: Option<String>,
     /// A newline has been consumed but its here-document bodies are not all
     /// read, so the `Tok::Newline` it owes has not been emitted yet.
     owed_newline: bool,
@@ -812,13 +825,20 @@ impl Lexer {
         }
     }
 
+    /// Whether the input can still GROW. Both callers ask it where the text ran
+    /// out, and both are the same question: request the rest, or take what is
+    /// here.
+    fn more_can_arrive(&self) -> bool {
+        !self.sealed || self.resumable
+    }
+
     /// A `\<newline>` was the last thing consumed and nothing follows it. While
     /// more input can arrive, that is a request for the rest of the line; once
     /// it cannot, the fold is simply SPENT -- ash reads it through
     /// `pgetc_eatbnl` and then gets PEOF, so `sh -c 'echo x \<newline>'` prints
     /// `x` rather than failing.
     fn fold_wants_more(&self) -> bool {
-        self.sc.continued && self.sc.peek().is_none() && (!self.sealed || self.resumable)
+        self.sc.continued && self.sc.peek().is_none() && self.more_can_arrive()
     }
 
     fn restore(&mut self, m: Mark) {
@@ -1076,22 +1096,27 @@ impl Lexer {
         Ok(op)
     }
 
-    fn read_raw_line(&mut self) -> Option<String> {
+    /// One raw line, and whether a NEWLINE ended it. A here-document body is the
+    /// characters up to its delimiter line, so a last line that ran out of input
+    /// contributes none -- `cat <<E` over `body` feeds four bytes where a
+    /// delimited body would feed five.
+    fn read_raw_line(&mut self) -> Option<(String, bool)> {
         self.sc.peek()?; // at end of input there is no next line
         let start = self.sc.pos;
         let start_line = self.sc.line;
         let mut line = String::new();
         while let Some(c) = self.sc.bump() {
             if c == '\n' {
-                return Some(line);
+                return Some((line, true));
             }
             line.push(c);
         }
-        // No terminator. Sealed, that IS the last line; unsealed, the rest of it
-        // is still coming, so give the characters back rather than treat half a
-        // line as whole -- it might be the delimiter with its tail unread.
-        if self.sealed {
-            Some(line)
+        // No terminator. Once nothing more can arrive that IS the last line;
+        // while it can, the rest is still coming, so give the characters back
+        // rather than treat half a line as whole -- it might be the delimiter
+        // with its tail unread.
+        if !self.more_can_arrive() {
+            Some((line, false))
         } else {
             self.sc.pos = start;
             self.sc.line = start_line;
@@ -1109,8 +1134,18 @@ impl Lexer {
                 break;
             };
             loop {
-                    let start = self.sc.line;
-                let Some(raw) = self.read_raw_line() else {
+                let start = self.sc.line;
+                let Some((raw, terminated)) = self.read_raw_line() else {
+                    // Input that has ENDED ends the body with it. ash leaves the
+                    // here-document read on PEOF (`case CENDFILE`, ash.c:12664)
+                    // and every syntax check under `endword` is guarded by
+                    // `eofmark == NULL`, so `cat <<E` runs what it collected and
+                    // says nothing. While more can still arrive this is the
+                    // reader's PS2 instead.
+                    if !self.more_can_arrive() {
+                        self.heredoc_ran_out.get_or_insert_with(|| delim.clone());
+                        break;
+                    }
                     return Err(format!("{INCOMPLETE}: here-document delimited by `{delim}`"));
                 };
                 let line = if strip_tabs {
@@ -1128,7 +1163,9 @@ impl Lexer {
                         p.body_line = start;
                     }
                     p.body.push_str(line);
-                    p.body.push('\n');
+                    if terminated {
+                        p.body.push('\n');
+                    }
                 }
                 self.committed = true;
             }
@@ -1882,6 +1919,7 @@ fn heredoc_body_word(body: &str, line: u32) -> Syn<Word> {
     let mut lx = Lexer {
         sealed: true,
         resumable: false,
+        heredoc_ran_out: None,
         owed_newline: false,
         committed: false,
         fatal: false,
