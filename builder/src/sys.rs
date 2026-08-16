@@ -13,8 +13,10 @@ compile_error!("td-builder's sandbox is x86_64-linux only (the pinned platform)"
 use std::ffi::CStr;
 use std::io;
 
+const SYS_READ: usize = 0;
 const SYS_CLOSE: usize = 3;
 const SYS_IOCTL: usize = 16;
+const SYS_PIPE2: usize = 293;
 const SYS_SOCKET: usize = 41;
 const SYS_GETUID: usize = 102;
 const SYS_GETGID: usize = 104;
@@ -259,6 +261,64 @@ pub fn set_pdeathsig(sig: usize) -> io::Result<()> {
     check(unsafe { syscall5(SYS_PRCTL, PR_SET_PDEATHSIG, sig, 0, 0, 0) })
 }
 
+const O_CLOEXEC: usize = 0o2_000_000;
+const O_NONBLOCK: usize = 0o4000;
+const EINTR: i32 = 4;
+
+/// pipe2(2), O_CLOEXEC|O_NONBLOCK — the sandbox's parent-liveness channel.
+///
+/// PR_SET_PDEATHSIG is armed AFTER a fork, so a parent that dies before the
+/// child is first scheduled is never signalled and the child runs on orphaned.
+/// The child closes the write end, so the read end reports EOF exactly when
+/// every OTHER holder is gone — which is what `getppid` cannot answer across a
+/// PID-namespace boundary, where the kernel reports 0. O_CLOEXEC because the
+/// question is asked before the exec and must not outlive it; O_NONBLOCK
+/// because a live parent must answer "alive" rather than block forever.
+pub fn pipe_liveness() -> io::Result<(i32, i32)> {
+    let mut fds: [i32; 2] = [-1, -1];
+    check(unsafe {
+        syscall5(
+            SYS_PIPE2,
+            fds.as_mut_ptr() as usize,
+            O_CLOEXEC | O_NONBLOCK,
+            0,
+            0,
+            0,
+        )
+    })?;
+    Ok((fds[0], fds[1]))
+}
+
+/// close(2).
+pub fn close(fd: i32) -> io::Result<()> {
+    check(unsafe { syscall5(SYS_CLOSE, fd as usize, 0, 0, 0, 0) })
+}
+
+/// Is any write end of `fd` still open? `Ok(false)` is EOF — every writer is
+/// gone, so the parent this channel watches has died. Nothing ever WRITES to
+/// it, so a live parent shows as EAGAIN on a non-blocking read. Any OTHER
+/// errno is returned rather than folded into `false`: the caller acts on this
+/// bit by killing itself, and an unreadable channel is not a dead parent.
+pub fn pipe_peer_open(fd: i32) -> io::Result<bool> {
+    let mut byte = [0u8; 1];
+    loop {
+        let ret = unsafe { syscall5(SYS_READ, fd as usize, byte.as_mut_ptr() as usize, 1, 0, 0) };
+        if ret == 0 {
+            return Ok(false);
+        }
+        if ret > 0 {
+            return Ok(true);
+        }
+        let errno = -ret as i32;
+        if errno == EWOULDBLOCK {
+            return Ok(true);
+        }
+        if errno != EINTR {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+    }
+}
+
 pub fn getgid() -> u32 {
     unsafe { syscall5(SYS_GETGID, 0, 0, 0, 0, 0) as u32 }
 }
@@ -483,6 +543,38 @@ mod tests {
             run(Some(32 * 1024 * 1024)),
             1,
             "a child capped at 32 MiB RLIMIT_DATA must fail to map {BIG} bytes"
+        );
+    }
+
+    #[test]
+    fn a_liveness_pipe_reports_eof_only_once_every_writer_is_gone() {
+        // The sandbox reads this ONE bit to decide whether its parent outlived
+        // the fork, so both answers have to be real: an open write end must not
+        // read as death (that would abort every healthy sandbox), and a closed
+        // one must not read as life (that is the orphan this exists to catch).
+        let (r, w) = pipe_liveness().expect("pipe2");
+        assert!(pipe_peer_open(r).expect("read"), "an open write end must read as alive");
+        close(w).expect("close");
+        assert!(!pipe_peer_open(r).expect("read"), "the last writer closing must read as EOF");
+        // EOF is level-triggered, so asking twice must not consume the answer.
+        assert!(!pipe_peer_open(r).expect("read"), "EOF must stay EOF on a second ask");
+        // The THIRD answer, and the dangerous one: an unreadable channel is not
+        // a dead parent. Folding every errno into `Ok(false)` would satisfy both
+        // asserts above while making pid 1 kill every sandbox it cannot ask.
+        assert_eq!(
+            pipe_peer_open(i32::MAX).unwrap_err().raw_os_error(),
+            Some(9 /* EBADF */),
+            "an unreadable channel must report its errno, not read as a dead parent"
+        );
+        close(r).expect("close");
+        // Never a descriptor that was once live: this harness runs tests in
+        // parallel threads of one process, so a freed fd number can be handed to
+        // another thread between the two calls — and closing it would break that
+        // test rather than this one.
+        assert_eq!(
+            close(i32::MAX).unwrap_err().raw_os_error(),
+            Some(9 /* EBADF */),
+            "close must reach the kernel — a stub returning Ok would pass the asserts above"
         );
     }
 

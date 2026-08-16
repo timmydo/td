@@ -251,10 +251,6 @@ pub fn cap_child_data_rlimit(cmd: &mut Command, bytes: u64) {
 /// orphan window to a gate's grandchildren rather than closing it — closing it
 /// needs a PID namespace or a cgroup.kill, neither of which is here.
 pub fn die_with_parent(cmd: &mut Command) {
-    /// ESRCH, "no such process" — the errno the bail path reports. Spelled here
-    /// rather than taken from libc: this workspace carries zero dependencies.
-    const ESRCH: i32 = 3;
-
     // Captured HERE, in the parent, rather than read once the fork has happened:
     // a getppid taken in the child cannot tell "my parent" from "the reaper that
     // already adopted me", so a parent dying anywhere in the fork→pre_exec path
@@ -276,6 +272,39 @@ pub fn die_with_parent(cmd: &mut Command) {
             Ok(())
         });
     }
+}
+
+/// ESRCH, "no such process" — what every bail on a vanished parent reports.
+/// Spelled here rather than taken from libc: this workspace carries zero
+/// dependencies.
+const ESRCH: i32 = 3;
+
+/// PID 1's half of the parent-liveness handshake, run just after it re-arms
+/// PR_SET_PDEATHSIG. Arming happens after a fork, so a parent killed while the
+/// child was still unscheduled is never signalled; PID 1 cannot fall back on
+/// `getppid` either, because its parent is in an ancestor PID namespace where
+/// the kernel reports 0. So it drops its own copy of the write end and reads
+/// the pipe: EOF means every other holder is gone. Arm-then-read leaves no
+/// window — a death before the read is EOF, one after is a signal.
+///
+/// Post-fork safe: three raw syscalls, and `from_raw_os_error` packs an errno
+/// without allocating.
+fn pid1_confirm_parent(live_r: i32, live_w: i32) -> io::Result<()> {
+    // Our own copy first, or the read below can never see EOF: this process
+    // would be the writer it is waiting to outlive. Load-bearing enough to
+    // report — a write end left open answers "alive" forever, which is the
+    // check silently becoming a no-op.
+    sys::close(live_w)
+        .map_err(|e| { sys::warn(b"td-builder sandbox: FAILED closing the liveness write end\n"); e })?;
+    // An unreadable channel is NOT a dead parent, so its errno propagates
+    // rather than taking the bail below.
+    if sys::pipe_peer_open(live_r)
+        .map_err(|e| { sys::warn(b"td-builder sandbox: FAILED reading the parent-liveness pipe\n"); e })?
+    {
+        return Ok(());
+    }
+    sys::warn(b"td-builder sandbox: parent died before pid 1 armed PR_SET_PDEATHSIG\n");
+    Err(io::Error::from_raw_os_error(ESRCH))
 }
 
 /// WHO issued the authority for a staged input's hash — its provenance CLASS
@@ -587,16 +616,23 @@ pub fn build(
     let cgroup_leaf = mem_cap.and_then(setup_build_cgroup);
     let cgroup_procs = cgroup_leaf.as_ref().map(|d| d.join("cgroup.procs"));
 
+    // Captured in the PARENT: a `getppid` taken in the CHILD cannot tell "my
+    // parent" from "the reaper that already adopted me", so both reads agree
+    // however early the parent died.
+    let outer_parent = i64::from(std::process::id());
+
     unsafe {
         cmd.pre_exec(move || {
             // Arm parent-death reaping before anything else: if the outer
             // td-builder dies during setup, this process is SIGKILLed rather than
             // left running. (Still in the outer PID namespace here, so getppid is
             // meaningful; the re-check closes the parent-died-mid-setup race.)
-            let parent = sys::getppid();
             sys::set_pdeathsig(sys::SIGKILL)?;
-            if sys::getppid() != parent {
-                sys::exit_group(0);
+            if sys::getppid() != outer_parent {
+                // Fail the SPAWN rather than exiting 0: std reads a clean child
+                // exit here as "exec succeeded", so the caller would take an
+                // orphan-avoidance bail for a build that ran.
+                return Err(io::Error::from_raw_os_error(ESRCH));
             }
             // Per-build memory caps, applied BEFORE the unshare (host cgroupfs is
             // still writable as the invoking user) and BEFORE the fork (so the
@@ -638,8 +674,15 @@ pub fn build(
             // parent, still in the outer PID ns) only waits for it and propagates
             // its exit. It must NOT fall through to std's exec path — the builder is
             // exec'd exactly once, as PID 1. Stdio is inherited, so output streams.
+            // Created BEFORE the fork so both ends are inherited; this process
+            // then holds the write end for the rest of its life, and its death
+            // — however abrupt — closes it. See `pid1_confirm_parent`.
+            let (live_r, live_w) = sys::pipe_liveness()?;
             let pid = sys::fork()?;
             if pid != 0 {
+                // Only the read end is surplus here; the write end is the thing
+                // PID 1 watches, and must stay open for this process's life.
+                let _ = sys::close(live_r);
                 let status = sys::waitpid(pid)?;
                 let code = if status & 0x7f == 0 {
                     (status >> 8) & 0xff
@@ -653,6 +696,10 @@ pub fn build(
             // waiting above dies, PID 1 is SIGKILLed and the kernel tears down the
             // whole namespace, reaping the build. PDEATHSIG survives the execve.
             sys::set_pdeathsig(sys::SIGKILL)?;
+            // Then check the parent outlived the fork: arming after one leaves a
+            // window where nothing would reap this process, and an orphan here is
+            // a whole build tree.
+            pid1_confirm_parent(live_r, live_w)?;
             // Keep every mount below private to this namespace.
             sys::mount(None, &root_c, None, sys::MS_REC | sys::MS_PRIVATE, None)?;
             // Stage each closure item into newstore (host scratch, OUTSIDE the new
@@ -970,19 +1017,27 @@ pub fn host_shell(
         }
     }
 
+    // Captured in the PARENT: a `getppid` taken in the CHILD cannot tell "my
+    // parent" from "the reaper that already adopted me", so both reads agree
+    // however early the parent died.
+    let outer_parent = i64::from(std::process::id());
+
     unsafe {
         command.pre_exec(move || {
             // Arm parent-death reaping BEFORE anything else: if the outer
             // td-builder is killed (CI cancellation, a timeout, Ctrl-C) during or
             // after setup, this process is SIGKILLed instead of left running.
-            // Re-checked just after, to close the race where the parent died
-            // between the getppid and the prctl. (This level is still in the
-            // outer PID namespace, so getppid is meaningful here.)
-            let parent = sys::getppid();
+            // Re-checked just after against the pid the PARENT recorded, closing
+            // the race where it died between the fork and the prctl. (This level
+            // is still in the outer PID namespace, so getppid is meaningful.)
             sys::set_pdeathsig(sys::SIGKILL)
                 .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED arming PR_SET_PDEATHSIG\n"); e })?;
-            if sys::getppid() != parent {
-                sys::exit_group(0);
+            if sys::getppid() != outer_parent {
+                // Fail the SPAWN rather than exiting 0: std reads a clean child
+                // exit here as "exec succeeded", so the caller would take an
+                // orphan-avoidance bail for a sandbox that ran.
+                sys::warn(b"td-builder host-sandbox: parent died before PR_SET_PDEATHSIG armed\n");
+                return Err(io::Error::from_raw_os_error(ESRCH));
             }
             // New USER + PID + mount + net + IPC + UTS namespaces. NEWPID is in
             // the SAME unshare as NEWUSER so the new PID namespace is OWNED by the
@@ -1023,9 +1078,17 @@ pub fn host_shell(
             // via exit_group. It must NOT fall through to std's exec path — the
             // command is exec'd exactly once, as PID 1. Stdio is inherited
             // directly, so output still streams; only the exit status flows here.
+            // Created BEFORE the fork so both ends are inherited; this process
+            // then holds the write end for the rest of its life, and its death
+            // — however abrupt — closes it. See `pid1_confirm_parent`.
+            let (live_r, live_w) = sys::pipe_liveness()
+                .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED at pipe2\n"); e })?;
             let pid = sys::fork()
                 .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED at fork\n"); e })?;
             if pid != 0 {
+                // Only the read end is surplus here; the write end is the thing
+                // PID 1 is watching and must stay open for this process's life.
+                let _ = sys::close(live_r);
                 let status = sys::waitpid(pid)?;
                 let code = if status & 0x7f == 0 {
                     (status >> 8) & 0xff
@@ -1042,6 +1105,12 @@ pub fn host_shell(
             // survives the upcoming execve, so the exec'd command stays covered.
             sys::set_pdeathsig(sys::SIGKILL)
                 .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED re-arming PR_SET_PDEATHSIG in pid 1\n"); e })?;
+            // Then check that the parent survived long enough for that arming
+            // to mean anything: under load a forked child can sit unscheduled
+            // while its parent is killed, and this process IS pid 1 of its own
+            // namespace, so nothing would reap it — it would finish setup, exec
+            // and leave the whole tree running.
+            pid1_confirm_parent(live_r, live_w)?;
             // Everything below private to this namespace.
             sys::mount(None, &root_c, None, sys::MS_REC | sys::MS_PRIVATE, None)
                 .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED at mount(/, MS_REC|MS_PRIVATE)\n"); e })?;
