@@ -3807,9 +3807,13 @@ fn an_interactive_shell_reports_a_line_only_for_input_it_opened(
     let out = std::process::Command::new(&shell).args(["-i", &sp]).output()?;
     assert_eq!(String::from_utf8_lossy(&out.stderr), format!("{sp}: cd: line 3: {want}"));
     // The SAME source on stdin: a real file, but one the shell did not open,
-    // which is ash's `pf_fd` being 0 rather than positive.
+    // which is ash's `pf_fd` being 0 rather than positive. This is the one shape
+    // here that reaches the REPL rather than a script or `-c`, so it PROMPTS --
+    // emptied, since what is under test is the diagnostic and not the prompt.
     let out = std::process::Command::new(&shell)
         .arg("-i")
+        .env("PS1", "")
+        .env("HISTFILE", "")
         .stdin(std::fs::File::open(&script)?)
         .output()?;
     assert_eq!(
@@ -4082,5 +4086,148 @@ fn a_broken_profile_is_not_a_failed_login() -> Result<(), Box<dyn std::error::Er
     assert_eq!(out, format!("{host_out}ok\n"));
     assert_eq!(err, host_err);
     let _ = std::fs::remove_dir_all(&home);
+    Ok(())
+}
+
+/// An explicit `-i` makes an interactive shell whatever stdin is, which is
+/// ash's `iflag == 2` guard (ash.c:14606): the terminal is consulted only where
+/// `i` was given no sign. Two things follow that a script must NOT do, and both
+/// are asserted against the SAME input so the contrast is the test -- a syntax
+/// error returns an interactive shell to its prompt and ends a script, and only
+/// the interactive one prompts at all.
+///
+/// Nothing reached the REPL before this: the other `-i` tests here pass a
+/// script operand or `-c`, which take their own paths, so every end-to-end
+/// run went through the reader `-i` was NOT supposed to select.
+///
+/// Both prompts are PINNED rather than inherited, so an operator's own `PS1`
+/// can neither fail the assertion nor satisfy it by accident, and `HISTFILE`
+/// is emptied because reaching the REPL is what opens one -- these children
+/// would otherwise append to whoever ran the suite.
+#[test]
+fn an_explicit_dash_i_is_interactive_on_a_pipe() -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let src = "echo ONE\n)\necho TWO\n";
+    let run = |args: &[&str]| -> Result<(String, String), Box<dyn std::error::Error>> {
+        let mut child = std::process::Command::new(&shell)
+            .args(args)
+            .env("PS1", "[P1]")
+            .env("PS2", "[P2]")
+            .env("HISTFILE", "")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        // Closed before the wait, so the child sees EOF while this side is not
+        // yet blocked reading its output.
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin.write_all(src.as_bytes())?;
+        }
+        let out = child.wait_with_output()?;
+        Ok((
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ))
+    };
+
+    let (iout, ierr) = run(&["-i"])?;
+    let (sout, serr) = run(&[])?;
+    // `+i` ASKS for one too: ash spells both signs in a single arm,
+    // `/* -i, +i */` (ash.c:11493), as it does for `-s`/`+s` and `-l`/`+l`.
+    // Measured against busybox ash, which prompts and recovers under `+i`.
+    let (pout, perr) = run(&["+i"])?;
+
+    // The error is reported whatever the sign, and names the token the same way.
+    for err in [&ierr, &serr, &perr] {
+        assert!(err.contains("syntax error: unexpected \")\""), "{err:?}");
+    }
+    // A script stops there; an interactive shell goes back to its prompt.
+    assert_eq!(sout, "ONE\n", "a script ran on past a syntax error: {sout:?}");
+    assert_eq!(iout, "ONE\nTWO\n", "a syntax error ended an interactive shell: {iout:?}");
+    // And only the interactive one prompts -- on STDERR, so the stdout above is
+    // the program's output and nothing else. POSIX puts PS1/PS2 there and ash
+    // does; a prompt on stdout is data in whatever the operator redirected it to.
+    assert!(ierr.contains("[P1]"), "an interactive shell wrote no prompt: {ierr:?}");
+    assert!(!serr.contains("[P1]"), "a script wrote a prompt: {serr:?}");
+    assert_eq!(pout, "ONE\nTWO\n", "`+i` did not ask for an interactive shell: {pout:?}");
+    assert!(perr.contains("[P1]"), "`+i` wrote no prompt: {perr:?}");
+    Ok(())
+}
+
+/// ash keeps history in its line editor, which a non-terminal stdin never
+/// reaches, so it writes no history file for `sh -i < script` -- measured. This
+/// shell reached the editor's COOKED fallback there instead, which remembers,
+/// so making `-i` interactive would otherwise have created and grown
+/// `$HOME/.ash_history` for a session nobody sat at: a filesystem side effect
+/// on an image or a CI run, and one nothing would have reported.
+///
+/// `HISTFILE` is left alone here on purpose. The other tests empty it so they
+/// cannot touch the runner's own file; this one has to let the default be
+/// computed, or it would pass by naming no history rather than by keeping none.
+#[test]
+fn an_interactive_shell_keeps_no_history_for_a_session_nobody_typed_at()
+-> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let home = std::env::temp_dir().join(format!("td-sh-hist-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home)?;
+    let mut child = std::process::Command::new(&shell)
+        .arg("-i")
+        .env("HOME", &home)
+        .env_remove("HISTFILE")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin.write_all(b"echo ONE\necho TWO\n")?;
+    }
+    let out = child.wait_with_output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ONE\nTWO\n");
+    let hist = home.join(".ash_history");
+    let kept = hist.exists();
+    let body = std::fs::read_to_string(&hist).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&home);
+    assert!(!kept, "a piped session wrote a history file: {body:?}");
+    Ok(())
+}
+
+/// The continuation half of the same reader: a construct left open at the end of
+/// a line is more input rather than an error, so PS2 is written and the next
+/// line finishes it. This is the only end-to-end exercise of `parse_probe`'s
+/// incomplete arm -- every other caller of it is a unit test.
+#[test]
+fn an_interactive_shell_asks_for_the_rest_of_an_open_construct()
+-> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    for (src, want) in [
+        ("echo 'a\nb'\necho AFTER\n", "a\nb\nAFTER\n"),
+        ("if false\nthen\necho no\nfi\necho AFTER\n", "AFTER\n"),
+        ("f() {\necho body\n}\nf\necho AFTER\n", "body\nAFTER\n"),
+        ("cat <<EOF\nbody\nEOF\necho AFTER\n", "body\nAFTER\n"),
+    ] {
+        let mut child = std::process::Command::new(&shell)
+            .arg("-i")
+            .env("PS1", "[P1]")
+            .env("PS2", "[P2]")
+            .env("HISTFILE", "")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin.write_all(src.as_bytes())?;
+        }
+        let out = child.wait_with_output()?;
+        let got = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(got, want, "{src:?} did not continue");
+        // PS2 is what an unfinished line is answered with, and it is the pinned
+        // one rather than any `> ` -- which `[P1]` could otherwise supply.
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("[P2]"), "{src:?}: no PS2 was written: {err:?}");
+    }
     Ok(())
 }

@@ -820,7 +820,6 @@ xfail here-doc.test.sh::Here doc within subshell with boolean
 xfail here-doc.test.sh::Multiple here docs in pipeline
 xfail here-doc.test.sh::Multiple here docs in pipeline on multiple lines
 xfail here-doc.test.sh::Multiple here docs with different descriptors
-xfail interactive-parse.test.sh::parse if
 xfail interactive.test.sh::'exit' in oshrc (regression)
 xfail interactive.test.sh::--rcfile with parse error - shell is executed anyway
 xfail interactive.test.sh::Error message with bad oshrc file (currently ignored)

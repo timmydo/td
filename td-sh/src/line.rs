@@ -1664,8 +1664,14 @@ fn pick_sink(candidates: [std::os::fd::BorrowedFd<'_>; 2]) -> Option<std::fs::Fi
 /// script never reaches here at all — `main`'s parser pulls from
 /// `read_script_line` directly.
 fn read_cooked(prompt: &str) -> Input {
-    let _ = write!(std::io::stdout(), "{prompt}");
-    let _ = std::io::stdout().flush();
+    // stderr, as POSIX requires of PS1/PS2 and as ash writes it (`out2`,
+    // ash.c:2712): this path is reached with no terminal to draw on, where a
+    // prompt on stdout is data in whatever the operator redirected it to.
+    // Flushed although `Stderr` is unbuffered: a prompt that never appears is
+    // not something the tests could see, since they read the stream at exit.
+    let mut err = std::io::stderr();
+    let _ = write!(err, "{prompt}");
+    let _ = err.flush();
     match read_script_line() {
         // The terminator is not part of what the operator typed, and a console
         // may end a line CRLF. Stripped HERE rather than in the reader, because

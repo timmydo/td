@@ -159,7 +159,13 @@ fn run(args: &[String]) -> Result<i32, String> {
                         consumed += 1;
                     }
                 }
-                'i' => sh.interactive = on,
+                // The SIGN carries no meaning, as it does not for `l` below:
+                // ash spells both in one arm, `/* -i, +i */` (ash.c:11493), the
+                // same way it treats `-s`/`+s` and `-c`/`+c`. So `+i` ASKS for
+                // an interactive shell rather than declining one, and there is
+                // no third state to record -- `iflag == 2` is reachable only
+                // where `i` went unmentioned.
+                'i' => sh.interactive = true,
                 // Not in the `set` table: this one is only ever a startup
                 // question, and `set -l` mid-script would be asking to have
                 // already been a login shell. The SIGN carries no meaning --
@@ -229,14 +235,19 @@ fn run(args: &[String]) -> Result<i32, String> {
         sh.params = args.iter().skip(i + 1).cloned().collect();
         Start::Script(file, path.clone())
     } else {
-        // No script and no `-c`: interactive when stdin is a terminal, otherwise
-        // read and run the whole of stdin as a script.
+        // No script and no `-c`: interactive when asked, or when stdin is a
+        // terminal; otherwise read and run the whole of stdin as a script.
         sh.params = args.iter().skip(i).cloned().collect();
         // dash sets sflag when no operand is left as well, which is what puts `s`
         // in `$-`; an EXPLICIT `-s` is what suppresses the prompt.
         let explicit_s = sh.opts.stdin;
         sh.opts.stdin = true;
-        if !explicit_s && std::io::stdin().is_terminal() {
+        // `i` in any form decides on its own; the terminal is asked only where
+        // it went unmentioned, which is ash's third `iflag` state (`iflag == 2`,
+        // ash.c:14606). That clause alone is what this takes: ash's own guard
+        // also wants `isatty(1)` and an `sflag` that an explicit `-s` SETS, and
+        // this shell diverges on both -- older than this and not adopted here.
+        if sh.interactive || (!explicit_s && std::io::stdin().is_terminal()) {
             sh.interactive = true;
             Start::Repl
         } else {
@@ -462,7 +473,12 @@ fn repl(sh: &mut Shell) -> i32 {
     let mut editor = line::Editor::new();
     // Only an interactive session persists history, and only from here: a
     // script's lines are not the operator's, and `sh -c` has none to keep.
-    editor.open_history(sh);
+    // A TYPED one at that: ash's history lives in its line editor, which a
+    // non-terminal stdin never reaches, so `sh -i < script` must not create and
+    // grow a file for a session nobody sat at.
+    if std::io::stdin().is_terminal() {
+        editor.open_history(sh);
+    }
     // The session's line count. dash reads an interactive shell's input as one
     // stream, so `$LINENO` runs for the life of the session rather than
     // restarting at each prompt -- measured over a pty at 1, 2, 5, 7 for two
