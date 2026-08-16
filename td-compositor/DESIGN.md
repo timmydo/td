@@ -664,8 +664,15 @@ Keyboard events update the model individually. Pointer events are bounded and
 applied transactionally only at `wl_pointer.frame`, so an incomplete frame is
 never rendered. An evdev report retains at most 64 button transitions.
 Pointer routing can add at most an initial motion plus one leave and enter
-when an implicit grab ends, so the client accepts the composed maximum of 67
-events per frame. At most one input-driven replacement is in flight; further
+when an implicit grab ends, and one axis event per axis, so the composed
+maximum is 69 events per frame and that is what the client accepts. Its own
+model queues at most 67 of them: an axis is validated and consumed where it
+arrives rather than joining the pending list, because the demo has nothing to
+scroll. So the guard it enforces moved with the routing bound while what it can
+actually hold did not, leaving it two looser than tight — noted rather than
+tightened, since the constant is the one the SERVER may compose and a second
+one meaning "what the demo queues" would be a number nothing checks.
+At most one input-driven replacement is in flight; further
 updates coalesce into the latest model revision until both buffer release and
 frame completion arrive. Configure-driven replacement retains the existing
 XDG behavior. The presentation handshake has a 20-second absolute deadline,
@@ -1402,7 +1409,7 @@ fall-through limit the paragraph above records.
 
 Client-side decoration negotiation, clipboard, drag-and-drop, subsurfaces,
 popups, output reconfiguration, fractional scale, screen capture, data
-devices, pointer axes, and touch are not yet advertised. Unknown objects,
+devices, and touch are not yet advertised. Unknown objects,
 malformed sizes, invalid object reuse, missing file descriptors, and
 unsupported requests disconnect only that client.
 
@@ -1593,11 +1600,75 @@ consuming a role even when socket delivery of the leave is delayed; a valid
 incompatible role uses `wl_pointer.error.role`. Cursor buffers are immediately
 released and never enter the tiling scene. The first renderer continues to
 draw its fixed software cursor and deliberately ignores the requested image
-and hotspot; themed client cursors are a later rendering increment. There are
-no axis events: this compositor emits no `wl_pointer.axis` at all, so nothing
-a device declares as a wheel reaches a client. Written as a property of the
-compositor rather than of the profile, which used to be PS/2 alone and now
-carries the tablet too.
+and hotspot; themed client cursors are a later rendering increment.
+
+A WHEEL reaches clients as `wl_pointer.axis`. `REL_WHEEL` and `REL_HWHEEL`
+accumulate into the same evdev frame the deltas and buttons do, so one report
+is one delivery and one `wl_pointer.frame`: a notch is not a path of its own.
+The high-resolution codes (`REL_WHEEL_HI_RES` and its horizontal twin) are
+deliberately NOT read — they report the same motion again in units of 120, and
+a device sending both would scroll twice.
+
+Two conversions happen once, in `PointerScroll::steps`, and both are the kind
+nothing observable would catch. The vertical SIGN flips: evdev counts a wheel
+pushed away from the operator as positive, while the protocol's value is a
+movement of the surface's own content, where positive is downward. Horizontal
+agrees in both, so it is carried through — which is why this is not one
+negation over a pair. The SCALE is ten surface units a detent, weston's, and a
+choice rather than a conversion: the protocol gives a wheel no unit. Both
+numbers come back together as an `AxisStep`, because `axis_discrete` must
+agree in SIGN with the value beside it and a pair passed separately would not
+enforce that.
+
+A notch goes to the pointer FOCUS, as a button does, so a wheel turned during
+a drag belongs to the surface being dragged rather than to whatever the cursor
+has moved over. A notch over nothing is DROPPED rather than queued: there is
+no surface to owe it to, and delivering it with the next enter would scroll a
+window the operator never scrolled over. A modal overlay swallows it outright
+where it lets a RELEASE through — a release is owed to a client already
+holding the button, and a notch is a whole gesture rather than half of one.
+
+Version 5 and newer also receive `axis_source` naming the wheel and
+`axis_discrete` carrying the notch count. Version 4 and below receive the axis
+alone, those two events not existing for them. The source is named rather than
+omitted because the protocol's silence means "unknown", which would be false
+here: a client uses it to decide whether to kinetic-scroll, and a wheel that
+claimed to be a finger would coast.
+
+The two are scoped DIFFERENTLY, and that difference is the whole of how they
+are emitted. `axis_source` "carries the source information for all events
+within that frame" and only one is permitted per frame, so it is the FRAME's:
+the first axis in a frame carries it and a second — which a tilting wheel
+produces, reporting both axes at once — carries none. `axis_discrete` is the
+AXIS's, one per axis, each immediately before the `axis` it belongs to. So the
+wire for a tilting wheel is one source, then a discrete-and-axis pair per axis,
+then one frame. Deciding the source per axis event instead is a spec violation
+on a path this compositor explicitly serves, and it is why the encoder is told
+whether this is the frame's first axis rather than working it out: it sees one
+event, and the question is about the frame.
+
+`axis_discrete` is DEPRECATED at `wl_pointer` version 8, which gets
+`axis_value120` instead, so it is gated at both ends rather than from below.
+That upper bound is unreachable while `wl_seat` is advertised at 7 — and is
+pinned precisely because nothing else relates those two numbers. `SEAT_VERSION`
+exists so the relation is checkable, and a test holds it inside the bound, so
+raising the seat reds rather than silently sending a version-8 client an event
+the protocol forbids it.
+
+Two silence tests had to learn about the wheel, and each would have swallowed
+every ordinary scroll on its own: a notch moves the pointer nowhere and
+presses nothing, so both the evdev frame and the delivery path would have read
+a wheel-only report as a report about nothing.
+
+Detents are CLAMPED before they are scaled, because the wheel is the first
+input to reach `wl_fixed` unbounded. A delta is clamped to the framebuffer
+before it is encoded and enter/motion coordinates are surface-local, but
+detents are summed straight off the device — and the reader's saturating sum
+lands a wheel-spamming device on exactly `i32::MAX`, the one value 24.8 cannot
+carry. The bound is an ENCODING one derived from `AXIS_STEP` rather than a
+physical guess, and it is a clamp rather than an error because the error would
+propagate out of the seat worker: one malformed report would end a client's
+whole event delivery rather than one absurd scroll.
 
 Keyboard and pointer deliveries share one bounded per-client seat queue.
 Each event serial is shared by all matching resources, and a resource bound
@@ -2033,9 +2104,12 @@ input devices, sockets, clocks, the filesystem, or ambient environment.
 Focused keyboard and pointer delivery now connect the demo client to the
 existing evdev input path, and the launcher has a filterable
 application registry with a terminal entry, and the terminal is the first
-client the BOOT starts, in place of the demo. Clipboard, pointer
-axes, client cursor rendering, hotplug, and real DRM/KMS profiles follow.
-The terminal stack has the separate contract below.
+client the BOOT starts, in place of the demo. Pointer axes are landed: a
+wheel reaches clients as `wl_pointer.axis`, with the source and notch count
+version 5 asks for. What is NOT landed is a client acting on one — the
+terminal's scrollback still moves by key alone, so scrolling over it does
+nothing yet. Clipboard, client cursor rendering, hotplug, and real DRM/KMS
+profiles follow. The terminal stack has the separate contract below.
 
 Of that contract these are built: the parser and terminal model, the native
 corpus including its `key` operations, the keyboard adapter of section 11

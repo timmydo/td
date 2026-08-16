@@ -33,6 +33,38 @@ const GLOBAL_SEAT: u32 = 5;
 const WL_DISPLAY_ERROR_IMPLEMENTATION: u32 = 3;
 const WL_SEAT_ERROR_MISSING_CAPABILITY: u32 = 0;
 const WL_POINTER_ERROR_ROLE: u32 = 0;
+/// `wl_pointer.axis_source`'s `wheel`. The other three sources — finger,
+/// continuous, wheel tilt — describe devices this compositor does not read,
+/// and naming one it cannot tell apart would be worse than the silence a
+/// version-4 client gets: a client uses the source to decide whether to
+/// kinetic-scroll, and a wheel that claimed to be a finger would coast.
+const WL_POINTER_AXIS_SOURCE_WHEEL: u32 = 0;
+/// `axis_source` and `axis_discrete`, both since version 5. Sent WITH the
+/// axis event rather than instead of it: `axis` is the one every version
+/// understands, and the other two only qualify it.
+const WL_POINTER_AXIS_SOURCE: u16 = 6;
+const WL_POINTER_AXIS_DISCRETE: u16 = 8;
+const WL_POINTER_AXIS_EVENTS_SINCE: u32 = 5;
+/// `axis_discrete` is DEPRECATED at version 8: the protocol says it is not
+/// sent to a client supporting 8 or later, which gets `axis_value120` instead.
+/// Unreachable while `wl_seat` is advertised at 7 — and that is exactly why it
+/// is pinned rather than left as a `>= 5`. A version bump would otherwise
+/// start sending a version-8 client an event the protocol forbids it, with
+/// nothing in the tree saying the two numbers were related;
+/// `the_seat_version_stays_inside_what_axis_discrete_may_be_sent_to` is what
+/// makes that bump red instead.
+const WL_POINTER_AXIS_DISCRETE_LAST: u32 = 7;
+/// The highest `wl_seat` this advertises, and so the highest `wl_pointer` a
+/// client can bind — the two are one number in this protocol. Named because
+/// `WL_POINTER_AXIS_DISCRETE_LAST` is a claim ABOUT it: a bare 7 in three
+/// places is three places to change and nothing relating them.
+const SEAT_VERSION: u32 = 7;
+/// Checked where it CANNOT be skipped. Both numbers are constants, so this is
+/// a compile-time relation and a test asserting it would only ever be true —
+/// clippy says as much. Raising `SEAT_VERSION` past the deprecation now fails
+/// the build rather than quietly sending a version-8 client an event the
+/// protocol forbids it.
+const _: () = assert!(SEAT_VERSION <= WL_POINTER_AXIS_DISCRETE_LAST);
 const MAX_POOL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CLIENT_BUFFER: usize = 256 * 1024;
 const MAX_PENDING_FDS: usize = 64;
@@ -551,8 +583,53 @@ fn pointer_message(
             builder.u32(input.state.wire());
             (3, builder)
         }
+        PointerEvent::Axis { time, step, .. } => {
+            let mut builder = wire::Builder::new();
+            builder.u32(*time);
+            builder.u32(step.axis.wire());
+            builder.i32(pointer_fixed(step.value)?);
+            (4, builder)
+        }
     };
     builder.message(object, opcode)
+}
+
+/// The messages one routed event becomes for a client at `version`. Only an
+/// axis is ever more than one, and only from version 5: the notch count is a
+/// separate event qualifying the axis it accompanies, and it precedes it
+/// because a client reading the frame in order should know what kind of
+/// scroll it is before it is handed a distance.
+///
+/// `carries_source` is the frame's answer rather than this event's. The
+/// protocol says `axis_source` "carries the source information for all events
+/// within that frame", so it belongs to the FRAME — and a tilting wheel, which
+/// reports both axes at once, is two axis events under one frame. Passed in
+/// rather than decided here so this stays a function of one event.
+fn pointer_messages(
+    object: u32,
+    version: u32,
+    serial: Option<u32>,
+    event: &PointerEvent,
+    carries_source: bool,
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut messages = Vec::new();
+    if let PointerEvent::Axis { step, .. } = event {
+        if version >= WL_POINTER_AXIS_EVENTS_SINCE {
+            if carries_source {
+                let mut source = wire::Builder::new();
+                source.u32(WL_POINTER_AXIS_SOURCE_WHEEL);
+                messages.push(source.message(object, WL_POINTER_AXIS_SOURCE)?);
+            }
+            if version <= WL_POINTER_AXIS_DISCRETE_LAST {
+                let mut discrete = wire::Builder::new();
+                discrete.u32(step.axis.wire());
+                discrete.i32(step.detents);
+                messages.push(discrete.message(object, WL_POINTER_AXIS_DISCRETE)?);
+            }
+        }
+    }
+    messages.push(pointer_message(object, serial, event)?);
+    Ok(messages)
 }
 
 fn pointer_event_serial(
@@ -566,7 +643,10 @@ fn pointer_event_serial(
                 .map_or_else(next_serial, |candidate| candidate.serial),
         ),
         PointerEvent::Leave { .. } | PointerEvent::Button { .. } => Some(next_serial()),
-        PointerEvent::Motion { .. } => None,
+        // Neither carries one: the protocol gives a serial to the events a
+        // client may quote back as authority for a request — a grab, a
+        // cursor set — and neither a move nor a notch is one of those.
+        PointerEvent::Motion { .. } | PointerEvent::Axis { .. } => None,
     }
 }
 
@@ -607,6 +687,21 @@ fn send_pointer_frame(
         .iter()
         .map(|event| pointer_event_serial(event, *authority))
         .collect();
+    // One per FRAME, so the first axis carries the source and a second — a
+    // tilting wheel reports both — carries none. Computed once here rather
+    // than per pointer object, because which axis is first is a property of
+    // the frame and not of who is being sent it.
+    let mut seen_axis = false;
+    let sources: Vec<bool> = frame
+        .events
+        .iter()
+        .map(|event| {
+            let axis = matches!(event, PointerEvent::Axis { .. });
+            let first = axis && !seen_axis;
+            seen_axis |= axis;
+            first
+        })
+        .collect();
     let mut sent = false;
     let mut outbound = outbound
         .lock()
@@ -616,8 +711,11 @@ fn send_pointer_frame(
             continue;
         }
         sent = true;
-        for (event, serial) in frame.events.iter().zip(&serials) {
-            outbound.send(&pointer_message(*object, *serial, event)?)?;
+        for ((event, serial), source) in frame.events.iter().zip(&serials).zip(&sources) {
+            for message in pointer_messages(*object, registration.version, *serial, event, *source)?
+            {
+                outbound.send(&message)?;
+            }
         }
         if registration.version >= 5 {
             outbound.send(&wire::Builder::new().message(*object, 5)?)?;
@@ -1110,7 +1208,7 @@ impl Client {
         self.global(registry, GLOBAL_SHM, "wl_shm", 1)?;
         self.global(registry, GLOBAL_OUTPUT, "wl_output", 4)?;
         self.global(registry, GLOBAL_XDG_WM_BASE, "xdg_wm_base", 1)?;
-        self.global(registry, GLOBAL_SEAT, "wl_seat", 7)
+        self.global(registry, GLOBAL_SEAT, "wl_seat", SEAT_VERSION)
     }
 
     fn bind_global(
@@ -1140,7 +1238,7 @@ impl Client {
             (GLOBAL_XDG_WM_BASE, "xdg_wm_base") if version == 1 => {
                 self.insert(id, Object::XdgWmBase)
             }
-            (GLOBAL_SEAT, "wl_seat") if (1..=7).contains(&version) => {
+            (GLOBAL_SEAT, "wl_seat") if (1..=SEAT_VERSION).contains(&version) => {
                 self.insert(id, Object::Seat { version })?;
                 let mut capabilities = wire::Builder::new();
                 capabilities.u32(3);
@@ -2409,7 +2507,7 @@ mod tests {
     use crate::framebuffer::Framebuffer;
     use crate::keyboard::{KeyInput, KeyState, ModifierState, RoutedKeyboardEvent, MOD_LOGO};
     use crate::layout::{Command, Direction, Layout};
-    use crate::pointer::{PointerButtonInput, PointerButtonState, PointerTarget};
+    use crate::pointer::{PointerButtonInput, PointerButtonState, PointerScroll, PointerTarget};
     use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2585,6 +2683,7 @@ mod tests {
                 i32::try_from(pointer_origin.0).unwrap(),
                 i32::try_from(pointer_origin.1).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
 
@@ -2976,6 +3075,7 @@ mod tests {
                 i32::try_from(rect.x).unwrap(),
                 i32::try_from(rect.y).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         let pointer = receive_messages(&mut peer, 2);
@@ -3005,6 +3105,7 @@ mod tests {
                     button: 272,
                     state: PointerButtonState::Pressed,
                 }],
+                PointerScroll::default(),
             )
             .unwrap();
         let pointer = receive_messages(&mut peer, 2);
@@ -3275,6 +3376,7 @@ mod tests {
                 i32::try_from(rect.x).unwrap(),
                 i32::try_from(rect.y).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         let press = PointerButtonInput {
@@ -3285,7 +3387,7 @@ mod tests {
         runtime
             .lock()
             .unwrap()
-            .pointer_frame(2, 0, 0, &[press])
+            .pointer_frame(2, 0, 0, &[press], PointerScroll::default())
             .unwrap();
         runtime
             .lock()
@@ -3688,6 +3790,7 @@ mod tests {
                 i32::try_from(rect.x.saturating_add(2)).unwrap(),
                 i32::try_from(rect.y.saturating_add(3)).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         let enter = receive_messages(&mut peer, 3);
@@ -3720,7 +3823,9 @@ mod tests {
             })
         );
 
-        runtime.pointer_frame(41, 1, 2, &[]).unwrap();
+        runtime
+            .pointer_frame(41, 1, 2, &[], PointerScroll::default())
+            .unwrap();
         let motion = receive_messages(&mut peer, 3);
         assert_eq!(
             motion
@@ -3740,7 +3845,9 @@ mod tests {
             button: 272,
             state: PointerButtonState::Pressed,
         };
-        runtime.pointer_frame(42, 0, 0, &[button]).unwrap();
+        runtime
+            .pointer_frame(42, 0, 0, &[button], PointerScroll::default())
+            .unwrap();
         let buttons = receive_messages(&mut peer, 3);
         assert_eq!(
             buttons
@@ -3761,6 +3868,54 @@ mod tests {
         assert_eq!(second.u32().unwrap(), 272);
         assert_eq!(second.u32().unwrap(), 1);
         second.finish().unwrap();
+
+        // A WHEEL over the same seat, driven from a report rather than a
+        // hand-built frame: this is the only place a scroll is observed on
+        // the wire from end to end, which is where the qualifiers' position
+        // relative to `wl_pointer.frame` can actually be seen. The version 7
+        // object gets the triple and its frame; the version 4 object gets the
+        // axis alone and no frame at all.
+        runtime
+            .pointer_frame(
+                41,
+                0,
+                0,
+                &[],
+                PointerScroll {
+                    vertical: 1,
+                    horizontal: 0,
+                },
+            )
+            .unwrap();
+        let scrolled = receive_messages(&mut peer, 5);
+        assert_eq!(
+            scrolled
+                .iter()
+                .map(|event| (event.object, event.opcode))
+                .collect::<Vec<_>>(),
+            [
+                (9, WL_POINTER_AXIS_SOURCE),
+                (9, WL_POINTER_AXIS_DISCRETE),
+                (9, 4),
+                (9, 5),
+                (10, 4),
+            ]
+        );
+        // The value is the protocol's, so a wheel pushed away from the
+        // operator arrives as a downward scroll — the sign flip surviving
+        // every layer between the device and the socket.
+        let mut axis = wire::Cursor::new(&scrolled.get(2).unwrap().payload);
+        assert_eq!(axis.u32().unwrap(), 41);
+        assert_eq!(axis.u32().unwrap(), 0, "vertical");
+        assert_eq!(axis.i32().unwrap(), -10 * 256);
+        axis.finish().unwrap();
+        // No serial: the protocol gives one to the events a client may quote
+        // back as authority, and a notch is not one of those.
+        let mut bare = wire::Cursor::new(&scrolled.get(4).unwrap().payload);
+        assert_eq!(bare.u32().unwrap(), 41);
+        assert_eq!(bare.u32().unwrap(), 0);
+        assert_eq!(bare.i32().unwrap(), -10 * 256);
+        bare.finish().unwrap();
 
         stop.stop();
         runtime.unsubscribe_keyboard(88);
@@ -3861,6 +4016,103 @@ mod tests {
                 surface: target.surface.object,
                 after_revision: 7,
             })
+        );
+    }
+
+    #[test]
+    fn a_tilting_wheel_names_its_source_once_for_the_whole_frame() {
+        // `axis_source` "carries the source information for all events within
+        // that frame", so it belongs to the FRAME rather than to an axis — and
+        // a tilting wheel is what tells the two apart, being two axis events
+        // under one `wl_pointer.frame`. Sent per axis it would assert the same
+        // source twice.
+        use crate::pointer::{AxisStep, PointerAxis};
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let outbound = Arc::new(Mutex::new(Outbound {
+            stream: server,
+            disconnected: false,
+        }));
+        let pointers = BTreeMap::from([(
+            9,
+            PointerRegistration {
+                after_revision: 0,
+                version: 5,
+            },
+        )]);
+        let surface = SurfaceKey {
+            client: 88,
+            object: 7,
+        };
+        let both = RoutedPointerFrame {
+            revision: 3,
+            client: 88,
+            events: vec![
+                PointerEvent::Axis {
+                    surface,
+                    time: 12,
+                    step: AxisStep::of(PointerAxis::Vertical, -1),
+                },
+                PointerEvent::Axis {
+                    surface,
+                    time: 12,
+                    step: AxisStep::of(PointerAxis::Horizontal, 2),
+                },
+            ],
+        };
+        let mut authority = None;
+        send_pointer_frame(&outbound, &pointers, &mut authority, &both).unwrap();
+        let events = receive_messages(&mut peer, 6);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.object, event.opcode))
+                .collect::<Vec<_>>(),
+            [
+                (9, WL_POINTER_AXIS_SOURCE),
+                (9, WL_POINTER_AXIS_DISCRETE),
+                (9, 4),
+                (9, WL_POINTER_AXIS_DISCRETE),
+                (9, 4),
+                (9, 5),
+            ],
+            "the source is not once per frame"
+        );
+
+        // Each axis still names ITSELF, so the one source is not standing in
+        // for a discrete event too.
+        let mut first = wire::Cursor::new(&events.get(1).unwrap().payload);
+        assert_eq!(first.u32().unwrap(), 0, "vertical");
+        assert_eq!(first.i32().unwrap(), -1);
+        first.finish().unwrap();
+        let mut second = wire::Cursor::new(&events.get(3).unwrap().payload);
+        assert_eq!(second.u32().unwrap(), 1, "horizontal");
+        assert_eq!(second.i32().unwrap(), 2);
+        second.finish().unwrap();
+
+        // A frame with ONE axis still carries a source, or the branch above
+        // would pass by never sending one at all.
+        let alone = RoutedPointerFrame {
+            revision: 4,
+            client: 88,
+            events: vec![PointerEvent::Axis {
+                surface,
+                time: 13,
+                step: AxisStep::of(PointerAxis::Vertical, 1),
+            }],
+        };
+        send_pointer_frame(&outbound, &pointers, &mut authority, &alone).unwrap();
+        assert_eq!(
+            receive_messages(&mut peer, 4)
+                .iter()
+                .map(|event| (event.object, event.opcode))
+                .collect::<Vec<_>>(),
+            [
+                (9, WL_POINTER_AXIS_SOURCE),
+                (9, WL_POINTER_AXIS_DISCRETE),
+                (9, 4),
+                (9, 5),
+            ]
         );
     }
 
@@ -4505,6 +4757,7 @@ mod tests {
                     button: 0x110,
                     state: PointerButtonState::Pressed,
                 }],
+                PointerScroll::default(),
             )
             .unwrap();
         // Motion owes a paint rather than taking one; the reader batch flushes.
@@ -5078,6 +5331,7 @@ mod tests {
                 i32::try_from(rect.x).unwrap(),
                 i32::try_from(rect.y).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         assert_eq!(
@@ -5266,6 +5520,7 @@ mod tests {
                 i32::try_from(rect.x.saturating_add(2)).unwrap(),
                 i32::try_from(rect.y.saturating_add(3)).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         let (server, mut peer) = UnixStream::pair().unwrap();
@@ -5321,7 +5576,7 @@ mod tests {
         runtime
             .lock()
             .unwrap()
-            .pointer_frame(2, 1_000, 1_000, &[])
+            .pointer_frame(2, 1_000, 1_000, &[], PointerScroll::default())
             .unwrap();
         let mut after_leave = wire::Builder::new();
         after_leave.u32(serial);
@@ -5338,7 +5593,7 @@ mod tests {
         runtime
             .lock()
             .unwrap()
-            .pointer_frame(3, -1_000, -1_000, &[])
+            .pointer_frame(3, -1_000, -1_000, &[], PointerScroll::default())
             .unwrap();
         runtime
             .lock()
@@ -5348,6 +5603,7 @@ mod tests {
                 i32::try_from(rect.x.saturating_add(2)).unwrap(),
                 i32::try_from(rect.y.saturating_add(3)).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         let mut set_cursor = wire::Builder::new();
@@ -5504,6 +5760,102 @@ mod tests {
         let message = request(1, 1, builder).unwrap();
         assert_eq!(message.object, 1);
         assert_eq!(message.opcode, 1);
+    }
+
+    #[test]
+    fn an_axis_carries_its_source_and_notch_count_only_from_version_five() {
+        use crate::pointer::{AxisStep, PointerAxis};
+        // Decoded from the BYTES rather than read off the builder, so the
+        // header the client will parse is what these assertions are about.
+        let parse_message = |encoded: &Vec<u8>| {
+            let mut bytes = encoded.clone();
+            wire::take(&mut bytes).unwrap().unwrap()
+        };
+        let surface = SurfaceKey {
+            client: 1,
+            object: 9,
+        };
+        let event = PointerEvent::Axis {
+            surface,
+            time: 44,
+            step: AxisStep {
+                axis: PointerAxis::Vertical,
+                value: -20,
+                detents: -2,
+            },
+        };
+
+        // Version 4 gets the axis and nothing else — even ASKED for the
+        // source. `axis_source` and `axis_discrete` do not exist for it, and
+        // sending one would be a message its object cannot decode.
+        let four = pointer_messages(7, 4, None, &event, true).unwrap();
+        assert_eq!(four.len(), 1);
+        let axis = parse_message(four.first().unwrap());
+        assert_eq!(axis.opcode, 4);
+        let mut body = wire::Cursor::new(&axis.payload);
+        assert_eq!(body.u32().unwrap(), 44);
+        assert_eq!(body.u32().unwrap(), 0, "vertical is axis 0");
+        assert_eq!(body.i32().unwrap(), -20 * 256, "the value is wl_fixed");
+        body.finish().unwrap();
+
+        // Version 5 gets all three when this is the frame's FIRST axis, and
+        // the two qualifiers come first: a client reading them in order
+        // learns what kind of scroll it is before it is handed a distance.
+        let five = pointer_messages(7, 5, None, &event, true).unwrap();
+        assert_eq!(five.len(), 3);
+        let source = parse_message(five.first().unwrap());
+        assert_eq!(source.opcode, 6);
+        let mut body = wire::Cursor::new(&source.payload);
+        assert_eq!(body.u32().unwrap(), 0, "the source is a wheel");
+        body.finish().unwrap();
+
+        let discrete = parse_message(five.get(1).unwrap());
+        assert_eq!(discrete.opcode, 8);
+        let mut body = wire::Cursor::new(&discrete.payload);
+        assert_eq!(body.u32().unwrap(), 0);
+        // Sign, not just magnitude: the protocol requires the discrete count
+        // to agree with the value beside it, and a client that scrolled by
+        // the notch count would go the wrong way on a disagreement.
+        assert_eq!(body.i32().unwrap(), -2);
+        body.finish().unwrap();
+        assert_eq!(parse_message(five.get(2).unwrap()).opcode, 4);
+
+        // Every other event is one message whatever the version, so the
+        // branch above is the axis's alone.
+        let motion = PointerEvent::Motion {
+            time: 1,
+            target: PointerTarget {
+                surface,
+                x: 0,
+                y: 0,
+            },
+        };
+        assert_eq!(
+            pointer_messages(7, 5, None, &motion, true).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            pointer_messages(7, 4, None, &motion, true).unwrap().len(),
+            1
+        );
+
+        // A second axis in the same frame is asked for no source, and that is
+        // the whole of the difference: the notch count still rides with it,
+        // being one per axis rather than one per frame.
+        let second = pointer_messages(7, 5, None, &event, false).unwrap();
+        assert_eq!(second.len(), 2);
+        assert_eq!(parse_message(second.first().unwrap()).opcode, 8);
+        assert_eq!(parse_message(second.get(1).unwrap()).opcode, 4);
+
+        // And version 8 would get no notch count at all — it is deprecated
+        // there in favour of `axis_value120`. Unreachable while `wl_seat` is
+        // advertised at 7, which the const assertion beside `SEAT_VERSION`
+        // holds it to; asserted here because the encoder is what would send
+        // it, and a bound only its caller respects is not one.
+        let eight = pointer_messages(7, 8, None, &event, true).unwrap();
+        assert_eq!(eight.len(), 2);
+        assert_eq!(parse_message(eight.first().unwrap()).opcode, 6);
+        assert_eq!(parse_message(eight.get(1).unwrap()).opcode, 4);
     }
 
     #[test]

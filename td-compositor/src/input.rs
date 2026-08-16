@@ -5,7 +5,7 @@ use crate::keyboard::{
 use crate::launcher::{LaunchOptions, LaunchProcesses, LaunchRequest, LauncherAction};
 use crate::layout::{Command, Direction, Presentation};
 use crate::pointer::{
-    PointerButtonInput, PointerButtonState, MAX_POINTER_BUTTON_TRANSITIONS_PER_FRAME,
+    PointerButtonInput, PointerButtonState, PointerScroll, MAX_POINTER_BUTTON_TRANSITIONS_PER_FRAME,
 };
 use crate::runtime::Runtime;
 use crate::scene::Fraction;
@@ -31,6 +31,12 @@ const SYN_REPORT: u16 = 0;
 const SYN_DROPPED: u16 = 3;
 const REL_X: u16 = 0;
 const REL_Y: u16 = 1;
+/// A wheel reports DETENTS, not distance: one notch is `value` 1 whatever the
+/// wheel's physical travel. `REL_WHEEL_HI_RES` (11) and its horizontal twin
+/// report the same motion again in units of 120 and are deliberately not read
+/// — a device that sends both would scroll twice.
+const REL_HWHEEL: u16 = 6;
+const REL_WHEEL: u16 = 8;
 const ABS_X: u16 = 0;
 const ABS_Y: u16 = 1;
 const KEY_ESC: u16 = 1;
@@ -551,6 +557,11 @@ struct PointerMotion {
     /// a device is before it has said anything.
     held_x: Option<i32>,
     held_y: Option<i32>,
+    /// Detents accumulated this frame, summed as the deltas are: a fast flick
+    /// puts several notches in one report, and a wheel that changed direction
+    /// inside one meant the difference.
+    wheel: i32,
+    hwheel: i32,
     pressed: BTreeSet<u16>,
     buttons: Vec<PointerButtonTransition>,
     overflowed: bool,
@@ -578,6 +589,7 @@ struct PointerFrame {
     time: u32,
     place: PointerPlace,
     buttons: Vec<PointerButtonTransition>,
+    scroll: PointerScroll,
 }
 
 trait InputTarget {
@@ -598,6 +610,7 @@ trait InputTarget {
         dx: i32,
         dy: i32,
         buttons: &[PointerButtonInput],
+        scroll: PointerScroll,
     ) -> Result<(), String>;
 
     /// The absolute form of the same report. Separate rather than one method
@@ -610,6 +623,7 @@ trait InputTarget {
         x: Fraction,
         y: Fraction,
         buttons: &[PointerButtonInput],
+        scroll: PointerScroll,
     ) -> Result<(), String>;
 
     /// Take any paint the delivered reports left owing.
@@ -691,11 +705,12 @@ impl InputTarget for LiveInputTarget {
         dx: i32,
         dy: i32,
         buttons: &[PointerButtonInput],
+        scroll: PointerScroll,
     ) -> Result<(), String> {
         self.runtime
             .lock()
             .map_err(|_| "runtime lock poisoned".to_string())?
-            .pointer_frame(time, dx, dy, buttons)
+            .pointer_frame(time, dx, dy, buttons, scroll)
     }
 
     fn pointer_frame_at(
@@ -704,11 +719,12 @@ impl InputTarget for LiveInputTarget {
         x: Fraction,
         y: Fraction,
         buttons: &[PointerButtonInput],
+        scroll: PointerScroll,
     ) -> Result<(), String> {
         self.runtime
             .lock()
             .map_err(|_| "runtime lock poisoned".to_string())?
-            .pointer_frame_at(time, x, y, buttons)
+            .pointer_frame_at(time, x, y, buttons, scroll)
     }
 
     fn flush(&mut self) -> Result<(), String> {
@@ -724,6 +740,8 @@ impl PointerMotion {
         match (event.kind, event.code) {
             (EV_REL, REL_X) => self.dx = self.dx.saturating_add(event.value),
             (EV_REL, REL_Y) => self.dy = self.dy.saturating_add(event.value),
+            (EV_REL, REL_WHEEL) => self.wheel = self.wheel.saturating_add(event.value),
+            (EV_REL, REL_HWHEEL) => self.hwheel = self.hwheel.saturating_add(event.value),
             // Recorded raw. Whether it MEANS anything is the frame's question,
             // since only a declared range turns a value into a place.
             (EV_ABS, ABS_X) => self.abs_x = Some(event.value),
@@ -739,12 +757,12 @@ impl PointerMotion {
                 };
                 if changed {
                     if self.buttons.len() >= MAX_POINTER_BUTTON_TRANSITIONS_PER_FRAME {
-                        self.dx = 0;
-                        self.dy = 0;
-                        self.abs_x = None;
-                        self.abs_y = None;
-                        self.pressed.clear();
-                        self.buttons.clear();
+                        // Through `reset` rather than clearing the fields
+                        // here: an overflow abandons the frame, which is what
+                        // `reset` means, and a second copy of that list is a
+                        // field somebody forgets. The wheel was exactly that
+                        // — added to the frame and not to the copy.
+                        self.reset();
                         self.overflowed = true;
                     } else {
                         self.buttons.push(PointerButtonTransition {
@@ -809,6 +827,10 @@ impl PointerMotion {
     fn frame(&mut self, time: u32, axes: Option<AbsoluteAxes>) -> Option<PointerFrame> {
         let buttons = std::mem::take(&mut self.buttons);
         let (dx, dy) = (std::mem::take(&mut self.dx), std::mem::take(&mut self.dy));
+        let scroll = PointerScroll {
+            vertical: std::mem::take(&mut self.wheel),
+            horizontal: std::mem::take(&mut self.hwheel),
+        };
         let (raw_x, raw_y) = (self.abs_x.take(), self.abs_y.take());
         let place = match axes {
             Some(axes) if raw_x.is_some() || raw_y.is_some() || !buttons.is_empty() => {
@@ -831,13 +853,18 @@ impl PointerMotion {
             PointerPlace::By { dx, dy } => dx == 0 && dy == 0,
             PointerPlace::At { .. } => false,
         };
-        if silent && buttons.is_empty() {
+        // A wheel is the third thing a report can carry and the one with no
+        // other trace: a notch moves the pointer nowhere and presses nothing,
+        // so a frame asked only about motion and buttons would drop every
+        // scroll that arrived without one.
+        if silent && buttons.is_empty() && scroll.is_still() {
             return None;
         }
         Some(PointerFrame {
             time,
             place,
             buttons,
+            scroll,
         })
     }
 }
@@ -1060,9 +1087,21 @@ fn deliver_pointer_frame<T: InputTarget>(
         buttons.retain(|button| button.state == PointerButtonState::Released);
     }
     let delivery = match frame.place {
-        PointerPlace::By { dx, dy } if dx == 0 && dy == 0 && buttons.is_empty() => Ok(()),
-        PointerPlace::By { dx, dy } => runtime.pointer_frame(frame.time, dx, dy, &buttons),
-        PointerPlace::At { x, y } => runtime.pointer_frame_at(frame.time, x, y, &buttons),
+        // The wheel joins this silence test for the reason it joined the
+        // reader's: a notch is the one thing in a report that leaves no
+        // motion and no button behind, so a scroll delivered here would be
+        // dropped by a guard asking only about the other two.
+        PointerPlace::By { dx, dy }
+            if dx == 0 && dy == 0 && buttons.is_empty() && frame.scroll.is_still() =>
+        {
+            Ok(())
+        }
+        PointerPlace::By { dx, dy } => {
+            runtime.pointer_frame(frame.time, dx, dy, &buttons, frame.scroll)
+        }
+        PointerPlace::At { x, y } => {
+            runtime.pointer_frame_at(frame.time, x, y, &buttons, frame.scroll)
+        }
     };
     bindings.commit_pointer_device(device, pressed, &buttons);
     delivery
@@ -1172,7 +1211,7 @@ fn release_device<T: InputTarget>(
     if !buttons.is_empty() {
         let delivery = runtime
             .as_deref_mut()
-            .map(|target| target.pointer_frame(time, 0, 0, &buttons));
+            .map(|target| target.pointer_frame(time, 0, 0, &buttons, PointerScroll::default()));
         bindings.commit_pointer(&buttons);
         if let Some(Err(error)) = delivery {
             retain_failure(&mut failure, error);
@@ -1232,6 +1271,11 @@ impl DeviceState<'_> {
                 y: AbsoluteAxes::fraction(fresh.y, fresh.y.value),
             },
             buttons: Vec::new(),
+            // A recovery frame reports a PLACE and nothing else. Whatever the
+            // wheel did inside the gap is among the reports the kernel
+            // dropped, and inventing a notch here would scroll a surface by a
+            // distance nobody turned.
+            scroll: PointerScroll::default(),
         })
     }
 }
@@ -1958,12 +2002,28 @@ mod tests {
         keyboard_calls: Vec<KeyboardCall>,
         pointer_frames: Vec<(u32, i32, i32, Vec<PointerButtonInput>)>,
         pointer_places: Vec<RecordedPlace>,
+        /// Kept apart from both lists, and only the reports that CARRY a
+        /// notch: a wheel is orthogonal to where the pointer is, so a test
+        /// about scrolling should not have to say which of the two ways the
+        /// report described its position.
+        pointer_scrolls: Vec<(u32, PointerScroll)>,
         pointer_error: Option<String>,
         flushes: usize,
         flush_error: Option<String>,
         launched: Vec<LaunchRequest>,
         help_actions: Vec<HelpAction>,
         help: crate::help::Help,
+    }
+
+    impl RecordingTarget {
+        /// Only a report that CARRIES a notch. Every report reaches one of
+        /// the two delivery methods, so recording them all would make the
+        /// list a count of reports rather than of scrolls.
+        fn record_scroll(&mut self, time: u32, scroll: PointerScroll) {
+            if !scroll.is_still() {
+                self.pointer_scrolls.push((time, scroll));
+            }
+        }
     }
 
     impl InputTarget for RecordingTarget {
@@ -2020,8 +2080,10 @@ mod tests {
             dx: i32,
             dy: i32,
             buttons: &[PointerButtonInput],
+            scroll: PointerScroll,
         ) -> Result<(), String> {
             self.pointer_frames.push((time, dx, dy, buttons.to_vec()));
+            self.record_scroll(time, scroll);
             match self.pointer_error.take() {
                 Some(error) => Err(error),
                 None => Ok(()),
@@ -2034,11 +2096,13 @@ mod tests {
             x: Fraction,
             y: Fraction,
             buttons: &[PointerButtonInput],
+            scroll: PointerScroll,
         ) -> Result<(), String> {
             // Kept apart from the relative list on purpose: a test that
             // asserted a tablet report as a delta would be reading the wrong
             // question answered the wrong way.
             self.pointer_places.push((time, x, y, buttons.to_vec()));
+            self.record_scroll(time, scroll);
             match self.pointer_error.take() {
                 Some(error) => Err(error),
                 None => Ok(()),
@@ -2101,8 +2165,9 @@ mod tests {
             dx: i32,
             dy: i32,
             buttons: &[PointerButtonInput],
+            scroll: PointerScroll,
         ) -> Result<(), String> {
-            self.recording.pointer_frame(time, dx, dy, buttons)
+            self.recording.pointer_frame(time, dx, dy, buttons, scroll)
         }
 
         fn pointer_frame_at(
@@ -2111,8 +2176,9 @@ mod tests {
             x: Fraction,
             y: Fraction,
             buttons: &[PointerButtonInput],
+            scroll: PointerScroll,
         ) -> Result<(), String> {
-            self.recording.pointer_frame_at(time, x, y, buttons)
+            self.recording.pointer_frame_at(time, x, y, buttons, scroll)
         }
 
         fn flush(&mut self) -> Result<(), String> {
@@ -2274,6 +2340,43 @@ mod tests {
             "a mouse was reported as a place"
         );
         assert_eq!(target.pointer_frames, [(2, 7, -3, Vec::new())]);
+    }
+
+    #[test]
+    fn a_wheel_only_report_is_delivered_rather_than_read_as_a_still_pointer() {
+        // The reader keeps a wheel-only frame; the DELIVERY path has a second
+        // silence test of its own, and this is the one that catches it asking
+        // only about motion and buttons. The whole path — bytes in, a scroll
+        // at the runtime — because either guard alone would swallow it.
+        let mut data = Vec::new();
+        for event in [
+            Event {
+                time: 3,
+                kind: EV_REL,
+                code: REL_WHEEL,
+                value: -2,
+            },
+            syn(3),
+        ] {
+            data.extend_from_slice(&encode(event));
+        }
+        let (target, result) = drain_device(data, Vec::new(), None);
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            target.pointer_scrolls,
+            [(
+                3,
+                PointerScroll {
+                    vertical: -2,
+                    horizontal: 0
+                }
+            )]
+        );
+        // Delivered as a report that moved nothing, which is what it is: the
+        // scroll rides the ordinary frame rather than a path of its own, so
+        // the client gets one `wl_pointer.frame` for the one report.
+        assert_eq!(target.pointer_frames, [(3, 0, 0, Vec::new())]);
+        assert!(target.pointer_places.is_empty());
     }
 
     fn motion(time: u32, dx: i32) -> Vec<u8> {
@@ -3203,6 +3306,95 @@ mod tests {
     }
 
     #[test]
+    fn the_wheel_codes_are_the_kernels_and_not_each_others() {
+        // Every other reference to these is BY NAME, so swapping the two
+        // values leaves the whole suite green while a vertical wheel scrolls
+        // the surface sideways — the same failure `PointerAxis::wire` is
+        // pinned against on the Wayland side, and the same argument: a wrong
+        // axis is a well-formed scroll and nothing observable says so.
+        assert_eq!(REL_HWHEEL, 6);
+        assert_eq!(REL_WHEEL, 8);
+        // And no hi-res code is DECLARED, rather than merely unmatched: a
+        // device sends both resolutions, so reading 11 or 12 as well would
+        // scroll twice. Read out of the module's own text, as `main.rs`'s
+        // scans are, since what is asserted is that no arm exists to drive.
+        // Spelled in halves because that text includes this test: written
+        // whole, the needle would be its own first occurrence.
+        let declaration = ["_HI_RES", ": u16"].concat();
+        assert!(
+            !include_str!("input.rs").contains(&declaration),
+            "a high-resolution wheel code was declared; it would scroll twice"
+        );
+    }
+
+    #[test]
+    fn a_report_that_only_turns_the_wheel_is_still_a_frame() {
+        // The case the silence test exists to let through: a notch moves the
+        // pointer nowhere and presses nothing, so a reader asking only about
+        // motion and buttons would drop every scroll that arrived alone —
+        // which is what an ordinary scroll IS.
+        let mut pointer = PointerMotion::default();
+        let rel = |code, value| Event {
+            time: 0,
+            kind: EV_REL,
+            code,
+            value,
+        };
+        assert_eq!(pointer.feed_relative(rel(REL_WHEEL, -1)), None);
+        let frame = pointer
+            .feed_relative(Event {
+                time: 4,
+                kind: EV_SYN,
+                code: SYN_REPORT,
+                value: 0,
+            })
+            .expect("a wheel-only report produced no frame");
+        assert_eq!(frame.place, PointerPlace::By { dx: 0, dy: 0 });
+        assert!(frame.buttons.is_empty());
+        assert_eq!(
+            frame.scroll,
+            PointerScroll {
+                vertical: -1,
+                horizontal: 0
+            }
+        );
+
+        // Notches SUM within a report as the deltas do, and the two axes are
+        // carried separately: a tilting wheel reports both, and a frame that
+        // added them would scroll diagonally by their difference.
+        pointer.feed_relative(rel(REL_WHEEL, 2));
+        pointer.feed_relative(rel(REL_WHEEL, 1));
+        pointer.feed_relative(rel(REL_HWHEEL, -4));
+        let frame = pointer
+            .feed_relative(Event {
+                time: 5,
+                kind: EV_SYN,
+                code: SYN_REPORT,
+                value: 0,
+            })
+            .unwrap();
+        assert_eq!(
+            frame.scroll,
+            PointerScroll {
+                vertical: 3,
+                horizontal: -4
+            }
+        );
+
+        // And the accumulator is emptied by the frame that took it, or the
+        // next report would scroll again by a wheel nobody turned.
+        assert_eq!(
+            pointer.feed_relative(Event {
+                time: 6,
+                kind: EV_SYN,
+                code: SYN_REPORT,
+                value: 0,
+            }),
+            None
+        );
+    }
+
+    #[test]
     fn pointer_motion_is_coalesced_at_syn_report_and_saturates() {
         let mut pointer = PointerMotion::default();
         assert_eq!(
@@ -3240,6 +3432,7 @@ mod tests {
                     dy: -7
                 },
                 buttons: Vec::new(),
+                scroll: PointerScroll::default(),
             })
         );
         assert_eq!(
@@ -3964,6 +4157,7 @@ mod tests {
                         pressed: false,
                     },
                 ],
+                scroll: PointerScroll::default(),
             })
         );
     }

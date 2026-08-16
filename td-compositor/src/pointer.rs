@@ -2,7 +2,9 @@ use crate::scene::SurfaceKey;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_POINTER_BUTTON_TRANSITIONS_PER_FRAME: usize = 64;
-const MAX_POINTER_ROUTING_EVENTS_PER_FRAME: usize = 3;
+/// A leave, an enter, a motion, and one axis event per axis. The two axes are
+/// counted separately because a wheel that tilts reports both in one frame.
+const MAX_POINTER_ROUTING_EVENTS_PER_FRAME: usize = 5;
 pub const MAX_POINTER_FRAME_EVENTS: usize =
     MAX_POINTER_BUTTON_TRANSITIONS_PER_FRAME + MAX_POINTER_ROUTING_EVENTS_PER_FRAME;
 
@@ -35,6 +37,117 @@ pub struct PointerButtonInput {
     pub state: PointerButtonState,
 }
 
+/// The two axes a wheel can turn, named rather than numbered because the wire
+/// values are 0 and 1 and a swapped pair scrolls a well-formed distance along
+/// the wrong one — which nothing in a byte stream distinguishes from the right
+/// one. `wire()` is where the numbers live, and it is pinned by a test.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PointerAxis {
+    Vertical,
+    Horizontal,
+}
+
+impl PointerAxis {
+    pub fn wire(self) -> u32 {
+        match self {
+            PointerAxis::Vertical => 0,
+            PointerAxis::Horizontal => 1,
+        }
+    }
+}
+
+/// What one report's wheel said, in DETENTS and in evdev's own signs — the
+/// unit the kernel reports and the only one in which "one notch" is a whole
+/// number. Turning that into the protocol's units is `PointerScroll::steps`,
+/// and it happens once, here, rather than at each layer that carries a scroll.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PointerScroll {
+    pub vertical: i32,
+    pub horizontal: i32,
+}
+
+impl PointerScroll {
+    /// A report whose wheel did not move. Not the same as `Default::default()`
+    /// being asked for: this is the question a frame asks to decide whether it
+    /// has anything to say.
+    pub fn is_still(self) -> bool {
+        self.vertical == 0 && self.horizontal == 0
+    }
+
+    /// The axes that moved, in the PROTOCOL's units and signs, vertical first.
+    ///
+    /// Both conversions happen here, and the SIGN one is why `detents` comes
+    /// back rather than being recovered later: evdev counts a wheel pushed
+    /// away from the operator as positive, while `wl_pointer.axis` is a
+    /// movement of the surface's own content, where positive is downward — so
+    /// a notch away from the operator is a NEGATIVE Wayland value, which is
+    /// what libinput does with the same two conventions. Horizontal agrees in
+    /// both (positive is rightward) and is carried through, which is why this
+    /// is not one negation applied to a pair. `axis_discrete` must agree in
+    /// sign with the value beside it, so the flipped count is what this
+    /// answers and no caller flips anything.
+    ///
+    /// The SCALE is `AXIS_STEP`, the distance a compositor declares a notch to
+    /// be worth. The protocol gives no unit for a wheel — the value is
+    /// "a length in the same coordinate space as motion" — so it is a choice
+    /// rather than a conversion, and this one is weston's.
+    pub fn steps(self) -> Vec<AxisStep> {
+        let mut steps = Vec::new();
+        if self.vertical != 0 {
+            steps.push(AxisStep::of(
+                PointerAxis::Vertical,
+                self.vertical.saturating_neg(),
+            ));
+        }
+        if self.horizontal != 0 {
+            steps.push(AxisStep::of(PointerAxis::Horizontal, self.horizontal));
+        }
+        steps
+    }
+}
+
+/// One axis of one report, converted. Both numbers are the protocol's and
+/// carry the same sign, which is the property `axis_discrete` needs and which
+/// a pair passed separately would not enforce.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AxisStep {
+    pub axis: PointerAxis,
+    pub value: i32,
+    pub detents: i32,
+}
+
+impl AxisStep {
+    /// Clamped, because the wheel is the first input to reach `wl_fixed`
+    /// UNBOUNDED. A delta is clamped to the framebuffer before it is encoded
+    /// and enter/motion coordinates are surface-local, but detents are summed
+    /// straight off the device — and `saturating_add` in the reader turns a
+    /// device spamming the wheel into exactly `i32::MAX`, the one value that
+    /// cannot be encoded. That is not a panic but it is worse than one here:
+    /// the encoder's error propagates out of the seat worker, so a single
+    /// malformed report would take down a client's whole event delivery.
+    pub fn of(axis: PointerAxis, detents: i32) -> Self {
+        let detents = detents.clamp(-MAX_DETENTS_PER_REPORT, MAX_DETENTS_PER_REPORT);
+        AxisStep {
+            axis,
+            value: detents.saturating_mul(AXIS_STEP),
+            detents,
+        }
+    }
+}
+
+/// Surface units one detent is worth. The protocol declines to say, so every
+/// compositor picks one and clients scale from what they are given; ten is
+/// weston's.
+pub const AXIS_STEP: i32 = 10;
+
+/// The most detents one report may carry. Not a PHYSICAL bound — a wheel
+/// reports single digits, and no real one comes near this — but an ENCODING
+/// one, derived from the only thing that makes a value unsendable: `wl_fixed`
+/// is 24.8, so `pointer_fixed` multiplies by 256 and refuses what leaves an
+/// `i32`. Derived rather than written out, so it cannot drift from `AXIS_STEP`
+/// if that is ever retuned.
+const MAX_DETENTS_PER_REPORT: i32 = i32::MAX / 256 / AXIS_STEP;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PointerEvent {
     Enter {
@@ -51,13 +164,22 @@ pub enum PointerEvent {
         surface: SurfaceKey,
         input: PointerButtonInput,
     },
+    /// Already converted: the step carries the protocol's units and signs, so
+    /// nothing downstream of the routing layer knows evdev's.
+    Axis {
+        surface: SurfaceKey,
+        time: u32,
+        step: AxisStep,
+    },
 }
 
 impl PointerEvent {
     pub fn surface(&self) -> SurfaceKey {
         match self {
             PointerEvent::Enter { target } | PointerEvent::Motion { target, .. } => target.surface,
-            PointerEvent::Leave { surface } | PointerEvent::Button { surface, .. } => *surface,
+            PointerEvent::Leave { surface }
+            | PointerEvent::Button { surface, .. }
+            | PointerEvent::Axis { surface, .. } => *surface,
         }
     }
 }
@@ -131,6 +253,7 @@ impl PointerState {
         hover: Option<PointerTarget>,
         grab_target: Option<PointerTarget>,
         buttons: &[PointerButtonInput],
+        scroll: PointerScroll,
         claim: impl Fn(PointerButtonInput) -> bool,
     ) -> Result<PointerFrameResult, String> {
         if buttons.len() > MAX_POINTER_BUTTON_TRANSITIONS_PER_FRAME {
@@ -169,6 +292,25 @@ impl PointerState {
                 next.transition(next.hover, time, &mut events);
             }
         }
+        // After the buttons, so the client sees the two in the order the
+        // report carried them, and so a release that ENDS a grab has already
+        // moved focus: the notch then goes where the pointer now is rather
+        // than to the surface that was being dragged a moment ago. Sent to
+        // `focus` and not to `hover` for the same reason a button is: while a
+        // grab IS held, the surface being dragged owns the pointer, and a
+        // wheel turned mid-drag belongs to it even if the cursor has left it.
+        // A scroll over nothing is DROPPED rather than queued — there is no
+        // surface to owe it to, and the next enter is not a place the
+        // operator scrolled.
+        if let Some(target) = next.focus {
+            for step in scroll.steps() {
+                events.push(PointerEvent::Axis {
+                    surface: target.surface,
+                    time,
+                    step,
+                });
+            }
+        }
         if events.len() > MAX_POINTER_FRAME_EVENTS {
             return Err(format!(
                 "pointer frame exceeds {MAX_POINTER_FRAME_EVENTS} routed events"
@@ -187,9 +329,17 @@ impl PointerState {
         hover: Option<PointerTarget>,
         grab_target: Option<PointerTarget>,
     ) -> Result<Vec<RoutedPointerFrame>, String> {
-        // No buttons, so no press: the caller has nothing to learn from it.
+        // No buttons and no wheel, so no press: the caller has nothing to
+        // learn from it.
         Ok(self
-            .frame(self.last_time, hover, grab_target, &[], |_| false)?
+            .frame(
+                self.last_time,
+                hover,
+                grab_target,
+                &[],
+                PointerScroll::default(),
+                |_| false,
+            )?
             .frames)
     }
 
@@ -331,7 +481,14 @@ mod tests {
             buttons: &[PointerButtonInput],
         ) -> Result<Vec<RoutedPointerFrame>, String> {
             Ok(self
-                .frame(time, hover, grab_target, buttons, |_| false)?
+                .frame(
+                    time,
+                    hover,
+                    grab_target,
+                    buttons,
+                    PointerScroll::default(),
+                    |_| false,
+                )?
                 .frames)
         }
 
@@ -344,7 +501,27 @@ mod tests {
             grab_target: Option<PointerTarget>,
             buttons: &[PointerButtonInput],
         ) -> Result<PointerFrameResult, String> {
-            self.frame(time, hover, grab_target, buttons, |_| false)
+            self.frame(
+                time,
+                hover,
+                grab_target,
+                buttons,
+                PointerScroll::default(),
+                |_| false,
+            )
+        }
+
+        /// A report whose only content is the wheel, which is the ordinary
+        /// scroll: a notch arrives with no motion and no button.
+        fn scrolled(
+            &mut self,
+            time: u32,
+            hover: Option<PointerTarget>,
+            scroll: PointerScroll,
+        ) -> Result<Vec<RoutedPointerFrame>, String> {
+            Ok(self
+                .frame(time, hover, None, &[], scroll, |_| false)?
+                .frames)
         }
     }
 
@@ -688,9 +865,26 @@ mod tests {
                 button(3, 272, state)
             })
             .collect();
+        // The worst case carries a wheel too, and on BOTH axes: the bound is
+        // the routing events plus the buttons, and a report that saturated
+        // the buttons while scrolling would exceed a bound that counted only
+        // the other three. Driven through `frame` rather than `frames`
+        // because the scroll is the point.
+        let scroll = PointerScroll {
+            vertical: 1,
+            horizontal: -1,
+        };
         let frames = state
-            .frames(3, Some(hover), Some(moved_grab), &transitions)
-            .unwrap();
+            .frame(
+                3,
+                Some(hover),
+                Some(moved_grab),
+                &transitions,
+                scroll,
+                |_| false,
+            )
+            .unwrap()
+            .frames;
         assert_eq!(frames.len(), 1);
         assert_eq!(
             frames.first().unwrap().events.len(),
@@ -725,5 +919,277 @@ mod tests {
     fn wire_states_cover_both_values() {
         assert_eq!(PointerButtonState::Released.wire(), 0);
         assert_eq!(PointerButtonState::Pressed.wire(), 1);
+    }
+
+    #[test]
+    fn the_axis_numbers_are_the_protocols_and_not_each_others() {
+        assert_eq!(PointerAxis::Vertical.wire(), 0);
+        assert_eq!(PointerAxis::Horizontal.wire(), 1);
+    }
+
+    #[test]
+    fn a_wheel_turned_away_from_the_operator_scrolls_a_surface_downwards() {
+        // The one conversion nothing observable would catch: both directions
+        // are well-formed scrolls, so a missing negation reads as a compositor
+        // whose wheel is upside down and as nothing at all to a test that only
+        // checked a value arrived.
+        let away = PointerScroll {
+            vertical: 1,
+            horizontal: 0,
+        };
+        let steps = away.steps();
+        assert_eq!(steps.len(), 1);
+        let step = *steps.first().unwrap();
+        assert_eq!(step.axis, PointerAxis::Vertical);
+        // evdev's +1 comes back as the protocol's -1. Both numbers flip, so
+        // the pair still agrees in sign — which `axis_discrete` requires, and
+        // which is asserted where it can FAIL, on the wire in
+        // `a_tilting_wheel_names_its_source_once_for_the_whole_frame`.
+        // Asserting it here would only restate the constructor.
+        assert_eq!(step.detents, -1, "the protocol's sign, not evdev's");
+        assert_eq!(step.value, -AXIS_STEP);
+
+        // Horizontal keeps evdev's sign: both call rightward positive.
+        let right = PointerScroll {
+            vertical: 0,
+            horizontal: 1,
+        };
+        let step = *right.steps().first().unwrap();
+        assert_eq!(step.axis, PointerAxis::Horizontal);
+        assert_eq!(step.detents, 1);
+        assert_eq!(step.value, AXIS_STEP);
+
+        // A still wheel produces no step at all rather than a zero one: an
+        // axis event carrying no distance is a scroll the client did not get.
+        assert!(PointerScroll::default().is_still());
+        assert!(PointerScroll::default().steps().is_empty());
+        assert!(!away.is_still());
+
+        // Several notches in one report are one event of several steps, not
+        // several events — the wheel was turned once, quickly.
+        let flick = PointerScroll {
+            vertical: -3,
+            horizontal: 0,
+        };
+        let step = *flick.steps().first().unwrap();
+        assert_eq!(flick.steps().len(), 1);
+        assert_eq!(step.detents, 3);
+        assert_eq!(step.value, 3 * AXIS_STEP);
+    }
+
+    #[test]
+    fn a_wheel_no_report_could_carry_is_clamped_to_something_sendable() {
+        // The wheel is the first input to reach `wl_fixed` unbounded, and the
+        // reader's `saturating_add` makes the unsendable value the one a
+        // spamming device lands on exactly. Encoding is where it would show:
+        // `pointer_fixed` refuses what leaves an `i32`, and that error
+        // propagates out of the seat worker — one malformed report taking
+        // down a client's whole delivery rather than one absurd scroll.
+        for detents in [i32::MAX, i32::MIN, MAX_DETENTS_PER_REPORT + 1] {
+            let step = AxisStep::of(PointerAxis::Vertical, detents);
+            assert!(
+                step.value.checked_mul(256).is_some(),
+                "{detents} detents encoded to an unsendable {}",
+                step.value
+            );
+            // The SIGN survives the clamp, so an absurd scroll is still a
+            // scroll the right way rather than one the other way.
+            assert_eq!(step.detents.signum(), detents.signum());
+            assert_eq!(step.value.signum(), detents.signum());
+        }
+
+        // And the bound is not so tight that a real wheel meets it: an
+        // ordinary flick is single digits.
+        let step = AxisStep::of(PointerAxis::Vertical, 12);
+        assert_eq!(step.detents, 12);
+        assert_eq!(step.value, 12 * AXIS_STEP);
+    }
+
+    #[test]
+    fn a_notch_is_routed_to_the_surface_under_the_pointer_and_to_no_other() {
+        let mut state = PointerState::default();
+        let under = target(1, 10, 4, 5);
+        // The enter comes first and in the same frame: a client is told where
+        // the pointer is before it is told the wheel turned there.
+        let frames = state
+            .scrolled(
+                7,
+                Some(under),
+                PointerScroll {
+                    vertical: 2,
+                    horizontal: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(frames.len(), 1);
+        let frame = frames.first().unwrap();
+        assert_eq!(frame.client, 1);
+        assert_eq!(
+            frame.events,
+            vec![
+                PointerEvent::Enter { target: under },
+                PointerEvent::Axis {
+                    surface: under.surface,
+                    time: 7,
+                    step: AxisStep::of(PointerAxis::Vertical, -2),
+                },
+            ]
+        );
+
+        // A second notch over the same surface is the axis ALONE: nothing
+        // entered or moved, so a frame that re-sent an enter would be telling
+        // the client its pointer had left and come back.
+        let frames = state
+            .scrolled(
+                8,
+                Some(under),
+                PointerScroll {
+                    vertical: 0,
+                    horizontal: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            frames.first().unwrap().events,
+            vec![PointerEvent::Axis {
+                surface: under.surface,
+                time: 8,
+                step: AxisStep::of(PointerAxis::Horizontal, 1),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_notch_over_nothing_is_dropped_rather_than_kept_for_the_next_surface() {
+        let mut state = PointerState::default();
+        // Over the desktop: no surface owes anything, and a scroll queued
+        // here would land on whatever the pointer next entered — a surface
+        // the operator never scrolled over.
+        let frames = state
+            .scrolled(
+                3,
+                None,
+                PointerScroll {
+                    vertical: 5,
+                    horizontal: -5,
+                },
+            )
+            .unwrap();
+        assert!(frames.is_empty(), "{frames:?}");
+
+        let under = target(1, 10, 0, 0);
+        let frames = state.frames(4, Some(under), None, &[]).unwrap();
+        assert_eq!(
+            frames.first().unwrap().events,
+            vec![PointerEvent::Enter { target: under }],
+            "the dropped scroll came back with the enter"
+        );
+    }
+
+    #[test]
+    fn a_notch_follows_a_release_that_ended_a_grab_rather_than_preceding_it() {
+        // The axis is emitted AFTER the buttons, which is what puts it in the
+        // order the report carried them and what makes a release that ENDS a
+        // grab move focus first. Emitted before, the notch would go to the
+        // surface that had just stopped being dragged.
+        let mut state = PointerState::default();
+        let held = target(1, 10, 2, 3);
+        let under = target(2, 20, 4, 5);
+        state
+            .frames(
+                1,
+                Some(held),
+                Some(held),
+                &[button(1, 272, PointerButtonState::Pressed)],
+            )
+            .unwrap();
+        assert_eq!(state.grab_surface(), Some(held.surface));
+
+        // One report: the release that ends the grab, and a notch. The cursor
+        // is over the OTHER surface by now, which is what a drag ending
+        // somewhere else looks like.
+        let frames = state
+            .frame(
+                2,
+                Some(under),
+                Some(held),
+                &[button(2, 272, PointerButtonState::Released)],
+                PointerScroll {
+                    vertical: 1,
+                    horizontal: 0,
+                },
+                |_| false,
+            )
+            .unwrap()
+            .frames;
+        let axis = frames
+            .iter()
+            .flat_map(|frame| frame.events.iter())
+            .find_map(|event| match event {
+                PointerEvent::Axis { surface, .. } => Some(*surface),
+                _ => None,
+            });
+        assert_eq!(
+            axis,
+            Some(under.surface),
+            "the notch went to the surface the release let go of"
+        );
+
+        // And the button reached the surface that HAD the grab, so the two
+        // halves of the report are not simply both going to the new focus.
+        let released = frames
+            .iter()
+            .flat_map(|frame| frame.events.iter())
+            .find_map(|event| match event {
+                PointerEvent::Button { surface, .. } => Some(*surface),
+                _ => None,
+            });
+        assert_eq!(released, Some(held.surface));
+    }
+
+    #[test]
+    fn a_notch_during_a_drag_goes_to_the_surface_being_dragged() {
+        // A grab owns the pointer, so the wheel goes where the buttons go
+        // even once the cursor has left the surface holding it. Delivering to
+        // whatever is under the cursor instead would scroll a window the
+        // operator is in the middle of dragging something out of.
+        let mut state = PointerState::default();
+        let held = target(1, 10, 2, 3);
+        let elsewhere = target(2, 20, 1, 1);
+        state
+            .frames(
+                1,
+                Some(held),
+                Some(held),
+                &[button(1, 272, PointerButtonState::Pressed)],
+            )
+            .unwrap();
+        assert_eq!(state.grab_surface(), Some(held.surface));
+
+        let frames = state
+            .frame(
+                2,
+                Some(elsewhere),
+                Some(held),
+                &[],
+                PointerScroll {
+                    vertical: 1,
+                    horizontal: 0,
+                },
+                |_| false,
+            )
+            .unwrap()
+            .frames;
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        let frame = frames.first().unwrap();
+        assert_eq!(frame.client, held.surface.client);
+        assert_eq!(
+            frame.events,
+            vec![PointerEvent::Axis {
+                surface: held.surface,
+                time: 2,
+                step: AxisStep::of(PointerAxis::Vertical, -1),
+            }]
+        );
     }
 }

@@ -6,8 +6,8 @@ use crate::keyboard::{
 use crate::launcher::{LaunchRequest, LauncherAction};
 use crate::layout::{Command, ViewLayout};
 use crate::pointer::{
-    PointerButtonInput, PointerButtonState, PointerSnapshot, PointerState, PointerTarget,
-    RoutedPointerFrame,
+    PointerButtonInput, PointerButtonState, PointerScroll, PointerSnapshot, PointerState,
+    PointerTarget, RoutedPointerFrame,
 };
 use crate::scene::{BandPress, Fraction, Scene, SharedInputRegion, Surface, SurfaceKey};
 use std::collections::BTreeMap;
@@ -519,6 +519,7 @@ impl Runtime {
         dx: i32,
         dy: i32,
         buttons: &[PointerButtonInput],
+        scroll: PointerScroll,
     ) -> Result<(), String> {
         // Whether the pointer MOVED, which a nonzero delta does not prove: an
         // outward one at the edge of the output is clamped away, and a report
@@ -527,7 +528,7 @@ impl Runtime {
         let moved =
             self.scene
                 .move_pointer(dx, dy, self.framebuffer.width, self.framebuffer.height);
-        self.pointer_report(time, moved, buttons)
+        self.pointer_report(time, moved, buttons, scroll)
     }
 
     /// The same report from an ABSOLUTE device, which says where the pointer
@@ -545,11 +546,12 @@ impl Runtime {
         x: Fraction,
         y: Fraction,
         buttons: &[PointerButtonInput],
+        scroll: PointerScroll,
     ) -> Result<(), String> {
         let moved = self
             .scene
             .place_pointer(x, y, self.framebuffer.width, self.framebuffer.height);
-        self.pointer_report(time, moved, buttons)
+        self.pointer_report(time, moved, buttons, scroll)
     }
 
     fn pointer_report(
@@ -557,6 +559,7 @@ impl Runtime {
         time: u32,
         moved: bool,
         buttons: &[PointerButtonInput],
+        scroll: PointerScroll,
     ) -> Result<(), String> {
         let modal = self.scene.modal();
         // Sampled BEFORE the frame, because the frame is what ENDS a grab: a
@@ -578,6 +581,16 @@ impl Runtime {
         } else {
             buttons
         };
+        // A modal overlay drops the wheel outright, where it lets a RELEASE
+        // through: a release is owed to a client already holding the button,
+        // and a notch is owed to nobody — it is a whole gesture rather than
+        // half of one, so passing it on would scroll a surface the operator
+        // cannot see behind the sheet.
+        let scroll = if modal {
+            PointerScroll::default()
+        } else {
+            scroll
+        };
         // What a claim looks like; the pointer model says when one holds,
         // since the grab a claim must not steal moves WITHIN a report. Gated
         // on picking something up, so a press that could move nothing is
@@ -588,9 +601,11 @@ impl Runtime {
                 .scene
                 .draggable_at_pointer(self.framebuffer.width, self.framebuffer.height)
                 .is_some();
-        let result = self.pointer.frame(time, hover, grab, buttons, |input| {
-            alt && input.button == POINTER_BUTTON_LEFT
-        })?;
+        let result = self
+            .pointer
+            .frame(time, hover, grab, buttons, scroll, |input| {
+                alt && input.button == POINTER_BUTTON_LEFT
+            })?;
         let alt_press = result.claimed;
         self.publish_pointer(result.frames);
         if moved {
@@ -1159,7 +1174,9 @@ mod tests {
         assert!(!runtime.paint_pending());
 
         for step in 0..16 {
-            runtime.pointer_frame(step, 1, 0, &[]).unwrap();
+            runtime
+                .pointer_frame(step, 1, 0, &[], PointerScroll::default())
+                .unwrap();
         }
         assert!(runtime.paint_pending());
         assert_eq!(runtime.take_writes(), vec![]);
@@ -1186,7 +1203,9 @@ mod tests {
         runtime.repaint().unwrap();
         runtime.take_writes();
 
-        runtime.pointer_frame(1, 30, 30, &[]).unwrap();
+        runtime
+            .pointer_frame(1, 30, 30, &[], PointerScroll::default())
+            .unwrap();
         runtime.flush_paint().unwrap();
         let banded = runtime.take_writes();
         assert_eq!(banded.len(), 1);
@@ -1210,7 +1229,9 @@ mod tests {
         runtime.repaint().unwrap();
         runtime.take_writes();
 
-        runtime.pointer_frame(1, 5, 5, &[]).unwrap();
+        runtime
+            .pointer_frame(1, 5, 5, &[], PointerScroll::default())
+            .unwrap();
         runtime.fail_next_repaint();
         assert!(runtime.flush_paint().is_err());
         // Settling on a failed paint would close the device showing the pointer
@@ -1250,7 +1271,9 @@ mod tests {
         let cleanup = Cleanup(path);
         let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap();
         let mut runtime = Runtime::new(framebuffer);
-        runtime.pointer_frame(1, 4, 4, &[]).unwrap();
+        runtime
+            .pointer_frame(1, 4, 4, &[], PointerScroll::default())
+            .unwrap();
         assert!(runtime.paint_pending());
         runtime
             .commit(
@@ -1408,7 +1431,9 @@ mod tests {
         receiver.try_recv().unwrap();
         let layout = runtime.layout_snapshot();
         runtime.commit(key, surface([4, 5, 6, 0])).unwrap();
-        runtime.pointer_frame(1, 1, 1, &[]).unwrap();
+        runtime
+            .pointer_frame(1, 1, 1, &[], PointerScroll::default())
+            .unwrap();
         assert!(Arc::ptr_eq(&layout, &runtime.layout_snapshot()));
         assert!(receiver.try_recv().is_err());
         stop.stop();
@@ -1577,6 +1602,7 @@ mod tests {
                 i32::try_from(first_rect.x.saturating_add(2)).unwrap(),
                 i32::try_from(first_rect.y.saturating_add(3)).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         assert_eq!(
@@ -1595,7 +1621,9 @@ mod tests {
             button: 272,
             state: PointerButtonState::Pressed,
         };
-        runtime.pointer_frame(11, 0, 0, &[press]).unwrap();
+        runtime
+            .pointer_frame(11, 0, 0, &[press], PointerScroll::default())
+            .unwrap();
         assert_eq!(
             recv_pointer(&first_events).events,
             vec![PointerEvent::Button {
@@ -1612,7 +1640,9 @@ mod tests {
             .unwrap()
             .saturating_sub(i32::try_from(first_rect.y.saturating_add(3)).unwrap())
             .saturating_add(1);
-        runtime.pointer_frame(12, dx, dy, &[]).unwrap();
+        runtime
+            .pointer_frame(12, dx, dy, &[], PointerScroll::default())
+            .unwrap();
         assert!(matches!(
             recv_pointer(&first_events).events.as_slice(),
             [PointerEvent::Motion { time: 12, target }]
@@ -1625,7 +1655,9 @@ mod tests {
             button: 272,
             state: PointerButtonState::Released,
         };
-        runtime.pointer_frame(13, 0, 0, &[release]).unwrap();
+        runtime
+            .pointer_frame(13, 0, 0, &[release], PointerScroll::default())
+            .unwrap();
         assert_eq!(
             recv_pointer(&first_events).events,
             vec![
@@ -1706,7 +1738,9 @@ mod tests {
                 i32::try_from(x).unwrap() - at_x,
                 i32::try_from(y).unwrap() - at_y,
             );
-            runtime.pointer_frame(1, dx, dy, buttons).unwrap();
+            runtime
+                .pointer_frame(1, dx, dy, buttons, PointerScroll::default())
+                .unwrap();
         };
         let press = |time| PointerButtonInput {
             time,
@@ -1846,7 +1880,9 @@ mod tests {
                 i32::try_from(x).unwrap() - at_x,
                 i32::try_from(y).unwrap() - at_y,
             );
-            runtime.pointer_frame(1, dx, dy, buttons).unwrap()
+            runtime
+                .pointer_frame(1, dx, dy, buttons, PointerScroll::default())
+                .unwrap()
         };
 
         // Pick 3 up by its own band — the second in the run — and drop it on
@@ -1917,7 +1953,9 @@ mod tests {
                 i32::try_from(x).unwrap() - at_x,
                 i32::try_from(y).unwrap() - at_y,
             );
-            runtime.pointer_frame(1, dx, dy, buttons).unwrap()
+            runtime
+                .pointer_frame(1, dx, dy, buttons, PointerScroll::default())
+                .unwrap()
         };
         let press = PointerButtonInput {
             time: 2,
@@ -1989,7 +2027,9 @@ mod tests {
                 i32::try_from(x).unwrap() - at_x,
                 i32::try_from(y).unwrap() - at_y,
             );
-            runtime.pointer_frame(1, dx, dy, buttons).unwrap()
+            runtime
+                .pointer_frame(1, dx, dy, buttons, PointerScroll::default())
+                .unwrap()
         };
 
         let slots = crate::scene::band_buttons(band(&runtime)).unwrap();
@@ -2111,7 +2151,9 @@ mod tests {
                 i32::try_from(x).unwrap() - at_x,
                 i32::try_from(y).unwrap() - at_y,
             );
-            runtime.pointer_frame(1, dx, dy, buttons).unwrap()
+            runtime
+                .pointer_frame(1, dx, dy, buttons, PointerScroll::default())
+                .unwrap()
         };
 
         // Pick 1 up by its band and drop it on the TOP THIRD of 3's tile.
@@ -2466,7 +2508,7 @@ mod tests {
         let goto = |runtime: &mut Runtime, x: i32, y: i32, buttons: &[PointerButtonInput]| {
             let (at_x, at_y) = runtime.scene.pointer_at();
             runtime
-                .pointer_frame(1, x - at_x, y - at_y, buttons)
+                .pointer_frame(1, x - at_x, y - at_y, buttons, PointerScroll::default())
                 .unwrap()
         };
         let settled = order(&runtime);
@@ -2537,7 +2579,7 @@ mod tests {
         let goto = |runtime: &mut Runtime, x: i32, y: i32, buttons: &[PointerButtonInput]| {
             let (at_x, at_y) = runtime.scene.pointer_at();
             runtime
-                .pointer_frame(1, x - at_x, y - at_y, buttons)
+                .pointer_frame(1, x - at_x, y - at_y, buttons, PointerScroll::default())
                 .unwrap()
         };
         runtime.flush_paint().unwrap();
@@ -2589,7 +2631,7 @@ mod tests {
         let goto = |runtime: &mut Runtime, x: i32, y: i32, buttons: &[PointerButtonInput]| {
             let (at_x, at_y) = runtime.scene.pointer_at();
             runtime
-                .pointer_frame(1, x - at_x, y - at_y, buttons)
+                .pointer_frame(1, x - at_x, y - at_y, buttons, PointerScroll::default())
                 .unwrap()
         };
         let settled = order(&runtime);
@@ -2656,7 +2698,7 @@ mod tests {
         let goto = |runtime: &mut Runtime, x: i32, y: i32, buttons: &[PointerButtonInput]| {
             let (at_x, at_y) = runtime.scene.pointer_at();
             runtime
-                .pointer_frame(1, x - at_x, y - at_y, buttons)
+                .pointer_frame(1, x - at_x, y - at_y, buttons, PointerScroll::default())
                 .unwrap()
         };
         let settled = order(&runtime);
@@ -2736,7 +2778,9 @@ mod tests {
                 i32::try_from(x).unwrap() - at_x,
                 i32::try_from(y).unwrap() - at_y,
             );
-            runtime.pointer_frame(1, dx, dy, buttons).unwrap()
+            runtime
+                .pointer_frame(1, dx, dy, buttons, PointerScroll::default())
+                .unwrap()
         };
         let press = |time| PointerButtonInput {
             time,
@@ -3018,7 +3062,9 @@ mod tests {
                 i32::try_from(x).unwrap() - at_x,
                 i32::try_from(y).unwrap() - at_y,
             );
-            runtime.pointer_frame(1, dx, dy, buttons).unwrap()
+            runtime
+                .pointer_frame(1, dx, dy, buttons, PointerScroll::default())
+                .unwrap()
         };
         let press = |time| PointerButtonInput {
             time,
@@ -3437,7 +3483,7 @@ mod tests {
                 i32::try_from(x).unwrap() - at_x,
                 i32::try_from(y).unwrap() - at_y,
             );
-            runtime.pointer_frame(1, dx, dy, buttons)
+            runtime.pointer_frame(1, dx, dy, buttons, PointerScroll::default())
         };
         let press = |time| PointerButtonInput {
             time,
@@ -3542,7 +3588,7 @@ mod tests {
                 i32::try_from(x).unwrap() - at_x,
                 i32::try_from(y).unwrap() - at_y,
             );
-            runtime.pointer_frame(1, dx, dy, buttons)
+            runtime.pointer_frame(1, dx, dy, buttons, PointerScroll::default())
         };
         let press = |time| PointerButtonInput {
             time,
@@ -3697,7 +3743,7 @@ mod tests {
                 i32::try_from(x).unwrap() - at_x,
                 i32::try_from(y).unwrap() - at_y,
             );
-            runtime.pointer_frame(1, dx, dy, buttons)
+            runtime.pointer_frame(1, dx, dy, buttons, PointerScroll::default())
         };
         assert_eq!(order(&runtime), [1, 2, 3]);
 
@@ -3788,7 +3834,9 @@ mod tests {
                 i32::try_from(x).unwrap() - at_x,
                 i32::try_from(y).unwrap() - at_y,
             );
-            runtime.pointer_frame(1, dx, dy, buttons).unwrap()
+            runtime
+                .pointer_frame(1, dx, dy, buttons, PointerScroll::default())
+                .unwrap()
         };
         // The GEOMETRY the clients were configured for, which is what a
         // configure carries. Not the whole view: picking a window up focuses
@@ -3899,6 +3947,7 @@ mod tests {
                 i32::try_from(rect.x.saturating_add(2)).unwrap(),
                 i32::try_from(rect.y.saturating_add(2)).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
@@ -3908,29 +3957,41 @@ mod tests {
         // window under the pointer, and no motion coming to bring it back.
         runtime.command(Command::Focus(Direction::Right)).unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
-        runtime.pointer_frame(2, 0, 0, &[press(2)]).unwrap();
+        runtime
+            .pointer_frame(2, 0, 0, &[press(2)], PointerScroll::default())
+            .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
 
         // A second press on the same tile changes nothing, and a press made
         // while a grab is HELD does not follow the pointer off the tile.
-        runtime.pointer_frame(3, 0, 0, &[release(3)]).unwrap();
-        runtime.pointer_frame(4, 0, 0, &[press(4)]).unwrap();
+        runtime
+            .pointer_frame(3, 0, 0, &[release(3)], PointerScroll::default())
+            .unwrap();
+        runtime
+            .pointer_frame(4, 0, 0, &[press(4)], PointerScroll::default())
+            .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
         let dx = i32::try_from(layout.get(&second).unwrap().rect.x)
             .unwrap()
             .saturating_sub(i32::try_from(rect.x.saturating_add(2)).unwrap())
             .saturating_add(2);
-        runtime.pointer_frame(5, dx, 0, &[]).unwrap();
+        runtime
+            .pointer_frame(5, dx, 0, &[], PointerScroll::default())
+            .unwrap();
         let second_press = PointerButtonInput {
             time: 6,
             button: 273,
             state: PointerButtonState::Pressed,
         };
-        runtime.pointer_frame(6, 0, 0, &[second_press]).unwrap();
+        runtime
+            .pointer_frame(6, 0, 0, &[second_press], PointerScroll::default())
+            .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
 
         // Grab over: now the pointer is on the other tile and a press takes.
-        runtime.pointer_frame(7, 0, 0, &[release(7)]).unwrap();
+        runtime
+            .pointer_frame(7, 0, 0, &[release(7)], PointerScroll::default())
+            .unwrap();
         runtime
             .pointer_frame(
                 8,
@@ -3941,9 +4002,12 @@ mod tests {
                     button: 273,
                     state: PointerButtonState::Released,
                 }],
+                PointerScroll::default(),
             )
             .unwrap();
-        runtime.pointer_frame(9, 0, 0, &[press(9)]).unwrap();
+        runtime
+            .pointer_frame(9, 0, 0, &[press(9)], PointerScroll::default())
+            .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
 
         // A HELD grab must not keep re-asserting its focus, or the keyboard
@@ -3953,7 +4017,9 @@ mod tests {
         // the client's while it holds the pointer.
         runtime.command(Command::Focus(Direction::Left)).unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
-        runtime.pointer_frame(10, 1, 0, &[]).unwrap();
+        runtime
+            .pointer_frame(10, 1, 0, &[], PointerScroll::default())
+            .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
     }
 
@@ -3985,7 +4051,9 @@ mod tests {
                 i32::try_from(x).unwrap() - at_x,
                 i32::try_from(y).unwrap() - at_y,
             );
-            runtime.pointer_frame(1, dx, dy, &[]).unwrap();
+            runtime
+                .pointer_frame(1, dx, dy, &[], PointerScroll::default())
+                .unwrap();
         };
         let tile = |runtime: &Runtime, key: SurfaceKey| {
             let placements = runtime.scene.tiled_placements(240, 120);
@@ -4053,6 +4121,7 @@ mod tests {
                 i32::try_from(one.x.saturating_add(2)).unwrap(),
                 i32::try_from(one.y.saturating_add(2)).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         runtime
@@ -4065,6 +4134,7 @@ mod tests {
                     button: 272,
                     state: PointerButtonState::Pressed,
                 }],
+                PointerScroll::default(),
             )
             .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
@@ -4090,13 +4160,16 @@ mod tests {
                     button: 272,
                     state: PointerButtonState::Released,
                 }],
+                PointerScroll::default(),
             )
             .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
         assert!(runtime.pointer.grab_surface().is_none());
 
         // And the next motion, which no grab covers, does follow.
-        runtime.pointer_frame(4, 1, 0, &[]).unwrap();
+        runtime
+            .pointer_frame(4, 1, 0, &[], PointerScroll::default())
+            .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
     }
 
@@ -4127,7 +4200,9 @@ mod tests {
                 i32::try_from(x).unwrap() - at_x,
                 i32::try_from(y).unwrap() - at_y,
             );
-            runtime.pointer_frame(1, dx, dy, &[]).unwrap();
+            runtime
+                .pointer_frame(1, dx, dy, &[], PointerScroll::default())
+                .unwrap();
         };
 
         // FULLSCREEN. The pointer is over where `first` was, and a hover must
@@ -4206,6 +4281,7 @@ mod tests {
                 i32::try_from(inside.0).unwrap(),
                 i32::try_from(inside.1).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         assert!(
@@ -4219,6 +4295,7 @@ mod tests {
                 -i32::try_from(inside.0).unwrap(),
                 -i32::try_from(inside.1).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
@@ -4229,6 +4306,7 @@ mod tests {
                 i32::try_from(one.x + 2).unwrap(),
                 i32::try_from(one.y + 2).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
@@ -4278,6 +4356,7 @@ mod tests {
                 button: 272,
                 state: PointerButtonState::Pressed,
             }],
+            PointerScroll::default(),
         );
         assert!(outcome.is_err(), "the failed paint was not reported");
         runtime.clear_repaint_failure();
@@ -4309,7 +4388,9 @@ mod tests {
         // Every edge of this output is bar or gap, so the pointer's window
         // cannot be asked about there. The paint debt is the observable, and
         // it is the SAME `moved` the focus and the drop read.
-        runtime.pointer_frame(1, 10_000, 0, &[]).unwrap();
+        runtime
+            .pointer_frame(1, 10_000, 0, &[], PointerScroll::default())
+            .unwrap();
         assert!(
             runtime.paint_pending(),
             "travelling to the edge owed no paint"
@@ -4317,7 +4398,9 @@ mod tests {
         runtime.flush_paint().unwrap();
         assert!(!runtime.paint_pending());
 
-        runtime.pointer_frame(2, 10_000, 0, &[]).unwrap();
+        runtime
+            .pointer_frame(2, 10_000, 0, &[], PointerScroll::default())
+            .unwrap();
         assert!(
             !runtime.paint_pending(),
             "a delta clamped away at the edge was taken for a move"
@@ -4373,7 +4456,9 @@ mod tests {
                 i32::try_from(x).unwrap() - at_x,
                 i32::try_from(y).unwrap() - at_y,
             );
-            runtime.pointer_frame(1, dx, dy, &[]).unwrap();
+            runtime
+                .pointer_frame(1, dx, dy, &[], PointerScroll::default())
+                .unwrap();
         };
         assert_eq!(shown(&runtime), keys.get(2).copied());
 
@@ -4447,6 +4532,7 @@ mod tests {
                 i32::try_from(rect.x.saturating_add(2)).unwrap(),
                 i32::try_from(rect.y.saturating_add(2)).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
@@ -4457,7 +4543,9 @@ mod tests {
         // every `Super+Left` the moment a button or a wheel arrived.
         runtime.command(Command::Focus(Direction::Right)).unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
-        runtime.pointer_frame(2, 0, 0, &[]).unwrap();
+        runtime
+            .pointer_frame(2, 0, 0, &[], PointerScroll::default())
+            .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
     }
 
@@ -4495,7 +4583,9 @@ mod tests {
                 i32::try_from(x).unwrap() - at_x,
                 i32::try_from(y).unwrap() - at_y,
             );
-            runtime.pointer_frame(1, dx, dy, buttons).unwrap();
+            runtime
+                .pointer_frame(1, dx, dy, buttons, PointerScroll::default())
+                .unwrap();
         };
 
         // A band press establishes no grab — a band belongs to no client — so
@@ -4567,6 +4657,7 @@ mod tests {
                 i32::try_from(first_rect.x.saturating_add(2)).unwrap(),
                 i32::try_from(first_rect.y.saturating_add(2)).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         runtime
@@ -4579,6 +4670,7 @@ mod tests {
                     button: 272,
                     state: PointerButtonState::Pressed,
                 }],
+                PointerScroll::default(),
             )
             .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
@@ -4586,7 +4678,9 @@ mod tests {
             .unwrap()
             .saturating_sub(i32::try_from(first_rect.x.saturating_add(2)).unwrap())
             .saturating_add(2);
-        runtime.pointer_frame(3, dx, 0, &[]).unwrap();
+        runtime
+            .pointer_frame(3, dx, 0, &[], PointerScroll::default())
+            .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
 
         // Rolling from one button to the other inside ONE report: the mouse
@@ -4609,6 +4703,7 @@ mod tests {
                         state: PointerButtonState::Pressed,
                     },
                 ],
+                PointerScroll::default(),
             )
             .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
@@ -4647,6 +4742,7 @@ mod tests {
                 i32::try_from(rect.x.saturating_add(2)).unwrap(),
                 i32::try_from(rect.y.saturating_add(2)).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         runtime
@@ -4659,6 +4755,7 @@ mod tests {
                     button: 272,
                     state: PointerButtonState::Pressed,
                 }],
+                PointerScroll::default(),
             )
             .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
@@ -4676,6 +4773,7 @@ mod tests {
                     button: 273,
                     state: PointerButtonState::Pressed,
                 }],
+                PointerScroll::default(),
             )
             .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
@@ -4702,6 +4800,7 @@ mod tests {
                     button: 274,
                     state: PointerButtonState::Pressed,
                 }],
+                PointerScroll::default(),
             )
             .unwrap();
         while events.try_recv().is_ok() {}
@@ -4717,6 +4816,7 @@ mod tests {
                     button: 275,
                     state: PointerButtonState::Pressed,
                 }],
+                PointerScroll::default(),
             )
             .unwrap();
         assert!(events.try_recv().is_err(), "a press reached a covered tile");
@@ -4880,6 +4980,7 @@ mod tests {
                 i32::try_from(rect.x.saturating_add(4)).unwrap(),
                 i32::try_from(rect.y.saturating_add(4)).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         assert!(matches!(
@@ -4895,7 +4996,9 @@ mod tests {
             recv_pointer(&events).events,
             vec![PointerEvent::Leave { surface: key }]
         );
-        runtime.pointer_frame(2, 3, 3, &[]).unwrap();
+        runtime
+            .pointer_frame(2, 3, 3, &[], PointerScroll::default())
+            .unwrap();
         assert!(events.try_recv().is_err(), "motion crossed the sheet");
 
         assert!(!runtime.help(HelpAction::Toggle).unwrap());
@@ -4950,6 +5053,7 @@ mod tests {
                 i32::try_from(rect.x.saturating_add(2)).unwrap(),
                 i32::try_from(rect.y.saturating_add(2)).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
@@ -4963,6 +5067,7 @@ mod tests {
                     button: 272,
                     state: PointerButtonState::Pressed,
                 }],
+                PointerScroll::default(),
             )
             .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
@@ -4980,9 +5085,81 @@ mod tests {
                     button: 273,
                     state: PointerButtonState::Pressed,
                 }],
+                PointerScroll::default(),
             )
             .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+    }
+
+    #[test]
+    fn a_modal_overlay_swallows_the_wheel_even_where_a_grab_survives_it() {
+        // The overlay forces HOVER to nothing but keeps a grab, so a surface
+        // holding one still has pointer focus while the sheet is up — and a
+        // notch would reach it. Suppressing the scroll is what stops the
+        // operator scrolling a window they cannot see.
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-modal-wheel-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let key = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
+        let rect = runtime.layout_snapshot().get(&key).unwrap().rect;
+        runtime
+            .pointer_frame(
+                1,
+                i32::try_from(rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(rect.y.saturating_add(2)).unwrap(),
+                &[],
+                PointerScroll::default(),
+            )
+            .unwrap();
+        // A held button is what gives the surface a grab that outlives the
+        // overlay opening over it.
+        runtime
+            .pointer_frame(
+                2,
+                0,
+                0,
+                &[PointerButtonInput {
+                    time: 2,
+                    button: 272,
+                    state: PointerButtonState::Pressed,
+                }],
+                PointerScroll::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.pointer_snapshot().focus.map(|at| at.surface),
+            Some(key)
+        );
+
+        let wheel = PointerScroll {
+            vertical: 1,
+            horizontal: 0,
+        };
+        // Scrolled once with the sheet DOWN, to prove the report reaches the
+        // surface at all: without this the assertion below would pass against
+        // a wheel that never worked.
+        let before = runtime.pointer_snapshot().revision;
+        runtime.pointer_frame(3, 0, 0, &[], wheel).unwrap();
+        let delivered = runtime.pointer_snapshot().revision;
+        assert!(delivered > before, "a notch produced no routed event");
+
+        runtime.launcher(LauncherAction::Open).unwrap();
+        let opened = runtime.pointer_snapshot().revision;
+        runtime.pointer_frame(4, 0, 0, &[], wheel).unwrap();
+        assert_eq!(
+            runtime.pointer_snapshot().revision,
+            opened,
+            "the wheel reached a surface behind the launcher"
+        );
     }
 
     #[test]
@@ -5008,7 +5185,9 @@ mod tests {
         assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
         // The gap between tiles belongs to no surface. A click there is not a
         // request to focus nothing — it is a click on the desktop.
-        runtime.pointer_frame(1, 0, 0, &[]).unwrap();
+        runtime
+            .pointer_frame(1, 0, 0, &[], PointerScroll::default())
+            .unwrap();
         runtime
             .pointer_frame(
                 2,
@@ -5019,6 +5198,7 @@ mod tests {
                     button: 272,
                     state: PointerButtonState::Pressed,
                 }],
+                PointerScroll::default(),
             )
             .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
@@ -5034,6 +5214,7 @@ mod tests {
                     button: 272,
                     state: PointerButtonState::Released,
                 }],
+                PointerScroll::default(),
             )
             .unwrap();
         let rect = runtime.layout_snapshot().get(&first).unwrap().rect;
@@ -5043,6 +5224,7 @@ mod tests {
                 i32::try_from(rect.x.saturating_add(2)).unwrap(),
                 i32::try_from(rect.y.saturating_add(2)).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         runtime
@@ -5055,6 +5237,7 @@ mod tests {
                     button: 272,
                     state: PointerButtonState::Pressed,
                 }],
+                PointerScroll::default(),
             )
             .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
@@ -5096,6 +5279,7 @@ mod tests {
                 i32::try_from(rect.x.saturating_add(2)).unwrap(),
                 i32::try_from(rect.y.saturating_add(2)).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         assert!(matches!(
@@ -5108,13 +5292,17 @@ mod tests {
             button: 272,
             state: PointerButtonState::Pressed,
         };
-        runtime.pointer_frame(2, 0, 0, &[press]).unwrap();
+        runtime
+            .pointer_frame(2, 0, 0, &[press], PointerScroll::default())
+            .unwrap();
         assert!(matches!(
             recv_pointer(&events).events.as_slice(),
             [PointerEvent::Button { input, .. }] if *input == press
         ));
         runtime.launcher(LauncherAction::Open).unwrap();
-        runtime.pointer_frame(3, 5, 0, &[]).unwrap();
+        runtime
+            .pointer_frame(3, 5, 0, &[], PointerScroll::default())
+            .unwrap();
         assert!(matches!(
             recv_pointer(&events).events.as_slice(),
             [PointerEvent::Motion { target, .. }] if target.surface == key
@@ -5125,7 +5313,9 @@ mod tests {
             button: 273,
             state: PointerButtonState::Pressed,
         };
-        runtime.pointer_frame(4, 0, 0, &[modal_press]).unwrap();
+        runtime
+            .pointer_frame(4, 0, 0, &[modal_press], PointerScroll::default())
+            .unwrap();
         assert!(events.try_recv().is_err());
 
         let release = PointerButtonInput {
@@ -5133,7 +5323,9 @@ mod tests {
             button: 272,
             state: PointerButtonState::Released,
         };
-        runtime.pointer_frame(5, 0, 0, &[release]).unwrap();
+        runtime
+            .pointer_frame(5, 0, 0, &[release], PointerScroll::default())
+            .unwrap();
         assert_eq!(
             recv_pointer(&events).events,
             vec![
@@ -5149,7 +5341,9 @@ mod tests {
             recv_pointer(&events).events.as_slice(),
             [PointerEvent::Enter { target }] if target.surface == key
         ));
-        runtime.pointer_frame(6, 0, 0, &[]).unwrap();
+        runtime
+            .pointer_frame(6, 0, 0, &[], PointerScroll::default())
+            .unwrap();
         assert!(events.try_recv().is_err());
 
         stop.stop();
@@ -5192,6 +5386,7 @@ mod tests {
                 i32::try_from(rect.x.saturating_add(2)).unwrap(),
                 i32::try_from(rect.y.saturating_add(2)).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         assert!(matches!(
@@ -5203,7 +5398,9 @@ mod tests {
             button: 272,
             state: PointerButtonState::Pressed,
         };
-        runtime.pointer_frame(2, 0, 0, &[press]).unwrap();
+        runtime
+            .pointer_frame(2, 0, 0, &[press], PointerScroll::default())
+            .unwrap();
         assert!(matches!(
             recv_pointer(&events).events.as_slice(),
             [PointerEvent::Button { input, .. }] if *input == press
@@ -5258,6 +5455,7 @@ mod tests {
                 i32::try_from(rect.x.saturating_add(2)).unwrap(),
                 i32::try_from(rect.y.saturating_add(2)).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         assert!(matches!(
@@ -5316,6 +5514,7 @@ mod tests {
                 i32::try_from(rect.x.saturating_add(1)).unwrap(),
                 i32::try_from(rect.y.saturating_add(1)).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         assert!(matches!(
@@ -5332,6 +5531,7 @@ mod tests {
                     button: 272,
                     state: PointerButtonState::Pressed,
                 }],
+                PointerScroll::default(),
             )
             .unwrap();
         recv_pointer(&events);
@@ -5389,6 +5589,7 @@ mod tests {
                 i32::try_from(rect.x.saturating_add(2)).unwrap(),
                 i32::try_from(rect.y.saturating_add(2)).unwrap(),
                 &[],
+                PointerScroll::default(),
             )
             .unwrap();
         assert!(events.try_recv().is_err());
@@ -5400,7 +5601,9 @@ mod tests {
             .saturating_add(2)
         {
             let dx = if time % 2 == 0 { 1 } else { -1 };
-            runtime.pointer_frame(time, dx, 0, &[]).unwrap();
+            runtime
+                .pointer_frame(time, dx, 0, &[], PointerScroll::default())
+                .unwrap();
         }
         // Bounded rather than `events.iter()`, which blocks until the channel
         // DISCONNECTS — and the only thing that disconnects it here is the
