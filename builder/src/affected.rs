@@ -979,13 +979,13 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     // td-boot's protocol.rs is the deployment contract, `#[path]`-included by
-    // three OTHER trees: two recipes (system-x86-64, qemu_boot) and — since the
-    // manifest header and size bound moved into it — the host-side td-net, whose
-    // `td-deploy` signs what td-boot verifies. The td-boot rule below covers the
-    // first two through recipe-checks but compiles no net, and no gate builds
-    // td-net from source: the WARM does, which is a chain target. So this file
-    // takes the td-boot rule plus those, or a change here that breaks only the
-    // signer runs nothing.
+    // two OTHER trees: the td-recipe lib root, which is where every recipe and
+    // the qemu oracle reach it, and — since the manifest header and size bound
+    // moved into it — the host-side td-net, whose `td-deploy` signs what td-boot
+    // verifies. The td-boot rule below covers the first through recipe-checks
+    // but compiles no net, and no gate builds td-net from source: the WARM does,
+    // which is a chain target. So this file takes the td-boot rule plus those,
+    // or a change here that breaks only the signer runs nothing.
     //
     // `realfile.rs` joined it in that class when the real-bounded-file rule
     // stopped being written three times: td-net includes it for the same

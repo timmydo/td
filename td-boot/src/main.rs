@@ -641,10 +641,10 @@ fn authenticate_manifest(
     // operator to the wrong file. Distinguishing them properly needs a key check
     // that duplicates `verify`'s own subgroup policy, which is a worse trade
     // than a precise sentence.
-    Err(invalid(
-        "manifest does not authenticate: the signature, the manifest bytes and \
-         the trusted key do not agree",
-    ))
+    Err(invalid(format!(
+        "{}: the signature, the manifest bytes and the trusted key do not agree",
+        protocol::MANIFEST_UNAUTHENTICATED
+    )))
 }
 
 fn sync_directory(path: &Path) -> io::Result<()> {
@@ -3183,7 +3183,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("does not authenticate"),
+            error.contains(protocol::MANIFEST_UNAUTHENTICATED),
             "a bundle signed under another key must be refused: {error}"
         );
         assert!(
@@ -3238,7 +3238,7 @@ mod tests {
 
         let error = refusal(open_bundle(&source, Some(&fixture.wrong_key())));
         assert!(
-            error.contains("does not authenticate"),
+            error.contains(protocol::MANIFEST_UNAUTHENTICATED),
             "authenticity must be decided before the payloads are read: {error}"
         );
 

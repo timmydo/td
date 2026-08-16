@@ -12,10 +12,7 @@ use crate::ladder::{
 };
 use crate::types::{Recipe, Step};
 
-#[cfg(test)]
-#[path = "../../../td-boot/src/protocol.rs"]
-#[allow(dead_code)]
-mod td_boot_protocol;
+use crate::td_boot_protocol;
 
 const BOOT_SUCCESS_RETRY_SECS: u8 = 3;
 const BOOT_SUCCESS_RETRY_MAX_SECS: u8 = 10;
@@ -1476,6 +1473,11 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
     }
     let td_login_probe = td_login_probe(sys);
     let td_txt_probes = build_td_txt_probes();
+    // Named rather than spelled, so a renamed key or a reworded refusal cannot
+    // leave the oracle's negative pass quietly satisfied by any failure at all.
+    let trusted_key = td_boot_protocol::VOLUME_TRUSTED_KEY;
+    let wrong_key = crate::ladder::DEPLOY_WRONG_KEY;
+    let unauthenticated = td_boot_protocol::MANIFEST_UNAUTHENTICATED;
     format!(
         "#!/bin/sh\n\
          set -f\n\
@@ -1539,7 +1541,15 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          && /bin/td-boot success /dev/vda /run/td-update \"$deployment\" >/run/td-success-id; then \
          if /bin/grep -q -F '{DEPLOY_INSTALL_CMDLINE_TOKEN}' /proc/cmdline; then \
          if /bin/td-boot install /dev/vda /run/td-update \
-         /run/td-volume/td/incoming/candidate >/run/td-installed-id; then \
+         /run/td-volume/td/incoming/candidate /run/td-volume/{wrong_key} \
+         >/run/td-refused-id 2>/run/td-refused-err; then \
+         echo 'td-boot install accepted a bundle under the wrong key'; healthy=0; \
+         elif ! /bin/grep -q -F '{unauthenticated}' /run/td-refused-err; then \
+         echo 'td-boot install refused under the wrong key for another reason'; \
+         healthy=0; \
+         elif /bin/td-boot install /dev/vda /run/td-update \
+         /run/td-volume/td/incoming/candidate /run/td-volume/{trusted_key} \
+         >/run/td-installed-id; then \
          echo {SYSTEM_DEPLOY_INSTALL_MARKER}; else healthy=0; fi; \
          fi; \
          if [ \"$healthy\" = 1 ]; then \
@@ -5356,6 +5366,46 @@ mod tests {
                 && bootsuccess.contains("td-boot install /dev/vda /run/td-update")
                 && bootsuccess.contains(SYSTEM_DEPLOY_INSTALL_MARKER),
             "the root-owned health target must wire transactional install through td-boot"
+        );
+        // The NEGATIVE half, guarded here because no gate boots a VM: the oracle
+        // that would notice its absence runs only under `qemu-boot-system`. The
+        // candidate is signed whether or not td-boot is told to check it, so
+        // without a refused pass the trusted-key argument could be ignored
+        // outright and every marker would still appear.
+        assert!(
+            bootsuccess.contains(&format!(
+                "/run/td-volume/{}",
+                crate::ladder::DEPLOY_WRONG_KEY
+            )) && bootsuccess.contains(&format!(
+                "/run/td-volume/{}",
+                td_boot_protocol::VOLUME_TRUSTED_KEY
+            )),
+            "the install pass must run under BOTH the wrong key and the real one"
+        );
+        assert!(
+            bootsuccess.contains(td_boot_protocol::MANIFEST_UNAUTHENTICATED),
+            "the refused pass must check WHY it was refused: a missing key or a \
+             busy lock would satisfy a bare failure check"
+        );
+        // Bound rather than compared as `Option`s: `None < Some(_)` is true,
+        // so a MISSING wrong key would satisfy the ordering it is meant to fail.
+        let wrong_at = bootsuccess.find(crate::ladder::DEPLOY_WRONG_KEY).unwrap();
+        let real_at = bootsuccess
+            .find(td_boot_protocol::VOLUME_TRUSTED_KEY)
+            .unwrap();
+        assert!(
+            wrong_at < real_at,
+            "the wrong key must be tried FIRST, so a refusal that did not refuse \
+             cannot be masked by the install that follows it"
+        );
+        // The refusal pattern is interpolated into SINGLE-QUOTED shell. A reword
+        // carrying an apostrophe emits a broken script that no gate executes, and
+        // an empty one turns `grep -F ''` into a match on anything — either way
+        // the refused pass stops testing what it says it does while staying green.
+        let pattern = td_boot_protocol::MANIFEST_UNAUTHENTICATED;
+        assert!(
+            pattern.len() >= 8 && !pattern.chars().any(|c| c == '\'' || c == '\\' || c.is_control()),
+            "the refusal pattern must be a non-trivial, single-quotable string: {pattern:?}"
         );
         assert!(
             bootfail.contains(BOOT_FAIL_TARGET_CMDLINE_TOKEN)

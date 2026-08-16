@@ -347,6 +347,16 @@ pub const PERSIST_READ_CMDLINE_TOKEN: &str = "td.persist=read";
 /// target installs the fixture candidate from the read-only top-volume view.
 pub const DEPLOY_INSTALL_CMDLINE_TOKEN: &str = "td.deploy=install";
 
+/// A valid ed25519 public key that signed NOTHING, staged on the fixture volume
+/// beside the real trust root. The oracle's install pass runs twice: once under
+/// this key, which must be REFUSED, and then under the real one. Without the
+/// first, the whole trusted-key argument could be ignored by td-boot and every
+/// assertion would still pass — the candidate is signed either way.
+///
+/// Volume-relative, because the two sides need it differently: the harness joins
+/// it to the seed tree, and the boot script joins it to `/run/td-volume`.
+pub const DEPLOY_WRONG_KEY: &str = "td/oracle-wrong.pub";
+
 /// Kernel-cmdline token used only by the boot-attempt oracle. The login profile blocks
 /// before its greeter milestone and an isolated root-owned watchdog reboots the target.
 pub const BOOT_FAIL_TARGET_CMDLINE_TOKEN: &str = "td.boot-fail-target=1";

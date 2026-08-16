@@ -1453,22 +1453,69 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    arrives from removable media, a share, or a build host, and the trust root
    does not.
 
-   Nothing on the shipped image passes it yet — the boot-success script's
-   `td-boot install` is still the three-argument form, so the in-guest update
-   the `td.deploy=install` oracle drives publishes unauthenticated. That is
-   the next increment, and it needs the VM harness to stage a trust root on
-   the fixture volume, which today it does not: it provisions the run key into
-   the selector initramfs alone.
+   **10e — the boot oracle's install runs under a key, and under a wrong one
+   first.** The `td.deploy=install` pass had never exercised authentication:
+   the script used the three-argument form, `switch_root` had taken the
+   selector's key away, and so the probe found nothing and the in-guest update
+   published unverified. The harness now stages the run's public half on the
+   fixture volume at `VOLUME_TRUSTED_KEY`, where `td-install` puts it, and the
+   script passes it.
 
-   Two things that increment must carry, both found in review of this one and
-   neither a defect until something passes the argument:
+   THE NEGATIVE IS THE POINT. The candidate is signed whether or not td-boot
+   is told to check it, so passing the key and asserting the same marker would
+   prove nothing — an ignored argument leaves every existing assertion green.
+   So the script installs TWICE: first under `DEPLOY_WRONG_KEY`, a second
+   generated key staged beside the real one, which must FAIL; then under the
+   real one, which must succeed. Only the second echoes the marker.
 
-   - `/run/td-volume` is not checked to BE a mount point. If the `mount -o
-     move` out of the selector initramfs never happened, or the volume was
-     unmounted, `/run/td-volume/td/trusted.pub` resolves against the `/run`
-     TMPFS instead of failing — an unmounted volume is not a refusal, it is a
-     different file. `is_mount_point` is already in this file and `publish`
-     already uses it, in the opposite direction.
+   A refusal is not enough on its own, because almost anything makes an
+   install fail — a key that is not there, a busy volume lock, a candidate
+   that moved — and each would satisfy a bare "it failed" as well as a
+   signature check does. So the refused pass greps the captured stderr for
+   `MANIFEST_UNAUTHENTICATED`, and that string is a `protocol.rs` constant
+   both sides derive from: td-boot formats its diagnostic out of it and the
+   script looks for it, so a reworded message cannot turn the check into a
+   tautology. The decoy is a WHOLE VALID key rather than a corrupt file, so
+   what it earns is a signature that does not verify rather than a key that
+   will not parse — different failures, and only the first is under test.
+
+   What the gate can and cannot see here is worth stating plainly, because no
+   gate boots a VM. It CAN see, and mutation-reds, that the script carries
+   both passes, that the wrong key is tried first, and that the refusal's
+   reason is checked; and separately that td-boot really does refuse a bundle
+   under a whole valid wrong key with that constant in the message. What only
+   `td-recipe-eval qemu-boot-system` can see is the guest executing it. The
+   two halves meet at the shared constant, which is what makes the guarded
+   half worth having.
+
+   **10f — two things still owed**, both found in review of 10d and neither a
+   defect until something passed the argument. 10e is what passed it, and 10e
+   carries neither:
+
+   - `/run/td-volume` is not checked to BE a mount point — and the first
+     version of this note, taken from review, overstated what that costs.
+     It said an unmounted volume "is not a refusal, it is a different file".
+     It is a refusal: `/init` creates the mountpoint before moving the volume
+     onto it, so a move that never happened leaves an EMPTY directory on the
+     `/run` tmpfs, the key is absent, and an explicit key that is absent is
+     already fail-closed. The ordinary failure is loud.
+
+     What is actually left is a PLANTED file — something writing
+     `/run/td-volume/td/` while the volume is not mounted — which on a booted
+     machine means root, and a root that can write `/run` has better things to
+     do. So this is defence in depth and is recorded at that weight.
+
+     Where it belongs is not td-boot, which is the other half of the
+     correction. The verb takes an arbitrary path, so requiring it to sit on a
+     mount would refuse a perfectly good `td-boot install … /root/key.pub`.
+     The caller that knows the key is supposed to be on the volume is
+     `td-update`, and that is where the check goes.
+
+     On 10e's path it is separately covered, by something that is nobody's
+     check of this: the boot-success script runs only after rootcheck, which
+     greps `/proc/mounts` for `/run/td-volume` as btrfs `ro`. One caller's
+     precondition, so it reaches no other caller and disappears if the script
+     is reordered.
    - an explicit key path is not required ABSOLUTE, where `source`, `device`,
      `mountpoint` and `root` all are. It resolves against whatever cwd the
      caller had. That is shared with `publish` and `authenticate` and so

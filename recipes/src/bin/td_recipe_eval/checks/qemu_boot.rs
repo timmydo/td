@@ -42,9 +42,7 @@ use std::time::{Duration, Instant};
 
 use crate::check_runner::{is_executable, RecipeCheckRunner};
 
-#[path = "../../../../../td-boot/src/protocol.rs"]
-#[allow(dead_code)]
-mod td_boot_protocol;
+use td_recipe::td_boot_protocol;
 
 /// The busybox /init prints this exact line on ttyS0 once the kernel has reached
 /// userspace and executed the static busybox userland. Sourced from the SHARED
@@ -2281,6 +2279,7 @@ fn populate_persistent_seed(
     // read-only store path, and `link_or_copy` hard-links when it can, so a
     // signature written through it would land in the store.
     trust.sign_deployment(&installed)?;
+    stage_volume_trust_roots(seed, trust)?;
     for slot in ["current", "previous"] {
         let link = seed.join(td_boot_protocol::BOOT_DIR).join(slot);
         symlink(
@@ -2288,6 +2287,45 @@ fn populate_persistent_seed(
             &link,
         )
         .map_err(|e| format!("create {} selector {}: {e}", slot, link.display()))?;
+    }
+    Ok(())
+}
+
+/// The two keys a booted machine's update path is given, written where
+/// `td-install` would put the first (DESIGN §10 item 10a).
+///
+/// The wrong one is what makes the oracle's install pass mean anything: the
+/// candidate is signed by the run key whether or not td-boot is told to check
+/// it, so an ignored `trusted-key` argument would leave every existing
+/// assertion green. It is a REAL key rather than a corrupt file, so the refusal
+/// it earns is a signature that does not verify and not a key that will not
+/// parse — those are different failures and only the first is the one under
+/// test.
+///
+/// Mode 0644 explicitly: `mkfs.btrfs --rootdir` copies a mode in verbatim, so
+/// an ambient umask would otherwise decide what the fixture's trust root looks
+/// like — the pin `td-install` makes for the same reason.
+fn stage_volume_trust_roots(seed: &Path, trust: &RunTrust) -> Result<(), String> {
+    let decoy = RunTrust::generate()?;
+    if decoy.trusted_key_line() == trust.trusted_key_line() {
+        return Err("the decoy trust root matched the run key".to_string());
+    }
+    for (relative, line) in [
+        (td_boot_protocol::VOLUME_TRUSTED_KEY, trust.trusted_key_line()),
+        (
+            td_recipe::ladder::DEPLOY_WRONG_KEY,
+            decoy.trusted_key_line(),
+        ),
+    ] {
+        let path = seed.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("create fixture trust root dir {}: {e}", parent.display()))?;
+        }
+        fs::write(&path, &line)
+            .map_err(|e| format!("write fixture trust root {}: {e}", path.display()))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .map_err(|e| format!("chmod fixture trust root {}: {e}", path.display()))?;
     }
     Ok(())
 }
@@ -3442,6 +3480,37 @@ mod tests {
             !deployment.join("manifest.sig").exists(),
             "the source deployment must be left untouched"
         );
+
+        // Both trust roots, checked HERE because no gate boots the VM that uses
+        // them: without this, deleting `stage_volume_trust_roots` outright would
+        // leave the whole gate green.
+        let real = fs::read(seed.join(td_boot_protocol::VOLUME_TRUSTED_KEY)).unwrap();
+        let decoy = fs::read(seed.join(td_recipe::ladder::DEPLOY_WRONG_KEY)).unwrap();
+        assert_eq!(
+            real,
+            trust.trusted_key_line(),
+            "the volume's trust root must be the key that signed the deployment"
+        );
+        assert_ne!(
+            real, decoy,
+            "a decoy equal to the real key would make the refused pass succeed"
+        );
+        // A WHOLE VALID key, so what it earns is a signature that does not
+        // verify rather than a key that will not parse.
+        let decoy_key = decode_hex_fixture::<32>(&decoy);
+        assert!(
+            !td_engine::ed25519::verify(&decoy_key, &staged, &signature),
+            "the decoy must fail to authenticate what the real key authenticates"
+        );
+        for relative in [
+            td_boot_protocol::VOLUME_TRUSTED_KEY,
+            td_recipe::ladder::DEPLOY_WRONG_KEY,
+        ] {
+            // `--rootdir` copies a mode in verbatim, so an ambient umask would
+            // otherwise decide what the fixture's trust root looks like.
+            let mode = fs::metadata(seed.join(relative)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o644, "{relative} must be staged 0644");
+        }
     }
 
     /// The appendix's members, and that its parents are DIRECTORIES.

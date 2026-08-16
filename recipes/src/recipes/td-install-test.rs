@@ -1,12 +1,7 @@
 use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
-// The on-disk shape, from the one file that declares it: the program name this
-// check binds at build time (D7) and the sizes the offsets below are computed
-// from, rather than a second copy of either.
-#[path = "../../../td-boot/src/protocol.rs"]
-#[allow(dead_code)]
-mod td_boot_protocol;
+use crate::td_boot_protocol;
 
 // The SAME fixture deployment td-boot's own tests verify, so the signature
 // staged here is over the manifest these payloads hash to rather than over a
@@ -224,6 +219,8 @@ fn publish_steps(
     // because `volume` creates its scratch tree BEFORE the publish, so the
     // failure that arrives really is the signature's. Measured on the built
     // binaries, which reported `manifest does not authenticate` and not ENOENT.
+    // The pattern is the shared constant, not a third spelling of it: a reworded
+    // diagnostic must move every site that greps for one.
     steps.push(Step::WriteFile {
         path: "{root}/other.pub".into(),
         content: format!("{}\n", td_boot_fixture::OTHER_PUBLIC_KEY),
@@ -240,7 +237,7 @@ fn publish_steps(
                         '{deployment}' '{{root}}/other.pub' > '{{root}}/wrong-out' 2>'{{root}}/wrong-err'; \
                      then echo 'a deployment signed by another key was published anyway' >&2; exit 1; fi; \
                      err=$(cat '{{root}}/wrong-err') || exit 1; \
-                     case \"$err\" in *'does not authenticate'*) ;; \
+                     case \"$err\" in *'{unauthenticated}'*) ;; \
                      *) echo \"the publish failed, but not on the signature: $err\" >&2; exit 1 ;; esac; \
                      [ ! -e '{{root}}/scratch2/td-volume-root/{boot}/{current}' ] && \
                      [ ! -L '{{root}}/scratch2/td-volume-root/{boot}/{current}' ] || \
@@ -250,7 +247,8 @@ fn publish_steps(
                      {{ echo 'a refused publish still left a trust root' >&2; exit 1; }}",
                     boot = td_boot_protocol::BOOT_DIR,
                     trusted = td_boot_protocol::VOLUME_TRUSTED_KEY,
-                    current = td_boot_protocol::CURRENT_SLOT
+                    current = td_boot_protocol::CURRENT_SLOT,
+                    unauthenticated = td_boot_protocol::MANIFEST_UNAUTHENTICATED
                 ),
             ],
         )

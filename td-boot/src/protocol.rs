@@ -56,6 +56,14 @@ pub const SELECTOR_PREFIX: &str = "../deployments/";
 // by one character.
 #[allow(dead_code)]
 pub const VOLUME_TRUSTED_KEY: &str = "td/trusted.pub";
+// The refusal a bundle gets when its signature, its bytes and the trust root do
+// not agree. Shared because the boot oracle's negative pass GREPS for it: that
+// pass installs under a valid-but-wrong key and requires a failure, and any
+// other failure — a key that is not there, a busy volume lock, a missing
+// candidate — would satisfy a test meant to prove the key was consulted. Stated
+// once so a reworded diagnostic cannot quietly turn that check into a tautology.
+#[allow(dead_code)]
+pub const MANIFEST_UNAUTHENTICATED: &str = "manifest does not authenticate";
 // The two selector slots, by the names they have on disk. Here rather than as
 // literals in td-boot alone because the installer's recipe check reads one back
 // out of an unmounted image: a check that spelled its own copy would keep
