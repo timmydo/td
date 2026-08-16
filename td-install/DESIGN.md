@@ -1558,9 +1558,10 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    (`td/incoming` of `td/incoming-idle`), so a substring test for the channel
    alone is satisfied by the idle pass and says nothing about the real one.
 
-   **10f — two things still owed**, both found in review of 10d and neither a
-   defect until something passed the argument. 10e is what passed it, and 10e
-   carries neither:
+   **10f — two things owed, both now closed for `update`.** Both were found in
+   review of 10d and neither was a defect until something passed the argument.
+   10e is what passed it, and 10e carried neither; each is closed below, in the
+   verb that turned out to own it:
 
    - `/run/td-volume` is not checked to BE a mount point — and the first
      version of this note, taken from review, overstated what that costs.
@@ -1588,6 +1589,86 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
      greps `/proc/mounts` for `/run/td-volume` as btrfs `ro`. One caller's
      precondition, so it reaches no other caller and disappears if the script
      is reordered.
+
+     **CLOSED.** `update` takes the volume's read-only view as an argument and
+     requires it to BE a mount point, through the `is_mount_point` this file
+     already had — `mountpoint(1)`'s test, a device number that differs from
+     its parent's, and no `/proc` at all. The trust root must then be UNDER
+     that volume, or naming any mount point would satisfy the gate while the
+     key came from somewhere else; `/proc` is a mount point on every host, so
+     that is not a hypothetical. The check is eager, before the candidate is
+     looked for, for the reason the key is read eagerly.
+
+     Both paths are RESOLVED before either is judged, and the resolved key is
+     what is then read. `Path::starts_with` is lexical — it compares components
+     and normalizes nothing — so `<volume>/../forged.pub` is inside the volume
+     to it and `/run/forged.pub` to the kernel, which is the whole gate
+     defeated by one `..`; an intermediate symlink escapes the same way, since
+     `realfile`'s `O_NOFOLLOW` binds only the final component. A symlink AT the
+     key is refused outright rather than resolved, because resolving it would
+     otherwise make `update` the one verb here that accepts one — `realfile`
+     refuses a symlink by lstat and `O_NOFOLLOW`, and neither ever sees a path
+     already resolved.
+
+     Resolving also NARROWS, but does not close, the window between the check
+     and the read: `open_real_file` walks the path again, so a rename of an
+     intermediate DIRECTORY still redirects it. What resolving removes is the
+     symlink-swap form. What bounds the rest is authentication rather than the
+     lookup, which is what `run_update`'s own note already says.
+
+     The volume is NAMED rather than derived, and that is the whole shape of
+     the answer. Nothing distinguishes a mounted volume from an ordinary
+     directory of the same name except being told which to expect — the
+     argument this bullet already makes about rootcheck's ERE, which spells the
+     path out. Deriving it from the key's own path cannot work: the conventional
+     layout would exclude the oracle's `DEPLOY_WRONG_KEY`, and a positional rule
+     like "the key's grandparent" is satisfied by `/` for a key at `/root/k.pub`
+     and so fails open exactly where it is loosest.
+
+     What it does not catch, and the list is longer than it first looked. A
+     bind mount of a directory on the same filesystem shares its parent's
+     device number — `is_mount_point`'s own documented gap, and not this
+     danger, which is a volume with a filesystem of its own. A btrfs SUBVOLUME
+     boundary goes the other way and reads as a mount point, since each
+     subvolume carries its own anonymous device number; that is a false
+     positive rather than a false negative, and it is unreachable in the layout
+     that matters because `/run` is a tmpfs and has no subvolumes. A file
+     planted on a volume that really is mounted needs a write to the disk and
+     is the out-of-scope case above.
+
+     And the property established is "the key is on WHATEVER mount point the
+     caller named", not "on the volume" — a caller who chooses argv can name
+     `/run` itself, which is a genuine mount point, and satisfy both checks with
+     a key on the writable tmpfs. That is inherent to naming rather than
+     deriving, and what stands behind it is that argv is not attacker input
+     here: the three passes are composed in `system-x86-64.rs` and pinned by
+     the gate three times over.
+
+     **A READ-ONLY-MOUNT CHECK WAS BUILT FIRST AND REJECTED**, and it is
+     recorded because both reasons are easy to walk back into. The idea was to
+     require the trust root's MOUNT to be read-only, which needs no extra
+     argument and looked strictly stronger.
+
+     It is not stronger. Read-only-per-mount and mount-point are INCOMPARABLE:
+     a read-only bind of a writable filesystem refuses writes through that path
+     while the same files stay writable through the original mount, so "a trust
+     root anything can rewrite in place is not a trust root" is not what the
+     check would have established.
+
+     And it cannot be implemented from `/proc/self/mountinfo` by pathname at
+     all. mountinfo is ordered by mount ID, `mount --move` PRESERVES the id, and
+     `/init` mounts the volume BEFORE the `/run` tmpfs it later moves it onto —
+     so the volume is listed BEFORE `/run`, and the last entry covering the key
+     is `/run`, which is `rw`. A "last covering entry" rule therefore refuses
+     td's own volume and would have failed every update on every booted machine,
+     which no gate could catch because none boots a VM. The obvious alternative,
+     "deepest covering entry", is wrong in the other direction: a read-only
+     mount at `/vol/sub` hidden by a later writable one at `/vol` is still in
+     the table, and a path under it resolves through the writable mount. Both
+     were reproduced against real kernel output in a user namespace. The
+     discriminator is the parent-ID column, which neither rule reads, and the
+     only thing that settles it is the ID of the mount a path actually resolved
+     through — `statx(STATX_MNT_ID)`, a syscall, so an `UNSAFE.md` amendment.
    - an explicit key path is not required ABSOLUTE, where `source`, `device`,
      `mountpoint` and `root` all are. It resolves against whatever cwd the
      caller had. CLOSED for `update`, where nothing sets a timer's working

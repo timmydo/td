@@ -122,6 +122,12 @@ enum Mode {
     Update {
         device: PathBuf,
         mountpoint: PathBuf,
+        /// The volume's READ-ONLY view, which `update` requires to be a real
+        /// mount point (DESIGN §10 item 10f). It is named rather than derived
+        /// because only the caller knows which directory ought to carry a
+        /// filesystem: nothing distinguishes a mounted volume from an ordinary
+        /// directory of the same name except being told which to expect.
+        volume: PathBuf,
         channel: PathBuf,
         /// REQUIRED, unlike `install`'s. An updater nobody is watching has no
         /// business deciding that a missing key means "publish anyway", and
@@ -223,7 +229,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]",
+        "usage: td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <volume> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]",
     )
 }
 
@@ -335,6 +341,7 @@ fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
         Some(mode) if mode == OsStr::new(protocol::UPDATE_VERB) => {
             let device = args.next().ok_or_else(usage_error)?;
             let mountpoint = args.next().ok_or_else(usage_error)?;
+            let volume = args.next().ok_or_else(usage_error)?;
             let channel = args.next().ok_or_else(usage_error)?;
             let trusted_key = args.next().ok_or_else(usage_error)?;
             if args.next().is_some() {
@@ -343,6 +350,7 @@ fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
             Ok(Mode::Update {
                 device: PathBuf::from(device),
                 mountpoint: PathBuf::from(mountpoint),
+                volume: PathBuf::from(volume),
                 channel: PathBuf::from(channel),
                 trusted_key: PathBuf::from(trusted_key),
             })
@@ -2721,10 +2729,11 @@ fn publish_onto_volume(
 fn run_update(
     device: &Path,
     mountpoint: &Path,
+    volume: &Path,
     channel: &Path,
     trusted_key: &Path,
 ) -> io::Result<()> {
-    match update_decision(channel, trusted_key)? {
+    match update_decision(volume, channel, trusted_key)? {
         None => Ok(()),
         Some((candidate, trust)) => publish_authenticated(device, mountpoint, &candidate, &trust),
     }
@@ -2743,9 +2752,102 @@ fn run_update(
 /// `None` is "nothing to do" and means EXACTLY one thing: no candidate. A
 /// channel that cannot be read, or one holding something that is not a real
 /// directory, is loud. That boundary is the verb.
-fn update_decision(channel: &Path, trusted_key: &Path) -> io::Result<Option<(PathBuf, TrustRoot)>> {
+/// Is `path` inside `volume`?
+///
+/// A named function for one call, because the rule it encodes is exactly what a
+/// plausible edit gets wrong and nothing else could then catch: `starts_with`
+/// compares COMPONENTS, and the string-prefix spelling that looks equivalent
+/// admits a key under `/run/tdx` for a volume of `/run/td`. Testing that needs
+/// two mount points a test cannot create, so the predicate is tested instead of
+/// the path through it.
+///
+/// It normalizes nothing — `..` is a component like any other — so both
+/// arguments must already be resolved.
+fn is_within(volume: &Path, path: &Path) -> bool {
+    path.starts_with(volume)
+}
+
+fn update_decision(
+    volume: &Path,
+    channel: &Path,
+    trusted_key: &Path,
+) -> io::Result<Option<(PathBuf, TrustRoot)>> {
+    require_absolute(volume, "update volume")?;
     require_absolute(channel, "update channel")?;
     require_absolute(trusted_key, "update trust root")?;
+    require_real_directory(volume, "update volume")?;
+    // BOTH are resolved before either is judged, and the RESOLVED key is what
+    // goes on to be read. `starts_with` is lexical — it compares components and
+    // normalizes nothing — so `<volume>/../forged.pub` is "under the volume" to
+    // it and `/run/forged.pub` to the kernel; an intermediate symlink escapes
+    // the same way, since `realfile`'s `O_NOFOLLOW` binds only the last
+    // component. Reading the resolved path is also what stops the check and the
+    // read disagreeing: judging one name and opening another leaves a window in
+    // which the name can be repointed.
+    let volume = fs::canonicalize(volume).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("update volume {}: {error}", volume.display()),
+        )
+    })?;
+    // Resolving the key would otherwise make `update` the one verb in this file
+    // that accepts a SYMLINKED trust root: `realfile` refuses one by lstat and
+    // `O_NOFOLLOW`, and a path that has already been resolved never reaches
+    // that. Refused here instead, so the invariant holds for every verb and the
+    // resolution below is only ever normalizing `..` and the directories above.
+    if fs::symlink_metadata(trusted_key)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("update trust root {}: {error}", trusted_key.display()),
+            )
+        })?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(invalid(format!(
+            "update trust root must not be a symlink: {}",
+            trusted_key.display()
+        )));
+    }
+    let trusted_key = fs::canonicalize(trusted_key).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("update trust root {}: {error}", trusted_key.display()),
+        )
+    })?;
+    // DESIGN §10 item 10f. `/init` creates this directory before moving the
+    // volume onto it, so a move that never happened leaves an ordinary
+    // directory on the `/run` tmpfs — and anything that can write `/run` can
+    // then put a key there for an unattended updater to trust. A mount point is
+    // what tells those apart, and `is_mount_point` is `mountpoint(1)`'s test:
+    // a device number that differs from its parent's.
+    //
+    // EAGER, before the candidate is looked for, for the reason the key is read
+    // eagerly: a machine whose volume is missing should say so on a tick with
+    // nothing to install rather than on the first tick that has something.
+    let mounted = is_mount_point(&volume).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("update volume {}: {error}", volume.display()),
+        )
+    })?;
+    if !mounted {
+        return Err(invalid(format!(
+            "update volume is not a mount point: {}",
+            volume.display()
+        )));
+    }
+    // ...and the key must be ON it, or naming a mount point elsewhere would
+    // satisfy the check while the key came from anywhere at all.
+    if !is_within(&volume, &trusted_key) {
+        return Err(invalid(format!(
+            "update trust root {} is not on the volume {}",
+            trusted_key.display(),
+            volume.display()
+        )));
+    }
+    let trusted_key = trusted_key.as_path();
     require_real_directory(channel, "update channel")?;
     // Read before the candidate is looked for, so an idle tick still reports a
     // trust root that has gone missing. Unwrapped to a `TrustRoot`, not left an
@@ -2943,9 +3045,10 @@ fn dispatch(mode: Mode) -> io::Result<()> {
         Mode::Update {
             device,
             mountpoint,
+            volume,
             channel,
             trusted_key,
-        } => run_update(&device, &mountpoint, &channel, &trusted_key),
+        } => run_update(&device, &mountpoint, &volume, &channel, &trusted_key),
         Mode::Rollback { device, mountpoint } => run_rollback(&device, &mountpoint),
         Mode::Success {
             device,
@@ -3226,34 +3329,50 @@ mod tests {
             "extra",
         ]))
         .is_err());
-        // `update`'s key is REQUIRED, so the three-argument form — which is a
+        // `update`'s key is REQUIRED, so the short forms — one of which is a
         // valid `install` — must not parse as an update that probes.
         assert!(parse_args(args(&["update", "/dev/vda", "/run/td-update", "/channel"])).is_err());
         assert!(parse_args(args(&[
             "update",
             "/dev/vda",
             "/run/td-update",
+            "/volume",
+            "/channel",
+        ]))
+        .is_err());
+        assert!(parse_args(args(&[
+            "update",
+            "/dev/vda",
+            "/run/td-update",
+            "/volume",
             "/channel",
             "/key.pub",
             "extra",
         ]))
         .is_err());
+        // All three paths by VALUE, not by shape: they are three absolute paths
+        // in a row, so a pair swapped at the call site still parses and the
+        // wrong one is checked. The volume is the one that arrived last and is
+        // easiest to mis-order.
         match parse_args(args(&[
             "update",
             "/dev/vda",
             "/run/td-update",
+            "/run/td-volume",
             "/run/td-volume/td/incoming",
             "/run/td-volume/td/trusted.pub",
         ])) {
             Ok(Mode::Update {
+                volume,
                 channel,
                 trusted_key,
                 ..
             }) => {
+                assert_eq!(volume, Path::new("/run/td-volume"));
                 assert_eq!(channel, Path::new("/run/td-volume/td/incoming"));
                 assert_eq!(trusted_key, Path::new("/run/td-volume/td/trusted.pub"));
             }
-            _ => panic!("update must parse and carry its channel and key"),
+            _ => panic!("update must parse and carry its volume, channel and key"),
         }
         assert!(parse_args(args(&["rollback", "/volume"])).is_err());
         assert!(parse_args(args(&["rollback", "/dev/vda", "/volume", "extra"])).is_err());
@@ -3657,6 +3776,17 @@ mod tests {
         );
     }
 
+    /// A volume the arms below can use, so that they are about what they say
+    /// they are about rather than about the mount gate.
+    ///
+    /// `/` because a test cannot MAKE a mount point — that is the whole
+    /// difficulty of this check — and `/` is one on every host while every
+    /// absolute path is under it. The gate's own arms take the other side and
+    /// use a directory that is NOT one, which a test can always arrange.
+    fn any_mount_point() -> &'static Path {
+        Path::new("/")
+    }
+
     /// `update` is the verb a timer runs, so what it does when there is
     /// NOTHING to do is most of its behaviour.
     ///
@@ -3683,6 +3813,7 @@ mod tests {
             run_update(
                 Path::new("/dev/null"),
                 &fixture.root.join("mountpoint"),
+                any_mount_point(),
                 &channel,
                 &key,
             )
@@ -3695,6 +3826,7 @@ mod tests {
         let error = run_update(
             Path::new("/dev/null"),
             &fixture.root.join("mountpoint"),
+            any_mount_point(),
             &fixture.root.join("no-such-channel"),
             &key,
         )
@@ -3711,6 +3843,7 @@ mod tests {
         let error = run_update(
             Path::new("/dev/null"),
             &fixture.root.join("mountpoint"),
+            any_mount_point(),
             &file,
             &key,
         )
@@ -3729,6 +3862,7 @@ mod tests {
             let error = run_update(
                 Path::new("/dev/null"),
                 &fixture.root.join("mountpoint"),
+                any_mount_point(),
                 if relative == Path::new("channel") {
                     relative
                 } else {
@@ -3758,6 +3892,7 @@ mod tests {
         let denied = run_update(
             Path::new("/dev/null"),
             &fixture.root.join("mountpoint"),
+            any_mount_point(),
             &sealed,
             &key,
         );
@@ -3776,6 +3911,7 @@ mod tests {
         let error = run_update(
             Path::new("/dev/null"),
             &fixture.root.join("mountpoint"),
+            any_mount_point(),
             &channel,
             &fixture.root.join("no-such-key.pub"),
         )
@@ -3827,13 +3963,13 @@ mod tests {
         fs::write(&key, format!("{FIXTURE_PUBLIC_KEY}\n")).unwrap();
 
         assert!(
-            update_decision(&channel, &key).unwrap().is_none(),
+            update_decision(any_mount_point(), &channel, &key).unwrap().is_none(),
             "an empty channel decides on nothing"
         );
 
         let candidate = channel.join(protocol::CHANNEL_CANDIDATE);
         fs::create_dir(&candidate).unwrap();
-        let (chosen, trust) = update_decision(&channel, &key)
+        let (chosen, trust) = update_decision(any_mount_point(), &channel, &key)
             .unwrap()
             .expect("a candidate that is there must be decided on");
         assert_eq!(chosen, candidate, "the decision names the candidate");
@@ -3863,6 +3999,7 @@ mod tests {
         let error = run_update(
             Path::new("/dev/null"),
             &fixture.root.join("mountpoint"),
+            any_mount_point(),
             &channel,
             &key,
         )
@@ -3877,8 +4014,9 @@ mod tests {
     /// `update`'s argv hop, pinned by BEHAVIOUR for `install`'s reason: the
     /// dispatch arm can drop `trusted_key` and still compile, and for this verb
     /// there is no `Option` to fall back to — it would not compile as `None`,
-    /// but it WOULD compile pointing at the wrong one of its four paths, and
-    /// `channel` and `trusted_key` are adjacent `PathBuf`s of the same type.
+    /// but it WOULD compile pointing at the wrong one of its five paths, and
+    /// `volume`, `channel` and `trusted_key` are three adjacent `PathBuf`s of
+    /// the same type.
     #[test]
     fn dispatch_hands_update_its_channel_and_its_key_the_right_way_round() {
         let fixture = Fixture::new();
@@ -3891,6 +4029,7 @@ mod tests {
         let error = dispatch(Mode::Update {
             device: PathBuf::from("/dev/null"),
             mountpoint: fixture.root.join("mountpoint"),
+            volume: any_mount_point().to_path_buf(),
             channel: channel.clone(),
             trusted_key: fixture.root.join("no-such-key.pub"),
         })
@@ -3899,6 +4038,209 @@ mod tests {
         assert!(
             error.contains("no-such-key.pub") && !error.contains("channel"),
             "the key must arrive as the key: {error}"
+        );
+    }
+
+    /// A volume that is not a MOUNT POINT is refused — DESIGN §10 item 10f.
+    ///
+    /// The failure this closes: `/init` creates `/run/td-volume` before moving
+    /// the volume onto it, so a move that never happened leaves an ordinary
+    /// directory on the `/run` tmpfs. Anything that can write `/run` can then
+    /// put a key there, and an unattended updater would trust it — a trust root
+    /// with no provenance at all, on the one verb with nobody watching.
+    ///
+    /// A directory that is NOT a mount point is the half of this a test can
+    /// arrange; `any_mount_point` above is the other half and explains why.
+    #[test]
+    fn a_volume_that_is_not_a_mount_point_is_refused() {
+        let fixture = Fixture::new();
+        let channel = fixture.root.join("channel");
+        fs::create_dir(&channel).unwrap();
+        let key = fixture.root.join("trusted.pub");
+        fs::write(&key, format!("{FIXTURE_PUBLIC_KEY}\n")).unwrap();
+
+        // With a candidate waiting, and again with the channel empty: the check
+        // is EAGER, so an up-to-date machine reports its missing volume too
+        // rather than only the tick that finally has work.
+        let idle = fixture.root.join("idle");
+        fs::create_dir(&idle).unwrap();
+        fs::create_dir(channel.join(protocol::CHANNEL_CANDIDATE)).unwrap();
+        for (offered, what) in [(&channel, "a candidate"), (&idle, "an empty channel")] {
+            let error = run_update(
+                Path::new("/dev/null"),
+                &fixture.root.join("mountpoint"),
+                &fixture.root,
+                offered,
+                &key,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("is not a mount point"),
+                "a volume that is only a directory must be refused with {what}: {error}"
+            );
+            assert!(
+                !error.contains("/dev/null"),
+                "the device must not have been reached: {error}"
+            );
+        }
+
+        // The volume gets the same two shape checks its siblings get, which
+        // review found nothing was asking for. A relative one is a different
+        // directory depending on who started the timer; a volume that is a FILE
+        // reaches `is_mount_point`, where a device number compares equal to its
+        // parent's and the diagnostic would be about mounting rather than about
+        // what was named.
+        let file = fixture.root.join("volume-file");
+        fs::write(&file, b"not a volume").unwrap();
+        for (volume, want) in [
+            (Path::new("volume"), "must be an absolute path"),
+            (file.as_path(), "must be a real directory"),
+            // An absent one reports the IO error rather than the type, which is
+            // the better diagnostic and is asserted as what it is.
+            (&fixture.root.join("no-such-volume"), "no-such-volume"),
+        ] {
+            let error = run_update(
+                Path::new("/dev/null"),
+                &fixture.root.join("mountpoint"),
+                volume,
+                &channel,
+                &key,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(want),
+                "a volume at {} must be refused with {want}: {error}",
+                volume.display()
+            );
+        }
+    }
+
+    /// ...and the key must be ON the volume that was named.
+    ///
+    /// Without this the gate is satisfied by naming ANY mount point while the
+    /// trust root comes from somewhere else entirely — `/proc` is a mount point
+    /// on every host, so the check would pass and say nothing about the key.
+    #[test]
+    fn a_trust_root_that_is_not_on_the_named_volume_is_refused() {
+        let fixture = Fixture::new();
+        let channel = fixture.root.join("channel");
+        fs::create_dir(&channel).unwrap();
+        let key = fixture.root.join("trusted.pub");
+        fs::write(&key, format!("{FIXTURE_PUBLIC_KEY}\n")).unwrap();
+
+        // `/proc` stands in for "some mount point that is not the fixture's".
+        // Asserted rather than assumed, so a sandbox without it says THAT
+        // instead of failing on the message below.
+        assert!(
+            is_mount_point(Path::new("/proc")).unwrap_or(false),
+            "this test needs /proc to be a mount point to have a volume to name"
+        );
+        // The CHANNEL is on the named volume while the key is not, which is what
+        // makes this about the key. Review found that pointing both off the
+        // volume left `channel.starts_with(volume)` — the gate asking about the
+        // wrong path entirely, with the error still naming the trust root —
+        // green across the whole suite.
+        let on_volume = Path::new("/proc/sys");
+        assert!(
+            on_volume.is_dir(),
+            "this test needs a real directory on the volume it names"
+        );
+        let error = run_update(
+            Path::new("/dev/null"),
+            &fixture.root.join("mountpoint"),
+            Path::new("/proc"),
+            on_volume,
+            &key,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("is not on the volume"),
+            "a key off the named volume must be refused: {error}"
+        );
+
+        // ...and containment is judged on the RESOLVED path, not the spelling.
+        // `Path::starts_with` compares components and normalizes nothing, so a
+        // `..` walks straight out of the volume while still "starting with" it.
+        // Review found this; the same resolution is what stops an intermediate
+        // symlink escaping, which `realfile`'s `O_NOFOLLOW` cannot since it
+        // binds only the final component.
+        let escaped = Path::new("/proc/..").join(
+            key.strip_prefix("/")
+                .expect("the fixture key is an absolute path"),
+        );
+        assert!(
+            escaped.starts_with("/proc"),
+            "the traversal must be lexically inside the volume, or it tests nothing"
+        );
+        let error = run_update(
+            Path::new("/dev/null"),
+            &fixture.root.join("mountpoint"),
+            Path::new("/proc"),
+            on_volume,
+            &escaped,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("is not on the volume"),
+            "a key that walks out of the volume with `..` must be refused: {error}"
+        );
+
+        // A SYMLINK is refused outright rather than resolved and admitted.
+        // Resolving the key would otherwise make `update` the one verb here
+        // that takes one, since `realfile`'s lstat and `O_NOFOLLOW` never see a
+        // path that has already been resolved.
+        let link = fixture.root.join("linked.pub");
+        std::os::unix::fs::symlink(&key, &link).unwrap();
+        let error = run_update(
+            Path::new("/dev/null"),
+            &fixture.root.join("mountpoint"),
+            any_mount_point(),
+            &channel,
+            &link,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("must not be a symlink"),
+            "a symlinked trust root must be refused: {error}"
+        );
+    }
+
+    /// Containment is COMPONENT-wise, which a string prefix is not.
+    ///
+    /// Tested on the predicate rather than through `update`, because the path
+    /// through it would need two mount points whose names share a prefix and a
+    /// test cannot create either.
+    #[test]
+    fn a_volume_does_not_contain_its_name_plus_more_letters() {
+        assert!(is_within(Path::new("/run/td"), Path::new("/run/td/key.pub")));
+        assert!(is_within(Path::new("/run/td"), Path::new("/run/td")));
+        assert!(is_within(Path::new("/"), Path::new("/anything/at/all")));
+        assert!(
+            !is_within(Path::new("/run/td"), Path::new("/run/tdx/key.pub")),
+            "a string prefix is not containment: /run/tdx is not under /run/td"
+        );
+        assert!(!is_within(Path::new("/run/td"), Path::new("/run/key.pub")));
+    }
+
+    /// The usage line and the parser agree about `update`'s arity.
+    ///
+    /// Nothing else asserts any usage text, so the operator-facing description
+    /// of a verb can drift from what it accepts — which is what happened here
+    /// the moment the volume argument was added.
+    #[test]
+    fn the_usage_line_names_every_argument_update_requires() {
+        let usage = usage_error().to_string();
+        assert!(
+            usage.contains(&format!(
+                "td-boot {} <device> <mountpoint> <volume> <channel> <trusted-key>",
+                protocol::UPDATE_VERB
+            )),
+            "the usage line must match the arity the parser enforces: {usage}"
         );
     }
 
@@ -3920,6 +4262,7 @@ mod tests {
         let error = run_update(
             Path::new("/dev/null"),
             &fixture.root.join("mountpoint"),
+            any_mount_point(),
             &channel,
             &key,
         )

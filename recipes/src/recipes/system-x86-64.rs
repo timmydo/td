@@ -1546,20 +1546,20 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          if [ \"$healthy\" = 1 ] \
          && /bin/td-boot success /dev/vda /run/td-update \"$deployment\" >/run/td-success-id; then \
          if /bin/grep -q -F '{DEPLOY_INSTALL_CMDLINE_TOKEN}' /proc/cmdline; then \
-         if /bin/td-boot {update} /dev/vda /run/td-update \
+         if /bin/td-boot {update} /dev/vda /run/td-update /run/td-volume \
          /run/td-volume/{channel} /run/td-volume/{wrong_key} \
          >/run/td-refused-id 2>/run/td-refused-err; then \
          echo 'td-boot update accepted a bundle under the wrong key'; healthy=0; \
          elif ! /bin/grep -q -F '{unauthenticated}' /run/td-refused-err; then \
          echo 'td-boot update refused under the wrong key for another reason'; \
          healthy=0; \
-         elif ! /bin/td-boot {update} /dev/vda /run/td-update \
+         elif ! /bin/td-boot {update} /dev/vda /run/td-update /run/td-volume \
          /run/td-volume/{idle_channel} /run/td-volume/{trusted_key} \
          >/run/td-idle-id; then \
          echo 'td-boot update failed on a channel with nothing in it'; healthy=0; \
          elif [ -s /run/td-idle-id ]; then \
          echo 'td-boot update named a deployment for an empty channel'; healthy=0; \
-         elif ! /bin/td-boot {update} /dev/vda /run/td-update \
+         elif ! /bin/td-boot {update} /dev/vda /run/td-update /run/td-volume \
          /run/td-volume/{channel} /run/td-volume/{trusted_key} \
          >/run/td-installed-id; then \
          echo 'td-boot update failed on the channel holding a bundle'; healthy=0; \
@@ -5387,6 +5387,19 @@ mod tests {
             "the root-owned health target must wire the transactional update through \
              td-boot's own update verb"
         );
+        // EVERY pass names the volume, including the wrong-key one, which is the
+        // only one no whole-fragment pin covers. `update` requires it to be a
+        // real mount point, so a pass that dropped it would not merely lose the
+        // check — it would take the CHANNEL as the volume and fail for a reason
+        // that has nothing to do with what the pass is about.
+        assert_eq!(
+            bootsuccess
+                .matches("/run/td-update /run/td-volume /run/td-volume/")
+                .count(),
+            3,
+            "all three update passes must name the volume between the mountpoint \
+             and the channel"
+        );
         // The verb takes a CHANNEL, not a bundle. Passing the candidate would
         // make it look for `<candidate>/candidate` and read every tick as
         // nothing to do — a silent no-op that leaves every other marker green.
@@ -5421,7 +5434,7 @@ mod tests {
         // false forever, and the pass would fall through to the install having
         // asserted nothing at all.
         let idle_branch = format!(
-            "elif ! /bin/td-boot {update} /dev/vda /run/td-update {volume}/{idle} \
+            "elif ! /bin/td-boot {update} /dev/vda /run/td-update {volume} {volume}/{idle} \
 {volume}/{key} >{out}; then echo 'td-boot update failed on a channel with nothing \
 in it'; healthy=0; elif [ -s {out} ]; then",
             update = td_boot_protocol::UPDATE_VERB,
@@ -5449,7 +5462,7 @@ in it'; healthy=0; elif [ -s {out} ]; then",
         // `contains` on the channel — or a `find` for it — is satisfied by the
         // IDLE pass and says nothing about this one.
         let real_branch = format!(
-            "elif ! /bin/td-boot {update} /dev/vda /run/td-update {volume}/{channel} \
+            "elif ! /bin/td-boot {update} /dev/vda /run/td-update {volume} {volume}/{channel} \
 {volume}/{key} >{out}; then echo 'td-boot update failed on the channel holding a \
 bundle'; healthy=0; elif ! [ -s {out} ]; then echo 'td-boot update installed nothing \
 from the channel holding a bundle'; healthy=0; else echo {marker}; fi;",
