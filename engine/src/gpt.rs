@@ -42,7 +42,7 @@
 use crate::crc32::crc32;
 
 /// Bytes per partition entry. Fixed at the value every firmware expects; the
-/// header records it, but writing anything else is how you find out which
+/// header records it, but writing anything else is how you learn which
 /// implementations only pretend to read the field.
 pub const ENTRY_SIZE: u32 = 128;
 /// Entries in the array. 128 is the universal convention and what makes the

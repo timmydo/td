@@ -325,6 +325,7 @@ mod tests {
             "elfutils-x86-64-test",
             "btrfs-progs-x86-64-test",
             "td-boot-test",
+            "td-install-test",
             "hello-test",
             "rust-userland-auto-test",
         ] {
@@ -359,6 +360,7 @@ mod tests {
             ("elfutils-x86-64-test", 1),
             ("btrfs-progs-x86-64-test", 1),
             ("td-boot-test", 1),
+            ("td-install-test", 1),
             ("hello-test", 1),
             ("rust-userland-auto-test", 1),
         ] {

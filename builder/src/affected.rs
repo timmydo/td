@@ -326,6 +326,123 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
 /// so they share one name rather than each explaining itself.
 const DQUOTE: u8 = 0x22;
 
+/// Crates whose source a RECIPE stages for a target build from a hand-written
+/// file list, paired with that recipe. That list and the crate's `#[path]`
+/// includes live in different files and nothing but the scan below relates
+/// them: an include added without its `WriteFile` compiles under host cargo and
+/// fails an hour later inside recipe-checks.
+///
+/// Every crate whose recipe stages a `.rs` file, not only the two that reach
+/// `engine/src/` — the pair is what a `#[path]` include costs, and which TREE
+/// the included file lives in has nothing to do with it.
+/// `every_recipe_that_stages_rust_sources_is_in_the_roster` holds this to the
+/// tree, so an entry cannot be quietly omitted.
+const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
+    ("td-boot/src", "recipes/src/recipes/td-boot.rs"),
+    ("td-compositor/src", "recipes/src/recipes/td-compositor.rs"),
+    ("td-firstboot/src", "recipes/src/recipes/td-firstboot.rs"),
+    ("td-init/src", "recipes/src/recipes/td-init.rs"),
+    ("td-install/src", "recipes/src/recipes/td-install.rs"),
+    ("td-kexec/src", "recipes/src/recipes/td-kexec.rs"),
+    ("td-login/src", "recipes/src/recipes/td-login.rs"),
+    ("td-netd/src", "recipes/src/recipes/td-netd.rs"),
+    ("td-seatd/src", "recipes/src/recipes/td-seatd.rs"),
+    ("td-sh/src", "recipes/src/recipes/td-sh.rs"),
+    ("td-svc/src", "recipes/src/recipes/td-svc.rs"),
+    ("td-txt/src", "recipes/src/recipes/td-txt.rs"),
+    ("td-util/src", "recipes/src/recipes/td-util.rs"),
+];
+
+/// Where a `#[path]` include resolves to in a recipe's STAGED tree.
+///
+/// `#[path]` is relative to the including file's own directory, and these
+/// crates put every include in `<crate>/src/main.rs`, so the include is walked
+/// against the crate's src dir: `td-install/src` + `../../engine/src/gpt.rs`
+/// gives `engine/src/gpt.rs`, which a recipe must stage at
+/// `{src}/engine/src/gpt.rs` for the RELATIVE include to resolve at all.
+///
+/// `None` if the walk climbs above the repository root, which is not a path any
+/// recipe can stage.
+fn staged_destination(src_dir: &str, included: &str) -> Option<String> {
+    let mut parts: Vec<&str> = src_dir.split('/').filter(|p| !p.is_empty()).collect();
+    for part in included.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    Some(format!("{{src}}/{}", parts.join("/")))
+}
+
+/// `path` relative to the repository root, with `/` separators.
+fn repo_relative(root: &Path, path: &Path) -> Option<String> {
+    Some(path.strip_prefix(root).ok()?.to_string_lossy().replace('\\', "/"))
+}
+
+/// The DIRECTORY holding `path`, relative to the repository root. `#[path]`
+/// resolves against the including file's own directory, so this is what an
+/// include is walked from.
+fn repo_relative_dir(root: &Path, path: &Path) -> Option<String> {
+    repo_relative(root, path.parent()?)
+}
+
+/// Every `#[path = "…"]` in `text`, each paired with whether its item is gated
+/// on `cfg(test)`.
+///
+/// The gate may sit on either side of the `#[path]` — attributes on one item
+/// are unordered — so the whole contiguous run of attribute lines around it is
+/// read, not just the line before.
+fn path_includes(text: &str) -> Vec<(String, bool)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(rest) = line.split_once("#[path = \"").map(|(_, r)| r) else {
+            continue;
+        };
+        let Some((included, _)) = rest.split_once(DQUOTE as char) else {
+            continue;
+        };
+        let attr_run = |range: &mut dyn Iterator<Item = usize>| {
+            let mut gated = false;
+            for j in range {
+                let Some(l) = lines.get(j).map(|l| l.trim()) else {
+                    break;
+                };
+                if !l.starts_with("#[") {
+                    break;
+                }
+                gated |= l.contains("cfg(test)");
+            }
+            gated
+        };
+        let gated = attr_run(&mut (0..i).rev()) || attr_run(&mut (i.saturating_add(1)..lines.len()));
+        out.push((included.to_string(), gated));
+    }
+    out
+}
+
+/// Every `.rs` under `dir`, recursively. A non-recursive read would never look
+/// inside a `src/<dir>/mod.rs`.
+fn collect_rs_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+}
+
 /// `text` with `//` line comments removed, so a source scan sees CODE.
 ///
 /// The confinement scans below look for tokens that must not appear, and the
@@ -361,7 +478,7 @@ fn strip_line_comments(text: &str) -> String {
         for (i, byte) in bytes.iter().enumerate() {
             if *byte == DQUOTE {
                 quotes = quotes.saturating_add(1);
-            } else if quotes % 2 == 0
+            } else if quotes.is_multiple_of(2)
                 && *byte == b'/'
                 && bytes.get(i.saturating_add(1)) == Some(&b'/')
             {
@@ -893,15 +1010,17 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // td-install: the disk installer. Same standalone-crate shape as td-boot, and
     // it shares that crate's `protocol.rs` plus the engine GPT/FAT32/CRC-32
     // writers through `#[path]`, so host cargo is what holds its Rust rules and
-    // its layout tests. No `recipe-checks` yet: nothing builds it as a recipe, so
-    // routing there would run a check that cannot see it. The increment that adds
-    // the recipe adds that target here with it.
+    // its layout tests. `recipe-checks` joins them because `td-install.rs` now
+    // links the same source statically for the target and `td-install-test.rs`
+    // runs THAT binary over a real destination — a link regression and a
+    // signature written to the wrong offset are both invisible to host cargo.
     if pattern_matches(
         "td-install/*|td-install/src/*|td-install/Cargo.toml|td-install/Cargo.lock",
         p,
     ) {
         sel.add_preflight("cargo-test");
         sel.add_target("check");
+        sel.add_target("recipe-checks");
         return;
     }
 
@@ -1633,22 +1752,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // RECURSIVE, because a non-recursive read would never look inside
     // `td-boot/src/<dir>/mod.rs` — a module tree this crate does not have today
     // and which nothing stops it growing.
-    let boot_sources = root.join("td-boot/src");
     let mut boot_files = Vec::new();
-    let mut pending = vec![boot_sources.clone()];
-    while let Some(dir) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                boot_files.push(path);
-            }
-        }
-    }
+    collect_rs_recursive(&root.join("td-boot/src"), &mut boot_files);
     if boot_files.is_empty() {
         fail("td-boot/src has no .rs files to scan for the ed25519 split".to_string());
     }
@@ -1665,44 +1770,102 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
             ));
         }
     }
-    // Every engine source td-boot `#[path]`-includes must ALSO be staged by its
-    // recipe, which builds from a hand-written file list rather than from cargo.
-    // Those two lists are edited in different files and nothing related them: an
-    // include added without its `WriteFile` compiles here and fails only inside
-    // recipe-checks, an hour away. That is precisely the loop the landing which
-    // added this was splitting itself in two to avoid, so the correspondence is
-    // asserted rather than remembered.
-    match std::fs::read_to_string(root.join("recipes/src/recipes/td-boot.rs")) {
-        Ok(recipe) => {
-            for path in &boot_files {
-                let Ok(text) = std::fs::read_to_string(path) else {
+    // Every engine source a target-static crate `#[path]`-includes must ALSO be
+    // staged by that crate's recipe, which builds from a hand-written file list
+    // rather than from cargo. Those two lists are edited in different files and
+    // nothing related them: an include added without its `WriteFile` compiles
+    // here and fails only inside recipe-checks, an hour away. That is precisely
+    // the loop the landing which added this was splitting itself in two to
+    // avoid, so the correspondence is asserted rather than remembered.
+    //
+    // One entry per crate that has such a recipe. td-install joined td-boot with
+    // the recipe that builds it, and a crate MISSING from this roster is the
+    // failure it exists for — so the roster is checked against the tree below.
+    for (src_dir, recipe_path) in TARGET_STATIC_RECIPES {
+        let mut sources = Vec::new();
+        collect_rs_recursive(&root.join(src_dir), &mut sources);
+        if sources.is_empty() {
+            fail(format!("{src_dir} has no .rs files to check against {recipe_path}"));
+            continue;
+        }
+        // Comment-stripped, and that is not tidiness: a recipe's own prose
+        // explains what its `#[path]`-relative staging is FOR and names the
+        // files while doing it, so a scan over raw text is satisfied by the
+        // sentence that describes the staging rather than by the staging.
+        let recipe = match std::fs::read_to_string(root.join(recipe_path)) {
+            Ok(text) => strip_line_comments(&text),
+            Err(e) => {
+                fail(format!("cannot read {recipe_path}: {e}"));
+                continue;
+            }
+        };
+        // TEST-ONLY modules are not staged and must not be asked for: rustc
+        // builds these recipes without `--test`, so a `#[cfg(test)] #[path]`
+        // include is never compiled and its file has no business in the target
+        // tree. Collected first because the property is INHERITED — the includes
+        // inside a test-only module are test-only too, however they are written
+        // there (td-compositor's `term_spec.rs` reaches `engine/src/sha256.rs`).
+        let mut test_only: Vec<String> = Vec::new();
+        for path in &sources {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            for (included, gated) in path_includes(&strip_line_comments(&text)) {
+                if !gated {
                     continue;
-                };
-                for line in strip_line_comments(&text).lines() {
-                    let Some(rest) = line.split_once("#[path = \"").map(|(_, r)| r) else {
-                        continue;
-                    };
-                    let Some((included, _)) = rest.split_once(DQUOTE as char) else {
-                        continue;
-                    };
-                    let Some(file) = included.rsplit('/').next() else {
-                        continue;
-                    };
-                    if !included.contains("engine/src/") {
-                        continue;
-                    }
-                    if !recipe.contains(file) {
-                        fail(format!(
-                            "{} #[path]-includes engine/src/{file}, which \
-                             recipes/src/recipes/td-boot.rs does not stage — the \
-                             target build would fail in recipe-checks, not here",
-                            path.display()
-                        ));
+                }
+                if let Some(dir) = repo_relative_dir(root, path) {
+                    if let Some(dest) = staged_destination(&dir, &included) {
+                        test_only.push(dest);
                     }
                 }
             }
         }
-        Err(e) => fail(format!("cannot read recipes/src/recipes/td-boot.rs: {e}")),
+        for path in &sources {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let (Some(file_dir), Some(own)) =
+                (repo_relative_dir(root, path), repo_relative(root, path))
+            else {
+                continue;
+            };
+            // A file reached only under `cfg(test)` is itself test-only.
+            if test_only.iter().any(|t| *t == format!("{{src}}/{own}")) {
+                continue;
+            }
+            for (included, gated) in path_includes(&strip_line_comments(&text)) {
+                if gated {
+                    continue;
+                }
+                let src_dir = file_dir.as_str();
+                let included = included.as_str();
+                // The staged DESTINATION, not the file's name. A recipe names
+                // each source twice — `include_str!` to read it at compile time
+                // and `WriteFile` to stage it — and only the second is what the
+                // target build compiles, so a basename match is satisfied by the
+                // `include_str!` of a file the recipe no longer stages. The
+                // destination is also not a proxy for the requirement but IS it:
+                // the include is RELATIVE, so it resolves only if the staged
+                // tree mirrors the repository at exactly this path.
+                let Some(want) = staged_destination(src_dir, included) else {
+                    fail(format!(
+                        "{} #[path]-includes {included}, which climbs above the \
+                         repository root and cannot be staged",
+                        path.display()
+                    ));
+                    continue;
+                };
+                if !recipe.contains(&want) {
+                    fail(format!(
+                        "{} #[path]-includes {included}, which {recipe_path} \
+                         does not stage at {want} — the target build would \
+                         fail in recipe-checks, not here",
+                        path.display()
+                    ));
+                }
+            }
+        }
     }
     match std::fs::read_to_string(root.join("engine/src/ed25519.rs")) {
         Ok(verifier) => {
@@ -1885,6 +2048,11 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // assertion is the routing guard for its user-approved wl_shm unsafe exception.
     assert_preflight!("td-install/src/main.rs", "cargo-test");
     assert_target!("td-install/src/main.rs", "check");
+    // `td-install.rs` links this source statically for the target and
+    // `td-install-test.rs` runs THAT binary over a real destination, so a
+    // change here can break a target link or move a signature off its offset
+    // with host cargo entirely green.
+    assert_target!("td-install/src/main.rs", "recipe-checks");
     assert_preflight!("td-install/Cargo.lock", "cargo-test");
     assert_preflight!("td-install/Cargo.toml", "cargo-test");
     // The installer's own specification is documentation, as td-svc's and
@@ -3645,6 +3813,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `TARGET_STATIC_RECIPES` is complete, checked the direction that can go
+    /// silent.
+    ///
+    /// The scan it drives runs roster → recipe, so a crate whose recipe stages
+    /// Rust sources while the crate is absent from the roster is scanned by
+    /// nothing: its `#[path]` includes and its recipe's file list are free to
+    /// disagree again, which is the whole failure the scan exists for. So the
+    /// recipes are asked rather than the roster believed.
+    ///
+    /// The question asked of each recipe is whether it STAGES a `.rs` file —
+    /// a `"{src}/….rs"` destination — deliberately not whether it names an
+    /// `include_str!`. The include is a compile-time read of this repository
+    /// and can be spelled over several lines, through `concat!`, or by a
+    /// helper; the staged destination is the thing the scan goes on to look
+    /// for, so keying on it is what makes the two agree by construction.
+    #[test]
+    fn every_recipe_that_stages_rust_sources_is_in_the_roster() {
+        let dir = repo_root().join("recipes/src/recipes");
+        let mut recipes = Vec::new();
+        collect_rs_recursive(&dir, &mut recipes);
+        assert!(!recipes.is_empty(), "no recipes to scan");
+        let mut checked = 0usize;
+        for path in &recipes {
+            let text = strip_line_comments(&std::fs::read_to_string(path).unwrap());
+            let stages_rust = text.lines().any(|line| {
+                line.split("\"{src}/")
+                    .skip(1)
+                    .any(|rest| rest.split(DQUOTE as char).next().is_some_and(|p| p.ends_with(".rs")))
+            });
+            if !stages_rust {
+                continue;
+            }
+            let rel = path.strip_prefix(repo_root()).unwrap().to_string_lossy().replace('\\', "/");
+            assert!(
+                TARGET_STATIC_RECIPES.iter().any(|(_, r)| *r == rel),
+                "{rel} stages Rust sources but is not in TARGET_STATIC_RECIPES, \
+                 so nothing checks its file list against the crate's #[path] includes"
+            );
+            checked = checked.saturating_add(1);
+        }
+        // POSITIVE CONTROL: a scan that matched no recipe would pass whatever
+        // the roster said.
+        assert_eq!(
+            checked,
+            TARGET_STATIC_RECIPES.len(),
+            "the roster and the recipes that stage Rust sources are different sizes"
+        );
     }
 
     // DURABLE renderer guard (replaces the now-deleted shell differential — the

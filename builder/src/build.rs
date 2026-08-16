@@ -2698,6 +2698,31 @@ pub fn run_mesboot() -> Result<(), String> {
                 .expand(p.as_str().ok_or_else(|| err("mkDir: not a string".into()))?)
                 .map_err(err)?;
             fs::create_dir_all(&path).map_err(|e| err(format!("mkdir {path}: {e}")))?;
+        } else if let Some(o) = step.get("truncate") {
+            let path = ctx.expand(&field(o, "path")?).map_err(err)?;
+            let raw = field(o, "bytes")?;
+            let bytes: u64 = raw
+                .parse()
+                .map_err(|_| err(format!("truncate {path}: {raw:?} is not a byte count")))?;
+            if let Some(parent) = Path::new(&path).parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| err(format!("mkdir {}: {e}", parent.display())))?;
+            }
+            // Create-or-resize, and the length is READ BACK: `set_len` past a
+            // filesystem's limit is the failure a disk image cares about, and a
+            // destination shorter than asked for is a partition table written
+            // over the end of it.
+            let f = fs::File::create(&path)
+                .map_err(|e| err(format!("truncate {path}: create: {e}")))?;
+            f.set_len(bytes)
+                .map_err(|e| err(format!("truncate {path} to {bytes}: {e}")))?;
+            let got = f
+                .metadata()
+                .map_err(|e| err(format!("truncate {path}: stat: {e}")))?
+                .len();
+            if got != bytes {
+                return Err(err(format!("truncate {path}: asked {bytes}, got {got}")));
+            }
         } else if let Some(o) = step.get("patchShebangs") {
             let dir = ctx.expand(&field(o, "dir")?).map_err(err)?;
             let shell = ctx.expand(&field(o, "shell")?).map_err(err)?;

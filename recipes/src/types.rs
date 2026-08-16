@@ -148,6 +148,21 @@ pub enum Step {
     MkDir {
         path: String,
     },
+    /// Create `path` (or resize it) to exactly `bytes`, engine-native.
+    ///
+    /// A disk image is a file of a declared SIZE and almost entirely hole, and
+    /// the shell spelling of that is `dd … count=0 seek=N` — which needs a `dd`
+    /// no roster declares. `busybox-x86-64` serves a curated applet set and `dd`
+    /// is not in it, so a recipe reaching for one depends on the multicall
+    /// carrying an applet nothing checks. This is `set_len(2)`, which is what
+    /// that `dd` does and what an installer's destination needs.
+    ///
+    /// Sparse where the filesystem has holes, which every filesystem td builds
+    /// on does; a filesystem without them would allocate `bytes` for real.
+    Truncate {
+        path: String,
+        bytes: u64,
+    },
     /// Rewrite `#!/bin/sh`-style shebangs under dir to the given shell (the
     /// engine's own patch_shebangs — the sandbox has no /bin/sh).
     PatchShebangs {
@@ -343,6 +358,17 @@ impl Step {
                 ]),
             )]),
             Step::MkDir { path } => Json::Obj(vec![("mkDir".into(), Json::Str(path.clone()))]),
+            // The size goes over as a STRING, as every other number in this
+            // encoding does: a disk image is bigger than an f64 counts exactly,
+            // and a JSON number that rounded would be a destination of the wrong
+            // size with nothing to say so.
+            Step::Truncate { path, bytes } => Json::Obj(vec![(
+                "truncate".into(),
+                Json::Obj(vec![
+                    ("path".into(), Json::Str(path.clone())),
+                    ("bytes".into(), Json::Str(bytes.to_string())),
+                ]),
+            )]),
             Step::PatchShebangs { dir, shell } => Json::Obj(vec![(
                 "patchShebangs".into(),
                 Json::Obj(vec![

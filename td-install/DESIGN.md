@@ -72,8 +72,10 @@ are tmpfs.
 
 What is **missing**, and what this workstream is:
 
-- No partitioner and no installer. A machine is only ever reached by QEMU
-  `-kernel`, which is a development harness, not a way to boot hardware.
+- No installer on any IMAGE. `td-install` writes the layout and a recipe now
+  links it statically for the target, but nothing packs it anywhere a person
+  could run it, so a machine is still only ever reached by QEMU `-kernel` —
+  a development harness, not a way to boot hardware.
 - No bootloader, and nothing that writes an ESP.
 - No **authenticity**. Manifest hashes prove integrity and transaction
   completeness. They prove nothing about who produced the bundle: anyone who
@@ -82,7 +84,9 @@ What is **missing**, and what this workstream is:
 
 `engine/src/gpt.rs` + `engine/src/fat.rs` (with `engine/src/crc32.rs`)
 landed toward it and were consumed by nothing until §10 item 7a, which is
-the installer that writes what they produce.
+the installer that writes what they produce — and by a TARGET binary since
+7b's recipe, which is what makes them shipped code rather than host code
+that happens to compile.
 `engine/src/ed25519.rs` + `engine/src/sha512.rs` (verify-only, `aa347e60`)
 were in that list until §10 item 5: td-boot compiles them in, and since item
 6's flip the boot path CALLS them — no slot is selected whose manifest does
@@ -845,28 +849,73 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
 
    **7b** adds the Btrfs volume and the `mkfs.btrfs` binding D7 requires to
    land with the exec. **7c** delegates the publish to `td-boot install`.
-   `recipe-checks` joins td-install's route in whichever of those adds a
-   recipe that builds it; until then routing there would run a check that
-   cannot see the crate.
 
-   **OPEN, and 7b's first problem: writing a partition table does not make
-   Linux reread one.** On a block device the kernel keeps serving the
-   partition layout it already has, so `/dev/sda1` may not exist after a
-   layout on a blank disk, and may still have the OLD bounds after a
-   reinstall. Nothing in 7a needs it — the layout writes offsets on the
-   whole-disk descriptor it opened — but 7b execs `mkfs.btrfs` on the volume
-   partition and 7c publishes into it, and both need the kernel to agree
-   about where that partition is. This is not visible in the regular-file
-   tests and will not be: a file has no partition devices at all, which is
-   the one place D9's single code path genuinely stops.
+   7b is itself two commits, and the RECIPE is the first of them. D7's binding
+   is a build-time complaint about a missing program, so something has to
+   build td-install with `btrfs-progs` declared beside it — and today nothing
+   builds td-install at all. There is also no install image to pack it into,
+   so the roster check `td-boot/src/protocol.rs` already models for td-init
+   applets has no image to read; what it reads instead is td-install's own
+   declared inputs. The recipe is worth landing on its own for the reason item
+   5 was split off: a `#[path]`-including crate that only ever compiles on the
+   host has not been shown to compile for the target, and the recipe is also
+   the only place a test can EXEC `mkfs.btrfs`, since no host is required to
+   have one. `recipe-checks` joins td-install's route with that recipe.
 
-   The conventional mechanism is the `BLKRRPART` ioctl (`_IO(0x12, 95)`,
+   **SETTLED, and the granted permission is not spent: 7b uses no partition
+   device.** `mkfs.btrfs` writes a scratch image sized to the volume
+   partition, and td-install copies that image into the partition through the
+   whole-disk descriptor it already holds — which is exactly how it writes the
+   ESP today. `BLKRRPART` was authorised as an `UNSAFE.md` amendment and is
+   not needed, because it does not answer the question for BOTH destinations:
+   a regular file has no partition device to rescan, so the scratch-image path
+   has to exist regardless, and once it exists the ioctl buys a second code
+   path for the one destination the tests cannot reach. D9 settles it — an
+   installer whose tested path and shipped path differ is an installer tested
+   somewhere other than where it runs — and D8 survives intact.
+
+   Two properties of that copy belong here rather than only in the code. It
+   writes only the chunks of the image that are not entirely zero, because a
+   freshly made Btrfs is nearly all hole and copying the holes would be a
+   write of the whole volume. That skip has a consequence: bytes the image
+   leaves as holes are bytes the destination KEEPS, so a reinstall over
+   another filesystem would keep that filesystem's superblock — mkfs erases
+   those signatures by writing zeros, which in a sparse image are
+   indistinguishable from the holes around them. So the volume's first
+   `PARTITION_ALIGN_BYTES` are zeroed before the copy, which covers every
+   signature a probe looks for (XFS at 0, ext* at 1 KiB, Btrfs at 64 KiB) and
+   is the same bounded-prefix argument the ESP's metadata region already
+   makes. Btrfs's own superblock MIRRORS need no such care: they sit at fixed
+   offsets and the new mkfs writes each one the volume is large enough to
+   hold, so a stale mirror is always overwritten by its replacement.
+
+   The cost is a read of the whole image per install — memory bandwidth over a
+   sparse file, no I/O — which is the price of not adding a syscall. If that
+   ever matters, `SEEK_DATA` is the fix and is an amendment then.
+
+   **The problem it answers: writing a partition table does not make Linux
+   reread one.** On a block device the kernel keeps serving the partition
+   layout it already has, so `/dev/sda1` may not exist after a layout on a
+   blank disk, and may still have the OLD bounds after a reinstall. Nothing in
+   7a needs it — the layout writes offsets on the whole-disk descriptor it
+   opened — but formatting the volume and publishing into it both want the
+   kernel to agree about where that partition is. Neither is visible in the
+   regular-file tests and neither will be: a file has no partition devices at
+   all, which is the one place D9's single code path genuinely stops, and the
+   decision above is what stops it stopping.
+
+   The two rejected candidates, so a later reader does not re-derive them. The
+   conventional mechanism is the `BLKRRPART` ioctl (`_IO(0x12, 95)`,
    `block/ioctl.c`), which needs `CAP_SYS_ADMIN`, must be issued on the whole
    disk rather than a partition, and returns EBUSY from
    `disk_scan_partitions` if ANY partition is currently open — so a reinstall
-   onto a disk with something mounted cannot rescan at all. D8 forbids it
-   without an `UNSAFE.md` amendment, since an ioctl is not reachable from
-   safe `std` and would make `td-install` a NINTH entry on that roster.
+   onto a disk with something mounted cannot rescan at all. The owner
+   AUTHORISED that amendment; it is declined rather than unavailable, because
+   it would make `td-install` a ninth entry on `UNSAFE.md`'s roster to serve
+   the one destination the tests cannot reach. A loop device over the
+   partition's byte range is the other, and it needs `LOOP_SET_STATUS64` for
+   the offset — another ioctl, so it trades the surface rather than avoiding
+   it.
 
    One tempting way out does not exist, and is written down because it reads
    like it should: the kernel does NOT rescan when the last writable
@@ -876,17 +925,6 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    itself, and nbd — and `bdev_release` is not among them. It syncs and
    flushes media-change events and nothing else. The rescan on open fires
    only if that flag is already set.
-
-   So 7b chooses between amending `UNSAFE.md` for one ioctl, a loop device
-   over the partition's byte range (which needs `LOOP_SET_STATUS64` for the
-   offset, another ioctl, so it trades the surface rather than avoiding it),
-   and using NO partition device at all: `mkfs.btrfs` into a file sized to
-   the partition, then those bytes written at the partition offset through
-   the whole-disk descriptor td-install already holds — which is exactly how
-   it writes the ESP today, and the only one of the three that keeps both D8
-   and D9 intact. Whichever it is gets recorded here before 7b execs
-   anything, rather than discovered in a diff, which is what D8's last
-   sentence asks for.
 8. **The EFI-stub kernel** (§5): `CONFIG_EFI`, `CONFIG_EFI_STUB`,
    `CONFIG_CMDLINE` in `linux-x86-64.rs`, having first confirmed what
    `CONFIG_EFI` drags in on the pinned tree.
