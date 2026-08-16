@@ -580,7 +580,6 @@ xfail builtin-printf.test.sh::printf octal backslash escapes
 xfail builtin-process.test.sh::arg that would overflow 64 bits is detected
 xfail builtin-process.test.sh::exec -- 2>&1
 xfail builtin-process.test.sh::exec builtin
-xfail builtin-process.test.sh::time with brace group argument
 xfail builtin-process.test.sh::ulimit -f 1 prevents files larger 512 bytes
 xfail builtin-process.test.sh::ulimit -n limits file descriptors
 xfail builtin-process.test.sh::ulimit accepts 'unlimited'
@@ -905,8 +904,6 @@ xfail parse-errors.test.sh::Bad var sub caught at parse time
 xfail parse-errors.test.sh::Long Token - 65535 bytes
 xfail parse-errors.test.sh::Token that's too long for Oils - 65536 bytes
 xfail parse-errors.test.sh::empty clause in [[
-xfail parse-errors.test.sh::{ is its own word, needs a space
-xfail parse-errors.test.sh::} is a parse error
 xfail pipeline.test.sh::Pipeline comments
 xfail pipeline.test.sh::Pipeline in eval
 xfail posix.test.sh::Command substitution in default
@@ -1013,7 +1010,6 @@ xfail tilde.test.sh::temp assignment x=~ env
 xfail tilde.test.sh::tilde expansion an assignment keyword
 xfail tilde.test.sh::x=${undef-~:~}
 xfail tilde.test.sh::~ expansion in readonly assignment
-xfail toysh-posix.test.sh::Can't parse extra }
 xfail toysh-posix.test.sh::IFS
 xfail toysh-posix.test.sh::IFS - http://landley.net/notes.html#15-02-2020 (TODO: osh)
 xfail toysh-posix.test.sh::IFS 2 - copied into spec/word-split

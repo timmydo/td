@@ -200,7 +200,10 @@ pub enum Cmd {
     /// own, kept because it is not the body's: dash reports `$LINENO` inside a
     /// function RELATIVE to it (`funcline`, eval.c:996).
     FuncDef {
-        name: String,
+        /// `None` for a definition nothing can ever name -- a quoted or
+        /// expanded one, or one carrying a `/`. Parsed and not registered,
+        /// which is ash's own unreachable definition observably.
+        name: Option<String>,
         /// A `Stage` and not a bare `Cmd` because the body is a command node
         /// too, and a compound's OWN line is what its header expands under:
         /// `f() for x in "$LINENO"; do …` is the definition's line in dash,

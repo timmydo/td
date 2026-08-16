@@ -91,12 +91,14 @@ fn is_cond_unary(w: &str) -> bool {
 /// refuses rather than running: `while :; do fi; done` is a syntax error there
 /// and an ENDLESS `fi: not found` without this. `case`/`if`/`for`/`while`/
 /// `until`/`{` are absent because each does start one.
-///
-/// `}` is absent for a different reason and only until `function name { … }`
-/// is a construct here: ash takes that spelling, this shell reads its `}` at a
-/// command position, and refusing would stop a script that merely CONTAINS one
-/// in a branch it never runs.
-const CANNOT_START_COMMAND: &[&str] = &["then", "else", "elif", "fi", "do", "done", "esac", "in"];
+const CANNOT_START_COMMAND: &[&str] =
+    &["then", "else", "elif", "fi", "do", "done", "esac", "in", "}"];
+
+/// What ash takes as the body of a `function NAME` written WITHOUT parentheses
+/// (ash.c:12132). `[[` is on it because this build has BASH_TEST2; a word, a
+/// `!`, a redirection or a nested definition is a syntax error there rather
+/// than a body.
+const FUNCTION_BODY_OPENS: &[&str] = &["{", "if", "case", "until", "while", "for", "[["];
 
 /// Reserved words. dash resolves these BEFORE aliases, so `alias if=…` never fires
 /// where a keyword is recognized.
@@ -118,6 +120,7 @@ pub fn is_reserved(w: &str) -> bool {
             | "{"
             | "}"
             | "!"
+            | "function"
     )
 }
 
@@ -775,6 +778,7 @@ impl Units {
             Some("until") => return self.parse_loop(true),
             Some("for") => return self.parse_for(),
             Some("case") => return self.parse_case(),
+            Some("function") => return self.parse_function_word_def(),
             Some("{") => {
                 self.bump();
                 let body = self.parse_list(&["}"])?;
@@ -1002,17 +1006,94 @@ impl Units {
         // The body is a command position like any other, so an alias may supply it:
         // `alias B='{ echo yes; }'` then `f()` / `B`.
         self.open_command()?;
+        self.func_body(Some(name), line)
+    }
+
+    /// The body both spellings share, its position already opened by the
+    /// caller. They share it because ash does: `()` clears the `function` flag
+    /// and reaches the same `do_func` the bare form does (ash.c:12163).
+    fn func_body(&mut self, name: Option<String>, line: u32) -> Syn<Cmd> {
         let body = self.staged()?;
         if matches!(body.cmd, Cmd::Simple { .. }) {
-            return Err(format!(
-                "syntax error: the body of function `{name}` must be a compound command"
-            ));
+            return Err(match &name {
+                Some(n) => {
+                    format!("syntax error: the body of function `{n}` must be a compound command")
+                }
+                None => "syntax error: a function body must be a compound command".to_string(),
+            });
         }
         Ok(Cmd::FuncDef {
             name,
             body: Arc::new(body),
             line,
         })
+    }
+
+    /// `function NAME [()] <compound>` — bash's spelling, which ash takes when
+    /// built with BASH_FUNCTION and the reference build is. WITH the
+    /// parentheses ash clears its `function_flag` (ash.c:12144) and rejoins the
+    /// ordinary `NAME()` path; without them only `FUNCTION_BODY_OPENS` follows,
+    /// and the NAME is any word rather than an `is_name` one either way.
+    fn parse_function_word_def(&mut self) -> Syn<Cmd> {
+        self.bump();
+        // ash reads the NAME with `savecheckkwd` (ash.c:12085), which is
+        // CHKALIAS and not CHKKWD: an alias fires here, a keyword does not.
+        self.check_alias(Chk::Word)?;
+        // The `)`'s line for the bare spelling, so the NAME's here: taking it
+        // anywhere later makes the two disagree about `$LINENO` in a body.
+        let mut line = self.line();
+        // `plain` is None for a quoted or expanded name, which ash takes as
+        // readily -- see `FuncDef::name`. The assignment test is asked of the
+        // WORD, since `a="$x"` is that shape too.
+        let taken = match self.peek() {
+            Some(Tok::Word(w)) => Some((w.plain().map(str::to_string), as_assignment(w).is_some())),
+            _ => None,
+        };
+        let Some((name, assignment)) = taken else {
+            // Only an input that ENDED is incomplete: that marker is the
+            // interactive reader's request for another line, and no line can
+            // rescue `function ;`.
+            return Err(if self.at_eof() {
+                format!("{INCOMPLETE}: expected a function name")
+            } else {
+                format!(
+                    "syntax error: expected a function name, found {}",
+                    self.describe()
+                )
+            });
+        };
+        // ash files an assignment-shaped name as a VARIABLE, leaving `do_func`
+        // (ash.c:12163) without the one argument it tests for.
+        if assignment {
+            return Err(format!(
+                "syntax error: expected a function name, found {}",
+                self.describe()
+            ));
+        }
+        // A command word with a `/` in it is never a function LOOKUP, so a
+        // definition under one is as unreachable as an unspellable name.
+        let name = name.filter(|n| !n.contains('/'));
+        self.bump();
+        // CHKNL|CHKKWD (ash.c:12133): newlines are skipped and an alias does
+        // NOT fire. The `()` spelling rejoins the ordinary path below, where
+        // one does.
+        self.skip_newlines();
+        if self.peek_op() == Some(Op::LParen) {
+            self.bump();
+            line = self.line();
+            self.expect_op(Op::RParen)?;
+            self.open_command()?;
+        } else if !self
+            .peek_reserved()
+            .is_some_and(|w| FUNCTION_BODY_OPENS.contains(&w))
+        {
+            return Err(if self.at_eof() {
+                format!("{INCOMPLETE}: expected a function body")
+            } else {
+                format!("syntax error: expected a function body, found {}", self.describe())
+            });
+        }
+        self.func_body(name, line)
     }
 
     fn parse_if(&mut self) -> Syn<Cmd> {
@@ -1443,6 +1524,19 @@ mod tests {
         }
     }
 
+    /// `INCOMPLETE` is the interactive reader's request for another line, so a
+    /// token that is merely WRONG must not carry it -- `parse_probe` would go
+    /// to PS2 and never come back.
+    #[test]
+    fn only_a_name_that_never_arrived_is_incomplete() {
+        let ended = parse("function").unwrap_err();
+        assert!(ended.starts_with(INCOMPLETE), "{ended}");
+        for src in ["function ;", "function |", "function (", "function <f", "function\n"] {
+            let e = parse(src).unwrap_err();
+            assert!(!e.starts_with(INCOMPLETE), "{src:?}: {e}");
+        }
+    }
+
     #[test]
     fn function_definition_requires_a_compound_body() -> Syn<()> {
         let src = "f() { echo hi; }";
@@ -1450,7 +1544,7 @@ mod tests {
         let Cmd::FuncDef { name, .. } = &cmd else {
             return Err(wrong(src, &cmd));
         };
-        assert_eq!(name, "f");
+        assert_eq!(name.as_deref(), Some("f"));
         assert!(parse("f() echo hi").is_err());
         Ok(())
     }

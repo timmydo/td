@@ -1277,13 +1277,15 @@ fn run_command_inner(sh: &mut Shell, cmd: &Cmd) -> R<()> {
             redirs,
         } => with_redirs(sh, redirs, |sh| run_case(sh, word, items)),
         Cmd::FuncDef { name, body, line } => {
-            sh.funcs.insert(
-                name.clone(),
-                Func {
-                    line: *line,
-                    body: body.clone(),
-                },
-            );
+            if let Some(name) = name {
+                sh.funcs.insert(
+                    name.clone(),
+                    Func {
+                        line: *line,
+                        body: body.clone(),
+                    },
+                );
+            }
             sh.set_status(0);
             Ok(())
         }
@@ -3899,7 +3901,7 @@ mod tests {
     /// against busybox ash 1.37.0, whose wording this matches byte for byte.
     #[test]
     fn a_word_that_only_closes_a_construct_cannot_start_a_command() {
-        for w in ["then", "else", "elif", "fi", "do", "done", "esac", "in"] {
+        for w in ["then", "else", "elif", "fi", "do", "done", "esac", "in", "}"] {
             let (status, out, err) = run(w);
             assert_eq!((status, out.as_str()), (2, ""), "{w}");
             assert_eq!(err, format!("td-sh: syntax error: unexpected \"{w}\"\n"), "{w}");
@@ -3951,13 +3953,145 @@ mod tests {
         for src in ["echo `fi`", "echo `echo a; done`", "echo `}`"] {
             assert_eq!(run(src).0, 0, "{src:?} must not stop the script");
         }
-        // `}` is off the roster until `function name { … }` is a construct: ash
-        // takes that spelling, and refusing its `}` stops a script that only
-        // CONTAINS one in a branch never taken.
+        // `}` is a closing word again because `function name { … }` is a
+        // construct now; before it was, refusing that `}` stopped a script
+        // that only CONTAINED one in a branch never taken.
         assert_eq!(
             run("if false; then function f { :; }; fi; echo alive"),
             (0, "alive\n".to_string(), String::new())
         );
+    }
+
+    /// `function NAME [()] <compound>` is bash's spelling and ash takes it, the
+    /// reference build carrying BASH_FUNCTION. It is what lets `}` be a closing
+    /// word: without the construct, the brace ending one of these reached a
+    /// command position and refusing it stopped the whole script.
+    /// Measured against busybox ash 1.37.0.
+    #[test]
+    fn the_function_keyword_defines_one_as_the_bare_name_does() {
+        for (src, want) in [
+            ("function f { echo x; }; f", "x\n"),
+            ("function f() { echo x; }; f", "x\n"),
+            // Any compound command is a body, not only a group.
+            ("function f case x in x) echo c;; esac; f", "c\n"),
+            ("function f if :; then echo i; fi; f", "i\n"),
+            ("function f for i in 1; do echo $i; done; f", "1\n"),
+            ("function f while false; do :; done; f", ""),
+            ("function f until :; do :; done; f", ""),
+            ("function f [[ -n x ]]; f", ""),
+            // ash reads what follows the name with CHKNL, so the `()` and the
+            // body may each start on the next line.
+            ("function f\n{ echo x; }\nf", "x\n"),
+            ("function f\n() { echo x; }\nf", "x\n"),
+            ("function f ()\n{ echo x; }\nf", "x\n"),
+            // The body takes redirections, as the bare spelling's does.
+            ("function f { echo x; } >/dev/null\nf; echo done", "done\n"),
+            // `=` makes an assignment only where a NAME precedes it, so this
+            // name is not one and does define.
+            ("function 1f=b { echo x; }; 1f=b", "x\n"),
+            // ash reads the NAME with CHKALIAS and not CHKKWD, so an alias
+            // fires there -- even one named for a keyword -- and may supply the
+            // `()` and the body with it.
+            ("alias N=f\nfunction N { echo BODY; }\nunalias N\nf", "BODY\n"),
+            ("alias fi=g\nfunction fi { echo BODY; }\nunalias fi\ng", "BODY\n"),
+            ("alias N=\"f() { echo BODY; }\"\nfunction N\nf", "BODY\n"),
+            // The BODY position takes one only through the `()` spelling, which
+            // rejoins the ordinary path; without it ash reads that token with
+            // no CHKALIAS at all.
+            ("alias B='{ echo BODY; }'\nfunction f() B\nf", "BODY\n"),
+            // The NAME is any word here, where the bare spelling needs a
+            // `is_name` one -- both of these define under ash and neither is
+            // a name.
+            ("function 1f { echo x; }; 1f", "x\n"),
+            ("function f-g { echo x; }; f-g", "x\n"),
+            // ... and `function` is a keyword only where a command starts.
+            // `type`/`command -v` report it as one, and an alias may not take
+            // its place, which is what `is_reserved` is for.
+            ("type function", "function is a shell keyword\n"),
+            ("command -v function", "function\n"),
+            ("echo function", "function\n"),
+            ("function=1; echo $function", "1\n"),
+            ("echo function f", "function f\n"),
+        ] {
+            assert_eq!(run(src), (0, want.to_string(), String::new()), "{src:?}");
+        }
+        // A RESERVED word is a name here, where the bare spelling refuses it:
+        // `function fi { …; }` defines one under ash and `fi() { …; }` does
+        // not, the second's name sitting at a command position. Calling it
+        // still needs the keyword not to win, which it always does.
+        assert_eq!(
+            run("function fi { echo x; }; echo defined"),
+            (0, "defined\n".to_string(), String::new())
+        );
+        assert_eq!(run("fi() { echo x; }").0, 2, "the bare spelling refuses it");
+        // A QUOTED or EXPANDED name is taken as readily -- refusing would stop
+        // a whole script ash runs -- and so is one carrying a `/`. None of the
+        // three can be called afterwards.
+        for src in [
+            "function \"myfunc\" { echo x; }; echo after",
+            "function $undef { echo x; }; echo after",
+            "function f/g { echo x; }; echo after",
+        ] {
+            assert_eq!(run(src), (0, "after\n".to_string(), String::new()), "{src:?}");
+        }
+        for src in ["function \"myfunc\" { echo x; }; myfunc", "function f/g { echo x; }; f/g"] {
+            assert_eq!(run(src).0, 127, "{src:?}");
+        }
+        assert_eq!(run("function f/g { echo x; }; type f/g").0, 127);
+        // What is measured against ash here is that the three spellings AGREE;
+        // the number is dash's, whose relative rule this shell follows for a
+        // definition's line, and ash says 4.
+        for def in ["function f", "function f ()", "f()"] {
+            assert_eq!(run(&format!(":\n:\n{def}\n{{\n  echo $LINENO\n}}\nf")).1, "3\n", "{def}");
+        }
+        // Without the parentheses the body must OPEN with one of ash's seven
+        // words, which a nested definition, a `!` and a redirection are not;
+        // `(` after the name opens the OPTIONAL `()`, so a subshell cannot be
+        // written as a body there -- ash refuses the word inside it. An
+        // assignment-shaped name is refused too, ash filing it as a variable
+        // rather than as the definition's one argument.
+        for src in [
+            "function f echo x",
+            "function f (echo s)",
+            "function f\n( echo s )",
+            "function f function g { echo x; }",
+            "function f f2() { echo x; }",
+            "function f ! true",
+            "function f >out { echo x; }",
+            "function a=b { echo x; }",
+            "function f= { echo x; }",
+            // An assignment whose VALUE is quoted or expanded is still one:
+            // ash asks of the word, and so must this.
+            "function a=\"$x\" { echo x; }",
+            "function a=$x { echo x; }",
+            "alias B='{ echo BODY; }'\nfunction f B",
+            "alias function=echo\nfunction hi\necho AFTER",
+            "function ;",
+            "function | cat",
+            "function\n{ echo x; }",
+        ] {
+            let (status, out, err) = run(src);
+            assert_eq!((status, out.as_str()), (2, ""), "{src:?}");
+            // A HARD error, not the marker the interactive reader reads as a
+            // request for another line: no continuation rescues `function ;`,
+            // and PS2 would ask for one forever.
+            assert!(err.contains("syntax error"), "{src:?}: {err}");
+            assert!(!err.contains(crate::ast::INCOMPLETE), "{src:?}: {err}");
+        }
+        // Only an input that ENDED is incomplete. A newline may follow
+        // `function f` and complete it; after the bare word one may NOT, and
+        // the marker means only that the name has not arrived -- the
+        // interactive reader has appended the newline before it probes, so a
+        // prompt takes the hard error above.
+        for src in ["function", "function f"] {
+            let (status, _, err) = run(src);
+            assert_eq!(status, 2, "{src:?}");
+            assert!(err.contains(crate::ast::INCOMPLETE), "{src:?}: {err}");
+        }
+        // WITH the parentheses ash rejoins the ordinary path, so the two
+        // spellings answer a body together -- including where this shell still
+        // refuses a simple one that ash takes.
+        assert_eq!(run("function f() echo x").0, run("f() echo x").0);
     }
 
     /// A `)` that ends a case PATTERN closes no substitution. It is the one
