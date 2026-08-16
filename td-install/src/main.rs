@@ -166,7 +166,7 @@ fn logical_sector_size(file: &File) -> io::Result<u64> {
     }
     if !metadata.file_type().is_block_device() {
         return Err(invalid(
-            "td-install: a destination must be a regular file or a block device".to_string(),
+            "a destination must be a regular file or a block device".to_string(),
         ));
     }
     let (major, minor) = device_numbers(metadata.st_rdev());
@@ -247,11 +247,11 @@ fn align_up(sectors: u64, align: u64) -> Option<u64> {
 /// an exclusive end written into that field is an off-by-one no reader detects.
 fn plan(sector_size: u64, disk_bytes: u64) -> Result<Plan, String> {
     if sector_size == 0 {
-        return Err("td-install: the destination reports a sector size of 0".to_string());
+        return Err("the destination reports a sector size of 0".to_string());
     }
     if !disk_bytes.is_multiple_of(sector_size) {
         return Err(format!(
-            "td-install: destination is {disk_bytes} bytes, not a whole number of \
+            "destination is {disk_bytes} bytes, not a whole number of \
              {sector_size}-byte sectors"
         ));
     }
@@ -259,14 +259,14 @@ fn plan(sector_size: u64, disk_bytes: u64) -> Result<Plan, String> {
     let minimum = gpt::minimum_disk_sectors(sector_size)?;
     if disk_sectors < minimum {
         return Err(format!(
-            "td-install: destination holds {disk_sectors} sectors, and a GPT alone \
+            "destination holds {disk_sectors} sectors, and a GPT alone \
              needs {minimum}"
         ));
     }
     let align = protocol::PARTITION_ALIGN_BYTES / sector_size;
     if align == 0 {
         return Err(format!(
-            "td-install: a {sector_size}-byte sector is larger than the \
+            "a {sector_size}-byte sector is larger than the \
              {}-byte partition alignment",
             protocol::PARTITION_ALIGN_BYTES
         ));
@@ -275,23 +275,23 @@ fn plan(sector_size: u64, disk_bytes: u64) -> Result<Plan, String> {
     let last_usable = gpt::last_usable_lba(sector_size, disk_sectors)?;
 
     let esp_start = align_up(first_usable, align)
-        .ok_or_else(|| "td-install: aligning the ESP start overflowed".to_string())?;
+        .ok_or_else(|| "aligning the ESP start overflowed".to_string())?;
     let esp_sectors = protocol::ESP_BYTES / sector_size;
     let esp_end = esp_start
         .checked_add(esp_sectors)
         .and_then(|end| end.checked_sub(1))
-        .ok_or_else(|| "td-install: the ESP does not fit in an LBA".to_string())?;
+        .ok_or_else(|| "the ESP does not fit in an LBA".to_string())?;
 
     let volume_start = align_up(
         esp_end
             .checked_add(1)
-            .ok_or_else(|| "td-install: the volume start overflowed".to_string())?,
+            .ok_or_else(|| "the volume start overflowed".to_string())?,
         align,
     )
-    .ok_or_else(|| "td-install: aligning the volume start overflowed".to_string())?;
+    .ok_or_else(|| "aligning the volume start overflowed".to_string())?;
     if volume_start > last_usable {
         return Err(format!(
-            "td-install: destination is too small — the ESP alone reaches LBA \
+            "destination is too small — the ESP alone reaches LBA \
              {esp_end} and the last usable LBA is {last_usable}"
         ));
     }
@@ -302,7 +302,7 @@ fn plan(sector_size: u64, disk_bytes: u64) -> Result<Plan, String> {
     let volume_bytes = volume_sectors.saturating_mul(sector_size);
     if volume_bytes < protocol::MIN_VOLUME_BYTES {
         return Err(format!(
-            "td-install: the td volume would be {volume_bytes} bytes and needs at \
+            "the td volume would be {volume_bytes} bytes and needs at \
              least {} — a disk this size cannot hold two deployments",
             protocol::MIN_VOLUME_BYTES
         ));
@@ -356,7 +356,7 @@ fn zero_at(file: &mut File, offset: u64, len: u64) -> io::Result<()> {
         let take = usize::try_from(remaining.min(span as u64)).unwrap_or(span);
         let chunk = zeros
             .get(..take)
-            .ok_or_else(|| invalid("td-install: zero chunk out of range".to_string()))?;
+            .ok_or_else(|| invalid("zero chunk out of range".to_string()))?;
         file.write_all(chunk)?;
         remaining -= take as u64;
     }
@@ -445,16 +445,16 @@ fn run_layout(destination: &Path, out: &mut dyn Write) -> io::Result<()> {
 
     let esp_offset = plan
         .esp_offset()
-        .ok_or_else(|| invalid("td-install: the ESP offset overflowed".to_string()))?;
+        .ok_or_else(|| invalid("the ESP offset overflowed".to_string()))?;
     let esp_sectors = plan
         .esp_sectors()
-        .ok_or_else(|| invalid("td-install: the ESP length overflowed".to_string()))?;
+        .ok_or_else(|| invalid("the ESP length overflowed".to_string()))?;
     let esp_start_lba = u32::try_from(plan.esp_start).map_err(|_| {
-        invalid("td-install: the ESP starts past what a FAT32 BPB can record".to_string())
+        invalid("the ESP starts past what a FAT32 BPB can record".to_string())
     })?;
     let volume = fat::Volume {
         bytes_per_sector: u32::try_from(sector_size)
-            .map_err(|_| invalid("td-install: sector size exceeds a FAT32 BPB".to_string()))?,
+            .map_err(|_| invalid("sector size exceeds a FAT32 BPB".to_string()))?,
         total_sectors: esp_sectors,
         hidden_sectors: esp_start_lba,
         // Derived from the ESP's own GUID rather than from a clock, so the same
@@ -466,7 +466,7 @@ fn run_layout(destination: &Path, out: &mut dyn Write) -> io::Result<()> {
     };
     let esp = fat::build(&volume).map_err(invalid)?;
     let metadata = metadata_bytes(&esp)
-        .ok_or_else(|| invalid("td-install: the ESP metadata region overflowed".to_string()))?;
+        .ok_or_else(|| invalid("the ESP metadata region overflowed".to_string()))?;
     // The region is exactly tight — today's last extent ENDS on it — so this is
     // the invariant the comment on `metadata_bytes` is really claiming, checked
     // rather than reasoned. A root directory needing a second cluster (item 8
@@ -480,10 +480,10 @@ fn run_layout(destination: &Path, out: &mut dyn Write) -> io::Result<()> {
             let end = extent.offset.checked_add(extent.bytes.len() as u64)?;
             Some(high.max(end))
         })
-        .ok_or_else(|| invalid("td-install: an ESP extent overflowed".to_string()))?;
+        .ok_or_else(|| invalid("an ESP extent overflowed".to_string()))?;
     if written > metadata {
         return Err(invalid(format!(
-            "td-install: the ESP zeroes {metadata} bytes but fat::build writes up \
+            "the ESP zeroes {metadata} bytes but fat::build writes up \
              to {written} — the zeroed region no longer covers the metadata it \
              must (see metadata_bytes)"
         )));
@@ -509,7 +509,7 @@ fn run_layout(destination: &Path, out: &mut dyn Write) -> io::Result<()> {
     for extent in &esp.extents {
         let at = esp_offset
             .checked_add(extent.offset)
-            .ok_or_else(|| invalid("td-install: an ESP extent overflowed".to_string()))?;
+            .ok_or_else(|| invalid("an ESP extent overflowed".to_string()))?;
         write_at(&mut file, at, &extent.bytes)?;
     }
     file.sync_all()?;
@@ -532,11 +532,11 @@ fn run_layout(destination: &Path, out: &mut dyn Write) -> io::Result<()> {
     // with nothing on either line to say which it got.
     let esp = plan
         .esp_offset()
-        .ok_or_else(|| invalid("td-install: the ESP offset overflowed".to_string()))?;
+        .ok_or_else(|| invalid("the ESP offset overflowed".to_string()))?;
     let volume = plan
         .volume_start
         .checked_mul(plan.sector_size)
-        .ok_or_else(|| invalid("td-install: the volume offset overflowed".to_string()))?;
+        .ok_or_else(|| invalid("the volume offset overflowed".to_string()))?;
     writeln!(out, "{esp} {volume}")
 }
 
@@ -551,14 +551,14 @@ fn table_ranges(sector_size: u64, disk_sectors: u64) -> Result<[(u64, u64); 2], 
     let primary_sectors = gpt::first_usable_lba(sector_size)?;
     let backup_sectors = entries
         .checked_add(1)
-        .ok_or_else(|| "td-install: the backup table length overflowed".to_string())?;
+        .ok_or_else(|| "the backup table length overflowed".to_string())?;
     let backup_start = disk_sectors
         .checked_sub(backup_sectors)
-        .ok_or_else(|| "td-install: the disk is too small to hold a backup table".to_string())?;
+        .ok_or_else(|| "the disk is too small to hold a backup table".to_string())?;
     let bytes = |sectors: u64| {
         sectors
             .checked_mul(sector_size)
-            .ok_or_else(|| "td-install: a table range overflowed".to_string())
+            .ok_or_else(|| "a table range overflowed".to_string())
     };
     Ok([
         (0, bytes(primary_sectors)?),
@@ -568,7 +568,7 @@ fn table_ranges(sector_size: u64, disk_sectors: u64) -> Result<[(u64, u64); 2], 
 
 fn read_at(file: &mut File, offset: u64, len: u64) -> io::Result<Vec<u8>> {
     let len = usize::try_from(len)
-        .map_err(|_| invalid("td-install: a table range exceeds this address space".to_string()))?;
+        .map_err(|_| invalid("a table range exceeds this address space".to_string()))?;
     let mut bytes = vec![0u8; len];
     file.seek(SeekFrom::Start(offset))?;
     file.read_exact(&mut bytes)?;
@@ -594,7 +594,7 @@ fn volume_region(file: &mut File, sector_size: u64, disk_sectors: u64) -> io::Re
     // table that was copied from one rather than written on this one.
     if table.disk_sectors != disk_sectors {
         return Err(invalid(format!(
-            "td-install: the table describes a {}-sector disk, not the {disk_sectors} sectors \
+            "the table describes a {}-sector disk, not the {disk_sectors} sectors \
              this destination has",
             table.disk_sectors
         )));
@@ -622,27 +622,27 @@ fn volume_region(file: &mut File, sector_size: u64, disk_sectors: u64) -> io::Re
     }
     if matches > 1 {
         return Err(invalid(format!(
-            "td-install: this disk has {matches} partitions named {}",
+            "this disk has {matches} partitions named {}",
             protocol::VOLUME_PARTITION_NAME
         )));
     }
     let part = found.ok_or_else(|| {
         invalid(format!(
-            "td-install: no {} partition on this disk — run `layout` first",
+            "no {} partition on this disk — run `layout` first",
             protocol::VOLUME_PARTITION_NAME
         ))
     })?;
     let offset = part
         .start_lba
         .checked_mul(sector_size)
-        .ok_or_else(|| invalid("td-install: the volume offset overflowed".to_string()))?;
+        .ok_or_else(|| invalid("the volume offset overflowed".to_string()))?;
     // INCLUSIVE end, as GPT stores it.
     let len = part
         .end_lba
         .checked_sub(part.start_lba)
         .and_then(|span| span.checked_add(1))
         .and_then(|sectors| sectors.checked_mul(sector_size))
-        .ok_or_else(|| invalid("td-install: the volume length overflowed".to_string()))?;
+        .ok_or_else(|| invalid("the volume length overflowed".to_string()))?;
     // ...and the region must not overlap either copy of the TABLE that named
     // it. `gpt::parse` bounds partitions by the header's OWN `first_usable` and
     // `last_usable`, which are fields in the same table — so a table declaring
@@ -654,7 +654,7 @@ fn volume_region(file: &mut File, sector_size: u64, disk_sectors: u64) -> io::Re
     let end = offset.saturating_add(len);
     if offset < primary_end || end > backup.0 {
         return Err(invalid(format!(
-            "td-install: the volume at {offset}..{end} overlaps a partition table \
+            "the volume at {offset}..{end} overlaps a partition table \
              ({}..{primary_end} and {}..)",
             primary.0, backup.0
         )));
@@ -700,12 +700,12 @@ fn copy_sparse(
         let take = usize::try_from(to.saturating_sub(at).min(span as u64)).unwrap_or(span);
         let chunk = buffer
             .get_mut(..take)
-            .ok_or_else(|| invalid("td-install: copy chunk out of range".to_string()))?;
+            .ok_or_else(|| invalid("copy chunk out of range".to_string()))?;
         image.read_exact(chunk)?;
         if chunk.iter().any(|byte| *byte != 0) {
             let dest = offset
                 .checked_add(at)
-                .ok_or_else(|| invalid("td-install: a copy offset overflowed".to_string()))?;
+                .ok_or_else(|| invalid("a copy offset overflowed".to_string()))?;
             write_at(file, dest, chunk)?;
             written = written.saturating_add(take as u64);
         }
@@ -741,7 +741,7 @@ fn zero_edges(file: &mut File, offset: u64, len: u64) -> io::Result<()> {
     let tail = offset
         .checked_add(len)
         .and_then(|end| end.checked_sub(edge))
-        .ok_or_else(|| invalid("td-install: the volume tail overflowed".to_string()))?;
+        .ok_or_else(|| invalid("the volume tail overflowed".to_string()))?;
     zero_at(file, tail, edge)
 }
 
@@ -806,14 +806,14 @@ fn publish_into(staging: &Path, publish: &Publish) -> io::Result<()> {
         // suspect first.
         .map_err(|error| {
             invalid(format!(
-                "td-install: cannot run {}: {error}",
+                "cannot run {}: {error}",
                 publish.td_boot.display()
             ))
         })?;
     let _ = io::stderr().write_all(&output.stdout);
     if !output.status.success() {
         return Err(invalid(format!(
-            "td-install: {} publish failed ({})",
+            "{} publish failed ({})",
             publish.td_boot.display(),
             output.status
         )));
@@ -836,21 +836,21 @@ fn publish_into(staging: &Path, publish: &Publish) -> io::Result<()> {
     let id = std::str::from_utf8(&output.stdout)
         .map_err(|_| {
             invalid(format!(
-                "td-install: {} printed a deployment id that is not ASCII",
+                "{} printed a deployment id that is not ASCII",
                 publish.td_boot.display()
             ))
         })?
         .trim();
     if !protocol::valid_digest(id.as_bytes()) {
         return Err(invalid(format!(
-            "td-install: {} published no deployment id ({id:?})",
+            "{} published no deployment id ({id:?})",
             publish.td_boot.display()
         )));
     }
     let published = staging.join(protocol::DEPLOYMENTS_DIR).join(id);
     if !published.is_dir() {
         return Err(invalid(format!(
-            "td-install: {} reported {id} but {} is not there",
+            "{} reported {id} but {} is not there",
             publish.td_boot.display(),
             published.display()
         )));
@@ -881,8 +881,12 @@ fn run_volume(
     ] {
         if let Some(program) = program {
             if !program.is_absolute() {
+                // The value is QUOTED because the label and it collide in the
+                // likely mistake: passing the conventional bare name gives
+                // `mkfs.btrfs mkfs.btrfs is not an absolute path`, which reads
+                // as a typo in the diagnostic rather than as the argument.
                 return Err(invalid(format!(
-                    "td-install: {label} {} is not an absolute path, and a bare name resolves \
+                    "{label} {:?} is not an absolute path, and a bare name resolves \
                      through PATH",
                     program.display()
                 )));
@@ -894,7 +898,7 @@ fn run_volume(
     let sector_size = logical_sector_size(&file)?;
     if !disk_bytes.is_multiple_of(sector_size) {
         return Err(invalid(format!(
-            "td-install: destination is {disk_bytes} bytes, not a whole number of \
+            "destination is {disk_bytes} bytes, not a whole number of \
              {sector_size}-byte sectors"
         )));
     }
@@ -907,10 +911,10 @@ fn run_volume(
     // would write over the real backup table before running out of room.
     let end = offset
         .checked_add(len)
-        .ok_or_else(|| invalid("td-install: the volume region overflowed".to_string()))?;
+        .ok_or_else(|| invalid("the volume region overflowed".to_string()))?;
     if end > disk_bytes {
         return Err(invalid(format!(
-            "td-install: the table puts the volume at {offset}..{end} on a {disk_bytes}-byte \
+            "the table puts the volume at {offset}..{end} on a {disk_bytes}-byte \
              destination"
         )));
     }
@@ -960,7 +964,7 @@ fn run_volume(
             let target = file.metadata()?;
             if (existing.st_dev(), existing.st_ino()) == (target.st_dev(), target.st_ino()) {
                 return Err(invalid(format!(
-                    "td-install: the scratch image {} is the destination itself",
+                    "the scratch image {} is the destination itself",
                     image_path.display()
                 )));
             }
@@ -986,7 +990,7 @@ fn run_volume(
     let got = image.metadata()?.len();
     if got != len {
         return Err(invalid(format!(
-            "td-install: the scratch image is {got} bytes, not the {len} the volume needs"
+            "the scratch image is {got} bytes, not the {len} the volume needs"
         )));
     }
     drop(image);
@@ -1016,14 +1020,14 @@ fn run_volume(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .output()
-        .map_err(|error| invalid(format!("td-install: cannot run {}: {error}", mkfs.display())))?;
+        .map_err(|error| invalid(format!("cannot run {}: {error}", mkfs.display())))?;
     // `let _`, as every other write to the diagnostic channel in this crate is:
     // a closed or full stderr is not a reason to abandon an install half done,
     // and reporting its ENOSPC would name the wrong disk entirely.
     let _ = io::stderr().write_all(&output.stdout);
     if !output.status.success() {
         return Err(invalid(format!(
-            "td-install: {} failed on the scratch image ({})",
+            "{} failed on the scratch image ({})",
             mkfs.display(),
             output.status
         )));
@@ -1081,13 +1085,13 @@ fn volume_serial(layout: &gpt::Layout) -> io::Result<u32> {
     let esp = layout
         .partitions
         .first()
-        .ok_or_else(|| invalid("td-install: the layout has no ESP".to_string()))?;
+        .ok_or_else(|| invalid("the layout has no ESP".to_string()))?;
     let bytes = esp
         .unique_guid
         .0
         .get(..4)
         .and_then(|slice| <[u8; 4]>::try_from(slice).ok())
-        .ok_or_else(|| invalid("td-install: the ESP GUID is too short".to_string()))?;
+        .ok_or_else(|| invalid("the ESP GUID is too short".to_string()))?;
     Ok(u32::from_le_bytes(bytes))
 }
 
@@ -1958,6 +1962,36 @@ mod tests {
     }
 
     /// A relative `mkfs` is refused rather than resolved through `PATH`.
+    #[test]
+    fn only_main_writes_the_program_name_into_a_diagnostic() {
+        // The subprocess guard can only reach diagnostics some invocation
+        // produces, and most of these are overflow arms, block-device-only
+        // paths and post-mkfs failures nothing drives — so a fifty-first
+        // message written with the prefix would be invisible to it. This is a
+        // scan over the crate's own SOURCE, the shape the confinement tests
+        // elsewhere in td use for exactly this reason.
+        //
+        // The needle is COMPOSED rather than written as a literal, or this
+        // assertion would count itself and be off by one forever.
+        let needle = format!("{}td-install: ", '"');
+        let hits: Vec<&str> = include_str!("main.rs")
+            .lines()
+            .filter(|line| line.contains(&needle))
+            .collect();
+        assert_eq!(
+            hits.len(),
+            2,
+            "the program's name belongs at the one place that PRINTS an \
+             error, not in the message: {hits:#?}"
+        );
+        for line in &hits {
+            assert!(
+                line.contains("writeln!(io::stderr()"),
+                "this names the program somewhere other than main's printer: {line}"
+            );
+        }
+    }
+
     #[test]
     fn a_relative_mkfs_is_refused_before_it_can_be_searched_for() {
         let scratch = Scratch::disk(DISK);

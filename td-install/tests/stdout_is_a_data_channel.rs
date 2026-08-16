@@ -125,6 +125,54 @@ fn a_childs_banner_stays_out_of_the_reported_line() -> Res<()> {
     Ok(())
 }
 
+/// A diagnostic names this program ONCE.
+///
+/// `main` prefixes every error it prints, so a message that also carries the
+/// prefix comes out `td-install: td-install: …`. Every error this program could
+/// emit read that way, which is the sort of thing no in-process test sees: the
+/// unit tests assert on `io::Error`'s payload, and the doubling happens where
+/// that payload is PRINTED. A SUBPROCESS test is the only place the two halves
+/// meet.
+///
+/// The failing argument is a relative `mkfs.btrfs`, which `volume` refuses
+/// before it opens anything — so this needs no disk at all, and the missing
+/// destination is deliberate: it proves the refusal really does come first.
+///
+/// The expected message is asserted with the count, and that is not belt and
+/// braces. Counting alone passes on ANY single-prefix diagnostic, so a future
+/// reordering that opened the destination first would fail with `No such file`
+/// and satisfy this test without the refusal it is written around ever
+/// running.
+#[test]
+fn a_diagnostic_names_the_program_once() -> Res<()> {
+    let dir = scratch_dir("prefix")?;
+
+    let refused = Command::new(BIN)
+        .arg("volume")
+        .arg(dir.join("no-such-disk.img"))
+        .arg("mkfs.btrfs")
+        .arg(&dir)
+        .output()?;
+    assert!(!refused.status.success(), "a relative mkfs must be refused");
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        err.contains("resolves through PATH"),
+        "this must fail on the relative mkfs, not on something else: {err:?}"
+    );
+    assert_eq!(
+        err.matches("td-install:").count(),
+        1,
+        "the program named itself more than once: {err:?}"
+    );
+    assert!(
+        err.starts_with("td-install: "),
+        "a diagnostic must say which program it is from: {err:?}"
+    );
+
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
 /// A RELATIVE `<scratch-dir>` publishes, as it formats.
 ///
 /// `td-boot` requires an absolute volume root, and the staging path is built by
