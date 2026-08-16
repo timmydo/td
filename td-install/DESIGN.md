@@ -1282,20 +1282,58 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    parsed: this crate has no ed25519 and should not grow one for a file it
    only carries, and the publish is the parse.
 
-   **That rule is now written twice, and 10b should make it one.** It lives in
-   `td-boot`'s `open_real_file`/`read_bounded_real_file` and again in
-   `td-install`'s `read_trusted_key`, which is exactly the shape `protocol.rs`
-   exists to prevent — "a thing spelled in both crates is a thing they can
-   come to disagree about". It is not a hypothetical here: the first version
-   of `read_trusted_key` diverged three ways on the day it was written (it
-   checked the type after the open, dropped the identity pin across the open,
-   and truncated rather than refusing an oversized read), and all three were
-   found by review rather than by anything that runs. The two agree now and
-   nothing will notice when they stop. The fix is the one `protocol.rs` and
-   `fixture.rs` already model — a shared file both crates `#[path]`-include —
-   and it is a separate landing because the helpers sit in
-   `td-boot/src/main.rs` and extracting them touches that crate's most-tested
-   file for no behaviour change.
+   **10b made that rule ONE implementation, across THREE crates.** It had been
+   written three times — `td-boot`'s `open_real_file`/`read_bounded_real_file`,
+   `td-install`'s own `read_trusted_key`, and `td-net`'s
+   `read_as_td_boot_would`, whose doc comment said outright that it was
+   "mirrored". That is exactly the shape `protocol.rs` exists to prevent, "a
+   thing spelled in both crates is a thing they can come to disagree about",
+   and it is not a hypothetical: the td-install copy diverged three ways on the
+   day it was written (type checked after the open, no identity pin across the
+   open, an oversized read truncated rather than refused), all found by review
+   rather than by anything that runs. So the pair moved to
+   `td-boot/src/realfile.rs`, which all three `#[path]`-include as they already
+   do `protocol.rs`.
+
+   The signer matters most of the three and was the one nobody would have
+   thought to check. Its own comment gives the reason to share rather than
+   mirror: a signer that accepts what the target REFUSES produces a bundle that
+   fails at boot instead of at signing. Mirroring makes that agreement a thing
+   somebody maintains; sharing makes it a thing that cannot drift. The one
+   check that stayed behind is the signer's own — an empty manifest, which
+   td-boot has no opinion about and which is worth refusing where the signature
+   is made.
+
+   It carries the redundant `#[path]` `fixture.rs` carries, for the same
+   reason: `affected.rs`'s staging guard reads `#[path]` attributes and is
+   blind to a plain `mod`, so spelling it that way is what makes BOTH target
+   recipes staging the file a checked property rather than something to
+   remember. Removing either stage reds `self_test_passes_against_repo` naming
+   the file and the recipe, instead of failing the target build an hour later
+   inside `recipe-checks`. `td-net` needs no stage: no recipe builds it.
+
+   That last fact is also why `realfile.rs` needed a ROUTING rule of its own,
+   beside the one `protocol.rs` already had. No gate builds td-net from source
+   — the recipe-graph warm does, which is a chain target — so a file td-net
+   `#[path]`-includes must select those targets or an edit that breaks only
+   the signer compiles td-boot and td-install and builds no net at all. There
+   are two files in that class now and `builder/src/affected.rs` pins both,
+   with `td-boot/src/main.rs` pinned to select NONE of them: the rule has to
+   be about these files rather than about the crate.
+
+   **10c is the residual race that consolidation now makes fixable once.**
+   `File::open` is issued after the type is settled, so an entry swapped for a
+   FIFO in between still blocks — the identity check that would catch it is on
+   the far side of the open. `O_NONBLOCK | O_NOFOLLOW` closes both that and the
+   symlink half, and it is deliberately not in this landing: it changes runtime
+   behaviour on a security path in all three crates, which deserves its own
+   diff rather than riding inside a move.
+
+   Applying the rule in `td-install` at all is not belt-and-braces, and the
+   doc comment says so: this program SNAPSHOTS the key and hands td-boot the
+   copy, and a copy is a small regular file whatever the original was — so
+   without it the snapshot would launder a key past every refusal the real
+   reader makes.
 
    Nothing READS it yet — that is `td-update`, the rest of this item. The
    recipe check asserts it off the RESTORED IMAGE rather than off the staging

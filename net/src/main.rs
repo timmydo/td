@@ -46,6 +46,14 @@ mod subst;
 #[allow(dead_code)]
 #[path = "../../td-boot/src/protocol.rs"]
 mod protocol;
+// The rule for reading a file that must be a real, bounded regular file —
+// td-boot's, and shared rather than mirrored. The signer has to refuse exactly
+// what the verifier refuses, or it signs a bundle that fails at boot instead
+// of at signing; `deploy.rs` used to hold a copy written to match, which is
+// the arrangement that guarantees they eventually will not.
+#[allow(dead_code)]
+#[path = "../../td-boot/src/realfile.rs"]
+mod realfile;
 
 // The TARGET-side verifier, compiled into the test build only. td signs here
 // with `ring` and verifies on the target with the engine's dependency-free

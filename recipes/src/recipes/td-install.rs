@@ -7,6 +7,7 @@ use crate::types::{Recipe, Step};
 // build does not link.
 const MAIN_RS: &str = include_str!("../../../td-install/src/main.rs");
 const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
+const REALFILE_RS: &str = include_str!("../../../td-boot/src/realfile.rs");
 const CRC32_RS: &str = include_str!("../../../engine/src/crc32.rs");
 const GPT_RS: &str = include_str!("../../../engine/src/gpt.rs");
 const FAT_RS: &str = include_str!("../../../engine/src/fat.rs");
@@ -50,6 +51,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-boot/src/protocol.rs".into(),
             content: PROTOCOL_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-boot/src/realfile.rs".into(),
+            content: REALFILE_RS.into(),
             exec: false,
         },
         Step::WriteFile {

@@ -13,6 +13,13 @@
 #[path = "../../td-boot/src/protocol.rs"]
 #[allow(dead_code)]
 mod protocol;
+// The real-regular-bounded file rule, td-boot's and now shared rather than
+// reimplemented here — DESIGN §10 item 10b. A rule spelled in both crates is
+// one they can come to disagree about, and this one did, three ways, on the
+// day the second copy was written.
+#[path = "../../td-boot/src/realfile.rs"]
+#[allow(dead_code)]
+mod realfile;
 // `gpt.rs` reaches its checksum as `crate::crc32`, the spelling that resolves
 // identically inside the engine lib and here, so the two are declared as a PAIR.
 #[path = "../../engine/src/crc32.rs"]
@@ -745,64 +752,15 @@ fn zero_edges(file: &mut File, offset: u64, len: u64) -> io::Result<()> {
     zero_at(file, tail, edge)
 }
 
-/// Read the trusted key under `td-boot`'s own rule, because the snapshot in
-/// `publish_into` would otherwise LAUNDER one past a refusal the real reader
-/// makes: a regular file, not a symlink, of at most `MAX_PUBLIC_KEY_BYTES`.
-/// Handing td-boot a copy is what closes the two-reads race, and a copy of
-/// something td-boot would have rejected is a behaviour change nobody asked
-/// for. The bound is not decoration either — without it this reads `/dev/zero`
-/// until the installer runs out of memory.
+/// Read the trusted key under td-boot's rule, which is now literally
+/// td-boot's: `realfile.rs` is one implementation both crates include.
+///
+/// Applied here rather than left to td-boot because this program SNAPSHOTS
+/// the key and hands td-boot the copy — a copy is a small regular file
+/// whatever the original was, so without this the snapshot would launder a
+/// key past every refusal the real reader makes.
 fn read_trusted_key(path: &Path) -> io::Result<Vec<u8>> {
-    let named = |what: String| invalid(format!("the trusted key {} {what}", path.display()));
-    let context = |error: io::Error| {
-        invalid(format!(
-            "cannot read the trusted key {}: {error}",
-            path.display()
-        ))
-    };
-    // TYPED BEFORE IT IS OPENED, which is the half a check after the open
-    // cannot do: opening a FIFO read-only BLOCKS until a writer appears, so an
-    // `is_file` that runs afterwards never runs at all and the installer hangs
-    // with no diagnostic. `lstat` answers the type without opening anything.
-    let entry = std::fs::symlink_metadata(path).map_err(context)?;
-    if entry.is_symlink() {
-        return Err(named("is a symlink".into()));
-    }
-    if !entry.is_file() {
-        return Err(named("is not a regular file".into()));
-    }
-    let file = File::open(path).map_err(context)?;
-    let metadata = file.metadata().map_err(context)?;
-    // ...and the thing OPENED is the thing that was typed. Between the two the
-    // entry can be replaced — a symlink put there after the `lstat` is opened
-    // and followed — so the pair is compared, as td-boot's own reader compares
-    // it, and this is the check that makes the type above hold of the bytes
-    // rather than of a name.
-    {
-        use std::os::linux::fs::MetadataExt;
-        if (entry.st_dev(), entry.st_ino()) != (metadata.st_dev(), metadata.st_ino()) {
-            return Err(named("was replaced while it was being opened".into()));
-        }
-    }
-    let max = protocol::MAX_PUBLIC_KEY_BYTES;
-    if metadata.len() > max {
-        return Err(named(format!(
-            "is {} bytes, over the {max} the format allows",
-            metadata.len()
-        )));
-    }
-    let mut bytes = Vec::new();
-    // One byte PAST the bound, so a file that grew between the stat and the
-    // read is refused rather than silently cut to a valid length — truncating
-    // it here would launder an oversized key past the refusal td-boot makes,
-    // which is the whole reason this function mirrors that rule.
-    file.take(max.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(context)?;
-    if bytes.len() as u64 > max {
-        return Err(named(format!("grew past the {max} bytes the format allows")));
-    }
-    Ok(bytes)
+    realfile::read_bounded_real_file(path, "trusted deployment key", protocol::MAX_PUBLIC_KEY_BYTES)
 }
 
 /// Publish `deployment` into the staging tree, through `td-boot`.
@@ -2043,7 +2001,7 @@ mod tests {
         let link = dir.join("link.pub");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let refused = read_trusted_key(&link).unwrap_err().to_string();
-        assert!(refused.contains("is a symlink"), "{refused}");
+        assert!(refused.contains("must be a real regular file"), "{refused}");
 
         let big = dir.join("big.pub");
         std::fs::write(&big, vec![b'a'; protocol::MAX_PUBLIC_KEY_BYTES as usize + 1]).unwrap();
@@ -2052,14 +2010,14 @@ mod tests {
         // and a pid containing the bound would satisfy a bare digit check.
         assert!(
             refused.contains(&format!(
-                "over the {} the format allows",
+                "trusted deployment key exceeds {} bytes",
                 protocol::MAX_PUBLIC_KEY_BYTES
             )),
             "{refused}"
         );
 
         let refused = read_trusted_key(&dir).unwrap_err().to_string();
-        assert!(refused.contains("is not a regular file"), "{refused}");
+        assert!(refused.contains("must be a real regular file"), "{refused}");
 
         // A FIFO is the case the type check must catch BEFORE the open rather
         // than after it: `File::open` on one blocks until a writer appears, so
@@ -2070,7 +2028,7 @@ mod tests {
         let made = std::process::Command::new("mkfifo").arg(&fifo).status();
         if made.map(|status| status.success()).unwrap_or(false) {
             let refused = read_trusted_key(&fifo).unwrap_err().to_string();
-            assert!(refused.contains("is not a regular file"), "{refused}");
+            assert!(refused.contains("must be a real regular file"), "{refused}");
         }
 
         // The bound is applied to what is READ and not only to what `stat`
@@ -2082,7 +2040,7 @@ mod tests {
         let proc_status = Path::new("/proc/self/status");
         assert_eq!(std::fs::metadata(proc_status).unwrap().len(), 0);
         let refused = read_trusted_key(proc_status).unwrap_err().to_string();
-        assert!(refused.contains("grew past"), "{refused}");
+        assert!(refused.contains("changed while reading"), "{refused}");
 
         // ...and the bound is not so tight that a key AT it is refused, nor so
         // loose that a real key trips it.
@@ -2129,7 +2087,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            format!("{error}").contains("cannot read the trusted key"),
+            format!("{error}").contains("trusted deployment key"),
             "the refusal must name the key: {error}"
         );
         assert_eq!(

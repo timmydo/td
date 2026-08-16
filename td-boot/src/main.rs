@@ -8,6 +8,12 @@
 #![forbid(unsafe_code)]
 
 mod protocol;
+// The real-regular-bounded file rule, shared with `td-install` for
+// `protocol.rs`'s reason — and with the same redundant `#[path]` the fixture
+// carries below, so the staging guard sees it. Unlike the fixture this one IS
+// staged: it is in the target binary.
+#[path = "realfile.rs"]
+mod realfile;
 // The committed fixture deployment, in its own file because the `td-install`
 // recipe check stages the SAME one and the signatures are over the manifest
 // its payloads hash to. `cfg(test)` keeps it out of the target binary, which
@@ -45,7 +51,7 @@ mod ed25519;
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions, TryLockError};
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, Seek, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{
     DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink,
@@ -359,49 +365,7 @@ fn require_real_directory(path: &Path, label: &str) -> io::Result<()> {
     }
 }
 
-fn open_real_file(path: &Path, label: &str) -> io::Result<(File, Metadata)> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        io::Error::new(error.kind(), format!("{label} {}: {error}", path.display()))
-    })?;
-    if !metadata.file_type().is_file() {
-        return Err(invalid(format!(
-            "{label} must be a real regular file: {}",
-            path.display()
-        )));
-    }
-    let file = File::open(path)?;
-    let opened = file.metadata()?;
-    if !opened.file_type().is_file()
-        || opened.dev() != metadata.dev()
-        || opened.ino() != metadata.ino()
-    {
-        return Err(invalid(format!(
-            "{label} changed while opening: {}",
-            path.display()
-        )));
-    }
-    Ok((file, opened))
-}
-
-fn read_bounded_real_file(path: &Path, label: &str, limit: u64) -> io::Result<Vec<u8>> {
-    let (file, metadata) = open_real_file(path, label)?;
-    if metadata.len() > limit {
-        return Err(invalid(format!(
-            "{label} exceeds {limit} bytes: {}",
-            path.display()
-        )));
-    }
-
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > limit {
-        return Err(invalid(format!(
-            "{label} changed while reading or exceeds {limit} bytes: {}",
-            path.display()
-        )));
-    }
-    Ok(bytes)
-}
+use realfile::{open_real_file, read_bounded_real_file};
 
 use protocol::valid_digest;
 

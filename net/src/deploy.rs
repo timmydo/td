@@ -35,9 +35,7 @@
 // check and the failure would surface at boot rather than at signing.
 use crate::protocol::{MANIFEST_HEADER, MAX_MANIFEST_BYTES};
 use crate::sig::{from_hex, keygen, sign_msg, to_hex, verify_msg, write_keypair};
-use std::fs::File;
-use std::io::Read;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 
 fn die(msg: String) -> ! {
@@ -70,49 +68,20 @@ fn sign_manifest(manifest: &Path, pkcs8: &[u8]) -> Result<String, String> {
     Ok(format!("{}\n", to_hex(&sig)))
 }
 
-/// `td-boot`'s `open_real_file` + `read_bounded_real_file`, mirrored.
+/// `td-boot`'s `open_real_file` + `read_bounded_real_file`, SHARED rather than
+/// mirrored: a signer that accepts what the target refuses produces a bundle
+/// that fails at boot instead of at signing, and a rule written twice to match
+/// is the arrangement that guarantees the two eventually will not.
 ///
-/// Mirrored rather than approximated because a signer that accepts what the
-/// target REFUSES produces a bundle that fails at boot instead of at signing.
-/// A plain `metadata()` follows symlinks and td-boot does not, so a symlinked
-/// manifest would sign here and be rejected there; and a size checked by one
-/// `stat` and a read issued separately are two different files if anything
-/// swaps the path in between — which for a signer means putting a signature
-/// over bytes nobody inspected.
+/// The one check that stays here is the signer's own. Emptiness is not a thing
+/// td-boot has an opinion about — an empty manifest simply fails its header
+/// check — but signing nothing is worth refusing where the signature is made.
 fn read_as_td_boot_would(path: &Path) -> Result<Vec<u8>, String> {
-    let stat = std::fs::symlink_metadata(path)
-        .map_err(|e| format!("stat {}: {e}", path.display()))?;
-    if !stat.file_type().is_file() {
+    let bytes = crate::realfile::read_bounded_real_file(path, "the manifest", MAX_MANIFEST_BYTES)
+        .map_err(|error| error.to_string())?;
+    if bytes.is_empty() {
         return Err(format!(
-            "{} must be a real regular file — td-boot refuses anything else",
-            path.display()
-        ));
-    }
-    let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let opened = file
-        .metadata()
-        .map_err(|e| format!("stat opened {}: {e}", path.display()))?;
-    if !opened.file_type().is_file() || !same_file(&stat, &opened) {
-        return Err(format!("{} changed while opening", path.display()));
-    }
-    if opened.len() == 0 {
-        return Err(format!("{} is empty — refusing to sign nothing", path.display()));
-    }
-    if opened.len() > MAX_MANIFEST_BYTES {
-        return Err(format!(
-            "{} is {} bytes; td-boot reads at most {MAX_MANIFEST_BYTES} and could never \
-             check a signature over it",
-            path.display(),
-            opened.len()
-        ));
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(opened.len()).unwrap_or(0));
-    file.take(MAX_MANIFEST_BYTES.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
-    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
-        return Err(format!(
-            "{} grew past {MAX_MANIFEST_BYTES} bytes while being read",
+            "{} is empty — refusing to sign nothing",
             path.display()
         ));
     }
@@ -147,16 +116,6 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         let _ = std::fs::remove_file(&tmp);
         format!("rename {} -> {}: {e}", tmp.display(), path.display())
     })
-}
-
-/// Same inode on the same device — the pair, because an inode number alone
-/// repeats across filesystems and a device alone says nothing about which file.
-///
-/// A named function so the comparison is testable: the RACE it guards needs
-/// interposition to reproduce, but a comparison that dropped either half would
-/// be silently wrong and is exactly what a test can catch.
-fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
-    a.dev() == b.dev() && a.ino() == b.ino()
 }
 
 // Matched as a SLICE rather than by `a.len()` plus `a[2]`: the crate-level
@@ -422,28 +381,6 @@ mod tests {
         );
     }
 
-    /// The stat-then-open guard: a signature over bytes nobody inspected is
-    /// what a swapped path buys, so the identity comparison must use BOTH
-    /// halves. The race itself is not reproduced here — that needs
-    /// interposition — but a comparison missing either half is caught.
-    #[test]
-    fn file_identity_needs_the_device_and_the_inode() {
-        let dir = tmp("ident");
-        let (a, b) = (dir.join("a"), dir.join("b"));
-        std::fs::write(&a, b"a").unwrap();
-        std::fs::write(&b, b"b").unwrap();
-        let (ma, mb) = (
-            std::fs::symlink_metadata(&a).unwrap(),
-            std::fs::symlink_metadata(&b).unwrap(),
-        );
-        assert!(same_file(&ma, &ma), "a file is itself");
-        assert!(!same_file(&ma, &mb), "two files are not the same file");
-        assert_ne!(ma.ino(), mb.ino(), "the fixture is only meaningful if the inodes differ");
-        // Reopening the same path must still be the same file.
-        let reopened = File::open(&a).unwrap().metadata().unwrap();
-        assert!(same_file(&ma, &reopened), "the same path reopened is the same file");
-    }
-
     /// td-boot refuses a symlinked manifest; so must the signer, or a bundle
     /// signs here and is rejected there.
     #[test]
@@ -487,12 +424,15 @@ mod tests {
         };
         let big = dir.join("big");
         std::fs::write(&big, padded(MAX_MANIFEST_BYTES + 1)).unwrap();
-        refused_because(sign_manifest(&big, &pkcs8), "td-boot reads at most");
+        refused_because(
+            sign_manifest(&big, &pkcs8),
+            &format!("the manifest exceeds {MAX_MANIFEST_BYTES} bytes"),
+        );
         // Exactly at the bound is fine — the bound is td-boot's read limit.
         let edge = dir.join("edge");
         std::fs::write(&edge, padded(MAX_MANIFEST_BYTES)).unwrap();
         assert!(sign_manifest(&edge, &pkcs8).is_ok(), "at the bound");
-        refused_because(sign_manifest(&dir.join("nope"), &pkcs8), "stat ");
+        refused_because(sign_manifest(&dir.join("nope"), &pkcs8), "the manifest ");
         refused_because(sign_manifest(&dir, &pkcs8), "must be a real regular file");
     }
 }

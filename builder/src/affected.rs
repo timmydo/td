@@ -986,7 +986,14 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // td-net from source: the WARM does, which is a chain target. So this file
     // takes the td-boot rule plus those, or a change here that breaks only the
     // signer runs nothing.
-    if p == "td-boot/src/protocol.rs" {
+    //
+    // `realfile.rs` joined it in that class when the real-bounded-file rule
+    // stopped being written three times: td-net includes it for the same
+    // reason — the signer must refuse exactly what the verifier refuses — so
+    // it needs the same chain targets. The rule is about these two FILES and
+    // not about the crate, which is why `td-boot/src/main.rs` is pinned to the
+    // narrower one beside the assertions below.
+    if p == "td-boot/src/protocol.rs" || p == "td-boot/src/realfile.rs" {
         sel.add_preflight("cargo-test");
         sel.add_target("check");
         sel.add_target("recipe-checks");
@@ -2131,6 +2138,22 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     );
     assert_target!("td-boot/src/protocol.rs", "bootstrap-x86_64-self-gcc-store-native");
     assert_preflight!("td-boot/src/protocol.rs", "cargo-test");
+    // realfile.rs is in that same class and pinned the same way: td-net
+    // `#[path]`-includes it so the signer refuses what the verifier refuses,
+    // and without the chain targets an edit here that breaks only the signer
+    // would compile td-boot and td-install and build no net at all.
+    assert_target!("td-boot/src/realfile.rs", "check");
+    assert_target!("td-boot/src/realfile.rs", "recipe-checks");
+    assert_target!(
+        "td-boot/src/realfile.rs",
+        "bootstrap-x86_64-toolchain-store-native"
+    );
+    assert_target!(
+        "td-boot/src/realfile.rs",
+        "bootstrap-x86_64-native-gcc-store-native"
+    );
+    assert_target!("td-boot/src/realfile.rs", "bootstrap-x86_64-self-gcc-store-native");
+    assert_preflight!("td-boot/src/realfile.rs", "cargo-test");
     assert_no_target!(
         "td-boot/src/main.rs",
         "bootstrap-x86_64-toolchain-store-native"
