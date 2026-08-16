@@ -899,7 +899,6 @@ xfail nul-bytes.test.sh::Strip ops # ## % %% with NUL bytes
 xfail osh-bugs.test.sh::YSH $[expr_sub] in OSH should not do dynamic globbing
 xfail osh-bugs.test.sh::var x = $(echo bad; false) in OSH
 xfail osh-bugs.test.sh::var x = $(echo one; false; echo two) in OSH
-xfail parse-errors.test.sh::Bad var sub caught at parse time
 xfail parse-errors.test.sh::Long Token - 65535 bytes
 xfail parse-errors.test.sh::Token that's too long for Oils - 65536 bytes
 xfail parse-errors.test.sh::empty clause in [[
@@ -1151,8 +1150,6 @@ xfail zsh-assoc.test.sh::iterate over both keys and values
 xfail zsh-assoc.test.sh::iterate over keys
 xfail zsh-assoc.test.sh::retrieve key
 xfail zsh-assoc.test.sh::set key
-xfail zsh-idioms.test.sh::asdf snippet
-xfail zsh-idioms.test.sh::git-completion snippet
 xfail zsh-idioms.test.sh::zsh var sub is rejected at runtime
 
 # ---- skip: not evaluated here (see header) ----

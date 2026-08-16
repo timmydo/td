@@ -863,7 +863,7 @@ struct Mark {
 /// literal characters. Used for the operand of `${x:-...}`, which is delimited by
 /// its brace, not by blanks. A nested `${…}` operand re-enters here one level
 /// deeper; the depth cap is checked before any scanning so the mutual recursion
-/// `scan_dollar -> parse_param -> word_from_str_at` is bounded.
+/// `scan_dollar -> parse_braced -> word_from_str_at` is bounded.
 fn word_from_str_at(text: &str, depth: u32, line: u32) -> Syn<Word> {
     let mut lx = lexer_over(text, depth, line)?;
     lx.in_braces = true;
@@ -1696,8 +1696,7 @@ impl Lexer {
                 // After the `{`, so this is where the braced text begins.
                 let line = self.sc.line;
                 let inner = self.scan_braced(in_dq)?;
-                let param = parse_param(&inner, in_dq, self.depth, line)?;
-                buf.push_seg(Seg::Param(Box::new(param)));
+                buf.push_seg(parse_braced(&inner, in_dq, self.depth, line)?);
             }
             '(' => {
                 self.sc.bump();
@@ -1763,40 +1762,18 @@ impl Lexer {
     }
 
     /// Text up to the `}` matching an already-consumed `${`.
-    /// Whether the `${` just consumed carries a SUBSTITUTION operator
-    /// (`-`/`=`/`?`/`+`, with or without a colon) rather than a pattern one or
-    /// none. Read-only lookahead, because the quoting rule for the rest of the
-    /// body depends on it and the body is scanned before it is parsed: dash
-    /// honours a `'` inside `"${v#'}'}"` and not inside `"${v-'}'}"`.
+    /// Whether the body after the name is scanned in BASE syntax, where a `'`
+    /// is real and so protects a `}`. Read-only lookahead, because the body is
+    /// scanned before it is parsed.
     ///
-    /// It mirrors `parse_param`'s own name/operator split rather than
-    /// approximating it -- the two disagreeing means a body scanned under the
-    /// wrong rule, which is not a diagnosable error but a different program.
-    fn braced_op_is_substitution(&self) -> bool {
+    /// ash's `newsyn` starts at the ENCLOSING syntax and only the three
+    /// PATTERN operators set `BASESYNTAX` (`parsesub`); a substring offset and
+    /// a body ash cannot read reach their arms without touching it. Reading
+    /// this wrong is no diagnosable error but a different program, silently.
+    fn braced_body_is_base_syntax(&self) -> bool {
         // Every step is taken through `past_folds`, so this reads the text the
-        // SCAN will read rather than the source it is written in. Getting that
-        // wrong is not a diagnosable error but a body scanned under the other
-        // quoting rule -- a different program, silently.
+        // SCAN will read rather than the source it is written in.
         let mut i = self.sc.past_folds(self.sc.pos);
-        // `${#x}` is a LENGTH and takes no word, while `${#}` and `${#-x}` are
-        // the parameter `#` itself: the prefix reading only holds when a bare
-        // name reaches the closing brace.
-        if self.sc.src.get(i) == Some(&'#') {
-            let mut j = self.sc.past_folds(i + 1);
-            let started = j;
-            match self.sc.src.get(j) {
-                Some(&c) if is_special_param(c) => j = self.sc.past_folds(j + 1),
-                _ => {
-                    while matches!(self.sc.src.get(j), Some(c) if c.is_ascii_alphanumeric() || *c == '_')
-                    {
-                        j = self.sc.past_folds(j + 1);
-                    }
-                }
-            }
-            if j > started && self.sc.src.get(j) == Some(&'}') {
-                return false;
-            }
-        }
         match self.sc.src.get(i) {
             Some(c) if c.is_ascii_digit() => {
                 while matches!(self.sc.src.get(i), Some(c) if c.is_ascii_digit()) {
@@ -1810,12 +1787,12 @@ impl Lexer {
                     i = self.sc.past_folds(i + 1);
                 }
             }
+            // No name ash would read: its `badsub:`, which changes nothing.
             _ => return false,
         }
-        if self.sc.src.get(i) == Some(&':') {
-            i = self.sc.past_folds(i + 1);
-        }
-        matches!(self.sc.src.get(i), Some('-' | '=' | '?' | '+'))
+        // The `:` of a substring is NOT skipped: `${v:#x}` is an offset
+        // starting `#`, which ash reads as `VSSUBSTR` and not as a pattern.
+        matches!(self.sc.src.get(i), Some('#' | '%' | '/'))
     }
 
     /// Raw source up to the `}` matching an already-consumed `${`.
@@ -1825,9 +1802,10 @@ impl Lexer {
     /// is `'xy'}` -- word `'x`, then literal outer text. A `"` still protects
     /// one, and `$'...'` is not a construct there at all.
     fn scan_braced(&mut self, in_dq: bool) -> Syn<String> {
-        // Only a SUBSTITUTION operator's body is double-quoted syntax; a
-        // pattern's quotes are real, and so still protect a `}`.
-        let quotes_off = in_dq && self.braced_op_is_substitution();
+        // Only a PATTERN operator's body leaves base syntax on, where quotes
+        // are real and still protect a `}`; every other body keeps what
+        // encloses it.
+        let quotes_off = in_dq && !self.braced_body_is_base_syntax();
         let mut out = String::new();
         let mut depth = 1usize;
         loop {
@@ -2260,20 +2238,23 @@ fn heredoc_body_word(body: &str, line: u32) -> Syn<Word> {
 /// replacement begins on that same line: what precedes one is the NAME, an
 /// optional `:` and the operator, and a name cannot hold a newline. The
 /// replacement is the exception, since the PATTERN before it can.
-fn parse_param(inner: &str, quoted: bool, depth: u32, line: u32) -> Syn<Param> {
+///
+/// A body that is none of those becomes a `Seg::BadSub`, which raises when the
+/// word is expanded; only one that could not be READ stays a `SynErr`.
+fn parse_braced(inner: &str, quoted: bool, depth: u32, line: u32) -> Syn<Seg> {
     let chars: Vec<char> = inner.chars().collect();
     if chars.is_empty() {
-        return Err("bad substitution: `${}`".into());
+        return Ok(Seg::BadSub("${}".to_string()));
     }
     // `${#}` is the parameter `#`; `${#x}` is the length of `x`.
     if chars.first() == Some(&'#') && chars.len() > 1 {
         let rest: String = chars.iter().skip(1).collect();
         if is_name(&rest) || (rest.chars().count() == 1 && is_special_param_name(&rest)) {
-            return Ok(Param {
+            return Ok(Seg::Param(Box::new(Param {
                 name: rest,
                 op: Some(ParamOp::Length),
                 quoted,
-            });
+            })));
         }
     }
     let mut i = 0usize;
@@ -2301,20 +2282,22 @@ fn parse_param(inner: &str, quoted: bool, depth: u32, line: u32) -> Syn<Param> {
                 i += 1;
             }
         }
-        _ => return Err(format!("bad substitution: `${{{inner}}}`").into()),
+        _ => return Ok(Seg::BadSub(format!("${{{inner}}}"))),
     }
     if i >= chars.len() {
-        return Ok(Param {
+        return Ok(Seg::Param(Box::new(Param {
             name,
             op: None,
             quoted,
-        });
+        })));
     }
     let colon = chars.get(i) == Some(&':');
     if colon {
         i += 1;
     }
     let Some(&opc) = chars.get(i) else {
+        // A `:` with no operator is the one body ash does not defer: it cannot
+        // read this far, reporting the enclosing quote unterminated instead.
         return Err(format!("bad substitution: `${{{inner}}}`").into());
     };
     i += 1;
@@ -2326,7 +2309,7 @@ fn parse_param(inner: &str, quoted: bool, depth: u32, line: u32) -> Syn<Param> {
     if colon && !matches!(opc, '-' | '=' | '?' | '+') {
         let rest = chars.get(i - 1..).unwrap_or_default();
         let (offset, length) = split_slice(rest);
-        return Ok(Param {
+        return Ok(Seg::Param(Box::new(Param {
             name,
             op: Some(ParamOp::Substring {
                 offset: arith_from_str_at(&offset, depth + 1, line)?,
@@ -2336,7 +2319,7 @@ fn parse_param(inner: &str, quoted: bool, depth: u32, line: u32) -> Syn<Param> {
                 },
             }),
             quoted,
-        });
+        })));
     }
     let doubled = chars.get(i) == Some(&opc) && matches!(opc, '%' | '#' | '/');
     if doubled {
@@ -2347,7 +2330,7 @@ fn parse_param(inner: &str, quoted: bool, depth: u32, line: u32) -> Syn<Param> {
     if opc == '/' && !colon {
         let rest = chars.get(i..).unwrap_or_default();
         let (pat, repl) = split_patsub(rest);
-        return Ok(Param {
+        return Ok(Seg::Param(Box::new(Param {
             name,
             op: Some(ParamOp::Replace {
                 pat: word_from_str_at(&pat, depth + 1, line)?,
@@ -2359,7 +2342,14 @@ fn parse_param(inner: &str, quoted: bool, depth: u32, line: u32) -> Syn<Param> {
                 all: doubled,
             }),
             quoted,
-        });
+        })));
+    }
+    // Decided BEFORE the operand is lexed. The rest of a body ash never reads
+    // is not a word, and lexing it makes an unclosed quote there a PARSE error
+    // -- which is the whole of what this defers: `"${v['}'"` would stop the
+    // script where ash raises at expansion and carries on.
+    if !matches!(opc, '-' | '=' | '?' | '+' | '%' | '#') {
+        return Ok(Seg::BadSub(format!("${{{inner}}}")));
     }
     let operand: String = chars.iter().skip(i).collect();
     let word = if quoted && matches!(opc, '-' | '=' | '?' | '+') {
@@ -2380,13 +2370,15 @@ fn parse_param(inner: &str, quoted: bool, depth: u32, line: u32) -> Syn<Param> {
             pat: word,
             longest: doubled,
         },
-        _ => return Err(format!("bad substitution: `${{{inner}}}`").into()),
+        // The guard above returned for every other operator, so this backs up
+        // the two `!colon` arms rather than deciding anything itself.
+        _ => return Ok(Seg::BadSub(format!("${{{inner}}}"))),
     };
-    Ok(Param {
+    Ok(Seg::Param(Box::new(Param {
         name,
         op: Some(op),
         quoted,
-    })
+    })))
 }
 
 /// Split a slice operand into offset and optional length at the colon between
@@ -3166,6 +3158,63 @@ mod tests {
         };
         assert!(param(r"echo ${v#$'a\''}")?.contains("Trim"));
         assert!(param(r"echo ${v#'a}b'}")?.contains("Trim"));
+        Ok(())
+    }
+
+    /// Which braced bodies a `'` is REAL in, inside `"..."`. ash starts
+    /// `newsyn` at the enclosing syntax and only the three PATTERN operators
+    /// set `BASESYNTAX` (`parsesub`), so a quote protects a `}` for those and
+    /// for nothing else -- not a substitution operator, not a substring
+    /// offset, and not a body ash cannot read, which reaches `badsub:` without
+    /// touching it. Each probe puts the quoted `}` LAST, which is what makes
+    /// the two rules different programs rather than the same error by luck.
+    #[test]
+    fn only_a_pattern_operator_makes_a_quote_real_inside_a_braced_body() -> Syn<()> {
+        // Quotes off: the body ends at the `}` between them, so this parses.
+        for src in [
+            r#"echo "${v-'}'""#,
+            r#"echo "${v:-'}'""#,
+            r#"echo "${v+'}'""#,
+            r#"echo "${v:?'}'""#,
+            // A substring OFFSET that starts with a pattern character is still
+            // an offset -- ash's `VSSUBSTR` -- so the `:` is not skipped when
+            // looking for one. Skipping it reads these as trims and scans the
+            // body under the other rule, where the quote protects the `}`.
+            r#"echo "${v:#'}'""#,
+            r#"echo "${v:%'}'""#,
+            r#"echo "${v:/'}'""#,
+        ] {
+            assert!(words(src).is_ok(), "{src:?} must parse");
+        }
+        // Quotes real: the `'` protects that `}` and the scan runs out.
+        for src in [
+            r#"echo "${v#'}'""#,
+            r#"echo "${v##'}'""#,
+            r#"echo "${v%'}'""#,
+            r#"echo "${v%%'}'""#,
+            r#"echo "${v/'}'""#,
+            r#"echo "${v//'}'""#,
+        ] {
+            assert!(words(src).is_err(), "{src:?} must not parse");
+        }
+        // A body this shell cannot read is quotes-off too, and the operator is
+        // judged BEFORE the operand is lexed -- otherwise the lone `'` left in
+        // the body is an unterminated quote and a PARSE error, which is the
+        // thing `Seg::BadSub` exists to avoid.
+        for (src, text) in [
+            (r#"echo "${v['}'""#, r"${v['}"),
+            (r#"echo "${v@'}'""#, r"${v@'}"),
+            (r#"echo "${!v'}'""#, r"${!v'}"),
+            (r#"echo "${#v'}'""#, r"${#v'}"),
+            (r#"echo "${%'}'""#, r"${%'}"),
+        ] {
+            let ws = words(src)?;
+            let seg = nth(&ws, 1)?.0.first().cloned();
+            assert!(
+                matches!(&seg, Some(Seg::BadSub(s)) if s == text),
+                "{src:?} wanted BadSub({text:?}), got {seg:?}"
+            );
+        }
         Ok(())
     }
 

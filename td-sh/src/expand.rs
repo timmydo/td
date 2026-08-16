@@ -290,6 +290,9 @@ fn expand_raw(sh: &mut Shell, w: &Word, force_quoted: bool, splitting: bool) -> 
                 push_expanded(&mut cur.chars, &value.to_string(), q);
             }
             Seg::Param(p) => expand_param(sh, p, force_quoted, splitting, &mut done, &mut cur)?,
+            // Raised from HERE rather than from the parser: ash reports it while
+            // expanding, so a word in a branch never taken never reports.
+            Seg::BadSub(text) => return Err(sh.fatal(&format!("bad substitution: `{text}`"), 2)),
         }
     }
     done.push(cur);

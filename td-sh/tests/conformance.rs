@@ -1081,6 +1081,32 @@ fn the_command_lines_own_option_refusal_splits_the_way_sets_does()
     Ok(())
 }
 
+/// `-n` parses and runs nothing, so a `${...}` body this shell does not serve
+/// is SILENT under it: ash raises `bad substitution` from its expander, which
+/// `-n` never reaches. Only the binary can be asked -- `run_capturing` takes
+/// source, not a command line -- and it is the property the corpus's
+/// parse-only differential turns on, so it is pinned rather than assumed.
+#[test]
+fn a_body_this_shell_cannot_serve_is_silent_under_dash_n()
+-> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    for body in ["${}", "${%}", "${!r}", "${a[@]}", "${PS1@P}", "${x^}", "${!x'}'"] {
+        let out = std::process::Command::new(&shell)
+            .args(["-n", "-c", &format!("echo \"{body}\"")])
+            .output()?;
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "", "{body:?}");
+        assert_eq!((out.stdout.as_slice(), out.status.code()), (b"".as_slice(), Some(0)), "{body:?}");
+    }
+    // A body that could not be READ is not deferred, so `-n` still refuses it.
+    for body in ["${x:}", "${x:-$((1+}"] {
+        let out = std::process::Command::new(&shell)
+            .args(["-n", "-c", &format!("echo \"{body}\"")])
+            .output()?;
+        assert_eq!(out.status.code(), Some(2), "{body:?}");
+    }
+    Ok(())
+}
+
 /// The script OPERAND is opened before the shell exists, so its failure is the
 /// one diagnostic the in-process harness cannot reach -- and it was still
 /// printing `io::Error`'s Display after every other site had stopped. ash words

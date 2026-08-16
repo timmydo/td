@@ -106,6 +106,10 @@ pub enum Seg {
     /// `$((...))` — the inner text is itself a word (it may contain `$x`), so it
     /// is expanded first and then evaluated as an arithmetic expression.
     Arith { expr: Word, quoted: bool },
+    /// A `${...}` whose body this shell does not serve, as its source text: ash
+    /// raises `bad substitution` from its expander, so this fails there too.
+    /// Not a `Param` -- `expand_param` would look the name up first.
+    BadSub(String),
 }
 
 #[derive(Clone, Debug)]

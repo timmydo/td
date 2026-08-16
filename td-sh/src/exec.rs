@@ -3962,6 +3962,62 @@ mod tests {
         );
     }
 
+    /// A `${...}` body this shell does not serve fails when the word is
+    /// EXPANDED, not when the list is parsed -- ash reports `bad substitution`
+    /// from its expander. So one in a branch never taken never reports, which
+    /// is how real scripts guard shell-specific syntax: the corpus's
+    /// git-completion and asdf snippets are `if false; then` around zsh.
+    #[test]
+    fn a_substitution_this_shell_cannot_serve_fails_when_it_is_expanded() {
+        for body in [
+            "${}", "${%}", "${!r}", "${ x}", "${1a}", "${a[@]}", "${PS1@P}", "${x^}",
+        ] {
+            for guard in [
+                "false && echo \"BODY\"; echo AFTER",
+                "if false; then echo \"BODY\"; fi; echo AFTER",
+                "f() { echo \"BODY\"; }; echo AFTER",
+                "case x in y) echo \"BODY\";; esac; echo AFTER",
+            ] {
+                let src = guard.replace("BODY", body);
+                let want = (0, "AFTER\n".to_string(), String::new());
+                assert_eq!(run(&src), want, "{src:?} must not report");
+            }
+            // Expanded, it raises -- and only after the commands BEFORE it on
+            // the same list have run, which a parse error would have skipped.
+            let (status, out, err) = run(&format!("echo ONE; : \"{body}\"; echo AFTER"));
+            assert_eq!((status, out.as_str()), (2, "ONE\n"), "{body:?}");
+            assert!(err.contains(&format!("bad substitution: `{body}`")), "{err}");
+        }
+        // The one body that did NOT move, because ash does not defer it either:
+        // a `:` with no operator makes ash take the `}` AS the operator, so the
+        // body never closes and it reports the enclosing quote unterminated.
+        // Both shells stop parsing, and a cold branch does not save it.
+        for src in ["false && echo \"${x:}\"; echo AFTER", "false && echo ${x:}; echo AFTER"] {
+            let (status, out, err) = run(src);
+            assert_eq!((status, out.as_str()), (2, ""), "{src:?}: {err}");
+            assert!(err.contains("bad substitution: `${x:}`"), "{src:?}: {err}");
+        }
+        // Nor is a body that could not be READ deferred: the brace scan runs
+        // before any of this, so its failure is still a parse error.
+        for src in [
+            "false && echo \"${x:-$((1+}\"; echo AFTER",
+            "false && echo \"${x:-\"; echo AFTER",
+        ] {
+            let (status, out, _) = run(src);
+            assert_eq!((status, out.as_str()), (2, ""), "{src:?}");
+        }
+        // A quote INSIDE such a body is the sharp case: it is ordinary text
+        // here (only a pattern operator leaves base syntax on), so the body
+        // ends at the `}` between the quotes and the guard still holds. Read
+        // the other way the `'` protects that `}`, the scan runs out, and the
+        // script dies at parse time -- which is what this defers.
+        for body in ["${!x'}'", "${a[@]'}'", "${x^'}'", "${#v'}'"] {
+            let src = format!("false && echo \"{body}\"; echo AFTER");
+            let want = (0, "AFTER\n".to_string(), String::new());
+            assert_eq!(run(&src), want, "{src:?} must not report");
+        }
+    }
+
     /// What an input that RAN OUT is called. ash spells this several ways with
     /// no common opening -- four of its own (`unterminated quoted string`, `EOF
     /// in backquote substitution`, `missing '))'`, `missing '}'`) and the
