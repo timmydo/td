@@ -2525,9 +2525,9 @@ mod tests {
     }
 
     /// `( … )` and `!` inside `[[ ]]` recurse WITHOUT passing through
-    /// `parse_command`, so they need its depth cap explicitly. This crate builds
-    /// with `panic = "abort"`, which makes an overflow the shell DYING rather
-    /// than a diagnostic -- and it did, with SIGABRT, until `cond_term` was
+    /// `parse_command`, so they need its depth cap explicitly. A stack overflow
+    /// is the shell DYING rather than a diagnostic, whatever the panic strategy
+    /// -- and it did, with SIGABRT, until `cond_term` was
     /// guarded. Both shapes are pinned: the parenthesis nesting that found it,
     /// and the `!` chain that reaches the same recursion without any bracket.
     #[test]
@@ -2551,6 +2551,56 @@ mod tests {
         assert_eq!(run(&src).1, "0\n");
         // ...and an ordinary depth still parses and runs.
         assert_eq!(run("[[ ((((a)))) ]]; echo $?").1, "0\n");
+    }
+
+    /// A pipeline STAGE and a background JOB run this same recursive evaluator
+    /// on a THREAD, and every depth guard here bounds native recursion against
+    /// the main thread's stack. Rust's default 2 MiB left `MAX_RUN_DEPTH` above
+    /// where a stage's stack actually ended, so the guard could not fire: a
+    /// debug build died on `${x:-$( )}` nesting from 200 and `$( )` from 240,
+    /// and dying is the whole PROCESS rather than the stage: Rust aborts on a
+    /// stack overflow whatever the panic strategy, so it is a signal and not a
+    /// diagnostic.
+    ///
+    /// Both thread kinds are pinned, at a depth PAST the guard, because what
+    /// broke was reaching the guard at all rather than what it then said.
+    ///
+    /// The JOB goes first, and that order is the test rather than a detail:
+    /// glibc caches an exiting thread's stack and gives it to the next request
+    /// whatever size that asks for, so a stage running first hands its 8 MiB on
+    /// and the job passes without ever having asked for one.
+    #[test]
+    fn a_stage_and_a_job_reach_the_recursion_guard_rather_than_the_stack_end() {
+        // Past the guard by construction rather than by a literal, so raising
+        // MAX_RUN_DEPTH cannot leave this passing a script that never reaches
+        // it -- and if it is ever raised past what the stack holds, this is
+        // what stops instead of a user.
+        let n = super::MAX_RUN_DEPTH as usize + 50;
+        let subs = format!("{}echo 1{}", "$(".repeat(n), ")".repeat(n));
+        let param = format!("{}echo 1{}", "${x:-$(".repeat(n), ")}".repeat(n));
+        for nest in [&subs, &param] {
+            for src in [
+                format!("{{ echo {nest}; }} &\nwait\necho AFTER"),
+                // Consumed by a BUILTIN: `cat` is not on the test shell's PATH,
+                // so the pipeline would report that as well and the assertion
+                // would be reading a stage that failed for a second reason.
+                format!("echo {nest} | while read x; do :; done; echo AFTER"),
+            ] {
+                let (_, out, err) = run(&src);
+                assert!(
+                    err.contains("maximum recursion depth exceeded"),
+                    "guard did not fire: {err:?}",
+                );
+                // Ends WITH it rather than equals: the abandoned substitution
+                // still leaves `echo` a blank line to print.
+                assert!(out.ends_with("AFTER\n"), "the shell did not survive it: {out:?}");
+            }
+        }
+        // ...and an ordinary nesting in a stage still runs, so the bound is not
+        // simply refusing everything a thread evaluates. Consumed by a BUILTIN
+        // rather than `cat`, whose output a captured fd never sees.
+        let src = "echo $(echo $(echo hi)) | while read x; do echo got=$x; done";
+        assert_eq!(run(src).1, "got=hi\n");
     }
 
     /// The three unary operators `test` does not serve. `-a` is the interesting

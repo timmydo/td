@@ -748,6 +748,7 @@ pub fn spawn(mut child: Subshell, and_or: &AndOr) -> Result<JoinHandle<i32>, Str
     // starts is whatever the operator wrote. This crate does not panic on an
     // error path.
     std::thread::Builder::new()
+        .stack_size(process::SHELL_THREAD_STACK)
         .spawn(move || {
             // NOT `run_and_or`: `&`'s operand is a node ash treats specially when
             // it is a bare compound carrying redirections. See

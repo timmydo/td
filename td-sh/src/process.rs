@@ -389,6 +389,18 @@ const MAX_FD: u32 = i32::MAX as u32;
 /// the same 2 as the two above, for a third unrelated reason.
 const BAD_FD_NUMBER: i32 = 2;
 
+/// The stack a thread running SHELL CODE gets. A pipeline stage and a background
+/// job are forks in every other shell and threads here, so each one runs the same
+/// recursive evaluator the main thread does -- and every depth guard in this crate
+/// is a bound on native recursion, sized against the main thread's 8 MiB. Rust's
+/// default 2 MiB left those bounds above where a stage's stack actually ended.
+///
+/// 8 MiB is `ulimit -s`'s usual value rather than a reading of it: asking would
+/// need `getrlimit(2)`, a syscall this crate's surface deliberately does not
+/// have. So the parity holds at that usual value and not below it -- launched
+/// with less, the MAIN thread becomes the shallow one instead.
+pub const SHELL_THREAD_STACK: usize = 8 * 1024 * 1024;
+
 /// The result of applying one command's redirections.
 pub enum RedirOutcome {
     /// All redirections applied; here is what to restore afterward.
@@ -896,7 +908,8 @@ pub fn run_pipeline(sh: &mut Shell, cmds: &[Stage]) -> R<()> {
                 // operator typed, so a low thread limit would abort the shell
                 // where a diagnostic belongs. This crate does not panic on an
                 // error path.
-                std::thread::Builder::new().spawn_scoped(scope, move || {
+                let builder = std::thread::Builder::new().stack_size(SHELL_THREAD_STACK);
+                builder.spawn_scoped(scope, move || {
                     let mut stage = stage;
                     // Per STAGE, not per pipeline: `true |\n  echo $LINENO`
                     // reports 2 in dash, and each stage is its own `Shell` here

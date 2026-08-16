@@ -795,8 +795,8 @@ impl Units {
     /// Depth-guarded, sharing `parse_command`'s counter. `( … )` and `!` recurse
     /// here WITHOUT going through `parse_command`, so without this the bound
     /// that stops `((((…))))` overflowing the stack would not cover the same
-    /// shape inside `[[ ]]` -- and this crate builds with `panic = "abort"`, so
-    /// an overflow is the shell dying rather than a diagnostic. Verified: 100k
+    /// shape inside `[[ ]]` -- and a stack overflow is the shell dying rather
+    /// than a diagnostic, whatever the panic strategy. Verified: 100k
     /// nested parens abort without it and are a syntax error with it.
     fn cond_term(&mut self) -> Syn<CondExpr> {
         self.depth += 1;

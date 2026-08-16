@@ -17,8 +17,8 @@ use crate::expand::QChar;
 use crate::pattern::ClassItem;
 
 /// The parser's nesting bound, shared in spirit with the shell parser's own:
-/// `((((…))))` must be an error rather than a stack overflow, and this crate
-/// builds with `panic = "abort"` so an overflow is the shell DYING.
+/// `((((…))))` must be an error rather than a stack overflow, which is the
+/// shell DYING -- Rust aborts on one whatever the panic strategy.
 const MAX_DEPTH: u32 = 256;
 
 /// The compiler's budget, spent one unit per `emit` call. It bounds the
@@ -206,8 +206,8 @@ impl Parser<'_> {
         // Each postfix operator wraps the last in another `Rep`, so a RUN of
         // them nests as deeply as it is long -- and both `emit` and the tree's
         // own `Drop` walk that spine. `a` followed by 200k `*` aborted with
-        // SIGABRT before this bound, which under `panic = "abort"` is the shell
-        // dying rather than reporting a bad pattern.
+        // SIGABRT before this bound, which is the shell dying rather than
+        // reporting a bad pattern.
         let mut chain = 0u32;
         loop {
             // glibc refuses a repeated ANCHOR (`^*`): there is no preceding
