@@ -1103,16 +1103,15 @@ fn run_gate(
                         // shares the pgid the spawn gave the gate.
                         //
                         // `stop` is re-read immediately before the kill, which
-                        // NARROWS a real hazard without closing it: the flag is
-                        // set by `child.wait` RETURNING, and the wait has already
-                        // reaped the pid by then, so a gate exiting on its
-                        // deadline can still be signalled after the kernel is
-                        // free to reuse the pgid — if this thread is scheduled
-                        // between that reap and the store. Closing it needs a
-                        // handle a reap cannot invalidate (pidfd, or WNOWAIT),
-                        // which is a new control-plane syscall and its own
-                        // increment. The RSS arm needs no guard at all: a reaped
-                        // group reads zero RSS, so it cannot fire late.
+                        // narrows the window where a gate exiting on its deadline
+                        // is signalled anyway; what makes a kill that still slips
+                        // through HARMLESS is that the waiter below does not
+                        // reap. The pgid is a pid, and only the reap releases it,
+                        // so until this thread is joined the worst a late kill
+                        // can reach is our own dead group. (The RSS arm needs no
+                        // guard at all: a zombie's /proc/<pid>/statm is all
+                        // zeroes, so the group reads zero RSS from the moment it
+                        // dies — held or reaped — and cannot fire late.)
                         if limit.is_some_and(|l| started.elapsed() >= l)
                             && !stop.load(std::sync::atomic::Ordering::Relaxed)
                         {
@@ -1125,7 +1124,31 @@ fn run_gate(
                     }
                 })
             });
-            let st = child.wait();
+            // Dropped exactly as `Child::wait` would, and before a wait that does
+            // not: a gate inherits stdin today, so this is a no-op, but piping it
+            // later would otherwise deadlock here rather than in `wait`.
+            drop(child.stdin.take());
+            // Wait for the body WITHOUT reaping it. The pgid IS this pid, and a
+            // reap frees the number the instant it returns, so a watchdog
+            // scheduled between the reap and the store below would signal
+            // whatever group the kernel handed it to next. A zombie holds the
+            // number until this scope joins the watchdog.
+            let early = match crate::sys::wait_exited_no_reap(child.id()) {
+                Ok(()) => None,
+                // Only a kernel without waitid(2) should reach this. Fall back to
+                // the reaping wait it replaced: the gate stays bounded, and what
+                // it gives up is named in the log rather than left to be
+                // inferred from a missing line.
+                Err(e) => {
+                    let _ = writeln!(
+                        logf,
+                        "gate-run: gate {}: waitid(WNOWAIT) failed ({e}); falling back to a \
+                         reaping wait — the late-kill window is open for this gate",
+                        g.name
+                    );
+                    Some(child.wait())
+                }
+            };
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
             // Wake it now rather than letting the scope wait out its interval.
             // An unpark before the park is not lost — it leaves a token the next
@@ -1133,8 +1156,14 @@ fn run_gate(
             if let Some(h) = &watchdog {
                 h.thread().unpark();
             }
-            st
+            early
         });
+        // The scope joined the watchdog, so no further kill can be issued and the
+        // pgid is free to release.
+        let status = match status {
+            Some(st) => st,
+            None => child.wait(),
+        };
         if let Some(cg) = &gate_cg {
             if cgroup_oom_kills(cg) > 0 {
                 breached.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1164,10 +1193,11 @@ fn run_gate(
         }
         // A process the watchdog killed cannot also have exited 0, so a
         // SUCCESSFUL status means the flag was set in the instant AFTER the body
-        // finished and the kill reached a group that was already gone. Believe
-        // the status: reporting a gate that ran to completion as a timeout would
-        // red a green branch on nothing but scheduling. (The RSS flag needs no
-        // such reading — a reaped group reads zero, so it never fires late.)
+        // finished and the kill reached a group already dead — held unreaped
+        // above precisely so it is still OURS to signal. Believe the status:
+        // reporting a gate that ran to completion as a timeout would red a green
+        // branch on nothing but scheduling. (The RSS flag needs no such reading —
+        // a dead group reads zero, so it never fires late.)
         let timed_out = timed_out.load(std::sync::atomic::Ordering::Relaxed)
             && !matches!(&status, Ok(st) if st.success());
         if timed_out {

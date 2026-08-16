@@ -1,5 +1,7 @@
-//! Minimal raw x86_64-linux syscall layer: unshare(2), mount(2), getuid(2),
-//! getgid(2) — exactly what the build sandbox needs. Hand-rolled to keep the
+//! Minimal raw x86_64-linux syscall layer: what the build sandbox, the gate
+//! runner and the store writer need and safe `std` does not reach — namespaces
+//! and mounts, process creation and waiting, ids and resource limits, and a
+//! handful of descriptor primitives. Hand-rolled to keep the
 //! crate zero-dependency (precedent is the
 //! hand-rolled SHA-256; the rung's differential proves behavior, and the drv
 //! platform field is checked to be x86_64-linux before any of this runs).
@@ -398,6 +400,37 @@ pub fn waitpid(pid: i64) -> io::Result<i32> {
     }
 }
 
+const SYS_WAITID: usize = 247;
+const P_PID: usize = 1;
+const WEXITED: usize = 0x0000_0004;
+const WNOWAIT: usize = 0x0100_0000;
+
+/// waitid(2) with WNOWAIT: block until `pid` has TERMINATED — exited or been
+/// killed, the second being the case this exists for — but leave it waitable so
+/// the pid stays allocated until something reaps it. A process-group id IS its
+/// leader's pid, so a REAPING wait frees that number as it returns, and a
+/// `kill(-pgid, …)` racing just behind one can reach whatever group the kernel
+/// handed the number to next. Measured: with the leader a zombie,
+/// `kill(-pgid, 0)` returns 0; after the reap, ESRCH.
+///
+/// `infop` is NULL, which the kernel accepts and which skips the siginfo_t copy
+/// entirely — so unlike every other pointer-taking call in this file there is no
+/// buffer whose length could be got wrong. WEXITED alone (no WSTOPPED, no
+/// WCONTINUED) is what keeps a stop or a continue from returning here; the
+/// caller reaps with `Child::wait` and takes the status from there.
+pub fn wait_exited_no_reap(pid: u32) -> io::Result<()> {
+    loop {
+        let ret = unsafe { syscall5(SYS_WAITID, P_PID, pid as usize, 0, WEXITED | WNOWAIT, 0) };
+        if ret >= 0 {
+            return Ok(());
+        }
+        let errno = -ret as i32;
+        if errno != EINTR {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+    }
+}
+
 /// exit_group(2): terminate the whole process immediately with `code`. The
 /// host-sandbox's PID-namespace PARENT uses this to propagate its PID-1 child's
 /// exit status WITHOUT returning into std's post-fork exec path — there must be
@@ -575,6 +608,43 @@ mod tests {
             close(i32::MAX).unwrap_err().raw_os_error(),
             Some(9 /* EBADF */),
             "close must reach the kernel — a stub returning Ok would pass the asserts above"
+        );
+    }
+
+    #[test]
+    fn a_no_reap_wait_leaves_the_pid_reserved_for_a_later_reap() {
+        // The gate watchdog signals a process GROUP by its leader's pid, so the
+        // wait that decides it may stop must not release that number. Both
+        // halves are asserted: the wait returns only once the child has exited,
+        // and the child is still there to reap afterwards.
+        let pid = fork().expect("fork");
+        if pid == 0 {
+            // Alive for long enough that a stub which returned without issuing
+            // anything would find the child still running, and read R/S below
+            // rather than Z. Without the pause a stub passes whenever the child
+            // wins the race to exit, which it usually does.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            exit_group(7);
+        }
+        wait_exited_no_reap(pid as u32).expect("waitid(WNOWAIT)");
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        // Field 3 is the state, and comm (field 2) can itself hold ')' and
+        // spaces, so read from the LAST one.
+        let after_comm = stat.rsplit(')').next().unwrap_or("");
+        assert_eq!(
+            after_comm.split_whitespace().next(),
+            Some("Z"),
+            "the child must have exited and still hold its pid: {stat}"
+        );
+        let status = waitpid(pid).expect("the pid must still be reapable");
+        assert_eq!(status & 0x7f, 0, "child should exit normally, not be signalled");
+        assert_eq!((status >> 8) & 0xff, 7, "the exit code must survive the no-reap wait");
+        // The control: the REAP is what frees the pid, which is what makes
+        // waiting without one worth doing.
+        assert_eq!(
+            waitpid(pid).unwrap_err().raw_os_error(),
+            Some(10 /* ECHILD */),
+            "a second wait must find nothing — the reap released it"
         );
     }
 
