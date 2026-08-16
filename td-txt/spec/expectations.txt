@@ -46,9 +46,5 @@ xfail sed-cli.test.txt::a dot pins no byte either, so the same pattern past a br
 xfail sed-cli.test.txt::nor does a star that can take none of its atom
 xfail sed-cli.test.txt::but a MANDATORY single-byte matcher after the pair matches nothing at all
 xfail sed-cli.test.txt::which a bracket spells the same way
-xfail sed-cli.test.txt::a [ consumed as a closer test leaves the reader somewhere unmodelled
-xfail sed-cli.test.txt::and the same shape after an earlier sub-expression
-xfail sed-cli.test.txt::the same with a class
-xfail sed-cli.test.txt::and with an equivalence class
 xfail sed-cli.test.txt::either posix level: a bracket AFTER a closed sub-expression keeps suppressing
 xfail sed-cli.test.txt::and the same shape under POSIXLY_CORRECT, which is the same gap

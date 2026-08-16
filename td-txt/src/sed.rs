@@ -533,21 +533,18 @@ impl ScriptParser<'_> {
     /// and a `\` may itself delimit (`sed -n '\\^\p'`).
     fn read_delimited(&mut self, delim: u8, unterminated: &str) -> Result<Vec<u8>, String> {
         let mut out = Vec::new();
-        let mut in_bracket = false;
-        let mut bracket_body = 0usize; // index in `out` where the set's members start
         loop {
             let Some(b) = self.bump() else {
                 return Err(unterminated.to_string());
             };
-            // Ahead of bracket state too, so `s/[<newline>]/X/` is refused.
             if b == b'\n' {
                 self.savchar();
                 return Err(unterminated.to_string());
             }
-            if b == delim && !in_bracket {
+            if b == delim {
                 return Ok(out);
             }
-            if b == b'\\' && !in_bracket {
+            if b == b'\\' {
                 // A part's closing newline is that part's end of input, so this
                 // backslash has nothing to escape and the half is unterminated
                 // — GNU compiled the part alone and ran out here. INSIDE one
@@ -570,52 +567,77 @@ impl ScriptParser<'_> {
                 }
                 continue;
             }
-            if in_bracket {
-                out.push(b);
-                // `[:`, `[.` and `[=` open a sub-expression running to that same
-                // character before a `]`, so the `]` of `[:alpha:]` does not end
-                // the set and a delimiter after one is still a member. GNU's
-                // reader CONSUMES the byte it tests after the kind character and
-                // does not put it back, where the regex compiler peeks it — which
-                // is why `[[...]]` is a set holding `.` to grep and unterminated
-                // to sed, the reader having eaten the `.]` its name needed.
-                if b == b'[' {
-                    if let Some(kind) = self.peek().filter(|c| matches!(c, b':' | b'.' | b'=')) {
-                        self.pos += 1;
-                        out.push(kind);
-                        loop {
-                            let c = self.sub_expr_byte(&mut out, unterminated)?;
-                            if c != kind {
-                                continue;
-                            }
-                            if self.sub_expr_byte(&mut out, unterminated)? == b']' {
-                                break;
-                            }
-                        }
-                    }
-                    continue;
-                }
-                if b == b']' && out.len() > bracket_body + 1 {
-                    in_bracket = false;
-                }
-                continue;
-            }
             if b == b'[' {
-                in_bracket = true;
                 out.push(b);
-                if self.eat(b'^') {
-                    out.push(b'^');
-                }
-                bracket_body = out.len();
+                self.snarf_char_class(&mut out, unterminated)?;
+                out.push(b']');
                 continue;
             }
             out.push(b);
         }
     }
 
-    /// One byte of a bracket sub-expression, kept in `out`. A bare newline ends
-    /// the half here as it does everywhere else in `read_delimited`.
-    fn sub_expr_byte(&mut self, out: &mut Vec<u8>, unterminated: &str) -> Result<u8, String> {
+    /// GNU's `snarf_char_class` (sed/compile.c:456-530): where the delimiter scan
+    /// resumes past a bracket expression. A sub-expression's closing `:`/`.`/`=`
+    /// only ARMS the `]` and any other byte disarms it again -- except `[`, which
+    /// disarms nothing, so `[[..[]]` closes where `[[...]]` runs off the end. It
+    /// decides only where the half ENDS; what it hands back is the regex
+    /// compiler's to reject, which is why `s/[[..[]]/X/` is `Unmatched [` rather
+    /// than `unterminated`. Returns having consumed the `]`, which the caller
+    /// appends.
+    fn snarf_char_class(&mut self, out: &mut Vec<u8>, unterminated: &str) -> Result<(), String> {
+        let mut state = 0u8;
+        let mut delim = 0u8;
+        let mut ch = self.class_byte(unterminated)?;
+        // Stepped over before the machine runs, so `[]a]` and `[^]a]` are sets
+        // whose first member is a `]` rather than empty ones.
+        if ch == b'^' {
+            out.push(ch);
+            ch = self.class_byte(unterminated)?;
+        }
+        if ch == b']' {
+            out.push(ch);
+            ch = self.class_byte(unterminated)?;
+        }
+        loop {
+            let mut demote = true;
+            match ch {
+                b'.' | b':' | b'=' => {
+                    if state == 1 {
+                        (delim, state, demote) = (ch, 2, false);
+                    } else if state == 2 && ch == delim {
+                        (state, demote) = (3, false);
+                    }
+                }
+                b'[' => {
+                    state = if state == 0 { 1 } else { state };
+                    demote = false;
+                }
+                b']' => {
+                    if state == 0 || state == 1 {
+                        return Ok(());
+                    }
+                    state = if state == 3 { 0 } else { state };
+                }
+                _ => {}
+            }
+            if demote {
+                // GNU's `state &= ~1`: a byte that is not the one the state was
+                // waiting for drops 1 to 0 and 3 to 2, and leaves the even ones.
+                state = match state {
+                    1 => 0,
+                    3 => 2,
+                    s => s,
+                };
+            }
+            out.push(ch);
+            ch = self.class_byte(unterminated)?;
+        }
+    }
+
+    /// One byte of a bracket expression. A bare newline ends the half here as it
+    /// does everywhere else in `read_delimited`, and so does end of input.
+    fn class_byte(&mut self, unterminated: &str) -> Result<u8, String> {
         let Some(c) = self.bump() else {
             return Err(unterminated.to_string());
         };
@@ -623,7 +645,6 @@ impl ScriptParser<'_> {
             self.savchar();
             return Err(unterminated.to_string());
         }
-        out.push(c);
         Ok(c)
     }
 

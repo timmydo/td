@@ -623,12 +623,22 @@ td-txt-authored case files
   literal it is anywhere else, so `[a-b-]` is not.
 
   The two readers part company on ONE thing, and it is why `[[...]]` is a set
-  holding a dot to grep and `unterminated` to sed. Looking for the closer, sed's
-  reader CONSUMES the byte it tests after the kind character and does not put it
-  back; the regex compiler peeks it. So the reader misses a closer that overlaps
-  the byte it just ate, and the parity shows: `[[..]]`, `[[....]]` close, while
+  holding a dot to grep and `unterminated` to sed. sed's is a FOUR-STATE MACHINE
+  over the bracket expression (`snarf_char_class`, compile.c:456) rather than a
+  parser: the kind character only ARMS the closing `]`, and any other byte
+  disarms it again, where the regex compiler looks for the pair. So the PARITY
+  of a run of kind characters decides -- `[[..]]` and `[[....]]` close, while
   `[[...]]` and `[[.....]]` run to the end of the script. Same for `[[:::]]` and
   `[[===]]`.
+
+  A `[` is the one byte that disarms nothing, and that is the half no amount of
+  reasoning about a consumed closer predicts -- an earlier draft here had the
+  parity right and this wrong. It arms the machine from outside a sub-expression
+  and is inert everywhere else, so `[[..[]]` is still closed at the `]` after it
+  (`[[::[]]` and `[[==[]]` likewise), while `[[...][.[.]]` is the parity rule
+  again and is unterminated. The reader REJECTS none of these: all it decides is
+  where the half ends, so the first three reach the compiler and come back
+  `Unmatched [` where the fourth never gets there.
 
   GNU also refuses the `[:alpha:]` that was meant to be `[[:alpha:]]`, and by the
   SHAPE of the list rather than the name in it: colons at both ends, a NON-COLON

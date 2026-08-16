@@ -7548,7 +7548,7 @@ b/p'
 ## stderr-json: ""
 ## status: 0
 
-#### a [ consumed as a closer test leaves the reader somewhere unmodelled
+#### a [ is the one byte that disarms nothing, so this set closes and the compiler judges it
 ## argv: sed 's/[[..[]]/X/'
 ## stdin-json: "a\n"
 ## stdout-json: ""
@@ -7575,6 +7575,104 @@ b/p'
 ## stdout-json: ""
 ## stderr-contains: Unmatched [, [^, [:, [., or [=
 ## status: 1
+
+#### an address regex is read by the same machine
+## argv: sed '/[[..[]]/d'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Unmatched [, [^, [:, [., or [=
+## status: 1
+
+#### a ] ends the set from a bracket just opened too, so this one holds a [
+## argv: sed 's/[[]/X/'
+## stdin-json: "[\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### the sub-expression opener must be the bracket itself: a byte between disarms it
+## argv: sed 's/[[a.b.]]/X/'
+## stdin-json: "a]\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### and the disarmed bracket's kind character is ordinary, so the set ends before the delimiter
+## argv: sed 's/[[a./]./X/'
+## stdin-json: "a?\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### and the closer must be the kind the opener named
+## argv: sed 's/[[.a:]]/X/'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: unterminated `s' command
+## status: 1
+
+#### a class opener is disarmed the same way
+## argv: sed 's/[[:a.]]/X/'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: unterminated `s' command
+## status: 1
+
+#### the reader having found the set does not make it a valid one
+## argv: sed 's/[[.a:.]]/X/'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid collation character
+## status: 1
+
+#### a closed sub-expression leaves the state where a plain ] can end the set
+## argv: sed 's/[[.a.]]]/X/'
+## stdin-json: "a]\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### the delimiter inside an open sub-expression is a member like any other
+## argv: sed 's,[[./.]],X,'
+## stdin-json: "/\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### the ^ the reader steps over is ahead of the machine, not a state of it
+## argv: sed 's/[^]/]/X/'
+## stdin-json: "b\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### as is a ] first among the members
+## argv: sed 's/[]/]/X/'
+## stdin-json: "/\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### a [ that is the DELIMITER ends the half and opens nothing
+## argv: sed 's[a[X['
+## stdin-json: "a\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### including as the half's first byte, where it is an empty pattern
+## argv: sed 's[[a][X['
+## stdin-json: "[a]\n"
+## stdout-json: ""
+## stderr-contains: unknown option to `s'
+## status: 1
+
+#### and an address delimited the same way
+## argv: sed -n '\[a[p'
+## stdin-json: "a\n"
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
 
 #### a brace in sed's ERE always opens an interval, so a bare one has nothing to repeat
 ## argv: sed -E 's@{@X@'
