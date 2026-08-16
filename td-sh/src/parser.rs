@@ -488,6 +488,15 @@ impl Units {
             .map_or(1, |p| p.line)
     }
 
+    /// The line a failed parse stopped on. ash sets `errlinno` from the
+    /// parser's own position (`raise_error_syntax`, ash.c:1477) rather than
+    /// from the last command's, which is what `$LINENO` still holds -- so
+    /// without this a syntax error carries the line of whatever ran BEFORE it,
+    /// which can be anywhere.
+    pub fn error_line(&mut self) -> u32 {
+        self.line()
+    }
+
     fn tok_at(&mut self, i: usize) -> Option<&Tok> {
         // The refill belongs HERE and not one fetch earlier: filling ahead of
         // the fetch reads a line the current unit does not need, which for a

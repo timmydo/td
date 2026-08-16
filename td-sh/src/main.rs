@@ -206,6 +206,11 @@ fn run(args: &[String]) -> Result<i32, String> {
         if let Some(name) = args.get(i + 1) {
             sh.arg0 = name.clone();
             sh.params = args.iter().skip(i + 2).cloned().collect();
+            // ash reaches the same `commandname = arg0` a script does, by
+            // jumping INTO that branch (`goto setarg0`, ash.c:14626) once `-c`
+            // has a name operand. So `-c CMD NAME` reports a line where bare
+            // `-c` reports none -- the name is what makes the difference.
+            sh.commandname = Some(name.clone());
         }
         Start::Command(cmd)
     } else if let Some(path) = script_operand {
@@ -255,6 +260,12 @@ fn run(args: &[String]) -> Result<i32, String> {
             let mut src = String::new();
             file.read_to_string(&mut src)
                 .map_err(|e| format!("{path}: {}", exec::strerror(&e)))?;
+            // ash.c:14630 sets `commandname = arg0` for a script named on the
+            // command line and nowhere else, which is why a script reports the
+            // line of a failure and `-c` does not. Equal to `$0`, so the
+            // component itself is dropped and only the line survives.
+            sh.commandname = Some(sh.arg0.clone());
+            sh.input_is_file = true;
             Ok(run_program(&mut sh, &src))
         }
         Start::Repl => {
@@ -312,7 +323,22 @@ fn read_profiles(sh: &mut Shell) -> Option<i32> {
 /// immediately.
 fn read_profile(sh: &mut Shell, path: &str) -> Option<i32> {
     let src = std::fs::read_to_string(path).ok()?;
-    match exec::run_source(sh, &src, &format!("{path}: ")) {
+    // A profile is read from a real file, which is ash's `pf_fd > 0`: an
+    // INTERACTIVE login still reports the line of a failure inside one, where
+    // the same failure typed at its prompt reports none.
+    //
+    // The NAME is a deliberate divergence rather than an oversight. ash's
+    // `read_profile` sets no `commandname`, so a broken profile there is a bare
+    // `ash: syntax error: …` naming no file; this shell names it, as `.` names
+    // a sourced file, because a login that fails on a file the operator cannot
+    // identify is one they cannot repair. A builtin inside the profile still
+    // overwrites this with its own name, so those diagnostics stay ash's.
+    let was_file = std::mem::replace(&mut sh.input_is_file, true);
+    let was_name = sh.commandname.replace(path.to_string());
+    let ran = exec::run_source(sh, &src);
+    sh.commandname = was_name;
+    sh.input_is_file = was_file;
+    match ran {
         Ok(()) => None,
         // td's own `/etc/profile` ends its autotest branch with `exit 0`, which
         // is what powers the VM off; a shell that swallowed it would sit at a
@@ -637,20 +663,30 @@ mod confinement {
 
     /// `write_stderr` is the one write that skips the `$0` every diagnostic
     /// carries, so its CALLERS are the whole of the exception: `diag`, which
-    /// puts the name on, and `err_raw`, which is the four messages busybox
-    /// writes with a bare `fprintf` (ash.c:3564, 3588, 11714, 11736). A third
-    /// caller would drop the prefix SILENTLY -- those four are worded
-    /// identically either way, so nothing but a comparison against ash sees it
-    /// -- which is the failure one sink exists to prevent and no compiler
-    /// checks. Three mentions in all: the definition and those two.
+    /// composes ash's whole `ash_vmsg` prefix; `diag_applet`, which composes
+    /// the `$0` alone for the libbb messages that reach no line; and
+    /// `err_raw`, which is the four messages busybox writes with a bare
+    /// `fprintf` (ash.c:3564, 3588, 11714, 11736). A FOURTH caller would drop
+    /// the prefix SILENTLY -- those four are worded identically either way, so
+    /// nothing but a comparison against ash sees it -- which is the failure
+    /// one sink exists to prevent and no compiler checks. Four mentions in
+    /// all: the definition and those three.
     #[test]
-    fn the_diagnostic_sink_has_exactly_two_callers() {
+    fn the_diagnostic_sink_has_exactly_three_callers() {
         let needle = concat!("write_", "stderr(");
-        assert_eq!(count_code(needle), 3, "a new caller of {needle} would bypass `$0`");
+        assert_eq!(count_code(needle), 4, "a new caller of {needle} would bypass `$0`");
         assert_eq!(count_code(concat!("pub fn write_", "stderr(")), 1);
-        // Named whole, so a third caller cannot arrive by REPLACING one.
-        let diag = concat!("write_", "stderr(sh, &format!(\"{}: {msg}\", sh.arg0))");
+        // Named whole, so a fourth caller cannot arrive by REPLACING one. The
+        // full sink builds its prefix over several lines now, so what is
+        // pinned there is the call plus the buffer it is handed.
+        let diag = concat!("write_", "stderr(sh, &out)");
         assert_eq!(code_only(source("exec.rs")).matches(diag).count(), 1);
+        // The applet sink is the shape `diag` had before the line arrived, and
+        // is pinned whole for the same reason: the two differ only in what
+        // they compose, so a message reaching the wrong one is invisible here
+        // and visible only against ash.
+        let applet = concat!("write_", "stderr(sh, &format!(\"{}: {msg}\", sh.arg0))");
+        assert_eq!(code_only(source("exec.rs")).matches(applet).count(), 1);
         let raw = concat!("exec::write_", "stderr(sh, msg)");
         assert_eq!(code_only(source("builtin.rs")).matches(raw).count(), 1);
     }

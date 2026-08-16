@@ -167,6 +167,19 @@ pub struct Shell {
     /// at each read. SIGNED because dash's is a plain `int` subtraction that
     /// can go below zero -- see `set_lineno`.
     pub lineno: i64,
+    /// ash's `commandname` (ash.c:635): the RUNNING builtin's `argv[0]`, or a
+    /// sourced file's path, or `$0` for a script invoked by name -- and `None`
+    /// under `-c` and on stdin, where ash never sets it. It is what `diag`
+    /// gates BOTH the command component and the line number on, so it decides
+    /// where a diagnostic says it happened rather than merely what it is called.
+    pub commandname: Option<String>,
+    /// ash's `pf_fd > 0`, which with `interactive` is its `!iflag || pf_fd > 0`:
+    /// a shell at a terminal prompt reports no line, since the operator just
+    /// typed it. The test is the DESCRIPTOR rather than the file -- `sh <
+    /// script` reads a real file and ash still prints none, because that file
+    /// arrived as fd 0 -- so this is set where a path was opened (a script
+    /// operand, a sourced file, a profile) and nowhere else.
+    pub input_is_file: bool,
     /// The line the function whose body is running was DEFINED on, or 0 outside
     /// one. dash reports `$LINENO` inside a function relative to its definition
     /// (eval.c:752), where busybox ash and bash report the absolute line; the
@@ -427,6 +440,8 @@ impl Shell {
             params: Vec::new(),
             arg0: "td-sh".to_string(),
             lineno: 1,
+            commandname: None,
+            input_is_file: false,
             funcline: 0,
             status: 0,
             last_bg: None,
@@ -553,6 +568,8 @@ impl Shell {
             random: Some(crate::random::Rand::seeded(1)),
             arg0: "td-sh".to_string(),
             lineno: 1,
+            commandname: None,
+            input_is_file: false,
             funcline: 0,
             status: 0,
             last_bg: None,
@@ -931,7 +948,7 @@ impl Default for Shell {
 /// Parse and run a whole program, returning the final `$?`. A parse error prints
 /// to stderr and yields 2 (the POSIX syntax-error status).
 pub fn run_program(sh: &mut Shell, src: &str) -> i32 {
-    let status = match run_source(sh, src, "") {
+    let status = match run_source(sh, src) {
         Ok(()) => sh.status,
         Err(Sig::Exit(code) | Sig::Abort(code) | Sig::Interrupt(code)) => code,
         // A stray break/continue/return at the top level is not an error worth
@@ -981,7 +998,7 @@ pub fn run_exit_trap(sh: &mut Shell, status: i32) -> i32 {
     // which is bounded and is what a second SIGPIPE would do.
     sh.stderr_epipe.store(false, Ordering::Relaxed);
     let saved = sh.trap_status.replace(status);
-    let code = match run_source(sh, &action, "") {
+    let code = match run_source(sh, &action) {
         Ok(()) => status,
         Err(Sig::Exit(code) | Sig::Abort(code) | Sig::Interrupt(code)) => code,
         Err(_) => status,
@@ -994,13 +1011,17 @@ pub fn run_exit_trap(sh: &mut Shell, status: i32) -> i32 {
 /// parsed only once everything before it has run. That is what makes an `alias`
 /// visible to the next line but not to the rest of its own line. A syntax error
 /// stops the run with status 2, reported as `$0: {what}{error}`.
-pub fn run_source(sh: &mut Shell, src: &str, what: &str) -> R<()> {
+pub fn run_source(sh: &mut Shell, src: &str) -> R<()> {
     let mut units = parser::Units::new(src);
     loop {
         match units.next_unit(&sh.aliases) {
             None => return Ok(()),
             Some(Err(e)) => {
-                let _ = diag(sh, &format!("{what}{e}"));
+                // The parser's position, not `$LINENO`: nothing RAN at the
+                // point a parse failed, so the line the shell is otherwise
+                // holding belongs to some earlier command.
+                sh.set_lineno(units.error_line());
+                let _ = diag(sh, &e);
                 sh.set_status(2);
                 // Abandons the enclosing list, as `eval 'if'; echo` shows in both
                 // references: reporting and returning Ok ran the rest of it.
@@ -1738,7 +1759,7 @@ fn dispatch_simple(
                     sh.set_var(&a.name, &value)?;
                     sh.export(&a.name);
                 }
-                process::exec_external(sh, argv, None, "", None)
+                process::exec_external(sh, argv, None, None)
             })();
             process::restore_redirs(sh, saved);
             r
@@ -2190,14 +2211,50 @@ pub fn write_stderr(sh: &Shell, msg: &str) -> std::io::Result<()> {
     note_epipe(sh, process::write_fd(sh, 2, format!("{msg}\n").as_bytes()))
 }
 
-/// Report a diagnostic: the shell's own name, then the message.
+/// Report a diagnostic: the shell's own name, the command component and the
+/// line if there is one, then the message.
 ///
 /// ash writes that name before every diagnostic it issues (`ash_vmsg`,
 /// ash.c:1419) and it is `$0` rather than a constant (ash.c:423), so a
 /// script's failures are attributed to the script and `-c CMD NAME` to NAME.
 /// Naming it in ONE place is the point: a prefix repeated at each call site
 /// is one a site can forget, which is how most of them came to lack it.
+///
+/// The other two parts come from shell STATE for the same reason, and are the
+/// whole of `ash_vmsg`'s remaining body: a component that repeats `$0` is
+/// dropped, and both it and the line are gated on `commandname`, so a `-c`
+/// command that never enters a builtin reports neither.
 pub fn diag(sh: &Shell, msg: &str) -> std::io::Result<()> {
+    let mut out = format!("{}: ", sh.arg0);
+    if let Some(cmd) = sh.commandname.as_deref() {
+        if cmd != sh.arg0 {
+            out.push_str(cmd);
+            out.push_str(": ");
+        }
+        if !sh.interactive || sh.input_is_file {
+            out.push_str("line ");
+            out.push_str(&sh.lineno.to_string());
+            out.push_str(": ");
+        }
+    }
+    out.push_str(msg);
+    write_stderr(sh, &out)
+}
+
+/// The libbb class: `$0` and the message, with neither component nor line.
+///
+/// `test`/`[`, `printf` and `read`'s bad variable name do not reach `ash_vmsg`
+/// at all -- they are busybox APPLET diagnostics through `bb_error_msg`, which
+/// knows nothing of `commandname` or the parser's line. Measured in a script,
+/// where `ash_vmsg` certainly would print one, ash answers `[ x` with a bare
+/// `missing ]` and `read 1bad` with `read: '1bad': bad variable name`: the
+/// name each carries is in the MESSAGE, not composed for it.
+///
+/// So this is the shape `diag` had before the line arrived, kept for exactly
+/// those messages. What still differs is the name in front, which is the
+/// applet's for ash and `$0` here -- the class a47199ef measured and deferred,
+/// and unchanged by this.
+pub fn diag_applet(sh: &Shell, msg: &str) -> std::io::Result<()> {
     write_stderr(sh, &format!("{}: {msg}", sh.arg0))
 }
 
@@ -3408,11 +3465,11 @@ mod tests {
             ("PATH=./pdir", "./pdir/target.sh"),
         ] {
             let (_s, _o, err) = run(&format!("cd {}; {dir_word}; . target.sh", dir.display()));
-            assert_eq!(err, format!("td-sh: .: can't open '{want}': Permission denied\n"));
+            assert_eq!(err, format!("td-sh: .: line 1: can't open '{want}': Permission denied\n"));
         }
         // An empty entry is the cwd and contributes NO prefix.
         let (_s, _o, err) = run(&format!("cd {}; PATH=; . target.sh", sub.display()));
-        assert_eq!(err, "td-sh: .: can't open 'target.sh': Permission denied\n");
+        assert_eq!(err, "td-sh: .: line 1: can't open 'target.sh': Permission denied\n");
         let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3486,7 +3543,7 @@ mod tests {
         // `exec` reads the SAME walk differently: it runs no lookup, so a
         // directory is the errno's own 126 where a plain command is 127.
         let (status, _o, err) = run(&format!("PATH={ad}; exec dirtool"));
-        assert_eq!(err, "td-sh: exec: dirtool: Permission denied\n");
+        assert_eq!(err, "td-sh: exec: line 1: dirtool: Permission denied\n");
         assert_eq!(status, 126);
         let (status, _o, _e) = run(&format!("PATH={ad}; exec zzznope"));
         assert_eq!(status, 127);
@@ -3502,7 +3559,7 @@ mod tests {
             format!("echo $(exec {g})"),
         ] {
             let (_s, _o, err) = run(&src);
-            assert_eq!(err, format!("td-sh: exec: {g}: not found\n"), "src: {src}");
+            assert_eq!(err, format!("td-sh: exec: line 1: {g}: not found\n"), "src: {src}");
         }
         let _ = std::fs::set_permissions(&noread, std::fs::Permissions::from_mode(0o755));
         // And a non-executable match must still not shadow a real one later.
@@ -3586,6 +3643,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `ash_vmsg` gates the component AND the line on `commandname`, so what a
+    /// diagnostic says about WHERE depends on whether a builtin is running --
+    /// not on the message. A builtin sets it (ash.c:10670) and nothing else in
+    /// this harness does, which is the `-c` shape: a failure that enters no
+    /// builtin reports neither half.
+    #[test]
+    fn only_a_running_builtin_gives_a_diagnostic_a_place() {
+        // The builtin names itself and the line.
+        assert_eq!(run("cd /nope/x").2, "td-sh: cd: line 1: can't cd to /nope/x: No such file or directory\n");
+        // The line is the COMMAND's, not a constant.
+        assert_eq!(run(":\n:\ncd /nope/x").2, "td-sh: cd: line 3: can't cd to /nope/x: No such file or directory\n");
+        // Inside a function it is whatever `$LINENO` answers, which this shell
+        // measures from the DEFINITION as dash does and ash measures
+        // absolutely. Defined below line 1 on purpose: with `f() {` on line 1
+        // the two rules agree and the divergence is invisible.
+        assert_eq!(
+            run(":\n:\nf() {\n  cd /nope/x\n}\nf").2,
+            "td-sh: cd: line 2: can't cd to /nope/x: No such file or directory\n"
+        );
+        // Neither half for a failure that enters no builtin: a command that is
+        // not found, and a redirection that cannot be opened.
+        assert_eq!(run("nosuchcmd_xyz").2, "td-sh: nosuchcmd_xyz: not found\n");
+        assert_eq!(run(": < /nope/x").2, "td-sh: can't open /nope/x: no such file\n");
+        // A readonly refusal is raised by the assignment rather than by a
+        // builtin, so it is in that second group even though `readonly` made it.
+        assert_eq!(run("readonly r=1\nr=2").2, "td-sh: r: is read only\n");
+    }
+
+    /// A sourced file is `commandname` for its duration (ash.c:13739), so a
+    /// failure inside one names the FILE rather than the `.` that read it --
+    /// and the line is the file's own, not the caller's.
+    #[test]
+    fn a_sourced_file_is_the_name_a_failure_inside_it_carries() {
+        let dir = std::env::temp_dir().join(format!("td-sh-srcname-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let Ok(()) = std::fs::create_dir_all(&dir) else { return };
+        let inner = dir.join("inner.sh");
+        let _ = std::fs::write(&inner, ":\n:\nnosuchcmd_xyz\n");
+        let path = inner.to_string_lossy().into_owned();
+        // The component is the file even though `nosuchcmd_xyz` entered no
+        // builtin: what set `commandname` was the `.`, and it stays set for
+        // everything the file runs.
+        assert_eq!(
+            run(&format!(":\n. {path}")).2,
+            format!("td-sh: {path}: line 3: nosuchcmd_xyz: not found\n")
+        );
+        // And it is given BACK afterwards, so the same failure outside the file
+        // reports neither half again.
+        assert_eq!(
+            run(&format!(". {path}\nnosuchcmd_xyz")).2,
+            format!("td-sh: {path}: line 3: nosuchcmd_xyz: not found\ntd-sh: nosuchcmd_xyz: not found\n")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `cd` and `.` report through ash's `perror` rather than its `errmsg`, so
     /// they take the system's word for ENOENT where a redirection substitutes.
     #[test]
@@ -3596,16 +3708,16 @@ mod tests {
         let d = dir.display();
         // Missing, and NOT `no such file`: that word is the redirection's.
         let (_s, _o, err) = run(&format!("cd {d}/nope"));
-        assert_eq!(err, format!("td-sh: cd: can't cd to {d}/nope: No such file or directory\n"));
+        assert_eq!(err, format!("td-sh: cd: line 1: can't cd to {d}/nope: No such file or directory\n"));
         // Resolves and is not a directory -- the arm no syscall answers, since
         // this shell's cwd is a variable and there is no `chdir` to fail.
         let (_s, _o, err) = run(&format!("cd {d}/f"));
-        assert_eq!(err, format!("td-sh: cd: can't cd to {d}/f: Not a directory\n"));
+        assert_eq!(err, format!("td-sh: cd: line 1: can't cd to {d}/f: Not a directory\n"));
         // `.` quotes the name, which nothing else in the shell does, and both
         // spellings of the word name themselves.
         for word in ["source", "."] {
             let (_s, _o, err) = run(&format!("{word} {d}/nope.sh"));
-            let want = format!("td-sh: {word}: can't open '{d}/nope.sh': No such file or directory\n");
+            let want = format!("td-sh: {word}: line 1: can't open '{d}/nope.sh': No such file or directory\n");
             assert_eq!(err, want);
         }
         let _ = std::fs::remove_dir_all(&dir);

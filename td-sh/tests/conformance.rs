@@ -1126,7 +1126,10 @@ fn a_spawn_failure_with_real_stdio_gives_the_systems_reason()
     let me = shell.display().to_string();
     for (src, want) in [
         (format!("{p}"), format!("{me}: {p}: Permission denied\n")),
-        (format!("exec {p}"), format!("{me}: exec: {p}: Permission denied\n")),
+        // `exec` is a builtin, so it is `commandname` while it runs and the
+        // diagnostic carries a line; the bare spelling above enters no builtin
+        // and `-c` sets none, so it carries neither name nor line.
+        (format!("exec {p}"), format!("{me}: exec: line 1: {p}: Permission denied\n")),
     ] {
         let out = std::process::Command::new(&shell).arg("-c").arg(&src).output()?;
         assert_eq!(String::from_utf8_lossy(&out.stderr), want, "src: {src}");
@@ -3651,6 +3654,149 @@ fn a_shell_with_a_background_job_can_still_be_interrupted(
 /// so `while :; do cmd & done`, the shape the interrupt work above is all about,
 /// died of SIGABRT in about a second. Reaping the ones already finished is what
 /// bounds it; measured aborting at 40000 before and clean after.
+#[test]
+fn a_loop_of_jobs_does_not_exhaust_the_process() -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let out = std::process::Command::new(&shell)
+        .args(["-c", "i=0; while [ $i -lt 40000 ]; do true & i=$((i+1)); done; echo ok"])
+        .output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    // Not merely non-zero: an abort has no code at all, and saying which it was
+    // is the difference between "the shell reported an error" and "the shell
+    // died". `stderr` carries the panic when it is the latter.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "40000 background jobs did not survive: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(())
+}
+
+/// The three places `commandname` comes from that no in-process harness can
+/// reach: a script named on the command line, `-c` WITH a name operand, and
+/// bare `-c` with neither. ash sets it at ash.c:14630 for the first, jumps
+/// into that same line for the second (`goto setarg0`), and leaves it null
+/// for the third -- which is why an identical failure says where it happened
+/// in two of the three and not in the last.
+#[test]
+fn where_a_diagnostic_says_it_happened_depends_on_how_the_shell_was_started(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let dir = std::env::temp_dir().join(format!("td-sh-diagwhere-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let script = dir.join("s.sh");
+    std::fs::write(&script, ":\n:\nnosuchcmd_xyz\n")?;
+    let sp = script.to_string_lossy().into_owned();
+
+    let err = |args: &[&str]| -> Result<String, Box<dyn std::error::Error>> {
+        let out = std::process::Command::new(&shell).args(args).output()?;
+        Ok(String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    // A script FILE: `commandname` equals `$0`, so the component is dropped
+    // and the line survives alone.
+    assert_eq!(err(&[&sp])?, format!("{sp}: line 3: nosuchcmd_xyz: not found\n"));
+    // Bare `-c`: neither. The command entered no builtin, and nothing else set
+    // a name.
+    assert_eq!(err(&["-c", "nosuchcmd_xyz"])?, format!("{}: nosuchcmd_xyz: not found\n", shell.display()));
+    // `-c` WITH a name: the name is `$0` and `commandname` both, so this is the
+    // script shape again -- a line, no component.
+    assert_eq!(err(&["-c", "nosuchcmd_xyz", "myname"])?, "myname: line 1: nosuchcmd_xyz: not found\n");
+    // And a builtin under bare `-c` DOES name itself, since it sets the name
+    // for as long as it runs.
+    assert_eq!(
+        err(&["-c", "cd /nope/x"])?,
+        format!("{}: cd: line 1: can't cd to /nope/x: No such file or directory\n", shell.display())
+    );
+    // The component is dropped whenever it repeats `$0`, whatever `$0` is:
+    // named `cd`, the builtin's own component disappears.
+    assert_eq!(
+        err(&["-c", "cd /nope/x", "cd"])?,
+        "cd: line 1: can't cd to /nope/x: No such file or directory\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// The OTHER half of `ash_vmsg`'s gate, `pf_fd > 0`, which decides nothing
+/// unless the shell is interactive -- `!iflag` already carries every
+/// non-interactive shape, so a suite that never runs `-i` can delete this
+/// field and stay green. `-i` needs no terminal, which is what makes it
+/// testable at all.
+///
+/// A subshell is here for a different reason: ash's `forkchild` copies the
+/// address space rather than clearing it, so a stage inherits the name and the
+/// file-ness both, and a diagnostic inside `( … )` says where it is.
+#[test]
+fn an_interactive_shell_reports_a_line_only_for_input_it_opened(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let dir = std::env::temp_dir().join(format!("td-sh-diagfd-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let script = dir.join("t.sh");
+    std::fs::write(&script, ":\n:\ncd /nope/x\n")?;
+    let sp = script.to_string_lossy().into_owned();
+    let want = "can't cd to /nope/x: No such file or directory\n";
+
+    let out = std::process::Command::new(&shell).args(["-i", &sp]).output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stderr), format!("{sp}: cd: line 3: {want}"));
+    // The SAME source on stdin: a real file, but one the shell did not open,
+    // which is ash's `pf_fd` being 0 rather than positive.
+    let out = std::process::Command::new(&shell)
+        .arg("-i")
+        .stdin(std::fs::File::open(&script)?)
+        .output()?;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("{}: cd: {want}", shell.display())
+    );
+    // A file the shell opens ITSELF while interactive is back in the first
+    // group, so sourcing one reports the line again.
+    let out = std::process::Command::new(&shell)
+        .args(["-i", "-c", &format!(". {sp}")])
+        .output()?;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("{}: cd: line 3: {want}", shell.display())
+    );
+
+    // A subshell inherits both fields; without that this loses the line. Run
+    // INTERACTIVELY, or `!iflag` alone carries it and only the name is tested.
+    std::fs::write(&script, ":\n:\n( nosuchcmd_zz )\n")?;
+    let out = std::process::Command::new(&shell).args(["-i", &sp]).output()?;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("{sp}: line 3: nosuchcmd_zz: not found\n")
+    );
+
+    // A profile is the third file the shell opens itself, and the only one
+    // that is ALWAYS read by an interactive shell -- so it is the only place
+    // this field can be observed without `-i` being passed for the test's own
+    // sake.
+    std::fs::write(dir.join(".profile"), ":\n:\ncd /nope/x\n")?;
+    let out = std::process::Command::new(&shell)
+        .args(["-i", "-l", "-c", ":"])
+        .env("HOME", &dir)
+        .output()?;
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains(&format!("cd: line 3: {want}")), "{err:?}");
+
+    // And the builtin name is given back on the ERROR path too: `getopts`
+    // raises here, and the command after it must not inherit its name.
+    let out = std::process::Command::new(&shell)
+        .args(["-c", "set -- -a; getopts ab 1bad; nosuchcmd_zz"])
+        .output()?;
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.ends_with(&format!("{}: nosuchcmd_zz: not found\n", shell.display())),
+        "{err:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
 /// `main` evaluates on a thread of its own, and only the BINARY can show it:
 /// every in-process test goes through a capturing harness, which spawns one
 /// itself, so reverting `main.rs` alone leaves the whole suite green and the
@@ -3672,25 +3818,6 @@ fn the_shell_evaluates_on_a_thread_it_made_itself() -> Result<(), Box<dyn std::e
         String::from_utf8_lossy(&out.stdout).trim(),
         "2",
         "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Ok(())
-}
-
-#[test]
-fn a_loop_of_jobs_does_not_exhaust_the_process() -> Result<(), Box<dyn std::error::Error>> {
-    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
-    let out = std::process::Command::new(&shell)
-        .args(["-c", "i=0; while [ $i -lt 40000 ]; do true & i=$((i+1)); done; echo ok"])
-        .output()?;
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
-    // Not merely non-zero: an abort has no code at all, and saying which it was
-    // is the difference between "the shell reported an error" and "the shell
-    // died". `stderr` carries the panic when it is the latter.
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "40000 background jobs did not survive: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     Ok(())

@@ -1591,6 +1591,16 @@ pub fn fork_shell(sh: &Shell) -> Subshell {
         // Carried, not reset: a subshell is the same script at the same point,
         // and `( echo $LINENO )` reports the line the subshell is written on.
         lineno: sh.lineno,
+        // Carried for that same reason: a subshell inherits ash's `commandname`
+        // because `forkchild` copies the address space rather than clearing it,
+        // so a diagnostic inside one is attributed where the fork happened.
+        commandname: sh.commandname.clone(),
+        // Carried for the same reason and observable in none: `interactive` is
+        // cleared below, and the suppression rule is `!interactive ||
+        // input_is_file`, so the first half already decides every subshell. It
+        // is the address space's answer rather than a live input, and no test
+        // pins it because nothing can see it.
+        input_is_file: sh.input_is_file,
         funcline: sh.funcline,
         status: sh.status,
         last_bg: sh.last_bg,
@@ -1718,7 +1728,7 @@ pub fn exec_replace(sh: &mut Shell, argv: &[String], arg0: Option<&str>) -> R<()
         Ok(p) => p,
         Err(seen) => {
             let (why, code) = seen.as_exec();
-            let _ = exec::diag(sh, &format!("exec: {program}: {why}"));
+            let _ = exec::diag(sh, &format!("{program}: {why}"));
             return failed_exec(sh, code);
         }
     };
@@ -1734,7 +1744,7 @@ pub fn exec_replace(sh: &mut Shell, argv: &[String], arg0: Option<&str>) -> R<()
         // emulation has to drop it too -- otherwise this shell runs an EXIT trap
         // the exec'd program could never have run.
         sh.traps.clear();
-        exec_external(sh, argv, None, "exec: ", arg0)?;
+        exec_external(sh, argv, None, arg0)?;
         return Err(Sig::Exit(sh.status));
     }
 
@@ -1767,7 +1777,7 @@ pub fn exec_replace(sh: &mut Shell, argv: &[String], arg0: Option<&str>) -> R<()
     // Safe: `CommandExt::exec` returns the error rather than trapping it.
     let e = cmd.exec();
     let (why, code) = exec_failure(&e);
-    let _ = exec::diag(sh, &format!("exec: {program}: {why}"));
+    let _ = exec::diag(sh, &format!("{program}: {why}"));
     failed_exec(sh, code)
 }
 
@@ -1794,7 +1804,6 @@ pub fn exec_external(
     sh: &mut Shell,
     argv: &[String],
     path: Option<&str>,
-    label: &str,
     arg0: Option<&str>,
 ) -> R<()> {
     use std::os::unix::process::CommandExt;
@@ -1807,7 +1816,7 @@ pub fn exec_external(
         Ok(p) => p,
         Err(seen) => {
             let (why, code) = seen.as_command();
-            let _ = exec::diag(sh, &format!("{label}{program}: {why}"));
+            let _ = exec::diag(sh, &format!("{program}: {why}"));
             sh.set_status(code);
             return Ok(());
         }
@@ -1867,7 +1876,7 @@ pub fn exec_external(
         Ok(c) => c,
         Err(e) => {
             let (why, code) = exec_failure(&e);
-            let _ = exec::diag(sh, &format!("{label}{program}: {why}"));
+            let _ = exec::diag(sh, &format!("{program}: {why}"));
             sh.set_status(code);
             return Ok(());
         }
@@ -1966,7 +1975,7 @@ pub fn exec_external(
         }
         Err(e) => {
             let (why, code) = exec_failure(&e);
-            let _ = exec::diag(sh, &format!("{label}{program}: {why}"));
+            let _ = exec::diag(sh, &format!("{program}: {why}"));
             sh.set_status(code);
             Ok(())
         }

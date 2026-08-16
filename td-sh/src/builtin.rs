@@ -148,7 +148,27 @@ pub fn is_ash_special_word(word: &str) -> bool {
     lookup(word).is_some_and(is_ash_special)
 }
 
+/// ash's `evalbltin` (ash.c:10664): the builtin's own name is `commandname`
+/// for as long as it runs, saved and restored around it so a nested one --
+/// `eval`, `.`, `command` -- gives the outer name back rather than clearing it.
 pub fn run(sh: &mut Shell, bi: Builtin, argv: &[String]) -> R<()> {
+    let name = match bi {
+        // `command` is the exception, and not a small one: ash's `evalcommand`
+        // collapses the DELEGATING form inline (ash.c:10424) and reaches
+        // `evalbltin` only for `-v`/`-V` or a bad option, so the wrapper leaves
+        // no name behind. What it runs names itself, or -- for an external --
+        // nothing does, and `command nosuchcmd` reports as the bare command
+        // would. Those two arms set it themselves, inside `command`.
+        Builtin::Command => sh.commandname.clone(),
+        _ => argv.first().cloned(),
+    };
+    let saved = std::mem::replace(&mut sh.commandname, name);
+    let r = run_named(sh, bi, argv);
+    sh.commandname = saved;
+    r
+}
+
+fn run_named(sh: &mut Shell, bi: Builtin, argv: &[String]) -> R<()> {
     match bi {
         Builtin::Colon | Builtin::True => ok(sh),
         Builtin::False => status(sh, 1),
@@ -216,7 +236,7 @@ fn jobs(sh: &mut Shell, argv: &[String]) -> R<()> {
         let Some(letters) = arg.strip_prefix('-').filter(|f| !f.is_empty()) else {
             // Named as an operand so the diagnostic says which mistake it was:
             // `jobs %1` is a jobspec, not a bad option.
-            err_line(sh, &format!("jobs: {arg}: selecting a job is not supported"));
+            err_line(sh, &format!("{arg}: selecting a job is not supported"));
             return status(sh, 2);
         };
         if letters == "-" {
@@ -226,13 +246,13 @@ fn jobs(sh: &mut Shell, argv: &[String]) -> R<()> {
             if c == 'p' {
                 ids_only = true;
             } else {
-                err_line(sh, &format!("jobs: illegal option -{c}"));
+                err_line(sh, &format!("illegal option -{c}"));
                 return status(sh, 2);
             }
         }
     }
     if let Some(operand) = rest.next() {
-        err_line(sh, &format!("jobs: {operand}: selecting a job is not supported"));
+        err_line(sh, &format!("{operand}: selecting a job is not supported"));
         return status(sh, 2);
     }
     let lines: Vec<String> = if ids_only {
@@ -288,7 +308,7 @@ fn wait(sh: &mut Shell, argv: &[String]) -> R<()> {
         // Anything but `--`, and this builtin serves no option at all.
         if letters != "-" {
             let c = letters.chars().next().unwrap_or('-');
-            err_line(sh, &format!("wait: illegal option -{c}"));
+            err_line(sh, &format!("illegal option -{c}"));
             return status(sh, 2);
         }
         operands = operands.get(1..).unwrap_or(&[]);
@@ -306,7 +326,7 @@ fn wait(sh: &mut Shell, argv: &[String]) -> R<()> {
         // COMMAND, and the command text is not kept.
         if operand.starts_with('%') {
             let Some(id) = sh.jobs.spec_id(operand) else {
-                err_line(sh, &format!("wait: {operand}: no such job"));
+                err_line(sh, &format!("{operand}: no such job"));
                 return status(sh, 2);
             };
             last = sh.jobs.wait_id(id).unwrap_or(127);
@@ -316,7 +336,7 @@ fn wait(sh: &mut Shell, argv: &[String]) -> R<()> {
         // `+`/`-`, which would make `wait +5` a number and, past a `--`, `wait
         // -5` one too.
         if operand.is_empty() || !operand.bytes().all(|b| b.is_ascii_digit()) {
-            err_line(sh, &format!("wait: Illegal number: {operand}"));
+            err_line(sh, &format!("Illegal number: {operand}"));
             return status(sh, 2);
         }
         // Not one of this shell's jobs -- including one already collected, which
@@ -375,6 +395,12 @@ fn sigpipe() -> Sig {
 /// in a status instead. Named for the same reason `SIGCHLD` is — a bare 13 in an
 /// arithmetic expression is the one kind of wrong number nothing else catches.
 const SIGPIPE: u8 = 13;
+
+/// The libbb applet diagnostics: `$0` and the message, no component and
+/// no line. See `exec::diag_applet`.
+fn err_applet(sh: &mut Shell, msg: &str) {
+    let _ = exec::diag_applet(sh, msg);
+}
 
 fn err_line(sh: &mut Shell, msg: &str) {
     let _ = exec::diag(sh, msg);
@@ -463,7 +489,7 @@ fn printf(sh: &mut Shell, argv: &[String]) -> R<()> {
         idx += 1;
     }
     let Some(format) = argv.get(idx) else {
-        err_line(sh, "printf: usage: printf format [arguments]");
+        err_applet(sh, "usage: printf format [arguments]");
         return status(sh, 2);
     };
     let args: Vec<&str> = argv.iter().skip(idx + 1).map(String::as_str).collect();
@@ -477,7 +503,7 @@ fn printf(sh: &mut Shell, argv: &[String]) -> R<()> {
         }
     }
     for e in &st.errors {
-        err_line(sh, e);
+        err_applet(sh, e);
     }
     match write_fd(sh, 1, &out_buf) {
         Ok(()) => sh.set_status(if st.error { 1 } else { 0 }),
@@ -630,7 +656,7 @@ fn conversion(chars: &[char], start: usize, args: &[&str], out: &mut Vec<u8>, st
             // %(..)T is not implemented yet (it needs strftime — a follow-up).
             // Both are handled the ash way: keep the prefix already emitted,
             // stop, exit status 1.
-            st.errors.push(format!("printf: %{conv}: invalid directive"));
+            st.errors.push(format!("%{conv}: invalid directive"));
             st.error = true;
             st.stop = true;
         }
@@ -676,7 +702,7 @@ fn emit_int(out: &mut Vec<u8>, args: &[&str], st: &mut Pf, conv: char, spec: &Sp
         Some(raw) => match parse_int_arg(raw) {
             Some(v) if range_ok(v, conv) => v,
             _ => {
-                st.errors.push(format!("printf: {raw}: expected a numeric value"));
+                st.errors.push(format!("{raw}: expected a numeric value"));
                 st.error = true;
                 0
             }
@@ -743,10 +769,10 @@ fn emit_float(out: &mut Vec<u8>, args: &[&str], st: &mut Pf, conv: char, spec: &
     // absent altogether, or empty, converts to 0 with no complaint.
     if num.consumed < raw.len() {
         let why = if num.consumed == 0 { "expected a numeric value" } else { "not completely converted" };
-        st.errors.push(format!("printf: {raw}: {why}"));
+        st.errors.push(format!("{raw}: {why}"));
         st.error = true;
     } else if num.erange {
-        st.errors.push(format!("printf: {raw}: Numerical result out of range"));
+        st.errors.push(format!("{raw}: Numerical result out of range"));
         st.error = true;
     }
     let value = num.value;
@@ -1198,7 +1224,7 @@ fn take_int(args: &[&str], st: &mut Pf) -> i64 {
         Some(raw) => match parse_int_arg(raw) {
             Some(v) if v >= i64::MIN as i128 && v <= i64::MAX as i128 => v as i64,
             _ => {
-                st.errors.push(format!("printf: {raw}: expected a numeric value"));
+                st.errors.push(format!("{raw}: expected a numeric value"));
                 st.error = true;
                 0
             }
@@ -1429,7 +1455,7 @@ fn pad_bytes(out: &mut Vec<u8>, sign: &[u8], prefix: &[u8], body: &[u8], width: 
 
 fn exit(sh: &mut Shell, argv: &[String]) -> R<()> {
     let code = match argv.get(1) {
-        Some(s) => number(sh, argv, s)?,
+        Some(s) => number(sh, s)?,
         // POSIX: inside a trap action, "the last command" is the one that ran
         // before the trap, so a bare `exit` there reports the status the shell was
         // already exiting with -- not whatever the action's own last command left.
@@ -1441,7 +1467,7 @@ fn exit(sh: &mut Shell, argv: &[String]) -> R<()> {
 
 fn ret(sh: &mut Shell, argv: &[String]) -> R<()> {
     let code = match argv.get(1) {
-        Some(s) => number(sh, argv, s)?,
+        Some(s) => number(sh, s)?,
         None => sh.status,
     };
     Err(Sig::Return(code))
@@ -1462,13 +1488,12 @@ fn parse_number(s: &str) -> Option<i32> {
     s.parse::<i32>().ok().filter(|_| is_all_digits(s))
 }
 
-fn number(sh: &mut Shell, argv: &[String], s: &str) -> R<i32> {
-    parse_number(s).ok_or_else(|| badnum(sh, argv, s))
+fn number(sh: &mut Shell, s: &str) -> R<i32> {
+    parse_number(s).ok_or_else(|| badnum(sh, s))
 }
 
-fn badnum(sh: &mut Shell, argv: &[String], s: &str) -> Sig {
-    let cmd = argv.first().map(String::as_str).unwrap_or_default();
-    err_line(sh, &format!("{cmd}: Illegal number: {s}"));
+fn badnum(sh: &mut Shell, s: &str) -> Sig {
+    err_line(sh, &format!("Illegal number: {s}"));
     sh.set_status(2);
     Sig::Abort(2)
 }
@@ -1479,7 +1504,7 @@ fn loop_ctl(sh: &mut Shell, argv: &[String], is_break: bool) -> R<()> {
         // non-positive count, so `break 0` reports the same way `break oops` does.
         Some(s) => match parse_number(s).filter(|n| *n > 0).and_then(|n| u32::try_from(n).ok()) {
             Some(n) => n,
-            None => return Err(badnum(sh, argv, s)),
+            None => return Err(badnum(sh, s)),
         },
         None => 1,
     };
@@ -1501,7 +1526,7 @@ fn shift(sh: &mut Shell, argv: &[String]) -> R<()> {
         // `shift 2147483648` is a bad number and not a huge count.
         Some(s) => match parse_number(s).and_then(|n| usize::try_from(n).ok()) {
             Some(n) => n,
-            None => return special_usage_error(sh, &format!("shift: Illegal number: {s}")),
+            None => return special_usage_error(sh, &format!("Illegal number: {s}")),
         },
         None => 1,
     };
@@ -1553,7 +1578,7 @@ fn set(sh: &mut Shell, argv: &[String]) -> R<()> {
                 // stays the no-op it was rather than becoming an error.
                 if let Some(name) = argv.get(i + 1 + names) {
                     if !apply_named_option(sh, name, sign) {
-                        err_line(sh, &format!("set: illegal option {flag}o {name}"));
+                        err_line(sh, &format!("illegal option {flag}o {name}"));
                         return status(sh, 1);
                     }
                     names += 1;
@@ -1561,7 +1586,7 @@ fn set(sh: &mut Shell, argv: &[String]) -> R<()> {
                 continue;
             }
             if !apply_option_letter(sh, c, sign) {
-                return special_usage_error(sh, &format!("set: illegal option {flag}{c}"));
+                return special_usage_error(sh, &format!("illegal option {flag}{c}"));
             }
         }
         i += 1 + names;
@@ -1677,7 +1702,7 @@ fn unset(sh: &mut Shell, argv: &[String]) -> R<()> {
         for c in flags.chars() {
             match c {
                 'f' | 'v' => mode = Some(c),
-                _ => return special_usage_error(sh, &format!("unset: illegal option -{c}")),
+                _ => return special_usage_error(sh, &format!("illegal option -{c}")),
             }
         }
     }
@@ -1695,7 +1720,7 @@ fn unset(sh: &mut Shell, argv: &[String]) -> R<()> {
         if !ast::is_name(name) {
             // The parsed prefix, not the operand: `unsetvar` is `setvar(s, NULL,
             // 0)` (ash.c:2525), which prints `%.*s` over `namelen` (ash.c:2492).
-            return special_usage_error(sh, &format!("unset: {name}: bad variable name"));
+            return special_usage_error(sh, &format!("{name}: bad variable name"));
         }
         // No flag means the VARIABLE and nothing else: both references gate the
         // function on `-f` alone (`if (flag != 'f') { unsetvar(*ap); continue; }`,
@@ -1716,7 +1741,7 @@ fn unset(sh: &mut Shell, argv: &[String]) -> R<()> {
         if !gone {
             // dash unsets through setvar too, so a readonly name aborts the shell
             // rather than reporting a status.
-            return special_usage_error(sh, &format!("unset: {name}: is read only"));
+            return special_usage_error(sh, &format!("{name}: is read only"));
         }
     }
     ok(sh)
@@ -1755,7 +1780,7 @@ fn export(sh: &mut Shell, argv: &[String], readonly: bool) -> R<()> {
                 }
             }
             if let Some(c) = bad {
-                return special_usage_error(sh, &format!("{cmd}: illegal option -{c}"));
+                return special_usage_error(sh, &format!("illegal option -{c}"));
             }
             continue;
         }
@@ -1764,7 +1789,7 @@ fn export(sh: &mut Shell, argv: &[String], readonly: bool) -> R<()> {
         match arg.split_once('=') {
             Some((name, value)) => {
                 if !ast::is_name(name) {
-                    return special_usage_error(sh, &format!("{cmd}: {name}: bad variable name"));
+                    return special_usage_error(sh, &format!("{name}: bad variable name"));
                 }
                 sh.set_var(name, value)?;
                 if readonly {
@@ -1778,7 +1803,7 @@ fn export(sh: &mut Shell, argv: &[String], readonly: bool) -> R<()> {
             }
             None => {
                 if !ast::is_name(arg) {
-                    return special_usage_error(sh, &format!("{cmd}: {arg}: bad variable name"));
+                    return special_usage_error(sh, &format!("{arg}: bad variable name"));
                 }
                 if readonly {
                     sh.set_readonly(arg);
@@ -1847,7 +1872,7 @@ fn export(sh: &mut Shell, argv: &[String], readonly: bool) -> R<()> {
 /// outer binding only comes back on unwind.
 fn local(sh: &mut Shell, argv: &[String]) -> R<()> {
     if sh.localvar_depth == 0 {
-        return special_usage_error(sh, "local: not in a function");
+        return special_usage_error(sh, "not in a function");
     }
     // Only the FIRST save of a name matters -- the frame unwinds newest-first, so
     // a later one is overwritten by it. Re-saving would let `while …; do local
@@ -1868,7 +1893,7 @@ fn local(sh: &mut Shell, argv: &[String]) -> R<()> {
             // setvar, which aborts the shell. (dash only validates the valueless
             // form -- `local 1bad=x` slips past setvareq into a name no expansion
             // can name again. td-sh rejects both rather than store that.)
-            return special_usage_error(sh, &format!("local: {name}: bad variable name"));
+            return special_usage_error(sh, &format!("{name}: bad variable name"));
         }
         // First declaration of this name in this frame, which is the only one that
         // does anything: ash walks the frame and skips a name already in it. A
@@ -1906,7 +1931,7 @@ fn local(sh: &mut Shell, argv: &[String]) -> R<()> {
             None => false,
         };
         if rejected {
-            return special_usage_error(sh, &format!("local: {name}: is read only"));
+            return special_usage_error(sh, &format!("{name}: is read only"));
         }
     }
     ok(sh)
@@ -1920,7 +1945,7 @@ fn local(sh: &mut Shell, argv: &[String]) -> R<()> {
 /// reports a bad option or a missing argument through `OPTARG` instead of stderr.
 fn getopts(sh: &mut Shell, argv: &[String]) -> R<()> {
     let (Some(optstring), Some(name)) = (argv.get(1), argv.get(2)) else {
-        err_line(sh, "getopts: usage: getopts optstring var [arg...]");
+        err_line(sh, "usage: getopts optstring var [arg...]");
         return status(sh, 2);
     };
     let args: Vec<String> = if argv.len() > 3 {
@@ -2066,7 +2091,7 @@ fn getopts_store(sh: &mut Shell, name: &str, optind: i64, letter: &str) -> R<()>
     if !ast::is_name(name) {
         sh.getopts_optind = 1;
         sh.getopts_off = -1;
-        return Err(sh.fatal(&format!("getopts: {name}: bad variable name"), 2));
+        return Err(sh.fatal(&format!("{name}: bad variable name"), 2));
     }
     getopts_write(sh, name, letter)
 }
@@ -2130,7 +2155,7 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
                         None => {
                             // `nextopt`'s second message, and lowercase like its
                             // first (ash.c:2045).
-                            err_line(sh, &format!("read: no arg for -{} option", c as char));
+                            err_line(sh, &format!("no arg for -{} option", c as char));
                             return status(sh, 2);
                         }
                     }
@@ -2149,7 +2174,7 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
                 b'n' => opt_n = value,
                 b'd' => opt_d = value,
                 _ => {
-                    err_line(sh, &format!("read: illegal option -{}", c as char));
+                    err_line(sh, &format!("illegal option -{}", c as char));
                     return status(sh, 2);
                 }
             }
@@ -2162,7 +2187,10 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
     // usage 2 that a bad option gets.
     for name in &names {
         if !ast::is_name(name) {
-            err_line(sh, &format!("read: '{name}': bad variable name"));
+            // libbb's, not `ash_vmsg`'s: shell_common.c:81 writes its own
+            // `read:` and reaches no line. Its OPTION refusals above are
+            // `nextopt`'s and do carry one, which is why the two differ.
+            err_applet(sh, &format!("read: '{name}': bad variable name"));
             return status(sh, 1);
         }
     }
@@ -2173,7 +2201,7 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
         Some(s) => match bb_strtoi(s) {
             Some(v) => i64::from(v),
             None => {
-                err_line(sh, "read: invalid count");
+                err_line(sh, "invalid count");
                 return status(sh, 2);
             }
         },
@@ -2183,7 +2211,7 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
         Some(s) => match parse_read_timeout(s) {
             Some(ms) => Some(ms),
             None => {
-                err_line(sh, "read: invalid timeout");
+                err_line(sh, "invalid timeout");
                 return status(sh, 2);
             }
         },
@@ -2193,7 +2221,7 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
         Some(s) => match bb_strtoi(s) {
             Some(v) => v.unsigned_abs(),
             None => {
-                err_line(sh, "read: invalid file descriptor");
+                err_line(sh, "invalid file descriptor");
                 return status(sh, 2);
             }
         },
@@ -2241,7 +2269,7 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
     // the caller's timeout has run.
     if sh.fds.is_terminal(fd) && (silent || nchars > 0) {
         let what = if silent { "-s" } else { "-n" };
-        err_line(sh, &format!("read: {what}: needs termios on a terminal"));
+        err_line(sh, &format!("{what}: needs termios on a terminal"));
         return status(sh, 2);
     }
 
@@ -2476,7 +2504,7 @@ fn read_ready_or_fail(sh: &mut Shell, fd: u32, timeout_ms: i32) -> Result<bool, 
     match process::read_ready(sh, fd, timeout_ms) {
         Ok(ready) => Ok(ready),
         Err(e) => {
-            err_line(sh, &format!("read: {e}"));
+            err_line(sh, &e);
             Err(2)
         }
     }
@@ -2697,9 +2725,7 @@ fn apply_disposition(sh: &mut Shell, signo: u8, want: crate::sys::Disposition) -
     let prev = match crate::sys::signal_set(signo, want) {
         Ok(prev) => prev,
         Err(e) => {
-            // `trap` is this function's only caller, so it names it as every
-            // other diagnostic out of that builtin now does.
-            err_line(sh, &format!("trap: {e}"));
+            err_line(sh, &e);
             return false;
         }
     };
@@ -2738,7 +2764,7 @@ fn trap(sh: &mut Shell, argv: &[String]) -> R<()> {
             ops = ops.get(1..).unwrap_or_default();
         } else if !rest.is_empty() {
             let c = rest.chars().next().unwrap_or('-');
-            return special_usage_error(sh, &format!("trap: illegal option -{c}"));
+            return special_usage_error(sh, &format!("illegal option -{c}"));
         }
     }
     let Some(first) = ops.first() else {
@@ -2761,7 +2787,7 @@ fn trap(sh: &mut Shell, argv: &[String]) -> R<()> {
     let mut code = 0;
     for name in conditions {
         let Some(signo) = decode_signal(name) else {
-            err_line(sh, &format!("trap: {name}: invalid signal specification"));
+            err_line(sh, &format!("{name}: invalid signal specification"));
             code = 1;
             continue;
         };
@@ -2894,7 +2920,7 @@ fn unalias(sh: &mut Shell, argv: &[String]) -> R<()> {
                 return status(sh, 0);
             }
             Some(bad) => {
-                err_line(sh, &format!("unalias: illegal option -{bad}"));
+                err_line(sh, &format!("illegal option -{bad}"));
                 return status(sh, 2);
             }
             // Unreachable: an empty `flags` is the arm above.
@@ -2944,7 +2970,7 @@ fn exec_options(argv: &[String]) -> Result<(usize, Option<&str>), String> {
         let mut cs = letters.chars();
         match cs.next() {
             Some('a') => {}
-            Some(bad) => return Err(format!("exec: illegal option -{bad}")),
+            Some(bad) => return Err(format!("illegal option -{bad}")),
             // Unreachable: the filter above rejects an empty `letters`.
             None => break,
         }
@@ -2953,7 +2979,7 @@ fn exec_options(argv: &[String]) -> Result<(usize, Option<&str>), String> {
         let attached = cs.as_str();
         if attached.is_empty() {
             let Some(next) = argv.get(i) else {
-                return Err("exec: no arg for -a option".to_owned());
+                return Err("no arg for -a option".to_owned());
             };
             arg0 = Some(next);
             i += 1;
@@ -2988,7 +3014,7 @@ fn eval(sh: &mut Shell, argv: &[String]) -> R<()> {
     }
     // Unit at a time, so `eval "alias x=…\nx"` sees its own alias (dash's
     // evalstring parses and runs one command at a time too).
-    exec::run_source(sh, &joined, "eval: ")
+    exec::run_source(sh, &joined)
 }
 
 /// dash's `updatepwd`: build the LOGICAL path `dir` names from `curdir`, purely
@@ -3083,7 +3109,7 @@ fn cd(sh: &mut Shell, argv: &[String]) -> R<()> {
     let (physical, i) = match cd_opts(argv) {
         Ok(v) => v,
         Err(c) => {
-            err_line(sh, &format!("cd: illegal option -{c}"));
+            err_line(sh, &format!("illegal option -{c}"));
             return status(sh, 2);
         }
     };
@@ -3124,11 +3150,11 @@ fn cd(sh: &mut Shell, argv: &[String]) -> R<()> {
         // from. ENOTDIR is what one would have answered.
         Ok(_) => {
             let e = std::io::Error::from_raw_os_error(exec::ENOTDIR);
-            err_line(sh, &format!("cd: can't cd to {dest}: {}", exec::strerror(&e)));
+            err_line(sh, &format!("can't cd to {dest}: {}", exec::strerror(&e)));
             return status(sh, 2);
         }
         Err(e) => {
-            err_line(sh, &format!("cd: can't cd to {dest}: {}", exec::strerror(&e)));
+            err_line(sh, &format!("can't cd to {dest}: {}", exec::strerror(&e)));
             return status(sh, 2);
         }
     };
@@ -3316,7 +3342,7 @@ fn umask_builtin(sh: &mut Shell, argv: &[String]) -> R<()> {
         }
         for c in flags.chars() {
             if c != 'S' {
-                err_line(sh, &format!("umask: illegal option -{c}"));
+                err_line(sh, &format!("illegal option -{c}"));
                 return status(sh, 2);
             }
             symbolic = true;
@@ -3339,7 +3365,7 @@ fn umask_builtin(sh: &mut Shell, argv: &[String]) -> R<()> {
     let numeric = text.as_bytes().first().is_some_and(|c| c.is_ascii_digit());
     let entry = if numeric { current } else { current ^ 0o777 };
     let illegal = |sh: &mut Shell| {
-        err_line(sh, &format!("umask: illegal mode: {text}"));
+        err_line(sh, &format!("illegal mode: {text}"));
         status(sh, 2)
     };
     let Some(parsed) = parse_mode(text, entry, current) else {
@@ -3366,7 +3392,7 @@ fn pwd(sh: &mut Shell, argv: &[String]) -> R<()> {
     let physical = match cd_opts(argv) {
         Ok((p, _)) => p,
         Err(c) => {
-            err_line(sh, &format!("pwd: illegal option -{c}"));
+            err_line(sh, &format!("illegal option -{c}"));
             return status(sh, 2);
         }
     };
@@ -3467,7 +3493,7 @@ fn times_text(ticks: [u64; 4]) -> String {
 /// way the arm can be reached.
 fn times_out(sh: &mut Shell, ticks: Option<[u64; 4]>) -> R<()> {
     let Some(ticks) = ticks else {
-        err_line(sh, "times: cannot read /proc/self/stat");
+        err_line(sh, "cannot read /proc/self/stat");
         return status(sh, 1);
     };
     // `out` sets `$?`; do not overwrite it.
@@ -3484,9 +3510,6 @@ fn times(sh: &mut Shell) -> R<()> {
 }
 
 fn dot(sh: &mut Shell, argv: &[String]) -> R<()> {
-    // ash prints the spelling it was CALLED by -- `source: can't open` against
-    // `.: can't open` -- so the word comes from argv rather than a literal.
-    let word = argv.first().map_or(".", String::as_str);
     // ash runs an option loop here despite accepting NO option, so the only
     // things it can do are end on `--` and refuse everything else. Refusing is
     // FATAL, `.` being special. A lone `-` is not an option but a FILENAME
@@ -3501,7 +3524,7 @@ fn dot(sh: &mut Shell, argv: &[String]) -> R<()> {
         // nothing to name, which is the same answer a word with no dash gets.
         Some(w) => {
             if let Some(bad) = w.strip_prefix('-').and_then(|o| o.chars().next()) {
-                return special_usage_error(sh, &format!("{word}: illegal option -{bad}"));
+                return special_usage_error(sh, &format!("illegal option -{bad}"));
             }
         }
         None => {}
@@ -3510,11 +3533,11 @@ fn dot(sh: &mut Shell, argv: &[String]) -> R<()> {
         // Not fatal in either shell: busybox ash returns 2 outright ("bash
         // compat" in its own words) and dash returns 0 without a word. Only a
         // file it cannot LOCATE raises.
-        err_line(sh, &format!("{word}: filename argument required"));
+        err_line(sh, "filename argument required");
         return status(sh, 2);
     };
     let Some((path, found)) = dot_path(sh, name) else {
-        return special_usage_error(sh, &format!("{word}: {name}: not found"));
+        return special_usage_error(sh, &format!("{name}: not found"));
     };
     // Only a failure to OPEN raises. A read that then fails -- a directory, most
     // often -- reaches dash's input layer as EOF, so it sources nothing and
@@ -3529,10 +3552,9 @@ fn dot(sh: &mut Shell, argv: &[String]) -> R<()> {
         // ash.c:11257), and reports through `perror` as `cd` does.
         Err(e) => {
             let why = exec::strerror(&e);
-            return special_usage_error(sh, &format!("{word}: can't open '{found}': {why}"));
+            return special_usage_error(sh, &format!("can't open '{found}': {why}"));
         }
     };
-    let what = format!("{name}: ");
     // OPERANDS become the file's positional parameters, and only then: given
     // none, ash saves nothing and the file both SEES and KEEPS the caller's, so
     // a `set --` inside one leaks out. Given any, the frame is restored
@@ -3554,10 +3576,16 @@ fn dot(sh: &mut Shell, argv: &[String]) -> R<()> {
             sh.getopts_off,
         )
     });
+    // ash.c:13739: the sourced FILE is `commandname` while it runs, so a
+    // failure inside one names the file rather than the `.` that read it. The
+    // restore is `builtin::run`'s, since `dotcmd` runs under `evalbltin`.
+    sh.commandname = Some(found.clone());
+    let was_file = std::mem::replace(&mut sh.input_is_file, true);
     // A `return` in a sourced file returns from the `.`, not the process -- and
     // is how such a file usually ends, so the frame has to come back on that
     // path as much as on the ordinary one. Not `?` for the same reason.
-    let ran = exec::run_source(sh, &text, &what);
+    let ran = exec::run_source(sh, &text);
+    sh.input_is_file = was_file;
     // But NOT on a terminating unwind. ash restores after `cmdloop` RETURNS, so
     // an `exit` inside the file longjmps straight past it and the EXIT trap runs
     // with the FILE's operands still in place. Measured: `. ./f a b` where `f`
@@ -3735,7 +3763,11 @@ fn command(sh: &mut Shell, argv: &[String]) -> R<()> {
                 }
             }
             if let Some(c) = bad {
-                err_line(sh, &format!("command: illegal option -{c}"));
+                // One of the two arms that DOES reach `commandcmd`, so this is
+                // where the wrapper names itself.
+                let outer = sh.commandname.replace("command".to_string());
+                err_line(sh, &format!("illegal option -{c}"));
+                sh.commandname = outer;
                 return status(sh, 2);
             }
         }
@@ -3786,7 +3818,7 @@ fn command(sh: &mut Shell, argv: &[String]) -> R<()> {
         sh.locals = saved;
         return result;
     }
-    crate::process::exec_external(sh, &rest, path, "", None)
+    crate::process::exec_external(sh, &rest, path, None)
 }
 
 // ---- test / [ ------------------------------------------------------------
@@ -3799,7 +3831,7 @@ fn test(sh: &mut Shell, argv: &[String]) -> R<()> {
         match args.pop() {
             Some(ref last) if last == "]" => {}
             _ => {
-                err_line(sh, "[: missing `]'");
+                err_applet(sh, "[: missing `]'");
                 return status(sh, 2);
             }
         }
@@ -3808,7 +3840,7 @@ fn test(sh: &mut Shell, argv: &[String]) -> R<()> {
         Ok(true) => status(sh, 0),
         Ok(false) => status(sh, 1),
         Err(msg) => {
-            err_line(sh, &format!("test: {msg}"));
+            err_applet(sh, &format!("test: {msg}"));
             status(sh, 2)
         }
     }
@@ -4350,7 +4382,7 @@ mod tests {
             let (status, out, err) =
                 run_capturing(&format!("set -- -a -b; getopts ab {bad}; echo \"rc=$?\""));
             assert_eq!((status, out.as_str()), (0, "rc=2\n"), "getopts ab {bad}");
-            assert_eq!(err, format!("td-sh: getopts: {named}: bad variable name\n"), "{bad}");
+            assert_eq!(err, format!("td-sh: getopts: line 1: {named}: bad variable name\n"), "{bad}");
         }
         // A good name is untouched in every respect, which needs the letter and
         // the cursor asserted and not merely the absence of a complaint.
@@ -4417,7 +4449,7 @@ mod tests {
                 run_capturing(&format!("set -- -a; getopts ab {dest}; echo \"rc=$?\""));
             assert_eq!(out, "rc=2\n", "getopts ab {dest}");
             assert!(
-                err.contains(&format!("getopts: {named}: bad variable name")),
+                err.contains(&format!("getopts: line 1: {named}: bad variable name")),
                 "getopts ab {dest}: {err:?}"
             );
         }
@@ -4751,7 +4783,7 @@ mod tests {
         ] {
             let (code, out, err) = run_capturing(src);
             assert_eq!((code, out.as_str()), (2, ""), "{src}: {err}");
-            assert!(err.contains("local: r: is read only"), "{src}: {err}");
+            assert!(err.contains("local: line 1: r: is read only"), "{src}: {err}");
         }
         let (_, _, err) = run_capturing("readonly r=1; r=2");
         assert!(err.contains("r: is read only") && !err.contains("local:"), "{err}");
@@ -4828,36 +4860,36 @@ mod tests {
         // A FATAL refusal reaches no `echo`, so the two output columns are what
         // says which of the two kinds it was.
         for (src, err, out, code) in [
-            ("jobs -Z", "td-sh: jobs: illegal option -Z\n", "after=2\n", 0),
-            ("wait -Z", "td-sh: wait: illegal option -Z\n", "after=2\n", 0),
-            ("read -Z", "td-sh: read: illegal option -Z\n", "after=2\n", 0),
-            ("unalias -Z", "td-sh: unalias: illegal option -Z\n", "after=2\n", 0),
-            ("cd -Z", "td-sh: cd: illegal option -Z\n", "after=2\n", 0),
-            ("umask -Z", "td-sh: umask: illegal option -Z\n", "after=2\n", 0),
-            ("pwd -Z", "td-sh: pwd: illegal option -Z\n", "after=2\n", 0),
-            ("command -x true", "td-sh: command: illegal option -x\n", "after=2\n", 0),
-            ("set -o bogus", "td-sh: set: illegal option -o bogus\n", "after=1\n", 0),
-            ("set +o bogus", "td-sh: set: illegal option +o bogus\n", "after=1\n", 0),
-            ("set -q", "td-sh: set: illegal option -q\n", "", 2),
-            ("unset -z", "td-sh: unset: illegal option -z\n", "", 2),
-            ("export -q", "td-sh: export: illegal option -q\n", "", 2),
-            ("readonly -q", "td-sh: readonly: illegal option -q\n", "", 2),
-            ("trap -Z", "td-sh: trap: illegal option -Z\n", "", 2),
-            (". -Z", "td-sh: .: illegal option -Z\n", "", 2),
-            ("source -Z", "td-sh: source: illegal option -Z\n", "", 2),
-            ("exec -Z", "td-sh: exec: illegal option -Z\n", "", 2),
+            ("jobs -Z", "td-sh: jobs: line 1: illegal option -Z\n", "after=2\n", 0),
+            ("wait -Z", "td-sh: wait: line 1: illegal option -Z\n", "after=2\n", 0),
+            ("read -Z", "td-sh: read: line 1: illegal option -Z\n", "after=2\n", 0),
+            ("unalias -Z", "td-sh: unalias: line 1: illegal option -Z\n", "after=2\n", 0),
+            ("cd -Z", "td-sh: cd: line 1: illegal option -Z\n", "after=2\n", 0),
+            ("umask -Z", "td-sh: umask: line 1: illegal option -Z\n", "after=2\n", 0),
+            ("pwd -Z", "td-sh: pwd: line 1: illegal option -Z\n", "after=2\n", 0),
+            ("command -x true", "td-sh: command: line 1: illegal option -x\n", "after=2\n", 0),
+            ("set -o bogus", "td-sh: set: line 1: illegal option -o bogus\n", "after=1\n", 0),
+            ("set +o bogus", "td-sh: set: line 1: illegal option +o bogus\n", "after=1\n", 0),
+            ("set -q", "td-sh: set: line 1: illegal option -q\n", "", 2),
+            ("unset -z", "td-sh: unset: line 1: illegal option -z\n", "", 2),
+            ("export -q", "td-sh: export: line 1: illegal option -q\n", "", 2),
+            ("readonly -q", "td-sh: readonly: line 1: illegal option -q\n", "", 2),
+            ("trap -Z", "td-sh: trap: line 1: illegal option -Z\n", "", 2),
+            (". -Z", "td-sh: .: line 1: illegal option -Z\n", "", 2),
+            ("source -Z", "td-sh: source: line 1: illegal option -Z\n", "", 2),
+            ("exec -Z", "td-sh: exec: line 1: illegal option -Z\n", "", 2),
             // The option scan runs BEFORE the no-command check, so a bad one is
             // fatal even where `exec` would otherwise have done nothing.
-            ("exec -aX -Z", "td-sh: exec: illegal option -Z\n", "", 2),
+            ("exec -aX -Z", "td-sh: exec: line 1: illegal option -Z\n", "", 2),
             // A CLUSTER is read letter by letter, so the refusal names the one
             // it stopped on rather than the word that carried it -- whichever
             // position in the word the bad letter is in.
-            ("cd -Zq", "td-sh: cd: illegal option -Z\n", "after=2\n", 0),
-            ("jobs -xy", "td-sh: jobs: illegal option -x\n", "after=2\n", 0),
-            ("jobs -pZ", "td-sh: jobs: illegal option -Z\n", "after=2\n", 0),
-            ("wait -xy", "td-sh: wait: illegal option -x\n", "after=2\n", 0),
+            ("cd -Zq", "td-sh: cd: line 1: illegal option -Z\n", "after=2\n", 0),
+            ("jobs -xy", "td-sh: jobs: line 1: illegal option -x\n", "after=2\n", 0),
+            ("jobs -pZ", "td-sh: jobs: line 1: illegal option -Z\n", "after=2\n", 0),
+            ("wait -xy", "td-sh: wait: line 1: illegal option -x\n", "after=2\n", 0),
             // `exec` can only ever show the bad-first one: `a` eats its word.
-            ("exec -Za", "td-sh: exec: illegal option -Z\n", "", 2),
+            ("exec -Za", "td-sh: exec: line 1: illegal option -Z\n", "", 2),
             // The one ash spells with a capital, and the one that carries no
             // name: a bare `fprintf` (ash.c:11714), not `nextopt`'s.
             ("set -- -Z; getopts a: o", "Illegal option -Z\n", "after=0\n", 0),
@@ -4875,22 +4907,22 @@ mod tests {
     #[test]
     fn a_missing_option_argument_and_a_non_option_are_ashs_too() {
         for (src, err, out, code) in [
-            ("read -p", "td-sh: read: no arg for -p option\n", "after=2\n", 0),
-            ("read -u", "td-sh: read: no arg for -u option\n", "after=2\n", 0),
+            ("read -p", "td-sh: read: line 1: no arg for -p option\n", "after=2\n", 0),
+            ("read -u", "td-sh: read: line 1: no arg for -u option\n", "after=2\n", 0),
             // `exec`'s is `nextopt`'s too, and fatal because `exec` is special.
-            ("exec -a", "td-sh: exec: no arg for -a option\n", "", 2),
+            ("exec -a", "td-sh: exec: line 1: no arg for -a option\n", "", 2),
             ("set -- -a; getopts a: o", "No arg for -a option\n", "after=0\n", 0),
-            ("wait -", "td-sh: wait: Illegal number: -\n", "after=2\n", 0),
-            ("wait -- -5", "td-sh: wait: Illegal number: -5\n", "after=2\n", 0),
+            ("wait -", "td-sh: wait: line 1: Illegal number: -\n", "after=2\n", 0),
+            ("wait -- -5", "td-sh: wait: line 1: Illegal number: -5\n", "after=2\n", 0),
             // `999` is a number, so the scan has STOPPED by `-Z`; `wait x -Z`
             // would fail on `x` first and pin nothing.
-            ("wait 999 -Z", "td-sh: wait: Illegal number: -Z\n", "after=2\n", 0),
+            ("wait 999 -Z", "td-sh: wait: line 1: Illegal number: -Z\n", "after=2\n", 0),
             // Still td-sh's word for an operand rather than ash's `no such
             // job`; what this pins is that `-` reaches that path at all.
-            ("jobs -", "td-sh: jobs: -: selecting a job is not supported\n", "after=2\n", 0),
+            ("jobs -", "td-sh: jobs: line 1: -: selecting a job is not supported\n", "after=2\n", 0),
             // `unaliascmd` returns on the `a` without reading the rest, so the
             // cluster's ORDER decides -- the one builtin where it does.
-            ("alias q=x; unalias -Za", "td-sh: unalias: illegal option -Z\n", "after=2\n", 0),
+            ("alias q=x; unalias -Za", "td-sh: unalias: line 1: illegal option -Z\n", "after=2\n", 0),
         ] {
             let (status, o, e) = run_capturing(&format!("{src}; echo after=$?"));
             assert_eq!((status, o.as_str(), e.as_str()), (code, out, err), "{src}");
@@ -4914,7 +4946,7 @@ mod tests {
     fn traps_two_refusals_are_worded_alike() {
         for src in ["trap - -Z", "trap '' -Z"] {
             let (status, _o, e) = run_capturing(&format!("{src}; echo after=$?"));
-            assert_eq!((status, e.as_str()), (0, "td-sh: trap: -Z: invalid signal specification\n"));
+            assert_eq!((status, e.as_str()), (0, "td-sh: trap: line 1: -Z: invalid signal specification\n"));
         }
         let (_s, out, _e) = run_capturing("trap a BOGUS; echo after=$?");
         assert_eq!(out, "after=1\n");
@@ -4947,11 +4979,11 @@ mod tests {
         let (status, out, err) =
             run_capturing("for i in 1 2 3; do echo hi; break oops; done; echo AFTER");
         assert_eq!((status, out.as_str()), (2, "hi\n"));
-        assert!(err.contains("break: Illegal number: oops"), "{err:?}");
+        assert!(err.contains("break: line 1: Illegal number: oops"), "{err:?}");
         let (status, out, err) =
             run_capturing("for i in 1 2 3; do echo hi; continue oops; done; echo AFTER");
         assert_eq!((status, out.as_str()), (2, "hi\n"));
-        assert!(err.contains("continue: Illegal number: oops"), "{err:?}");
+        assert!(err.contains("continue: line 1: Illegal number: oops"), "{err:?}");
         // `is_all_digits` is busybox's rule, so a sign disqualifies either way even
         // though dash's `atomax10` accepts `+1`.
         for bad in ["0", "-1", "+1", "1x", "''", "' 1'"] {
@@ -4965,7 +4997,7 @@ mod tests {
             let (status, out, err) =
                 run_capturing(&format!("set -- a b; shift {bad}; echo AFTER"));
             assert_eq!((status, out.as_str()), (2, ""), "shift {bad}");
-            assert!(err.contains(&format!("shift: Illegal number: {bad}")), "{err:?}");
+            assert!(err.contains(&format!("shift: line 1: Illegal number: {bad}")), "{err:?}");
         }
     }
 
@@ -5007,11 +5039,11 @@ mod tests {
         for bad in ["-1", "-2", "abc", "1x", "''", "2147483648", "99999999999999999999"] {
             let (status, out, err) = run_capturing(&format!("exit {bad}; echo AFTER"));
             assert_eq!((status, out.as_str()), (2, ""), "exit {bad}");
-            assert!(err.contains("exit: Illegal number:"), "exit {bad}: {err:?}");
+            assert!(err.contains("exit: line 1: Illegal number:"), "exit {bad}: {err:?}");
             let (status, out, err) =
                 run_capturing(&format!("f() {{ return {bad}; }}; f; echo AFTER"));
             assert_eq!((status, out.as_str()), (2, ""), "return {bad}");
-            assert!(err.contains("return: Illegal number:"), "return {bad}: {err:?}");
+            assert!(err.contains("return: line 1: Illegal number:"), "return {bad}: {err:?}");
         }
     }
 
@@ -5309,7 +5341,7 @@ mod tests {
                 assert_eq!((st, out.as_str()), (2, ""), "{w} {src}");
                 assert_eq!(
                     err.trim_end(),
-                    format!("td-sh: {w}: illegal option {letter}"),
+                    format!("td-sh: {w}: line 1: illegal option {letter}"),
                     "{w} {src}"
                 );
             }
@@ -5330,7 +5362,7 @@ mod tests {
             for src in ["--x ./s.sh", "---", "--x"] {
                 let (st, _o, err) = sh(&format!("{w} {src}; echo AFTER"));
                 assert_eq!(st, 2, "{w} {src}");
-                assert_eq!(err.trim_end(), format!("td-sh: {w}: illegal option --"), "{w} {src}");
+                assert_eq!(err.trim_end(), format!("td-sh: {w}: line 1: illegal option --"), "{w} {src}");
             }
             // `--` with NO operand after it is the no-operand case, not an
             // option error: status 2 and the script CARRIES ON. That is the one
@@ -5439,13 +5471,13 @@ mod tests {
         // On a special builtin an unknown option ends the script. `n` and `p`
         // are the only two that are not (`nextopt("np")`, ash.c:14137).
         for (src, err) in [
-            ("export -z x; echo reached", "td-sh: export: illegal option -z\n"),
-            ("readonly -q x; echo reached", "td-sh: readonly: illegal option -q\n"),
+            ("export -z x; echo reached", "td-sh: export: line 1: illegal option -z\n"),
+            ("readonly -q x; echo reached", "td-sh: readonly: line 1: illegal option -q\n"),
             // ash reads the WHOLE cluster, so a bad letter after a good one is
             // still fatal -- and names the letter it stopped on, not the word.
             // dash calls nextopt once and would list and exit 0.
-            ("export -px; echo reached", "td-sh: export: illegal option -x\n"),
-            ("readonly -pq; echo reached", "td-sh: readonly: illegal option -q\n"),
+            ("export -px; echo reached", "td-sh: export: line 1: illegal option -x\n"),
+            ("readonly -pq; echo reached", "td-sh: readonly: line 1: illegal option -q\n"),
         ] {
             let (status, out, e) = run_capturing(src);
             assert_eq!((status, out.as_str(), e.as_str()), (2, "", err), "{src}");
@@ -6039,7 +6071,7 @@ mod tests {
         // shell survives it, unlike `export -x`.
         let (status, out, err) = run_capturing("command -x export n=1; echo \"after=$?\"");
         assert_eq!((status, out.as_str()), (0, "after=2\n"), "{err}");
-        assert_eq!(err, "td-sh: command: illegal option -x\n");
+        assert_eq!(err, "td-sh: command: line 1: illegal option -x\n");
         // A name that resolves to nothing is 127, not 1: `command -v` reports what
         // `describe_command` returns.
         assert_eq!(run_capturing("command -v td_sh_no_such_thing").0, 127);
@@ -6276,7 +6308,7 @@ mod tests {
         assert_eq!(out, "[inf]");
         assert_eq!(status, 1);
         assert!(err.contains("out of range"), "err: {err:?}");
-        assert_eq!(run_capturing("printf '[%f]' 1e-400"), (1, "[0.000000]".into(), "td-sh: printf: 1e-400: Numerical result out of range\n".into()));
+        assert_eq!(run_capturing("printf '[%f]' 1e-400"), (1, "[0.000000]".into(), "td-sh: 1e-400: Numerical result out of range\n".into()));
         // Leading whitespace is skipped; a wholly unconvertible operand is 0.
         assert_eq!(run_capturing("printf '[%g]' '  42'").1, "[42]");
         let (status, out, err) = run_capturing("printf '[%f]' abc");
@@ -6821,7 +6853,7 @@ mod tests {
             "127\n"
         );
         let (status, _, err) = run_capturing("unalias -z");
-        assert_eq!((status, err.as_str()), (2, "td-sh: unalias: illegal option -z\n"));
+        assert_eq!((status, err.as_str()), (2, "td-sh: unalias: line 1: illegal option -z\n"));
     }
 
     #[test]
@@ -7608,13 +7640,13 @@ mod tests {
         ] {
             let (status, _, err) = run_capturing(&format!("unset {op}; echo NOTREACHED"));
             assert_eq!(status, 2, "unset {op}");
-            assert_eq!(err, format!("td-sh: unset: {named}: bad variable name\n"), "unset {op}");
+            assert_eq!(err, format!("td-sh: unset: line 1: {named}: bad variable name\n"), "unset {op}");
         }
         // `-v` is the same path; `-f` judges no name at all, in either shell,
         // so its stderr is asserted too -- silence is the property.
         assert_eq!(
             run_capturing("unset -v '1b=c'; echo NOTREACHED"),
-            (2, String::new(), "td-sh: unset: 1b: bad variable name\n".into())
+            (2, String::new(), "td-sh: unset: line 1: 1b: bad variable name\n".into())
         );
         assert_eq!(
             run_capturing("unset -f '1b=c'; echo rc=$?"),
@@ -7624,7 +7656,7 @@ mod tests {
         // could regress the same way, so it is pinned in the `=` form too.
         assert_eq!(
             run_capturing("readonly R=1; unset 'R=x'; echo NOTREACHED"),
-            (2, String::new(), "td-sh: unset: R: is read only\n".into())
+            (2, String::new(), "td-sh: unset: line 1: R: is read only\n".into())
         );
         // The last of `-f`/`-v` wins, as in dash's option loop.
         assert_eq!(
