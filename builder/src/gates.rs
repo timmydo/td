@@ -863,15 +863,8 @@ fn pgroup_rss_bytes(pgid: u32) -> u64 {
         let Some(pid) = name.to_str().filter(|n| n.bytes().all(|b| b.is_ascii_digit())) else {
             continue;
         };
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { continue };
-        // pgrp is field 5, but comm (field 2) may contain spaces — parse after
-        // the closing paren.
-        let Some(after) = stat.rsplit_once(')').map(|(_, a)| a) else { continue };
-        let mut it = after.split_whitespace();
-        let _state = it.next();
-        let _ppid = it.next();
-        let Some(grp) = it.next() else { continue };
-        if grp != pgid.to_string() {
+        let Some((_state, grp)) = proc_state_and_pgrp(pid) else { continue };
+        if grp != pgid {
             continue;
         }
         let Ok(statm) = std::fs::read_to_string(format!("/proc/{pid}/statm")) else { continue };
@@ -881,6 +874,181 @@ fn pgroup_rss_bytes(pgid: u32) -> u64 {
         }
     }
     total
+}
+
+/// LIVE members of process group `pgid`, and of `cg` where a cgroup layer
+/// answers. Zombies are excluded — the gate's own leader is one by the time the
+/// sweep runs, held unreaped on purpose, and a process that has already exited
+/// is not something left running.
+///
+/// The cgroup half is the only way to see a descendant that called `setsid(2)`:
+/// it has left the gate's process group, so the group walk is blind to it by
+/// construction and the group kill cannot reach it either.
+fn live_survivors(pgid: u32, cg: Option<&Path>) -> Vec<u32> {
+    let mut out = pgroup_live_pids(pgid);
+    if let Some(cg) = cg {
+        for pid in cgroup_live_pids(cg) {
+            if !out.contains(&pid) {
+                out.push(pid);
+            }
+        }
+    }
+    out
+}
+
+/// Pids rather than formatted lines, so the COUNT is the group's and does not
+/// depend on whether an argv could be read: a survivor whose `/proc` cmdline is
+/// empty — caught between `fork` and `execve` — is still a survivor.
+fn pgroup_live_pids(pgid: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else { return out };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name.to_str().filter(|n| n.bytes().all(|b| b.is_ascii_digit())) else {
+            continue;
+        };
+        let Some((state, grp)) = proc_state_and_pgrp(pid) else { continue };
+        if grp != pgid || state == 'Z' {
+            continue;
+        }
+        if let Ok(n) = pid.parse() {
+            out.push(n);
+        }
+    }
+    out
+}
+
+/// LIVE members of cgroup `cg`, read from its `cgroup.procs`. Empty where no
+/// cgroup layer answers. A member is still listed there while it is a zombie,
+/// so the state filter is the group walk's rather than implied.
+fn cgroup_live_pids(cg: &Path) -> Vec<u32> {
+    let Ok(text) = std::fs::read_to_string(cg.join("cgroup.procs")) else { return Vec::new() };
+    // Parsed BEFORE it is used to build a path. cgroupfs writes this file, but
+    // on a hybrid v1/v2 host /sys/fs/cgroup is plain tmpfs and the gate body
+    // owns it — it is handed the path in TD_GATE_CG — so nothing it can put
+    // there becomes part of a `/proc` lookup.
+    text.lines().filter_map(|l| l.trim().parse().ok()).filter(|p| pid_is_live(*p)).collect()
+}
+
+/// A process's `state` and `pgrp` from `/proc/<pid>/stat`, the one parse both
+/// the RSS sampler and the sweep read those fields through. They are fields 3
+/// and 5, taken after the LAST ')' because comm is field 2 and may contain both
+/// spaces and parentheses — counting from the left mis-parses `sh -c 'x) y'`.
+fn proc_state_and_pgrp(pid: &str) -> Option<(char, u32)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let mut it = stat.rsplit_once(')')?.1.split_whitespace();
+    let state = it.next()?.chars().next()?;
+    let _ppid = it.next()?;
+    Some((state, it.next()?.parse().ok()?))
+}
+
+/// Whether one pid is a process that has not exited. A zombie is not: it holds
+/// a `/proc` entry and a pid, but it is done, and the drain must stop for it or
+/// it would wait out its whole window on every gate.
+fn pid_is_live(pid: u32) -> bool {
+    proc_state_and_pgrp(&pid.to_string()).is_some_and(|(state, _)| state != 'Z')
+}
+
+/// How much of one survivor's argv reaches the log. argv can be ARG_MAX long
+/// (2 MiB on Linux) and there is nothing to learn past the first screenful.
+/// A soft bound: the char that crosses it is escaped whole rather than split.
+const CMDLINE_MAX: usize = 200;
+
+/// How many survivors are named. A gate that forked a thousand of something
+/// says the same thing in twenty lines, and the count above them is exact.
+const CMDLINE_LINES_MAX: usize = 20;
+
+/// The drain after the sweep's kill. Two seconds of 20ms ticks: delivery is
+/// immediate for anything runnable, and what is not runnable is in an
+/// uninterruptible sleep that no longer bound would fix either. The window is
+/// spelled out rather than multiplied, since `Duration * u32` panics on
+/// overflow and this crate takes no panicking arithmetic off a test.
+const DRAIN_TICK: Duration = Duration::from_millis(20);
+const DRAIN_TICKS: u32 = 100;
+const DRAIN_WINDOW: Duration = Duration::from_secs(2);
+
+/// So a 2 MiB argv is not read to print 200 bytes of it. Every raw byte
+/// contributes at least one to the output (a NUL becomes a space), so reading
+/// this many guarantees the cut fires for anything longer.
+const CMDLINE_READ: u64 = CMDLINE_MAX as u64 + 2;
+
+/// `pid: argv` for a process with a readable cmdline, or None.
+///
+/// The argv is ESCAPED rather than printed raw, which is the half that is not
+/// cosmetic: it is whatever a gate spawned, and this line lands in the log a
+/// later pass re-reads. That pass's sentinel is printable, so escaping alone
+/// cannot make the line safe — what makes it safe is that the sentinel is read
+/// BEFORE the sweep writes. Escaping closes the rest: without it an argument
+/// holding a newline could forge a whole `gate-run:` line.
+fn live_cmdline(pid: u32) -> Option<String> {
+    use std::io::Read;
+    let mut raw = Vec::new();
+    std::fs::File::open(format!("/proc/{pid}/cmdline"))
+        .and_then(|f| f.take(CMDLINE_READ).read_to_end(&mut raw))
+        .ok()?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(format_cmdline(pid, &raw))
+}
+
+/// The formatting half of `live_cmdline`, split out because it is the half with
+/// a property to check and `/proc` cannot be asked for an argv of choice.
+fn format_cmdline(pid: u32, raw: &[u8]) -> String {
+    let mut line = format!("{pid}: ");
+    let mut cut = false;
+    // The terminating NUL is stripped rather than the parts filtered, so an
+    // argument that IS empty stays in the line it is printed on.
+    for (n, arg) in raw.strip_suffix(&[0]).unwrap_or(raw).split(|b| *b == 0).enumerate() {
+        // Checked HERE as well as per char, because the separator is what an
+        // empty argument contributes: a NUL-padded cmdline is all separators
+        // and would otherwise grow the line without ever entering the loop
+        // below, so nothing would mark it cut.
+        if line.len() >= CMDLINE_MAX {
+            cut = true;
+            break;
+        }
+        if n > 0 {
+            line.push(' ');
+        }
+        for c in String::from_utf8_lossy(arg).chars() {
+            if line.len() >= CMDLINE_MAX {
+                cut = true;
+                break;
+            }
+            escape_char(c, &mut line);
+        }
+        if cut {
+            break;
+        }
+    }
+    if cut {
+        line.push_str("...");
+    }
+    line
+}
+
+/// One char into `out`, control bytes as `\xNN` and `\` doubled so the escape
+/// cannot be spelled by the argv itself.
+fn escape_char(c: char, out: &mut String) {
+    if c == '\\' {
+        out.push_str("\\\\");
+    } else if c.is_control() {
+        let mut buf = [0u8; 4];
+        for b in c.encode_utf8(&mut buf).as_bytes() {
+            out.push('\\');
+            out.push('x');
+            out.push(hex_nibble(b >> 4));
+            out.push(hex_nibble(b & 0xf));
+        }
+    } else {
+        out.push(c);
+    }
+}
+
+fn hex_nibble(n: u8) -> char {
+    let n = n & 0xf;
+    char::from(if n < 10 { b'0' + n } else { b'a' + n - 10 })
 }
 
 /// Create the gate's child cgroup with the tree budget; returns its dir.
@@ -975,10 +1143,12 @@ enum Outcome {
 /// child is dead and its writes to the log are flushed — so a token its
 /// provisioning path emitted is present. Bytes, not String: a build log routinely
 /// carries non-UTF-8, and a lossy decode must not drop the token.
-fn log_has_unprovisioned_sentinel(log_path: &Path) -> bool {
+fn log_has_unprovisioned_sentinel(log_path: &Path, upto: u64) -> bool {
+    use std::io::Read;
     let needle = crate::check_loop::UNPROVISIONED_SENTINEL.as_bytes();
-    match std::fs::read(log_path) {
-        Ok(bytes) => bytes.windows(needle.len()).any(|w| w == needle),
+    let mut bytes = Vec::new();
+    match std::fs::File::open(log_path).and_then(|f| f.take(upto).read_to_end(&mut bytes)) {
+        Ok(_) => bytes.windows(needle.len()).any(|w| w == needle),
         Err(_) => false,
     }
 }
@@ -1220,8 +1390,146 @@ fn run_gate(
             }
             early
         });
-        // The scope joined the watchdog, so no further kill can be issued and the
-        // pgid is free to release.
+        // The scope joined the watchdog, so no further kill can be issued.
+        //
+        // A body that EXITS leaves whatever it started still running: the
+        // watchdog only kills on the deadline or an RSS breach, so nothing at
+        // all tore the group down on the healthy path, and a backgrounded test
+        // binary reparented to init and kept spinning with nobody waiting on it
+        // (re f370e471, which recorded this and deferred it).
+        //
+        // It goes HERE, between the join and the reap, and that placement is the
+        // whole reason the GROUP kill can exist: the pgid IS the leader's pid,
+        // and the kernel keeps that number reserved while the group still has a
+        // member — the leader's own zombie being one. So this is the last
+        // instant it is provably ours rather than one the kernel may have
+        // reissued. On the fallback arm the wait already reaped, so the group is
+        // not signalled there; the cgroup, which names members rather than a
+        // reusable number, still is.
+        //
+        // The LISTING happens on BOTH ARMS OF THE WAIT — that axis, not the
+        // watchdog's, which suppresses it below. It costs the one /proc walk the
+        // drain then repeats, and it is the only thing that connects a stray
+        // process to the gate that left it.
+        //
+        // First, though, the log's LENGTH — everything written to it so far.
+        // The unprovisioned sentinel is found by an unanchored search, and
+        // everything written BELOW this point is a survivor's argv, which is
+        // text a gate chose; without a boundary a background process named after
+        // the token would turn a real failure into a tolerated skip. Escaping
+        // cannot close that one, since the token is printable. (The mark is not
+        // "what the body wrote": a survivor holds the log fd too. That is not a
+        // new capability — the body could always print the token itself — so the
+        // boundary is about what this code appends, and nothing more.) The
+        // length rather than the answer because reading the log here would put a
+        // multi-megabyte read and scan on every gate's happy path for a value
+        // only the failing arm ever looks at.
+        //
+        // Fails CLOSED. An unreadable stat leaves no boundary at all, and the
+        // safe direction on this one is a genuine toolchain gap reported as a
+        // red rather than a real regression tolerated as a skip.
+        let body_log_len = std::fs::metadata(log_path).map(|m| m.len()).unwrap_or(0);
+        let survivors = live_survivors(pgid, gate_cg.as_deref());
+        // On the deadline and RSS arms the watchdog has ALREADY SIGKILLed this
+        // group, so what the walk just found is the gate's own children partway
+        // through dying — still R or S, cmdline already unreadable — rather than
+        // anything the gate left behind. Those arms have said what happened; a
+        // list of their victims would overcount and name nothing actionable.
+        // They are still DRAINED below: the point there is that the next gate
+        // does not start on top of them.
+        let already_killed = breached.load(std::sync::atomic::Ordering::Relaxed)
+            || timed_out.load(std::sync::atomic::Ordering::Relaxed);
+        if !survivors.is_empty() && !already_killed {
+            let _ = writeln!(
+                logf,
+                "gate-run: gate {} left {} process(es) running; {}",
+                g.name,
+                survivors.len(),
+                if status.is_none() {
+                    "killing the group"
+                } else {
+                    "the group is NOT killed — the fallback wait already released its id, so \
+                     that half may name a stranger's processes"
+                }
+            );
+            for pid in survivors.iter().take(CMDLINE_LINES_MAX) {
+                // Named even with no argv to name it by, or the count above
+                // would be a number with nothing accounting for it.
+                match live_cmdline(*pid) {
+                    Some(line) => {
+                        let _ = writeln!(logf, "gate-run:   left behind: {line}");
+                    }
+                    None => {
+                        let _ = writeln!(
+                            logf,
+                            "gate-run:   left behind: {pid}: <no cmdline — mid-exec, or gone \
+                             since the walk>"
+                        );
+                    }
+                }
+            }
+            if let Some(more) = survivors.len().checked_sub(CMDLINE_LINES_MAX).filter(|n| *n > 0) {
+                let _ = writeln!(logf, "gate-run:   left behind: … and {more} more");
+            }
+        }
+        // The group kill is the arm's to withhold; the CGROUP kill is not. The
+        // reuse argument is about the pgid, and `cgroup.procs` names this gate's
+        // own members whatever the leader's reap did to that number — so the
+        // fallback arm still gets the half that is unambiguous.
+        let killed_group = status.is_none();
+        if killed_group {
+            // Group first for the deadline path's reason: one syscall, and the
+            // one that works with no cgroup at all.
+            let _ = crate::sys::kill_process_group(pgid, crate::sys::SIGKILL);
+        }
+        let killed_cg = gate_cg.as_deref().is_some_and(cgroup_kill);
+        // kill(2) QUEUES a signal, it does not deliver one, so without this the
+        // runner returns and starts the next gate while a survivor still holds a
+        // lock, a port or a core — the failure this exists to prevent, arriving
+        // a moment later instead. Draining is safe for exactly as long as the
+        // kill was: the leader's zombie still pins the pgid, and it is excluded
+        // from the walk that decides when to stop.
+        //
+        // RE-WALKED each tick rather than retained over the pids already found.
+        // Retaining is the cheaper shape and the wrong one: a survivor that
+        // forked between the walk and the kill is in the group and dies with it,
+        // but it was never on that list, so the drain would return while it was
+        // still alive — and a subtree cgroup's members are not in `cgroup.procs`
+        // at all, though `cgroup.kill` reaches them. Re-walking also makes this
+        // MEMBERSHIP rather than bare existence, so a reissued pid cannot be
+        // mistaken for a survivor and waited on. The walk is /proc-wide, and
+        // paying for it fifty times a second is why the loop is entered only
+        // when the pre-kill walk found something — a gate that has already
+        // misbehaved.
+        let mut remaining = survivors.len();
+        if (killed_group || killed_cg) && remaining > 0 {
+            let mut ticks = 0;
+            while remaining > 0 && ticks < DRAIN_TICKS {
+                std::thread::sleep(DRAIN_TICK);
+                ticks += 1;
+                remaining = live_survivors(pgid, gate_cg.as_deref()).len();
+            }
+            if remaining > 0 {
+                // Reported rather than waited out: nothing bounds an
+                // uninterruptible sleep, and a gate that hangs the runner is
+                // worse than one that leaks. A pre-5.14 kernel reaches this too
+                // — a setsid escapee is listed by cgroup.procs, unreachable by
+                // the group kill, and cgroup.kill does not exist to catch it —
+                // so the line names the outcome and leaves the cause open.
+                //
+                // NOT suppressed on the watchdog's arms, unlike the listing
+                // above: that one names processes expected to be dying anyway,
+                // while this one is a teardown that did not finish, which is
+                // worth saying on every path. And it is inside the kill, so it
+                // cannot claim a wait that was never made.
+                let _ = writeln!(
+                    logf,
+                    "gate-run: gate {} — {remaining} process(es) outlived the kill by \
+                     {DRAIN_WINDOW:?} and are still running",
+                    g.name
+                );
+            }
+        }
         let status = match status {
             Some(st) => st,
             None => child.wait(),
@@ -1292,10 +1600,14 @@ fn run_gate(
                 // `exit 69` (a stray EX_UNAVAILABLE from an unrelated tool, or an
                 // accidental exit) has no token and stays a real failure, so a
                 // genuine regression can never masquerade as a skip (Codex review).
+                // Searched only as far as the body's own output reached: the
+                // sweep appends a survivor's argv below that mark, and the
+                // token is printable, so a background process named after it
+                // would otherwise turn this real failure into a tolerated skip.
                 if !breached
                     && td_engine::exit::host_gap_from_parts(
                         st.code(),
-                        log_has_unprovisioned_sentinel(log_path),
+                        log_has_unprovisioned_sentinel(log_path, body_log_len),
                     )
                 {
                     let _ = writeln!(
@@ -2986,9 +3298,220 @@ mod tests {
         );
     }
 
-    /// The deadline kill now issues a cgroup kill BEFORE the group kill wherever
-    /// a cgroup is configured. This is the arm where that layer answers nothing
-    /// — a plain directory, which is both what a pre-5.14 kernel's cgroup looks
+    /// A body that exits while something it started keeps running: the survivor
+    /// must be dead when the gate returns, and named in the log. Before this the
+    /// gate PASSED and the sleeper spun on, reparented to init.
+    #[test]
+    fn a_gate_does_not_leave_its_descendants_running() {
+        let d = tmpdir("sweep");
+        // Prints each pid, then exits at once leaving them behind. Stdio is
+        // redirected or the sleepers hold the log handle open.
+        //
+        // SIXTY rather than one, which is what makes this a test of the DRAIN
+        // and not only of the kill: kill(2) queues a signal rather than
+        // delivering one, and with a single sleeper the runner won that race
+        // every time — with sixty it never does.
+        let body = r#"i=0; while [ $i -lt 60 ]; do sleep 30 </dev/null >/dev/null 2>&1 & echo "SLEEPER $!"; i=$((i+1)); done"#;
+        let set = synth(&d, &[("leaky", Pool::Cheap, body, &[])]);
+        let sel = expand_goals(&set, &["check-fast".to_string()]).unwrap();
+        let c = cfg(&d, 1, None);
+        assert!(run_selected(&set, &sel, &c).unwrap(), "the body exits 0, so the gate passes");
+        let log = std::fs::read_to_string(d.join("logs/leaky.log")).unwrap();
+        let pids: Vec<u32> = log
+            .lines()
+            .filter_map(|l| l.strip_prefix("SLEEPER "))
+            .filter_map(|v| v.trim().parse().ok())
+            .collect();
+        assert_eq!(pids.len(), 60, "the body must report every pid it backgrounded");
+        // A zombie keeps its /proc entry, so the pathname alone would read a
+        // killed sleeper as alive; the state field is the honest answer. They
+        // are grandchildren, so nothing here can reap them.
+        let alive = |p: u32| -> bool {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{p}/stat")) else {
+                return false;
+            };
+            match stat.rsplit_once(')') {
+                Some((_, rest)) => !matches!(rest.split_whitespace().next(), Some("Z") | None),
+                None => false,
+            }
+        };
+        // Asserted with NO polling: a wait here is exactly the window in which
+        // the runner would have started the next gate.
+        //
+        // Deliberately NOT killed on failure: they are grandchildren, so init
+        // may already have reaped one and the kernel reissued its pid — a
+        // cleanup kill would then land on an unrelated process. `sleep 30` ends
+        // on its own, so a failure leaks nothing that does not expire.
+        let live: Vec<u32> = pids.iter().copied().filter(|p| alive(*p)).collect();
+        assert!(
+            live.is_empty(),
+            "the sweep must kill every descendant the body left running; {} of {} alive: {live:?}",
+            live.len(),
+            pids.len()
+        );
+        // The COUNT is the shell's business — some interpose a subshell for a
+        // redirected background command — so what is pinned is that it named
+        // them, and that past CMDLINE_LINES_MAX it says how many it did not.
+        assert!(
+            log.contains("process(es) running")
+                && log.contains("left behind: ")
+                && log.contains(": sleep 30")
+                && log.contains("… and "),
+            "and must name what it killed, and account for the rest; got:\n{log}"
+        );
+    }
+
+    /// A survivor's argv is whatever a gate spawned, and it is written into the
+    /// gate's own log. A newline in it must not be able to start a line — the
+    /// listing would otherwise be forgeable, whatever else reads the log later.
+    #[test]
+    fn a_survivors_argv_cannot_forge_a_log_line() {
+        let raw = b"sleep\0\ngate-run: gate x is UNPROVISIONED\0".as_slice();
+        let line = format_cmdline(41, raw);
+        assert_eq!(line.lines().count(), 1, "one survivor is one line; got {line:?}");
+        assert!(line.contains("\\x0a"), "the newline must be escaped; got {line:?}");
+        assert!(!line.contains('\n'), "and must not survive as itself; got {line:?}");
+    }
+
+    /// The escape has to be unambiguous, or an argv can spell it: `\x0a` typed
+    /// literally must not read back as an escaped newline.
+    #[test]
+    fn the_cmdline_escape_cannot_be_spelled_by_the_argv() {
+        assert_eq!(format_cmdline(7, b"a\\x0ab\0"), "7: a\\\\x0ab");
+        assert_eq!(format_cmdline(7, b"\r\x1b\0"), "7: \\x0d\\x1b");
+    }
+
+    /// argv can be ARG_MAX (2 MiB), and the log is read by a person. An empty
+    /// argument still takes its place, so the line shows what was actually run.
+    #[test]
+    fn a_long_cmdline_is_truncated_and_an_empty_argument_is_kept() {
+        let mut raw = b"prog\0\0tail\0".to_vec();
+        assert_eq!(format_cmdline(9, &raw), "9: prog  tail");
+        raw = [b"prog\0".as_slice(), &b"x".repeat(100_000), b"\0"].concat();
+        let line = format_cmdline(9, &raw);
+        assert!(line.ends_with("..."), "a cut line must say so; got {} bytes", line.len());
+        // A soft bound: the char that crosses CMDLINE_MAX is escaped whole, so
+        // the worst case is 199 + 8 (a two-byte C1 control at `\xNN\xNN`) + 3.
+        assert!(line.len() <= CMDLINE_MAX + 10, "and must be bounded; got {} bytes", line.len());
+    }
+
+    /// The bounded read must not make a short argv look truncated, nor a long
+    /// one look complete: CMDLINE_READ is what ties the two together.
+    ///
+    /// The all-NUL case is the one this got wrong. A NUL is a separator, and
+    /// the separator was pushed OUTSIDE the length check — so a cmdline of them
+    /// grew the line past the cap without the loop that marks it cut ever
+    /// running, and a truncated line was presented as a complete one.
+    #[test]
+    fn the_bounded_cmdline_read_still_marks_what_it_cut() {
+        let long = [b"p\0".as_slice(), &b"y".repeat(4096)].concat();
+        let capped = long.get(..CMDLINE_READ as usize).unwrap();
+        assert!(format_cmdline(3, capped).ends_with("..."), "a capped read is still a cut line");
+        let padded = format_cmdline(3, &[0u8; CMDLINE_READ as usize]);
+        assert!(padded.ends_with("..."), "and so is one that is all separators; got {padded:?}");
+        assert!(padded.len() <= CMDLINE_MAX + 10, "and bounded; got {} bytes", padded.len());
+        let short = b"p\0-v\0";
+        assert_eq!(format_cmdline(3, short), "3: p -v", "and a short argv is untouched");
+    }
+
+    /// A survivor's argv is text a gate chose and the unprovisioned sentinel is
+    /// printable, so escaping cannot stop one spelling it. What stops it is the
+    /// ORDER — the sentinel is read before the sweep writes — and this is the
+    /// assertion of that: a bare `exit 69` stays a real failure even when a
+    /// process the body left behind is named after the token.
+    #[test]
+    fn a_survivors_argv_cannot_forge_the_unprovisioned_sentinel() {
+        let d = tmpdir("forge69");
+        // The trailing `:` stops the shell tail-exec'ing `sleep` over its own
+        // argv, which is where the token has to stay to be swept up.
+        let body = format!(
+            "sh -c 'sleep 30; :' '{}' </dev/null >/dev/null 2>&1 & exit 69",
+            crate::check_loop::UNPROVISIONED_SENTINEL
+        );
+        let set = synth(&d, &[("forger", Pool::Cheap, body.as_str(), &[])]);
+        let sel = expand_goals(&set, &["check-fast".to_string()]).unwrap();
+        assert!(
+            !run_selected(&set, &sel, &cfg(&d, 1, None)).unwrap(),
+            "a bare exit 69 must red even when a survivor's argv carries the sentinel"
+        );
+        let log = std::fs::read_to_string(d.join("logs/forger.log")).unwrap();
+        assert!(
+            log.contains(crate::check_loop::UNPROVISIONED_SENTINEL),
+            "and the token must really have reached the log, or this proves nothing; got:\n{log}"
+        );
+    }
+
+    /// The sweep's cgroup arm, without a delegated subtree: `cgroup.procs` is
+    /// an ordinary file to read, so the UNION and the dedup — the parts this
+    /// crate wrote — are testable anywhere. What needs a real delegation is the
+    /// KILL, and `cgroup_kill_reaches_a_process_group_escapee` covers that
+    /// wherever one exists.
+    #[test]
+    fn live_survivors_unions_a_cgroup_member_that_left_the_process_group() {
+        use std::os::unix::process::CommandExt;
+        let null = || std::process::Stdio::null();
+        let d = tmpdir("cgunion");
+        // A live process in a group of its own: the setsid escapee's shape.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(null())
+            .stdout(null())
+            .stderr(null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let escapee = child.id();
+        // And an unreaped one, which cgroup.procs lists exactly as it lists a
+        // live member — the reason cgroup_live_pids checks the state itself
+        // rather than inheriting the group walk's filter.
+        let mut dead = std::process::Command::new("true")
+            .stdin(null())
+            .stdout(null())
+            .stderr(null())
+            .spawn()
+            .unwrap();
+        let zombie = dead.id();
+        let mut is_zombie = false;
+        for _ in 0..200 {
+            if proc_state_and_pgrp(&zombie.to_string()).is_some_and(|(s, _)| s == 'Z') {
+                is_zombie = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(is_zombie, "the exited child must be an unreaped zombie (pid {zombie})");
+        let mine = std::process::id();
+        let (_, pgid) = proc_state_and_pgrp("self").unwrap();
+        std::fs::write(d.join("cgroup.procs"), format!("{escapee}\n{mine}\n{zombie}\n")).unwrap();
+        let group_only = live_survivors(pgid, None);
+        assert!(!group_only.contains(&escapee), "the group walk cannot see an escapee");
+        assert!(group_only.contains(&mine), "but it does see this process");
+        let both = live_survivors(pgid, Some(&d));
+        assert!(both.contains(&escapee), "and the cgroup arm must add it; got {both:?}");
+        assert!(!both.contains(&zombie), "but never a zombie member; got {both:?}");
+        assert_eq!(
+            both.iter().filter(|p| **p == mine).count(),
+            1,
+            "a member in BOTH is named once, or the count double-counts it; got {both:?}"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = dead.wait();
+    }
+
+    /// A pid whose cmdline cannot be read — it vanished between the walk and
+    /// the read, or it is mid-`execve`. The count comes from the walk and the
+    /// argv only from `/proc`, so the two must not be able to disagree.
+    #[test]
+    fn a_pid_with_no_readable_cmdline_answers_none() {
+        // pid 0 is never a process, so this is that shape without racing one.
+        assert_eq!(live_cmdline(0), None);
+        assert!(!pid_is_live(0), "and it is not something the drain waits out");
+    }
+
+    /// The deadline kill issues a cgroup kill AFTER the group kill wherever a
+    /// cgroup is configured. This is the arm where that layer answers nothing —
+    /// a plain directory, which is both what a pre-5.14 kernel's cgroup looks
     /// like to `cgroup_kill` and what a hybrid v1/v2 host's tmpfs
     /// /sys/fs/cgroup really is. The group kill must still be the whole
     /// teardown, and it runs everywhere, unlike the delegated tests.
