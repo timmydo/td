@@ -1129,6 +1129,75 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    delegate the publish (D1 again), and roll back on a failed boot. This is
    where the update channel that was its own workstream rejoins this one.
 
+   **Most of item 10 is already built, and the first thing this item needs is
+   for that to be written down** — otherwise its obvious-looking scope is a
+   rebuild of `td-boot`. Everything after "verify it" exists and is driven
+   from the shipped image today. `install_deployment` IS the update
+   transaction: it opens the bundle, authenticates it where a key is
+   supplied, publishes it, and activates it against a known-good fallback.
+   It is already idempotent — republishing the id that is `current` retains
+   it and repairs `previous` rather than activating anything — and it already
+   refuses the cases that would leave a machine with nowhere to go: activation
+   while `current` is pending without a verified fallback, retaining a pending
+   deployment as the fallback, replacing an invalid fallback with a pending
+   one. Rollback is a verb (`td-boot rollback`), acknowledgement is a verb
+   (`td-boot success`), the three durable attempts and the automatic demotion
+   of an exhausted candidate are in `select_boot_deployment`, and
+   `/etc/inittab` on the shipped image already runs `td-boot success /dev/vda
+   /run/td-update "$deployment"` after a good boot. That mountpoint is named
+   for this item and predates it.
+
+   So `td-update` is a CHANNEL front end, not a second publisher. What it adds
+   over `td-boot install` is where a bundle comes from, which one to take, and
+   the trust root to check it under. D1 still holds: it execs the one writer.
+
+   **THE TRUST ROOT IS THE REAL QUESTION, and it is the reason this item is
+   not just a directory scan.** A running machine has none. The key lives at
+   `TRUSTED_KEY_PATH` in the SELECTOR initramfs — the rootfs td-boot is
+   running from when it selects and verifies — and `switch_root` replaces
+   that rootfs with the deployment's `root.erofs`, which ships no such file
+   (§6). `td-boot authenticate`'s default path is spelled for the selector's
+   benefit and resolves to nothing once a machine is up. An update that ran
+   there today would publish whatever it was handed and warn that nothing
+   could check it, which is exactly the wrong end of the operation to learn
+   at — item 7c's argument, one machine further along.
+
+   **The answer taken is that the VOLUME carries it**, at a path outside
+   `/td/deployments` so it is not inside anything it authenticates, and
+   `td-install` writes it there at install time from the key it is already
+   given (7c-ii). That gives a running machine a trust root with exactly the
+   provenance of the media that installed it, survives every update and
+   rollback because no deployment owns it, and is one place to rotate.
+   `td-update` then passes it EXPLICITLY to `td-boot`, the rule 7c already
+   set for `td-install`: no probe, so no absence that reads as "publish
+   without checking".
+
+   Two alternatives were weighed and are recorded because the choice is not
+   obvious. Shipping the key INSIDE the deployment root would make each
+   deployment vouch for its successor, which is a normal enough design, but
+   it couples key rotation to rebuilding a deployment and it flips every
+   `td-boot install` on that machine to fail-closed as a side effect — the
+   silent change 7c's last paragraph warns about, which should be a decision
+   rather than a consequence. Requiring the operator to pass a key on every
+   invocation is honest and unusable unattended, which is the case an update
+   channel exists for. Neither is refuted by anything here; if the volume
+   turns out to be the wrong home, this paragraph is what to change.
+
+   What the volume's key does NOT buy is protection against someone who can
+   already write the disk — they can replace the key as easily as the bundle.
+   That is not a regression: the selector initramfs it replaces is on the same
+   disk, in the ESP, and is no harder to rewrite. Making either meaningfully
+   harder is Secure Boot and a measured boot chain, which is out of scope here
+   and would be its own specification.
+
+   **The LOCAL channel** is a directory of deployment directories, and local
+   is the whole of it for now: no network, no fetch, no protocol. td's
+   network tools are the only crates allowed dependencies and none of them is
+   built for the target, so a fetching `td-update` is a separate decision with
+   its own trust argument, not an increment of this one. The bundle arrives by
+   whatever put it there — removable media, a share the operator mounted, a
+   build host writing into the volume.
+
 Items 8 and 9 depend on nothing above them and may land whenever they fit.
 
 ## 11. Validation
