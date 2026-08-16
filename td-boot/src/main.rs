@@ -524,16 +524,16 @@ fn open_bundle(directory: &Path, trust: Option<&TrustRoot>) -> io::Result<Verifi
     let manifest_path = directory.join(protocol::MANIFEST_NAME);
     let manifest =
         read_bounded_real_file(&manifest_path, "deployment manifest", protocol::MAX_MANIFEST_BYTES)?;
-    let signature = read_optional_signature(directory)?;
+    let signature = read_optional_signature(signature_path(directory))?;
     if let Some(key) = trust {
         // An UNSIGNED bundle is refused rather than treated as unverifiable,
         // or the check would be escapable by deleting `manifest.sig`.
-        let bytes = signature.as_deref().ok_or_else(|| {
+        let detached = signature.as_ref().ok_or_else(|| {
             invalid(
                 "deployment carries no signature and this publish has a trust root".to_string(),
             )
         })?;
-        authenticate_manifest(&manifest, bytes, key)?;
+        authenticate_manifest(&manifest, detached, key)?;
     }
     let parsed = parse_manifest(&manifest)?;
     let id = sha256::hex_digest(&manifest);
@@ -543,37 +543,94 @@ fn open_bundle(directory: &Path, trust: Option<&TrustRoot>) -> io::Result<Verifi
     Ok(VerifiedBundle {
         id,
         manifest,
-        signature,
+        signature: signature.map(DetachedSignature::into_bytes),
         kernel,
         initramfs,
         root,
     })
 }
 
-/// The detached signature beside the manifest, if the bundle carries one.
+/// Where a bundle's detached signature lives — the one join, so nothing can
+/// read one name and report another.
+fn signature_path(directory: &Path) -> PathBuf {
+    directory.join(protocol::MANIFEST_SIG_NAME)
+}
+
+/// A signature and the file it was READ FROM, kept together by a MODULE
+/// BOUNDARY rather than by convention.
 ///
-/// Absent is `None` rather than an error: nothing verifies it yet, so requiring
-/// it would make every existing bundle uninstallable for no gain. Every OTHER
-/// failure is still an error — a signature that exists but is a symlink, a
-/// directory, or too large is a bundle to refuse rather than one to treat as
-/// unsigned, since silently downgrading to "no signature" is exactly the
-/// fail-open the verifying half must not inherit.
-fn read_optional_signature(directory: &Path) -> io::Result<Option<Vec<u8>>> {
-    let path = directory.join(protocol::MANIFEST_SIG_NAME);
-    match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(io::Error::new(
-            error.kind(),
-            format!("deployment signature {}: {error}", path.display()),
-        )),
-        Ok(_) => read_bounded_real_file(
-            &path,
-            "deployment signature",
-            protocol::MAX_SIGNATURE_BYTES,
-        )
-        .map(Some),
+/// A refusal has to name the file, and signature bytes beside a `&Path`
+/// parameter let a caller name one those bytes never came from — which
+/// compiles, runs, and reports the wrong file at exactly the moment an
+/// operator has nothing else to go on. Reachable FIELDS are that same hole one
+/// step further in, since a caller could assign `path` after the read. Both
+/// shapes were reached in review, the first by a mutation that left every test
+/// green, so the pair is the compiler's rule here: the fields are private and
+/// `read_optional_signature` is the only way to make one outside tests.
+mod detached {
+    use super::{protocol, read_bounded_real_file};
+    use std::fs;
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    pub struct DetachedSignature {
+        path: PathBuf,
+        bytes: Vec<u8>,
+    }
+
+    impl DetachedSignature {
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+
+        pub fn bytes(&self) -> &[u8] {
+            &self.bytes
+        }
+
+        pub fn into_bytes(self) -> Vec<u8> {
+            self.bytes
+        }
+    }
+
+    /// The detached signature beside the manifest, if the bundle carries one.
+    ///
+    /// Absent is `None` rather than an error: nothing verifies it yet, so
+    /// requiring it would make every existing bundle uninstallable for no
+    /// gain. Every OTHER failure is still an error — a signature that exists
+    /// but is a symlink, a directory, or too large is a bundle to refuse
+    /// rather than one to treat as unsigned, since silently downgrading to "no
+    /// signature" is exactly the fail-open the verifying half must not
+    /// inherit.
+    ///
+    /// Takes the path BY VALUE: it is the one that lands in the pair, so
+    /// moving it is both one allocation fewer and one fewer chance for the
+    /// stored path to be some other path.
+    pub fn read_optional_signature(path: PathBuf) -> io::Result<Option<DetachedSignature>> {
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(io::Error::new(
+                error.kind(),
+                format!("deployment signature {}: {error}", path.display()),
+            )),
+            Ok(_) => read_bounded_real_file(
+                &path,
+                "deployment signature",
+                protocol::MAX_SIGNATURE_BYTES,
+            )
+            .map(|bytes| Some(DetachedSignature { path, bytes })),
+        }
+    }
+
+    /// The tests decode signatures that are compiled in and were never on
+    /// disk, so they need a pair this module did not read. `cfg(test)` keeps
+    /// the shipped guarantee exactly what it claims to be.
+    #[cfg(test)]
+    pub fn pair(path: PathBuf, bytes: Vec<u8>) -> DetachedSignature {
+        DetachedSignature { path, bytes }
     }
 }
+
+use detached::{DetachedSignature, read_optional_signature};
 
 /// Decode exactly `N` bytes of hex, tolerating surrounding ASCII whitespace —
 /// `td-deploy` writes a trailing newline after both the signature and the key,
@@ -587,18 +644,24 @@ fn read_optional_signature(directory: &Path) -> io::Result<Option<Vec<u8>>> {
 /// in exactly this position — that was a live remote-reachable panic in
 /// `net/src/sig.rs`, reached from a fetched narinfo's `Sig:` field BEFORE
 /// anything was verified, and it is not going to be reintroduced here.
-fn decode_hex<const N: usize>(text: &[u8], label: &str) -> io::Result<[u8; N]> {
+/// `path` is a PARAMETER rather than something a caller folds into `label`, so
+/// a refusal cannot omit the file: the reading half of both callers already
+/// names it, and a decode that did not left an operator with a character count
+/// and several candidate files. Built only in the refusing arms, so nothing is
+/// allocated for it on the path that succeeds.
+fn decode_hex<const N: usize>(text: &[u8], label: &str, path: &Path) -> io::Result<[u8; N]> {
+    let refuse = |what: String| invalid(format!("{label} {}: {what}", path.display()));
     let trimmed = text.trim_ascii();
     // `checked_mul`, not `saturating_mul`: saturation would leave the expected
     // length at `usize::MAX`, which is ODD, and an odd expected length is one
     // `chunks_exact` below would silently drop a byte from. Unreachable for the
     // two callers (N is 32 and 64), and refused rather than reasoned about.
     let Some(expected) = N.checked_mul(2) else {
-        return Err(invalid(format!("{label}: absurd expected length")));
+        return Err(refuse("absurd expected length".to_string()));
     };
     if trimmed.len() != expected {
-        return Err(invalid(format!(
-            "{label} must be exactly {expected} hexadecimal characters, got {}",
+        return Err(refuse(format!(
+            "must be exactly {expected} hexadecimal characters, got {}",
             trimmed.len()
         )));
     }
@@ -607,7 +670,7 @@ fn decode_hex<const N: usize>(text: &[u8], label: &str) -> io::Result<[u8; N]> {
             b'0'..=b'9' => Ok(c - b'0'),
             b'a'..=b'f' => Ok(c - b'a' + 10),
             b'A'..=b'F' => Ok(c - b'A' + 10),
-            _ => Err(invalid(format!("{label} is not hexadecimal"))),
+            _ => Err(refuse("is not hexadecimal".to_string())),
         }
     };
     // `as_chunks` so each pair arrives as `[u8; 2]` and destructures without a
@@ -623,7 +686,7 @@ fn decode_hex<const N: usize>(text: &[u8], label: &str) -> io::Result<[u8; N]> {
     // checked anyway, since "provably" is doing the work of a bounds check.
     let (pairs, rest) = trimmed.as_chunks::<2>();
     if !rest.is_empty() {
-        return Err(invalid(format!("{label} is not hexadecimal")));
+        return Err(refuse("is not hexadecimal".to_string()));
     }
     let mut out = [0u8; N];
     for (slot, [high, low]) in out.iter_mut().zip(pairs) {
@@ -641,13 +704,20 @@ fn decode_hex<const N: usize>(text: &[u8], label: &str) -> io::Result<[u8; N]> {
 /// pin could only carry a key that existed before the build, and since no
 /// private key is committed, nothing at test time would hold the half needed to
 /// sign for it. `tests/td-subst.pub` is the same shape for the same reason.
+///
+/// EVERY error this returns names the file, the decode included — a refusal
+/// reading only "must be exactly 64 hexadecimal characters" sends an operator
+/// through every key on the media to work out which one it meant, and of the
+/// five verbs that reach a trust root only `boot` wrapped one with a path.
+/// Both halves take the file rather than a label a caller might forget to fold
+/// it into, so this holds for a sixth caller nobody has written yet.
 fn read_trusted_key(path: &Path) -> io::Result<[u8; ed25519::PUBLIC_KEY_LEN]> {
     let text = read_bounded_real_file(
         path,
         "trusted deployment key",
         protocol::MAX_PUBLIC_KEY_BYTES,
     )?;
-    decode_hex(&text, "trusted deployment key")
+    decode_hex(&text, "trusted deployment key", path)
 }
 
 /// Does `signature` — the bytes of `manifest.sig`, hex — authenticate
@@ -661,10 +731,18 @@ fn read_trusted_key(path: &Path) -> io::Result<[u8; ed25519::PUBLIC_KEY_LEN]> {
 /// from a wrong key.
 fn authenticate_manifest(
     manifest: &[u8],
-    signature: &[u8],
+    signature: &DetachedSignature,
     key: &[u8; ed25519::PUBLIC_KEY_LEN],
 ) -> io::Result<()> {
-    let signature = decode_hex::<{ ed25519::SIGNATURE_LEN }>(signature, "deployment signature")?;
+    // A decode failure is unambiguously that file's fault, and a bundle is one
+    // directory among the deployments, so a length with no path does not say
+    // which. Taking the pair rather than bytes plus a path is what makes the
+    // file named here the file those bytes were read from.
+    let signature = decode_hex::<{ ed25519::SIGNATURE_LEN }>(
+        signature.bytes(),
+        "deployment signature",
+        signature.path(),
+    )?;
     if ed25519::verify(key, manifest, &signature) {
         return Ok(());
     }
@@ -1124,7 +1202,7 @@ fn write_signature_temporary(
 }
 
 fn replace_signature(directory: &Path, signature: &[u8]) -> io::Result<()> {
-    let destination = directory.join(protocol::MANIFEST_SIG_NAME);
+    let destination = signature_path(directory);
     // A crash must leave the old signature or the new one, never a half-written
     // file: a truncated signature verifies as nothing and would strand a
     // machine on a deployment it can no longer authenticate.
@@ -1253,7 +1331,7 @@ fn publish_bundle(
     copy_verified_payload(&mut bundle.root, &staging.join("root.erofs"))?;
     write_synced_file(&staging.join(protocol::MANIFEST_NAME), &bundle.manifest)?;
     if let Some(signature) = &bundle.signature {
-        write_synced_file(&staging.join(protocol::MANIFEST_SIG_NAME), signature)?;
+        write_synced_file(&signature_path(&staging), signature)?;
     }
     sync_directory(&staging)?;
 
@@ -1637,12 +1715,13 @@ type TrustRoot = [u8; ed25519::PUBLIC_KEY_LEN];
 fn read_boot_trust_root(rootfs: &Path) -> io::Result<TrustRoot> {
     let path = rootfs.join(protocol::TRUSTED_KEY_PATH);
     read_trusted_key(&path).map_err(|error| {
+        // The path is NOT repeated here: `read_trusted_key` names the file in
+        // every error it returns, and spelling it twice reads as two files.
         io::Error::new(
             error.kind(),
             format!(
-                "no usable trust root at {}: {error} — this initramfs was built \
-                 without one, or its key archive did not land",
-                path.display()
+                "no usable trust root: {error} — this initramfs was built \
+                 without one, or its key archive did not land"
             ),
         )
     })
@@ -1664,7 +1743,7 @@ fn authenticated_manifest(
     key: &TrustRoot,
 ) -> io::Result<(PathBuf, Manifest)> {
     let (directory, bytes) = manifest_bytes(root, id)?;
-    let signature = read_optional_signature(&directory)?.ok_or_else(|| {
+    let signature = read_optional_signature(signature_path(&directory))?.ok_or_else(|| {
         invalid(format!(
             "deployment {id} carries no {} — an unsigned deployment is refused, \
              not trusted",
@@ -2998,7 +3077,7 @@ fn run_authenticate(directory: &Path, trusted_key: &Path) -> io::Result<()> {
         "deployment manifest",
         protocol::MAX_MANIFEST_BYTES,
     )?;
-    let signature = read_optional_signature(directory)?
+    let signature = read_optional_signature(signature_path(directory))?
         .ok_or_else(|| invalid("deployment carries no signature to authenticate"))?;
     authenticate_manifest(&manifest, &signature, &key)?;
     // Parsed only AFTER the signature holds, so nothing about an unauthenticated
@@ -3129,6 +3208,13 @@ mod tests {
         }
     }
 
+    /// Where a compiled-in fixture would have come from. These decode bytes
+    /// already in the binary, so the path only has to be the name a refusal
+    /// would report.
+    fn fixture_path() -> &'static Path {
+        Path::new("/td/fixtures/compiled-in")
+    }
+
     struct Fixture {
         root: PathBuf,
     }
@@ -3162,7 +3248,7 @@ mod tests {
 
         /// The trust root these deployments verify under.
         fn key(&self) -> TrustRoot {
-            decode_hex(FIXTURE_PUBLIC_KEY.as_bytes(), "fixture key").unwrap()
+            decode_hex(FIXTURE_PUBLIC_KEY.as_bytes(), "fixture key", fixture_path()).unwrap()
         }
 
         /// A key nobody signed under: the negative control for authentication.
@@ -3172,7 +3258,12 @@ mod tests {
         /// or off the curve — only about the signature not being under THIS
         /// key. See `FIXTURE_OTHER_PUBLIC_KEY`.
         fn wrong_key(&self) -> TrustRoot {
-            decode_hex(FIXTURE_OTHER_PUBLIC_KEY.as_bytes(), "other fixture key").unwrap()
+            decode_hex(
+                FIXTURE_OTHER_PUBLIC_KEY.as_bytes(),
+                "other fixture key",
+                fixture_path(),
+            )
+            .unwrap()
         }
 
         fn source_bundle(&self, name: &str, tag: &str) -> (PathBuf, String) {
@@ -5284,15 +5375,16 @@ mod tests {
     /// td-boot cannot sign, but it can verify, so this needs nothing new.
     #[test]
     fn every_committed_fixture_signature_verifies_over_its_own_manifest() {
-        let key: TrustRoot = decode_hex(FIXTURE_PUBLIC_KEY.as_bytes(), "fixture key").unwrap();
+        let key: TrustRoot =
+            decode_hex(FIXTURE_PUBLIC_KEY.as_bytes(), "fixture key", fixture_path()).unwrap();
         let other: TrustRoot =
-            decode_hex(FIXTURE_OTHER_PUBLIC_KEY.as_bytes(), "other key").unwrap();
+            decode_hex(FIXTURE_OTHER_PUBLIC_KEY.as_bytes(), "other key", fixture_path()).unwrap();
         assert_ne!(key, other, "the negative control must be a different key");
 
         for (tag, hex) in FIXTURE_SIGNATURES {
             let manifest = fixture_manifest(tag);
             let signature: [u8; ed25519::SIGNATURE_LEN] =
-                decode_hex(hex.as_bytes(), "fixture signature").unwrap();
+                decode_hex(hex.as_bytes(), "fixture signature", fixture_path()).unwrap();
             assert!(
                 ed25519::verify(&key, manifest.as_bytes(), &signature),
                 "the committed signature for {tag:?} does not verify — regenerate \
@@ -5501,6 +5593,17 @@ mod tests {
         );
 
         let key_path = fixture.root.join(protocol::TRUSTED_KEY_PATH);
+        // ONCE, not merely present: `read_trusted_key` names the file in every
+        // error it returns, so a wrapper that named it too would report one
+        // missing key as two.
+        assert_eq!(
+            refused
+                .to_string()
+                .matches(&key_path.display().to_string())
+                .count(),
+            1,
+            "the missing key must be named exactly once: {refused}"
+        );
         fs::create_dir_all(key_path.parent().unwrap()).unwrap();
         fs::write(&key_path, format!("{FIXTURE_PUBLIC_KEY}\n")).unwrap();
         assert_eq!(read_boot_trust_root(&fixture.root).unwrap(), fixture.key());
@@ -5916,13 +6019,31 @@ mod tests {
     const FIXTURE_OTHER_KEY: &[u8] = include_bytes!("../tests/deployment-other.pub");
 
     fn fixture_key() -> [u8; ed25519::PUBLIC_KEY_LEN] {
-        decode_hex(FIXTURE_KEY, "fixture key").expect("the committed key is 64 hex characters")
+        decode_hex(FIXTURE_KEY, "fixture key", fixture_path())
+            .expect("the committed key is 64 hex characters")
+    }
+
+    /// A signature as `read_optional_signature` hands one over: bytes plus the
+    /// file they came from. Nothing is read from that path — the triple is
+    /// compiled in — so it need only be the file a refusal names. Through the
+    /// module's own `cfg(test)` constructor, since the fields are private and
+    /// that is the point.
+    fn detached_fixture(bytes: &[u8]) -> DetachedSignature {
+        super::detached::pair(
+            PathBuf::from("/td/deployments/fixture/manifest.sig"),
+            bytes.to_vec(),
+        )
     }
 
     #[test]
     fn the_committed_signature_authenticates_its_manifest() {
         assert!(
-            authenticate_manifest(FIXTURE_MANIFEST, FIXTURE_SIGNATURE, &fixture_key()).is_ok(),
+            authenticate_manifest(
+                FIXTURE_MANIFEST,
+                &detached_fixture(FIXTURE_SIGNATURE),
+                &fixture_key(),
+            )
+            .is_ok(),
             "the committed triple must agree, or every negative below proves nothing"
         );
         // And the triple is a DEPLOYMENT, not just bytes: the manifest carries
@@ -5935,9 +6056,12 @@ mod tests {
     #[test]
     fn a_signature_under_another_key_is_refused() {
         let other: [u8; ed25519::PUBLIC_KEY_LEN] =
-            decode_hex(FIXTURE_OTHER_KEY, "other key").expect("64 hex characters");
+            decode_hex(FIXTURE_OTHER_KEY, "other key", fixture_path()).expect("64 hex characters");
         assert_ne!(other, fixture_key(), "the two fixture keys must differ");
-        assert!(authenticate_manifest(FIXTURE_MANIFEST, FIXTURE_SIGNATURE, &other).is_err());
+        assert!(
+            authenticate_manifest(FIXTURE_MANIFEST, &detached_fixture(FIXTURE_SIGNATURE), &other)
+                .is_err()
+        );
     }
 
     #[test]
@@ -5951,7 +6075,12 @@ mod tests {
                 *byte ^= 1;
             }
             assert!(
-                authenticate_manifest(&tampered, FIXTURE_SIGNATURE, &fixture_key()).is_err(),
+                authenticate_manifest(
+                    &tampered,
+                    &detached_fixture(FIXTURE_SIGNATURE),
+                    &fixture_key(),
+                )
+                .is_err(),
                 "manifest byte {i} must not be free to move"
             );
         }
@@ -5960,7 +6089,7 @@ mod tests {
     #[test]
     fn every_bit_of_the_signature_matters() {
         let good: [u8; ed25519::SIGNATURE_LEN] =
-            decode_hex(FIXTURE_SIGNATURE, "signature").expect("128 hex characters");
+            decode_hex(FIXTURE_SIGNATURE, "signature", fixture_path()).expect("128 hex characters");
         for byte in 0..ed25519::SIGNATURE_LEN {
             for bit in 0..8u32 {
                 let mut broken = good;
@@ -5972,8 +6101,12 @@ mod tests {
                     s
                 });
                 assert!(
-                    authenticate_manifest(FIXTURE_MANIFEST, hex.as_bytes(), &fixture_key())
-                        .is_err(),
+                    authenticate_manifest(
+                        FIXTURE_MANIFEST,
+                        &detached_fixture(hex.as_bytes()),
+                        &fixture_key(),
+                    )
+                    .is_err(),
                     "signature byte {byte} bit {bit} must not be free to move"
                 );
             }
@@ -6011,7 +6144,7 @@ mod tests {
         cases.push(vec![b'0'; 128]);
         for case in cases {
             assert!(
-                authenticate_manifest(FIXTURE_MANIFEST, &case, &key).is_err(),
+                authenticate_manifest(FIXTURE_MANIFEST, &detached_fixture(&case), &key).is_err(),
                 "malformed signature {:?} must be refused",
                 String::from_utf8_lossy(&case)
             );
@@ -6030,7 +6163,12 @@ mod tests {
             trimmed.to_uppercase(),
         ] {
             assert!(
-                authenticate_manifest(FIXTURE_MANIFEST, spelling.as_bytes(), &key).is_ok(),
+                authenticate_manifest(
+                    FIXTURE_MANIFEST,
+                    &detached_fixture(spelling.as_bytes()),
+                    &key,
+                )
+                .is_ok(),
                 "{spelling:?} is the same signature"
             );
         }
@@ -6095,6 +6233,85 @@ mod tests {
         let link = fixture.root.join("link.pub");
         symlink(&target, &link).unwrap();
         assert!(read_trusted_key(&link).is_err(), "a symlinked key is refused");
+    }
+
+    /// EVERY refusal names the file, which is the property `read_trusted_key`
+    /// documents and `read_boot_trust_root` now leans on rather than repeating
+    /// the path itself.
+    ///
+    /// The three DECODE arms are the ones this exists for — the reading half
+    /// already named it — and they are the arms an operator meets on a key that
+    /// was provisioned but mistyped, where "must be exactly 64 hexadecimal
+    /// characters" alone says nothing about which of a volume's keys was read.
+    /// The reading arms are here too so the property is checked at the function
+    /// rather than at the branch that happened to be wrong.
+    #[test]
+    fn every_refused_trusted_key_names_the_file() {
+        let fixture = Fixture::new();
+        let keys = fixture.root.join("keys");
+        fs::create_dir_all(&keys).unwrap();
+
+        let directory = keys.join("directory.pub");
+        fs::create_dir(&directory).unwrap();
+        let target = keys.join("real.pub");
+        fs::write(&target, FIXTURE_KEY).unwrap();
+        let link = keys.join("link.pub");
+        symlink(&target, &link).unwrap();
+
+        let mut cases = vec![keys.join("absent.pub"), directory, link];
+        for (name, bytes) in [
+            ("empty.pub", Vec::new()),
+            ("short.pub", b"deadbeef\n".to_vec()),
+            ("not-hex.pub", vec![b'z'; 64]),
+            (
+                "huge.pub",
+                vec![b'0'; protocol::MAX_PUBLIC_KEY_BYTES as usize + 1],
+            ),
+        ] {
+            let path = keys.join(name);
+            fs::write(&path, bytes).unwrap();
+            cases.push(path);
+        }
+
+        for path in cases {
+            let named = path.display().to_string();
+            let refused = read_trusted_key(&path)
+                .err()
+                .unwrap_or_else(|| panic!("{named} is not a key and must be refused"))
+                .to_string();
+            // ONCE, not merely present: a path folded in at two levels reads
+            // as two files, which is the failure the boot wrapper's own count
+            // pins for its one arm and this pins for all seven.
+            assert_eq!(
+                refused.matches(&named).count(),
+                1,
+                "a refusal must name the file it read exactly once, got {refused:?}"
+            );
+        }
+    }
+
+    /// A signature that will not decode names the file it came from, and names
+    /// the one that was actually READ — which is what `DetachedSignature`
+    /// exists for. Driven through `run_authenticate` rather than
+    /// `authenticate_manifest` directly for exactly that: a decoder joining its
+    /// own path could name a file the reader never opened, and only the whole
+    /// verb has both halves in it.
+    #[test]
+    fn a_signature_that_will_not_decode_names_the_file_that_was_read() {
+        let fixture = Fixture::new();
+        let directory = fixture.root.join("bundle");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join(protocol::MANIFEST_NAME), FIXTURE_MANIFEST).unwrap();
+        let signature = directory.join(protocol::MANIFEST_SIG_NAME);
+        fs::write(&signature, b"not a signature\n").unwrap();
+        let key = fixture.root.join("trusted.pub");
+        fs::write(&key, FIXTURE_KEY).unwrap();
+
+        let refused = run_authenticate(&directory, &key).unwrap_err().to_string();
+        assert!(
+            refused.contains(&signature.display().to_string()),
+            "a signature that will not decode must name it, got {refused:?}"
+        );
     }
 
     /// The verb exists so the verifier is REACHABLE, which is not a stylistic
@@ -6206,13 +6423,13 @@ mod tests {
 
     #[test]
     fn decode_hex_is_exact_about_length_and_alphabet() {
-        assert_eq!(decode_hex::<2>(b"00ff", "x").unwrap(), [0x00, 0xff]);
-        assert_eq!(decode_hex::<2>(b"00FF\n", "x").unwrap(), [0x00, 0xff]);
-        assert!(decode_hex::<2>(b"00f", "x").is_err(), "odd length");
-        assert!(decode_hex::<2>(b"00ff00", "x").is_err(), "too long");
-        assert!(decode_hex::<2>(b"00 ff", "x").is_err(), "inner space");
-        assert!(decode_hex::<2>(b"00g0", "x").is_err(), "not hex");
+        assert_eq!(decode_hex::<2>(b"00ff", "x", fixture_path()).unwrap(), [0x00, 0xff]);
+        assert_eq!(decode_hex::<2>(b"00FF\n", "x", fixture_path()).unwrap(), [0x00, 0xff]);
+        assert!(decode_hex::<2>(b"00f", "x", fixture_path()).is_err(), "odd length");
+        assert!(decode_hex::<2>(b"00ff00", "x", fixture_path()).is_err(), "too long");
+        assert!(decode_hex::<2>(b"00 ff", "x", fixture_path()).is_err(), "inner space");
+        assert!(decode_hex::<2>(b"00g0", "x", fixture_path()).is_err(), "not hex");
         // `from_str_radix` accepted a sign; a key parser must not.
-        assert!(decode_hex::<1>(b"+f", "x").is_err(), "a signed nibble is not hex");
+        assert!(decode_hex::<1>(b"+f", "x", fixture_path()).is_err(), "a signed nibble is not hex");
     }
 }
