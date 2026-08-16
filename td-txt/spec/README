@@ -816,6 +816,58 @@ td-txt-authored case files
   on its own -- but only as an OPERAND: a file the walk finds that happens to be
   called `-` is searched like any other.
 
+  The walk's ORDER is td-txt's and not GNU's, and deliberately. Both descend
+  into a directory at the point they meet it -- that is fts(3)'s traversal --
+  and what differs is the order the entries of one directory come in. GNU
+  passes NO comparison function to `fts_open` (grep.c:1868), so it takes the
+  kernel's; td-txt sorts them (`entries.sort()` in `walk_from`). td-txt is
+  therefore fts with a name comparator rather than a different traversal.
+
+  Per-DIRECTORY, which is not the same as sorting the paths and is worth being
+  exact about, since the two agree on almost every tree. `-` and `.` sort below
+  `/`, so for `mid/aaa`, `mid-z` and `mid.a` a path sort gives `mid-z mid.a
+  mid/aaa` where this walk gives `mid/aaa mid-z mid.a`: `mid` sorts before both
+  siblings among the entries of the root, and is descended when it is reached.
+
+  So GNU's `grep -r` output order is a property of the FILESYSTEM rather than
+  of grep. Two checkouts of one tree can print the same matches in a different
+  order, and so can one tree after a file is REPLACED -- write-a-temp-and-
+  rename, which is what `sed -i` does; measured on btrfs, that moves the entry
+  to the end (`a b c d` -> `b c d a`) where an in-place truncate-and-write
+  leaves it alone.
+
+  "Whatever readdir returns" is itself only true of SMALL directories, which is
+  worth knowing before checking this against grep. gnulib's fts -- which grep
+  bundles -- sorts a directory's entries by INODE NUMBER when it has no
+  comparator and the directory holds MORE than 10000 of them, on every
+  filesystem but CIFS/NFS/TMPFS. Line numbers are grep 3.11's vendored copy,
+  which is what the scored binary runs, and later gnulib has both moved them
+  and added an exemption: lib/fts.c:151 the threshold's value, 1568 the test,
+  1624 the sort, 766-771 the three exempt types.
+
+  More than, not at least, and the off-by-one is the code's rather than a
+  quibble: the test reads `nitems == THRESHOLD` and runs BEFORE the `++nitems`
+  under it, so it is true while reading the 10001st entry and a directory of
+  exactly 10000 never reaches it. Measured on names and inodes deliberately
+  ordered against each other, the boundary is exactly there -- 9999 and 10000
+  come back in readdir order, 10001 and 10002 in inode order. That strengthens
+  the point rather than weakening it: above the threshold the order depends on
+  the filesystem's ALLOCATION HISTORY, which is less reproducible still.
+
+  Measured on the tree the conformance test builds, GNU prints `root/mid/beta
+  root/mid/aaa root/adir/x root/zdir/y root/zeta root/alpha root/mmm
+  root/mid-z root/mid.a` -- readdir order, which is that tree's creation order
+  on btrfs, and neither sorted nor td-txt's.
+
+  Sorting is the choice a distribution builder should make: a recipe that greps
+  a tree has to produce the same bytes on every build, and "the order the kernel
+  felt like" is the one input to that which nothing declares. It is also why
+  this is recorded rather than closed -- matching GNU here would mean
+  reproducing an artifact of the directory, which is not reproducible even for
+  GNU. There is no golden against GNU to have; there IS one against td-txt, and
+  both the conformance test and a divergence.test.txt case use it, on a fixture
+  shaped so that a path sort and a per-directory sort disagree.
+
   `-R` is the LOGICAL walk, and it is not `-r` with a longer name: EVERY symlink
   is followed rather than only the operand, and -- the one consequence of `-R`
   that is not about symlinks at all -- it FLIPS the device default (grep.c:3007),

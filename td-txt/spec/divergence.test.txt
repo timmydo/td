@@ -9,11 +9,14 @@
 # Most cases here are refusals and fail CLOSED — a diagnosed error and a non-zero
 # status, never a silent no-op — so a script written for GNU cannot mistake a
 # refusal for success. Several are not refusals but different ANSWERS (the anchor
-# inside a repeated group, and the permuted `-NUM` family at the end); they are
-# here because the reason is the same — a decision, not a gap — and a differing
-# answer needs pinning more than a refusal does, since nothing about it is
-# self-announcing. One differs in KIND rather than in value: a permuted `-NUM`
-# past the digit cap is a refusal here and a wait that never ends there.
+# inside a repeated group, the `-r` walk ORDER after it, and the permuted `-NUM`
+# family at the end); they are here because the reason is the same — a decision,
+# not a gap — and a differing answer needs pinning more than a refusal does,
+# since nothing about it is self-announcing. One differs in KIND rather than in
+# value: a permuted `-NUM` past the digit cap is a refusal here and a wait that
+# never ends there. The walk order differs in what a GOLDEN can be: the other
+# two reject an answer GNU gives consistently, where GNU has no stable answer
+# here to capture at all.
 
 #### sed refuses the e command, which would need a shell
 # GNU sed's `e` runs its argument through /bin/sh. td-txt is a static binary
@@ -223,6 +226,35 @@ a
 ## stdout:
 a
 ## END
+## stderr-json: ""
+## status: 0
+
+#### grep -r sorts each directory's entries, where GNU takes the kernel's order
+# GNU passes fts NO comparison function (grep.c:1868), so its `-r` listing is
+# whatever readdir returns -- a property of the filesystem rather than of grep,
+# and past 10000 entries in one directory gnulib's fts sorts by INODE instead
+# (grep 3.11's lib/fts.c:150,1568,1624; the boundary is measured at 10001).
+# Neither is reproducible across checkouts, and a recipe that greps a tree has
+# to produce the same bytes on every build, so td-txt sorts. This golden is
+# td-txt's own for a reason the other non-refusals do NOT share: theirs reject
+# an answer GNU gives consistently, where GNU has none here to capture.
+#
+# Per-DIRECTORY, and the tree is shaped to tell that from a sort of the PATHS:
+# `-` and `.` sort below `/`, so a path sort gives `t/mid-z t/mid.a t/mid/aaa`
+# where this walk descends `mid` when it reaches it among the root's entries.
+# The files are declared in a third order again, so nothing here can pass by
+# reproducing the order it was written in.
+## argv: grep -rl hit t
+## file t/mid.a:
+hit
+## END
+## file t/mid/aaa:
+hit
+## END
+## file t/mid-z:
+hit
+## END
+## stdout-json: "t/mid/aaa\nt/mid-z\nt/mid.a\n"
 ## stderr-json: ""
 ## status: 0
 

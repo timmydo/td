@@ -1081,7 +1081,9 @@ pub struct Found {
 }
 
 pub struct Walked {
-    /// Files to search, sorted.
+    /// Files to search: each directory's entries in name order, and one
+    /// descended where it was met — which is NOT the whole list in path order,
+    /// since `-` and `.` sort below `/`.
     pub files: Vec<Found>,
     /// In the order the walk MET them, both kinds in one list: GNU interleaves
     /// its errors and its cycle warnings, and two lists could only be drained one
@@ -1092,8 +1094,10 @@ pub struct Walked {
     pub descended: bool,
 }
 
-/// Directory walk for `grep -r`/`-R`, deepest-last, sorted for a deterministic
-/// listing.
+/// Directory walk for `grep -r`/`-R`: each directory's entries sorted, and one
+/// descended where it is met, for a deterministic listing — GNU passes fts no
+/// comparator (grep.c:1868) and so takes the kernel's order, which is not
+/// reproducible across checkouts.
 ///
 /// `logical` is `-R`. Without it the walk is PHYSICAL: the root is followed but
 /// nothing below it is, so a symlink named as an operand is descended and one

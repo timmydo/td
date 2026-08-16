@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 2355;
+const CORPUS_FLOOR: usize = 2356;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -3163,6 +3163,95 @@ fn a_byte_offset_past_a_skipped_run_counts_the_bytes_that_were_there()
             n + 2,
             n + 2
         ),
+    );
+    Ok(())
+}
+
+/// `grep -r` sorts each directory's entries and descends at the point a
+/// directory is reached -- fts(3)'s own traversal with a name comparator, where
+/// GNU passes NONE (`fts_open (fts_arg, opts, NULL)`, grep.c:1868) and so takes
+/// whatever order the kernel returns. GNU's listing is therefore a property of
+/// the filesystem rather than of grep: two checkouts of one tree can print the
+/// same matches in a different order, so there is no golden to match here, for
+/// GNU either.
+///
+/// Per-directory and NOT by whole path, which this tree is shaped to tell
+/// apart: `-` and `.` sort below `/`, so a path sort puts `mid-z` and `mid.a`
+/// before `mid/aaa` where this one takes `mid`'s children first. Asserting
+/// mere sortedness would pass under either and pin neither.
+///
+/// `divergence.test.txt` carries the same decision as a corpus case, on the
+/// three-path minimum that separates those two orders. What that minimum
+/// cannot tell apart -- it holds one directory, which sorts first among the
+/// root's entries either way -- is a walk that took every DIRECTORY before any
+/// file. This tree can: three directories and five files at the root, with
+/// `alpha` sorting between `adir` and `mid`, so descent-where-met and
+/// directories-first disagree about where it goes.
+#[test]
+fn a_recursive_walk_sorts_each_directory_where_gnu_takes_the_kernels_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("walk-order")?;
+    let root = dir.join("root");
+    std::fs::create_dir_all(root.join("mid"))?;
+    std::fs::create_dir_all(root.join("adir"))?;
+    std::fs::create_dir_all(root.join("zdir"))?;
+    // Created in an order that is neither sorted nor the expected one.
+    for rel in [
+        "zeta", "alpha", "mid/beta", "mid/aaa", "adir/x", "zdir/y", "mmm",
+        "mid-z", "mid.a",
+    ] {
+        std::fs::write(root.join(rel), b"hit\n")?;
+    }
+    let out = std::process::Command::new(bin())
+        .args(["grep", "-r", "-l", "hit", "root"])
+        .current_dir(&dir.0)
+        .env("LC_ALL", "C")
+        .output()?;
+    let got: Vec<String> =
+        String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect();
+    let want = [
+        "root/adir/x",
+        "root/alpha",
+        "root/mid/aaa",
+        "root/mid/beta",
+        "root/mid-z",
+        "root/mid.a",
+        "root/mmm",
+        "root/zdir/y",
+        "root/zeta",
+    ];
+    // Status first: a crash after partial output would otherwise be reported as
+    // a wrong ORDER, which is a long way from what happened. With stderr, since
+    // that is where the reason for a non-zero status is and `got` is stdout.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "grep -r failed: stdout={got:?} stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // `want` is written out rather than derived from `got`: a sortedness check
+    // on the output alone passes for any sorted list, a dropped file and a
+    // doubled one included.
+    assert_eq!(got, want, "the walk did not sort each directory in turn");
+
+    // The two guards below are about the FIXTURE, not the walk: `want` reds for
+    // any reordering, so what needs saying is that this tree still separates
+    // the orders it was built to separate. Simplify it and both go quiet while
+    // the test keeps passing against a new `want`.
+    let mut by_path = got.clone();
+    by_path.sort();
+    assert_ne!(got, by_path, "this tree no longer tells the two sorts apart");
+    // A root FILE emitted before a root DIRECTORY's contents is the whole of
+    // what this tree adds over the corpus case, which has one directory and so
+    // cannot distinguish a directories-first walk from this one. Both paths are
+    // resolved rather than compared as `Option`s: a missing one is the fixture
+    // change this guard exists to catch, and `None < Some` would call it a pass.
+    let pos = |p: &str| {
+        got.iter().position(|g| g == p).ok_or_else(|| format!("{p} left the fixture"))
+    };
+    assert!(
+        pos("root/alpha")? < pos("root/mid/aaa")?,
+        "this tree no longer tells descent-where-met from directories-first"
     );
     Ok(())
 }
