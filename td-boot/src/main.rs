@@ -95,6 +95,10 @@ enum Mode {
         device: PathBuf,
         mountpoint: PathBuf,
         source: PathBuf,
+        /// `None` means "look where a td rootfs keeps one" — which on a booted
+        /// deployment finds nothing (§6), so an updater on a running machine
+        /// must say WHICH key. See `install_trust_root`.
+        trusted_key: Option<PathBuf>,
     },
     /// Publish into a volume root that is ALREADY writable — the inner half of
     /// `install`, which mounts and then does exactly this.
@@ -208,7 +212,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]",
+        "usage: td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]",
     )
 }
 
@@ -285,6 +289,10 @@ fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
             let device = args.next().ok_or_else(usage_error)?;
             let mountpoint = args.next().ok_or_else(usage_error)?;
             let source = args.next().ok_or_else(usage_error)?;
+            // `publish`'s optional key, for `publish`'s reason: absence is a
+            // real configuration rather than a mistake, and only
+            // `install_trust_root` may decide what it means.
+            let trusted_key = args.next().map(PathBuf::from);
             if args.next().is_some() {
                 return Err(usage_error());
             }
@@ -292,6 +300,7 @@ fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
                 device: PathBuf::from(device),
                 mountpoint: PathBuf::from(mountpoint),
                 source: PathBuf::from(source),
+                trusted_key,
             })
         }
         Some(mode) if mode == OsStr::new(protocol::PUBLISH_VERB) => {
@@ -2614,12 +2623,32 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
     result
 }
 
-fn run_install(device: &Path, mountpoint: &Path, source: &Path) -> io::Result<()> {
+/// Mount the volume and publish into it, under an optional named trust root.
+///
+/// The key is a PARAMETER because §6 leaves a booted deployment without one:
+/// `install_trust_root`'s probe answers for the selector initramfs and finds
+/// nothing on the real root, so before this an update running on a live machine
+/// published whatever it was handed and only warned. The volume carries a trust
+/// root now (item 10a), and this is the argument that lets it be used.
+///
+/// A key ON the volume being installed into is not circular, but only because
+/// of an ordering that must not be reversed: the key is read while the volume
+/// is still mounted READ-ONLY where the running system already has it, before
+/// this verb mounts the same device writable. What is checked is therefore the
+/// trust root as it stood before the transaction, which is the one the operator
+/// provisioned — not one the bundle could have arranged to be there.
+fn run_install(
+    device: &Path,
+    mountpoint: &Path,
+    source: &Path,
+    trusted_key: Option<&Path>,
+) -> io::Result<()> {
     require_absolute(source, "deployment source")?;
     // Resolved BEFORE the mount, so a missing or unusable key fails without
     // having touched the volume: an install refused for want of a trust root
-    // should leave the disk exactly as it found it.
-    let trust = install_trust_root(None, Path::new("/"))?;
+    // should leave the disk exactly as it found it. That ordering is what a
+    // key ON the volume relies on — see the verb's own note below.
+    let trust = install_trust_root(trusted_key, Path::new("/"))?;
     let id = run_on_writable_volume(device, mountpoint, |root| {
         install_deployment(root, source, trust.as_ref())
     })?;
@@ -2751,7 +2780,17 @@ fn run_authenticate(directory: &Path, trusted_key: &Path) -> io::Result<()> {
 }
 
 fn run() -> io::Result<()> {
-    match parse_args(std::env::args_os().skip(1))? {
+    dispatch(parse_args(std::env::args_os().skip(1))?)
+}
+
+/// The verb table, split from `run` so a test can reach it without argv.
+///
+/// Each arm is a hop nothing else pins: an arm that drops a field compiles, and
+/// for `Install`'s trust root that is the fail-open this whole verb exists to
+/// prevent. `a_named_trust_root_is_resolved_before_the_device_is_touched`
+/// drives this function rather than `run_install` for exactly that reason.
+fn dispatch(mode: Mode) -> io::Result<()> {
+    match mode {
         Mode::Verify { root } => run_verify(&root),
         Mode::RootLoop {
             root,
@@ -2767,7 +2806,8 @@ fn run() -> io::Result<()> {
             device,
             mountpoint,
             source,
-        } => run_install(&device, &mountpoint, &source),
+            trusted_key,
+        } => run_install(&device, &mountpoint, &source, trusted_key.as_deref()),
         Mode::Publish {
             root,
             source,
@@ -3016,7 +3056,10 @@ mod tests {
                 "/run/td-update",
                 "/incoming/deployment"
             ])),
-            Ok(Mode::Install { .. })
+            Ok(Mode::Install {
+                trusted_key: None,
+                ..
+            })
         ));
         assert!(matches!(
             parse_args(args(&["rollback", "/dev/vda", "/run/td-update"])),
@@ -3041,15 +3084,40 @@ mod tests {
         .is_err());
         assert!(parse_args(args(&["boot", "/dev/vda", "/volume"])).is_err());
         assert!(parse_args(args(&["install", "/dev/vda", "/volume"])).is_err());
+        assert!(parse_args(args(&[
+            "install",
+            "/dev/vda",
+            "/volume",
+            "/incoming/deployment",
+            "/key.pub",
+            "extra",
+        ]))
+        .is_err());
         assert!(parse_args(args(&["rollback", "/volume"])).is_err());
         assert!(parse_args(args(&["rollback", "/dev/vda", "/volume", "extra"])).is_err());
         assert!(parse_args(args(&["success", "/dev/vda", "/volume", "not-a-digest"])).is_err());
         assert!(parse_args(args(&["unknown", "/volume"])).is_err());
 
-        // `publish` is the file's only VARIABLE arity, so its third argument is
-        // checked by value rather than by shape: dropping it on the floor is a
-        // fail-open, since `None` means "probe the default and maybe publish
-        // unverified" while the caller believed it had named a key.
+        // `install` and `publish` are the file's two VARIABLE arities, so the
+        // optional argument is checked by value rather than by shape: dropping
+        // it on the floor is a fail-open, since `None` means "probe the default
+        // and maybe publish unverified" while the caller believed it had named
+        // a key.
+        match parse_args(args(&[
+            "install",
+            "/dev/vda",
+            "/run/td-update",
+            "/incoming/deployment",
+            "/run/td-volume/td/trusted.pub",
+        ])) {
+            Ok(Mode::Install { trusted_key, .. }) => {
+                assert_eq!(
+                    trusted_key.as_deref(),
+                    Some(Path::new("/run/td-volume/td/trusted.pub"))
+                );
+            }
+            _ => panic!("install must parse and carry its trusted key"),
+        }
         assert!(matches!(
             parse_args(args(&["publish", "/volume", "/incoming/deployment"])),
             Ok(Mode::Publish {
@@ -3278,16 +3346,29 @@ mod tests {
 
     /// What production passes for that rootfs, stated as a literal — the
     /// parameter exists for the test above, and this is what pins the real one.
-    /// A publish that read its trust root from the VOLUME would be the surface
-    /// §6 rules out by name: whoever can write a forged deployment can write a
-    /// matching public key beside it.
+    ///
+    /// What it rules out is a BOOT trust root read off the volume, which is
+    /// §6's surface: it would authorise the deployments sitting beside it, so
+    /// whoever writes a forged one writes the matching key too. The key item
+    /// 10 puts on the volume is a different role — it checks an incoming
+    /// bundle, and the boot path still authenticates under the initramfs's
+    /// key, so it can admit a deployment to the volume and never to a boot.
+    /// §6 carries that reconciliation; this pin is only the probe half of it,
+    /// and a probe is what would make ABSENCE mean "publish without checking".
+    ///
+    /// Both shipped calls must also PASS THEIR PARAMETER: `install_trust_root(
+    /// None, …)` compiles and would silently ignore the key the caller named.
     #[test]
-    fn the_publish_trust_root_comes_from_the_running_rootfs() {
+    fn the_shipped_trust_root_calls_probe_the_rootfs_and_honour_their_argument() {
         let source = include_str!("main.rs");
+        // Spelled in two pieces so the scan does not match its own needle.
+        let honours_argument = concat!("install_trust_root", "(trusted_key,");
         let mut calls = 0;
         for line in source.lines() {
             if line.contains("install_trust_root(") && !line.contains("fn install_trust_root") {
-                if line.contains("#[test]") {
+                // A comment is not a call, and this file's prose names both
+                // arguments the assertions below look for.
+                if line.trim_start().starts_with("//") {
                     continue;
                 }
                 if line.contains("&fixture.root") {
@@ -3297,6 +3378,10 @@ mod tests {
                 assert!(
                     line.contains("Path::new(\"/\")"),
                     "a shipped install_trust_root call must name the running rootfs: {line}"
+                );
+                assert!(
+                    line.contains(honours_argument),
+                    "a shipped trust-root call must pass the key it was given: {line}"
                 );
             }
         }
@@ -3334,6 +3419,41 @@ mod tests {
                 "publish must refuse a mounted root: {error}"
             );
         }
+    }
+
+    /// The argv hop the source scan cannot see, pinned by BEHAVIOUR.
+    ///
+    /// `dispatch`'s `Install` arm can drop `trusted_key` and still compile —
+    /// that is the fail-open the verb exists to prevent, and it passed every
+    /// other test in this crate. So this drives `dispatch` with a key that is
+    /// not there and a device that is not a volume, and requires the error to
+    /// name THE KEY: the trust root is resolved before the device is touched,
+    /// so whichever complaint comes back says which of the two ran first.
+    /// Dropping the argument anywhere between argv and `install_trust_root`
+    /// leaves `None`, which probes instead and gets as far as the device.
+    ///
+    /// It needs no root and no block device precisely because it never reaches
+    /// one.
+    #[test]
+    fn a_named_trust_root_is_resolved_before_the_device_is_touched() {
+        let fixture = Fixture::new();
+        let missing = fixture.root.join("no-such-key.pub");
+        let error = dispatch(Mode::Install {
+            device: PathBuf::from("/dev/null"),
+            mountpoint: fixture.root.join("mountpoint"),
+            source: fixture.root.join("bundle"),
+            trusted_key: Some(missing.clone()),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("no-such-key.pub"),
+            "a named trust root must be read before the device is looked at: {error}"
+        );
+        assert!(
+            !error.contains("/dev/null"),
+            "the device must not have been reached: {error}"
+        );
     }
 
     #[test]

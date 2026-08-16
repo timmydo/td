@@ -104,9 +104,9 @@ with the second one exercised only by installs, which are the rarest
 operation on the path and the one nobody watches.
 
 That writer has TWO ways in and one body, which is the distinction the rule
-is about: `td-boot install <device> <mountpoint> <source>` mounts and then
-publishes, and the verb 7c adds publishes into a volume root that is already
-writable. The second exists because `td-install` cannot mount (D8) and a
+is about: `td-boot install <device> <mountpoint> <source> [key]` mounts and
+then publishes, and the verb 7c adds publishes into a volume root that is
+already writable. The second exists because `td-install` cannot mount (D8) and a
 regular-file destination has no partition device to mount anyway (D9); the
 first is what a running machine and the update path use. Neither reimplements
 the other — `install` calls the same function once its mount has succeeded.
@@ -355,6 +355,34 @@ is WHERE, and the distinction is not "compiled in vs. read from a file":
   real weakening. Anyone who can write a forged deployment can write the
   matching public key next to it, and the signature degrades to an integrity
   check the manifest hashes already provide. Do not put it there.
+
+  That prohibition is about THIS key — the one the boot path reads to decide
+  what to kexec — rather than about the location, and item 10 puts one on the
+  volume at `td/trusted.pub` without contradicting it. What that second key
+  checks is an INCOMING BUNDLE, which is a claim someone is making rather
+  than state already on the disk (item 6 draws the same line). So it does not
+  authorise anything beside it, and the objection above does not reach it:
+  the bundle came from somewhere else, and replacing the key does not make a
+  forged bundle appear.
+
+  It can also admit a deployment to the VOLUME and never to a BOOT. Every
+  branch of `select_boot_deployment` authenticates `current` under the
+  initramfs's key before anything else, including before a boot attempt is
+  consumed, so a deployment published under the wrong update key — or under
+  none — is refused at the next boot and rolled back from. That is what
+  bounds the whole update-time check: it turns a bad bundle into a refusal
+  NOW instead of a failed boot later, and it is not what stands between an
+  attacker and running code.
+
+  Where the bundle IS on the volume the check degrades to exactly what this
+  bullet describes, and that case is not hypothetical: the qemu oracle stages
+  its candidate at `td/incoming/candidate`, the same filesystem and the same
+  write domain as `td/trusted.pub`. Against someone who can write the volume
+  nothing there is gained — the last paragraph of this section already says
+  td has no defence against that one either way. What the update-time check
+  is worth is what it is worth for a bundle that arrived from somewhere else,
+  which is the channel item 10 is for and which does not exist yet.
+
 - A key travelling in the **same artifact as td-boot** — the initramfs the
   firmware loads — moves the trust boundary hardly at all. Substituting it
   requires writing that artifact, which is what patching a compiled-in
@@ -366,6 +394,15 @@ path that writes a trust root can be induced to write the wrong one; a
 missing key becomes a runtime branch, where the tempting branch is the
 fail-open D2 forbids, so absence must be a refusal; and the trust root
 becomes per-machine state that the reproducible artifact does not record.
+
+The first of those has a concrete form waiting for item 8. A machine will
+eventually carry TWO copies of this key — the selector initramfs's
+`etc/td/deployment.pub` and the volume's `td/trusted.pub` — and nothing
+checks that they agree. They cannot disagree today only because no machine
+has both: `td-install` writes an EMPTY ESP, and item 8 is what would put a
+selector on it. When it lands, td-install becomes the writer of both and
+that check becomes its to make, because a disk whose volume key is not its
+selector's is a disk that accepts an update it then refuses to boot.
 
 Against the threat this signature exists for — a hostile or compromised
 update source — the two are equivalent: that attacker supplies bytes and
@@ -1374,14 +1411,70 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    without it the snapshot would launder a key past every refusal the real
    reader makes.
 
-   Nothing READS it yet — that is `td-update`, the rest of this item. The
-   recipe check asserts it off the RESTORED IMAGE rather than off the staging
-   tree, for the reason the selector symlink is checked that way, and the
-   wrong-key pass asserts the volume carries neither a selector nor a trust
-   root. What that check does NOT cover is the MODE: `btrfs restore` does not
-   restore permissions without `-m`, so the 0644 is asserted on the staging
-   tree — which is what `--rootdir` reads — and under a hostile umask by the
-   subprocess test, rather than off the image.
+   The recipe check asserts it off the RESTORED IMAGE rather than off the
+   staging tree, for the reason the selector symlink is checked that way, and
+   the wrong-key pass asserts the volume carries neither a selector nor a
+   trust root. What that check does NOT cover is the MODE: `btrfs restore`
+   does not restore permissions without `-m`, so the 0644 is asserted on the
+   staging tree — which is what `--rootdir` reads — and under a hostile umask
+   by the subprocess test, rather than off the image.
+
+   **10d — `td-boot install` can be TOLD which key**, which is what makes the
+   trust root 10a writes reachable by anything. The verb took three arguments
+   and resolved its key by PROBING the running rootfs, which is the right
+   answer in the selector initramfs and finds nothing on a booted deployment
+   (§6) — so an update on a live machine published whatever it was handed and
+   only warned. The fourth argument is optional and is `publish`'s, with
+   `publish`'s semantics: absent still probes, and a NAMED key is fail-closed,
+   so a missing or truncated one refuses rather than quietly publishing
+   unverified.
+
+   A key ON the volume being installed into is not circular, and what makes
+   that true is an ORDERING rather than an argument. `run_install` resolves
+   the trust root BEFORE it mounts the device writable — the property that
+   already made "an install refused for want of a key leaves the disk exactly
+   as it found it" hold — and a running td machine already has the volume
+   mounted READ-ONLY at `/run/td-volume`, moved there out of the selector
+   initramfs by `/init`. So the key is read through a mount nothing can write,
+   off the state the volume was in before the transaction opened.
+
+   That reading is the reason §6's own pin needed rewording rather than
+   relaxing, and the distinction is the whole of it. What §6 rules out is
+   td-boot PROBING the volume: a probe makes ABSENCE mean "publish without
+   checking", so deleting the key is a silent downgrade to an unauthenticated
+   install. Being TOLD a path is the opposite — the caller has decided, and
+   the same deletion is a refusal. The test that pinned this now says so, and
+   pins the second half as well: both shipped calls must PASS THE KEY THEY
+   WERE GIVEN, since dropping it on the floor compiles and reads as the probe.
+
+   What the volume's key still does not defend against is someone who can
+   already write the volume, which item 10 recorded above and is not what it
+   is for. The threat an update channel has is the other one: the BUNDLE
+   arrives from removable media, a share, or a build host, and the trust root
+   does not.
+
+   Nothing on the shipped image passes it yet — the boot-success script's
+   `td-boot install` is still the three-argument form, so the in-guest update
+   the `td.deploy=install` oracle drives publishes unauthenticated. That is
+   the next increment, and it needs the VM harness to stage a trust root on
+   the fixture volume, which today it does not: it provisions the run key into
+   the selector initramfs alone.
+
+   Two things that increment must carry, both found in review of this one and
+   neither a defect until something passes the argument:
+
+   - `/run/td-volume` is not checked to BE a mount point. If the `mount -o
+     move` out of the selector initramfs never happened, or the volume was
+     unmounted, `/run/td-volume/td/trusted.pub` resolves against the `/run`
+     TMPFS instead of failing — an unmounted volume is not a refusal, it is a
+     different file. `is_mount_point` is already in this file and `publish`
+     already uses it, in the opposite direction.
+   - an explicit key path is not required ABSOLUTE, where `source`, `device`,
+     `mountpoint` and `root` all are. It resolves against whatever cwd the
+     caller had. That is shared with `publish` and `authenticate` and so
+     predates this argument, but `install` is now the verb whose key is
+     documented to live at a named absolute mount path, which is what makes
+     the asymmetry worth closing rather than noting.
 
    **The LOCAL channel** is a directory of deployment directories, and local
    is the whole of it for now: no network, no fetch, no protocol. td's
