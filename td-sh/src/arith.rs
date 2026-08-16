@@ -5,14 +5,46 @@
 //! `e=1+2; echo $((e+3))` is 6 and a name reached from its own value is refused
 //! rather than followed.
 
-use crate::exec::{Shell, R};
+use crate::exec::{Shell, Sig, R};
+
+/// Why an evaluation stopped, and the two arms differ in whether anything was
+/// PRINTED. `Msg` is arith's own diagnostic, still unwritten, so whoever
+/// receives it decides both the wording and the severity. `Reported` is a
+/// refusal the SHELL already wrote and unwound from -- `readonly n=1; $((n=2))`
+/// -- where the only thing left to do is carry the `Sig`.
+///
+/// One type rather than two channels because the distinction has to survive
+/// every `?` in this module.
+pub enum Stop {
+    Msg(String),
+    Reported(Sig),
+}
+
+impl From<String> for Stop {
+    fn from(msg: String) -> Stop {
+        Stop::Msg(msg)
+    }
+}
+
+impl From<&str> for Stop {
+    fn from(msg: &str) -> Stop {
+        Stop::Msg(msg.into())
+    }
+}
+
+impl From<Sig> for Stop {
+    fn from(sig: Sig) -> Stop {
+        Stop::Reported(sig)
+    }
+}
 
 /// `$(( ))`'s entry point: a malformed expression is FATAL, which is what dash
 /// does and what every caller here wants.
 pub fn eval(sh: &mut Shell, text: &str) -> R<i64> {
     match try_eval(sh, text) {
         Ok(v) => Ok(v),
-        Err(msg) => Err(sh.fatal(&msg, 2)),
+        Err(Stop::Msg(msg)) => Err(sh.fatal(&msg, 2)),
+        Err(Stop::Reported(sig)) => Err(sig),
     }
 }
 
@@ -20,7 +52,7 @@ pub fn eval(sh: &mut Shell, text: &str) -> R<i64> {
 /// of ending the shell. `[[ ]]` needs this: bash answers `[[ 1+ -eq 2 ]]` with
 /// a diagnostic and a false result and carries on, where routing it through
 /// `eval` above kills a non-interactive shell at the first bad expression.
-pub fn try_eval(sh: &mut Shell, text: &str) -> Result<i64, String> {
+pub fn try_eval(sh: &mut Shell, text: &str) -> Result<i64, Stop> {
     let mut p = Arith {
         toks: Vec::new(),
         pos: 0,
@@ -413,7 +445,7 @@ struct Arith {
 /// native stack.
 const MAX_EXPR_DEPTH: u32 = 100;
 
-type A<T> = Result<T, String>;
+type A<T> = Result<T, Stop>;
 
 impl Arith {
     fn peek(&self) -> Option<&Tk> {
@@ -509,7 +541,7 @@ impl Arith {
         let saved_pos = std::mem::replace(&mut self.pos, 0);
         let value = self.expr_comma(sh).and_then(|v| {
             if self.peek().is_some() {
-                return Err(self.stopped_at());
+                return Err(self.stopped_at().into());
             }
             Ok(v)
         });
@@ -572,8 +604,7 @@ impl Arith {
                     _ => cur | rhs,
                 };
                 if live {
-                    sh.set_var(&name, &value.to_string())
-                        .map_err(|_| format!("{name}: is read only"))?;
+                    sh.set_var(&name, &value.to_string())?;
                 }
                 return Ok(value);
             }
@@ -810,7 +841,7 @@ impl Arith {
                 self.pos += 1;
                 let v = self.expr_comma(sh)?;
                 if !self.eat_op(")") {
-                    return Err(self.stopped_at());
+                    return Err(self.stopped_at().into());
                 }
                 Ok(v)
             }
@@ -824,8 +855,7 @@ impl Arith {
         let cur = self.name_value(sh, name)?;
         let new = if up { cur.wrapping_add(1) } else { cur.wrapping_sub(1) };
         if self.live {
-            sh.set_var(name, &new.to_string())
-                .map_err(|_| format!("{name}: is read only"))?;
+            sh.set_var(name, &new.to_string())?;
         }
         Ok((cur, new))
     }
@@ -952,11 +982,20 @@ mod tests {
         eval(&mut sh, src).map_err(|_| format!("evaluation of {src:?} failed"))
     }
 
+    /// A failure's words. `Reported` has none of its own -- the shell wrote
+    /// them and unwound -- so it names itself rather than inventing any.
+    fn words(e: Stop) -> String {
+        match e {
+            Stop::Msg(msg) => msg,
+            Stop::Reported(_) => "<already reported>".into(),
+        }
+    }
+
     /// `ev` throws the message away; this keeps it. Which words a failure
     /// carries is the whole of what ash is being matched on below.
     fn ev_msg(src: &str) -> Result<i64, String> {
         let mut sh = Shell::new_for_test();
-        try_eval(&mut sh, src)
+        try_eval(&mut sh, src).map_err(words)
     }
 
     #[test]
@@ -1455,7 +1494,7 @@ mod tests {
     -> Result<(), String> {
         let mut sh = Shell::new_for_test();
         let ev = |sh: &mut Shell, src: &str| {
-            try_eval(sh, src).map_err(|e| format!("eval {src}: {e}"))
+            try_eval(sh, src).map_err(|e| format!("eval {src}: {}", words(e)))
         };
         for (src, want) in [
             ("2**3", 8),
@@ -1493,7 +1532,7 @@ mod tests {
         // A negative exponent is refused rather than rounded to zero, and the
         // refusal is the operator's own rather than a parse failure.
         for src in ["2**-1", "2**-2", "0**-1", "1**-2", "2**(1-2)"] {
-            let e = try_eval(&mut sh, src).err().ok_or(format!("{src} evaluated"))?;
+            let e = try_eval(&mut sh, src).map_err(words).err().ok_or(format!("{src} evaluated"))?;
             assert!(e.contains("exponent less than 0"), "{src}: {e}");
         }
         // Inside the arm the conditional disables, that refusal is not raised,
@@ -1661,14 +1700,15 @@ mod tests {
             (&[("a", "b"), ("b", "c"), ("c", "a")][..], "a"),
         ] {
             let mut sh = shell_with(vars)?;
-            let err = try_eval(&mut sh, src).err().ok_or(format!("{src} evaluated"))?;
+            let err = try_eval(&mut sh, src).map_err(words).err();
+            let err = err.ok_or(format!("{src} evaluated"))?;
             assert!(err.contains("recursion loop"), "{src}: {err}");
         }
         // A name reassigned to a plain number while it is being resolved is
         // still that name, which is what puts the cycle guard ahead of the
         // fast path -- `a` holds `5` by the time the inner read reaches it.
         let mut sh = shell_with(&[("a", "b"), ("b", "a=5,a")])?;
-        let err = try_eval(&mut sh, "a").err().ok_or("reassigned cycle evaluated")?;
+        let err = try_eval(&mut sh, "a").map_err(words).err().ok_or("reassigned cycle evaluated")?;
         assert!(err.contains("recursion loop"), "{err}");
         // The guard is exact-name, in BOTH directions, and neither value may be
         // a plain decimal -- that answers before the guard is ever asked, which
@@ -1739,7 +1779,7 @@ mod tests {
                 continue;
             };
             taken += 1;
-            let slow = try_eval(&mut sh, text).map_err(|e| format!("{text:?}: {e}"))?;
+            let slow = try_eval(&mut sh, text).map_err(|e| format!("{text:?}: {}", words(e)))?;
             assert_eq!(fast, slow, "{text:?}");
         }
         assert!(taken > 700, "fast path took only {taken}");
@@ -1756,7 +1796,7 @@ mod tests {
     fn only_the_c_blanks_separate_tokens() -> Result<(), String> {
         let mut sh = Shell::new_for_test();
         for text in [" 1 ", "\t1\t", "\r1\r", "\u{b}1\u{c}", "\n1\n", " 1 + 1 - 1 "] {
-            assert_eq!(try_eval(&mut sh, text).map_err(|e| e)?, 1, "{text:?}");
+            assert_eq!(try_eval(&mut sh, text).map_err(words)?, 1, "{text:?}");
         }
         // ash refuses a Unicode space outright rather than skipping it, so a
         // value or expression carrying one is an error and not a number.
@@ -1806,6 +1846,7 @@ mod tests {
                     assert_eq!(v, 9, "{links} links");
                 }
                 Err(e) => {
+                    let e = words(e);
                     assert!(deep, "{links} links: {e}");
                     assert!(e.contains("too deeply"), "{links} links: {e}");
                 }
@@ -1821,7 +1862,7 @@ mod tests {
             .collect();
         let refs: Vec<(&str, &str)> = names.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let mut sh = shell_with(&refs)?;
-        let e = try_eval(&mut sh, "v0").err().ok_or("lvalue chain evaluated")?;
+        let e = try_eval(&mut sh, "v0").map_err(words).err().ok_or("lvalue chain evaluated")?;
         assert!(e.contains("too deeply"), "{e}");
         Ok(())
     }

@@ -1373,7 +1373,9 @@ fn run_cond(sh: &mut Shell, expr: &CondExpr) -> R<()> {
         Ok(false) => sh.set_status(1),
         Err(CondError { msg, status }) => {
             // `write_stderr` supplies the newline.
-            let _ = diag(sh, &format!("[[: {msg}"));
+            if let Some(msg) = msg {
+                let _ = diag(sh, &format!("[[: {msg}"));
+            }
             sh.set_status(status);
         }
     }
@@ -1384,16 +1386,37 @@ fn run_cond(sh: &mut Shell, expr: &CondExpr) -> R<()> {
 /// STATUS varies because bash's does -- a malformed ARITHMETIC operand is
 /// diagnosed and then treated as FALSE (1), where a malformed expression is 2,
 /// the status `test` uses for one.
+///
+/// The MESSAGE is `None` where the failure was already reported by whoever
+/// raised it -- an arithmetic operand refused as read only writes its own
+/// diagnostic and unwinds, and saying it again under a `[[: ` prefix is the
+/// same words twice.
 struct CondError {
-    msg: String,
+    msg: Option<String>,
     status: i32,
 }
 
 impl CondError {
     /// A malformed EXPRESSION: status 2, the one `test` reports for one.
     fn bad(msg: String) -> CondError {
-        CondError { msg, status: 2 }
+        CondError { msg: Some(msg), status: 2 }
     }
+}
+
+/// A failed arithmetic OPERAND: diagnosed, then FALSE, which is bash's answer
+/// and the reason `CondError` carries a status rather than assuming 2.
+///
+/// The abort is the readonly refusal, whose words `set_var` already wrote. Any
+/// other `Sig` leaves the construct instead of becoming a false result -- the
+/// outer channel's whole purpose -- and none is reachable from `set_var`
+/// today, which is why this is written as a rule rather than a match on one.
+fn operand_error(stop: arith::Stop) -> R<CondError> {
+    let msg = match stop {
+        arith::Stop::Msg(msg) => Some(msg),
+        arith::Stop::Reported(Sig::Abort(_)) => None,
+        arith::Stop::Reported(sig) => return Err(sig),
+    };
+    Ok(CondError { msg, status: 1 })
 }
 
 /// Two error channels, and they are not interchangeable. The OUTER `R` carries
@@ -1473,13 +1496,17 @@ fn eval_cond(sh: &mut Shell, expr: &CondExpr) -> R<Result<bool, CondError>> {
                 // every one of those.
                 CondOp::Arith(cmp) => {
                     let right = expand::expand_single(sh, rhs)?;
-                    let (a, b) = match (cond_arith(sh, &left), cond_arith(sh, &right)) {
-                        (Ok(a), Ok(b)) => (a, b),
-                        // Diagnosed, then FALSE -- bash's answer, and the reason
-                        // `CondError` carries a status rather than assuming 2.
-                        (Err(msg), _) | (_, Err(msg)) => {
-                            return Ok(Err(CondError { msg, status: 1 }))
-                        }
+                    // The operands are evaluated in ORDER and the second is not
+                    // reached once the first has failed, which is bash's answer
+                    // and not merely tidier: an operand ASSIGNS, so evaluating
+                    // it anyway leaves a name set that bash never sets.
+                    let a = match cond_arith(sh, &left) {
+                        Ok(a) => a,
+                        Err(stop) => return Ok(Err(operand_error(stop)?)),
+                    };
+                    let b = match cond_arith(sh, &right) {
+                        Ok(b) => b,
+                        Err(stop) => return Ok(Err(operand_error(stop)?)),
                     };
                     Ok(match cmp {
                         ArithCmp::Eq => a == b,
@@ -1526,7 +1553,7 @@ fn cond_is_set(sh: &Shell, name: &str) -> bool {
 /// and carries on, where `arith::eval` would end a non-interactive shell at the
 /// first bad expression -- and an operand here is usually a variable somebody
 /// else set.
-fn cond_arith(sh: &mut Shell, text: &str) -> Result<i64, String> {
+fn cond_arith(sh: &mut Shell, text: &str) -> Result<i64, arith::Stop> {
     if text.trim().is_empty() {
         return Ok(0);
     }
@@ -2564,6 +2591,76 @@ mod tests {
         // The conditional's own status is bash's 1, not the 2 a malformed
         // EXPRESSION gets.
         assert_eq!(run("[[ 1+ -eq 2 ]]").0, 1);
+    }
+
+    /// A refusal the SHELL raised is reported ONCE.
+    ///
+    /// All three constructs that reach arith are pinned, because they report
+    /// DIFFERENTLY and share only the mechanism: `$(( ))` is fatal at status 2
+    /// as ash's is, `[[ ]]` diagnoses and answers 1 as bash's does, and a
+    /// SLICE bound carries the refusal out through the expansion around it.
+    /// Stderr is asserted WHOLE rather than by substring, since the defect was
+    /// a duplicate that every `contains` check passed.
+    #[test]
+    fn a_refusal_the_shell_reported_is_not_reported_again() {
+        for expr in ["n=2", "n+=2", "n++", "++n", "1?n=2:3"] {
+            let (st, out, err) = run(&format!("readonly n=1; echo $(({expr}))"));
+            assert_eq!(err, "td-sh: n: is read only\n", "$(({expr}))");
+            assert_eq!(st, 2, "$(({expr}))");
+            assert_eq!(out, "", "$(({expr}))");
+        }
+        // Fatal, so nothing after it runs -- ash and bash both stop here too.
+        assert_eq!(run("readonly n=1; echo $((n=2)); echo after").1, "");
+        // An arm the conditional disabled never assigns, so there is no
+        // refusal to report once or twice.
+        assert_eq!(run("readonly n=1; echo $((0?n=2:3))"), (0, "3\n".into(), String::new()));
+        // `[[ ]]` catches it instead of dying of it: one diagnostic, and NOT
+        // under the `[[: ` prefix, which belongs to messages it raised itself.
+        let (st, out, err) = run("readonly n=1; [[ 'n=2' -eq 2 ]]; echo after=$?");
+        assert_eq!(err, "td-sh: n: is read only\n");
+        assert_eq!(out, "after=1\n");
+        assert_eq!(st, 0);
+        // The other arm still earns that prefix, which is what stops the fix
+        // above from silencing a message arith really did raise.
+        assert_eq!(run("[[ 1+ -eq 2 ]]").2, "td-sh: [[: arithmetic syntax error\n");
+        // A SLICE bound is the third way into arith, and reaches it through
+        // `expand` rather than either entry point above -- so it is the one
+        // that shows the fix is in the shared type and not in a caller.
+        for src in ["${v:n=2:2}", "${v:1:n=2}"] {
+            let (st, _, err) = run(&format!("readonly n=1; v=abcdef; echo \"{src}\""));
+            assert_eq!(err, "td-sh: n: is read only\n", "{src}");
+            assert_eq!(st, 2, "{src}");
+        }
+    }
+
+    /// A failed arithmetic OPERAND stops the comparison: the second is never
+    /// evaluated, which is bash's answer and matters twice over. It is how two
+    /// refusals stay one diagnostic, and -- the half no message count would
+    /// catch -- an operand ASSIGNS, so evaluating the second anyway left a name
+    /// set that bash never sets. The side effect is the assertion for that
+    /// reason; `m` is the witness that the operand ran.
+    #[test]
+    fn a_failed_arithmetic_operand_stops_the_comparison() {
+        // Left refused as read only: `m` is untouched and the refusal is said
+        // once, where before it was said twice and `m` took 3.
+        let (st, out, err) = run("readonly n=1; [[ 'n=2' -eq 'm=3' ]]; echo m=[$m]");
+        assert_eq!(err, "td-sh: n: is read only\n");
+        assert_eq!(out, "m=[]\n");
+        assert_eq!(st, 0);
+        // Two readonly names is the shape that printed two different lines.
+        let err = run("readonly n=1 m=1; [[ 'n=2' -eq 'm=3' ]]").2;
+        assert_eq!(err, "td-sh: n: is read only\n");
+        // A left operand that is merely MALFORMED stops it just the same.
+        assert_eq!(run("[[ '1+' -eq 'm=3' ]]; echo m=[$m]").1, "m=[]\n");
+        // A failure on the RIGHT still leaves the left one's assignment, which
+        // is what makes the rule an ORDER rather than a refusal to assign.
+        let (_, out, err) = run("readonly n=1; [[ 'a=1' -eq 'n=2' ]]; echo a=[$a]");
+        assert_eq!(err, "td-sh: n: is read only\n");
+        assert_eq!(out, "a=[1]\n");
+        // Both operands run when the first SUCCEEDS -- the short-circuit must
+        // not cost the ordinary case its second side effect.
+        assert_eq!(run("[[ 'a=1' -eq 'm=3' ]]; echo a=[$a] m=[$m]").1, "a=[1] m=[3]\n");
+        assert_eq!(run("[[ 'a=3' -eq 'm=3' ]]").0, 0);
     }
 
     /// `=~` searches rather than matching whole, its right-hand side is a
