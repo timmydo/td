@@ -94,14 +94,22 @@ not verify under the trust root in the selector's own rootfs.
 
 ## 3. Hard invariants
 
-**D1. There is exactly ONE bundle writer.** `td-boot install <device>
-<mountpoint> <source>` is it. `td-install` formats a disk and then
-*delegates* the publish; it does not learn to write a deployment directory,
-update a selector, or account for attempts. The transactional publish is the
-part of this path where a partial write is a machine that does not boot, and
-two implementations of it would be two chances to get the rename order wrong
-— with the second one exercised only by installs, which are the rarest
+**D1. There is exactly ONE bundle writer.** `td-boot`'s
+`install_deployment` is it. `td-install` formats a disk and then *delegates*
+the publish; it does not learn to write a deployment directory, update a
+selector, or account for attempts. The transactional publish is the part of
+this path where a partial write is a machine that does not boot, and two
+implementations of it would be two chances to get the rename order wrong —
+with the second one exercised only by installs, which are the rarest
 operation on the path and the one nobody watches.
+
+That writer has TWO ways in and one body, which is the distinction the rule
+is about: `td-boot install <device> <mountpoint> <source>` mounts and then
+publishes, and the verb 7c adds publishes into a volume root that is already
+writable. The second exists because `td-install` cannot mount (D8) and a
+regular-file destination has no partition device to mount anyway (D9); the
+first is what a running machine and the update path use. Neither reimplements
+the other — `install` calls the same function once its mount has succeeded.
 
 Consequently `td-install` shares `td-boot/src/protocol.rs`'s
 `DEPLOYMENTS_DIR`, `SELECTOR_PREFIX` and `BOOT_DIR` through the same `#[path]`
@@ -850,7 +858,9 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    **7b, the VOLUME**, is landed: `td-install volume` formats the volume
    partition and leaves it holding the read-write `@var` subvolume, with the
    `mkfs.btrfs` binding D7 requires beside the exec that needs it. **7c**
-   delegates the publish to `td-boot install`.
+   delegates the publish to `td-boot`, into the staging tree rather than
+   through a mount, and settles the install-time trust root; its own
+   paragraphs are below the 7b ones.
 
    7b is itself two commits, and the RECIPE is the first of them. D7's binding
    is a build-time complaint about a missing program, so something has to
@@ -973,6 +983,63 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    itself, and nbd — and `bdev_release` is not among them. It syncs and
    flushes media-change events and nothing else. The rescan on open fires
    only if that flag is already set.
+
+   **7c, the PUBLISH: into the staging tree, before the filesystem exists.**
+   D1 gives the whole transactional publish to `td-boot`, and D8 leaves
+   `td-install` unable to mount anything — so the question 7c answers is not
+   who writes a deployment but WHERE `td-boot` writes it, given a destination
+   whose volume partition has no name a mount could take.
+
+   The answer follows 7b's rather than fighting it. `td-boot install <device>
+   <mountpoint> <source>` is two things in a trench coat: mount this device,
+   then publish into the result. Only the second half is D1's one bundle
+   writer, and it is already a function of a plain PATH —
+   `install_deployment(root, source)` requires `root/td`, `root/<BOOT_DIR>`
+   and `root/<DEPLOYMENTS_DIR>` to be real directories and after that does
+   ordinary file operations and renames, with nothing in it that knows it is
+   on Btrfs. So the inner half is exposed as its own verb, `install` is
+   refactored to call it once it has mounted, and there remains exactly ONE
+   implementation of the publish — strictly less duplication than today, not
+   more.
+
+   `td-install` then stages the deployment into the SAME `--rootdir` tree that
+   already carries `@var`, and mkfs bakes the published result into the image
+   the sparse copy is about to write. Nothing mounts, nothing loops, no
+   partition device is needed, `UNSAFE.md` is untouched, and the oracle
+   exercises the shipped code path rather than a cousin of it — which is D9,
+   and the same argument that settled the `BLKRRPART` question above. It is
+   also verifiable offline, which is what makes it a check rather than a
+   hope: `btrfs inspect-internal dump-tree -t fs` lists the directory entries
+   of an unmounted image, so the recipe can assert `td/deployments/<id>` and
+   the selector are really in the filesystem on the destination. Measured on
+   a real image before this was written down.
+
+   **The install-time trust root is settled here, because it is item 7's to
+   settle** — `warn_unverifiable_resign` says so in as many words. Today
+   `install` runs with no trust root at all (§6: the real root has none), so
+   it publishes what it is given and warns that nothing present can check it;
+   the first thing that actually verifies the bundle is the next boot, and a
+   bundle signed with the wrong key is discovered by a machine that does not
+   come back. That is the wrong end of the operation to learn it at.
+
+   An INSTALLER is not the real root, though, and that is the distinction the
+   warning was waiting for. It runs from installation media that td built,
+   which can carry a trust root exactly as the selector initramfs does, so
+   the publishing verb takes an optional trusted key — the spelling
+   `td-boot authenticate <deployment-directory> [trusted-key]` already uses —
+   and REFUSES a bundle that does not verify under it. Fail-closed where a
+   key is supplied, and today's warn-and-publish only where one is not, which
+   keeps a rootfs with no trust root behaving as D3 requires while making the
+   installer the first thing on the path to check rather than the last.
+
+   Two consequences worth stating rather than discovering. The deployment
+   source has to exist when `volume` runs, since the publish now happens
+   before the filesystem does — so it is an argument to that verb rather than
+   a later step, and an install with no bundle to publish is the same command
+   without it. And a bundle published this way is subject to the copy's
+   ordering above: it is inside the image, so it lands before the superblock
+   does, and an interrupted install leaves no filesystem rather than a
+   filesystem with a half-written deployment in it.
 8. **The EFI-stub kernel** (§5): `CONFIG_EFI`, `CONFIG_EFI_STUB`,
    `CONFIG_CMDLINE` in `linux-x86-64.rs`, having first confirmed what
    `CONFIG_EFI` drags in on the pinned tree.
