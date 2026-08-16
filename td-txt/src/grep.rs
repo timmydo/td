@@ -8,12 +8,24 @@
 //! a buffer is assembled whole before it is matched, so a pattern never
 //! straddles a read boundary.
 //!
-//! Deliberate omissions: no `-P` (PCRE — a second regex engine), no `--color`,
-//! no `--include`/`--exclude` globs, and no `-u`, whose only subject is the
-//! `-b` it cannot change here. Each is DIAGNOSED and never a silent no-op —
-//! `invalid option` for the short spellings, `unrecognized option` for the
-//! long ones, which is getopt's own split and GNU's wording for both. Each is
-//! pinned in spec/divergence.test.txt.
+//! Deliberate omissions, by what they would cost to serve:
+//!
+//! * a second regex engine — `-P`, and `-X`, whose argument reaches the same
+//!   one (`-X perl` IS `-P`);
+//! * output this one does not produce — `--color`, `-T`/`--initial-tab`;
+//! * a file filter — `--include`/`--exclude`, and `-I`/`--binary-files`,
+//!   which is the third binary mode beside the default and `-a`'s;
+//! * nothing at all — `-u` and `-U`, whose second answer a POSIX system does
+//!   not have.
+//!
+//! Each is DIAGNOSED and never a silent no-op: `invalid option` for the short
+//! spellings, `unrecognized option` for the long ones, which is getopt's own
+//! split and GNU's wording for both. Each named above is pinned in
+//! spec/divergence.test.txt. The SHORT roster is complete — swept against
+//! grep.c:486 — but the long one is not: `--colour`, `--exclude-dir`,
+//! `--group-separator`, `--no-group-separator`, `--no-ignore-case`, `--label`
+//! and `--line-buffered` are refused too and have neither an entry here nor a
+//! case, which is a sweep still owed rather than a roster.
 
 use crate::regex::{Filter, OnBudget, Options, Regex};
 use crate::util::{

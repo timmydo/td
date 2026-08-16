@@ -57,6 +57,132 @@ a
 ## status: 2
 ## stderr-contains: invalid option -- 'u'
 
+#### grep refuses -I, whose effect a caller reads in the STATUS
+# -I is --binary-files=without-match: a binary file stops counting as a match.
+# Not retroactively -- matches already emitted before the binary verdict trips
+# are still printed -- but from the verdict onward, and the STATUS is withheld.
+# td-txt serves the behaviour of the other two modes: the default (`binary file
+# matches' on stderr) and `text', which is what -a and --text do. So the
+# machinery exists and this refusal is the third mode. That is what makes ignoring the
+# option the tempting mistake, and it would be wrong twice over: on a matching
+# binary file GNU's `grep -I hit b' exits 1 where the default exits 0, AND it
+# prints nothing where the default writes `b: binary file matches' to stderr.
+# The status is the half a script branches on, which is why it leads here, but
+# the diagnostic goes too.
+#
+# `--binary-files=' refuses with it, and that part is NOT all decision: only
+# the `without-match' value is unimplemented here. Refusing the whole option
+# also refuses `=text' and `=binary', which name behaviour td-txt HAS under
+# other spellings -- `-a'/`--text' and the default. That half is a gap of
+# `-V's shape, found while writing this entry and left open by it; the case
+# below pins today's answer so closing it has to move a golden.
+## argv: grep -I a
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: invalid option -- 'I'
+
+#### and --binary-files, the long option -I selects one mode of
+## argv: grep --binary-files=without-match a
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: unrecognized option '--binary-files=without-match'
+
+#### grep refuses -T rather than dropping an alignment that WAS asked for
+# --initial-tab pads the prefix and puts a TAB before the line. Ignoring it
+# would leave the columns a caller explicitly asked to line up unaligned, and
+# anything reading a field by offset reads the wrong one. The padding is
+# COMPUTED, and from a quantity nothing about the output shows: grep.c:1545
+# takes the digit width of the operand's BYTE SIZE, or 19 for a stream it
+# cannot size. So this case's own stdin prints eighteen spaces before `1:<TAB>a'
+# where `grep -n' prints `1:a', and a named file's pad tracks its size and not
+# its line count -- 0 at 4 bytes, 2 at 500, 4 at 12000, whatever the lines do.
+# "Ignore the option" therefore has no fallback to be right about.
+## argv: grep -T -n a
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: invalid option -- 'T'
+
+#### and --initial-tab, its long spelling
+## argv: grep --initial-tab a
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: unrecognized option '--initial-tab'
+
+#### grep refuses -U, which does nothing here, for the reason -u is refused
+# GNU documents -U/--binary as having no effect off MS-DOS and Windows, and
+# measurably it has none: `grep -U hit f' and `grep hit f' agree. So this is
+# `-u' above wearing another letter -- an option whose second answer does not
+# exist on a POSIX system -- and it is refused for that entry's reason rather
+# than for a behaviour td-txt lacks. Accepting a no-op would be defensible
+# exactly here and nowhere near it, and the roster is easier to defend whole.
+## argv: grep -U a
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: invalid option -- 'U'
+
+#### and --binary, its long spelling
+## argv: grep --binary a
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: unrecognized option '--binary'
+
+#### grep refuses -X, because -X perl IS -P
+# -X names a MATCHER. `grep -X perl '\d'' matches a digit while `grep -X grep
+# '\d'' warns `stray \ before d' and does not, so the option reaches the PCRE
+# engine the -P entry below refuses; serving it would need that engine or a silent
+# downgrade to POSIX semantics, which is the same trap. It is also
+# UNDOCUMENTED, absent from GNU's own --help, which is why a sweep of that help
+# text does not turn it up and why grep.rs's omission list names it with the
+# reason attached. This case is the one whose argument names an engine td-txt
+# HAS, so its refusal cannot be read as "no such matcher".
+## argv: grep -X grep a
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: invalid option -- 'X'
+
+#### and the argument that IS -P, which is the reason above
+## argv: grep -X perl a
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: invalid option -- 'X'
+
+#### and with NO argument, where the refusal beats the arity check
+# The only shape that shows WHEN -X is refused. GNU consumes the option and
+# then complains the argument is missing (`option requires an argument -- 'X''),
+# where td-txt never gets that far. Alone among these cases it diverges on the
+# DIAGNOSTIC rather than on the status: both exit 2.
+## argv: grep -X
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: invalid option -- 'X'
+
 #### grep refuses -P rather than pretending to have PCRE
 # GNU grep's -P switches to a whole second regex engine (PCRE). td-txt carries
 # one POSIX engine; accepting -P and quietly running POSIX semantics would

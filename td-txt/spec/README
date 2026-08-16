@@ -2767,7 +2767,7 @@ td-txt-authored case files
   oracle against a new case and confirm it does NOT match, comparing status,
   stdout AND stderr: for every refusal here the whole divergence is the
   diagnostic, so a check that reads only status and stdout reports agreement.
-  42 cases, of which 40 differ; the other TWO are counts GNU never finishes, so
+  51 cases, of which 49 differ; the other TWO are counts GNU never finishes, so
   they are not comparable by construction and their divergence is the
   non-finishing itself. This number had gone STALE -- it read 36 while the file
   held 33, five commits having touched the file without re-running it, which is
