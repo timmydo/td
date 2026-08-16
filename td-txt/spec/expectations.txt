@@ -41,7 +41,6 @@ xfail grep-cli.test.txt::a backreference in ANOTHER branch reads the whole patte
 xfail grep-cli.test.txt::where its -o, reading glibc, selects nothing in those same lines
 xfail sed-cli.test.txt::an R compiled before the w that creates its source is dead for the run in GNU
 xfail sed-cli.test.txt::and a w naming the -f script truncates it before GNU reads it
-xfail sed-cli.test.txt::the compile half, which td-txt does not model: xfail with GNU's golden
 xfail sed-cli.test.txt::\c at the end of a text controls the text's own terminator
 xfail sed-cli.test.txt::where nothing before the dollar pins where a match may start, GNU's literal shows through
 xfail sed-cli.test.txt::a dot pins no byte either, so the same pattern past a branch start still does

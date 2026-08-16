@@ -296,6 +296,12 @@ impl ScriptParser<'_> {
         self.mode().sandbox
     }
 
+    /// `-z` as THIS part saw it, which is what GNU's `newline_anchor` is set
+    /// from. Not `Invocation::null_data`, which is the run's.
+    fn null_data_at_compile(&self) -> bool {
+        self.mode().null_data
+    }
+
     fn peek(&self) -> Option<u8> {
         self.src.get(self.pos).copied()
     }
@@ -423,7 +429,7 @@ impl ScriptParser<'_> {
     /// `s` -- today the two address spellings -- has nothing to run between the
     /// compile and the lint, which is where GNU raises it too.
     fn add_regex(&mut self, raw: &[u8], icase: bool, multiline: bool) -> Result<Option<usize>, String> {
-        let (re, pending) = self.add_regex_pending(raw, icase, multiline)?;
+        let (re, pending) = self.add_regex_pending(raw, icase, multiline, NoSub::Address)?;
         pending.raise()?;
         Ok(re)
     }
@@ -439,7 +445,9 @@ impl ScriptParser<'_> {
         raw: &[u8],
         icase: bool,
         multiline: bool,
+        sub: NoSub,
     ) -> Result<(Option<usize>, PendingLint), String> {
+        let no_sub = matches!(sub, NoSub::Address);
         if raw.is_empty() {
             // `//` reuses whatever matched last, which has its own flags — so GNU
             // refuses to be given new ones rather than silently dropping them.
@@ -448,6 +456,10 @@ impl ScriptParser<'_> {
             }
             return Ok((None, PendingLint(false)));
         }
+        // GNU decodes `\x`/`\o`/`\d` in `normalize_text` BEFORE `compile_regex_1`
+        // (sed/regexp.c:168-170), so the begline/endline test below sees the
+        // DECODED text: `\x5e` is a lone `^` there and must be here.
+        let normalized = normalize_regex(raw, !self.extended())?;
         // `M` is relative to the RECORD separator, which `N` can put inside the
         // pattern space: under `-z`, `N` joins with a NUL and GNU anchors there.
         let opts = Options {
@@ -465,10 +477,24 @@ impl ScriptParser<'_> {
             glibc_engine: true,
             // sed lexes one regex at a time, and has no `-x`/`-w` to wrap it.
             lex_continues: false,
-            reg_newline: multiline.then_some(separator_for(self.inv.null_data)),
+            // GNU compiles an ADDRESS with `needed_sub == 0` and so `RE_NO_SUB`,
+            // which is what makes it RECOMPILE on the first `s//…/` that reuses
+            // one. `s`'s own regex wants registers and is never recompiled.
+            no_sub,
+            // `-z` read TWICE, as GNU reads it: the run's delimiter is what a
+            // match splits on, and the part's is glibc's `newline_anchor`. They
+            // differ only when `-z` follows the `-e`, and then `M` anchors on
+            // both. A pattern that is EXACTLY `^` or `$` is the exception --
+            // GNU marks it begline/endline and matches it by hand from the
+            // delimiter in force at RUN time (sed/regexp.c:139-144,215-278), so
+            // the compiled anchor never reaches it.
+            reg_newline: multiline.then(|| crate::regex::Anchor {
+                sep: separator_for(self.inv.null_data),
+                newline_anchor: !self.null_data_at_compile()
+                    && !matches!(normalized.as_slice(), b"^" | b"$"),
+            }),
         };
-        let re = Regex::compile(&normalize_regex(raw, !self.extended())?, opts)
-            .map_err(|e| e.msg)?;
+        let re = Regex::compile(&normalized, opts).map_err(|e| e.msg)?;
         let pending = PendingLint(re.class_syntax && !self.inv.posixly);
         self.regexes.push(re);
         Ok((Some(self.regexes.len() - 1), pending))
@@ -1069,7 +1095,8 @@ impl ScriptParser<'_> {
                 _ => return Err("unknown option to `s'".to_string().into()),
             }
         }
-        let (re, pending) = self.add_regex_pending(&pattern, icase, multiline)?;
+        let (re, pending) =
+            self.add_regex_pending(&pattern, icase, multiline, NoSub::Substitution)?;
         // A `\N` naming a group the pattern does not have is a script error, not
         // an empty expansion -- except under EITHER posix level, where it is
         // accepted and expands to nothing (regexp.c:122 asks
@@ -2516,6 +2543,13 @@ struct Sed {
     quit: Option<i32>,
     /// Index in the regex table of the last regex applied — what `//` reuses.
     last_regex: Option<usize>,
+    /// Regexes GNU has RECOMPILED, by index. An ADDRESS regex compiles with
+    /// `RE_NO_SUB` and is thrown away and rebuilt on the first `s//…/` that
+    /// reuses it (sed/regexp.c:198-211), which reads the record delimiter a
+    /// THIRD time -- at run time. The rebuild MUTATES the object, so this is a
+    /// set rather than a per-call answer: every later use of that regex, an
+    /// address's included, reads what the rebuild read.
+    recompiled: std::collections::BTreeSet<usize>,
     wfiles: BTreeMap<FileTarget, WFile>,
     /// `R` reads ONE line per invocation, so the file is parsed once and the
     /// cursor kept; re-reading per line would be quadratic. Keyed by NAME, not
@@ -2557,6 +2591,8 @@ fn kind_matches(
     kind: &AddrKind,
     regexes: &[Regex],
     last_regex: Option<usize>,
+    // Regexes GNU has already recompiled -- see `NoSub`.
+    recompiled: &std::collections::BTreeSet<usize>,
     pattern: &[u8],
     line_number: u64,
     stream: &mut Stream,
@@ -2581,7 +2617,13 @@ fn kind_matches(
                 None => last_regex.ok_or_else(|| NO_PREVIOUS_REGEX.to_string())?,
             };
             let re = regexes.get(idx).ok_or_else(|| NO_PREVIOUS_REGEX.to_string())?;
-            Ok((re.is_match(pattern).map_err(|e| e.msg)?, Some(idx)))
+            // GNU's recompile mutates the regex, so an address use AFTER an
+            // `s//…/` reads the run's delimiter as that `s` did.
+            let hit = match recompiled.contains(&idx) {
+                true => re.is_match_recompiled(pattern),
+                false => re.is_match(pattern),
+            };
+            Ok((hit.map_err(|e| e.msg)?, Some(idx)))
         }
     }
 }
@@ -2727,6 +2769,7 @@ impl Sed {
             kind,
             &self.script.regexes,
             self.last_regex,
+            &self.recompiled,
             &self.pattern,
             line,
             stream,
@@ -2748,6 +2791,7 @@ impl Sed {
             kind,
             &self.script.regexes,
             self.last_regex,
+            &self.recompiled,
             &self.pattern,
             self.line_number,
             stream,
@@ -3136,6 +3180,7 @@ fn mode_of(conf: &Conf, posixly: bool) -> Mode {
         extended: !conf.posix && !posixly,
         ere: conf.ere,
         sandbox: conf.sandbox,
+        null_data: conf.null_data,
     }
 }
 
@@ -3597,6 +3642,7 @@ fn compile_and_run(
         replaced: false,
         quit: None,
         last_regex: None,
+        recompiled: std::collections::BTreeSet::new(),
         wfiles,
         rfiles: BTreeMap::new(),
     };
@@ -3974,11 +4020,28 @@ struct Mode {
     /// target is opened, because refusing the command is GNU's answer whether or
     /// not the file could have been opened.
     sandbox: bool,
+    /// `-z` AS THIS PART SAW IT, which is only half of what `-z` means. GNU's
+    /// `buffer_delimiter` is one global read at two different times, so the RUN's
+    /// value (`Invocation::null_data`) still decides what a record is and what a
+    /// substitution may not cross -- this one decides `newline_anchor` alone.
+    null_data: bool,
 }
 
 /// The confusing-bracket lint, decided but not yet raised. GNU raises it inside
 /// `dfacomp`, a step after the `s` command's out-of-range `\N` check, so a
 /// caller with that check to run holds one of these across it.
+/// Which of GNU's two compile forms a regex takes. An ADDRESS asks for no
+/// registers and so compiles with `RE_NO_SUB`, which is what makes GNU throw it
+/// away and compile it again on the first `s//…/` that reuses it -- reading the
+/// record delimiter a THIRD time, at run time. An `s` command's own regex wants
+/// registers and is compiled once. A named pair rather than a `bool`, since the
+/// call sites are two lines apart and read alike.
+#[derive(Clone, Copy)]
+enum NoSub {
+    Address,
+    Substitution,
+}
+
 #[must_use = "a pending lint that is never raised accepts a pattern GNU refuses"]
 struct PendingLint(bool);
 
@@ -3991,11 +4054,15 @@ impl PendingLint {
     }
 }
 
-/// The two compile inputs that are properties of the INVOCATION rather than of
-/// an `-e` part, which is what keeps them out of `Mode`: every part sees the
-/// same pair, so a per-part answer could only ever be the same answer written
-/// once per part. Threaded as a struct for `Mode`'s reason -- two adjacent
-/// `bool` parameters of the same shape transpose silently.
+/// The two compile inputs read as the RUN had them rather than as an `-e` part
+/// did, which is what keeps them out of `Mode`. Threaded as a struct for
+/// `Mode`'s reason -- two adjacent `bool` parameters of the same shape
+/// transpose silently.
+///
+/// `posixly` is here because it cannot differ per part at all. `null_data` is
+/// here because only HALF of it can: GNU keeps one `buffer_delimiter` and reads
+/// it at two times, so the part's reading lives in `Mode` and the run's lives
+/// here. It is the one flag on both.
 ///
 /// `Conf` still carries `null_data`, since it is what the option loop WRITES;
 /// this is what the COMPILE reads, built once beside the separator that shares
@@ -4003,11 +4070,11 @@ impl PendingLint {
 /// `conf.null_data`.
 #[derive(Clone, Copy, Debug)]
 struct Invocation {
-    /// `-z`, read by the `M` flag. GNU reads the record separator at compile
-    /// time AND again in `match_regexp`, and for a pattern that is only `^` or
-    /// `$` the RUN-time read is what anchors it -- so a part-scoped answer is
-    /// wrong for exactly the patterns the option is most used with. See
-    /// spec/README.
+    /// `-z` as the RUN has it: what a record is, what a match splits on, and
+    /// what a substitution may not cross. The part's reading of the same flag
+    /// is `Mode::null_data` and decides only glibc's `newline_anchor` and the
+    /// filtering dfa's end-of-line; see spec/README for the three rules that
+    /// come of the two disagreeing.
     null_data: bool,
     /// `POSIXLY_CORRECT` PRESENT in the environment, which is a THIRD thing
     /// that variable does and the only one that is not `posixicity`: GNU's
@@ -4910,6 +4977,12 @@ impl Sed {
         let Some(re) = self.script.regexes.get(re_idx) else {
             return Err(NO_PREVIOUS_REGEX.as_bytes().to_vec());
         };
+        // This use is the one that wants registers, so an address regex is
+        // recompiled here and stays that way. Recorded BEFORE the match, since
+        // GNU rebuilds before it searches.
+        if re.no_sub {
+            self.recompiled.insert(re_idx);
+        }
         let Some(Cmd { kind: Kind::Subst(sub), .. }) = self.script.cmds.get(idx) else {
             return Ok((false, false, None));
         };
@@ -4923,7 +4996,14 @@ impl Sed {
         loop {
             // A SUBSTITUTION is confined to one segment under `M` with a
             // non-newline separator; an address is not. See `search_subst`.
-            let caps = match re.search_subst(&hay, pos) {
+            //
+            // And an ADDRESS regex reused by `s//…/` is one GNU RECOMPILES
+            // before this call, so it reads the delimiter as the RUN has it.
+            let found = match re.no_sub {
+                true => re.search_subst_recompiled(&hay, pos),
+                false => re.search_subst(&hay, pos),
+            };
+            let caps = match found {
                 Ok(Some(c)) => c,
                 Ok(None) => break,
                 Err(e) => {
@@ -4983,9 +5063,9 @@ mod tests {
     use super::*;
 
     /// What every test here compiles under: no `--posix`, no `POSIXLY_CORRECT`,
-    /// and none of the three compile flags a part can carry.
+    /// and none of the four compile flags a part can carry.
     const EXTENDED: Mode =
-        Mode { posix: false, extended: true, ere: false, sandbox: false };
+        Mode { posix: false, extended: true, ere: false, sandbox: false, null_data: false };
 
     /// `EXTENDED` with the one flag a test varies.
     fn mode_with(ere: bool) -> Mode {
@@ -5083,7 +5163,8 @@ mod tests {
         let ere = opts.contains(&"-E") || opts.contains(&"-r");
         let null_data = opts.contains(&"-z");
         let sep = separator_for(null_data);
-        let mode = mode_with(ere);
+        // These opts stand for flags BEFORE the script, so the part saw `-z` too.
+        let mode = Mode { null_data, ..mode_with(ere) };
         let inv = Invocation { null_data, posixly: false };
         let mut script = compile_script(script.as_bytes(), Vec::new(), mode, inv).unwrap();
         let seed = seed_ranges(&script.cmds);
@@ -5107,6 +5188,7 @@ mod tests {
             replaced: false,
             quit: None,
             last_regex: None,
+        recompiled: std::collections::BTreeSet::new(),
             wfiles,
             rfiles: BTreeMap::new(),
             };

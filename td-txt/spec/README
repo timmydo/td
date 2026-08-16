@@ -1786,16 +1786,98 @@ td-txt-authored case files
     above is why that distinction is the whole design rather than a quibble.)
 
   - `-z` LOOKS like a fourth member of that class and is a HYBRID, which is what
-    an attempt to add it turned up. GNU reads the record separator when it
-    compiles (`regexp.c:101`, which is what `M` bakes in) and AGAIN in
-    `match_regexp`, and for a pattern that is only `^` or `$` the run-time read
-    is what anchors it. td-txt models the run-time half -- `sed -e 's/^/>/Mg' -z`
-    over `a\nb\0` is `>a\nb\0` in both, where a part-scoped answer would give
-    `>a\n>b\0` -- and not the compile half: `sed -n -e '/a$/Mp' -z` prints in GNU
-    and not here, which is an xfail carrying GNU's golden. Modelling both wants
-    the separator threaded to the matcher as well as to the compiler, which is a
-    landing of its own; a part-scoped `-z` alone is a REGRESSION, since the
-    patterns it gets wrong are the ones `M` is most used with.
+    an attempt to add it turned up -- and BOTH halves are served now. GNU keeps
+    one `buffer_delimiter` and reads it at two different times: compiling a part
+    sets glibc's `newline_anchor` from it (`regexp.c:101`) and builds the
+    filtering dfa's end-of-line from it (`regexp.c:130`), while running the
+    regex chooses from it the segment split that stands in for that anchor once
+    the delimiter is not a newline (`regexp.c:303`). So the flag reaches a part
+    it FOLLOWS, but only through those two, and everything else about it is the
+    run's. `Mode` carries the part's reading beside `--posix` and `-E`;
+    `Invocation` keeps the run's, which is still what a record is.
+
+    THREE rules, and the second and third are why "a late `-z` anchors on both"
+    is the wrong summary alone.
+
+    1. `^`/`$` hold at BOTH bytes -- `sed -n -e 's/^x*/</Mgp' -z` marks the
+       start of every NUL record AND of every line inside one, where the same
+       script with the flag first marks only the records. `newline_anchor` moves
+       those two and nothing else, so a substitution's `` \` ``/`\'` stay on the
+       segment; an address's are `^`/`$` by another spelling and do move.
+    2. A buffer the pattern cannot match under the COMPILE-time reading ALONE
+       is no match at all, because the dfa GNU filters with was built from that
+       delimiter and knows the newline, not the NUL. So the late flag can match
+       LESS than the early one: `N;s/^c/</Mg` over `a\nb\0c` rewrites nothing
+       here and rewrites the `c` with the flag first. The filter reads as an
+       ADDRESS whatever asked it (a dfa models neither segments nor buffer
+       identity), and its verdict covers the whole buffer -- it runs only at
+       offset 0 (`regexp.c:280`), so a `g` loop's later searches are not
+       filtered. Nothing without a NUL in the PATTERN SPACE reaches it, the two
+       readings naming the same positions then, which is why every case joins
+       with `N`.
+    3. A BACKREFERENCE changes both of those, and not in the same way. GNU
+       hands such a pattern to glibc's backref matcher, which sees one segment
+       and its true ends, so an address's `` \` ``/`\'` stop moving with `M` --
+       the same condition `consumable` already used, not a second rule, and it
+       closes a divergence that had nothing to do with `-z`: `N;/\`b\(c\)\1/Mp`
+       over `a\nbcc` matched here and not in GNU. Rule 2 still applies, with
+       the reference APPROXIMATED: a dfa cannot enforce one, so it reads it as
+       a single NULLABLE position under NO constraint (lib/dfa.c:2285,2796),
+       and `dfaexec`'s `backref` flag says only that a HIT needs verifying --
+       a MISS still returns 0. Both simpler answers are wrong in a direction a
+       case pins. Filtering with the reference ENFORCED rejects where GNU
+       accepts (`N;s/^\(.\)\1*$/</Mg` over `\na\0b\n` rewrites both bytes
+       there); not filtering a backref pattern at all accepts where GNU
+       rejects (`N;/^c\(x\)\1/Mp` over `a\nb\0cxx` prints nothing there).
+       The filter is also not allowed to FAIL: a step budget exhausted inside
+       it is an artefact of filtering with a backtracker where GNU has a
+       linear dfa, so it is read as "cannot decide" and lets the buffer
+       through rather than becoming an error the pattern itself would not
+       raise.
+
+    Two more rules came out of review rather than out of the fuzz, and both
+    are about WHICH pattern or WHICH compile the two readings apply to.
+
+    4. The lone-`^`/`$` exception is on the DECODED text. `normalize_text`
+       runs before `compile_regex_1` (regexp.c:168-170), so `\x5e`, `\o136`
+       and `\d094` are each a one-byte `^` when `sz == 1` is tested, and
+       `\x24`/`\o044`/`\d036` a lone `$`. Matching the RAW pattern leaves
+       them four or five bytes long and compiles the anchor, which anchors at
+       the newline as well -- an ordinary record shows it, no `N` needed.
+    5. There is a THIRD read of the delimiter, and it is not about placement.
+       An ADDRESS compiles with `needed_sub == 0` (compile.c:927) and so with
+       `RE_NO_SUB` (regexp.c:87); the first use that wants REGISTERS -- which
+       is only an `s//…/` reusing it -- frees the pattern and the dfa and
+       compiles it AGAIN (regexp.c:198-211), at run time. So for that regex
+       both halves of `-z` agree however the flag was placed. The rebuild
+       MUTATES the object, so it persists: every later use of that address
+       reads what the rebuild read. `Sed::recompiled` is the set, since the
+       state belongs to the regex rather than to the call. Modelling only the
+       substitution half would leave the persistence face wrong, and it is
+       measurable -- `sed -n -e 'N;/^b/Mp;s//&/' -z` over two `a\nb\0c\0`
+       records prints ONE record in GNU, where reading the part's delimiter
+       for the address prints two and this crate printed none before either
+       rule existed.
+
+    Method, because the finding is about the METHOD as much as the flag. The
+    ordinary `-z` fuzz -- 2000 random scripts over inputs carrying both
+    separators, compared on status, stdout AND stderr -- reports NOTHING here,
+    on the parent binary as well as this one, so it would not have found any of
+    this. It puts `-z` first every time, and even placed late a random 1-5 atom
+    pattern almost never both carries an anchor and lands on one of these
+    boundaries. A fuzz BIASED at the family -- short bodies likely to match,
+    an anchor in every draw, `-z` in all three positions -- reports 353 shapes
+    on the parent and 0 here. Every refinement above except the first came from
+    it rather than from reading GNU: the filter, its address reading, and both
+    backreference halves were each a shape it reported after the previous fix.
+    The corpus's own `-z`+`M` cases had the same blind spot in the other
+    direction (see the `N` note at the top of this file), which is twice now
+    that this family has hidden behind a sweep that had no script of the right
+    shape. THREE times, counting rules 4 and 5: both live outside that
+    generator's alphabet -- it draws no `\x5e`-style spelling of an anchor and
+    no `s//` at all -- and a cross-model review found them where 12,000 fuzzed
+    shapes did not. The alphabet has since been widened to carry both, so the
+    guard is real rather than retrospective.
 
   - STDIN is left where sed stopped READING, which used to be drained here and
     now holds for a REGULAR FILE and for a PIPE alike -- by two different

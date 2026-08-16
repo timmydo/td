@@ -4430,12 +4430,103 @@ sed: couldn't open file /nosuchdir/out: No such file or directory
 ## status: 1
 
 # `-z` is NOT in the class, and the attempt to put it there is what showed why.
-# GNU reads the record separator TWICE -- once compiling (`regexp.c:101`, which
-# is what `M` bakes in) and again in `match_regexp` -- and for a pattern that is
-# only `^` or `$` the RUN-time read is what anchors it. So the flag is a hybrid,
-# td-txt models the run-time half, and the compile half is an xfail below.
+# It is a HYBRID: GNU keeps one `buffer_delimiter` and reads it TWICE, at
+# different times. Compiling a part sets glibc's `newline_anchor` from it
+# (regexp.c:101); running the regex chooses from it the segment split that
+# stands in for that anchor once the delimiter is not a newline (regexp.c:303).
+# So a part compiled BEFORE `-z` was seen anchors `M` on BOTH -- the NUL the
+# run splits on and the newline the compile baked in -- while every other half
+# of the flag is the run's.
+#
+# The input carries both separators, so which one anchors is visible: two NUL
+# records, each holding a newline.
 
-#### the run-time half: a lone ^ under M anchors on the FINAL -z
+#### a part compiled before -z anchors M on the newline AND the NUL
+## argv: sed -n -e 's/^x*/</Mgp' -z
+## stdin-json: "a\nb\u0000c\nd\u0000"
+## stdout-json: "<a\n<b\u0000<c\n<d\u0000"
+## stderr-json: ""
+## status: 0
+
+#### where the same script with the flag FIRST anchors on the NUL alone
+## argv: sed -n -z -e 's/^x*/</Mgp'
+## stdin-json: "a\nb\u0000c\nd\u0000"
+## stdout-json: "<a\nb\u0000<c\nd\u0000"
+## stderr-json: ""
+## status: 0
+
+#### the end anchor divides the same way
+## argv: sed -n -e 's/x*$/</Mgp' -z
+## stdin-json: "a\nb\u0000c\nd\u0000"
+## stdout-json: "a<\nb<\u0000c<\nd<\u0000"
+## stderr-json: ""
+## status: 0
+
+#### and with the flag first
+## argv: sed -n -z -e 's/x*$/</Mgp'
+## stdin-json: "a\nb\u0000c\nd\u0000"
+## stdout-json: "a\nb<\u0000c\nd<\u0000"
+## stderr-json: ""
+## status: 0
+
+#### an ADDRESS takes the pair too, which is the case this was found through
+## argv: sed -n -e '/a$/Mp' -z z1
+## file-json z1: "a\nb\n"
+## stdin-json: ""
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### with the flag FIRST the two reads agree, so nothing anchors at the newline
+## argv: sed -n -z -e '/a$/Mp' z1
+## file-json z1: "a\nb\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+# `newline_anchor` moves `^`/`$` and nothing else, so the late flag comes apart
+# at the BUFFER anchors -- where sed's two callers already disagree. In a
+# substitution `\`' and `\'' follow the segment alone, so the late flag leaves
+# them exactly where the early one puts them; in an address they are `^'/`$' by
+# another spelling and take the newline with them.
+
+#### a substitution's \` does NOT gain the newline, where its ^ does
+## argv: sed -n -e 's/\`x*/</Mgp' -z
+## stdin-json: "a\nb\u0000c\nd\u0000"
+## stdout-json: "<a\nb\u0000<c\nd\u0000"
+## stderr-json: ""
+## status: 0
+
+#### nor does its \', where its $ does
+## argv: sed -n -e s/x*\\\'/</Mgp -z
+## stdin-json: "a\nb\u0000c\nd\u0000"
+## stdout-json: "a\nb<\u0000c\nd<\u0000"
+## stderr-json: ""
+## status: 0
+
+#### but an ADDRESS's \` does, being ^ by another spelling there
+## argv: sed -n -e '/\`b/Mp' -z
+## stdin-json: "a\nb\u0000c\nd\u0000"
+## stdout-json: "a\nb\u0000"
+## stderr-json: ""
+## status: 0
+
+#### and so does its \'
+## argv: sed -n -e /a\\\'/Mp -z
+## stdin-json: "a\nb\u0000c\nd\u0000"
+## stdout-json: "a\nb\u0000"
+## stderr-json: ""
+## status: 0
+
+# The two shapes the compile-time read never reaches, and the two rules the
+# late flag must not move.
+
+#### a lone ^ is GNU's begline case, matched by hand from the RUN's delimiter
+# `compile_regex_1' marks a pattern that is EXACTLY `^' or `$' as
+# begline/endline (regexp.c:139-144), and `match_regexp' then answers it
+# without the compiled pattern at all (regexp.c:215-278) -- so `newline_anchor'
+# never consulted and the late flag reads like the early one.
 ## argv: sed -e 's/^/>/Mg' -z
 ## stdin-json: "a\nb\u0000"
 ## stdout-json: ">a\nb\u0000"
@@ -4449,19 +4540,276 @@ sed: couldn't open file /nosuchdir/out: No such file or directory
 ## stderr-json: ""
 ## status: 0
 
-#### the compile half, which td-txt does not model: xfail with GNU's golden
-## argv: sed -n -e '/a$/Mp' -z z1
-## file-json z1: "a\nb\n"
-## stdin-json: ""
-## stdout-json: "a\nb\n"
+#### and an ESCAPED lone ^ is a lone ^ too, the test being on the DECODED text
+# `normalize_text' decodes `\x'/`\o'/`\d' BEFORE `compile_regex_1' runs
+# (regexp.c:168-170), so the `sz == 1' test above sees one byte here. Reading
+# the RAW pattern instead leaves this four bytes long and anchors it at the
+# newline as well -- which is what it did until this was measured.
+## argv: sed -n -e 's/\x5e/>/Mgp' -z
+## stdin-json: "a\nb\u0000c\nd\u0000"
+## stdout-json: ">a\nb\u0000>c\nd\u0000"
 ## stderr-json: ""
 ## status: 0
 
-#### with the flag FIRST the two halves agree, so this one passes
-## argv: sed -n -z -e '/a$/Mp' z1
-## file-json z1: "a\nb\n"
-## stdin-json: ""
+#### the octal spelling likewise
+## argv: sed -n -e 's/\o136/>/Mgp' -z
+## stdin-json: "a\nb\u0000c\nd\u0000"
+## stdout-json: ">a\nb\u0000>c\nd\u0000"
+## stderr-json: ""
+## status: 0
+
+#### and the decimal one, on the end anchor
+## argv: sed -n -e 's/\d036/</Mgp' -z
+## stdin-json: "a\nb\u0000c\nd\u0000"
+## stdout-json: "a\nb<\u0000c\nd<\u0000"
+## stderr-json: ""
+## status: 0
+
+#### while a DECODED pattern of two bytes is not the exception, and anchors on both
+# The control that keeps the rule about the decoded LENGTH rather than about
+# the escape: `\x5ea' decodes to `^a', which is two bytes and so compiled.
+## argv: sed -n -e 's/\x5ea/>/Mgp' -z
+## stdin-json: "a\nb\u0000c\nd\u0000"
+## stdout-json: ">\nb\u0000"
+## stderr-json: ""
+## status: 0
+
+#### the SEGMENT stays the run's, so a substitution still may not cross the NUL
+# Only the ANCHOR is doubled. What a match may consume is the run's delimiter
+# whichever side of the script the flag falls.
+## argv: sed -n -e 's/b.c/X/Mg' -e p -z
+## stdin-json: "a\nb\u0000c\nd\u0000"
+## stdout-json: "a\nb\u0000c\nd\u0000"
+## stderr-json: ""
+## status: 0
+
+#### and REG_NEWLINE's exclusion half stays bound to the newline
+# `.' loses the newline because `M' was given, not because of any delimiter,
+# so this answer is the same wherever the flag falls.
+## argv: sed -n -e 's/a.b/X/Mg' -e p -z
+## stdin-json: "a\nb\u0000c\nd\u0000"
+## stdout-json: "a\nb\u0000c\nd\u0000"
+## stderr-json: ""
+## status: 0
+
+# The other half of the compile-time read, and the one that makes "anchors on
+# both" the wrong summary on its own. `dfasyntax' takes its end-of-line from
+# the delimiter too (regexp.c:130), so in this state the dfa GNU FILTERS with
+# knows the newline and not the NUL -- and a buffer it rejects is no match at
+# all, even where the NUL anchor would have matched. So the late flag can
+# match LESS than the early one as well as more.
+#
+# It runs only at `buf_start_offset == 0' (regexp.c:280), so one verdict
+# covers the whole buffer and a `g' loop's later searches are not filtered.
+# Nothing without a NUL in the PATTERN SPACE can reach it -- the two readings
+# then name the same positions -- which is why every case here joins with `N'.
+
+#### both anchors fire in one buffer: the newline's b and the NUL's c
+## argv: sed -n -e 'N;s/^[bc]/</Mgp' -z
+## stdin-json: "a\nb\u0000c\u0000"
+## stdout-json: "a\n<\u0000<\u0000"
+## stderr-json: ""
+## status: 0
+
+#### where the flag first leaves only the NUL's
+## argv: sed -n -z -e 'N;s/^[bc]/</Mgp'
+## stdin-json: "a\nb\u0000c\u0000"
+## stdout-json: "a\nb\u0000<\u0000"
+## stderr-json: ""
+## status: 0
+
+#### and the veto: no c follows a newline, so the NUL anchor never fires
+# The counter-intuitive half. `^c' has a match under the RUN's reading -- the
+# case below finds it -- but none under the COMPILE's, and the filter is
+# built from the compile's.
+## argv: sed -n -e 'N;s/^c/</Mgp' -z
+## stdin-json: "a\nb\u0000c\u0000"
 ## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### the same script with the flag FIRST matches, which is the sharp contrast
+## argv: sed -n -z -e 'N;s/^c/</Mgp'
+## stdin-json: "a\nb\u0000c\u0000"
+## stdout-json: "a\nb\u0000<\u0000"
+## stderr-json: ""
+## status: 0
+
+#### a b before a newline passes the filter, so this one substitutes
+## argv: sed -e 'N;s/b$/</Mg' -z
+## stdin-json: "\na\u0000b\n\u0000"
+## stdout-json: "\na\u0000<\n\u0000"
+## stderr-json: ""
+## status: 0
+
+#### while the a beside it is before a NUL, and the filter rejects the buffer
+## argv: sed -e 'N;s/a$/</Mg' -z
+## stdin-json: "\na\u0000b\n\u0000"
+## stdout-json: "\na\u0000b\n\u0000"
+## stderr-json: ""
+## status: 0
+
+#### the same, with the flag first: no filter to disagree, so the NUL anchors
+## argv: sed -z -e 'N;s/a$/</Mg'
+## stdin-json: "\na\u0000b\n\u0000"
+## stdout-json: "\n<\u0000b\n\u0000"
+## stderr-json: ""
+## status: 0
+
+#### the filter reads as an ADDRESS, whatever asked it
+# A dfa knows lines. Neither the segment a substitution may not cross nor the
+# buffer identity that makes `\`' more than `^' is anything it models, so
+# filtering a substitution AS one would reject this, which GNU rewrites: the
+# `\`' would be pinned to byte 0, where `.' under `M' cannot take the newline.
+## argv: sed -e 'N;s/\`./</M' -z
+## stdin-json: "\na\u0000b\n\u0000"
+## stdout-json: "\na\u0000<\n\u0000"
+## stderr-json: ""
+## status: 0
+
+#### and the flag first gives the same answer, there being no filter at all
+## argv: sed -z -e 'N;s/\`./</M'
+## stdin-json: "\na\u0000b\n\u0000"
+## stdout-json: "\na\u0000<\n\u0000"
+## stderr-json: ""
+## status: 0
+
+# A BACKREFERENCE changes both halves, and not in the same way. GNU hands such
+# a pattern to glibc's backref matcher, which sees one segment and its true
+# ends -- so an address's `\`'/`\'' stop moving with `M', exactly as a
+# substitution's already do. The FILTER still runs, though: a dfa cannot
+# enforce a backreference, so it reads one as a single NULLABLE position under
+# NO constraint (lib/dfa.c:2285,2796) and filters with that. `dfaexec's
+# `backref' flag says only that a HIT needs verifying; a MISS still returns 0.
+# Both simpler answers are wrong in a measurable direction, and the two cases
+# below the anchor pair are what say so.
+
+#### a backreference stops an address's \` moving with M, even without -z
+# Nothing about `-z' here: the confinement is the backref's, and with no `-z'
+# there is no segment at all, so the anchor stops moving entirely.
+## argv: sed -n -e 'N;/\`b\(c\)\1/Mp'
+## stdin-json: "a\nbcc\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### where the same shape without one matches
+## argv: sed -n -e 'N;/\`bcc/Mp'
+## stdin-json: "a\nbcc\n"
+## stdout-json: "a\nbcc\n"
+## stderr-json: ""
+## status: 0
+
+#### and the same for \', the other buffer anchor
+## argv: sed -n -e N;/\\(b\\)\\1\\\'/Mp
+## stdin-json: "abb\nc\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### which its own control matches
+## argv: sed -n -e N;/abb\\\'/Mp
+## stdin-json: "abb\nc\n"
+## stdout-json: "abb\nc\n"
+## stderr-json: ""
+## status: 0
+
+#### the backreference is APPROXIMATED, so this passes the filter and matches
+# Filtering with the backreference ENFORCED would reject here: `\1*' can take
+# nothing that keeps `$' on a newline. Read as the dfa reads it -- any byte,
+# nullable -- the buffer passes, and the segment-confined `\`' then finds the
+# `b' after the NUL.
+## argv: sed -n -e 'N;/\`\(.\)\1*$/Mp' -z
+## stdin-json: "\na\u0000b\n\u0000"
+## stdout-json: "\na\u0000b\n\u0000"
+## stderr-json: ""
+## status: 0
+
+#### while the backref-free shape beside it is filtered out
+# `\`' moves to the newline here, but no byte before a newline can start the
+# match, so the filter rejects the buffer and the segment anchor never fires.
+## argv: sed -n -e 'N;/\`\(.\)$/Mp' -z
+## stdin-json: "\na\u0000b\n\u0000"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### the same divide with ^ and $, where the filter is the whole of it
+## argv: sed -e 'N;s/^\(.\)\1*$/</Mg' -z
+## stdin-json: "\na\u0000b\n\u0000"
+## stdout-json: "\n<\u0000<\n\u0000"
+## stderr-json: ""
+## status: 0
+
+#### and without the backreference the filter rejects the buffer
+## argv: sed -e 'N;s/^\(.\)$/</Mg' -z
+## stdin-json: "\na\u0000b\n\u0000"
+## stdout-json: "\na\u0000b\n\u0000"
+## stderr-json: ""
+## status: 0
+
+#### but a MISS under that reading still rejects, so a backref is not exempt
+# The other direction, and the one that says the filter is not simply off for
+# a backreference: no `c' follows a newline, so nothing the dfa's reading can
+# match starts one, and the buffer is rejected whatever `\1' would have done.
+## argv: sed -n -e 'N;/^c\(x\)\1/Mp' -z
+## stdin-json: "a\nb\u0000cxx\u0000"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### where the flag first has no filter at all, and the same script matches
+## argv: sed -n -z -e 'N;/^c\(x\)\1/Mp'
+## stdin-json: "a\nb\u0000cxx\u0000"
+## stdout-json: "a\nb\u0000cxx\u0000"
+## stderr-json: ""
+## status: 0
+
+# A THIRD read of the delimiter, and the one that is not about placement at
+# all. An ADDRESS compiles with `needed_sub == 0' (compile.c:927) and so with
+# `RE_NO_SUB' (regexp.c:87); the first use that wants REGISTERS -- which is
+# only an `s//…/' reusing it -- frees the pattern and the dfa and compiles it
+# again (regexp.c:198-211). That second compile happens at RUN time, so both
+# halves of `-z' agree for it however the flag was placed. And it MUTATES the
+# regex, so every later use of that same address reads what the rebuild read.
+
+#### an address regex reused by s// is RECOMPILED, so it reads the RUN's -z
+## argv: sed -n -e 'N;/^b/Mp' -z -e 's//X/p'
+## stdin-json: "a\nb\u0000b\u0000"
+## stdout-json: "a\nb\u0000b\u0000a\nb\u0000X\u0000"
+## stderr-json: ""
+## status: 0
+
+#### the same with the two commands in ONE part, which changes nothing
+## argv: sed -n -e 'N;/^b/Mp;s//X/p' -z
+## stdin-json: "a\nb\u0000b\u0000"
+## stdout-json: "a\nb\u0000b\u0000a\nb\u0000X\u0000"
+## stderr-json: ""
+## status: 0
+
+#### and the flag FIRST gives the same answer, there being nothing to recompile
+## argv: sed -n -z -e 'N;/^b/Mp' -e 's//X/p'
+## stdin-json: "a\nb\u0000b\u0000"
+## stdout-json: "a\nb\u0000b\u0000a\nb\u0000X\u0000"
+## stderr-json: ""
+## status: 0
+
+#### the recompile PERSISTS, so the ADDRESS reads the run's -z from then on
+# Two records each; the address matches both under the part's reading and only
+# the first under the run's. GNU prints one, so the second cycle's address is
+# reading what the first cycle's `s//' rebuilt.
+## argv: sed -n -e 'N;/^b/Mp;s//&/' -z
+## stdin-json: "a\nb\u0000c\u0000a\nb\u0000c\u0000"
+## stdout-json: "a\nb\u0000c\u0000"
+## stderr-json: ""
+## status: 0
+
+#### but an s command's OWN regex wants registers already, so it is not rebuilt
+# The control that keeps the rule about `RE_NO_SUB' rather than about reuse:
+# this `s//' reuses a regex compiled by an `s', which GNU never recompiles.
+## argv: sed -n -e 'N;s/^b/X/Mp' -z -e 's//Y/p'
+## stdin-json: "a\nb\u0000b\u0000"
+## stdout-json: "a\nX\u0000b\u0000"
 ## stderr-json: ""
 ## status: 0
 

@@ -130,7 +130,55 @@ pub struct Options {
     /// So under `-z` a `\n` inside a record stays ordinary to `\W` while the NUL is
     /// unmatchable by `s///` and ordinary to an address, and `s/^d/X/M` does not
     /// match after a `\n`.
-    pub reg_newline: Option<u8>,
+    pub reg_newline: Option<Anchor>,
+    /// GNU's `RE_NO_SUB` (sed/regexp.c:87), which an ADDRESS gets because it
+    /// compiles with `needed_sub == 0` (compile.c:927). It is not a matching
+    /// rule: it is what makes GNU RECOMPILE the pattern on the first use that
+    /// wants registers. See `Regex::search_subst_recompiled`.
+    pub no_sub: bool,
+}
+
+/// Where `M` puts `^` and `$`. Two bytes rather than one, because GNU reads
+/// sed's record delimiter TWICE and at different times: glibc's
+/// `newline_anchor` is set from the delimiter as it stood when the part was
+/// COMPILED (sed/regexp.c:101), while the segment split that stands in for it
+/// once the delimiter is not a newline is chosen from the delimiter in force
+/// when the regex RUNS (regexp.c:303).
+///
+/// Those are the same byte unless `-z` FOLLOWS the `-e` it applies to, and
+/// then a pattern anchors on both: `sed -n -e 's/^/>/Mgp' -z` marks the start
+/// of every NUL record AND of every line inside one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Anchor {
+    /// The delimiter the RUN splits on, which is also what confines a
+    /// substitution (`Regex::segment`).
+    pub sep: u8,
+    /// glibc's `newline_anchor`: `buffer_delimiter == '\n'` at COMPILE time.
+    pub newline_anchor: bool,
+}
+
+impl Anchor {
+    fn holds(self, b: u8) -> bool {
+        b == self.sep || (self.newline_anchor && b == b'\n')
+    }
+}
+
+/// How ONE scan reads positions. Normally what the pattern compiled to, but
+/// GNU's dfa prefilter is a scan of the SAME pattern under a different reading,
+/// so this is a parameter of the scan rather than a property of the `Regex`.
+#[derive(Clone, Copy)]
+struct Reading {
+    reg_newline: Option<Anchor>,
+    /// What a substitution may not consume, and what moves its buffer anchors.
+    segment: Option<u8>,
+    /// Is this a SUBSTITUTION? See `Regex::search_subst`.
+    subst: bool,
+    /// Read a backreference as GNU's dfa does rather than as the pattern means
+    /// it: one NULLABLE position matching any byte under no constraint
+    /// (lib/dfa.c:2285,2796). Only the prefilter sets it -- see
+    /// `Regex::veto_reading` for why filtering with the exact backreference is
+    /// wrong in one direction and not filtering at all is wrong in the other.
+    approx_backref: bool,
 }
 
 /// A 256-bit byte set.
@@ -259,10 +307,12 @@ pub struct Regex {
     /// so sed's `s` path has to compile first and refuse afterwards. `compile`
     /// still refuses for every caller that has nothing to run in between.
     pub class_syntax: bool,
+    /// See `Options::no_sub`.
+    pub no_sub: bool,
     root: Node,
     ngroups: usize,
     icase: bool,
-    reg_newline: Option<u8>,
+    reg_newline: Option<Anchor>,
     /// The record separator when it is not a newline, i.e. when GNU works in
     /// SEGMENTS. It moves `\`` and `\'` (both match paths) and is what nothing may
     /// consume in a substitution. See `Options::reg_newline`.
@@ -1348,11 +1398,14 @@ impl Regex {
         let has_backref = has_backref(&root);
         Ok(Self {
             class_syntax: p.class_syntax,
+            no_sub: opts.no_sub,
             root,
             ngroups: p.ngroups,
             icase: opts.icase,
             reg_newline: opts.reg_newline,
-            segment: opts.reg_newline.filter(|sep| *sep != b'\n'),
+            // The RUN's delimiter, which is the one the split is on -- a part
+            // compiled before `-z` still runs in NUL segments.
+            segment: opts.reg_newline.map(|a| a.sep).filter(|sep| *sep != b'\n'),
             first,
             has_alt,
             has_backref,
@@ -1378,6 +1431,29 @@ impl Regex {
     /// of the CALL, not of the compiled pattern.
     pub fn search_subst(&self, hay: &[u8], from: usize) -> Result<Option<Captures>, Error> {
         self.scan(hay, from, None, OnBudget::Fail, true)
+    }
+
+    /// As `search_subst`, for a regex GNU would RECOMPILE before this call.
+    ///
+    /// An ADDRESS regex compiles with `RE_NO_SUB` (sed/regexp.c:87, from
+    /// `needed_sub == 0` at compile.c:927), and the first use that wants
+    /// registers -- which is only `s//…/` reusing one -- frees the pattern and
+    /// the dfa and compiles it again (regexp.c:198-211). That second compile
+    /// reads `buffer_delimiter` as it stands at RUN time, so BOTH halves of the
+    /// flag agree there: `newline_anchor` follows the separator, and the filter
+    /// built from the same byte has nothing left to disagree with.
+    pub fn search_subst_recompiled(
+        &self,
+        hay: &[u8],
+        from: usize,
+    ) -> Result<Option<Captures>, Error> {
+        let reading = Reading {
+            reg_newline: self
+                .reg_newline
+                .map(|a| Anchor { sep: a.sep, newline_anchor: a.sep == b'\n' }),
+            ..self.reading(true)
+        };
+        self.scan_reading(hay, from, None, OnBudget::Fail, reading)
     }
 
     /// As `search`, but a budget exhausted with a match in hand answers with that
@@ -1427,14 +1503,79 @@ impl Regex {
         on_budget: OnBudget,
         subst: bool,
     ) -> Result<Option<Captures>, Error> {
-        match self.scan_once(hay, from, filter, on_budget, subst) {
+        self.scan_reading(hay, from, filter, on_budget, self.reading(subst))
+    }
+
+    /// `scan` under an explicit reading, which is what lets a recompiled regex
+    /// be scanned without a second compiled copy of it.
+    fn scan_reading(
+        &self,
+        hay: &[u8],
+        from: usize,
+        filter: Option<&Filter<'_>>,
+        on_budget: OnBudget,
+        reading: Reading,
+    ) -> Result<Option<Captures>, Error> {
+        // GNU's dfa prefilter. `dfasyntax` takes its end-of-line from the
+        // delimiter as it stood at COMPILE time (sed/regexp.c:130), so where
+        // that differs from the run's the dfa knows the newline and not the
+        // NUL -- and a buffer it rejects is no match AT ALL, even where the
+        // NUL anchor would have matched. `veto_reading` is that reading; GNU
+        // runs it only at `buf_start_offset == 0` (regexp.c:280), and so a `g`
+        // loop's later searches are unfiltered.
+        if from == 0 {
+            if let Some(veto) = self.veto_reading(reading) {
+                // A filter that could not DECIDE must not reject: GNU's dfa is
+                // linear and always answers, so an exhausted budget here is an
+                // artefact of filtering with a backtracker rather than an
+                // answer about the pattern.
+                if let Ok(None) = self.scan_once(hay, 0, None, OnBudget::Existence, veto) {
+                    return Ok(None);
+                }
+            }
+        }
+        match self.scan_once(hay, from, filter, on_budget, reading) {
             Err(e) => match on_budget == OnBudget::Fail && !self.has_alt {
                 // One retry, so the worst case stays a bounded multiple of the budget.
-                true => self.scan_once(hay, from, filter, OnBudget::Existence, subst),
+                true => self.scan_once(hay, from, filter, OnBudget::Existence, reading),
                 false => Err(e),
             },
             found => found,
         }
+    }
+
+    fn reading(&self, subst: bool) -> Reading {
+        Reading {
+            reg_newline: self.reg_newline,
+            segment: self.segment,
+            subst,
+            approx_backref: false,
+        }
+    }
+
+    /// The prefilter's reading, when there is one to disagree with: the compiled
+    /// newline alone, and no segment, which is all the dfa was built to know.
+    ///
+    /// A BACKREFERENCE is APPROXIMATED rather than enforced or skipped, and
+    /// both of the simpler answers are wrong in a measurable direction.
+    /// Filtering with the exact backreference rejects where GNU accepts --
+    /// `N;s/^\(.\)\1*$/</Mg` over `\na\0b\n` rewrites both bytes there. Not
+    /// filtering at all accepts where GNU rejects: `dfaexec`'s `backref` flag
+    /// only says a HIT needs verifying, so a MISS still returns 0, and
+    /// `N;/^c\(x\)\1/Mp` over `a\nb\0cxx` prints nothing in GNU. So the pass
+    /// reads a backreference as the dfa does -- see `Reading::approx_backref`.
+    fn veto_reading(&self, reading: Reading) -> Option<Reading> {
+        let a = reading.reg_newline?;
+        // `segment` is not READ on this path -- `consumable` and `buf_anchor`
+        // both consult it only for a substitution or a backreference, and the
+        // pass is neither -- so `None` states the intent rather than an
+        // observable, and no case can pin it.
+        (a.newline_anchor && a.sep != b'\n').then_some(Reading {
+            reg_newline: Some(Anchor { sep: b'\n', newline_anchor: true }),
+            segment: None,
+            subst: false,
+            approx_backref: true,
+        })
     }
 
     /// Advance the start position until `match_from` reports a match. One step
@@ -1446,7 +1587,7 @@ impl Regex {
         from: usize,
         filter: Option<&Filter<'_>>,
         on_budget: OnBudget,
-        subst: bool,
+        reading: Reading,
     ) -> Result<Option<Captures>, Error> {
         let mut steps = 0u64;
         let mut at = from;
@@ -1467,7 +1608,9 @@ impl Regex {
             // rediscover spans the word test then throws away.
             skippable = skippable || filter.is_some_and(|f| !(f.start)(at));
             if !skippable {
-                if let Some(caps) = self.match_from(hay, at, &mut steps, filter, on_budget, subst)? {
+                if let Some(caps) =
+                    self.match_from(hay, at, &mut steps, filter, on_budget, reading)?
+                {
                     return Ok(Some(caps));
                 }
             }
@@ -1485,13 +1628,26 @@ impl Regex {
         Ok(self.search_existence(hay, 0)?.is_some())
     }
 
+    /// `is_match` for a regex GNU has already RECOMPILED -- see
+    /// `search_subst_recompiled`. The recompile MUTATES the object, so every
+    /// later use reads the run's delimiter, an address's included.
+    pub fn is_match_recompiled(&self, hay: &[u8]) -> Result<bool, Error> {
+        let reading = Reading {
+            reg_newline: self
+                .reg_newline
+                .map(|a| Anchor { sep: a.sep, newline_anchor: a.sep == b'\n' }),
+            ..self.reading(false)
+        };
+        Ok(self.scan_reading(hay, 0, None, OnBudget::Existence, reading)?.is_some())
+    }
+
     /// Does some match cover `hay` exactly? Used by `grep -x`, which cannot be
     /// expressed by wrapping the pattern in `^\(…\)$` without renumbering the
     /// backreferences. Explores the whole space, so a match reaching the end is
     /// seen even when a greedier one does not.
     pub fn matches_whole(&self, hay: &[u8]) -> Result<bool, Error> {
         let mut steps = 0u64;
-        match self.match_from(hay, 0, &mut steps, None, OnBudget::Fail, false)? {
+        match self.match_from(hay, 0, &mut steps, None, OnBudget::Fail, self.reading(false))? {
             Some(caps) => Ok(caps.end() == hay.len()),
             None => Ok(false),
         }
@@ -1521,15 +1677,19 @@ impl Regex {
         steps: &mut u64,
         filter: Option<&Filter<'_>>,
         on_budget: OnBudget,
-        subst: bool,
+        reading: Reading,
     ) -> Result<Option<Captures>, Error> {
         let mut st = State {
             hay,
             icase: self.icase,
-            reg_newline: self.reg_newline,
-            segment: self.segment,
-            subst,
-            has_backref: self.has_backref,
+            reg_newline: reading.reg_newline,
+            segment: reading.segment,
+            subst: reading.subst,
+            // Reading a backreference as the dfa does means reading it as no
+            // backreference at all, so the confinement one brings with it
+            // (`consumable`, `buf_anchor`) is not this scan's either.
+            has_backref: self.has_backref && !reading.approx_backref,
+            approx_backref: reading.approx_backref,
             caps: vec![None; self.ngroups + 1],
             best: None,
             steps: *steps,
@@ -1635,7 +1795,7 @@ fn first_bytes(node: &Node) -> Option<ByteSet> {
 struct State<'a> {
     hay: &'a [u8],
     icase: bool,
-    reg_newline: Option<u8>,
+    reg_newline: Option<Anchor>,
     /// Compile-time: the record separator, when it is not a newline. This is the
     /// half of `M` libc cannot express, so GNU splits on it itself.
     segment: Option<u8>,
@@ -1645,6 +1805,9 @@ struct State<'a> {
     subst: bool,
     /// See `Regex::has_backref`: it confines an address as a substitution already is.
     has_backref: bool,
+    /// See `Reading::approx_backref`: the prefilter reads a backreference as the
+    /// dfa does, which is not what the pattern means.
+    approx_backref: bool,
     caps: Spans,
     /// The longest match seen so far and where it ended.
     best: Option<(Spans, usize)>,
@@ -1668,13 +1831,16 @@ impl State<'_> {
 
     fn at_bol(&self, pos: usize) -> bool {
         pos == 0
-            || self
-                .reg_newline
-                .is_some_and(|sep| self.byte(pos.wrapping_sub(1)) == Some(sep))
+            || self.reg_newline.is_some_and(|a| {
+                self.byte(pos.wrapping_sub(1)).is_some_and(|b| a.holds(b))
+            })
     }
 
     fn at_eol(&self, pos: usize) -> bool {
-        pos == self.hay.len() || self.reg_newline.is_some_and(|sep| self.byte(pos) == Some(sep))
+        pos == self.hay.len()
+            || self
+                .reg_newline
+                .is_some_and(|a| self.byte(pos).is_some_and(|b| a.holds(b)))
     }
 
     /// Which separator moves ``\` `` and `\'`, which is not the same for both callers.
@@ -1682,20 +1848,36 @@ impl State<'_> {
     /// separator with them. In a SUBSTITUTION only a segment moves them: `sed -n
     /// 'N;s/\`a/X/Mg'` over `a\na` rewrites only the first `a`, where `/\`a/M`
     /// matches at both, so REG_NEWLINE alone leaves them at the buffer's real ends.
-    fn buf_anchor(&self) -> Option<u8> {
-        match self.subst {
-            true => self.segment,
+    /// A substitution takes the SEGMENT alone -- never the compile-time newline,
+    /// which is glibc's `newline_anchor` and moves only `^`/`$`. So `-z` after
+    /// the `-e` splits the two apart: `s/\`x*/</Mg` marks each record where
+    /// `s/^x*/</Mg` marks each record AND each line.
+    ///
+    /// A BACKREFERENCE puts an address on that side too, and it is the same
+    /// condition `consumable` uses rather than a second rule: GNU hands such a
+    /// pattern to glibc's backref matcher, which sees one segment and its true
+    /// ends. Without `-z` there is no segment at all, so the anchors stop
+    /// moving entirely -- `N;/\`b\(c\)\1/Mp` over `a\nbcc` finds nothing where
+    /// the backref-free `N;/\`bcc/Mp` matches.
+    fn buf_anchor(&self) -> Option<Anchor> {
+        match self.subst || self.has_backref {
+            true => self.segment.map(|sep| Anchor { sep, newline_anchor: false }),
             false => self.reg_newline,
         }
     }
 
     fn at_buf_start(&self, pos: usize) -> bool {
         pos == 0
-            || self.buf_anchor().is_some_and(|sep| self.byte(pos.wrapping_sub(1)) == Some(sep))
+            || self.buf_anchor().is_some_and(|a| {
+                self.byte(pos.wrapping_sub(1)).is_some_and(|b| a.holds(b))
+            })
     }
 
     fn at_buf_end(&self, pos: usize) -> bool {
-        pos == self.hay.len() || self.buf_anchor().is_some_and(|sep| self.byte(pos) == Some(sep))
+        pos == self.hay.len()
+            || self
+                .buf_anchor()
+                .is_some_and(|a| self.byte(pos).is_some_and(|b| a.holds(b)))
     }
 
     fn word_at(&self, pos: usize) -> bool {
@@ -1810,6 +1992,12 @@ fn m(st: &mut State, node: &Node, pos: usize, k: &mut dyn FnMut(&mut State, usiz
             stop
         }
         Node::Backref(n) => {
+            if st.approx_backref {
+                // Nullable, and any byte: the dfa cannot carry a captured group
+                // forward, so it admits both. A group that did not participate
+                // is not special here either, for the same reason.
+                return k(st, pos) || (pos < st.hay.len() && k(st, pos + 1));
+            }
             let Some((s, e)) = st.caps.get(*n).copied().flatten() else {
                 // A group that did not PARTICIPATE has no text, and GNU makes the
                 // reference fail rather than match the empty string it has no claim
@@ -1989,6 +2177,13 @@ fn m_repeat(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `M` where the two readings of the delimiter agree, which is every
+    /// invocation but one: `-z` placed after the `-e` it applies to. That one
+    /// has its own test.
+    fn m(sep: u8) -> Option<Anchor> {
+        Some(Anchor { sep, newline_anchor: sep == b'\n' })
+    }
 
     fn bre(pat: &str) -> Regex {
         Regex::compile(pat.as_bytes(), Options::default()).unwrap()
@@ -2385,7 +2580,7 @@ mod tests {
     /// and a NON-MATCHING bracket list stop at a separator.
     #[test]
     fn reg_newline_keeps_dot_and_negated_lists_off_the_newline() {
-        let opts = Options { reg_newline: Some(b'\n'), ..Options::default() };
+        let opts = Options { reg_newline: m(b'\n'), ..Options::default() };
         let dot = Regex::compile(b"c.d", opts).unwrap();
         assert!(dot.search(b"abc\ndef", 0).unwrap().is_none());
         let neg = Regex::compile(b"[^abc]", opts).unwrap();
@@ -2410,7 +2605,7 @@ mod tests {
     /// the anchor half takes the separator ALONE, the exclusion half takes both.
     #[test]
     fn reg_newline_anchors_on_the_separator_but_excludes_the_newline_too() {
-        let nul = Options { reg_newline: Some(0), ..Options::default() };
+        let nul = Options { reg_newline: m(0), ..Options::default() };
         // Anchors at the NUL, for EITHER caller...
         assert!(Regex::compile(b"^b", nul).unwrap().search(b"a\0b", 0).unwrap().is_some());
         assert!(Regex::compile(b"^b", nul).unwrap().search_subst(b"a\0b", 0).unwrap().is_some());
@@ -2431,13 +2626,68 @@ mod tests {
         assert!(Regex::compile(b"^b", plain).unwrap().search(b"a\0b", 0).unwrap().is_none());
     }
 
+    /// `newline_anchor` set while the separator is a NUL -- sed's `-z` placed
+    /// after the `-e` it applies to, where GNU compiled the part against a
+    /// newline delimiter and runs it against a NUL one.
+    ///
+    /// TWO rules, and the second is why this is not simply "more anchors".
+    /// `^`/`$` hold at both bytes; but a buffer the pattern cannot match under
+    /// the COMPILE-time reading ALONE is no match at all, because the dfa GNU
+    /// filters with was built from that delimiter. So the late flag can match
+    /// LESS than the early one as well as more.
+    #[test]
+    fn a_newline_anchor_over_a_nul_separator_holds_at_both_bytes() {
+        let both = Options {
+            reg_newline: Some(Anchor { sep: 0, newline_anchor: true }),
+            ..Options::default()
+        };
+        let nul = Options { reg_newline: m(0), ..Options::default() };
+        // `N` under `-z` joins two records, one of which holds a newline -- so
+        // one buffer carries both bytes and the pair is observable in it.
+        let hay = &b"a\nb\0c"[..];
+        let at = |o, pat: &[u8], from| {
+            Regex::compile(pat, o).unwrap().search(hay, from).unwrap().map(|c| c.start())
+        };
+        // The newline anchors `b`, the NUL anchors `c`, under ONE pattern.
+        assert_eq!(at(both, b"^[bc]", 0), Some(2));
+        assert_eq!(at(both, b"^[bc]", 3), Some(4), "the veto is not re-run past 0");
+        // The NUL-only reading has the second alone.
+        assert_eq!(at(nul, b"^[bc]", 0), Some(4));
+        // The veto: `c` follows no newline, so the compile-time reading finds
+        // nothing and the NUL anchor never gets to fire -- where the NUL-only
+        // reading, which has no dfa to disagree with, matches.
+        assert_eq!(at(both, b"^c", 0), None);
+        assert_eq!(at(nul, b"^c", 0), Some(4));
+        // The BUFFER anchors take the segment alone in a substitution, so the
+        // compiled newline does not reach them -- while an address has them as
+        // `^`/`$` by another spelling and does.
+        assert!(Regex::compile(b"\\`d", both).unwrap().search(b"abc\ndef", 0).unwrap().is_some());
+        assert!(Regex::compile(b"\\`d", both).unwrap().search_subst(b"abc\ndef", 0).unwrap()
+            .is_none());
+        // The exclusion half was never about the separator, so it is unmoved.
+        assert!(Regex::compile(b"c.d", both).unwrap().search(b"abc\ndef", 0).unwrap().is_none());
+        // And the segment is still what a substitution may not consume.
+        assert!(Regex::compile(b"a.b", both).unwrap().search_subst(b"a\0b", 0).unwrap().is_none());
+        // A BACKREFERENCE is filtered too, with the reference APPROXIMATED as
+        // the dfa approximates it. Enforced, `\1*` could take nothing that
+        // keeps `$` on a newline and the first would be rejected; unfiltered,
+        // the second would be accepted. Neither simpler answer gives both.
+        let br = &b"\na\0b\n"[..];
+        assert!(Regex::compile(b"^\\(.\\)\\1*$", both).unwrap().search(br, 0).unwrap().is_some());
+        assert!(Regex::compile(b"^c\\(x\\)\\1", both).unwrap()
+            .search(b"a\nb\0cxx", 0).unwrap().is_none());
+        // ...and with no filter to disagree, the same pattern matches.
+        assert!(Regex::compile(b"^c\\(x\\)\\1", nul).unwrap()
+            .search(b"a\nb\0cxx", 0).unwrap().is_some());
+    }
+
     /// A separator that is not a newline confines a SUBSTITUTION to the segments
     /// between them, so nothing consumes one there — while the same pattern used as
     /// an ADDRESS matches the whole space, and the newline half of the flag (libc's
     /// REG_NEWLINE, touching only `.` and a non-matching list) applies to both.
     #[test]
     fn a_non_newline_separator_is_consumed_by_nothing_in_a_substitution() {
-        let nul = Options { reg_newline: Some(0), ..Options::default() };
+        let nul = Options { reg_newline: m(0), ..Options::default() };
         // Nothing may cover the separator at index 1 in a substitution. The NUL is
         // written raw because sed decodes `\x00` before a pattern reaches this layer;
         // `[\0]` is here for the fast paths' sake, and `\s` because a NUL is not
@@ -2469,7 +2719,7 @@ mod tests {
         assert!(Regex::compile(b"a.b", nul).unwrap().search(b"a\nb", 0).unwrap().is_none());
         assert!(Regex::compile(b"a.b", nul).unwrap().search_subst(b"a\nb", 0).unwrap().is_none());
         // With a NEWLINE separator nothing is confined; REG_NEWLINE alone applies.
-        let opts = Options { reg_newline: Some(b'\n'), ..Options::default() };
+        let opts = Options { reg_newline: m(b'\n'), ..Options::default() };
         let w = Regex::compile(b"\\W", opts).unwrap();
         assert_eq!(w.search(b"a\nb", 0).unwrap().unwrap().start(), 1);
         assert_eq!(w.search_subst(b"a\nb", 0).unwrap().unwrap().start(), 1);
@@ -2480,7 +2730,7 @@ mod tests {
     #[test]
     fn the_buffer_anchors_follow_the_separator_only_where_gnu_moves_them() {
         for (sep, hay) in [(b'\n', &b"a\nb"[..]), (0, b"a\0b")] {
-            let opts = Options { reg_newline: Some(sep), ..Options::default() };
+            let opts = Options { reg_newline: m(sep), ..Options::default() };
             let (open, close) = (Regex::compile(b"\\`b", opts).unwrap(), Regex::compile(b"a\\'", opts).unwrap());
             // An address moves them to the record separator, whatever it is.
             assert!(open.search(hay, 0).unwrap().is_some(), "sep {sep}: address lost \\`");
@@ -2494,7 +2744,7 @@ mod tests {
         // does move: `s/\`a/X/Mg` over `a\na` rewrites one `a`, `s/^a/X/Mg` both.
         let plain = Options::default();
         assert!(Regex::compile(b"\\`b", plain).unwrap().search(b"a\nb", 0).unwrap().is_none());
-        let m = Options { reg_newline: Some(b'\n'), ..Options::default() };
+        let m = Options { reg_newline: m(b'\n'), ..Options::default() };
         assert!(Regex::compile(b"^b", m).unwrap().search_subst(b"a\nb", 0).unwrap().is_some());
     }
 
@@ -2502,7 +2752,7 @@ mod tests {
     /// see `Regex::has_backref`.
     #[test]
     fn a_backreference_confines_the_address_path_as_well() {
-        let nul = Options { reg_newline: Some(0), ..Options::default() };
+        let nul = Options { reg_newline: m(0), ..Options::default() };
         let hay = &b"a\0\0b"[..];
         // Nothing crosses the separator once a backref is in the pattern, whether the
         // backref does the crossing or a literal does.
@@ -2515,7 +2765,7 @@ mod tests {
         assert!(Regex::compile(b"\\(a\\)\0", nul).unwrap().search(hay, 0).unwrap().is_some());
         assert!(Regex::compile(b"\\(b\\)\\1*", nul).unwrap().search(hay, 0).unwrap().is_some());
         // A newline separator has no segment, so a doubled NUL is an ordinary pair.
-        let nl = Options { reg_newline: Some(b'\n'), ..Options::default() };
+        let nl = Options { reg_newline: m(b'\n'), ..Options::default() };
         assert!(Regex::compile(b"\\(.\\)\\1", nl).unwrap().search(hay, 0).unwrap().is_some());
     }
 

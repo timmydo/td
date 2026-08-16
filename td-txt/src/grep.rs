@@ -1541,6 +1541,9 @@ fn compile(conf: &Conf, lines: &[Vec<u8>]) -> Result<Patterns, String> {
         // hold newlines: `grep -z 'a.c'` matches across one and `-z '^c'` does not
         // anchor after one. sed's `M` is the only way into that rule.
         reg_newline: None,
+        // grep has no `s` and no address, so nothing recompiles: this is only
+        // ever sed's question.
+        no_sub: false,
     };
     let mut res = Vec::with_capacity(lines.len());
     let wrapped = conf.whole_line || conf.word;
