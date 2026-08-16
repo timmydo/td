@@ -914,9 +914,15 @@ focus to the band it landed on before running the command; without that,
 pressing a button on an unfocused window would present some other container
 entirely. The button marked in a lit ink is the one the container is already
 in, so the band SAYS which of the three it is as well as offering the other
-two — and each button draws the arrangement rather than a letter, bands down
-for a stack, one divided row over a body for tabs, two tiles for a split.
-A letter would name the chord, and the chords are already on the help sheet.
+two — and each button draws the arrangement rather than a letter: two
+collapsed titles over the window they leave for a stack, one divided row over
+a body for tabs, two tiles for a split. A letter would name the chord, and the
+chords are already on the help sheet. Three EQUAL bars for the stack would be
+a hamburger, which is a menu everywhere else on a screen and says nothing
+about which of the leaves under it is shown; each icon also fills its own
+rectangle top to bottom — the slot inset on all four sides, so the padding
+around it is the same for all three — or one of them reads as a smaller button
+beside its neighbours.
 
 TWO bands carry NO buttons, both for want of ROOM, and the painter and the hit
 test decide it in one place, because a button drawn where nothing answers is a
@@ -1745,14 +1751,20 @@ The landing must prove:
   copy nor an empty one overwriting the container a window arrives into, and
   a workspace emptied of a grouped lone window hands its grouping to neither
   the next window nor the one after. The stack icon is counted as three
-  separate runs of ink at every height a band carries buttons at, since two
-  bars merged would colour the same rows and read as one thicker mark. The
-  press is driven through the runtime, where it both presents the container
-  and takes focus to the band, and leaves NO drag live — verified red with
-  the interception removed and again with the press allowed to fall through
-  to the band — while an ALT press over the same pixels picks the window up
-  instead and runs no command, which is the one contract that rested on a
-  single token no test covered;
+  separate runs of ink at EVERY height a band carries buttons at rather than
+  at a sample of them — the reachable set is the gate's threshold up to a
+  full band, and dividing by a constant other than the gate's own draws
+  three equal bars in the middle of it that a sample misses. Two marks
+  merged would colour the same rows and read as one thicker mark, so the
+  last run is held thicker than the two above it, with ink on the icon's own
+  first and last row and none outside it: a hamburger, an icon sitting short
+  inside its rectangle, and one that overran onto its neighbour each pass
+  the count alone. The press is driven through the runtime, where it both
+  presents the container and takes focus to the band, and leaves NO drag
+  live — verified red with the interception removed and again with the press
+  allowed to fall through to the band — while an ALT press over the same
+  pixels picks the window up instead and runs no command, which is the one
+  contract that rested on a single token no test covered;
 - a tile's five drop zones are proved as a function — each zone by a point,
   the middle ninth by the points just outside it, the nearest edge by a wide
   short tile where pixels and proportion disagree, and a sweep of the whole

@@ -122,9 +122,12 @@ const BUTTON_WIDTH: usize = 16;
 const BUTTON_INSET: usize = 3;
 const BUTTON_INK: [u8; 4] = [0xc8, 0xc0, 0xd0, 0];
 const BUTTON_INK_ON: [u8; 4] = [0x60, 0xd0, 0x60, 0];
-/// Three marks and the two gaps between them, which is the least an icon can
-/// be drawn in — the stack is the tallest of the three and needs every one.
-const BUTTON_ICON_LEAST: usize = 5;
+/// The least height an icon can be drawn in. The stack is the demanding one:
+/// two lines, a gap after each, and the body — five units of a line's own
+/// thickness, of which three are inked. SIX pixels rather than five, because
+/// at five the body comes out as thin as the lines above it and the picture
+/// stops being two titles over a window.
+const BUTTON_ICON_LEAST: usize = 6;
 
 /// What a bare press on a title band landed on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -149,9 +152,9 @@ pub(crate) const BUTTONS: [Presentation; 3] = [
 ];
 
 /// A button's icon: what the container would LOOK like in that presentation,
-/// drawn from the same rectangles the layout would use. A stack is bands down,
-/// tabs are one row divided across with a body under it, and a split is two
-/// tiles side by side. Nothing here is a glyph — a letter would name the chord
+/// drawn from the same rectangles the layout would use. A stack is two
+/// collapsed titles over the window they leave, tabs are one row divided
+/// across with a body under it, and a split is two tiles side by side. Nothing here is a glyph — a letter would name the chord
 /// rather than the arrangement, and the chords are already on the help sheet.
 fn draw_button(
     frame: &mut [u8],
@@ -174,23 +177,35 @@ fn draw_button(
         ui::fill(frame, width, height, stride, (x, y, w, h), ink);
     };
     match shows {
-        // Three bars down, which is a stack's run. Three bars and the two gaps
-        // between them is FIVE of the same thickness, so that is what the
-        // height divides by: dividing by less leaves the third bar wanting the
-        // pixels the gaps took, and the icon that says STACK draws two.
-        // `band_buttons` refuses a band too short to hold all five.
+        // Two collapsed titles and the window under them, which is what a
+        // stack IS: bands in a run and one leaf given the rest. Drawn as two
+        // thin lines over a THICK body rather than three equal bars — three
+        // equal bars is a hamburger, a menu everywhere else, and it says
+        // nothing about which of the three is shown.
+        //
+        // It fills the icon top to bottom, as the other two do. An earlier
+        // form centred a short run inside the icon and left blank rows above
+        // and below, which read as a smaller button beside its neighbours
+        // rather than as a different picture.
         Presentation::Stacked => {
-            let bar = (icon.height / BUTTON_ICON_LEAST).max(1);
-            let span = bar.saturating_mul(BUTTON_ICON_LEAST);
-            let top = icon.y.saturating_add(icon.height.saturating_sub(span) / 2);
-            for row in 0usize..3 {
-                mark(
-                    icon.x,
-                    top.saturating_add(row.saturating_mul(bar.saturating_mul(2))),
-                    icon.width,
-                    bar,
-                );
-            }
+            let line = (icon.height / BUTTON_ICON_LEAST).max(1);
+            let step = line.saturating_mul(2);
+            mark(icon.x, icon.y, icon.width, line);
+            mark(icon.x, icon.y.saturating_add(step), icon.width, line);
+            // Exactly what the two lines and their gaps leave, with no floor
+            // under it. A floor would be the wrong failure: `ui::fill` bounds
+            // a mark to the FRAME rather than to the slot, so a body forced
+            // thicker than the room left would land on the band or on the
+            // neighbouring button. It cannot bind at any height the gate
+            // admits — four units are spent and at least two remain — and
+            // below the gate an unpainted body beats an escaped one.
+            let body = icon.y.saturating_add(step.saturating_mul(2));
+            mark(
+                icon.x,
+                body,
+                icon.width,
+                icon.y.saturating_add(icon.height).saturating_sub(body),
+            );
         }
         // One row divided across, and the body it leaves below.
         Presentation::Tabbed => {
@@ -2839,14 +2854,20 @@ mod tests {
     }
 
     #[test]
-    fn the_stack_button_draws_three_bars_at_every_height_that_carries_one() {
-        // Three bars are the whole of what tells this icon from the other two,
-        // and the arithmetic that draws them has to hold at the band height
-        // the compositor actually uses as well as at the edges. Counting RUNS
-        // of ink down the middle rather than pixels: a bar that merged with
-        // its neighbour would still colour the same rows, and would read as
+    fn the_stack_button_is_two_lines_over_a_thicker_window_and_fills_its_icon() {
+        // Three marks are what tell this icon from the other two, and the
+        // arithmetic has to hold at the band height the compositor actually
+        // uses as well as at the edges. Counted as RUNS of ink rather than
+        // rows: two marks that merged would colour the same rows and read as
         // one thicker mark on screen.
-        for height in [TITLE_HEIGHT, BUTTON_ICON_LEAST + BUTTON_INSET * 2, 40] {
+        // EVERY band height that carries buttons rather than a sample of
+        // three. A band is `min(TITLE_HEIGHT, tile height)`, so the reachable
+        // set is the gate's threshold up to a full band — nine heights — and
+        // a 40 past it, since this arithmetic should not turn over on a band
+        // taller than the one drawn today. Three samples left the middle
+        // uncovered, where dividing by 5 rather than by the gate's own
+        // constant draws three equal bars that pass every assertion below.
+        for height in (BUTTON_ICON_LEAST + BUTTON_INSET * 2..=TITLE_HEIGHT).chain([40]) {
             let slot = Rect {
                 x: 0,
                 y: 0,
@@ -2873,13 +2894,50 @@ mod tests {
                 };
                 count_color(&frame, stride, row, BUTTON_INK) > 0
             };
-            let mut runs = 0;
+            // Thicknesses of each run of ink, top to bottom.
+            let mut runs: Vec<usize> = Vec::new();
             for y in 0..height {
-                if inked(y) && (y == 0 || !inked(y - 1)) {
-                    runs += 1;
+                match (inked(y), y > 0 && inked(y - 1)) {
+                    (true, false) => runs.push(1),
+                    (true, true) => {
+                        if let Some(last) = runs.last_mut() {
+                            *last += 1;
+                        }
+                    }
+                    _ => {}
                 }
             }
-            assert_eq!(runs, 3, "the stack icon is not three bars at {height}");
+            assert_eq!(
+                runs.len(),
+                3,
+                "the stack icon is not three marks at {height}"
+            );
+            // The last is the WINDOW under two collapsed titles, so it is the
+            // thickest — three equal bars would be a hamburger menu and would
+            // say nothing about which leaf a stack shows.
+            let body = runs.last().copied().unwrap();
+            assert!(
+                runs.iter().take(2).all(|thickness| body > *thickness),
+                "the stack icon's body is not thicker than its lines at {height}"
+            );
+            // And it fills the icon rather than sitting short inside it, or it
+            // reads as a smaller button beside its neighbours.
+            let icon = inset(slot, BUTTON_INSET).unwrap();
+            assert!(
+                inked(icon.y),
+                "the icon starts below its own top at {height}"
+            );
+            assert!(
+                inked(icon.y + icon.height - 1),
+                "the icon stops above its own bottom at {height}"
+            );
+            // And NOWHERE outside it. `ui::fill` bounds a mark to the FRAME
+            // and not to the slot, so ink that overran the icon would land on
+            // the band or on the neighbouring button — which is why the body
+            // takes exactly what the lines leave and is given no floor.
+            for y in (0..icon.y).chain(icon.y.saturating_add(icon.height)..height) {
+                assert!(!inked(y), "ink at row {y} outside the icon at {height}");
+            }
         }
     }
 
