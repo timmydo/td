@@ -22,20 +22,28 @@ pub type Aliases = std::collections::BTreeMap<String, String>;
 /// is the grammar tests' entry point.
 #[cfg(test)]
 fn parse(src: &str) -> Syn<List> {
-    parse_aliased(src, &Aliases::new())
+    parse_aliased_at(src, &Aliases::new(), 1)
 }
 
 /// Parse all of `src` under one alias table, for the callers that run nothing
-/// while parsing: the interactive line and command substitution.
-pub fn parse_aliased(src: &str, aliases: &Aliases) -> Syn<List> {
-    parse_aliased_at(src, aliases, 1)
+/// while parsing: the interactive line and command substitution. `line` numbers
+/// the text's first line, which only `$(...)` needs anything but 1 for -- dash
+/// reads that body from the outer input rather than re-scanning it as a string.
+pub fn parse_aliased_at(src: &str, aliases: &Aliases, line: u32) -> Syn<List> {
+    drain(Units::at(src, line), aliases)
 }
 
-/// The same, with the text's first line numbered `line` rather than 1. Only
-/// `$(...)` needs it, and only because dash reads that body from the outer
-/// input rather than re-scanning it as a string.
-pub fn parse_aliased_at(src: &str, aliases: &Aliases, line: u32) -> Syn<List> {
-    let mut units = Units::at(src, line);
+/// The interactive reader's probe: does what it has read so far parse, and if
+/// not, could another line finish it? Everything else about `parse_aliased_at`,
+/// but the text is a snapshot of a source that can still be asked -- so a
+/// trailing `\<newline>` is a request for the next line rather than a fold the
+/// input ended on. The same buffer is parsed for REAL through `parse_aliased_at`
+/// once the reader has stopped asking.
+pub fn parse_probe(src: &str, aliases: &Aliases) -> Syn<List> {
+    drain(Units::probe(src), aliases)
+}
+
+fn drain(mut units: Units, aliases: &Aliases) -> Syn<List> {
     let mut items = Vec::new();
     while let Some(unit) = units.next_unit(aliases) {
         items.extend(unit?.items);
@@ -162,6 +170,17 @@ impl Units {
     pub fn at(src: &str, line: u32) -> Units {
         let mut scan = Scan::new_at(src, line);
         scan.seal();
+        Units::over(scan, None)
+    }
+
+    /// The same over a snapshot the reader can still add to; see `parse_probe`.
+    /// Sealed as well, because an unsealed scan reports an unfinished construct
+    /// by rewinding rather than by erroring, and with no source to ask that
+    /// becomes a silent partial parse -- half a line RUN instead of prompted for.
+    pub fn probe(src: &str) -> Units {
+        let mut scan = Scan::new_at(src, 1);
+        scan.seal();
+        scan.resumable();
         Units::over(scan, None)
     }
 
@@ -1410,6 +1429,41 @@ mod tests {
             match parse(src) {
                 Err(e) => assert!(e.starts_with(INCOMPLETE), "{src}: {e}"),
                 Ok(_) => return Err(format!("{src}: expected an incomplete-input error")),
+            }
+        }
+        Ok(())
+    }
+
+    /// A trailing `\<newline>` is the one construct the two parses of the same
+    /// buffer must answer differently. The reader's PROBE has a source it can
+    /// still ask, so it must report incomplete and prompt; the parse that
+    /// finally RUNS the text has not, so the fold is spent and `echo x \` runs
+    /// `echo x` -- which is what ash does at `-c`, at end of a script, and at
+    /// end of an interactive session alike.
+    ///
+    /// Without it the probe would report the line COMPLETE, and an operator
+    /// typing a continuation would watch the shell run half of what they meant.
+    /// This is the level it can be tested at: `repl` needs a terminal, since a
+    /// shell whose stdin is not one reads it as a script however `-i` is set.
+    #[test]
+    fn the_probe_asks_for_the_rest_of_a_folded_line_where_the_real_parse_runs_it() -> Syn<()> {
+        let aliases = Aliases::new();
+        for src in ["echo x \\\n", "echo ab\\\n", "true &\\\n", "\\\n"] {
+            match parse_probe(src, &aliases) {
+                Err(e) => assert!(e.starts_with(INCOMPLETE), "{src:?}: {e}"),
+                Ok(_) => return Err(format!("{src:?}: the probe must ask for more")),
+            }
+            parse_aliased_at(src, &aliases, 1)
+                .map_err(|e| format!("{src:?}: the real parse must take it: {e}"))?;
+        }
+        // Everything else answers the same to both, because more input really
+        // could finish it and the text really is unfinished.
+        for src in ["if true; then", "echo 'abc", "echo x |", "cat <<E"] {
+            for got in [parse_probe(src, &aliases), parse_aliased_at(src, &aliases, 1)] {
+                match got {
+                    Err(e) => assert!(e.starts_with(INCOMPLETE), "{src:?}: {e}"),
+                    Ok(_) => return Err(format!("{src:?}: expected incomplete input")),
+                }
             }
         }
         Ok(())

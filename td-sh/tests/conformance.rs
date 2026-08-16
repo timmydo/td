@@ -1602,6 +1602,11 @@ fn a_file_stdin_script_agrees_with_a_piped_one()
         // A here-document is consumed by the PARSER rather than by `read`, so
         // its lines go through the reader under test.
         ("read v <<EOF\nbody\nEOF\necho \"[$v]\"\n".to_string(), "[body]\n"),
+        // Input ENDING in a fold. This reader reaches that decision by a route
+        // of its own -- an unsealed pull rewinds, the source answers `Eof`, the
+        // scan seals and the re-pull spends the fold -- so the whole-string
+        // reader passing says nothing about it.
+        ("echo x \\\n".to_string(), "x\n"),
         // A SCRIPT line longer than SCRIPT_BLOCK, so the seekable path has to
         // accumulate across reads before it finds a newline to rewind to. The
         // length has to be in a line the PARSER reads: as data after `read v`

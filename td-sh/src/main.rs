@@ -565,7 +565,7 @@ fn read_complete(
                 buffer.push('\n');
             }
         }
-        match parser::parse_aliased(buffer, &sh.aliases) {
+        match parser::parse_probe(buffer, &sh.aliases) {
             Ok(_) => return ReadResult::Ready,
             Err(e) if e.starts_with(ast::INCOMPLETE) => {
                 prompt =
@@ -638,6 +638,31 @@ mod confinement {
             squeeze(&repl).contains(concat!("editor.", "open_history(sh)")),
             "`repl` no longer opens the history file"
         );
+    }
+
+    /// The reader at the prompt must probe with `parse_probe` and nothing else:
+    /// it is the one caller that can be asked for another line, and swapping it
+    /// back to the parse that RUNS the text would make a trailing `\<newline>`
+    /// look finished and run half a typed line. `parse_probe` is tested
+    /// directly, so that swap leaves every test green -- `repl` wants a
+    /// terminal, exactly as the history call above does. Over `code_only` for
+    /// the same reason that one is: a needle can match a comment.
+    #[test]
+    fn the_reader_at_the_prompt_probes_rather_than_parses() {
+        let src = code_only(source("main.rs"));
+        let read = src
+            .split_once(concat!("fn ", "read_complete("))
+            .map_or("", |(_, rest)| rest)
+            .to_string();
+        assert!(
+            squeeze(&read).contains(concat!("parser::", "parse_probe(buffer")),
+            "the prompt's reader no longer probes"
+        );
+        // And the mark that makes the probe one is set in a single place, which
+        // is what `Scan::resumable`'s own doc claims and nothing else enforces.
+        // Not a count of `parse_probe` CALLS beside it: tests call it too, and
+        // a number that moves whenever one is added pins nothing.
+        assert_eq!(count_code(concat!("scan.", "resumable()")), 1);
     }
 
     fn count(needle: &str) -> usize {

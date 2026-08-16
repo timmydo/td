@@ -506,6 +506,7 @@ impl Scan {
                 },
                 ended_in_comment: false,
                 sealed: false,
+                resumable: false,
                 owed_newline: false,
                 committed: false,
                 fatal: false,
@@ -532,6 +533,13 @@ impl Scan {
     pub fn seal(&mut self) {
         self.sealed = true;
         self.lx.sealed = true;
+    }
+
+    /// Mark the text a SNAPSHOT of a source that can still be asked for more.
+    /// Only the interactive reader needs it: its buffer is whole at every probe
+    /// and grows between them, so `sealed` alone would say the input had ended.
+    pub fn resumable(&mut self) {
+        self.lx.resumable = true;
     }
 
     pub fn ended_in_comment(&self) -> bool {
@@ -687,6 +695,7 @@ fn lexer_over(text: &str, depth: u32, line: u32) -> Syn<Lexer> {
     }
     Ok(Lexer {
         sealed: true,
+        resumable: false,
         owed_newline: false,
         committed: false,
         fatal: false,
@@ -716,6 +725,12 @@ struct Lexer {
     /// Set once no more input can arrive, which is what makes an unterminated
     /// final line the last line rather than half of one still being typed.
     sealed: bool,
+    /// The text is a SNAPSHOT whose source can still be asked for more, even
+    /// though the snapshot itself is sealed. Only the interactive reader sets
+    /// it, and only the trailing-fold question consults it: `sealed` is a fact
+    /// about the string, this is a fact about where the string came from, and
+    /// a fold at the end is the one place the two answers differ.
+    resumable: bool,
     /// A newline has been consumed but its here-document bodies are not all
     /// read, so the `Tok::Newline` it owes has not been emitted yet.
     owed_newline: bool,
@@ -772,6 +787,15 @@ impl Lexer {
         }
     }
 
+    /// A `\<newline>` was the last thing consumed and nothing follows it. While
+    /// more input can arrive, that is a request for the rest of the line; once
+    /// it cannot, the fold is simply SPENT -- ash reads it through
+    /// `pgetc_eatbnl` and then gets PEOF, so `sh -c 'echo x \<newline>'` prints
+    /// `x` rather than failing.
+    fn fold_wants_more(&self) -> bool {
+        self.sc.continued && self.sc.peek().is_none() && (!self.sealed || self.resumable)
+    }
+
     fn restore(&mut self, m: Mark) {
         self.sc.pos = m.pos;
         self.sc.line = m.line;
@@ -802,7 +826,7 @@ impl Lexer {
             }
             self.skip_blanks();
             let Some(c) = self.sc.peek() else {
-                if self.sc.continued {
+                if self.fold_wants_more() {
                     return Err(format!("{INCOMPLETE}: line continuation"));
                 }
                 self.finish_heredocs()?;
@@ -1021,7 +1045,7 @@ impl Lexer {
         // still become `&&` -- so this asks for more input rather than banking
         // the short one, which `pull` would take for a token boundary and never
         // wind back past.
-        if self.sc.continued && self.sc.peek().is_none() {
+        if self.fold_wants_more() {
             return Err(format!("{INCOMPLETE}: line continuation"));
         }
         Ok(op)
@@ -1793,6 +1817,7 @@ impl Lexer {
 fn heredoc_body_word(body: &str, line: u32) -> Syn<Word> {
     let mut lx = Lexer {
         sealed: true,
+        resumable: false,
         owed_newline: false,
         committed: false,
         fatal: false,

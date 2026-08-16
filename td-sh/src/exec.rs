@@ -3619,6 +3619,34 @@ mod tests {
         }
     }
 
+    /// Input that ENDS in a fold. ash reads it through `pgetc_eatbnl` and then
+    /// gets PEOF, so nothing is unfinished: the line simply runs. What must NOT
+    /// move with it is the interactive reader's probe, which still asks for
+    /// another line -- `parser.rs` pins that half, and this one is the sealed
+    /// parse every non-interactive reader ends at -- the STREAMING one reaches
+    /// the same decision by another route, and `conformance.rs` drives that.
+    /// Statuses measured on ash.
+    #[test]
+    fn a_fold_at_the_end_of_the_input_is_spent_rather_than_unfinished() {
+        for (src, out) in [
+            ("echo x \\\n", "x\n"),
+            ("echo ab\\\n", "ab\n"),
+            ("\\\n", ""),
+            ("echo a; echo b \\\n", "a\nb\n"),
+        ] {
+            assert_eq!(run(src), (0, out.to_string(), String::new()), "{src:?}");
+        }
+        // An operator the fold left open is still a syntax error -- what ended
+        // is the input, not the command. ash exits 2 for both, as this does;
+        // only the wording differs, which is its own open item.
+        for src in ["echo x >\\\n", "echo x |\\\n"] {
+            let (status, out, err) = run(src);
+            assert_eq!(status, 2, "{src:?}");
+            assert_eq!(out, "", "{src:?}");
+            assert!(!err.is_empty(), "{src:?}: the refusal is reported");
+        }
+    }
+
     /// Only `<` reaches ash's `eopen`; `>`, `>>`, `<>`, `>|` and the `>&word`
     /// that writes both streams all reach `ecreate`. That is one choice made
     /// six times, so it is pinned as a table -- the same ENOENT, told apart

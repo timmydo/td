@@ -2191,9 +2191,11 @@ pub fn run_capturing_bytes(src: &str) -> (i32, Vec<u8>) {
     .expect("could not start the shell thread")
 }
 
-/// Drive several units through the INTERACTIVE handler, as the prompt loop does,
-/// returning `$?` plus captured stdout/stderr. Distinct from `run_capturing`:
-/// only this path can show that a shell survives an aborted command.
+/// Drive several units through the INTERACTIVE handler, returning `$?` plus
+/// captured stdout/stderr. Distinct from `run_capturing`: only this path can
+/// show that a shell survives an aborted command. Each unit arrives whole, so
+/// this models the prompt loop's second parse -- the one that RUNS the text --
+/// and not the probe that decides the text is finished.
 #[cfg(test)]
 pub fn run_capturing_interactive_units(units: &[&str]) -> (i32, String, String) {
     on_shell_stack(|| {
@@ -2204,7 +2206,7 @@ pub fn run_capturing_interactive_units(units: &[&str]) -> (i32, String, String) 
         sh.fds.set(1, Fd::WriteBuf(out.clone()));
         sh.fds.set(2, Fd::WriteBuf(err.clone()));
         for unit in units {
-            match crate::parser::parse_aliased(unit, &sh.aliases) {
+            match crate::parser::parse_aliased_at(unit, &sh.aliases, 1) {
                 Ok(list) => {
                     if let Some(code) = exec::run_interactive_unit(&mut sh, &list) {
                         sh.set_status(code);
