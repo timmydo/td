@@ -41,6 +41,14 @@ fn noisy_mkfs(dir: &Path) -> Res<PathBuf> {
     Ok(fake)
 }
 
+/// The trusted key, as a real file: `td-install` carries it onto the volume, so
+/// it reads the bytes whatever the stand-in td-boot does with the path.
+fn key_file(dir: &Path) -> Res<PathBuf> {
+    let path = dir.join("key.pub");
+    std::fs::write(&path, format!("{}\n", "ab".repeat(32)))?;
+    Ok(path)
+}
+
 fn script(path: &Path, body: &str) -> Res<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::write(path, body)?;
@@ -211,7 +219,7 @@ fn a_relative_scratch_directory_still_reaches_td_boot() -> Res<()> {
         .arg(".")
         .arg(&td_boot)
         .arg(dir.join("deployment"))
-        .arg(dir.join("key.pub"))
+        .arg(key_file(&dir)?)
         .output()?;
     assert!(
         volume.status.success(),
@@ -269,7 +277,7 @@ fn the_staged_directories_do_not_take_the_ambient_umask() -> Res<()> {
             .arg(&dir)
             .arg(&td_boot)
             .arg(dir.join("deployment"))
-            .arg(dir.join("key.pub"))
+            .arg(key_file(&dir)?)
             .output()?;
         assert!(
             volume.status.success(),
@@ -287,6 +295,15 @@ fn the_staged_directories_do_not_take_the_ambient_umask() -> Res<()> {
                 "{directory} came out {mode:#o} under umask {mask}"
             );
         }
+        // The trust root too, and this is where a hostile umask is actually
+        // applied: the unit assertion runs under the harness's own, where a
+        // file created with no mode at all comes out 0644 anyway. Under 077
+        // the widening is what makes this 0644 rather than 0600. The FINAL
+        // mode is all this reads — the window a create-then-chmod would open
+        // is closed by construction and observed by nothing here.
+        let key = staging.join("td/trusted.pub");
+        let mode = std::fs::metadata(&key)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "the trust root came out {mode:#o} under umask {mask}");
         std::fs::remove_dir_all(&dir)?;
     }
     Ok(())
@@ -320,7 +337,7 @@ fn a_publishing_childs_id_stays_out_of_the_reported_line() -> Res<()> {
         .arg(&dir)
         .arg(&td_boot)
         .arg(dir.join("deployment"))
-        .arg(dir.join("key.pub"))
+        .arg(key_file(&dir)?)
         .output()?;
     assert!(
         volume.status.success(),

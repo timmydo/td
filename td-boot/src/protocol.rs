@@ -43,6 +43,19 @@ pub const BOOT_DIR: &str = "td/boot";
 pub const ATTEMPTS_DIR: &str = "td/boot/attempts";
 pub const DEPLOYMENTS_DIR: &str = "td/deployments";
 pub const SELECTOR_PREFIX: &str = "../deployments/";
+// The trust root a RUNNING machine authenticates an update under, on the
+// persistent volume rather than in any rootfs. `TRUSTED_KEY_PATH` above is the
+// SELECTOR initramfs's copy and is gone after `switch_root`, so a booted system
+// has no key at all until this one exists (DESIGN §10 item 10).
+//
+// Outside `DEPLOYMENTS_DIR` deliberately: a trust root inside the thing it
+// authenticates vouches for nothing, and one owned by a deployment would be
+// replaced by every update. Named `trusted.pub` rather than repeating the
+// selector's `deployment.pub` so a path says WHICH of the two it is — and
+// because it would otherwise differ from the `deployments` directory beside it
+// by one character.
+#[allow(dead_code)]
+pub const VOLUME_TRUSTED_KEY: &str = "td/trusted.pub";
 // The two selector slots, by the names they have on disk. Here rather than as
 // literals in td-boot alone because the installer's recipe check reads one back
 // out of an unmounted image: a check that spelled its own copy would keep

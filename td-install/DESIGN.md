@@ -1190,6 +1190,122 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    harder is Secure Boot and a measured boot chain, which is out of scope here
    and would be its own specification.
 
+   **10a — the volume carries the trust root — is BUILT.** The path is
+   `protocol::VOLUME_TRUSTED_KEY` (`td/trusted.pub`), stated once beside the
+   layout for D1's reason, and named `trusted.pub` rather than repeating the
+   selector's `deployment.pub` so a path says WHICH of the two copies it is.
+   It sits beside `td/deployments` rather than in it, for the reason above.
+   Mode 0644, pinned for the staged directories' reason — `--rootdir` copies a
+   mode in verbatim, so an ambient umask would otherwise decide what a
+   machine's trust root looks like.
+
+   **The key is SNAPSHOT ONCE and PROMOTED, not read twice.** `publish_into`
+   copies the operator's key to `<scratch>/td-trusted.pub`, hands td-boot THAT
+   path, and renames it into the volume on success. The obvious shape — read
+   the bytes, pass the original path to td-boot, write the bytes out
+   afterwards — reads one path twice, and two reads are two chances for it to
+   say different things: td-boot authenticates under what its read found, the
+   volume keeps what this program's read found, and an attacker able to swap
+   the file between them installs a legitimately-signed deployment while
+   provisioning THEIR key for every update after it. Nothing reports the
+   difference, which is the "nothing observable distinguishes the wrong
+   outcome" test that also drove `losetup`'s read-only readback. With one file
+   renamed, the volume's key is not merely equal to the one that authenticated
+   the bundle; it IS that file.
+
+   A SNAPSHOT IS A FILE AN ATTACKER CAN ALSO REACH, though, and most of what
+   surrounds it is about that. It sits BESIDE the staging tree, never inside
+   it, so td-boot is never asked to read its trust root out of the volume root
+   it is writing — the shape `TRUSTED_KEY_PATH`'s comment warns about. It sits
+   in a directory of its OWN, removed and recreated at 0700, because the
+   scratch directory is not private and `td-trusted.pub` is a guessable name:
+   every other measure here narrows the window in which the file can be
+   swapped, and a directory nothing else may write into is what removes the
+   window rather than narrowing it. Restricting needs no chmod afterwards — a
+   umask only takes mode bits away — which is the reverse of the widening
+   below and worth stating because the two look alike and are not.
+
+   Within it the file is created by `create_new` at 0600 and WIDENED to 0644,
+   and every part of that is load-bearing. `create_new` refuses to open what
+   is already there, so a pre-placed symlink is not followed and its target
+   not truncated. 0600-then-widen rather than a create at 0644, because a
+   creation mode is masked by the umask: 0644 asked for directly is 0600 under
+   `umask 077` with nothing to correct it, and the opposite order leaves a
+   window in which a machine's trust root is world-writable. And the widening
+   goes through the open DESCRIPTOR rather than the path, because a path-based
+   chmod follows a symlink — one swapped in after the write would take the
+   0644 instead, and closing that race at creation while leaving it open at
+   the chmod closes neither.
+
+   The PROMOTE checks identity before it renames, since a rename moves
+   whatever the path names at rename time and not the file td-boot read. The
+   `st_dev`/`st_ino` pair written is compared against the pair the path
+   carries now — the same comparison the scratch image already makes against
+   the destination — and a mismatch is a refusal. With the 0700 directory this
+   is a check nothing is expected to trip; it is there because the alternative
+   to tripping it is a volume carrying a key that authenticated nothing.
+
+   The READ applies td-boot's own rule — a regular file, not a symlink, of at
+   most `MAX_PUBLIC_KEY_BYTES`. Not defensive duplication: handing td-boot a
+   copy would otherwise LAUNDER a key past a refusal the real reader makes,
+   since the copy is a small regular file whatever the original was, and
+   silently turning three refusals into successful installs is the kind of
+   side effect this section elsewhere insists should be a decision.
+
+   Its ORDER matters twice over. The type is settled by `lstat` BEFORE the
+   open, not by `is_file` after it, because opening a FIFO read-only blocks
+   until a writer appears — a check that runs afterwards never runs at all,
+   and the installer hangs with no diagnostic. The `st_dev`/`st_ino` pair is
+   then compared across the open, as td-boot's own reader compares it, so the
+   type holds of the bytes rather than of a name an attacker replaced in
+   between. And the bound is applied to what is READ and not only to what
+   `stat` claimed: the read takes one byte past the limit and refuses if it
+   gets it, since cutting an oversized file to a valid length is precisely the
+   laundering the rest of this paragraph exists to prevent. `/proc/self/status`
+   is that disagreement without a race to arrange — a regular file whose
+   reported length is zero and whose contents are not — and is what the test
+   uses.
+
+   The ORDER is the rest of it, and it has two ends. The read happens in
+   `run_volume`, in the same block that refuses a relative `mkfs.btrfs` or
+   `td-boot` — before the destination is opened and before the staging tree is
+   emptied. A key path is an argv-shaped mistake like those two, and reading
+   it inside `publish_into` put the refusal AFTER `remove_dir_all`, so a
+   mistyped fifth argument destroyed a directory before saying it did not like
+   the fifth argument. That is verbatim the failure this crate already
+   recorded and fixed for the fourth, reintroduced one argument along; the
+   test named for it is `a_key_that_is_not_there_does_not_cost_the_staging_
+   tree`. At the other end the key reaches the VOLUME only once the publish
+   has succeeded, so a failed publish leaves none — otherwise it would outlive
+   the publish it belonged to and become the root a later, unrelated publish
+   into the same scratch tree inherited. The bytes are carried rather than
+   parsed: this crate has no ed25519 and should not grow one for a file it
+   only carries, and the publish is the parse.
+
+   **That rule is now written twice, and 10b should make it one.** It lives in
+   `td-boot`'s `open_real_file`/`read_bounded_real_file` and again in
+   `td-install`'s `read_trusted_key`, which is exactly the shape `protocol.rs`
+   exists to prevent — "a thing spelled in both crates is a thing they can
+   come to disagree about". It is not a hypothetical here: the first version
+   of `read_trusted_key` diverged three ways on the day it was written (it
+   checked the type after the open, dropped the identity pin across the open,
+   and truncated rather than refusing an oversized read), and all three were
+   found by review rather than by anything that runs. The two agree now and
+   nothing will notice when they stop. The fix is the one `protocol.rs` and
+   `fixture.rs` already model — a shared file both crates `#[path]`-include —
+   and it is a separate landing because the helpers sit in
+   `td-boot/src/main.rs` and extracting them touches that crate's most-tested
+   file for no behaviour change.
+
+   Nothing READS it yet — that is `td-update`, the rest of this item. The
+   recipe check asserts it off the RESTORED IMAGE rather than off the staging
+   tree, for the reason the selector symlink is checked that way, and the
+   wrong-key pass asserts the volume carries neither a selector nor a trust
+   root. What that check does NOT cover is the MODE: `btrfs restore` does not
+   restore permissions without `-m`, so the 0644 is asserted on the staging
+   tree — which is what `--rootdir` reads — and under a hostile umask by the
+   subprocess test, rather than off the image.
+
    **The LOCAL channel** is a directory of deployment directories, and local
    is the whole of it for now: no network, no fetch, no protocol. td's
    network tools are the only crates allowed dependencies and none of them is

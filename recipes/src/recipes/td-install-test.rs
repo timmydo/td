@@ -141,10 +141,19 @@ fn publish_steps(
     // `readlink` on the restored tree is also the one assertion that ties the
     // selector to THIS deployment rather than to any deployment, and the
     // payload comparison is what stops an empty directory of the right name
-    // counting as a published bundle. Compared through `cat` because `cmp` is
-    // not in this recipe's declared applet set and the fixture payloads are
-    // text; `dump-tree` is kept for the id because it reads the filesystem's
-    // own directory entries rather than a restored copy of them.
+    // counting as a published bundle. `dump-tree` is kept for the id because it
+    // reads the filesystem's own directory entries rather than a restored copy
+    // of them.
+    //
+    // Compared through `od -v` rather than `cat`: `$(cat f)` strips trailing
+    // newlines from BOTH sides, so two files differing only there compare
+    // equal — and every file compared here is one whose exact bytes are the
+    // assertion, the trust root most of all. `-v` because od otherwise
+    // COLLAPSES repeated identical lines to `*`, under which files differing
+    // in how many identical blocks they hold compare equal too — a key of
+    // repeating bytes is exactly that shape. `cmp` would say the same thing
+    // more directly and is not in this recipe's declared applet set; `od`
+    // already is, three checks up.
     let deployment_is_in_the_volume = format!(
         "'{btrfs}' restore -s -S '{{root}}/scratch/td-volume.img' '{{root}}/restored' || \
          {{ echo 'the volume could not be restored' >&2; exit 1; }}; \
@@ -153,16 +162,23 @@ fn publish_steps(
          [ \"$target\" = '{prefix}{id}' ] || \
          {{ echo \"the {current} selector points at $target, not {prefix}{id}\" >&2; exit 1; }}; \
          for f in {manifest} {sig} bzImage; do \
-           [ \"$(cat \"{{root}}/restored/{deployments}/{id}/$f\")\" = \
-             \"$(cat \"{{root}}/deployment/$f\")\" ] || \
+           [ -f \"{{root}}/restored/{deployments}/{id}/$f\" ] || \
+           {{ echo \"the published $f is not in the volume at all\" >&2; exit 1; }}; \
+           [ \"$(od -An -v -tx1 \"{{root}}/restored/{deployments}/{id}/$f\")\" = \
+             \"$(od -An -v -tx1 \"{{root}}/deployment/$f\")\" ] || \
            {{ echo \"the published $f is not the one that was signed\" >&2; exit 1; }}; \
          done; \
+         [ -f '{{root}}/restored/{trusted}' ] && [ ! -L '{{root}}/restored/{trusted}' ] || \
+         {{ echo 'the volume trust root is missing or not a regular file' >&2; exit 1; }}; \
+         [ \"$(od -An -v -tx1 '{{root}}/restored/{trusted}')\" = \"$(od -An -v -tx1 '{key}')\" ] || \
+         {{ echo 'the volume does not carry the key that authenticated it' >&2; exit 1; }}; \
          tree=$('{btrfs}' inspect-internal dump-tree -t fs '{{root}}/scratch/td-volume.img') || \
          {{ echo 'the volume has no readable filesystem tree' >&2; exit 1; }}; \
          case \"$tree\" in *'name: {id}'*) ;; \
          *) echo 'the published deployment {id} is not in the volume' >&2; exit 1 ;; esac",
         boot = td_boot_protocol::BOOT_DIR,
         deployments = td_boot_protocol::DEPLOYMENTS_DIR,
+        trusted = td_boot_protocol::VOLUME_TRUSTED_KEY,
         current = td_boot_protocol::CURRENT_SLOT,
         prefix = td_boot_protocol::SELECTOR_PREFIX,
         manifest = td_boot_protocol::MANIFEST_NAME,
@@ -226,9 +242,14 @@ fn publish_steps(
                      err=$(cat '{{root}}/wrong-err') || exit 1; \
                      case \"$err\" in *'does not authenticate'*) ;; \
                      *) echo \"the publish failed, but not on the signature: $err\" >&2; exit 1 ;; esac; \
-                     [ ! -e '{{root}}/scratch2/td-volume-root/{boot}/{current}' ] || \
-                     {{ echo 'a refused publish still left a selector' >&2; exit 1; }}",
+                     [ ! -e '{{root}}/scratch2/td-volume-root/{boot}/{current}' ] && \
+                     [ ! -L '{{root}}/scratch2/td-volume-root/{boot}/{current}' ] || \
+                     {{ echo 'a refused publish still left a selector' >&2; exit 1; }}; \
+                     [ ! -e '{{root}}/scratch2/td-volume-root/{trusted}' ] && \
+                     [ ! -L '{{root}}/scratch2/td-volume-root/{trusted}' ] || \
+                     {{ echo 'a refused publish still left a trust root' >&2; exit 1; }}",
                     boot = td_boot_protocol::BOOT_DIR,
+                    trusted = td_boot_protocol::VOLUME_TRUSTED_KEY,
                     current = td_boot_protocol::CURRENT_SLOT
                 ),
             ],
@@ -410,7 +431,7 @@ pub fn recipe() -> Recipe {
         },
         Step::WriteFile {
             path: "{out}/result".into(),
-            content: "PASS: target-built static td-install writes a GPT with its backup, a labelled FAT32 ESP, and a freshly drawn disk GUID on install and reinstall, then a checked Btrfs volume copied into its own partition, with a signed deployment published into it by the target-built td-boot and refused under an unrelated key\n".into(),
+            content: "PASS: target-built static td-install writes a GPT with its backup, a labelled FAT32 ESP, and a freshly drawn disk GUID on install and reinstall, then a checked Btrfs volume copied into its own partition, with a signed deployment published into it by the target-built td-boot, the authenticating key carried onto the volume beside it, and both refused under an unrelated key\n".into(),
             exec: false,
         },
         Step::Require {

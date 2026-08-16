@@ -745,6 +745,66 @@ fn zero_edges(file: &mut File, offset: u64, len: u64) -> io::Result<()> {
     zero_at(file, tail, edge)
 }
 
+/// Read the trusted key under `td-boot`'s own rule, because the snapshot in
+/// `publish_into` would otherwise LAUNDER one past a refusal the real reader
+/// makes: a regular file, not a symlink, of at most `MAX_PUBLIC_KEY_BYTES`.
+/// Handing td-boot a copy is what closes the two-reads race, and a copy of
+/// something td-boot would have rejected is a behaviour change nobody asked
+/// for. The bound is not decoration either — without it this reads `/dev/zero`
+/// until the installer runs out of memory.
+fn read_trusted_key(path: &Path) -> io::Result<Vec<u8>> {
+    let named = |what: String| invalid(format!("the trusted key {} {what}", path.display()));
+    let context = |error: io::Error| {
+        invalid(format!(
+            "cannot read the trusted key {}: {error}",
+            path.display()
+        ))
+    };
+    // TYPED BEFORE IT IS OPENED, which is the half a check after the open
+    // cannot do: opening a FIFO read-only BLOCKS until a writer appears, so an
+    // `is_file` that runs afterwards never runs at all and the installer hangs
+    // with no diagnostic. `lstat` answers the type without opening anything.
+    let entry = std::fs::symlink_metadata(path).map_err(context)?;
+    if entry.is_symlink() {
+        return Err(named("is a symlink".into()));
+    }
+    if !entry.is_file() {
+        return Err(named("is not a regular file".into()));
+    }
+    let file = File::open(path).map_err(context)?;
+    let metadata = file.metadata().map_err(context)?;
+    // ...and the thing OPENED is the thing that was typed. Between the two the
+    // entry can be replaced — a symlink put there after the `lstat` is opened
+    // and followed — so the pair is compared, as td-boot's own reader compares
+    // it, and this is the check that makes the type above hold of the bytes
+    // rather than of a name.
+    {
+        use std::os::linux::fs::MetadataExt;
+        if (entry.st_dev(), entry.st_ino()) != (metadata.st_dev(), metadata.st_ino()) {
+            return Err(named("was replaced while it was being opened".into()));
+        }
+    }
+    let max = protocol::MAX_PUBLIC_KEY_BYTES;
+    if metadata.len() > max {
+        return Err(named(format!(
+            "is {} bytes, over the {max} the format allows",
+            metadata.len()
+        )));
+    }
+    let mut bytes = Vec::new();
+    // One byte PAST the bound, so a file that grew between the stat and the
+    // read is refused rather than silently cut to a valid length — truncating
+    // it here would launder an oversized key past the refusal td-boot makes,
+    // which is the whole reason this function mirrors that rule.
+    file.take(max.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(context)?;
+    if bytes.len() as u64 > max {
+        return Err(named(format!("grew past the {max} bytes the format allows")));
+    }
+    Ok(bytes)
+}
+
 /// Publish `deployment` into the staging tree, through `td-boot`.
 ///
 /// D1: this crate does not learn to write a deployment directory, update a
@@ -761,7 +821,7 @@ fn zero_edges(file: &mut File, offset: u64, len: u64) -> io::Result<()> {
 /// of byte offsets, and an id is neither a byte offset nor something a caller
 /// reading by position expects to see there. It is also READ, which is the
 /// whole of what stops a successful exit standing in for a publish — see below.
-fn publish_into(staging: &Path, publish: &Publish) -> io::Result<()> {
+fn publish_into(staging: &Path, publish: &Publish, key: &[u8]) -> io::Result<()> {
     // The four `install_deployment` requires, in its order and its spelling —
     // `td` is a literal there too, and the two nested constants make it
     // redundant only for as long as they stay under it. Mirroring the check
@@ -792,11 +852,62 @@ fn publish_into(staging: &Path, publish: &Publish) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
     }
+    // The key is SNAPSHOT and td-boot is handed the snapshot, so the file that
+    // authenticates the bundle is the file the volume keeps — two reads of one
+    // path are two chances for it to say different things, and nothing would
+    // report the disagreement. Beside the staging tree rather than in it, so
+    // td-boot never reads a trust root out of the volume root it is writing.
+    // `staging` is canonical, so its parent is the scratch directory.
+    //
+    // In a directory of its own at 0700, because the scratch directory is not
+    // private and `td-trusted.pub` is a guessable name: everything below
+    // narrows the window in which the snapshot can be swapped, and a directory
+    // nothing else may write into is what removes it rather than narrowing it.
+    // Restricting needs no chmod after the fact — a umask can only take mode
+    // bits away, and 0700 is already the fewest this needs — which is the
+    // reverse of the widening two blocks down.
+    let private = staging
+        .parent()
+        .ok_or_else(|| invalid(format!("the staging tree {} has no parent", staging.display())))?
+        .join("td-install-key");
+    if let Err(error) = std::fs::remove_dir_all(&private) {
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error);
+        }
+    }
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(&private)?;
+    }
+    let snapshot = private.join("td-trusted.pub");
+    let identity;
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // Created 0600 and WIDENED, not created 0644: a creation mode is
+        // masked by the umask, so 0644 asked for directly is 0600 under `umask
+        // 077` with nothing to correct it — and the other order would leave a
+        // window where a machine's trust root is world-writable.
+        //
+        // Widened through the open DESCRIPTOR, not the path: a path-based
+        // chmod follows a symlink, so one swapped in after the write would
+        // take the 0644 instead — the same race `create_new` closes at the
+        // other end, and closing only one end closes neither.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&snapshot)?;
+        file.write_all(key)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+        use std::os::linux::fs::MetadataExt;
+        let written = file.metadata()?;
+        identity = (written.st_dev(), written.st_ino());
+    }
     let output = std::process::Command::new(&publish.td_boot)
         .arg(protocol::PUBLISH_VERB)
         .arg(staging)
         .arg(&publish.deployment)
-        .arg(&publish.trusted_key)
+        .arg(&snapshot)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .output()
@@ -855,6 +966,39 @@ fn publish_into(staging: &Path, publish: &Publish) -> io::Result<()> {
             published.display()
         )));
     }
+    // The volume keeps the key, so the machine this installs can authenticate
+    // its own updates: it has none otherwise, since `TRUSTED_KEY_PATH` is the
+    // SELECTOR initramfs's copy and `switch_root` replaces that rootfs
+    // (DESIGN §10 item 10a).
+    //
+    // Promoted only now, so a key that authenticated nothing never reaches a
+    // disk — and by RENAME, which neither copies the bytes again nor follows a
+    // symlink standing at the destination.
+    //
+    // A rename moves whatever the path names AT RENAME TIME, though, not the
+    // file td-boot just read, so the inode is checked against the one written
+    // above — the `st_dev`/`st_ino` comparison the scratch image already makes
+    // one screen down. The 0700 directory is what makes this a check nothing
+    // is expected to trip; it is here because the alternative to tripping it
+    // is a volume carrying a key that authenticated nothing, which is the one
+    // outcome this whole path exists to prevent.
+    {
+        use std::os::linux::fs::MetadataExt;
+        let now = std::fs::symlink_metadata(&snapshot)?;
+        if !now.is_file() || (now.st_dev(), now.st_ino()) != identity {
+            return Err(invalid(format!(
+                "the trusted key {} was replaced while the deployment was published",
+                snapshot.display()
+            )));
+        }
+    }
+    let destination = staging.join(protocol::VOLUME_TRUSTED_KEY);
+    std::fs::rename(&snapshot, &destination).map_err(|error| {
+        invalid(format!(
+            "cannot put the trusted key at {}: {error}",
+            destination.display()
+        ))
+    })?;
     Ok(())
 }
 
@@ -893,6 +1037,15 @@ fn run_volume(
             }
         }
     }
+    // The KEY is read here for the same reason and in the same place. It is an
+    // argv-shaped mistake like the two above — a path that is not there, or is
+    // not a key — and reading it inside `publish_into` put the refusal after
+    // the staging tree had been emptied, so a mistyped fifth argument
+    // destroyed a directory before saying it did not like the fifth argument.
+    // That is verbatim the failure the paragraph above records for the fourth.
+    let key = publish
+        .map(|publish| read_trusted_key(&publish.trusted_key))
+        .transpose()?;
     let mut file = OpenOptions::new().read(true).write(true).open(destination)?;
     let disk_bytes = destination_bytes(&mut file)?;
     let sector_size = logical_sector_size(&file)?;
@@ -950,7 +1103,14 @@ fn run_volume(
     // different names for one directory.
     let staging = std::fs::canonicalize(&staging)?;
     if let Some(publish) = publish {
-        publish_into(&staging, publish)?;
+        // `key` is `Some` exactly when `publish` is — both come from the one
+        // `Option` above. Asked for rather than matched alongside, because a
+        // pattern over the pair would SKIP the publish if they ever
+        // disagreed, and a skipped publish reports success and ships a volume
+        // with nothing on it: the fail-open this verb's whole read-back
+        // exists to refuse.
+        let key = key.ok_or_else(|| invalid("the trusted key was not read".to_string()))?;
+        publish_into(&staging, publish, &key)?;
     }
     // `File::create` TRUNCATES, so a scratch directory that puts the image on
     // top of the DESTINATION destroys the disk whose table was just read — and
@@ -1697,6 +1857,15 @@ mod tests {
     /// anything else is exercising the refusal.
     const STAND_IN_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+    /// A trusted key on disk. Real bytes and a real file, because the key is
+    /// carried onto the volume and so has to be readable — a stand-in td-boot
+    /// ignores it, but `publish_into` does not.
+    fn key_file(dir: &Path) -> PathBuf {
+        let path = dir.join("key.pub");
+        std::fs::write(&path, format!("{}\n", "ab".repeat(32))).unwrap();
+        path
+    }
+
     /// A `td-boot` stand-in that publishes: runs `body`, then does the two
     /// things `publish_into` reads back — creates `td/deployments/<id>` and
     /// prints that id.
@@ -1741,10 +1910,11 @@ mod tests {
             "printf '%s\\n' \"$@\" > \"$(dirname \"$0\")/publish-argv\"\n\
              echo publish >> \"$(dirname \"$0\")/order\"\n",
         );
+        let key = key_file(&dir);
         let publish = Publish {
             td_boot: td_boot.clone(),
             deployment: PathBuf::from("/media/deployment"),
-            trusted_key: PathBuf::from("/media/key.pub"),
+            trusted_key: key.clone(),
         };
         let mut out = Vec::new();
         run_volume(
@@ -1762,16 +1932,35 @@ mod tests {
         // temporary directory is itself a symlink would otherwise fail this on
         // the spelling rather than on anything it is about.
         let staging = std::fs::canonicalize(dir.join("td-volume-root")).unwrap();
+        // The key argument is the SNAPSHOT, not the path this program was
+        // given: handing td-boot the caller's path would be a second read of
+        // it, which is the race the snapshot exists to close. Asserted as the
+        // exact path rather than merely "not the original", so a snapshot
+        // written somewhere unexpected is a failure too.
+        let snapshot = std::fs::canonicalize(&dir)
+            .unwrap()
+            .join("td-install-key")
+            .join("td-trusted.pub");
+        assert_ne!(snapshot, key, "the snapshot and the given key are one file");
         assert_eq!(
             words,
             vec![
                 "publish",
                 staging.to_str().unwrap(),
                 "/media/deployment",
-                "/media/key.pub",
+                snapshot.to_str().unwrap(),
             ],
             "td-boot was not asked to publish into the staging tree: {argv:?}"
         );
+        // ...and it is BESIDE the volume root, never inside it: td-boot must
+        // not read its trust root out of the tree it is writing.
+        assert!(
+            !snapshot.starts_with(&staging),
+            "the trust root snapshot is inside the volume root"
+        );
+        // The snapshot is gone once promoted — it was RENAMED, so the volume's
+        // key is the very file td-boot authenticated under.
+        assert!(!snapshot.exists(), "the snapshot was copied rather than renamed");
         assert!(
             staging.join(protocol::DEPLOYMENTS_DIR).join(STAND_IN_ID).is_dir(),
             "the deployments directory was not there when td-boot ran"
@@ -1791,6 +1980,259 @@ mod tests {
         // is caught by the subprocess test instead.
         let text = String::from_utf8(out).unwrap();
         assert_eq!(text.split_whitespace().count(), 3, "{text:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The volume keeps the trust root, so the installed machine can
+    /// authenticate its own updates — and keeps it only once the publish that
+    /// used those bytes has succeeded.
+    #[test]
+    fn the_volume_carries_the_key_that_authenticated_it() {
+        let scratch = Scratch::disk(DISK);
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
+        let dir = fake_mkfs(RECORDING_MKFS);
+        let td_boot = dir.join("td-boot");
+        publishing_td_boot(&td_boot, "");
+        let key = key_file(&dir);
+        let publish = Publish {
+            td_boot,
+            deployment: PathBuf::from("/media/deployment"),
+            trusted_key: key.clone(),
+        };
+        run_volume(
+            &scratch.path,
+            &dir.join("mkfs.btrfs"),
+            &dir,
+            Some(&publish),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let staging = dir.join("td-volume-root");
+        let carried = staging.join(protocol::VOLUME_TRUSTED_KEY);
+        assert_eq!(
+            std::fs::read(&carried).unwrap(),
+            std::fs::read(&key).unwrap(),
+            "the volume's key is not the one the install was given"
+        );
+        // Where that path is, and that it is relative, are properties of the
+        // constant and are pinned in their own test rather than asserted here
+        // against themselves.
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&carried).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The snapshot must not LAUNDER a key past td-boot's own reader.
+    ///
+    /// td-boot refuses a symlink, a non-regular file, and anything over
+    /// `MAX_PUBLIC_KEY_BYTES`. Handing it a copy would turn every one of those
+    /// refusals into a successful install, because the copy is a small regular
+    /// file whatever the original was — so the same rule is applied here, and
+    /// each refusal is checked by its REASON rather than by failing at all: a
+    /// non-zero result is satisfied by any error, including one from a later
+    /// step that would mean the rule never ran.
+    #[test]
+    fn a_key_td_boot_would_refuse_is_refused_here_too() {
+        let dir = fake_mkfs(RECORDING_MKFS);
+        let real = key_file(&dir);
+
+        let link = dir.join("link.pub");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let refused = read_trusted_key(&link).unwrap_err().to_string();
+        assert!(refused.contains("is a symlink"), "{refused}");
+
+        let big = dir.join("big.pub");
+        std::fs::write(&big, vec![b'a'; protocol::MAX_PUBLIC_KEY_BYTES as usize + 1]).unwrap();
+        let refused = read_trusted_key(&big).unwrap_err().to_string();
+        // The whole phrase: the message carries the path, which holds a pid,
+        // and a pid containing the bound would satisfy a bare digit check.
+        assert!(
+            refused.contains(&format!(
+                "over the {} the format allows",
+                protocol::MAX_PUBLIC_KEY_BYTES
+            )),
+            "{refused}"
+        );
+
+        let refused = read_trusted_key(&dir).unwrap_err().to_string();
+        assert!(refused.contains("is not a regular file"), "{refused}");
+
+        // A FIFO is the case the type check must catch BEFORE the open rather
+        // than after it: `File::open` on one blocks until a writer appears, so
+        // a version that opened first hung here with no diagnostic instead of
+        // failing. Nothing writes to this one, so a regression does not fail
+        // this test — it hangs it, which is the honest signal.
+        let fifo = dir.join("fifo.pub");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if made.map(|status| status.success()).unwrap_or(false) {
+            let refused = read_trusted_key(&fifo).unwrap_err().to_string();
+            assert!(refused.contains("is not a regular file"), "{refused}");
+        }
+
+        // The bound is applied to what is READ and not only to what `stat`
+        // claimed, since the two can disagree — a file that grew between them
+        // would otherwise be cut to a valid length and laundered past td-boot's
+        // refusal. `/proc/self/status` is that disagreement without a race to
+        // arrange: a regular file whose reported length is 0 and whose
+        // contents are not.
+        let proc_status = Path::new("/proc/self/status");
+        assert_eq!(std::fs::metadata(proc_status).unwrap().len(), 0);
+        let refused = read_trusted_key(proc_status).unwrap_err().to_string();
+        assert!(refused.contains("grew past"), "{refused}");
+
+        // ...and the bound is not so tight that a key AT it is refused, nor so
+        // loose that a real key trips it.
+        let edge = dir.join("edge.pub");
+        std::fs::write(&edge, vec![b'a'; protocol::MAX_PUBLIC_KEY_BYTES as usize]).unwrap();
+        assert_eq!(
+            read_trusted_key(&edge).unwrap().len(),
+            protocol::MAX_PUBLIC_KEY_BYTES as usize
+        );
+        assert_eq!(read_trusted_key(&real).unwrap(), std::fs::read(&real).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A KEY THAT IS NOT THERE COSTS NOTHING.
+    ///
+    /// The refusal has to come before the staging tree is emptied, or a
+    /// mistyped fifth argument destroys a directory before saying it did not
+    /// like the fifth argument. That is the same failure `run_volume`'s own
+    /// comment records for the fourth, which is why the read sits beside those
+    /// checks rather than in `publish_into` where it started: there it ran
+    /// after `remove_dir_all`, and this test reds.
+    #[test]
+    fn a_key_that_is_not_there_does_not_cost_the_staging_tree() {
+        let scratch = Scratch::disk(DISK);
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
+        let dir = fake_mkfs(RECORDING_MKFS);
+        let td_boot = dir.join("td-boot");
+        publishing_td_boot(&td_boot, "");
+        // Something in the staging tree that a premature refusal would take.
+        let keep = dir.join("td-volume-root").join("keepme");
+        std::fs::create_dir_all(&keep).unwrap();
+        std::fs::write(keep.join("data"), b"not yours to remove").unwrap();
+        let publish = Publish {
+            td_boot,
+            deployment: PathBuf::from("/media/deployment"),
+            trusted_key: dir.join("no-such-key.pub"),
+        };
+        let error = run_volume(
+            &scratch.path,
+            &dir.join("mkfs.btrfs"),
+            &dir,
+            Some(&publish),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error}").contains("cannot read the trusted key"),
+            "the refusal must name the key: {error}"
+        );
+        assert_eq!(
+            std::fs::read(keep.join("data")).unwrap(),
+            b"not yours to remove",
+            "a missing key emptied the caller's staging tree"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The trust root's path is RELATIVE and outside the deployments
+    /// directory.
+    ///
+    /// Both are properties of the constant rather than of any run, and both
+    /// are pinned here because `staging.join(…)` is where they bite: an
+    /// absolute constant would discard the staging tree silently and put a
+    /// machine's trust root at `/td/trusted.pub` on the INSTALLER, and one
+    /// under `td/deployments` would be replaced by the first update. The
+    /// literal is pinned too, as `TRUSTED_KEY_PATH` is, since a rename is a
+    /// key the reader never finds.
+    #[test]
+    fn the_trust_roots_path_is_relative_and_outside_the_deployments() {
+        assert_eq!(protocol::VOLUME_TRUSTED_KEY, "td/trusted.pub");
+        let path = Path::new(protocol::VOLUME_TRUSTED_KEY);
+        assert!(path.is_relative(), "an absolute key path discards the volume");
+        assert!(!path.starts_with(protocol::DEPLOYMENTS_DIR));
+        assert_eq!(
+            Path::new("/vol").join(protocol::VOLUME_TRUSTED_KEY),
+            Path::new("/vol/td/trusted.pub")
+        );
+    }
+
+    /// Nothing pre-placed where the snapshot goes is ever WRITTEN THROUGH.
+    ///
+    /// The scratch directory is not private and both names here are guessable,
+    /// so each is tried as a symlink pointing at a file that must survive:
+    /// following either would truncate it under an installer that is usually
+    /// root. Whether the install then succeeds or refuses is not the property
+    /// — the victim is — so both outcomes are accepted and only the bytes are
+    /// asserted.
+    #[test]
+    fn nothing_pre_placed_at_the_snapshot_is_written_through() {
+        for name in ["td-install-key", "td-install-key/td-trusted.pub"] {
+            let scratch = Scratch::disk(DISK);
+            run_layout(&scratch.path, &mut Vec::new()).unwrap();
+            let dir = fake_mkfs(RECORDING_MKFS);
+            let td_boot = dir.join("td-boot");
+            publishing_td_boot(&td_boot, "");
+            let victim = dir.join("victim");
+            std::fs::write(&victim, b"do not truncate me").unwrap();
+            let planted = dir.join(name);
+            if let Some(parent) = planted.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::os::unix::fs::symlink(&victim, &planted).unwrap();
+            let publish = Publish {
+                td_boot,
+                deployment: PathBuf::from("/media/deployment"),
+                trusted_key: key_file(&dir),
+            };
+            let _ = run_volume(
+                &scratch.path,
+                &dir.join("mkfs.btrfs"),
+                &dir,
+                Some(&publish),
+                &mut Vec::new(),
+            );
+            assert_eq!(
+                std::fs::read(&victim).unwrap(),
+                b"do not truncate me",
+                "a symlink at {name} was followed and its target truncated"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// No publish, no key.
+    ///
+    /// Honestly labelled: with no publish `publish_into` never runs, so no
+    /// mutation of the code this names can red it. It is a GUARD against a
+    /// later change that writes the key somewhere earlier or unconditionally
+    /// — a trust root with no deployment beside it is one nothing has ever
+    /// checked — and not evidence about the code as it stands.
+    #[test]
+    fn a_volume_with_no_deployment_carries_no_key() {
+        let scratch = Scratch::disk(DISK);
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
+        let dir = fake_mkfs(RECORDING_MKFS);
+        run_volume(
+            &scratch.path,
+            &dir.join("mkfs.btrfs"),
+            &dir,
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            !dir
+                .join("td-volume-root")
+                .join(protocol::VOLUME_TRUSTED_KEY)
+                .exists(),
+            "a volume with no deployment carries a trust root"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1828,7 +2270,7 @@ mod tests {
             let publish = Publish {
                 td_boot,
                 deployment: PathBuf::from("/media/deployment"),
-                trusted_key: PathBuf::from("/media/key.pub"),
+                trusted_key: key_file(&dir),
             };
             let error = run_volume(
                 &scratch.path,
@@ -1870,7 +2312,7 @@ mod tests {
         let publish = Publish {
             td_boot,
             deployment: PathBuf::from("/media/deployment"),
-            trusted_key: PathBuf::from("/media/key.pub"),
+            trusted_key: key_file(&dir),
         };
         let error = run_volume(
             &scratch.path,
@@ -1903,7 +2345,7 @@ mod tests {
         let publish = Publish {
             td_boot,
             deployment: PathBuf::from("/media/deployment"),
-            trusted_key: PathBuf::from("/media/key.pub"),
+            trusted_key: key_file(&dir),
         };
         let error = run_volume(
             &scratch.path,
@@ -1922,6 +2364,17 @@ mod tests {
             !dir.join("argv").exists(),
             "the filesystem was made despite the publish failing"
         );
+        // Nor is the trust root there. The key is READ before the publish and
+        // written after it, so a staging tree that failed carries no key — one
+        // written first would outlive the publish it belonged to and be the
+        // root a later, unrelated publish into the same scratch inherited.
+        assert!(
+            !dir
+                .join("td-volume-root")
+                .join(protocol::VOLUME_TRUSTED_KEY)
+                .exists(),
+            "a failed publish left its trust root behind"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1935,7 +2388,7 @@ mod tests {
         let publish = Publish {
             td_boot: PathBuf::from("td-boot"),
             deployment: PathBuf::from("/media/deployment"),
-            trusted_key: PathBuf::from("/media/key.pub"),
+            trusted_key: key_file(&dir),
         };
         let error = run_volume(
             &scratch.path,
