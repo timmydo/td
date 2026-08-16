@@ -3599,6 +3599,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// What the folds `lexer.rs` pins the token shape of actually DO. Every
+    /// line below runs under busybox ash 1.37.0.
+    #[test]
+    fn an_operator_split_by_a_line_continuation_still_runs() {
+        // Status and BOTH streams per case, or a diagnostic written beside the
+        // right output would pass.
+        for (before, after, out, err) in [
+            ("true &", "& echo yes", "yes\n", ""),
+            ("false |", "| echo yes", "yes\n", ""),
+            ("case a in a) echo hit ;", "; esac", "hit\n", ""),
+            ("echo hi >", "&2", "", "hi\n"),
+            // The here-document pair, and the `-` that strips its body's tabs.
+            ("read v <", "<E\nbody\nE\necho $v", "body\n", ""),
+            ("read v <<", "-E\n\tbody\nE\necho $v", "body\n", ""),
+        ] {
+            let src = format!("{before}\\\n{after}");
+            assert_eq!(run(&src), (0, out.to_string(), err.to_string()), "{src:?}");
+        }
+    }
+
     /// Only `<` reaches ash's `eopen`; `>`, `>>`, `<>`, `>|` and the `>&word`
     /// that writes both streams all reach `ecreate`. That is one choice made
     /// six times, so it is pinned as a table -- the same ENOENT, told apart

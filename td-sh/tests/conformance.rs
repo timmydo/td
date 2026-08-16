@@ -1765,6 +1765,52 @@ fn a_stdin_script_still_ends_where_it_should()
     Ok(())
 }
 
+/// An operator split by a `\<newline>` reads the same however the script
+/// arrives. The line-at-a-time readers are the ones that can get this wrong,
+/// because they see the fold at the end of what they have read and the operator
+/// is not finished there — measured, a stdin-fed `true &\<newline>& echo yes`
+/// ran `true &` and reported a syntax error on the second line, where the same
+/// text under `-c` ran. Both spellings of each shape below run under busybox
+/// ash 1.37.0.
+#[test]
+fn an_operator_split_across_lines_reads_the_same_from_stdin()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    for (script, want) in [
+        ("true &\\\n& echo yes\n", "yes\n"),
+        ("false |\\\n| echo yes\n", "yes\n"),
+        ("case a in a) echo hit ;\\\n; esac\n", "hit\n"),
+        ("read v <\\\n<E\nbody\nE\necho $v\n", "body\n"),
+        // The one shape whose rewind must UNDO lexer state: `<<` reserves a
+        // here-document slot and arms `awaiting` before the fold that follows
+        // can leave the operator open, so `Mark` has to carry both back.
+        ("read v <<\\\n-E\n\tbody\nE\necho $v\n", "body\n"),
+    ] {
+        let mut child = std::process::Command::new(&shell)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        match child.stdin.take() {
+            Some(mut w) => w.write_all(script.as_bytes())?,
+            None => return Err("no stdin pipe".into()),
+        }
+        let out = child.wait_with_output()?;
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want, "{script:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "", "{script:?}");
+        assert_eq!(out.status.code(), Some(0), "{script:?}");
+        // The `-c` spelling is the one that already worked, so it is what the
+        // stdin answer is held against rather than only against `want`. All
+        // three fields, or a diagnostic beside the right output would pass.
+        let same = std::process::Command::new(&shell).arg("-c").arg(script).output()?;
+        assert_eq!(String::from_utf8_lossy(&same.stdout), want, "-c {script:?}");
+        assert_eq!(String::from_utf8_lossy(&same.stderr), "", "-c {script:?}");
+        assert_eq!(same.status.code(), Some(0), "-c {script:?}");
+    }
+    Ok(())
+}
+
 /// The `read` builtin takes ONE BYTE off stdin, leaving the rest for the next
 /// reader — `sh -c 'read a; cat'` on a pipe.
 ///

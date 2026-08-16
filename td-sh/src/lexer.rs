@@ -162,6 +162,18 @@ impl Scanner {
         self.bump();
         self.continued = true;
     }
+
+    /// `eat`, with any `\<newline>` folds at the cursor consumed first: ash's
+    /// `pgetc_eatbnl`, which every second character of an operator is read
+    /// through. A fold is NOT given back when the character then fails to
+    /// match -- ash's `pungetc()` hands back one character, and the one it
+    /// hands back is the one AFTER the fold.
+    fn eat_folded(&mut self, c: char) -> bool {
+        while self.peek() == Some('\\') && self.peek_at(1) == Some('\n') {
+            self.fold_continuation();
+        }
+        self.eat(c)
+    }
 }
 
 /// Characters that end a word without being part of it.
@@ -951,23 +963,23 @@ impl Lexer {
         };
         let op = match c {
             ';' => {
-                if self.sc.eat(';') {
+                if self.sc.eat_folded(';') {
                     Op::DSemi
                 } else {
                     Op::Semi
                 }
             }
             '&' => {
-                if self.sc.eat('&') {
+                if self.sc.eat_folded('&') {
                     Op::AndIf
-                } else if self.sc.eat('>') {
+                } else if self.sc.eat_folded('>') {
                     Op::AmpGreat
                 } else {
                     Op::Amp
                 }
             }
             '|' => {
-                if self.sc.eat('|') {
+                if self.sc.eat_folded('|') {
                     Op::OrIf
                 } else {
                     Op::Pipe
@@ -976,28 +988,28 @@ impl Lexer {
             '(' => Op::LParen,
             ')' => Op::RParen,
             '<' => {
-                if self.sc.eat('<') {
-                    let strip = self.sc.eat('-');
+                if self.sc.eat_folded('<') {
+                    let strip = self.sc.eat_folded('-');
                     let id = self.heredocs.len();
                     // Reserve the slot now; the body is filled in at the next
                     // newline, once the delimiter word has been scanned.
                     self.heredocs.push(Word::default());
                     self.awaiting = Some((id, strip));
                     Op::DLess(id)
-                } else if self.sc.eat('&') {
+                } else if self.sc.eat_folded('&') {
                     Op::LessAnd
-                } else if self.sc.eat('>') {
+                } else if self.sc.eat_folded('>') {
                     Op::LessGreat
                 } else {
                     Op::Less
                 }
             }
             '>' => {
-                if self.sc.eat('>') {
+                if self.sc.eat_folded('>') {
                     Op::DGreat
-                } else if self.sc.eat('&') {
+                } else if self.sc.eat_folded('&') {
                     Op::GreatAnd
-                } else if self.sc.eat('|') {
+                } else if self.sc.eat_folded('|') {
                     Op::Clobber
                 } else {
                     Op::Great
@@ -1005,6 +1017,13 @@ impl Lexer {
             }
             other => return Err(format!("unexpected character {other:?}")),
         };
+        // A fold with nothing after it leaves the operator UNFINISHED -- `&` can
+        // still become `&&` -- so this asks for more input rather than banking
+        // the short one, which `pull` would take for a token boundary and never
+        // wind back past.
+        if self.sc.continued && self.sc.peek().is_none() {
+            return Err(format!("{INCOMPLETE}: line continuation"));
+        }
         Ok(op)
     }
 
@@ -2404,6 +2423,88 @@ mod tests {
     fn line_continuation_joins_words() -> Syn<()> {
         let ws = words("echo a\\\nb")?;
         assert_eq!(nth(&ws, 1)?.plain(), Some("ab"));
+        Ok(())
+    }
+
+    /// Every token of a script rendered flat, so a test can pin what a source
+    /// lexed to rather than only the words in it.
+    fn shape(src: &str) -> Syn<String> {
+        let mut out = String::new();
+        for p in tokenize(src, 1)?.toks {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            match p.tok {
+                Tok::Word(w) => out.push_str(w.plain().unwrap_or("<expansion>")),
+                Tok::Op(op) => out.push_str(&format!("{op:?}")),
+                Tok::IoNumber(n) => out.push_str(&format!("Io{n}")),
+                Tok::Newline => out.push_str("NL"),
+                Tok::Eof => out.push_str("EOF"),
+            }
+        }
+        Ok(out)
+    }
+
+    /// ash reads the SECOND character of an operator through `pgetc_eatbnl`
+    /// (ash.c:13256 for the connectives, 12802/12824/12834 for redirections),
+    /// so a `\<newline>` may sit inside one. Measured against busybox ash
+    /// 1.37.0, which runs every line below.
+    #[test]
+    fn a_line_continuation_folds_inside_an_operator() -> Syn<()> {
+        let split = |a: &str, b: &str| format!("x {a}\\\n{b} y");
+        assert_eq!(shape(&split("&", "&"))?, "x AndIf y EOF");
+        assert_eq!(shape(&split("|", "|"))?, "x OrIf y EOF");
+        assert_eq!(shape(&split(">", ">"))?, "x DGreat y EOF");
+        assert_eq!(shape(&split(">", "|"))?, "x Clobber y EOF");
+        assert_eq!(shape(&split(">", "&"))?, "x GreatAnd y EOF");
+        assert_eq!(shape(&split("<", "&"))?, "x LessAnd y EOF");
+        assert_eq!(shape(&split("<", ">"))?, "x LessGreat y EOF");
+        assert_eq!(shape("case x in x) y ;\\\n; esac")?, "case x in x RParen y DSemi esac EOF");
+        // The heredoc pair and the `-` that strips its tabs are two more. The
+        // fold spends a newline, so the delimiter and `y` are on ONE line and
+        // the body begins after the next.
+        assert_eq!(shape("x <\\\n<E y\nE\n")?, "x DLess(0) E y NL EOF");
+        assert_eq!(shape("x <<\\\n-E y\nE\n")?, "x DLess(0) E y NL EOF");
+        // Consecutive folds, since ash's is a `while` loop.
+        assert_eq!(shape("x &\\\n\\\n& y")?, "x AndIf y EOF");
+        // A fold that completes no operator is still SPENT: ash's `pungetc()`
+        // gives back one character and gives back the one after the fold.
+        assert_eq!(shape("x >\\\ny")?, "x Great y EOF");
+        assert_eq!(shape("x &\\\ny")?, "x Amp y EOF");
+        // `&>` glued to a word is the one ash reads with a plain `pgetc`
+        // (ash.c:12670 says why), so THAT pair does not fold: `2&>f` names fd
+        // 2, and split it is the word `2` and a bare `&>`.
+        assert_eq!(shape("x 2&>f")?, "x Io2 AmpGreat f EOF");
+        assert_eq!(shape("x 2&\\\n>f")?, "x 2 AmpGreat f EOF");
+        assert_eq!(shape("x &\\\n>f")?, "x AmpGreat f EOF");
+        Ok(())
+    }
+
+    /// A LINE-AT-A-TIME source sees the fold at the end of what it has read, and
+    /// there the operator is not finished -- `&` can still become `&&`. So the
+    /// pull must ask for more rather than bank the short one: a completed token
+    /// is a boundary `pull` rewinds no further than, so emitting `Amp` here made
+    /// a stdin-fed `true &\<newline>& echo yes` run `true &` and then report a
+    /// syntax error on the rest, while `sh -c` on the same text ran it.
+    #[test]
+    fn an_operator_left_open_by_a_fold_asks_for_the_rest_of_it() -> Syn<()> {
+        let mut scan = Scan::new("true &\\\n");
+        let first = scan.pull();
+        assert!(first.incomplete, "the operator is unfinished");
+        assert_eq!(first.toks.len(), 1, "only the word is banked");
+        scan.feed("& echo yes\n");
+        scan.seal();
+        let rest = scan.pull();
+        assert!(rest.error.is_none(), "{:?}", rest.error);
+        let ops: Vec<Op> = rest
+            .toks
+            .iter()
+            .filter_map(|p| match p.tok {
+                Tok::Op(op) => Some(op),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ops, vec![Op::AndIf]);
         Ok(())
     }
 
