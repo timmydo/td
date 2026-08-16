@@ -1695,6 +1695,52 @@ hit
 ## status: 2
 ## stderr-json: "grep: option '--co' is ambiguous; possibilities: '--context' '--color' '--colour' '--count'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
 
+#### --l lists four, the last family to close
+# With `--label' and `--line-buffered' in the table this agrees with GNU. It
+# is one of FOUR families that closed in the same landing -- `--l', `--li',
+# `--n', `--no' -- which is why none of them is "the last". Note `--li'
+# is NOT the same list minus one: `--label' is not a `li' name, so the pair
+# narrows by a name that has nothing to do with the letter added.
+## argv: grep --l a f1
+## file f1:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: option '--l' is ambiguous; possibilities: '--label' '--line-buffered' '--line-number' '--line-regexp'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
+#### and --li, which drops --label rather than the name nearest it
+## argv: grep --li a f1
+## file f1:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: option '--li' is ambiguous; possibilities: '--line-buffered' '--line-number' '--line-regexp'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
+#### --n lists SIX, and its order is the sharpest evidence the table is GNU's
+# The longest candidate list any case PINS -- `--=' produces a longer one, 49
+# names, of which that case asserts only the leading five -- and the one
+# alphabetical order would get most obviously wrong: `--no-ignore-case' comes FIRST, ahead of
+# `--no-filename', because GNU declares it at grep.c:531 beside `--ignore-case'
+# while `--no-filename' waits until 539. Sorted by name it would come third.
+## argv: grep --n a f1
+## file f1:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: option '--n' is ambiguous; possibilities: '--no-ignore-case' '--no-filename' '--no-group-separator' '--no-messages' '--null' '--null-data'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
+#### and --no, the same four without the two --null spellings
+## argv: grep --no a f1
+## file f1:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: option '--no' is ambiguous; possibilities: '--no-ignore-case' '--no-filename' '--no-group-separator' '--no-messages'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
 #### an EMPTY prefix lists the whole table, so it shows the order most plainly
 # `--=` splits into an empty name and a value, and every option prefixes the
 # empty string -- so this one diagnostic is the table read out in order. Only
@@ -1715,6 +1761,13 @@ hit
 # Both spellings of `-F` are listed here and only one is listed under `--f`,
 # which is not an inconsistency: getopt_long compares each later match to the
 # FIRST, and the first here is `--basic-regexp`.
+#
+# This is also the ONE spelling whose full list still differs from GNU's: 50
+# names there against 49 here, the missing one being `--unix-byte-offsets`,
+# which is deliberately not in the table (its divergence is a status, not a
+# diagnostic). Pinning only the head is therefore load-bearing twice over --
+# it survives a landing that serves another option, and it keeps this a
+# conformance case rather than a divergence one.
 ## argv: grep --= a f1
 ## file f1:
 a

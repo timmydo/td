@@ -293,6 +293,76 @@ hit
 ## status: 2
 ## stderr-json: "grep: unsupported option '--color'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
 
+#### grep refuses --label, which names STANDARD INPUT in every prefixed line
+# Only standard input: measured, `grep --label=X -H a f1' prints `f1:a' and
+# leaves the operand's own name alone, while the same command reading `-'
+# prints `X:a'. A draft of this case said it renamed any operand and used a
+# file fixture, which would have demonstrated nothing -- GNU's own output for
+# it is unchanged by the option. Ignoring it prints the literal `(standard
+# input)' instead of the name a caller supplied to make a pipeline's output
+# readable, which is the whole of what the option is for.
+## argv: grep --label=X -H a -
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: unsupported option '--label'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
+#### and --line-buffered, which is a FLUSHING policy and not an output change
+# The one refusal here whose output would be byte-identical if accepted as a
+# no-op: line buffering changes WHEN bytes appear, never which. It is refused
+# anyway because that is the whole of what a caller asks it for -- a reader
+# waiting on a pipe gets nothing until the buffer fills, which for an endless
+# source is indistinguishable from a hang. Failing OPEN would be silent.
+## argv: grep --line-buffered a f1
+## file f1:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: unsupported option '--line-buffered'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
+#### and --no-ignore-case, whose no-op reading is the DANGEROUS one
+# It cancels an earlier `-i'. Ignoring it leaves the `-i' standing, so
+# `grep -i --no-ignore-case Foo' would match `foo' -- MORE than was asked for,
+# in the one direction a caller cannot see from the output. The same argument
+# as the file filters, arrived at from the other end of the command line.
+## argv: grep -i --no-ignore-case a f1
+## file f1:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: unsupported option '--no-ignore-case'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
+#### and --group-separator, which sets the string printed between -A/-B runs
+## argv: grep --group-separator=XX -A1 a f1
+## file f1:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: unsupported option '--group-separator'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
+#### and --no-group-separator, which is that option's OTHER name in GNU
+# Same `val' as `--group-separator' and so the fourth entry in the `SYNONYMS'
+# roster, but the arities differ -- one takes a string, the other takes
+# nothing -- so glibc would NOT collapse them. That difference is untestable
+# and stays so: collapsing needs a prefix matching both names with one of them
+# matched first, and the only string prefixing `group-separator' and
+# `no-group-separator' is the empty one, whose first match is
+# `--basic-regexp'. The roster names the pair for the same reason it names
+# `quiet'/`silent': what makes two names one option is the option, not the
+# letters.
+## argv: grep --no-group-separator -A1 a f1
+## file f1:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: unsupported option '--no-group-separator'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
 #### grep refuses -P rather than pretending to have PCRE
 # GNU grep's -P switches to a whole second regex engine (PCRE). td-txt carries
 # one POSIX engine; accepting -P and quietly running POSIX semantics would

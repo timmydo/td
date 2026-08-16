@@ -50,15 +50,14 @@
 //! ambiguity list and from every abbreviation that would reach it. Each named
 //! above is pinned in spec/divergence.test.txt, except `--i`/`--in`, which
 //! stopped diverging when `--initial-tab` landed and moved to
-//! spec/grep-cli.test.txt. The SHORT roster is complete, swept
-//! against grep.c:486; the long one is not — `--group-separator`,
-//! `--no-group-separator`, `--no-ignore-case`, `--label`, `--line-buffered`
-//! and `--unix-byte-offsets` are refused too with neither an entry here nor a
-//! case, which is a sweep still owed. The last of those is the odd one: `-u`
-//! IS refused above with a case, but only in its short spelling, and GNU
-//! answers the long one with `warning: --unix-byte-offsets (-u) is obsolete`
-//! and then MATCHES — so unlike the other five it diverges in status, not
-//! only in wording.
+//! spec/grep-cli.test.txt. BOTH rosters are complete now — the short one
+//! swept against grep.c:486, the long one against grep.c:504 — with ONE
+//! name deliberately left out: `--unix-byte-offsets`. It is the only GNU
+//! long option absent from the table, and it is absent because it is the
+//! only one whose divergence is not a diagnostic. GNU answers it with
+//! `warning: --unix-byte-offsets (-u) is obsolete` and then MATCHES, exit 0;
+//! tabling it would change `unrecognized` to `unsupported` and leave the
+//! status difference exactly where it is. `-u` carries the case.
 
 use crate::regex::{Filter, OnBudget, Options, Regex};
 use crate::util::{
@@ -1045,9 +1044,21 @@ enum Arg {
 /// match that matches the FIRST one in both option and arity (getopt.c:230),
 /// which is a comparison against the first rather than a global dedup -- so
 /// this is only the "same option" half, and the caller tests the arity.
+///
+/// Two of the four can never fire, and are here because what makes two names
+/// one option is the option rather than the letters: collapsing needs a prefix
+/// matching BOTH with one of them matched first, and the only string prefixing
+/// `quiet` and `silent` -- or `group-separator` and `no-group-separator` -- is
+/// the empty one, whose first match is `--basic-regexp`. Measured: removing
+/// either pair changes no spelling, `--=` included. The separator pair has a
+/// SECOND, independent reason, which is the arity half below: GNU gives them
+/// the same `val` but different arities, so the caller would refuse the
+/// collapse even if a shared prefix existed. It is the only pair for which
+/// that test could ever be the deciding one.
 const SYNONYMS: &[&[&[u8]]] = &[
     &[b"fixed-regexp", b"fixed-strings"],
     &[b"color", b"colour"],
+    &[b"group-separator", b"no-group-separator"],
     &[b"quiet", b"silent"],
 ];
 
@@ -1061,8 +1072,10 @@ fn synonymous(a: &[u8], b: &[u8]) -> bool {
 /// always winning over being a prefix of a longer one.
 ///
 /// GNU's `long_options[]` (grep.c:504), order intact. A name is here to be
-/// RESOLVED, which is not the same as being served; most unserved options are
-/// still absent, which spec/README's ambiguity entry records as a sweep owed.
+/// RESOLVED, which is not the same as being served: most of these are refused
+/// by the dispatch. Every GNU long name is here but `--unix-byte-offsets`,
+/// whose divergence is a status rather than a diagnostic, so tabling it would
+/// change the wording and leave the difference.
 /// This is the order an ambiguity lists its possibilities in, so the table is
 /// OUTPUT rather than housekeeping: sorted by name it answers `--d` with
 /// `--dereference-recursive` first, which GNU never prints.
@@ -1088,14 +1101,19 @@ const LONG_OPTIONS: &[(&[u8], Arg)] = &[
     (b"file", Arg::Required),
     (b"files-with-matches", Arg::None),
     (b"files-without-match", Arg::None),
+    (b"group-separator", Arg::Required),
     (b"help", Arg::None),
     (b"include", Arg::Required),
     (b"ignore-case", Arg::None),
+    (b"no-ignore-case", Arg::None),
     (b"initial-tab", Arg::None),
+    (b"label", Arg::Required),
+    (b"line-buffered", Arg::None),
     (b"line-number", Arg::None),
     (b"line-regexp", Arg::None),
     (b"max-count", Arg::Required),
     (b"no-filename", Arg::None),
+    (b"no-group-separator", Arg::None),
     (b"no-messages", Arg::None),
     (b"null", Arg::None),
     (b"null-data", Arg::None),
@@ -1337,7 +1355,12 @@ fn parse_long(
         | b"initial-tab"
         | b"perl-regexp"
         | b"color"
-        | b"colour" => {
+        | b"colour"
+        | b"group-separator"
+        | b"no-group-separator"
+        | b"no-ignore-case"
+        | b"label"
+        | b"line-buffered" => {
             errb(&name_in("unsupported option '--", name, "'"));
             eprintln!("{USAGE}");
             return Err(LongErr::Handled);

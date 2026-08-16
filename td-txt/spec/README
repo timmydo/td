@@ -2065,13 +2065,13 @@ td-txt-authored case files
     and `--colou` all resolve here as they do in GNU. It is the only one of
     the landings below that needed anything but a table row.)
 
-    EIGHT of the thirteen are done, over three landings recorded in the
-    paragraphs below: the four filters, then `--initial-tab`/`--perl-regexp`,
-    then `--color`/`--colour`. The five left are `--group-separator`,
-    `--no-group-separator`, `--no-ignore-case`, `--label` and
-    `--line-buffered`. They go one family at a time because a name in the
-    table is a refusal that has to say WHY, which is a per-option decision
-    and not a sweep.
+    ALL THIRTEEN are done, over four landings recorded in the paragraphs
+    below: the four filters, then `--initial-tab`/`--perl-regexp`, then
+    `--color`/`--colour`, then the last five together. They went a family at
+    a time rather than as one sweep because a name in the table is a refusal
+    that has to say WHY, and that is a per-option decision -- which is also
+    why the last five could go together: their whys are four different ones
+    and each got its own case.
 
     The FILTER family -- `--exclude`, `--exclude-from`, `--exclude-dir` and
     `--include` -- is the four, and it had to enter together: `exclude` is a
@@ -2168,10 +2168,6 @@ td-txt-authored case files
     next argv element, so GNU's `grep --color always f` searches for `always`,
     while td-txt refuses whichever way it is declared.
 
-    FOUR families and four names remain, and all four need the feature rather
-    than the name: `--l`/`--li` want `--label` and `--line-buffered`, and
-    `--n`/`--no` want `--no-group-separator` and `--no-ignore-case`.
-
     Two things about that count, both of which a reviewer got wrong from this
     text and neither of which is a wrong NUMBER. The universe is BOUNDED AT
     TWO CHARACTERS -- 27 one-character prefixes over `a-z` and `-` plus 729
@@ -2180,14 +2176,55 @@ td-txt-authored case files
     now marked as-of; marking that paragraph superseded made its NUMBERS
     historical and accidentally made its METHOD look historical too, so the
     definition is repeated here. Every figure in this entry is 3x a count of
-    prefixes: 20 both-ambiguous, 16 identical, 4 by SET.
+    prefixes: as of THIS landing, 20 both-ambiguous, 16 identical, 4 by SET
+    -- the next one takes it to 20/20/0.
 
-    And because of that bound, four families do NOT exhaust the divergent
-    spellings -- they exhaust the divergent NAMES. Go past two characters and
-    `--lin`, `--line`, `--line-` and `--no-` diverge by SET as well, each for
-    the same missing name as the two-character prefix it extends. The bound
+    And because of that bound, four families did NOT exhaust the divergent
+    spellings -- they exhausted the divergent NAMES. Past two characters
+    `--lin`, `--line`, `--line-` and `--no-` diverged by SET as well, each for
+    the same missing name as the two-character prefix it extends. (All four
+    closed with those names, in the landing below; this sentence is what the
+    bound was hiding AT THIS LANDING, not a live gap.) The bound
     buys a sweep that reruns in seconds and a count that moves only when a
     NAME lands; it costs the tail, which no landing has ever been decided by.
+
+    THE LAST FIVE NAMES then closed it. `--label`, `--line-buffered`,
+    `--no-group-separator` and `--no-ignore-case` were what those four
+    families wanted; `--group-separator` went with them for completeness and
+    for `--group-separator=XX` to say `unsupported` rather than
+    `unrecognized`. A draft of this said `--g` wanted it, which is wrong and
+    this entry says why a few paragraphs up: `--g` and `--p` prefix exactly
+    one GNU name each, so neither is ever ambiguous and neither can be closed
+    by a table row. Measured, `grep --g a f1` takes `a` as the separator in
+    GNU and reports nothing at all.
+
+    The two-character sweep is now 60 both-ambiguous,
+    60 identical, none by SET, none by ORDER -- 20 prefixes, all agreeing,
+    where the paragraph above counted 4 of 20 divergent.
+
+    The tail that bound leaves out was then swept too, which is the point of
+    naming it a bound rather than a universe. Every NON-EMPTY prefix of every
+    one of GNU's 50 long names -- 427 of them -- gives 40 ambiguous in both
+    tools and all 40 identical, closing `--lin`, `--line`, `--line-` and
+    `--no-` along with everything else past two characters.
+
+    NON-EMPTY is load-bearing and was got wrong here first. The empty prefix
+    is a prefix too, `--=` reaches it, and it DISAGREES: GNU lists 50 names
+    and td-txt 49. The missing one is `--unix-byte-offsets`, the single GNU
+    long name deliberately not in the table (its divergence is a status, not
+    a diagnostic -- GNU warns it is obsolete and then matches), so the empty
+    prefix is exactly where that omission shows. A first draft of this
+    paragraph claimed "no prefix of any GNU option name disagrees", which is
+    false by one name, and false against a measurement that had already been
+    taken and not connected to the claim. The true statement is narrower and
+    still worth having: every non-empty prefix agrees, and the only prefix
+    that does not differs by exactly the one name this crate chose to leave
+    out.
+
+    The entry is therefore finished as an ambiguity entry. It stays because
+    the METHOD is the durable part -- re-run the sweep when a name lands, and
+    expect a landing that closes one gap to uncover another, which happened
+    twice here (`-D` uncovering an order gap, `--include` uncovering `--in`).
 
     Every "byte for byte" in this entry means the DIAGNOSTIC LINE and carries
     TWO preconditions, not the one this paragraph first claimed. The second is
@@ -2959,7 +2996,7 @@ td-txt-authored case files
   oracle against a new case and confirm it does NOT match, comparing status,
   stdout AND stderr: for every refusal here the whole divergence is the
   diagnostic, so a check that reads only status and stdout reports agreement.
-  65 cases, of which 63 differ; the other TWO are counts GNU never finishes, so
+  70 cases, of which 68 differ; the other TWO are counts GNU never finishes, so
   they are not comparable by construction and their divergence is the
   non-finishing itself. This number had gone STALE -- it read 36 while the file
   held 33, five commits having touched the file without re-running it, which is
