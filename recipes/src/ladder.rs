@@ -744,7 +744,7 @@ mod tests {
     ];
     const SELF_HOSTED_PHASE_MARKERS: [&str; 3] =
         ["rust-toolchain", "gcc-x86-64-self", "binutils-x86-64-self"];
-    const POST_BOOTSTRAP_PROTECTED_INPUT_EXCEPTIONS: [(&str, &str); 5] = [
+    const POST_BOOTSTRAP_PROTECTED_INPUT_EXCEPTIONS: [(&str, &str); 6] = [
         // Identity/codegen audits deliberately look back across the boundary.
         ("rust-userland-auto-test", "rust-stage0"),
         ("gcc-x86-64-self-test", "gcc-x86-64-native"),
@@ -752,6 +752,14 @@ mod tests {
         // Later boot artifacts consume the pre-self kernel and its cpio packer.
         ("kexec-spike-x86-64", "linux-x86-64"),
         ("system-x86-64", "linux-x86-64"),
+        // ...and the installer consumes the pre-self FILESYSTEM tool, for the
+        // same reason: `td-install/DESIGN.md`'s D7 approves `mkfs.btrfs` as the
+        // one third-party program on the install path, because writing a Btrfs
+        // formatter in Rust would produce a volume that mounts and then loses
+        // data. btrfs-progs is a C program built by the GNU toolchain and
+        // belongs on the bootstrap side; nothing about it moves post-boundary,
+        // so the consumer declares the edge instead.
+        ("td-install-test", "btrfs-progs-x86-64"),
     ];
     const RECIPE_SHEBANG_INTERPRETERS: [&str; 2] = [super::SH, super::POST_BOOTSTRAP_SH];
     const GUEST_LITERAL_SHEBANGS: [(&str, &str); 12] = [

@@ -39,26 +39,40 @@ fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+const USAGE: &str = "usage: td-install layout <destination>\n       \
+                     td-install volume <destination> <mkfs.btrfs> <scratch-dir>";
+
 #[derive(Debug, Eq, PartialEq)]
 enum Mode {
-    Layout { destination: PathBuf },
+    Layout {
+        destination: PathBuf,
+    },
+    /// `mkfs` is passed rather than looked up: this crate execs exactly what it
+    /// is told to and never resolves a program through an ambient `PATH`, which
+    /// is what makes the one third-party program on the install path (D7) a
+    /// declared input of whoever calls it. `scratch` is the caller's too — the
+    /// image needs room the size of the volume's real contents, and only the
+    /// caller knows where there is any.
+    Volume {
+        destination: PathBuf,
+        mkfs: PathBuf,
+        scratch: PathBuf,
+    },
 }
 
 fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
-    let verb = args
-        .next()
-        .ok_or_else(|| invalid("usage: td-install layout <destination>".to_string()))?;
-    let destination = args.next().map(PathBuf::from);
-    if args.next().is_some() {
-        return Err(invalid(
-            "usage: td-install layout <destination>".to_string(),
-        ));
-    }
-    match (verb.to_str(), destination) {
-        (Some("layout"), Some(destination)) => Ok(Mode::Layout { destination }),
-        _ => Err(invalid(
-            "usage: td-install layout <destination>".to_string(),
-        )),
+    let verb = args.next().ok_or_else(|| invalid(USAGE.to_string()))?;
+    let rest: Vec<PathBuf> = args.map(PathBuf::from).collect();
+    match (verb.to_str(), rest.as_slice()) {
+        (Some("layout"), [destination]) => Ok(Mode::Layout {
+            destination: destination.clone(),
+        }),
+        (Some("volume"), [destination, mkfs, scratch]) => Ok(Mode::Volume {
+            destination: destination.clone(),
+            mkfs: mkfs.clone(),
+            scratch: scratch.clone(),
+        }),
+        _ => Err(invalid(USAGE.to_string())),
     }
 }
 
@@ -129,12 +143,24 @@ fn logical_sector_size(file: &File) -> io::Result<u64> {
             )
         })?;
     let trimmed = text.trim();
-    trimmed.parse::<u64>().map_err(|_| {
+    let size = trimmed.parse::<u64>().map_err(|_| {
         invalid(format!(
             "{} reads {trimmed:?}, which is not a sector size",
             path.display()
         ))
-    })
+    })?;
+    // Refused HERE, where the number arrives from outside, rather than at each
+    // division downstream. A device with no media reports 0 bytes and can read 0
+    // here, and `0.is_multiple_of(0)` is TRUE — so a sector check written the
+    // obvious way passes and the division after it aborts the process, this
+    // crate being `panic = "abort"`.
+    if size == 0 {
+        return Err(invalid(format!(
+            "{} reads a sector size of 0",
+            path.display()
+        )));
+    }
+    Ok(size)
 }
 
 /// Where the two partitions go, in sectors.
@@ -345,7 +371,7 @@ fn invalidate_table(file: &mut File, table: &gpt::Image) -> io::Result<()> {
     Ok(())
 }
 
-fn run_layout(destination: &Path) -> io::Result<()> {
+fn run_layout(destination: &Path, out: &mut dyn Write) -> io::Result<()> {
     let mut file = OpenOptions::new().read(true).write(true).open(destination)?;
     let disk_bytes = destination_bytes(&mut file)?;
     let sector_size = logical_sector_size(&file)?;
@@ -453,13 +479,412 @@ fn run_layout(destination: &Path) -> io::Result<()> {
     write_at(&mut file, table.primary_offset, &table.primary)?;
     file.sync_all()?;
 
-    writeln!(
-        io::stdout(),
-        "{} {} {}",
-        destination.display(),
-        plan.esp_start,
-        plan.volume_start
-    )
+    // NUMBERS ONLY, whitespace-separated, and every one a BYTE OFFSET. The
+    // destination is deliberately not echoed back: a caller already knows what
+    // it passed, and a path is the one field here that can contain a space —
+    // which shifts every field a caller reads by position — or a newline, which
+    // would break the one-line promise outright. Nothing that can carry either
+    // goes on this channel.
+    //
+    // Bytes rather than the LBAs this function works in, because `volume`
+    // reports bytes and two verbs of one program reporting the same-shaped line
+    // in different units is a caller reading 2048 where the ESP is at 1048576 —
+    // with nothing on either line to say which it got.
+    let esp = plan
+        .esp_offset()
+        .ok_or_else(|| invalid("td-install: the ESP offset overflowed".to_string()))?;
+    let volume = plan
+        .volume_start
+        .checked_mul(plan.sector_size)
+        .ok_or_else(|| invalid("td-install: the volume offset overflowed".to_string()))?;
+    writeln!(out, "{esp} {volume}")
+}
+
+/// The two byte ranges a table occupies, as `(offset, len)` pairs.
+///
+/// The same positions `gpt::build` writes to, derived rather than remembered:
+/// the primary runs from LBA 0 through the end of its entry array (which is
+/// `first_usable_lba`), and the backup is the entry array plus the header on
+/// the LAST sector.
+fn table_ranges(sector_size: u64, disk_sectors: u64) -> Result<[(u64, u64); 2], String> {
+    let entries = gpt::entry_array_sectors(sector_size)?;
+    let primary_sectors = gpt::first_usable_lba(sector_size)?;
+    let backup_sectors = entries
+        .checked_add(1)
+        .ok_or_else(|| "td-install: the backup table length overflowed".to_string())?;
+    let backup_start = disk_sectors
+        .checked_sub(backup_sectors)
+        .ok_or_else(|| "td-install: the disk is too small to hold a backup table".to_string())?;
+    let bytes = |sectors: u64| {
+        sectors
+            .checked_mul(sector_size)
+            .ok_or_else(|| "td-install: a table range overflowed".to_string())
+    };
+    Ok([
+        (0, bytes(primary_sectors)?),
+        (bytes(backup_start)?, bytes(backup_sectors)?),
+    ])
+}
+
+fn read_at(file: &mut File, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+    let len = usize::try_from(len)
+        .map_err(|_| invalid("td-install: a table range exceeds this address space".to_string()))?;
+    let mut bytes = vec![0u8; len];
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Where the td volume is, read back off the disk rather than recomputed.
+///
+/// `plan()` would answer the same for a disk this installer laid out, and that
+/// is exactly why it is not asked: the partition the filesystem goes in must be
+/// the one the TABLE describes, or a `plan` that changed between the layout and
+/// the volume would write a filesystem outside its own partition. So the table
+/// is parsed — which also refuses a destination that was never laid out, and a
+/// disk whose two copies of the table disagree.
+fn volume_region(file: &mut File, sector_size: u64, disk_sectors: u64) -> io::Result<(u64, u64)> {
+    let [primary, backup] = table_ranges(sector_size, disk_sectors).map_err(invalid)?;
+    let primary = read_at(file, primary.0, primary.1)?;
+    let backup = read_at(file, backup.0, backup.1)?;
+    let table = gpt::parse(&primary, &backup, sector_size).map_err(invalid)?;
+    // The table must be a table OF THIS DISK. `gpt::parse` is handed two byte
+    // slices and never learns where they came from, so it cannot tell; here the
+    // real count is known, and a header describing a different-sized disk is a
+    // table that was copied from one rather than written on this one.
+    if table.disk_sectors != disk_sectors {
+        return Err(invalid(format!(
+            "td-install: the table describes a {}-sector disk, not the {disk_sectors} sectors \
+             this destination has",
+            table.disk_sectors
+        )));
+    }
+    // A loop rather than the searching iterator adaptor, whose name this file
+    // may not spell: it is staged into a recipe as a `WriteFile` body, and the
+    // ladder's host-tool guard tokenises those bodies and reads that name as an
+    // invocation of the GNU tool it shares
+    // (`no_bootstrap_step_invokes_host_find_or_xargs`).
+    // A NAME is not an identity: GPT does not require partition names to be
+    // unique, so a table carrying two of them is one this program cannot choose
+    // between and must not guess at — the wrong choice formats a partition
+    // somebody else's data is in. The TYPE is checked with it for the same
+    // reason, since a name is 36 characters anyone can write and the type GUID
+    // is what says what the partition is FOR.
+    let mut found = None;
+    let mut matches = 0usize;
+    for part in &table.partitions {
+        if part.name == protocol::VOLUME_PARTITION_NAME && part.type_guid == gpt::TYPE_LINUX_FS {
+            matches += 1;
+            if found.is_none() {
+                found = Some(part);
+            }
+        }
+    }
+    if matches > 1 {
+        return Err(invalid(format!(
+            "td-install: this disk has {matches} partitions named {}",
+            protocol::VOLUME_PARTITION_NAME
+        )));
+    }
+    let part = found.ok_or_else(|| {
+        invalid(format!(
+            "td-install: no {} partition on this disk — run `layout` first",
+            protocol::VOLUME_PARTITION_NAME
+        ))
+    })?;
+    let offset = part
+        .start_lba
+        .checked_mul(sector_size)
+        .ok_or_else(|| invalid("td-install: the volume offset overflowed".to_string()))?;
+    // INCLUSIVE end, as GPT stores it.
+    let len = part
+        .end_lba
+        .checked_sub(part.start_lba)
+        .and_then(|span| span.checked_add(1))
+        .and_then(|sectors| sectors.checked_mul(sector_size))
+        .ok_or_else(|| invalid("td-install: the volume length overflowed".to_string()))?;
+    // ...and the region must not overlap either copy of the TABLE that named
+    // it. `gpt::parse` bounds partitions by the header's OWN `first_usable` and
+    // `last_usable`, which are fields in the same table — so a table declaring
+    // a usable range over its own entry array is self-consistent, and this is
+    // the only place the REAL positions are known. A volume overlapping them is
+    // an install that destroys the table on its way to using it.
+    let [primary, backup] = table_ranges(sector_size, disk_sectors).map_err(invalid)?;
+    let primary_end = primary.0.saturating_add(primary.1);
+    let end = offset.saturating_add(len);
+    if offset < primary_end || end > backup.0 {
+        return Err(invalid(format!(
+            "td-install: the volume at {offset}..{end} overlaps a partition table \
+             ({}..{primary_end} and {}..)",
+            primary.0, backup.0
+        )));
+    }
+    Ok((offset, len))
+}
+
+/// The unit both the sparse copy and the edge zeroing work in. Named once
+/// because `run_volume` orders the copy by it: the chunk it defers has to be
+/// the one holding the superblock, and two spellings of a megabyte could
+/// disagree about which that is.
+const COPY_CHUNK: u64 = 1024 * 1024;
+
+/// Copy the parts of `image` that are not all zero to `offset` in `file`.
+///
+/// A freshly made Btrfs is nearly all hole, so copying the holes would be a
+/// write of the whole volume — on a 100 GB partition, minutes of writes to say
+/// nothing. Reading them costs no I/O: a hole reads from the zero page.
+///
+/// What that skip gives up is stated in DESIGN §10 item 7 and is why the
+/// caller zeroes the region's first bytes: a chunk the image leaves as a hole
+/// is a chunk the destination KEEPS, so a signature mkfs erased by writing
+/// zeros would survive here, being indistinguishable from the holes around it.
+///
+/// Returns the bytes actually written, which the caller reports — an install
+/// that copied nothing is one whose mkfs wrote nothing.
+///
+/// `from`..`to` is a range WITHIN the image, so the caller can order the copy;
+/// see `run_volume` for why the first chunk goes last.
+fn copy_sparse(
+    image: &mut File,
+    file: &mut File,
+    offset: u64,
+    from: u64,
+    to: u64,
+) -> io::Result<u64> {
+    let span = usize::try_from(COPY_CHUNK).unwrap_or(1).max(1);
+    let mut buffer = vec![0u8; span];
+    let mut at = from;
+    let mut written = 0u64;
+    image.seek(SeekFrom::Start(from))?;
+    while at < to {
+        let take = usize::try_from(to.saturating_sub(at).min(span as u64)).unwrap_or(span);
+        let chunk = buffer
+            .get_mut(..take)
+            .ok_or_else(|| invalid("td-install: copy chunk out of range".to_string()))?;
+        image.read_exact(chunk)?;
+        if chunk.iter().any(|byte| *byte != 0) {
+            let dest = offset
+                .checked_add(at)
+                .ok_or_else(|| invalid("td-install: a copy offset overflowed".to_string()))?;
+            write_at(file, dest, chunk)?;
+            written = written.saturating_add(take as u64);
+        }
+        at = at.saturating_add(take as u64);
+    }
+    Ok(written)
+}
+
+/// Zero both ENDS of the region before the copy lands on it.
+///
+/// This is the whole of what the sparse copy gives up. mkfs erases a previous
+/// filesystem's signature by WRITING ZEROS, and zeros in a fresh sparse image
+/// are holes the copy skips — so a signature the new filesystem believes it
+/// erased survives underneath it, and a prober that finds two says the disk is
+/// ambiguous or, worse, assembles the older one.
+///
+/// BOTH ends, because "the first megabyte covers every signature" is false: XFS
+/// at 0, ext* at 1 KiB and Btrfs at 64 KiB are all at the front, but MD RAID
+/// 0.90 and 1.0 metadata and ZFS's L2/L3 labels sit in the LAST few hundred
+/// kilobytes of the device. An alignment's worth at each end covers both sets,
+/// and costs two megabytes against a partition measured in gigabytes.
+///
+/// Btrfs's own superblock mirrors need no such care: they are at fixed offsets
+/// and the new mkfs writes every one this volume is large enough to hold.
+fn zero_edges(file: &mut File, offset: u64, len: u64) -> io::Result<()> {
+    let edge = protocol::PARTITION_ALIGN_BYTES.min(len);
+    // A region too small to hold two disjoint edges is zeroed once, whole,
+    // rather than twice over its own middle.
+    if len <= edge.saturating_mul(2) {
+        return zero_at(file, offset, len);
+    }
+    zero_at(file, offset, edge)?;
+    let tail = offset
+        .checked_add(len)
+        .and_then(|end| end.checked_sub(edge))
+        .ok_or_else(|| invalid("td-install: the volume tail overflowed".to_string()))?;
+    zero_at(file, tail, edge)
+}
+
+fn run_volume(
+    destination: &Path,
+    mkfs: &Path,
+    scratch: &Path,
+    out: &mut dyn Write,
+) -> io::Result<()> {
+    // `Command::new` SEARCHES `PATH` for a name with no separator in it, which
+    // is the ambient resolution the declared-input contract above rules out —
+    // and the one form of it a caller cannot see they asked for.
+    if !mkfs.is_absolute() {
+        return Err(invalid(format!(
+            "td-install: {} is not an absolute path, and a bare name resolves through PATH",
+            mkfs.display()
+        )));
+    }
+    let mut file = OpenOptions::new().read(true).write(true).open(destination)?;
+    let disk_bytes = destination_bytes(&mut file)?;
+    let sector_size = logical_sector_size(&file)?;
+    if !disk_bytes.is_multiple_of(sector_size) {
+        return Err(invalid(format!(
+            "td-install: destination is {disk_bytes} bytes, not a whole number of \
+             {sector_size}-byte sectors"
+        )));
+    }
+    let (offset, len) = volume_region(&mut file, sector_size, disk_bytes / sector_size)?;
+    // The partition the TABLE describes must fit in the destination the table
+    // is on. `gpt::parse` cannot check this — it is handed two byte slices and
+    // never learns where they came from — so a header claiming a larger disk
+    // than it sits on passes every checksum and puts `td-volume` past the end.
+    // On a regular file the copy would then EXTEND it; on a block device it
+    // would write over the real backup table before running out of room.
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| invalid("td-install: the volume region overflowed".to_string()))?;
+    if end > disk_bytes {
+        return Err(invalid(format!(
+            "td-install: the table puts the volume at {offset}..{end} on a {disk_bytes}-byte \
+             destination"
+        )));
+    }
+
+    // The image is the volume's own size, because `--byte-count` is what the
+    // filesystem records as the device it lives on: a smaller one would make a
+    // volume that reports less space than the partition it is copied into, and
+    // a larger one a volume whose tail is off the end of the partition.
+    let image_path = scratch.join("td-volume.img");
+    let staging = scratch.join("td-volume-root");
+    let subvol = staging.join(protocol::VOLUME_SUBVOL);
+    // The staging tree is not a working directory but the volume's CONTENTS:
+    // `--rootdir` copies whatever is under it into the filesystem. So it is
+    // emptied rather than merely ensured — a scratch directory a previous run
+    // or another program left something in would otherwise put that something
+    // on a machine's /var, with nothing about the install saying so.
+    if let Err(error) = std::fs::remove_dir_all(&staging) {
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error);
+        }
+    }
+    std::fs::create_dir_all(&subvol)?;
+    // `File::create` TRUNCATES, so a scratch directory that puts the image on
+    // top of the DESTINATION destroys the disk whose table was just read — and
+    // reports success, since everything after this writes a filesystem into
+    // what is left. Compared by device and inode rather than by name: a symlink
+    // or a hard link is the same file under a different path, and `metadata`
+    // follows the one while a string comparison sees neither.
+    {
+        use std::os::linux::fs::MetadataExt;
+        if let Ok(existing) = std::fs::metadata(&image_path) {
+            let target = file.metadata()?;
+            if (existing.st_dev(), existing.st_ino()) == (target.st_dev(), target.st_ino()) {
+                return Err(invalid(format!(
+                    "td-install: the scratch image {} is the destination itself",
+                    image_path.display()
+                )));
+            }
+        }
+    }
+    // UNLINK then CREATE NEW, rather than `File::create`, which opens what is
+    // there — following a symlink to wherever it points and truncating THAT.
+    // The inode check above covers the destination and nothing else, so a
+    // `td-volume.img` pointing at some other file or a block device would be
+    // truncated and grown to the partition's size, under an installer that is
+    // usually root. Removing the ENTRY affects only the link, and `create_new`
+    // then refuses anything that appeared in between rather than opening it.
+    if let Err(error) = std::fs::remove_file(&image_path) {
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error);
+        }
+    }
+    let image = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&image_path)?;
+    image.set_len(len)?;
+    let got = image.metadata()?.len();
+    if got != len {
+        return Err(invalid(format!(
+            "td-install: the scratch image is {got} bytes, not the {len} the volume needs"
+        )));
+    }
+    drop(image);
+
+    let uuid = random_guid()?.to_string();
+    // The child's stdout is CAPTURED and replayed on ours, because this
+    // program's stdout is a machine-readable line and mkfs.btrfs opens with a
+    // banner. Inherited, that banner is the first line of what a caller parses
+    // — which is exactly how this was found, the recipe check reading `v7.0`
+    // where it wanted an offset. stderr is inherited, so a failure still says
+    // what went wrong as it happens.
+    let output = std::process::Command::new(mkfs)
+        .arg("--byte-count")
+        .arg(len.to_string())
+        .arg("--uuid")
+        .arg(&uuid)
+        .arg("--label")
+        .arg(protocol::VOLUME_LABEL)
+        // The one directory in the staged root becomes the read-write subvolume
+        // the boot path mounts on /var. An empty volume without it is a disk
+        // that lays out, formats, and then cannot boot.
+        .arg("--rootdir")
+        .arg(&staging)
+        .arg("--subvol")
+        .arg(format!("rw:{}", protocol::VOLUME_SUBVOL))
+        .arg(&image_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .output()?;
+    // `let _`, as every other write to the diagnostic channel in this crate is:
+    // a closed or full stderr is not a reason to abandon an install half done,
+    // and reporting its ENOSPC would name the wrong disk entirely.
+    let _ = io::stderr().write_all(&output.stdout);
+    if !output.status.success() {
+        return Err(invalid(format!(
+            "td-install: {} failed on the scratch image ({})",
+            mkfs.display(),
+            output.status
+        )));
+    }
+
+    zero_edges(&mut file, offset, len)?;
+    // Durable BEFORE the copy starts, or the ordering below buys nothing: a
+    // power loss could otherwise persist new filesystem blocks while the zero
+    // over the old superblock is still only in page cache, which is exactly the
+    // mixed, apparently-valid volume the deferral exists to prevent.
+    file.sync_all()?;
+    let mut image = File::open(&image_path)?;
+    // The copy is ORDERED, for `run_layout`'s reason one level down: the
+    // superblock is this filesystem's commit point, as the primary table is the
+    // disk's, and it is only true once everything it points at is durable.
+    // Btrfs puts it 64 KiB in, so the FIRST chunk is the commit point — write it
+    // last, behind a barrier, and an interrupted `volume` leaves nothing at the
+    // offset a mount reads. Written first, the same interruption leaves a
+    // superblock a prober calls valid over chunks that are still the PREVIOUS
+    // install's bytes, which is a disk that reports a good btrfs and fails to
+    // mount.
+    //
+    // The PRIMARY only. A mirror 64 MiB in is written during the first pass,
+    // and deferring it too would not buy the same thing: the zeroing does not
+    // reach that far, so what stands there meanwhile is the previous install's
+    // mirror rather than nothing. `btrfs rescue super-recover` can promote a
+    // mirror, so an interrupted install is recoverable-into-nonsense by a tool
+    // asked to try; every path that MOUNTS reads the primary.
+    //
+    // This is also what makes the head half of `zero_edges` load-bearing rather
+    // than merely tidy: with the chunk deferred, those zeros are what stands in
+    // the superblock's place for the length of the copy.
+    let head = COPY_CHUNK.min(len);
+    let rest = copy_sparse(&mut image, &mut file, offset, head, len)?;
+    file.sync_all()?;
+    let first = copy_sparse(&mut image, &mut file, offset, 0, head)?;
+    file.sync_all()?;
+    let written = rest.saturating_add(first);
+
+    // The scratch directory is the CALLER's, and so is what is left in it. Not
+    // tidiness deferred: the image is the only artifact anything can check the
+    // filesystem itself against — `btrfs check` wants a device or a file, and
+    // the copy on the destination begins half a gigabyte in, where no tool can
+    // be pointed at it. Deleting it here would leave the strongest available
+    // check with nothing to run on.
+    writeln!(out, "{offset} {len} {written}")
 }
 
 /// The FAT volume serial, taken from the ESP partition's own GUID.
@@ -490,7 +915,12 @@ fn main() -> ExitCode {
         }
     };
     let result = match mode {
-        Mode::Layout { destination } => run_layout(&destination),
+        Mode::Layout { destination } => run_layout(&destination, &mut io::stdout()),
+        Mode::Volume {
+            destination,
+            mkfs,
+            scratch,
+        } => run_volume(&destination, &mkfs, &scratch, &mut io::stdout()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -554,6 +984,29 @@ mod tests {
         }
     }
 
+    /// A stand-in that RECORDS the argv it was given, one word a line, beside
+    /// itself. Every check in this file and in the recipe reads what mkfs
+    /// produced, and the arguments are invisible to all of them: `--byte-count`
+    /// half the real size still puts the superblock at 64 KiB, the label at
+    /// 64 KiB+299 and a mirror at 64 MiB, so a volume sized wrongly passes every
+    /// one. The only place the request itself can be seen is here.
+    const RECORDING_MKFS: &str = "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/argv\"\n";
+
+    /// A directory holding an executable `mkfs.btrfs` stand-in with `body`.
+    fn fake_mkfs(body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "td-install-mkfs-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("mkfs.btrfs");
+        std::fs::write(&fake, body).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
     fn args(values: &[&str]) -> std::vec::IntoIter<OsString> {
         values
             .iter()
@@ -577,6 +1030,626 @@ mod tests {
         );
         assert!(parse_args(args(&["format", "/dev/sda"])).is_err(), "verb");
         assert!(parse_args(args(&[])).is_err(), "no arguments");
+        assert_eq!(
+            parse_args(args(&["volume", "/dev/sda", "/bin/mkfs.btrfs", "/tmp"])).unwrap(),
+            Mode::Volume {
+                destination: PathBuf::from("/dev/sda"),
+                mkfs: PathBuf::from("/bin/mkfs.btrfs"),
+                scratch: PathBuf::from("/tmp"),
+            }
+        );
+        // Each of the three is REQUIRED, and none is defaulted: a `volume` that
+        // guessed where mkfs.btrfs is would resolve it out of an ambient PATH,
+        // and one that guessed a scratch directory would put a
+        // partition-sized image somewhere nobody chose.
+        for short in [
+            vec!["volume", "/dev/sda"],
+            vec!["volume", "/dev/sda", "/bin/mkfs.btrfs"],
+        ] {
+            assert!(parse_args(args(&short)).is_err(), "{short:?} is incomplete");
+        }
+        assert!(
+            parse_args(args(&["volume", "/dev/sda", "/bin/mkfs.btrfs", "/tmp", "x"])).is_err(),
+            "a fourth argument is not silently ignored"
+        );
+    }
+
+    /// The ranges a table is read back from are the ones `gpt::build` wrote to.
+    /// Derived rather than remembered, so this pins them at BOTH sector sizes —
+    /// the 4Kn arithmetic is where a hardcoded 34/33 would be wrong by eight.
+    #[test]
+    fn the_table_ranges_are_where_the_table_was_written() {
+        for (sector, disk) in [(512u64, DISK), (4096, DISK)] {
+            let sectors = disk / sector;
+            let [primary, backup] = table_ranges(sector, sectors).unwrap();
+            let layout = gpt::Layout {
+                sector_size: sector,
+                disk_sectors: sectors,
+                disk_guid: gpt::Guid::parse("12345678-1234-4234-8234-123456789abc").unwrap(),
+                align_sectors: protocol::PARTITION_ALIGN_BYTES / sector,
+                partitions: Vec::new(),
+            };
+            let image = gpt::build(&layout).unwrap();
+            assert_eq!(primary, (image.primary_offset, image.primary.len() as u64));
+            assert_eq!(backup, (image.backup_offset, image.backup.len() as u64));
+        }
+    }
+
+    /// The volume region comes off the TABLE, so it is the partition the disk
+    /// describes and not a recomputation that could have drifted from it.
+    #[test]
+    fn the_volume_region_is_the_partition_the_table_describes() {
+        let scratch = Scratch::disk(DISK);
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
+        let plan = plan(512, DISK).unwrap();
+        let mut file = File::open(&scratch.path).unwrap();
+        let (offset, len) = volume_region(&mut file, 512, DISK / 512).unwrap();
+        assert_eq!(offset, plan.volume_start * 512);
+        assert_eq!(len, (plan.volume_end - plan.volume_start + 1) * 512);
+        // ...and it ends on the last usable sector, so the partition the
+        // filesystem is sized for is the whole of what the table set aside.
+        assert_eq!(offset + len, (plan.volume_end + 1) * 512);
+    }
+
+    /// A table that is INTERNALLY consistent but describes a different disk is
+    /// refused.
+    ///
+    /// `gpt::parse` is handed two byte slices and never learns where they came
+    /// from, so it cannot catch this: every checksum is over the bytes, and a
+    /// backup written somewhere other than the LBA its own header names is
+    /// still a backup that verifies. Built here exactly that way — a table for
+    /// a disk twice this size, with its backup placed where THIS disk's backup
+    /// goes — because the consequence is a `td-volume` past the end of the
+    /// destination, which a regular file silently EXTENDS to fit.
+    #[test]
+    fn a_table_describing_a_different_disk_is_refused() {
+        let scratch = Scratch::disk(DISK);
+        let claimed = (DISK * 2) / 512;
+        let layout = gpt::Layout {
+            sector_size: 512,
+            disk_sectors: claimed,
+            disk_guid: gpt::Guid::parse("12345678-1234-4234-8234-123456789abc").unwrap(),
+            align_sectors: protocol::PARTITION_ALIGN_BYTES / 512,
+            partitions: Vec::new(),
+        };
+        let forged = gpt::build(&layout).unwrap();
+        {
+            let mut file = OpenOptions::new().write(true).open(&scratch.path).unwrap();
+            write_at(&mut file, forged.primary_offset, &forged.primary).unwrap();
+            // ...at THIS disk's backup position, not the one the header names.
+            let [_, backup] = table_ranges(512, DISK / 512).unwrap();
+            write_at(&mut file, backup.0, &forged.backup).unwrap();
+        }
+        let mut file = File::open(&scratch.path).unwrap();
+        let error = volume_region(&mut file, 512, DISK / 512).unwrap_err();
+        assert!(
+            format!("{error}").contains("-sector disk, not the"),
+            "a table for another disk must be refused: {error}"
+        );
+    }
+
+    /// The volume mkfs is ASKED for is the partition's own size.
+    ///
+    /// Nothing downstream can see this. `--byte-count` half the real length
+    /// still leaves the superblock at 64 KiB, the label beside it and a mirror
+    /// at 64 MiB, so every offset check in this crate and in the recipe passes
+    /// while the filesystem reports less space than the partition it lives in.
+    /// The argv is the only place the request itself is visible.
+    #[test]
+    fn mkfs_is_asked_for_the_partitions_own_size() {
+        let scratch = Scratch::disk(DISK);
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
+        let dir = fake_mkfs(RECORDING_MKFS);
+        run_volume(
+            &scratch.path,
+            &dir.join("mkfs.btrfs"),
+            &dir,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
+        let words: Vec<&str> = argv.lines().collect();
+        let plan = plan(512, DISK).unwrap();
+        let expected = (plan.volume_end - plan.volume_start + 1) * 512;
+        let after = |flag: &str| {
+            words
+                .iter()
+                .position(|w| *w == flag)
+                .and_then(|i| words.get(i + 1))
+                .map(|s| s.to_string())
+        };
+        assert_eq!(
+            after("--byte-count"),
+            Some(expected.to_string()),
+            "mkfs was sized for something other than the partition: {argv:?}"
+        );
+        assert_eq!(
+            after("--label"),
+            Some(protocol::VOLUME_LABEL.to_string()),
+            "the label is the one td-boot looks for: {argv:?}"
+        );
+        assert_eq!(
+            after("--subvol"),
+            Some(format!("rw:{}", protocol::VOLUME_SUBVOL)),
+            "the subvolume is read-write and named: {argv:?}"
+        );
+        // The UUID is per-install and random, so what is pinned is that one was
+        // asked for and that it PARSES — a malformed one mkfs would reject.
+        let uuid = after("--uuid").unwrap_or_default();
+        assert!(
+            gpt::Guid::parse(&uuid).is_ok(),
+            "the uuid is not a GUID: {uuid:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Two installs draw different volume UUIDs, so two td disks are not one
+    /// filesystem as far as anything resolving by UUID is concerned.
+    #[test]
+    fn each_volume_gets_its_own_uuid() {
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let scratch = Scratch::disk(DISK);
+            run_layout(&scratch.path, &mut Vec::new()).unwrap();
+            let dir = fake_mkfs(RECORDING_MKFS);
+            run_volume(
+                &scratch.path,
+                &dir.join("mkfs.btrfs"),
+                &dir,
+                &mut Vec::new(),
+            )
+            .unwrap();
+            let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
+            let words: Vec<&str> = argv.lines().collect();
+            let uuid = words
+                .iter()
+                .position(|w| *w == "--uuid")
+                .and_then(|i| words.get(i + 1))
+                .map(|s| s.to_string())
+                .unwrap();
+            seen.push(uuid);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        assert_ne!(seen.first(), seen.get(1), "two installs shared a volume UUID");
+    }
+
+    /// A table with TWO partitions of the volume's name is refused rather than
+    /// resolved by position: GPT does not make names unique, and picking the
+    /// first formats whichever partition happens to be listed earlier.
+    ///
+    /// A partition of the right name and the WRONG TYPE is not a match at all —
+    /// a name is 36 characters anyone can write, and the type GUID is what says
+    /// what the partition is for.
+    #[test]
+    fn an_ambiguous_or_wrongly_typed_volume_is_refused() {
+        let make = |parts: Vec<gpt::Partition>| {
+            let scratch = Scratch::disk(DISK);
+            let layout = gpt::Layout {
+                sector_size: 512,
+                disk_sectors: DISK / 512,
+                disk_guid: gpt::Guid::parse("12345678-1234-4234-8234-123456789abc").unwrap(),
+                align_sectors: protocol::PARTITION_ALIGN_BYTES / 512,
+                partitions: parts,
+            };
+            let image = gpt::build(&layout).unwrap();
+            {
+                let mut file = OpenOptions::new().write(true).open(&scratch.path).unwrap();
+                write_at(&mut file, image.primary_offset, &image.primary).unwrap();
+                write_at(&mut file, image.backup_offset, &image.backup).unwrap();
+            }
+            let mut file = File::open(&scratch.path).unwrap();
+            let error = volume_region(&mut file, 512, DISK / 512).unwrap_err();
+            format!("{error}")
+        };
+        // Distinct unique GUIDs, because `gpt::build` refuses two of one — the
+        // ambiguity under test here is of the NAME, which nothing refuses.
+        let volume = |start: u64, end: u64, type_guid: gpt::Guid, tag: u8| gpt::Partition {
+            type_guid,
+            unique_guid: gpt::Guid::parse(&format!("00000000-0000-4000-8000-00000000000{tag}"))
+                .unwrap(),
+            start_lba: start,
+            end_lba: end,
+            attributes: 0,
+            name: protocol::VOLUME_PARTITION_NAME.to_string(),
+        };
+        let two = make(vec![
+            volume(2048, 4095, gpt::TYPE_LINUX_FS, 1),
+            volume(4096, 8191, gpt::TYPE_LINUX_FS, 2),
+        ]);
+        assert!(
+            two.contains("has 2 partitions named"),
+            "two of the name must be refused: {two}"
+        );
+        let wrong_type = make(vec![volume(2048, 4095, gpt::TYPE_ESP, 3)]);
+        assert!(
+            wrong_type.contains("no td-volume partition on this disk"),
+            "the name alone is not a match: {wrong_type}"
+        );
+    }
+
+    /// The ENGINE refuses to place a partition over the table, which is the
+    /// first of the two answers to a volume that would overwrite one.
+    ///
+    /// The second is `volume_region`'s own `overlaps a partition table` bound,
+    /// and NO TEST HERE REACHES IT — deliberately recorded rather than left to
+    /// be discovered. `gpt::parse` bounds partitions by the header's own
+    /// `first_usable`, a field in the same table, so a hand-forged table
+    /// declaring a usable range over its own entry array would be
+    /// self-consistent and would reach it. Building one means re-sealing two
+    /// headers and an entry-array CRC by hand, which is `gpt.rs`'s job
+    /// reimplemented in a test that would then pass while the real sealing
+    /// changed underneath it. So the bound stays as what it is — a check on the
+    /// last value before a raw write to somebody's disk — and this test pins
+    /// the reachable half.
+    #[test]
+    fn a_volume_over_the_table_cannot_even_be_built() {
+        let layout = gpt::Layout {
+            sector_size: 512,
+            disk_sectors: DISK / 512,
+            disk_guid: gpt::Guid::parse("12345678-1234-4234-8234-123456789abc").unwrap(),
+            align_sectors: protocol::PARTITION_ALIGN_BYTES / 512,
+            partitions: vec![gpt::Partition {
+                type_guid: gpt::TYPE_LINUX_FS,
+                unique_guid: gpt::Guid::parse("00000000-0000-4000-8000-000000000002").unwrap(),
+                // LBA 2 is inside the primary entry array at any sector size.
+                start_lba: 2,
+                end_lba: 2047,
+                attributes: 0,
+                name: protocol::VOLUME_PARTITION_NAME.to_string(),
+            }],
+        };
+        let error = gpt::build(&layout).unwrap_err();
+        assert!(
+            error.contains("the table itself occupies through"),
+            "the engine must refuse a partition over its own table: {error}"
+        );
+    }
+
+    /// A scratch image that is a SYMLINK is replaced, not followed — otherwise
+    /// `File::create` truncates whatever it points at and grows it to the
+    /// partition's size, under an installer that is usually root.
+    #[test]
+    fn a_symlinked_scratch_image_is_replaced_rather_than_followed() {
+        let dir = fake_mkfs(RECORDING_MKFS);
+        let scratch = Scratch::disk(DISK);
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
+        let bystander = dir.join("someone-elses-file");
+        std::fs::write(&bystander, b"do not truncate me").unwrap();
+        std::os::unix::fs::symlink(&bystander, dir.join("td-volume.img")).unwrap();
+        run_volume(
+            &scratch.path,
+            &dir.join("mkfs.btrfs"),
+            &dir,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&bystander).unwrap(),
+            b"do not truncate me",
+            "the symlink's target was written through"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A destination with no table at all is refused, and SO IS one with a
+    /// valid table that has no `td-volume` in it — a different branch, and the
+    /// one the diagnostic is written for.
+    #[test]
+    fn a_volume_needs_a_layout_first() {
+        let scratch = Scratch::disk(DISK);
+        let mut file = File::open(&scratch.path).unwrap();
+        let error = volume_region(&mut file, 512, DISK / 512).unwrap_err();
+        assert!(
+            format!("{error}").contains("gpt:"),
+            "an unlaid-out disk is refused by the parser: {error}"
+        );
+
+        // A well-formed table for this disk, carrying no partitions.
+        let layout = gpt::Layout {
+            sector_size: 512,
+            disk_sectors: DISK / 512,
+            disk_guid: gpt::Guid::parse("12345678-1234-4234-8234-123456789abc").unwrap(),
+            align_sectors: protocol::PARTITION_ALIGN_BYTES / 512,
+            partitions: Vec::new(),
+        };
+        let empty = gpt::build(&layout).unwrap();
+        {
+            let mut file = OpenOptions::new().write(true).open(&scratch.path).unwrap();
+            write_at(&mut file, empty.primary_offset, &empty.primary).unwrap();
+            write_at(&mut file, empty.backup_offset, &empty.backup).unwrap();
+        }
+        let mut file = File::open(&scratch.path).unwrap();
+        let error = volume_region(&mut file, 512, DISK / 512).unwrap_err();
+        assert!(
+            format!("{error}").contains("no td-volume partition on this disk"),
+            "a table without the volume must say so: {error}"
+        );
+    }
+
+    /// The line `run_volume` reports is the volume's own geometry, and a
+    /// `mkfs` that wrote nothing copies nothing.
+    ///
+    /// The stand-in is a shell script rather than the real thing: no host is
+    /// required to have `mkfs.btrfs`, and what is under test here is the
+    /// arithmetic and the reporting, not the filesystem. It leaves the image
+    /// all zeros, so `written` is 0 — which is pinned too, since a copy that
+    /// wrote something out of an empty image would be inventing it.
+    ///
+    /// What this canNOT cover is the child's stdout staying out of the
+    /// process's own, which is what the parent commit's recipe check caught:
+    /// `out` here is a `Vec`, so a child inheriting fd 1 is invisible to it.
+    /// `tests/stdout_is_a_data_channel.rs` runs the real binary for that.
+    #[test]
+    fn the_reported_line_is_the_volumes_geometry() {
+        let scratch = Scratch::disk(DISK);
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
+        let dir = fake_mkfs("#!/bin/sh\necho 'btrfs-progs v7.0'\n");
+        let mut out = Vec::new();
+        run_volume(&scratch.path, &dir.join("mkfs.btrfs"), &dir, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let fields: Vec<&str> = text.split_whitespace().collect();
+        assert_eq!(fields.len(), 3, "the line is <off> <len> <written>: {text:?}");
+        let plan = plan(512, DISK).unwrap();
+        assert_eq!(
+            fields.first().map(|f| f.parse::<u64>().unwrap()),
+            Some(plan.volume_start * 512)
+        );
+        assert_eq!(
+            fields.get(1).map(|f| f.parse::<u64>().unwrap()),
+            Some((plan.volume_end - plan.volume_start + 1) * 512)
+        );
+        assert_eq!(fields.get(2).map(|f| f.parse::<u64>().unwrap()), Some(0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A destination whose PATH has a space in it does not shift the fields a
+    /// caller reads by position. Nothing but numbers goes on that channel, so
+    /// this holds by construction rather than by escaping — which is the point:
+    /// escaping is a rule every future field has to remember.
+    #[test]
+    fn a_destination_with_a_space_in_its_name_does_not_shift_the_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "td-install-space {}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a disk.img");
+        File::create(&path).unwrap().set_len(DISK).unwrap();
+        let mut out = Vec::new();
+        run_layout(&path, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().count(), 1, "one line: {text:?}");
+        let fields: Vec<&str> = text.split_whitespace().collect();
+        assert_eq!(fields.len(), 2, "the line is <esp> <volume>: {text:?}");
+        for field in &fields {
+            assert!(field.parse::<u64>().is_ok(), "{field:?} is not a number");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A relative `mkfs` is refused rather than resolved through `PATH`.
+    #[test]
+    fn a_relative_mkfs_is_refused_before_it_can_be_searched_for() {
+        let scratch = Scratch::disk(DISK);
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
+        let error = run_volume(
+            &scratch.path,
+            Path::new("mkfs.btrfs"),
+            &std::env::temp_dir(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error}").contains("resolves through PATH"),
+            "a bare name must be refused: {error}"
+        );
+    }
+
+    /// A scratch directory that would put the image ON the destination is
+    /// refused, rather than truncating the disk whose table was just parsed.
+    #[test]
+    fn a_scratch_image_that_is_the_destination_is_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "td-install-alias-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("td-volume.img");
+        File::create(&path).unwrap().set_len(DISK).unwrap();
+        run_layout(&path, &mut Vec::new()).unwrap();
+        let fake = fake_mkfs("#!/bin/sh\nexit 0\n");
+        let error = run_volume(&path, &fake.join("mkfs.btrfs"), &dir, &mut Vec::new()).unwrap_err();
+        assert!(
+            format!("{error}").contains("is the destination itself"),
+            "the alias must be refused: {error}"
+        );
+        // ...and the disk it would have truncated is still the size it was.
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), DISK);
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&fake).unwrap();
+    }
+
+    /// Both ENDS of the region are cleared before the copy, because a signature
+    /// the sparse copy would skip can be at either.
+    #[test]
+    fn the_copy_clears_both_ends_of_the_region_first() {
+        const MIB: u64 = 1024 * 1024;
+        let dest = Scratch::disk(8 * MIB);
+        let (offset, len) = (MIB, 6 * MIB);
+        {
+            let mut file = OpenOptions::new().write(true).open(&dest.path).unwrap();
+            // A signature at each end of the region, and one in its middle that
+            // the copy is expected to leave alone.
+            write_at(&mut file, offset, &[0xaa; 512]).unwrap();
+            write_at(&mut file, offset + len - 512, &[0xbb; 512]).unwrap();
+            write_at(&mut file, offset + 3 * MIB, &[0xcc; 512]).unwrap();
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&dest.path)
+            .unwrap();
+        zero_edges(&mut file, offset, len).unwrap();
+        assert_eq!(dest.read_at(offset, 4), [0; 4], "the head was cleared");
+        assert_eq!(
+            dest.read_at(offset + len - 512, 4),
+            [0; 4],
+            "the tail was cleared — MD RAID and ZFS put metadata there"
+        );
+        assert_eq!(
+            dest.read_at(offset + 3 * MIB, 4),
+            [0xcc; 4],
+            "the middle is the copy's to write, not this function's"
+        );
+    }
+
+    /// The copy honours its RANGE, which is what lets `run_volume` order it.
+    ///
+    /// The ordering itself — everything but the first chunk, a barrier, then the
+    /// first chunk — cannot be observed from the final state, and an interrupted
+    /// install is not something a test can stage. What can be pinned is the
+    /// mechanism the ordering rests on: a range that starts past a live chunk
+    /// must leave that chunk's destination untouched, or "deferred" would mean
+    /// "written twice" and the barrier would guarantee nothing.
+    #[test]
+    fn the_copy_writes_only_the_range_it_is_given() {
+        const CHUNK: u64 = 1024 * 1024;
+        let source = Scratch::disk(3 * CHUNK);
+        let dest = Scratch::disk(4 * CHUNK);
+        {
+            let mut file = OpenOptions::new().write(true).open(&source.path).unwrap();
+            write_at(&mut file, 0, &[0xab; 4096]).unwrap();
+            write_at(&mut file, 2 * CHUNK, &[0xcd; 4096]).unwrap();
+        }
+        {
+            let mut file = OpenOptions::new().write(true).open(&dest.path).unwrap();
+            write_at(&mut file, CHUNK, &[0xee; 512]).unwrap();
+        }
+        let mut image = File::open(&source.path).unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&dest.path)
+            .unwrap();
+        // Everything BUT the first chunk, exactly as `run_volume` does it.
+        let written = copy_sparse(&mut image, &mut file, CHUNK, CHUNK, 3 * CHUNK).unwrap();
+        assert_eq!(written, CHUNK, "only the one live chunk in range");
+        assert_eq!(
+            dest.read_at(CHUNK, 4),
+            [0xee; 4],
+            "the deferred chunk's destination was not touched"
+        );
+        assert_eq!(dest.read_at(3 * CHUNK, 4), [0xcd; 4], "the in-range chunk landed");
+        // ...and the deferred pass then lands it, at its own offset.
+        let first = copy_sparse(&mut image, &mut file, CHUNK, 0, CHUNK).unwrap();
+        assert_eq!(first, CHUNK);
+        assert_eq!(dest.read_at(CHUNK, 4), [0xab; 4]);
+    }
+
+    /// The staging tree is EMPTIED, not merely ensured: `--rootdir` copies what
+    /// is under it into the filesystem, so anything left there by a previous run
+    /// would land on a machine's /var.
+    #[test]
+    fn a_stale_staging_tree_does_not_reach_the_volume() {
+        let scratch = Scratch::disk(DISK);
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
+        let dir = fake_mkfs(RECORDING_MKFS);
+        let stale = dir.join("td-volume-root").join("junk");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, b"not mine").unwrap();
+        run_volume(
+            &scratch.path,
+            &dir.join("mkfs.btrfs"),
+            &dir,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(!stale.exists(), "a stale staging file survived into the volume");
+        assert!(
+            dir.join("td-volume-root").join(protocol::VOLUME_SUBVOL).is_dir(),
+            "the subvolume directory is still staged"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A region too small for two disjoint edges is cleared once, whole,
+    /// rather than twice over its own middle.
+    #[test]
+    fn a_region_smaller_than_two_edges_is_cleared_once_and_entirely() {
+        const MIB: u64 = 1024 * 1024;
+        let dest = Scratch::disk(4 * MIB);
+        {
+            let mut file = OpenOptions::new().write(true).open(&dest.path).unwrap();
+            write_at(&mut file, MIB, &vec![0xff; MIB as usize]).unwrap();
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&dest.path)
+            .unwrap();
+        zero_edges(&mut file, MIB, MIB).unwrap();
+        assert_eq!(dest.read_at(MIB, 4), [0; 4]);
+        assert_eq!(dest.read_at(2 * MIB - 4, 4), [0; 4], "to its very end");
+    }
+
+    /// A `mkfs` that FAILS fails the install, rather than leaving a partition
+    /// with whatever was in it before and a zero exit status.
+    #[test]
+    fn a_failing_mkfs_fails_the_volume() {
+        let scratch = Scratch::disk(DISK);
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
+        let dir = fake_mkfs("#!/bin/sh\nexit 3\n");
+        let error =
+            run_volume(&scratch.path, &dir.join("mkfs.btrfs"), &dir, &mut Vec::new()).unwrap_err();
+        assert!(
+            format!("{error}").contains("failed on the scratch image"),
+            "a failing mkfs must be reported: {error}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The sparse copy writes the chunks that hold something and skips the
+    /// holes — and the skip is not free, which is the half worth pinning: a
+    /// byte under a hole SURVIVES. That is why `run_volume` zeroes the region's
+    /// first megabyte before copying, and this is the test that would notice if
+    /// the skip ever silently became a full copy (`written` would jump).
+    #[test]
+    fn the_sparse_copy_skips_holes_and_keeps_what_is_under_them() {
+        const CHUNK: u64 = 1024 * 1024;
+        let source = Scratch::disk(3 * CHUNK);
+        let dest = Scratch::disk(4 * CHUNK);
+        {
+            let mut file = OpenOptions::new().write(true).open(&source.path).unwrap();
+            // First chunk holds data, second is a hole, third holds data.
+            write_at(&mut file, 0, &[0xab; 4096]).unwrap();
+            write_at(&mut file, 2 * CHUNK, &[0xcd; 4096]).unwrap();
+        }
+        {
+            // Something already on the destination, under what will be the hole.
+            let mut file = OpenOptions::new().write(true).open(&dest.path).unwrap();
+            write_at(&mut file, CHUNK + CHUNK, &[0xee; 512]).unwrap();
+        }
+        let mut image = File::open(&source.path).unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&dest.path)
+            .unwrap();
+        let written = copy_sparse(&mut image, &mut file, CHUNK, 0, 3 * CHUNK).unwrap();
+        assert_eq!(written, 2 * CHUNK, "only the two live chunks are written");
+        assert_eq!(dest.read_at(CHUNK, 4), [0xab; 4], "the first chunk arrived");
+        assert_eq!(
+            dest.read_at(3 * CHUNK, 4),
+            [0xcd; 4],
+            "the third chunk arrived at its own offset, not packed after the first"
+        );
+        assert_eq!(
+            dest.read_at(2 * CHUNK, 4),
+            [0xee; 4],
+            "the skipped hole left the destination's own bytes in place"
+        );
     }
 
     #[test]
@@ -665,7 +1738,7 @@ mod tests {
     #[test]
     fn a_laid_out_disk_carries_a_table_gpt_reads_back() {
         let scratch = Scratch::disk(DISK);
-        run_layout(&scratch.path).unwrap();
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
         let table = scratch.table(DISK);
 
         let p = plan(512, DISK).unwrap();
@@ -694,7 +1767,7 @@ mod tests {
     #[test]
     fn the_esp_is_a_fat32_volume_of_the_partitions_size() {
         let scratch = Scratch::disk(DISK);
-        run_layout(&scratch.path).unwrap();
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
         let p = plan(512, DISK).unwrap();
 
         let boot = scratch.read_at(p.esp_offset().unwrap(), 512);
@@ -730,7 +1803,7 @@ mod tests {
             file.seek(SeekFrom::Start(at)).unwrap();
             file.write_all(&vec![0xffu8; 8 * MIB as usize]).unwrap();
         }
-        run_layout(&scratch.path).unwrap();
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
 
         let esp = fat::build(&fat::Volume {
             bytes_per_sector: 512,
@@ -797,7 +1870,7 @@ mod tests {
     #[test]
     fn a_reinstall_clears_the_old_table_before_the_esp_beneath_it() {
         let scratch = Scratch::disk(DISK);
-        run_layout(&scratch.path).unwrap();
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
         let first = scratch.table(DISK);
 
         {
@@ -823,7 +1896,7 @@ mod tests {
             "an invalidated disk must not parse as partitioned"
         );
 
-        run_layout(&scratch.path).unwrap();
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
         let second = scratch.table(DISK);
         assert_eq!(second.partitions.len(), 2, "the reinstall wrote a table");
         assert_ne!(
@@ -839,8 +1912,8 @@ mod tests {
     fn each_install_gets_its_own_guids() {
         let first = Scratch::disk(DISK);
         let second = Scratch::disk(DISK);
-        run_layout(&first.path).unwrap();
-        run_layout(&second.path).unwrap();
+        run_layout(&first.path, &mut Vec::new()).unwrap();
+        run_layout(&second.path, &mut Vec::new()).unwrap();
 
         let (a, b) = (first.table(DISK), second.table(DISK));
         assert_ne!(a.disk_guid, b.disk_guid);

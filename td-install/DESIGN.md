@@ -847,8 +847,10 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    descriptor is open on. A 4Kn disk laid out in 512-byte sectors has every
    LBA off by eight, which firmware reads as no table at all.
 
-   **7b** adds the Btrfs volume and the `mkfs.btrfs` binding D7 requires to
-   land with the exec. **7c** delegates the publish to `td-boot install`.
+   **7b, the VOLUME**, is landed: `td-install volume` formats the volume
+   partition and leaves it holding the read-write `@var` subvolume, with the
+   `mkfs.btrfs` binding D7 requires beside the exec that needs it. **7c**
+   delegates the publish to `td-boot install`.
 
    7b is itself two commits, and the RECIPE is the first of them. D7's binding
    is a build-time complaint about a missing program, so something has to
@@ -874,24 +876,70 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    installer whose tested path and shipped path differ is an installer tested
    somewhere other than where it runs — and D8 survives intact.
 
-   Two properties of that copy belong here rather than only in the code. It
+   Three properties of that copy belong here rather than only in the code. It
    writes only the chunks of the image that are not entirely zero, because a
    freshly made Btrfs is nearly all hole and copying the holes would be a
    write of the whole volume. That skip has a consequence: bytes the image
    leaves as holes are bytes the destination KEEPS, so a reinstall over
    another filesystem would keep that filesystem's superblock — mkfs erases
    those signatures by writing zeros, which in a sparse image are
-   indistinguishable from the holes around them. So the volume's first
-   `PARTITION_ALIGN_BYTES` are zeroed before the copy, which covers every
-   signature a probe looks for (XFS at 0, ext* at 1 KiB, Btrfs at 64 KiB) and
-   is the same bounded-prefix argument the ESP's metadata region already
-   makes. Btrfs's own superblock MIRRORS need no such care: they sit at fixed
-   offsets and the new mkfs writes each one the volume is large enough to
-   hold, so a stale mirror is always overwritten by its replacement.
+   indistinguishable from the holes around them. So `PARTITION_ALIGN_BYTES` at
+   EACH END of the volume are zeroed before the copy, the same bounded-prefix
+   argument the ESP's metadata region already makes, doubled.
+
+   Both ends, because one is not enough and a bounded prefix alone would be a
+   claim this file made and the disk did not keep. The front holds XFS at 0,
+   ext* at 1 KiB and Btrfs at 64 KiB; the TAIL holds MD RAID 0.90 metadata in
+   the last 64 KiB, MD RAID 1.0 eight kilobytes from the end, and ZFS's L2/L3
+   labels. btrfs-progs wipes both ends of its device, so on a fresh image both
+   wipes are holes — and it is exactly those holes the copy discards. Installing
+   over a former mdadm member with 1.0 metadata therefore left `blkid` reporting
+   both `btrfs` and `linux_raid_member`, which is a disk mdadm may assemble and
+   a `LABEL=` that resolves ambiguously. Btrfs's own superblock MIRRORS need no
+   such care: they sit at fixed offsets and the new mkfs writes each one the
+   volume is large enough to hold, so a stale mirror is always overwritten by
+   its replacement.
+
+   The copy is also ORDERED, for the same reason the primary table is written
+   last: a filesystem has a commit point too, and Btrfs's is the superblock
+   64 KiB in — inside the FIRST chunk. So every other chunk is written and
+   synced, and that one goes last. An interrupted `volume` then leaves nothing
+   at the offset a mount reads: a partition that holds no filesystem, which is
+   what it is. Written first, the same interruption leaves a superblock every
+   prober calls valid over chunks that are still the previous install's, which
+   mounts as `open_ctree failed` and reads as corruption rather than as an
+   install that did not finish. This is also what makes zeroing the FRONT
+   load-bearing rather than merely tidy — without the deferral the copy
+   rewrites that whole chunk immediately, and with it those zeros are what
+   stands in the superblock's place meanwhile. The zeroing is synced before
+   the copy begins, or the barrier orders nothing: a loss could persist new
+   blocks while the zero over the old superblock was still page cache.
+
+   The deferral covers the PRIMARY superblock and deliberately not the
+   mirrors. A mirror 64 MiB in is written in the first pass, and holding it
+   back would not buy the same property — the bounded zeroing does not reach
+   that far, so what stands there in the meantime is the previous install's
+   mirror rather than nothing. The residual is therefore that `btrfs rescue
+   super-recover`, asked to try, can promote a mirror of an interrupted
+   install; every path that MOUNTS reads the primary, which is absent. Making
+   that residual go away means zeroing the whole region, which is the write of
+   the whole volume the sparse copy exists to avoid.
 
    The cost is a read of the whole image per install — memory bandwidth over a
    sparse file, no I/O — which is the price of not adding a syscall. If that
    ever matters, `SEEK_DATA` is the fix and is an amendment then.
+
+   **Both verbs report one line of whitespace-separated BYTE OFFSETS on stdout
+   and nothing else** — `layout` the ESP and the volume, `volume` the volume's
+   offset, length and the bytes actually written. Bytes rather than the LBAs
+   the layout works in, and the same unit for both, because two verbs of one
+   program reporting the same-shaped line in different units is a caller
+   reading 2048 where the ESP is at 1048576, with nothing on either line to say
+   which it got. The destination is NOT echoed back: a caller knows what it
+   passed, and a path is the one value here that can carry a space — which
+   shifts every field read by position — or a newline, which would break the
+   one-line promise outright. Everything a person reads goes to stderr,
+   including the output of the one child process this path runs.
 
    **The problem it answers: writing a partition table does not make Linux
    reread one.** On a block device the kernel keeps serving the partition

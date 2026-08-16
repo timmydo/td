@@ -52,11 +52,13 @@ pub const SELECTOR_PREFIX: &str = "../deployments/";
 // because item 8's EFI stub puts them there and a full ESP is discovered by an
 // update that cannot finish. Its FAT label is at most 11 characters, which the
 // FAT32 boot sector pads rather than checks.
-// Scoped `dead_code` because these six have exactly one reader and it is not
-// td-boot: `td-install` reaches them through the same `#[path]` include, which
-// is the point of their being here rather than there. Without it td-boot's
-// clippy — which the preflight really does run — carries six warnings forever,
-// and a clean lint run is what makes the next real one visible.
+// Scoped `dead_code` because none of the following has a reader in td-boot:
+// `td-install` reaches them through the same `#[path]` include — and
+// `MKFS_BTRFS` is read by the RECIPE, through a third include of this same file
+// — which is the point of their being here rather than in either. Without the
+// scope td-boot's clippy, which the preflight really does run, carries a
+// warning per constant forever, and a clean lint run is what makes the next
+// real one visible.
 #[allow(dead_code)]
 pub const ESP_PARTITION_NAME: &str = "td-esp";
 #[allow(dead_code)]
@@ -69,6 +71,22 @@ pub const VOLUME_PARTITION_NAME: &str = "td-volume";
 // installs the third before retiring the first.
 #[allow(dead_code)]
 pub const MIN_VOLUME_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+#[allow(dead_code)]
+pub const VOLUME_LABEL: &str = "td-system";
+// The read-write subvolume the boot path mounts on /var, so a deployment's
+// mutable state survives an update that replaces everything else. Named here
+// for the reason the layout is: the installer CREATES it and the boot path
+// MOUNTS it by this name, and the two disagreeing is a machine that boots to a
+// read-only /var.
+#[allow(dead_code)]
+pub const VOLUME_SUBVOL: &str = "@var";
+// The one third-party program on the install path (D7). A NAME, not a path:
+// `td-install` is told where it is, and this is what the build-time check binds
+// against so an image or a recipe that stops providing it reds the build rather
+// than failing an install on a machine someone is standing in front of. Same
+// argument as `REQUIRED_TD_INIT_APPLETS` above, one program wide.
+#[allow(dead_code)]
+pub const MKFS_BTRFS: &str = "mkfs.btrfs";
 // 1 MiB, the alignment every partition start is held to. A start that ignores
 // it reads and writes across a physical block boundary forever, and nothing
 // reports it — `gpt.rs` refuses 0 for the same reason.
