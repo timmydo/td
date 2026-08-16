@@ -16,7 +16,11 @@ const VIRTUAL_EXTENT: usize = 65_536;
 /// There is deliberately no command to change it. `Super+v`/`Super+h` used to
 /// set a per-workspace split axis, and they now choose a column's
 /// PRESENTATION — a thing the operator can see, rather than a mode that only
-/// shows up when the next window opens. Getting a second window into one
+/// shows up when the next window opens. On a workspace holding ONE window
+/// that contrast is at its weakest, since there is no column yet and the
+/// choice does wait for the second window; what keeps it from being the old
+/// mode is that the band's lit button says which one is waiting. Getting a
+/// second window into one
 /// column is `Super+Shift+Down` or a drop onto its band, both of which say so
 /// at the moment they are used.
 const FIRST_SPLIT: Axis = Axis::Horizontal;
@@ -53,6 +57,16 @@ impl Presentation {
             Presentation::Split => None,
             Presentation::Stacked => Some(Axis::Vertical),
             Presentation::Tabbed => Some(Axis::Horizontal),
+        }
+    }
+
+    /// The presentation whose run travels along `axis` — `run`'s inverse, so
+    /// a placement can name the presentation it is in rather than leaving
+    /// every reader to map the direction back.
+    fn of_run(axis: Axis) -> Presentation {
+        match axis {
+            Axis::Vertical => Presentation::Stacked,
+            Axis::Horizontal => Presentation::Tabbed,
         }
     }
 
@@ -165,6 +179,15 @@ pub struct Placement {
     /// tell the two apart — and the drop asks because a block along the run
     /// goes on the edge the run runs to.
     pub run: Option<Axis>,
+    /// Which of the three presentations the container showing this leaf is in.
+    /// The same fact as `run` for every leaf in a container — and NOT the same
+    /// for a lone leaf, which has no container and is presented by its
+    /// WORKSPACE. That one is laid out as an ordinary tile whatever the
+    /// presentation says, since a run of one leaf draws one band over one
+    /// content rectangle either way, so it has no run and the border still
+    /// wraps its band together with its client. The band's buttons ask this;
+    /// the geometry asks `run`.
+    pub presented: Presentation,
     /// Whether the CLIENT's pixels are shown. A leaf stacked away keeps the
     /// `rect` it WOULD have rather than an empty one, so this cannot be
     /// inferred from the rectangle: five sites ask instead — the border pass,
@@ -504,6 +527,18 @@ struct Workspace {
     /// Focus alone cannot answer that: it names one leaf per workspace, and a
     /// stack the operator is not in has none of it.
     recent: Vec<SurfaceKey>,
+    /// How the workspace presents its root while that root is a LONE LEAF.
+    ///
+    /// A single window is in no container, so without this it has no
+    /// presentation to change and its band offers nothing — the operator's
+    /// first window is the one that says least about how the shell works. The
+    /// workspace is that window's container of last resort, and the setting is
+    /// carried onto the real root the moment a second window makes one, so
+    /// choosing tabs while ONE window is open means the second opens into a
+    /// tab rather than being an instruction that quietly expired. An EMPTY
+    /// workspace is not that case and cannot be set up in advance: no leaf is
+    /// focused, so the command returns before reaching this.
+    presentation: Presentation,
 }
 
 impl Workspace {
@@ -513,6 +548,7 @@ impl Workspace {
             focused: None,
             fullscreen: None,
             recent: Vec::new(),
+            presentation: Presentation::Split,
         }
     }
 
@@ -539,6 +575,17 @@ impl Workspace {
             self.focus(key);
             return;
         };
+        // The workspace presents a LONE leaf, and this is where it stops being
+        // one: whatever the operator chose while there was nothing to group
+        // moves onto the container that now exists, so `Super+h` before a
+        // second window opens is tabs when it does rather than a setting that
+        // quietly expired. Handed OVER rather than copied — a workspace that
+        // kept it would re-apply it to some later lone leaf that never asked.
+        let carried = if matches!(root, Node::Leaf(_)) {
+            std::mem::replace(&mut self.presentation, Presentation::Split)
+        } else {
+            Presentation::Split
+        };
         let focused = self.focused.or_else(|| {
             let mut keys = Vec::new();
             root.leaves(&mut keys);
@@ -554,8 +601,13 @@ impl Workspace {
             root = Node::Split {
                 axis: FIRST_SPLIT,
                 children: vec![root, Node::Leaf(key)],
-                presentation: Presentation::Split,
+                presentation: carried,
             };
+        } else if let Node::Split { presentation, .. } = &mut root {
+            // `insert_after` turned the lone leaf into the split itself.
+            if carried.grouped() {
+                *presentation = carried;
+            }
         }
         self.root = Some(root);
         self.focus(key);
@@ -568,6 +620,14 @@ impl Workspace {
             return;
         };
         self.root = remove_node(root, key);
+        if self.root.is_none() {
+            // A container is destroyed with its last child and takes its
+            // presentation with it. The workspace's own is that setting one
+            // level out, so it goes the same way: keeping it would group a
+            // later window that never asked — the copy `map` refuses, one
+            // step further on.
+            self.presentation = Presentation::Split;
+        }
         self.recent.retain(|candidate| *candidate != key);
         let after = self.leaves();
         if self.fullscreen == Some(key) {
@@ -856,12 +916,22 @@ impl Layout {
                 {
                     return;
                 }
-                if let Some(slot) = self
-                    .workspace_mut(self.active)
-                    .root
-                    .as_mut()
-                    .and_then(|root| root.presented_mut(focused))
-                {
+                // A lone leaf has no container, and the WORKSPACE is its
+                // presenter — same rule the placement pass and the band's
+                // buttons read, so all three agree about what a first window
+                // is in.
+                let workspace = self.workspace_mut(self.active);
+                let slot = match workspace.root.as_mut() {
+                    Some(Node::Leaf(_)) => Some(&mut workspace.presentation),
+                    Some(root) => root.presented_mut(focused),
+                    // Unreachable rather than a case: a workspace with no root
+                    // has no focused leaf, and the focus above already
+                    // returned. An EMPTY workspace therefore cannot be asked
+                    // for a presentation, which is why this is not the way to
+                    // set one up before the first window opens.
+                    None => None,
+                };
+                if let Some(slot) = slot {
                     *slot = match command {
                         // Grouping picks STACKED, and ungrouping forgets which
                         // mode was in use: a container remembers its axis, not
@@ -952,6 +1022,14 @@ impl Layout {
         }
         let mut seen = BTreeSet::new();
         for (number, workspace) in &self.workspaces {
+            // The workspace presents a LONE leaf and nothing else, so a choice
+            // held beside any other root is one `map` would hand to a container
+            // that already has its own — or would hand twice.
+            if workspace.presentation.grouped() && !matches!(workspace.root, Some(Node::Leaf(_))) {
+                return Err(format!(
+                    "workspace {number} holds a presentation with no lone leaf to present"
+                ));
+            }
             match (&workspace.root, workspace.focused) {
                 (None, None) => {}
                 (None, Some(_)) => {
@@ -1180,6 +1258,10 @@ fn visible_placements(
             },
             focused: workspace.focused == Some(fullscreen),
             run: None,
+            // A fullscreen window is presented by the output, not by anything
+            // in the tree, and its band is zero-height — so nothing marks a
+            // presentation while it is up, as no command may set one.
+            presented: Presentation::Split,
             visible: true,
         }];
     }
@@ -1230,18 +1312,30 @@ fn laid_out(
         height: height.saturating_sub(inset_y.saturating_mul(2)),
     };
     let mut placements = Vec::new();
-    place_node(
-        root,
-        rect,
-        &Pass {
-            gap,
-            band,
-            focused: workspace.focused,
-            recent: &workspace.recent,
-            honour_stacking,
-        },
-        &mut placements,
-    );
+    let pass = Pass {
+        gap,
+        band,
+        focused: workspace.focused,
+        recent: &workspace.recent,
+        honour_stacking,
+    };
+    place_node(root, rect, &pass, &mut placements);
+    // A LONE LEAF is presented by its WORKSPACE, the only container it has.
+    // The presentation reaches the band's buttons and NOTHING else: a run of
+    // one leaf is one band over one content rectangle, which is what an
+    // ordinary tile already is, so the geometry is the geometry `place_node`
+    // just produced and `run` stays empty — with it the border that wraps a
+    // window's band together with its client, which a run gives up.
+    //
+    // Not on the UNSTACKED pass, which reports what the arrangement would be
+    // with every group expanded — a grouped container's leaves come back
+    // `Split` there because `place_group` is skipped, and a lone leaf would
+    // otherwise be the one placement in that pass still naming a group.
+    if honour_stacking && matches!(root, Node::Leaf(_)) {
+        if let Some(alone) = placements.first_mut() {
+            alone.presented = workspace.presentation;
+        }
+    }
     placements
 }
 
@@ -1485,6 +1579,7 @@ fn place_node(node: &Node, rect: Rect, pass: &Pass, placements: &mut Vec<Placeme
                 },
                 focused: pass.focused == Some(*key),
                 run: None,
+                presented: Presentation::Split,
                 visible: true,
             });
         }
@@ -1596,6 +1691,7 @@ fn place_group(
             band: *own,
             focused: pass.focused == Some(*key),
             run: Some(run),
+            presented: Presentation::of_run(run),
             visible: index == shown,
         });
     }
@@ -1746,6 +1842,20 @@ mod tests {
 
     fn key(object: u32) -> SurfaceKey {
         SurfaceKey { client: 1, object }
+    }
+
+    #[test]
+    fn a_presentation_and_the_direction_it_runs_name_each_other() {
+        // `of_run` recovers what `run` discarded, which is sound only while
+        // `run` is injective over the grouped presentations — a property the
+        // compiler does not check and a third grouped presentation would
+        // quietly break, leaving `place_group` naming the wrong one.
+        for presentation in [Presentation::Stacked, Presentation::Tabbed] {
+            let run = presentation.run().expect("a grouped presentation runs");
+            assert_eq!(Presentation::of_run(run), presentation);
+        }
+        assert_eq!(Presentation::Split.run(), None);
+        assert!(!Presentation::Split.grouped());
     }
 
     /// Open `object` BELOW whatever is focused, splitting that window's tile
@@ -2045,14 +2155,34 @@ mod tests {
     }
 
     #[test]
-    fn stacking_toggles_the_focused_leafs_own_container_and_a_lone_window_has_none() {
+    fn grouping_takes_the_focused_leafs_own_container_and_a_lone_windows_workspace() {
         let mut layout = Layout::new();
         layout.map(key(1));
-        // A lone window IS the root, with no container to stack. Nothing
-        // happens rather than the workspace acquiring a presentation — and
-        // the whole placement has to say so, since `visible` is a constant
-        // for an unstacked leaf and could not have reported otherwise.
+        // A lone window IS the root and has no container, so its WORKSPACE
+        // presents it — which is what puts a presentation on the very first
+        // window rather than leaving its band with nothing to offer. The whole
+        // placement but `presented` is unchanged, `run` among it: a run of one
+        // leaf draws one band over one content rectangle, which is what an
+        // ordinary tile already is, and a `run` would cost this window the
+        // border around its own title bar.
         let alone = layout.placements(100, 300, 0, 20);
+        layout.apply(Command::ToggleGrouped);
+        let grouped = layout.placements(100, 300, 0, 20);
+        assert_eq!(
+            grouped.first().map(|placement| placement.presented),
+            Some(Presentation::Stacked),
+            "the workspace did not take the presentation"
+        );
+        let but_presented = |placements: &[Placement]| {
+            placements
+                .iter()
+                .map(|placement| Placement {
+                    presented: Presentation::Split,
+                    ..*placement
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(but_presented(&grouped), but_presented(&alone));
         layout.apply(Command::ToggleGrouped);
         assert_eq!(layout.placements(100, 300, 0, 20), alone);
 
@@ -2079,6 +2209,81 @@ mod tests {
         }
         let stacked_band: Vec<usize> = placements.iter().skip(1).map(|p| p.band.y).collect();
         assert_eq!(stacked_band, [0, 20]);
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn the_workspace_hands_its_presentation_over_and_keeps_no_copy() {
+        // Both halves of the hand-over are load-bearing. The workspace must
+        // not KEEP the choice: a container that collapses back to one leaf is
+        // gone and its presentation with it, so the leaf left behind is
+        // ungrouped rather than presented by a workspace still holding what
+        // that container was given.
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.apply(Command::ToggleGrouped);
+        layout.map(key(2));
+        layout.unmap(key(2));
+        assert_eq!(
+            layout
+                .placements(100, 300, 0, 20)
+                .first()
+                .map(|placement| placement.presented),
+            Some(Presentation::Split),
+            "the workspace kept a copy of what it handed over"
+        );
+        layout.check_invariants().unwrap();
+
+        // And a workspace holding NOTHING must not overwrite the container a
+        // window arrives into. `Split` is both "no choice" and a presentation,
+        // so handing it on unconditionally would ungroup a grouped root every
+        // time a window opened in it.
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.map(key(2));
+        layout.apply(Command::ToggleGrouped);
+        layout.map(key(3));
+        assert!(
+            layout
+                .placements(100, 300, 0, 20)
+                .iter()
+                .all(|placement| placement.presented == Presentation::Stacked),
+            "a new window ungrouped the container it joined"
+        );
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn an_emptied_workspace_forgets_the_presentation_its_last_window_had() {
+        // A container is destroyed with its last child and its presentation
+        // goes with it. The workspace's own is that setting one level out, so
+        // it goes the same way — otherwise a window opened long afterwards is
+        // grouped by one that is gone, and the window after THAT joins it.
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.apply(Command::ToggleGrouped);
+        layout.unmap(key(1));
+        layout.map(key(2));
+        // `presented` and NOT `run`: a lone leaf never carries a run, which is
+        // the whole of why the two are separate fields, so asking about that
+        // one here would be asking a question with a constant answer.
+        assert_eq!(
+            layout
+                .placements(100, 300, 0, 20)
+                .first()
+                .map(|placement| placement.presented),
+            Some(Presentation::Split),
+            "a new window inherited the closed one's grouping"
+        );
+        layout.map(key(3));
+        assert!(
+            layout
+                .placements(100, 300, 0, 20)
+                .iter()
+                .all(|placement| placement.run.is_none()
+                    && placement.presented == Presentation::Split),
+            "the container it grew was grouped by a window that is gone"
+        );
         layout.check_invariants().unwrap();
     }
 
@@ -2356,6 +2561,7 @@ mod tests {
                     band: band_at(0, 0, 50),
                     focused: false,
                     run: None,
+                    presented: Presentation::Split,
                     visible: true
                 },
                 Placement {
@@ -2369,6 +2575,7 @@ mod tests {
                     band: band_at(50, 0, 50),
                     focused: false,
                     run: None,
+                    presented: Presentation::Split,
                     visible: true
                 },
                 Placement {
@@ -2382,6 +2589,7 @@ mod tests {
                     band: band_at(50, 50, 50),
                     focused: true,
                     run: None,
+                    presented: Presentation::Split,
                     visible: true
                 }
             ]
@@ -3685,6 +3893,7 @@ mod tests {
                 band: band_at(0, 0, 80),
                 focused: true,
                 run: None,
+                presented: Presentation::Split,
                 visible: true
             }]
         );
@@ -3875,6 +4084,7 @@ mod tests {
                 band: band_at(0, 0, 1),
                 focused: true,
                 run: None,
+                presented: Presentation::Split,
                 visible: true
             }]
         );

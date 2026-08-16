@@ -991,7 +991,7 @@ impl Scene {
             .iter()
             .position(|placement| contains(placement.band, x, y))?;
         let placement = placements.get(index)?;
-        if let Some((rects, _)) = self.band_buttons_of(placement, placements.len()) {
+        if let Some((rects, _)) = self.band_buttons_of(placement) {
             if let Some(at) = rects.iter().position(|slot| contains(*slot, x, y)) {
                 return Some(BandPress::Button(placement.key, *BUTTONS.get(at)?));
             }
@@ -1000,39 +1000,32 @@ impl Scene {
     }
 
     /// The buttons a band actually carries, with the presentation its container
-    /// is already in. `None` where it carries none — a band with no room for
-    /// them, or a LONE window, which is in no container and whose buttons would
-    /// every one of them do nothing.
+    /// is already in. `None` where it carries none, which is a band with no
+    /// room for them.
     ///
     /// The painter and the hit test both come through here rather than each
     /// asking `band_buttons`: a button drawn where nothing answers is a button
     /// that does nothing when pressed, with nothing on screen to say so.
     ///
     /// The presentation is READ OFF the placement rather than walked out of the
-    /// tree. `run` is the direction the container's bands travel and only a
-    /// grouped one has it, so the two grouped presentations are exactly its two
-    /// values — the same container produced both. Asking the layout per band
+    /// tree, and off the placement's own `presented` rather than derived from
+    /// the `run` beside it: the two are the same fact for a leaf in a container
+    /// and are not for a leaf its WORKSPACE presents, which is in no run at
+    /// all. Asking the layout per band
     /// instead would search the tree once for every window on every repaint,
     /// which is quadratic in a flat row of them, and would be a SECOND reading
     /// of the rule `presented_mut` owns: a band could then mark one container
     /// while its buttons changed another.
     ///
-    /// `tiled` is how many placements the workspace has, which is the whole of
-    /// what distinguishes an ungrouped container from NO container: a workspace
-    /// with two or more leaves has a root split, so every leaf in it has a
-    /// parent, and a workspace with one has a bare leaf for a root.
+    /// Every window has a presenting container, so there is no case here that
+    /// answers nothing: a leaf with no container of its own is presented by its
+    /// WORKSPACE, which is what puts these buttons on the very first window
+    /// rather than leaving the one band an operator sees first saying least.
     fn band_buttons_of(
         &self,
         placement: &Placement,
-        tiled: usize,
     ) -> Option<([Rect; BUTTONS.len()], Presentation)> {
-        let current = match placement.run {
-            Some(Axis::Vertical) => Presentation::Stacked,
-            Some(Axis::Horizontal) => Presentation::Tabbed,
-            None if tiled > 1 => Presentation::Split,
-            None => return None,
-        };
-        Some((band_buttons(placement.band)?, current))
+        Some((band_buttons(placement.band)?, placement.presented))
     }
 
     /// Where a drop lands: the window under the pointer, and what landing
@@ -1176,7 +1169,6 @@ impl Scene {
         height: usize,
         stride: usize,
         placement: &Placement,
-        tiled: usize,
     ) {
         let band = placement.band;
         if band.width == 0 || band.height == 0 {
@@ -1192,7 +1184,7 @@ impl Scene {
         // Before the name and independently of it: a window that set no title
         // still sits in a container, and its band is the only handle the
         // pointer has on one.
-        let buttons = self.band_buttons_of(placement, tiled);
+        let buttons = self.band_buttons_of(placement);
         if let Some((rects, current)) = buttons {
             for (slot, wanted) in rects.iter().zip(BUTTONS) {
                 let ink = if wanted == current {
@@ -1255,7 +1247,7 @@ impl Scene {
             }
             // Whether or not the client is shown: a leaf stacked away behind a
             // sibling draws nothing else, and its band says it is there.
-            self.draw_title(frame, width, height, stride, placement, placements.len());
+            self.draw_title(frame, width, height, stride, placement);
         }
         for placement in &placements {
             if !self.surfaces.contains_key(&placement.key) || !placement.visible {
@@ -2722,26 +2714,106 @@ mod tests {
     }
 
     #[test]
-    fn a_band_with_no_container_and_a_band_with_no_room_carry_no_buttons() {
-        // A LONE window is in no container, so every button would change
-        // nothing; a narrow one has no room for them beside a name. Both
-        // answer `None`, and the painter and the hit test come through the
-        // same gate, so neither draws one either.
+    fn the_first_window_carries_buttons_and_they_reach_its_workspace() {
+        // The band an operator sees FIRST used to be the one that said least:
+        // a lone window is in no container, so it had no presentation and its
+        // band offered nothing until a second window existed. Its workspace is
+        // its container now, so the buttons are there and pressing one is real.
         let mut scene = Scene::new();
         let key = |object| SurfaceKey { client: 1, object };
         scene.commit(key(1), surface([1, 1, 1, 0], 8, 8)).unwrap();
         let (width, height) = (600, least_output_height(8));
+        assert_eq!(scene.tiled_placements(width, height).len(), 1);
         let alone = tile(&scene, width, height, 1);
         assert!(
-            band_buttons(alone.band).is_some(),
-            "the band is too narrow to tell the two refusals apart"
+            scene.band_buttons_of(&alone).is_some(),
+            "the first window's band carries no buttons"
         );
-        assert_eq!(scene.tiled_placements(width, height).len(), 1);
-        assert!(scene.band_buttons_of(&alone, 1).is_none());
 
-        // Now a column of six tabs across a narrow output: each tab is a
-        // fraction of one strip, and buttons there would be the whole tab.
-        for object in 2..=7 {
+        // Pressing one is not a no-op: the mark moves, and the choice is
+        // waiting for the window that makes it visible.
+        let lit = |scene: &Scene| {
+            let frame = painted(scene, width, height);
+            let band = tile(scene, width, height, 1).band;
+            band_buttons(band)
+                .unwrap()
+                .iter()
+                .map(|slot| count_color(&frame, width * 4, *slot, BUTTON_INK_ON) > 0)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lit(&scene), [false, false, true], "split is not marked");
+        let slots = band_buttons(alone.band).unwrap();
+        // Pressed where the pointer would press it, not by command: the hit
+        // test is the half of a button an operator uses, and a lone window is
+        // the case that answered nothing. Aimed before the frame below is
+        // taken, since the pointer is itself something the scene draws.
+        let stack = slots.first().copied().unwrap();
+        scene.pointer_x = i32::try_from(stack.x + stack.width / 2).unwrap();
+        scene.pointer_y = i32::try_from(stack.y + stack.height / 2).unwrap();
+        assert_eq!(
+            scene.band_press_at_pointer(width, height),
+            Some(BandPress::Button(
+                key(1),
+                crate::layout::Presentation::Stacked
+            )),
+            "the first window's band answered no button"
+        );
+        // And the press moves NOTHING else. This is an assertion about PIXELS
+        // and it has to be: a lone leaf laid out as a run of one would draw
+        // the same tile and lose the border around its own title bar, since
+        // `frame_rect` drops the band for any placement in a run. Both grouped
+        // presentations are checked, because the lone-leaf case is served by
+        // one line and a line can be written for one of them.
+        let ungrouped = painted(&scene, width, height);
+        let stride = width * 4;
+        let moved_off_the_buttons = |after: &[u8]| {
+            let mut moved = 0usize;
+            for y in 0..height {
+                for x in 0..width {
+                    let at = y * stride + x * 4;
+                    if ungrouped.get(at..at + 4) != after.get(at..at + 4)
+                        && !slots.iter().any(|slot| contains(*slot, x, y))
+                    {
+                        moved = moved.saturating_add(1);
+                    }
+                }
+            }
+            moved
+        };
+        for (wanted, marks) in [
+            (crate::layout::Presentation::Stacked, [true, false, false]),
+            (crate::layout::Presentation::Tabbed, [false, true, false]),
+        ] {
+            scene.command(Command::SetPresentation(wanted));
+            assert_eq!(lit(&scene), marks, "{wanted:?} did not take");
+            assert_eq!(
+                moved_off_the_buttons(&painted(&scene, width, height)),
+                0,
+                "{wanted:?} moved a lone window's pixels off its buttons"
+            );
+        }
+
+        // A second window opens INTO that choice rather than ignoring it.
+        scene.commit(key(2), surface([1, 1, 1, 0], 8, 8)).unwrap();
+        assert!(
+            scene
+                .tiled_placements(width, height)
+                .iter()
+                .all(|placement| placement.run == Some(Axis::Horizontal)),
+            "the workspace's tabs did not reach the container it grew"
+        );
+    }
+
+    #[test]
+    fn a_band_with_no_room_for_buttons_carries_none() {
+        // A column of six tabs across a narrow output: each tab is a fraction
+        // of one strip, and buttons there would be the whole tab with the
+        // title squeezed out. The painter and the hit test come through the
+        // same gate, so neither draws one either.
+        let mut scene = Scene::new();
+        let key = |object| SurfaceKey { client: 1, object };
+        let height = least_output_height(8);
+        for object in 1..=7 {
             scene
                 .commit(key(object), surface([1, 1, 1, 0], 8, 8))
                 .unwrap();
@@ -2756,9 +2828,7 @@ mod tests {
         let tab = tile(&scene, narrow, height, 4);
         assert_eq!(tab.run, Some(Axis::Horizontal), "the column did not tab");
         assert!(band_buttons(tab.band).is_none(), "a tab found room");
-        assert!(scene
-            .band_buttons_of(&tab, scene.tiled_placements(narrow, height).len())
-            .is_none());
+        assert!(scene.band_buttons_of(&tab).is_none());
         scene.pointer_x = i32::try_from(tab.band.x + tab.band.width - 1).unwrap();
         scene.pointer_y = i32::try_from(tab.band.y + 1).unwrap();
         assert_eq!(

@@ -761,7 +761,10 @@ placement SAYS which it is rather than being measured: the run's last band
 abuts the content exactly as an ordinary band does, so adjacency cannot tell
 the two apart, and joining it would draw that leaf's border four pixels above
 its own band — over the band before it — and only when the last of a stack is
-shown. A stack's frame is therefore the client area alone.
+shown. A stack's frame is therefore the client area alone. A leaf its
+WORKSPACE presents is NOT that exception, whichever of the three the workspace
+is in: it is in no run, nothing sits above its band, and the frame wraps the
+two as an ordinary tile's does.
 
 The band takes the focused or unfocused colour with the border, in its own
 pair rather than the border's, and its text is clipped to itself so an
@@ -915,31 +918,66 @@ two — and each button draws the arrangement rather than a letter, bands down
 for a stack, one divided row over a body for tabs, two tiles for a split.
 A letter would name the chord, and the chords are already on the help sheet.
 
-Three bands carry NO buttons, and the painter and the hit test decide it in
-one place, because a button drawn where nothing answers is a button that does
-nothing when pressed with nothing on screen to say so. A LONE window is in no
-container, so all three would change nothing. A band too NARROW to hold them
-beside a name gets none: a tabbed run divides ONE strip between its leaves, so
-a column of eight gives each tab a few dozen pixels, and buttons there would
-be the whole tab with the title squeezed out — the room reserved for the name
-is a glyph at the scale titles are DRAWN at rather than at 1x, or the reserve
-is half a cell and the smear is what the band shows. And a band too SHORT to
-draw an icon in gets none either, which is the same rule seen the other way: a
-tile clipped to a sliver keeps its band and loses its client, and the run's
-last band is clipped to whatever the container has left, so this is reachable
-rather than theoretical. The keys still reach every presentation, and any
-larger band on the workspace still carries them.
+TWO bands carry NO buttons, both for want of ROOM, and the painter and the hit
+test decide it in one place, because a button drawn where nothing answers is a
+button that does nothing when pressed with nothing on screen to say so. A band
+too NARROW to hold them beside a name gets none: a tabbed run divides ONE
+strip between its leaves, so a column of eight gives each tab a few dozen
+pixels, and buttons there would be the whole tab with the title squeezed out —
+the room reserved for the name is a glyph at the scale titles are DRAWN at
+rather than at 1x, or the reserve is half a cell and the smear is what the
+band shows. And a band too SHORT to draw an icon in gets none either, which is
+the same rule seen the other way: a tile clipped to a sliver keeps its band
+and loses its client, and the run's last band is clipped to whatever the
+container has left, so this is reachable rather than theoretical. The keys
+still reach every presentation, and any larger band on the workspace still
+carries them.
+
+A LONE window was a third case and is not. It is in no container of its own,
+so it had no presentation to mark and all three of its buttons would have
+changed nothing — which left the band an operator sees FIRST as the one saying
+least about how the shell works. Its WORKSPACE presents it instead, and is the
+container of last resort the keys reach too.
+
+Grouping one window moves no pixels, and that is arranged rather than
+observed. The placement takes the presentation WITHOUT taking a run, so the
+geometry is the ungrouped geometry and the border still wraps the band
+together with the client. Laying the leaf out as a run of one would draw the
+same picture — one band over one content rectangle is what an ordinary tile
+already is — but a placement in a run gives up that border, and the operator's
+only window would have its own title bar outside its own frame the moment a
+button was pressed.
+
+What the choice buys is therefore entirely the NEXT window: it is carried onto
+the container the second window creates, and forgotten by the workspace at
+that same moment, so `Super+h` while one window is open means the second opens
+into a tab rather than being an instruction that quietly expired. An EMPTY
+workspace cannot be set up that way — no leaf is focused, so the command never
+reaches the workspace — and the first window is where the choice starts.
+
+Handed over rather than copied, in both directions. A workspace that kept its
+choice would re-apply it to some later lone leaf that never asked: a container
+collapsing back to one child is gone and its presentation with it, and the
+survivor must not find the workspace still holding what that container was
+given. And a workspace holding NOTHING must not overwrite the container a
+window arrives into — `Split` is both "no choice" and a presentation, so
+handing it on unconditionally would ungroup a grouped root every time a window
+opened in it. A workspace emptied of its last window forgets the choice by
+that same rule the tree already follows, so a window opened long afterwards is
+not grouped by one that is gone.
 
 Which presentation a band MARKS is read off the placement rather than walked
-out of the tree. A placement's `run` is the direction its container's bands
-travel and only a grouped container has one, so the two grouped presentations
-are exactly its two values — the same container produced both — and the count
-of placements is the whole of what separates an ungrouped container from NO
-container, since a workspace with two or more leaves has a root split. Asking
-the layout per band instead would search the tree once for every window on
-every repaint, which is quadratic in a flat row of them, and would be a SECOND
-reading of the rule that picks the container a leaf is displayed in: a band
-could then mark one container while its buttons changed another.
+out of the tree, and the placement carries the presentation ITSELF beside the
+`run` its geometry needs. The two are the same fact for every leaf in a
+container — the direction its bands travel names which of the two grouped
+presentations that container is in — and they are NOT the same for a leaf a
+workspace presents, which is in no run at all. Two fields rather than one
+because a run is what costs a window the border around its own title bar, and
+a run of one leaf would pay that for a picture identical to the one it already
+draws. Asking the layout per band instead would search the tree once for every
+window on every repaint, which is quadratic in a flat row of them, and would
+be a SECOND reading of the rule that picks the container a leaf is displayed
+in: a band could then mark one container while its buttons changed another.
 
 An Alt PRESS is withheld from the client. It is what starts the gesture, so
 handing it on would leave the client acting on a click the operator aimed at
@@ -1164,8 +1202,10 @@ for twenty as for two. What tabs give up for it is the titles: a stack shows
 every name in full, and a tab shows a name in its share of one strip, which
 past a handful of leaves is a few characters.
 
-A lone window is in no container of its own, so there is nothing to group and
-all three bindings do nothing rather than grouping the whole workspace.
+A lone window is in no container of its own, so its WORKSPACE is the one that
+presents it and all three bindings land there. That moves no pixels while the
+window is alone — the placement takes the presentation without taking a run —
+and what it decides is the container the second window makes.
 
 Which leaf is shown is the container's own most recently focused, which is
 the focused one whenever focus is in the stack at all. Focus alone cannot
@@ -1686,21 +1726,33 @@ The landing must prove:
   beside it;
 - a band's presentation buttons are proved where they are, where they are
   NOT, and in the order they take a press: the three slots are adjacent and
-  flush to the band's right edge with room left for a name, each answers over
-  its own slot while the strip's left stays a drag handle, exactly one is lit
-  and it follows the presentation, a long title stops before them rather than
-  running under them, and none of a lone window's band, a tab too narrow for
-  them, or a band too short to draw one carries any — the last two pinned at
-  the threshold and one pixel under it, and the short case as the implication
-  that matters, that a band which ANSWERS has all three icons to draw. The
-  stack icon is counted as three separate runs of ink at every height a band
-  carries buttons at, since two bars merged would colour the same rows and
-  read as one thicker mark. The press is driven through the runtime, where it
-  both presents the container and takes focus to the band, and leaves NO drag
-  live — verified red with the interception removed and again with the press
-  allowed to fall through to the band — while an ALT press over the same
-  pixels picks the window up instead and runs no command, which is the one
-  contract that rested on a single token no test covered;
+  flush to the band's right edge with room left for a name, each answers
+  over its own slot while the strip's left stays a drag handle, exactly one
+  is lit and it follows the presentation, a long title stops before them
+  rather than running under them, and neither a tab too narrow for them nor
+  a band too short to draw one carries any — both pinned at the threshold
+  and one pixel under it, and the short case as the implication that
+  matters, that a band which ANSWERS has all three icons to draw. The FIRST
+  window's band carries them, which is the case that used to carry none: the
+  hit test is driven over a slot on that band, the lit mark is proved to
+  follow, and the choice is proved to reach the container the second window
+  opens into. That press is also held to moving no pixel OFF the three
+  slots, frame against frame and for BOTH grouped presentations — the
+  lone-leaf case is served by one line, and a line can be written for one of
+  the two. The claim it carries is about pixels, which is where a run would
+  have been felt: the border wrapping the window's own title bar. The
+  hand-over is pinned in both directions, neither the workspace keeping a
+  copy nor an empty one overwriting the container a window arrives into, and
+  a workspace emptied of a grouped lone window hands its grouping to neither
+  the next window nor the one after. The stack icon is counted as three
+  separate runs of ink at every height a band carries buttons at, since two
+  bars merged would colour the same rows and read as one thicker mark. The
+  press is driven through the runtime, where it both presents the container
+  and takes focus to the band, and leaves NO drag live — verified red with
+  the interception removed and again with the press allowed to fall through
+  to the band — while an ALT press over the same pixels picks the window up
+  instead and runs no command, which is the one contract that rested on a
+  single token no test covered;
 - a tile's five drop zones are proved as a function — each zone by a point,
   the middle ninth by the points just outside it, the nearest edge by a wide
   short tile where pixels and proportion disagree, and a sweep of the whole
