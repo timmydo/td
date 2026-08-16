@@ -9,7 +9,9 @@ use crate::pointer::{
     PointerButtonInput, PointerButtonState, PointerScroll, PointerSnapshot, PointerState,
     PointerTarget, RoutedPointerFrame,
 };
-use crate::scene::{BandPress, Fraction, Scene, SharedInputRegion, Surface, SurfaceKey};
+use crate::scene::{
+    BandPress, CursorRequest, Fraction, Scene, SharedInputRegion, Surface, SurfaceKey,
+};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -290,6 +292,42 @@ impl Runtime {
         let layout_changed = self.scene.commit(key, surface)?;
         self.scene.set_input_region(key, input_region);
         self.settle(layout_changed)
+    }
+
+    /// A client named its cursor: a hotspot, or `None` for a null surface,
+    /// which asks for no cursor at all. Repaints only for a change, so a
+    /// toolkit re-setting the same cursor on every enter costs nothing.
+    ///
+    /// A cursor is not a tile — it enters no layout, takes no focus and
+    /// publishes nothing — so this repaints rather than settling.
+    pub fn set_cursor(
+        &mut self,
+        client: u64,
+        request: Option<CursorRequest>,
+    ) -> Result<(), String> {
+        if self.scene.set_cursor(client, request) {
+            return self.repaint();
+        }
+        Ok(())
+    }
+
+    /// What a cursor-role surface contains. Retained whether or not the
+    /// client is pointing with it, so only a commit to the surface actually
+    /// being pointed with repaints; the caller owes its client the buffer
+    /// release regardless of either.
+    pub fn commit_cursor(&mut self, key: SurfaceKey, image: Surface) -> Result<(), String> {
+        if self.scene.commit_cursor(key, image) {
+            return self.repaint();
+        }
+        Ok(())
+    }
+
+    /// The pixels behind a named cursor are taken away by a null attach.
+    pub fn detach_cursor(&mut self, key: SurfaceKey) -> Result<(), String> {
+        if self.scene.detach_cursor(key) {
+            return self.repaint();
+        }
+        Ok(())
     }
 
     /// Settle the screen, the input aim and the clients for a change already
@@ -608,7 +646,14 @@ impl Runtime {
             })?;
         let alt_press = result.claimed;
         self.publish_pointer(result.frames);
-        if moved {
+        // A cursor belongs to the client the pointer is focused on, so a
+        // report that moved focus takes the cursor with it — including to
+        // NOTHING, over the bar or a gap, where td's own is what is left.
+        // Read from the model rather than from the geometry under the
+        // pointer, because a grab holds focus off its own surface and a
+        // client dragging with a resize cursor keeps it for the whole drag.
+        let cursor_changed = self.settle_cursor();
+        if moved || cursor_changed {
             // Coalesced by the caller: a reader batch that carries many reports
             // owes one paint, not one per report. Before the focus below, so a
             // focusing repaint settles this debt instead of being followed by
@@ -860,6 +905,16 @@ impl Runtime {
         self.scene.surface_size(key)
     }
 
+    #[cfg(test)]
+    pub fn cursor_image(&self) -> Option<(i32, i32, usize, usize)> {
+        self.scene.cursor_image()
+    }
+
+    #[cfg(test)]
+    pub fn cursor_is_hidden(&self) -> bool {
+        self.scene.cursor_is_hidden()
+    }
+
     pub fn subscribe(&mut self, id: u64) -> Result<LayoutSubscription, String> {
         if self.subscribers.contains_key(&id) {
             return Err(format!("layout subscriber {id} already exists"));
@@ -997,12 +1052,52 @@ impl Runtime {
     }
 
     fn refresh_focus(&mut self) -> Result<(), String> {
-        let keyboard = self.keyboard.set_focus(self.scene.focused())?;
-        self.publish_keyboard(keyboard);
+        // Every step runs whatever the one before it did, as `settle`'s own
+        // steps do and for its reason: the cursor settle below is OWED, so a
+        // `?` above it loses the drop outright rather than deferring it. The
+        // failures either half can report — a keyboard or pointer revision
+        // exhausted — are exactly the moments a stale cursor would be least
+        // explicable.
+        let mut failures = Vec::new();
+        match self.keyboard.set_focus(self.scene.focused()) {
+            Ok(keyboard) => self.publish_keyboard(keyboard),
+            Err(error) => failures.push(error),
+        }
         let (hover, grab) = self.routed_pointer_targets();
-        let pointer = self.pointer.refresh(hover, grab)?;
-        self.publish_pointer(pointer);
-        Ok(())
+        match self.pointer.refresh(hover, grab) {
+            Ok(pointer) => self.publish_pointer(pointer),
+            Err(error) => failures.push(error),
+        }
+        // Focus moves here with no pointer report to carry it: a window
+        // closing under a stationary pointer, a workspace switch, a client
+        // disconnecting. Painted rather than deferred because `settle` makes
+        // its paint BEFORE this runs, and what would otherwise be left on
+        // screen is a departed client's cursor.
+        if self.settle_cursor() {
+            if let Err(error) = self.repaint() {
+                failures.push(error);
+            }
+        }
+        if failures.is_empty() {
+            return Ok(());
+        }
+        Err(failures.join("; "))
+    }
+
+    /// Point the scene at the client the pointer model now focuses, so a
+    /// cursor that client set is dropped the moment focus leaves it. Answers
+    /// whether anything on screen changed.
+    ///
+    /// Called from BOTH places that focus is recomputed. A pointer report
+    /// settles its own, since most reports change no focus and owe no paint;
+    /// `refresh_focus` covers every change that arrives without one.
+    fn settle_cursor(&mut self) -> bool {
+        self.scene.focus_cursor(
+            self.pointer
+                .snapshot()
+                .focus
+                .map(|target| target.surface.client),
+        )
     }
 
     fn routed_pointer_targets(&self) -> (Option<PointerTarget>, Option<PointerTarget>) {
@@ -1157,6 +1252,140 @@ mod tests {
         runtime.command(Command::Focus(Direction::Left)).unwrap();
         let first_focused = fs::read(&cleanup.0).unwrap();
         assert_ne!(first_focused, second_focused);
+    }
+
+    /// A cursor outlives its owner only until focus is next answered, and
+    /// focus is answered by more than a pointer report. A client that
+    /// disconnects under a STATIONARY pointer sends no report at all, so
+    /// without this the dead client's cursor stays on screen until the
+    /// operator happens to move the mouse.
+    #[test]
+    fn a_departing_client_takes_its_cursor_with_it_without_moving_the_pointer() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-cursor-departure-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 200, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
+        let rect = runtime.layout_snapshot().get(&key).unwrap().rect;
+        runtime
+            .pointer_frame(
+                1,
+                i32::try_from(rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(rect.y.saturating_add(2)).unwrap(),
+                &[],
+                PointerScroll::default(),
+            )
+            .unwrap();
+        runtime
+            .set_cursor(
+                1,
+                Some(CursorRequest {
+                    surface: 1,
+                    hotspot_x: 0,
+                    hotspot_y: 0,
+                }),
+            )
+            .unwrap();
+        runtime
+            .commit_cursor(
+                SurfaceKey {
+                    client: 1,
+                    object: 1,
+                },
+                Surface {
+                    width: 4,
+                    height: 4,
+                    pixels: vec![9; 4 * 4 * 4],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        assert_eq!(runtime.cursor_image(), Some((0, 0, 4, 4)));
+
+        // No pointer report between the two: the client simply goes away.
+        runtime.remove_client(1).unwrap();
+        assert_eq!(runtime.cursor_image(), None);
+    }
+
+    /// Destroying the cursor surface alone changes NO layout and no focus, so
+    /// the paint it owes rides on `settle` repainting unconditionally rather
+    /// than on the `layout_changed` it returns. That is worth pinning against
+    /// the output itself: routing the cursor drop through that return value
+    /// instead would publish a layout update to every client for a change no
+    /// layout had, and reading it off the framebuffer is what says the paint
+    /// happens without it.
+    #[test]
+    fn destroying_a_cursor_surface_repaints_without_claiming_a_layout_change() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-cursor-destroy-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 200, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
+        let rect = runtime.layout_snapshot().get(&key).unwrap().rect;
+        runtime
+            .pointer_frame(
+                1,
+                i32::try_from(rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(rect.y.saturating_add(2)).unwrap(),
+                &[],
+                PointerScroll::default(),
+            )
+            .unwrap();
+        let cursor_surface = 2;
+        runtime
+            .set_cursor(
+                1,
+                Some(CursorRequest {
+                    surface: cursor_surface,
+                    hotspot_x: 0,
+                    hotspot_y: 0,
+                }),
+            )
+            .unwrap();
+        runtime
+            .commit_cursor(
+                SurfaceKey {
+                    client: 1,
+                    object: cursor_surface,
+                },
+                Surface {
+                    width: 8,
+                    height: 8,
+                    pixels: vec![0x5a; 8 * 8 * 4],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        runtime.flush_paint().unwrap();
+        let with_cursor = fs::read(&cleanup.0).unwrap();
+
+        runtime
+            .remove(SurfaceKey {
+                client: 1,
+                object: cursor_surface,
+            })
+            .unwrap();
+        assert_eq!(runtime.cursor_image(), None);
+        // The image is off the SCREEN, not merely out of the scene's slot,
+        // and nothing further was needed to put it there.
+        let without_cursor = fs::read(&cleanup.0).unwrap();
+        assert_ne!(with_cursor, without_cursor);
     }
 
     #[test]

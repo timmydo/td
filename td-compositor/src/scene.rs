@@ -25,6 +25,29 @@ pub const MAX_INPUT_REGION_OPERATIONS: usize = 256;
 /// in CHARACTERS rather than bytes so the truncation cannot split a UTF-8
 /// sequence and leave a string the renderer walks off the end of.
 pub const MAX_TITLE_CHARS: usize = 256;
+/// The widest and tallest cursor td will hold pixels for. Themes stop at 256
+/// on a side, so this refuses nothing an operator would see; what it bounds
+/// is a client naming a wl_surface of output size as its cursor, which the
+/// protocol permits and which would cost the scene a second framebuffer for
+/// an image a few dozen pixels of are ever on screen at once.
+pub(crate) const MAX_CURSOR_DIMENSION: usize = 256;
+/// One CLIENT's retained cursor surfaces together. The dimension bound above
+/// limits one image; nothing limits how many cursor surfaces a client
+/// creates, so a per-surface bound would bound nothing.
+///
+/// Per client rather than one shared ledger, which the tile path settled the
+/// same way with `client_surface_total`: a single first-come total lets one
+/// client that pointed with 32 full-size cursors once deny every other
+/// client a cursor for as long as it stays connected, and the denial is
+/// silent — the others just show td's cross with nothing saying why. At 1
+/// MiB a client holds four full-size cursors, or an animated set of the
+/// ordinary 32-pixel kind hundreds of frames deep.
+///
+/// Counted in PIXEL bytes, which is what dominates and not what a map entry
+/// costs: a tiny image is a few accounted bytes and some tens of real ones,
+/// so this bounds the pixels rather than the footprint. What keeps the
+/// difference finite is that a client's surfaces are capped elsewhere.
+pub(crate) const MAX_CURSOR_BYTES_PER_CLIENT: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SurfaceKey {
@@ -44,6 +67,101 @@ pub struct SurfacePoint {
     pub key: SurfaceKey,
     pub x: i32,
     pub y: i32,
+}
+
+/// What a client asked its pointer to look like while the pointer is over
+/// its own surfaces. One slot for the whole scene rather than one per client:
+/// the protocol makes a cursor undefined again on every `wl_pointer.leave`,
+/// so a client re-sets it on each enter, and remembering the last cursor of
+/// every client that ever had focus would be unbounded state nothing reads.
+enum ClientCursor {
+    /// `set_cursor` with a null surface: NO cursor over this client, which is
+    /// what a full-screen video player or a game asks for.
+    Hidden,
+    /// The surface being pointed WITH, and the pixel of it that sits on the
+    /// pointer's own position. Deliberately no pixels: what a surface
+    /// CONTAINS is the surface's own state, held in `cursor_images` and
+    /// outliving any number of `set_cursor` calls, where which surface is
+    /// being pointed with is the cursor's. A client that pre-renders four
+    /// cursor surfaces and switches between them by naming them is asking
+    /// for exactly that distinction.
+    Shown {
+        surface: u32,
+        hotspot_x: i32,
+        hotspot_y: i32,
+    },
+}
+
+/// What the pointer draws, once the selection above has been resolved
+/// against the surface contents. `None` from `Scene::drawn_cursor` is td's
+/// own cross, which covers both "no client cursor" and "a named surface
+/// whose pixels have not arrived".
+enum DrawnCursor<'a> {
+    Nothing,
+    Image {
+        image: &'a Surface,
+        hotspot_x: i32,
+        hotspot_y: i32,
+    },
+}
+
+/// A `set_cursor` that named a surface: which one, and where on it the
+/// pointer's own position falls.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CursorRequest {
+    pub surface: u32,
+    pub hotspot_x: i32,
+    pub hotspot_y: i32,
+}
+
+/// What the pointer PAINTS, coarsely enough that two SELECTIONS can be
+/// compared by it. Which surface is named rather than what that surface
+/// contains: comparing contents would mean comparing pixels, and the one
+/// call that changes them — `commit_cursor` — answers for itself whether the
+/// surface it wrote is the one being drawn.
+///
+/// The surface has to be in here even though the hotspot usually moves with
+/// it. A client switching between pre-rendered cursors names a different
+/// surface at the SAME hotspot, which is a different image at the same place
+/// and owes a repaint that a hotspot alone reports as no change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CursorPaint {
+    /// td's own, which stands for both "no client cursor" and "a client
+    /// named one whose pixels have not arrived".
+    Cross,
+    Nothing,
+    Image {
+        surface: SurfaceKey,
+        hotspot_x: i32,
+        hotspot_y: i32,
+    },
+}
+
+/// Where an image lands on the output, in the output's own pixels. Signed,
+/// unlike the layout's `Rect`: subtracting a hotspot puts a cursor's top-left
+/// off the top or left edge whenever the pointer is near one, which is the
+/// ordinary case at a corner rather than something to refuse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ImageRect {
+    x: i64,
+    y: i64,
+    width: usize,
+    height: usize,
+}
+
+impl ImageRect {
+    /// A tile's client area. Unsigned at the source because a placement is
+    /// computed inside the output, and clipped to the tile rather than to the
+    /// image: a client that committed a buffer larger than the tile it was
+    /// configured for must not paint over its neighbour.
+    fn tile(rect: Rect) -> ImageRect {
+        ImageRect {
+            x: i64::try_from(rect.x).unwrap_or(i64::MAX),
+            y: i64::try_from(rect.y).unwrap_or(i64::MAX),
+            width: rect.width,
+            height: rect.height,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -558,6 +676,18 @@ pub struct Scene {
     /// by every mutation of it, so nothing here can outlive what it was
     /// computed from.
     hint: Option<DropHint>,
+    /// The cursor of the client the pointer is focused on, and which client
+    /// that is. Held together because the pair is what makes it droppable on
+    /// a focus change without asking the pointer model a second time.
+    cursor: Option<(u64, ClientCursor)>,
+    /// What each cursor-role surface CONTAINS. Keyed by surface rather than
+    /// by client because that is whose state it is: it survives the client
+    /// pointing with something else and is there again when it points back,
+    /// which a client switching between pre-rendered cursors relies on.
+    /// Emptied of a surface by its destroy or a null attach, and of a
+    /// client by its departure.
+    cursor_images: BTreeMap<SurfaceKey, Surface>,
+    cursor_bytes: usize,
     launcher: Launcher,
     help: Help,
     status: String,
@@ -574,10 +704,209 @@ impl Scene {
             pointer_y: 0,
             surface_bytes: 0,
             hint: None,
+            cursor: None,
+            cursor_images: BTreeMap::new(),
+            cursor_bytes: 0,
             launcher: Launcher::new(),
             help: Help::default(),
             status: String::new(),
         }
+    }
+
+    /// A client named what its pointer should look like: which surface to
+    /// point WITH and where on it the pointer falls, or `None` for a null
+    /// surface, which asks for no cursor at all.
+    ///
+    /// Selection only. What the named surface CONTAINS arrived, or will
+    /// arrive, through `commit_cursor` and outlives any number of these
+    /// calls, so naming a surface a client committed to earlier draws it
+    /// again with no fresh commit — which is what a client switching between
+    /// pre-rendered cursors does. Answers whether anything on screen changed,
+    /// since a toolkit re-setting the same cursor on every enter owes no
+    /// repaint.
+    pub fn set_cursor(&mut self, client: u64, request: Option<CursorRequest>) -> bool {
+        let was = self.cursor_paint();
+        self.cursor = Some((
+            client,
+            match request {
+                None => ClientCursor::Hidden,
+                Some(request) => ClientCursor::Shown {
+                    surface: request.surface,
+                    hotspot_x: request.hotspot_x,
+                    hotspot_y: request.hotspot_y,
+                },
+            },
+        ));
+        was != self.cursor_paint()
+    }
+
+    /// What a cursor-role surface contains. Retained whether or not the
+    /// client is pointing with it at the moment, because it is the SURFACE's
+    /// state; only the repaint is conditional.
+    ///
+    /// Refused, rather than clamped, above `MAX_CURSOR_DIMENSION`: a clamp
+    /// would draw part of an image whose hotspot was computed for the whole
+    /// of it, putting the operator's point somewhere other than where they
+    /// are pointing. A refusal also DISCARDS whatever that surface held
+    /// before, since its contents are now something td will not draw and the
+    /// previous frame is one the client has replaced.
+    ///
+    /// Answers whether anything on screen changed, which a commit to a
+    /// surface nobody is pointing with does not.
+    pub fn commit_cursor(&mut self, key: SurfaceKey, image: Surface) -> bool {
+        let drawn = self.drawn_cursor_key() == Some(key);
+        // Both refusals DISCARD what the surface held, and for one reason:
+        // the surface's contents are now the image just committed, and td
+        // cannot draw it. Keeping the previous frame would paint one the
+        // client has replaced — and, since the buffer is released either
+        // way, would freeze an animated cursor on a frame while the client
+        // believed every one of them took. The cross says something is
+        // wrong; a stale frame says nothing.
+        let refused = image.width > MAX_CURSOR_DIMENSION
+            || image.height > MAX_CURSOR_DIMENSION
+            || !self.cursor_fits(key, image.pixels.len());
+        if refused {
+            return self.forget_cursor_image(key) && drawn;
+        }
+        self.forget_cursor_image(key);
+        self.cursor_bytes = self.cursor_bytes.saturating_add(image.pixels.len());
+        self.cursor_images.insert(key, image);
+        drawn
+    }
+
+    /// Whether `client` may hold `bytes` more of cursor pixels, counting what
+    /// the same surface already holds as returned first: a client replacing
+    /// one frame with another the same size must not walk into its own
+    /// ceiling.
+    fn cursor_fits(&self, key: SurfaceKey, bytes: usize) -> bool {
+        let held = self
+            .cursor_images
+            .iter()
+            .filter(|(held, _)| held.client == key.client && **held != key)
+            .fold(0usize, |total, (_, image)| {
+                total.saturating_add(image.pixels.len())
+            });
+        held.saturating_add(bytes) <= MAX_CURSOR_BYTES_PER_CLIENT
+    }
+
+    /// A cursor surface's pixels are taken away by a null attach, leaving the
+    /// surface itself named and still aimed. td's own cross stands until the
+    /// client commits something to it again.
+    pub fn detach_cursor(&mut self, key: SurfaceKey) -> bool {
+        let drawn = self.drawn_cursor_key() == Some(key);
+        self.forget_cursor_image(key) && drawn
+    }
+
+    /// Drop a cursor surface's retained pixels. Answers whether there were
+    /// any, which is not the same as whether the screen changed.
+    fn forget_cursor_image(&mut self, key: SurfaceKey) -> bool {
+        let Some(held) = self.cursor_images.remove(&key) else {
+            return false;
+        };
+        self.cursor_bytes = self.cursor_bytes.saturating_sub(held.pixels.len());
+        true
+    }
+
+    /// The surface the pointer is drawing WITH, whether or not it has any
+    /// pixels yet. `None` for a hidden cursor as well as for no cursor: both
+    /// draw no client image, and neither is a surface.
+    fn drawn_cursor_key(&self) -> Option<SurfaceKey> {
+        match self.cursor.as_ref() {
+            Some((client, ClientCursor::Shown { surface, .. })) => Some(SurfaceKey {
+                client: *client,
+                object: *surface,
+            }),
+            _ => None,
+        }
+    }
+
+    /// What the pointer paints, with the selection resolved against the
+    /// surface contents. `None` is td's own cross.
+    fn drawn_cursor(&self) -> Option<DrawnCursor<'_>> {
+        match self.cursor.as_ref() {
+            None => None,
+            Some((_, ClientCursor::Hidden)) => Some(DrawnCursor::Nothing),
+            Some((
+                client,
+                ClientCursor::Shown {
+                    surface,
+                    hotspot_x,
+                    hotspot_y,
+                },
+            )) => {
+                let image = self.cursor_images.get(&SurfaceKey {
+                    client: *client,
+                    object: *surface,
+                })?;
+                Some(DrawnCursor::Image {
+                    image,
+                    hotspot_x: *hotspot_x,
+                    hotspot_y: *hotspot_y,
+                })
+            }
+        }
+    }
+
+    fn cursor_paint(&self) -> CursorPaint {
+        match self.drawn_cursor() {
+            None => CursorPaint::Cross,
+            Some(DrawnCursor::Nothing) => CursorPaint::Nothing,
+            Some(DrawnCursor::Image {
+                hotspot_x,
+                hotspot_y,
+                ..
+            }) => match self.drawn_cursor_key() {
+                Some(surface) => CursorPaint::Image {
+                    surface,
+                    hotspot_x,
+                    hotspot_y,
+                },
+                None => CursorPaint::Cross,
+            },
+        }
+    }
+
+    /// The cursor as the renderer will draw it: the hotspot and the size of
+    /// the image behind it, absent while td's own cross stands.
+    #[cfg(test)]
+    pub(crate) fn cursor_image(&self) -> Option<(i32, i32, usize, usize)> {
+        match self.drawn_cursor()? {
+            DrawnCursor::Image {
+                image,
+                hotspot_x,
+                hotspot_y,
+            } => Some((hotspot_x, hotspot_y, image.width, image.height)),
+            DrawnCursor::Nothing => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cursor_is_hidden(&self) -> bool {
+        matches!(self.cursor, Some((_, ClientCursor::Hidden)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cursor_bytes(&self) -> usize {
+        self.cursor_bytes
+    }
+
+    /// Which client the pointer is focused on, as the pointer model answers
+    /// it — a grab included, so a cursor set before a button press survives
+    /// the drag off its own surface that the press entitles the client to.
+    ///
+    /// Any change drops the SELECTION, because `wl_pointer.leave` makes a
+    /// cursor undefined: a client sets one on every enter, and keeping the
+    /// last one would show a departed client's cursor over the bar and the
+    /// gaps. The surfaces' CONTENTS are untouched — they are not the
+    /// cursor's to discard, and a client whose pointer re-enters names one
+    /// of them again rather than resending it.
+    pub fn focus_cursor(&mut self, client: Option<u64>) -> bool {
+        if self.cursor.as_ref().map(|(owner, _)| *owner) == client {
+            return false;
+        }
+        let was = self.cursor_paint();
+        self.cursor = None;
+        was != CursorPaint::Cross
     }
 
     pub fn commit(&mut self, key: SurfaceKey, surface: Surface) -> Result<bool, String> {
@@ -701,7 +1030,22 @@ impl Scene {
         self.titles.remove(&key);
         self.layout.forget(key);
         self.clear_hint();
+        self.forget_cursor_surface(key);
         layout_changed
+    }
+
+    /// Destroying a surface takes its pixels with it wherever td holds them —
+    /// for a tile that is `discard_pixels` above, and for a cursor it is
+    /// this. A client that destroyed the surface it was pointing with has
+    /// said nothing about what to point with instead, so td's own cross is
+    /// what is left rather than a copy of an image that no longer exists.
+    fn forget_cursor_surface(&mut self, key: SurfaceKey) -> bool {
+        let was = self.cursor_paint();
+        self.forget_cursor_image(key);
+        if self.drawn_cursor_key() == Some(key) {
+            self.cursor = None;
+        }
+        was != self.cursor_paint()
     }
 
     pub fn remove_client(&mut self, client: u64) -> bool {
@@ -717,6 +1061,25 @@ impl Scene {
         self.input_regions.retain(|key, _| key.client != client);
         self.titles.retain(|key, _| key.client != client);
         self.surface_bytes = self.surface_bytes.saturating_sub(removed);
+        // Cursor surfaces are not in `surfaces`, so the sweep above misses
+        // them: a departing client's retained cursor pixels would be held
+        // for the life of the compositor with nothing left to name them.
+        let mut cursors = 0usize;
+        self.cursor_images.retain(|key, image| {
+            if key.client == client {
+                cursors = cursors.saturating_add(image.pixels.len());
+                return false;
+            }
+            true
+        });
+        self.cursor_bytes = self.cursor_bytes.saturating_sub(cursors);
+        if self
+            .cursor
+            .as_ref()
+            .is_some_and(|(owner, _)| *owner == client)
+        {
+            self.cursor = None;
+        }
         self.layout.unmap_client(client);
         self.clear_hint();
         layout_changed
@@ -1299,7 +1662,14 @@ impl Scene {
             let Some(surface) = self.surfaces.get(&placement.key) else {
                 continue;
             };
-            draw_surface(frame, width, height, stride, placement.rect, surface);
+            draw_surface(
+                frame,
+                width,
+                height,
+                stride,
+                ImageRect::tile(placement.rect),
+                surface,
+            );
         }
         // Over the windows and under everything that is not one: the block
         // says where a release would land, and a bar or an overlay it hid
@@ -1312,7 +1682,15 @@ impl Scene {
         bar::paint(frame, width, height, stride, &desks, active, &self.status);
         self.launcher.paint(frame, width, height, stride);
         self.help.paint(frame, width, height, stride);
-        draw_pointer(frame, width, height, stride, self.pointer_x, self.pointer_y);
+        draw_pointer(
+            frame,
+            width,
+            height,
+            stride,
+            self.pointer_x,
+            self.pointer_y,
+            self.drawn_cursor(),
+        );
     }
 }
 
@@ -1530,13 +1908,12 @@ fn draw_surface(
     width: usize,
     height: usize,
     stride: usize,
-    rect: Rect,
+    at: ImageRect,
     surface: &Surface,
 ) {
-    let x = i64::try_from(rect.x).unwrap_or(i64::MAX);
-    let y = i64::try_from(rect.y).unwrap_or(i64::MAX);
-    let draw_width = surface.width.min(rect.width);
-    let draw_height = surface.height.min(rect.height);
+    let (x, y) = (at.x, at.y);
+    let draw_width = surface.width.min(at.width);
+    let draw_height = surface.height.min(at.height);
     let Some((source_x_start, visible_columns)) = visible_span(x, draw_width, width) else {
         return;
     };
@@ -1666,7 +2043,51 @@ fn put_pixel(
     }
 }
 
-fn draw_pointer(frame: &mut [u8], width: usize, height: usize, stride: usize, x: i32, y: i32) {
+/// The pointer, as whichever client it is over asked for it to look — and as
+/// td draws it otherwise. td's own cross is the fallback rather than the
+/// default, and it stands for three different situations: no client focused,
+/// a client that has asked for nothing, and one that named a cursor surface
+/// whose pixels have not arrived. All three mean the same thing to an
+/// operator, which is that nobody has said where the pointer is except td.
+fn draw_pointer(
+    frame: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    x: i32,
+    y: i32,
+    cursor: Option<DrawnCursor<'_>>,
+) {
+    match cursor {
+        Some(DrawnCursor::Nothing) => {}
+        Some(DrawnCursor::Image {
+            image,
+            hotspot_x,
+            hotspot_y,
+        }) => draw_surface(
+            frame,
+            width,
+            height,
+            stride,
+            ImageRect {
+                // The hotspot is the pixel of the IMAGE that sits on the
+                // pointer, so the image's own corner is that far back from
+                // it. In i64 because both are client-chosen: a hotspot near
+                // `i32::MIN` under a pointer near `i32::MAX` is a difference
+                // no i32 holds, and saturating it would draw the image at an
+                // edge rather than off-screen where it belongs.
+                x: i64::from(x).saturating_sub(i64::from(hotspot_x)),
+                y: i64::from(y).saturating_sub(i64::from(hotspot_y)),
+                width: image.width,
+                height: image.height,
+            },
+            image,
+        ),
+        None => draw_cross(frame, width, height, stride, x, y),
+    }
+}
+
+fn draw_cross(frame: &mut [u8], width: usize, height: usize, stride: usize, x: i32, y: i32) {
     for delta in -6i64..=6 {
         put_pixel(
             frame,
@@ -3371,6 +3792,445 @@ mod tests {
         // colours: a band that took the border's would say nothing new.
         assert_eq!(tiled(&frame, stride, 24, 24), TITLE_FOCUSED);
         assert_eq!(tiled(&frame, stride, 72, 24), TITLE_UNFOCUSED);
+    }
+
+    const BACKGROUND: [u8; 4] = [0x30, 0x25, 0x20, 0];
+    const CROSS: [u8; 4] = [0xff, 0xff, 0xff, 0];
+    const INK: [u8; 4] = [0x11, 0x22, 0x33, 0];
+    const OTHER_INK: [u8; 4] = [0x44, 0x55, 0x66, 0];
+    /// The one cursor surface most of these tests need; they are about what
+    /// is DRAWN rather than about which surface named it.
+    const CURSOR_SURFACE: u32 = 5;
+
+    fn cursor_key(client: u64, object: u32) -> SurfaceKey {
+        SurfaceKey { client, object }
+    }
+
+    fn aim(hotspot_x: i32, hotspot_y: i32) -> CursorRequest {
+        CursorRequest {
+            surface: CURSOR_SURFACE,
+            hotspot_x,
+            hotspot_y,
+        }
+    }
+
+    /// An output with nothing committed to it, so every pixel below the bar
+    /// is background and whatever the pointer paints is the only thing there.
+    fn bare_output() -> (Scene, Vec<u8>, usize, usize, usize) {
+        let width = 80usize;
+        let height = least_output_height(40);
+        let stride = width.saturating_mul(4);
+        (
+            Scene::new(),
+            vec![0; stride * height],
+            width,
+            height,
+            stride,
+        )
+    }
+
+    #[test]
+    fn a_client_cursor_lands_with_its_hotspot_on_the_pointer() {
+        let (mut scene, mut frame, width, height, stride) = bare_output();
+        scene.pointer_x = 40;
+        scene.pointer_y = 60;
+        // Nothing on screen moves for a cursor whose pixels have not
+        // arrived, so the request itself owes no repaint.
+        assert!(!scene.set_cursor(7, Some(aim(2, 3))));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), CROSS);
+
+        assert!(scene.commit_cursor(cursor_key(7, CURSOR_SURFACE), surface(INK, 4, 4)));
+        scene.render(&mut frame, width, height, stride);
+        // The hotspot is the pixel of the IMAGE that sits on the pointer, so
+        // the image's own corner is that far back from it. Both corners are
+        // asserted: a hotspot ADDED rather than subtracted puts the image the
+        // same distance away on the other side, and one corner would not tell
+        // the two apart.
+        assert_eq!(pixel(&frame, stride, 38, 57), INK);
+        assert_eq!(pixel(&frame, stride, 41, 60), INK);
+        assert_eq!(pixel(&frame, stride, 37, 57), BACKGROUND);
+        assert_eq!(pixel(&frame, stride, 42, 60), BACKGROUND);
+        // And td's own is gone rather than drawn under it: the cross reaches
+        // six pixels out, which a four-pixel image cannot have covered.
+        assert_eq!(pixel(&frame, stride, 34, 60), BACKGROUND);
+    }
+
+    #[test]
+    fn a_transparent_cursor_pixel_keeps_what_is_behind_it() {
+        let (mut scene, mut frame, width, height, stride) = bare_output();
+        scene.pointer_x = 40;
+        scene.pointer_y = 60;
+        scene.set_cursor(7, Some(aim(0, 0)));
+        // Opaque on the diagonal and clear elsewhere, which is the shape
+        // every real cursor has: an arrow in a square of nothing. Premultiplied,
+        // so a clear pixel contributes no colour of its own either.
+        let mut pixels = Vec::new();
+        for y in 0..2usize {
+            for x in 0..2usize {
+                if x == y {
+                    pixels.extend_from_slice(&[INK[0], INK[1], INK[2], 0xff]);
+                } else {
+                    pixels.extend_from_slice(&[0, 0, 0, 0]);
+                }
+            }
+        }
+        assert!(scene.commit_cursor(
+            cursor_key(7, CURSOR_SURFACE),
+            Surface {
+                width: 2,
+                height: 2,
+                pixels,
+                format: SHM_ARGB8888,
+            }
+        ));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), INK);
+        assert_eq!(pixel(&frame, stride, 41, 61), INK);
+        assert_eq!(pixel(&frame, stride, 41, 60), BACKGROUND);
+        assert_eq!(pixel(&frame, stride, 40, 61), BACKGROUND);
+    }
+
+    #[test]
+    fn a_hidden_cursor_paints_nothing_where_the_cross_was() {
+        let (mut scene, mut frame, width, height, stride) = bare_output();
+        scene.pointer_x = 40;
+        scene.pointer_y = 60;
+        assert!(scene.set_cursor(7, None));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), BACKGROUND);
+        // Asking twice changes nothing, so the second request owes no paint.
+        assert!(!scene.set_cursor(7, None));
+    }
+
+    #[test]
+    fn pointer_focus_leaving_a_client_takes_its_cursor_with_it() {
+        let (mut scene, mut frame, width, height, stride) = bare_output();
+        scene.pointer_x = 40;
+        scene.pointer_y = 60;
+        scene.set_cursor(7, Some(aim(0, 0)));
+        assert!(scene.commit_cursor(cursor_key(7, CURSOR_SURFACE), surface(INK, 4, 4)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), INK);
+
+        // Focus staying put keeps it, which is what makes the drop below
+        // about the CHANGE rather than about being asked at all.
+        assert!(!scene.focus_cursor(Some(7)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), INK);
+
+        // Onto a gap, the bar, or another client: `wl_pointer.leave` makes a
+        // cursor undefined, and a departed client's is not td's to keep.
+        assert!(scene.focus_cursor(None));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), CROSS);
+        // And it does not come back when the pointer returns: the client
+        // sets one again on the enter, which is what the protocol asks of it.
+        assert!(!scene.focus_cursor(Some(7)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), CROSS);
+    }
+
+    /// Contents are keyed by CLIENT as well as surface, so one client's
+    /// commit to the same object number cannot become another's cursor. The
+    /// key type carries that rather than a check — but the same object
+    /// number under two clients is exactly the collision a key that dropped
+    /// the client would produce, so it is worth an assertion.
+    #[test]
+    fn one_clients_commit_cannot_fill_in_anothers_cursor() {
+        let (mut scene, mut frame, width, height, stride) = bare_output();
+        scene.pointer_x = 40;
+        scene.pointer_y = 60;
+        scene.set_cursor(7, Some(aim(0, 0)));
+        assert!(!scene.commit_cursor(cursor_key(9, CURSOR_SURFACE), surface(INK, 4, 4)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), CROSS);
+        // Client 9's pixels are RETAINED — they are its surface's — and
+        // pointing 7 at its own surface of the same number still draws 7's.
+        assert!(scene.commit_cursor(cursor_key(7, CURSOR_SURFACE), surface(OTHER_INK, 4, 4)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), OTHER_INK);
+    }
+
+    /// A client may hold several cursor surfaces at once — an animated
+    /// cursor is a frame per surface, and a toolkit pre-renders one per
+    /// shape — and switching between them by NAMING them is a `set_cursor`
+    /// with no commit behind it. Each surface keeps its own contents, so the
+    /// switch draws what that surface holds rather than the cross.
+    #[test]
+    fn each_cursor_surface_keeps_its_own_contents_across_a_switch() {
+        let (mut scene, mut frame, width, height, stride) = bare_output();
+        scene.pointer_x = 40;
+        scene.pointer_y = 60;
+        let other = CURSOR_SURFACE.saturating_add(1);
+        scene.set_cursor(7, Some(aim(0, 0)));
+
+        // A commit to a surface nobody is pointing with is RETAINED and not
+        // drawn: it owes no paint, and the cross still stands.
+        assert!(!scene.commit_cursor(cursor_key(7, other), surface(OTHER_INK, 4, 4)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), CROSS);
+
+        assert!(scene.commit_cursor(cursor_key(7, CURSOR_SURFACE), surface(INK, 4, 4)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), INK);
+
+        // Naming the other surface draws what IT holds — neither the cross
+        // nor a copy of the surface just left. Two distinct inks, so a
+        // switch that kept the previous image and one that drew nothing are
+        // different failures rather than the same one.
+        assert!(scene.set_cursor(
+            7,
+            Some(CursorRequest {
+                surface: other,
+                hotspot_x: 0,
+                hotspot_y: 0,
+            })
+        ));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), OTHER_INK);
+
+        // And back, with no commit in either direction.
+        assert!(scene.set_cursor(7, Some(aim(0, 0))));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), INK);
+    }
+
+    /// A destroyed surface takes its pixels with it wherever td holds them.
+    /// A tile's go with `remove`; a cursor's went nowhere until this, so a
+    /// client that destroyed the surface it was pointing with left a copy of
+    /// a surface that no longer exists on screen until focus next moved.
+    #[test]
+    fn destroying_the_surface_being_pointed_with_takes_its_cursor_too() {
+        let (mut scene, mut frame, width, height, stride) = bare_output();
+        scene.pointer_x = 40;
+        scene.pointer_y = 60;
+        scene.set_cursor(7, Some(aim(0, 0)));
+        assert!(scene.commit_cursor(cursor_key(7, CURSOR_SURFACE), surface(INK, 4, 4)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), INK);
+
+        // Another of the client's surfaces going first changes nothing: the
+        // drop is about the surface being POINTED with, not about the client
+        // destroying anything at all.
+        scene.remove(SurfaceKey {
+            client: 7,
+            object: CURSOR_SURFACE.saturating_add(1),
+        });
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), INK);
+
+        scene.remove(SurfaceKey {
+            client: 7,
+            object: CURSOR_SURFACE,
+        });
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), CROSS);
+    }
+
+    /// A cursor surface whose buffer is taken away keeps its aim and loses
+    /// its image, which is a different state from both "hidden" and "never
+    /// named" even though the cross serves two of the three.
+    #[test]
+    fn detaching_a_cursor_buffer_leaves_the_surface_named_and_aimed() {
+        let (mut scene, mut frame, width, height, stride) = bare_output();
+        scene.pointer_x = 40;
+        scene.pointer_y = 60;
+        scene.set_cursor(7, Some(aim(0, 0)));
+        assert!(scene.commit_cursor(cursor_key(7, CURSOR_SURFACE), surface(INK, 4, 4)));
+        assert!(scene.detach_cursor(cursor_key(7, CURSOR_SURFACE)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), CROSS);
+        // Detaching twice takes nothing the second time, so it owes no paint.
+        assert!(!scene.detach_cursor(cursor_key(7, CURSOR_SURFACE)));
+        // Still NAMED: a commit is adopted without another `set_cursor`, which
+        // a drop to "never named" would have refused.
+        assert!(scene.commit_cursor(cursor_key(7, CURSOR_SURFACE), surface(INK, 4, 4)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), INK);
+        // And it is scoped like every other cursor call: another surface's
+        // detach takes nothing.
+        assert!(!scene.detach_cursor(cursor_key(7, CURSOR_SURFACE.saturating_add(1))));
+        assert!(!scene.detach_cursor(cursor_key(9, CURSOR_SURFACE)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), INK);
+    }
+
+    /// The byte ledger is per CLIENT, and it is a ledger rather than a
+    /// high-water mark: everything that drops a retained image has to give
+    /// its bytes back, or the ceiling leaks until no cursor is admitted at
+    /// all and nothing says why.
+    #[test]
+    fn the_cursor_ledger_is_per_client_and_gives_its_bytes_back() {
+        let mut scene = Scene::new();
+        // A full-size cursor is a quarter of one client's allowance, so four
+        // fit and the fifth does not.
+        let side = MAX_CURSOR_DIMENSION;
+        let each = side.saturating_mul(side).saturating_mul(4);
+        assert_eq!(each.saturating_mul(4), MAX_CURSOR_BYTES_PER_CLIENT);
+        for object in 0..4u32 {
+            assert!(!scene.commit_cursor(cursor_key(7, object), surface(INK, side, side)));
+        }
+        assert_eq!(scene.cursor_bytes(), MAX_CURSOR_BYTES_PER_CLIENT);
+        assert!(!scene.commit_cursor(cursor_key(7, 4), surface(INK, side, side)));
+        assert_eq!(scene.cursor_bytes(), MAX_CURSOR_BYTES_PER_CLIENT);
+
+        // ANOTHER client is unaffected, which one shared ledger would not
+        // manage: a first-come total would let the client above deny every
+        // other a cursor for as long as it stayed connected.
+        assert!(!scene.commit_cursor(cursor_key(9, 0), surface(INK, side, side)));
+        assert_eq!(
+            scene.cursor_bytes(),
+            MAX_CURSOR_BYTES_PER_CLIENT.saturating_add(each)
+        );
+
+        // Replacing a frame with one the same size is not a fifth cursor:
+        // what the surface already holds is returned before the new image is
+        // weighed, or a client at its ceiling could never redraw.
+        assert!(!scene.commit_cursor(cursor_key(7, 0), surface(OTHER_INK, side, side)));
+        assert_eq!(
+            scene.cursor_bytes(),
+            MAX_CURSOR_BYTES_PER_CLIENT.saturating_add(each)
+        );
+
+        // Every route out gives the bytes back: a null attach, a destroy,
+        // and a departure.
+        assert!(!scene.detach_cursor(cursor_key(7, 0)));
+        assert_eq!(
+            scene.cursor_bytes(),
+            MAX_CURSOR_BYTES_PER_CLIENT.saturating_add(each) - each
+        );
+        scene.remove(cursor_key(7, 1));
+        assert_eq!(scene.cursor_bytes(), each.saturating_mul(3));
+        scene.remove_client(7);
+        assert_eq!(scene.cursor_bytes(), each);
+        scene.remove_client(9);
+        assert_eq!(scene.cursor_bytes(), 0);
+        assert!(scene.cursor_images.is_empty());
+    }
+
+    /// A commit td cannot hold DISCARDS what the surface held, rather than
+    /// leaving the previous frame drawn. The buffer is released either way,
+    /// so keeping it would freeze an animated cursor on one frame while the
+    /// client believed every one of them took.
+    #[test]
+    fn a_refused_cursor_frame_takes_the_one_it_replaces_with_it() {
+        let (mut scene, mut frame, width, height, stride) = bare_output();
+        scene.pointer_x = 40;
+        scene.pointer_y = 60;
+        scene.set_cursor(7, Some(aim(0, 0)));
+        assert!(scene.commit_cursor(cursor_key(7, CURSOR_SURFACE), surface(INK, 4, 4)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), INK);
+
+        // Refused for its SIZE.
+        let over = MAX_CURSOR_DIMENSION.saturating_add(1);
+        assert!(scene.commit_cursor(cursor_key(7, CURSOR_SURFACE), surface(INK, over, over)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), CROSS);
+        assert_eq!(scene.cursor_bytes(), 0);
+
+        // And refused for the client's CEILING, which answers the same way
+        // rather than keeping a frame the client has replaced. The small
+        // image is what is drawn; the others are just weight, taken to where
+        // one more full-size image does not fit beside them.
+        let side = MAX_CURSOR_DIMENSION;
+        let full = side.saturating_mul(side).saturating_mul(4);
+        assert!(scene.commit_cursor(cursor_key(7, CURSOR_SURFACE), surface(INK, 4, 4)));
+        for object in 1..4u32 {
+            assert!(!scene.commit_cursor(cursor_key(7, object), surface(INK, side, side)));
+        }
+        let half = side.saturating_div(2);
+        assert!(!scene.commit_cursor(cursor_key(7, 4), surface(INK, half, half)));
+        let weight = full
+            .saturating_mul(3)
+            .saturating_add(half.saturating_mul(half).saturating_mul(4));
+        assert!(weight.saturating_add(full) > MAX_CURSOR_BYTES_PER_CLIENT);
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), INK);
+
+        assert!(scene.commit_cursor(cursor_key(7, CURSOR_SURFACE), surface(INK, side, side)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), CROSS);
+        // The weight is still there: a refusal drops the surface's own image
+        // and nobody else's.
+        assert_eq!(scene.cursor_bytes(), weight);
+    }
+
+    #[test]
+    fn an_oversized_cursor_is_refused_and_tds_own_stands() {
+        let (mut scene, mut frame, width, height, stride) = bare_output();
+        scene.pointer_x = 40;
+        scene.pointer_y = 60;
+        scene.set_cursor(7, Some(aim(0, 0)));
+        let over = MAX_CURSOR_DIMENSION.saturating_add(1);
+        // One side over the bound is enough, and it is checked on both: a
+        // check on the area alone would admit a 1x100000 image.
+        assert!(!scene.commit_cursor(cursor_key(7, CURSOR_SURFACE), surface(INK, over, 1)));
+        assert!(!scene.commit_cursor(cursor_key(7, CURSOR_SURFACE), surface(INK, 1, over)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), CROSS);
+        // The bound itself is admitted rather than being off by one.
+        assert!(scene.commit_cursor(
+            cursor_key(7, CURSOR_SURFACE),
+            surface(INK, MAX_CURSOR_DIMENSION, MAX_CURSOR_DIMENSION)
+        ));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), INK);
+
+        // An oversized image REPLACES a drawable one rather than being
+        // dropped beside it: the surface's content is now something td will
+        // not draw, and the previous frame is one the client has replaced.
+        assert!(scene.commit_cursor(cursor_key(7, CURSOR_SURFACE), surface(INK, over, over)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), CROSS);
+    }
+
+    #[test]
+    fn a_re_aimed_cursor_keeps_the_pixels_already_committed() {
+        let (mut scene, mut frame, width, height, stride) = bare_output();
+        scene.pointer_x = 40;
+        scene.pointer_y = 60;
+        scene.set_cursor(7, Some(aim(0, 0)));
+        assert!(scene.commit_cursor(cursor_key(7, CURSOR_SURFACE), surface(INK, 4, 4)));
+        // A second request moves the image the client already sent, so this
+        // one DOES owe a paint where the first owed none.
+        assert!(scene.set_cursor(7, Some(aim(3, 0))));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 37, 60), INK);
+        assert_eq!(pixel(&frame, stride, 40, 60), INK);
+        assert_eq!(pixel(&frame, stride, 41, 60), BACKGROUND);
+        // Re-asking for the same hotspot moves nothing, which is the request
+        // a toolkit makes on every enter.
+        assert!(!scene.set_cursor(7, Some(aim(3, 0))));
+        // Hiding draws nothing, and naming the surface again draws it again:
+        // what the SURFACE holds is not the cursor's to discard, and a
+        // client that hides and re-shows sends no second copy of it.
+        assert!(scene.set_cursor(7, None));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), BACKGROUND);
+        assert!(scene.set_cursor(7, Some(aim(3, 0))));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), INK);
+    }
+
+    #[test]
+    fn a_cursor_past_the_corner_is_clipped_rather_than_wrapped() {
+        let (mut scene, mut frame, width, height, stride) = bare_output();
+        scene.pointer_x = 2;
+        scene.pointer_y = 50;
+        // A hotspot deeper into the image than the pointer is into the
+        // output, so the image's corner lands at a NEGATIVE column — the
+        // ordinary case at a screen edge rather than something to refuse.
+        scene.set_cursor(7, Some(aim(10, 10)));
+        assert!(scene.commit_cursor(cursor_key(7, CURSOR_SURFACE), surface(INK, 16, 16)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 0, 40), INK);
+        assert_eq!(pixel(&frame, stride, 7, 40), INK);
+        assert_eq!(pixel(&frame, stride, 8, 40), BACKGROUND);
+        // The columns that fell off the left are not on the right: an origin
+        // taken as unsigned would wrap them to the far edge of the row.
+        assert_eq!(pixel(&frame, stride, width - 1, 40), BACKGROUND);
     }
 
     #[test]

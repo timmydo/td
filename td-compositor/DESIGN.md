@@ -1597,10 +1597,55 @@ latest enter sent to that client for the seat and the runtime still focuses
 that entered surface. Late pointer resources reuse the client-wide serial.
 Stale, pre-enter, and logically post-leave requests are ignored without
 consuming a role even when socket delivery of the leave is delayed; a valid
-incompatible role uses `wl_pointer.error.role`. Cursor buffers are immediately
-released and never enter the tiling scene. The first renderer continues to
-draw its fixed software cursor and deliberately ignores the requested image
-and hotspot; themed client cursors are a later rendering increment.
+incompatible role uses `wl_pointer.error.role`. Cursor buffers are released as
+soon as their pixels are copied and never enter the tiling scene: a cursor is
+arranged by nothing, focuses nothing and is drawn over everything.
+
+That image is what the pointer PAINTS, at the position the hotspot names —
+the pixel of the image that sits on the pointer's own coordinate, so the
+image's corner is that far back from it and lands off the top or left edge
+whenever the pointer is near one. Clipping there is ordinary rather than an
+error, which is why the cursor's origin is signed where a placement's is not.
+A null surface asks for NO cursor and is the whole of the request: there is no
+surface to give a role to and no commit to wait for. td's own cross is the
+FALLBACK rather than the default, and it stands for three situations an
+operator cannot tell apart anyway — no client focused, a focused client that
+has asked for nothing, and one that named a cursor surface whose pixels have
+not arrived.
+
+A cursor belongs to the client the pointer is FOCUSED on, as the pointer model
+answers it rather than as the geometry under the pointer does: a grab holds
+focus off its own surface, so a client that set a resize cursor before a press
+keeps it for the whole drag. Any change of focused client drops the cursor,
+because `wl_pointer.leave` makes it undefined — a client sets one on every
+enter, and keeping the last one would show a departed client's cursor over the
+bar and the gaps. That drop is taken wherever focus is RECOMPUTED and not only
+on a pointer report, because the changes that strand a cursor are exactly the
+ones that arrive without one — a window closing under a stationary pointer, a
+workspace switch, a client disconnecting. One slot serves the whole scene for
+that reason: remembering what every client that ever held focus last asked for
+would be unbounded state nothing reads.
+
+What a cursor SURFACE contains is separate state from which surface is being
+pointed with, and only the second is the cursor's. A surface's contents are
+the surface's: they are retained per surface, survive the client pointing with
+something else, and are there again when it points back. That is what a client
+switching between pre-rendered cursor surfaces relies on — `set_cursor` alone,
+with no commit behind it, is a legal way to change cursors, and a compositor
+that dropped the contents on the way out would draw nothing for it. Committing
+to a surface nobody is pointing with is likewise retained rather than ignored;
+it just owes no repaint. Conflating the two was this increment's own bug: the
+selection is undefined after a leave, the contents are not.
+
+Those contents go when the SURFACE does. Destroying it takes them, as
+destroying a toplevel takes its tile's pixels — what td holds is a COPY, so
+nothing dangles, but a copy of a surface that no longer exists is not what the
+operator should be pointing with — and so does the client's departure, which
+the tiling sweep would otherwise miss because cursor surfaces are not tiles. A
+null attach takes them too and leaves the surface named and still aimed, so a
+later commit is adopted without another `set_cursor`. None of the three is
+read as "hide": a client asking for no cursor says so with a null SURFACE,
+which cannot be confused with one between two frames of an animated cursor.
 
 A WHEEL reaches clients as `wl_pointer.axis`. `REL_WHEEL` and `REL_HWHEEL`
 accumulate into the same evdev frame the deltas and buttons do, so one report
@@ -1688,11 +1733,37 @@ new initial serial is pending, for at most 33 serials total; the tracker
 enforces the retained-generation bound itself. Output pixels, the bundled
 demo's generated buffer, and one client's aggregate retained toplevel pixels
 share the same 32 MiB ceiling, so every accepted output has a representable
-single-client tile. Cursor-role buffers are released without retaining their
-pixels. A framebuffer's stride-padded shadow allocation has a
+single-client tile. Cursor-role pixels are outside that total and carry their
+own PER-CLIENT ceiling of 1 MiB, which is four cursors at the maximum
+dimension below or an ordinary animated set hundreds of frames deep. Per
+client rather than one shared ledger, for the reason the tile path is: a
+single first-come total lets one client that pointed with a few full-size
+cursors deny every other client a cursor for as long as it stays connected,
+and the denial is silent — the others simply show td's cross. A framebuffer's
+stride-padded shadow allocation has a
 separate 64 MiB ceiling. Framebuffer and buffer dimensions share a
 16,384-pixel ceiling. At four bytes per pixel the area ceiling is 8,388,608
-pixels: tight 3840x2160 is accepted, while 4096x2160 is rejected. The complete
+pixels: tight 3840x2160 is accepted, while 4096x2160 is rejected. A CURSOR is
+bounded separately and far more tightly, at 256 pixels on a side: themes stop
+there, so nothing an operator would see is refused, and what it bounds is a
+client naming a surface of output size as its cursor — which the protocol
+permits and which would cost the scene a second framebuffer for an image a few
+dozen pixels of are ever on screen at once. An image over that bound is
+REFUSED rather than clipped, since a clip would draw part of an image whose
+hotspot was computed for the whole of it, putting the operator's point
+somewhere other than where they are pointing; td's own cross stands instead.
+A refusal DISCARDS whatever that surface held before, whether it was refused
+for its size or for the client's ceiling: the surface's contents are now the
+image just committed, so keeping the previous frame would paint one the client
+has replaced — and, since the buffer is released either way, would freeze an
+animated cursor on a frame while the client believed every one of them took.
+The cross says something is wrong; a stale frame says nothing. The dimension
+check is applied BEFORE the buffer is copied rather than on what is retained,
+or the bound would limit what td holds while every connected client could
+still make it materialise an image of full output size at once. Its buffer is
+released either way, because a client left waiting on a buffer it is entitled
+to reuse stops drawing altogether — a worse failure than the cursor it asked
+for not appearing. The complete
 scene retains at most 128 MiB. Rendering clips rows and columns to the output
 before visiting pixels. These are availability bounds against a same-user
 client, not isolation between mutually distrusting users.
@@ -2008,8 +2079,11 @@ The landing must prove:
   and a tiling command resends it immediately, so foreign pixels fbcon left on
   the device cannot outlive either bound;
 - framebuffer tests pin the damaged band exactly: an unchanged scene writes
-  nothing, a one-pixel pointer step writes the cursor's 13 rows, a diagonal step
-  writes 14, a full-size output writes under 2% of its image, a banded sequence
+  nothing, a one-pixel pointer step writes td's own cursor's 13 rows, a diagonal
+  step writes 14 — both figures are the FALLBACK cross's, and a client cursor
+  is as tall as its image up to the maximum dimension, so the band is a
+  property of what is being pointed with rather than of the compositor —
+  a full-size output writes under 2% of its image, a banded sequence
   leaves the device byte-identical to one full write of the same scene, and a
   failed write resends everything even though the scene did not change;
 - pointer wire tests cover checked fixed-point coordinates, event payloads,
@@ -2111,7 +2185,12 @@ application registry with a terminal entry, and the terminal is the first
 client the BOOT starts, in place of the demo. Pointer axes are landed on both
 sides: a wheel reaches clients as `wl_pointer.axis`, with the source and notch
 count version 5 asks for, and the terminal binds a `wl_pointer` and scrolls
-its scrollback with one. Clipboard, client cursor rendering, hotplug, and real
+its scrollback with one. Client cursor rendering is landed on the COMPOSITOR
+side: a client's own image is drawn where its hotspot says, a null surface
+hides the pointer outright, and td's cross is what is left when no focused
+client has asked for either. No td client sets one yet, so the booted machine
+still shows the cross everywhere — the protocol half is what a toolkit needs
+and the asking half is a client's own increment. Clipboard, hotplug, and real
 DRM/KMS profiles follow. The terminal stack has the separate contract below.
 
 Of that contract these are built: the parser and terminal model, the native

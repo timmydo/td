@@ -4,8 +4,8 @@ use crate::layout::ViewLayout;
 use crate::pointer::{PointerEvent, PointerSnapshot, RoutedPointerFrame};
 use crate::runtime::{KeyboardDelivery, KeyboardSubscriptionStop, Runtime, SubscriptionStop};
 use crate::scene::{
-    InputRegion, SharedInputRegion, Surface, SurfaceKey, MAX_INPUT_REGION_OPERATIONS, SHM_ARGB8888,
-    SHM_XRGB8888,
+    CursorRequest, InputRegion, SharedInputRegion, Surface, SurfaceKey, MAX_CURSOR_DIMENSION,
+    MAX_INPUT_REGION_OPERATIONS, SHM_ARGB8888, SHM_XRGB8888,
 };
 #[cfg(test)]
 use crate::scene::{GAP, TITLE_HEIGHT};
@@ -1516,20 +1516,62 @@ impl Client {
             return Err(format!("wl_surface {id} attached a buffer without a role"));
         }
         if let Some(pending) = state.pending_buffer {
+            let key = SurfaceKey {
+                client: self.id,
+                object: id,
+            };
             if cursor {
-                if let PendingBuffer::Buffer { object, buffer } = pending {
-                    if matches!(
-                        self.objects.get(&object),
-                        Some(Object::Buffer(current)) if current.serial == buffer.serial
-                    ) {
-                        self.send(object, 0, wire::Builder::new())?;
+                match pending {
+                    // A cursor surface with its buffer taken away has no
+                    // image to be, so td's own cross stands. Deliberately NOT
+                    // read as "hide": a client asking for no cursor says so
+                    // with a null SURFACE, which cannot be confused with a
+                    // client between two frames of an animated one.
+                    PendingBuffer::Detach => self
+                        .runtime
+                        .lock()
+                        .map_err(|_| "runtime lock poisoned".to_string())?
+                        .detach_cursor(key)?,
+                    PendingBuffer::Buffer { object, buffer } => {
+                        // The dimension bound is applied HERE rather than at
+                        // the scene, because `copy_buffer` allocates and
+                        // reads the whole image: refusing it afterwards
+                        // bounds what is RETAINED and not what is spent, so
+                        // every connected client could make td materialise a
+                        // buffer of full output size at once. The scene
+                        // checks again on what it keeps; this is what stops
+                        // the copy from happening at all.
+                        if buffer.width <= MAX_CURSOR_DIMENSION
+                            && buffer.height <= MAX_CURSOR_DIMENSION
+                        {
+                            let image = Self::copy_buffer(&buffer)?;
+                            self.runtime
+                                .lock()
+                                .map_err(|_| "runtime lock poisoned".to_string())?
+                                .commit_cursor(key, image)?;
+                        } else {
+                            // Still a REPLACEMENT: the surface's contents are
+                            // now something td will not draw, so the frame it
+                            // held is one the client has superseded.
+                            self.runtime
+                                .lock()
+                                .map_err(|_| "runtime lock poisoned".to_string())?
+                                .detach_cursor(key)?;
+                        }
+                        // Released whether or not the image was KEPT. A
+                        // cursor over the scene's bound is refused, and a
+                        // client left waiting on the buffer it would have
+                        // reused is a client that stops drawing — a worse
+                        // failure than the cursor it asked for not appearing.
+                        if matches!(
+                            self.objects.get(&object),
+                            Some(Object::Buffer(current)) if current.serial == buffer.serial
+                        ) {
+                            self.send(object, 0, wire::Builder::new())?;
+                        }
                     }
                 }
             } else {
-                let key = SurfaceKey {
-                    client: self.id,
-                    object: id,
-                };
                 match pending {
                     PendingBuffer::Detach => {
                         if was_mapped {
@@ -1947,19 +1989,27 @@ impl Client {
                 0 => {
                     let serial = args.u32()?;
                     let surface = args.u32()?;
-                    args.i32()?;
-                    args.i32()?;
+                    let hotspot_x = args.i32()?;
+                    let hotspot_y = args.i32()?;
                     args.finish()?;
                     let authority = *self
                         .pointer_authority
                         .lock()
                         .map_err(|_| "pointer authority lock poisoned".to_string())?;
-                    let focus = self
-                        .runtime
+                    // The focus check and the install that follows it happen
+                    // under ONE hold of the runtime lock. Released between
+                    // them, a pointer report could move focus in the gap, and
+                    // the cursor would then be installed by a client that no
+                    // longer has one — where it would stay until some later
+                    // report happened to move focus again. Held through a
+                    // cloned handle rather than `self.runtime` so the guard
+                    // borrows nothing of `self`, leaving the role assignment
+                    // and `fail_protocol` reachable inside it.
+                    let runtime = Arc::clone(&self.runtime);
+                    let mut runtime = runtime
                         .lock()
-                        .map_err(|_| "runtime lock poisoned".to_string())?
-                        .pointer_snapshot()
-                        .focus;
+                        .map_err(|_| "runtime lock poisoned".to_string())?;
+                    let focus = runtime.pointer_snapshot().focus;
                     let authorized = authority.is_some_and(|candidate| {
                         candidate.serial == serial
                             && focus.is_some_and(|target| {
@@ -1970,30 +2020,40 @@ impl Client {
                     if !authorized {
                         return Ok(());
                     }
-                    if surface != 0 {
-                        let mut state = match self.objects.get(&surface).cloned() {
-                            Some(Object::Surface(state)) => state,
-                            _ => {
-                                return Err(format!(
-                                    "wl_pointer cursor references non-surface {surface}"
-                                ))
-                            }
-                        };
-                        match state.role {
-                            None => state.role = Some(SurfaceRole::Cursor),
-                            Some(SurfaceRole::Cursor) => {}
-                            Some(SurfaceRole::Xdg(_)) => {
-                                return self.fail_protocol(
-                                    WL_POINTER_ERROR_ROLE,
-                                    &format!(
-                                        "wl_surface {surface} already has an incompatible role"
-                                    ),
-                                );
-                            }
-                        }
-                        self.objects.insert(surface, Object::Surface(state));
+                    if surface == 0 {
+                        // A null surface is the request for NO cursor, and it
+                        // is the whole of what this call means: there is no
+                        // surface to give a role to and no commit to wait for.
+                        return runtime.set_cursor(self.id, None);
                     }
-                    Ok(())
+                    let mut state = match self.objects.get(&surface).cloned() {
+                        Some(Object::Surface(state)) => state,
+                        _ => {
+                            return Err(format!(
+                                "wl_pointer cursor references non-surface {surface}"
+                            ))
+                        }
+                    };
+                    match state.role {
+                        None => state.role = Some(SurfaceRole::Cursor),
+                        Some(SurfaceRole::Cursor) => {}
+                        Some(SurfaceRole::Xdg(_)) => {
+                            drop(runtime);
+                            return self.fail_protocol(
+                                WL_POINTER_ERROR_ROLE,
+                                &format!("wl_surface {surface} already has an incompatible role"),
+                            );
+                        }
+                    }
+                    self.objects.insert(surface, Object::Surface(state));
+                    runtime.set_cursor(
+                        self.id,
+                        Some(CursorRequest {
+                            surface,
+                            hotspot_x,
+                            hotspot_y,
+                        }),
+                    )
                 }
                 1 if version >= 3 => {
                     args.finish()?;
@@ -5681,6 +5741,28 @@ mod tests {
             None
         );
         assert_eq!(client.mapped_total, 0);
+        // The hotspot reached the scene rather than being parsed and dropped,
+        // and the pixels came with it. Both halves matter and arrive by
+        // different routes — the hotspot with the request, the image with the
+        // commit — so this is what says the two met.
+        assert_eq!(
+            runtime.lock().unwrap().cursor_image(),
+            Some((1, 2, 1, 1)),
+            "the set_cursor hotspot and the committed image reach the scene"
+        );
+
+        // A null surface asks for NO cursor, and it drops the image the
+        // client had already committed rather than leaving it standing.
+        let mut hide = wire::Builder::new();
+        hide.u32(serial);
+        hide.u32(0);
+        hide.i32(0);
+        hide.i32(0);
+        client
+            .dispatch(request(6, 0, hide).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert_eq!(runtime.lock().unwrap().cursor_image(), None);
+        assert!(runtime.lock().unwrap().cursor_is_hidden());
 
         client.insert(8, Object::XdgWmBase).unwrap();
         let mut xdg = wire::Builder::new();
@@ -5690,6 +5772,135 @@ mod tests {
             .dispatch(request(8, 2, xdg).unwrap(), &mut VecDeque::new())
             .unwrap_err()
             .contains("already has a role"));
+        stop.stop();
+        runtime.lock().unwrap().unsubscribe_keyboard(2);
+        fs::remove_file(framebuffer_path).unwrap();
+        fs::remove_file(pool_path).unwrap();
+    }
+
+    /// A cursor td refuses to hold pixels for must still have its buffer
+    /// released. The client is entitled to reuse it, and one left waiting
+    /// stops drawing altogether — a worse failure than the cursor it asked
+    /// for not appearing.
+    #[test]
+    fn an_oversized_cursor_is_refused_with_its_buffer_still_released() {
+        let stem = format!(
+            "td-wayland-cursor-bound-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let pool_path = std::env::temp_dir().join(format!("{stem}.pool"));
+        let over = crate::scene::MAX_CURSOR_DIMENSION.saturating_add(1);
+        // FOUR BYTES behind a buffer that declares 257 pixels. The bound is
+        // applied before `copy_buffer`, so nothing reads this file; a bound
+        // applied afterwards — which bounds what is RETAINED and not what is
+        // SPENT — would try to read 1028 bytes from it and fail the commit.
+        // That failure is what pins the check to the right side of the copy.
+        fs::write(&pool_path, [1, 2, 3, 0]).unwrap();
+        let framebuffer = Framebuffer::test_file(
+            &framebuffer_path,
+            80,
+            crate::scene::least_output_height(8),
+            80 * 4,
+        )
+        .unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let focused = SurfaceKey {
+            client: 2,
+            object: 9,
+        };
+        runtime
+            .lock()
+            .unwrap()
+            .commit(
+                focused,
+                Surface {
+                    width: 32,
+                    height: 32,
+                    pixels: vec![1; 32 * 32 * 4],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        let rect = runtime
+            .lock()
+            .unwrap()
+            .layout_snapshot()
+            .get(&focused)
+            .unwrap()
+            .rect;
+        runtime
+            .lock()
+            .unwrap()
+            .pointer_frame(
+                1,
+                i32::try_from(rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(rect.y.saturating_add(3)).unwrap(),
+                &[],
+                PointerScroll::default(),
+            )
+            .unwrap();
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut client = Client::new(2, server, Arc::clone(&runtime), test_keymap()).unwrap();
+        let subscription = runtime
+            .lock()
+            .unwrap()
+            .subscribe_input_with_activity(
+                2,
+                Arc::clone(&client.keyboard_active),
+                Arc::clone(&client.pointer_active),
+            )
+            .unwrap();
+        let (_receiver, stop) = subscription.split();
+        client
+            .insert(5, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        client.create_pointer(6, 7).unwrap();
+        let enter = receive_messages(&mut peer, 2);
+        let mut first = wire::Cursor::new(&enter.first().unwrap().payload);
+        let serial = first.u32().unwrap();
+
+        let mut set_cursor = wire::Builder::new();
+        set_cursor.u32(serial);
+        set_cursor.u32(5);
+        set_cursor.i32(0);
+        set_cursor.i32(0);
+        client
+            .dispatch(request(6, 0, set_cursor).unwrap(), &mut VecDeque::new())
+            .unwrap();
+
+        let buffer = Buffer {
+            serial: 1,
+            file: Arc::new(File::open(&pool_path).unwrap()),
+            offset: 0,
+            width: over,
+            height: 1,
+            stride: over.saturating_mul(4),
+            format: SHM_XRGB8888,
+        };
+        client.insert(7, Object::Buffer(buffer.clone())).unwrap();
+        let state = SurfaceState {
+            pending_buffer: Some(PendingBuffer::Buffer { object: 7, buffer }),
+            role: Some(SurfaceRole::Cursor),
+            ..SurfaceState::default()
+        };
+        client.objects.insert(5, Object::Surface(state.clone()));
+        // Not an error: the protocol permits the size, so refusing to DRAW it
+        // is td's bound rather than the client's mistake.
+        client.commit_surface(5, state).unwrap();
+        let release = receive_messages(&mut peer, 1);
+        assert_eq!(
+            (
+                release.first().unwrap().object,
+                release.first().unwrap().opcode
+            ),
+            (7, 0)
+        );
+        assert_eq!(runtime.lock().unwrap().cursor_image(), None);
+        assert!(!runtime.lock().unwrap().cursor_is_hidden());
+
         stop.stop();
         runtime.lock().unwrap().unsubscribe_keyboard(2);
         fs::remove_file(framebuffer_path).unwrap();
