@@ -419,14 +419,34 @@ impl ScriptParser<'_> {
         Some(n)
     }
 
+    /// `add_regex`, raising the confusing-bracket lint at once. Everything but
+    /// `s` -- today the two address spellings -- has nothing to run between the
+    /// compile and the lint, which is where GNU raises it too.
     fn add_regex(&mut self, raw: &[u8], icase: bool, multiline: bool) -> Result<Option<usize>, String> {
+        let (re, pending) = self.add_regex_pending(raw, icase, multiline)?;
+        pending.raise()?;
+        Ok(re)
+    }
+
+    /// The compile, with the lint left PENDING. GNU compiles the pattern, then
+    /// checks the `s` command's out-of-range `\N`, then calls `dfacomp` -- and
+    /// it is `dfacomp` that raises this (sed/regexp.c:118-133). So a pattern
+    /// carrying BOTH faults is `invalid reference` in GNU and was the lint here,
+    /// exit 1 against exit 4. `s` is the only command with a check in between,
+    /// because it is the only one with a replacement to read a `\N` from.
+    fn add_regex_pending(
+        &mut self,
+        raw: &[u8],
+        icase: bool,
+        multiline: bool,
+    ) -> Result<(Option<usize>, PendingLint), String> {
         if raw.is_empty() {
             // `//` reuses whatever matched last, which has its own flags — so GNU
             // refuses to be given new ones rather than silently dropping them.
             if icase || multiline {
                 return Err("cannot specify modifiers on empty regexp".to_string());
             }
-            return Ok(None);
+            return Ok((None, PendingLint(false)));
         }
         // `M` is relative to the RECORD separator, which `N` can put inside the
         // pattern space: under `-z`, `N` joins with a NUL and GNU anchors there.
@@ -436,8 +456,11 @@ impl ScriptParser<'_> {
             strict_repeats: true,
             posix: self.posix(),
             unmatched_rparen_ordinary: !self.extended(),
-            // GNU's one POSIXLY_CORRECT rule that is not a posixicity read.
-            confusing_bracket_ok: self.inv.posixly,
+            // Never raised by the ENGINE here: sed raises it itself, at the
+            // point in the compile GNU does. The variable's suppression --
+            // GNU's one POSIXLY_CORRECT rule that is not a posixicity read --
+            // is applied below, where the lint is decided rather than deferred.
+            confusing_bracket_ok: true,
             // sed has only glibc, which never satisfies a mid-branch `$`.
             glibc_engine: true,
             // sed lexes one regex at a time, and has no `-x`/`-w` to wrap it.
@@ -446,8 +469,9 @@ impl ScriptParser<'_> {
         };
         let re = Regex::compile(&normalize_regex(raw, !self.extended())?, opts)
             .map_err(|e| e.msg)?;
+        let pending = PendingLint(re.class_syntax && !self.inv.posixly);
         self.regexes.push(re);
-        Ok(Some(self.regexes.len() - 1))
+        Ok((Some(self.regexes.len() - 1), pending))
     }
 
     /// A `/re/` or `\cREc` address, consuming the blanks before an `I`/`M`
@@ -1045,7 +1069,7 @@ impl ScriptParser<'_> {
                 _ => return Err("unknown option to `s'".to_string().into()),
             }
         }
-        let re = self.add_regex(&pattern, icase, multiline)?;
+        let (re, pending) = self.add_regex_pending(&pattern, icase, multiline)?;
         // A `\N` naming a group the pattern does not have is a script error, not
         // an empty expansion -- except under EITHER posix level, where it is
         // accepted and expands to nothing (regexp.c:122 asks
@@ -1065,6 +1089,8 @@ impl ScriptParser<'_> {
                 }
             }
         }
+        // AFTER the reference check, which is the whole point of deferring it.
+        pending.raise()?;
         Ok(Subst {
             re,
             replacement,
@@ -3948,6 +3974,21 @@ struct Mode {
     /// target is opened, because refusing the command is GNU's answer whether or
     /// not the file could have been opened.
     sandbox: bool,
+}
+
+/// The confusing-bracket lint, decided but not yet raised. GNU raises it inside
+/// `dfacomp`, a step after the `s` command's out-of-range `\N` check, so a
+/// caller with that check to run holds one of these across it.
+#[must_use = "a pending lint that is never raised accepts a pattern GNU refuses"]
+struct PendingLint(bool);
+
+impl PendingLint {
+    fn raise(self) -> Result<(), String> {
+        match self.0 {
+            true => Err(crate::regex::CLASS_SYNTAX.to_string()),
+            false => Ok(()),
+        }
+    }
 }
 
 /// The two compile inputs that are properties of the INVOCATION rather than of

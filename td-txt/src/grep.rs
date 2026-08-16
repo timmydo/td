@@ -1527,8 +1527,8 @@ fn compile(conf: &Conf, lines: &[Vec<u8>]) -> Result<Patterns, String> {
         // the `dfaerror` arm and `[:alpha:]` without its outer bracket is an
         // error whatever the environment says. sed sets that bit nowhere, which
         // is why the same lint is `dfawarn` there and the variable can discard
-        // it. Reusing sed's switch here is the obvious wrong fix, so two
-        // grep-cli cases pin this `false` against the variable.
+        // it. Wiring the variable in here is the obvious wrong fix, so two
+        // grep-cli cases pin this `false` against it.
         confusing_bracket_ok: false,
         // grep matches with its own dfa, which satisfies a mid-branch `$`. It falls
         // back to glibc for `-o` and for any pattern with a backreference, where GNU

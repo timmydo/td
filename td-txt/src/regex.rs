@@ -85,11 +85,13 @@ pub struct Options {
     /// ACCEPTED as the ordinary bracket expression it looks like, rather than
     /// refused with `CLASS_SYNTAX`.
     ///
-    /// GNU's `dfawarn` (sed/regexp.c:52) asks `getenv("POSIXLY_CORRECT")`
-    /// DIRECTLY, so this is the one rule that variable drives without going
-    /// through `posixicity`: it is not `posix`, not the level, and no `v`
-    /// restores the lint. `false` is today's answer everywhere else -- grep
-    /// hands dfa `DFA_CONFUSING_BRACKETS_ERROR` whatever the environment says.
+    /// A per-applet constant rather than a question about the invocation:
+    /// `false` in grep, which hands dfa `DFA_CONFUSING_BRACKETS_ERROR` so the
+    /// pattern is refused here; `true` in sed, which raises the lint ITSELF,
+    /// after the `s` command's reference check, because that is the order
+    /// `compile_regex_1` puts them in (sed/regexp.c:118-133). Whether sed
+    /// raises it at all is `POSIXLY_CORRECT`, decided where the deferred lint
+    /// is built and not here.
     ///
     /// Only the DIAGNOSTIC is conditional. The pattern parses identically
     /// either way: `class_syntax` is a flag the bracket parser raises and the
@@ -251,6 +253,12 @@ fn is_assertion(node: &Node) -> bool {
 /// A compiled pattern.
 #[derive(Clone, Debug)]
 pub struct Regex {
+    /// A class was written without its outer bracket (`[:alpha:]`). Exposed
+    /// rather than only raised because GNU raises it in `dfacomp`, a step
+    /// AFTER the `s` command's out-of-range `\N` check (sed/regexp.c:118-133),
+    /// so sed's `s` path has to compile first and refuse afterwards. `compile`
+    /// still refuses for every caller that has nothing to run in between.
+    pub class_syntax: bool,
     root: Node,
     ngroups: usize,
     icase: bool,
@@ -1339,6 +1347,7 @@ impl Regex {
         let has_alt = has_alt(&root);
         let has_backref = has_backref(&root);
         Ok(Self {
+            class_syntax: p.class_syntax,
             root,
             ngroups: p.ngroups,
             icase: opts.icase,

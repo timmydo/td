@@ -1501,11 +1501,14 @@ td-txt-authored case files
     lint -- `[:alpha:]` written without its outer bracket, GNU's one bare exit-4
     pattern error -- is DISCARDED whenever the variable is present, at any
     level, `--posix` included, and a `v` cannot bring it back. Served, and by
-    the switch GNU uses rather than by the nearest one to hand: `Options`'
-    `confusing_bracket_ok`, set from the variable's PRESENCE, which reaches the
-    compiler through `Invocation` -- the struct for the compile inputs that are
-    properties of the run rather than of an `-e` part, and so cannot go in
-    `Mode`. Only the DIAGNOSTIC is conditional; `class_syntax` is a flag the
+    the switch GNU uses rather than by the nearest one to hand: the variable's
+    PRESENCE, read once per run and carried to the compiler by `Invocation` --
+    the struct for the compile inputs that are properties of the run rather
+    than of an `-e` part, and so cannot go in `Mode`. WHERE sed then raises the
+    lint is a separate question and the entry below answers it; `Options`'
+    `confusing_bracket_ok` is what tells the ENGINE not to, and is a per-applet
+    constant rather than a reading of the variable. Only the DIAGNOSTIC is
+    conditional; `class_syntax` is a flag the
     bracket parser raises and the error is built from it afterwards, so the
     pattern parses identically either way and accepting one costs nothing but
     the refusal. FIVE cases, four of them saying which switch it is: `--posix`
@@ -1584,6 +1587,37 @@ td-txt-authored case files
     are stale now and deliberately not re-measured -- the thing they were
     measuring is a shortcut nobody should take, and what replaced it fixes the
     99 without the 48.
+
+  - WHICH compile diagnostic wins when two apply, which is a rule about GNU's
+    ORDER rather than about either error. `compile_regex_1` does three things
+    in a fixed sequence (sed/regexp.c:96-133): `re_compile_pattern`, then the
+    `s` command's out-of-range `\N` check, then `dfacomp` -- and `dfacomp` is
+    what raises the confusing-bracket lint. So a pattern carrying BOTH faults
+    is `invalid reference \1` at exit 1, not the lint at exit 4:
+    `sed 's/[:alpha:]/\1/'` is the minimal shape. td-txt raised the lint
+    inside its single compile and answered exit 4, which is a different STATUS
+    and not merely a different message. `add_regex_pending` returns a
+    `#[must_use]` `PendingLint` the `s` path holds across its reference check;
+    every other caller has nothing to run in between and raises at once, which
+    is where GNU raises it too. `s` is the only command that can have anything
+    in between, being the only one with a replacement to read a `\N` from.
+
+    Found by a 1500-script randomized fuzz across the three posixicity levels,
+    run right after the lint's own commit landed and reporting 3 cases, all at
+    the DEFAULT level. Only the default has two diagnostics to order:
+    `POSIXLY_CORRECT` suppresses BOTH -- the lint by `dfawarn`'s getenv and the
+    reference check by the level -- and `--posix` suppresses the reference
+    check alone, leaving the lint with nothing to race. Worth recording
+    as the fuzz's first find that no hand-written sweep had reached: every
+    sweep in this campaign varied ONE rule at a time, and this needs two faults
+    in one pattern. The same fuzz now reports none. Twelve cases pin it, nine
+    of them guards: either fault alone, an in-range group, a pattern that will
+    not compile at all (GNU's first step, which outranks both), each POSIX
+    level, and the OTHER raise site the split creates -- an address, in both
+    spellings, which raises at once, plus the variable suppressing one. That
+    last group is the coverage the split silently opened: with the lint
+    reachable only through `s` in the corpus, a mutant that never raised it on
+    the address path left all 2453 cases green.
 
   - The POSIX levels' bracket suppression carries across a closed
     sub-expression in a way td-txt does not model. Written here as `--posix`'s

@@ -7771,6 +7771,126 @@ a
 ## stderr-json: ""
 ## status: 0
 
+#### a pattern carrying BOTH faults reports the REFERENCE, not the lint
+# Two compile diagnostics apply and GNU's order decides: `compile_regex_1'
+# compiles the pattern, checks the `s' command's out-of-range `\N', and
+# only THEN calls `dfacomp' -- which is what raises the confusing-bracket
+# lint (sed/regexp.c:118-133). td-txt raised the lint inside its single
+# compile, so it answered exit 4 with the wrong message where GNU answers
+# exit 1 with the right one. Found by fuzzing after the lint's own commit,
+# which is why it is a case and not a footnote: nothing here asked for two
+# faults at once.
+## argv: sed 's/[:alpha:]/\1/' h
+## file-json h: "a\n"
+## stdout-json: ""
+## stderr-contains: -e expression #1, char 15: invalid reference \1 on `s' command's RHS
+## status: 1
+
+#### and the reference error names the group it could not find
+## argv: sed 's/[:alpha:]/\9/' h
+## file-json h: "a\n"
+## stdout-json: ""
+## stderr-contains: -e expression #1, char 15: invalid reference \9 on `s' command's RHS
+## status: 1
+
+#### the same with the fault buried in a longer pattern
+# The three shapes the fuzz turned up were all of this form -- an operator
+# or anchor before the bracket -- so one of them is kept as found.
+## argv: sed -E 's/a\b[:alpha:]b./\1/g' h
+## file-json h: "a\n"
+## stdout-json: ""
+## stderr-contains: -e expression #1, char 21: invalid reference \1 on `s' command's RHS
+## status: 1
+
+#### either fault ALONE still reports itself
+# The pair that makes the case above about ORDER rather than about which
+# error is reachable.
+## argv: sed 's/[:alpha:]/X/' h
+## file-json h: "a\n"
+## stdout-json: ""
+## stderr-contains: character class syntax is [[:space:]], not [:space:]
+## status: 4
+
+#### the reference fault alone
+## argv: sed 's/x/\1/' h
+## file-json h: "a\n"
+## stdout-json: ""
+## stderr-contains: -e expression #1, char 7: invalid reference \1 on `s' command's RHS
+## status: 1
+
+#### a group the pattern DOES have leaves only the lint
+# `\1' is in range here, so the reference check passes and the lint is what
+# is left -- the same order, with the first step not firing.
+## argv: sed 's/\(a\)[:alpha:]/\1/' h
+## file-json h: "a\n"
+## stdout-json: ""
+## stderr-contains: character class syntax is [[:space:]], not [:space:]
+## status: 4
+
+#### a pattern that will not compile at all outranks both
+# GNU's first step is the pattern compile itself, so its errors come before
+# either of the two above. Already true here, and pinned so a change to the
+# order cannot pass by moving only the pair.
+## argv: sed 's/[:alpha:]\(a/\1/' h
+## file-json h: "a\n"
+## stdout-json: ""
+## stderr-contains: -e expression #1, char 18: Unmatched ( or \(
+## status: 1
+
+#### an ADDRESS raises the same lint, and raises it at once
+# The deferral splits one raise site into two, and this is the other one:
+# an address has nothing to run between the compile and the lint, so it
+# raises immediately -- which is also where GNU raises it, `dfacomp' being
+# the next thing `compile_regex_1' does when there is no `s' replacement to
+# read a `\N' from. Pinned with its LOCUS attached rather than the message
+# alone: the lint carries none, so `sed: ' is what must come before it,
+# where every diagnostic the parser raises names an expression and a char.
+## argv: sed -n /[:alpha:]/p h
+## file-json h: "a\nb\n"
+## stdout-json: ""
+## stderr-contains: sed: character class syntax is [[:space:]], not [:space:]
+## status: 4
+
+#### and the \cREc spelling of one reaches it too
+# The two address spellings are two call sites into the same reader, so
+# the second is a case rather than an assumption.
+## argv: sed -n '\%[:alpha:]%p' h
+## file-json h: "a\nb\n"
+## stdout-json: ""
+## stderr-contains: sed: character class syntax is [[:space:]], not [:space:]
+## status: 4
+
+#### the variable suppresses the address lint as well, and the class matches
+# One decision, shared: the suppression is computed where the pending lint
+# is built, not in the `s' path that defers it. So the address answers all
+# three levels -- and prints, because {:,a,l,p,h} matches the `a'.
+## argv: sed -n /[:alpha:]/p h
+## file-json h: "a\nb\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+#### and under POSIXLY_CORRECT neither fault is one, so the script runs
+# Both diagnostics are suppressed at that level -- the lint by `dfawarn's
+# getenv and the reference check by `posixicity' -- so the order stops
+# mattering and the class {:,a,l,p,h} matches the input's `a'.
+## argv: sed 's/[:alpha:]/[\1]/' h
+## file-json h: "a\nb\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: "[]\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### while --posix keeps the lint and drops the reference check
+# The level suppresses the reference check but NOT the lint, so `--posix'
+# is where the two rules come apart and the lint is what is reported.
+## argv: sed --posix 's/[:alpha:]/[\1]/' h
+## file-json h: "a\nb\n"
+## stdout-json: ""
+## stderr-contains: character class syntax is [[:space:]], not [:space:]
+## status: 4
+
 #### the variable is NOT --posix: v is accepted under it and clears the mode
 # This case exists to stop the paren case above being 'fixed' by wiring the
 # variable to the --posix flag. GNU refuses `v' under --posix but ACCEPTS it under
