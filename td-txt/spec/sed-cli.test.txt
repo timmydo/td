@@ -8738,38 +8738,187 @@ a
 ## stderr-json: ""
 ## status: 0
 
-#### either posix level: a bracket AFTER a closed sub-expression keeps suppressing
-# The one shape of this rule td-txt does not model, carrying GNU's golden as an
-# xfail. Standalone, `[]\x41]' stops suppressing at its leading `]' -- the case
-# above pins that. Here the same bracket follows a closed `[::]' and GNU does
-# NOT stop: its class is {], \, x, 4, 1} where td-txt's is {], A}. Which state
-# GNU carries across the first bracket is not derivable from the outside, and
-# guessing a rule that fits one shape would be worse than recording it. Found by
-# a reviewer; three neighbouring shapes it also flagged (`[[:]\x41]' and the
-# `.'/`=' spellings) turned out to be refusals in BOTH, differing only in the
-# pre-existing missing `char N:' offset.
+#### either posix level: a bracket AFTER an unclosed sub-expression keeps suppressing
+# Standalone, `[]\x41]' stops suppressing at its leading `]' -- the case above
+# pins that. Here the same bracket follows `[::]' and GNU does NOT stop: its
+# class is {], \, x, 4, 1} rather than {], A}. The reason is the LOOKBEHIND in
+# compile.c:1493, which returns the walk to "inside a bracket" only when the
+# byte before the `]' is the opener's kind and the one before THAT is not -- so
+# `[::]' never closes its sub-expression and suppression runs to the end of the
+# pattern.
 ## argv: sed --posix 's/[::][]\x41]/Z/g' h
 ## file-json h: ":A\n:x\n:4\n:]\n"
 ## stdout-json: ":A\nZ\nZ\nZ\n"
 ## stderr-json: ""
 ## status: 0
 
-#### and the same shape under POSIXLY_CORRECT, which is the same gap
-# XFAIL with GNU's golden. `--posix' and the variable are two values of one
-# LEVEL and compile.c:1473 asks `!= POSIXLY_EXTENDED', so GNU suppresses under
-# both and so does the gap: this case is not a second defect but the first one
-# seen from the other spelling, and it exists because nothing else would have
-# said so. Found by a reviewer on the commit that gave the compiler the level;
-# the divergence itself predates that commit, which neither caused nor closed
-# it. A sweep of 330 bracket-family runs across the three levels finds exactly
-# this family -- the `[::]', `[..]' and `[==]' closers -- and no other shape of
-# THIS rule, so the case below bounds it rather than sampling it. Not the only
-# bracket shape that diverges under the variable: a class written without its
-# outer bracket is `dfawarn', a different rule with its own cases above.
+#### and the same under POSIXLY_CORRECT, which is the same LEVEL
+# `--posix' and the variable are two values of one level and compile.c:1473 asks
+# `!= POSIXLY_EXTENDED', so GNU suppresses under both. Not the only bracket
+# shape that diverges under the variable: a class written without its outer
+# bracket is `dfawarn', a different rule with its own cases above.
 ## argv: sed 's/[::][]\x41]/Z/g' h
 ## file-json h: ":A\n:x\n:4\n:]\n"
 ## env POSIXLY_CORRECT: 1
 ## stdout-json: ":A\nZ\nZ\nZ\n"
+## stderr-json: ""
+## status: 0
+
+#### the family is every four-byte sub-expression, not just the doubled closers
+# An earlier note here said a 330-run sweep "bounds it rather than sampling it"
+# and named `[::]', `[..]' and `[==]' as the whole family. It was a sample: an
+# exhaustive enumeration finds `[:a]' too, and for the same reason. Closing
+# needs the opener's kind one byte back and NOT two, which no FOUR-byte `[:X]'
+# can satisfy, whatever X is -- the byte two back from that `]' is the opener
+# itself. Three bytes can (`[:]', below) and five can (`[:a:]'); four cannot.
+## argv: sed --posix 's/[:a][]\x41]/Z/g'
+## stdin-json: ":A\n:x\n:4\n:]\n"
+## stdout-json: ":A\nZ\nZ\nZ\n"
+## stderr-json: ""
+## status: 0
+
+#### which the collating-element spelling reaches the same way
+## argv: sed --posix 's/[.a][]\x41]/Z/g'
+## stdin-json: ".A\n.x\n.4\n.]\n"
+## stdout-json: ".A\nZ\nZ\nZ\n"
+## stderr-json: ""
+## status: 0
+
+#### and the equivalence-class one
+## argv: sed --posix 's/[=a][]\x41]/Z/g'
+## stdin-json: "=A\n=x\n=4\n=]\n"
+## stdout-json: "=A\nZ\nZ\nZ\n"
+## stderr-json: ""
+## status: 0
+
+#### the same under the variable, since the level is what is asked
+## argv: sed 's/[:a][]\x41]/Z/g'
+## stdin-json: ":A\n:x\n:4\n:]\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: ":A\nZ\nZ\nZ\n"
+## stderr-json: ""
+## status: 0
+
+#### the class-syntax lint outranks all of this, and says nothing about the walk
+# Kept as the shape a reader reaches for, and named for what it really shows: a
+# review found this pinning NOTHING when it was titled "five bytes DO close it".
+# GNU raises the same lint with no escape in the pattern at all (`[:a:]x'), so
+# `:' is the one spelling of the five-byte close that cannot be observed. The
+# two below are the spellings that can.
+## argv: sed --posix 's/[:a:][]\x41]/Z/g'
+## stdin-json: ":A\n:x\n"
+## stdout-json: ""
+## stderr-contains: character class syntax is [[:space:]], not [:space:]
+## status: 4
+
+#### FIVE bytes do close it, which a collating element can show
+## argv: sed --posix 's/[.a.][]\x41]/Z/g'
+## stdin-json: ".A\n.x\n.4\n.]\n"
+## stdout-json: "Z\n.x\n.4\nZ\n"
+## stderr-json: ""
+## status: 0
+
+#### and so can an equivalence class
+## argv: sed --posix 's/[=a=][]\x41]/Z/g'
+## stdin-json: "=A\n=x\n=4\n=]\n"
+## stdout-json: "Z\n=x\n=4\nZ\n"
+## stderr-json: ""
+## status: 0
+
+#### but at a gap of one not even five bytes close, the lookbehind being aliased
+## argv: sed --posix 's/\t[.a.][]\x41]/Z/g'
+## stdin-json: "\t.A\n\t.x\n\t.4\n"
+## stdout-json: "\t.A\nZ\nZ\n"
+## stderr-json: ""
+## status: 0
+
+#### a kind character opens nothing unless the bracket is the byte before it
+## argv: sed --posix 's/[a:x:]\x41/Z/g'
+## stdin-json: "aA\n:A\nxA\n"
+## stdout-json: "Z\nZ\nZ\n"
+## stderr-json: ""
+## status: 0
+
+#### and a closed sub-expression returns to INSIDE the bracket, not outside it
+## argv: sed --posix 's/[[.a.]\x41]/Z/g'
+## stdin-json: "aA\na1\nxA\n"
+## stdout-json: "ZA\nZZ\nZA\n"
+## stderr-json: ""
+## status: 0
+
+#### the byte one back must BE the opener's kind, not merely differ from the one two back
+## argv: sed --posix 's/[:aa]]\x41/Z/g'
+## stdin-json: "a]x41\na]A\n:]A\n:]x41\n"
+## stdout-json: "Z\na]A\n:]A\nZ\n"
+## stderr-json: ""
+## status: 0
+
+#### which the collating-element opener asks the same way
+## argv: sed --posix 's/[.aa]]\x41/Z/g'
+## stdin-json: "a]x41\na]A\n.]A\n.]x41\n"
+## stdout-json: "Z\na]A\n.]A\nZ\n"
+## stderr-json: ""
+## status: 0
+
+#### and THREE bytes close, since the byte two back is then the bracket itself
+## argv: sed --posix 's/[:]]\x41/Z/g'
+## stdin-json: "]x41\n]A\n:]A\n:]x41\n"
+## stdout-json: "]x41\n]A\nZ\n:]x41\n"
+## stderr-json: ""
+## status: 0
+
+#### the lookbehind reads the buffer GNU is compacting, so a shorter escape ahead of the bracket changes it
+# GNU's `normalize_text' reads and writes one array (compile.c:1379-1380). A
+# decoded escape leaves the write cursor behind the read one, and at a gap of
+# exactly ONE the byte two back IS the byte one back, so the closing test reads
+# `x != k && x == k' and nothing can close. `\t' is two bytes decoding to one.
+## argv: sed --posix 's/\t[:][]\x41]/Z/g'
+## stdin-json: "\t:x\n\t:A\n\t:4\n"
+## stdout-json: "Z\n\t:A\nZ\n"
+## stderr-json: ""
+## status: 0
+
+#### the collating-element spelling aliases identically
+## argv: sed --posix 's/\t[.][]\x41]/Z/g'
+## stdin-json: "\t.x\n\t.A\n\t.4\n"
+## stdout-json: "Z\n\t.A\nZ\n"
+## stderr-json: ""
+## status: 0
+
+#### a gap of TWO already leaves both bytes original, so the walk closes as it does bare
+# `\x4' is three bytes decoding to one; `\t' above is two decoding to one. ONE
+# is the only gap that aliases, and these two are the pair either side of it.
+## argv: sed --posix 's/\x4[:][]\x41]/Z/g'
+## stdin-json: "\u0004:x\n\u0004:A\n\u0004:4\n"
+## stdout-json: "\u0004:x\nZ\n\u0004:4\n"
+## stderr-json: ""
+## status: 0
+
+#### as does a gap of three
+## argv: sed --posix 's/\x41[:][]\x41]/Z/g'
+## stdin-json: "A:x\nA:A\nA:4\n"
+## stdout-json: "A:x\nZ\nA:4\n"
+## stderr-json: ""
+## status: 0
+
+#### and a gap of ZERO, where the escape keeps its backslash and nothing shifts
+## argv: sed --posix 's/\q[:][]\x41]/Z/g'
+## stdin-json: "q:x\nq:A\nq:4\n"
+## stdout-json: "q:x\nZ\nq:4\n"
+## stderr-json: ""
+## status: 0
+
+#### a kind character inside a sub-expression opens no second one
+## argv: sed --posix 's/[:[.].]\x41]/Z/g'
+## stdin-json: ":[.].A\n:[.].x41\n"
+## stdout-json: "Z[.Z.A\nZ[.Z.ZZZ\n"
+## stderr-json: ""
+## status: 0
+
+#### and the byte an escape merely escaped does not reach the walk either
+## argv: sed --posix 's/\[\x41/Z/g'
+## stdin-json: "[A\n[x41\n"
+## stdout-json: "Z\n[x41\n"
 ## stderr-json: ""
 ## status: 0
 

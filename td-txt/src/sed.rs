@@ -1304,7 +1304,9 @@ fn escape_byte(raw: &[u8], i: &mut usize) -> Result<Esc, String> {
 fn normalize_regex(raw: &[u8], at_posix_level: bool) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(raw.len());
     let mut i = 0usize;
+    let mut bracket = Bracket::Out;
     while let Some(b) = raw.get(i).copied() {
+        let at = i;
         i += 1;
         // EITHER posix level drops the decoding INSIDE a bracket expression, so
         // `[\x41]` holds four ordinary members there rather than an `A`
@@ -1312,71 +1314,67 @@ fn normalize_regex(raw: &[u8], at_posix_level: bool) -> Result<Vec<u8>, String> 
         // this takes the level and not `--posix`). GNU judges "inside" on the
         // pattern TEXT, not on what decoding produces: a `[` that is itself an
         // escape opens nothing, and `\x5b\x41]` decodes under either level
-        // exactly as it does without one.
-        if at_posix_level && b == b'[' {
-            out.push(b);
-            copy_bracket(raw, &mut i, &mut out);
-            continue;
-        }
-        if b != b'\\' {
-            out.push(b);
-            continue;
-        }
-        match escape_byte(raw, &mut i)? {
-            Esc::Byte(c) => out.push(c),
-            Esc::Other => {
-                out.push(b'\\');
-                if let Some(c) = raw.get(i).copied() {
-                    out.push(c);
-                    i += 1;
+        // exactly as it does without one -- which follows from the walk below
+        // never seeing a byte an escape consumed.
+        if b == b'\\' && bracket == Bracket::Out {
+            match escape_byte(raw, &mut i)? {
+                Esc::Byte(c) => out.push(c),
+                Esc::Other => {
+                    out.push(b'\\');
+                    if let Some(c) = raw.get(i).copied() {
+                        out.push(c);
+                        i += 1;
+                    }
                 }
+                Esc::Bare => out.push(b'\\'),
             }
-            Esc::Bare => out.push(b'\\'),
+            continue;
         }
+        if at_posix_level {
+            bracket = bracket.step(raw, &out, at, b);
+        }
+        out.push(b);
     }
     Ok(out)
 }
 
-/// Copy the suppressed region through verbatim, leaving `i` past its `]`. This is
-/// NOT a bracket parse and must not become one: GNU stops at the FIRST `]`, so
-/// POSIX's rule that a leading `]` is an ordinary member does not hold here, and
-/// the region can end before the bracket itself does. `[]\x41]` is the observable
-/// case -- suppression covers only `[]`, the `\x41` after it decodes, and the
-/// class is {], A}. The one thing that carries it PAST a `]` is a `[:`/`[.`/`[=`
-/// sub-expression, and that runs to the NEXT `]` rather than to its own
-/// `:]`/`.]`/`=]` -- so `[[.].]` ends at the second `]`, not the third character
-/// from the end. The bracket's OWN `[` opens one like any other, which is why
-/// `[.]\x41` suppresses the `\x41` where `[x]\x41` does not. A backslash means
-/// nothing either way, POSIX giving it no role inside a bracket. Unterminated,
-/// this runs to the end and the regex parser reports it, as without the flag.
-/// One shape is NOT modelled: after a closed sub-expression, GNU keeps
-/// suppressing a following bracket whose leading `]` would otherwise end it
-/// (`[::][]\x41]`). See spec/README; it is an xfail, not an oversight.
-fn copy_bracket(raw: &[u8], i: &mut usize, out: &mut Vec<u8>) {
-    // The `[` the caller has already emitted, which pairs like any other.
-    let mut after_open = true;
-    while let Some(b) = raw.get(*i).copied() {
-        *i += 1;
-        out.push(b);
-        if after_open && matches!(b, b':' | b'.' | b'=') {
-            copy_past_close(raw, i, out);
-            after_open = false;
-            continue;
-        }
-        if b == b']' {
-            return;
-        }
-        after_open = b == b'[';
-    }
+/// GNU's `bracket_state` (sed/compile.c:1390), the decoder's own account of where
+/// a bracket expression is -- a SECOND and different machine from the delimiter
+/// reader's `snarf_char_class`, over the same syntax. Decoding is suppressed
+/// anywhere but `Out`.
+#[derive(Clone, Copy, PartialEq)]
+enum Bracket {
+    Out,
+    /// Inside a bracket, but not in a `[:`/`[.`/`[=` sub-expression.
+    In,
+    /// Inside one opened by this byte, which is what its closer must match.
+    Sub(u8),
 }
 
-/// Consume through the next `]`, where a `[:`/`[.`/`[=` sub-expression ends.
-fn copy_past_close(raw: &[u8], i: &mut usize, out: &mut Vec<u8>) {
-    while let Some(c) = raw.get(*i).copied() {
-        *i += 1;
-        out.push(c);
-        if c == b']' {
-            return;
+impl Bracket {
+    /// One byte of the walk (compile.c:1473-1495). The two LOOKBEHINDS on the
+    /// closing arm (compile.c:1493) are GNU's own and are why this cannot be a
+    /// state machine alone: they make `[::]` differ from `[:a:]`, since a closer
+    /// that is also the opener leaves the state armed and suppression never ends.
+    ///
+    /// They read the buffer GNU is COMPACTING IN PLACE, not the original text --
+    /// `p` reads and `q` writes into one array (compile.c:1379-1380), so a byte
+    /// below `q` is one already emitted. That is invisible until a decoded escape
+    /// makes the two cursors differ, and at a gap of exactly one it aliases
+    /// `p[-2]` onto `p[-1]`'s value, which reads as `x != k && x == k` and stops
+    /// any sub-expression closing at all. `out` is `q`'s side of that.
+    fn step(self, raw: &[u8], out: &[u8], at: usize, b: u8) -> Self {
+        let back = |n: usize| {
+            at.checked_sub(n)
+                .and_then(|j| out.get(j).or_else(|| raw.get(j)))
+                .copied()
+        };
+        match (b, self) {
+            (b'[', Self::Out) => Self::In,
+            (b':' | b'.' | b'=', Self::In) if back(1) == Some(b'[') => Self::Sub(b),
+            (b']', Self::In) => Self::Out,
+            (b']', Self::Sub(k)) if back(2) != Some(k) && back(1) == Some(k) => Self::In,
+            _ => self,
         }
     }
 }

@@ -1600,14 +1600,16 @@ td-txt-authored case files
     posixicity. That looked like a closed gap and was not, TWICE over, and
     both times because the sweep had no script of the shape. One reviewer
     found the bracket carry: a second sweep of 330 bracket-family runs shows
-    both lower levels diverging on exactly three scripts -- the `[::]`, `[..]`
-    and `[==]` closers followed by a bracket, which is the family the
-    `--posix` bracket entry below already records. Another found `dfawarn`
-    above, which no sweep here had a `[:alpha:]` shape for at all; that one is
-    served now, so the bracket carry is what is left. The variable
-    INHERITS that gap by being routed through the same `copy_bracket`, so it
-    is one defect with two spellings rather than a new one, and it is carried
-    as an xfail under each. The lesson is the sweep's rather than the code's,
+    both lower levels diverging on three scripts -- the `[::]`, `[..]` and
+    `[==]` closers followed by a bracket. That sweep was read at the time as
+    BOUNDING the family and did not: an exhaustive enumeration later found
+    `[:a]` behaving identically, so it was a third sample being mistaken for a
+    proof. See the `--posix` bracket entry below. Another found `dfawarn`
+    above, which no sweep here had a `[:alpha:]` shape for at all. Both are
+    served now. The variable INHERITED the bracket gap by being routed through
+    the same decoder, so it was one defect with two spellings rather than a new
+    one, and it was carried as an xfail under each until the decoder's own
+    bracket walk became GNU's. The lesson is the sweep's rather than the code's,
     and is worth more than either finding: a divergence a sweep has no script
     for reads exactly like a closure. Neither gap is a REGRESSION -- the
     parent binary answers both identically -- so what the reviews caught was a
@@ -1670,28 +1672,48 @@ td-txt-authored case files
     reachable only through `s` in the corpus, a mutant that never raised it on
     the address path left all 2453 cases green.
 
-  - The POSIX levels' bracket suppression carries across a closed
-    sub-expression in a way td-txt does not model. Written here as `--posix`'s
-    while that was the only spelling that reached the rule; compile.c:1473
-    asks `!= POSIXLY_EXTENDED`, so it is the LEVEL's and `POSIXLY_CORRECT`
-    shows it identically -- carried as an xfail under each, one defect with
-    two spellings. `sed --posix 's/[::][]\x41]/Z/g'` has GNU
-    suppress the SECOND bracket entirely -- class {], \, x, 4, 1} -- where the
-    same `[]\x41]` standing alone stops at its leading `]` in both tools, which
-    is the rule the passing cases pin. So GNU carries some state across the
-    first bracket, and what it is cannot be read off from the outside; a rule
-    guessed to fit this one shape would be worse than the gap. The `.` and `=`
-    spellings behave IDENTICALLY -- GNU suppresses, td-txt decodes -- so the one
-    xfail witnesses a family of three; they are not separately cased. Both an
-    earlier draft here and a reviewer got that wrong in opposite directions (it
-    said GNU matches nothing; the review said the two agree), each from a
-    fixture with no line the `.`/`=` spellings could match. The same trap, twice
-    over, from two directions. Found by a reviewer, and the three neighbouring
-    shapes flagged with
-    it (`[[:]\x41]`, `[[.]\x41]`, `[[=]\x41]`) are NOT divergences: both tools
-    refuse all three identically, down to the `char N:` offset -- which they did
-    not when this was written, the offset being the last piece of the diagnostic
-    locus to land.
+  - The POSIX levels' bracket suppression carries past a sub-expression that
+    never closed, and this WAS an xfail here on the ground that "what state GNU
+    carries across the first bracket cannot be read off from the outside". It
+    can be read off the SOURCE, which is where it now comes from. The decoder
+    keeps its own `bracket_state` (compile.c:1390) -- outside, inside, or the
+    byte that opened a `[:`/`[.`/`[=` -- and its `]` arm returns to "inside"
+    only when the byte one back IS the opener's kind and the byte two back is
+    NOT (compile.c:1493). That is a LOOKBEHIND rather than a state, and it is a
+    second machine over the same syntax as the delimiter reader's
+    `snarf_char_class`, agreeing with it nowhere in particular. `[::]` fails
+    the two-back test, so it never closes and `sed --posix
+    's/[::][]\x41]/Z/g'` suppresses the second bracket entirely -- class {], \,
+    x, 4, 1} -- where the same `[]\x41]` alone stops at its leading `]`.
+
+    The family is wider than the entry it replaces said, and the correction is
+    the useful part. That entry named `[::]`, `[..]` and `[==]` as the whole of
+    it, from a 330-run sweep it described as bounding the family rather than
+    sampling it. Closing needs the kind one byte back and NOT two, which no
+    FOUR-byte `[:X]` can satisfy, whatever X is -- the byte two back from that
+    `]` is the opener itself -- so `[:a][]\x41]` suppresses exactly as `[::]`
+    does. THREE bytes close (`[:]`, where two back is the `[`) and five close
+    (`[:a:]`); only four cannot, and a draft of this entry said "needs five
+    bytes" having forgotten the three. An exhaustive enumeration finds all of
+    it at once; the sweep that "bounded" it had no script of the shape, which
+    is the same lesson the paragraph above draws.
+
+    The lookbehind reads the buffer GNU is COMPACTING IN PLACE rather than the
+    original pattern: `normalize_text` reads through `p` and writes through `q`
+    into one array (compile.c:1379-1380), so a byte below `q` has already been
+    rewritten. That is invisible until a decoded escape makes the cursors
+    differ, and at a gap of exactly ONE it puts `p[-1]`'s value at `p[-2]`, so
+    the closing test reads `x != k && x == k` and NO sub-expression closes.
+    `sed --posix 's/\t[:][]\x41]/Z/g'` is the witness -- `\t` is two bytes
+    decoding to one. ONE is the only gap that does it: at zero (`\q`, which
+    keeps its backslash) nothing has shifted, and at two (`\x4`) or more
+    (`\x41`, which is three) both bytes are still original. td-txt read the
+    original text here until a review caught it; the enumeration could not,
+    having no escape ahead of the bracket in any of its 39062 scripts.
+
+    The three neighbouring shapes a reviewer once flagged with this
+    (`[[:]\x41]`, `[[.]\x41]`, `[[=]\x41]`) are NOT divergences: both tools
+    refuse all three identically, down to the `char N:` offset.
 
   - `v` DISCARDS its own address in GNU, which only the empty regex can show.
     GNU's `case 'v'` ends in `continue` rather than `break` (compile.c:1081),
