@@ -203,7 +203,13 @@ binding is ONE chord on `Super`:
 
 - the arrow keys focus left, right, up, and down;
 - adding Shift to a focus binding MOVES the focused tile in that direction,
-  re-parenting it rather than trading places (see below);
+  re-parenting it rather than trading places (see below). The sheet spells
+  that row `MOVE A TILE / SPLIT OUT`, because leaving is what an operator
+  cannot otherwise find: moved ACROSS the grain a tile leaves its container
+  and makes the perpendicular one, which is the only way out of a column that
+  keeps the window on the workspace, and was not derivable from `MOVE A
+  TILE`. Not `NEW COLUMN`, which is only half true — out of a column the tile
+  becomes one, and out of a ROW it becomes a full-width row;
 - `Super+1` through `Super+9` switch workspaces, and adding Shift moves the
   focused tile to that workspace;
 - `Super+v` STACKS the container the focused window sits in and `Super+h`
@@ -253,8 +259,17 @@ pressed, the action from the effect it produced — and it counts the rows, so
 one added without a probe fails rather than going unchecked. A binding that
 changes without this table changing is therefore a failing test rather than
 a screen that lies, which is the only guarantee available for painted text.
-`CLICK` is the one row no chord can drive; it is pinned by name and by its
-action text, and the pointer path proves the behaviour itself. The limit of
+Three rows no chord can drive — `HOVER`, `CLICK`, and `DRAG A TITLE` — are
+pinned by name and by an EFFECT that same table turns into words, so a mouse
+row cannot invent words of its own. The limit of THAT is worth stating beside
+the keymap one: a keyboard row derives its effect from the dispatch that just
+ran, and a mouse row has none to derive from, so a row and its probe changed
+together would agree about something untrue. What each gesture actually does
+is proved where it happens, in the runtime's hover, click, and band-drag
+tests. The drag row is on the sheet for the reason the move chord's wording
+changed: the mouse's way out of a container is a title dragged against the
+side of another tile, and a sheet naming neither left an operator with a
+column of windows and no way to find either. The limit of
 that check is worth stating: it links the table to the DISPATCH, not to the
 keymap, so the glyph names (`?`, `V`, `T`) are literals — remapping a key in
 `keys.rs` would make the sheet lie with the suite green. The card is
@@ -1809,10 +1824,14 @@ The landing must prove:
   duplicate buttons, mid-frame re-grabs, implicit grabs, surface removal,
   workspace cancellation, snapshots, and revision exhaustion;
 - every painted help row is driven through the dispatch, both columns
-  derived from the result, with the row count pinned; the sheet's own tests
-  cover toggling, column and card fit, and clipping on an undersized output,
-  and runtime tests cover its modal pointer — hover withdrawal and the
-  button filter separately, since either alone hides the other;
+  derived from the result, with the row count pinned; the mouse rows name an
+  EFFECT rather than words of their own, though nothing there ties a GESTURE
+  to the effect it claims — a keyboard row derives its effect from the
+  dispatch and a mouse row has none to derive from, so what each gesture
+  does is proved in the runtime instead; the sheet's own tests cover
+  toggling, column and card fit, and clipping on an undersized output, and
+  runtime tests cover its modal pointer — hover withdrawal and the button
+  filter separately, since either alone hides the other;
 - the status bar's `/proc` parsing is driven from fixture roots rather than
   the host's own `/proc`, its calendar is walked day by day across a leap
   year, its strip is proved to paint only its own rows and to clip on an

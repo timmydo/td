@@ -2641,10 +2641,28 @@ mod tests {
         Launcher(LauncherAction),
         Launch(LaunchRequest),
         Help(HelpAction),
-        /// Documented but not a key, so this row is exercised elsewhere. Its
-        /// word is carried here because the mouse has two ways to focus and
-        /// the sheet names both.
-        Pointer(&'static str),
+        /// Documented but not a key, so this row is exercised elsewhere. The
+        /// SPELLING is carried because the mouse has three gestures here and
+        /// the sheet names them all; the WORDS come from `action`, so a mouse
+        /// row still cannot invent its own.
+        ///
+        /// What is NOT checked, and cannot be from this table, is that the
+        /// gesture named produces the effect claimed: a keyboard row derives
+        /// its effect from the dispatch that just ran, and a mouse row has no
+        /// dispatch to derive from, so a row and its probe changed TOGETHER
+        /// would agree about something untrue. The gestures themselves are
+        /// proved where they happen — `runtime.rs`'s hover and click focus
+        /// tests, and `dragging_a_title_band_drops_the_window_beside_where_
+        /// it_was_released`.
+        Pointer(&'static str, Pointing),
+    }
+
+    /// What a mouse row claims the pointer does, as an effect rather than a
+    /// string — the sheet's words live in exactly one table either way.
+    #[derive(Debug, Eq, PartialEq)]
+    enum Pointing {
+        Focus,
+        Move,
     }
 
     impl Bound {
@@ -2653,8 +2671,14 @@ mod tests {
         /// name the right chord beside a description of something else.
         fn action(&self) -> &'static str {
             match self {
-                Bound::Command(Command::Focus(_)) | Bound::Pointer(_) => "FOCUS A TILE",
-                Bound::Command(Command::Move(_)) => "MOVE A TILE",
+                Bound::Command(Command::Focus(_)) | Bound::Pointer(_, Pointing::Focus) => {
+                    "FOCUS A TILE"
+                }
+                // Across the grain a tile LEAVES its container, which "MOVE A
+                // TILE" did not say and is the only way out of one.
+                Bound::Command(Command::Move(_)) | Bound::Pointer(_, Pointing::Move) => {
+                    "MOVE A TILE / SPLIT OUT"
+                }
                 Bound::Command(Command::SwitchWorkspace(_)) => "SWITCH WORKSPACE",
                 Bound::Command(Command::MoveToWorkspace(_)) => "MOVE TO WORKSPACE",
                 Bound::Command(Command::SetPresentation(Presentation::Stacked)) => "STACK A COLUMN",
@@ -2760,8 +2784,9 @@ mod tests {
                 KEY_SLASH,
                 Bound::Help(HelpAction::Toggle),
             ),
-            (&[], 0, Bound::Pointer("HOVER")),
-            (&[], 0, Bound::Pointer("CLICK")),
+            (&[], 0, Bound::Pointer("HOVER", Pointing::Focus)),
+            (&[], 0, Bound::Pointer("CLICK", Pointing::Focus)),
+            (&[], 0, Bound::Pointer("DRAG A TITLE", Pointing::Move)),
         ];
         assert_eq!(
             probes.len(),
@@ -2770,7 +2795,7 @@ mod tests {
         );
         for (probe, row) in probes.iter().zip(crate::help::ROWS) {
             let (modifiers, code, expected) = probe;
-            if let Bound::Pointer(keys) = expected {
+            if let Bound::Pointer(keys, _) = expected {
                 assert_eq!(row.keys, *keys);
                 assert_eq!(row.action, expected.action());
                 continue;

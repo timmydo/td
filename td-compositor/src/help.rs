@@ -26,7 +26,7 @@ pub const ROWS: &[Row] = &[
     },
     Row {
         keys: "SUPER+SHIFT+ARROWS",
-        action: "MOVE A TILE",
+        action: "MOVE A TILE / SPLIT OUT",
     },
     Row {
         keys: "SUPER+1..9",
@@ -76,6 +76,10 @@ pub const ROWS: &[Row] = &[
     Row {
         keys: "CLICK",
         action: "FOCUS A TILE",
+    },
+    Row {
+        keys: "DRAG A TITLE",
+        action: "MOVE A TILE / SPLIT OUT",
     },
 ];
 
@@ -236,6 +240,18 @@ mod tests {
             .saturating_add(ROWS.len().saturating_sub(1).saturating_mul(ROW_STEP))
             .saturating_add(ui::GLYPH_HEIGHT.saturating_mul(SCALE));
         assert!(last <= card_height(), "{last} rows past {}", card_height());
+        // And the card the rows are sized against fits a real screen, which
+        // `card_height` alone does not say: `paint` CLIPS it to the output, so
+        // a row past the bottom of one is a row that silently does not appear.
+        // 768 is the ordinary virtio-gpu mode this crate is written against;
+        // below it the sheet clips, which is defined and has its own test, but
+        // a cheat sheet missing its last rows is a cheat sheet nobody can use.
+        const ORDINARY_ROWS: usize = 768;
+        assert!(
+            card_height() <= ORDINARY_ROWS.saturating_sub(CARD_PADDING.saturating_mul(2)),
+            "the card wants {} rows of a {ORDINARY_ROWS}-row output",
+            card_height()
+        );
     }
 
     #[test]
