@@ -444,7 +444,7 @@ fn stdin_script(sh: &mut Shell) -> i32 {
                 // Through the shell's own fd 2, as `run_source` reported a parse
                 // error before this, so a script that redirected it still sees
                 // the message where it sent everything else.
-                let _ = exec::diag(sh, &e);
+                let _ = exec::diag(sh, &e.msg);
                 sh.set_status(2);
                 return 2;
             }
@@ -488,7 +488,7 @@ fn repl(sh: &mut Shell) -> i32 {
                     }
                 }
                 Err(e) => {
-                    let _ = exec::diag(sh, &e);
+                    let _ = exec::diag(sh, &e.msg);
                     sh.set_status(2);
                 }
             }
@@ -567,7 +567,7 @@ fn read_complete(
         }
         match parser::parse_probe(buffer, &sh.aliases) {
             Ok(_) => return ReadResult::Ready,
-            Err(e) if e.starts_with(ast::INCOMPLETE) => {
+            Err(e) if e.is_incomplete() => {
                 prompt =
                     line::expand_prompt(&sh.get_var("PS2").unwrap_or_else(|| "> ".to_string()), &env);
             }

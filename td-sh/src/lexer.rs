@@ -7,7 +7,7 @@
 //! here: whether `in` is a keyword or an argument depends on grammar position,
 //! which only the parser knows.
 
-use crate::ast::{is_name, Param, ParamOp, Seg, Syn, Word, INCOMPLETE};
+use crate::ast::{is_name, Param, ParamOp, Seg, Syn, SynErr, Word};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
@@ -99,7 +99,7 @@ pub struct Lexed {
     /// What stopped the scan, if anything. `toks` is then the valid prefix before
     /// it, which the parser runs before reporting: a shell lexes as it parses, so
     /// the commands ahead of a bad quote have already run when it is diagnosed.
-    pub error: Option<String>,
+    pub error: Option<SynErr>,
 }
 
 /// A here-document whose operator has been seen but whose body has not been
@@ -393,7 +393,7 @@ fn close_paren(lx: &mut Lexer) -> Syn<(usize, usize)> {
                     return Ok((before, lx.sc.pos));
                 }
             }
-            Tok::Eof => return Err(format!("{INCOMPLETE}: unmatched `$(`")),
+            Tok::Eof => return Err(SynErr::incomplete("unmatched `$(`")),
             _ => {}
         }
     }
@@ -684,7 +684,7 @@ pub fn tokenize_prefix(src: &str, line: u32) -> Lexed {
 pub struct Chunk {
     pub toks: Vec<Placed>,
     pub incomplete: bool,
-    pub error: Option<String>,
+    pub error: Option<SynErr>,
 }
 
 /// A token and the input line it starts on. One value rather than two parallel
@@ -825,7 +825,7 @@ impl Scan {
                 // Unsealed, an unfinished construct is a request for more input
                 // rather than an error: rewind so the open token is scanned once,
                 // whole, when the rest of it arrives.
-                Err(e) if !self.sealed && !self.lx.fatal && e.starts_with(INCOMPLETE) => {
+                Err(e) if !self.sealed && !self.lx.fatal && e.is_incomplete() => {
                     // A rewind would throw away here-document lines already
                     // consumed, and re-reading them on every refill is what
                     // makes a large body quadratic. Progress stays; the scan is
@@ -1059,7 +1059,7 @@ impl Lexer {
             self.skip_blanks();
             let Some(c) = self.sc.peek() else {
                 if self.fold_wants_more() {
-                    return Err(format!("{INCOMPLETE}: line continuation"));
+                    return Err(SynErr::incomplete("line continuation"));
                 }
                 self.finish_heredocs()?;
                 return Ok(Tok::Eof);
@@ -1215,7 +1215,7 @@ impl Lexer {
 
     fn scan_op(&mut self) -> Syn<Op> {
         let Some(c) = self.sc.bump() else {
-            return Err(format!("{INCOMPLETE}: expected an operator"));
+            return Err(SynErr::incomplete("expected an operator"));
         };
         let op = match c {
             ';' => {
@@ -1271,14 +1271,14 @@ impl Lexer {
                     Op::Great
                 }
             }
-            other => return Err(format!("unexpected character {other:?}")),
+            other => return Err(format!("unexpected character {other:?}").into()),
         };
         // A fold with nothing after it leaves the operator UNFINISHED -- `&` can
         // still become `&&` -- so this asks for more input rather than banking
         // the short one, which `pull` would take for a token boundary and never
         // wind back past.
         if self.fold_wants_more() {
-            return Err(format!("{INCOMPLETE}: line continuation"));
+            return Err(SynErr::incomplete("line continuation"));
         }
         Ok(op)
     }
@@ -1333,7 +1333,7 @@ impl Lexer {
                         self.heredoc_ran_out.get_or_insert_with(|| delim.clone());
                         break;
                     }
-                    return Err(format!("{INCOMPLETE}: here-document delimited by `{delim}`"));
+                    return Err(SynErr::incomplete(format!("here-document delimited by `{delim}`")));
                 };
                 let line = if strip_tabs {
                     raw.trim_start_matches('\t')
@@ -1390,7 +1390,7 @@ impl Lexer {
 
     fn finish_heredocs(&mut self) -> Syn<()> {
         if self.awaiting.is_some() {
-            return Err(format!("{INCOMPLETE}: expected a here-document delimiter"));
+            return Err(SynErr::incomplete("expected a here-document delimiter"));
         }
         if self.pending.is_empty() {
             return Ok(());
@@ -1449,7 +1449,7 @@ impl Lexer {
                         // Sealed, a trailing backslash is a literal one; unsealed
                         // it is half of a fold whose newline has not arrived.
                         None if !self.sealed => {
-                            return Err(format!("{INCOMPLETE}: line continuation"))
+                            return Err(SynErr::incomplete("line continuation"))
                         }
                         None => buf.push_quoted('\\'),
                         Some('\n') => {
@@ -1467,7 +1467,7 @@ impl Lexer {
                     let before = buf.segs.len();
                     loop {
                         match self.sc.bump() {
-                            None => return Err(format!("{INCOMPLETE}: unmatched `'`")),
+                            None => return Err(SynErr::incomplete("unmatched `'`")),
                             Some('\'') => break,
                             Some(ch) => buf.push_quoted(ch),
                         }
@@ -1502,7 +1502,7 @@ impl Lexer {
         // starting a new one, and ending it here would split `foo\<nl>bar` into
         // two words.
         if ran_out && !self.sealed {
-            return Err(format!("{INCOMPLETE}: line continuation"));
+            return Err(SynErr::incomplete("line continuation"));
         }
         Ok(buf.finish())
     }
@@ -1574,7 +1574,7 @@ impl Lexer {
     fn scan_double(&mut self, buf: &mut WordBuf) -> Syn<()> {
         loop {
             let Some(c) = self.sc.peek() else {
-                return Err(format!("{INCOMPLETE}: unmatched `\"`"));
+                return Err(SynErr::incomplete("unmatched `\"`"));
             };
             match c {
                 '"' => {
@@ -1640,7 +1640,7 @@ impl Lexer {
         let mut body: Vec<char> = Vec::new();
         loop {
             let Some(c) = self.sc.bump() else {
-                return Err(format!("{INCOMPLETE}: unmatched `$'`"));
+                return Err(SynErr::incomplete("unmatched `$'`"));
             };
             if c == '\'' {
                 break;
@@ -1648,7 +1648,7 @@ impl Lexer {
             body.push(c);
             if c == '\\' {
                 let Some(esc) = self.sc.bump() else {
-                    return Err(format!("{INCOMPLETE}: unmatched `$'`"));
+                    return Err(SynErr::incomplete("unmatched `$'`"));
                 };
                 body.push(esc);
             }
@@ -1832,7 +1832,7 @@ impl Lexer {
         let mut depth = 1usize;
         loop {
             let Some(c) = self.sc.bump() else {
-                return Err(format!("{INCOMPLETE}: unmatched `${{`"));
+                return Err(SynErr::incomplete("unmatched `${`"));
             };
             match c {
                 '{' if !quotes_off => depth += 1,
@@ -1889,7 +1889,7 @@ impl Lexer {
                     out.push('`');
                     loop {
                         let Some(q) = self.sc.bump() else {
-                            return Err(format!("{INCOMPLETE}: unmatched `` ` ``"));
+                            return Err(SynErr::incomplete("unmatched `` ` ``"));
                         };
                         out.push(q);
                         if q == '\\' {
@@ -1917,7 +1917,7 @@ impl Lexer {
                     self.sc.bump();
                     loop {
                         let Some(q) = self.sc.bump() else {
-                            return Err(format!("{INCOMPLETE}: unmatched `$'`"));
+                            return Err(SynErr::incomplete("unmatched `$'`"));
                         };
                         out.push(q);
                         if q == '\\' {
@@ -1941,7 +1941,7 @@ impl Lexer {
                     // mistaken for the closing brace.
                     loop {
                         let Some(q) = self.sc.bump() else {
-                            return Err(format!("{INCOMPLETE}: unmatched {c:?}"));
+                            return Err(SynErr::incomplete(format!("unmatched {c:?}")));
                         };
                         out.push(q);
                         if q == '\\' && c == '"' {
@@ -1998,7 +1998,7 @@ impl Lexer {
             // so the parens are counted instead -- the split this code had
             // before. Only a body that ran OUT is decided here: a `)` that has
             // not arrived is not one the count reaches either.
-            Err(e) if e.starts_with(INCOMPLETE) => return Err(e),
+            Err(e) if e.is_incomplete() => return Err(e),
             Err(_) => return self.count_paren_body(),
         };
         let mut out = String::new();
@@ -2020,7 +2020,7 @@ impl Lexer {
         let mut depth = 1usize;
         loop {
             let Some(c) = self.sc.bump() else {
-                return Err(format!("{INCOMPLETE}: unmatched `$(`"));
+                return Err(SynErr::incomplete("unmatched `$(`"));
             };
             match c {
                 '(' => depth = depth.saturating_add(1),
@@ -2047,7 +2047,7 @@ impl Lexer {
                     self.sc.bump();
                     loop {
                         let Some(q) = self.sc.bump() else {
-                            return Err(format!("{INCOMPLETE}: unmatched `$'`"));
+                            return Err(SynErr::incomplete("unmatched `$'`"));
                         };
                         out.push(q);
                         if q == '\\' {
@@ -2066,7 +2066,7 @@ impl Lexer {
                     out.push(c);
                     loop {
                         let Some(q) = self.sc.bump() else {
-                            return Err(format!("{INCOMPLETE}: unmatched {c:?}"));
+                            return Err(SynErr::incomplete(format!("unmatched {c:?}")));
                         };
                         out.push(q);
                         if q == '\\' && c != '\'' {
@@ -2126,7 +2126,7 @@ impl Lexer {
         let mut depth = 1usize;
         loop {
             let Some(c) = self.sc.peek() else {
-                return Err(format!("{INCOMPLETE}: unmatched `$((`"));
+                return Err(SynErr::incomplete("unmatched `$((`"));
             };
             match c {
                 '(' => {
@@ -2145,7 +2145,7 @@ impl Lexer {
                         // and a fatal error refuses it where every other
                         // construct would have asked. `scan_op`'s argument.
                         if self.sc.peek().is_none() {
-                            return Err(format!("{INCOMPLETE}: unmatched `$((`"));
+                            return Err(SynErr::incomplete("unmatched `$((`"));
                         }
                         return Err("bad arithmetic expansion: expected `))`".into());
                     }
@@ -2167,7 +2167,7 @@ impl Lexer {
         let mut out = String::new();
         loop {
             let Some(c) = self.sc.bump() else {
-                return Err(format!("{INCOMPLETE}: unmatched `` ` ``"));
+                return Err(SynErr::incomplete("unmatched `` ` ``"));
             };
             match c {
                 '`' => return Ok(out),
@@ -2295,7 +2295,7 @@ fn parse_param(inner: &str, quoted: bool, depth: u32, line: u32) -> Syn<Param> {
                 i += 1;
             }
         }
-        _ => return Err(format!("bad substitution: `${{{inner}}}`")),
+        _ => return Err(format!("bad substitution: `${{{inner}}}`").into()),
     }
     if i >= chars.len() {
         return Ok(Param {
@@ -2309,7 +2309,7 @@ fn parse_param(inner: &str, quoted: bool, depth: u32, line: u32) -> Syn<Param> {
         i += 1;
     }
     let Some(&opc) = chars.get(i) else {
-        return Err(format!("bad substitution: `${{{inner}}}`"));
+        return Err(format!("bad substitution: `${{{inner}}}`").into());
     };
     i += 1;
     // `${v:off}` and `${v:off:len}`. A colon followed by anything that is not
@@ -2374,7 +2374,7 @@ fn parse_param(inner: &str, quoted: bool, depth: u32, line: u32) -> Syn<Param> {
             pat: word,
             longest: doubled,
         },
-        _ => return Err(format!("bad substitution: `${{{inner}}}`")),
+        _ => return Err(format!("bad substitution: `${{{inner}}}`").into()),
     };
     Ok(Param {
         name,
@@ -2621,7 +2621,7 @@ mod tests {
     }
 
     fn nth(ws: &[Word], i: usize) -> Syn<&Word> {
-        ws.get(i).ok_or_else(|| format!("no word at index {i}"))
+        ws.get(i).ok_or_else(|| format!("no word at index {i}").into())
     }
 
     fn heredoc0(src: &str) -> Syn<Word> {
@@ -2629,7 +2629,7 @@ mod tests {
             .heredocs
             .into_iter()
             .next()
-            .ok_or_else(|| "no here-document".to_string())
+            .ok_or_else(|| "no here-document".into())
     }
 
     #[test]
@@ -2911,7 +2911,7 @@ mod tests {
     fn unterminated_quote_reports_incomplete_input() -> Syn<()> {
         match tokenize("echo 'abc", 1) {
             Err(e) => {
-                assert!(e.starts_with(INCOMPLETE), "{e}");
+                assert!(e.is_incomplete(), "{e}");
                 Ok(())
             }
             Ok(_) => Err("an unterminated quote must not tokenize".into()),
@@ -2930,7 +2930,7 @@ mod tests {
         // `set -- a $'' b` pass two arguments unnoticed.
         match w.0.as_slice() {
             [Seg::Quoted(s)] => Ok(s.clone()),
-            other => Err(format!("expected one quoted segment, got {other:?}")),
+            other => Err(format!("expected one quoted segment, got {other:?}").into()),
         }
     }
 
@@ -3085,7 +3085,7 @@ mod tests {
         // ending at whatever `\c` swallowed.
         for src in [r"echo $'\c", r"echo $'\c\", r"echo $'a\'"] {
             match tokenize(src, 1) {
-                Err(e) => assert!(e.starts_with(INCOMPLETE), "{src}: {e}"),
+                Err(e) => assert!(e.is_incomplete(), "{src}: {e}"),
                 Ok(_) => return Err(format!("`{src}` must not tokenize").into()),
             }
         }
@@ -3141,7 +3141,7 @@ mod tests {
             let ws = words(src)?;
             match nth(&ws, 1)?.0.as_slice() {
                 [Seg::Cmd { code, .. }] => Ok(code.clone()),
-                other => Err(format!("expected one command segment, got {other:?}")),
+                other => Err(format!("expected one command segment, got {other:?}").into()),
             }
         };
         assert_eq!(body(r"echo $(f $'a\'b')")?, r"f $'a\'b'");
@@ -3155,7 +3155,7 @@ mod tests {
             let ws = words(src)?;
             match nth(&ws, 1)?.0.as_slice() {
                 [Seg::Param(p)] => Ok(format!("{:?}", p.op)),
-                other => Err(format!("expected one param segment, got {other:?}")),
+                other => Err(format!("expected one param segment, got {other:?}").into()),
             }
         };
         assert!(param(r"echo ${v#$'a\''}")?.contains("Trim"));
@@ -3189,7 +3189,7 @@ mod tests {
     fn an_unterminated_ansi_c_quote_reports_incomplete_input() -> Syn<()> {
         for src in ["echo $'abc", "echo $'a\\", "echo $'a\\c"] {
             match tokenize(src, 1) {
-                Err(e) => assert!(e.starts_with(INCOMPLETE), "{src}: {e}"),
+                Err(e) => assert!(e.is_incomplete(), "{src}: {e}"),
                 Ok(_) => return Err(format!("`{src}` must not tokenize").into()),
             }
         }

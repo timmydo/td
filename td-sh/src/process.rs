@@ -1669,7 +1669,7 @@ pub fn fork_shell(sh: &Shell) -> Subshell {
 pub fn capture_stdout(sh: &mut Shell, code: &str, line: u32) -> R<String> {
     let list = match crate::parser::parse_subst_body(code, &sh.aliases, line) {
         Ok(l) => l,
-        Err(e) => return Err(sh.fatal(&e, 2)),
+        Err(e) => return Err(sh.fatal(&e.msg, 2)),
     };
     let buf = Arc::new(Mutex::new(Vec::new()));
     let mut child = fork_shell(sh);

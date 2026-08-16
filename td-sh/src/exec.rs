@@ -1021,7 +1021,7 @@ pub fn run_source(sh: &mut Shell, src: &str) -> R<()> {
                 // point a parse failed, so the line the shell is otherwise
                 // holding belongs to some earlier command.
                 sh.set_lineno(units.error_line());
-                let _ = diag(sh, &e);
+                let _ = diag(sh, &e.msg);
                 sh.set_status(2);
                 // Abandons the enclosing list, as `eval 'if'; echo` shows in both
                 // references: reporting and returning Ok ran the rest of it.
@@ -1622,7 +1622,7 @@ fn trace(sh: &mut Shell, parts: &[String], errout: Option<Option<&process::Fd>>)
     let expanded = (|| {
         // `fatal` here is only a way to get the diagnostic onto stderr: the `Sig` it
         // builds is dropped with the rest of the error below, so the status is inert.
-        let word = crate::lexer::word_from_str(&ps4).map_err(|e| sh.fatal(&e, 2))?;
+        let word = crate::lexer::word_from_str(&ps4).map_err(|e| sh.fatal(&e.msg, 2))?;
         expand::expand_single(sh, &word)
     })();
     sh.in_ps4 = false;

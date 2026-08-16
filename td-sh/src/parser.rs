@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::ast::{
     is_name, AndOr, ArithCmp, Assign, CaseItem, Cmd, CondExpr, CondOp, Conn, IfArm, List, Pipeline, Redir,
-    RedirKind, Seg, Sep, Stage, Syn, Word, INCOMPLETE,
+    RedirKind, Seg, Sep, Stage, Syn, SynErr, Word, INCOMPLETE,
 };
 use crate::lexer::{tokenize, Op, Placed, Scan, Tok};
 
@@ -156,7 +156,7 @@ pub struct Units {
     /// `<<` is scanned, and the body is written into that slot later.
     scan: Scan,
     /// What stopped the lexer, raised only once a parse needs the text there.
-    pending: Option<String>,
+    pending: Option<SynErr>,
     /// Set when a fetch ran off the end of the tokens, which is how `pending`
     /// becomes this unit's error rather than a bare "unexpected end of input".
     hit_end: bool,
@@ -459,8 +459,11 @@ impl Units {
         // script: dash shifts it by the body's newlines, so a two-line body
         // makes the file's line 4 report 5.
         let line = self.toks.get(self.pos).map_or(1, |p| p.line);
-        // Not incomplete input however it failed: no amount of further input can
-        // complete a replacement, so the unit loop must stop rather than read on.
+        // Neither this nor the unclosed here-document below is incomplete input
+        // however it failed: no amount of further input can complete a
+        // replacement, so the unit loop must stop rather than read on. Both go
+        // through `From<String>`, which clears the flag whatever the wrapped
+        // message says.
         let lexed = tokenize(value, line).map_err(|e| format!("alias `{name}': {e}"))?;
         // A here-document the replacement OPENED but did not close is refused
         // rather than run. ash reads that body from the enclosing input, this
@@ -468,9 +471,9 @@ impl Units {
         // empty body and hand the script's here-document DATA back to the
         // parser as commands.
         if let Some(delim) = lexed.heredoc_ran_out {
-            return Err(format!(
+            return Err(SynErr::from(format!(
                 "alias `{name}': {INCOMPLETE}: here-document delimited by `{delim}`"
-            ));
+            )));
         }
         let base = self.scan.push_heredocs(lexed.heredocs);
         let sub: Vec<Placed> = lexed
@@ -622,21 +625,22 @@ impl Units {
 
     /// ash's `raise_error_unexpected_syntax`: the token that stopped the parse,
     /// and the one the grammar was owed where there is one to name.
-    fn unexpected(&mut self, expecting: Option<&str>) -> String {
+    fn unexpected(&mut self, expecting: Option<&str>) -> SynErr {
         self.unexpected_named(expecting, true)
     }
 
     /// The same from a WORD position, where a reserved word is just a word.
-    fn unexpected_in_word(&mut self, expecting: Option<&str>) -> String {
+    fn unexpected_in_word(&mut self, expecting: Option<&str>) -> SynErr {
         self.unexpected_named(expecting, false)
     }
 
-    fn unexpected_named(&mut self, expecting: Option<&str>, kw: bool) -> String {
+    fn unexpected_named(&mut self, expecting: Option<&str>, kw: bool) -> SynErr {
         let tok = self.tokname(kw);
         match expecting {
             Some(want) => format!("syntax error: unexpected {tok} (expecting {want})"),
             None => format!("syntax error: unexpected {tok}"),
         }
+        .into()
     }
 
     fn describe(&mut self) -> String {
@@ -674,7 +678,7 @@ impl Units {
             return Ok(());
         }
         if self.at_eof() {
-            return Err(format!("{INCOMPLETE}: expected `{}`", want.text()));
+            return Err(SynErr::incomplete(format!("expected `{}`", want.text())));
         }
         let want = format!("\"{}\"", want.text());
         Err(self.unexpected_named(Some(&want), kw))
@@ -686,7 +690,7 @@ impl Units {
             return Ok(());
         }
         if self.at_eof() {
-            return Err(format!("{INCOMPLETE}: expected `{want}`"));
+            return Err(SynErr::incomplete(format!("expected `{want}`")));
         }
         let want = format!("\"{want}\"");
         Err(self.unexpected(Some(&want)))
@@ -702,7 +706,7 @@ impl Units {
                 self.bump();
                 Ok(w)
             }
-            None | Some(Tok::Eof) => Err(format!("{INCOMPLETE}: expected a word")),
+            None | Some(Tok::Eof) => Err(SynErr::incomplete("expected a word")),
             // A word POSITION, so a reserved word would be named `word` --
             // which nothing reaching this arm can be, the `Word` arm above
             // having matched first.
@@ -804,7 +808,7 @@ impl Units {
         self.depth += 1;
         if self.depth > MAX_PARSE_DEPTH {
             self.depth -= 1;
-            return Err("syntax error: command nesting too deep".to_string());
+            return Err("syntax error: command nesting too deep".into());
         }
         let result = self.parse_command_inner();
         self.depth -= 1;
@@ -847,7 +851,7 @@ impl Units {
         let refuse = self.refuse_closers;
         if let Some(w) = self.peek_reserved() {
             if refuse && CANNOT_START_COMMAND.contains(&w) {
-                return Err(format!("syntax error: unexpected \"{w}\""));
+                return Err(format!("syntax error: unexpected \"{w}\"").into());
             }
         }
         if self.at_func_def() {
@@ -893,7 +897,7 @@ impl Units {
         while self.peek_op() == Some(Op::OrIf) {
             chain += 1;
             if chain > MAX_PARSE_DEPTH {
-                return Err("syntax error: `[[` expression too long".to_string());
+                return Err("syntax error: `[[` expression too long".into());
             }
             self.bump();
             let right = self.cond_and()?;
@@ -908,7 +912,7 @@ impl Units {
         while self.peek_op() == Some(Op::AndIf) {
             chain += 1;
             if chain > MAX_PARSE_DEPTH {
-                return Err("syntax error: `[[` expression too long".to_string());
+                return Err("syntax error: `[[` expression too long".into());
             }
             self.bump();
             let right = self.cond_term()?;
@@ -927,7 +931,7 @@ impl Units {
         self.depth += 1;
         if self.depth > MAX_PARSE_DEPTH {
             self.depth -= 1;
-            return Err("syntax error: `[[` nesting too deep".to_string());
+            return Err("syntax error: `[[` nesting too deep".into());
         }
         let result = self.cond_term_inner();
         self.depth -= 1;
@@ -1015,14 +1019,14 @@ impl Units {
             // comparison of "2" with "1". Turning it back into a word would
             // silently answer a question the user did not ask. (`[[ 2 -gt 1 ]]`
             // never reaches here: the space makes `2` an ordinary word.)
-            Some(Tok::IoNumber(_)) => Err(
-                "syntax error: unexpected redirection inside `[[`".to_string()
-            ),
-            None | Some(Tok::Eof) => Err(format!("{INCOMPLETE}: expected `]]`")),
+            Some(Tok::IoNumber(_)) => {
+                Err("syntax error: unexpected redirection inside `[[`".into())
+            }
+            None | Some(Tok::Eof) => Err(SynErr::incomplete("expected `]]`")),
             _ => Err(format!(
                 "syntax error: expected an operand inside `[[`, found {}",
                 self.describe()
-            )),
+            ).into()),
         }
     }
 
@@ -1067,7 +1071,8 @@ impl Units {
                     format!("syntax error: the body of function `{n}` must be a compound command")
                 }
                 None => "syntax error: a function body must be a compound command".to_string(),
-            });
+            }
+            .into());
         }
         Ok(Cmd::FuncDef {
             name,
@@ -1101,7 +1106,7 @@ impl Units {
             // interactive reader's request for another line, and no line can
             // rescue `function ;`.
             return Err(if self.at_eof() {
-                format!("{INCOMPLETE}: expected a function name")
+                SynErr::incomplete("expected a function name")
             } else {
                 self.unexpected(Some("word"))
             });
@@ -1132,7 +1137,7 @@ impl Units {
             .is_some_and(|w| FUNCTION_BODY_OPENS.contains(&w))
         {
             return Err(if self.at_eof() {
-                format!("{INCOMPLETE}: expected a function body")
+                SynErr::incomplete("expected a function body")
             } else {
                 self.unexpected(None)
             });
@@ -1257,7 +1262,7 @@ impl Units {
                 break;
             }
             if self.at_eof() {
-                return Err(format!("{INCOMPLETE}: expected `esac`"));
+                return Err(SynErr::incomplete("expected `esac`"));
             }
             if self.peek_op() == Some(Op::LParen) {
                 self.bump();
@@ -1333,7 +1338,7 @@ impl Units {
             // Running out of input where a command was due is incomplete, not
             // wrong: `f ()` on its own line still has its body coming.
             return Err(if self.at_eof() {
-                format!("{INCOMPLETE}: expected a command")
+                SynErr::incomplete("expected a command")
             } else {
                 self.unexpected(None)
             });
@@ -1368,7 +1373,7 @@ impl Units {
 
     fn parse_redir(&mut self, fd: Option<u32>) -> Syn<Redir> {
         let Some(op) = self.peek_op() else {
-            return Err(format!("{INCOMPLETE}: expected a redirection"));
+            return Err(SynErr::incomplete("expected a redirection"));
         };
         self.bump();
         if let Op::DLess(id) = op {
@@ -1392,7 +1397,7 @@ impl Units {
             Op::LessAnd => RedirKind::DupIn,
             Op::GreatAnd => RedirKind::DupOut,
             Op::AmpGreat => RedirKind::OutBoth,
-            other => return Err(format!("syntax error near `{}`", other.text())),
+            other => return Err(format!("syntax error near `{}`", other.text()).into()),
         };
         let word = self.take_word(None)?;
         Ok(Redir { fd, kind, word })
@@ -1449,18 +1454,18 @@ mod tests {
             .items
             .into_iter()
             .next()
-            .ok_or_else(|| format!("{src}: parsed to no commands"))?;
+            .ok_or_else(|| SynErr::from(format!("{src}: parsed to no commands")))?;
         and_or
             .first
             .cmds
             .into_iter()
             .next()
             .map(|s| s.cmd)
-            .ok_or_else(|| format!("{src}: pipeline has no command"))
+            .ok_or_else(|| SynErr::from(format!("{src}: pipeline has no command")))
     }
 
-    fn wrong(src: &str, got: &Cmd) -> String {
-        format!("{src}: unexpected command shape {got:?}")
+    fn wrong(src: &str, got: &Cmd) -> SynErr {
+        format!("{src}: unexpected command shape {got:?}").into()
     }
 
     #[test]
@@ -1576,16 +1581,38 @@ mod tests {
         }
     }
 
+    /// The flag and the message are separate things, and the alias splice is
+    /// where they disagree: the same unclosed here-document is more input
+    /// where it is typed and a refusal where it is a replacement, since no
+    /// line completes an alias. Both messages carry the same phrase, which is
+    /// why matching that text got this right only by accident of the prefix.
+    #[test]
+    fn an_alias_that_opens_a_here_document_is_refused_rather_than_continued() {
+        let typed = parse_probe("cat <<EOF\n", &Aliases::new()).unwrap_err();
+        assert!(typed.is_incomplete(), "{typed}");
+        let mut aliases = Aliases::new();
+        aliases.insert("q".to_string(), "cat <<EOF".to_string());
+        let spliced = parse_probe("q\n", &aliases).unwrap_err();
+        assert!(!spliced.is_incomplete(), "{spliced}");
+        // Named, so this is the here-document refusal and not some other one,
+        // and carrying the phrase but not LEADING with it -- which is the only
+        // reason prefix-matching ever answered this correctly.
+        assert!(spliced.msg.starts_with("alias `q':"), "{spliced}");
+        assert!(spliced.msg.contains("here-document delimited by `EOF`"), "{spliced}");
+        assert!(spliced.msg.contains(INCOMPLETE), "{spliced}");
+        assert!(!spliced.msg.starts_with(INCOMPLETE), "{spliced}");
+    }
+
     /// `INCOMPLETE` is the interactive reader's request for another line, so a
     /// token that is merely WRONG must not carry it -- `parse_probe` would go
     /// to PS2 and never come back.
     #[test]
     fn only_a_name_that_never_arrived_is_incomplete() {
         let ended = parse("function").unwrap_err();
-        assert!(ended.starts_with(INCOMPLETE), "{ended}");
+        assert!(ended.is_incomplete(), "{ended}");
         for src in ["function ;", "function |", "function (", "function <f", "function\n"] {
             let e = parse(src).unwrap_err();
-            assert!(!e.starts_with(INCOMPLETE), "{src:?}: {e}");
+            assert!(!e.is_incomplete(), "{src:?}: {e}");
         }
     }
 
@@ -1629,8 +1656,8 @@ mod tests {
     fn incomplete_input_is_reported_as_such() -> Syn<()> {
         for src in ["if true; then", "while true; do", "case x in", "f() {"] {
             match parse(src) {
-                Err(e) => assert!(e.starts_with(INCOMPLETE), "{src}: {e}"),
-                Ok(_) => return Err(format!("{src}: expected an incomplete-input error")),
+                Err(e) => assert!(e.is_incomplete(), "{src}: {e}"),
+                Ok(_) => return Err(format!("{src}: expected an incomplete-input error").into()),
             }
         }
         Ok(())
@@ -1665,8 +1692,8 @@ mod tests {
             "cat <<A\none\nA\ncat <<B\ntwo\n",
         ] {
             match parse_probe(src, &aliases) {
-                Err(e) => assert!(e.starts_with(INCOMPLETE), "{src:?}: {e}"),
-                Ok(_) => return Err(format!("{src:?}: the probe must ask for more")),
+                Err(e) => assert!(e.is_incomplete(), "{src:?}: {e}"),
+                Ok(_) => return Err(format!("{src:?}: the probe must ask for more").into()),
             }
             parse_aliased_at(src, &aliases, 1)
                 .map_err(|e| format!("{src:?}: the real parse must take it: {e}"))?;
@@ -1678,8 +1705,8 @@ mod tests {
         for src in ["if true; then", "echo 'abc", "echo x |", "cat <<"] {
             for got in [parse_probe(src, &aliases), parse_aliased_at(src, &aliases, 1)] {
                 match got {
-                    Err(e) => assert!(e.starts_with(INCOMPLETE), "{src:?}: {e}"),
-                    Ok(_) => return Err(format!("{src:?}: expected incomplete input")),
+                    Err(e) => assert!(e.is_incomplete(), "{src:?}: {e}"),
+                    Ok(_) => return Err(format!("{src:?}: expected incomplete input").into()),
                 }
             }
         }
@@ -1705,7 +1732,7 @@ mod tests {
         // (which would make the REPL wait for more).
         let src = "(".repeat(2000) + "true" + &")".repeat(2000);
         match parse(&src) {
-            Err(e) => assert!(!e.starts_with(INCOMPLETE), "should be a hard error: {e}"),
+            Err(e) => assert!(!e.is_incomplete(), "should be a hard error: {e}"),
             Ok(_) => panic!("expected a nesting-depth error"),
         }
     }

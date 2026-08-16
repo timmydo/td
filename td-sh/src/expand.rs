@@ -1103,7 +1103,7 @@ mod tests {
     /// Expand one source word, KEEPING the error -- `fields` swallows it, and
     /// whether an expansion fails is exactly what these assertions are about.
     fn try_expand(sh: &mut Shell, src: &str) -> R<Vec<String>> {
-        let toks = crate::lexer::tokenize(src, 1).map_err(|e| sh.fatal(&e, 2))?;
+        let toks = crate::lexer::tokenize(src, 1).map_err(|e| sh.fatal(&e.msg, 2))?;
         let mut out = Vec::new();
         for p in toks.toks {
             if let crate::lexer::Tok::Word(w) = p.tok {

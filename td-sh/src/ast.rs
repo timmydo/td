@@ -9,12 +9,53 @@
 
 use std::sync::Arc;
 
-/// Lex/parse errors are plain messages; the caller adds the `$0: ` prefix.
-pub type Syn<T> = Result<T, String>;
+/// A lex/parse error: the message the caller prefixes with `$0: `, and whether
+/// the input simply ENDED early -- which the interactive reader answers with a
+/// continuation line rather than a diagnostic.
+#[derive(Clone, Debug)]
+pub struct SynErr {
+    pub msg: String,
+    /// Private, so the constructors below are the only way to set it.
+    incomplete: bool,
+}
 
-/// The marker a syntax error carries when the input simply ended early. The
-/// interactive reader uses it to ask for a continuation line instead of
-/// reporting an error.
+impl SynErr {
+    /// The input ran out where more of it was owed; `what` says what. A
+    /// message rather than anything printable, so a `SynErr` cannot be passed
+    /// in: that would double the marker and keep the flag.
+    pub fn incomplete(what: impl Into<String>) -> Self {
+        Self { msg: format!("{INCOMPLETE}: {}", what.into()), incomplete: true }
+    }
+
+    pub fn is_incomplete(&self) -> bool {
+        self.incomplete
+    }
+}
+
+/// A message alone is a hard error. Wrapping one -- an alias splicing the
+/// failure of its own replacement into a diagnostic -- therefore clears the
+/// flag, which is what that caller wants: no further input completes an alias.
+impl From<String> for SynErr {
+    fn from(msg: String) -> Self {
+        Self { msg, incomplete: false }
+    }
+}
+
+impl From<&str> for SynErr {
+    fn from(msg: &str) -> Self {
+        Self { msg: msg.to_string(), incomplete: false }
+    }
+}
+
+impl std::fmt::Display for SynErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+pub type Syn<T> = Result<T, SynErr>;
+
+/// What an incomplete input's message opens with.
 pub const INCOMPLETE: &str = "unexpected end of input";
 
 #[derive(Clone, Debug, Default)]
