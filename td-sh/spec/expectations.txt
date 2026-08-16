@@ -372,7 +372,6 @@ xfail assign-extended.test.sh::typeset -p
 xfail assign-extended.test.sh::typeset -r makes a string readonly
 xfail assign-extended.test.sh::typeset -x makes it exported
 xfail assign-extended.test.sh::unset and shell funcs
-xfail assign.test.sh::Env binding not allowed before compound command
 xfail assign.test.sh::Escaped = in command name
 xfail assign.test.sh::Multiple temporary envs on the stack
 xfail assign.test.sh::aliased assignment doesn't split
@@ -682,7 +681,6 @@ xfail command-sub.test.sh::Command Sub trailing newline removed
 xfail command-sub.test.sh::Command Sub trailing whitespace not removed
 xfail command-sub.test.sh::Double Quotes in Command Sub in Double Quotes
 xfail command-sub.test.sh::Here doc with pipeline
-xfail command-sub.test.sh::Making keyword out of command sub should NOT work
 xfail command-sub.test.sh::More levels of double quotes in backticks
 xfail command-sub.test.sh::Nested backticks
 xfail command_.test.sh::$PATH lookup
@@ -906,7 +904,6 @@ xfail osh-bugs.test.sh::var x = $(echo one; false; echo two) in OSH
 xfail parse-errors.test.sh::Bad var sub caught at parse time
 xfail parse-errors.test.sh::Long Token - 65535 bytes
 xfail parse-errors.test.sh::Token that's too long for Oils - 65536 bytes
-xfail parse-errors.test.sh::do unexpected
 xfail parse-errors.test.sh::empty clause in [[
 xfail parse-errors.test.sh::{ is its own word, needs a space
 xfail parse-errors.test.sh::} is a parse error
@@ -961,7 +958,6 @@ xfail prompt.test.sh::special case for $
 xfail prompt.test.sh::username
 xfail quote.test.sh::$'' octal escapes don't have leading 0
 xfail quote.test.sh::YSH allows unquoted foo\ bar too
-xfail redirect-command.test.sh::Prefix redirect for loop -- not allowed
 xfail redirect-command.test.sh::Redirect in function body is evaluated multiple times
 xfail redirect.test.sh::&> redirects stdout and stderr
 xfail redirect.test.sh::: >/dev/null 2> / (OSH regression: fail to pop fd frame)

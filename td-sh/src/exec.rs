@@ -3891,6 +3891,75 @@ mod tests {
         }
     }
 
+    /// A reserved word that only ever CLOSES a construct is a syntax error
+    /// where a command was expected, not a command named `fi`. The status is
+    /// the point as much as the text: ash refuses the whole input with 2 and
+    /// runs none of it, where a command name would be 127 after everything
+    /// before it had already run -- and inside a loop, forever. Measured
+    /// against busybox ash 1.37.0, whose wording this matches byte for byte.
+    #[test]
+    fn a_word_that_only_closes_a_construct_cannot_start_a_command() {
+        for w in ["then", "else", "elif", "fi", "do", "done", "esac", "in"] {
+            let (status, out, err) = run(w);
+            assert_eq!((status, out.as_str()), (2, ""), "{w}");
+            assert_eq!(err, format!("td-sh: syntax error: unexpected \"{w}\"\n"), "{w}");
+        }
+        // Every position that is a command position, including the one that
+        // would otherwise LOOP: `fi` as a command is not found over and over.
+        for (src, want) in [
+            ("( fi )", "fi"),
+            ("{ fi; }", "fi"),
+            ("true && fi", "fi"),
+            ("true | fi", "fi"),
+            ("while :; do fi; done", "fi"),
+            ("if :; then done; fi", "done"),
+            // A name is read as one only after the word is allowed to be a
+            // command at all, so the DEFINITION is refused -- with nothing
+            // after it, or the refusal could be of the call instead.
+            ("fi() { echo x; }", "fi"),
+            ("done() { echo x; }", "done"),
+        ] {
+            let (status, out, err) = run(src);
+            assert_eq!((status, out.as_str()), (2, ""), "{src:?}");
+            // The TOKEN, not merely that something was unexpected.
+            assert!(err.contains(&format!("unexpected \"{want}\"")), "{src:?}: {err}");
+        }
+        // The whole input is refused, so what precedes the word does not run.
+        assert_eq!(run("echo a; done").1, "", "nothing before the error runs");
+        // And where it is NOT a command position it is an ordinary word: an
+        // argument, an assignment's value, a name, or quoted. ash agrees with
+        // every row -- `x=1 fi` really does look for a command called `fi`.
+        for (src, want) in [
+            ("echo fi", "fi\n"),
+            ("fi=1; echo $fi", "1\n"),
+            ("for fi in 1; do echo $fi; done", "1\n"),
+            ("echo done esac in", "done esac in\n"),
+        ] {
+            assert_eq!(run(src), (0, want.to_string(), String::new()), "{src:?}");
+        }
+        for src in ["x=1 fi", "\"fi\"", ">/dev/null fi", "2>&1 fi"] {
+            assert_eq!(run(src).0, 127, "{src:?} is a command name, not a keyword");
+        }
+        // An arm's terminator position: refused, though ash adds `(expecting
+        // ";;")` to the text and this does not.
+        let (status, _, err) = run("case x in x) fi;; esac");
+        assert_eq!(status, 2);
+        assert!(err.contains("unexpected \"fi\""), "{err}");
+        // A substitution BODY is not refused: ash reads an old-style `` `…` ``
+        // with `list(2)`, which ends its list at one of these and never checks,
+        // so the script runs. Refusing would stop one ash runs.
+        for src in ["echo `fi`", "echo `echo a; done`", "echo `}`"] {
+            assert_eq!(run(src).0, 0, "{src:?} must not stop the script");
+        }
+        // `}` is off the roster until `function name { … }` is a construct: ash
+        // takes that spelling, and refusing its `}` stops a script that only
+        // CONTAINS one in a branch never taken.
+        assert_eq!(
+            run("if false; then function f { :; }; fi; echo alive"),
+            (0, "alive\n".to_string(), String::new())
+        );
+    }
+
     /// A `)` that ends a case PATTERN closes no substitution. It is the one
     /// thing a `)` token cannot say for itself, so the walk that finds the
     /// closer carries the little of the grammar that answers it -- and the

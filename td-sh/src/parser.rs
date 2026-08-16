@@ -33,6 +33,18 @@ pub fn parse_aliased_at(src: &str, aliases: &Aliases, line: u32) -> Syn<List> {
     drain(Units::at(src, line), aliases)
 }
 
+/// The same for a command-substitution BODY, where a word that only closes a
+/// construct is NOT refused. ash reads an old-style `` `…` `` body with
+/// `list(2)`, which ends the list at one of them and never checks what is
+/// left, so `` echo `fi` `` is empty output and status 0 there; refusing would
+/// stop a script ash runs. `$( )` does refuse in ash and does not here, which
+/// is the half of this still owed.
+pub fn parse_subst_body(src: &str, aliases: &Aliases, line: u32) -> Syn<List> {
+    let mut units = Units::at(src, line);
+    units.refuse_closers = false;
+    drain(units, aliases)
+}
+
 /// The interactive reader's probe: does what it has read so far parse, and if
 /// not, could another line finish it? Everything else about `parse_aliased_at`,
 /// but the text is a snapshot of a source that can still be asked -- so a
@@ -73,6 +85,18 @@ const MAX_ALIAS_EXPANSIONS: u32 = 4096;
 fn is_cond_unary(w: &str) -> bool {
     matches!(w.strip_prefix('-'), Some(u) if u.len() == 1 && "znefdrwxshLtbcpSugkvoa".contains(u))
 }
+
+/// Reserved words that can only CLOSE or continue a construct. Reaching a
+/// command position means the construct they belong to is not open, which ash
+/// refuses rather than running: `while :; do fi; done` is a syntax error there
+/// and an ENDLESS `fi: not found` without this. `case`/`if`/`for`/`while`/
+/// `until`/`{` are absent because each does start one.
+///
+/// `}` is absent for a different reason and only until `function name { … }`
+/// is a construct here: ash takes that spelling, this shell reads its `}` at a
+/// command position, and refusing would stop a script that merely CONTAINS one
+/// in a branch it never runs.
+const CANNOT_START_COMMAND: &[&str] = &["then", "else", "elif", "fi", "do", "done", "esac", "in"];
 
 /// Reserved words. dash resolves these BEFORE aliases, so `alias if=…` never fires
 /// where a keyword is recognized.
@@ -151,6 +175,9 @@ pub struct Units {
     /// Set once the scan has yielded its `Eof` or its error. Without it a fetch
     /// past the end would pull again and append a SECOND `Eof` every time.
     spent: bool,
+    /// Whether a word that only CLOSES a construct is a syntax error here. Off
+    /// for a substitution body; see `parse_subst_body`.
+    refuse_closers: bool,
 }
 
 /// What a streaming source hands back. `Eof` and `Failed` are distinct because a
@@ -202,6 +229,7 @@ impl Units {
             scan,
             pending: None,
             hit_end: false,
+            refuse_closers: true,
             pos: 0,
             depth: 0,
             budget: 0,
@@ -762,6 +790,14 @@ impl Units {
         // everywhere except the one position the grammar claims it.
         if self.peek_reserved() == Some("[[") {
             return self.parse_cond();
+        }
+        // Before the function-definition test, or `fi() { … }` defines one where
+        // ash refuses it. The text is ash's spelling exactly.
+        let refuse = self.refuse_closers;
+        if let Some(w) = self.peek_reserved() {
+            if refuse && CANNOT_START_COMMAND.contains(&w) {
+                return Err(format!("syntax error: unexpected \"{w}\""));
+            }
         }
         if self.at_func_def() {
             return self.parse_func_def();
@@ -1395,6 +1431,16 @@ mod tests {
         assert_eq!(items.len(), 3);
         assert_eq!(items.first().map(|i| i.patterns.len()), Some(2));
         Ok(())
+    }
+
+    /// A word only closes a construct if it is RESERVED at all. Nothing else
+    /// ties the two lists together, and the guard is `peek_reserved`, which
+    /// returns any plain literal -- so a typo here would refuse a command name.
+    #[test]
+    fn every_word_that_cannot_start_a_command_is_reserved() {
+        for w in CANNOT_START_COMMAND {
+            assert!(is_reserved(w), "{w} is not a reserved word");
+        }
     }
 
     #[test]

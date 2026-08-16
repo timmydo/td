@@ -1667,7 +1667,7 @@ pub fn fork_shell(sh: &Shell) -> Subshell {
 /// `$(code)`: run `code` in a subshell with stdout captured to a buffer, and
 /// return the captured bytes as text.
 pub fn capture_stdout(sh: &mut Shell, code: &str, line: u32) -> R<String> {
-    let list = match crate::parser::parse_aliased_at(code, &sh.aliases, line) {
+    let list = match crate::parser::parse_subst_body(code, &sh.aliases, line) {
         Ok(l) => l,
         Err(e) => return Err(sh.fatal(&e, 2)),
     };
