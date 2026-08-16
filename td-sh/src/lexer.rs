@@ -212,6 +212,27 @@ fn is_word_end(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '|' | '&' | ';' | '<' | '>' | '(' | ')')
 }
 
+/// Lex forward to the `)` closing an open `$(`, returning where the BODY ends
+/// -- before the blanks ahead of that `)`, which belong to neither -- and where
+/// the `)` itself does.
+fn close_paren(lx: &mut Lexer) -> Syn<(usize, usize)> {
+    let mut depth = 1usize;
+    loop {
+        let before = lx.sc.pos;
+        match lx.next_tok()? {
+            Tok::Op(Op::LParen) => depth = depth.saturating_add(1),
+            Tok::Op(Op::RParen) => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Ok((before, lx.sc.pos));
+                }
+            }
+            Tok::Eof => return Err(format!("{INCOMPLETE}: unmatched `$(`")),
+            _ => {}
+        }
+    }
+}
+
 fn is_special_param(c: char) -> bool {
     matches!(c, '@' | '*' | '#' | '?' | '-' | '$' | '!')
 }
@@ -1717,7 +1738,7 @@ impl Lexer {
                     }
                     continue;
                 }
-                // As in `scan_paren_body`: only a `$'...'` escapes its own
+                // As in `count_paren_body`: only a `$'...'` escapes its own
                 // closing quote, so `${v#$'a\''}` ends at the wrong one under a
                 // plain single quote's rule and the brace never closes.
                 '$' if !quotes_off && {
@@ -1776,7 +1797,58 @@ impl Lexer {
     }
 
     /// Raw source up to the `)` matching an already-consumed `$(`.
+    ///
+    /// Found by LEXING rather than by counting parens. ash reads a `$( )` body
+    /// with the parser itself (`PARSEBACKQNEW`, ash.c:12898), so a `)` inside a
+    /// comment, a here-document body, or an arithmetic `<<` never reaches a
+    /// paren count at all. A counting scan has to be taught each of those
+    /// separately, and a rule copied out of the lexer is a rule that can come
+    /// to differ from it -- which is exactly what happened. So the body is
+    /// tokenised with this same lexer and the closer is the `)` its tokens
+    /// arrive at.
+    ///
+    /// A `)` that ends a CASE PATTERN is still taken as the closer: the lexer
+    /// emits it as an operator either way, and which one closes the
+    /// substitution is a question about the grammar rather than the tokens.
     fn scan_paren_body(&mut self) -> Syn<String> {
+        // The scan RECURSES once per nested `$(`, so it is charged and capped
+        // like every other re-lexing pass. Past the cap the count takes over
+        // rather than the stack running out: it does not recurse, and a script
+        // that deep has its own depth error to report when the body is lexed.
+        if self.depth >= MAX_EXPANSION_DEPTH {
+            return self.count_paren_body();
+        }
+        let mut lx = self.nested_at_cursor(self.depth.saturating_add(1));
+        let found = close_paren(&mut lx);
+        // Back before `?`: the source is MOVED rather than copied -- the input
+        // left to scan can be the whole script, and copying it at every `$(`
+        // would be quadratic in a script that uses many -- so an error must not
+        // leave this lexer holding none.
+        self.sc.src = std::mem::take(&mut lx.sc.src);
+        let (body_end, close_end) = match found {
+            Ok(pair) => pair,
+            // A body the lexer cannot read cannot be SPLIT by lexing either,
+            // so the parens are counted instead -- the split this code had
+            // before. Only a body that ran OUT is decided here: a `)` that has
+            // not arrived is not one the count reaches either.
+            Err(e) if e.starts_with(INCOMPLETE) => return Err(e),
+            Err(_) => return self.count_paren_body(),
+        };
+        let mut out = String::new();
+        while self.sc.pos < close_end {
+            let Some(c) = self.sc.bump() else { break };
+            if self.sc.pos <= body_end {
+                out.push(c);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The closer by paren COUNT, for a body `close_paren` could not lex. Blind
+    /// to comments and here-document bodies, which is why it is the fallback
+    /// and not the rule -- but a body that does not lex has an error to report
+    /// whichever `)` is picked, and this is the split it had before.
+    fn count_paren_body(&mut self) -> Syn<String> {
         let mut out = String::new();
         let mut depth = 1usize;
         loop {
@@ -1784,9 +1856,9 @@ impl Lexer {
                 return Err(format!("{INCOMPLETE}: unmatched `$(`"));
             };
             match c {
-                '(' => depth += 1,
+                '(' => depth = depth.saturating_add(1),
                 ')' => {
-                    depth -= 1;
+                    depth = depth.saturating_sub(1);
                     if depth == 0 {
                         return Ok(out);
                     }
@@ -1799,9 +1871,9 @@ impl Lexer {
                     continue;
                 }
                 // A `$'...'` escapes its own closing quote, where a plain
-                // `'...'` has no escapes at all -- so this scan has to tell
-                // them apart or `$(printf %s $'a\'b')` ends at the WRONG quote
-                // and the substitution never closes.
+                // `'...'` has no escapes at all -- so this scan has to tell them
+                // apart or `$(printf %s $'a\'b')` ends at the WRONG quote and
+                // the substitution never closes.
                 '$' if self.sc.peek() == Some('\'') => {
                     out.push('$');
                     out.push('\'');
@@ -1845,6 +1917,39 @@ impl Lexer {
                 _ => {}
             }
             out.push(c);
+        }
+    }
+
+    /// A lexer over the SAME source, positioned at the cursor. `sealed` carries
+    /// over so text that has merely not arrived yet still reads as unfinished.
+    /// Nothing else does, deliberately: this pass reports WHERE the body ends
+    /// and the body is lexed again for real, so `fatal`, `heredoc_ran_out`,
+    /// `committed` and `ended_in_comment` are that second pass's to set.
+    fn nested_at_cursor(&mut self, depth: u32) -> Lexer {
+        Lexer {
+            sealed: self.sealed,
+            resumable: false,
+            heredoc_ran_out: None,
+            owed_newline: false,
+            committed: false,
+            fatal: false,
+            sc: Scanner {
+                src: std::mem::take(&mut self.sc.src),
+                pos: self.sc.pos,
+                line: self.sc.line,
+                continued: false,
+            },
+            ended_in_comment: false,
+            heredocs: Vec::new(),
+            pending: Vec::new(),
+            awaiting: None,
+            depth,
+            cond_depth: 0,
+            regex_next: false,
+            cond_continues: false,
+            cmd_position: true,
+            regex_word: false,
+            in_braces: false,
         }
     }
 

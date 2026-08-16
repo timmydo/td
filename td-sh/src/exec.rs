@@ -3774,11 +3774,12 @@ mod tests {
     /// that, so an open body there is REFUSED rather than given an empty one --
     /// otherwise the script's here-document DATA comes back as commands.
     ///
-    /// `$( )` is where this shell still differs: ash refuses `$(cmd <<E` over a
-    /// body, its `)` having been eaten by that body, where this substitutes a
-    /// value. Closing it needs the substitution's SPELLING carried into the AST,
-    /// since ash's own two spellings disagree -- so it is pinned here rather
-    /// than left to be found, and lands as a deliberate change.
+    /// `$( )` refuses, and for ash's OWN reason rather than by policy: the
+    /// here-document body swallows the `)`, so the substitution never closes.
+    /// That the two agree is not luck -- a body is collected before a closer is
+    /// looked for either way -- and it holds on both sides of the boundary
+    /// where the models could part, the delimiter falling inside the parens or
+    /// after them.
     #[test]
     fn only_a_text_that_owns_its_end_ends_a_here_document_body() {
         let l = r#"while read x || [ -n "$x" ]; do echo [$x]; done"#;
@@ -3790,17 +3791,23 @@ mod tests {
             // A substitution with no body LINE at all agrees with ash too: its
             // body would start on a line the parens do not reach.
             (format!("v=$({l} <<E); echo \"v=[$v]\""), "v=[]\n"),
-            // ... and one WITH a body is the divergence above; ash exits 2.
-            (format!("v=$({l} <<E\none); echo \"v=[$v]\""), "v=[[one]]\n"),
-            // Which reaches THROUGH an alias, a substitution being its own scan
-            // wherever it is written -- so the splice's refusal does not cover
-            // it, and this is the third shape that stops refusing. The
-            // backquote in that same position is the win beside it: ash agrees
-            // with this one and the parent refused both.
-            (format!("alias e='v=$({l} <<E\none); echo \"v=[$v]\"'\ne"), "v=[[one]]\n"),
+            // A backquote body inside an alias replacement is still its own
+            // text, so it ends there as well.
             (format!("alias e='v=`{l} <<E\none`; echo \"v=[$v]\"'\ne"), "v=[[one]]\n"),
         ] {
             assert_eq!(run(&src), (0, want.to_string(), String::new()), "{src:?}");
+        }
+        // A `$( )` whose body runs PAST the `)` does not close, written plainly
+        // or through an alias. ash exits 2 for both.
+        for src in [
+            format!("v=$({l} <<E\none); echo \"v=[$v]\""),
+            format!("alias e='v=$({l} <<E\none); echo \"v=[$v]\"'\ne"),
+        ] {
+            let (status, out, err) = run(&src);
+            assert_eq!((status, out.as_str()), (2, ""), "{src:?}");
+            // The REASON, not merely that something failed: an unrelated error
+            // reaching stderr would satisfy a non-empty check.
+            assert!(err.contains("unmatched `$(`"), "{src:?}: {err}");
         }
         // A `.` script is the third text that owns its end, and takes a file to
         // be one. What it pins beyond the body is that the SOURCING script
@@ -3824,6 +3831,87 @@ mod tests {
             assert_eq!((status, out.as_str()), (2, ""), "{src:?}");
             assert!(err.contains("alias `e'"), "{src:?}: {err}");
         }
+    }
+
+    /// A `)` the body's own syntax has ALREADY accounted for does not close
+    /// the substitution. The closer is the one the body's own TOKENS reach, so
+    /// a `)` inside a comment, a here-document body, an arithmetic shift or a
+    /// `${...}` operand is not one. Measured against busybox ash 1.37.0.
+    #[test]
+    fn a_paren_the_body_has_accounted_for_does_not_close_a_substitution() {
+        let l = r#"while read x || [ -n "$x" ]; do echo [$x]; done"#;
+        for (src, want) in [
+            ("echo $(echo hi # )\n)".to_string(), "hi\n"),
+            ("echo $(echo hi # ))\n)".to_string(), "hi\n"),
+            ("echo $(echo hi # )\necho bye)".to_string(), "hi bye\n"),
+            // A `#` INSIDE a word is not a comment, and one inside quotes is
+            // not either -- the same rule the main lexer uses, which is why the
+            // body means the same thing when it is lexed again.
+            ("echo $(echo a#b)".to_string(), "a#b\n"),
+            ("echo $(echo \"a # )b\")".to_string(), "a # )b\n"),
+            // A here-document body, plain, with a quoted delimiter, and `<<-`.
+            (format!("echo $({l} <<E\n)\nE\n)"), "[)]\n"),
+            (format!("echo $({l} <<'E'\n)\nE\n)"), "[)]\n"),
+            (format!("echo $({l} <<-E\n\t)\n\tE\n)"), "[)]\n"),
+            // A `(` in a body is not an opener either.
+            (format!("echo $({l} <<E\n(\nE\n)"), "[(]\n"),
+            // TWO bodies deferred at once, and the second is the one read.
+            (format!("echo $({l} <<A <<B\nx\nA\n)\nB\n)"), "[)]\n"),
+            // The operator names a body that does not begin until the NEXT
+            // line, so a `)` on the operator's own line still closes.
+            (format!("v=$({l} <<E); echo \"v=[$v]\""), "v=[]\n"),
+            // A `<<` that is not an operator at all: an arithmetic SHIFT, and
+            // one inside a `${...}` operand. Both read as raw text by anything
+            // that does not lex, and both then eat the rest of the script.
+            ("echo $(echo $((1<<3))\necho done)".to_string(), "8 done\n"),
+            ("echo $(echo $(( 1 << 3 ))\necho done)".to_string(), "8 done\n"),
+            ("echo $(echo ${x:-a<<b}\necho two)".to_string(), "a<<b two\n"),
+            // ... and a `#` that is not a comment: inside a `${...}` operand,
+            // and after a QUOTED blank, which leaves a word still open.
+            ("x=abc; echo $(echo ${x:- #y})".to_string(), "abc\n"),
+            ("echo $(echo a\\ #c)".to_string(), "a #c\n"),
+            // A here-document delimiter folded across a line: `E\<newline>OF`
+            // is the delimiter `EOF`, which no body line can equal if the fold
+            // is left in it.
+            (format!("v=$({l} <<E\\\nOF\nbody\nEOF\n); echo \"v=[$v]\""), "v=[[body]]\n"),
+        ] {
+            assert_eq!(run(&src), (0, want.to_string(), String::new()), "{src:?}");
+        }
+        // What must still be refused: a substitution that never closes, however
+        // the scan got there. ash exits 2 for each of these too.
+        for src in [
+            "echo $(echo hi".to_string(),
+            "echo $(echo hi #".to_string(),
+            format!("echo $({l} <<E"),
+            format!("echo $({l} <<E\nx"),
+        ] {
+            let (status, out, err) = run(&src);
+            assert_eq!((status, out.as_str()), (2, ""), "{src:?}");
+            assert!(err.contains("unmatched `$(`"), "{src:?}: {err}");
+        }
+    }
+
+    /// Finding the closer is a LEXING pass of its own, so it can recurse and it
+    /// can fail. Both exits route to the paren count, which does neither.
+    #[test]
+    fn a_scan_that_cannot_finish_leaves_the_report_where_it_was() {
+        // Twice the depth at which an unbounded scan ran out of stack in the
+        // profile the gate builds. What must survive is the DIAGNOSTIC: the
+        // depth guard reporting, not an abort.
+        let deep = format!("echo {}:{}", "$(".repeat(3_000), ")".repeat(3_000));
+        let (status, _, err) = run(&deep);
+        assert_eq!(status, 0, "{err}");
+        assert!(err.contains("maximum recursion depth"), "{err}");
+        // `$'...'` escapes its own closing quote, so the count has to know it or
+        // the body ends at a quote that is the end of nothing. The bad delimiter
+        // is what forces the fallback this reaches it through.
+        let (status, out, err) = run("printf 'before\\n'; echo $(cat <<$x; printf %s $'a\\'b')");
+        assert_eq!((status, out.as_str()), (2, "before\n"), "{err}");
+        assert!(err.contains("delimiter may not be an expansion"), "{err}");
+        // A FATAL body error refuses the whole text rather than the body alone,
+        // so what is ahead of the substitution does not run. ash agrees.
+        let (status, out, _) = run("printf 'before\\n'; echo $(cat <<E\n${\nE\n)");
+        assert_eq!((status, out.as_str()), (2, ""));
     }
 
     /// Only `<` reaches ash's `eopen`; `>`, `>>`, `<>`, `>|` and the `>&word`
