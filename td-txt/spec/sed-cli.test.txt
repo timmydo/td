@@ -7440,12 +7440,12 @@ a
 ## stderr-json: ""
 ## status: 0
 
-#### POSIXLY_CORRECT also selects a POSIX mode, which td-txt does not drive
-# XFAIL, and the golden is GNU's. The variable's second job: `N' at end of input
-# prints the pattern space in GNU's default mode and does not in POSIX mode.
-# td-txt has `--posix' and gets this right under it, but does NOT drive that flag
-# from the variable -- the two are different switches in GNU, so one flag cannot
-# serve both. See the POSIXLY_CORRECT gap in spec/README for the measurement.
+#### POSIXLY_CORRECT also selects a POSIX mode, which the run now reads
+# The variable's second job: `N' at end of input prints the pattern space in
+# GNU's DEFAULT mode and drops it in either POSIX one. So the run's question is
+# `posixicity == POSIXLY_EXTENDED' (execute.c:1478) rather than `--posix', and
+# the variable needs no flag of its own to reach it -- both switches LOWER the
+# same three-valued level and only its top value prints.
 ## argv: sed $!d;N h
 ## file h:
 a
@@ -7484,9 +7484,12 @@ a
 # XFAIL, and the sharp one: td-txt REFUSES at exit 1 a script GNU runs, which is a
 # worse failure than a wrong line. GNU's ERE takes an unmatched `)' as an error by
 # extension and POSIX says it is ordinary; `sed --posix -E s/a)/X/' is already
-# right here -- for THAT spelling only: the BRE `\)' is a second gap, see README. What is missing is a SECOND flag for the behaviours both spellings
-# share -- not this one driven from the variable; see README and the two guard
-# cases at the end of this file for why that shortcut is wrong.
+# right here -- for THAT spelling only: the BRE `\)' is a second gap, see README.
+# This is the same `== POSIXLY_EXTENDED' test the `N' case above now passes, but
+# asked at COMPILE time rather than at run time: the flag reaches each regex's
+# options as `posix', and what is missing is the level reaching them instead.
+# Not the variable wired to the flag -- the two guard cases at the end of this
+# file are why that shortcut is wrong.
 ## argv: sed -E s/a)/X/ h
 ## file h:
 a
@@ -7512,12 +7515,60 @@ a
 ## status: 1
 
 #### the variable is NOT --posix: v is accepted under it and clears the mode
-# This case exists to stop the three xfails above being 'fixed' by wiring the
+# This case exists to stop the xfail above being 'fixed' by wiring the
 # variable to the --posix flag. GNU refuses `v' under --posix but ACCEPTS it under
 # the variable, where its documented side effect is to clear posix mode -- so the
 # `$!d;N' after it runs in DEFAULT mode and prints `a'. One flag driving both
 # spellings prints nothing here, which is how that mistake announces itself.
 ## argv: sed v;$!d;N h
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT: 1
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+#### --posix AFTER the last -e still governs the run
+# The run reads GNU's `posixicity` as the OPTION LOOP left it, which is not any
+# part's scan-time mode: this part is scanned before `--posix' exists, so a
+# per-part answer says EXTENDED and prints `a'. GNU drops the pattern space.
+# A first attempt at this rule folded over the parts and took the last one's
+# mode, which was right for every case that existed before these three and
+# wrong for two of them -- this one and the next, whose last part is likewise
+# scanned before the flag. Nothing caught it, which is why they exist.
+## argv: sed -e $!d;N --posix h
+## file h:
+a
+b
+a
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### and it overrides a v compiled before it, which is the same rule twice
+# `v' assigns POSIXLY_EXTENDED at COMPILE time (compile.c:1079) and `--posix'
+# assigns POSIXLY_BASIC in the option loop, so the later assignment wins and
+# the `v' buys nothing. Refusing `v' under the flag does not cover this: the
+# part holding it was scanned before the flag, so it compiles.
+## argv: sed -e v -e $!d;N --posix h
+## file h:
+a
+b
+a
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### while the same v without it still promotes
+# The other side of that pair, and what stops the rule being read as "--posix
+# anywhere wins": with no flag the `v' leaves the run POSIXLY_EXTENDED and the
+# pattern space prints, under the variable as well as without it.
+## argv: sed -e v -e $!d;N h
 ## file h:
 a
 b

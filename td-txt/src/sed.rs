@@ -168,6 +168,12 @@ struct Cmd {
 #[derive(Debug, Default)]
 struct Script {
     cmds: Vec<Cmd>,
+    /// A `v` was compiled, which is GNU's `posixicity = POSIXLY_EXTENDED`
+    /// (compile.c:1079). Half of what the RUN needs: the other half is the
+    /// option loop's own final value, and the two are combined there rather
+    /// than here because `--posix` given AFTER the last `-e` still wins --
+    /// `sed -e v -e '$!d;N' --posix` drops the pattern space, measured.
+    v_promoted: bool,
     regexes: Vec<Regex>,
     labels: BTreeMap<Vec<u8>, usize>,
     /// The `w` targets, ALREADY OPEN: GNU opens one while it parses the command
@@ -250,12 +256,10 @@ impl ScriptParser<'_> {
                 break;
             }
         }
-        // A `v` already COMPILED promotes what follows it to GNU's
-        // POSIXLY_EXTENDED (compile.c:1079) -- across later parts, since GNU
-        // holds one `posixicity` for the whole compile. `--posix` is the other
-        // way: it sets POSIXLY_BASIC, so a part scanned under it wins over an
-        // earlier `v`, which is why this is not a bare OR.
-        mode.extended |= self.v_promoted && !mode.posix;
+        // A `v` already COMPILED promotes what follows it, across later parts:
+        // GNU holds one `posixicity` for the whole compile, so this is the same
+        // question the RUN asks and the same function answers it.
+        mode.extended = mode.extended_with_v(self.v_promoted);
         mode
     }
 
@@ -1702,6 +1706,7 @@ fn parse_commands(p: &mut ScriptParser) -> Result<Script, Fatal> {
     }
     Ok(Script {
         cmds,
+        v_promoted: p.v_promoted,
         regexes: std::mem::take(&mut p.regexes),
         labels,
         wfiles: std::mem::take(&mut p.wfiles),
@@ -2456,7 +2461,10 @@ struct Sed {
     ranges: Vec<RangeState>,
     suppress: bool,
     separator: u8,
-    posix: bool,
+    /// `posixicity == POSIXLY_EXTENDED`, not `!--posix`. The only runtime read
+    /// of the compile's posixicity, and the two are not the same question: the
+    /// third level, which `POSIXLY_CORRECT` selects, is neither.
+    extended: bool,
     /// The fallback width (`COLS`, then `-l`), read HERE rather than at compile
     /// time because GNU reads it when `l` runs: `sed -e l -l 12` folds at 12
     /// though the option came after.
@@ -3524,6 +3532,10 @@ fn compile_and_run(
 ) -> Result<i32, Fatal> {
     let mut script = compile_script(source, parts, mode, conf.null_data)?;
     let seed = seed_ranges(&script.cmds);
+    // GNU's `posixicity` at the moment the run starts: the option loop's FINAL
+    // value plus a compiled `v`. Not a part's scan-time mode -- `--posix` after
+    // the last `-e` never reaches one and still governs the run.
+    let script_extended = mode.extended_with_v(script.v_promoted);
     let wfiles = std::mem::take(&mut script.wfiles);
     // BEFORE `sed`, which is what makes the `w`-before-sink order structural: a
     // local drops in reverse declaration order, so `sed`'s targets flush and then
@@ -3540,7 +3552,7 @@ fn compile_and_run(
         ranges: seed,
         suppress: conf.suppress,
         separator,
-        posix: mode.posix,
+        extended: script_extended,
         line_wrap: conf.line_wrap,
         pattern: Vec::new(),
         hold: Vec::new(),
@@ -3917,8 +3929,9 @@ impl ScriptFailure {
 ///
 /// `posix` and `extended` are deliberately not each other's negation: `posix` is
 /// `--posix`, which withdraws extensions, while `extended` is GNU's
-/// POSIXLY_EXTENDED, the level `--posix` and `POSIXLY_CORRECT` each leave, and
-/// only the special-file table reads it.
+/// POSIXLY_EXTENDED, the level `--posix` and `POSIXLY_CORRECT` each leave. Two
+/// things read it, and both through `extended_with_v`: the special-file table
+/// while it compiles, and the run at end of input.
 #[derive(Clone, Copy, Debug)]
 struct Mode {
     posix: bool,
@@ -3929,6 +3942,17 @@ struct Mode {
     /// target is opened, because refusing the command is GNU's answer whether or
     /// not the file could have been opened.
     sandbox: bool,
+}
+
+impl Mode {
+    /// GNU's `posixicity == POSIXLY_EXTENDED` once a compiled `v` is accounted
+    /// for. Both are ASSIGNMENTS to one level, so this is not an OR: `v` sets
+    /// EXTENDED (compile.c:1079) and `--posix` sets BASIC, and the flag wins
+    /// wherever both appear. One function so the compile-time answer
+    /// (`ScriptParser::mode`) and the run-time one cannot drift apart.
+    fn extended_with_v(self, v_promoted: bool) -> bool {
+        self.extended || (v_promoted && !self.posix)
+    }
 }
 
 /// One of the three names GNU's `get_openfile` resolves to a STREAM the process
@@ -4657,10 +4681,15 @@ impl Sed {
                     // flushes the append queue, so the flush waits until a line is
                     // known to exist: `sed -e 'r f' -e N` over a one-line input
                     // writes the line before f's text. Both flows the early returns
-                    // take already flush, in that order. (`--posix` drops the
-                    // pattern space instead, and `n` never had the problem.)
+                    // take already flush, in that order. (`n` never had the
+                    // problem.) Dropping it instead is what BOTH non-default
+                    // posixicities do, so the test is `extended` and not `!posix`
+                    // -- execute.c:1478 asks `== POSIXLY_EXTENDED`. `-n` needs no
+                    // test here: GNU's `!no_default_output` is this crate's
+                    // ordinary end-of-cycle print, which `suppress` already
+                    // governs on the flow below.
                     let Some(line) = stream.next_line(Opener::Lookahead) else {
-                        if self.posix {
+                        if !self.extended {
                             self.pattern.clear();
                             return Ok(Flow::Deleted);
                         }
@@ -4942,16 +4971,17 @@ mod tests {
         let ere = opts.contains(&"-E") || opts.contains(&"-r");
         let null_data = opts.contains(&"-z");
         let sep = separator_for(null_data);
-        let mut script =
-            compile_script(script.as_bytes(), Vec::new(), mode_with(ere), null_data).unwrap();
+        let mode = mode_with(ere);
+        let mut script = compile_script(script.as_bytes(), Vec::new(), mode, null_data).unwrap();
         let seed = seed_ranges(&script.cmds);
+        let script_extended = mode.extended_with_v(script.v_promoted);
         let wfiles = std::mem::take(&mut script.wfiles);
         let mut sed = Sed {
             script,
             ranges: seed,
             suppress: opts.contains(&"-n"),
             separator: sep,
-            posix: false,
+            extended: script_extended,
             line_wrap: DEFAULT_LINE_WRAP,
             pattern: Vec::new(),
             hold: Vec::new(),
