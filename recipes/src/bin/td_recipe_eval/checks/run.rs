@@ -33,8 +33,8 @@ use std::process::Command;
 
 use crate::check_runner::RecipeCheckRunner;
 use crate::checks::qemu_boot::{
-    build_btrfs_tools, create_persistent_volume, drive_arg, find_qemu, verify_deployment,
-    verify_selector,
+    build_btrfs_tools, create_persistent_volume, drive_arg, find_qemu, provision_selector,
+    verify_deployment, verify_selector, RunTrust,
 };
 
 /// The distro image recipe this runner boots; its recipe closure pulls in the
@@ -319,9 +319,14 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
     // is removed when it drops — on every return path.
     let images = TempImages::new(runner.ladder_work_dir())?;
     let boot_bzimage = images.stage(&bzimage, "bzImage")?;
-    let boot_init = images.stage(&selector, "selector-initramfs.cpio")?;
+    // This run's trust root. `provision_selector` is what copies the verified
+    // store output into the private image dir AND appends the key, so the
+    // bootable path cannot exist without it — the same helper the headless
+    // modes use, rather than a second copy-then-append here.
+    let trust = RunTrust::generate()?;
+    let boot_init = provision_selector(&selector, &images.dir, &trust)?;
     let boot_disk = images.dir.join("system.btrfs");
-    create_persistent_volume(&deployment, &mkfs, &btrfs, &boot_disk)?;
+    create_persistent_volume(&deployment, &mkfs, &btrfs, &boot_disk, &trust)?;
 
     // The build is done and every verified payload is staged out.
     // Release the ladder lock now, BEFORE the unbounded interactive boot: this process

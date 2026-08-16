@@ -165,7 +165,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory>\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> <trusted-key>",
+        "usage: td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory>\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]",
     )
 }
 
@@ -193,13 +193,23 @@ fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
         }
         Some(mode) if mode == OsStr::new("authenticate") => {
             let directory = args.next().ok_or_else(usage_error)?;
-            let trusted_key = args.next().ok_or_else(usage_error)?;
+            // The key argument is optional, and its default is the one place a
+            // booted td-boot ever reads a trust root from: `TRUSTED_KEY_PATH`
+            // in its own rootfs, which the harness writes into the selector
+            // initramfs. Spelling it here rather than only in the harness is
+            // what makes that constant a shared contract instead of one side's
+            // preference — a disagreement would be a key placed where nothing
+            // looks, silent on both sides.
+            let trusted_key = args.next().map_or_else(
+                || Path::new("/").join(protocol::TRUSTED_KEY_PATH),
+                PathBuf::from,
+            );
             if args.next().is_some() {
                 return Err(usage_error());
             }
             Ok(Mode::Authenticate {
                 directory: PathBuf::from(directory),
-                trusted_key: PathBuf::from(trusted_key),
+                trusted_key,
             })
         }
         Some(mode) if mode == OsStr::new("root-loop") => {
@@ -2371,7 +2381,8 @@ fn run_success(device: &Path, mountpoint: &Path, deployment_id: &str) -> io::Res
     writeln!(io::stdout(), "{id}")
 }
 
-/// `td-boot authenticate <deployment-directory> <trusted-key>`.
+/// `td-boot authenticate <deployment-directory> [trusted-key]`, the key
+/// defaulting to `/` + `protocol::TRUSTED_KEY_PATH`.
 ///
 /// Prints the deployment id — `sha256(manifest)`, the same identity every other
 /// verb uses — on success, and refuses with a reason otherwise. An ABSENT
@@ -4076,6 +4087,26 @@ mod tests {
             .into_iter(),
         );
         assert!(matches!(parsed, Ok(Mode::Authenticate { .. })));
+        // An explicit key is taken verbatim.
+        let Ok(Mode::Authenticate { trusted_key, .. }) = parsed else {
+            panic!("authenticate with an explicit key must parse");
+        };
+        assert_eq!(trusted_key, PathBuf::from("/key.pub"));
+
+        // Omitted, it defaults to the one place a booted td-boot finds a trust
+        // root — the absolute form of the constant the harness writes into the
+        // selector initramfs. Spelled as a LITERAL: comparing it to the
+        // constant would agree with itself however wrong the constant was, and
+        // wrong here is a key nothing ever reads.
+        let defaulted = parse_args(
+            [OsString::from("authenticate"), OsString::from("/bundle")].into_iter(),
+        );
+        let Ok(Mode::Authenticate { trusted_key, .. }) = defaulted else {
+            panic!("authenticate must parse with the key omitted");
+        };
+        assert_eq!(trusted_key, PathBuf::from("/etc/td/deployment.pub"));
+        assert_eq!(protocol::TRUSTED_KEY_PATH, "etc/td/deployment.pub");
+
         // Too few and too many are both usage errors, as every other verb's are.
         assert!(parse_args([OsString::from("authenticate")].into_iter()).is_err());
         assert!(parse_args(

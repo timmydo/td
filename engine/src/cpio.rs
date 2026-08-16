@@ -3,9 +3,12 @@
 //!
 //! There is no reader here and no general archiver. What this exists for is one
 //! job, described in `td-install/DESIGN.md` §6: a harness must put a per-run
-//! trusted public key inside the initramfs td-boot is in, without any recipe
-//! being parameterized. Linux accepts CONCATENATED cpio archives, so the key
-//! rides in a second archive appended to the recipe-built one.
+//! trusted public key inside the SELECTOR initramfs — the one firmware loads,
+//! in whose rootfs the td-boot that VERIFIES runs — without any recipe being
+//! parameterized. Linux accepts CONCATENATED cpio archives, so the key rides
+//! in a second archive appended to the recipe-built one. "The initramfs
+//! td-boot is in" is what this used to say, and it is ambiguous in the one way
+//! that matters: td-boot is in both of them.
 //!
 //! ## The format, as the pinned kernel's own producer writes it
 //!
@@ -40,9 +43,19 @@
 //! the value the recipes pass `gen_init_cpio` as `-t 1`, so both halves of a
 //! concatenation agree; `uid`/`gid` are 0; inode numbers count up from 721 as
 //! `gen_init_cpio`'s do. The same entries therefore always produce the same
-//! bytes, which matters because this archive's content changes the initramfs
-//! hash, and that hash is named by the manifest whose digest IS the deployment
-//! id.
+//! bytes, so the only thing that varies between two runs is what the caller
+//! put IN the archive.
+//!
+//! Which side of the trust boundary that lands on is the caller's to get right
+//! and is worth stating here, because an earlier draft of this file got it
+//! backwards. td's appendix goes onto a private copy of the SELECTOR
+//! initramfs — the artifact firmware loads, whose rootfs runs the td-boot that
+//! verifies. Its modified hash is recorded nowhere: the selector's own manifest
+//! describes the recipe output and is checked BEFORE the append. It is
+//! emphatically NOT appended to a deployment's `initramfs.cpio`, which the
+//! deployment manifest hashes and whose digest is the deployment id — a key
+//! there would be inside the artifact being authenticated, and would make the
+//! id depend on the key.
 //!
 //! ## Why the appendix works at all, and what it rests on
 //!
@@ -60,7 +73,8 @@
 //!   it stopped at is unaligned (`:324-331`), which sets `message` — and the
 //!   driver loop is `while (!message && len)`, so `decompress_method` and its
 //!   `invalid magic` are never reached. Where that error then goes depends on
-//!   which archive it came from, and td's deployment initramfs is an INITRD
+//!   which archive it came from, and td's SELECTOR initramfs — the one this
+//!   appendix rides, and the one firmware loads — is an INITRD
 //!   (`CONFIG_INITRAMFS_SOURCE=""`, qemu `-initrd`) rather than the built-in
 //!   one: it takes `:726-733`, not the `panic_show_mem` at `:714-716`. With
 //!   `CONFIG_BLK_DEV_RAM` off — allnoconfig leaves it off and the recipe's

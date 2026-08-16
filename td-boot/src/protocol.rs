@@ -27,6 +27,18 @@ pub const MAX_SIGNATURE_BYTES: u64 = 160;
 // reason — whatever supplies it, td-boot reads it as a file and a file can be
 // any size.
 pub const MAX_PUBLIC_KEY_BYTES: u64 = 96;
+// Where that key sits in the SELECTOR initramfs, relative to its root — the
+// rootfs td-boot is running from when it selects and verifies, which is the
+// artifact firmware loads and NOT the deployment's own initramfs. A key inside
+// the deployment would be inside the thing being authenticated, and a verifier
+// that reads its trust root out of its input authenticates nothing.
+//
+// Rootfs-relative rather than absolute because the harness writes it as a cpio
+// entry name, and `engine/src/cpio.rs` refuses an absolute one; td-boot joins
+// it to `/`. Shared here so the writer and the reader cannot disagree about the
+// spelling — a mismatch is a key the kernel places somewhere td-boot never
+// looks, which reports nothing on either side.
+pub const TRUSTED_KEY_PATH: &str = "etc/td/deployment.pub";
 pub const BOOT_DIR: &str = "td/boot";
 pub const ATTEMPTS_DIR: &str = "td/boot/attempts";
 pub const DEPLOYMENTS_DIR: &str = "td/deployments";

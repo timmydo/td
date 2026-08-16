@@ -33,7 +33,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{symlink, DirBuilderExt};
+use std::os::unix::fs::{symlink, DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -383,8 +383,12 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
 /// state, and clean self-exit; healthy boots assert the runtime target.
 pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     let qemu = find_qemu()?;
-    let (bzimage, init_cpio, deployment) = build_system(runner)?;
+    let (bzimage, selector, deployment) = build_system(runner)?;
     let (mkfs, btrfs) = build_btrfs_tools(runner)?;
+    // One trust root for the run: its public half rides the selector this boots,
+    // its private half signs every deployment reaching the volume below.
+    let trust = RunTrust::generate()?;
+    let init_cpio = provision_selector(&selector, runner.scratch_dir(), &trust)?;
     let volume = runner.scratch_dir().join("system-volume.btrfs");
     let fixture = create_persistent_volume_layout(
         &deployment,
@@ -392,6 +396,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &btrfs,
         &volume,
         VolumeLayout::Transactional,
+        &trust,
     )?;
     if fixture.initial_id == fixture.alternate_id {
         return Err("transaction fixture candidate did not change the deployment id".to_string());
@@ -573,6 +578,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &btrfs,
         &volume,
         VolumeLayout::Transactional,
+        &trust,
     )?;
     if failure_fixture.initial_id != fixture.initial_id
         || failure_fixture.alternate_id != fixture.alternate_id
@@ -741,6 +747,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &btrfs,
         &volume,
         VolumeLayout::CorruptCurrent,
+        &trust,
     )?;
     if fallback_fixture.initial_id != failure_fixture.initial_id
         || fallback_fixture.alternate_id == fallback_fixture.initial_id
@@ -1764,7 +1771,7 @@ pub(crate) fn verify_deployment(deployment: &Path) -> Result<(PathBuf, PathBuf, 
 
 /// Verify the direct-boot selector before handing its privileged td-boot/td-kexec
 /// contents to qemu.
-pub(crate) fn verify_selector(boot: &Path) -> Result<PathBuf, String> {
+pub(crate) fn verify_selector(boot: &Path) -> Result<VerifiedSelector, String> {
     const NAME: &str = "selector-initramfs.cpio";
     let manifest_path = boot.join("manifest");
     let digest = parse_host_manifest(&manifest_path, "selector", &[NAME])?
@@ -1785,12 +1792,27 @@ pub(crate) fn verify_selector(boot: &Path) -> Result<PathBuf, String> {
             "system-x86-64 selector hash mismatch: manifest has {digest}, payload has {actual}"
         ));
     }
-    Ok(selector)
+    Ok(VerifiedSelector(selector))
 }
+
+/// A selector initramfs straight from the store, verified against its own
+/// manifest — and NOT yet bootable.
+///
+/// The path is private on purpose. `provision_selector` is the only way to get
+/// a bootable one out, and it is what appends the run's trusted key, so a
+/// caller cannot boot the unprovisioned original by naming the wrong variable.
+/// That mistake has no symptom: the machine comes up with no trust root and
+/// nothing on either side reports it. A review found four mutations of exactly
+/// that shape surviving the whole suite, which is why this is a type rather
+/// than another assertion.
+#[derive(Debug)]
+pub(crate) struct VerifiedSelector(PathBuf);
 
 /// Build `system-x86-64` and return the direct-boot kernel, selector initramfs,
 /// and verified deployment directory.
-fn build_system(runner: &RecipeCheckRunner) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+fn build_system(
+    runner: &RecipeCheckRunner,
+) -> Result<(PathBuf, VerifiedSelector, PathBuf), String> {
     runner.prepare_recipe_target("system-x86-64")?;
     let build_out = runner.build_plan("system-x86-64")?;
     let system_tree = runner.ladder_out_from(&build_out, "system-x86-64")?;
@@ -1803,10 +1825,12 @@ fn build_system(runner: &RecipeCheckRunner) -> Result<(PathBuf, PathBuf, PathBuf
 fn build_persistent_system(
     runner: &RecipeCheckRunner,
 ) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf), String> {
-    let (bzimage, initramfs, deployment) = build_system(runner)?;
+    let (bzimage, selector, deployment) = build_system(runner)?;
     let (mkfs, btrfs) = build_btrfs_tools(runner)?;
+    let trust = RunTrust::generate()?;
+    let initramfs = provision_selector(&selector, runner.scratch_dir(), &trust)?;
     let volume = runner.scratch_dir().join("system-volume.btrfs");
-    create_persistent_volume(&deployment, &mkfs, &btrfs, &volume)?;
+    create_persistent_volume(&deployment, &mkfs, &btrfs, &volume, &trust)?;
     Ok((bzimage, initramfs, volume, btrfs))
 }
 
@@ -1836,8 +1860,9 @@ pub(crate) fn create_persistent_volume(
     mkfs: &Path,
     btrfs: &Path,
     output: &Path,
+    trust: &RunTrust,
 ) -> Result<(), String> {
-    create_persistent_volume_layout(deployment, mkfs, btrfs, output, VolumeLayout::Basic)
+    create_persistent_volume_layout(deployment, mkfs, btrfs, output, VolumeLayout::Basic, trust)
         .map(|_| ())
 }
 
@@ -1858,6 +1883,7 @@ fn create_persistent_volume_layout(
     btrfs: &Path,
     output: &Path,
     layout: VolumeLayout,
+    trust: &RunTrust,
 ) -> Result<VolumeFixture, String> {
     let manifest = deployment.join("manifest");
     let deployment_id = crate::sha256::sha256_file(&manifest)
@@ -1906,16 +1932,16 @@ fn create_persistent_volume_layout(
     }
     let _seed_cleanup = Scratch { dir: seed.clone() };
 
-    populate_persistent_seed(deployment, &seed, &deployment_id)?;
+    populate_persistent_seed(deployment, &seed, &deployment_id, trust)?;
     let alternate_id = match layout {
         VolumeLayout::Basic => deployment_id.clone(),
         VolumeLayout::Transactional => {
             let candidate = seed.join("td/incoming/candidate");
-            create_bootable_candidate(deployment, &candidate)?
+            create_bootable_candidate(deployment, &candidate, trust)?
         }
         VolumeLayout::CorruptCurrent => {
             let candidate = seed.join("td/incoming/corrupt-candidate");
-            let id = create_bootable_candidate(deployment, &candidate)?;
+            let id = create_bootable_candidate(deployment, &candidate, trust)?;
             let installed = seed.join(td_boot_protocol::DEPLOYMENTS_DIR).join(&id);
             fs::rename(&candidate, &installed).map_err(|e| {
                 format!(
@@ -1993,7 +2019,179 @@ fn copy_candidate_payload(source: &Path, destination: &Path) -> Result<(), Strin
     Ok(())
 }
 
-fn create_bootable_candidate(deployment: &Path, destination: &Path) -> Result<String, String> {
+/// One run's trust root, generated per run and never stored.
+///
+/// The public half goes into the SELECTOR initramfs — the artifact firmware
+/// loads, and the rootfs `td-boot boot` is running from when it selects and
+/// verifies. The private half signs every deployment that reaches the volume.
+///
+/// WHICH initramfs is the whole of it. The deployment's own initramfs is a
+/// payload the manifest hashes and it sits on the Btrfs volume, so a key there
+/// would be inside the artifact being authenticated: a hostile update source
+/// supplies bundle, key and signature together and self-authenticates, which
+/// is the Btrfs-volume weakening §6 forbids by name. Putting it in the selector
+/// also keeps D3 intact — rotating the key changes the selector rather than any
+/// deployment's initramfs digest, so a re-signed deployment keeps its id.
+pub(crate) struct RunTrust {
+    seed: [u8; 32],
+    public: [u8; 32],
+}
+
+impl RunTrust {
+    /// D4: a signing key never enters a recipe or a store path, so it is made
+    /// here, host-side, from `/dev/urandom` and dropped when the run ends.
+    pub(crate) fn generate() -> Result<Self, String> {
+        let mut seed = [0u8; 32];
+        File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut seed))
+            .map_err(|e| format!("read /dev/urandom for a throwaway signing seed: {e}"))?;
+        let public = td_engine::ed25519_sign::public_key(&seed)
+            .ok_or_else(|| "derive a public key from the throwaway seed".to_string())?;
+        Ok(Self { seed, public })
+    }
+
+    /// The public half in the wire format td-boot reads: lowercase hex, one
+    /// trailing newline.
+    pub(crate) fn trusted_key_line(&self) -> Vec<u8> {
+        hex_line(&self.public)
+    }
+
+    /// Write `manifest.sig` beside a staged deployment's manifest.
+    ///
+    /// EVERY deployment that reaches the volume gets one, not just the ones a
+    /// test swaps in. The seed deployment is what current and previous point at
+    /// and what every mode but the transactional ones boots, so signing only
+    /// candidates would leave the ordinary boot path unsigned — and the moment
+    /// verification is fail-closed, refused.
+    fn sign_deployment(&self, directory: &Path) -> Result<(), String> {
+        let manifest_path = directory.join(td_boot_protocol::MANIFEST_NAME);
+        let manifest = fs::read(&manifest_path)
+            .map_err(|e| format!("read manifest {}: {e}", manifest_path.display()))?;
+        let signature = td_engine::ed25519_sign::sign(&self.seed, &manifest)
+            .ok_or_else(|| format!("sign manifest {}", manifest_path.display()))?;
+        let path = directory.join(td_boot_protocol::MANIFEST_SIG_NAME);
+        fs::write(&path, hex_line(&signature))
+            .map_err(|e| format!("write signature {}: {e}", path.display()))
+    }
+}
+
+/// Copy the verified selector initramfs into scratch and append this run's
+/// trusted key to the copy, returning the path to boot.
+///
+/// A copy because the verified original is a content-addressed store output,
+/// and because `verify_selector` has already checked it against its own
+/// manifest — appending before that check would invalidate it, and appending
+/// after is what makes the boot artifact this run's rather than the recipe's.
+pub(crate) fn provision_selector(
+    selector: &VerifiedSelector,
+    destination_dir: &Path,
+    trust: &RunTrust,
+) -> Result<PathBuf, String> {
+    let provisioned = destination_dir.join("selector-initramfs-trusted.cpio");
+    match fs::remove_file(&provisioned) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "remove stale provisioned selector {}: {error}",
+                provisioned.display()
+            ))
+        }
+    }
+    fs::copy(&selector.0, &provisioned).map_err(|e| {
+        format!(
+            "copy selector {} -> {}: {e}",
+            selector.0.display(),
+            provisioned.display()
+        )
+    })?;
+    append_trusted_key(&provisioned, &trust.trusted_key_line())?;
+    Ok(provisioned)
+}
+
+/// Append `key` to `initramfs` as a second, concatenated cpio archive.
+///
+/// The alignment is the whole of this function's correctness and is NOT
+/// backstopped by the kernel. A misaligned appendix makes `do_reset` error
+/// `broken padding`, and because td's initramfs is an initrd built with
+/// `CONFIG_BLK_DEV_RAM` off, that error is a lone `printk` and the boot
+/// CONTINUES with the key absent (`init/initramfs.c:726-733`). Nothing
+/// downstream reports it, so the padding here is the only thing between a run
+/// and a machine that boots without its trust root.
+///
+/// The directory entries are emitted rather than assumed: neither phase of
+/// `build_initramfs_spec` creates `/etc`, and a missing parent is silent too —
+/// `filp_open` failing is `return 0` (`init/initramfs.c:385-387`).
+pub(crate) fn append_trusted_key(initramfs: &Path, key: &[u8]) -> Result<(), String> {
+    use td_engine::cpio::{Entry, Kind};
+
+    // The caller's copy came from a store output, and `fs::copy` preserves the
+    // source's mode — which `copy_canonical` fixed at 0444 for a non-executable
+    // file (`builder/src/main.rs:806-807`). So the copy is read-only and the
+    // append below is EACCES for any non-root runner. Widened here rather than
+    // at each caller because both of them copy, and because a private scratch
+    // file is the only thing this is ever handed.
+    let mode = fs::metadata(initramfs)
+        .map_err(|e| format!("stat staged initramfs {}: {e}", initramfs.display()))?
+        .permissions()
+        .mode();
+    fs::set_permissions(initramfs, fs::Permissions::from_mode(mode | 0o200)).map_err(|e| {
+        format!(
+            "make the staged initramfs {} writable: {e}",
+            initramfs.display()
+        )
+    })?;
+
+    let length = fs::metadata(initramfs)
+        .map_err(|e| format!("stat initramfs {}: {e}", initramfs.display()))?
+        .len();
+    let length = usize::try_from(length)
+        .map_err(|_| format!("initramfs {} is too large", initramfs.display()))?;
+
+    let mut entries = Vec::new();
+    for parent in key_path_parents() {
+        entries.push(Entry { name: parent, mode: 0o755, kind: Kind::Directory });
+    }
+    entries.push(Entry {
+        name: td_boot_protocol::TRUSTED_KEY_PATH,
+        mode: 0o644,
+        kind: Kind::File(key),
+    });
+
+    let mut appendix = vec![0u8; td_engine::cpio::alignment_padding(length)];
+    appendix.extend_from_slice(&td_engine::cpio::build(&entries)?);
+
+    OpenOptions::new()
+        .append(true)
+        .open(initramfs)
+        .and_then(|mut f| f.write_all(&appendix))
+        .map_err(|e| format!("append key archive to {}: {e}", initramfs.display()))
+}
+
+/// Every proper directory prefix of `TRUSTED_KEY_PATH`, shallowest first.
+///
+/// Derived from the path rather than written beside it, so moving the key
+/// cannot leave the parent list behind — which the kernel would report by
+/// creating nothing at all.
+fn key_path_parents() -> Vec<&'static str> {
+    let path = td_boot_protocol::TRUSTED_KEY_PATH;
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while let Some(slash) = path.get(at..).and_then(|rest| rest.find('/')) {
+        at = at.saturating_add(slash);
+        if let Some(prefix) = path.get(..at) {
+            out.push(prefix);
+        }
+        at = at.saturating_add(1);
+    }
+    out
+}
+
+fn create_bootable_candidate(
+    deployment: &Path,
+    destination: &Path,
+    trust: &RunTrust,
+) -> Result<String, String> {
     fs::create_dir_all(destination)
         .map_err(|e| format!("create candidate directory {}: {e}", destination.display()))?;
     for name in ["bzImage", "initramfs.cpio", "root.erofs"] {
@@ -2020,9 +2218,28 @@ fn create_bootable_candidate(deployment: &Path, destination: &Path) -> Result<St
     );
     fs::write(destination.join("manifest"), manifest)
         .map_err(|e| format!("write candidate manifest {}: {e}", destination.display()))?;
+    trust.sign_deployment(destination)?;
     verify_deployment(destination)?;
     crate::sha256::sha256_file(&destination.join("manifest"))
         .map_err(|e| format!("hash candidate manifest {}: {e}", destination.display()))
+}
+
+/// Lowercase hex plus a trailing newline — the wire format DESIGN.md §6 fixes
+/// for both the key and the signature, and the one td-boot's `decode_hex` trims
+/// back off. Lowercase is the documented half a permissive reader would hide.
+fn hex_line(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len().saturating_mul(2).saturating_add(1));
+    for byte in bytes {
+        out.push(hex_nibble(byte >> 4));
+        out.push(hex_nibble(byte & 0xf));
+    }
+    out.push(b'\n');
+    out
+}
+
+fn hex_nibble(value: u8) -> u8 {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    *DIGITS.get(value as usize).unwrap_or(&b'0')
 }
 
 fn replace_seed_selector(seed: &Path, slot: &str, deployment_id: &str) -> Result<(), String> {
@@ -2045,6 +2262,7 @@ fn populate_persistent_seed(
     deployment: &Path,
     seed: &Path,
     deployment_id: &str,
+    trust: &RunTrust,
 ) -> Result<(), String> {
     let installed = seed
         .join(td_boot_protocol::DEPLOYMENTS_DIR)
@@ -2059,6 +2277,10 @@ fn populate_persistent_seed(
         let target = installed.join(name);
         link_or_copy(&source, &target)?;
     }
+    // The staged copy is signed, not the recipe output: the source is a
+    // read-only store path, and `link_or_copy` hard-links when it can, so a
+    // signature written through it would land in the store.
+    trust.sign_deployment(&installed)?;
     for slot in ["current", "previous"] {
         let link = seed.join(td_boot_protocol::BOOT_DIR).join(slot);
         symlink(
@@ -3128,7 +3350,8 @@ mod tests {
         let initial_id = crate::sha256::sha256_file(&deployment.join("manifest")).unwrap();
 
         let candidate = dir.join("incoming/candidate");
-        let candidate_id = create_bootable_candidate(&deployment, &candidate).unwrap();
+        let trust = RunTrust::generate().unwrap();
+        let candidate_id = create_bootable_candidate(&deployment, &candidate, &trust).unwrap();
         assert_ne!(candidate_id, initial_id);
         assert_eq!(
             crate::sha256::sha256_file(&candidate.join("manifest")).unwrap(),
@@ -3138,6 +3361,283 @@ mod tests {
         assert!(fs::read(candidate.join("initramfs.cpio"))
             .unwrap()
             .ends_with(&[0u8; 4]));
+
+        // The candidate's IDENTITY must not depend on the key, or `run_system`
+        // — which recreates this fixture and requires the id to be unchanged —
+        // fails every run. A second trust root signs differently and names the
+        // same deployment.
+        let other_trust = RunTrust::generate().unwrap();
+        let resigned = dir.join("incoming/resigned");
+        let resigned_id =
+            create_bootable_candidate(&deployment, &resigned, &other_trust).unwrap();
+        assert_eq!(
+            resigned_id, candidate_id,
+            "D3: re-signing under another key must not change the deployment id"
+        );
+        assert_ne!(
+            fs::read(resigned.join("manifest.sig")).unwrap(),
+            fs::read(candidate.join("manifest.sig")).unwrap(),
+            "a different key must produce a different signature"
+        );
+    }
+
+    /// The signature the harness writes must verify under the key it would put
+    /// in the selector — through `engine/src/ed25519.rs`, the same file td-boot
+    /// `#[path]`-includes and a DIFFERENT module from the `ed25519_sign` that
+    /// signed. So this checks the mechanism rather than the signer agreeing
+    /// with itself.
+    #[test]
+    fn every_staged_deployment_is_signed_by_the_runs_key() {
+        let seq = AtomicU64::new(2060);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        let deployment = dir.join("deployment");
+        fs::create_dir(&deployment).unwrap();
+        for (name, bytes) in [
+            ("bzImage", b"kernel".as_slice()),
+            ("initramfs.cpio", b"initramfs".as_slice()),
+            ("root.erofs", b"root".as_slice()),
+        ] {
+            fs::write(deployment.join(name), bytes).unwrap();
+        }
+        let mut manifest = String::from("td-deployment-v1\n");
+        for name in ["bzImage", "initramfs.cpio", "root.erofs"] {
+            let digest = crate::sha256::sha256_file(&deployment.join(name)).unwrap();
+            manifest.push_str(&format!("{digest}  {name}\n"));
+        }
+        fs::write(deployment.join("manifest"), &manifest).unwrap();
+        let id = crate::sha256::sha256_file(&deployment.join("manifest")).unwrap();
+
+        let trust = RunTrust::generate().unwrap();
+        let seed = dir.join("seed");
+        populate_persistent_seed(&deployment, &seed, &id, &trust).unwrap();
+
+        // The SEED deployment, not just a candidate: this is what current and
+        // previous point at and what every mode but the transactional ones
+        // boots. Signing only candidates would leave the ordinary boot path
+        // unsigned, and fail-closed verification would then refuse it.
+        let installed = seed.join(td_boot_protocol::DEPLOYMENTS_DIR).join(&id);
+        let signature =
+            decode_hex_fixture::<64>(&fs::read(installed.join("manifest.sig")).unwrap());
+        let staged = fs::read(installed.join("manifest")).unwrap();
+        assert!(
+            td_engine::ed25519::verify(&trust.public, &staged, &signature),
+            "the run's key must verify the seed deployment's signature"
+        );
+
+        // Negative controls: a verifier returning true unconditionally passes
+        // the line above.
+        let mut tampered = staged.clone();
+        tampered[0] ^= 1;
+        assert!(!td_engine::ed25519::verify(&trust.public, &tampered, &signature));
+        let stranger = RunTrust::generate().unwrap();
+        assert!(
+            !td_engine::ed25519::verify(&stranger.public, &staged, &signature),
+            "another run's key must not authenticate this run's deployment"
+        );
+
+        // The signature must NOT be written back through the hard link into the
+        // source deployment, which in a real run is a read-only store path.
+        assert!(
+            !deployment.join("manifest.sig").exists(),
+            "the source deployment must be left untouched"
+        );
+    }
+
+    /// The appendix's members, and that its parents are DIRECTORIES.
+    ///
+    /// The key path is spelled as a LITERAL here rather than as
+    /// `TRUSTED_KEY_PATH`. Comparing the constant to itself passes however
+    /// wrong the constant is — a review showed `var/lib/td/deployment.pub`
+    /// surviving, which at boot is `filp_open` failing on a missing `var` and
+    /// returning 0 with no diagnostic. The type bits are asserted for the same
+    /// class of reason: parents emitted as empty FILES also survived, and give
+    /// ENOTDIR and the same silent absence.
+    #[test]
+    fn the_appendix_places_the_key_under_real_parent_directories() {
+        let seq = AtomicU64::new(2070);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        const BASE: &[u8] = b"070701selector";
+        const BASE_LEN: usize = BASE.len();
+        let initramfs = dir.join("selector-initramfs.cpio");
+        fs::write(&initramfs, BASE).unwrap();
+        // 0444, as `fs::copy` from a store output leaves it: `copy_canonical`
+        // fixes a non-executable store file at that mode, so an append onto the
+        // copy is EACCES. A writable 0644 fixture — which `fs::write` gives —
+        // passes whatever the code does about permissions, and did.
+        fs::set_permissions(&initramfs, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let trust = RunTrust::generate().unwrap();
+        append_trusted_key(&initramfs, &trust.trusted_key_line()).unwrap();
+        let bytes = fs::read(&initramfs).unwrap();
+
+        let members = appendix_members(&bytes, BASE_LEN);
+        let names: Vec<&str> = members.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["etc", "etc/td", "etc/td/deployment.pub"],
+            "the literal path td-boot will open, and every parent of it"
+        );
+        assert_eq!(
+            td_boot_protocol::TRUSTED_KEY_PATH,
+            "etc/td/deployment.pub",
+            "the shared constant must be the path asserted above"
+        );
+
+        const S_IFMT: u32 = 0o170000;
+        const S_IFDIR: u32 = 0o040000;
+        const S_IFREG: u32 = 0o100000;
+        for (name, mode, _) in &members {
+            let expected = if name == "etc/td/deployment.pub" { S_IFREG } else { S_IFDIR };
+            assert_eq!(
+                mode & S_IFMT,
+                expected,
+                "{name} has the wrong type bits — a parent that is not a directory \
+                 gives ENOTDIR and the kernel skips the file in silence"
+            );
+        }
+
+        // And the key bytes are this run's public half in the documented wire
+        // format, not something that merely parses.
+        let (_, _, key) = members
+            .iter()
+            .find(|(n, _, _)| n == "etc/td/deployment.pub")
+            .expect("the key member");
+        assert_eq!(key, &trust.trusted_key_line());
+        assert_eq!(decode_hex_fixture::<32>(key), trust.public);
+    }
+
+    /// The wire format DESIGN.md §6 fixes: lowercase hex and one trailing
+    /// newline. Both readers accept uppercase, so neither would notice.
+    #[test]
+    fn hex_line_is_lowercase_hex_with_one_trailing_newline() {
+        assert_eq!(hex_line(&[0x00, 0xff, 0xa5]), b"00ffa5\n".to_vec());
+        assert_eq!(hex_line(&[0xde, 0xad, 0xbe, 0xef]), b"deadbeef\n".to_vec());
+        let signature = hex_line(&[0u8; 64]);
+        assert_eq!(signature.len(), 129, "64 bytes as hex plus the newline");
+        assert!(signature.iter().all(|b| b.is_ascii_lowercase()
+            || b.is_ascii_digit()
+            || *b == b'\n'));
+    }
+
+    /// The WIRING, which none of the other tests reach: that what
+    /// `provision_selector` hands back is a different file from the store
+    /// output, carries the run's key, and leaves the original alone.
+    ///
+    /// A review mutated four ways of losing this — returning the source instead
+    /// of the copy, dropping the append in either caller, and booting the
+    /// unprovisioned selector — and all four survived the whole suite. Three
+    /// are now type errors (`VerifiedSelector`'s path is private, and this is
+    /// the only way out of it); this covers the fourth, which is a body a
+    /// compiler cannot object to.
+    #[test]
+    fn provisioning_returns_a_keyed_copy_and_leaves_the_store_output_alone() {
+        let seq = AtomicU64::new(2080);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        const BASE: &[u8] = b"070701selector";
+        const BASE_LEN: usize = BASE.len();
+
+        // A stand-in store output: 0444, as `copy_canonical` leaves a
+        // non-executable file.
+        let store = dir.join("store-selector-initramfs.cpio");
+        fs::write(&store, BASE).unwrap();
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let out = dir.join("images");
+        fs::create_dir(&out).unwrap();
+        let trust = RunTrust::generate().unwrap();
+        let booted = provision_selector(&VerifiedSelector(store.clone()), &out, &trust).unwrap();
+
+        assert_ne!(booted, store, "the bootable path must not be the store output");
+        assert!(booted.starts_with(&out), "the copy belongs in the destination dir");
+
+        // The store output is untouched, bytes and mode: the append widens the
+        // COPY, and a chmod of the original would break the store's invariant.
+        assert_eq!(fs::read(&store).unwrap(), BASE);
+        assert_eq!(
+            fs::metadata(&store).unwrap().permissions().mode() & 0o777,
+            0o444,
+            "the store output's mode must survive provisioning"
+        );
+
+        // The copy is widened by exactly the owner-write bit, not flattened to
+        // a literal: 0444 becomes 0644, and nothing gains group or world write.
+        // Pinned because a mode wide enough to append is also a mode wide
+        // enough to be rewritten by anything sharing the directory.
+        assert_eq!(
+            fs::metadata(&booted).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "the provisioned copy takes owner-write and nothing else"
+        );
+
+        // And what boots really does carry this run's key.
+        let bytes = fs::read(&booted).unwrap();
+        assert!(bytes.starts_with(BASE), "the base archive must still be first");
+        let members = appendix_members(&bytes, BASE_LEN);
+        let names: Vec<&str> = members.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["etc", "etc/td", "etc/td/deployment.pub"]);
+        let (_, _, key) = members
+            .iter()
+            .find(|(n, _, _)| n == "etc/td/deployment.pub")
+            .expect("the key member");
+        assert_eq!(decode_hex_fixture::<32>(key), trust.public);
+    }
+
+    #[test]
+    fn key_path_parents_are_every_proper_prefix_shallowest_first() {
+        assert_eq!(key_path_parents(), vec!["etc", "etc/td"]);
+    }
+
+    /// `(name, mode, data)` for each member of the appendix, walked from the
+    /// offset alignment REQUIRES it to start at — computed, never searched
+    /// for, since a search finds the appendix wherever it landed and so cannot
+    /// fail on a misalignment. The fixture base opens with `070701` to make
+    /// that concrete.
+    fn appendix_members(bytes: &[u8], base_len: usize) -> Vec<(String, u32, Vec<u8>)> {
+        let mut at = base_len.next_multiple_of(4);
+        assert_eq!(
+            &bytes[at..at + 6],
+            b"070701",
+            "the appendix must start at {at}, the first 4-aligned offset past the \
+             {base_len}-byte base — the kernel reports nothing if it does not"
+        );
+        for (offset, byte) in bytes.iter().enumerate().take(at).skip(base_len) {
+            assert_eq!(*byte, 0, "padding at {offset} must be NUL");
+        }
+
+        let mut members = Vec::new();
+        loop {
+            assert_eq!(at % 4, 0, "header at {at} is not 4-aligned");
+            assert_eq!(&bytes[at..at + 6], b"070701", "magic at {at}");
+            let field = |i: usize| {
+                let s = at + 6 + i * 8;
+                u32::from_str_radix(std::str::from_utf8(&bytes[s..s + 8]).unwrap(), 16).unwrap()
+            };
+            let (mode, filesize, namesize) =
+                (field(1), field(6) as usize, field(11) as usize);
+            let name =
+                String::from_utf8(bytes[at + 110..at + 110 + namesize - 1].to_vec()).unwrap();
+            let data = (at + 110 + namesize).next_multiple_of(4);
+            at = (data + filesize).next_multiple_of(4);
+            if name == "TRAILER!!!" {
+                assert_eq!(at, bytes.len(), "the walk must consume the archive exactly");
+                return members;
+            }
+            members.push((name, mode, bytes[data..data + filesize].to_vec()));
+            assert!(members.len() < 16, "walked off the end without a trailer");
+        }
+    }
+
+    fn decode_hex_fixture<const N: usize>(text: &[u8]) -> [u8; N] {
+        let trimmed = text.trim_ascii();
+        assert_eq!(trimmed.len(), N * 2, "expected {N} bytes of hex");
+        let mut out = [0u8; N];
+        for (slot, pair) in out.iter_mut().zip(trimmed.chunks_exact(2)) {
+            *slot = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
+        }
+        out
     }
 
     #[test]
@@ -3153,7 +3653,7 @@ mod tests {
             format!("td-deployment-v1\n{digest}  {name}\n"),
         )
         .unwrap();
-        assert_eq!(verify_selector(&dir).unwrap(), dir.join(name));
+        assert_eq!(verify_selector(&dir).unwrap().0, dir.join(name));
 
         fs::write(dir.join(name), b"tampered").unwrap();
         let error = verify_selector(&dir).unwrap_err();
@@ -3172,7 +3672,7 @@ mod tests {
         }
         let id = "a".repeat(64);
         let seed = dir.join("seed");
-        populate_persistent_seed(&deployment, &seed, &id).unwrap();
+        populate_persistent_seed(&deployment, &seed, &id, &RunTrust::generate().unwrap()).unwrap();
 
         let installed = seed.join(td_boot_protocol::DEPLOYMENTS_DIR).join(&id);
         assert_eq!(fs::read(installed.join("manifest")).unwrap(), b"manifest");

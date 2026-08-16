@@ -113,8 +113,10 @@ closed on its first boot. The first thing the installer ever does would be
 the thing that bricks it.
 
 Fail-closed means: a missing signature, a malformed signature, a signature by
-a key other than the pinned one, or a manifest that does not verify, each
+a key other than the trusted one, or a manifest that does not verify, each
 refuse the deployment. There is no permissive mode and no flag to add one.
+"Trusted" rather than "pinned": §6 settled on a key read at runtime from the
+selector initramfs, so there is no build-time pin to be other than.
 
 **D3. The signature is DETACHED and the id is unchanged by it.** The
 deployment id stays `sha256(manifest)`. The signature lives beside the
@@ -271,10 +273,28 @@ refuses `S >= L`, non-canonical encodings, keys outside the prime-order
 subgroup, and small-order `R`. It reaches SHA-512 as `crate::sha512`, so a
 consumer must declare **both** modules at its crate root; they are a pair.
 
-### Where the trusted public key lives — OPEN
+### Where the trusted public key lives — SETTLED
 
-This is not settled, and it is recorded here rather than decided quietly
-because a first answer turned out to be unbuildable.
+**In the SELECTOR initramfs** (`boot/selector-initramfs.cpio`), in a cpio
+archive the harness appends, at `TRUSTED_KEY_PATH` — `etc/td/deployment.pub`,
+declared in `td-boot/src/protocol.rs` so the writer and the reader cannot
+disagree about the spelling.
+
+*Which* initramfs is the whole of the answer and the sentence below that says
+only "the initramfs the firmware loads" was not specific enough to prevent a
+wrong implementation of itself. td builds two: the selector, which firmware
+loads and in whose rootfs `td-boot boot` runs when it selects, verifies and
+kexecs; and the deployment's own, which is a payload the manifest hashes and
+which lives on the Btrfs volume. Only the first is right. A key in the second
+is inside the artifact being authenticated — a hostile update source supplies
+bundle, key and signature together and self-authenticates, which is exactly
+the Btrfs-volume weakening the first bullet below forbids by name. It also
+breaks D3: the key would be hashed into the deployment's initramfs, so
+rotating it would rename the deployment.
+
+The reasoning that got here is kept below rather than replaced by the answer,
+because a first answer turned out to be unbuildable and that is the
+load-bearing part of the record.
 
 The intent was that td-boot's key be pinned at build time. It cannot be a key
 the test harness generates: every recipe embeds its sources with
@@ -328,7 +348,8 @@ correction matters because the whole appeal of the mechanism was that the
 kernel would catch the mistake loudly. It does not, twice over. `do_reset`
 eats the NUL run and errors `broken padding` (`:324-331`) — not `invalid
 magic`, which is unreachable here, because that error sets `message` and the
-driver loop is `while (!message && len)`. And td's deployment initramfs is an
+driver loop is `while (!message && len)`. And td's selector initramfs — the
+one this appendix rides — is an
 **initrd** (`CONFIG_INITRAMFS_SOURCE=""`, qemu `-initrd`), so it takes
 `:726-733` rather than the `panic_show_mem` the built-in archive gets at
 `:714-716`; with `CONFIG_BLK_DEV_RAM` off — allnoconfig leaves it off and the
@@ -352,6 +373,34 @@ rewrite td-boot itself, so pinning buys nothing against them. What D5 does
 rule out is treating the ESP as a place where a key could be *safely* left
 for something else to trust; the key is only as good as the binary beside it,
 and that is the whole of the claim.
+
+**What is built.** The system oracle generates a throwaway ed25519 keypair per
+run from `/dev/urandom` (`RunTrust`). The public half is appended to a *copy*
+of the verified selector initramfs — the copy is what boots, so the recipe
+output and its own manifest stay intact — and the private half signs the
+manifest of **every** deployment the run stages onto the volume: the seed that
+`current` and `previous` point at, and every candidate. Signing only candidates
+would leave the ordinary boot path unsigned, and fail-closed verification would
+then refuse the deployment nearly every mode boots. Nothing is committed and
+nothing is stored; the private half is dropped when the run ends.
+
+This is what dissolves the contradiction recorded above as unbuildable.
+"Build-pinned" and "no committed private key" cannot both hold — and neither
+does. The key is per-run.
+
+D3 survives because the key is not in any deployment: the deployment id stays
+`sha256(manifest)`, re-signing under another key changes only `manifest.sig`,
+and `run_system` — which recreates its fixture and requires the ids to be
+unchanged — keeps working. A key hashed into a deployment's initramfs would
+break all three at once.
+
+Two things the appendix must carry that are easy to omit, both because the
+kernel declines in silence rather than complaining. It emits its own `etc` and
+`etc/td` directory entries — derived from `TRUSTED_KEY_PATH` rather than
+written beside it — since a missing parent is `filp_open` returning 0
+(`init/initramfs.c:385-387`), and a parent that exists but is not a directory
+is ENOTDIR through the same path. And it is padded to a 4-byte boundary at the
+join, which per the correction above nothing downstream would report.
 
 ### The signature file
 
@@ -627,12 +676,14 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    `manifest.sig` beside the manifest and treats a changed signature on an
    already-published deployment as an update rather than a no-op. Still
    nothing that verifies — this is the half that makes a signature able to
-   REACH a machine, and it needs no answer to the open question below.
+   REACH a machine, and it needs no answer to the §6 key question above.
 5. **The verifier reaches the target** (§6): td-boot `#[path]`-includes
    `ed25519.rs` and `sha512.rs`, its recipe stages them, and it gains a hex
    decoder, a trusted-key reader, and `authenticate_manifest` — reached by
    one new verb, `td-boot authenticate <deployment-directory>
-   <trusted-key>`, which answers authenticity and nothing else. The BOOT
+   [trusted-key]`, which answers authenticity and nothing else. (The key
+   became optional with item 6's provisioning half, defaulting to
+   `TRUSTED_KEY_PATH`; it was mandatory when this landed.) The BOOT
    path is untouched, which is the shape items 3 and 4 landed in; what this
    settles is that the target-static build carries those sources, separately
    from the boot-path change that depends on it.
@@ -648,16 +699,29 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    td-boot has the verifier and deliberately not the signer; every negative
    needs no signer at all.
 6. **Verification, target-side, fail-closed** (§6, D2): `td-boot` refuses a
-   deployment whose manifest does not verify, and the system oracle signs the
-   bundle it stages and gains a wrong-key negative control. This is the
-   increment that decides the OPEN question in §6 — where the trusted key
-   lives — because it is the first one whose ANSWER has to reach a running
-   machine. It was scoped with item 3 as a single landing and split three
-   times: as that question turned out to be unsettled, as carrying the file
-   turned out to be its own increment, and as getting the verifier into the
-   target binary turned out to be separable from deciding what it trusts.
-   Each earlier half needs no answer to the question; this one cannot
-   proceed without one.
+   deployment whose manifest does not verify. This is the increment that
+   needed §6's key question answered — where the trusted key lives — because
+   it is the first one whose ANSWER has to reach a running machine. It was
+   scoped with item 3 as a single landing and has been split five times: as
+   that question turned out to be unsettled, as carrying the file turned out
+   to be its own increment, as getting the verifier into the target binary
+   turned out to be separable from deciding what it trusts, and then twice
+   more inside the answer itself.
+
+   Two of those halves are done and are what settled §6. First a newc cpio
+   WRITER in the engine (`engine/src/cpio.rs`), since the mechanism is an
+   appended archive and the tree had no writer at all. Then PROVISIONING:
+   the oracle's `RunTrust` puts a per-run public key in the selector
+   initramfs it boots and signs every deployment it stages with the private
+   half. Both are host-side and change no boot path, which is what makes
+   them separable from the flip.
+
+   What remains is the POLICY, and it is deliberately last, because until
+   td-boot refuses there is nothing to distinguish a run whose key arrived
+   from one whose key did not — which per §6's alignment correction is also
+   what a misaligned appendix silently produces. The flip lands with the
+   wrong-key negative control that proves refusal happens, and it is where
+   `td-boot authenticate`'s default key path stops being merely a default.
 7. **`td-install`**, a standalone crate outside the workspace (D9): GPT +
    FAT32 ESP + Btrfs volume onto a device or a regular file,
    `#[path]`-including `gpt.rs`/`fat.rs`/`crc32.rs` and `protocol.rs`, and
