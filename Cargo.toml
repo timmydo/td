@@ -39,6 +39,10 @@
 #                     assigner; pure safe std with no broker daemon.
 #   td-compositor/  — the target-built software Wayland compositor; its only
 #                     unsafe is the confined SCM_RIGHTS syscall layer.
+#   td-install/     — the disk installer: GPT + the FAT32 EFI System Partition
+#                     + the td volume, onto a block device or a regular file.
+#                     Pure std, sharing the engine GPT/FAT32/CRC-32 writers and
+#                     td-boot's on-disk protocol so the layout is stated once.
 #   td-review/      — a HOST-side integrator utility (branch review + squash
 #                     landing TUI). In neither bootstrap graph: it is not a
 #                     control-plane build program and never enters a closure.
@@ -47,7 +51,7 @@
 [workspace]
 resolver = "2"
 members = ["builder", "recipes", "engine"]
-exclude = ["net", "td-kexec", "td-sh", "td-txt", "td-netd", "td-boot", "td-util", "td-init", "td-firstboot", "td-seatd", "td-compositor", "td-review", "td-svc", "tests/sshd"]
+exclude = ["net", "td-kexec", "td-sh", "td-txt", "td-netd", "td-boot", "td-install", "td-util", "td-init", "td-firstboot", "td-seatd", "td-compositor", "td-review", "td-svc", "tests/sshd"]
 
 [profile.release]
 # Keep the release profile explicit and minimal so the reproducibility oracle

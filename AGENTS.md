@@ -438,10 +438,12 @@ td's Rust is defensive and minimal-surface.
   way. The gate enforces it on the ONE workspace-root `Cargo.lock`: exactly 3
   `[[package]]` entries (the known path members) AND no external `source = ` line
   (path members carry none), so a new registry/git dep OR a new path member both red it.
-  The target-side `td-kexec`, `td-sh`, `td-txt`, `td-netd`, `td-boot`, `td-util`,
-  `td-init`, `td-firstboot`, `td-login`, `td-svc`, `td-seatd`, and `td-compositor`
+  The target-side `td-kexec`, `td-sh`, `td-txt`, `td-netd`, `td-boot`,
+  `td-install`, `td-util`, `td-init`, `td-firstboot`, `td-login`, `td-svc`,
+  `td-seatd`, and `td-compositor`
   crates outside the workspace each keep their own 1-package lock; `td-txt`,
-  `td-boot`, `td-firstboot`, and `td-seatd` contain no `unsafe`, and the rest are
+  `td-boot`, `td-install`, `td-firstboot`, and `td-seatd` contain no `unsafe`,
+  and the rest are
   the surfaces `UNSAFE.md` records — including why each stays at the size it is.
   `td-review` (the host-side integrator branch-review/landing TUI) keeps one
   too: it is in NEITHER bootstrap graph — no recipe builds it and it never
@@ -449,7 +451,13 @@ td's Rust is defensive and minimal-surface.
   `unsafe_code`, and rides the same cargo-test gate, so the coding rules are
   enforced on it like any other td crate. A new standalone crate must be added to
   that gate and to `builder/src/affected.rs` in its landing, or its lints and tests
-  never run.
+  never run. In `affected.rs` that means BOTH the `DEPENDENCY_FREE_LOCKS` roster
+  and a `cargo test` AND `cargo clippy` line in `CARGO_TEST_CMDS`: the gate file
+  is inert while the in-loop tier is unprovisioned, so the preflight's command
+  list is what actually compiles anything. `td-install` landed guarded-but-never-
+  built for exactly that reason, and
+  `every_guarded_lock_has_a_preflight_that_compiles_it` is the check that now
+  refuses it.
   The network tools (`fetch`/`feed`/`subst`) are the *only* crates allowed dependencies,
   and only the vendored-through-the-cargo-proxy FSDG set they already have
   (`ureq`/`rustls`/`sha2`/`ring`); a *new* dependency anywhere is a reviewed decision

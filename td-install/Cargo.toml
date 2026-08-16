@@ -1,0 +1,40 @@
+[package]
+name = "td-install"
+version = "0.1.0"
+edition = "2021"
+description = "td's disk installer: GPT, the EFI System Partition, and the td volume"
+license = "GPL-3.0-or-later"
+
+# Own workspace root, for td-boot's reason: the engine root manifest excludes this
+# crate, but that exclude only stops cargo at that manifest — from a nested checkout
+# (.claude/worktrees/*, which lives physically under the main checkout) cargo would
+# keep walking up and be captured by the outer manifest, which lists neither member
+# nor exclude for the nested path. An explicit empty `[workspace]` pins THIS as the
+# root and stops the walk, so `cargo clippy/test` works identically from the main
+# checkout or a worktree.
+[workspace]
+
+[[bin]]
+name = "td-install"
+path = "src/main.rs"
+
+# td-install is a TARGET-built program outside the control-plane workspace, with
+# zero external dependencies. It compiles this source plus the shared engine GPT,
+# FAT32 and CRC-32 writers and td-boot's on-disk protocol directly with rustc.
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+strip = true

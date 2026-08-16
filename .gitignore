@@ -77,6 +77,10 @@ td-svc/target/
 # validating the login chain.
 td-login/target/
 
+# td-install: the installer is built directly while developing and by the
+# cargo-test gate, which redirects CARGO_TARGET_DIR to a scratch dir.
+td-install/target/
+
 # td's minimal graphical stack is built directly during development and by
 # rustc in its recipes; the gate uses a scratch CARGO_TARGET_DIR.
 td-compositor/target/

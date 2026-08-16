@@ -81,7 +81,8 @@ What is **missing**, and what this workstream is:
 - No update channel.
 
 `engine/src/gpt.rs` + `engine/src/fat.rs` (with `engine/src/crc32.rs`)
-landed toward it and are not yet consumed by anything.
+landed toward it and were consumed by nothing until §10 item 7a, which is
+the installer that writes what they produce.
 `engine/src/ed25519.rs` + `engine/src/sha512.rs` (verify-only, `aa347e60`)
 were in that list until §10 item 5: td-boot compiles them in, and since item
 6's flip the boot path CALLS them — no slot is selected whose manifest does
@@ -195,19 +196,28 @@ runs.
 
 ## 4. Disk layout
 
+Positions are in SECTORS of the destination's own logical size, not in
+512-byte units. The entry array is 16 KiB and the first partition starts at
+1 MiB whatever that size is, so the LBA numbers below differ between a 512e
+and a 4Kn disk while the byte offsets do not:
+
 ```text
-LBA 0            protective MBR
-LBA 1            primary GPT header
-LBA 2..33        primary partition entry array (128 x 128 bytes)
-LBA 2048..       partition 1: EFI System Partition, FAT32
-                 partition 2: td, Btrfs
-last-33..last-1  backup entry array
-last             backup GPT header
+LBA 0                    protective MBR
+LBA 1                    primary GPT header
+LBA 2..                  primary partition entry array (128 x 128 bytes;
+                           16 KiB, so 32 LBAs at 512 and 4 at 4096)
+1 MiB..                  partition 1: EFI System Partition, FAT32
+                         partition 2: td, Btrfs
+last - (1 + array)..     backup entry array
+last                     backup GPT header
 ```
 
-Partitions start at 2048 sectors (1 MiB) and are megabyte-aligned, which is
-what every current partitioner does and what keeps writes off the wrong side
-of an erase block on flash media.
+Partitions start at 1 MiB and are megabyte-aligned, which is what every
+current partitioner does and what keeps writes off the wrong side of an erase
+block on flash media. At 512 bytes that is LBA 2048 and at 4096 it is LBA
+256; `td-install` derives it by dividing rather than naming either, because a
+4Kn disk laid out in 512-byte sectors has every LBA off by a factor of eight
+and firmware reads that as no table at all.
 
 **The ESP is at least 33 MiB.** This is not a round number chosen for
 comfort: `engine/src/fat.rs` refuses to format a volume below **66599
@@ -804,6 +814,79 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    `Cargo.lock` assertion plus its clippy and test lines
    (`builder/src/gate_defs/325-cargo-test.rs`), a route and assertions in
    `builder/src/affected.rs`, and the workspace `exclude` list.
+
+   Split in three, because the volume and the publish each bring a
+   dependency the layout does not. **7a, the LAYOUT**, is landed: the crate,
+   its three registration points, and a `layout` verb that writes the
+   protective-MBR GPT and formats the ESP. That is what finally gives
+   `gpt.rs` and `fat.rs` a consumer — §2 listed them as landed toward this
+   and used by nothing.
+
+   Two things in it are worth finding here rather than in the code. The
+   disk LAYOUT constants live in `td-boot/src/protocol.rs` with the rest of
+   the on-disk shape, for D1's reason: `td-install` writes the partitions
+   and td-boot reads what is inside them, and a layout stated twice can
+   disagree with itself at the first boot after an install. And the ESP's
+   metadata region is ZEROED before it is formatted, because `fat.rs` states
+   that precondition and cannot check it — it emits only what must be
+   non-zero, so over a disk that already held a filesystem the bytes past
+   the live FAT prefix read as ALLOCATED clusters. Zeroing the whole ESP
+   would also satisfy it, at half a gigabyte of writes per install; the
+   reserved sectors, both FATs and the root cluster are enough, and past
+   them every cluster reads free.
+
+   Neither the size nor the sector size is assumed from which destination it
+   is. Both are asked: the size by seeking to the end, which answers for a
+   device as well as a file and keeps D8 intact where `BLKGETSIZE64` would
+   not, and the sector size from sysfs by the opened file's device NUMBER —
+   `losetup`'s argument, since a path can name a different device than the
+   descriptor is open on. A 4Kn disk laid out in 512-byte sectors has every
+   LBA off by eight, which firmware reads as no table at all.
+
+   **7b** adds the Btrfs volume and the `mkfs.btrfs` binding D7 requires to
+   land with the exec. **7c** delegates the publish to `td-boot install`.
+   `recipe-checks` joins td-install's route in whichever of those adds a
+   recipe that builds it; until then routing there would run a check that
+   cannot see the crate.
+
+   **OPEN, and 7b's first problem: writing a partition table does not make
+   Linux reread one.** On a block device the kernel keeps serving the
+   partition layout it already has, so `/dev/sda1` may not exist after a
+   layout on a blank disk, and may still have the OLD bounds after a
+   reinstall. Nothing in 7a needs it — the layout writes offsets on the
+   whole-disk descriptor it opened — but 7b execs `mkfs.btrfs` on the volume
+   partition and 7c publishes into it, and both need the kernel to agree
+   about where that partition is. This is not visible in the regular-file
+   tests and will not be: a file has no partition devices at all, which is
+   the one place D9's single code path genuinely stops.
+
+   The conventional mechanism is the `BLKRRPART` ioctl (`_IO(0x12, 95)`,
+   `block/ioctl.c`), which needs `CAP_SYS_ADMIN`, must be issued on the whole
+   disk rather than a partition, and returns EBUSY from
+   `disk_scan_partitions` if ANY partition is currently open — so a reinstall
+   onto a disk with something mounted cannot rescan at all. D8 forbids it
+   without an `UNSAFE.md` amendment, since an ioctl is not reachable from
+   safe `std` and would make `td-install` a NINTH entry on that roster.
+
+   One tempting way out does not exist, and is written down because it reads
+   like it should: the kernel does NOT rescan when the last writable
+   descriptor on a whole-disk device is closed. `GD_NEED_PART_SCAN` is set in
+   four places — a disk appearing (`add_disk_final`), removable media
+   actually changing (`disk_check_media_change`), `disk_scan_partitions`
+   itself, and nbd — and `bdev_release` is not among them. It syncs and
+   flushes media-change events and nothing else. The rescan on open fires
+   only if that flag is already set.
+
+   So 7b chooses between amending `UNSAFE.md` for one ioctl, a loop device
+   over the partition's byte range (which needs `LOOP_SET_STATUS64` for the
+   offset, another ioctl, so it trades the surface rather than avoiding it),
+   and using NO partition device at all: `mkfs.btrfs` into a file sized to
+   the partition, then those bytes written at the partition offset through
+   the whole-disk descriptor td-install already holds — which is exactly how
+   it writes the ESP today, and the only one of the three that keeps both D8
+   and D9 intact. Whichever it is gets recorded here before 7b execs
+   anything, rather than discovered in a diff, which is what D8's last
+   sentence asks for.
 8. **The EFI-stub kernel** (§5): `CONFIG_EFI`, `CONFIG_EFI_STUB`,
    `CONFIG_CMDLINE` in `linux-x86-64.rs`, having first confirmed what
    `CONFIG_EFI` drags in on the pinned tree.

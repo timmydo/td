@@ -43,6 +43,37 @@ pub const BOOT_DIR: &str = "td/boot";
 pub const ATTEMPTS_DIR: &str = "td/boot/attempts";
 pub const DEPLOYMENTS_DIR: &str = "td/deployments";
 pub const SELECTOR_PREFIX: &str = "../deployments/";
+// The DISK layout, stated here for D1's reason: `td-install` writes it and
+// td-boot reads what sits inside it, and a layout stated twice is a layout that
+// can disagree with itself — at the first boot after an install rather than at
+// build time.
+//
+// The ESP is sized for several kernel + initramfs pairs rather than for one,
+// because item 8's EFI stub puts them there and a full ESP is discovered by an
+// update that cannot finish. Its FAT label is at most 11 characters, which the
+// FAT32 boot sector pads rather than checks.
+// Scoped `dead_code` because these six have exactly one reader and it is not
+// td-boot: `td-install` reaches them through the same `#[path]` include, which
+// is the point of their being here rather than there. Without it td-boot's
+// clippy — which the preflight really does run — carries six warnings forever,
+// and a clean lint run is what makes the next real one visible.
+#[allow(dead_code)]
+pub const ESP_PARTITION_NAME: &str = "td-esp";
+#[allow(dead_code)]
+pub const ESP_VOLUME_LABEL: &str = "TD-ESP";
+#[allow(dead_code)]
+pub const ESP_BYTES: u64 = 512 * 1024 * 1024;
+#[allow(dead_code)]
+pub const VOLUME_PARTITION_NAME: &str = "td-volume";
+// Two deployments plus the attempt bookkeeping, with room for the update that
+// installs the third before retiring the first.
+#[allow(dead_code)]
+pub const MIN_VOLUME_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+// 1 MiB, the alignment every partition start is held to. A start that ignores
+// it reads and writes across a physical block boundary forever, and nothing
+// reports it — `gpt.rs` refuses 0 for the same reason.
+#[allow(dead_code)]
+pub const PARTITION_ALIGN_BYTES: u64 = 1024 * 1024;
 // Raising this changes the v1 reader contract; bump or migrate the format with it.
 pub const ATTEMPT_V1_MAX_REMAINING: u8 = 3;
 pub const DEFAULT_BOOT_ATTEMPTS: u8 = ATTEMPT_V1_MAX_REMAINING;

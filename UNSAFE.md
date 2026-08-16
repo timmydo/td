@@ -24,6 +24,16 @@ value-pinned request, or a second scoped `#[allow]` is likewise an
 amendment to this file, and to the crate's own normative doc where it has
 one.
 
+Standalone crates that carry NO `unsafe` are not on the roster and do not
+need to be, but two of them are worth naming because they look like they
+would need one and do not: `td-boot` verifies a signature and kexecs
+through a helper, and `td-install` writes GPT and FAT32 onto a block
+device. Partition tables and filesystems are bytes at offsets, a device's
+size is a `seek`, and its sector size is a file under `/sys` — so
+`td-install/DESIGN.md`'s D8 asks for that to stay true, and where a later
+increment cannot keep it (rereading a partition table needs `BLKRRPART`,
+an ioctl) the amendment is made here first rather than found in a diff.
+
 ## Roster
 
 | # | crate | syscalls |
