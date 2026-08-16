@@ -3891,6 +3891,88 @@ mod tests {
         }
     }
 
+    /// A `)` that ends a case PATTERN closes no substitution. It is the one
+    /// thing a `)` token cannot say for itself, so the walk that finds the
+    /// closer carries the little of the grammar that answers it -- and the
+    /// answer has to hold in both directions, since reading `case` where it is
+    /// an ordinary word would run the scan past the closer instead.
+    /// Measured against busybox ash 1.37.0.
+    #[test]
+    fn a_case_patterns_paren_does_not_close_a_substitution() {
+        let l = r#"while read x || [ -n "$x" ]; do echo [$x]; done"#;
+        // A here-document body is the other region only the lexer sees; its `(`
+        // used to cancel the pattern's `)` in a count, and cancels nothing now.
+        assert_eq!(
+            run(&format!("echo $({l} <<E\n(\nE\ncase x in x) echo p;; esac)")),
+            (0, "[(] p\n".to_string(), String::new())
+        );
+        for (src, want) in [
+            ("echo $(case x in x) echo hit;; esac)", "hit\n"),
+            ("echo $(case x in\nx) echo hit;;\nesac)", "hit\n"),
+            // The optional opener, alternation, several arms, the default arm.
+            ("echo $(case x in (x) echo hit;; esac)", "hit\n"),
+            ("echo $(case x in a|x) echo hit;; esac)", "hit\n"),
+            ("echo $(case y in x) echo a;; y) echo b;; esac)", "b\n"),
+            ("echo $(case z in x) echo a;; *) echo d;; esac)", "d\n"),
+            // An arm with no `;;` before `esac`, and a case with no arm at all.
+            ("echo $(case x in x) echo hit; esac)", "hit\n"),
+            ("echo $(case x in esac; echo after)", "after\n"),
+            // A `)` inside an arm that IS a closer -- a subshell's -- and a
+            // whole nested case, whose patterns are pinned to their own depth.
+            ("echo $(case x in x) (echo sub);; esac)", "sub\n"),
+            (
+                "echo $(case x in x) case y in y) echo deep;; esac;; esac)",
+                "deep\n",
+            ),
+            // A case that a command can start before: after `then`, after `do`,
+            // and after a pattern's own `)`, which has no separator after it.
+            ("echo $(if :; then case x in x) echo t;; esac; fi)", "t\n"),
+            ("echo $(for i in 1; do case x in x) echo d;; esac; done)", "d\n"),
+            // The substitution keeps closing where it did: after `esac`, with a
+            // command still to come, and around a nested substitution.
+            ("echo $(case x in x) echo hit;; esac; echo tail)", "hit tail\n"),
+            ("echo $(case x in x) echo $(echo in);; esac)", "in\n"),
+            // `(` that only the LEXER hides: a `${...}` operand and a
+            // here-document body. A count sees them and they used to cancel the
+            // pattern's `)`; nothing cancels it now, so the rule above is what
+            // these turn on.
+            ("echo $(echo ${x:-(}; case x in x) echo p;; esac)", "( p\n"),
+            // ... and the other direction: `case` is a reserved word only where
+            // a command could start, so none of these opens one.
+            ("echo $(echo case)", "case\n"),
+            ("echo $(echo esac)", "esac\n"),
+            ("echo $(echo case x in)", "case x in\n"),
+            // ... and a word that opens a command only where it is one ITSELF.
+            // `echo if` leaves ash at an argument, so the `case` after it is an
+            // argument too, and the `)` is the closer it always was.
+            ("echo $(echo if case x in a)", "if case x in a\n"),
+            ("echo $(echo then case x in)", "then case x in\n"),
+            ("echo $(echo { case x in a)", "{ case x in a\n"),
+            // `esac` likewise: it ends an arm only from a command position, so
+            // one echoed inside an arm leaves the case running.
+            ("echo $(case y in x) echo esac;; y) echo hit;; esac)", "hit\n"),
+            // ... and it is only RESERVED where a pattern may start. Past a `(`
+            // or a `|` it is a pattern word, which ash checks no keyword at.
+            ("echo $(case esac in (esac) echo hit;; esac)", "hit\n"),
+            ("echo $(case esac in a|esac) echo hit;; esac)", "hit\n"),
+            ("echo $(case esac in \"esac\") echo hit;; esac)", "hit\n"),
+            // A function header's `()` is the other place a command starts with
+            // no separator before it -- a body needs no braces to be a case.
+            ("echo $(f() case x in x) echo yes;; esac; f)", "yes\n"),
+            ("echo $(f() { case x in x) echo y;; esac; }; f)", "y\n"),
+            ("echo $(echo \"case x in\")", "case x in\n"),
+            ("case=1; echo $(echo $case)", "1\n"),
+        ] {
+            assert_eq!(run(src), (0, want.to_string(), String::new()), "{src:?}");
+        }
+        // A case the body never closes is still a refusal, as it is for ash.
+        for src in ["echo $(case x in x) echo hit)", "echo $(case x in x"] {
+            let (status, out, err) = run(src);
+            assert_eq!((status, out.as_str()), (2, ""), "{src:?}");
+            assert!(!err.is_empty(), "{src:?}");
+        }
+    }
+
     /// Finding the closer is a LEXING pass of its own, so it can recurse and it
     /// can fail. Both exits route to the paren count, which does neither.
     #[test]

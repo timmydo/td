@@ -685,7 +685,6 @@ xfail command-sub.test.sh::Here doc with pipeline
 xfail command-sub.test.sh::Making keyword out of command sub should NOT work
 xfail command-sub.test.sh::More levels of double quotes in backticks
 xfail command-sub.test.sh::Nested backticks
-xfail command-sub.test.sh::case in subshell
 xfail command_.test.sh::$PATH lookup
 xfail command_.test.sh::Command block
 xfail command_.test.sh::File in relative subdirectory and no shebang is executed

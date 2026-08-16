@@ -212,14 +212,180 @@ fn is_word_end(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '|' | '&' | ';' | '<' | '>' | '(' | ')')
 }
 
+/// Where a `case` has got to. A `)` that ends a PATTERN closes nothing, and
+/// that is the one thing a `)` token cannot say for itself: ash knows because
+/// its parser reads the body, and this is that rule at the only place the scan
+/// needs it.
+enum CaseAt {
+    /// `case` is read, the word it selects on is not.
+    Subject,
+    /// The subject is read, `in` is not. Until `in` arrives this is a CANDIDATE
+    /// only -- `echo $(case)` is a word and a closer -- so a paren still counts.
+    In,
+    /// Where a pattern could START. `esac` HERE ends the case -- ash's
+    /// `parsecase` breaks on it wherever a pattern may begin, so a bare `esac`
+    /// is not a pattern in ash or bash, both measured.
+    PatternStart,
+    /// Inside a pattern list, past the optional `(` or a `|`, where `esac` is
+    /// an ordinary word: `case esac in (esac) …` matches.
+    PatternWords,
+    /// An arm's commands, until `;;` starts another pattern or `esac` ends it.
+    Body,
+}
+
+/// Whether the case walk consumed a token or left it to the paren rules.
+enum Took {
+    Whole,
+    Fall,
+}
+
+/// Words after which a command can START, so a `case` following one opens a
+/// case statement rather than being an argument. `is_word_end` cannot answer
+/// this: it is about characters, and this is about position.
+const OPENS_COMMAND: &[&str] = &["do", "then", "else", "elif", "{", "!", "if", "while", "until"];
+
+/// Advance the case walk by one token. `depth` pins each open `case` to the
+/// paren depth it began at, so a `)` inside a subshell in an arm's body is
+/// still an ordinary closer.
+fn step_case(
+    cases: &mut Vec<(CaseAt, usize)>,
+    tok: &Tok,
+    plain: Option<&str>,
+    depth: usize,
+    at_cmd: bool,
+) -> Took {
+    // Never consumed: the caller has to see the end of input to report it.
+    if matches!(tok, Tok::Eof) {
+        return Took::Fall;
+    }
+    let mut decided = None;
+    let mut pop = false;
+    if let Some((state, base)) = cases.last_mut() {
+        let at_base = *base == depth;
+        match state {
+            CaseAt::Subject => {
+                decided = Some(match tok {
+                    Tok::Newline => Took::Whole,
+                    Tok::Word(_) => {
+                        *state = CaseAt::In;
+                        Took::Whole
+                    }
+                    _ => {
+                        pop = true;
+                        Took::Fall
+                    }
+                })
+            }
+            CaseAt::In => {
+                decided = Some(match (tok, plain) {
+                    (Tok::Newline, _) => Took::Whole,
+                    (_, Some("in")) => {
+                        *state = CaseAt::PatternStart;
+                        Took::Whole
+                    }
+                    _ => {
+                        pop = true;
+                        Took::Fall
+                    }
+                })
+            }
+            // Everything here is the pattern's, the leading `(` included -- so
+            // neither paren moves the depth this arm is pinned to.
+            CaseAt::PatternStart if at_base => {
+                decided = Some(match (tok, plain) {
+                    (_, Some("esac")) => {
+                        pop = true;
+                        Took::Whole
+                    }
+                    (Tok::Op(Op::RParen), _) => {
+                        *state = CaseAt::Body;
+                        Took::Whole
+                    }
+                    (Tok::Newline, _) => Took::Whole,
+                    _ => {
+                        *state = CaseAt::PatternWords;
+                        Took::Whole
+                    }
+                })
+            }
+            CaseAt::PatternWords if at_base => {
+                decided = Some(match tok {
+                    Tok::Op(Op::RParen) => {
+                        *state = CaseAt::Body;
+                        Took::Whole
+                    }
+                    _ => Took::Whole,
+                })
+            }
+            CaseAt::Body if at_base => {
+                if matches!(tok, Tok::Op(Op::DSemi)) {
+                    *state = CaseAt::PatternStart;
+                    decided = Some(Took::Whole);
+                } else if at_cmd && plain == Some("esac") {
+                    pop = true;
+                    decided = Some(Took::Whole);
+                }
+            }
+            _ => {}
+        }
+    }
+    if pop {
+        cases.pop();
+    }
+    if let Some(t) = decided {
+        return t;
+    }
+    if at_cmd && plain == Some("case") {
+        cases.push((CaseAt::Subject, depth));
+        return Took::Whole;
+    }
+    Took::Fall
+}
+
 /// Lex forward to the `)` closing an open `$(`, returning where the BODY ends
 /// -- before the blanks ahead of that `)`, which belong to neither -- and where
 /// the `)` itself does.
 fn close_paren(lx: &mut Lexer) -> Syn<(usize, usize)> {
     let mut depth = 1usize;
+    let mut cases = Vec::new();
+    let mut at_cmd = true;
+    let mut open_paren = false;
     loop {
         let before = lx.sc.pos;
-        match lx.next_tok()? {
+        let tok = lx.next_tok()?;
+        let plain = match &tok {
+            Tok::Word(w) => w.plain(),
+            _ => None,
+        };
+        let took = step_case(&mut cases, &tok, plain, depth, at_cmd);
+        // A `)` that closes an empty `(` is a function HEADER's, after which the
+        // body -- a compound command, `case` among them -- begins with no
+        // separator. Only where the case walk left the parens alone.
+        let header = open_paren && matches!((&took, &tok), (Took::Fall, Tok::Op(Op::RParen)));
+        open_paren = matches!((&took, &tok), (Took::Fall, Tok::Op(Op::LParen)));
+        let was_cmd = at_cmd;
+        at_cmd = header
+            || matches!(
+            tok,
+            Tok::Newline
+                | Tok::Op(
+                    Op::Semi
+                        | Op::DSemi
+                        | Op::Amp
+                        | Op::AndIf
+                        | Op::OrIf
+                        | Op::Pipe
+                        | Op::LParen
+                )
+        ) || (was_cmd && plain.is_some_and(|w| OPENS_COMMAND.contains(&w)))
+            // The only `)` the case walk consumes is a pattern's, and an arm's
+            // commands begin right after it -- with no separator between, so
+            // nothing else here would say a command can start.
+            || matches!((&took, &tok), (Took::Whole, Tok::Op(Op::RParen)));
+        if matches!(took, Took::Whole) {
+            continue;
+        }
+        match tok {
             Tok::Op(Op::LParen) => depth = depth.saturating_add(1),
             Tok::Op(Op::RParen) => {
                 depth = depth.saturating_sub(1);
@@ -1807,9 +1973,10 @@ impl Lexer {
     /// tokenised with this same lexer and the closer is the `)` its tokens
     /// arrive at.
     ///
-    /// A `)` that ends a CASE PATTERN is still taken as the closer: the lexer
-    /// emits it as an operator either way, and which one closes the
-    /// substitution is a question about the grammar rather than the tokens.
+    /// The one `)` that is not the closer despite being the same token is a
+    /// case PATTERN's; `step_case` carries the little grammar that tells them
+    /// apart. The COUNT below has none of it, which is why the two paths can
+    /// pick different parens for a body that does not lex.
     fn scan_paren_body(&mut self) -> Syn<String> {
         // The scan RECURSES once per nested `$(`, so it is charged and capped
         // like every other re-lexing pass. Past the cap the count takes over
