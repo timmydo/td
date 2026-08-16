@@ -884,6 +884,13 @@ fn pgroup_rss_bytes(pgid: u32) -> u64 {
 }
 
 /// Create the gate's child cgroup with the tree budget; returns its dir.
+///
+/// `create_dir`, never `create_dir_all` or a plain join: an EXISTING cgroup must
+/// never be adopted. The runner's own leaf is `run_dir/host` and `host` is a
+/// legal gate name, so a gate called that is refused here by EEXIST alone. That
+/// was untidiness while the only consequence was a stray `memory.max`; it is
+/// load-bearing now that the deadline kill writes `cgroup.kill` into whatever
+/// this returns, which for `host` would be the cgroup holding the runner.
 fn cgroup_enter(run_dir: &Path, gate: &str, budget_mib: u64) -> Option<PathBuf> {
     let cg = run_dir.join(gate);
     std::fs::create_dir(&cg).ok()?;
@@ -905,6 +912,39 @@ fn cgroup_enter(run_dir: &Path, gate: &str, budget_mib: u64) -> Option<PathBuf> 
         return None;
     }
     Some(cg)
+}
+
+/// SIGKILL every member of `cg` at once, whatever process group each is in.
+/// True iff the kernel took the write.
+///
+/// This is what `kill(-pgid, …)` cannot do: a descendant that called `setsid(2)`
+/// — or merely `setpgid` — has left the gate's process group and is invisible to
+/// a group kill, while nothing it can do to its own process group moves it out
+/// of the cgroup. (Writing another cgroup's `cgroup.procs` would, and a gate
+/// body is handed one in `TD_GATE_CG`; gates are td's own code, so that is a
+/// bound on the claim rather than a threat.) cgroup v2 only (Linux 5.14+); an
+/// older kernel has no such file, which is why the caller still issues the group
+/// kill rather than choosing between them.
+///
+/// Opened rather than written, so "never CREATES the file" is a property of the
+/// syscall instead of the stat before it: `fs::write` is `O_CREAT|O_TRUNC`, and
+/// while cgroupfs refuses a create, `cgroup_enter` only ever made a DIRECTORY —
+/// on a hybrid v1/v2 host /sys/fs/cgroup is plain tmpfs where the create
+/// succeeds, leaving a stray file and reporting a kill with no kernel behind it.
+/// `is_file()` stays in front of the open for a second reason: it refuses a
+/// FIFO, and opening one of those for writing BLOCKS until a reader appears —
+/// the one shape that could hang the watchdog.
+fn cgroup_kill(cg: &Path) -> bool {
+    use std::io::Write;
+    let f = cg.join("cgroup.kill");
+    if !f.is_file() {
+        return false;
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&f)
+        .and_then(|mut h| h.write_all(b"1"))
+        .is_ok()
 }
 
 /// oom_kill count from the cgroup's memory.events (0 when unreadable).
@@ -965,6 +1005,13 @@ fn run_gate(
     // Cgroup mode (primary when delegated): the BODY self-moves into the gate's
     // cgroup before anything else runs — written by the child itself, so there
     // is no parent-side move race with early forks.
+    //
+    // A cgroup is made only for a MEMORY budget, so the deadline kill's
+    // cgroup.kill arm is off under TD_CHECK_GATE_TREE_MEM_MIB=0 and a setsid
+    // escapee survives a timeout there as it always did. Provisioning one for
+    // containment alone is a policy change rather than an oversight: the body's
+    // enter prelude exits 97 when the move fails, so a cgroup made where none
+    // was before turns a partially-delegated host's passing gates red.
     let gate_cg = match (cgroup_dir, tree_mem_mib) {
         (Some(run_dir), b) if b > 0 => cgroup_enter(run_dir, &g.name, b),
         _ => None,
@@ -1100,7 +1147,12 @@ fn run_gate(
                         }
                         // The GROUP, not the child: a hang is usually in a
                         // grandchild (a test binary under cargo under sh), which
-                        // shares the pgid the spawn gave the gate.
+                        // shares the pgid the spawn gave the gate. Where a
+                        // cgroup is delegated the SUBTREE is killed as well, and
+                        // that one reaches a descendant which left the group
+                        // with setsid(2) — the escape the group kill has always
+                        // had. Both, not either: cgroup.kill is Linux 5.14+, and
+                        // an older kernel silently has no such file.
                         //
                         // `stop` is re-read immediately before the kill, which
                         // narrows the window where a gate exiting on its deadline
@@ -1116,7 +1168,17 @@ fn run_gate(
                             && !stop.load(std::sync::atomic::Ordering::Relaxed)
                         {
                             timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
+                            // The group kill FIRST: it is one syscall and it is
+                            // the teardown that works on every kernel, so it
+                            // does not queue behind a stat, an open and a write
+                            // whose kernel side takes cgroup_mutex. The cgroup
+                            // kill then catches whatever left the group. Its
+                            // result is discarded on purpose — the group kill
+                            // above is the fallback for every way it answers no.
                             let _ = crate::sys::kill_process_group(pgid, crate::sys::SIGKILL);
+                            if let Some(cg) = gate_cg.as_deref() {
+                                let _ = cgroup_kill(cg);
+                            }
                             return;
                         }
                         tick = tick.wrapping_add(1);
@@ -1365,9 +1427,10 @@ struct RunCfg {
     /// gate's process group's summed RSS and SIGKILLs the whole group on breach
     /// — the layer the per-process rlimit below cannot provide (N children each
     /// under the per-process cap can collectively exceed the box; human review
-    /// re #319). KNOWN GAP: a setsid() escapee leaves the process group and the
-    /// sampler's sight — the cgroup v2 layer is the escape-proof successor once
-    /// the host delegates a subtree.
+    /// re #319). KNOWN GAP, and only for the UNDELEGATED host this sampler runs
+    /// on: a setsid() escapee leaves the process group and so the sampler's
+    /// sight. Where a subtree IS delegated the kernel charges the whole cgroup,
+    /// escapee included, and the deadline kill reaches it through cgroup.kill.
     gate_tree_mem_mib: u64,
     /// Per-PROCESS RLIMIT_DATA cap for gate bodies, in MiB (0 = off). Applied
     /// via a pre_exec setrlimit in the spawned body (sys::set_rlimit — no host
@@ -2607,6 +2670,136 @@ mod tests {
     }
 
     #[test]
+    fn a_cgroup_kill_that_cannot_be_written_reports_it() {
+        // The caller issues the group kill BECAUSE this can fail: a kernel
+        // before 5.14 has no cgroup.kill, and a false here is what makes that a
+        // fallback rather than a teardown the watchdog silently stops doing. An
+        // ordinary directory stands in — and it is not a contrived one, being
+        // exactly what a hybrid v1/v2 host's plain-tmpfs /sys/fs/cgroup gives.
+        let d = tmpdir("cgkill");
+        assert!(!cgroup_kill(&d), "a directory with no cgroup.kill must report false");
+        assert!(
+            !d.join("cgroup.kill").exists(),
+            "and must not CREATE one — a stray regular file would take the write and \
+             report a kill with no kernel behind it"
+        );
+        assert!(!cgroup_kill(&d.join("absent")), "a missing directory must report false too");
+    }
+
+    #[test]
+    fn cgroup_kill_reaches_a_process_group_escapee() {
+        // The property the group kill cannot have: a descendant in a process
+        // group of its own is invisible to kill(-pgid) and still inside the
+        // cgroup. Runs ONLY where a writable delegated subtree exists; the
+        // probe is the one cgroup_mode_enforces_the_tree_budget_when_delegated
+        // uses.
+        let probe = |c: &Path| -> bool {
+            if !c.join("cgroup.controllers").is_file() {
+                return false;
+            }
+            let p = c.join(format!("td-killprobe-{}", std::process::id()));
+            std::fs::create_dir(&p).map(|_| { let _ = std::fs::remove_dir(&p); true }).unwrap_or(false)
+        };
+        let root = [PathBuf::from("/sys/fs/cgroup/td")]
+            .into_iter()
+            .chain(
+                std::fs::read_to_string("/proc/self/cgroup")
+                    .ok()
+                    .and_then(|t| t.lines().find_map(|l| l.strip_prefix("0::").map(|p| PathBuf::from(format!("/sys/fs/cgroup{}", p.trim()))))),
+            )
+            .find(|c| probe(c));
+        let Some(root) = root else { return };
+        let cg = root.join(format!("td-test-kill-{}", std::process::id()));
+        if std::fs::create_dir(&cg).is_err() {
+            return;
+        }
+        // Never this process's own cgroup: the escapee is moved into a child
+        // made for it, so the kill below cannot reach the test harness.
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30")
+            .process_group(0) // its OWN group — the escape being modelled
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let Ok(mut child) = cmd.spawn() else {
+            let _ = std::fs::remove_dir(&cg);
+            return;
+        };
+        let pid = child.id();
+        if std::fs::write(cg.join("cgroup.procs"), pid.to_string()).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir(&cg);
+            return; // no common-ancestor grant for the cgroup.procs move
+        }
+        // A delegated v2 subtree does NOT imply cgroup.kill: delegation predates
+        // it and the interface is 5.14+. Asserting through it on such a kernel
+        // would red for the kernel's age, which is the one thing the production
+        // fallback exists to tolerate.
+        if !cg.join("cgroup.kill").is_file() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir(&cg);
+            return;
+        }
+        // THE CONTROL: the escapee really is out of reach of a group kill.
+        // Established by reading the kernel's own answer — /proc's pgrp field —
+        // rather than by signalling, because the only group this test could
+        // legitimately signal is its OWN, and killing that kills the harness.
+        let pgrp_of = |p: u32| -> Option<String> {
+            let stat = std::fs::read_to_string(format!("/proc/{p}/stat")).ok()?;
+            // state, ppid, pgrp — counted from after the last ')', a comm being
+            // able to contain both spaces and parentheses.
+            let (_, rest) = stat.rsplit_once(')')?;
+            rest.split_whitespace().nth(2).map(str::to_string)
+        };
+        let escapee_pgrp = pgrp_of(pid);
+        let our_pgrp = pgrp_of(std::process::id());
+        // Alive AT THE MOMENT OF THE KILL, or the whole test is vacuous: a
+        // `sleep` that was missing or exited at once is a zombie, whose /proc
+        // still reads, whose pgrp is still its own, and whose `try_wait` returns
+        // Some on the first poll — green, having proved nothing about
+        // cgroup.kill. (A cgroup.procs write naming a dying task can succeed
+        // while migrating nothing, so the move above does not establish this.)
+        let alive_before = child.try_wait().ok().flatten().is_none();
+        let wrote = cgroup_kill(&cg);
+        // SIGKILL is not instant; poll rather than assume.
+        let mut gone = false;
+        for _ in 0..100 {
+            if child.try_wait().ok().flatten().is_some() {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Everything is OBSERVED first and asserted after, so that a failing
+        // assertion cannot unwind past the cleanup and leave a live sleeper and
+        // a cgroup directory behind in /sys/fs/cgroup.
+        if !gone {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // Retried as the runner's own teardown is: a straggler zombie makes the
+        // rmdir fail, and a leaf left in /sys/fs/cgroup is permanent.
+        for _ in 0..10 {
+            if std::fs::remove_dir(&cg).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(alive_before, "the escapee must be alive at the kill, or this proves nothing");
+        assert!(escapee_pgrp.is_some(), "the escapee must still be alive to be a control");
+        assert_ne!(
+            escapee_pgrp, our_pgrp,
+            "the escapee must be in its OWN process group — otherwise a group kill \
+             would reach it and this proves nothing about cgroup.kill"
+        );
+        assert!(wrote, "cgroup.kill must take the write in a delegated subtree");
+        assert!(gone, "cgroup.kill must reach a member that left the process group");
+    }
+
+    #[test]
     fn psi_parser_reads_some_avg10() {
         let sample = "some avg10=3.25 avg60=1.00 avg300=0.10 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
         assert_eq!(parse_psi_some_avg10(sample), Some(3.25));
@@ -2790,6 +2983,79 @@ mod tests {
         assert!(
             !log.contains("body exited"),
             "a budget kill must not also report the SIGKILL as the body's own exit; got:\n{log}"
+        );
+    }
+
+    /// The deadline kill now issues a cgroup kill BEFORE the group kill wherever
+    /// a cgroup is configured. This is the arm where that layer answers nothing
+    /// — a plain directory, which is both what a pre-5.14 kernel's cgroup looks
+    /// like to `cgroup_kill` and what a hybrid v1/v2 host's tmpfs
+    /// /sys/fs/cgroup really is. The group kill must still be the whole
+    /// teardown, and it runs everywhere, unlike the delegated tests.
+    #[test]
+    fn a_timeout_still_kills_where_the_cgroup_layer_answers_nothing() {
+        let d = tmpdir("timeout-nocg");
+        let set = synth(&d, &[("hang", Pool::Cheap, "sleep 30", &[])]);
+        let sel = expand_goals(&set, &["check-fast".to_string()]).unwrap();
+        let mut c = cfg(&d, 1, None);
+        c.gate_timeout_secs = 1;
+        // cgroup_enter only creates a directory and writes memory.max, both of
+        // which succeed on tmpfs — so this really does drive the `Some(cg)` arm
+        // rather than skipping it the way a None would.
+        let fake_cg = d.join("cg");
+        std::fs::create_dir(&fake_cg).unwrap();
+        c.cgroup_dir = Some(fake_cg.clone());
+        c.gate_tree_mem_mib = 64;
+        let started = std::time::Instant::now();
+        assert!(!run_selected(&set, &sel, &c).unwrap());
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the group kill must still end the gate when cgroup.kill is absent"
+        );
+        let log = std::fs::read_to_string(d.join("logs/hang.log")).unwrap();
+        assert!(log.contains("wall-clock budget"), "must still be reported as the clock; got:\n{log}");
+        // Pins the arm rather than assuming it: without this every assertion
+        // here also passes with gate_cg == None, which is not what is claimed.
+        assert!(
+            fake_cg.join("hang").join("memory.max").is_file(),
+            "cgroup_enter must have returned Some — otherwise this is the None arm"
+        );
+        assert!(
+            !fake_cg.join("hang").join("cgroup.kill").exists(),
+            "and no stray cgroup.kill may be left behind by the attempt"
+        );
+    }
+
+    /// Pins the WIRING, which the two tests above do not: both stay green if the
+    /// `cgroup_kill` call in the watchdog is deleted outright, since one exercises
+    /// the helper directly and the other passes through the group-kill fallback.
+    /// Here the gate BODY creates a `cgroup.kill` in its own cgroup — the one
+    /// place a test can put a file inside a directory `cgroup_enter` makes — so
+    /// the deadline kill finds a writable interface and its `1` is observable
+    /// afterwards. Everything is tmpfs; no kernel is involved and it runs
+    /// everywhere.
+    #[test]
+    fn a_timeout_asks_the_cgroup_layer_to_kill_when_one_is_there() {
+        let d = tmpdir("timeout-cg");
+        // $TD_GATE_CG is <cg>/cgroup.procs, so its dirname is the gate's cgroup.
+        let body = r#"d=$(dirname "$TD_GATE_CG"); : > "$d/cgroup.kill"; sleep 30"#;
+        let set = synth(&d, &[("hang", Pool::Cheap, body, &[])]);
+        let sel = expand_goals(&set, &["check-fast".to_string()]).unwrap();
+        let mut c = cfg(&d, 1, None);
+        c.gate_timeout_secs = 1;
+        let fake_cg = d.join("cg");
+        std::fs::create_dir(&fake_cg).unwrap();
+        c.cgroup_dir = Some(fake_cg.clone());
+        c.gate_tree_mem_mib = 64;
+        assert!(!run_selected(&set, &sel, &c).unwrap());
+        // The dir survives the run's rmdir attempts precisely because it is not
+        // empty, which is what leaves the evidence readable.
+        let killfile = fake_cg.join("hang").join("cgroup.kill");
+        assert!(killfile.is_file(), "the body must have made the interface; got no file");
+        assert_eq!(
+            std::fs::read_to_string(&killfile).unwrap_or_default(),
+            "1",
+            "the deadline kill must WRITE the cgroup layer, not only the process group"
         );
     }
 
