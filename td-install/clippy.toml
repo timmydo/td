@@ -1,0 +1,71 @@
+# Every path-taking entry point into the filesystem, refused everywhere in
+# this crate but the two choke points that carry a scoped `#[allow]`.
+#
+# `io::Error` holds an errno and no filename, so a call that propagates one
+# raw refuses with `No such file or directory` on a command line naming five
+# paths. `mod paths` pairs each operation with the path it was given;
+# `td-boot/src/realfile.rs`, compiled in through a `#[path]`, is the second
+# such point and already named its own.
+#
+# CLIPPY rather than a source scan, because these are resolved by the
+# COMPILER: an alias, a raw identifier, a turbofish, a qualified path, a type
+# alias, a macro-assembled callee and a line break between two tokens are all
+# the same path to it, and each of those was a separate review round's escape
+# from the scan this replaces.
+disallowed-methods = [
+    # `std::fs`, every free function that takes a path.
+    { path = "std::fs::canonicalize", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::copy", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::create_dir", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::create_dir_all", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::exists", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::hard_link", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::metadata", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::read", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::read_dir", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::read_link", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::read_to_string", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::remove_dir", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::remove_dir_all", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::remove_file", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::rename", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::set_permissions", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::soft_link", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::symlink_metadata", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::write", reason = "use td-install's `paths` module, which names the path in the error" },
+
+    # The two builders and `File`, whose associated functions open by name.
+    { path = "std::fs::File::open", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::File::create", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::File::create_new", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::OpenOptions::open", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::DirBuilder::create", reason = "use td-install's `paths` module, which names the path in the error" },
+
+    # `std::os::unix::fs`, the three this platform adds.
+    { path = "std::os::unix::fs::symlink", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::os::unix::fs::chown", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::os::unix::fs::lchown", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::os::unix::fs::chroot", reason = "use td-install's `paths` module, which names the path in the error" },
+
+    # `Path`'s own fallible methods, whose path is the RECEIVER — the shape no
+    # roster of call spellings could see.
+    { path = "std::path::Path::canonicalize", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::path::Path::exists", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::path::Path::is_dir", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::path::Path::is_file", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::path::Path::is_symlink", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::path::Path::metadata", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::path::Path::read_dir", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::path::Path::read_link", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::path::Path::symlink_metadata", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::path::Path::try_exists", reason = "use td-install's `paths` module, which names the path in the error" },
+
+    # Path-taking calls that are not `std::fs` at all: a working directory is
+    # a `chdir(2)`, and a Unix socket address is a filesystem entry.
+    { path = "std::env::set_current_dir", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::os::unix::net::UnixListener::bind", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::os::unix::net::UnixStream::connect", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::os::unix::net::UnixDatagram::bind", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::os::unix::net::UnixDatagram::connect", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::os::unix::net::UnixDatagram::send_to", reason = "use td-install's `paths` module, which names the path in the error" },
+]

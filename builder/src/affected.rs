@@ -2062,6 +2062,12 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-install/src/main.rs", "recipe-checks");
     assert_preflight!("td-install/Cargo.lock", "cargo-test");
     assert_preflight!("td-install/Cargo.toml", "cargo-test");
+    // Its `clippy.toml` is not configuration ABOUT the checks, it IS one: the
+    // disallowed-path roster that keeps every filesystem call inside the
+    // crate's two choke points lives there, so an edit to it has to run the
+    // clippy leg that reads it.
+    assert_preflight!("td-install/clippy.toml", "cargo-test");
+    assert_target!("td-install/clippy.toml", "check");
     // The installer's own specification is documentation, as td-svc's and
     // td-compositor's are: the docs arm runs BEFORE the crate arm, so a spec
     // edit does not drag the crate's checks in behind it.

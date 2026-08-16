@@ -209,6 +209,27 @@ file, then boots that file under OVMF. An installer whose tested path and
 shipped path differ is an installer tested somewhere other than where it
 runs.
 
+**D10. Every filesystem call goes through a choke point that names its
+path.** `io::Error` carries an errno and no filename, and one command line
+here names as many as five paths — so `No such file or directory` alone is
+a diagnostic an operator cannot act on. This crate's SHIPPED source reaches
+the filesystem only through `mod paths`, whose wrappers each pair the
+operation with the path they were given; `realfile.rs`, which the crate
+compiles in, is the second such point and already named its own. ONE
+wrapper is exempt from the naming and is named in the test that enforces
+it: `metadata_if_present` discards its error, because its caller asks only
+whether two files are the same and an unreadable path is not one of them.
+
+The COMPILER holds the first half of that. `clippy.toml` disallows every
+path-taking entry point into the filesystem and `Cargo.toml` denies the
+lint, so a call outside the two choke points does not build; the three
+scoped `#[allow]`s are the whole of the exception, and a test reads where
+they sit. What is left for a test is whether a wrapper puts its path in the
+message, which clippy has no opinion about. A source SCAN held the first
+half before this and lost nine rounds of review to spellings it did not
+model — `clippy.toml` is the roster now, and a new verb is a new wrapper
+rather than a call at the site that wants one.
+
 ## 4. Disk layout
 
 Positions are in SECTORS of the destination's own logical size, not in

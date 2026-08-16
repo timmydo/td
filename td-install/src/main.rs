@@ -33,7 +33,7 @@ mod gpt;
 mod fat;
 
 use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -180,15 +180,7 @@ fn logical_sector_size(file: &File) -> io::Result<u64> {
     let path = PathBuf::from(format!(
         "/sys/dev/block/{major}:{minor}/queue/logical_block_size"
     ));
-    let mut text = String::new();
-    File::open(&path)
-        .and_then(|mut f| f.read_to_string(&mut text))
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("cannot read {}: {error}", path.display()),
-            )
-        })?;
+    let text = paths::read_to_string(&path)?;
     let trimmed = text.trim();
     let size = trimmed.parse::<u64>().map_err(|_| {
         invalid(format!(
@@ -333,7 +325,9 @@ fn plan(sector_size: u64, disk_bytes: u64) -> Result<Plan, String> {
 /// `/dev/urandom` is an ordinary file, which is what keeps D8 intact.
 fn random_guid() -> io::Result<gpt::Guid> {
     let mut bytes = [0u8; 16];
-    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let urandom = Path::new("/dev/urandom");
+    let mut file = paths::open_read(urandom)?;
+    file.read_exact(&mut bytes)?;
     // Version 4 and the RFC 4122 variant, in the on-disk mixed-endian layout:
     // the version nibble is the high nibble of byte 7's field, which little-endian
     // encoding of the third group puts at index 7, and the variant at index 8.
@@ -344,6 +338,173 @@ fn random_guid() -> io::Result<gpt::Guid> {
         *byte = (*byte & 0x3f) | 0x80;
     }
     Ok(gpt::Guid(bytes))
+}
+
+/// EVERY filesystem call this program makes, and the only place a path is
+/// paired with the error that names it.
+///
+/// `io::Error` carries an errno and nothing else, so a destination that is not
+/// there refuses with a bare `No such file or directory` on a command line
+/// that names up to five paths — and an operator has no way to tell which one
+/// it meant. Same argument `td-boot`'s `read_trusted_key` makes, on the other
+/// half of the deployment path.
+///
+/// The property is STRUCTURAL rather than checked. Each wrapper takes its path
+/// as a parameter and holds no other, so `.at()` cannot be handed a file the
+/// operation never touched: there is no second path in scope to hand it. What
+/// the test outside enforces is only that nothing else in the crate opens
+/// anything, which is a question about where a call IS rather than about what
+/// it means — and four rounds of review are why it is put that way round.
+///
+/// Scoped to operations that take a PATH. A call on an already-open `File` — a
+/// write, a `sync_all`, a `set_len` — is deliberately not here: it is about a
+/// descriptor rather than a name, and the name it would be given is the one
+/// the open already reported.
+///
+/// The wrap costs `raw_os_error()` and any `source()` chain, neither of which
+/// `io::Error::new` can carry. `kind()` survives, which is what the callers'
+/// `!= NotFound` tests read.
+#[allow(clippy::disallowed_methods)]
+mod paths {
+    use std::fs::{DirBuilder, File, Metadata, OpenOptions, Permissions};
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    /// Name the file an IO failure was about.
+    fn named(error: io::Error, path: &Path) -> io::Error {
+        io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+    }
+
+    /// `named` where the result is being propagated, which is most of them.
+    trait NamePath<T> {
+        fn at(self, path: &Path) -> io::Result<T>;
+    }
+
+    impl<T> NamePath<T> for io::Result<T> {
+        fn at(self, path: &Path) -> io::Result<T> {
+            self.map_err(|error| named(error, path))
+        }
+    }
+
+    pub fn open_read(path: &Path) -> io::Result<File> {
+        File::open(path).at(path)
+    }
+
+    pub fn open_read_write(path: &Path) -> io::Result<File> {
+        OpenOptions::new().read(true).write(true).open(path).at(path)
+    }
+
+    /// Create, refusing anything already there — which is what keeps a symlink
+    /// left at the path from being followed and truncated.
+    pub fn create_new(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .at(path)
+    }
+
+    /// The same, at a chosen creation mode.
+    pub fn create_new_with_mode(path: &Path, mode: u32) -> io::Result<File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(path)
+            .at(path)
+    }
+
+    pub fn create_dir_all(path: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(path).at(path)
+    }
+
+    /// A directory created AT `mode` rather than widened to it, so there is no
+    /// window in which it is more permissive than asked for.
+    pub fn create_dir_with_mode(path: &Path, mode: u32) -> io::Result<()> {
+        use std::os::unix::fs::DirBuilderExt;
+        DirBuilder::new().mode(mode).create(path).at(path)
+    }
+
+    pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, Permissions::from_mode(mode)).at(path)
+    }
+
+    pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
+        std::fs::canonicalize(path).at(path)
+    }
+
+    pub fn symlink_metadata(path: &Path) -> io::Result<Metadata> {
+        std::fs::symlink_metadata(path).at(path)
+    }
+
+    /// What is at `path`, or nothing — the one call here whose error is
+    /// DISCARDED, because the caller asks only whether two files are the same
+    /// and an unreadable path is not one of them.
+    pub fn metadata_if_present(path: &Path) -> Option<Metadata> {
+        std::fs::metadata(path).ok()
+    }
+
+    /// Whether `path` is a directory, and an ERROR rather than `false` where
+    /// the question cannot be answered.
+    ///
+    /// `Path::is_dir` is the obvious spelling and is wrong twice over: it is a
+    /// filesystem call outside this module, and it reports a directory it was
+    /// REFUSED as one that is not there. Its caller turns that answer into
+    /// "td-boot published nothing", which would be a false accusation against
+    /// the program that had just done the work.
+    pub fn is_dir(path: &Path) -> io::Result<bool> {
+        match std::fs::metadata(path) {
+            Ok(metadata) => Ok(metadata.is_dir()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(named(error, path)),
+        }
+    }
+
+    /// A rename names BOTH paths: either can be the one at fault, and the
+    /// errno alone does not say which.
+    pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::rename(from, to).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot rename {} to {}: {error}",
+                    from.display(),
+                    to.display()
+                ),
+            )
+        })
+    }
+
+    /// A whole small file, named as a READ failure so it cannot be mistaken
+    /// for the parse that follows it — `device_numbers` turns on the
+    /// difference between a sysfs path that is not there and a sector size
+    /// that does not parse.
+    pub fn read_to_string(path: &Path) -> io::Result<String> {
+        std::fs::read_to_string(path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("cannot read {}: {error}", path.display()),
+            )
+        })
+    }
+
+    /// Absent is the state wanted, so an absent path is not a failure.
+    pub fn remove_file_if_present(path: &Path) -> io::Result<()> {
+        match std::fs::remove_file(path) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(named(error, path)),
+            _ => Ok(()),
+        }
+    }
+
+    /// The same for a tree, which is how both verbs empty a staging root.
+    pub fn remove_dir_all_if_present(path: &Path) -> io::Result<()> {
+        match std::fs::remove_dir_all(path) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(named(error, path)),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Write `bytes` at `offset`, seeking first.
@@ -419,7 +580,7 @@ fn invalidate_table(file: &mut File, table: &gpt::Image) -> io::Result<()> {
 }
 
 fn run_layout(destination: &Path, out: &mut dyn Write) -> io::Result<()> {
-    let mut file = OpenOptions::new().read(true).write(true).open(destination)?;
+    let mut file = paths::open_read_write(destination)?;
     let disk_bytes = destination_bytes(&mut file)?;
     let sector_size = logical_sector_size(&file)?;
     let plan = plan(sector_size, disk_bytes).map_err(invalid)?;
@@ -816,9 +977,8 @@ fn publish_into(staging: &Path, publish: &Publish, key: &[u8]) -> io::Result<()>
         protocol::VOLUME_CHANNEL_DIR,
     ] {
         let path = staging.join(directory);
-        std::fs::create_dir_all(&path)?;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        paths::create_dir_all(&path)?;
+        paths::set_mode(&path, 0o755)?;
     }
     // The key is SNAPSHOT and td-boot is handed the snapshot, so the file that
     // authenticates the bundle is the file the volume keeps — two reads of one
@@ -838,19 +998,12 @@ fn publish_into(staging: &Path, publish: &Publish, key: &[u8]) -> io::Result<()>
         .parent()
         .ok_or_else(|| invalid(format!("the staging tree {} has no parent", staging.display())))?
         .join("td-install-key");
-    if let Err(error) = std::fs::remove_dir_all(&private) {
-        if error.kind() != io::ErrorKind::NotFound {
-            return Err(error);
-        }
-    }
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().mode(0o700).create(&private)?;
-    }
+    paths::remove_dir_all_if_present(&private)?;
+    paths::create_dir_with_mode(&private, 0o700)?;
     let snapshot = private.join("td-trusted.pub");
     let identity;
     {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::PermissionsExt;
         // Created 0600 and WIDENED, not created 0644: a creation mode is
         // masked by the umask, so 0644 asked for directly is 0600 under `umask
         // 077` with nothing to correct it — and the other order would leave a
@@ -860,11 +1013,7 @@ fn publish_into(staging: &Path, publish: &Publish, key: &[u8]) -> io::Result<()>
         // chmod follows a symlink, so one swapped in after the write would
         // take the 0644 instead — the same race `create_new` closes at the
         // other end, and closing only one end closes neither.
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&snapshot)?;
+        let mut file = paths::create_new_with_mode(&snapshot, 0o600)?;
         file.write_all(key)?;
         file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
         use std::os::linux::fs::MetadataExt;
@@ -927,7 +1076,7 @@ fn publish_into(staging: &Path, publish: &Publish, key: &[u8]) -> io::Result<()>
         )));
     }
     let published = staging.join(protocol::DEPLOYMENTS_DIR).join(id);
-    if !published.is_dir() {
+    if !paths::is_dir(&published)? {
         return Err(invalid(format!(
             "{} reported {id} but {} is not there",
             publish.td_boot.display(),
@@ -952,7 +1101,7 @@ fn publish_into(staging: &Path, publish: &Publish, key: &[u8]) -> io::Result<()>
     // outcome this whole path exists to prevent.
     {
         use std::os::linux::fs::MetadataExt;
-        let now = std::fs::symlink_metadata(&snapshot)?;
+        let now = paths::symlink_metadata(&snapshot)?;
         if !now.is_file() || (now.st_dev(), now.st_ino()) != identity {
             return Err(invalid(format!(
                 "the trusted key {} was replaced while the deployment was published",
@@ -961,12 +1110,7 @@ fn publish_into(staging: &Path, publish: &Publish, key: &[u8]) -> io::Result<()>
         }
     }
     let destination = staging.join(protocol::VOLUME_TRUSTED_KEY);
-    std::fs::rename(&snapshot, &destination).map_err(|error| {
-        invalid(format!(
-            "cannot put the trusted key at {}: {error}",
-            destination.display()
-        ))
-    })?;
+    paths::rename(&snapshot, &destination)?;
     Ok(())
 }
 
@@ -1014,7 +1158,7 @@ fn run_volume(
     let key = publish
         .map(|publish| read_trusted_key(&publish.trusted_key))
         .transpose()?;
-    let mut file = OpenOptions::new().read(true).write(true).open(destination)?;
+    let mut file = paths::open_read_write(destination)?;
     let disk_bytes = destination_bytes(&mut file)?;
     let sector_size = logical_sector_size(&file)?;
     if !disk_bytes.is_multiple_of(sector_size) {
@@ -1052,12 +1196,8 @@ fn run_volume(
     // emptied rather than merely ensured — a scratch directory a previous run
     // or another program left something in would otherwise put that something
     // on a machine's /var, with nothing about the install saying so.
-    if let Err(error) = std::fs::remove_dir_all(&staging) {
-        if error.kind() != io::ErrorKind::NotFound {
-            return Err(error);
-        }
-    }
-    std::fs::create_dir_all(&subvol)?;
+    paths::remove_dir_all_if_present(&staging)?;
+    paths::create_dir_all(&subvol)?;
     // BEFORE the mkfs that bakes this tree into the image, which is the whole
     // of why the publish can happen without a mount: `--rootdir` is what puts
     // it in the filesystem.
@@ -1069,7 +1209,7 @@ fn run_volume(
     // two forms that nothing about either says. Resolved once and used for
     // `--rootdir` too, so the publish and the filesystem cannot be given two
     // different names for one directory.
-    let staging = std::fs::canonicalize(&staging)?;
+    let staging = paths::canonicalize(&staging)?;
     if let Some(publish) = publish {
         // `key` is `Some` exactly when `publish` is — both come from the one
         // `Option` above. Asked for rather than matched alongside, because a
@@ -1088,7 +1228,7 @@ fn run_volume(
     // follows the one while a string comparison sees neither.
     {
         use std::os::linux::fs::MetadataExt;
-        if let Ok(existing) = std::fs::metadata(&image_path) {
+        if let Some(existing) = paths::metadata_if_present(&image_path) {
             let target = file.metadata()?;
             if (existing.st_dev(), existing.st_ino()) == (target.st_dev(), target.st_ino()) {
                 return Err(invalid(format!(
@@ -1105,15 +1245,8 @@ fn run_volume(
     // truncated and grown to the partition's size, under an installer that is
     // usually root. Removing the ENTRY affects only the link, and `create_new`
     // then refuses anything that appeared in between rather than opening it.
-    if let Err(error) = std::fs::remove_file(&image_path) {
-        if error.kind() != io::ErrorKind::NotFound {
-            return Err(error);
-        }
-    }
-    let image = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&image_path)?;
+    paths::remove_file_if_present(&image_path)?;
+    let image = paths::create_new(&image_path)?;
     image.set_len(len)?;
     let got = image.metadata()?.len();
     if got != len {
@@ -1167,7 +1300,7 @@ fn run_volume(
     // over the old superblock is still only in page cache, which is exactly the
     // mixed, apparently-valid volume the deferral exists to prevent.
     file.sync_all()?;
-    let mut image = File::open(&image_path)?;
+    let mut image = paths::open_read(&image_path)?;
     // The copy is ORDERED, for `run_layout`'s reason one level down: the
     // superblock is this filesystem's commit point, as the primary table is the
     // disk's, and it is only true once everything it points at is durable.
@@ -1258,6 +1391,10 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The shipped half reaches the filesystem only through `mod paths` now, so
+    // this is the test half's own — a test opening a fixture is not a path the
+    // installer takes from an operator, and the scan reads only the half above.
+    use std::fs::OpenOptions;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -2086,6 +2223,395 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A path this program cannot open NAMES ITSELF.
+    ///
+    /// `io::Error` carries an errno and nothing else, so the destination — the
+    /// one argument an operator is most likely to mistype, and the one that is
+    /// a device node on a real install — refused with a bare `No such file or
+    /// directory` on a command line naming up to five paths. The key already
+    /// named itself, through `realfile`; this is the rest of them.
+    ///
+    /// Both verbs, because they open the destination independently and only
+    /// `layout` was ever driven with a bad one.
+    #[test]
+    fn a_path_that_cannot_be_opened_names_itself() {
+        let dir = std::env::temp_dir().join(format!(
+            "td-install-named-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let absent = dir.join("no-such-disk");
+        let refused = run_layout(&absent, &mut Vec::new()).unwrap_err().to_string();
+        assert!(
+            refused.contains(&absent.display().to_string()),
+            "layout must name the destination it could not open, got {refused:?}"
+        );
+
+        let refused = run_volume(&absent, &dir.join("mkfs.btrfs"), &dir, None, &mut Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains(&absent.display().to_string()),
+            "volume must name the destination it could not open, got {refused:?}"
+        );
+
+        // A DIRECTORY is the other shape a mistyped destination takes, and it
+        // fails at a different call than an absent one.
+        let refused = run_layout(&dir, &mut Vec::new()).unwrap_err().to_string();
+        assert!(
+            refused.contains(&dir.display().to_string()),
+            "layout must name a destination that is not a file, got {refused:?}"
+        );
+
+        // The key's own refusal is `realfile`'s and predates this; asserted
+        // here so the property is stated over every path the verbs take.
+        let refused = read_trusted_key(&absent).unwrap_err().to_string();
+        assert!(
+            refused.contains(&absent.display().to_string()),
+            "the trusted key must name itself, got {refused:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// NOTHING OUTSIDE THE CHOKE POINTS TOUCHES THE FILESYSTEM, AND THE
+    /// COMPILER IS WHAT SAYS SO.
+    ///
+    /// `clippy.toml` disallows every path-taking entry point into the
+    /// filesystem and `Cargo.toml` denies the lint, so such a call outside
+    /// the two choke points is a BUILD failure and not a test failure. That
+    /// pair IS the roster. What is left for a test is the attribute that
+    /// opens a hole in it, and an attribute is text.
+    ///
+    /// This replaced a source scan over six files, and the scan is the reason
+    /// the roster moved. Nine rounds of review walked out of it, every time
+    /// through a spelling it did not model: an import, an alias, a turbofish,
+    /// a qualified path, a raw identifier, a macro-assembled callee, a line
+    /// break between two tokens, a string holding `fn `. Clippy resolves a
+    /// PATH, so every one of those is the same call to it. The last round
+    /// found the one that ended the argument rather than extending it: a
+    /// wrapper taking `sidecar: &str` opens a file, because `File::open`
+    /// takes `impl AsRef<Path>` — no text can tell that a parameter is a path
+    /// when its own type does not say so, and a compiler never had to ask.
+    #[test]
+    fn the_lint_is_allowed_only_at_the_choke_points() {
+        for (label, source, expected) in compiled_files() {
+            let mut seen = Vec::new();
+            let mut from = 0;
+            // Every mention of the LINT, not of one attribute — an
+            // `#[expect(…)]`, a crate-level `#![allow(…)]` and a
+            // `reason = "…"` beside it each suppress a denied lint just as
+            // well, and none of them is the string the exemption is written
+            // as here. So the line carrying a mention has to BE the permitted
+            // spelling, and the line under it the item it may sit on.
+            while let Some(hit) = source.get(from..).and_then(|rest| index_of(rest, LINT)) {
+                let at = from + hit;
+                from = at + LINT.len();
+                let before = source.get(..at).unwrap_or_default();
+                let start = index_of_last(before, "\n").map_or(0, |nl| nl + 1);
+                let line = source
+                    .get(start..)
+                    .and_then(|rest| rest.lines().next())
+                    .unwrap_or_default()
+                    .trim();
+                assert_eq!(
+                    line, ALLOW,
+                    "{label}: the filesystem lint is suppressed by something \
+                     other than the one permitted attribute"
+                );
+                let item = source
+                    .get(from..)
+                    .and_then(|rest| rest.lines().nth(1))
+                    .unwrap_or_default()
+                    .trim();
+                seen.push(item);
+            }
+            assert_eq!(
+                seen, expected,
+                "{label}: the filesystem lint is allowed somewhere other than \
+                 a choke point"
+            );
+        }
+    }
+
+    /// THE OTHER TWO PARTS OF THE MECHANISM, which live outside this file and
+    /// would each stop it dead without a word.
+    ///
+    /// `Cargo.toml` is what turns the roster into an error; without the deny
+    /// every entry in `clippy.toml` is advice. And the roster itself is the
+    /// roster — its length is pinned because a deleted line refuses nothing
+    /// and looks like nothing.
+    #[test]
+    fn the_roster_and_the_deny_are_both_still_there() {
+        let manifest = include_str!("../Cargo.toml");
+        assert!(
+            manifest.contains(concat!("disallowed", "_methods = \"deny\"")),
+            "Cargo.toml no longer denies the lint, so the roster is advice"
+        );
+        let roster = include_str!("../clippy.toml");
+        assert_eq!(
+            roster.matches("{ path = ").count(),
+            44,
+            "the disallowed-path roster is not the length it was"
+        );
+        // The four that are not `std::fs` at all are the easiest to lose to a
+        // tidy-up, since they do not look like filesystem calls.
+        for entry in [
+            "std::env::set_current_dir",
+            "std::os::unix::net::UnixListener::bind",
+            "std::os::unix::net::UnixDatagram::connect",
+            "std::path::Path::try_exists",
+        ] {
+            assert!(roster.contains(entry), "the roster no longer holds {entry}");
+        }
+    }
+
+    /// The lint that carries all of this, spelled in two pieces so this file
+    /// does not match itself: `include_str!("main.rs")` reads the whole of it,
+    /// test half included.
+    const LINT: &str = concat!("clippy::disallowed", "_methods");
+
+    /// The one attribute that may carry it.
+    const ALLOW: &str = concat!("#[allow(clippy::", "disallowed_methods)]");
+
+    /// The last index of `needle`, spelled without the method that names it
+    /// for `index_of`'s reason.
+    fn index_of_last(haystack: &str, needle: &str) -> Option<usize> {
+        haystack.match_indices(needle).last().map(|(index, _)| index)
+    }
+
+    /// The six files this binary compiles, with the item each allow in them
+    /// must sit on — none, for the four that reach no filesystem.
+    type Compiled = (&'static str, &'static str, &'static [&'static str]);
+
+    fn compiled_files() -> [Compiled; 6] {
+        [
+            ("main.rs", include_str!("main.rs"), MAIN_CHOKE.as_slice()),
+            (
+                "realfile.rs",
+                include_str!("../../td-boot/src/realfile.rs"),
+                REALFILE_CHOKE.as_slice(),
+            ),
+            ("gpt.rs", include_str!("../../engine/src/gpt.rs"), [].as_slice()),
+            ("fat.rs", include_str!("../../engine/src/fat.rs"), [].as_slice()),
+            ("crc32.rs", include_str!("../../engine/src/crc32.rs"), [].as_slice()),
+            (
+                "protocol.rs",
+                include_str!("../../td-boot/src/protocol.rs"),
+                [].as_slice(),
+            ),
+        ]
+    }
+
+    /// `main.rs`'s one choke point, as the line under its allow reads.
+    const MAIN_CHOKE: [&str; 1] = ["mod paths {"];
+
+    /// `realfile.rs`'s two, which are functions rather than a module: td-boot
+    /// compiles that file too and has no `clippy.toml`, so the allow there is
+    /// inert for it and load-bearing here.
+    const REALFILE_CHOKE: [&str; 2] = [
+        "pub fn open_real_file(path: &Path, label: &str) -> io::Result<(File, Metadata)> {",
+        "fn open_checked(path: &Path, expected: &Metadata, label: &str) -> io::Result<(File, Metadata)> {",
+    ];
+
+    /// EVERY WRAPPER IN A CHOKE POINT NAMES EVERY PATH IT TAKES.
+    ///
+    /// The half the compiler cannot check. Clippy says WHERE a call may be;
+    /// whether the wrapper holding it puts the path in the message is a
+    /// question about the wrapper's own text, and the wrappers are short
+    /// enough for text to answer it.
+    ///
+    /// It earns its place: review wrote a `rename` that named only `from`,
+    /// and the destination is the argument an operator is likelier to have
+    /// got wrong.
+    #[test]
+    fn every_choke_wrapper_names_every_path_it_takes() {
+        let mut checked = 0;
+        for (label, source, markers) in compiled_files() {
+            for marker in markers {
+                let body = uncommented(region(label, source, marker));
+                checked += names_every_path(label, marker, &body);
+            }
+        }
+        // A naming test that found nothing to check would pass whatever the
+        // wrappers did.
+        assert_eq!(checked, 19, "{checked} wrappers were checked");
+    }
+
+    /// The text of the item opened at `marker`, up to the next line that is a
+    /// lone `}`.
+    ///
+    /// A brace WALK would have to know which braces are inside a string, and
+    /// that lexer is what this commit deleted. Every item here closes at
+    /// column 0 — `mod paths` and both `realfile.rs` functions are top-level
+    /// — which is a property of the file's layout that a reader can check and
+    /// `rustfmt` keeps.
+    fn region<'a>(label: &str, source: &'a str, marker: &str) -> &'a str {
+        let Some(at) = index_of(source, marker) else {
+            panic!("{label}: the choke point {marker} is not there any more");
+        };
+        let tail = source.get(at..).unwrap_or_default();
+        let Some(end) = index_of(tail, "\n}") else {
+            panic!("{label}: the choke point {marker} never closes");
+        };
+        tail.get(..end).unwrap_or_default()
+    }
+
+    /// `code` without its line comments, which discuss `.at(path)` and
+    /// `File::open` in prose and would otherwise answer for the code.
+    fn uncommented(code: &str) -> String {
+        let mut out = String::with_capacity(code.len());
+        for line in code.lines() {
+            match index_of(line, "//") {
+                Some(at) => out.push_str(line.get(..at).unwrap_or_default()),
+                None => out.push_str(line),
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// How many wrappers were checked, so the caller can refuse a run that
+    /// checked none.
+    fn names_every_path(label: &str, region: &str, body: &str) -> usize {
+        let mut checked = 0;
+        for piece in functions(body) {
+            // A trait's method SIGNATURE has no body to name anything in.
+            // Its piece runs on to the next declaration, so holding a `{` does
+            // not tell the two apart — which comes FIRST does.
+            let opens = index_of(piece, "{");
+            let ends = index_of(piece, ";");
+            if opens.is_none() || (ends.is_some() && ends < opens) {
+                continue;
+            }
+            // A path parameter is spelled as a `Path` here, so the signature
+            // says which arguments are ones. Taken GENERICALLY it does not:
+            // review wrote `open_any(path: impl AsRef<Path>)` naming
+            // `/not-the-file` for every failure, and the loop below found no
+            // parameter to require a naming for.
+            assert!(
+                !piece.contains("AsRef<") && !piece.contains("Into<"),
+                "{label}: {region} takes a path generically, where this cannot \
+                 read it off the signature: {piece}"
+            );
+            let names = path_parameters(piece);
+            if names.is_empty() {
+                continue;
+            }
+            checked += 1;
+            let body = unspaced(piece);
+            // The one wrapper whose error never becomes a message is exempt
+            // BY NAME, because a shape was tried twice and broken twice: a
+            // bare `.ok()` anywhere excused every path in the function, and
+            // narrowing that to `(path).ok()` still let `let _ =
+            // std::fs::metadata(path).ok();` sit beside an unnamed
+            // `File::open(path)`. The `(` is part of the name, or
+            // `metadata_if_present_and_open` inherits the exemption.
+            //
+            // And the RETURN TYPE, which is what actually makes it safe:
+            // nothing that hands back an `Option` can propagate an error at
+            // all, so there is none to leave unnamed. A wrapper of this name
+            // that started returning `io::Result` would keep the exemption
+            // without it and could then propagate one raw.
+            let discarded = piece.trim_start().starts_with(DISCARDS_ITS_ERROR)
+                && piece.contains("-> Option<")
+                && names
+                    .iter()
+                    .any(|name| body.contains(&format!("({name}).ok()")));
+            for name in names {
+                // The three ways a name reaches a message, spelled out rather
+                // than counted. Counting is what review broke: `p` occurring
+                // twice in `File::open(p).at(Path::new("/wrong"))` is once as
+                // the argument and once inside the word `open`, so a wrapper
+                // reporting an unrelated path passed. A wrapper that names its
+                // path some fourth way reds here and adds its spelling.
+                let spellings = [
+                    format!(".at({name})"),
+                    format!("named(error,{name})"),
+                    format!("{name}.display()"),
+                ];
+                assert!(
+                    spellings.iter().any(|spelling| body.contains(spelling)) || discarded,
+                    "{label}: {region} takes `{name}` and does not name it: {piece}"
+                );
+            }
+        }
+        checked
+    }
+
+    /// The functions `body` declares, cut at each `fn NAME(` rather than at
+    /// each `fn `, so a string or a name ending in `fn` opens nothing.
+    fn functions(body: &str) -> Vec<&str> {
+        let mut heads = Vec::new();
+        let mut from = 0;
+        while let Some(hit) = body.get(from..).and_then(|rest| index_of(rest, "fn ")) {
+            let after = from + hit + "fn ".len();
+            from = after;
+            let tail = body.get(after..).unwrap_or_default();
+            let name: String = tail
+                .chars()
+                .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
+                .collect();
+            if !name.is_empty() && tail.get(name.len()..).is_some_and(|r| r.starts_with('(')) {
+                heads.push(after);
+            }
+        }
+        let mut out = Vec::new();
+        for (index, start) in heads.iter().enumerate() {
+            let end = heads.get(index + 1).copied().unwrap_or(body.len());
+            out.push(body.get(*start..end).unwrap_or_default());
+        }
+        out
+    }
+
+    /// `code` with every space taken out, so the spellings above match a
+    /// wrapper however it is wrapped across lines.
+    fn unspaced(code: &str) -> String {
+        code.chars().filter(|ch| !ch.is_whitespace()).collect()
+    }
+
+    /// The path parameters `piece` declares, read off its signature.
+    ///
+    /// By the TYPE naming `Path`, which is what a wrapper here writes and not
+    /// what every path-taking parameter must be: `File::open` accepts an
+    /// `impl AsRef<Path>`, so a `&str` is a path too and this cannot tell.
+    /// The generic form is refused above; the concrete one is a limit, and a
+    /// small one now that it applies to seventeen short functions the
+    /// compiler has already fenced rather than to a whole crate.
+    fn path_parameters(piece: &str) -> Vec<String> {
+        let Some((signature, _)) = piece.split_once(')') else {
+            return Vec::new();
+        };
+        let Some((_, arguments)) = signature.split_once('(') else {
+            return Vec::new();
+        };
+        arguments
+            .split(',')
+            .filter(|argument| argument.contains("Path"))
+            .filter_map(|argument| argument.split(':').next())
+            .map(|name| name.trim().trim_start_matches("mut ").trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect()
+    }
+
+    /// How a path reaches a message.
+    const NAMINGS: [&str; 3] = [".at(", "named(", ".display()"];
+
+    /// The ONE wrapper whose error never becomes a message, named rather than
+    /// recognised.
+    const DISCARDS_ITS_ERROR: &str = "metadata_if_present(";
+
+    /// The first index of `needle`, spelled without the method that names it.
+    ///
+    /// This file is `include_str!`'d into its recipe, and the catalog's
+    /// command-surface scan reds on the bare token that method would leave in
+    /// the text — the same reason a comment here cannot spell it either.
+    fn index_of(haystack: &str, needle: &str) -> Option<usize> {
+        haystack.match_indices(needle).next().map(|(index, _)| index)
+    }
+
     /// A KEY THAT IS NOT THERE COSTS NOTHING.
     ///
     /// The refusal has to come before the staging tree is emptied, or a
@@ -2281,6 +2807,66 @@ mod tests {
             );
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// A DEPLOYMENTS DIRECTORY THAT CANNOT BE READ is not a publish that
+    /// wrote nothing, and says so.
+    ///
+    /// This is the one behaviour `paths::is_dir` changed rather than merely
+    /// named. `Path::is_dir` answers `false` for every failure it meets, so a
+    /// `td/deployments` that is not a directory at all — or that this process
+    /// may not traverse — read as an id td-boot never wrote, and the operator
+    /// was told the program that had just done the work published nothing.
+    /// The errno is the whole difference between "look at td-boot" and "look
+    /// at the disk", so it is the errno that has to reach the message.
+    #[test]
+    fn a_deployments_directory_that_cannot_be_read_is_not_a_missing_publish() {
+        let scratch = Scratch::disk(DISK);
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
+        let dir = fake_mkfs(RECORDING_MKFS);
+        let td_boot = dir.join("td-boot");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // The staging root is `$2`. td-install created `td/deployments` as
+            // a directory before this ran; putting a FILE there is ENOTDIR on
+            // the join below, which needs no ownership games to arrange and so
+            // behaves the same for a test run as root.
+            std::fs::write(
+                &td_boot,
+                "#!/bin/sh\nrmdir \"$2/td/deployments\"\n: > \"$2/td/deployments\"\n\
+                 echo 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&td_boot, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let publish = Publish {
+            td_boot,
+            deployment: PathBuf::from("/media/deployment"),
+            trusted_key: key_file(&dir),
+        };
+        let error = run_volume(
+            &scratch.path,
+            &dir.join("mkfs.btrfs"),
+            &dir,
+            Some(&publish),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        let text = format!("{error}");
+        assert!(
+            !text.contains("is not there"),
+            "an unreadable deployments directory was reported as a publish \
+             that never happened: {text}"
+        );
+        assert!(
+            text.contains("td/deployments"),
+            "the refusal does not name the path it could not read: {text}"
+        );
+        assert!(
+            !dir.join("argv").exists(),
+            "the refusal still made a filesystem"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// An id that is well-formed but points OUT of the staging tree is refused

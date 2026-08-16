@@ -65,6 +65,7 @@ fn same_file(a: &Metadata, b: &Metadata) -> bool {
 /// the two puts the allow on the `mod`, so leaving it off here is what makes
 /// one going unused in td-boot — which uses both — a warning rather than
 /// silence.
+#[allow(clippy::disallowed_methods)]
 pub fn open_real_file(path: &Path, label: &str) -> io::Result<(File, Metadata)> {
     let metadata = std::fs::symlink_metadata(path).map_err(|error| {
         io::Error::new(error.kind(), format!("{label} {}: {error}", path.display()))
@@ -100,6 +101,7 @@ pub fn open_real_file(path: &Path, label: &str) -> io::Result<(File, Metadata)> 
 /// this off device nodes, some of which act merely on being opened, but a node
 /// swapped in after it is still opened here and neither flag prevents that.
 /// DESIGN §10 item 10c records why the `O_PATH` route that would is refused.
+#[allow(clippy::disallowed_methods)]
 fn open_checked(path: &Path, expected: &Metadata, label: &str) -> io::Result<(File, Metadata)> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()

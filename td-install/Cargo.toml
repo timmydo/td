@@ -33,6 +33,7 @@ unreachable = "deny"
 todo = "deny"
 unimplemented = "deny"
 indexing_slicing = "deny"
+disallowed_methods = "deny"
 
 [profile.release]
 opt-level = 2
