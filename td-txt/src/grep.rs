@@ -12,7 +12,9 @@
 //!
 //! * a second regex engine — `-P`/`--perl-regexp`, and `-X`, whose argument
 //!   reaches the same one (`-X perl` IS `-P`);
-//! * output this one does not produce — `--color`, `-T`/`--initial-tab`;
+//! * output this one does not produce — `--color`/`--colour`, whose escapes
+//!   would need a second output path and a terminal test, and
+//!   `-T`/`--initial-tab`;
 //! * a file filter — `--include`, `--exclude`, `--exclude-from` and
 //!   `--exclude-dir`, and `-I`, which is `--binary-files=without-match`: the
 //!   one value of that option not served, the other two being the default and
@@ -49,10 +51,14 @@
 //! above is pinned in spec/divergence.test.txt, except `--i`/`--in`, which
 //! stopped diverging when `--initial-tab` landed and moved to
 //! spec/grep-cli.test.txt. The SHORT roster is complete, swept
-//! against grep.c:486; the long one is not — `--colour`, `--group-separator`,
-//! `--no-group-separator`, `--no-ignore-case`, `--label` and `--line-buffered`
-//! are refused too with neither an entry here nor a case, which is a sweep
-//! still owed.
+//! against grep.c:486; the long one is not — `--group-separator`,
+//! `--no-group-separator`, `--no-ignore-case`, `--label`, `--line-buffered`
+//! and `--unix-byte-offsets` are refused too with neither an entry here nor a
+//! case, which is a sweep still owed. The last of those is the odd one: `-u`
+//! IS refused above with a case, but only in its short spelling, and GNU
+//! answers the long one with `warning: --unix-byte-offsets (-u) is obsolete`
+//! and then MATCHES — so unlike the other five it diverges in status, not
+//! only in wording.
 
 use crate::regex::{Filter, OnBudget, Options, Regex};
 use crate::util::{
@@ -533,8 +539,10 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                     return 2;
                 }
             };
-            // Arity is GNU's: a value-taking option accepts `=VALUE` or the next
-            // argv element; a flag accepts neither.
+            // Arity is GNU's, and its THREE cases differ in what they accept
+            // beyond `=VALUE`: a required argument also takes the next argv
+            // element, an OPTIONAL one never does (so `--color always` leaves
+            // `always` an operand), and a flag takes neither.
             let value = match (arity, inline) {
                 (Arg::None, Some(_)) => {
                     errb(&name_in("option '--", name, "' doesn't allow an argument"));
@@ -542,6 +550,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                     return 2;
                 }
                 (Arg::None, None) => None,
+                (Arg::Optional, v) => v,
                 (Arg::Required, Some(v)) => Some(v),
                 (Arg::Required, None) => match args.get(i) {
                     Some(v) => {
@@ -1025,14 +1034,22 @@ fn split_long(arg: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
 enum Arg {
     None,
     Required,
+    /// GNU's `optional_argument`, which `--color` is grep's only user of. It
+    /// takes `=VALUE` and NEVER the next argv element, so `grep --color always
+    /// f` searches for `always` -- measured against GNU 3.11, where a
+    /// `Required` reading would have eaten the pattern.
+    Optional,
 }
 
 /// Names GNU declares TWICE for one option. `getopt_long` drops a later prefix
 /// match that matches the FIRST one in both option and arity (getopt.c:230),
 /// which is a comparison against the first rather than a global dedup -- so
 /// this is only the "same option" half, and the caller tests the arity.
-const SYNONYMS: &[&[&[u8]]] =
-    &[&[b"fixed-regexp", b"fixed-strings"], &[b"quiet", b"silent"]];
+const SYNONYMS: &[&[&[u8]]] = &[
+    &[b"fixed-regexp", b"fixed-strings"],
+    &[b"color", b"colour"],
+    &[b"quiet", b"silent"],
+];
 
 /// Whether two long names are the same option under two spellings.
 fn synonymous(a: &[u8], b: &[u8]) -> bool {
@@ -1060,6 +1077,8 @@ const LONG_OPTIONS: &[(&[u8], Arg)] = &[
     (b"binary-files", Arg::Required),
     (b"byte-offset", Arg::None),
     (b"context", Arg::Required),
+    (b"color", Arg::Optional),
+    (b"colour", Arg::Optional),
     (b"count", Arg::None),
     (b"devices", Arg::Required),
     (b"directories", Arg::Required),
@@ -1316,7 +1335,9 @@ fn parse_long(
         | b"include"
         | b"binary"
         | b"initial-tab"
-        | b"perl-regexp" => {
+        | b"perl-regexp"
+        | b"color"
+        | b"colour" => {
             errb(&name_in("unsupported option '--", name, "'"));
             eprintln!("{USAGE}");
             return Err(LongErr::Handled);

@@ -2060,9 +2060,18 @@ td-txt-authored case files
     leaves TWO, `--col` and `--colo`: `color` and `colour` share a `val` and an
     arity in GNU, so glibc collapses them the way it collapses
     `--fixed-regexp`/`--fixed-strings`, which is a `SYNONYMS` entry rather than
-    a table row. FOUR of the thirteen are done, in the paragraph below; the
-    rest go one family at a time because a name in the table is a refusal that
-    has to say WHY, which is a per-option decision and not a sweep.
+    a table row. (That prediction held and is now DONE -- the two names went
+    in together with the `SYNONYMS` entry beside them, and `--col`, `--colo`
+    and `--colou` all resolve here as they do in GNU. It is the only one of
+    the landings below that needed anything but a table row.)
+
+    EIGHT of the thirteen are done, over three landings recorded in the
+    paragraphs below: the four filters, then `--initial-tab`/`--perl-regexp`,
+    then `--color`/`--colour`. The five left are `--group-separator`,
+    `--no-group-separator`, `--no-ignore-case`, `--label` and
+    `--line-buffered`. They go one family at a time because a name in the
+    table is a refusal that has to say WHY, which is a per-option decision
+    and not a sweep.
 
     The FILTER family -- `--exclude`, `--exclude-from`, `--exclude-dir` and
     `--include` -- is the four, and it had to enter together: `exclude` is a
@@ -2136,7 +2145,8 @@ td-txt-authored case files
     is that the diagnostic names `--perl-regexp` rather than reporting `--p`
     unrecognized.
 
-    That leaves SIX families and six names, all of them options this crate
+    That left SIX families and six names — as of the `--initial-tab` landing,
+    superseded by the paragraph below — all of them options this crate
     would have to actually implement rather than merely resolve: `--c`/`--co`
     want `--color` and `--colour`, `--l` wants `--label` and
     `--line-buffered` (`--li` only the second), and `--n`/`--no` want
@@ -2144,6 +2154,40 @@ td-txt-authored case files
     entry is therefore done — every name whose absence distorted an
     ambiguity list without costing a feature is now in the table — and what
     remains needs the features.
+
+    `--color`/`--colour` then closed `--c` and `--co`, taking the sweep to 60
+    both-ambiguous, 48 identical, 12 by SET, none by ORDER. It needed the two
+    things flagged above: a THIRD arity,
+    `Arg::Optional`, because `--color` is grep's only `optional_argument`, and
+    a `SYNONYMS` pair. Both are pinned from both
+    sides — declared `Arg::None` the option would answer `doesn't allow an
+    argument` to `--color=always`, declared `Arg::Required` it would answer
+    `requires an argument` to a bare `--color`, and dropping the `SYNONYMS`
+    pair makes `--col` ambiguous where GNU searches. The arity's third effect
+    is real and NOT observable here: an `optional_argument` never consumes the
+    next argv element, so GNU's `grep --color always f` searches for `always`,
+    while td-txt refuses whichever way it is declared.
+
+    FOUR families and four names remain, and all four need the feature rather
+    than the name: `--l`/`--li` want `--label` and `--line-buffered`, and
+    `--n`/`--no` want `--no-group-separator` and `--no-ignore-case`.
+
+    Two things about that count, both of which a reviewer got wrong from this
+    text and neither of which is a wrong NUMBER. The universe is BOUNDED AT
+    TWO CHARACTERS -- 27 one-character prefixes over `a-z` and `-` plus 729
+    two-character ones, each bare and with `=1` and `=`, which is where 2,268
+    comes from. It is defined in full further down, in the reorder paragraph
+    now marked as-of; marking that paragraph superseded made its NUMBERS
+    historical and accidentally made its METHOD look historical too, so the
+    definition is repeated here. Every figure in this entry is 3x a count of
+    prefixes: 20 both-ambiguous, 16 identical, 4 by SET.
+
+    And because of that bound, four families do NOT exhaust the divergent
+    spellings -- they exhaust the divergent NAMES. Go past two characters and
+    `--lin`, `--line`, `--line-` and `--no-` diverge by SET as well, each for
+    the same missing name as the two-character prefix it extends. The bound
+    buys a sweep that reruns in seconds and a count that moves only when a
+    NAME lands; it costs the tail, which no landing has ever been decided by.
 
     Every "byte for byte" in this entry means the DIAGNOSTIC LINE and carries
     TWO preconditions, not the one this paragraph first claimed. The second is
@@ -2267,20 +2311,24 @@ td-txt-authored case files
     each other in every field but not to `--context`, which it matched first.
     A global dedup would drop one of those and be wrong.
 
-    td-txt has exactly two such pairs, `fixed-regexp`/`fixed-strings` and
-    `quiet`/`silent`, and only the first can ever collapse. Not because no
-    prefix reaches the second -- the EMPTY one does, and `--=` duly lists both
-    `--quiet` and `--silent` -- but because collapsing requires one of the pair
-    to be the FIRST match, and the only prefix matching both is the empty
-    string, whose first match is `--basic-regexp`. Their common prefix would
-    have to be at least `q`-or-`s` long to select one of them, and no string is
-    a prefix of both `quiet` and `silent` but the empty one. The roster names
-    the pair anyway, since what makes two names collapse is being one OPTION
-    rather than anything about their letters.
+    td-txt has THREE such pairs: `fixed-regexp`/`fixed-strings`,
+    `color`/`colour`, and `quiet`/`silent`. Two of them collapse and the third
+    never can, which is a fact about their LETTERS rather than about the rule.
+    Collapsing requires one of the pair to be the FIRST match, so it needs a
+    prefix that selects one of them, and the only string that is a prefix of
+    both `quiet` and `silent` is the empty one -- whose first match is
+    `--basic-regexp`, not either of them. `--=` duly lists both `--quiet` and
+    `--silent`. The roster names that pair anyway, since what makes two names
+    collapse is being one OPTION rather than anything about their letters.
 
-    A third case confirms the rule from outside td-txt's own table: GNU's
-    `--colo` prefixes both `--color` and `--colour`, and GNU RESOLVES it rather
-    than refusing -- the same mechanism that makes `--fixed` resolve here.
+    `color`/`colour` was written up here as a case from OUTSIDE td-txt's table
+    -- GNU resolves `--colo` where td-txt, lacking both names, could not be
+    asked. It is inside now, and it is the second pair that collapses:
+    `--col`, `--colo` and `--colou` resolve here exactly as `--fixed` does,
+    and spec/divergence.test.txt's `--col` case is what holds it. That case
+    exists BECAUSE dropping the roster entry makes `--col` ambiguous, which is
+    the failure this whole paragraph is about, reproduced on the one pair
+    added since it was written.
 
     glibc's condition is `val` AND `has_arg`, and td-txt splits it: the roster
     above is the first half, the caller compares the arity for the second.
@@ -2293,7 +2341,8 @@ td-txt-authored case files
     because the rule belongs to `getopt_long` rather than to one program's
     options.
 
-    Re-sweeping the same 2,268 spellings: 24 identical where the reorder left
+    Re-sweeping the same 2,268 spellings, as of the `--fixed-regexp` landing
+    and superseded by every entry above it: 24 identical where the reorder left
     18, 24 differing by SET where it left 30, none by order. The six that moved
     are `--f` and `--fi` in three spellings each.
 
@@ -2910,7 +2959,7 @@ td-txt-authored case files
   oracle against a new case and confirm it does NOT match, comparing status,
   stdout AND stderr: for every refusal here the whole divergence is the
   diagnostic, so a check that reads only status and stdout reports agreement.
-  61 cases, of which 59 differ; the other TWO are counts GNU never finishes, so
+  65 cases, of which 63 differ; the other TWO are counts GNU never finishes, so
   they are not comparable by construction and their divergence is the
   non-finishing itself. This number had gone STALE -- it read 36 while the file
   held 33, five commits having touched the file without re-running it, which is

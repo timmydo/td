@@ -1662,6 +1662,39 @@ a
 ## status: 2
 ## stderr-json: "grep: option '--in' is ambiguous; possibilities: '--include' '--initial-tab' '--invert-match'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
 
+#### --c lists four candidates, both --color spellings among them
+# spec/README's ambiguity entry has used `--c' as its running example since
+# before either `--color' spelling was in the table, and it was never pinned.
+# It is now: GNU's four, in GNU's declaration order. What it shows that the
+# other order cases do not is that the SYNONYMS collapse is NOT a dedup --
+# `--color' and `--colour' are one option under two spellings and BOTH are
+# listed here, because the collapse only decides whether a prefix is
+# ambiguous, and `--context'/`--count' make this one ambiguous regardless.
+## argv: grep --c hit f1
+## file f1:
+hit
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: option '--c' is ambiguous; possibilities: '--context' '--color' '--colour' '--count'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
+#### and --co, which lists the SAME four, `--context' being a `co' name too
+# `--c`'s case above reds for every mutation this landing was tested against,
+# so this one is not there to catch one -- it is there because the claim made
+# for this landing is that `--c' AND `--co' close, and a claim about two
+# spellings that tests one is a claim about one. A draft of this comment said
+# `--context' drops out at this width; it does not, `context' beginning `co',
+# and the corpus caught that rather than a reviewer. So the two widths list
+# the same four names, which is worth a case precisely because it is the
+# answer one would not predict.
+## argv: grep --co hit f1
+## file f1:
+hit
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: option '--co' is ambiguous; possibilities: '--context' '--color' '--colour' '--count'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
 #### an EMPTY prefix lists the whole table, so it shows the order most plainly
 # `--=` splits into an empty name and a value, and every option prefixes the
 # empty string -- so this one diagnostic is the table read out in order. Only
