@@ -159,19 +159,44 @@ impl Scanner {
     /// mid-line if it stops here.
     fn fold_continuation(&mut self) {
         self.bump();
+        self.fold_tail();
+    }
+
+    /// The same, for a caller that has already consumed the backslash -- the
+    /// one scan that matches on it before knowing what follows.
+    fn fold_tail(&mut self) {
         self.bump();
         self.continued = true;
     }
 
-    /// `eat`, with any `\<newline>` folds at the cursor consumed first: ash's
-    /// `pgetc_eatbnl`, which every second character of an operator is read
-    /// through. A fold is NOT given back when the character then fails to
-    /// match -- ash's `pungetc()` hands back one character, and the one it
-    /// hands back is the one AFTER the fold.
-    fn eat_folded(&mut self, c: char) -> bool {
+    /// The index of the next character at or after `i`, stepping over any
+    /// `\<newline>` folds. For the READ-ONLY lookaheads, which cannot consume:
+    /// ash never sees a fold there either, its own lookahead reading through
+    /// `pgetc_eatbnl` and pushing back one character.
+    fn past_folds(&self, mut i: usize) -> usize {
+        while self.src.get(i) == Some(&'\\') && self.src.get(i + 1) == Some(&'\n') {
+            i += 2;
+        }
+        i
+    }
+
+    /// Consume any `\<newline>` folds at the cursor. ash eats them at the READ
+    /// -- `pgetc_top` (ash.c:11130) is `pgetc_eatbnl` for every syntax but the
+    /// single-quoted one -- so they are invisible to the scanners rather than
+    /// something each has to look for. This shell folds at the points that
+    /// need it instead, and this is the shared one.
+    fn skip_folds(&mut self) {
         while self.peek() == Some('\\') && self.peek_at(1) == Some('\n') {
             self.fold_continuation();
         }
+    }
+
+    /// `eat`, with folds spent first: ash's `pgetc_eatbnl`, which every second
+    /// character of an operator is read through. A fold is NOT given back when
+    /// the character then fails to match -- ash's `pungetc()` hands back one
+    /// character, and the one it hands back is the one AFTER the fold.
+    fn eat_folded(&mut self, c: char) -> bool {
+        self.skip_folds();
         self.eat(c)
     }
 }
@@ -1419,6 +1444,10 @@ impl Lexer {
     /// its result is neither field-split nor globbed.
     fn scan_dollar(&mut self, buf: &mut WordBuf, in_dq: bool) -> Syn<()> {
         self.sc.bump(); // '$'
+        // The opener is read through any fold, so `$\<newline>{a}` is `${a}`
+        // and `$\<newline>(cmd)` a substitution. At end of input the fold is
+        // spent and a bare `$` is left, which is a literal.
+        self.sc.skip_folds();
         let push_dollar = |buf: &mut WordBuf| {
             if in_dq {
                 buf.push_quoted('$')
@@ -1447,9 +1476,11 @@ impl Lexer {
                 buf.push_seg(Seg::Param(Box::new(param)));
             }
             '(' => {
-                if self.sc.peek_at(1) == Some('(') {
-                    self.sc.bump();
-                    self.sc.bump();
+                self.sc.bump();
+                // A fold between the two parens is invisible too, so
+                // `$(\<newline>(1+2))` is arithmetic rather than a
+                // substitution whose body opens with a subshell.
+                if self.sc.eat_folded('(') {
                     let line = self.sc.line;
                     let text = self.scan_arith()?;
                     buf.push_seg(Seg::Arith {
@@ -1457,7 +1488,6 @@ impl Lexer {
                         quoted: in_dq,
                     });
                 } else {
-                    self.sc.bump();
                     // After the `(`, so this is the line the BODY opens on.
                     let line = self.sc.line;
                     let code = self.scan_paren_body()?;
@@ -1486,13 +1516,16 @@ impl Lexer {
             }
             c if c.is_ascii_alphabetic() || c == '_' => {
                 let mut name = String::new();
-                while let Some(c) = self.sc.peek() {
-                    if c.is_ascii_alphanumeric() || c == '_' {
-                        name.push(c);
-                        self.sc.bump();
-                    } else {
+                loop {
+                    // Through folds, as every other character of the construct
+                    // is: `$a\<newline>b` names `ab`, not `a` then a literal.
+                    self.sc.skip_folds();
+                    let Some(c) = self.sc.peek() else { break };
+                    if !(c.is_ascii_alphanumeric() || c == '_') {
                         break;
                     }
+                    name.push(c);
+                    self.sc.bump();
                 }
                 buf.push_seg(Seg::Param(Box::new(Param {
                     name,
@@ -1516,42 +1549,47 @@ impl Lexer {
     /// approximating it -- the two disagreeing means a body scanned under the
     /// wrong rule, which is not a diagnosable error but a different program.
     fn braced_op_is_substitution(&self) -> bool {
-        let mut i = self.sc.pos;
+        // Every step is taken through `past_folds`, so this reads the text the
+        // SCAN will read rather than the source it is written in. Getting that
+        // wrong is not a diagnosable error but a body scanned under the other
+        // quoting rule -- a different program, silently.
+        let mut i = self.sc.past_folds(self.sc.pos);
         // `${#x}` is a LENGTH and takes no word, while `${#}` and `${#-x}` are
         // the parameter `#` itself: the prefix reading only holds when a bare
         // name reaches the closing brace.
         if self.sc.src.get(i) == Some(&'#') {
-            let mut j = i + 1;
+            let mut j = self.sc.past_folds(i + 1);
+            let started = j;
             match self.sc.src.get(j) {
-                Some(&c) if is_special_param(c) => j += 1,
+                Some(&c) if is_special_param(c) => j = self.sc.past_folds(j + 1),
                 _ => {
                     while matches!(self.sc.src.get(j), Some(c) if c.is_ascii_alphanumeric() || *c == '_')
                     {
-                        j += 1;
+                        j = self.sc.past_folds(j + 1);
                     }
                 }
             }
-            if j > i + 1 && self.sc.src.get(j) == Some(&'}') {
+            if j > started && self.sc.src.get(j) == Some(&'}') {
                 return false;
             }
         }
         match self.sc.src.get(i) {
             Some(c) if c.is_ascii_digit() => {
                 while matches!(self.sc.src.get(i), Some(c) if c.is_ascii_digit()) {
-                    i += 1;
+                    i = self.sc.past_folds(i + 1);
                 }
             }
-            Some(&c) if is_special_param(c) => i += 1,
+            Some(&c) if is_special_param(c) => i = self.sc.past_folds(i + 1),
             Some(c) if c.is_ascii_alphabetic() || *c == '_' => {
                 while matches!(self.sc.src.get(i), Some(c) if c.is_ascii_alphanumeric() || *c == '_')
                 {
-                    i += 1;
+                    i = self.sc.past_folds(i + 1);
                 }
             }
             _ => return false,
         }
         if self.sc.src.get(i) == Some(&':') {
-            i += 1;
+            i = self.sc.past_folds(i + 1);
         }
         matches!(self.sc.src.get(i), Some('-' | '=' | '?' | '+'))
     }
@@ -1581,6 +1619,16 @@ impl Lexer {
                     }
                 }
                 '\\' => {
+                    // A fold is eaten before the substitution's own syntax ever
+                    // sees it, so `${a\<newline>-x}` is `${a-x}` rather than a
+                    // name with a backslash in it. Quoted runs are copied
+                    // verbatim below and keep theirs, which is right for a
+                    // single-quoted one and harmless for the rest: that text is
+                    // lexed again, and folds there.
+                    if self.sc.peek() == Some('\n') {
+                        self.sc.fold_tail();
+                        continue;
+                    }
                     out.push('\\');
                     if let Some(n) = self.sc.bump() {
                         out.push(n);
@@ -1591,18 +1639,24 @@ impl Lexer {
                 // nested construct, so each is copied WHOLE. dash pushes a
                 // fresh syntax for these, where a `'` quotes again -- which is
                 // what the recursive call reproduces.
-                '$' if quotes_off && self.sc.peek() == Some('(') => {
-                    self.sc.bump();
-                    out.push_str("$(");
-                    out.push_str(&self.scan_paren_body()?);
-                    out.push(')');
-                    continue;
-                }
-                '$' if quotes_off && self.sc.peek() == Some('{') => {
-                    self.sc.bump();
-                    out.push_str("${");
-                    out.push_str(&self.scan_braced(in_dq)?);
-                    out.push('}');
+                // The opener is found through a fold, as it is after any other
+                // `$`; without that the nested construct is not copied WHOLE
+                // and a `}` inside it ends the outer expansion.
+                '$' if quotes_off && {
+                    self.sc.skip_folds();
+                    matches!(self.sc.peek(), Some('(' | '{'))
+                } =>
+                {
+                    let opener = self.sc.bump();
+                    if opener == Some('(') {
+                        out.push_str("$(");
+                        out.push_str(&self.scan_paren_body()?);
+                        out.push(')');
+                    } else {
+                        out.push_str("${");
+                        out.push_str(&self.scan_braced(in_dq)?);
+                        out.push('}');
+                    }
                     continue;
                 }
                 // Copied verbatim rather than through `scan_backtick`, which
@@ -1629,7 +1683,11 @@ impl Lexer {
                 // As in `scan_paren_body`: only a `$'...'` escapes its own
                 // closing quote, so `${v#$'a\''}` ends at the wrong one under a
                 // plain single quote's rule and the brace never closes.
-                '$' if !quotes_off && self.sc.peek() == Some('\'') => {
+                '$' if !quotes_off && {
+                    self.sc.skip_folds();
+                    self.sc.peek() == Some('\'')
+                } =>
+                {
                     out.push('$');
                     out.push('\'');
                     self.sc.bump();
@@ -1769,10 +1827,16 @@ impl Lexer {
                 }
                 ')' => {
                     if depth == 1 {
-                        if self.sc.peek_at(1) == Some(')') {
-                            self.sc.bump();
-                            self.sc.bump();
+                        self.sc.bump();
+                        if self.sc.eat_folded(')') {
                             return Ok(out);
+                        }
+                        // Running OUT of input here is not a malformed
+                        // expansion: the second `)` may be on the next line,
+                        // and a fatal error refuses it where every other
+                        // construct would have asked. `scan_op`'s argument.
+                        if self.sc.peek().is_none() {
+                            return Err(format!("{INCOMPLETE}: unmatched `$((`"));
                         }
                         return Err("bad arithmetic expansion: expected `))`".into());
                     }

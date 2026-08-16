@@ -961,7 +961,6 @@ xfail prompt.test.sh::sh -i
 xfail prompt.test.sh::special case for $
 xfail prompt.test.sh::username
 xfail quote.test.sh::$'' octal escapes don't have leading 0
-xfail quote.test.sh::$? split over multiple lines
 xfail quote.test.sh::YSH allows unquoted foo\ bar too
 xfail redirect-command.test.sh::Prefix redirect for loop -- not allowed
 xfail redirect-command.test.sh::Redirect in function body is evaluated multiple times

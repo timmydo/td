@@ -3619,6 +3619,53 @@ mod tests {
         }
     }
 
+    /// ash reads every character of a `$` construct through `pgetc_top`
+    /// (ash.c:11130) -- `pgetc_eatbnl` for every syntax but the single-quoted
+    /// one -- so a fold never reaches that construct's syntax. Every line below
+    /// produces the same output under busybox ash 1.37.0, and each was a `bad
+    /// substitution` or a syntax error here before.
+    #[test]
+    fn a_line_continuation_is_invisible_inside_a_dollar_construct() {
+        let out = |src: &str| run(src).1;
+        // Between the `$` and whatever it opens.
+        assert_eq!(out("a=1; echo $\\\n{a}"), "1\n");
+        assert_eq!(out("a=1; echo $\\\na"), "1\n");
+        assert_eq!(out("echo $\\\n(echo sub)"), "sub\n");
+        assert_eq!(out("echo $\\\n((1+2))"), "3\n");
+        // The corpus case this promotes: `$` and a special parameter, split.
+        assert_eq!(out("true; echo $\\\n?"), "0\n");
+        // Inside the braces, where the text is collected for a later re-lex.
+        assert_eq!(out("a=1; echo ${\\\na}"), "1\n");
+        assert_eq!(out("a=1; echo ${a\\\n}"), "1\n");
+        assert_eq!(out("echo ${a\\\n-x}"), "x\n");
+        assert_eq!(out("a=abc; echo ${#\\\na}"), "3\n");
+        assert_eq!(out("a=abc; echo ${a\\\n#a}"), "bc\n");
+        assert_eq!(out("set -- p; echo ${\\\n1}"), "p\n");
+        assert_eq!(out("a=1; echo ${b-${\\\na}}"), "1\n");
+        // Both parens of `$((` and of the `))` that closes it.
+        assert_eq!(out("echo $(\\\n(1+2))"), "3\n");
+        assert_eq!(out("echo $((1+2)\\\n)"), "3\n");
+        // A single-quoted run keeps its backslash and its newline, which is the
+        // one syntax ash reads with a plain `pgetc`.
+        assert_eq!(out("echo '${a\\\n}'"), "${a\\\n}\n");
+        // And a fold with nothing after the `$` spends itself, leaving the `$`
+        // as an ordinary character rather than an unfinished construct.
+        assert_eq!(out("echo $\\\n"), "$\n");
+        // An UNBRACED name is read through folds too, so this names `ab` --
+        // splitting it would silently expand a different variable.
+        assert_eq!(out("a=X; ab=Y; echo $a\\\nb"), "Y\n");
+        assert_eq!(out("a=X; ab=Y; echo \"$a\\\nb\""), "Y\n");
+        // The two READ-ONLY lookaheads inside `${...}` have to read the same
+        // text the scan will. The first decides whether the body is scanned
+        // with quotes demoted, and a fold before the operator flipping that
+        // answer is not an error but a different program: here the `'` would
+        // wrongly protect the first `}`. The second finds a nested opener, and
+        // without it the nested `$( )` is not copied whole and its `}` ends
+        // the outer expansion.
+        assert_eq!(out("echo \"${u\\\n-'x}y'}\""), "'xy'}\n");
+        assert_eq!(out("echo \"${u-$\\\n(printf %s '}')}\""), "}\n");
+    }
+
     /// Input that ENDS in a fold. ash reads it through `pgetc_eatbnl` and then
     /// gets PEOF, so nothing is unfinished: the line simply runs. What must NOT
     /// move with it is the interactive reader's probe, which still asks for

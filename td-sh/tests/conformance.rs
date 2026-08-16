@@ -1607,6 +1607,10 @@ fn a_file_stdin_script_agrees_with_a_piped_one()
         // scan seals and the re-pull spends the fold -- so the whole-string
         // reader passing says nothing about it.
         ("echo x \\\n".to_string(), "x\n"),
+        // A construct left open at the end of a LINE, for the same reason: the
+        // whole-string reader has the second `)` in hand already, and only this
+        // one has to ask for it.
+        ("echo $((1+2)\\\n)\n".to_string(), "3\n"),
         // A SCRIPT line longer than SCRIPT_BLOCK, so the seekable path has to
         // accumulate across reads before it finds a newline to rewind to. The
         // length has to be in a line the PARSER reads: as data after `read v`
