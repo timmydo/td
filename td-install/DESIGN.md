@@ -154,8 +154,11 @@ there the re-sign costs the machine its boot, and nothing before the next
 power-on says so. So `td-boot install` warns on stderr when a re-sign replaces
 the signature of a slot that selects it — a warning rather than a refusal
 because refusing is D3's feature, and rather than silence because the next
-report is a machine that does not come back. The real answer is a trust root on
-the installing rootfs, which is item 7's to settle.
+report is a machine that does not come back. The real answer was a trust root
+on the installing rootfs, and item 7c is where it arrived: where one is
+present the replacement is authenticated before anything is written, a wrong
+key is a refusal rather than a warning, and this path is what remains for a
+rootfs that has none.
 
 **D4. Signing happens outside the derivation.** A signing key inside a build
 would break both reproducibility (the output depends on a secret) and offline
@@ -773,12 +776,19 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    downstream reader holding `<id>/manifest` is holding the bytes the
    selector authenticated or it errors.
 
-   What does NOT authenticate, and must not: `install`, which asks whether
-   the fallback slot is intact from the real root where no trust root exists,
-   and `verify`, the operator's diagnostic, which runs in the same place. The
-   two questions are separate functions — `verify_slot` for state,
-   `authenticated_slot` for the boot decision — because a key threaded
-   through the shared one would turn every install into a hard failure.
+   What does NOT authenticate, and must not: `install`'s question about the
+   EXISTING slots — whether the fallback is intact — asked from the real root
+   where no trust root exists, and `verify`, the operator's diagnostic, which
+   runs in the same place. The two questions are separate functions —
+   `verify_slot` for state, `authenticated_slot` for the boot decision —
+   because a key threaded through the shared one would turn every install into
+   a hard failure.
+
+   What install DOES authenticate, since 7c, is the bundle it is about to
+   publish, and only where a trust root is present: `open_bundle` takes the
+   key, and the two questions stay separate because they are about different
+   things — the slots already on the volume are state, and the incoming bundle
+   is a claim someone is making. Where there is no trust root nothing changes.
 
    The manifest is read ONCE and the signature checked over the bytes the
    payload digests are then parsed out of. Reading it again to parse would
@@ -1040,6 +1050,30 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    ordering above: it is inside the image, so it lands before the superblock
    does, and an interrupted install leaves no filesystem rather than a
    filesystem with a half-written deployment in it.
+
+   Two more that are about the trust root, written down because both are the
+   kind of thing a later reader would otherwise re-derive from a diff.
+
+   **`td-install` passes the key EXPLICITLY, and that is load-bearing rather
+   than tidy.** The unasked-for default answers "no trust root" from the
+   ABSENCE of a file, and absence is indistinguishable from a key provisioned
+   under the wrong name, behind a dangling symlink, or in an image that was
+   built without one — all of which publish unverified. That fail-open is
+   structural: a probe cannot tell a deliberate absence from a mistake. The
+   explicit branch has no such hole (a path that is not there is an error),
+   so the installer names its key rather than hoping one is where it looks.
+
+   **`install`'s own policy is coupled to what a rootfs ships, and nothing
+   enforces that coupling.** `install` probes the same default path, so the
+   day any real rootfs gains `TRUSTED_KEY_PATH` every `td-boot install` on
+   that machine becomes fail-closed and unsigned bundles — a supported case
+   today — start being refused, with no code change. Nothing ships that key
+   to the real root now (the harness writes it into the selector initramfs,
+   and `/etc` there is immutable store content), so behaviour is unchanged;
+   but `td-boot authenticate` defaults to the same path for a running
+   machine's benefit, and a later decision to make THAT work by shipping the
+   key would flip install silently. Whoever makes it should change this
+   paragraph in the same landing.
 8. **The EFI-stub kernel** (§5): `CONFIG_EFI`, `CONFIG_EFI_STUB`,
    `CONFIG_CMDLINE` in `linux-x86-64.rs`, having first confirmed what
    `CONFIG_EFI` drags in on the pinned tree.

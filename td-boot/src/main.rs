@@ -74,6 +74,23 @@ enum Mode {
         mountpoint: PathBuf,
         source: PathBuf,
     },
+    /// Publish into a volume root that is ALREADY writable — the inner half of
+    /// `install`, which mounts and then does exactly this.
+    ///
+    /// It exists because `td-install` cannot mount (its DESIGN's D8 leaves it
+    /// no syscall surface) and a regular-file destination has no partition
+    /// device to mount anyway (D9). So the installer stages a deployment into
+    /// the tree `mkfs.btrfs --rootdir` bakes into the volume, and the publish
+    /// happens before the filesystem does. D1 is unharmed: this is not a second
+    /// implementation but the same `install_deployment`, reached without the
+    /// mount.
+    Publish {
+        root: PathBuf,
+        source: PathBuf,
+        /// `None` means "look where a td rootfs keeps one"; see
+        /// `install_trust_root` for why absence and unreadability differ.
+        trusted_key: Option<PathBuf>,
+    },
     Rollback {
         device: PathBuf,
         mountpoint: PathBuf,
@@ -169,7 +186,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory>\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]",
+        "usage: td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]",
     )
 }
 
@@ -253,6 +270,24 @@ fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
                 device: PathBuf::from(device),
                 mountpoint: PathBuf::from(mountpoint),
                 source: PathBuf::from(source),
+            })
+        }
+        Some(mode) if mode == OsStr::new("publish") => {
+            let root = args.next().ok_or_else(usage_error)?;
+            let source = args.next().ok_or_else(usage_error)?;
+            // `Option`, not `authenticate`'s defaulted path: there the key is
+            // the whole question, so a missing one is a failure; here its
+            // absence is a real configuration — a rootfs with no trust root
+            // publishes as it always has — and only `install_trust_root` may
+            // decide that, from whether the file is there.
+            let trusted_key = args.next().map(PathBuf::from);
+            if args.next().is_some() {
+                return Err(usage_error());
+            }
+            Ok(Mode::Publish {
+                root: PathBuf::from(root),
+                source: PathBuf::from(source),
+                trusted_key,
             })
         }
         Some(mode) if mode == OsStr::new("rollback") => {
@@ -450,15 +485,40 @@ fn verify_payload(directory: &Path, name: &str, expected: &str) -> io::Result<Fi
     }
 }
 
-fn open_bundle(directory: &Path) -> io::Result<VerifiedBundle> {
+/// `trust` is the key a PUBLISH runs under, and `Some` makes this fail-closed.
+///
+/// Where it is given, the manifest is authenticated between being READ and
+/// being PARSED, which is the only point that satisfies both halves of DESIGN
+/// §10 item 6. Before the parse, because a deployment nobody vouched for must
+/// be refused without its contents ever being interpreted — the boot path's
+/// order, and an install source is exactly as untrusted as a slot, item 10's
+/// update channel being what fetches these. And over the bytes already in hand,
+/// because re-reading the manifest to parse it would leave a window in which a
+/// writer could serve a signed manifest to the check and a different one to the
+/// parse.
+///
+/// `None` is every OTHER caller: `existing_bundle` and the staged readback ask
+/// about deployments td itself already published, which is a question about
+/// integrity rather than authenticity.
+fn open_bundle(directory: &Path, trust: Option<&TrustRoot>) -> io::Result<VerifiedBundle> {
     require_absolute(directory, "deployment directory")?;
     require_real_directory(directory, "deployment directory")?;
     let manifest_path = directory.join(protocol::MANIFEST_NAME);
     let manifest =
         read_bounded_real_file(&manifest_path, "deployment manifest", protocol::MAX_MANIFEST_BYTES)?;
+    let signature = read_optional_signature(directory)?;
+    if let Some(key) = trust {
+        // An UNSIGNED bundle is refused rather than treated as unverifiable,
+        // or the check would be escapable by deleting `manifest.sig`.
+        let bytes = signature.as_deref().ok_or_else(|| {
+            invalid(
+                "deployment carries no signature and this publish has a trust root".to_string(),
+            )
+        })?;
+        authenticate_manifest(&manifest, bytes, key)?;
+    }
     let parsed = parse_manifest(&manifest)?;
     let id = sha256::hex_digest(&manifest);
-    let signature = read_optional_signature(directory)?;
     let kernel = verify_payload(directory, "bzImage", &parsed.kernel)?;
     let initramfs = verify_payload(directory, "initramfs.cpio", &parsed.initramfs)?;
     let root = verify_payload(directory, "root.erofs", &parsed.root)?;
@@ -975,7 +1035,7 @@ enum Existing {
 }
 
 fn existing_bundle(directory: &Path, want: &VerifiedBundle) -> io::Result<Existing> {
-    let found = open_bundle(directory)?;
+    let found = open_bundle(directory, None)?;
     if found.id != want.id {
         return Ok(Existing::Different);
     }
@@ -1095,8 +1155,12 @@ fn slots_pointing_at(root: &Path, id: &str) -> Vec<&'static str> {
 ///
 /// A warning rather than a refusal because refusing is D3's feature, and rather
 /// than silence because the next report is a machine that does not come back.
-/// The real answer is for the installing rootfs to have a trust root, which is
-/// §10 item 7's to settle.
+///
+/// The real answer was for the installing rootfs to have a trust root, and it
+/// now can: where `install_trust_root` finds one, the re-signed manifest is
+/// authenticated before anything is written and a wrong key is a refusal
+/// instead of this. So this path is what remains when there is NO trust root —
+/// the real root §6 describes — rather than the only answer there is.
 fn warn_unverifiable_resign(root: &Path, id: &str) -> io::Result<()> {
     let live = slots_pointing_at(root, id);
     if live.is_empty() {
@@ -1112,7 +1176,11 @@ fn warn_unverifiable_resign(root: &Path, id: &str) -> io::Result<()> {
     )
 }
 
-fn publish_bundle(root: &Path, mut bundle: VerifiedBundle) -> io::Result<String> {
+fn publish_bundle(
+    root: &Path,
+    mut bundle: VerifiedBundle,
+    authenticated: bool,
+) -> io::Result<String> {
     let deployments = root.join(protocol::DEPLOYMENTS_DIR);
     require_real_directory(&deployments, "deployments directory")?;
     let destination = deployments.join(&bundle.id);
@@ -1122,7 +1190,19 @@ fn publish_bundle(root: &Path, mut bundle: VerifiedBundle) -> io::Result<String>
                 Existing::Same => {}
                 Existing::Resigned(signature) => {
                     replace_signature(&destination, &signature)?;
-                    warn_unverifiable_resign(root, &bundle.id)?;
+                    // Only where nothing checked it. Under a trust root the
+                    // replacement was authenticated before anything was
+                    // written, so the warning would be false — and a false one
+                    // here is worse than none, since its whole job is to make
+                    // an operator look at a machine that may not come back.
+                    //
+                    // `let _`, not `?`: the signature is already replaced, so
+                    // failing on a diagnostic write would report a publish that
+                    // in fact happened, and the caller would retry a thing that
+                    // is done.
+                    if !authenticated {
+                        let _ = warn_unverifiable_resign(root, &bundle.id);
+                    }
                 }
                 Existing::SignatureWithdrawn => {
                     return Err(invalid(format!(
@@ -1159,7 +1239,7 @@ fn publish_bundle(root: &Path, mut bundle: VerifiedBundle) -> io::Result<String>
     }
     sync_directory(&staging)?;
 
-    let staged = open_bundle(&staging)?;
+    let staged = open_bundle(&staging, None)?;
     if staged.id != bundle.id {
         return Err(invalid(format!(
             "staged deployment id {} changed from verified source {}",
@@ -1314,7 +1394,47 @@ fn activate_install(root: &Path, previous: &str, current: &str) -> io::Result<()
     replace_selector(root, "current", current)
 }
 
-fn install_deployment(root: &Path, source: &Path) -> io::Result<String> {
+/// The trust root a PUBLISH runs under, which is not the boot path's.
+///
+/// §6 gives the booted selector's rootfs the only trust root a running machine
+/// has, and the real root none — so `install` could not check what it wrote and
+/// said so (`warn_unverifiable_resign`). An INSTALLER is the case that
+/// distinction was waiting for: it runs from media td built, which can carry a
+/// key exactly as the selector initramfs does.
+///
+/// Three outcomes, and which one a caller gets is never a matter of how the
+/// read went. An explicit path is fail-closed — asking for a key and getting an
+/// unreadable one is a refusal, not a fallback. With no argument the key is
+/// looked for where a td rootfs keeps one, and its ABSENCE is the only thing
+/// that means "no trust root": present-but-unusable refuses, because a
+/// truncated or mistyped key is a provisioning fault and publishing anyway
+/// would make it invisible until the machine failed to boot.
+/// `rootfs` is a parameter for `read_boot_trust_root`'s reason: the branch that
+/// takes no explicit key is the one PRODUCTION uses, and hardcoding `/` would
+/// leave it reachable only by writing to the host's own root. What production
+/// passes is pinned as a literal by its own test instead.
+fn install_trust_root(explicit: Option<&Path>, rootfs: &Path) -> io::Result<Option<TrustRoot>> {
+    if let Some(path) = explicit {
+        return read_trusted_key(path).map(Some);
+    }
+    // `TRUSTED_KEY_PATH` must stay RELATIVE for this join to mean anything —
+    // an absolute one would discard `rootfs` silently, which is the shape of
+    // the worst single edit DESIGN §10 item 6 names. It is pinned as a literal
+    // by `authenticate_parses_its_arguments_exactly`.
+    let path = rootfs.join(protocol::TRUSTED_KEY_PATH);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        // Wrapped with the path, as every other read in this file is: this one
+        // REFUSES an install, and `td-boot: Permission denied` names no file.
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("trust root {}: {error}", path.display()),
+        )),
+        Ok(_) => read_trusted_key(&path).map(Some),
+    }
+}
+
+fn install_deployment(root: &Path, source: &Path, trust: Option<&TrustRoot>) -> io::Result<String> {
     require_absolute(root, "volume root")?;
     require_absolute(source, "deployment source")?;
     require_real_directory(root, "volume root")?;
@@ -1327,7 +1447,12 @@ fn install_deployment(root: &Path, source: &Path) -> io::Result<String> {
     reap_install_temporaries(&root.join(protocol::DEPLOYMENTS_DIR))?;
     reap_selector_temporaries(&root.join(protocol::BOOT_DIR))?;
 
-    let bundle = open_bundle(source)?;
+    // Authenticity is decided INSIDE `open_bundle`, between the manifest being
+    // read and its being parsed — see there. Passing the key down rather than
+    // checking around the call is what satisfies both halves of DESIGN §10 item
+    // 6 at once: refuse before anything interprets the bundle, and read the
+    // manifest exactly ONCE.
+    let bundle = open_bundle(source, trust)?;
     let candidate = bundle.id.clone();
     let selection = match select_deployment(root) {
         Ok(selection) => Some(selection),
@@ -1338,7 +1463,7 @@ fn install_deployment(root: &Path, source: &Path) -> io::Result<String> {
             )));
         }
     };
-    let installed = publish_bundle(root, bundle)?;
+    let installed = publish_bundle(root, bundle, trust.is_some())?;
     if selection
         .as_ref()
         .is_some_and(|selected| selected.slot == "current" && selected.deployment.id == installed)
@@ -2516,7 +2641,56 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
 
 fn run_install(device: &Path, mountpoint: &Path, source: &Path) -> io::Result<()> {
     require_absolute(source, "deployment source")?;
-    let id = run_on_writable_volume(device, mountpoint, |root| install_deployment(root, source))?;
+    // Resolved BEFORE the mount, so a missing or unusable key fails without
+    // having touched the volume: an install refused for want of a trust root
+    // should leave the disk exactly as it found it.
+    let trust = install_trust_root(None, Path::new("/"))?;
+    let id = run_on_writable_volume(device, mountpoint, |root| {
+        install_deployment(root, source, trust.as_ref())
+    })?;
+    writeln!(io::stdout(), "{id}")
+}
+
+/// Is `path` where a filesystem is mounted?
+///
+/// `mountpoint(1)`'s test, and for its reason: a mount point's device number
+/// differs from its parent's. `/proc` is deliberately not consulted — this runs
+/// inside a build sandbox as readily as on a machine, and a check that failed
+/// where `/proc/self/mountinfo` is absent would fail exactly where `publish`
+/// is meant to be used.
+///
+/// It misses a BIND mount of a directory on the same filesystem, which shares
+/// its parent's device number. That case is not what this guards against: the
+/// danger is a live volume with its own filesystem, which always differs.
+fn is_mount_point(path: &Path) -> io::Result<bool> {
+    use std::os::linux::fs::MetadataExt;
+    let here = fs::metadata(path)?;
+    let Some(parent) = path.parent() else {
+        // No parent means the filesystem root, which is one.
+        return Ok(true);
+    };
+    Ok(fs::metadata(parent)?.st_dev() != here.st_dev())
+}
+
+fn run_publish(root: &Path, source: &Path, trusted_key: Option<&Path>) -> io::Result<()> {
+    require_absolute(root, "volume root")?;
+    // A MOUNT POINT is refused, and this is what stands in for the transaction
+    // locking `install` does. Every other mutating verb goes through
+    // `run_on_writable_volume`, which serialises on a lock keyed by the volume's
+    // BLOCK DEVICE — a thing this verb does not have and cannot be given, since
+    // its whole purpose is a root with no device under it. Rather than publish
+    // unserialised onto a volume something else may be mutating, it declines to
+    // be pointed at one at all: a mounted root is `install`'s, and what is left
+    // is the staging tree this exists for, which by construction has one writer.
+    if is_mount_point(root)? {
+        return Err(invalid(format!(
+            "{} is a mount point; publish is for a staging directory — use `install` \
+             for a mounted volume, which takes the update locks",
+            root.display()
+        )));
+    }
+    let trust = install_trust_root(trusted_key, Path::new("/"))?;
+    let id = install_deployment(root, source, trust.as_ref())?;
     writeln!(io::stdout(), "{id}")
 }
 
@@ -2619,6 +2793,11 @@ fn run() -> io::Result<()> {
             mountpoint,
             source,
         } => run_install(&device, &mountpoint, &source),
+        Mode::Publish {
+            root,
+            source,
+            trusted_key,
+        } => run_publish(&root, &source, trusted_key.as_deref()),
         Mode::Rollback { device, mountpoint } => run_rollback(&device, &mountpoint),
         Mode::Success {
             device,
@@ -2940,6 +3119,33 @@ mod tests {
         assert!(parse_args(args(&["rollback", "/dev/vda", "/volume", "extra"])).is_err());
         assert!(parse_args(args(&["success", "/dev/vda", "/volume", "not-a-digest"])).is_err());
         assert!(parse_args(args(&["unknown", "/volume"])).is_err());
+
+        // `publish` is the file's only VARIABLE arity, so its third argument is
+        // checked by value rather than by shape: dropping it on the floor is a
+        // fail-open, since `None` means "probe the default and maybe publish
+        // unverified" while the caller believed it had named a key.
+        assert!(matches!(
+            parse_args(args(&["publish", "/volume", "/incoming/deployment"])),
+            Ok(Mode::Publish {
+                trusted_key: None,
+                ..
+            })
+        ));
+        match parse_args(args(&["publish", "/volume", "/incoming/deployment", "/key.pub"])) {
+            Ok(Mode::Publish { trusted_key, .. }) => {
+                assert_eq!(trusted_key.as_deref(), Some(Path::new("/key.pub")));
+            }
+            _ => panic!("publish must parse and carry its trusted key"),
+        }
+        assert!(parse_args(args(&["publish", "/volume"])).is_err());
+        assert!(parse_args(args(&[
+            "publish",
+            "/volume",
+            "/incoming/deployment",
+            "/key.pub",
+            "extra"
+        ]))
+        .is_err());
     }
 
     #[test]
@@ -2966,6 +3172,244 @@ mod tests {
         contender.join().unwrap();
     }
 
+    /// A publish under a trust root REFUSES a bundle that does not verify.
+    ///
+    /// This is the half of §10 item 7c that is about security rather than
+    /// plumbing. Before it, the first thing on the path to check a bundle was
+    /// the next BOOT — so a deployment signed with the wrong key produced a
+    /// machine that did not come back, discovered by whoever was standing in
+    /// front of it. The wrong key is a whole valid one, so the refusal cannot
+    /// be about a malformed key.
+    #[test]
+    fn a_publish_under_a_trust_root_refuses_what_does_not_verify() {
+        let fixture = Fixture::new();
+        let (source, id) = fixture.source_bundle("candidate", "next");
+
+        let error = install_deployment(&fixture.root, &source, Some(&fixture.wrong_key()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("does not authenticate"),
+            "a bundle signed under another key must be refused: {error}"
+        );
+        assert!(
+            !fixture
+                .root
+                .join(protocol::DEPLOYMENTS_DIR)
+                .join(&id)
+                .exists(),
+            "the refused deployment must not have been published"
+        );
+
+        // ...and the SAME bundle under the right key publishes, so the refusal
+        // above is about the key and not about the bundle.
+        assert_eq!(
+            install_deployment(&fixture.root, &source, Some(&fixture.key())).unwrap(),
+            id
+        );
+        // What landed carries the signature that was authenticated, rather than
+        // a deployment published beside a signature nothing checked.
+        let published = fixture
+            .root
+            .join(protocol::DEPLOYMENTS_DIR)
+            .join(&id)
+            .join(protocol::MANIFEST_SIG_NAME);
+        assert_eq!(
+            fs::read_to_string(&published).unwrap().trim(),
+            fixture_signature("next"),
+            "the published signature is the one that authenticated"
+        );
+    }
+
+    /// A bundle nobody vouched for is refused WITHOUT its contents being
+    /// interpreted — the order DESIGN §10 item 6 states as policy for the boot
+    /// path, and an install source is exactly as untrusted as a slot.
+    ///
+    /// Staged so the two orders give different answers: the payloads are
+    /// removed, so anything that reached `verify_payload` would fail about a
+    /// missing `bzImage`. Getting the signature error instead is what says the
+    /// check ran first. A manifest that does not even PARSE is the sharper half
+    /// — under the wrong order its parse error would arrive before any question
+    /// of authenticity.
+    #[test]
+    fn a_bundle_nobody_vouched_for_is_refused_before_it_is_interpreted() {
+        let fixture = Fixture::new();
+        let (source, _) = fixture.source_bundle("candidate", "next");
+        for (label, _) in fixture_payloads("next") {
+            fs::remove_file(source.join(label)).unwrap();
+        }
+
+        // `VerifiedBundle` holds open files and is deliberately not `Debug`.
+        let refusal = |r: io::Result<VerifiedBundle>| r.map(|_| ()).unwrap_err().to_string();
+
+        let error = refusal(open_bundle(&source, Some(&fixture.wrong_key())));
+        assert!(
+            error.contains("does not authenticate"),
+            "authenticity must be decided before the payloads are read: {error}"
+        );
+
+        // The same source with no trust root gets as far as the payloads, which
+        // is what proves the assertion above is about ORDER and not about the
+        // payloads being unreachable anyway.
+        let untrusted = refusal(open_bundle(&source, None));
+        assert!(
+            untrusted.contains("bzImage"),
+            "without a trust root the payloads are what fails: {untrusted}"
+        );
+    }
+
+    /// An UNSIGNED bundle is refused under a trust root, rather than published
+    /// as an unverifiable one. Without this the check is trivially escapable:
+    /// deleting `manifest.sig` would turn a refusal into a successful install.
+    #[test]
+    fn a_publish_under_a_trust_root_refuses_an_unsigned_bundle() {
+        let fixture = Fixture::new();
+        let (source, id) = fixture.unsigned_source_bundle("candidate", "next");
+
+        let error = install_deployment(&fixture.root, &source, Some(&fixture.key()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("carries no signature"),
+            "an unsigned bundle must be refused under a trust root: {error}"
+        );
+
+        // With NO trust root the same bundle publishes, which is what keeps a
+        // rootfs that has no key behaving exactly as it did.
+        assert_eq!(
+            install_deployment(&fixture.root, &source, None).unwrap(),
+            id
+        );
+    }
+
+    /// Absence of a trust root and UNREADABILITY of one are different answers.
+    ///
+    /// The distinction is the whole of `install_trust_root`: a rootfs with no
+    /// key publishes as it always has, and a key that is present but truncated
+    /// or mistyped is a provisioning fault that must not be published through —
+    /// publishing anyway would hide it until the machine failed to boot.
+    #[test]
+    fn an_explicit_trust_root_is_fail_closed() {
+        let fixture = Fixture::new();
+        let good = fixture.root.join("good.pub");
+        fs::write(&good, format!("{FIXTURE_PUBLIC_KEY}\n")).unwrap();
+        assert_eq!(
+            install_trust_root(Some(&good), &fixture.root).unwrap(),
+            Some(fixture.key())
+        );
+
+        let truncated = fixture.root.join("truncated.pub");
+        fs::write(&truncated, "9ae001c4\n").unwrap();
+        assert!(
+            install_trust_root(Some(&truncated), &fixture.root).is_err(),
+            "a truncated key must refuse rather than read as absent"
+        );
+
+        // A path that does not exist, asked for EXPLICITLY, is an error rather
+        // than an absence: only the unasked-for default may answer "no trust
+        // root", or a mistyped argument would silently publish unverified.
+        let missing = fixture.root.join("nothing-here.pub");
+        assert!(
+            install_trust_root(Some(&missing), &fixture.root).is_err(),
+            "an explicit key that is not there must refuse"
+        );
+    }
+
+    /// The DEFAULT branch, which is the one production takes.
+    ///
+    /// It is the branch worth testing hardest and the one a hardcoded `/` would
+    /// have made unreachable — hence the `rootfs` parameter, as
+    /// `read_boot_trust_root` has for the same reason. Three states, three
+    /// answers: absent is the only "no trust root", and present-but-unusable
+    /// refuses, because a truncated or mistyped key is a provisioning fault and
+    /// publishing through it hides that fault until the machine fails to boot.
+    #[test]
+    fn only_an_absent_default_trust_root_means_there_is_none() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join(protocol::TRUSTED_KEY_PATH);
+        let parent = path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&parent).unwrap();
+
+        assert_eq!(
+            install_trust_root(None, &fixture.root).unwrap(),
+            None,
+            "no key file at all is the one absence"
+        );
+
+        fs::write(&path, "9ae001c4\n").unwrap();
+        assert!(
+            install_trust_root(None, &fixture.root).is_err(),
+            "a truncated default key must refuse, not read as absent"
+        );
+
+        fs::write(&path, format!("{FIXTURE_PUBLIC_KEY}\n")).unwrap();
+        assert_eq!(
+            install_trust_root(None, &fixture.root).unwrap(),
+            Some(fixture.key()),
+            "a usable default key is found without being asked for"
+        );
+    }
+
+    /// What production passes for that rootfs, stated as a literal — the
+    /// parameter exists for the test above, and this is what pins the real one.
+    /// A publish that read its trust root from the VOLUME would be the surface
+    /// §6 rules out by name: whoever can write a forged deployment can write a
+    /// matching public key beside it.
+    #[test]
+    fn the_publish_trust_root_comes_from_the_running_rootfs() {
+        let source = include_str!("main.rs");
+        let mut calls = 0;
+        for line in source.lines() {
+            if line.contains("install_trust_root(") && !line.contains("fn install_trust_root") {
+                if line.contains("#[test]") {
+                    continue;
+                }
+                if line.contains("&fixture.root") {
+                    continue;
+                }
+                calls += 1;
+                assert!(
+                    line.contains("Path::new(\"/\")"),
+                    "a shipped install_trust_root call must name the running rootfs: {line}"
+                );
+            }
+        }
+        assert_eq!(calls, 2, "run_install and run_publish are its shipped callers");
+    }
+
+    /// `publish` refuses a MOUNT POINT, which is what stands in for the
+    /// transaction locking it cannot do: the lock every other mutating verb
+    /// takes is keyed by the volume's block device, and this verb has none by
+    /// construction. So rather than publish unserialised onto a volume
+    /// something else may be mutating, it declines to be pointed at one.
+    #[test]
+    fn publish_refuses_a_mounted_root() {
+        // `/proc` is a mount point on any host that can run this, and `/` is
+        // one by definition; the fixture's own directory is not.
+        let fixture = Fixture::new();
+        assert!(
+            !is_mount_point(&fixture.root).unwrap(),
+            "a plain directory is not a mount point"
+        );
+        assert!(
+            is_mount_point(Path::new("/")).unwrap(),
+            "the filesystem root is a mount point"
+        );
+        if Path::new("/proc/self").exists() {
+            assert!(
+                is_mount_point(Path::new("/proc")).unwrap(),
+                "/proc is a mount point"
+            );
+            let error = run_publish(Path::new("/proc"), &fixture.root, None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("is a mount point"),
+                "publish must refuse a mounted root: {error}"
+            );
+        }
+    }
+
     #[test]
     fn install_publishes_then_moves_previous_before_current() {
         let fixture = Fixture::new();
@@ -2975,7 +3419,7 @@ mod tests {
         let (source, candidate) = fixture.source_bundle("candidate", "next");
 
         assert_eq!(
-            install_deployment(&fixture.root, &source).unwrap(),
+            install_deployment(&fixture.root, &source, None).unwrap(),
             candidate
         );
         assert_eq!(read_selector(&fixture.root, "previous").unwrap(), initial);
@@ -3007,7 +3451,7 @@ mod tests {
         fixture.sign_source(&source, "aa11");
 
         assert_eq!(
-            install_deployment(&fixture.root, &source).unwrap(),
+            install_deployment(&fixture.root, &source, None).unwrap(),
             candidate
         );
         assert_eq!(
@@ -3028,7 +3472,7 @@ mod tests {
         let (source, candidate) = fixture.unsigned_source_bundle("candidate", "next");
 
         assert_eq!(
-            install_deployment(&fixture.root, &source).unwrap(),
+            install_deployment(&fixture.root, &source, None).unwrap(),
             candidate
         );
         assert_eq!(fixture.published_signature(&candidate), None);
@@ -3046,12 +3490,12 @@ mod tests {
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.source_bundle("candidate", "next");
         fixture.sign_source(&source, "aa11");
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
 
         // Same bundle, new key. The id is unchanged by construction.
         fixture.sign_source(&source, "bb22");
         assert_eq!(
-            install_deployment(&fixture.root, &source).unwrap(),
+            install_deployment(&fixture.root, &source, None).unwrap(),
             candidate,
             "the deployment keeps its id across a re-signing"
         );
@@ -3110,7 +3554,7 @@ mod tests {
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.source_bundle("candidate", "next");
         fixture.sign_source(&source, "aa11");
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
 
         // A directory at the destination makes the rename fail with the
         // temporary already written.
@@ -3140,7 +3584,7 @@ mod tests {
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.source_bundle("candidate", "next");
         fixture.sign_source(&source, "aa11");
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
 
         let path = fixture
             .root
@@ -3148,7 +3592,7 @@ mod tests {
             .join(&candidate)
             .join(protocol::MANIFEST_SIG_NAME);
         let before = fs::symlink_metadata(&path).unwrap().ino();
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
         assert_eq!(
             fs::symlink_metadata(&path).unwrap().ino(),
             before,
@@ -3173,7 +3617,7 @@ mod tests {
             "128 hex characters and a newline, with slack for a trailing CRLF"
         );
         fs::write(&path, vec![b'a'; 160]).unwrap();
-        let bundle = open_bundle(&source).unwrap();
+        let bundle = open_bundle(&source, None).unwrap();
         assert_eq!(
             bundle.signature.as_deref(),
             Some(&vec![b'a'; 160][..]),
@@ -3181,7 +3625,7 @@ mod tests {
         );
         // And one byte more is not.
         fs::write(&path, vec![b'a'; 161]).unwrap();
-        assert!(open_bundle(&source).map(|_| ()).is_err(), "one past the bound");
+        assert!(open_bundle(&source, None).map(|_| ()).is_err(), "one past the bound");
     }
 
     /// Upgrading an already-installed unsigned deployment to a signed one is
@@ -3194,11 +3638,11 @@ mod tests {
         fixture.selector("current", &initial);
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.unsigned_source_bundle("candidate", "next");
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
         assert_eq!(fixture.published_signature(&candidate), None);
 
         fixture.sign_source(&source, "cc33");
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
         assert_eq!(
             fixture.published_signature(&candidate).as_deref(),
             Some(&b"cc33\n"[..])
@@ -3216,10 +3660,10 @@ mod tests {
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.source_bundle("candidate", "next");
         fixture.sign_source(&source, "dd44");
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
 
         fs::remove_file(source.join(protocol::MANIFEST_SIG_NAME)).unwrap();
-        let error = install_deployment(&fixture.root, &source).unwrap_err();
+        let error = install_deployment(&fixture.root, &source, None).unwrap_err();
         assert!(
             error.to_string().contains("refusing to remove it"),
             "refused, but for {error}"
@@ -3244,12 +3688,12 @@ mod tests {
         let refusal = |r: io::Result<VerifiedBundle>| r.map(|_| ()).unwrap_err();
 
         fs::write(&path, vec![b'a'; (protocol::MAX_SIGNATURE_BYTES + 1) as usize]).unwrap();
-        let error = refusal(open_bundle(&source));
+        let error = refusal(open_bundle(&source, None));
         assert!(error.to_string().contains("deployment signature"), "{error}");
 
         fs::remove_file(&path).unwrap();
         symlink("manifest", &path).unwrap();
-        let error = refusal(open_bundle(&source));
+        let error = refusal(open_bundle(&source, None));
         assert!(
             error.to_string().contains("must be a real regular file"),
             "a symlinked signature must be refused, got {error}"
@@ -3257,7 +3701,7 @@ mod tests {
 
         fs::remove_file(&path).unwrap();
         fs::create_dir(&path).unwrap();
-        let error = refusal(open_bundle(&source));
+        let error = refusal(open_bundle(&source, None));
         assert!(
             error.to_string().contains("must be a real regular file"),
             "a directory must be refused, got {error}"
@@ -3271,13 +3715,13 @@ mod tests {
         fixture.selector("current", &current);
         fixture.selector("previous", &current);
         let (source, previous) = fixture.source_bundle("previous", "previous");
-        let bundle = open_bundle(&source).unwrap();
-        publish_bundle(&fixture.root, bundle).unwrap();
+        let bundle = open_bundle(&source, None).unwrap();
+        publish_bundle(&fixture.root, bundle, false).unwrap();
         replace_selector(&fixture.root, "previous", &previous).unwrap();
         let attempts = attempts_directory(&fixture.root, true).unwrap().unwrap();
         fs::create_dir(attempts.join(&previous)).unwrap();
 
-        assert!(install_deployment(&fixture.root, &source).is_err());
+        assert!(install_deployment(&fixture.root, &source, None).is_err());
         assert_eq!(read_selector(&fixture.root, "current").unwrap(), current);
         assert_eq!(read_selector(&fixture.root, "previous").unwrap(), current);
     }
@@ -3290,13 +3734,13 @@ mod tests {
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.source_bundle("candidate", "next");
 
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
         let first = select_boot_deployment(&fixture.root, &fixture.key()).unwrap();
         assert_eq!(
             first.remaining_attempts,
             Some(protocol::DEFAULT_BOOT_ATTEMPTS - 1)
         );
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
 
         assert_eq!(read_selector(&fixture.root, "current").unwrap(), candidate);
         assert_eq!(read_selector(&fixture.root, "previous").unwrap(), initial);
@@ -3315,9 +3759,9 @@ mod tests {
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.source_bundle("candidate", "next");
 
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
         fs::remove_dir_all(fixture.root.join("td/deployments").join(initial)).unwrap();
-        let error = install_deployment(&fixture.root, &source).unwrap_err();
+        let error = install_deployment(&fixture.root, &source, None).unwrap_err();
 
         assert!(error
             .to_string()
@@ -3334,9 +3778,9 @@ mod tests {
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.source_bundle("candidate", "next");
 
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
         write_attempt_state(&fixture.root, &initial, 1).unwrap();
-        let error = install_deployment(&fixture.root, &source).unwrap_err();
+        let error = install_deployment(&fixture.root, &source, None).unwrap_err();
 
         assert!(error
             .to_string()
@@ -3359,7 +3803,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = install_deployment(&fixture.root, &source).unwrap_err();
+        let error = install_deployment(&fixture.root, &source, None).unwrap_err();
 
         assert!(error.to_string().contains("does not verify as"));
         assert_eq!(read_selector(&fixture.root, "current").unwrap(), initial);
@@ -3390,7 +3834,7 @@ mod tests {
         let malformed_selector = fixture.root.join(format!("td/boot/.previous-{pid}-0"));
         fs::create_dir(&malformed_selector).unwrap();
 
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
 
         assert!(!staging.exists());
         assert!(!malformed_staging.exists());
@@ -3409,7 +3853,7 @@ mod tests {
         let (source, candidate) = fixture.source_bundle("candidate", "corrupt");
         fs::write(source.join("root.erofs"), b"tampered\n").unwrap();
 
-        let error = install_deployment(&fixture.root, &source).unwrap_err();
+        let error = install_deployment(&fixture.root, &source, None).unwrap_err();
         assert!(error.to_string().contains("root.erofs hash mismatch"));
         assert_eq!(read_selector(&fixture.root, "current").unwrap(), initial);
         assert_eq!(read_selector(&fixture.root, "previous").unwrap(), initial);
@@ -3433,7 +3877,7 @@ mod tests {
         .unwrap();
         let (source, candidate) = fixture.source_bundle("candidate", "recovery");
 
-        let error = install_deployment(&fixture.root, &source).unwrap_err();
+        let error = install_deployment(&fixture.root, &source, None).unwrap_err();
 
         assert!(error
             .to_string()
@@ -3450,7 +3894,7 @@ mod tests {
         fixture.selector("current", &initial);
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.source_bundle("candidate", "next");
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
 
         assert_eq!(rollback_deployment(&fixture.root).unwrap(), initial);
         assert_eq!(read_selector(&fixture.root, "current").unwrap(), initial);
@@ -3465,7 +3909,7 @@ mod tests {
         fixture.selector("current", &initial);
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.source_bundle("candidate", "next");
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
 
         rollback_deployment(&fixture.root).unwrap();
         rollback_deployment(&fixture.root).unwrap();
@@ -3483,7 +3927,7 @@ mod tests {
         fs::create_dir(fixture.root.join("td/boot/current")).unwrap();
         let (source, candidate) = fixture.source_bundle("candidate", "next");
 
-        let error = install_deployment(&fixture.root, &source).unwrap_err();
+        let error = install_deployment(&fixture.root, &source, None).unwrap_err();
         assert!(error.to_string().contains("replace current selector"));
         assert_eq!(read_selector(&fixture.root, "previous").unwrap(), initial);
         let selected = select_deployment(&fixture.root).unwrap();
@@ -3533,7 +3977,7 @@ mod tests {
         fixture.selector("current", &initial);
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.source_bundle("candidate", "next");
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
         fs::remove_file(fixture.root.join("td/boot/previous")).unwrap();
         fixture.selector("previous", &candidate);
 
@@ -3550,7 +3994,7 @@ mod tests {
         let (source, candidate) = fixture.source_bundle("candidate", "first");
 
         assert_eq!(
-            install_deployment(&fixture.root, &source).unwrap(),
+            install_deployment(&fixture.root, &source, None).unwrap(),
             candidate
         );
         assert_eq!(read_selector(&fixture.root, "current").unwrap(), candidate);
@@ -3588,7 +4032,7 @@ mod tests {
         fixture.selector("current", &initial);
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.source_bundle("candidate", "next");
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
         let attempts = fixture.root.join(protocol::ATTEMPTS_DIR);
         fs::set_permissions(&attempts, fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -3618,7 +4062,7 @@ mod tests {
         fixture.selector("current", &initial);
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.source_bundle("candidate", "next");
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
 
         for remaining in [2, 1, 0] {
             let decision = select_boot_deployment(&fixture.root, &fixture.key()).unwrap();
@@ -3646,7 +4090,7 @@ mod tests {
         fixture.selector("current", &initial);
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.source_bundle("candidate", "next");
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
         fs::remove_dir_all(fixture.root.join("td/deployments").join(initial)).unwrap();
         for _ in 0..protocol::DEFAULT_BOOT_ATTEMPTS {
             select_boot_deployment(&fixture.root, &fixture.key()).unwrap();
@@ -3671,7 +4115,7 @@ mod tests {
         fixture.selector("current", &initial);
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.source_bundle("candidate", "next");
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
         select_boot_deployment(&fixture.root, &fixture.key()).unwrap();
         assert_eq!(
             current_attempt_state(&fixture.root, &candidate).unwrap(),
@@ -3699,7 +4143,7 @@ mod tests {
         fixture.selector("current", &initial);
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.source_bundle("candidate", "next");
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
 
         let error = mark_deployment_successful(&fixture.root, &initial).unwrap_err();
 
@@ -3717,7 +4161,7 @@ mod tests {
         fixture.selector("current", &initial);
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.source_bundle("candidate", "next");
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
         fs::write(
             fixture.root.join(protocol::ATTEMPTS_DIR).join(&candidate),
             b"malformed\n",
@@ -3739,7 +4183,7 @@ mod tests {
         fixture.selector("current", &initial);
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.source_bundle("candidate", "next");
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
         fs::remove_dir_all(fixture.root.join("td/deployments").join(initial)).unwrap();
         fs::write(
             fixture.root.join(protocol::ATTEMPTS_DIR).join(&candidate),
@@ -3976,7 +4420,7 @@ mod tests {
         fixture.selector("current", &initial);
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.source_bundle("candidate", "next");
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
         assert_eq!(
             select_boot_deployment(&fixture.root, &fixture.key())
                 .unwrap()
@@ -3987,7 +4431,7 @@ mod tests {
         // A well-formed signature under nobody's key: 128 hex characters, so it
         // is the SIGNATURE that fails rather than the file being malformed.
         fixture.sign_source(&source, &"ab".repeat(ed25519::SIGNATURE_LEN));
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
 
         assert_eq!(
             slots_pointing_at(&fixture.root, &candidate),
@@ -4046,6 +4490,48 @@ mod tests {
             "a slot selecting something else is not this deployment"
         );
         assert!(warn_unverifiable_resign(&fixture.root, &initial).is_ok());
+    }
+
+    /// A re-sign under a TRUST ROOT does not warn that nothing can check it,
+    /// because something did.
+    ///
+    /// The warning's whole job is to make an operator look at a machine that
+    /// may not come back; a false one spends that. Asserted against the source
+    /// as well as run, because the branch is a `writeln!` to stderr that a test
+    /// in this process cannot observe — and asserted BOTH ways because the
+    /// source check alone would pass on a body that never reached the guard,
+    /// while the run alone would pass on one that warned every time.
+    #[test]
+    fn an_authenticated_resign_does_not_warn_that_nothing_checked_it() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        // The same tag `valid_deployment` uses, so this really is the live
+        // deployment being published again rather than a different one.
+        let (source, id) = fixture.source_bundle("resigned", "");
+        assert_eq!(id, initial, "the re-sign is of the LIVE deployment");
+
+        // Publishing the same deployment again, authenticated, is the resign
+        // path and must succeed.
+        assert_eq!(
+            install_deployment(&fixture.root, &source, Some(&fixture.key())).unwrap(),
+            initial
+        );
+
+        let body = include_str!("main.rs");
+        let guarded = body
+            .split("Existing::Resigned(signature) =>")
+            .nth(1)
+            .unwrap_or_default();
+        let arm = guarded.split("Existing::SignatureWithdrawn").next().unwrap_or_default();
+        assert!(
+            arm.contains("if !authenticated"),
+            "the resign warning must be guarded by whether anything checked it"
+        );
+        assert!(
+            arm.contains("let _ = warn_unverifiable_resign"),
+            "the warning must not fail a publish whose signature is already replaced"
+        );
     }
 
     /// Nothing `run_boot` hands to kexec was read by an unauthenticated
@@ -4140,7 +4626,7 @@ mod tests {
         );
 
         let (source, candidate) = fixture.source_bundle("candidate", "next");
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
 
         assert!(read_only_current(&fixture.root, &fixture.key()).is_none());
         assert_eq!(read_selector(&fixture.root, "current").unwrap(), candidate);
@@ -4153,7 +4639,7 @@ mod tests {
         fixture.selector("current", &initial);
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.source_bundle("candidate", "next");
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
         let transaction_error = io::Error::other("read-write mount rejected");
 
         let (decision, _) = read_only_recovery(&fixture.root, &transaction_error, &fixture.key()).unwrap();
@@ -4205,7 +4691,7 @@ mod tests {
         fixture.selector("current", &initial);
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.source_bundle("candidate", "next");
-        install_deployment(&fixture.root, &source).unwrap();
+        install_deployment(&fixture.root, &source, None).unwrap();
         fs::write(
             fixture
                 .root
