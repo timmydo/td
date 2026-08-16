@@ -1630,14 +1630,54 @@ a
 ## status: 2
 ## stderr-json: "grep: option '--de' is ambiguous; possibilities: '--devices' '--dereference-recursive'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
 
+#### --i lists GNU's four candidates, `--include' first as GNU declares it
+# These two were divergence cases until `--initial-tab' entered the table: the
+# only name they lacked, so the DIAGNOSTIC LINE, the status and stdout now all
+# agree with GNU. Not the whole of stderr -- GNU follows it with `Usage: grep
+# [OPTION]... PATTERNS [FILE]...' and a `Try ...--help' line where td-txt
+# prints its own one-line usage, which spec/README records as a divergence of
+# its own and which every refusal in the corpus carries. Agreeing on the line
+# is still what took these out of divergence.test.txt: the ambiguity itself is
+# what they assert, and it is now GNU's.
+#
+# They are also the only assertion holding `--include' in its declared slot.
+# Measured, moving it one place past `--ignore-case' reds THIS case alone --
+# `--in' does not match `--ignore-case', so its list is unchanged by that move
+# and it stays green. The pair holds the slot; only one of the pair can see
+# any given move.
+## argv: grep --i a f1
+## file f1:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: option '--i' is ambiguous; possibilities: '--include' '--ignore-case' '--initial-tab' '--invert-match'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
+#### and --in, narrowed to three, keeps that order
+## argv: grep --in a f1
+## file f1:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: option '--in' is ambiguous; possibilities: '--include' '--initial-tab' '--invert-match'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
 #### an EMPTY prefix lists the whole table, so it shows the order most plainly
 # `--=` splits into an empty name and a value, and every option prefixes the
 # empty string -- so this one diagnostic is the table read out in order. Only
-# the HEAD is pinned: the full list would have to be re-recorded by every
-# landing that serves another option, where the head changes only if the
-# table's leading group does. Alphabetical put `--after-context` first; GNU's
-# declaration leads with the regexp-syntax group, and so does this -- these
-# four ARE GNU's first four, since td-txt now serves all of them.
+# the LEADING GROUP is pinned: the full list would have to be re-recorded by
+# every landing that serves another option, where the head changes only if
+# that group does. Alphabetical put `--after-context` first; GNU's declaration
+# leads with the regexp-syntax group, and so does this -- these five ARE GNU's
+# first five (grep.c:506-510), since td-txt now names all of them.
+#
+# `--perl-regexp` is the fifth and is here for a reason the other four are
+# not: it is the table's only `p`, so NO ambiguity list but this one can ever
+# contain it, and this assertion is the whole of what holds it in its declared
+# slot. Moving it to the end of the table passes every other case in the
+# corpus -- measured -- which is why the boundary is drawn after it rather
+# than before. Where the group ENDS is still a judgement: pinning further
+# would re-record this line on every landing.
 #
 # Both spellings of `-F` are listed here and only one is listed under `--f`,
 # which is not an inconsistency: getopt_long compares each later match to the
@@ -1648,7 +1688,7 @@ a
 ## END
 ## stdout-json: ""
 ## status: 2
-## stderr-contains: possibilities: '--basic-regexp' '--extended-regexp' '--fixed-regexp' '--fixed-strings'
+## stderr-contains: possibilities: '--basic-regexp' '--extended-regexp' '--fixed-regexp' '--fixed-strings' '--perl-regexp'
 
 #### --r agreed under either order, and is here to stay agreeing
 # Not evidence of the reorder: `--recursive` precedes `--regexp` alphabetically

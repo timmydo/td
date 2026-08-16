@@ -10,8 +10,8 @@
 //!
 //! Deliberate omissions, by what they would cost to serve:
 //!
-//! * a second regex engine — `-P`, and `-X`, whose argument reaches the same
-//!   one (`-X perl` IS `-P`);
+//! * a second regex engine — `-P`/`--perl-regexp`, and `-X`, whose argument
+//!   reaches the same one (`-X perl` IS `-P`);
 //! * output this one does not produce — `--color`, `-T`/`--initial-tab`;
 //! * a file filter — `--include`, `--exclude`, `--exclude-from` and
 //!   `--exclude-dir`, and `-I`, which is `--binary-files=without-match`: the
@@ -23,21 +23,36 @@
 //! Each is DIAGNOSED and never a silent no-op: `invalid option` for the short
 //! spellings, `unrecognized option` for the long ones — getopt's own split and
 //! GNU's wording for both — except where a name must be in the TABLE to be
-//! refused, which says `unsupported` instead. Three reasons put one there, and
-//! they are not the same reason. `--binary` and the two long `--exclude-*` are
-//! SHADOWED otherwise: each has a proper prefix that is itself an option
-//! (`--binary-files`, `--exclude`), so leaving one out makes it parse as an
-//! ill-formed spelling of its neighbour. `--exclude` is not shadowed and is
-//! there because its absence made `--e`/`--ex` resolve to `--extended-regexp`
-//! where GNU calls them ambiguous — a divergence in what got COMPILED, which
-//! nothing reports. `--include` is neither: nothing shadows it and it shadows
-//! nothing, and it is there only to narrow `--i` and close `--in` against
-//! GNU's candidate list. Each named above is pinned in
-//! spec/divergence.test.txt. The SHORT roster is complete, swept against
-//! grep.c:486; the long one is not — `--colour`, `--group-separator`,
-//! `--no-group-separator`, `--no-ignore-case`, `--label`, `--line-buffered`
-//! and `--perl-regexp` are refused too with neither an entry here nor a case,
-//! which is a sweep still owed.
+//! refused, which says `unsupported` instead. What decides whether a name
+//! needs a row is the CONSEQUENCE of leaving it out, and that has to be
+//! measured against THIS table rather than reasoned from which name is a
+//! prefix of which — two drafts of this paragraph got it wrong in opposite
+//! directions, one sorting by prefix geometry and one crediting a single row
+//! with an effect that needed its whole group gone.
+//!
+//! Remove ONE row and only `--binary` changes what runs: it resolved to
+//! `--binary-files` and took the next argv as its value, so a refusal became
+//! a successful search. Every other single removal still ends in an error,
+//! because the siblings that remain keep the abbreviation ambiguous — which
+//! is exactly why these names arrived in GROUPS, and the group is the unit
+//! the effect belongs to. Drop all three `--exclude*` and `--e` resolves to
+//! `--extended-regexp`: `grep --e 'a+'` then matches `a` and `aa` as an ERE
+//! where the refusal it replaced ran nothing. Drop both `--include` and
+//! `--initial-tab` and `--in` resolves to `--invert-match`, printing the
+//! NON-matching lines and exiting 0.
+//!
+//! For the rest, absence changes only the DIAGNOSTIC — `--exclude-from` and
+//! `--exclude-dir` report `unrecognized` against the whole argument instead
+//! of `unsupported` against the option, `--initial-tab` and `--perl-regexp`
+//! likewise — because a name absent from the table is absent from every
+//! ambiguity list and from every abbreviation that would reach it. Each named
+//! above is pinned in spec/divergence.test.txt, except `--i`/`--in`, which
+//! stopped diverging when `--initial-tab` landed and moved to
+//! spec/grep-cli.test.txt. The SHORT roster is complete, swept
+//! against grep.c:486; the long one is not — `--colour`, `--group-separator`,
+//! `--no-group-separator`, `--no-ignore-case`, `--label` and `--line-buffered`
+//! are refused too with neither an entry here nor a case, which is a sweep
+//! still owed.
 
 use crate::regex::{Filter, OnBudget, Options, Regex};
 use crate::util::{
@@ -1039,6 +1054,7 @@ const LONG_OPTIONS: &[(&[u8], Arg)] = &[
     (b"extended-regexp", Arg::None),
     (b"fixed-regexp", Arg::None),
     (b"fixed-strings", Arg::None),
+    (b"perl-regexp", Arg::None),
     (b"after-context", Arg::Required),
     (b"before-context", Arg::Required),
     (b"binary-files", Arg::Required),
@@ -1056,6 +1072,7 @@ const LONG_OPTIONS: &[(&[u8], Arg)] = &[
     (b"help", Arg::None),
     (b"include", Arg::Required),
     (b"ignore-case", Arg::None),
+    (b"initial-tab", Arg::None),
     (b"line-number", Arg::None),
     (b"line-regexp", Arg::None),
     (b"max-count", Arg::Required),
@@ -1293,7 +1310,13 @@ fn parse_long(
         // at all differs and is the module doc's. The usage block goes with it
         // because this is an OPTION error, where the value errors above are
         // GNU's `die()` and print none.
-        b"exclude" | b"exclude-from" | b"exclude-dir" | b"include" | b"binary" => {
+        b"exclude"
+        | b"exclude-from"
+        | b"exclude-dir"
+        | b"include"
+        | b"binary"
+        | b"initial-tab"
+        | b"perl-regexp" => {
             errb(&name_in("unsupported option '--", name, "'"));
             eprintln!("{USAGE}");
             return Err(LongErr::Handled);

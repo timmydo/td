@@ -113,14 +113,19 @@ a
 ## status: 2
 ## stderr-contains: invalid option -- 'T'
 
-#### and --initial-tab, its long spelling
+#### and --initial-tab, its long spelling, which is TABLED to say so
+# In the table rather than unknown, which changes the wording from
+# `unrecognized' to `unsupported' and adds the usage block -- and is not about
+# this option at all. `--initial-tab' is shadowed by nothing; it is there so
+# that `--i' and `--in' list GNU's candidates, which they now do exactly (see
+# grep-cli.test.txt, where those two cases moved on stopping diverging).
 ## argv: grep --initial-tab a
 ## stdin:
 a
 ## END
 ## stdout-json: ""
 ## status: 2
-## stderr-contains: unrecognized option '--initial-tab'
+## stderr-json: "grep: unsupported option '--initial-tab'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
 
 #### grep refuses -U, which does nothing here, for the reason -u is refused
 # GNU documents -U/--binary as having no effect off MS-DOS and Windows, and
@@ -235,6 +240,28 @@ a
 ## stdout-json: ""
 ## status: 2
 ## stderr-contains: invalid option -- 'P'
+
+#### and --perl-regexp, which GNU SERVES here -- this build has PCRE
+# Worth pinning beside `-P' rather than folded into it, because the divergence
+# is behavioural and not a wording: measured against GNU grep 3.11 on this
+# host, `grep --perl-regexp a' MATCHES and exits 0. So does `--p', GNU's
+# shortest unambiguous spelling of it. td-txt refuses both.
+## argv: grep --perl-regexp a
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: unsupported option '--perl-regexp'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
+#### and --p, which is that name's shortest unambiguous prefix in either tool
+## argv: grep --p a
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: unsupported option '--perl-regexp'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
 
 #### sed refuses --debug rather than accepting it as a no-op
 # GNU's --debug prints an annotated dump of the program and each cycle's state.
@@ -493,35 +520,6 @@ a
 ## END
 ## stdout-json: ""
 ## stderr-json: "grep: option '--ex' is ambiguous; possibilities: '--extended-regexp' '--exclude' '--exclude-from' '--exclude-dir'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
-## status: 2
-
-#### --i lists --include FIRST, which is where GNU declares it
-# The ONLY assertion that pins `include`'s slot in the table. Moving it to the
-# end of LONG_OPTIONS leaves every other case green -- measured -- because no
-# other spelling matches both `include` and a name declared near it. The list
-# still differs from GNU by `--initial-tab`, which is why this is a divergence
-# case and not a conformance one; what it pins is the ORDER of the three names
-# that ARE here. GNU answers `'--include' '--ignore-case' '--initial-tab'
-# '--invert-match'`.
-## argv: grep --i a
-## stdin:
-a
-## END
-## stdout-json: ""
-## stderr-json: "grep: option '--i' is ambiguous; possibilities: '--include' '--ignore-case' '--invert-match'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
-## status: 2
-
-#### and --in, which was UNAMBIGUOUS here until --include joined the table
-# The divergence this landing uncovered: `--in` matched only `--invert-match`
-# before, so the two tools disagreed about whether it was an error at all.
-# They now agree it is one and still differ by `--initial-tab`. GNU answers
-# `'--include' '--initial-tab' '--invert-match'`.
-## argv: grep --in a
-## stdin:
-a
-## END
-## stdout-json: ""
-## stderr-json: "grep: option '--in' is ambiguous; possibilities: '--include' '--invert-match'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
 ## status: 2
 
 #### and --exc, where only the three filters remain

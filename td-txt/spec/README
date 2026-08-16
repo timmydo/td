@@ -2081,7 +2081,9 @@ td-txt-authored case files
     while the tool moved closer to GNU, and both readings are honest -- what
     grew is the number of divergences that are VISIBLE as diagnostics, which is
     what a previously-silent one becomes when the option table stops guessing.
-    That leaves seven names under this sweep, in eight families: `--c`/`--co`
+    That left seven names under this sweep, in eight families — as of the
+    filter landing, superseded by the `--initial-tab` paragraph below and the
+    six-family count after it: `--c`/`--co`
     want `--color` and `--colour`, `--i`/`--in` want `--initial-tab`, `--l`
     wants `--label` AND `--line-buffered` while `--li` wants only the second
     (`--label` is not a `--li` prefix match, so that pair is a union and not a
@@ -2098,16 +2100,60 @@ td-txt-authored case files
     pinned to sit after `--extended-regexp` (moving it to the front reds `--e`)
     and its internal order is pinned, but moving the whole group to the END of
     the table reds NOTHING -- no spelling matches both an `exclude` and a
-    non-`e` name, so that half of its slot is unobservable by construction and
-    no case can be written for it. `include`'s slot IS observable, through `--i`
+    non-`e` name. That was first written here as "unobservable by
+    construction", which is WRONG and is corrected rather than quietly
+    dropped: `--=` is an empty prefix, so it matches every name and its
+    diagnostic is the whole table in order. Every position in the table is
+    observable through that one case. What is true is narrower -- no
+    OTHER spelling can see the `exclude` group's position, and pinning it
+    through `--=` would mean re-recording that assertion on every landing that
+    serves another option, which is why the case pins the leading group and
+    stops. Unpinned deliberately, then, not unobservable.
+
+    `include`'s slot IS observable, through `--i`
     and `--in` alone, and was pinned by nothing until those two cases were
     added: moving `include` even ONE slot, past `--ignore-case`, had left the
     corpus green. Both now red. This is the rule at the end of this entry
     applied to a new family, and it is why the claim above is that the table
     MATCHES GNU's order rather than that the tests prove it does.
 
-    Every "byte for byte" in this entry carries ONE unstated precondition, and
-    it is a divergence of its own that nothing here had recorded. GNU prefixes
+    `--initial-tab` then closed the `--i` family -- `--perl-regexp` landed
+    with it and had nothing to do with that, its own family being `--p` -- and
+    the sweep re-run gives 60 both-ambiguous, 42 identical, 18 by SET, none by
+    ORDER. Neither option is shadowed and neither changes what gets compiled;
+    they are in the table for the reason the module doc gives LAST, which is
+    that a name absent from it is absent from every ambiguity list and from
+    every abbreviation that would reach it -- removing either row leaves the
+    tool erroring exactly as before, only with a different diagnostic. So
+    `--i` and `--in` now match GNU's diagnostic LINE, and its status and
+    stdout, and LEFT divergence.test.txt for grep-cli.test.txt — the one
+    way a case leaves that file, td-txt having stopped diverging — where they
+    are also, still, the only assertion holding `--include` in its declared
+    slot. `--p` is the mirror image and stayed: GNU resolves it to
+    `--perl-regexp` and SERVES it (this host's grep has PCRE compiled in, so
+    `grep --p a` matches and exits 0), where td-txt resolves the same name and
+    refuses it. The refusal is the deliberate omission; what the table row buys
+    is that the diagnostic names `--perl-regexp` rather than reporting `--p`
+    unrecognized.
+
+    That leaves SIX families and six names, all of them options this crate
+    would have to actually implement rather than merely resolve: `--c`/`--co`
+    want `--color` and `--colour`, `--l` wants `--label` and
+    `--line-buffered` (`--li` only the second), and `--n`/`--no` want
+    `--no-group-separator` and `--no-ignore-case`. The cheap half of this
+    entry is therefore done — every name whose absence distorted an
+    ambiguity list without costing a feature is now in the table — and what
+    remains needs the features.
+
+    Every "byte for byte" in this entry means the DIAGNOSTIC LINE and carries
+    TWO preconditions, not the one this paragraph first claimed. The second is
+    the block BELOW that line: GNU follows a getopt error with `Usage: grep
+    [OPTION]... PATTERNS [FILE]...' and `Try 'grep --help' for more
+    information.', where td-txt prints its own single usage line. That applies
+    to every refusal in the corpus and is why a case can assert GNU's exact
+    diagnostic while its `stderr-json` holds a block GNU never prints. The
+    first precondition is argv[0], and it is a divergence of its own that
+    nothing here had recorded. GNU prefixes
     a diagnostic with `argv[0]` VERBATIM, not its basename, so
     `/usr/bin/grep --e a` opens `/usr/bin/grep: option '--e' is ambiguous`;
     td-txt hardcodes `grep: `. So the two agree exactly when invoked as plain
