@@ -80,6 +80,29 @@ pub const VOLUME_LABEL: &str = "td-system";
 // read-only /var.
 #[allow(dead_code)]
 pub const VOLUME_SUBVOL: &str = "@var";
+
+// The verb `td-install` execs to reach the one bundle writer. Stated here for
+// the reason the layout above is: the caller spells it and the callee parses
+// it, and nothing else ties the two together — a renamed verb would be a usage
+// error at install time from a program the operator did not run.
+#[allow(dead_code)]
+pub const PUBLISH_VERB: &str = "publish";
+
+/// A deployment id is `sha256(manifest)` written as 64 lowercase hex
+/// characters, and this is the ONLY statement of that shape.
+///
+/// Shared because both halves check it against different things: td-boot
+/// validates an id it was given as an argument, and td-install validates one a
+/// td-boot it execed printed back. The second is not cosmetic — the id is
+/// JOINED onto a path, so an id free to contain `/` or `..` would be a
+/// directory traversal out of the staging tree from a program's stdout.
+#[allow(dead_code)]
+pub fn valid_digest(bytes: &[u8]) -> bool {
+    bytes.len() == 64
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
 // The one third-party program on the install path (D7). A NAME, not a path:
 // `td-install` is told where it is, and this is what the build-time check binds
 // against so an image or a recipe that stops providing it reds the build rather

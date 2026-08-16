@@ -272,7 +272,7 @@ fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
                 source: PathBuf::from(source),
             })
         }
-        Some(mode) if mode == OsStr::new("publish") => {
+        Some(mode) if mode == OsStr::new(protocol::PUBLISH_VERB) => {
             let root = args.next().ok_or_else(usage_error)?;
             let source = args.next().ok_or_else(usage_error)?;
             // `Option`, not `authenticate`'s defaulted path: there the key is
@@ -387,12 +387,7 @@ fn read_bounded_real_file(path: &Path, label: &str, limit: u64) -> io::Result<Ve
     Ok(bytes)
 }
 
-fn valid_digest(bytes: &[u8]) -> bool {
-    bytes.len() == 64
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-}
+use protocol::valid_digest;
 
 fn parse_manifest_entry(line: &[u8], label: &[u8]) -> io::Result<String> {
     let mut fields = line.splitn(2, |byte| *byte == b' ');

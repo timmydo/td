@@ -959,7 +959,11 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    passed, and a path is the one value here that can carry a space — which
    shifts every field read by position — or a newline, which would break the
    one-line promise outright. Everything a person reads goes to stderr,
-   including the output of the one child process this path runs.
+   including the stdout of EVERY child this path runs — `mkfs.btrfs`, whose
+   banner is a version string, and since 7c `td-boot publish`, whose is the
+   deployment id. Both are things a caller might want and neither is a byte
+   offset, so the rule is about the CHANNEL rather than about how interesting
+   the bytes are.
 
    **The problem it answers: writing a partition table does not make Linux
    reread one.** On a block device the kernel keeps serving the partition
@@ -1022,7 +1026,23 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    hope: `btrfs inspect-internal dump-tree -t fs` lists the directory entries
    of an unmounted image, so the recipe can assert `td/deployments/<id>` and
    the selector are really in the filesystem on the destination. Measured on
-   a real image before this was written down.
+   a real image before this was written down — including that `--rootdir`
+   preserves a SYMLINK as one (`type SYMLINK`), which the selector is and
+   without which the assertion would be about a file of the same name.
+
+   That recipe check is 7c's THIRD commit and is not landed with the first
+   two, which is worth naming rather than leaving to be noticed. The two
+   before it substitute a shell script for `td-boot`, so what is proven today
+   is td-install's side of the contract — the ordering, the arity, the
+   staging tree, the channels — and not that a target-built `td-boot`
+   authenticates a real bundle that a real `mkfs.btrfs` then carries into the
+   image. What blocks it is the FIXTURE, not the plumbing: the signed bundle
+   committed under `td-boot/tests` names digests that are deliberately never
+   resolved, so it cannot be published. A real end-to-end needs a new triple
+   — manifest, `.sig` and `.pub` — generated with `td-deploy keygen` and
+   `td-deploy sign` over payload bytes that exist, with the private half
+   discarded rather than committed. Until it exists this item is specified
+   and half-checked, which is a worse place to stop than either end.
 
    **The install-time trust root is settled here, because it is item 7's to
    settle** — `warn_unverifiable_resign` says so in as many words. Today
@@ -1046,10 +1066,14 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    source has to exist when `volume` runs, since the publish now happens
    before the filesystem does — so it is an argument to that verb rather than
    a later step, and an install with no bundle to publish is the same command
-   without it. And a bundle published this way is subject to the copy's
-   ordering above: it is inside the image, so it lands before the superblock
-   does, and an interrupted install leaves no filesystem rather than a
-   filesystem with a half-written deployment in it.
+   without it. Three arguments or none, never a subset: the publish needs a
+   writer, a bundle and the key that makes it CHECK that bundle, so a caller
+   naming two of them asked for something this cannot do, and defaulting the
+   third is how the fail-open the paragraph below is about gets in through
+   the command line instead. And a bundle published this way is subject to
+   the copy's ordering above: it is inside the image, so it lands before the
+   superblock does, and an interrupted install leaves no filesystem rather
+   than a filesystem with a half-written deployment in it.
 
    Two more that are about the trust root, written down because both are the
    kind of thing a later reader would otherwise re-derive from a diff.

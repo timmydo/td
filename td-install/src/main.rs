@@ -40,7 +40,8 @@ fn invalid(message: String) -> io::Error {
 }
 
 const USAGE: &str = "usage: td-install layout <destination>\n       \
-                     td-install volume <destination> <mkfs.btrfs> <scratch-dir>";
+                     td-install volume <destination> <mkfs.btrfs> <scratch-dir> \
+                     [<td-boot> <deployment> <trusted-key>]";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Mode {
@@ -52,12 +53,38 @@ enum Mode {
     /// is what makes the one third-party program on the install path (D7) a
     /// declared input of whoever calls it. `scratch` is the caller's too — the
     /// image needs room the size of the volume's real contents, and only the
-    /// caller knows where there is any.
+    /// caller knows where there is any. With a publish that is the deployment
+    /// TWICE over: td-boot copies the bundle into the staging tree and mkfs
+    /// then copies the tree into the image, so a scratch sized from the volume
+    /// alone runs out inside mkfs rather than here.
     Volume {
         destination: PathBuf,
         mkfs: PathBuf,
         scratch: PathBuf,
+        /// The deployment to publish into the volume as it is made, if any.
+        ///
+        /// All THREE together or none: the publish is `td-boot`'s (D1), it
+        /// needs a bundle, and the key is what makes it check that bundle
+        /// rather than take it on trust — so a caller that named two of them
+        /// asked for something this cannot do, and defaulting the third is
+        /// how a fail-open gets in. An install with nothing to publish is
+        /// this command without them.
+        publish: Option<Publish>,
     },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct Publish {
+    /// Where `td-boot` is. Passed, never resolved: this crate execs what it is
+    /// told to, as it does for `mkfs.btrfs`.
+    td_boot: PathBuf,
+    deployment: PathBuf,
+    /// Named EXPLICITLY rather than left to td-boot's probe, and DESIGN §10
+    /// item 7c says why: absence is what the probe reads as "no trust root",
+    /// and absence is indistinguishable from a key provisioned under the wrong
+    /// name or behind a dangling symlink. Naming it means a wrong path is an
+    /// error instead of an unverified publish.
+    trusted_key: PathBuf,
 }
 
 fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
@@ -67,10 +94,23 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
         (Some("layout"), [destination]) => Ok(Mode::Layout {
             destination: destination.clone(),
         }),
+        (Some("volume"), [destination, mkfs, scratch, td_boot, deployment, trusted_key]) => {
+            Ok(Mode::Volume {
+                destination: destination.clone(),
+                mkfs: mkfs.clone(),
+                scratch: scratch.clone(),
+                publish: Some(Publish {
+                    td_boot: td_boot.clone(),
+                    deployment: deployment.clone(),
+                    trusted_key: trusted_key.clone(),
+                }),
+            })
+        }
         (Some("volume"), [destination, mkfs, scratch]) => Ok(Mode::Volume {
             destination: destination.clone(),
             mkfs: mkfs.clone(),
             scratch: scratch.clone(),
+            publish: None,
         }),
         _ => Err(invalid(USAGE.to_string())),
     }
@@ -705,20 +745,149 @@ fn zero_edges(file: &mut File, offset: u64, len: u64) -> io::Result<()> {
     zero_at(file, tail, edge)
 }
 
+/// Publish `deployment` into the staging tree, through `td-boot`.
+///
+/// D1: this crate does not learn to write a deployment directory, update a
+/// selector, or account for attempts — it hands the whole transaction to the
+/// one writer. What it does here is make the directories that writer requires,
+/// which are the LAYOUT rather than the transaction. Everything this function
+/// shares with `td-boot` — the two nested directory names, the VERB, and the
+/// shape of a deployment id — is `protocol.rs`'s, for that file's own stated
+/// reason: a thing spelled in both crates is a thing they can come to disagree
+/// about, at the first boot after an install rather than at build time.
+///
+/// The child's stdout is the deployment id, and it is replayed on OUR stderr
+/// for `mkfs.btrfs`'s reason: this program's stdout is a machine-readable line
+/// of byte offsets, and an id is neither a byte offset nor something a caller
+/// reading by position expects to see there. It is also READ, which is the
+/// whole of what stops a successful exit standing in for a publish — see below.
+fn publish_into(staging: &Path, publish: &Publish) -> io::Result<()> {
+    // The four `install_deployment` requires, in its order and its spelling —
+    // `td` is a literal there too, and the two nested constants make it
+    // redundant only for as long as they stay under it. Mirroring the check
+    // rather than deriving from it is what makes a moved constant a missing
+    // directory td-boot names, instead of one this loop silently stopped
+    // creating.
+    //
+    // MODE PINNED rather than left to the ambient umask, because `--rootdir` copies a
+    // staging directory's mode into the filesystem verbatim: these are baked
+    // onto a machine's disk, not scratch. Under `umask 000` the selector
+    // directory — which holds the `current`/`previous` symlinks the boot path
+    // follows — shipped as 0777, world-writable on the installed system, and
+    // nothing downstream pins it: td-boot pins the mode of everything it
+    // writes ITSELF, and `require_real_directory` asks only whether these are
+    // directories. It also makes two installs of the same inputs produce the
+    // same image, which is the oracle's comparison.
+    //
+    // What this does NOT fix is OWNERSHIP: the tree is owned by whoever ran
+    // the installer, and changing that needs `chown`, which is a syscall this
+    // crate deliberately does not have (DESIGN D8). An installer runs as root
+    // on the path that matters, where the answer is already right.
+    // SET rather than passed to `mkdir`, because a creation mode is masked by
+    // the umask and a `chmod` is not: `DirBuilder::mode(0o755)` still yields
+    // 0700 under `umask 077`, which is a different image for the same inputs.
+    for directory in ["td", protocol::BOOT_DIR, protocol::DEPLOYMENTS_DIR] {
+        let path = staging.join(directory);
+        std::fs::create_dir_all(&path)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    let output = std::process::Command::new(&publish.td_boot)
+        .arg(protocol::PUBLISH_VERB)
+        .arg(staging)
+        .arg(&publish.deployment)
+        .arg(&publish.trusted_key)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        // A failure to SPAWN reports the errno and no path, so a mistyped or
+        // unbuilt `td-boot` says only `No such file or directory` — on a
+        // command line that names four other paths any of which a reader would
+        // suspect first.
+        .map_err(|error| {
+            invalid(format!(
+                "td-install: cannot run {}: {error}",
+                publish.td_boot.display()
+            ))
+        })?;
+    let _ = io::stderr().write_all(&output.stdout);
+    if !output.status.success() {
+        return Err(invalid(format!(
+            "td-install: {} publish failed ({})",
+            publish.td_boot.display(),
+            output.status
+        )));
+    }
+    // A SUCCESSFUL EXIT IS NOT A PUBLISH. Nothing about a zero status says a
+    // deployment landed, and the failure that hides behind one is the worst
+    // this verb has: a complete, correct, mountable volume with an empty
+    // `td/deployments` — a disk that installs, formats, reports its offsets and
+    // then cannot boot, discovered by the machine rather than by the installer.
+    // So the id the child prints is READ BACK against the tree it claims to
+    // have written, which is a fact this crate already has: it made the
+    // directory the id has to appear in.
+    //
+    // This is not the crate learning the transaction (D1) — it does not know
+    // what a deployment CONTAINS, only that the writer named one and that the
+    // name resolves. `valid_digest` is `protocol.rs`'s so the shape is stated
+    // once, and it is checked BEFORE the join rather than after: an id is
+    // otherwise a path component out of a program's stdout, and `..` in it
+    // would answer this question with a directory outside the staging tree.
+    let id = std::str::from_utf8(&output.stdout)
+        .map_err(|_| {
+            invalid(format!(
+                "td-install: {} printed a deployment id that is not ASCII",
+                publish.td_boot.display()
+            ))
+        })?
+        .trim();
+    if !protocol::valid_digest(id.as_bytes()) {
+        return Err(invalid(format!(
+            "td-install: {} published no deployment id ({id:?})",
+            publish.td_boot.display()
+        )));
+    }
+    let published = staging.join(protocol::DEPLOYMENTS_DIR).join(id);
+    if !published.is_dir() {
+        return Err(invalid(format!(
+            "td-install: {} reported {id} but {} is not there",
+            publish.td_boot.display(),
+            published.display()
+        )));
+    }
+    Ok(())
+}
+
 fn run_volume(
     destination: &Path,
     mkfs: &Path,
     scratch: &Path,
+    publish: Option<&Publish>,
     out: &mut dyn Write,
 ) -> io::Result<()> {
     // `Command::new` SEARCHES `PATH` for a name with no separator in it, which
     // is the ambient resolution the declared-input contract above rules out —
     // and the one form of it a caller cannot see they asked for.
-    if !mkfs.is_absolute() {
-        return Err(invalid(format!(
-            "td-install: {} is not an absolute path, and a bare name resolves through PATH",
-            mkfs.display()
-        )));
+    //
+    // BOTH programs, and both here, before anything is opened or removed. An
+    // argv-shaped mistake should cost nothing, and the td-boot check began life
+    // inside `publish_into` — which runs after the destination is open and,
+    // worse, after the caller's staging tree has been emptied. A bare name in
+    // the fourth argument therefore destroyed a directory before saying it did
+    // not like the fourth argument.
+    for (label, program) in [
+        ("mkfs.btrfs", Some(mkfs)),
+        ("td-boot", publish.map(|publish| publish.td_boot.as_path())),
+    ] {
+        if let Some(program) = program {
+            if !program.is_absolute() {
+                return Err(invalid(format!(
+                    "td-install: {label} {} is not an absolute path, and a bare name resolves \
+                     through PATH",
+                    program.display()
+                )));
+            }
+        }
     }
     let mut file = OpenOptions::new().read(true).write(true).open(destination)?;
     let disk_bytes = destination_bytes(&mut file)?;
@@ -764,6 +933,21 @@ fn run_volume(
         }
     }
     std::fs::create_dir_all(&subvol)?;
+    // BEFORE the mkfs that bakes this tree into the image, which is the whole
+    // of why the publish can happen without a mount: `--rootdir` is what puts
+    // it in the filesystem.
+    //
+    // CANONICALIZED first, because `td-boot` requires an absolute volume root
+    // and a relative `<scratch-dir>` is otherwise accepted by every other part
+    // of this verb — a `volume ./scratch` that worked would start failing the
+    // moment a deployment was passed to it, which is a difference between the
+    // two forms that nothing about either says. Resolved once and used for
+    // `--rootdir` too, so the publish and the filesystem cannot be given two
+    // different names for one directory.
+    let staging = std::fs::canonicalize(&staging)?;
+    if let Some(publish) = publish {
+        publish_into(&staging, publish)?;
+    }
     // `File::create` TRUNCATES, so a scratch directory that puts the image on
     // top of the DESTINATION destroys the disk whose table was just read — and
     // reports success, since everything after this writes a filesystem into
@@ -831,7 +1015,8 @@ fn run_volume(
         .arg(&image_path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
-        .output()?;
+        .output()
+        .map_err(|error| invalid(format!("td-install: cannot run {}: {error}", mkfs.display())))?;
     // `let _`, as every other write to the diagnostic channel in this crate is:
     // a closed or full stderr is not a reason to abandon an install half done,
     // and reporting its ENOSPC would name the wrong disk entirely.
@@ -920,7 +1105,14 @@ fn main() -> ExitCode {
             destination,
             mkfs,
             scratch,
-        } => run_volume(&destination, &mkfs, &scratch, &mut io::stdout()),
+            publish,
+        } => run_volume(
+            &destination,
+            &mkfs,
+            &scratch,
+            publish.as_ref(),
+            &mut io::stdout(),
+        ),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -1036,6 +1228,7 @@ mod tests {
                 destination: PathBuf::from("/dev/sda"),
                 mkfs: PathBuf::from("/bin/mkfs.btrfs"),
                 scratch: PathBuf::from("/tmp"),
+                publish: None,
             }
         );
         // Each of the three is REQUIRED, and none is defaulted: a `volume` that
@@ -1144,6 +1337,7 @@ mod tests {
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
+            None,
             &mut Vec::new(),
         )
         .unwrap();
@@ -1196,6 +1390,7 @@ mod tests {
                 &scratch.path,
                 &dir.join("mkfs.btrfs"),
                 &dir,
+                None,
                 &mut Vec::new(),
             )
             .unwrap();
@@ -1320,6 +1515,7 @@ mod tests {
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
+            None,
             &mut Vec::new(),
         )
         .unwrap();
@@ -1385,7 +1581,7 @@ mod tests {
         run_layout(&scratch.path, &mut Vec::new()).unwrap();
         let dir = fake_mkfs("#!/bin/sh\necho 'btrfs-progs v7.0'\n");
         let mut out = Vec::new();
-        run_volume(&scratch.path, &dir.join("mkfs.btrfs"), &dir, &mut out).unwrap();
+        run_volume(&scratch.path, &dir.join("mkfs.btrfs"), &dir, None, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         let fields: Vec<&str> = text.split_whitespace().collect();
         assert_eq!(fields.len(), 3, "the line is <off> <len> <written>: {text:?}");
@@ -1428,6 +1624,339 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The publish arguments are three or none, never a defaulted subset.
+    #[test]
+    fn a_publish_is_all_three_arguments_or_none() {
+        assert_eq!(
+            parse_args(args(&[
+                "volume",
+                "/dev/sda",
+                "/bin/mkfs.btrfs",
+                "/tmp",
+                "/bin/td-boot",
+                "/media/deployment",
+                "/media/key.pub",
+            ]))
+            .unwrap(),
+            Mode::Volume {
+                destination: PathBuf::from("/dev/sda"),
+                mkfs: PathBuf::from("/bin/mkfs.btrfs"),
+                scratch: PathBuf::from("/tmp"),
+                publish: Some(Publish {
+                    td_boot: PathBuf::from("/bin/td-boot"),
+                    deployment: PathBuf::from("/media/deployment"),
+                    trusted_key: PathBuf::from("/media/key.pub"),
+                }),
+            }
+        );
+        // Four and five arguments are a caller who asked for something this
+        // cannot do. Defaulting the missing one is how a fail-open gets in —
+        // the key most of all, whose absence is what td-boot reads as "publish
+        // without checking".
+        for short in [
+            vec![
+                "volume",
+                "/dev/sda",
+                "/bin/mkfs.btrfs",
+                "/tmp",
+                "/bin/td-boot",
+            ],
+            vec![
+                "volume",
+                "/dev/sda",
+                "/bin/mkfs.btrfs",
+                "/tmp",
+                "/bin/td-boot",
+                "/media/deployment",
+            ],
+        ] {
+            assert!(parse_args(args(&short)).is_err(), "{short:?} is incomplete");
+        }
+        assert!(
+            parse_args(args(&[
+                "volume",
+                "/dev/sda",
+                "/bin/mkfs.btrfs",
+                "/tmp",
+                "/bin/td-boot",
+                "/media/deployment",
+                "/media/key.pub",
+                "extra",
+            ]))
+            .is_err(),
+            "a seventh argument is not silently ignored"
+        );
+    }
+
+    /// 64 lowercase hex, because that is what a deployment id is: `td-install`
+    /// checks the shape before joining it onto a path, so a stand-in printing
+    /// anything else is exercising the refusal.
+    const STAND_IN_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// A `td-boot` stand-in that publishes: runs `body`, then does the two
+    /// things `publish_into` reads back — creates `td/deployments/<id>` and
+    /// prints that id.
+    fn publishing_td_boot(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(
+            path,
+            format!(
+                "#!/bin/sh\n{body}mkdir -p \"$2/{}/{STAND_IN_ID}\"\necho {STAND_IN_ID}\n",
+                protocol::DEPLOYMENTS_DIR
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The publish runs BEFORE mkfs, into the tree `--rootdir` bakes in, and
+    /// hands td-boot exactly what it was told to — the three directories the
+    /// one writer requires already made.
+    #[test]
+    fn the_publish_reaches_td_boot_before_the_filesystem_is_made() {
+        let scratch = Scratch::disk(DISK);
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
+        // Both stand-ins APPEND their name to one file, so the order is read off
+        // that file rather than inferred. Nothing else here can see the order:
+        // a publish that ran after mkfs would still see the directories made
+        // and still write its witness, which is how this test passed the
+        // mutation it is named for until the log existed.
+        let dir = fake_mkfs(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/argv\"\n\
+             echo mkfs >> \"$(dirname \"$0\")/order\"\n",
+        );
+        // A td-boot stand-in that records its argv and proves the staging tree
+        // was ready when it ran: it writes into the deployments directory,
+        // which only exists if `publish_into` made it first. It also DOES what
+        // a publish does — makes `td/deployments/<id>` and names it on stdout —
+        // because that is now the contract, and a stand-in that did less would
+        // be testing the refusal rather than the path.
+        let td_boot = dir.join("td-boot");
+        publishing_td_boot(
+            &td_boot,
+            "printf '%s\\n' \"$@\" > \"$(dirname \"$0\")/publish-argv\"\n\
+             echo publish >> \"$(dirname \"$0\")/order\"\n",
+        );
+        let publish = Publish {
+            td_boot: td_boot.clone(),
+            deployment: PathBuf::from("/media/deployment"),
+            trusted_key: PathBuf::from("/media/key.pub"),
+        };
+        let mut out = Vec::new();
+        run_volume(
+            &scratch.path,
+            &dir.join("mkfs.btrfs"),
+            &dir,
+            Some(&publish),
+            &mut out,
+        )
+        .unwrap();
+
+        let argv = std::fs::read_to_string(dir.join("publish-argv")).unwrap();
+        let words: Vec<&str> = argv.lines().collect();
+        // Canonical on BOTH sides: the argument is resolved, so a host whose
+        // temporary directory is itself a symlink would otherwise fail this on
+        // the spelling rather than on anything it is about.
+        let staging = std::fs::canonicalize(dir.join("td-volume-root")).unwrap();
+        assert_eq!(
+            words,
+            vec![
+                "publish",
+                staging.to_str().unwrap(),
+                "/media/deployment",
+                "/media/key.pub",
+            ],
+            "td-boot was not asked to publish into the staging tree: {argv:?}"
+        );
+        assert!(
+            staging.join(protocol::DEPLOYMENTS_DIR).join(STAND_IN_ID).is_dir(),
+            "the deployments directory was not there when td-boot ran"
+        );
+        let order = std::fs::read_to_string(dir.join("order")).unwrap();
+        assert_eq!(
+            order.lines().collect::<Vec<_>>(),
+            vec!["publish", "mkfs"],
+            "the deployment must be in the tree before `--rootdir` reads it"
+        );
+        // The staging tree still carries @var, so the publish did not displace
+        // what the volume already needed.
+        assert!(staging.join(protocol::VOLUME_SUBVOL).is_dir());
+        // The reported line is still three fields. That the id did not reach fd
+        // 1 is NOT checkable here — `out` is a `Vec`, so a child handed
+        // `Stdio::inherit()` writes past it and this stays green; that mutation
+        // is caught by the subprocess test instead.
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.split_whitespace().count(), 3, "{text:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A SUCCESSFUL EXIT IS NOT A PUBLISH.
+    ///
+    /// The shape this exists for: a td-boot that exits 0 having written
+    /// nothing produced a complete, correct, mountable volume with an empty
+    /// `td/deployments`, and `volume` printed its byte offsets and returned
+    /// success. The disk installs and cannot boot, and the first thing to
+    /// notice is the machine. Each of the three answers is refused separately,
+    /// because they fail for different reasons: nothing printed, a malformed
+    /// id, and — the one that matters — a well-formed id naming a directory
+    /// that is not there.
+    #[test]
+    fn a_publish_that_writes_nothing_is_not_a_publish() {
+        for (name, body) in [
+            ("silent", "#!/bin/sh\nexit 0\n"),
+            ("malformed", "#!/bin/sh\necho not-a-digest\n"),
+            // The id is REAL and the directory is not: this is the only one of
+            // the three a check on the child's output alone would pass.
+            (
+                "absent",
+                "#!/bin/sh\necho 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+            ),
+        ] {
+            let scratch = Scratch::disk(DISK);
+            run_layout(&scratch.path, &mut Vec::new()).unwrap();
+            let dir = fake_mkfs(RECORDING_MKFS);
+            let td_boot = dir.join("td-boot");
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::write(&td_boot, body).unwrap();
+                std::fs::set_permissions(&td_boot, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let publish = Publish {
+                td_boot,
+                deployment: PathBuf::from("/media/deployment"),
+                trusted_key: PathBuf::from("/media/key.pub"),
+            };
+            let error = run_volume(
+                &scratch.path,
+                &dir.join("mkfs.btrfs"),
+                &dir,
+                Some(&publish),
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+            let text = format!("{error}");
+            assert!(
+                text.contains("published no deployment id") || text.contains("is not there"),
+                "the {name} publish was taken for a real one: {text}"
+            );
+            assert!(
+                !dir.join("argv").exists(),
+                "the {name} publish still made a filesystem"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// An id that is well-formed but points OUT of the staging tree is refused
+    /// on its shape, before it is joined onto a path.
+    #[test]
+    fn a_traversing_deployment_id_is_refused_before_it_is_joined() {
+        let scratch = Scratch::disk(DISK);
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
+        let dir = fake_mkfs(RECORDING_MKFS);
+        let td_boot = dir.join("td-boot");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // `..` resolves to the staging tree itself, which IS a directory —
+            // so a readback that joined first and asked afterwards would accept
+            // this and report a deployment that was never written.
+            std::fs::write(&td_boot, "#!/bin/sh\necho ../..\n").unwrap();
+            std::fs::set_permissions(&td_boot, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let publish = Publish {
+            td_boot,
+            deployment: PathBuf::from("/media/deployment"),
+            trusted_key: PathBuf::from("/media/key.pub"),
+        };
+        let error = run_volume(
+            &scratch.path,
+            &dir.join("mkfs.btrfs"),
+            &dir,
+            Some(&publish),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error}").contains("published no deployment id"),
+            "a traversing id must be refused on its shape: {error}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A td-boot that FAILS fails the install, rather than making a volume
+    /// with no deployment in it and reporting success.
+    #[test]
+    fn a_failing_publish_fails_the_volume() {
+        let scratch = Scratch::disk(DISK);
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
+        let dir = fake_mkfs(RECORDING_MKFS);
+        let td_boot = dir.join("td-boot");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&td_boot, "#!/bin/sh\nexit 7\n").unwrap();
+            std::fs::set_permissions(&td_boot, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let publish = Publish {
+            td_boot,
+            deployment: PathBuf::from("/media/deployment"),
+            trusted_key: PathBuf::from("/media/key.pub"),
+        };
+        let error = run_volume(
+            &scratch.path,
+            &dir.join("mkfs.btrfs"),
+            &dir,
+            Some(&publish),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error}").contains("publish failed"),
+            "a failing publish must be reported: {error}"
+        );
+        // ...and mkfs never ran, so no volume was made to hold nothing.
+        assert!(
+            !dir.join("argv").exists(),
+            "the filesystem was made despite the publish failing"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A relative `td-boot` is refused rather than resolved through `PATH`,
+    /// for the reason the mkfs one is.
+    #[test]
+    fn a_relative_td_boot_is_refused() {
+        let scratch = Scratch::disk(DISK);
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
+        let dir = fake_mkfs(RECORDING_MKFS);
+        let publish = Publish {
+            td_boot: PathBuf::from("td-boot"),
+            deployment: PathBuf::from("/media/deployment"),
+            trusted_key: PathBuf::from("/media/key.pub"),
+        };
+        let error = run_volume(
+            &scratch.path,
+            &dir.join("mkfs.btrfs"),
+            &dir,
+            Some(&publish),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        // Named, not just refused: the mkfs refusal emits the same sentence, so
+        // an assertion on it alone would pass whichever of the two fired.
+        let text = format!("{error}");
+        assert!(
+            text.contains("resolves through PATH") && text.contains("td-boot"),
+            "a bare td-boot name must be refused, and said to be td-boot's: {text}"
+        );
+        // ...and it costs nothing: the caller's staging tree is untouched,
+        // which is what moving this check ahead of the wipe bought.
+        assert!(
+            !dir.join("td-volume-root").exists(),
+            "an argv mistake destroyed the staging tree before reporting itself"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A relative `mkfs` is refused rather than resolved through `PATH`.
     #[test]
     fn a_relative_mkfs_is_refused_before_it_can_be_searched_for() {
@@ -1437,6 +1966,7 @@ mod tests {
             &scratch.path,
             Path::new("mkfs.btrfs"),
             &std::env::temp_dir(),
+            None,
             &mut Vec::new(),
         )
         .unwrap_err();
@@ -1460,7 +1990,8 @@ mod tests {
         File::create(&path).unwrap().set_len(DISK).unwrap();
         run_layout(&path, &mut Vec::new()).unwrap();
         let fake = fake_mkfs("#!/bin/sh\nexit 0\n");
-        let error = run_volume(&path, &fake.join("mkfs.btrfs"), &dir, &mut Vec::new()).unwrap_err();
+        let error =
+            run_volume(&path, &fake.join("mkfs.btrfs"), &dir, None, &mut Vec::new()).unwrap_err();
         assert!(
             format!("{error}").contains("is the destination itself"),
             "the alias must be refused: {error}"
@@ -1563,6 +2094,7 @@ mod tests {
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
+            None,
             &mut Vec::new(),
         )
         .unwrap();
@@ -1601,8 +2133,14 @@ mod tests {
         let scratch = Scratch::disk(DISK);
         run_layout(&scratch.path, &mut Vec::new()).unwrap();
         let dir = fake_mkfs("#!/bin/sh\nexit 3\n");
-        let error =
-            run_volume(&scratch.path, &dir.join("mkfs.btrfs"), &dir, &mut Vec::new()).unwrap_err();
+        let error = run_volume(
+            &scratch.path,
+            &dir.join("mkfs.btrfs"),
+            &dir,
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
         assert!(
             format!("{error}").contains("failed on the scratch image"),
             "a failing mkfs must be reported: {error}"
