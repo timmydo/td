@@ -787,8 +787,11 @@ mod svc_timeouts {
     /// also resolves (3s x 3) and reaches (5s connect) a real host.
     pub const NETUP: u32 = 300;
     /// The script's own retry loop is clamped to BOOT_SUCCESS_RETRY_MAX_SECS iterations,
-    /// but each runs a large probe farm (seven `su` blocks) and can run a transactional
-    /// `td-boot install`, so an iteration is worth seconds on a slow disk, not one.
+    /// but each runs a large probe farm (seven `su` blocks) and can run three
+    /// transactional `td-boot update` passes, so an iteration is worth seconds on a
+    /// slow disk, not one. Two of the three are cheap by construction — a refusal and
+    /// an idle tick each read a bounded manifest and stop — so only one copies an
+    /// image, which is what the budget below is sized for.
     pub const BOOTSUCCESS: u32 = 600;
     /// The park handshake: a grep and a 1s sleep, clamped to BOOT_FAIL_PARK_WAIT_SECS.
     pub const BOOTFAIL: u32 = 300;
@@ -1478,11 +1481,9 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
     let trusted_key = td_boot_protocol::VOLUME_TRUSTED_KEY;
     let wrong_key = crate::ladder::DEPLOY_WRONG_KEY;
     let unauthenticated = td_boot_protocol::MANIFEST_UNAUTHENTICATED;
-    let candidate = format!(
-        "{}/{}",
-        td_boot_protocol::VOLUME_CHANNEL_DIR,
-        td_boot_protocol::CHANNEL_CANDIDATE
-    );
+    let channel = td_boot_protocol::VOLUME_CHANNEL_DIR;
+    let idle_channel = crate::ladder::DEPLOY_IDLE_CHANNEL;
+    let update = td_boot_protocol::UPDATE_VERB;
     format!(
         "#!/bin/sh\n\
          set -f\n\
@@ -1545,17 +1546,27 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          if [ \"$healthy\" = 1 ] \
          && /bin/td-boot success /dev/vda /run/td-update \"$deployment\" >/run/td-success-id; then \
          if /bin/grep -q -F '{DEPLOY_INSTALL_CMDLINE_TOKEN}' /proc/cmdline; then \
-         if /bin/td-boot install /dev/vda /run/td-update \
-         /run/td-volume/{candidate} /run/td-volume/{wrong_key} \
+         if /bin/td-boot {update} /dev/vda /run/td-update \
+         /run/td-volume/{channel} /run/td-volume/{wrong_key} \
          >/run/td-refused-id 2>/run/td-refused-err; then \
-         echo 'td-boot install accepted a bundle under the wrong key'; healthy=0; \
+         echo 'td-boot update accepted a bundle under the wrong key'; healthy=0; \
          elif ! /bin/grep -q -F '{unauthenticated}' /run/td-refused-err; then \
-         echo 'td-boot install refused under the wrong key for another reason'; \
+         echo 'td-boot update refused under the wrong key for another reason'; \
          healthy=0; \
-         elif /bin/td-boot install /dev/vda /run/td-update \
-         /run/td-volume/{candidate} /run/td-volume/{trusted_key} \
+         elif ! /bin/td-boot {update} /dev/vda /run/td-update \
+         /run/td-volume/{idle_channel} /run/td-volume/{trusted_key} \
+         >/run/td-idle-id; then \
+         echo 'td-boot update failed on a channel with nothing in it'; healthy=0; \
+         elif [ -s /run/td-idle-id ]; then \
+         echo 'td-boot update named a deployment for an empty channel'; healthy=0; \
+         elif ! /bin/td-boot {update} /dev/vda /run/td-update \
+         /run/td-volume/{channel} /run/td-volume/{trusted_key} \
          >/run/td-installed-id; then \
-         echo {SYSTEM_DEPLOY_INSTALL_MARKER}; else healthy=0; fi; \
+         echo 'td-boot update failed on the channel holding a bundle'; healthy=0; \
+         elif ! [ -s /run/td-installed-id ]; then \
+         echo 'td-boot update installed nothing from the channel holding a bundle'; \
+         healthy=0; \
+         else echo {SYSTEM_DEPLOY_INSTALL_MARKER}; fi; \
          fi; \
          if [ \"$healthy\" = 1 ]; then \
          echo {SYSTEM_BOOT_SUCCESS_MARKER}; \
@@ -3167,7 +3178,7 @@ mod tests {
                 svc_timeouts::BOOTSUCCESS,
                 // The loop is clamped to this many iterations; budget a slow one each.
                 (BOOT_SUCCESS_RETRY_MAX_SECS as u32).saturating_mul(30),
-                "clamped iterations of seven su probe blocks plus a td-boot install",
+                "clamped iterations of seven su probe blocks plus three td-boot updates",
             ),
             (
                 svc_timeouts::BOOTFAIL,
@@ -5368,9 +5379,92 @@ mod tests {
         );
         assert!(
             bootsuccess.contains(DEPLOY_INSTALL_CMDLINE_TOKEN)
-                && bootsuccess.contains("td-boot install /dev/vda /run/td-update")
+                && bootsuccess.contains(&format!(
+                    "td-boot {} /dev/vda /run/td-update",
+                    td_boot_protocol::UPDATE_VERB
+                ))
                 && bootsuccess.contains(SYSTEM_DEPLOY_INSTALL_MARKER),
-            "the root-owned health target must wire transactional install through td-boot"
+            "the root-owned health target must wire the transactional update through \
+             td-boot's own update verb"
+        );
+        // The verb takes a CHANNEL, not a bundle. Passing the candidate would
+        // make it look for `<candidate>/candidate` and read every tick as
+        // nothing to do — a silent no-op that leaves every other marker green.
+        //
+        // Scoped to the update chain rather than asked of the whole script,
+        // which review called correctly: it is a bare substring test for a
+        // common English word over 10 KB that also carries the uutils, td-init,
+        // td-util, td-txt and td-login probe farms and the configured hostname,
+        // so unscoped it false-REDS on any innocent later use of the word —
+        // rewording a diagnostic here would do it — and the message it fails
+        // with points at these three passes.
+        let chain = bootsuccess
+            .split_once(DEPLOY_INSTALL_CMDLINE_TOKEN)
+            .and_then(|(_, rest)| rest.split_once(SYSTEM_DEPLOY_INSTALL_MARKER))
+            .map(|(chain, _)| chain)
+            .expect("the update chain runs from the cmdline token to the install marker");
+        assert!(
+            !chain.contains(td_boot_protocol::CHANNEL_CANDIDATE),
+            "the update passes a channel; naming the candidate would look one \
+             level too deep and read as nothing to do"
+        );
+        // An IDLE channel is the state a machine is in on almost every tick, so
+        // the oracle drives it: exit 0 AND print nothing. Only the second half
+        // separates it from an update that silently installed something.
+        //
+        // Pinned as ONE fragment rather than as two `contains` calls, because
+        // the two halves are only a contract when they are joined: review
+        // showed that dropping the `!` — which inverts the exit test — and
+        // redirecting the command somewhere other than the file `-s` reads
+        // BOTH left the separate assertions green. The second is the worse of
+        // the two: `/run/td-idle-id` would then never be written, `-s` would be
+        // false forever, and the pass would fall through to the install having
+        // asserted nothing at all.
+        let idle_branch = format!(
+            "elif ! /bin/td-boot {update} /dev/vda /run/td-update {volume}/{idle} \
+{volume}/{key} >{out}; then echo 'td-boot update failed on a channel with nothing \
+in it'; healthy=0; elif [ -s {out} ]; then",
+            update = td_boot_protocol::UPDATE_VERB,
+            volume = "/run/td-volume",
+            idle = crate::ladder::DEPLOY_IDLE_CHANNEL,
+            key = td_boot_protocol::VOLUME_TRUSTED_KEY,
+            out = "/run/td-idle-id",
+        );
+        assert!(
+            bootsuccess.contains(&idle_branch),
+            "the oracle must drive an empty channel under the REAL key, require exit \
+             0, and read the same file it redirected; wanted\n{idle_branch}\nin\n{bootsuccess}"
+        );
+        // The REAL pass, held to BOTH halves as the idle one is. Review found it
+        // held to only the first: it asserted exit 0 and never looked at what it
+        // redirected, and `update` exits 0 printing nothing whenever a channel
+        // holds no candidate — so ANY wrong channel here printed the install
+        // marker and the boot-success marker with every gate assertion green.
+        // That is the silent no-op this whole item is about, reintroduced by the
+        // very commit that added the idle pass to catch it.
+        //
+        // The pair is pinned rather than the channel alone, and that is not
+        // belt-and-braces: `VOLUME_CHANNEL_DIR` is a strict PREFIX of
+        // `DEPLOY_IDLE_CHANNEL` (`td/incoming` of `td/incoming-idle`), so a bare
+        // `contains` on the channel — or a `find` for it — is satisfied by the
+        // IDLE pass and says nothing about this one.
+        let real_branch = format!(
+            "elif ! /bin/td-boot {update} /dev/vda /run/td-update {volume}/{channel} \
+{volume}/{key} >{out}; then echo 'td-boot update failed on the channel holding a \
+bundle'; healthy=0; elif ! [ -s {out} ]; then echo 'td-boot update installed nothing \
+from the channel holding a bundle'; healthy=0; else echo {marker}; fi;",
+            update = td_boot_protocol::UPDATE_VERB,
+            volume = "/run/td-volume",
+            channel = td_boot_protocol::VOLUME_CHANNEL_DIR,
+            key = td_boot_protocol::VOLUME_TRUSTED_KEY,
+            out = "/run/td-installed-id",
+            marker = SYSTEM_DEPLOY_INSTALL_MARKER,
+        );
+        assert!(
+            bootsuccess.contains(&real_branch),
+            "the real update pass must name the channel AND the real key, and must \
+             require that it INSTALLED something rather than only that it exited 0; \
+             wanted\n{real_branch}\nin\n{bootsuccess}"
         );
         // The NEGATIVE half, guarded here because no gate boots a VM: the oracle
         // that would notice its absence runs only under `qemu-boot-system`. The
@@ -5385,7 +5479,7 @@ mod tests {
                 "/run/td-volume/{}",
                 td_boot_protocol::VOLUME_TRUSTED_KEY
             )),
-            "the install pass must run under BOTH the wrong key and the real one"
+            "the update pass must run under BOTH the wrong key and the real one"
         );
         assert!(
             bootsuccess.contains(td_boot_protocol::MANIFEST_UNAUTHENTICATED),

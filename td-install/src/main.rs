@@ -1991,6 +1991,28 @@ mod tests {
             std::fs::metadata(&carried).unwrap().permissions().mode() & 0o777,
             0o644
         );
+
+        // The update CHANNEL, empty and 0755. `td-boot update` treats a missing
+        // channel as a configuration fault rather than as nothing to do, so a
+        // machine installed without one fails every timer tick — and the qemu
+        // harness stages its own, so no oracle would ever show it. Asserted on
+        // the staging tree because that is what `--rootdir` reads, and empty
+        // directories do survive into the image.
+        let channel = staging.join(protocol::VOLUME_CHANNEL_DIR);
+        assert!(
+            channel.is_dir(),
+            "the volume must carry an update channel: {}",
+            channel.display()
+        );
+        assert_eq!(
+            std::fs::read_dir(&channel).unwrap().count(),
+            0,
+            "a freshly installed channel has been offered nothing"
+        );
+        assert_eq!(
+            std::fs::metadata(&channel).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

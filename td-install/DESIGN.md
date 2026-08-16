@@ -1485,9 +1485,10 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    THE NEGATIVE IS THE POINT. The candidate is signed whether or not td-boot
    is told to check it, so passing the key and asserting the same marker would
    prove nothing — an ignored argument leaves every existing assertion green.
-   So the script installs TWICE: first under `DEPLOY_WRONG_KEY`, a second
-   generated key staged beside the real one, which must FAIL; then under the
-   real one, which must succeed. Only the second echoes the marker.
+   So the script updates THREE times: first under `DEPLOY_WRONG_KEY`, a second
+   generated key staged beside the real one, which must FAIL; then over an
+   EMPTY channel, which must succeed and name nothing; then over the real one,
+   which must install. Only the last echoes the marker.
 
    A refusal is not enough on its own, because almost anything makes an
    install fail — a key that is not there, a busy volume lock, a candidate
@@ -1501,13 +1502,61 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    will not parse — different failures, and only the first is under test.
 
    What the gate can and cannot see here is worth stating plainly, because no
-   gate boots a VM. It CAN see, and mutation-reds, that the script carries
-   both passes, that the wrong key is tried first, and that the refusal's
-   reason is checked; and separately that td-boot really does refuse a bundle
-   under a whole valid wrong key with that constant in the message. What only
-   `td-recipe-eval qemu-boot-system` can see is the guest executing it. The
-   two halves meet at the shared constant, which is what makes the guarded
-   half worth having.
+   gate boots a VM. It CAN see, and mutation-reds, that the script carries all
+   three passes, that the wrong key is tried first, that the refusal's reason
+   is checked, and that each pass is held to BOTH halves of its contract; and
+   separately that td-boot really does refuse a bundle under a whole valid
+   wrong key with that constant in the message. What only `td-recipe-eval
+   qemu-boot-system` can see is the guest executing it. The two halves meet at
+   the shared constant, which is what makes the guarded half worth having.
+
+   **10g — the oracle drives the VERB.** Those passes went through `install`
+   with a bundle path until `td-boot update` existed; they take a CHANNEL now,
+   which is what an actual machine's timer runs. The gate refuses a script
+   whose update chain names the candidate at all: `update` would look for
+   `<candidate>/candidate` one level too deep, find nothing, and read every
+   tick as nothing to do — a silent no-op leaving every other marker green.
+   That tripwire is scoped to the chain rather than asked of the whole script,
+   because it is a substring test for a common English word over 10 KB that
+   also carries five probe farms and the configured hostname: unscoped, any
+   innocent later use of the word false-REDS it, and the message points here.
+
+   The IDLE pass is the one this verb needed and `install` could not have. An
+   up-to-date machine is in that state on almost every tick, so a verb that
+   errored there would fail a machine continuously and no gate could see it.
+   Both halves are asserted, and only the second separates idle from an update
+   that quietly installed something: exit 0 AND stdout empty. The harness
+   stages `DEPLOY_IDLE_CHANNEL` as a second, empty directory rather than
+   emptying the real channel, which has to keep its candidate for the pass that
+   follows.
+
+   Empty directories DO survive `mkfs.btrfs --rootdir` and `btrfs restore` —
+   checked rather than assumed, since both this fixture and the installer's own
+   `VOLUME_CHANNEL_DIR` depend on it. `td-install-test` asserts it on the real
+   restored image now, rather than leaving it to a check somebody once ran by
+   hand: `td-install`'s own tests read the STAGING tree, before a filesystem
+   exists, so nothing else looks at the channel after both have had it. It is
+   asserted with `[ -d ]` plus `ls -A`, whose exit status is CHECKED, because
+   `$(…)` captures stdout alone — a busybox whose `ls` did not take `-A` would
+   print its usage to stderr and hand back the empty string, and an emptiness
+   test that reads that as "empty" passes whatever is in the directory. `rmdir`
+   would say all three things in one call and is not in that recipe's declared
+   applet set, which is the trap `cmp` is already noted for one line above it.
+
+   EACH PASS IS HELD TO BOTH HALVES OF ITS CONTRACT, which the first version of
+   this item got right for the idle pass and wrong for the real one. That pass
+   asserted only that `update` exited 0 and never looked at what it had
+   redirected — and `update` exits 0 printing nothing whenever a channel holds
+   no candidate, so ANY wrong channel there printed the install marker and the
+   boot-success marker with every gate assertion green. It is the exact failure
+   the paragraph above says this item keeps circling, reintroduced by the commit
+   that added the idle pass to catch it. The real pass now requires a non-empty
+   id as the idle pass requires an empty one.
+
+   The gate pins the real pass's channel and key as a PAIR, which is not
+   redundancy: `VOLUME_CHANNEL_DIR` is a strict PREFIX of `DEPLOY_IDLE_CHANNEL`
+   (`td/incoming` of `td/incoming-idle`), so a substring test for the channel
+   alone is satisfied by the idle pass and says nothing about the real one.
 
    **10f — two things still owed**, both found in review of 10d and neither a
    defect until something passed the argument. 10e is what passed it, and 10e

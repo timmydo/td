@@ -149,6 +149,21 @@ fn publish_steps(
     // repeating bytes is exactly that shape. `cmp` would say the same thing
     // more directly and is not in this recipe's declared applet set; `od`
     // already is, three checks up.
+    //
+    // The update channel is asserted for all three of its properties: it
+    // exists, it is a DIRECTORY, and it is EMPTY. The last is the contract — a
+    // machine has a channel and has been offered nothing — and this is also the
+    // only check that an empty directory survives `mkfs.btrfs --rootdir` and
+    // `btrfs restore` at all, which everything `td-boot update` does on an
+    // installed machine rests on.
+    //
+    // `ls` and `[`, because `rmdir` would say all three in one call and is NOT
+    // in this recipe's declared applet set — the trap the `cmp` note above is
+    // about, one applet further on. Its exit status is CHECKED rather than
+    // discarded: `$(…)` captures stdout only, so a busybox whose `ls` did not
+    // take `-A` would print its usage to stderr and hand back the empty string,
+    // and an emptiness test that reads that as "empty" passes whatever is in
+    // the directory.
     let deployment_is_in_the_volume = format!(
         "'{btrfs}' restore -s -S '{{root}}/scratch/td-volume.img' '{{root}}/restored' || \
          {{ echo 'the volume could not be restored' >&2; exit 1; }}; \
@@ -167,6 +182,12 @@ fn publish_steps(
          {{ echo 'the volume trust root is missing or not a regular file' >&2; exit 1; }}; \
          [ \"$(od -An -v -tx1 '{{root}}/restored/{trusted}')\" = \"$(od -An -v -tx1 '{key}')\" ] || \
          {{ echo 'the volume does not carry the key that authenticated it' >&2; exit 1; }}; \
+         [ -d '{{root}}/restored/{channel}' ] || \
+         {{ echo 'the volume has no update channel, or it is not a directory' >&2; exit 1; }}; \
+         offered=$(ls -A '{{root}}/restored/{channel}') || \
+         {{ echo 'the update channel could not be listed' >&2; exit 1; }}; \
+         [ -z \"$offered\" ] || \
+         {{ echo \"a fresh install offers $offered in its update channel\" >&2; exit 1; }}; \
          tree=$('{btrfs}' inspect-internal dump-tree -t fs '{{root}}/scratch/td-volume.img') || \
          {{ echo 'the volume has no readable filesystem tree' >&2; exit 1; }}; \
          case \"$tree\" in *'name: {id}'*) ;; \
@@ -174,6 +195,7 @@ fn publish_steps(
         boot = td_boot_protocol::BOOT_DIR,
         deployments = td_boot_protocol::DEPLOYMENTS_DIR,
         trusted = td_boot_protocol::VOLUME_TRUSTED_KEY,
+        channel = td_boot_protocol::VOLUME_CHANNEL_DIR,
         current = td_boot_protocol::CURRENT_SLOT,
         prefix = td_boot_protocol::SELECTOR_PREFIX,
         manifest = td_boot_protocol::MANIFEST_NAME,
@@ -458,7 +480,7 @@ exec "$TD_RECIPE_EVAL" check-run td-install-test 1
 
 #[cfg(test)]
 mod tests {
-    use super::td_boot_fixture;
+    use super::{td_boot_fixture, td_boot_protocol, Step};
 
     /// The fixture this recipe stages really carries a signature.
     ///
@@ -481,6 +503,33 @@ mod tests {
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
             "the committed signature is not lowercase hexadecimal"
+        );
+    }
+
+    /// The restored volume is checked for an EMPTY update channel.
+    ///
+    /// Everything `td-boot update` does on an installed machine rests on that
+    /// directory being there and empty, and `td-install`'s own tests cannot
+    /// say it: they read the staging tree, before a filesystem exists. Only
+    /// this check sees the channel after `mkfs.btrfs --rootdir` and `btrfs
+    /// restore` have both had it — which is the survival of an empty directory
+    /// through them, the fact the whole channel design rests on. It runs in the
+    /// tier that does not run on every host, so its PRESENCE is asserted where
+    /// `cargo test` can see it, as the signature above is.
+    #[test]
+    fn the_restored_volume_is_checked_for_an_empty_update_channel() {
+        // The EMPTINESS half specifically, since `[ -d … ]` alone would leave
+        // the property this item rests on unchecked.
+        let wanted = format!(
+            "offered=$(ls -A '{{root}}/restored/{}')",
+            td_boot_protocol::VOLUME_CHANNEL_DIR
+        );
+        assert!(
+            super::recipe().steps.iter().flatten().any(|step| {
+                matches!(step, Step::Run { argv, .. }
+                    if argv.iter().any(|arg| arg.contains(&wanted)))
+            }),
+            "no step checks the restored volume's update channel; wanted {wanted}"
         );
     }
 

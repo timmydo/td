@@ -2298,7 +2298,7 @@ fn populate_persistent_seed(
 /// The two keys a booted machine's update path is given, written where
 /// `td-install` would put the first (DESIGN §10 item 10a).
 ///
-/// The wrong one is what makes the oracle's install pass mean anything: the
+/// The wrong one is what makes the oracle's update passes mean anything: the
 /// candidate is signed by the run key whether or not td-boot is told to check
 /// it, so an ignored `trusted-key` argument would leave every existing
 /// assertion green. It is a REAL key rather than a corrupt file, so the refusal
@@ -2314,6 +2314,15 @@ fn stage_volume_trust_roots(seed: &Path, trust: &RunTrust) -> Result<(), String>
     if decoy.trusted_key_line() == trust.trusted_key_line() {
         return Err("the decoy trust root matched the run key".to_string());
     }
+    // The idle channel is a DIRECTORY and stays empty; `update` must read it as
+    // nothing to do rather than as a fault. Its mode is pinned for the trust
+    // roots' reason below — `--rootdir` copies one in verbatim — and to 0755
+    // because that is what `td-install` gives the real channel.
+    let idle = seed.join(td_recipe::ladder::DEPLOY_IDLE_CHANNEL);
+    fs::create_dir_all(&idle)
+        .map_err(|e| format!("create fixture idle channel {}: {e}", idle.display()))?;
+    fs::set_permissions(&idle, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("chmod fixture idle channel {}: {e}", idle.display()))?;
     for (relative, line) in [
         (td_boot_protocol::VOLUME_TRUSTED_KEY, trust.trusted_key_line()),
         (
@@ -3515,6 +3524,30 @@ mod tests {
             let mode = fs::metadata(seed.join(relative)).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o644, "{relative} must be staged 0644");
         }
+
+        // The IDLE channel, for the same reason the two keys above are here:
+        // the only thing that reads it boots a VM, and no gate does. Removing
+        // the two lines that stage it left every check green while the oracle's
+        // idle pass got a MISSING channel — which `update` calls a fault, so the
+        // pass that proves an up-to-date machine is quiet would have failed as
+        // loudly as a broken one. All three properties are the fixture: a
+        // directory (a file gives ENOTDIR), empty (a candidate makes the pass
+        // install something and print an id), and 0755 as `td-install` leaves
+        // the real one.
+        let idle = seed.join(td_recipe::ladder::DEPLOY_IDLE_CHANNEL);
+        let staged = fs::metadata(&idle)
+            .unwrap_or_else(|e| panic!("the idle channel must be staged: {e}"));
+        assert!(staged.is_dir(), "the idle channel must be a directory");
+        assert_eq!(
+            fs::read_dir(&idle).unwrap().count(),
+            0,
+            "an idle channel with anything in it is not idle"
+        );
+        assert_eq!(
+            staged.permissions().mode() & 0o777,
+            0o755,
+            "the idle channel must be staged 0755, as td-install leaves the real one"
+        );
     }
 
     /// The appendix's members, and that its parents are DIRECTORIES.

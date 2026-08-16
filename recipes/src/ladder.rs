@@ -348,14 +348,25 @@ pub const PERSIST_READ_CMDLINE_TOKEN: &str = "td.persist=read";
 pub const DEPLOY_INSTALL_CMDLINE_TOKEN: &str = "td.deploy=install";
 
 /// A valid ed25519 public key that signed NOTHING, staged on the fixture volume
-/// beside the real trust root. The oracle's install pass runs twice: once under
-/// this key, which must be REFUSED, and then under the real one. Without the
-/// first, the whole trusted-key argument could be ignored by td-boot and every
-/// assertion would still pass — the candidate is signed either way.
+/// beside the real trust root. The oracle's update pass runs three times: under
+/// this key, which must be REFUSED; over an empty channel, which must be quiet;
+/// and then under the real one, which must INSTALL. Without the first, the whole
+/// trusted-key argument could be ignored by td-boot and every assertion would
+/// still pass — the candidate is signed either way.
 ///
 /// Volume-relative, because the two sides need it differently: the harness joins
 /// it to the seed tree, and the boot script joins it to `/run/td-volume`.
 pub const DEPLOY_WRONG_KEY: &str = "td/oracle-wrong.pub";
+
+/// An EMPTY channel, staged beside the real one so the oracle can exercise the
+/// state an up-to-date machine is in almost all of the time: `update` must exit
+/// 0 and print nothing. That is the path a timer takes on every tick that has
+/// no work, so a verb that errored there would fail a machine continuously —
+/// and no gate can boot a VM to notice.
+///
+/// A second directory rather than the real channel emptied, because the real one
+/// has to keep its candidate for the pass that follows.
+pub const DEPLOY_IDLE_CHANNEL: &str = "td/incoming-idle";
 
 /// Kernel-cmdline token used only by the boot-attempt oracle. The login profile blocks
 /// before its greeter milestone and an isolated root-owned watchdog reboots the target.
