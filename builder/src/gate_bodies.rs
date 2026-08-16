@@ -3249,9 +3249,144 @@ exit 0
         ));
     }
 
+    // (D) the CONSTRUCTION window, which leg B deliberately no longer reaches.
+    //
+    // Probabilistic in ONE direction: whether a cycle lands in the window is up
+    // to the scheduler, so a miss proves nothing and cycles are repeated. A
+    // healthy sandbox reaps whatever the timing, so none can red for having
+    // sampled badly. Cycles are NOT independent trials — measured detection
+    // clusters — so this SAMPLES the race rather than proving its absence.
+    println!(">> (D) construction-window reaping: killing td-builder before its tree is up");
+    const CYCLES: usize = 40;
+    // Load-bearing rather than a taste: the marker packs the cycle into two
+    // decimal digits, so at 100 the (pid, i) mapping stops being injective and
+    // a sibling run one pid away collides outright. It is also what keeps every
+    // marker the same LENGTH, which is what makes one impossible to find inside
+    // another under `has_marker`'s substring match.
+    const CYCLE_DIGITS: u64 = 100;
+    const _: () = assert!(CYCLES as u64 <= CYCLE_DIGITS);
+    // Leg B's 100ms tick is wrong here: a SIGTERM'd top becomes reapable in a
+    // few ms, and at one coarse tick per cycle that is paid CYCLES times over
+    // for nothing. Same 10s ceiling, finer grain.
+    let fine = std::time::Duration::from_millis(1);
+    const FINE_TICKS: usize = 10_000;
+    for i in 0..CYCLES {
+        let marker = ((2_000_000u64 + u64::from(std::process::id()) % 1_000_000) * CYCLE_DIGITS
+            + i as u64)
+            .to_string();
+        let stale = scan_marker_procs(&marker);
+        if stale != 0 {
+            // Named, as leg B names its own: this is the path an UNRELATED
+            // process carrying those digits trips, so the cmdline is the only
+            // way to tell that from a real leak.
+            for line in marker_cmdlines(&marker) {
+                println!("   pre-existing: {line}");
+            }
+            return Err(format!(
+                "FAIL: {stale} process(es) already carry marker={marker} before cycle {i}"
+            ));
+        }
+        let inner = format!("{sleep_exec_s} {marker} & {sleep_exec_s} {marker} & wait");
+        let mut args: Vec<&str> = vec!["host-sandbox"];
+        args.extend_from_slice(&bind_flags);
+        args.extend_from_slice(&["--", &sh_exec_s, "-c", &inner]);
+        let mut probe = Command::new(&tb);
+        probe.args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = crate::spawn::past_a_busy_program(|| probe.spawn())
+            .map_err(|e| format!("FAIL: cannot spawn construction-window probe {i}: {e}"))?;
+        let top = i64::from(child.id());
+        // The EARLIEST moment anything of the tree exists beyond the top
+        // itself: two marker-bearing processes is the top plus the child
+        // `Command::spawn` forked, which is the one that unshares and then
+        // forks PID 1. Killing here is what B stopped doing.
+        let mut at_kill = 0;
+        for _ in 0..2_000 {
+            at_kill = scan_marker_procs(&marker);
+            if at_kill >= 2 {
+                break;
+            }
+            std::thread::sleep(fine);
+        }
+        if at_kill < 2 {
+            // NOT a pass. Killing a tree that never began finds no survivors
+            // and reports success — this leg answering a question it never
+            // asked, which is the one way it can go quietly useless.
+            let _ = crate::sys::kill_pid(top, crate::sys::SIGTERM);
+            let _ = child.kill();
+            let _ = child.wait();
+            sweep_marker_procs(&marker);
+            return Err(format!(
+                "FAIL: cycle {i} never saw the sandbox start constructing — {at_kill} \
+                 marker-bearing process(es) after 2s (marker={marker})"
+            ));
+        }
+        if let Err(e) = crate::sys::kill_pid(top, crate::sys::SIGTERM) {
+            sweep_marker_procs(&marker);
+            // Timed, for the reason leg B's `!top_exited` path is: an untimed
+            // wait on a child still somehow running hangs the gate for its
+            // whole budget rather than failing it here.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("FAIL: cannot SIGTERM the top td-builder ({top}) in cycle {i}: {e}"));
+        }
+        let mut top_exited = false;
+        for _ in 0..FINE_TICKS {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                top_exited = true;
+                break;
+            }
+            std::thread::sleep(fine);
+        }
+        if !top_exited {
+            for line in marker_cmdlines(&marker) {
+                println!("   still up: {line}");
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            sweep_marker_procs(&marker);
+            return Err(format!(
+                "FAIL: the top td-builder ({top}) was still alive 10s after SIGTERM in cycle {i}"
+            ));
+        }
+        let mut drained = false;
+        for _ in 0..FINE_TICKS {
+            if scan_marker_procs(&marker) == 0 {
+                drained = true;
+                break;
+            }
+            std::thread::sleep(fine);
+        }
+        let survivors = marker_cmdlines(&marker);
+        if !survivors.is_empty() {
+            for line in &survivors {
+                println!("   surviving: {line}");
+            }
+            sweep_marker_procs(&marker);
+            return Err(format!(
+                "FAIL: {} descendant(s) survived a kill during construction (cycle {i}, \
+                 marker={marker}) — a sandbox killed before PID 1 confirmed its parent",
+                survivors.len()
+            ));
+        }
+        if !drained {
+            // The drain ran out and the last scan happened to read zero. Not a
+            // failure — the tree IS gone — but ten seconds to reap it is not
+            // the healthy shape either, and nothing else would say so.
+            println!("   note: cycle {i} took the full drain budget to reach zero");
+        }
+        // What was actually up when the kill landed. Without it a run where the
+        // scan never catches the tree early is byte-identical to one that
+        // samples the window every time — the leg going quietly useless, which
+        // is the failure this whole leg exists to prevent for the sandbox.
+        if at_kill > 2 {
+            println!("   note: cycle {i} killed at {at_kill} marker procs, past the earliest point");
+        }
+    }
+    println!("   {CYCLES} construction-window kills, no survivors");
+
     println!(
         "PASS: minimal /dev (no host device leak) + the inner sandbox tree is fully reaped when \
-         td-builder is killed."
+         td-builder is killed, whether it is up or still being built."
     );
     Ok(())
 }
@@ -3605,6 +3740,42 @@ mod tests {
     /// ends with a trailing space. A `want` built without one never equals
     /// anything, the leaf count stays at zero, and the gate reports that the
     /// tree never started rather than that its matcher is broken.
+    #[test]
+    fn no_construction_cycle_marker_can_be_found_inside_another() {
+        // Leg D scans by SUBSTRING, so distinctness is not enough: one cycle's
+        // marker must not appear inside another's cmdline, or a cycle counts a
+        // sibling's leaf as its own survivor. What buys that is every marker
+        // being the same LENGTH, which holds only while the cycle index fits
+        // the two decimal digits the derivation reserves — the invariant a
+        // future CYCLES bump would otherwise break in silence.
+        const CYCLE_DIGITS: u64 = 100;
+        let markers = |pid: u64, n: u64| -> Vec<String> {
+            (0..n)
+                .map(|i| ((2_000_000 + pid % 1_000_000) * CYCLE_DIGITS + i).to_string())
+                .collect()
+        };
+        let ms = markers(4242, 40);
+        for (a, x) in ms.iter().enumerate() {
+            assert_eq!(x.len(), 9, "every marker is nine digits: {x}");
+            for (b, y) in ms.iter().enumerate() {
+                if a != b {
+                    assert_ne!(x, y, "markers must be distinct");
+                    assert!(!x.contains(y.as_str()), "{y} must not be inside {x}");
+                }
+            }
+        }
+        // The bound is real, not decorative: at 100 the cycle digits overflow
+        // into the pid and a run one pid away collides outright.
+        let over = markers(4242, 101);
+        let next = markers(4243, 1);
+        assert_eq!(
+            over.get(100),
+            next.first(),
+            "at CYCLES=101 a sibling pid's cycle 0 IS this run's cycle 100 — \
+             which is what the const assert in the leg refuses"
+        );
+    }
+
     #[test]
     fn a_cmdline_matches_whole_argv_rather_than_a_substring_of_it() {
         let leaf = cook_cmdline(b"/bin/sleep\x001000050\x00".to_vec()).unwrap();
