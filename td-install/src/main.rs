@@ -804,7 +804,17 @@ fn publish_into(staging: &Path, publish: &Publish, key: &[u8]) -> io::Result<()>
     // SET rather than passed to `mkdir`, because a creation mode is masked by
     // the umask and a `chmod` is not: `DirBuilder::mode(0o755)` still yields
     // 0700 under `umask 077`, which is a different image for the same inputs.
-    for directory in ["td", protocol::BOOT_DIR, protocol::DEPLOYMENTS_DIR] {
+    // `VOLUME_CHANNEL_DIR` is here because `td-boot update` treats a MISSING
+    // channel as a configuration fault rather than as nothing to do — which is
+    // right, and which means an installed machine whose channel was never
+    // created fails every timer tick. Empty is the correct initial state: the
+    // machine has an update channel and nothing has been offered in it yet.
+    for directory in [
+        "td",
+        protocol::BOOT_DIR,
+        protocol::DEPLOYMENTS_DIR,
+        protocol::VOLUME_CHANNEL_DIR,
+    ] {
         let path = staging.join(directory);
         std::fs::create_dir_all(&path)?;
         use std::os::unix::fs::PermissionsExt;

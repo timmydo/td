@@ -1184,9 +1184,30 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    /run/td-update "$deployment"` after a good boot. That mountpoint is named
    for this item and predates it.
 
-   So `td-update` is a CHANNEL front end, not a second publisher. What it adds
-   over `td-boot install` is where a bundle comes from, which one to take, and
-   the trust root to check it under. D1 still holds: it execs the one writer.
+   So the update path is a CHANNEL front end, not a second publisher. What it
+   adds over `td-boot install` is where a bundle comes from, which one to take,
+   and the trust root to check it under.
+
+   **It is a VERB, `td-boot update`, and not the separate `td-update` program
+   this item first specified.** The reversal is recorded rather than quietly
+   applied, because the earlier text said "it execs the one writer" and that
+   is no longer what happens — D1 is served by a CALL now, which is strictly
+   more direct. td-boot already carries `install`, `publish`, `success` and
+   `rollback`: four verbs that are the update transaction rather than the
+   boot, so the binary is already the deployment tool that also boots, and
+   `update` is consistent with what it is. A separate crate would have needed
+   a manifest and lock, two `affected.rs` rosters, a target recipe and image
+   inclusion before any behaviour landed, plus a third `#[path]` copy of both
+   `protocol.rs` and `realfile.rs` — and would still have had to exec td-boot,
+   putting the channel logic and the publish logic in two processes with argv
+   between them.
+
+   What that costs is real and worth naming: the SELECTOR initramfs packs
+   td-boot, so it now carries channel code it never reaches. That is dead
+   weight on the boot path rather than live surface — `run_boot` has no path
+   to it — and the same is already true of the other four verbs. If the
+   selector ever needs to shrink, splitting the update verbs out is the move,
+   and this paragraph is what to re-read.
 
    **THE TRUST ROOT IS THE REAL QUESTION, and it is the reason this item is
    not just a directory scan.** A running machine has none. The key lives at
@@ -1205,9 +1226,9 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    given (7c-ii). That gives a running machine a trust root with exactly the
    provenance of the media that installed it, survives every update and
    rollback because no deployment owns it, and is one place to rotate.
-   `td-update` then passes it EXPLICITLY to `td-boot`, the rule 7c already
-   set for `td-install`: no probe, so no absence that reads as "publish
-   without checking".
+   `td-boot update` is then handed it EXPLICITLY, the rule 7c already set for
+   `td-install`: no probe, so no absence that reads as "publish without
+   checking".
 
    Two alternatives were weighed and are recorded because the choice is not
    obvious. Shipping the key INSIDE the deployment root would make each
@@ -1505,11 +1526,13 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
      machine means root, and a root that can write `/run` has better things to
      do. So this is defence in depth and is recorded at that weight.
 
-     Where it belongs is not td-boot, which is the other half of the
-     correction. The verb takes an arbitrary path, so requiring it to sit on a
-     mount would refuse a perfectly good `td-boot install … /root/key.pub`.
-     The caller that knows the key is supposed to be on the volume is
-     `td-update`, and that is where the check goes.
+     Where it belongs is not `install`, which is the other half of the
+     correction. That verb takes an arbitrary path, so requiring it to sit on
+     a mount would refuse a perfectly good `td-boot install … /root/key.pub`.
+     The caller that knows the key is supposed to be on the volume is the
+     UPDATE verb — which is td-boot's own now rather than the separate program
+     this paragraph was written against, so the check has an owner again and
+     is owed by `update` rather than by a program that will not exist.
 
      On 10e's path it is separately covered, by something that is nobody's
      check of this: the boot-success script runs only after rootcheck, which
@@ -1518,18 +1541,120 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
      is reordered.
    - an explicit key path is not required ABSOLUTE, where `source`, `device`,
      `mountpoint` and `root` all are. It resolves against whatever cwd the
-     caller had. That is shared with `publish` and `authenticate` and so
-     predates this argument, but `install` is now the verb whose key is
-     documented to live at a named absolute mount path, which is what makes
-     the asymmetry worth closing rather than noting.
+     caller had. CLOSED for `update`, where nothing sets a timer's working
+     directory and the key is mandatory; still open for `install`, `publish`
+     and `authenticate`, whose key belongs to a person who typed it.
 
-   **The LOCAL channel** is a directory of deployment directories, and local
-   is the whole of it for now: no network, no fetch, no protocol. td's
-   network tools are the only crates allowed dependencies and none of them is
-   built for the target, so a fetching `td-update` is a separate decision with
-   its own trust argument, not an increment of this one. The bundle arrives by
-   whatever put it there — removable media, a share the operator mounted, a
-   build host writing into the volume.
+   **The LOCAL channel** is a directory holding AT MOST ONE bundle, under the
+   fixed name `protocol::CHANNEL_CANDIDATE`. Local is the whole of it for now:
+   no network, no fetch, no protocol. td's network tools are the only crates
+   allowed dependencies and none of them is built for the target, so a fetching
+   update is a separate decision with its own trust argument, not an increment
+   of this one. The bundle arrives by whatever put it there — removable media,
+   a share the operator mounted, a build host writing into the volume, for
+   which `VOLUME_CHANNEL_DIR` is the volume's own.
+
+   **One fixed name rather than a search, because td cannot order two
+   bundles.** A manifest is a header and a list of payload digests; it carries
+   no version, no timestamp and nothing else that says which of two is later,
+   and the deployment id is a hash, which sorts meaninglessly. Anything that
+   picked the "newest" would be guessing from mtimes an attacker supplies or
+   from names nobody validates. So WHICH bundle is the producer's decision,
+   expressed by what it leaves at that name. Giving td a real notion of newer
+   means a version field inside the signed manifest, which is a change to the
+   deployment contract and its own landing.
+
+   **How a producer publishes into the channel**, stated because an earlier
+   draft of this paragraph said "replacement is `rename` — atomic" and that is
+   not implementable. `rename(2)` refuses a destination directory that is not
+   EMPTY, so it can put a FIRST candidate in place atomically and cannot
+   replace an existing one. The protocol is therefore: stage the bundle under
+   any other name INSIDE the channel, remove the old candidate if there is
+   one, then rename the staged one over it.
+
+   That leaves a window in which the candidate is absent, and the window is
+   affordable for exactly the reason the verb exists — a timer. A tick landing
+   in it reads "nothing offered", exits 0, and the next tick installs. What
+   stage-then-rename does still buy is the atomicity that matters: no reader
+   ever sees a HALF-WRITTEN bundle, only a whole one or none. A tick that
+   catches the removal mid-read fails loudly rather than installing something
+   partial, because the payload names come from a manifest that must verify
+   first.
+
+   Closing the window properly needs an atomic exchange — `renameat2`'s
+   `RENAME_EXCHANGE`, a syscall, so an `UNSAFE.md` amendment — or a `candidate`
+   SYMLINK swung between generation directories, which rename does replace
+   atomically. The second is cheap and is refused for now only because it
+   contradicts the real-directory rule below; if the window ever matters, that
+   is the trade to revisit.
+
+   **What `update` does that `install` does not** is all about being run by a
+   TIMER rather than a person, and each difference is the same judgement: an
+   updater nobody is watching must not decide for itself that something
+   missing is fine.
+
+   Its trust root is REQUIRED, where `install`'s is optional. For `install` an
+   absent key is a real configuration — a rootfs with no trust root publishes
+   as it always has — and for an unattended updater there is no such
+   configuration. It is also required ABSOLUTE, as the channel is: nothing sets
+   a timer's working directory, so a relative path is a different file
+   depending on who started it. That is 10f's second bullet, and it is closed
+   HERE rather than in `install` because `install`'s key belongs to a person
+   who typed it.
+
+   A missing CHANNEL is an error and a missing CANDIDATE is not. That is the
+   one distinction the verb exists to draw: pointing a timer at a typo would
+   otherwise answer "nothing to do" forever, and the report arrives only when
+   an update is finally urgent. An absent candidate, by contrast, is the
+   ordinary state of a machine that is up to date, so it exits 0 with stdout
+   EMPTY.
+
+   What that empty stdout distinguishes is narrower than an earlier draft
+   claimed, and the difference is worth being exact about: it separates "the
+   channel offered nothing" from "the channel offered something", NOT
+   "installed" from "already installed". NOTHING REMOVES THE CANDIDATE after a
+   successful install — no code does it and no document assigned it — so a
+   machine that is up to date keeps re-deciding on the same bundle and printing
+   its id every tick. That is harmless because the publish is idempotent and
+   because a repeat costs almost nothing (below), but a caller that read a
+   printed id as "something changed" would be wrong every tick after the first.
+
+   Consuming the candidate is the obvious refinement and is deliberately not
+   taken here, because it decides something this item has not: whether the
+   channel is the updater's to mutate. On removable media or a read-only share
+   it is not, and a verb that only works when it can write the channel is a
+   worse verb than one that re-reads a 4 KiB manifest.
+
+   The trust root is read BEFORE the candidate is looked for. That costs a read
+   on every idle tick and is the point: a key that has gone missing or
+   unreadable is reported on a tick with nothing to install rather than on the
+   first tick that has one, which is the tick least able to afford it.
+
+   The candidate must be a real DIRECTORY, `require_real_directory`'s rule
+   everywhere else in td-boot. A symlink would make the channel's contents
+   depend on something outside it whose path nothing authenticates — the bundle
+   is authenticated, but where it was read from would not be.
+
+   That rule holds against a producer that got it wrong and NOT against one
+   RACING the call, which is a residual worth stating rather than leaving to be
+   discovered. The candidate is typed before the volume is locked and mounted
+   and is opened by pathname afterwards, so a writer who has the channel can
+   swap a directory in between; `O_NOFOLLOW` binds only the final component of
+   each file it then opens, not the directory above them. What bounds the
+   damage is AUTHENTICATION rather than the lookup: whatever is read still has
+   to verify under the trust root, so the most a racing writer achieves is
+   installing a DIFFERENT SIGNED bundle — which is also what it achieves by
+   simply writing that bundle to the candidate, which it is entitled to do.
+   Closing it needs the directory-handle route (`O_PATH` plus `openat`), which
+   `std` does not expose and which item 10c already declined on the boot path.
+
+   A REPEAT tick is cheap, which is the property that makes this fit for a
+   timer at all and is not obvious from the call. `open_bundle` reads the
+   bounded manifest and the signature and nothing else — payload digests are
+   verified on the BOOT path, not here — and `publish_bundle` short-circuits an
+   id already published, so a tick that finds the candidate it installed last
+   time costs a 4 KiB read, one signature check and a directory sync rather
+   than a copy of the image.
 
 Items 8 and 9 depend on nothing above them and may land whenever they fit.
 

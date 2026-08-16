@@ -1478,6 +1478,11 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
     let trusted_key = td_boot_protocol::VOLUME_TRUSTED_KEY;
     let wrong_key = crate::ladder::DEPLOY_WRONG_KEY;
     let unauthenticated = td_boot_protocol::MANIFEST_UNAUTHENTICATED;
+    let candidate = format!(
+        "{}/{}",
+        td_boot_protocol::VOLUME_CHANNEL_DIR,
+        td_boot_protocol::CHANNEL_CANDIDATE
+    );
     format!(
         "#!/bin/sh\n\
          set -f\n\
@@ -1541,14 +1546,14 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          && /bin/td-boot success /dev/vda /run/td-update \"$deployment\" >/run/td-success-id; then \
          if /bin/grep -q -F '{DEPLOY_INSTALL_CMDLINE_TOKEN}' /proc/cmdline; then \
          if /bin/td-boot install /dev/vda /run/td-update \
-         /run/td-volume/td/incoming/candidate /run/td-volume/{wrong_key} \
+         /run/td-volume/{candidate} /run/td-volume/{wrong_key} \
          >/run/td-refused-id 2>/run/td-refused-err; then \
          echo 'td-boot install accepted a bundle under the wrong key'; healthy=0; \
          elif ! /bin/grep -q -F '{unauthenticated}' /run/td-refused-err; then \
          echo 'td-boot install refused under the wrong key for another reason'; \
          healthy=0; \
          elif /bin/td-boot install /dev/vda /run/td-update \
-         /run/td-volume/td/incoming/candidate /run/td-volume/{trusted_key} \
+         /run/td-volume/{candidate} /run/td-volume/{trusted_key} \
          >/run/td-installed-id; then \
          echo {SYSTEM_DEPLOY_INSTALL_MARKER}; else healthy=0; fi; \
          fi; \

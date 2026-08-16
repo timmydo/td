@@ -64,6 +64,20 @@ pub const VOLUME_TRUSTED_KEY: &str = "td/trusted.pub";
 // once so a reworded diagnostic cannot quietly turn that check into a tautology.
 #[allow(dead_code)]
 pub const MANIFEST_UNAUTHENTICATED: &str = "manifest does not authenticate";
+// An update CHANNEL is a directory holding at most one bundle, under this fixed
+// name. Which bundle to install is the producer's decision and not a search:
+// a manifest carries a header and payload digests and nothing that orders two
+// of them, so td has no notion of "newer" to sort by and would be guessing.
+// A producer stages elsewhere in the channel and renames onto this name, so no
+// reader ever sees a half-written bundle; DESIGN §10 has why replacing an
+// EXISTING one is not atomic and why a timer can afford that.
+#[allow(dead_code)]
+pub const CHANNEL_CANDIDATE: &str = "candidate";
+// Where the volume keeps its own channel, for a producer writing into the disk
+// rather than onto removable media. Beside `td/deployments` and outside it, for
+// `VOLUME_TRUSTED_KEY`'s reason: an incoming bundle is a claim, not state.
+#[allow(dead_code)]
+pub const VOLUME_CHANNEL_DIR: &str = "td/incoming";
 // The two selector slots, by the names they have on disk. Here rather than as
 // literals in td-boot alone because the installer's recipe check reads one back
 // out of an unmounted image: a check that spelled its own copy would keep
@@ -116,6 +130,10 @@ pub const VOLUME_SUBVOL: &str = "@var";
 // error at install time from a program the operator did not run.
 #[allow(dead_code)]
 pub const PUBLISH_VERB: &str = "publish";
+// Named rather than a bare literal like the verbs beside it, because the
+// boot-success script spells this one too — the one verb an image invokes.
+#[allow(dead_code)]
+pub const UPDATE_VERB: &str = "update";
 
 /// A deployment id is `sha256(manifest)` written as 64 lowercase hex
 /// characters, and this is the ONLY statement of that shape.

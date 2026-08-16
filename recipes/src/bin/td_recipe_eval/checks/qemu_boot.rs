@@ -1934,11 +1934,15 @@ fn create_persistent_volume_layout(
     let alternate_id = match layout {
         VolumeLayout::Basic => deployment_id.clone(),
         VolumeLayout::Transactional => {
-            let candidate = seed.join("td/incoming/candidate");
+            let candidate = seed
+                .join(td_boot_protocol::VOLUME_CHANNEL_DIR)
+                .join(td_boot_protocol::CHANNEL_CANDIDATE);
             create_bootable_candidate(deployment, &candidate, trust)?
         }
         VolumeLayout::CorruptCurrent => {
-            let candidate = seed.join("td/incoming/corrupt-candidate");
+            let candidate = seed
+                .join(td_boot_protocol::VOLUME_CHANNEL_DIR)
+                .join("corrupt-candidate");
             let id = create_bootable_candidate(deployment, &candidate, trust)?;
             let installed = seed.join(td_boot_protocol::DEPLOYMENTS_DIR).join(&id);
             fs::rename(&candidate, &installed).map_err(|e| {

@@ -117,6 +117,17 @@ enum Mode {
         /// `install_trust_root` for why absence and unreadability differ.
         trusted_key: Option<PathBuf>,
     },
+    /// The unattended entry point: take whatever the channel is offering, if
+    /// anything, under a trust root the caller must name.
+    Update {
+        device: PathBuf,
+        mountpoint: PathBuf,
+        channel: PathBuf,
+        /// REQUIRED, unlike `install`'s. An updater nobody is watching has no
+        /// business deciding that a missing key means "publish anyway", and
+        /// there is no configuration in which it should.
+        trusted_key: PathBuf,
+    },
     Rollback {
         device: PathBuf,
         mountpoint: PathBuf,
@@ -212,7 +223,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]",
+        "usage: td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]",
     )
 }
 
@@ -319,6 +330,21 @@ fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
                 root: PathBuf::from(root),
                 source: PathBuf::from(source),
                 trusted_key,
+            })
+        }
+        Some(mode) if mode == OsStr::new(protocol::UPDATE_VERB) => {
+            let device = args.next().ok_or_else(usage_error)?;
+            let mountpoint = args.next().ok_or_else(usage_error)?;
+            let channel = args.next().ok_or_else(usage_error)?;
+            let trusted_key = args.next().ok_or_else(usage_error)?;
+            if args.next().is_some() {
+                return Err(usage_error());
+            }
+            Ok(Mode::Update {
+                device: PathBuf::from(device),
+                mountpoint: PathBuf::from(mountpoint),
+                channel: PathBuf::from(channel),
+                trusted_key: PathBuf::from(trusted_key),
             })
         }
         Some(mode) if mode == OsStr::new("rollback") => {
@@ -2649,10 +2675,111 @@ fn run_install(
     // should leave the disk exactly as it found it. That ordering is what a
     // key ON the volume relies on — see the verb's own note below.
     let trust = install_trust_root(trusted_key, Path::new("/"))?;
+    publish_onto_volume(device, mountpoint, source, trust.as_ref())
+}
+
+/// The half `install` and `update` share, after each has decided what it is
+/// installing and under whose key.
+fn publish_onto_volume(
+    device: &Path,
+    mountpoint: &Path,
+    source: &Path,
+    trust: Option<&TrustRoot>,
+) -> io::Result<()> {
     let id = run_on_writable_volume(device, mountpoint, |root| {
-        install_deployment(root, source, trust.as_ref())
+        install_deployment(root, source, trust)
     })?;
     writeln!(io::stdout(), "{id}")
+}
+
+/// Install whatever the channel is offering, if it is offering anything.
+///
+/// The differences from `install` are all about being run by a TIMER rather
+/// than by a person, and each is the same judgement: an updater nobody is
+/// watching must not decide for itself that something missing is fine.
+///
+/// So the CHANNEL must be there and be a directory — pointing this at a typo
+/// is a configuration fault, and answering "nothing to do" forever is how that
+/// goes unnoticed until an update is urgently needed. The CANDIDATE inside it
+/// may be absent, and that alone is the quiet success: it is the ordinary state
+/// of a machine that is up to date, and stdout stays empty so a caller can tell
+/// "installed" from "nothing offered" without parsing anything.
+///
+/// The trust root is read BEFORE the candidate is looked for, which costs a read
+/// on every idle run and is the point: a key that has gone missing or unreadable
+/// is reported on the next timer tick rather than on the first tick that had an
+/// update to install, which is the tick least able to afford it. Both paths are
+/// required ABSOLUTE, since nothing sets a timer's working directory.
+///
+/// The candidate is refused unless it is a real directory. That rule holds
+/// against a producer that got it wrong and NOT against one racing this call:
+/// the path is looked up again under the mount, so a writer with the channel can
+/// swap it in between. What bounds that is authentication rather than the
+/// lookup — whatever is read still has to verify under the trust root — so it is
+/// recorded in DESIGN as a residual instead of being closed with the directory
+/// handles it would really need.
+fn run_update(
+    device: &Path,
+    mountpoint: &Path,
+    channel: &Path,
+    trusted_key: &Path,
+) -> io::Result<()> {
+    match update_decision(channel, trusted_key)? {
+        None => Ok(()),
+        Some((candidate, trust)) => publish_authenticated(device, mountpoint, &candidate, &trust),
+    }
+}
+
+/// Everything `update` DECIDES, split from what it does so the decision is
+/// reachable without a block device.
+///
+/// The verb cannot be driven end to end in this crate: the transaction lock
+/// refuses a character device before any mount, so `/dev/null` never gets far
+/// enough to install anything. Review found that this left the whole publish
+/// unpinned — replacing it with `Ok(())` was green, and so was publishing
+/// UNAUTHENTICATED. What is testable is the decision, and the decision is
+/// everything that makes this verb different from `install`.
+///
+/// `None` is "nothing to do" and means EXACTLY one thing: no candidate. A
+/// channel that cannot be read, or one holding something that is not a real
+/// directory, is loud. That boundary is the verb.
+fn update_decision(channel: &Path, trusted_key: &Path) -> io::Result<Option<(PathBuf, TrustRoot)>> {
+    require_absolute(channel, "update channel")?;
+    require_absolute(trusted_key, "update trust root")?;
+    require_real_directory(channel, "update channel")?;
+    // Read before the candidate is looked for, so an idle tick still reports a
+    // trust root that has gone missing. Unwrapped to a `TrustRoot`, not left an
+    // `Option`: `install_trust_root` answers `None` only for an absent DEFAULT,
+    // and this key is explicit, so `None` here is unreachable rather than a
+    // configuration — and carrying it would put the fail-open back in the type.
+    let trust = install_trust_root(Some(trusted_key), Path::new("/"))?.ok_or_else(|| {
+        invalid(format!(
+            "update trust root {}: an explicit key cannot be absent",
+            trusted_key.display()
+        ))
+    })?;
+    let candidate = channel.join(protocol::CHANNEL_CANDIDATE);
+    // ONE lookup rather than an existence test and then a type test: two put the
+    // quiet/loud boundary on different instants, so a candidate removed between
+    // them reports "no such file" where this verb's rule says absent is quiet.
+    match require_real_directory(&candidate, "update candidate") {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        other => other?,
+    }
+    Ok(Some((candidate, trust)))
+}
+
+/// `publish_onto_volume` for a caller that must NEVER publish unauthenticated.
+///
+/// A `&TrustRoot` rather than an `Option`, so `update`'s central safety property
+/// is not left to a test to catch: the fail-open does not typecheck.
+fn publish_authenticated(
+    device: &Path,
+    mountpoint: &Path,
+    source: &Path,
+    trust: &TrustRoot,
+) -> io::Result<()> {
+    publish_onto_volume(device, mountpoint, source, Some(trust))
 }
 
 /// Is `path` where a filesystem is mounted?
@@ -2813,6 +2940,12 @@ fn dispatch(mode: Mode) -> io::Result<()> {
             source,
             trusted_key,
         } => run_publish(&root, &source, trusted_key.as_deref()),
+        Mode::Update {
+            device,
+            mountpoint,
+            channel,
+            trusted_key,
+        } => run_update(&device, &mountpoint, &channel, &trusted_key),
         Mode::Rollback { device, mountpoint } => run_rollback(&device, &mountpoint),
         Mode::Success {
             device,
@@ -3093,6 +3226,35 @@ mod tests {
             "extra",
         ]))
         .is_err());
+        // `update`'s key is REQUIRED, so the three-argument form — which is a
+        // valid `install` — must not parse as an update that probes.
+        assert!(parse_args(args(&["update", "/dev/vda", "/run/td-update", "/channel"])).is_err());
+        assert!(parse_args(args(&[
+            "update",
+            "/dev/vda",
+            "/run/td-update",
+            "/channel",
+            "/key.pub",
+            "extra",
+        ]))
+        .is_err());
+        match parse_args(args(&[
+            "update",
+            "/dev/vda",
+            "/run/td-update",
+            "/run/td-volume/td/incoming",
+            "/run/td-volume/td/trusted.pub",
+        ])) {
+            Ok(Mode::Update {
+                channel,
+                trusted_key,
+                ..
+            }) => {
+                assert_eq!(channel, Path::new("/run/td-volume/td/incoming"));
+                assert_eq!(trusted_key, Path::new("/run/td-volume/td/trusted.pub"));
+            }
+            _ => panic!("update must parse and carry its channel and key"),
+        }
         assert!(parse_args(args(&["rollback", "/volume"])).is_err());
         assert!(parse_args(args(&["rollback", "/dev/vda", "/volume", "extra"])).is_err());
         assert!(parse_args(args(&["success", "/dev/vda", "/volume", "not-a-digest"])).is_err());
@@ -3356,13 +3518,44 @@ mod tests {
     /// §6 carries that reconciliation; this pin is only the probe half of it,
     /// and a probe is what would make ABSENCE mean "publish without checking".
     ///
-    /// Both shipped calls must also PASS THEIR PARAMETER: `install_trust_root(
-    /// None, …)` compiles and would silently ignore the key the caller named.
+    /// `update` must never publish unauthenticated, and the type only gets that
+    /// most of the way: `publish_authenticated` takes a `&TrustRoot`, so no
+    /// caller can hand it `None` — but its own one-line body could still pass
+    /// one on, and that mutation was green with everything else in place.
+    ///
+    /// Pinned as TEXT because the behavioural route needs a block device: the
+    /// transaction lock refuses a character device before any mount, so nothing
+    /// in this crate can drive a publish to completion.
+    #[test]
+    fn the_authenticated_publish_passes_the_trust_root_it_was_given() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn publish_authenticated(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .unwrap_or("");
+        assert!(
+            body.contains("Some(trust)"),
+            "publish_authenticated must pass its trust root on: {body}"
+        );
+        assert!(
+            !body.contains("None"),
+            "publish_authenticated must not be able to publish unverified: {body}"
+        );
+    }
+
+    /// Every shipped call must also PASS ITS PARAMETER as its FIRST argument:
+    /// a `None` there compiles and would silently ignore the key the caller
+    /// named.
     #[test]
     fn the_shipped_trust_root_calls_probe_the_rootfs_and_honour_their_argument() {
         let source = include_str!("main.rs");
-        // Spelled in two pieces so the scan does not match its own needle.
-        let honours_argument = concat!("install_trust_root", "(trusted_key,");
+        // The FIRST ARGUMENT, not the line: `update` passes `Some(trusted_key)`
+        // where the other two pass the `Option` they were handed, so the needle
+        // cannot be one spelling of the call — and a needle that merely wants
+        // `trusted_key` SOMEWHERE on the line is satisfied by
+        // `{ let _ = trusted_key; … (None, …) }`, which is the fail-open itself.
+        let call = concat!("install_trust_root", "(");
         let mut calls = 0;
         for line in source.lines() {
             if line.contains("install_trust_root(") && !line.contains("fn install_trust_root") {
@@ -3379,13 +3572,21 @@ mod tests {
                     line.contains("Path::new(\"/\")"),
                     "a shipped install_trust_root call must name the running rootfs: {line}"
                 );
+                let first = line
+                    .split(call)
+                    .nth(1)
+                    .and_then(|rest| rest.split(',').next())
+                    .unwrap_or("");
                 assert!(
-                    line.contains(honours_argument),
+                    first.contains("trusted_key"),
                     "a shipped trust-root call must pass the key it was given: {line}"
                 );
             }
         }
-        assert_eq!(calls, 2, "run_install and run_publish are its shipped callers");
+        assert_eq!(
+            calls, 3,
+            "run_install, run_publish and run_update are its shipped callers"
+        );
     }
 
     /// `publish` refuses a MOUNT POINT, which is what stands in for the
@@ -3453,6 +3654,280 @@ mod tests {
         assert!(
             !error.contains("/dev/null"),
             "the device must not have been reached: {error}"
+        );
+    }
+
+    /// `update` is the verb a timer runs, so what it does when there is
+    /// NOTHING to do is most of its behaviour.
+    ///
+    /// Three outcomes are pinned here and the difference between them is the
+    /// whole design: a channel that is not there is a configuration fault and
+    /// must be loud, a candidate that is not there is an up-to-date machine and
+    /// must be silent, and a trust root that is not readable must be loud in
+    /// BOTH cases — including the idle one, which is the run that can afford to
+    /// report it.
+    ///
+    /// None of these reaches a block device, which is what makes them testable:
+    /// `/dev/null` stands in, and an error naming it would mean a check ran in
+    /// the wrong order.
+    #[test]
+    fn update_is_quiet_only_when_the_channel_has_nothing_to_offer() {
+        let fixture = Fixture::new();
+        let channel = fixture.root.join("channel");
+        fs::create_dir(&channel).unwrap();
+        let key = fixture.root.join("trusted.pub");
+        fs::write(&key, format!("{FIXTURE_PUBLIC_KEY}\n")).unwrap();
+
+        // An empty channel is the ordinary state of an up-to-date machine.
+        assert!(
+            run_update(
+                Path::new("/dev/null"),
+                &fixture.root.join("mountpoint"),
+                &channel,
+                &key,
+            )
+            .is_ok(),
+            "an absent candidate is nothing to do, not a failure"
+        );
+
+        // A channel that is not there is a typo, and answering "nothing to do"
+        // to a typo hides it until an update is urgently needed.
+        let error = run_update(
+            Path::new("/dev/null"),
+            &fixture.root.join("mountpoint"),
+            &fixture.root.join("no-such-channel"),
+            &key,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("no-such-channel"),
+            "a missing channel must name itself: {error}"
+        );
+
+        // A file where the channel should be is the same class of fault.
+        let file = fixture.root.join("channel-file");
+        fs::write(&file, b"not a channel").unwrap();
+        let error = run_update(
+            Path::new("/dev/null"),
+            &fixture.root.join("mountpoint"),
+            &file,
+            &key,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("must be a real directory"),
+            "a channel that is not a directory must be refused: {error}"
+        );
+
+        // Nothing sets a timer's working directory, so a relative path is a
+        // different file depending on who started it. Both arguments, because
+        // the channel's own check runs before the mount and `install_deployment`
+        // would otherwise catch it only inside the transaction.
+        for relative in [Path::new("channel"), Path::new("trusted.pub")] {
+            let error = run_update(
+                Path::new("/dev/null"),
+                &fixture.root.join("mountpoint"),
+                if relative == Path::new("channel") {
+                    relative
+                } else {
+                    &channel
+                },
+                if relative == Path::new("channel") {
+                    &key
+                } else {
+                    relative
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("must be an absolute path"),
+                "a relative {} must be refused: {error}",
+                relative.display()
+            );
+        }
+
+        // A channel that cannot be READ is loud too. It is the case that would
+        // most plausibly have been folded into "nothing to offer", and it is a
+        // fault rather than an absence.
+        let sealed = fixture.root.join("sealed");
+        fs::create_dir(&sealed).unwrap();
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = run_update(
+            Path::new("/dev/null"),
+            &fixture.root.join("mountpoint"),
+            &sealed,
+            &key,
+        );
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755)).unwrap();
+        // Root ignores the mode, so this asserts only where it can mean anything.
+        if !running_as_root() {
+            let error = denied.unwrap_err().to_string();
+            assert!(
+                error.contains("update candidate"),
+                "an unreadable channel must be loud: {error}"
+            );
+        }
+
+        // The idle run still reads the key, so a broken trust root surfaces on
+        // a tick with nothing to install rather than on the tick that has one.
+        let error = run_update(
+            Path::new("/dev/null"),
+            &fixture.root.join("mountpoint"),
+            &channel,
+            &fixture.root.join("no-such-key.pub"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("no-such-key.pub"),
+            "an idle update must still check its trust root: {error}"
+        );
+        assert!(
+            !error.contains("/dev/null"),
+            "the device must not have been reached: {error}"
+        );
+    }
+
+    /// Is this process root? Root bypasses directory modes, so a test that
+    /// arranges "cannot read" has nothing to assert when it is.
+    ///
+    /// `find_map` rather than the shorter iterator method: this file is
+    /// `include_str!`'d into the td-boot recipe, and
+    /// `no_bootstrap_step_invokes_host_find_or_xargs` scans a recipe's step text
+    /// for the retired findutils tool as a bare token. A Rust method call reads
+    /// as one to that scan, which is the right conservatism on its side — and
+    /// this comment cannot name it either, for exactly the same reason.
+    fn running_as_root() -> bool {
+        fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Uid:"))
+                    .and_then(|rest| rest.split_whitespace().next().map(str::to_string))
+            })
+            .is_some_and(|uid| uid == "0")
+    }
+
+    /// What the decision IS, which is the half `run_update` can be driven to.
+    ///
+    /// A candidate that is there must come back WITH a trust root — the
+    /// alternative, publishing unauthenticated, is what review found green
+    /// before `publish_authenticated` made it untypeable, and this is the other
+    /// half of that: the decision must actually carry the key it read.
+    #[test]
+    fn a_candidate_that_is_there_is_decided_on_with_its_trust_root() {
+        let fixture = Fixture::new();
+        let channel = fixture.root.join("channel");
+        fs::create_dir(&channel).unwrap();
+        let key = fixture.root.join("trusted.pub");
+        fs::write(&key, format!("{FIXTURE_PUBLIC_KEY}\n")).unwrap();
+
+        assert!(
+            update_decision(&channel, &key).unwrap().is_none(),
+            "an empty channel decides on nothing"
+        );
+
+        let candidate = channel.join(protocol::CHANNEL_CANDIDATE);
+        fs::create_dir(&candidate).unwrap();
+        let (chosen, trust) = update_decision(&channel, &key)
+            .unwrap()
+            .expect("a candidate that is there must be decided on");
+        assert_eq!(chosen, candidate, "the decision names the candidate");
+        assert_eq!(
+            trust,
+            read_trusted_key(&key).unwrap(),
+            "the decision carries the key it was told to check under"
+        );
+    }
+
+    /// The decision is not merely made, it is ACTED ON.
+    ///
+    /// With a candidate present the verb must get as far as the device and fail
+    /// THERE — `/dev/null` is not a volume. A `run_update` that dropped the
+    /// publish and returned `Ok(())` was green before this, which is the whole
+    /// point: "did nothing" and "nothing to do" are the two states this verb
+    /// must never confuse.
+    #[test]
+    fn a_decided_update_reaches_the_device_instead_of_returning_quietly() {
+        let fixture = Fixture::new();
+        let channel = fixture.root.join("channel");
+        fs::create_dir(&channel).unwrap();
+        fs::create_dir(channel.join(protocol::CHANNEL_CANDIDATE)).unwrap();
+        let key = fixture.root.join("trusted.pub");
+        fs::write(&key, format!("{FIXTURE_PUBLIC_KEY}\n")).unwrap();
+
+        let error = run_update(
+            Path::new("/dev/null"),
+            &fixture.root.join("mountpoint"),
+            &channel,
+            &key,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("/dev/null"),
+            "an update with a candidate must reach the device: {error}"
+        );
+    }
+
+    /// `update`'s argv hop, pinned by BEHAVIOUR for `install`'s reason: the
+    /// dispatch arm can drop `trusted_key` and still compile, and for this verb
+    /// there is no `Option` to fall back to — it would not compile as `None`,
+    /// but it WOULD compile pointing at the wrong one of its four paths, and
+    /// `channel` and `trusted_key` are adjacent `PathBuf`s of the same type.
+    #[test]
+    fn dispatch_hands_update_its_channel_and_its_key_the_right_way_round() {
+        let fixture = Fixture::new();
+        let channel = fixture.root.join("channel");
+        fs::create_dir(&channel).unwrap();
+
+        // The key is missing, so the run must fail NAMING it. Swapped, the
+        // channel would be the unreadable key and the key the missing channel,
+        // and each mistake names the other path.
+        let error = dispatch(Mode::Update {
+            device: PathBuf::from("/dev/null"),
+            mountpoint: fixture.root.join("mountpoint"),
+            channel: channel.clone(),
+            trusted_key: fixture.root.join("no-such-key.pub"),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("no-such-key.pub") && !error.contains("channel"),
+            "the key must arrive as the key: {error}"
+        );
+    }
+
+    /// A candidate must be a real directory, `require_real_directory`'s rule
+    /// everywhere else in this file. A symlink would make the channel's
+    /// contents depend on something outside it that nothing here
+    /// authenticates the path of.
+    #[test]
+    fn an_update_candidate_that_is_not_a_real_directory_is_refused() {
+        let fixture = Fixture::new();
+        let channel = fixture.root.join("channel");
+        fs::create_dir(&channel).unwrap();
+        let key = fixture.root.join("trusted.pub");
+        fs::write(&key, format!("{FIXTURE_PUBLIC_KEY}\n")).unwrap();
+        let elsewhere = fixture.root.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, channel.join(protocol::CHANNEL_CANDIDATE)).unwrap();
+
+        let error = run_update(
+            Path::new("/dev/null"),
+            &fixture.root.join("mountpoint"),
+            &channel,
+            &key,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("update candidate must be a real directory"),
+            "a symlinked candidate must be refused: {error}"
         );
     }
 
@@ -5366,6 +5841,11 @@ mod tests {
         };
         assert_eq!(trusted_key, PathBuf::from("/etc/td/deployment.pub"));
         assert_eq!(protocol::TRUSTED_KEY_PATH, "etc/td/deployment.pub");
+        // `CHANNEL_CANDIDATE` has the same hazard and needs the same pin: it is
+        // `join`ed onto the channel, and a leading slash would silently discard
+        // the channel and point the updater at the filesystem root.
+        assert_eq!(protocol::CHANNEL_CANDIDATE, "candidate");
+        assert_eq!(protocol::VOLUME_CHANNEL_DIR, "td/incoming");
 
         // Too few and too many are both usage errors, as every other verb's are.
         assert!(parse_args([OsString::from("authenticate")].into_iter()).is_err());
