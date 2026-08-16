@@ -93,15 +93,49 @@ was indistinguishable from a failed one. The fallback is a box now, `.` and
 `?` are glyphs of their own, and both the bar's line and the help sheet's
 rows are held to a font that has every character they spell.
 
-The NETWORK field is leftmost, as the ethernet stanza is in the config this
-follows. It names the interface, whether it is up, and the address — and the
-address is the part with a story. Nothing td writes down records it: td-netd
-prints the acquired lease to stdout and drops it, `/run/resolv.conf` gets
-nameservers only, and the generated `/etc/hosts` is loopback. So the address
-comes from `/proc/net/fib_trie`, the kernel's own routing dump, where a local
-address is a `/32 host LOCAL` leaf. That file is the only one that has it
-without a `SIOCGIFADDR` ioctl, which would be a new syscall on a surface that
-has none and so an `UNSAFE.md` amendment for a status field.
+Before any of those fields the strip names the WORKSPACES, which is the one
+thing on it that is not a reading. A workspace switch is otherwise invisible:
+moving to an empty one leaves a bare desktop, and that is what the workspace
+just left looks like from behind a fullscreen window, so an operator who
+pressed `Super+7` by accident has nothing to tell them where they are. The
+strip names every workspace holding a window, plus the ACTIVE one whether or
+not it holds anything — a workspace exists in the layout's map as soon as
+anything asks for it, so holding a root is what separates one somebody is
+using from a number nobody has been to.
+
+The active one is the strip's own two colours EXCHANGED. It needs no third
+colour and no glyph beside the number, and inverse video says "you are here"
+without an operator being told which of two shades of one hue means what. Each
+cell is its number and a little air either side rather than a fixed column, so
+a workspace costs the fields beside it twenty pixels and not a reserved strip.
+The number is CENTRED in that cell rather than padded equally, because a
+glyph's advance carries a trailing column it never inks: equal padding leaves
+it a pixel left of centre, which nothing shows on the bar and the block of ink
+around an active cell does.
+
+The workspaces are painted from the LAYOUT on every frame rather than folded
+into the status line, and that is what makes the mark follow a switch at once:
+the line is composed by the bar's own thread on a one-second tick, so a
+workspace in it would lag the keystroke by up to a second. Every tiling
+command repaints unconditionally, which is what makes a switch between two
+EMPTY workspaces — where the strip is the only thing that changes — reach the
+screen at all.
+
+They are not CLICKABLE. The strip's rows already answer no press (§3's hit
+test stops at the tiling area), and making one region of it answer is a
+pointer surface of its own rather than a label; the keys reach every
+workspace meanwhile.
+
+The NETWORK field is leftmost of the readings, as the ethernet stanza is in
+the config this follows. It names the interface, whether it is up, and the
+address — and the address is the part with a story. Nothing td writes down
+records it: td-netd prints the acquired lease to stdout and drops it,
+`/run/resolv.conf` gets nameservers only, and the generated `/etc/hosts` is
+loopback. So the address comes from `/proc/net/fib_trie`, the kernel's own
+routing dump, where a local address is a `/32 host LOCAL` leaf. That file is
+the only one that has it without a `SIOCGIFADDR` ioctl, which would be a new
+syscall on a surface that has none and so an `UNSAFE.md` amendment for a
+status field.
 
 The dump says which addresses EXIST and never whose they are, and that governs
 the whole field. An address is attributable only when there is exactly one
@@ -141,16 +175,22 @@ anything but `?` — a permanent question mark is worse than an absent stanza.
 Temperature is out for the same reason until a target has a thermal zone.
 
 The fields are otherwise ordered as the i3status config they are modelled on
-has them, which puts the clock last. The line is left-aligned from x=8, and
-the CLOCK is therefore what clips first on a narrow output — the field the bar
+has them, which puts the clock last. The line begins after the workspaces and
+is clipped to what they leave, so a line long enough to reach one loses its
+own end rather than being drawn over the cell that says where the operator is.
+The CLOCK is therefore what clips first on a narrow output — the field the bar
 most exists for. The network field made that a live concern rather than a
 theoretical one: without it the line is 752 pixels, with `NET eth0 10.0.2.15`
 it is 992, and a longer name and address (`NET enp0s3 192.168.100.42`) reaches
 1076. 1024x768 is an ordinary virtio-gpu mode, so this now clips on a target
 td plausibly runs on, where the previous claim that no such output exists was
-true and is not any more. It is a real cost of following the model rather than
-an oversight, and nothing is lost but pixels — `draw_text_clipped` clips. The
-fix, when it matters, is dropping whole FIELDS rather than clipping a glyph.
+true and is not any more. The workspaces moved that line further: one costs 20
+pixels and the strip shows as many as are in use, so the long case reaches
+1096 with one workspace and 1256 with nine. It is a real cost of following the
+model rather than an oversight, and nothing is lost but pixels —
+`draw_text_clipped` clips. The fix, when it matters, is dropping whole FIELDS
+rather than clipping a glyph, which is also what would keep the clock while
+the workspaces grow.
 
 The clock is UTC and SAYS so. There is no TZif parser here, and a
 local-looking time that is silently UTC is worse than a UTC one that admits
@@ -1838,7 +1878,13 @@ The landing must prove:
   output shorter than itself, the layout/render/hit-test agreement is
   checked at several output sizes with the bar's rows proved unclickable,
   and the runtime is held to repainting only on a changed line and to
-  restoring the previous one when that paint fails;
+  restoring the previous one when that paint fails; the workspace strip is
+  proved as its own list — every occupied workspace plus the active one,
+  named once and in order, with an EMPTY active one still named — and as
+  pixels: the active cell is the same cell's ink and background COUNTS
+  exchanged, the status line starts after the cells and leaves their pixels
+  exactly as no status line would, and the mark is driven through the scene
+  across two switches to prove it follows the layout rather than a constant;
 - the focus policy is proved end to end through the runtime in both its
   halves — a hover focuses, and does so over a band and over a tile its
   client does not fill; a still pointer, a delta clamped away at the edge,

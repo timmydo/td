@@ -665,9 +665,20 @@ impl Layout {
         }
     }
 
-    #[cfg(test)]
     pub fn active_workspace(&self) -> u8 {
         self.active
+    }
+
+    /// The workspaces holding a window, in number order. A workspace exists
+    /// in the map as soon as anything ASKS for it — switching to an empty one
+    /// creates the entry — so holding a root is what separates a workspace
+    /// somebody is using from a number nobody has been to.
+    pub fn occupied_workspaces(&self) -> Vec<u8> {
+        self.workspaces
+            .iter()
+            .filter(|(_, workspace)| workspace.root.is_some())
+            .map(|(number, _)| *number)
+            .collect()
     }
 
     pub fn focused(&self) -> Option<SurfaceKey> {
@@ -2628,6 +2639,28 @@ mod tests {
         layout.apply(Command::ToggleFullscreen);
         assert!(layout.focus_key(key(2)));
         assert_eq!(layout.focused(), Some(key(2)));
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_workspace_is_occupied_only_while_it_holds_a_window() {
+        // Switching to a workspace CREATES its entry in the map, so a filter
+        // on the map alone would name every number anybody has been to — and
+        // the bar draws a cell per name. The trip that separates the two is
+        // going somewhere empty and coming back.
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        assert_eq!(layout.occupied_workspaces(), vec![1]);
+
+        layout.apply(Command::SwitchWorkspace(7));
+        assert_eq!(layout.occupied_workspaces(), vec![1]);
+        layout.map(key(2));
+        assert_eq!(layout.occupied_workspaces(), vec![1, 7]);
+
+        // And it stops being occupied when its last window goes, rather than
+        // keeping a cell for as long as the compositor runs.
+        layout.unmap(key(2));
+        assert_eq!(layout.occupied_workspaces(), vec![1]);
         layout.check_invariants().unwrap();
     }
 

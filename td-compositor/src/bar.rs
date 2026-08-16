@@ -11,6 +11,13 @@ const TEXT_TOP: usize = 5;
 const TEXT_LEFT: usize = 8;
 const SCALE: usize = 2;
 const SEPARATOR: &str = "  ";
+pub(crate) const BACKGROUND: [u8; 4] = [0x18, 0x14, 0x20, 0];
+pub(crate) const INK: [u8; 4] = [0xd0, 0xc8, 0xe0, 0];
+/// Air either side of a workspace number inside its own cell. The cell is the
+/// number and this twice, so a workspace costs the status line twenty pixels
+/// rather than a fixed column — which matters, since the two share one strip
+/// and the clock is what gives way when they do not both fit.
+const DESK_PAD: usize = 4;
 /// The clock shows seconds, so this is what makes it tick. The renderer
 /// writes only the rows that changed, so a second's repaint is the bar's own
 /// rows rather than the screen.
@@ -362,24 +369,142 @@ pub fn line(readings: &Readings) -> String {
     [net, load, memory, uptime, clock].join(SEPARATOR)
 }
 
-/// Paint the strip across the top. The caller owns the text, so this never
-/// reads a clock or a file — the same split the launcher and the sheet have.
-pub fn paint(frame: &mut [u8], width: usize, height: usize, stride: usize, text: &str) {
+/// The workspaces the strip names: those holding a window, and the ACTIVE one
+/// whether or not it holds anything. An operator who switches to an empty
+/// workspace would otherwise have nothing on screen saying where they went —
+/// the screen is bare either way, and the bar is what tells the two apart.
+///
+/// Takes the occupied list by value because it is already allocated: the only
+/// edit is the active one. Sorted here rather than trusted to arrive that way
+/// — it does, `Layout` keeping its workspaces in a `BTreeMap` — because the
+/// order this returns is the order they are DRAWN in, and nine numbers cost
+/// nothing to sort beside depending on the container type of another module.
+pub fn desks(mut occupied: Vec<u8>, active: u8) -> Vec<u8> {
+    occupied.push(active);
+    occupied.sort_unstable();
+    occupied.dedup();
+    occupied
+}
+
+/// `number` in decimal, written into a caller's buffer. The compositor draws
+/// this every frame, so it is a stack buffer and not a `String`: three digits
+/// bound a `u8`, and both the label and the width a cell needs are measured
+/// through here, which is what stops the two disagreeing about a two-digit
+/// number.
+///
+/// The bytes are ASCII by construction, so the `from_utf8` cannot fail; the
+/// empty string is what an impossible failure draws, since this crate does not
+/// unwrap.
+fn decimal(number: u8, buffer: &mut [u8; 3]) -> &str {
+    let mut at = buffer.len();
+    let mut left = number;
+    loop {
+        at = at.saturating_sub(1);
+        if let Some(slot) = buffer.get_mut(at) {
+            *slot = b'0'.saturating_add(left % 10);
+        }
+        left /= 10;
+        if left == 0 || at == 0 {
+            break;
+        }
+    }
+    buffer
+        .get(at..)
+        .and_then(|of| std::str::from_utf8(of).ok())
+        .unwrap_or("")
+}
+
+/// How wide `number` draws in the strip, cell air included.
+fn desk_width(number: u8) -> usize {
+    let mut buffer = [0u8; 3];
+    decimal(number, &mut buffer)
+        .len()
+        .saturating_mul(ui::GLYPH_ADVANCE)
+        .saturating_mul(SCALE)
+        .saturating_add(DESK_PAD.saturating_mul(2))
+}
+
+/// How far into its cell a label starts, so the INK lands centred. Padding
+/// both sides by `DESK_PAD` does not: a glyph's ADVANCE carries a trailing
+/// column the glyph never fills, so the number would sit a pixel left of
+/// centre — which is invisible on the strip and not inside the active cell,
+/// where a solid block surrounds it.
+fn label_inset(cell_width: usize, label: &str) -> usize {
+    let ink = label
+        .len()
+        .saturating_mul(ui::GLYPH_ADVANCE)
+        .saturating_sub(ui::GLYPH_ADVANCE.saturating_sub(ui::GLYPH_WIDTH))
+        .saturating_mul(SCALE);
+    cell_width.saturating_sub(ink) / 2
+}
+
+/// Paint the strip across the top. The caller owns both the workspaces and
+/// the text, so this never reads a clock, a file, or a layout — the same
+/// split the launcher and the sheet have.
+///
+/// The workspaces are LEFTMOST and the status line follows them, which is
+/// where an operator looks for them and is also the order that survives a
+/// narrow output: the strip is clipped from the right, so what gives way
+/// first is the end of the status line rather than where the operator is.
+pub fn paint(
+    frame: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    desks: &[u8],
+    active: u8,
+    text: &str,
+) {
     // Not clamped to `height`: both primitives clip against it, and a second
     // clamp here would read as though they did not.
     let bar = (0, 0, width, BAR_HEIGHT);
-    ui::fill(frame, width, height, stride, bar, [0x18, 0x14, 0x20, 0]);
+    ui::fill(frame, width, height, stride, bar, BACKGROUND);
+    let mut left = 0usize;
+    let mut label = [0u8; 3];
+    for number in desks {
+        let cell = (left, 0, desk_width(*number), BAR_HEIGHT);
+        // The active workspace is the strip's own two colours EXCHANGED. It
+        // needs no third colour and no glyph beside the number, and inverse
+        // video says "you are here" without the operator being told which of
+        // two shades of one hue means what.
+        let ink = if *number == active {
+            ui::fill(frame, width, height, stride, cell, INK);
+            BACKGROUND
+        } else {
+            INK
+        };
+        let written = decimal(*number, &mut label);
+        ui::draw_text_clipped(
+            frame,
+            width,
+            height,
+            stride,
+            left.saturating_add(label_inset(cell.2, written)),
+            TEXT_TOP,
+            SCALE,
+            written,
+            ink,
+            cell,
+        );
+        left = left.saturating_add(cell.2);
+    }
+    // What keeps the status line off the cells TODAY is where it starts: a
+    // line is drawn rightwards from there and cannot reach back. The clip
+    // rectangle is what keeps that true of a line positioned any other way —
+    // right-aligned, say — and it costs nothing to narrow, since a narrower
+    // clip can only ever remove drawing.
+    let text_left = left.saturating_add(TEXT_LEFT);
     ui::draw_text_clipped(
         frame,
         width,
         height,
         stride,
-        TEXT_LEFT,
+        text_left,
         TEXT_TOP,
         SCALE,
         text,
-        [0xd0, 0xc8, 0xe0, 0],
-        bar,
+        INK,
+        (text_left, 0, width.saturating_sub(text_left), BAR_HEIGHT),
     );
 }
 
@@ -949,6 +1074,163 @@ Local:
     }
 
     #[test]
+    fn a_workspace_number_writes_itself_into_a_borrowed_buffer() {
+        // The whole `u8` range, not just the nine workspaces there are: the
+        // cell's WIDTH is this string's length, so a number that wrote more
+        // digits than it measured would draw its own label over its neighbour.
+        for number in 0..=u8::MAX {
+            let mut buffer = [0u8; 3];
+            let written = decimal(number, &mut buffer).to_string();
+            assert_eq!(written, format!("{number}"), "{number} is written wrong");
+            assert_eq!(
+                desk_width(number),
+                written.len() * ui::GLYPH_ADVANCE * SCALE + DESK_PAD * 2
+            );
+        }
+        // One buffer serves every cell in a paint, so a SHORTER number after a
+        // longer one must not carry the longer one's leading digits.
+        let mut buffer = [0u8; 3];
+        assert_eq!(decimal(255, &mut buffer), "255");
+        assert_eq!(decimal(7, &mut buffer), "7");
+    }
+
+    #[test]
+    fn the_strip_names_every_occupied_workspace_and_the_one_being_looked_at() {
+        // An EMPTY active workspace is the case this exists for: switching to
+        // one leaves a bare screen, and without its number on the strip the
+        // operator has no way to tell that from the workspace they left.
+        assert_eq!(desks(Vec::new(), 4), [4]);
+        assert_eq!(desks(vec![1, 3], 4), [1, 3, 4]);
+        // Sorted whatever the active one is, and named ONCE when it holds
+        // windows of its own — it is in both lists and is one place on screen.
+        assert_eq!(desks(vec![2, 9], 5), [2, 5, 9]);
+        assert_eq!(desks(vec![1, 2, 3], 2), [1, 2, 3]);
+    }
+
+    #[test]
+    fn the_active_workspace_is_the_strips_own_colours_exchanged() {
+        let (width, height) = (400usize, BAR_HEIGHT);
+        let stride = width * 4;
+        // The SAME cell either way round. Comparing two different workspaces
+        // would compare two different glyphs, which are not each other's
+        // inverse and never could be.
+        let cell_one = |active: u8| {
+            let mut frame = vec![0u8; stride * height];
+            paint(&mut frame, width, height, stride, &[1, 2], active, "");
+            let (mut ink, mut background) = (0usize, 0usize);
+            for y in 0..BAR_HEIGHT {
+                for x in 0..desk_width(1) {
+                    match frame.get(y * stride + x * 4..y * stride + x * 4 + 4) {
+                        Some(pixel) if pixel == INK => ink += 1,
+                        Some(pixel) if pixel == BACKGROUND => background += 1,
+                        _ => {}
+                    }
+                }
+            }
+            (ink, background)
+        };
+        // Idle, the cell is a number on the strip: mostly background, some
+        // ink. Active, it is those two counts SWAPPED — a block of ink with
+        // the number cut out of it — which is what makes "you are here"
+        // readable without a third colour or a glyph beside the number.
+        let idle = cell_one(2);
+        let live = cell_one(1);
+        assert!(
+            idle.0 > 0 && idle.1 > idle.0,
+            "1 is not a number on the strip"
+        );
+        assert!(
+            live.1 > 0 && live.0 > live.1,
+            "the active cell is not a block"
+        );
+        assert_eq!(
+            idle,
+            (live.1, live.0),
+            "the cell is not one picture and its inverse"
+        );
+    }
+
+    #[test]
+    fn the_status_line_starts_after_the_workspaces_and_is_cut_before_reaching_them() {
+        let (width, height) = (400usize, BAR_HEIGHT);
+        let stride = width * 4;
+        let ink_left = |desks: &[u8], text: &str| {
+            let mut frame = vec![0u8; stride * height];
+            paint(&mut frame, width, height, stride, desks, 0, text);
+            // `position`, not the iterator method whose name is also a shell
+            // command: this file is `include_str!`'d into the td-compositor
+            // recipe, so its text is scanned as a bootstrap step's. Over
+            // `0..width` the index it answers IS the column.
+            (0..width).position(|x| {
+                (0..BAR_HEIGHT).any(|y| {
+                    frame.get(y * stride + x * 4..y * stride + x * 4 + 4) == Some(&INK[..])
+                })
+            })
+        };
+        // Active 0 is no workspace, so every cell here is a plain number and
+        // the leftmost ink is the FIRST one — which is what says the strip
+        // starts with the workspaces rather than with the status line.
+        assert_eq!(ink_left(&[], "LOAD 0.42"), Some(TEXT_LEFT));
+        assert_eq!(
+            ink_left(&[7], "LOAD 0.42"),
+            Some(label_inset(desk_width(7), "7"))
+        );
+
+        // The number is CENTRED in its cell, air equal either side. Padding
+        // both sides by the same number does not centre it, since a glyph's
+        // advance carries a column it never inks — and off-centre is what an
+        // inverted cell, a block of ink around the number, makes visible.
+        let mut alone = vec![0u8; stride * height];
+        paint(&mut alone, width, height, stride, &[7], 0, "");
+        let inked: Vec<usize> = (0..desk_width(7))
+            .filter(|x| {
+                (0..BAR_HEIGHT).any(|y| {
+                    alone.get(y * stride + x * 4..y * stride + x * 4 + 4) == Some(&INK[..])
+                })
+            })
+            .collect();
+        let (first, last) = (inked.first().copied(), inked.last().copied());
+        assert_eq!(
+            first,
+            last.map(|last| desk_width(7).saturating_sub(last).saturating_sub(1)),
+            "the number is not centred in its cell: {first:?}..{last:?} of {}",
+            desk_width(7)
+        );
+
+        // And the status is clipped to what they leave rather than drawn over
+        // them: a line long enough to reach a cell loses its own end, not the
+        // one thing on the strip that says where the operator is. Asserted as
+        // the cell's pixels being exactly what NO status line leaves, for the
+        // cell both ways round. Idle is the sensitive one — ink landing on
+        // background is a change at every pixel it touches — while inside the
+        // ACTIVE cell most of an overdraw is ink on ink and only the digit
+        // could show it, which is why one of the two would not do.
+        let narrow = 64usize;
+        let cell_pixels = |active: u8, text: &str| {
+            let mut frame = vec![0u8; stride * height];
+            paint(&mut frame, narrow, height, stride, &[1], active, text);
+            let mut pixels = Vec::new();
+            for y in 0..BAR_HEIGHT {
+                for x in 0..desk_width(1) {
+                    pixels.push(
+                        frame
+                            .get(y * stride + x * 4..y * stride + x * 4 + 4)
+                            .map(<[u8]>::to_vec),
+                    );
+                }
+            }
+            pixels
+        };
+        for active in [0u8, 1] {
+            assert_eq!(
+                cell_pixels(active, ""),
+                cell_pixels(active, &"X".repeat(narrow)),
+                "the status line reached the workspace cell (active {active})"
+            );
+        }
+    }
+
+    #[test]
     fn a_repeated_failure_is_reported_once_and_a_returning_one_again() {
         let mut reported = Reported::default();
         assert_eq!(reported.note(Some("no framebuffer")).as_deref(), Some("no framebuffer"));
@@ -1082,7 +1364,7 @@ Local:
         let (width, height) = (400usize, 200usize);
         let stride = width * 4;
         let mut frame = vec![0u8; stride * height];
-        paint(&mut frame, width, height, stride, "LOAD 0.42");
+        paint(&mut frame, width, height, stride, &[1, 2], 1, "LOAD 0.42");
         for y in 0..height {
             for x in 0..width {
                 let offset = y * stride + x * 4;
@@ -1104,11 +1386,15 @@ Local:
         // does not say: `draw_text_clipped`'s clip rect IS the band, so a
         // `TEXT_TOP` that cut every glyph in half would clip rather than
         // overflow and nothing above would notice.
+        //
+        // Scanned from where the STATUS starts, since the active workspace's
+        // cell is a block of the same ink filling the band's full height.
+        let text_left = desk_width(1) + desk_width(2) + TEXT_LEFT;
         let rows: Vec<usize> = (0..height)
             .filter(|y| {
-                (0..width).any(|x| {
+                (text_left..width).any(|x| {
                     let offset = y * stride + x * 4;
-                    frame.get(offset..offset + 4) == Some(&[0xd0, 0xc8, 0xe0, 0][..])
+                    frame.get(offset..offset + 4) == Some(&INK[..])
                 })
             })
             .collect();
@@ -1128,17 +1414,28 @@ Local:
         let (width, height, guard) = (64usize, 8usize, 4usize);
         let stride = width * 4;
         let mut frame = vec![0u8; stride * (height + guard)];
-        paint(&mut frame, width, height, stride, "LOAD 0.42  MEM 2.7G/7.7G");
+        paint(
+            &mut frame,
+            width,
+            height,
+            stride,
+            &[1],
+            1,
+            "LOAD 0.42  MEM 2.7G/7.7G",
+        );
         assert!(frame
             .get(stride * height..)
             .is_some_and(|rows| rows.iter().all(|byte| *byte == 0)));
         // Clipped, not SKIPPED: an output too short for the band still gets
         // every row of it, or a small screen would show the desktop where the
         // bar's rows are while the tiling area is reserved for it anyway.
+        // Read in the gap between the workspace cell and the status line,
+        // which is the band's own colour whatever either of them draws.
+        let gap = desk_width(1) + TEXT_LEFT / 2;
         for y in 0..height {
             assert_eq!(
-                frame.get(y * stride..y * stride + 4),
-                Some(&[0x18, 0x14, 0x20, 0][..]),
+                frame.get(y * stride + gap * 4..y * stride + gap * 4 + 4),
+                Some(&BACKGROUND[..]),
                 "row {y} is not the bar"
             );
         }

@@ -1307,7 +1307,9 @@ impl Scene {
         if let Some(hint) = self.hint {
             draw_hint(frame, width, height, stride, hint.area);
         }
-        bar::paint(frame, width, height, stride, &self.status);
+        let active = self.layout.active_workspace();
+        let desks = bar::desks(self.layout.occupied_workspaces(), active);
+        bar::paint(frame, width, height, stride, &desks, active, &self.status);
         self.launcher.paint(frame, width, height, stride);
         self.help.paint(frame, width, height, stride);
         draw_pointer(frame, width, height, stride, self.pointer_x, self.pointer_y);
@@ -3157,6 +3159,68 @@ mod tests {
     }
 
     #[test]
+    fn the_bar_names_the_workspaces_and_the_mark_follows_a_switch() {
+        // The strip is the ONLY thing on screen that says which workspace an
+        // operator is on: switching to an empty one leaves a bare desktop,
+        // which is what the workspace they left looks like from behind a
+        // fullscreen window. Driven through the scene rather than over
+        // `bar::paint` directly, since what the strip is handed comes from the
+        // layout and nothing else checks that it is asked at paint time.
+        let mut scene = Scene::new();
+        let key = |object| SurfaceKey { client: 1, object };
+        let (width, height) = (600, least_output_height(8));
+        let stride = width * 4;
+        scene.commit(key(1), surface([1, 1, 1, 0], 8, 8)).unwrap();
+        scene.command(Command::SwitchWorkspace(3));
+        scene.commit(key(2), surface([1, 1, 1, 0], 8, 8)).unwrap();
+        // The pointer paints last and parks at the origin, which is the first
+        // cell — so it is moved off the strip before any of this is read.
+        scene.pointer_y = i32::try_from(height - 1).unwrap();
+
+        // Two workspaces hold a window, so the strip names both — and the
+        // BLOCK is on the one being looked at.
+        let blocks = |scene: &Scene| {
+            let frame = painted(scene, width, height);
+            // The block's OWN top row: the number is punched out of it lower
+            // down, so a column of solid ink is not what a marked cell is.
+            let mut runs = Vec::new();
+            for x in 0..width {
+                let inked = pixel(&frame, stride, x, 0) == bar::INK;
+                match (inked, runs.last_mut()) {
+                    (true, Some((_, end))) if *end == x => *end = x + 1,
+                    (true, _) => runs.push((x, x + 1)),
+                    _ => {}
+                }
+            }
+            runs
+        };
+        let on_three = blocks(&scene);
+        assert_eq!(
+            on_three.len(),
+            1,
+            "one workspace is marked, not {on_three:?}"
+        );
+        scene.command(Command::SwitchWorkspace(1));
+        let on_one = blocks(&scene);
+        assert_eq!(on_one.len(), 1, "one workspace is marked, not {on_one:?}");
+        // The mark MOVED, and leftwards, because 1 sorts before 3.
+        assert!(
+            on_one.first() < on_three.first(),
+            "the mark did not follow the switch: {on_one:?} then {on_three:?}"
+        );
+
+        // A workspace nobody has been to is not on the strip; one the operator
+        // switches to is, empty or not.
+        scene.command(Command::SwitchWorkspace(7));
+        let on_seven = blocks(&scene);
+        assert_eq!(on_seven.len(), 1, "an empty workspace lost its mark");
+        assert!(
+            on_seven.first() > on_three.first(),
+            "7 is not to the right of 3"
+        );
+    }
+
+    #[test]
     fn a_fullscreen_tile_stops_at_the_bar_rather_than_covering_them() {
         // This is where the reservation is load-bearing and the tiled case is
         // not: a tiled placement is already inset by GAP, which happens to
@@ -3192,10 +3256,20 @@ mod tests {
             scene.pointer_y = i32::try_from(height - 1).unwrap();
             scene.render(&mut frame, width, height, stride);
             for y in 0..BAR_HEIGHT {
-                for x in [0, width / 2, width - 1] {
+                // The leftmost pixels are the active workspace's cell, which
+                // is the strip's two colours exchanged, so only THAT sample is
+                // allowed either of them. The rest stay pinned to the bar's
+                // background, or a strip that spanned the whole output would
+                // pass this.
+                let found = pixel(&frame, stride, 0, y);
+                assert!(
+                    found == bar::BACKGROUND || found == bar::INK,
+                    "{width}x{height}: fullscreen reached the bar at 0,{y}"
+                );
+                for x in [width / 2, width - 1] {
                     assert_eq!(
                         pixel(&frame, stride, x, y),
-                        [0x18, 0x14, 0x20, 0],
+                        bar::BACKGROUND,
                         "{width}x{height}: fullscreen reached the bar at {x},{y}"
                     );
                 }
