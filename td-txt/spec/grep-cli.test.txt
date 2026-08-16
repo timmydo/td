@@ -3595,16 +3595,20 @@ ab
 ## status: 0
 
 
-# A KNOWN GAP, listed xfail in expectations.txt rather than fixed: `-o` with `-w`.
-# GNU shrinks a non-word-bounded greedy span only at the line's FIRST search
-# position; at a later start it advances past the span instead, so `-o -w '..\?'`
-# on `a b c` prints `a` and `c` and never `b` -- though every one of the three IS
-# a word-bounded match, and `-w` alone selects the line in both programs. td-txt
-# prints all three. The fourth case is the contrast: when no span needs shrinking
-# the two agree, which is what localizes the rule. Found by a `-w` fuzz run AFTER
-# the fixes above, so it is a gap this landing narrowed rather than opened -- the
-# previous release printed only `c`, missing the word-bounded `a` outright. The
-# blast radius is `-o` output alone: selection, `-c`, `-n` and `-v` all agree.
+# `-w` asks TWO questions and GNU answers them in two different places, which is
+# what the rest of this file's `-w` cases turn on. Whether a line MATCHES is its
+# dfa's answer over the pattern WRAPPED in word boundaries -- "is there any
+# word-bounded span at all" -- and on a hit with no backreference that is the whole
+# of it (grep/src/dfasearch.c:301-325,479). Which span to PRINT is a different
+# reading: the retry loop at dfasearch.c:528-567, which shrinks a non-word-bounded
+# match at the same start and otherwise advances the start by one.
+#
+# So `-o -w '..\?'` on `a b c` prints `a` and `c` and never `b`, though every one
+# of the three IS a word-bounded match and `-w` alone selects the line. The shrink
+# window is cut at `s + len - from`, an offset measured from the SEARCH START but
+# applied from the LINE start, so under `-o` it closes over the match as the line
+# is consumed and shrinking stops working. The fourth case is the contrast: where
+# no span needs shrinking every start is printed.
 
 #### -o -w prints a shrunk span only at the first search position
 ## argv: grep -o -w -e '..\?'
@@ -3643,6 +3647,327 @@ d
 a
 bb
 c
+## END
+## stderr-json: ""
+## status: 0
+
+#### a shrink at the FIRST start still happens, which is the window still open
+## argv: grep -o -w -e '..\?'
+## stdin-json: "ab c d\n"
+## stdout:
+ab
+d
+## END
+## stderr-json: ""
+## status: 0
+
+# The window's WIDTH is the rule, not the position: it closes once the match is
+# no longer longer than the distance already consumed. Both lines below hold the
+# same words in the same order, and differ only in which one comes first.
+
+#### a long enough span still shrinks after the line start
+## argv: grep -o -w -e '.\{1,6\}'
+## stdin-json: "a bcdefg h\n"
+## stdout:
+a
+bcdefg
+h
+## END
+## stderr-json: ""
+## status: 0
+
+#### and the same span is skipped when more of the line was consumed first
+## argv: grep -o -w -e '.\{1,6\}'
+## stdin-json: "ab cdefg h\n"
+## stdout:
+ab
+h
+## END
+## stderr-json: ""
+## status: 0
+
+#### a trailing optional byte is enough to lose every span but the ends
+## argv: grep -o -w -e '[a-z]\+ \?'
+## stdin-json: "foo bar baz\n"
+## stdout:
+foo
+baz
+## END
+## stderr-json: ""
+## status: 0
+
+# An EMPTY shrink does not count where an empty match the search itself reports
+# does (`0 < shorter_len`, dfasearch.c:546). `.a` and `..a` differ by exactly
+# that: both shrink from a span the following `a` disqualifies, and only the
+# second has a non-empty shorter one left. Selection is unaffected -- the wrapped
+# dfa finds the empty span in both -- so the first line SELECTS with no span `-o`
+# will print, which is the pair of cases above at `-w selects on an empty span`.
+
+#### the shrunk span -o prints where a non-empty shorter one exists
+## argv: grep -o -w -e '\.*'
+## stdin-json: "..a"
+## stdout:
+.
+## END
+## stderr-json: ""
+## status: 0
+
+#### and nothing where only the empty one is left, on a line that still selects
+## argv: grep -o -w -e '\.*'
+## stdin-json: ".a"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+# `-w` AND `-x` is where the printed span reaches PAST the line. GNU's `start_ptr`
+# shortcut is guarded by `!match_words` (dfasearch.c:512), so with both flags it
+# falls through to the `match_lines` arm, whose length is `end - ptr` -- measured
+# past the record separator. `-o` prints that byte and then adds its own, so every
+# match leaves a blank line. Without `-w` the shortcut fires and there is no extra
+# byte, which is the control below.
+
+#### -w -x -o prints the record separator as part of the match
+## argv: grep -o -w -x -e ab
+## stdin-json: "ab\n"
+## stdout-json: "ab\n\n"
+## stderr-json: ""
+## status: 0
+
+#### while -x -o without -w takes the shortcut and does not
+## argv: grep -o -x -e ab
+## stdin-json: "ab\n"
+## stdout-json: "ab\n"
+## stderr-json: ""
+## status: 0
+
+#### the byte is the RECORD separator, which -z makes a NUL
+## argv: grep -z -o -w -x -e ab
+## stdin-json: "ab\x00"
+## stdout-json: "ab\x00\x00"
+## stderr-json: ""
+## status: 0
+
+#### and it is per match, so -b numbers the next one past both bytes
+## argv: grep -o -w -x -b -e ab
+## stdin-json: "ab\nab\n"
+## stdout-json: "0:ab\n\n3:ab\n\n"
+## stderr-json: ""
+## status: 0
+
+#### -c counts lines and so cannot see the extra byte
+## argv: grep -c -w -x -e ab
+## stdin-json: "ab\n"
+## stdout:
+1
+## END
+## stderr-json: ""
+## status: 0
+
+# Two properties of the shrink that no case above reaches, each a shape where
+# getting it wrong INVENTS a span rather than losing one. Both need a THIRD
+# alternative matching later in the line, because a line the wrapped dfa does not
+# select never reaches the `-o` loop at all and the decision stays invisible --
+# which is how these two were first written, and they pinned nothing.
+#
+# GNU shrinks with `not_eol` set, so `$` does not hold at the cut: `a\.` matches
+# the `a.` of `a.b`, the `b` disqualifies it, and the only shorter span left is the
+# `a` that `a$` would give if the cut counted as the line's end -- word-bounded, so
+# a shrink without `not_eol` prints it ahead of the `c`. And the shrink is
+# ANCHORED, where a plain search over the cut window would report a match starting
+# LATER: in `ab.dZ` the window is `ab.`, the `b` alternative matches inside it, and
+# its end read as a length from the start gives the word-bounded `ab`.
+
+#### $ does not hold at the cut, so that shorter span is not there to find
+## argv: grep -o -w -e 'a\.\|a$\|c'
+## stdin-json: "a.b c\n"
+## stdout:
+c
+## END
+## stderr-json: ""
+## status: 0
+
+#### and it does hold at the REAL end, the same pattern one byte shorter
+## argv: grep -o -w -e 'a\.\|a$\|c'
+## stdin-json: "a. c\n"
+## stdout:
+a.
+c
+## END
+## stderr-json: ""
+## status: 0
+
+#### the shrink is anchored, so a match later in the window is not a shorter one
+## argv: grep -o -w -e 'ab.d\|b\|q'
+## stdin-json: "ab.dZ q\n"
+## stdout:
+q
+## END
+## stderr-json: ""
+## status: 0
+
+#### while the same pattern needing no shrink prints that span too
+## argv: grep -o -w -e 'ab.d\|b\|q'
+## stdin-json: "ab.d q\n"
+## stdout:
+ab.d
+q
+## END
+## stderr-json: ""
+## status: 0
+
+# The shrink is ANCHORED in cost as well as in meaning. Scanning the cut window
+# for a match at any start answers the same -- a match found later is filtered
+# out -- but pays the window's length for it, inside a loop already linear in the
+# line. That second factor is what exhausts the shared budget: this line refused
+# with `regular expression is too complex` where GNU answers, and the shape is
+# ordinary, one greedy repeat and 600 bytes.
+
+#### a shrink over a long line stays affordable because it is anchored
+## argv: grep -o -w -e '\.*a'
+## stdin-json: "........................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................aZ a\n"
+## stdout:
+a
+## END
+## stderr-json: ""
+## status: 0
+
+# `-F` reaches GNU's same `match_lines` arm, so the `-w -x` span runs past the
+# record separator there too. The empty pattern is the sharper half: its span is
+# EMPTY without the extra byte, and `-o` prints nothing at all for an empty span,
+# so the whole line goes missing rather than one separator.
+
+#### -F -w -x -o prints the record separator as part of the match
+## argv: grep -F -o -w -x -e ab
+## stdin-json: "ab\n"
+## stdout-json: "ab\n\n"
+## stderr-json: ""
+## status: 0
+
+#### and an empty -F pattern prints the separator pair rather than nothing
+## argv: grep -F -o -w -x -e ''
+## stdin-json: "\n"
+## stdout-json: "\n\n"
+## stderr-json: ""
+## status: 0
+
+#### while -F -x -o without -w takes the shortcut and does not
+## argv: grep -F -o -x -e ab
+## stdin-json: "ab\n"
+## stdout-json: "ab\n"
+## stderr-json: ""
+## status: 0
+
+# Which matcher GNU ENDS on decides the byte, and it is not the one the flags
+# asked for (grep.c:2953-2972). A single-pattern `-F -w` run switches TO the
+# regex matcher because `-G` is typically faster for it; a multi-pattern `-E`/`-G`
+# run whose patterns are all literal switches AWAY from it because `-F` is. Only
+# the regex matcher measures the `-w -x` span past the record separator, so the
+# byte follows the switch rather than the flag -- and `-e ab -e cd` loses it under
+# EVERY syntax while one metacharacter anywhere in the set brings it back. The
+# count is taken AFTER GNU drops duplicate patterns, so `-e ab -e ab` is one.
+
+#### two literal patterns switch GNU to the fixed matcher, which drops the byte
+## argv: grep -o -w -x -e ab -e cd
+## stdin-json: "ab\ncd\n"
+## stdout-json: "ab\ncd\n"
+## stderr-json: ""
+## status: 0
+
+#### one metacharacter among them keeps the regex matcher and the byte
+## argv: grep -o -w -x -e a.b -e cd
+## stdin-json: "a.b\ncd\n"
+## stdout-json: "a.b\n\ncd\n\n"
+## stderr-json: ""
+## status: 0
+
+#### a duplicate is dropped before the count, so this is a ONE-pattern run
+## argv: grep -o -w -x -e ab -e ab
+## stdin-json: "ab\n"
+## stdout-json: "ab\n\n"
+## stderr-json: ""
+## status: 0
+
+#### -E reads the same switch, where its own operators are the metacharacters
+## argv: grep -E -o -w -x -e ab -e 'c|d'
+## stdin-json: "ab\n"
+## stdout-json: "ab\n\n"
+## stderr-json: ""
+## status: 0
+
+#### and two literal patterns under -E drop it, as under -G
+## argv: grep -E -o -w -x -e ab -e cd
+## stdin-json: "ab\ncd\n"
+## stdout-json: "ab\ncd\n"
+## stderr-json: ""
+## status: 0
+
+#### two -F patterns stay on the fixed matcher and drop it too
+## argv: grep -F -o -w -x -e ab -e cd
+## stdin-json: "ab\ncd\n"
+## stdout-json: "ab\ncd\n"
+## stderr-json: ""
+## status: 0
+
+#### a BRE escape that only an ERE reads as literal keeps the regex matcher
+## argv: grep -o -w -x -e 'a\|b' -e cd
+## stdin-json: "cd\n"
+## stdout-json: "cd\n\n"
+## stderr-json: ""
+## status: 0
+
+
+# A KNOWN GAP, listed xfail in expectations.txt rather than fixed: the retry loop
+# above runs over GNU's whole pattern LIST at once, not over one pattern at a
+# time. Without a backreference `dc->pcount` stays 1 and GEAcompile hands the
+# newline-joined list to glibc as a SINGLE regex (dfasearch.c:236-295), so
+# `re_search` is leftmost-longest over the union and the shrink walks down from
+# the union's span. td-txt compiles one regex per pattern, runs one loop each and
+# takes the leftmost-longest of the answers, which is a different function rather
+# than an optimisation of the same one -- a start whose union span cannot be
+# shrunk into a word can still be word-bounded for one pattern alone.
+#
+# So `-e '..\?' -e '[a-z]\+'` over `a.b aa` prints `b` here and not in GNU: the
+# union's greedy span at that start is `.b`, every shrink window from it is
+# closed, and GNU slides past. SELECTION is unaffected and agrees -- the wrapped
+# dfa over the union answers the same question as the per-pattern scan does --
+# which the last two cases pin. Closing it needs the pattern list compiled as one
+# regex, which is its own increment and reaches well past `-w`.
+
+#### -o -w over two patterns reads the list as one regex in GNU
+## argv: grep -w -o -e '..\?' -e '[a-z]\+'
+## stdin-json: "a.b aa\n"
+## stdout:
+a
+aa
+## END
+## stderr-json: ""
+## status: 0
+
+#### and the same with a pattern that can match a trailing space
+## argv: grep -w -o -e b -e '[a-z]* \?'
+## stdin-json: "a.b a.b x\n"
+## stdout:
+a
+a
+x
+## END
+## stderr-json: ""
+## status: 0
+
+#### while SELECTION over the same list agrees, being one question either way
+## argv: grep -w -e '..\?' -e '[a-z]\+'
+## stdin-json: "a.b aa\n"
+## stdout:
+a.b aa
+## END
+## stderr-json: ""
+## status: 0
+
+#### and so does -c, which counts the lines selection chose
+## argv: grep -w -c -e '..\?' -e '[a-z]\+'
+## stdin-json: "a.b aa\n"
+## stdout:
+1
 ## END
 ## stderr-json: ""
 ## status: 0

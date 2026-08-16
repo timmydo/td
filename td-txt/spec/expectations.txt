@@ -23,9 +23,8 @@
 #           gate the full per-case timeout for an answer already known to be
 #           wrong.
 xfail grep-cli.test.txt::-w over sliding greedy repeats on a long line
-xfail grep-cli.test.txt::-o -w prints a shrunk span only at the first search position
-xfail grep-cli.test.txt::-o -w skips two shrinkable spans in the middle of the line
-xfail grep-cli.test.txt::-o -w after a shrunk span at the line start
+xfail grep-cli.test.txt::-o -w over two patterns reads the list as one regex in GNU
+xfail grep-cli.test.txt::and the same with a pattern that can match a trailing space
 xfail grep-cli.test.txt::and `-o` runs glibc for the same pattern, which disagrees with the dfa `-c` uses
 xfail grep-cli.test.txt::a BACKREFERENCE anywhere in the list hands the whole list to glibc, which reads the pipe rule differently
 xfail grep-cli.test.txt::a fuzz composite that diverges where each of its parts agrees

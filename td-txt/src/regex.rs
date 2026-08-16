@@ -179,6 +179,10 @@ struct Reading {
     /// `Regex::veto_reading` for why filtering with the exact backreference is
     /// wrong in one direction and not filtering at all is wrong in the other.
     approx_backref: bool,
+    /// glibc's `not_eol`: `$` does not hold at the end of THIS haystack. GNU sets
+    /// it for `-w`'s shrink (grep/src/dfasearch.c:539), where the haystack is the
+    /// line cut short and its end is not the line's.
+    not_eol: bool,
 }
 
 /// A 256-bit byte set.
@@ -1453,7 +1457,7 @@ impl Regex {
                 .map(|a| Anchor { sep: a.sep, newline_anchor: a.sep == b'\n' }),
             ..self.reading(true)
         };
-        self.scan_reading(hay, from, None, OnBudget::Fail, reading)
+        self.scan_reading(hay, from, None, OnBudget::Fail, reading, &mut 0)
     }
 
     /// As `search`, but a budget exhausted with a match in hand answers with that
@@ -1481,6 +1485,52 @@ impl Regex {
         self.scan(hay, from, Some(filter), on_budget, false)
     }
 
+    /// The length of the longest match ANCHORED at `at` within `hay[..limit]`,
+    /// which is glibc's `re_match` under `not_eol` — the one primitive `grep -w`'s
+    /// shrink needs (grep/src/dfasearch.c:540). `None` is "no match starts there";
+    /// `Some(0)` is the empty match, which GNU's CALLER rejects rather than the
+    /// primitive, so this does not fold the two together.
+    ///
+    /// Cutting the haystack is what makes the answer a SHORTER match rather than
+    /// another one, and it is also why `not_eol` is set: the cut end is not the
+    /// line's, so `$` must not hold at it.
+    ///
+    /// `match_from` rather than a scan: a scan would try every later start and be
+    /// filtered back to this one, which answers the same and costs the window's
+    /// length each time. The shrink runs inside a loop already linear in the line,
+    /// so that second factor is what exhausts the shared budget — `grep -o -w
+    /// '\.*a'` over 600 dots refused where GNU answers.
+    pub fn match_anchored(
+        &self,
+        hay: &[u8],
+        limit: usize,
+        at: usize,
+        steps: &mut u64,
+    ) -> Result<Option<usize>, Error> {
+        let Some(hay) = hay.get(..limit) else {
+            return Ok(None);
+        };
+        if at > hay.len() {
+            return Ok(None);
+        }
+        let reading = Reading { not_eol: true, ..self.reading(false) };
+        let found = self.match_from(hay, at, steps, None, OnBudget::Fail, reading)?;
+        Ok(found.map(|c| c.end() - at))
+    }
+
+    /// `search`, spending a budget the CALLER owns. `grep -o -w` slides its start
+    /// across the line and searches again from each, and a fresh budget for every
+    /// search would multiply the worst case by the line's length — the same
+    /// argument that gives one scan one budget rather than one per start.
+    pub fn search_budgeted(
+        &self,
+        hay: &[u8],
+        from: usize,
+        steps: &mut u64,
+    ) -> Result<Option<Captures>, Error> {
+        self.scan_reading(hay, from, None, OnBudget::Fail, self.reading(false), steps)
+    }
+
     /// `scan_once`, with the PREVIOUS release's algorithm as a floor beneath it.
     ///
     /// Searching every end is what leftmost-longest costs, and on a long line with
@@ -1503,7 +1553,7 @@ impl Regex {
         on_budget: OnBudget,
         subst: bool,
     ) -> Result<Option<Captures>, Error> {
-        self.scan_reading(hay, from, filter, on_budget, self.reading(subst))
+        self.scan_reading(hay, from, filter, on_budget, self.reading(subst), &mut 0)
     }
 
     /// `scan` under an explicit reading, which is what lets a recompiled regex
@@ -1515,6 +1565,7 @@ impl Regex {
         filter: Option<&Filter<'_>>,
         on_budget: OnBudget,
         reading: Reading,
+        steps: &mut u64,
     ) -> Result<Option<Captures>, Error> {
         // GNU's dfa prefilter. `dfasyntax` takes its end-of-line from the
         // delimiter as it stood at COMPILE time (sed/regexp.c:130), so where
@@ -1529,15 +1580,30 @@ impl Regex {
                 // linear and always answers, so an exhausted budget here is an
                 // artefact of filtering with a backtracker rather than an
                 // answer about the pattern.
-                if let Ok(None) = self.scan_once(hay, 0, None, OnBudget::Existence, veto) {
+                //
+                // It spends a COPY: what the filter costs is not the caller's,
+                // GNU's dfa pass being linear where this one backtracks. The copy
+                // starts at the caller's spend rather than at zero so the pair
+                // still cannot exceed a bounded multiple of one budget.
+                let mut filter_steps = *steps;
+                if let Ok(None) =
+                    self.scan_once(hay, 0, None, OnBudget::Existence, veto, &mut filter_steps)
+                {
                     return Ok(None);
                 }
             }
         }
-        match self.scan_once(hay, from, filter, on_budget, reading) {
+        // The retry rewinds to what THIS call started with rather than to zero, so
+        // "a bounded multiple of the budget" stays true of a call spending a
+        // budget it does not own.
+        let spent = *steps;
+        match self.scan_once(hay, from, filter, on_budget, reading, steps) {
             Err(e) => match on_budget == OnBudget::Fail && !self.has_alt {
                 // One retry, so the worst case stays a bounded multiple of the budget.
-                true => self.scan_once(hay, from, filter, OnBudget::Existence, reading),
+                true => {
+                    *steps = spent;
+                    self.scan_once(hay, from, filter, OnBudget::Existence, reading, steps)
+                }
                 false => Err(e),
             },
             found => found,
@@ -1550,6 +1616,7 @@ impl Regex {
             segment: self.segment,
             subst,
             approx_backref: false,
+            not_eol: false,
         }
     }
 
@@ -1575,6 +1642,7 @@ impl Regex {
             segment: None,
             subst: false,
             approx_backref: true,
+            not_eol: false,
         })
     }
 
@@ -1588,8 +1656,8 @@ impl Regex {
         filter: Option<&Filter<'_>>,
         on_budget: OnBudget,
         reading: Reading,
+        steps: &mut u64,
     ) -> Result<Option<Captures>, Error> {
-        let mut steps = 0u64;
         let mut at = from;
         loop {
             if at > hay.len() {
@@ -1609,7 +1677,7 @@ impl Regex {
             skippable = skippable || filter.is_some_and(|f| !(f.start)(at));
             if !skippable {
                 if let Some(caps) =
-                    self.match_from(hay, at, &mut steps, filter, on_budget, reading)?
+                    self.match_from(hay, at, steps, filter, on_budget, reading)?
                 {
                     return Ok(Some(caps));
                 }
@@ -1638,7 +1706,7 @@ impl Regex {
                 .map(|a| Anchor { sep: a.sep, newline_anchor: a.sep == b'\n' }),
             ..self.reading(false)
         };
-        Ok(self.scan_reading(hay, 0, None, OnBudget::Existence, reading)?.is_some())
+        Ok(self.scan_reading(hay, 0, None, OnBudget::Existence, reading, &mut 0)?.is_some())
     }
 
     /// Does some match cover `hay` exactly? Used by `grep -x`, which cannot be
@@ -1690,6 +1758,7 @@ impl Regex {
             // (`consumable`, `buf_anchor`) is not this scan's either.
             has_backref: self.has_backref && !reading.approx_backref,
             approx_backref: reading.approx_backref,
+            not_eol: reading.not_eol,
             caps: vec![None; self.ngroups + 1],
             best: None,
             steps: *steps,
@@ -1808,6 +1877,9 @@ struct State<'a> {
     /// See `Reading::approx_backref`: the prefilter reads a backreference as the
     /// dfa does, which is not what the pattern means.
     approx_backref: bool,
+    /// See `Reading::not_eol`: this haystack's end is not the line's, so `$`
+    /// must not hold there.
+    not_eol: bool,
     caps: Spans,
     /// The longest match seen so far and where it ended.
     best: Option<(Spans, usize)>,
@@ -1837,7 +1909,7 @@ impl State<'_> {
     }
 
     fn at_eol(&self, pos: usize) -> bool {
-        pos == self.hay.len()
+        (!self.not_eol && pos == self.hay.len())
             || self
                 .reg_newline
                 .is_some_and(|a| self.byte(pos).is_some_and(|b| a.holds(b)))

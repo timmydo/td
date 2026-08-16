@@ -107,6 +107,21 @@ td-txt-authored case files
   `rootcheck_pins_the_td_volume_ere`, which is the other half of the binding: that
   end proves the script still spells what this end scores.
 
+  `-w` asks TWO questions, and GNU answers them in two different places. Whether a
+  line MATCHES is its dfa's answer over the pattern WRAPPED in word boundaries,
+  `\(^\|[^[:alnum:]_]\)\(PAT\)\([^[:alnum:]_]\|$\)` (grep/src/dfasearch.c:301-325);
+  on a hit with no backreference that is the whole answer (dfasearch.c:479), so the
+  question is "is there ANY word-bounded span". Which span to PRINT is a different
+  reading: the retry loop at dfasearch.c:528-567, which shrinks a match that is not
+  word-bounded at the same start and otherwise advances the start by one. The two
+  DISAGREE, and a case pins each side of it: `grep -o -w '..\?'` on `a b c` prints
+  `a` and `c` and passes the word-bounded `b` that selection finds. Two details
+  carry most of that — the shrink window is cut at `s + len - from`, an offset
+  measured from the SEARCH START but applied from the LINE start, so under `-o` it
+  closes over the match as the line is consumed; and an EMPTY shrink does not count
+  where an empty match the search itself reports does. The second is why
+  `grep -w '\.*'` SELECTS `.a` while `grep -o -w '\.*'` prints nothing for it.
+
   Three further blocks come from DIFFERENTIAL FUZZING against grep 3.11 rather than
   from reading the option list — `grep -w` over a pattern that can match a shorter
   span, BRE anchor-vs-literal (`^^`), and POSIX leftmost-longest across a bounded
@@ -1445,9 +1460,35 @@ td-txt-authored case files
     which this one had already named, and for its scope.
 
   - GNU's extra EMPTY span under `-o` with `-x` and `-w` together: `grep -o -w
-    -x a` over `a/ab` is `a` and an empty line in GNU and just `a` here. It
-    needs no context flag, so it is not part of the range rule above, and the
-    `-w -o` case in the corpus is one where the two AGREE. Pre-existing.
+    -x a` over `a/ab` is `a` and an empty line in GNU and just `a` here.
+    CLOSED, and it was never an extra SPAN: GNU's `start_ptr` shortcut is
+    guarded by `!match_words` (dfasearch.c:512), so with both flags set it
+    falls through to the `match_lines` arm, whose length is `end - ptr` --
+    measured PAST the record separator. `-o` prints that byte and then adds
+    its own, which is the blank line. `-z` is what shows it is the record
+    separator rather than a newline: the extra byte is a NUL there.
+
+    The byte follows GNU's MATCHER and not its flags, which is the half that
+    makes it more than a curiosity. `Fexecute` measures the same span without
+    the separator (kwsearch.c:152-156), and grep.c:2953-2972 switches between
+    the two under the run's feet: a single-pattern `-F -w` run moves TO the
+    regex matcher, and a multi-pattern `-E`/`-G` run whose patterns are all
+    literal moves AWAY from it. So `grep -w -x -o -e ab` prints the byte while
+    `-e ab -e cd` prints it for neither line, under every syntax, and one
+    metacharacter anywhere in the set brings it back. td-txt does not switch
+    matchers -- it has no reason to prefer either -- but it has to model the
+    CHOICE, since this byte is observable through it. The count is taken after
+    GNU drops duplicate patterns (grep.c:182-201), so `-e ab -e ab` is one.
+
+  - `-o` with `-w` over a pattern LIST, which is STILL open and now xfailed.
+    GNU joins the list with newlines and compiles it as ONE regex when nothing
+    holds a backreference (dfasearch.c:236-295), so its retry loop shrinks the
+    union's span; td-txt runs the loop per pattern and takes the
+    leftmost-longest answer. A start the union cannot shrink into a word can
+    still be word-bounded for one pattern alone, so td-txt prints spans GNU
+    passes. Selection agrees, the wrapped dfa over the union asking what the
+    per-pattern scan asks. Closing it wants the pattern list compiled as one
+    regex, which reaches well past `-w`.
 
   - A huge `-B`/`-C`/`-NUM` count costs GNU TIME, not memory, and past a point it
     stops finishing at all. Its output path walks back the before-count in a

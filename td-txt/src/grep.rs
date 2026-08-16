@@ -59,7 +59,7 @@
 //! tabling it would change `unrecognized` to `unsupported` and leave the
 //! status difference exactly where it is. `-u` carries the case.
 
-use crate::regex::{Filter, OnBudget, Options, Regex};
+use crate::regex::{Error, Filter, OnBudget, Options, Regex};
 use crate::util::{
     byte_in, errmsg, name_in, number, path_bytes, posixly_correct, print_line, read_input,
     open_search, records, walk, DeviceRule, Diag, Input, Out, Records, VERSION,
@@ -274,10 +274,85 @@ struct Grep {
     /// matches", which `-e '' -e a` does too without GNU taking the short cut.
     /// Only `settled` reads this; matching compiles an empty pattern like any other.
     only_empty: bool,
+    /// Whether GNU would run its REGEX matcher for this pattern set — see
+    /// `gnu_runs_regex_matcher`. Only the `-w -x` span reads it.
+    regex_matcher: bool,
+}
+
+/// Which of GNU's matchers this run would end on (grep.c:2953-2972). It is not the
+/// syntax the user asked for: a single-pattern `-F -w` run switches TO the regex
+/// matcher because `-G` is typically faster for that, and a multi-pattern `-E`/`-G`
+/// run whose patterns are all literal switches AWAY from it because `-F` is.
+///
+/// td-txt has no reason to care which is faster and does not switch. It cares
+/// because the two matchers disagree about ONE observable: a `-w -x` span runs past
+/// the record separator in `EGexecute` (dfasearch.c:512-519) and not in `Fexecute`
+/// (kwsearch.c:152-156). So `grep -w -x -o -e ab` prints the extra byte and
+/// `-e ab -e cd` prints it for neither line.
+fn gnu_runs_regex_matcher(conf: &Conf, pats: &[&Vec<u8>]) -> bool {
+    match conf.syntax == Syntax::Fixed {
+        // `-F` -> `-G` for a single word-matching pattern in a unibyte locale.
+        // `separator_in_span` is the only caller and asks only under `-w`.
+        true => pats.len() == 1,
+        // `-E`/`-G` -> `-F` when two or more patterns are all literal.
+        false => pats.len() <= 1 || !all_literal(conf.syntax == Syntax::Extended, pats),
+    }
+}
+
+/// GNU's `try_fgrep_pattern` (grep.c:2389-2456): can this pattern set be handed to
+/// the fixed-string matcher? Read over the patterns joined by newlines, as GNU
+/// reads them, so a `\` before the join is the `\<newline>` that refuses.
+fn all_literal(ere: bool, pats: &[&Vec<u8>]) -> bool {
+    let joined = pats.iter().map(|p| p.as_slice()).collect::<Vec<_>>().join(&b'\n');
+    let mut i = 0;
+    while let Some(&c) = joined.get(i) {
+        match c {
+            b'$' | b'*' | b'.' | b'[' | b'^' => return false,
+            // Literal in a BRE, operators in an ERE.
+            b'(' | b'+' | b'?' | b'{' | b'|' if ere => return false,
+            b'\\' => {
+                match joined.get(i + 1) {
+                    // An operator or an assertion in both dialects.
+                    Some(
+                        b'\n' | b'B' | b'S' | b'W' | b'\'' | b'<' | b'b' | b's' | b'w' | b'`'
+                        | b'>' | b'1'..=b'9',
+                    ) => return false,
+                    // A BRE's operators, where an ERE reads the escape as making
+                    // them literal. `\)` rides with them so GEAcompile can
+                    // complain about it rather than this deciding.
+                    Some(b'(' | b'+' | b'?' | b'{' | b'|' | b')') if !ere => return false,
+                    // Any other escape drops out, leaving the byte literal.
+                    Some(_) => i += 2,
+                    None => i += 1,
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    true
 }
 
 fn is_word(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// GNU's `start_ptr`: whether the caller needs the exact SPAN or only whether the
+/// line matches at all. Under `-w` these are not one question at two costs but two
+/// questions with two ANSWERS, reached through different code in GNU — a line it
+/// selects can have no span it will print, which `grep -o -w '\.*'` over `.a` shows:
+/// status 0, nothing on stdout.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Want {
+    /// Does the line match? GNU asks its dfa, built from the pattern WRAPPED in word
+    /// boundaries — `\(^\|[^[:alnum:]_]\)\(PAT\)\([^[:alnum:]_]\|$\)`
+    /// (grep/src/dfasearch.c:301-325) — and a hit with no backreference IS the answer
+    /// (dfasearch.c:479). So this asks "is there ANY word-bounded span", which is
+    /// what the filtered scan asks.
+    Selection,
+    /// Which span? GNU's retry loop — see `Grep::word_match`.
+    Span,
 }
 
 /// The `-w` test splits in two, and this half depends only on the START. That is what
@@ -342,6 +417,7 @@ impl Grep {
         line: &[u8],
         from: usize,
         on_budget: OnBudget,
+        want: Want,
     ) -> Result<Option<(usize, usize)>, String> {
         // An empty pattern takes no short cut here. It is compiled like any other, and
         // it still has to clear -x/-w: `grep -x ''` selects only EMPTY lines, and
@@ -359,6 +435,12 @@ impl Grep {
                     let mut at = from;
                     while let Some((s, e)) = locate(line, lit, at, self.conf.icase) {
                         if self.acceptable(line, s, e) {
+                            // `-F` reaches the same `match_lines` arm, so a `-w -x`
+                            // span runs past the record separator here too.
+                            let e = match self.conf.whole_line {
+                                true => e + self.separator_in_span(want),
+                                false => e,
+                            };
                             best = Some(better(best, (s, e)));
                             break;
                         }
@@ -386,11 +468,20 @@ impl Grep {
                             // `-x` consumes the span implicitly (it compares the end to
                             // the line length), so it never takes the relaxed budget.
                             true => re.matches_whole(line).map(|hit| match hit {
-                                true => Some((0, line.len())),
+                                // `-w` AND `-x` together is where the span reaches
+                                // PAST the line. GNU's `start_ptr` shortcut is guarded
+                                // by `!match_words` (dfasearch.c:512), so with both
+                                // flags it falls through to the `match_lines` arm,
+                                // whose length is `end - ptr` — measured past the
+                                // record separator, which `-o` then prints
+                                // (dfasearch.c:514-519).
+                                true => Some((0, line.len() + self.separator_in_span(want))),
                                 false => None,
                             }),
                             false => Ok(None),
                         }
+                    } else if self.conf.word && want == Want::Span {
+                        self.word_match(re, line, from)
                     } else if self.conf.word {
                         // The word test belongs INSIDE the scan: GNU retries a shorter
                         // match at the same start before advancing, and the acceptable
@@ -436,6 +527,94 @@ impl Grep {
         Ok(best)
     }
 
+    /// GNU's `-w` retry loop (grep/src/dfasearch.c:528-567), which is what decides
+    /// the SPAN once the line is already selected. It is not a search for any
+    /// word-bounded span — that is `Want::Selection`'s question, and the two
+    /// disagree: `grep -o -w '..\?'` prints `a` and `c` of `a b c`, passing the
+    /// perfectly word-bounded `b` that selection would have found.
+    ///
+    /// Given a match that is not word-bounded, GNU tries a SHORTER one anchored at
+    /// the same start, and only when there is none does it advance the start by one
+    /// and search again. Two details of that decide the divergences:
+    ///
+    /// The shrink window is cut at `s + len - from`, an offset measured from the
+    /// SEARCH START but applied to a buffer beginning at the LINE start. Under `-o`
+    /// the two part company as the line is consumed, so the window closes over the
+    /// match and shrinking stops working once `len <= from`. That is why `b` above
+    /// is skipped: at its start the greedy `b ` is not word-bounded, and the `b`
+    /// that would be is past the window.
+    ///
+    /// And an EMPTY shrink does not count (`0 < shorter_len`), where an empty match
+    /// `re_search` itself reports does.
+    ///
+    /// A pattern LIST is where this is still not GNU. Without a backreference
+    /// GEAcompile hands the newline-joined list to glibc as ONE regex
+    /// (dfasearch.c:236-295), so GNU runs this loop once over the union while
+    /// td-txt runs it per pattern and takes the leftmost-longest of the answers.
+    /// A start whose union span cannot be shrunk into a word can still be
+    /// word-bounded for one pattern alone, so the two differ — see the xfail
+    /// block in spec/grep-cli.test.txt. Selection is unaffected, the wrapped dfa
+    /// over the union asking what the per-pattern scan asks.
+    fn word_match(
+        &self,
+        re: &Regex,
+        line: &[u8],
+        from: usize,
+    ) -> Result<Option<(usize, usize)>, Error> {
+        // ONE budget for the whole slide, not one per search — see
+        // `Regex::search_budgeted`.
+        // ONE budget for the whole slide, not one per search — see
+        // `Regex::search_budgeted`.
+        let steps = &mut 0u64;
+        // Always leftmost-then-LONGEST, even where the caller would have settled for
+        // a boolean: the shrink walks DOWN from the longest span, so entering the
+        // loop with a shorter one would start it somewhere GNU never does.
+        let Some(caps) = re.search_budgeted(line, from, steps)? else {
+            return Ok(None);
+        };
+        let (mut s, mut e) = (caps.start(), caps.end());
+        loop {
+            if word_start_ok(line, s) && word_end_ok(line, e) {
+                return Ok(Some((s, e)));
+            }
+            // GNU's `len > 0`, and its `--len` BEFORE the call: the window ends one
+            // byte short of this match, so what comes back is strictly shorter. The
+            // width saturates rather than relying on that guard for its own sake —
+            // `e - 1` under it is only non-negative because `e > s`.
+            let shorter = match e > s {
+                true => {
+                    let width = e.saturating_sub(1).saturating_sub(from);
+                    re.match_anchored(line, width, s, steps)?
+                }
+                false => None,
+            };
+            match shorter {
+                // `len > 0` is GNU's. The second half is this crate's: a shrink
+                // that did not SHORTEN is not one, and without the test the loop
+                // spins on a span it keeps rediscovering. It cannot fire, the
+                // window being cut strictly inside the match — which is the point,
+                // since that makes termination structural rather than a property
+                // of the arithmetic above it.
+                Some(len) if len > 0 && s + len < e => e = s + len,
+                _ => {
+                    if s == line.len() {
+                        return Ok(None);
+                    }
+                    let Some(caps) = re.search_budgeted(line, s + 1, steps)? else {
+                        return Ok(None);
+                    };
+                    (s, e) = (caps.start(), caps.end());
+                }
+            }
+        }
+    }
+
+    /// Whether an `-x` span runs one byte past the line, which is `1` only for the
+    /// `-w`-and-`-x` span above.
+    fn separator_in_span(&self, want: Want) -> usize {
+        usize::from(self.conf.word && want == Want::Span && self.regex_matcher)
+    }
+
     /// `-w`/`-x` filters on a candidate span.
     fn acceptable(&self, line: &[u8], s: usize, e: usize) -> bool {
         if self.conf.whole_line && (s != 0 || e != line.len()) {
@@ -450,7 +629,7 @@ impl Grep {
     fn selects(&self, line: &[u8]) -> Result<bool, String> {
         // Selection asks only WHETHER the line matches, so a budget exhausted with
         // a match in hand still answers it. `-o` below consumes the span and cannot.
-        let hit = self.match_at(line, 0, OnBudget::Existence)?.is_some();
+        let hit = self.match_at(line, 0, OnBudget::Existence, Want::Selection)?.is_some();
         Ok(hit != self.conf.invert)
     }
 }
@@ -887,7 +1066,8 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
     // GNU decides the name from the OPERANDS, not from how many files the walk
     // turned them into.
     let show_name = conf.with_filename.unwrap_or(files.len() > 1 || descended);
-    let grep = Grep { conf, pats, only_empty };
+    let regex_matcher = gnu_runs_regex_matcher(&conf, &deduped(&patterns));
+    let grep = Grep { conf, pats, only_empty, regex_matcher };
     // Fallible because the sink DUPLICATES descriptor 1; grep's own error status.
     let mut out = match Out::new() {
         Ok(out) => out,
@@ -1501,11 +1681,18 @@ fn push_file(patterns: &mut Vec<Vec<u8>>, content: &[u8]) {
     }
 }
 
-fn compile(conf: &Conf, lines: &[Vec<u8>]) -> Result<Patterns, String> {
-    // GNU drops a duplicate pattern, keeping the first. Only `lex_continues` can
-    // see it, so this must precede the loop that decides which pattern ends the lex.
+/// GNU drops a duplicate pattern, keeping the first, and COUNTS what is left --
+/// `n_patterns` is incremented only for one it inserted (grep.c:182-201), which
+/// is what makes `-e ab -e ab` a one-pattern run to the matcher switch.
+fn deduped(lines: &[Vec<u8>]) -> Vec<&Vec<u8>> {
     let mut seen = std::collections::HashSet::with_capacity(lines.len());
-    let lines: Vec<&Vec<u8>> = lines.iter().filter(|l| seen.insert(l.as_slice())).collect();
+    lines.iter().filter(|l| seen.insert(l.as_slice())).collect()
+}
+
+fn compile(conf: &Conf, lines: &[Vec<u8>]) -> Result<Patterns, String> {
+    // The duplicate drop must precede the loop that decides which pattern ends
+    // the lex, since only `lex_continues` can see it.
+    let lines = deduped(lines);
     if conf.syntax == Syntax::Fixed {
         return Ok(Patterns::Fixed(lines.into_iter().cloned().collect()));
     }
@@ -1620,7 +1807,7 @@ fn write_spans(
     let data_sep = if grep.conf.null_data { 0u8 } else { b'\n' };
     // A cursor INTO the line, not an offset: `At` next door means the other one.
     let mut scan = 0usize;
-    while let Some((s, e)) = grep.match_at(line, scan, OnBudget::Fail)? {
+    while let Some((s, e)) = grep.match_at(line, scan, OnBudget::Fail, Want::Span)? {
         if e == s {
             scan = s + 1;
             if scan > line.len() {
@@ -1635,7 +1822,13 @@ fn write_spans(
                 .map(|b| b.saturating_add(u64::try_from(s).unwrap_or(u64::MAX))),
         };
         io(prefix(out, grep, display, show_name, span, sep))?;
-        io(out.write(line.get(s..e).unwrap_or_default()))?;
+        io(out.write(line.get(s..e.min(line.len())).unwrap_or_default()))?;
+        // A span reaching PAST the line is `-w -x`: GNU measured it past the record
+        // separator, so that byte is part of the match and prints before the one
+        // `-o` adds itself. Hence the blank line `grep -w -x -o` leaves per match.
+        if e > line.len() {
+            io(out.write(&[data_sep]))?;
+        }
         io(out.write(&[data_sep]))?;
         scan = e;
     }
@@ -2001,7 +2194,9 @@ mod tests {
         }
         let pats = compile(&conf, &patterns).unwrap();
         let only_empty = !patterns.is_empty() && patterns.iter().all(Vec::is_empty);
-        Grep { conf, pats, only_empty }
+        let regex_matcher =
+            gnu_runs_regex_matcher(&conf, &deduped(&patterns));
+        Grep { conf, pats, only_empty, regex_matcher }
     }
 
     #[test]
@@ -2024,7 +2219,7 @@ mod tests {
     fn word_option_scans_for_a_word_bounded_gap_under_an_empty_pattern() {
         let g = grep_with(Conf { word: true, ..conf() }, &[""]);
         // The only word-bounded gap in `a.` is the one after the dot.
-        assert_eq!(g.match_at(b"a.", 0, OnBudget::Fail).unwrap(), Some((2, 2)));
+        assert_eq!(g.match_at(b"a.", 0, OnBudget::Fail, Want::Selection).unwrap(), Some((2, 2)));
         assert!(g.selects(b"a.").unwrap());
         assert!(g.selects(b"a ").unwrap());
         // Every gap in `ab`/`a.b` touches a word character.
@@ -2043,9 +2238,14 @@ mod tests {
     fn word_option_retries_a_shorter_span_at_the_same_start() {
         let g = grep_with(Conf { word: true, ..conf() }, &[r"\.*"]);
         // Greedy at 0 is `..`, not word-bounded (`a` follows); `.` is.
-        assert_eq!(g.match_at(b"..a", 0, OnBudget::Fail).unwrap(), Some((0, 1)));
+        assert_eq!(g.match_at(b"..a", 0, OnBudget::Fail, Want::Selection).unwrap(), Some((0, 1)));
         // Greedy at 0 is `.`, not word-bounded; only the EMPTY span is.
-        assert_eq!(g.match_at(b".a", 0, OnBudget::Fail).unwrap(), Some((0, 0)));
+        assert_eq!(g.match_at(b".a", 0, OnBudget::Fail, Want::Selection).unwrap(), Some((0, 0)));
+        // ...and that span is where the two questions part company: GNU's retry
+        // loop rejects an empty SHRINK, so the line selects with no span to print.
+        assert_eq!(g.match_at(b".a", 0, OnBudget::Fail, Want::Span).unwrap(), None);
+        // Where the shorter span is not empty both agree on it.
+        assert_eq!(g.match_at(b"..a", 0, OnBudget::Fail, Want::Span).unwrap(), Some((0, 1)));
         assert!(g.selects(b"..a").unwrap());
         assert!(g.selects(b".a").unwrap());
         // A word character on either side blocks the empty span too.
@@ -2060,7 +2260,7 @@ mod tests {
     #[test]
     fn word_option_starts_only_at_a_word_edge() {
         let g = grep_with(Conf { word: true, ..conf() }, &["at"]);
-        assert_eq!(g.match_at(b"cat at", 0, OnBudget::Fail).unwrap(), Some((4, 6)));
+        assert_eq!(g.match_at(b"cat at", 0, OnBudget::Fail, Want::Selection).unwrap(), Some((4, 6)));
         assert!(!g.selects(b"cat cat").unwrap());
     }
 
@@ -2124,8 +2324,8 @@ mod tests {
     #[test]
     fn only_matching_reports_leftmost_longest_spans() {
         let g = grep_with(conf(), &["ab*"]);
-        assert_eq!(g.match_at(b"xabb yab", 0, OnBudget::Fail).unwrap(), Some((1, 4)));
-        assert_eq!(g.match_at(b"xabb yab", 4, OnBudget::Fail).unwrap(), Some((6, 8)));
+        assert_eq!(g.match_at(b"xabb yab", 0, OnBudget::Fail, Want::Span).unwrap(), Some((1, 4)));
+        assert_eq!(g.match_at(b"xabb yab", 4, OnBudget::Fail, Want::Span).unwrap(), Some((6, 8)));
     }
 
     #[test]
