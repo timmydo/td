@@ -1660,8 +1660,10 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
      `/init` mounts the volume BEFORE the `/run` tmpfs it later moves it onto —
      so the volume is listed BEFORE `/run`, and the last entry covering the key
      is `/run`, which is `rw`. A "last covering entry" rule therefore refuses
-     td's own volume and would have failed every update on every booted machine,
-     which no gate could catch because none boots a VM. The obvious alternative,
+     td's own volume and would have failed every update on every booted machine.
+     No gate would have caught it — not because nothing boots a VM, since
+     `qemu-boot-system` does, but because that check runs only in a full image
+     build and no gate runs one. The obvious alternative,
      "deepest covering entry", is wrong in the other direction: a read-only
      mount at `/vol/sub` hidden by a later writable one at `/vol` is still in
      the table, and a path under it resolves through the writable mount. Both
@@ -1804,3 +1806,68 @@ Beyond the existing deployment/persistence/rollback oracles, this path adds:
 an install onto a regular file that then boots under OVMF; a bundle signed by
 an unpinned key that must be refused; and an update that installs a second
 deployment and rolls back to the first.
+
+The second and third are BUILT, both inside `qemu-boot-system`'s install boot,
+which is the only place a running td machine exists to drive them from. The
+refused pass is 10e's. The rollback pass runs after the install one and ends
+where it began — it rolls back to the deployment that is RUNNING, requires the
+id it lands on to be exactly that one, then reinstalls from the same channel
+and requires that to name what the first install named. Restoring is not
+tidiness: the boots after this one expect the candidate to be current, so a
+pass that left the volume rolled back would fail them and blame selection.
+What the restore buys beyond that is the thing worth having — a rolled-back
+volume is one an update can still proceed from, which is the real sequence an
+operator meets, an update that boots badly followed by another attempt.
+`SYSTEM_DEPLOY_ROLLBACK_MARKER` is the only report that any of it happened,
+precisely because the pass is a round trip.
+
+Between those two halves is the branch that makes the pass mean anything, and
+it was missing from the first version of it. Every other branch reads a
+PRINTED id, and a rollback that printed the right id without rewriting
+`current` satisfies all of them: the reinstall then finds its own id already
+current, takes `install_deployment`'s idempotent branch, prints that id, and
+the comparison after it agrees too — a round trip that went green having
+rolled nothing back, which is exactly the silent no-op this item keeps
+producing. So the pass also runs `td-boot success` on the deployment it
+claims to have rolled back to, which refuses unless that id IS current. It is
+the one branch observing an EFFECT rather than a report, and on a deployment
+already marked successful it returns before doing anything else, so it stays
+an observation.
+
+Two clocks run over that loop and both had to move. `svc_timeouts::BOOTSUCCESS`
+is td-svc's backstop on the unit; `ladder::DEFAULT_BOOT_TIMEOUT_SECS` is the
+host's ceiling on the whole boot, and it is declared in `ladder` rather than
+beside the oracle so the guest side can assert the relation between them. A
+host that gives up first turns a diagnosable unhealthy boot into a bare
+timeout carrying no guest-side reason, so the ceiling must outlast the
+clamped iteration count times what an iteration may cost — which is a test
+now, because the first version of this pass raised the guest's per-iteration
+budget past the host's entire ceiling and nothing noticed.
+
+What the pass costs is worth stating precisely, because the fixture's size
+budget turns on it and a wrong version of this sentence was written first.
+The REINSTALL copies nothing: the deployment is already published, so
+`publish_bundle` finds its destination and takes the existing-bundle path.
+`create_persistent_volume_layout` sizes the volume for three deployment-sized
+copies and that is still right. What the pass adds is deployment-sized READS.
+
+Two limits, both found in review of it and neither closed:
+
+- The RETRY loop no longer covers this pass. Reaching `current = candidate`
+  used to imply the boot was healthy and about to exit; now a rollback branch
+  can fail with the candidate current and the running deployment not, and
+  every later iteration then fails at the `td-boot success` that guards the
+  chain — nine iterations reporting that the running deployment is not
+  current rather than what actually broke. A transient failure in this pass
+  is therefore a hard boot failure, where the loop exists to absorb one.
+- The REINSTALL's effect is not observed in the pass, where the rollback's
+  now is. A reinstall that printed the right id without activating it would
+  pass here and surface three boots later, as the healthy-candidate boot
+  selecting the initial deployment instead of the candidate — caught, but
+  attributed to selection. The rollback half could be closed with `td-boot
+  success` because that verb refuses unless the id it is given is current and
+  does nothing else to a deployment already marked successful; the reinstall
+  half has no such observer, since `success` on the CANDIDATE would clear the
+  attempt state the boots after this one are written around.
+
+The first is item 9 and is still owed.

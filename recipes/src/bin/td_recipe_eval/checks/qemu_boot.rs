@@ -130,6 +130,7 @@ const SYSTEM_PERSIST_WRITE_MARKER: &str = td_recipe::ladder::SYSTEM_PERSIST_WRIT
 const SYSTEM_PERSIST_READ_MARKER: &str = td_recipe::ladder::SYSTEM_PERSIST_READ_MARKER;
 const SYSTEM_BOOT_SUCCESS_MARKER: &str = td_recipe::ladder::SYSTEM_BOOT_SUCCESS_MARKER;
 const SYSTEM_DEPLOY_INSTALL_MARKER: &str = td_recipe::ladder::SYSTEM_DEPLOY_INSTALL_MARKER;
+const SYSTEM_DEPLOY_ROLLBACK_MARKER: &str = td_recipe::ladder::SYSTEM_DEPLOY_ROLLBACK_MARKER;
 const SYSTEM_SHUTDOWN_MARKER: &str = td_recipe::ladder::SYSTEM_SHUTDOWN_MARKER;
 const BOOKKEEPING_UNAVAILABLE_MARKER: &str = td_boot_protocol::BOOKKEEPING_UNAVAILABLE_MARKER;
 
@@ -165,12 +166,9 @@ const KEXEC_STAGE1_MARKER: &str = td_recipe::ladder::KEXEC_STAGE1_MARKER;
 /// kexec_file_load(2) + reboot(LINUX_REBOOT_CMD_KEXEC). Shared via `td_recipe::ladder`.
 const KEXEC_STAGE2_MARKER: &str = td_recipe::ladder::KEXEC_STAGE2_MARKER;
 
-/// Default wall-clock ceiling. A tiny allnoconfig kernel boots to userspace under
-/// TCG in a few seconds, but the persistent system modes hash their deployment,
-/// kexec, and boot a second kernel. The poll loop returns as soon as the selected
-/// mode finishes, so this ceiling only bounds a failed or unusually slow boot.
-/// `TD_QEMU_BOOT_TIMEOUT_SECS` overrides it.
-const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 300;
+/// Default wall-clock ceiling — declared in `ladder` rather than here so the guest
+/// side can assert it outlasts the loop it is waiting for; see there.
+const DEFAULT_BOOT_TIMEOUT_SECS: u64 = td_recipe::ladder::DEFAULT_BOOT_TIMEOUT_SECS;
 const GUEST_WAIT_MARGIN_SECS: u64 = 30;
 const POLL: Duration = Duration::from_millis(200);
 
@@ -245,6 +243,7 @@ struct ConsoleEvidence {
     persist_read: bool,
     boot_success: bool,
     deploy_install: bool,
+    deploy_rollback: bool,
     shutdown: bool,
     net_up: bool,
     net_resolve: bool,
@@ -442,6 +441,16 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         SYSTEM_DEPLOY_INSTALL_MARKER,
         "install",
     )?;
+    // Asked of the same boot rather than of a later one, because the pass ends
+    // where it began: it rolls back to the deployment that is running and then
+    // reinstalls, so nothing downstream can tell it happened. This marker is
+    // the only report that it did.
+    require_action_marker(
+        &first,
+        first.evidence.deploy_rollback,
+        SYSTEM_DEPLOY_ROLLBACK_MARKER,
+        "install",
+    )?;
     if first.evidence.attempt_consumed || first.evidence.attempts_exhausted {
         return Err(format!(
             "the install boot unexpectedly consumed or exhausted a boot-attempt budget. \
@@ -609,6 +618,12 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &failure_install,
         failure_install.evidence.deploy_install,
         SYSTEM_DEPLOY_INSTALL_MARKER,
+        "failure-sequence install",
+    )?;
+    require_action_marker(
+        &failure_install,
+        failure_install.evidence.deploy_rollback,
+        SYSTEM_DEPLOY_ROLLBACK_MARKER,
         "failure-sequence install",
     )?;
     // The @var was recreated, so this is a DIFFERENT machine and must have a
@@ -779,7 +794,9 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
 
     println!(
         "PASS: system-x86-64 transactionally installed and booted a new content-addressed \
-         deployment ({SYSTEM_DEPLOY_INSTALL_MARKER}), recovered verified previous when boot \
+         deployment ({SYSTEM_DEPLOY_INSTALL_MARKER}), rolled that deployment back to the one \
+         running and reinstalled it ({SYSTEM_DEPLOY_ROLLBACK_MARKER}), recovered verified \
+         previous when boot \
          bookkeeping was read-only ({BOOKKEEPING_UNAVAILABLE_MARKER}), acknowledged a healthy \
          pending candidate and proved its durable attempt state stayed cleared, consumed {} unacknowledged boot \
          attempts in a fresh fixture ({}) and automatically restored the retained successful \
@@ -2904,6 +2921,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         SYSTEM_PERSIST_READ_MARKER.len(),
         SYSTEM_BOOT_SUCCESS_MARKER.len(),
         SYSTEM_DEPLOY_INSTALL_MARKER.len(),
+        SYSTEM_DEPLOY_ROLLBACK_MARKER.len(),
         SYSTEM_SHUTDOWN_MARKER.len(),
         SYSTEM_NET_UP_MARKER.len(),
         SYSTEM_NET_RESOLVE_MARKER.len(),
@@ -3063,6 +3081,11 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         &mut evidence.deploy_install,
         buf,
         SYSTEM_DEPLOY_INSTALL_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.deploy_rollback,
+        buf,
+        SYSTEM_DEPLOY_ROLLBACK_MARKER.as_bytes(),
     );
     latch_marker(
         &mut evidence.shutdown,
@@ -3836,7 +3859,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 34] {
+    fn all_console_markers() -> [&'static str; 35] {
         [
             MARKER,
             EROFS_MARKER,
@@ -3858,6 +3881,7 @@ mod tests {
             SYSTEM_PERSIST_READ_MARKER,
             SYSTEM_BOOT_SUCCESS_MARKER,
             SYSTEM_DEPLOY_INSTALL_MARKER,
+            SYSTEM_DEPLOY_ROLLBACK_MARKER,
             SYSTEM_SHUTDOWN_MARKER,
             UUTILS_RUNTIME_MARKER,
             RIPGREP_FD_RUNTIME_MARKER,
@@ -4010,6 +4034,7 @@ mod tests {
             SYSTEM_PERSIST_READ_MARKER,
             SYSTEM_BOOT_SUCCESS_MARKER,
             SYSTEM_DEPLOY_INSTALL_MARKER,
+            SYSTEM_DEPLOY_ROLLBACK_MARKER,
             SYSTEM_SHUTDOWN_MARKER,
             SYSTEM_NET_UP_MARKER,
             SYSTEM_NET_RESOLVE_MARKER,
@@ -4061,6 +4086,7 @@ mod tests {
         assert!(evidence.persist_read);
         assert!(evidence.boot_success);
         assert!(evidence.deploy_install);
+        assert!(evidence.deploy_rollback);
         assert!(evidence.shutdown);
         assert!(evidence.net_up);
         assert!(evidence.net_resolve);

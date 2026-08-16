@@ -195,9 +195,40 @@ pub const SYSTEM_PERSIST_WRITE_MARKER: &str = "TD-PERSIST-WRITE-OK";
 /// first boot survives with its exact content.
 pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 
+/// The host's wall-clock ceiling on one `qemu-boot-system` boot, and the value
+/// `TD_QEMU_BOOT_TIMEOUT_SECS` overrides. A tiny allnoconfig kernel boots to
+/// userspace under TCG in a few seconds, but the persistent system modes hash their
+/// deployment, kexec, and boot a second kernel. The poll loop returns as soon as the
+/// selected mode finishes, so this bounds a failed or unusually slow boot alone.
+///
+/// It lives HERE, beside no other host constant, because it is only half of a pair:
+/// the guest's boot-success loop has a patience of its own, and a host that gives up
+/// first turns a diagnosable unhealthy boot into a bare timeout with no guest-side
+/// reason in it. `the_host_ceiling_outlasts_the_guest_loop_it_waits_for` holds the
+/// two together, and it is the reason for this number rather than any measurement:
+/// the rollback pass added deployment-sized work to the install boot — the fallback's
+/// payload digests verified, and the candidate hashed twice more by a reinstall that
+/// copies nothing — which raised the guest's per-iteration budget and so raised this.
+/// Raising it costs only how long a HUNG boot takes to be called one.
+/// It does not change what the guest does: the wait token derived from it is clamped
+/// in the generated scripts, so the retry budgets are the same at either value.
+pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 480;
+
 /// Printed after the running system installs and activates a verified candidate
 /// deployment through td-boot's fsync + atomic-rename transaction.
 pub const SYSTEM_DEPLOY_INSTALL_MARKER: &str = "TD-DEPLOY-INSTALL-OK";
+
+/// Printed after the deployment that update installed is ROLLED BACK to the one that
+/// is running, and then reinstalled — `td-install/DESIGN.md` §11's third oracle. The
+/// `previous` slot is already exercised by the automatic-rollback and corrupt-current
+/// boots; what is new here is the `rollback` VERB, driven on a running machine.
+///
+/// The reinstall is not decoration. The boots after this one expect the candidate to
+/// be current, so the pass has to end where it began; and asserting that the second
+/// install names the same deployment is what proves a rolled-back volume is one an
+/// update can still proceed from — which is the real operational sequence, an update
+/// that boots badly followed by another attempt.
+pub const SYSTEM_DEPLOY_ROLLBACK_MARKER: &str = "TD-DEPLOY-ROLLBACK-OK";
 
 /// Printed after the root-owned target passes immutable-state checks plus unprivileged
 /// uutils and SSH runtime probes, then td-boot records or confirms the deployment successful.

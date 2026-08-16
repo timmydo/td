@@ -3,8 +3,9 @@ use crate::ladder::{
     BOOT_SUCCESS_WAIT_CMDLINE_PREFIX, DEPLOY_INSTALL_CMDLINE_TOKEN, GREETER_MARKER,
     NETTEST_CMDLINE_TOKEN, NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN,
     PERSIST_WRITE_CMDLINE_TOKEN, POST_BOOTSTRAP_SH, RIPGREP_FD_RUNTIME_MARKER, SSHD_MARKER,
-    SYSTEM_BOOT_SUCCESS_MARKER, SYSTEM_DEPLOY_INSTALL_MARKER, SYSTEM_ETC_MUTABLE_MARKER,
-    SYSTEM_ETC_RO_MARKER, SYSTEM_NET_REACH_MARKER, SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
+    SYSTEM_BOOT_SUCCESS_MARKER, SYSTEM_DEPLOY_INSTALL_MARKER, SYSTEM_DEPLOY_ROLLBACK_MARKER,
+    SYSTEM_ETC_MUTABLE_MARKER, SYSTEM_ETC_RO_MARKER, SYSTEM_NET_REACH_MARKER,
+    SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
     SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
     TD_INIT_RUNTIME_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER,
@@ -16,6 +17,14 @@ use crate::td_boot_protocol;
 
 const BOOT_SUCCESS_RETRY_SECS: u8 = 3;
 const BOOT_SUCCESS_RETRY_MAX_SECS: u8 = 10;
+/// What ONE iteration of the boot-success loop may cost on a slow TCG guest: seven
+/// `su` probe blocks, four `td-boot update` passes and a `rollback`. Exactly ONE of
+/// those copies an image; what the rest add is deployment-sized READS, and the
+/// distinction is worth the words because the fixture's own size budget turns on it
+/// — see BOOTSUCCESS below. Named rather than spelled twice because the td-svc
+/// backstop and the host's own ceiling are both derived from it, and a figure that
+/// drifted between them would leave one of the two killing a healthy boot.
+const BOOT_SUCCESS_ITERATION_BUDGET_SECS: u32 = 45;
 const BOOT_FAIL_PARK_WAIT_SECS: u8 = 30;
 const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
 
@@ -787,12 +796,24 @@ mod svc_timeouts {
     /// also resolves (3s x 3) and reaches (5s connect) a real host.
     pub const NETUP: u32 = 300;
     /// The script's own retry loop is clamped to BOOT_SUCCESS_RETRY_MAX_SECS iterations,
-    /// but each runs a large probe farm (seven `su` blocks) and can run three
-    /// transactional `td-boot update` passes, so an iteration is worth seconds on a
-    /// slow disk, not one. Two of the three are cheap by construction — a refusal and
-    /// an idle tick each read a bounded manifest and stop — so only one copies an
-    /// image, which is what the budget below is sized for.
-    pub const BOOTSUCCESS: u32 = 600;
+    /// but each runs a large probe farm (seven `su` blocks) and can run four
+    /// transactional `td-boot update` passes plus a `rollback`, so an iteration is worth
+    /// seconds on a slow disk, not one. Two of the four are cheap by construction — a
+    /// refusal and an idle tick each read a bounded manifest and stop.
+    ///
+    /// Exactly ONE copies an image, and that is the first install. The REINSTALL the
+    /// rollback pass restores with copies nothing: the deployment is already published,
+    /// so `publish_bundle` finds the destination and takes its existing-bundle path. An
+    /// earlier version of this comment said two copies, which is wrong in a direction
+    /// that matters — `create_persistent_volume_layout` sizes the fixture for exactly
+    /// three deployment-sized copies, so a reader who believed it would conclude the
+    /// volume is a whole deployment short and go and "fix" a budget that is correct.
+    /// What the rollback and the reinstall really add is deployment-sized READS: the
+    /// candidate hashed again to verify it, the published copy hashed to confirm it is
+    /// the same bytes, and the FALLBACK's payload digests verified by `verify_slot` —
+    /// the fallback being the deployment that is running, since this fixture has two
+    /// deployments and not three.
+    pub const BOOTSUCCESS: u32 = 900;
     /// The park handshake: a grep and a 1s sleep, clamped to BOOT_FAIL_PARK_WAIT_SECS.
     pub const BOOTFAIL: u32 = 300;
 }
@@ -1566,7 +1587,24 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          elif ! [ -s /run/td-installed-id ]; then \
          echo 'td-boot update installed nothing from the channel holding a bundle'; \
          healthy=0; \
-         else echo {SYSTEM_DEPLOY_INSTALL_MARKER}; fi; \
+         else echo {SYSTEM_DEPLOY_INSTALL_MARKER}; \
+         if ! /bin/td-boot rollback /dev/vda /run/td-update >/run/td-rolled-id; then \
+         echo 'td-boot rollback failed after the update installed a deployment'; \
+         healthy=0; \
+         elif ! /bin/grep -q -x -F \"$deployment\" /run/td-rolled-id; then \
+         echo 'td-boot rollback did not return to the deployment that booted'; \
+         healthy=0; \
+         elif ! /bin/td-boot success /dev/vda /run/td-update \"$deployment\" \
+         >/run/td-rolled-current; then \
+         echo 'td-boot rollback printed an id without making it current'; healthy=0; \
+         elif ! /bin/td-boot {update} /dev/vda /run/td-update /run/td-volume \
+         /run/td-volume/{channel} /run/td-volume/{trusted_key} \
+         >/run/td-reinstalled-id; then \
+         echo 'td-boot update could not reinstall the deployment after a rollback'; \
+         healthy=0; \
+         elif ! /bin/grep -q -x -F -f /run/td-installed-id /run/td-reinstalled-id; then \
+         echo 'the reinstall after a rollback named a different deployment'; healthy=0; \
+         else echo {SYSTEM_DEPLOY_ROLLBACK_MARKER}; fi; fi; \
          fi; \
          if [ \"$healthy\" = 1 ]; then \
          echo {SYSTEM_BOOT_SUCCESS_MARKER}; \
@@ -3151,6 +3189,31 @@ mod tests {
     /// network — visible only to the qemu oracle. Under the inittab these jobs had NO
     /// bound, so a too-tight value is a failure mode this landing introduces, and the
     /// values are therefore reviewed constants rather than free parameters.
+    /// The td-svc backstop is not the only clock over this loop: the HOST kills the
+    /// VM at `DEFAULT_BOOT_TIMEOUT_SECS`. If it gives up first, an unhealthy boot
+    /// stops being diagnosable — the guest never reaches the branch that prints WHICH
+    /// probe failed, and the oracle reports a bare timeout instead. So the ceiling
+    /// must outlast the guest's own patience, which is the clamped iteration count
+    /// times what an iteration may cost.
+    ///
+    /// Review found this the other way round: the rollback pass raised the guest's
+    /// per-iteration budget past the host's whole ceiling, which no test noticed
+    /// because nothing related the two.
+    #[test]
+    fn the_host_ceiling_outlasts_the_guest_loop_it_waits_for() {
+        let guest = u64::from(BOOT_SUCCESS_RETRY_MAX_SECS)
+            .saturating_mul(u64::from(BOOT_SUCCESS_ITERATION_BUDGET_SECS));
+        assert!(
+            crate::ladder::DEFAULT_BOOT_TIMEOUT_SECS >= guest,
+            "the host gives up after {}s while the guest's boot-success loop may run \
+             {}s ({BOOT_SUCCESS_RETRY_MAX_SECS} iterations x \
+             {BOOT_SUCCESS_ITERATION_BUDGET_SECS}s); the VM would be killed mid-loop \
+             and the failure reported with no guest-side reason in it",
+            crate::ladder::DEFAULT_BOOT_TIMEOUT_SECS,
+            guest
+        );
+    }
+
     #[test]
     fn each_timeout_stays_above_the_worst_case_its_comment_claims() {
         // A backstop must clear its worst case with room, not by a hair: these run on a
@@ -3177,8 +3240,10 @@ mod tests {
             (
                 svc_timeouts::BOOTSUCCESS,
                 // The loop is clamped to this many iterations; budget a slow one each.
-                (BOOT_SUCCESS_RETRY_MAX_SECS as u32).saturating_mul(30),
-                "clamped iterations of seven su probe blocks plus three td-boot updates",
+                (BOOT_SUCCESS_RETRY_MAX_SECS as u32)
+                    .saturating_mul(BOOT_SUCCESS_ITERATION_BUDGET_SECS),
+                "clamped iterations of seven su probe blocks, four td-boot updates and \
+                 a rollback",
             ),
             (
                 svc_timeouts::BOOTFAIL,
@@ -5396,8 +5461,9 @@ mod tests {
             bootsuccess
                 .matches("/run/td-update /run/td-volume /run/td-volume/")
                 .count(),
-            3,
-            "all three update passes must name the volume between the mountpoint \
+            4,
+            "all four update passes — wrong key, idle, real, and the reinstall \
+             after the rollback — must name the volume between the mountpoint \
              and the channel"
         );
         // The verb takes a CHANNEL, not a bundle. Passing the candidate would
@@ -5410,12 +5476,15 @@ mod tests {
         // td-util, td-txt and td-login probe farms and the configured hostname,
         // so unscoped it false-REDS on any innocent later use of the word —
         // rewording a diagnostic here would do it — and the message it fails
-        // with points at these three passes.
+        // with points at these four passes. The scan grew with the rollback
+        // pass and so did that hazard: its four diagnostics sit inside the
+        // region now, and one reworded to say "a different candidate" would
+        // red this for no reason. None of them does today.
         let chain = bootsuccess
             .split_once(DEPLOY_INSTALL_CMDLINE_TOKEN)
-            .and_then(|(_, rest)| rest.split_once(SYSTEM_DEPLOY_INSTALL_MARKER))
+            .and_then(|(_, rest)| rest.split_once(SYSTEM_DEPLOY_ROLLBACK_MARKER))
             .map(|(chain, _)| chain)
-            .expect("the update chain runs from the cmdline token to the install marker");
+            .expect("the update chain runs from the cmdline token to the rollback marker");
         assert!(
             !chain.contains(td_boot_protocol::CHANNEL_CANDIDATE),
             "the update passes a channel; naming the candidate would look one \
@@ -5465,7 +5534,7 @@ in it'; healthy=0; elif [ -s {out} ]; then",
             "elif ! /bin/td-boot {update} /dev/vda /run/td-update {volume} {volume}/{channel} \
 {volume}/{key} >{out}; then echo 'td-boot update failed on the channel holding a \
 bundle'; healthy=0; elif ! [ -s {out} ]; then echo 'td-boot update installed nothing \
-from the channel holding a bundle'; healthy=0; else echo {marker}; fi;",
+from the channel holding a bundle'; healthy=0; else echo {marker};",
             update = td_boot_protocol::UPDATE_VERB,
             volume = "/run/td-volume",
             channel = td_boot_protocol::VOLUME_CHANNEL_DIR,
@@ -5478,6 +5547,51 @@ from the channel holding a bundle'; healthy=0; else echo {marker}; fi;",
             "the real update pass must name the channel AND the real key, and must \
              require that it INSTALLED something rather than only that it exited 0; \
              wanted\n{real_branch}\nin\n{bootsuccess}"
+        );
+        // The ROLLBACK pass, §11's third oracle, pinned whole for the reason the
+        // other two are: its five branches are only a contract joined, and
+        // separating them lets one pass while another does nothing — a rollback
+        // whose id is never compared could land anywhere, and a reinstall never
+        // compared to what the first install named would leave the volume in a
+        // state the boots after this one do not expect and blame on selection.
+        //
+        // The `success` branch is the one review had to add, and it is the only
+        // branch that observes an EFFECT rather than a printed id. A rollback
+        // that printed the right id and never rewrote `current` satisfies the
+        // comparison above it; the reinstall then finds its own id already
+        // current, takes `install_deployment`'s idempotent branch, prints that
+        // same id, and satisfies the comparison below it — so the whole pass
+        // went green without anything having rolled back. `success` refuses
+        // unless the id it is given IS current, so it is the assertion; on a
+        // deployment already marked successful it returns before doing anything
+        // else, so it is only that.
+        let rollback_branch = format!(
+            "else echo {install}; if ! /bin/td-boot rollback /dev/vda /run/td-update >{rolled}; \
+then echo 'td-boot rollback failed after the update installed a deployment'; healthy=0; \
+elif ! /bin/grep -q -x -F \"$deployment\" {rolled}; then echo 'td-boot rollback did not \
+return to the deployment that booted'; healthy=0; elif ! /bin/td-boot success /dev/vda \
+/run/td-update \"$deployment\" >{current}; then echo 'td-boot rollback printed an id \
+without making it current'; healthy=0; elif ! /bin/td-boot {update} /dev/vda \
+/run/td-update {volume} {volume}/{channel} {volume}/{key} >{again}; then echo 'td-boot \
+update could not reinstall the deployment after a rollback'; healthy=0; elif ! /bin/grep \
+-q -x -F -f {installed} {again}; then echo 'the reinstall after a rollback named a \
+different deployment'; healthy=0; else echo {marker}; fi; fi;",
+            install = SYSTEM_DEPLOY_INSTALL_MARKER,
+            update = td_boot_protocol::UPDATE_VERB,
+            volume = "/run/td-volume",
+            channel = td_boot_protocol::VOLUME_CHANNEL_DIR,
+            key = td_boot_protocol::VOLUME_TRUSTED_KEY,
+            rolled = "/run/td-rolled-id",
+            current = "/run/td-rolled-current",
+            installed = "/run/td-installed-id",
+            again = "/run/td-reinstalled-id",
+            marker = SYSTEM_DEPLOY_ROLLBACK_MARKER,
+        );
+        assert!(
+            bootsuccess.contains(&rollback_branch),
+            "the rollback pass must roll back, require the id it lands on to be the \
+             deployment that BOOTED, reinstall, and require that reinstall to name \
+             what the first install did; wanted\n{rollback_branch}\nin\n{bootsuccess}"
         );
         // The NEGATIVE half, guarded here because no gate boots a VM: the oracle
         // that would notice its absence runs only under `qemu-boot-system`. The
