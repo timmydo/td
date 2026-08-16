@@ -984,6 +984,18 @@ enum Arg {
     Required,
 }
 
+/// Names GNU declares TWICE for one option. `getopt_long` drops a later prefix
+/// match that matches the FIRST one in both option and arity (getopt.c:230),
+/// which is a comparison against the first rather than a global dedup -- so
+/// this is only the "same option" half, and the caller tests the arity.
+const SYNONYMS: &[&[&[u8]]] =
+    &[&[b"fixed-regexp", b"fixed-strings"], &[b"quiet", b"silent"]];
+
+/// Whether two long names are the same option under two spellings.
+fn synonymous(a: &[u8], b: &[u8]) -> bool {
+    SYNONYMS.iter().any(|g| g.contains(&a) && g.contains(&b))
+}
+
 /// Every long option this applet knows, so an unambiguous PREFIX resolves the
 /// way GNU's `getopt_long` accepts one (`grep --ignore-c`), an exact name
 /// always winning over being a prefix of a longer one.
@@ -995,6 +1007,7 @@ enum Arg {
 const LONG_OPTIONS: &[(&[u8], Arg)] = &[
     (b"basic-regexp", Arg::None),
     (b"extended-regexp", Arg::None),
+    (b"fixed-regexp", Arg::None),
     (b"fixed-strings", Arg::None),
     (b"after-context", Arg::Required),
     (b"before-context", Arg::Required),
@@ -1038,9 +1051,17 @@ fn resolve_long(name: &[u8], arg: &[u8]) -> Result<(&'static [u8], Arg), Vec<u8>
         if *cand == name {
             return Ok((cand, *arity));
         }
-        if cand.starts_with(name) {
-            hits.push((cand, *arity));
+        if !cand.starts_with(name) {
+            continue;
         }
+        // A second spelling of the first match is neither an ambiguity nor a
+        // possibility to report, which is glibc's rule and not a tidy-up.
+        if let Some((first, first_arity)) = hits.first() {
+            if first_arity == arity && synonymous(first, cand) {
+                continue;
+            }
+        }
+        hits.push((cand, *arity));
     }
     match hits.as_slice() {
         [one] => Ok(*one),
@@ -1163,7 +1184,7 @@ fn parse_long(
                 return Err(LongErr::Handled);
             }
         }
-        b"fixed-strings" => {
+        b"fixed-regexp" | b"fixed-strings" => {
             if !choose_syntax(conf, syntax_chosen, Syntax::Fixed) {
                 return Err(LongErr::Handled);
             }
@@ -1777,6 +1798,44 @@ fn search_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// glibc dedupes by comparing the option STRUCT -- same `has_arg`, `flag`
+    /// and `val` -- so an accidentally duplicated entry collapses there for
+    /// free. td-txt names its pairs instead, which is narrower on purpose but
+    /// leaves two things the compiler will not check: a repeated name would be
+    /// reported as ambiguous with ITSELF, and a typo in the roster silently
+    /// stops a real pair collapsing.
+    #[test]
+    fn the_option_table_and_its_synonym_roster_agree() {
+        let names: Vec<&[u8]> = LONG_OPTIONS.iter().map(|(n, _)| *n).collect();
+        for (i, n) in names.iter().enumerate() {
+            assert!(
+                !names.get(i + 1..).unwrap_or_default().contains(n),
+                "{} is declared twice, and would be ambiguous with itself",
+                String::from_utf8_lossy(n)
+            );
+        }
+        for group in SYNONYMS {
+            assert!(group.len() >= 2, "a synonym group needs two names");
+            for n in *group {
+                assert!(
+                    names.contains(n),
+                    "{} is in the synonym roster but not the table",
+                    String::from_utf8_lossy(n)
+                );
+            }
+            // Deliberately NOT asserted: that a group agrees about its
+            // argument policy. glibc collapses on `val` AND `has_arg`, so the
+            // roster is the first half and the arity test at the call site is
+            // the second. Enumerating GNU's four same-option groups, nothing
+            // reaches that second half: `fixed-*` and `color`/`colour` agree
+            // about arity, and the one pair that does NOT --
+            // `--group-separator` against `--no-group-separator`, both
+            // GROUP_SEPARATOR_OPTION -- shares no prefix but the empty one,
+            // where neither can be the first match. It is kept because the
+            // rule belongs to getopt_long rather than to this table.
+        }
+    }
 
     fn conf() -> Conf {
         Conf::default()

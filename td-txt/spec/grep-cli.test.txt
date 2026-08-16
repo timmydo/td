@@ -1575,7 +1575,11 @@ a
 ## status: 0
 ## stderr-json: ""
 
-#### an ambiguous long-option prefix is refused
+#### an ambiguous long-option prefix is refused, listing exactly what GNU lists
+# `--fixed-strings` is absent because `--fixed-regexp` is the FIRST match and
+# names the same option with the same arity, so getopt_long counts it as
+# neither an ambiguity nor a possibility. Serving the obsolete spelling is what
+# made this line GNU's: without it td-txt named `--fixed-strings` in that slot.
 ## argv: grep --f a f1
 ## file f1:
 a
@@ -1587,7 +1591,7 @@ c
 ## END
 ## stdout-json: ""
 ## status: 2
-## stderr-contains: ambiguous
+## stderr-json: "grep: option '--f' is ambiguous; possibilities: '--fixed-regexp' '--file' '--files-with-matches' '--files-without-match'\nusage: grep [-abEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
 
 #### the ambiguity names the argv ELEMENT, value and all
 # `--f` and `--f=1` are the same ambiguity -- the `=` never gets as far as
@@ -1629,17 +1633,22 @@ a
 #### an EMPTY prefix lists the whole table, so it shows the order most plainly
 # `--=` splits into an empty name and a value, and every option prefixes the
 # empty string -- so this one diagnostic is the table read out in order. Only
-# the HEAD is pinned: the full list is 33 names and would have to be re-recorded
-# by every landing that serves another option, where the head changes only if
-# the table's leading group does. Alphabetical put `--after-context` first;
-# GNU's declaration leads with the regexp-syntax group, and so does this.
+# the HEAD is pinned: the full list would have to be re-recorded by every
+# landing that serves another option, where the head changes only if the
+# table's leading group does. Alphabetical put `--after-context` first; GNU's
+# declaration leads with the regexp-syntax group, and so does this -- these
+# four ARE GNU's first four, since td-txt now serves all of them.
+#
+# Both spellings of `-F` are listed here and only one is listed under `--f`,
+# which is not an inconsistency: getopt_long compares each later match to the
+# FIRST, and the first here is `--basic-regexp`.
 ## argv: grep --= a f1
 ## file f1:
 a
 ## END
 ## stdout-json: ""
 ## status: 2
-## stderr-contains: possibilities: '--basic-regexp' '--extended-regexp' '--fixed-strings' '--after-context'
+## stderr-contains: possibilities: '--basic-regexp' '--extended-regexp' '--fixed-regexp' '--fixed-strings'
 
 #### --r agreed under either order, and is here to stay agreeing
 # Not evidence of the reorder: `--recursive` precedes `--regexp` alphabetically
@@ -1653,6 +1662,94 @@ a
 ## stdout-json: ""
 ## status: 2
 ## stderr-json: "grep: option '--r' is ambiguous; possibilities: '--recursive' '--regexp'\nusage: grep [-abEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
+#### a prefix of BOTH spellings of -F resolves rather than being ambiguous
+# The collapse is not only about what a diagnostic lists: `--fixed` prefixes
+# two names, and because they are one option it selects it instead of refusing.
+# Without that rule serving the obsolete spelling would have BROKEN `--fixed`,
+# which is why the two arrived together.
+## argv: grep --fixed a.b f1
+## file f1:
+a.b
+axb
+## END
+## stdout:
+a.b
+## END
+## status: 0
+## stderr-json: ""
+
+#### each spelling still resolves on its own once the prefix separates them
+## argv: grep --fixed-r a.b f1
+## file f1:
+a.b
+axb
+## END
+## stdout:
+a.b
+## END
+## status: 0
+## stderr-json: ""
+
+#### and the other way, which is the half a "drop the second name" rule breaks
+## argv: grep --fixed-s a.b f1
+## file f1:
+a.b
+axb
+## END
+## stdout:
+a.b
+## END
+## status: 0
+## stderr-json: ""
+
+#### --fixed-regexp is GNU's obsolete name for -F and selects the same syntax
+## argv: grep --fixed-regexp a.b f1
+## file f1:
+a.b
+axb
+## END
+## stdout:
+a.b
+## END
+## status: 0
+## stderr-json: ""
+
+#### the collapsed prefix is diagnosed under the FIRST name, not the served one
+# The second observable of the same rule, and this one has no possibilities
+# list in it at all: `getopt_long` reports `pfound->name`, so an argument
+# refused for `--fixed` is refused in the name of `--fixed-regexp`. Before this
+# landing td-txt said `--fixed-strings` here, that being the only name it had.
+## argv: grep --fixed=1 a.b f1
+## file f1:
+a.b
+axb
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: option '--fixed-regexp' doesn't allow an argument\nusage: grep [-abEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
+#### two spellings of one matcher are not conflicting matchers
+## argv: grep --fixed-regexp --fixed-strings a.b f1
+## file f1:
+a.b
+axb
+## END
+## stdout:
+a.b
+## END
+## status: 0
+## stderr-json: ""
+
+#### but the obsolete spelling still conflicts with a DIFFERENT matcher
+## argv: grep --fixed-regexp -E a.b f1
+## file f1:
+a.b
+axb
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: conflicting matchers specified\n"
 
 #### --max-c=N takes an inline argument
 ## argv: grep --max-c=1 a f1

@@ -2041,10 +2041,58 @@ td-txt-authored case files
     td-txt's own (`usage: grep [-ab...]` against GNU's `Usage: grep [OPTION]...`
     plus a `Try 'grep --help'` line), which is a divergence recorded in its own
     right. `--=` is pinned too but only at the HEAD of its
-    list: 33 names would have to be re-recorded by every landing that serves
+    list: 34 names would have to be re-recorded by every landing that serves
     another option, where the head moves only if the leading group does.
-    `--f` and `--n` stay name-only, since what still differs there is the SET
-    and no order can fix that.
+    `--n` stays name-only, since what still differs there is the SET and no
+    order can fix that. `--f` no longer does -- see below.
+
+    `--fixed-regexp` is GNU's obsolete second spelling of `-F`, and serving it
+    is what takes `--f` from SET-divergent to identical. It arrives with the
+    rule that makes it safe, because alone it would have made things WORSE:
+    `getopt_long` compares each later prefix match against the FIRST one and
+    drops it when both name the same option with the same argument policy, so
+    GNU's `--f` lists `--fixed-regexp` and NOT `--fixed-strings`. Without that
+    rule td-txt would have listed five where GNU lists four, and `--fixed`
+    -- a prefix of both spellings -- would have become ambiguous where GNU
+    resolves it. The two are one landing for that reason.
+
+    It is compared against the FIRST match and not against all of them, which
+    is the part no summary of `getopt_long` would tell you and which the corpus
+    now pins from both sides: `--f` omits `--fixed-strings`, while `--=` lists
+    it, the first match there being `--basic-regexp`. GNU behaves that way on
+    its own table too -- `--co` lists BOTH `--color` and `--colour`, equal to
+    each other in every field but not to `--context`, which it matched first.
+    A global dedup would drop one of those and be wrong.
+
+    td-txt has exactly two such pairs, `fixed-regexp`/`fixed-strings` and
+    `quiet`/`silent`, and only the first can ever collapse. Not because no
+    prefix reaches the second -- the EMPTY one does, and `--=` duly lists both
+    `--quiet` and `--silent` -- but because collapsing requires one of the pair
+    to be the FIRST match, and the only prefix matching both is the empty
+    string, whose first match is `--basic-regexp`. Their common prefix would
+    have to be at least `q`-or-`s` long to select one of them, and no string is
+    a prefix of both `quiet` and `silent` but the empty one. The roster names
+    the pair anyway, since what makes two names collapse is being one OPTION
+    rather than anything about their letters.
+
+    A third case confirms the rule from outside td-txt's own table: GNU's
+    `--colo` prefixes both `--color` and `--colour`, and GNU RESOLVES it rather
+    than refusing -- the same mechanism that makes `--fixed` resolve here.
+
+    glibc's condition is `val` AND `has_arg`, and td-txt splits it: the roster
+    above is the first half, the caller compares the arity for the second.
+    Nothing reaches that second half. Enumerating GNU's table there are exactly
+    four same-option groups -- `fixed-regexp`/`fixed-strings`,
+    `color`/`colour`, `quiet`/`silent`, and
+    `group-separator`/`no-group-separator` -- and only the last disagrees about
+    arity, sharing no prefix but the empty one, where neither can be the first
+    match. So GNU's own table never exercises the arity test either; it is kept
+    because the rule belongs to `getopt_long` rather than to one program's
+    options.
+
+    Re-sweeping the same 2,268 spellings: 24 identical where the reorder left
+    18, 24 differing by SET where it left 30, none by order. The six that moved
+    are `--f` and `--fi` in three spellings each.
 
   - `-V` is an option GNU sed still TAKES, with an argument, and td-txt refuses.
     GNU's getopt string carries it (the obsolete `--version` spelling) but its
