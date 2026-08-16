@@ -1,6 +1,10 @@
-//! td-boot verifies a deployment on the persistent volume, preferring
-//! `current` and falling back to `previous`, then invokes the confined kexec
-//! helper. Hashes detect corruption; they do not authenticate a deployment.
+//! td-boot selects a deployment on the persistent volume, preferring `current`
+//! and falling back to `previous`, then invokes the confined kexec helper.
+//! Hashes detect corruption and cannot answer who produced a deployment, so
+//! the BOOT decision also requires an ed25519 signature over the manifest,
+//! under a trust root read from the rootfs td-boot is running in. `install`
+//! and `verify` run where there is no such rootfs and check hashes alone —
+//! `td-install/DESIGN.md` §6 is why.
 #![forbid(unsafe_code)]
 
 mod protocol;
@@ -1063,6 +1067,51 @@ fn replace_signature(directory: &Path, signature: &[u8]) -> io::Result<()> {
     }
 }
 
+/// Which boot slots currently select this deployment, in slot order.
+///
+/// A slot that cannot be read is not one that selects it: a missing `previous`
+/// is the ordinary state of a freshly installed volume, not a reason to fail an
+/// install.
+fn slots_pointing_at(root: &Path, id: &str) -> Vec<&'static str> {
+    let mut live = Vec::new();
+    for slot in ["current", "previous"] {
+        if read_selector(root, slot).is_ok_and(|selected| selected == id) {
+            live.push(slot);
+        }
+    }
+    live
+}
+
+/// Say so when a re-sign replaced the signature of a slot that boots.
+///
+/// D3 wants re-signing a LIVE deployment to work — that is the whole point of
+/// the signature being detached and outside the id, so a key rotation reaches a
+/// machine that already has the deployment. What the boot flip added is that
+/// the replacement decides whether that deployment still boots, and `install`
+/// cannot check it: it runs on the real root, which per §6 has no trust root.
+/// So an operator who re-signs with the wrong key gets a machine that stops
+/// booting, and if `current` and `previous` are the same deployment there is
+/// nothing to fall back to.
+///
+/// A warning rather than a refusal because refusing is D3's feature, and rather
+/// than silence because the next report is a machine that does not come back.
+/// The real answer is for the installing rootfs to have a trust root, which is
+/// §10 item 7's to settle.
+fn warn_unverifiable_resign(root: &Path, id: &str) -> io::Result<()> {
+    let live = slots_pointing_at(root, id);
+    if live.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        io::stderr(),
+        "td-boot: warning: replaced the signature of deployment {id}, which {} \
+         point{} at; nothing here can check it — the next boot will, and will \
+         refuse the deployment if it does not verify",
+        live.join(" and "),
+        if live.len() == 1 { "s" } else { "" }
+    )
+}
+
 fn publish_bundle(root: &Path, mut bundle: VerifiedBundle) -> io::Result<String> {
     let deployments = root.join(protocol::DEPLOYMENTS_DIR);
     require_real_directory(&deployments, "deployments directory")?;
@@ -1071,7 +1120,10 @@ fn publish_bundle(root: &Path, mut bundle: VerifiedBundle) -> io::Result<String>
         Ok(_) => {
             match existing_bundle(&destination, &bundle)? {
                 Existing::Same => {}
-                Existing::Resigned(signature) => replace_signature(&destination, &signature)?,
+                Existing::Resigned(signature) => {
+                    replace_signature(&destination, &signature)?;
+                    warn_unverifiable_resign(root, &bundle.id)?;
+                }
                 Existing::SignatureWithdrawn => {
                     return Err(invalid(format!(
                         "deployment {} is already published WITH a signature and the source \
@@ -1372,7 +1424,14 @@ fn mark_deployment_successful(root: &Path, deployment_id: &str) -> io::Result<St
     Ok(deployment_id.to_string())
 }
 
-fn verified_manifest(root: &Path, id: &str) -> io::Result<(PathBuf, Manifest)> {
+/// A deployment's manifest bytes, read ONCE and bound to its id by hash.
+///
+/// Returned as bytes rather than parsed because the authenticated path needs
+/// exactly these bytes to check a signature over, and a second read to get
+/// them would be a window: check the signature against one revision, take the
+/// payload digests from another. There is one read here, and both callers work
+/// from what it returned.
+fn manifest_bytes(root: &Path, id: &str) -> io::Result<(PathBuf, Vec<u8>)> {
     require_absolute(root, "volume root")?;
     require_real_directory(root, "volume root")?;
     require_real_directory(&root.join("td"), "td directory")?;
@@ -1389,15 +1448,90 @@ fn verified_manifest(root: &Path, id: &str) -> io::Result<(PathBuf, Manifest)> {
     let directory = root.join(protocol::DEPLOYMENTS_DIR).join(id);
     require_real_directory(&directory, "deployment")?;
     let manifest_path = directory.join(protocol::MANIFEST_NAME);
-    let manifest_bytes =
-        read_bounded_real_file(&manifest_path, "deployment manifest", protocol::MAX_MANIFEST_BYTES)?;
-    let manifest_id = sha256::hex_digest(&manifest_bytes);
+    let bytes = read_bounded_real_file(
+        &manifest_path,
+        "deployment manifest",
+        protocol::MAX_MANIFEST_BYTES,
+    )?;
+    let manifest_id = sha256::hex_digest(&bytes);
     if manifest_id.as_str() != id {
         return Err(invalid(format!(
             "deployment id {id} does not match manifest hash {manifest_id}"
         )));
     }
-    let manifest = parse_manifest(&manifest_bytes)?;
+    Ok((directory, bytes))
+}
+
+fn verified_manifest(root: &Path, id: &str) -> io::Result<(PathBuf, Manifest)> {
+    let (directory, bytes) = manifest_bytes(root, id)?;
+    let manifest = parse_manifest(&bytes)?;
+    Ok((directory, manifest))
+}
+
+/// The rootfs a booting td-boot reads its trust root out of: the selector
+/// initramfs it is itself running in. Named rather than spelled at the call
+/// site so a test can state what production passes; the parameter exists so
+/// the tests can point the read somewhere writable, and has exactly one
+/// non-test caller.
+const BOOT_ROOTFS: &str = "/";
+
+/// The machine's trust root, read once per `boot` and threaded from there.
+///
+/// A distinct name because it is not interchangeable with the key argument the
+/// `authenticate` verb takes from its caller: this one comes from the rootfs
+/// td-boot is running in and nowhere else.
+type TrustRoot = [u8; ed25519::PUBLIC_KEY_LEN];
+
+/// Read the trusted key from this rootfs, where the harness put it.
+///
+/// A machine with no readable trust root cannot authenticate ANY slot, so this
+/// is a hard failure of the whole selection rather than something to fall back
+/// from — falling back to `previous` would just fail the same way, one slot
+/// later and with a message about the wrong thing. It is also what makes a
+/// mis-provisioned selector loud: per DESIGN.md §6 the kernel says nothing at
+/// all about an appendix it could not parse, so this refusal is the only
+/// report that the key never arrived.
+fn read_boot_trust_root(rootfs: &Path) -> io::Result<TrustRoot> {
+    let path = rootfs.join(protocol::TRUSTED_KEY_PATH);
+    read_trusted_key(&path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "no usable trust root at {}: {error} — this initramfs was built \
+                 without one, or its key archive did not land",
+                path.display()
+            ),
+        )
+    })
+}
+
+/// Authenticate a deployment's manifest under the machine's trust root.
+///
+/// Reached from the BOOT DECISION and nowhere downstream of it, which §6 of
+/// `td-install/DESIGN.md` forces rather than prefers: only the selector's
+/// rootfs holds the key. `verify_slot` below is the unauthenticated question
+/// `install` and `verify` ask from the real root, where there is none.
+///
+/// Returns the manifest rather than a verdict so the signature is checked over
+/// the same bytes the payload digests are parsed from. A second read to parse
+/// would be a window: signed manifest to the check, another to the parse.
+fn authenticated_manifest(
+    root: &Path,
+    id: &str,
+    key: &TrustRoot,
+) -> io::Result<(PathBuf, Manifest)> {
+    let (directory, bytes) = manifest_bytes(root, id)?;
+    let signature = read_optional_signature(&directory)?.ok_or_else(|| {
+        invalid(format!(
+            "deployment {id} carries no {} — an unsigned deployment is refused, \
+             not trusted",
+            protocol::MANIFEST_SIG_NAME
+        ))
+    })?;
+    // Before `parse_manifest`, so a deployment nobody vouched for is refused
+    // without its contents ever being interpreted.
+    authenticate_manifest(&bytes, &signature, key)?;
+    let manifest = parse_manifest(&bytes)?;
     Ok((directory, manifest))
 }
 
@@ -1406,13 +1540,51 @@ fn verify_slot(root: &Path, slot: &str) -> io::Result<Deployment> {
     verify_deployment(root, &id)
 }
 
+/// `verify_slot` for the boot decision: authentic FIRST, then whole.
+///
+/// The order is the point. A slot is refused for being unsigned before any of
+/// its payload digests are read, so the hashes that decide what to kexec are
+/// only ever hashes out of bytes the trust root vouched for.
+fn authenticated_slot(root: &Path, slot: &str, key: &TrustRoot) -> io::Result<Deployment> {
+    let id = read_selector(root, slot)?;
+    authenticated_deployment(root, id.as_str(), key)
+}
+
+/// `verify_deployment` for the boot decision, by id rather than by slot.
+///
+/// `run_boot` re-verifies the chosen deployment under the mount whose handles
+/// are passed to kexec, and does it through this rather than through
+/// `verify_deployment`. The id it re-verifies came from an authenticated
+/// selection, so the hashes alone would already bind it — the manifest must
+/// hash to that id, and the payloads to that manifest. Using this instead
+/// makes "everything handed to kexec was authenticated" a property of the call
+/// rather than of a trace back to where the id came from, which is the half a
+/// later edit can break silently.
+fn authenticated_deployment(root: &Path, id: &str, key: &TrustRoot) -> io::Result<Deployment> {
+    let (directory, manifest) = authenticated_manifest(root, id, key)?;
+    verify_deployment_payloads(&directory, id, &manifest)
+}
+
 fn verify_deployment(root: &Path, id: &str) -> io::Result<Deployment> {
     let (directory, manifest) = verified_manifest(root, id)?;
-    let kernel = verify_payload(&directory, "bzImage", &manifest.kernel)?;
-    let initramfs = verify_payload(&directory, "initramfs.cpio", &manifest.initramfs)?;
+    verify_deployment_payloads(&directory, id, &manifest)
+}
+
+/// The payload half, given a manifest a caller has already established.
+///
+/// Split so the authenticated path can hand over the manifest it checked a
+/// signature against rather than causing it to be read again — see
+/// `authenticated_manifest`.
+fn verify_deployment_payloads(
+    directory: &Path,
+    id: &str,
+    manifest: &Manifest,
+) -> io::Result<Deployment> {
+    let kernel = verify_payload(directory, "bzImage", &manifest.kernel)?;
+    let initramfs = verify_payload(directory, "initramfs.cpio", &manifest.initramfs)?;
     // Verify root here so corruption selects previous; root-loop repeats the hash
     // after kexec to bind the verified inode at the actual mount boundary.
-    verify_payload(&directory, "root.erofs", &manifest.root)?;
+    verify_payload(directory, "root.erofs", &manifest.root)?;
 
     Ok(Deployment {
         id: id.to_string(),
@@ -1455,12 +1627,17 @@ fn select_deployment(root: &Path) -> io::Result<Selection> {
     }
 }
 
-fn verified_previous_decision(
+/// The fallback decision, given an already-read `previous`.
+///
+/// Split from its callers because the two read that slot differently and must:
+/// `boot` authenticates (it is choosing what to run), `verify` cannot, because
+/// it runs on the operator's real root where §6's trust root does not exist.
+fn previous_decision(
     root: &Path,
+    previous: Deployment,
     current_error: Option<String>,
     exhausted_deployment: Option<String>,
 ) -> io::Result<BootDecision> {
-    let previous = verify_slot(root, "previous")?;
     if read_attempt_state(root, &previous.id)?.is_some() {
         return Err(invalid(format!(
             "previous deployment {} is not marked successful",
@@ -1478,7 +1655,17 @@ fn verified_previous_decision(
     })
 }
 
-fn select_boot_deployment(root: &Path) -> io::Result<BootDecision> {
+fn verified_previous_decision(
+    root: &Path,
+    current_error: Option<String>,
+    exhausted_deployment: Option<String>,
+    key: &TrustRoot,
+) -> io::Result<BootDecision> {
+    let previous = authenticated_slot(root, "previous", key)?;
+    previous_decision(root, previous, current_error, exhausted_deployment)
+}
+
+fn select_boot_deployment(root: &Path, key: &TrustRoot) -> io::Result<BootDecision> {
     require_absolute(root, "volume root")?;
     require_real_directory(root, "volume root")?;
     require_real_directory(&root.join("td"), "td directory")?;
@@ -1496,10 +1683,10 @@ fn select_boot_deployment(root: &Path) -> io::Result<BootDecision> {
         reap_attempt_temporaries(&attempts)?;
     }
 
-    let current = match verify_slot(root, "current") {
+    let current = match authenticated_slot(root, "current", key) {
         Ok(current) => current,
         Err(error) => {
-            let decision = verified_previous_decision(root, Some(error.to_string()), None)
+            let decision = verified_previous_decision(root, Some(error.to_string()), None, key)
                 .map_err(|previous| {
                     invalid(format!(
                         "no verified deployment: current rejected ({error}); \
@@ -1531,7 +1718,7 @@ fn select_boot_deployment(root: &Path) -> io::Result<BootDecision> {
         }),
         Ok(AttemptDecision::Exhausted) => {
             let exhausted = current.id;
-            match verified_previous_decision(root, None, Some(exhausted.clone())) {
+            match verified_previous_decision(root, None, Some(exhausted.clone()), key) {
                 Ok(decision) => {
                     replace_selector(root, "current", &decision.deployment_id)?;
                     Ok(decision)
@@ -1548,7 +1735,7 @@ fn select_boot_deployment(root: &Path) -> io::Result<BootDecision> {
             }
         }
         Err(error) => {
-            match verified_previous_decision(root, Some(error.to_string()), None) {
+            match verified_previous_decision(root, Some(error.to_string()), None, key) {
                 Ok(decision) => {
                     replace_selector(root, "current", &decision.deployment_id)?;
                     Ok(decision)
@@ -1796,9 +1983,9 @@ fn run_verify(root: &Path) -> io::Result<()> {
     report_fallback(&selection)?;
     let state = read_attempt_state(root, &selection.deployment.id)?;
     if selection.slot == "current" && state == Some(0) {
-        if let Ok(previous) =
-            verified_previous_decision(root, None, Some(selection.deployment.id.clone()))
-        {
+        if let Ok(previous) = verify_slot(root, "previous").and_then(|previous| {
+            previous_decision(root, previous, None, Some(selection.deployment.id.clone()))
+        }) {
             return writeln!(
                 io::stdout(),
                 "previous {} successful current-exhausted={}",
@@ -2135,12 +2322,12 @@ fn run_on_writable_volume<T>(
         .map_err(WritableVolumeFailure::into_io)
 }
 
-fn read_only_current(root: &Path) -> Option<(BootDecision, Deployment)> {
+fn read_only_current(root: &Path, key: &TrustRoot) -> Option<(BootDecision, Deployment)> {
     let id = read_selector(root, "current").ok()?;
     if read_attempt_state(root, &id).ok()?.is_some() {
         return None;
     }
-    let deployment = verify_deployment(root, &id).ok()?;
+    let deployment = authenticated_deployment(root, &id, key).ok()?;
     Some((
         BootDecision {
             slot: "current",
@@ -2158,10 +2345,11 @@ fn read_only_current(root: &Path) -> Option<(BootDecision, Deployment)> {
 fn read_only_recovery(
     root: &Path,
     transaction_error: &io::Error,
+    key: &TrustRoot,
 ) -> io::Result<(BootDecision, Deployment)> {
     let bookkeeping_error = Some(transaction_error.to_string());
-    let current = verify_slot(root, "current");
-    let previous = verify_slot(root, "previous");
+    let current = authenticated_slot(root, "current", key);
+    let previous = authenticated_slot(root, "previous", key);
     // The writable transaction owns attempt-state authority; recovery can only trust
     // verified payloads and the invariant that activation retains previous as fallback.
     match (current, previous) {
@@ -2234,13 +2422,17 @@ fn kexec_boot_decision(
 fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Result<()> {
     require_absolute(device, "volume device")?;
     require_absolute(mountpoint, "mountpoint")?;
+    // Read before the volume is touched: with no trust root nothing on it can
+    // be chosen, so the failure should name the missing key rather than
+    // whatever the first slot happens to be wrong about.
+    let key = read_boot_trust_root(Path::new(BOOT_ROOTFS))?;
     let (_transaction_lock, _device_lock, device_id) = acquire_update_locks(device)?;
     prepare_update_mountpoint(mountpoint, device_id)?;
     run_command(
         &mut mount_command(device, mountpoint),
         "read-only Btrfs mount",
     )?;
-    if let Some((decision, deployment)) = read_only_current(mountpoint) {
+    if let Some((decision, deployment)) = read_only_current(mountpoint, &key) {
         let result = kexec_boot_decision(deployment, &decision, base_cmdline);
         best_effort_unmount(mountpoint);
         return result;
@@ -2249,7 +2441,7 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
         run_command(&mut unmount_command(mountpoint), "read-only Btrfs unmount")
     {
         let result = (|| {
-            let (decision, deployment) = read_only_recovery(mountpoint, &transaction_error)?;
+            let (decision, deployment) = read_only_recovery(mountpoint, &transaction_error, &key)?;
             kexec_boot_decision(deployment, &decision, base_cmdline)
         })();
         best_effort_unmount(mountpoint);
@@ -2258,7 +2450,7 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
 
     let decision =
         match run_on_prelocked_writable_volume(device, mountpoint, device_id, |root| {
-            select_boot_deployment(root)
+            select_boot_deployment(root, &key)
         }) {
             Ok(decision) => decision,
             Err(WritableVolumeFailure::Committed {
@@ -2271,7 +2463,8 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
                         "td-boot: selection committed but Btrfs unmount failed \
                          ({unmount_error}); booting the committed deployment"
                     )?;
-                    let deployment = verify_deployment(mountpoint, &decision.deployment_id)?;
+                    let deployment =
+                        authenticated_deployment(mountpoint, &decision.deployment_id, &key)?;
                     kexec_boot_decision(deployment, &decision, base_cmdline)
                 })();
                 best_effort_unmount(mountpoint);
@@ -2280,7 +2473,7 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
             Err(WritableVolumeFailure::Mounted(transaction_error)) => {
                 let result = (|| {
                     let (decision, deployment) =
-                        read_only_recovery(mountpoint, &transaction_error)?;
+                        read_only_recovery(mountpoint, &transaction_error, &key)?;
                     kexec_boot_decision(deployment, &decision, base_cmdline)
                 })();
                 best_effort_unmount(mountpoint);
@@ -2297,7 +2490,7 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
                 )?;
                 let result = (|| {
                     let (decision, deployment) =
-                        read_only_recovery(mountpoint, &transaction_error)?;
+                        read_only_recovery(mountpoint, &transaction_error, &key)?;
                     kexec_boot_decision(deployment, &decision, base_cmdline)
                 })();
                 best_effort_unmount(mountpoint);
@@ -2314,7 +2507,7 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
     let result = (|| {
         // The writable transaction closed its payload handles before unmounting.
         // Reverify under the mount whose handles are passed to kexec.
-        let deployment = verify_deployment(mountpoint, &decision.deployment_id)?;
+        let deployment = authenticated_deployment(mountpoint, &decision.deployment_id, &key)?;
         kexec_boot_decision(deployment, &decision, base_cmdline)
     })();
     best_effort_unmount(mountpoint);
@@ -2459,6 +2652,102 @@ mod tests {
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
+    /// The one public key every fixture deployment is signed under.
+    ///
+    /// A committed VECTOR because td-boot cannot sign: `ed25519_sign.rs` is
+    /// deliberately not in this binary and `affected.rs` refuses any file under
+    /// `td-boot/src` that names it. Only public halves and signatures are
+    /// written down, the practice `td-boot/tests/README` records — whose own
+    /// fixtures cannot serve here, since a deployment that BOOTS needs payloads
+    /// that hash to what its manifest says.
+    ///
+    /// Regenerate the SET together under one fresh key, private half discarded:
+    ///
+    ///     td-net deploy keygen PRIV PUB
+    ///     td-net deploy sign <manifest> PRIV <out>      # once per tag below
+    ///
+    /// where each manifest is `fixture_manifest(tag)`. A changed payload
+    /// constant invalidates all of them, which
+    /// `every_committed_fixture_signature_verifies_over_its_own_manifest`
+    /// reports.
+    const FIXTURE_PUBLIC_KEY: &str =
+        "9ae001c47ad75dee6349d9355be09f8c19df0fbd6c038258795b10c84c24bbd1";
+
+    /// A second, UNRELATED public key — a real one from a second `td-deploy
+    /// keygen`, private half likewise discarded.
+    ///
+    /// Generated rather than derived from the key above by flipping a bit,
+    /// which is what this was at first. An ed25519 public key is a compressed
+    /// curve point, so a flipped bit is not reliably a point at all: such a key
+    /// is refused while being DECODED, and a test built on one proves that a
+    /// malformed key is rejected rather than that a signature by somebody
+    /// else's key is. Those are different properties and only the second is
+    /// what fail-closed means.
+    const FIXTURE_OTHER_PUBLIC_KEY: &str =
+        "8f73d78d4c82e12acdcc3d1a8addf056df16518732b235de0a824b0f26c62df2";
+
+    /// Keyed by `source_bundle`'s tag; `""` is `valid_deployment`'s manifest.
+    const FIXTURE_SIGNATURES: [(&str, &str); 8] = [
+        ("", "2e7f46310a09de44bcc2362dd5bf1282d72993fe2608bd92b8b42fd5c7d48378\
+              0aca392552c748994765ef3036ee1d43289a5817c6405dd4abf22f272d41eb09"),
+        ("next", "c4324706c24841f5779c144d67a420174c669bcc2b19e12f3b4258a7eb3cf41a\
+                  d1941c12e9d0e2b72ea3d7f06759c485d55992e7d8251d7259b1c475d2f34805"),
+        ("previous", "debcdd8992e3df4742ac952e3dae6465f03d081af57175a873b216d31026825b\
+                      0e0a08023330b92d952c2e684457e36bfe9d5e05109baa7a6593de344b440603"),
+        ("wrong", "360c0421b77640ffaa274f7207e6f2838348a0e54d6cb2fd74d9816fe9ca6069\
+                   f795322b6b98b9275944f254f5fe34d64fc027e4f4f24c342c4cbe87675c8100"),
+        ("recovery", "9acf3fb487a9affda20b719cc6ab58323aa198c8dfddb3aea080ff7bfea8ee37\
+                      14e8659869f8211f6fdf81c5347ab37c39bf89b305c76e878953fc86c908190d"),
+        ("first", "ef85fb87748d1030c59a0d9433626def520a29bafc5cc368efa3585f23cf89e7\
+                   914a6eae5ad25a68b2fdf74579ff36a2c7938b97b7bea448dadf2d1e7d06960b"),
+        ("current", "ba3956a36ba965e826e44888776ad9b0d0188762e269651650a7e9867252e594\
+                     8c7e25d50e2fc862524c18397ea70ee8fbf5191b1a3a1ab54deac1f8f08c2204"),
+        ("corrupt", "10bd5340cdaa56ed2863fa7b81cb69a5e5a3f28ab9baeaa0c7e23dec66165b25\
+                     3b8656f83332571c05e5e683c13bd92fc53204efc6b0ce450ab3fef34cf2f207"),
+    ];
+
+    /// The committed signature for a fixture manifest, as the hexadecimal TEXT
+    /// a real `manifest.sig` holds — so what the fixture writes goes through
+    /// the shipped parser on the way back in, rather than around it.
+    // A loop rather than the searching iterator adaptor: `ladder.rs` refuses
+    // that method's bare name anywhere in a body a recipe stages, this whole
+    // file being one, since the same token is how it catches a bootstrap step
+    // reaching for the host search utility.
+    /// The three payloads a fixture deployment carries, keyed by tag.
+    ///
+    /// One definition because the committed signatures are over the manifest
+    /// these produce: two copies would let a payload drift under a signature
+    /// that still verifies for the other.
+    fn fixture_payloads(tag: &str) -> [(&'static str, String); 3] {
+        let suffix = if tag.is_empty() { "payload" } else { tag };
+        [
+            ("bzImage", format!("kernel-{suffix}\n")),
+            ("initramfs.cpio", format!("initramfs-{suffix}\n")),
+            ("root.erofs", format!("root-{suffix}\n")),
+        ]
+    }
+
+    fn fixture_manifest(tag: &str) -> String {
+        let payloads = fixture_payloads(tag);
+        let mut manifest = String::from("td-deployment-v1\n");
+        for (label, bytes) in &payloads {
+            manifest.push_str(&sha256::hex_digest(bytes.as_bytes()));
+            manifest.push_str("  ");
+            manifest.push_str(label);
+            manifest.push('\n');
+        }
+        manifest
+    }
+
+    fn fixture_signature(tag: &str) -> &'static str {
+        for (name, hex) in FIXTURE_SIGNATURES {
+            if name == tag {
+                return hex;
+            }
+        }
+        panic!("no committed signature for fixture tag {tag:?}")
+    }
+
     struct Fixture {
         root: PathBuf,
     }
@@ -2474,42 +2763,62 @@ mod tests {
         }
 
         fn valid_deployment(&self) -> String {
-            let kernel = b"kernel-payload\n";
-            let initramfs = b"initramfs-payload\n";
-            let root = b"root-payload\n";
-            let manifest = format!(
-                "td-deployment-v1\n{}  bzImage\n{}  initramfs.cpio\n{}  root.erofs\n",
-                sha256::hex_digest(kernel),
-                sha256::hex_digest(initramfs),
-                sha256::hex_digest(root)
-            );
+            let manifest = fixture_manifest("");
             let id = sha256::hex_digest(manifest.as_bytes());
             let directory = self.root.join("td/deployments").join(&id);
             fs::create_dir(&directory).unwrap();
-            fs::write(directory.join("bzImage"), kernel).unwrap();
-            fs::write(directory.join("initramfs.cpio"), initramfs).unwrap();
-            fs::write(directory.join("root.erofs"), root).unwrap();
+            for (label, bytes) in fixture_payloads("") {
+                fs::write(directory.join(label), bytes).unwrap();
+            }
             fs::write(directory.join("manifest"), manifest).unwrap();
+            fs::write(
+                directory.join(protocol::MANIFEST_SIG_NAME),
+                format!("{}\n", fixture_signature("")),
+            )
+            .unwrap();
             id
+        }
+
+        /// The trust root these deployments verify under.
+        fn key(&self) -> TrustRoot {
+            decode_hex(FIXTURE_PUBLIC_KEY.as_bytes(), "fixture key").unwrap()
+        }
+
+        /// A key nobody signed under: the negative control for authentication.
+        ///
+        /// A whole valid key rather than a corruption of the real one, so a
+        /// refusal cannot be about the key being malformed, the wrong length,
+        /// or off the curve — only about the signature not being under THIS
+        /// key. See `FIXTURE_OTHER_PUBLIC_KEY`.
+        fn wrong_key(&self) -> TrustRoot {
+            decode_hex(FIXTURE_OTHER_PUBLIC_KEY.as_bytes(), "other fixture key").unwrap()
         }
 
         fn source_bundle(&self, name: &str, tag: &str) -> (PathBuf, String) {
             let directory = self.root.join(name);
             fs::create_dir(&directory).unwrap();
-            let kernel = format!("kernel-{tag}\n");
-            let initramfs = format!("initramfs-{tag}\n");
-            let root = format!("root-{tag}\n");
-            let manifest = format!(
-                "td-deployment-v1\n{}  bzImage\n{}  initramfs.cpio\n{}  root.erofs\n",
-                sha256::hex_digest(kernel.as_bytes()),
-                sha256::hex_digest(initramfs.as_bytes()),
-                sha256::hex_digest(root.as_bytes())
-            );
+            let manifest = fixture_manifest(tag);
             let id = sha256::hex_digest(manifest.as_bytes());
-            fs::write(directory.join("bzImage"), kernel).unwrap();
-            fs::write(directory.join("initramfs.cpio"), initramfs).unwrap();
-            fs::write(directory.join("root.erofs"), root).unwrap();
+            for (label, bytes) in fixture_payloads(tag) {
+                fs::write(directory.join(label), bytes).unwrap();
+            }
             fs::write(directory.join("manifest"), manifest).unwrap();
+            self.sign_source_verifiably(&directory, tag);
+            (directory, id)
+        }
+
+        /// A source bundle carrying NO signature, for the two tests that are
+        /// about publication of an unsigned one.
+        ///
+        /// The default is signed, and deliberately: an unsigned candidate is
+        /// refused by the boot decision for that reason alone, which silently
+        /// takes over from whatever a test was actually about. Three tests were
+        /// defeated that way before this — one of them the only cover for
+        /// `read_only_current`'s attempt-state guard, so the whole
+        /// attempt/rollback mechanism went untested while staying green.
+        fn unsigned_source_bundle(&self, name: &str, tag: &str) -> (PathBuf, String) {
+            let (directory, id) = self.source_bundle(name, tag);
+            fs::remove_file(directory.join(protocol::MANIFEST_SIG_NAME)).unwrap();
             (directory, id)
         }
 
@@ -2526,6 +2835,15 @@ mod tests {
             .unwrap();
         }
 
+        /// Sign a source bundle so the deployment it publishes AUTHENTICATES.
+        ///
+        /// Distinct from `sign_source`, which writes opaque bytes for the tests
+        /// that are only about publication carrying the file across: those
+        /// would pass just as well with garbage, and this one cannot.
+        fn sign_source_verifiably(&self, directory: &Path, tag: &str) {
+            self.sign_source(directory, fixture_signature(tag));
+        }
+
         fn published_signature(&self, id: &str) -> Option<Vec<u8>> {
             let path = self
                 .root
@@ -2533,6 +2851,15 @@ mod tests {
                 .join(id)
                 .join(protocol::MANIFEST_SIG_NAME);
             fs::read(path).ok()
+        }
+
+        /// `selector` over a slot that already exists.
+        fn selector_replace(&self, slot: &str, id: &str) {
+            let path = self.root.join(protocol::BOOT_DIR).join(slot);
+            if fs::symlink_metadata(&path).is_ok() {
+                fs::remove_file(&path).unwrap();
+            }
+            self.selector(slot, id);
         }
 
         fn selector(&self, slot: &str, id: &str) {
@@ -2698,7 +3025,7 @@ mod tests {
         let initial = fixture.valid_deployment();
         fixture.selector("current", &initial);
         fixture.selector("previous", &initial);
-        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        let (source, candidate) = fixture.unsigned_source_bundle("candidate", "next");
 
         assert_eq!(
             install_deployment(&fixture.root, &source).unwrap(),
@@ -2866,7 +3193,7 @@ mod tests {
         let initial = fixture.valid_deployment();
         fixture.selector("current", &initial);
         fixture.selector("previous", &initial);
-        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        let (source, candidate) = fixture.unsigned_source_bundle("candidate", "next");
         install_deployment(&fixture.root, &source).unwrap();
         assert_eq!(fixture.published_signature(&candidate), None);
 
@@ -2964,7 +3291,7 @@ mod tests {
         let (source, candidate) = fixture.source_bundle("candidate", "next");
 
         install_deployment(&fixture.root, &source).unwrap();
-        let first = select_boot_deployment(&fixture.root).unwrap();
+        let first = select_boot_deployment(&fixture.root, &fixture.key()).unwrap();
         assert_eq!(
             first.remaining_attempts,
             Some(protocol::DEFAULT_BOOT_ATTEMPTS - 1)
@@ -3265,8 +3592,8 @@ mod tests {
         let attempts = fixture.root.join(protocol::ATTEMPTS_DIR);
         fs::set_permissions(&attempts, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let error = select_boot_deployment(&fixture.root).err().unwrap();
-        let (decision, _) = read_only_recovery(&fixture.root, &error).unwrap();
+        let error = select_boot_deployment(&fixture.root, &fixture.key()).err().unwrap();
+        let (decision, _) = read_only_recovery(&fixture.root, &error, &fixture.key()).unwrap();
 
         assert!(error.to_string().contains("mode 0700"));
         assert_eq!(error.kind(), io::ErrorKind::Other);
@@ -3294,14 +3621,14 @@ mod tests {
         install_deployment(&fixture.root, &source).unwrap();
 
         for remaining in [2, 1, 0] {
-            let decision = select_boot_deployment(&fixture.root).unwrap();
+            let decision = select_boot_deployment(&fixture.root, &fixture.key()).unwrap();
             assert_eq!(decision.slot, "current");
             assert_eq!(decision.deployment_id, candidate);
             assert_eq!(decision.remaining_attempts, Some(remaining));
             assert!(decision.exhausted_deployment.is_none());
         }
 
-        let decision = select_boot_deployment(&fixture.root).unwrap();
+        let decision = select_boot_deployment(&fixture.root, &fixture.key()).unwrap();
         assert_eq!(decision.slot, "previous");
         assert_eq!(decision.deployment_id, initial);
         assert_eq!(decision.exhausted_deployment, Some(candidate.clone()));
@@ -3322,10 +3649,10 @@ mod tests {
         install_deployment(&fixture.root, &source).unwrap();
         fs::remove_dir_all(fixture.root.join("td/deployments").join(initial)).unwrap();
         for _ in 0..protocol::DEFAULT_BOOT_ATTEMPTS {
-            select_boot_deployment(&fixture.root).unwrap();
+            select_boot_deployment(&fixture.root, &fixture.key()).unwrap();
         }
 
-        let decision = select_boot_deployment(&fixture.root).unwrap();
+        let decision = select_boot_deployment(&fixture.root, &fixture.key()).unwrap();
 
         assert_eq!(decision.slot, "current");
         assert_eq!(decision.deployment_id, candidate);
@@ -3345,7 +3672,7 @@ mod tests {
         fixture.selector("previous", &initial);
         let (source, candidate) = fixture.source_bundle("candidate", "next");
         install_deployment(&fixture.root, &source).unwrap();
-        select_boot_deployment(&fixture.root).unwrap();
+        select_boot_deployment(&fixture.root, &fixture.key()).unwrap();
         assert_eq!(
             current_attempt_state(&fixture.root, &candidate).unwrap(),
             Some(protocol::DEFAULT_BOOT_ATTEMPTS - 1)
@@ -3360,7 +3687,7 @@ mod tests {
             current_attempt_state(&fixture.root, &candidate).unwrap(),
             None
         );
-        let decision = select_boot_deployment(&fixture.root).unwrap();
+        let decision = select_boot_deployment(&fixture.root, &fixture.key()).unwrap();
         assert_eq!(decision.deployment_id, candidate);
         assert_eq!(decision.remaining_attempts, None);
     }
@@ -3397,7 +3724,7 @@ mod tests {
         )
         .unwrap();
 
-        let decision = select_boot_deployment(&fixture.root).unwrap();
+        let decision = select_boot_deployment(&fixture.root, &fixture.key()).unwrap();
 
         assert_eq!(decision.slot, "previous");
         assert_eq!(decision.deployment_id, initial);
@@ -3420,7 +3747,7 @@ mod tests {
         )
         .unwrap();
 
-        let decision = select_boot_deployment(&fixture.root).unwrap();
+        let decision = select_boot_deployment(&fixture.root, &fixture.key()).unwrap();
 
         assert_eq!(decision.slot, "current");
         assert_eq!(decision.deployment_id, candidate);
@@ -3439,6 +3766,368 @@ mod tests {
         assert!(selected.current_error.is_none());
     }
 
+    /// The fail-closed flip: a deployment nobody vouched for does not boot.
+    ///
+    /// Every other assertion in this file is about a deployment being WHOLE.
+    /// This one is about it being VOUCHED FOR, which hashes cannot answer: the
+    /// payloads here verify perfectly and the manifest hashes to its own id, so
+    /// nothing but the signature distinguishes it from the deployments the
+    /// tests above boot.
+    #[test]
+    fn a_deployment_signed_under_another_key_does_not_boot() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+
+        let accepted = select_boot_deployment(&fixture.root, &fixture.key()).unwrap();
+        let refused = select_boot_deployment(&fixture.root, &fixture.wrong_key())
+            .err()
+            .unwrap();
+
+        // Same volume, same bytes, one byte different in the key.
+        assert_eq!(accepted.deployment_id, initial);
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            refused.to_string().contains("signature"),
+            "the refusal must name what was wrong: {refused}"
+        );
+    }
+
+    /// An unsigned deployment is refused rather than trusted, which is the
+    /// direction that matters: the absent file must not read as consent.
+    #[test]
+    fn an_unsigned_deployment_does_not_boot() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        fs::remove_file(
+            fixture
+                .root
+                .join(protocol::DEPLOYMENTS_DIR)
+                .join(&initial)
+                .join(protocol::MANIFEST_SIG_NAME),
+        )
+        .unwrap();
+
+        let refused = select_boot_deployment(&fixture.root, &fixture.key())
+            .err()
+            .unwrap();
+
+        assert!(
+            refused.to_string().contains("carries no manifest.sig"),
+            "an unsigned deployment must be refused by name: {refused}"
+        );
+    }
+
+    /// The read-only fast path authenticates too, and this is the one that
+    /// would have been easy to miss: it returns `Option`, so an unauthenticated
+    /// current does not error there — it declines, and the writable path
+    /// refuses it properly afterwards. What must not happen is a kexec.
+    #[test]
+    fn the_read_only_fast_path_declines_a_deployment_it_cannot_authenticate() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+
+        assert!(read_only_current(&fixture.root, &fixture.key()).is_some());
+        assert!(read_only_current(&fixture.root, &fixture.wrong_key()).is_none());
+    }
+
+    /// Read-only RECOVERY authenticates both slots. It runs when the writable
+    /// transaction failed, so it is the path with the least state to reason
+    /// about and the most temptation to accept whatever verifies.
+    #[test]
+    fn read_only_recovery_refuses_slots_it_cannot_authenticate() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let transaction_error = io::Error::other("read-write mount rejected");
+
+        assert!(read_only_recovery(&fixture.root, &transaction_error, &fixture.key()).is_ok());
+        let refused = read_only_recovery(&fixture.root, &transaction_error, &fixture.wrong_key())
+            .err()
+            .unwrap();
+
+        assert!(
+            refused.to_string().contains("signature"),
+            "recovery must refuse an unauthenticated slot: {refused}"
+        );
+    }
+
+    /// Authenticity is decided BEFORE any payload digest is read, so the
+    /// hashes that choose what to kexec are only ever hashes out of vouched-for
+    /// bytes. Asserted by making BOTH wrong and reading which one is reported:
+    /// a corrupt payload under a valid signature names the payload, and the
+    /// same corruption unsigned names the signature instead.
+    #[test]
+    fn authenticity_is_decided_before_a_payload_is_hashed() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let directory = fixture.root.join(protocol::DEPLOYMENTS_DIR).join(&initial);
+        fs::write(directory.join("bzImage"), b"tampered\n").unwrap();
+
+        let signed = select_boot_deployment(&fixture.root, &fixture.key())
+            .err()
+            .unwrap()
+            .to_string();
+        fs::remove_file(directory.join(protocol::MANIFEST_SIG_NAME)).unwrap();
+        let unsigned = select_boot_deployment(&fixture.root, &fixture.key())
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(signed.contains("bzImage"), "payload failure: {signed}");
+        assert!(
+            !signed.contains("manifest.sig"),
+            "a signed deployment must not be reported as unsigned: {signed}"
+        );
+        assert!(
+            unsigned.contains("carries no manifest.sig") && !unsigned.contains("bzImage"),
+            "the signature must be decided first: {unsigned}"
+        );
+    }
+
+    /// The id/manifest binding, which is what makes ONE read enough.
+    ///
+    /// A signature vouches for manifest BYTES; the selector names a deployment
+    /// by ID. Requiring the bytes to hash to the id is the join between the
+    /// two, and without it a deployment directory could serve a validly signed
+    /// manifest while its id — the thing handed to `root-loop` past the kexec —
+    /// named something else entirely.
+    #[test]
+    fn a_manifest_that_does_not_hash_to_its_directory_name_is_refused() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let manifest = fixture
+            .root
+            .join(protocol::DEPLOYMENTS_DIR)
+            .join(&initial)
+            .join(protocol::MANIFEST_NAME);
+        let mut bytes = fs::read(&manifest).unwrap();
+        bytes.extend_from_slice(b"\n");
+        fs::write(&manifest, &bytes).unwrap();
+
+        let refused = select_boot_deployment(&fixture.root, &fixture.key())
+            .err()
+            .unwrap();
+
+        assert!(
+            refused.to_string().contains("does not match manifest hash"),
+            "the id must be bound to the bytes: {refused}"
+        );
+    }
+
+    /// EVERY committed signature verifies over the manifest the fixture builds
+    /// for its tag.
+    ///
+    /// The doc on `FIXTURE_SIGNATURES` says a changed payload constant is
+    /// caught because no signature verifies afterwards. That is only true of
+    /// the tags some test happens to use — the rest would go stale in the tree
+    /// with nothing red, which is the maintenance trap the doc claims not to
+    /// be. So the table is checked as a whole, and against the SAME
+    /// `fixture_manifest` the fixture writes, so the two cannot drift.
+    ///
+    /// td-boot cannot sign, but it can verify, so this needs nothing new.
+    #[test]
+    fn every_committed_fixture_signature_verifies_over_its_own_manifest() {
+        let key: TrustRoot = decode_hex(FIXTURE_PUBLIC_KEY.as_bytes(), "fixture key").unwrap();
+        let other: TrustRoot =
+            decode_hex(FIXTURE_OTHER_PUBLIC_KEY.as_bytes(), "other key").unwrap();
+        assert_ne!(key, other, "the negative control must be a different key");
+
+        for (tag, hex) in FIXTURE_SIGNATURES {
+            let manifest = fixture_manifest(tag);
+            let signature: [u8; ed25519::SIGNATURE_LEN] =
+                decode_hex(hex.as_bytes(), "fixture signature").unwrap();
+            assert!(
+                ed25519::verify(&key, manifest.as_bytes(), &signature),
+                "the committed signature for {tag:?} does not verify — regenerate \
+                 the whole set, see FIXTURE_SIGNATURES"
+            );
+            assert!(
+                !ed25519::verify(&other, manifest.as_bytes(), &signature),
+                "{tag:?} verifies under the wrong key too, so it proves nothing"
+            );
+        }
+    }
+
+    /// Re-signing a LIVE deployment with a signature nobody can check here
+    /// really does take its bootability away — pinned as a test because the
+    /// boot flip is what created the hazard, and a hazard nothing exercises is
+    /// one the next change can quietly widen.
+    ///
+    /// D3 wants the re-sign itself to succeed (a key rotation must reach a
+    /// machine that already has the deployment) and `install` cannot check the
+    /// new signature, since per §6 the real root has no trust root. So the
+    /// install is allowed, `warn_unverifiable_resign` reports it, and this is
+    /// what the operator was warned about. The real fix is a trust root on the
+    /// installing rootfs, which is §10 item 7's.
+    #[test]
+    fn resigning_a_live_deployment_with_an_uncheckable_signature_costs_it_the_boot() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        install_deployment(&fixture.root, &source).unwrap();
+        assert_eq!(
+            select_boot_deployment(&fixture.root, &fixture.key())
+                .unwrap()
+                .deployment_id,
+            candidate
+        );
+
+        // A well-formed signature under nobody's key: 128 hex characters, so it
+        // is the SIGNATURE that fails rather than the file being malformed.
+        fixture.sign_source(&source, &"ab".repeat(ed25519::SIGNATURE_LEN));
+        install_deployment(&fixture.root, &source).unwrap();
+
+        assert_eq!(
+            slots_pointing_at(&fixture.root, &candidate),
+            vec!["current"],
+            "the warning names what it selects"
+        );
+        // ROLLBACK absorbs it while `previous` is a different, still-authentic
+        // deployment — the fail-closed refusal of `current` is exactly what the
+        // fallback exists for, so the machine still boots.
+        let decision = select_boot_deployment(&fixture.root, &fixture.key()).unwrap();
+        assert_eq!(decision.slot, "previous");
+        assert_eq!(decision.deployment_id, initial);
+        assert!(
+            decision
+                .current_error
+                .as_deref()
+                .is_some_and(|error| error.contains("signature")),
+            "the rollback must say the signature is why: {:?}",
+            decision.current_error
+        );
+
+        // What has no fallback is the case where both slots are the SAME
+        // deployment, which is the state a freshly installed machine is in.
+        // Then the re-sign really does cost the machine its boot, and nothing
+        // before the next power-on says so.
+        fs::remove_file(fixture.root.join(protocol::BOOT_DIR).join("previous")).unwrap();
+        fixture.selector("previous", &candidate);
+        fixture.selector_replace("current", &candidate);
+        let refused = select_boot_deployment(&fixture.root, &fixture.key())
+            .err()
+            .unwrap();
+        assert!(
+            refused.to_string().contains("signature"),
+            "with no distinct fallback the machine stops booting: {refused}"
+        );
+    }
+
+    /// The warning fires on exactly the slots that select the deployment, and
+    /// a volume with no `previous` is not an error — that is a freshly
+    /// installed one.
+    #[test]
+    fn a_resign_names_every_slot_that_selects_the_deployment() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+
+        assert!(slots_pointing_at(&fixture.root, &initial).is_empty());
+        fixture.selector("current", &initial);
+        assert_eq!(slots_pointing_at(&fixture.root, &initial), vec!["current"]);
+        fixture.selector("previous", &initial);
+        assert_eq!(
+            slots_pointing_at(&fixture.root, &initial),
+            vec!["current", "previous"]
+        );
+        assert!(
+            slots_pointing_at(&fixture.root, "not-a-deployment").is_empty(),
+            "a slot selecting something else is not this deployment"
+        );
+        assert!(warn_unverifiable_resign(&fixture.root, &initial).is_ok());
+    }
+
+    /// Nothing `run_boot` hands to kexec was read by an unauthenticated
+    /// reader.
+    ///
+    /// A property of the SOURCE because `run_boot` needs a block device, a
+    /// mount and a working kexec, and no unit test has any of the three — so
+    /// its four exit paths cannot be driven here at all. Each of them ends in
+    /// `kexec_boot_decision`, and what must hold is that the `Deployment` each
+    /// one passes came from an authenticating reader: `read_only_current`,
+    /// `read_only_recovery` or `authenticated_deployment`. The unauthenticated
+    /// `verify_slot`/`verify_deployment` pair exists for `install` and
+    /// `verify`, which run on the real root and have no trust root to read,
+    /// and naming either inside this function would be the fail-open D2
+    /// forbids.
+    #[test]
+    fn run_boot_reaches_kexec_through_authenticating_readers_only() {
+        let source = include_str!("main.rs");
+        let start = source
+            .split_once("\nfn run_boot(")
+            .map(|(_, rest)| rest)
+            .unwrap();
+        let body = start.split_once("\n}\n").map(|(body, _)| body).unwrap();
+        assert!(
+            body.contains("kexec_boot_decision"),
+            "the scan lost run_boot's body"
+        );
+        for unauthenticated in ["verify_slot(", "verify_deployment(", "verified_manifest("] {
+            assert!(
+                !body.contains(unauthenticated),
+                "run_boot names {unauthenticated}: every deployment it kexecs must \
+                 come from an authenticating reader"
+            );
+        }
+        // The WHOLE call, not just the name. `read_boot_trust_root(mountpoint)`
+        // reads the trust root off the Btrfs volume — the surface §6's first
+        // bullet rules out by name, since anyone who can write a forged
+        // deployment can write the matching public key beside it — and it
+        // satisfies every other assertion in this file, this one included if it
+        // only looked for the function's name.
+        assert!(
+            body.contains("read_boot_trust_root(Path::new(BOOT_ROOTFS))"),
+            "run_boot must read the trust root from its OWN rootfs"
+        );
+        assert!(
+            !body.contains("read_boot_trust_root(mountpoint"),
+            "the trust root must not come from the volume being selected from"
+        );
+    }
+
+    /// A missing trust root is a hard failure of the whole selection rather
+    /// than something to fall back from — see `read_boot_trust_root`. It is
+    /// also the ONLY report that a mis-provisioned key never arrived, because
+    /// per DESIGN.md §6 the kernel says nothing about an appendix it could not
+    /// parse.
+    #[test]
+    fn a_rootfs_without_a_trust_root_cannot_boot_anything() {
+        let fixture = Fixture::new();
+        let refused = read_boot_trust_root(&fixture.root).err().unwrap();
+
+        assert!(
+            refused.to_string().contains("no usable trust root"),
+            "the failure must name the missing key: {refused}"
+        );
+
+        let key_path = fixture.root.join(protocol::TRUSTED_KEY_PATH);
+        fs::create_dir_all(key_path.parent().unwrap()).unwrap();
+        fs::write(&key_path, format!("{FIXTURE_PUBLIC_KEY}\n")).unwrap();
+        assert_eq!(read_boot_trust_root(&fixture.root).unwrap(), fixture.key());
+    }
+
+    /// What production passes for that rootfs, stated as a literal. The
+    /// parameter exists for the test above; this is what pins the real one.
+    #[test]
+    fn the_boot_trust_root_is_read_from_the_running_rootfs() {
+        assert_eq!(BOOT_ROOTFS, "/");
+        assert_eq!(
+            Path::new(BOOT_ROOTFS).join(protocol::TRUSTED_KEY_PATH),
+            Path::new("/etc/td/deployment.pub")
+        );
+    }
+
     #[test]
     fn read_only_fast_path_accepts_only_successful_current() {
         let fixture = Fixture::new();
@@ -3446,14 +4135,14 @@ mod tests {
         fixture.selector("current", &initial);
         fixture.selector("previous", &initial);
         assert_eq!(
-            read_only_current(&fixture.root).map(|(decision, _)| decision.deployment_id),
+            read_only_current(&fixture.root, &fixture.key()).map(|(decision, _)| decision.deployment_id),
             Some(initial.clone())
         );
 
         let (source, candidate) = fixture.source_bundle("candidate", "next");
         install_deployment(&fixture.root, &source).unwrap();
 
-        assert!(read_only_current(&fixture.root).is_none());
+        assert!(read_only_current(&fixture.root, &fixture.key()).is_none());
         assert_eq!(read_selector(&fixture.root, "current").unwrap(), candidate);
     }
 
@@ -3467,7 +4156,7 @@ mod tests {
         install_deployment(&fixture.root, &source).unwrap();
         let transaction_error = io::Error::other("read-write mount rejected");
 
-        let (decision, _) = read_only_recovery(&fixture.root, &transaction_error).unwrap();
+        let (decision, _) = read_only_recovery(&fixture.root, &transaction_error, &fixture.key()).unwrap();
 
         assert_eq!(decision.slot, "previous");
         assert_eq!(decision.deployment_id, initial);
@@ -3480,7 +4169,7 @@ mod tests {
                 .join(&decision.deployment_id),
         )
         .unwrap();
-        let (decision, _) = read_only_recovery(&fixture.root, &transaction_error).unwrap();
+        let (decision, _) = read_only_recovery(&fixture.root, &transaction_error, &fixture.key()).unwrap();
         assert_eq!(decision.slot, "current");
         assert_eq!(decision.deployment_id, candidate);
     }
@@ -3527,7 +4216,7 @@ mod tests {
         )
         .unwrap();
 
-        let selected = select_boot_deployment(&fixture.root).unwrap();
+        let selected = select_boot_deployment(&fixture.root, &fixture.key()).unwrap();
 
         assert_eq!(selected.slot, "previous");
         assert_eq!(selected.deployment_id, initial);

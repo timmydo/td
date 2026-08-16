@@ -83,8 +83,9 @@ What is **missing**, and what this workstream is:
 `engine/src/gpt.rs` + `engine/src/fat.rs` (with `engine/src/crc32.rs`)
 landed toward it and are not yet consumed by anything.
 `engine/src/ed25519.rs` + `engine/src/sha512.rs` (verify-only, `aa347e60`)
-were in that list until §10 item 5: td-boot compiles them in now, though
-nothing on the boot path calls them until item 6 flips the policy.
+were in that list until §10 item 5: td-boot compiles them in, and since item
+6's flip the boot path CALLS them — no slot is selected whose manifest does
+not verify under the trust root in the selector's own rootfs.
 
 ## 3. Hard invariants
 
@@ -126,6 +127,22 @@ from a test key to a release key — **without changing its identity**, so a
 machine that already has that deployment installed still recognises it as the
 same one. Folding the signature into the id would make every re-signing a
 different deployment, and rollback would stop finding what it rolled back to.
+
+Item 6's flip gave that a consequence worth writing down. A re-sign now decides
+whether the deployment still BOOTS, and `install` cannot check the replacement:
+it runs on the real root, which per §6 has no trust root. Publishing already
+refuses to remove a signature (`SignatureWithdrawn`); it cannot refuse to
+replace one with a signature under the wrong key, because telling those apart
+is the thing it has no key for. Mostly this is absorbed by the mechanism that
+exists for it — `current` fails to authenticate and the boot rolls back to
+`previous`. What it is not absorbed by is the case where both slots select the
+SAME deployment, which is exactly the state a freshly installed machine is in:
+there the re-sign costs the machine its boot, and nothing before the next
+power-on says so. So `td-boot install` warns on stderr when a re-sign replaces
+the signature of a slot that selects it — a warning rather than a refusal
+because refusing is D3's feature, and rather than silence because the next
+report is a machine that does not come back. The real answer is a trust root on
+the installing rootfs, which is item 7's to settle.
 
 **D4. Signing happens outside the derivation.** A signing key inside a build
 would break both reproducibility (the output depends on a secret) and offline
@@ -359,8 +376,9 @@ continues**, base archive extracted and the key absent. That is precisely the
 "a missing key becomes a runtime branch" hazard named three paragraphs above
 — whose tempting branch is the fail-open D2 forbids — arriving through the
 very mechanism meant to avoid it. So the harness's own padding is the entire
-defence, and item 6's fail-closed flip is what turns a keyless boot from a
-silent one into a refusal.
+defence, and item 6's fail-closed flip is what turned a keyless boot from a
+silent one into a refusal: `run_boot` reads the trust root before it touches
+the volume, so the missing key is what gets named.
 
 One tension in the list above is worth naming rather than leaving to be
 noticed: D5 calls the ESP the least trustworthy surface on the disk —
@@ -708,20 +726,75 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    turned out to be separable from deciding what it trusts, and then twice
    more inside the answer itself.
 
-   Two of those halves are done and are what settled §6. First a newc cpio
-   WRITER in the engine (`engine/src/cpio.rs`), since the mechanism is an
-   appended archive and the tree had no writer at all. Then PROVISIONING:
-   the oracle's `RunTrust` puts a per-run public key in the selector
-   initramfs it boots and signs every deployment it stages with the private
-   half. Both are host-side and change no boot path, which is what makes
-   them separable from the flip.
+   All three halves are done. First a newc cpio WRITER in the engine
+   (`engine/src/cpio.rs`), since the mechanism is an appended archive and the
+   tree had no writer at all. Then PROVISIONING: the oracle's `RunTrust` puts
+   a per-run public key in the selector initramfs it boots and signs every
+   deployment it stages with the private half. Both are host-side and change
+   no boot path, which is what made them separable from the flip.
 
-   What remains is the POLICY, and it is deliberately last, because until
-   td-boot refuses there is nothing to distinguish a run whose key arrived
-   from one whose key did not — which per §6's alignment correction is also
-   what a misaligned appendix silently produces. The flip lands with the
-   wrong-key negative control that proves refusal happens, and it is where
-   `td-boot authenticate`'s default key path stops being merely a default.
+   Then the POLICY, deliberately last, because until td-boot refuses there is
+   nothing to distinguish a run whose key arrived from one whose key did not
+   — which per §6's alignment correction is also what a misaligned appendix
+   silently produces. `run_boot` reads the trust root from the rootfs it is
+   running in BEFORE it touches the volume, so a selector provisioned without
+   one names the missing key rather than failing about whatever the first
+   slot happens to be wrong about; and every slot the BOOT DECISION considers
+   — `select_boot_deployment`, its verified-previous fallback, and both
+   read-only paths — is authenticated before its payload digests are read.
+
+   Authentication is a property of SELECTION and could not be anything else,
+   which is what the answer to §6's key question forces: only the selector's
+   rootfs has the key, so the td-boot that runs `root-loop` after kexec and
+   the one that runs `success` after switch_root cannot check a signature.
+   Nothing is lost, because the deployment id IS the manifest hash — a
+   downstream reader holding `<id>/manifest` is holding the bytes the
+   selector authenticated or it errors.
+
+   What does NOT authenticate, and must not: `install`, which asks whether
+   the fallback slot is intact from the real root where no trust root exists,
+   and `verify`, the operator's diagnostic, which runs in the same place. The
+   two questions are separate functions — `verify_slot` for state,
+   `authenticated_slot` for the boot decision — because a key threaded
+   through the shared one would turn every install into a hard failure.
+
+   The manifest is read ONCE and the signature checked over the bytes the
+   payload digests are then parsed out of. Reading it again to parse would
+   leave a window in which a writer could serve a signed manifest to the
+   check and a different one to the parse, and an attacker who can write the
+   volume is the entire reason any of this is signed.
+
+   `run_boot` re-verifies the chosen deployment under the mount whose handles
+   go to kexec, and does that through the authenticated reader too. The id
+   came from an authenticated selection, so the hashes alone already bound
+   it; going through the authenticated reader makes "everything handed to
+   kexec was authenticated" a property of the call rather than of a trace
+   back to the id's origin, which is the half a later edit breaks silently.
+   It is asserted over the SOURCE, because `run_boot` needs a block device, a
+   mount and a working kexec, and no unit test has any of the three. That
+   assertion pins the WHOLE trust-root call and not just the function's name,
+   which is the sharpest thing review found here: `read_boot_trust_root(
+   mountpoint)` reads the key off the Btrfs volume — the surface the first
+   bullet of §6 rules out by name, since anyone who can write a forged
+   deployment can write the matching public key beside it — and it passed
+   every test in the crate. It is the most damaging single edit possible in
+   that file, it is one word, and nothing saw it.
+
+   Its negative controls are the point of the increment rather than its trim:
+   a deployment signed under another key, an unsigned one, a manifest that
+   does not hash to its directory name, and a rootfs with no trust root at
+   all. Each was verified to red by removing the guard it names. The
+   wrong-key control is a whole SECOND key rather than the trusted one with a
+   bit flipped: a public key is a compressed curve point, so a flipped bit is
+   not reliably a point at all, and a control built on one proves that a
+   malformed key is refused rather than that somebody else's signature is.
+
+   What is NOT proven is a real boot. The oracle for that is
+   `qemu-boot-system`, which wants a warm store — a cold one means building
+   the whole ladder. What stands in for it is that nothing can boot an
+   unprovisioned selector: every selector that reaches qemu comes from
+   `provision_selector`, and `VerifiedSelector`'s path is private, so the
+   store output cannot be reached around it.
 7. **`td-install`**, a standalone crate outside the workspace (D9): GPT +
    FAT32 ESP + Btrfs volume onto a device or a regular file,
    `#[path]`-including `gpt.rs`/`fat.rs`/`crc32.rs` and `protocol.rs`, and

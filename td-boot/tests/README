@@ -24,3 +24,14 @@ manifest is verified as bytes, and the digests it names are never resolved.
 Every NEGATIVE case (wrong key, tampered manifest, malformed or truncated
 signature, absent key) needs no signer, which is why those are exhaustive and
 this is not.
+
+The BOOT path needs a second set, and cannot use these. The sentence above —
+that nothing here has to match the payload bytes a test writes — is exactly
+what makes these unusable for it: a deployment that boots must carry payloads
+that hash to what its manifest names, so its manifest is decided by those
+payload bytes rather than chosen. That set therefore lives beside the fixture
+that writes them, as FIXTURE_PUBLIC_KEY and FIXTURE_SIGNATURES in
+td-boot/src/main.rs, signed the same way and under the same rule: one key,
+every fixture manifest signed with it, the private half discarded. The
+regeneration procedure is recorded there because it is the payload constants
+next to it that force a regeneration.
