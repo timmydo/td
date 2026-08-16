@@ -425,15 +425,21 @@ a
 ## stderr-contains: unrecognized option '--color=auto'
 
 #### grep refuses --include rather than searching everything
-# A glob filter that is silently ignored SEARCHES MORE than the caller asked, so
-# a refusal is the only safe reading.
+# A glob filter that is silently ignored SEARCHES MORE than the caller asked,
+# so a refusal is the only safe reading. All four of GNU's filters are in the
+# option table now and refuse from their arm rather than by being unknown --
+# which they had to be, since `--exclude' is a prefix of `--exclude-from' and
+# `--exclude-dir', and leaving the family out made `--e' and `--ex' resolve to
+# `--extended-regexp' here where GNU calls them ambiguous. The diagnostic names
+# the OPTION and not the whole argument, because the argument is no longer part
+# of what was not understood.
 ## argv: grep -r --include=*.c a .
 ## file x.txt:
 a
 ## END
 ## stdout-json: ""
 ## status: 2
-## stderr-contains: unrecognized option '--include=*.c'
+## stderr-json: "grep: unsupported option '--include'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
 
 #### and --exclude, its other half, which fails the OTHER way round
 # Ignoring `--exclude` searches more than was asked exactly as ignoring
@@ -446,7 +452,86 @@ a
 ## END
 ## stdout-json: ""
 ## status: 2
-## stderr-contains: unrecognized option '--exclude=*.c'
+## stderr-json: "grep: unsupported option '--exclude'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
+#### and --exclude-from, which reads its globs from a FILE
+# Not a duplicate of the two above: this one takes a PATH rather than a glob,
+# so it is the one whose argument the refusal never opens.
+## argv: grep -r --exclude-from=pats a .
+## file x.txt:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: unsupported option '--exclude-from'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
+#### and --exclude-dir, which prunes the WALK rather than the file list
+## argv: grep -r --exclude-dir=d a .
+## file x.txt:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-json: "grep: unsupported option '--exclude-dir'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+
+#### --e is ambiguous now, where it used to resolve to --extended-regexp
+# The reason the family had to enter the table together. Before it, `grep --e
+# pat' was `-E' here and an ambiguity in GNU -- a silent difference in what got
+# COMPILED, not a diagnostic. GNU's line is identical to this one.
+## argv: grep --e a
+## stdin:
+a
+## END
+## stdout-json: ""
+## stderr-json: "grep: option '--e' is ambiguous; possibilities: '--extended-regexp' '--exclude' '--exclude-from' '--exclude-dir'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## status: 2
+
+#### and --ex, which never had an --extended-regexp reading in GNU at all
+## argv: grep --ex a
+## stdin:
+a
+## END
+## stdout-json: ""
+## stderr-json: "grep: option '--ex' is ambiguous; possibilities: '--extended-regexp' '--exclude' '--exclude-from' '--exclude-dir'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## status: 2
+
+#### --i lists --include FIRST, which is where GNU declares it
+# The ONLY assertion that pins `include`'s slot in the table. Moving it to the
+# end of LONG_OPTIONS leaves every other case green -- measured -- because no
+# other spelling matches both `include` and a name declared near it. The list
+# still differs from GNU by `--initial-tab`, which is why this is a divergence
+# case and not a conformance one; what it pins is the ORDER of the three names
+# that ARE here. GNU answers `'--include' '--ignore-case' '--initial-tab'
+# '--invert-match'`.
+## argv: grep --i a
+## stdin:
+a
+## END
+## stdout-json: ""
+## stderr-json: "grep: option '--i' is ambiguous; possibilities: '--include' '--ignore-case' '--invert-match'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## status: 2
+
+#### and --in, which was UNAMBIGUOUS here until --include joined the table
+# The divergence this landing uncovered: `--in` matched only `--invert-match`
+# before, so the two tools disagreed about whether it was an error at all.
+# They now agree it is one and still differ by `--initial-tab`. GNU answers
+# `'--include' '--initial-tab' '--invert-match'`.
+## argv: grep --in a
+## stdin:
+a
+## END
+## stdout-json: ""
+## stderr-json: "grep: option '--in' is ambiguous; possibilities: '--include' '--invert-match'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## status: 2
+
+#### and --exc, where only the three filters remain
+## argv: grep --exc a
+## stdin:
+a
+## END
+## stdout-json: ""
+## stderr-json: "grep: option '--exc' is ambiguous; possibilities: '--exclude' '--exclude-from' '--exclude-dir'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## status: 2
 
 #### --version=x is GNU's arity error, but the usage that follows is td-txt's
 # The ERROR matches GNU exactly (`option '--version' doesn't allow an argument`,

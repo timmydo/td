@@ -2060,9 +2060,67 @@ td-txt-authored case files
     leaves TWO, `--col` and `--colo`: `color` and `colour` share a `val` and an
     arity in GNU, so glibc collapses them the way it collapses
     `--fixed-regexp`/`--fixed-strings`, which is a `SYNONYMS` entry rather than
-    a table row. None of it is done, and the reason is that a name in the table
-    is a refusal that has to say WHY, which is a per-option decision and not a
-    sweep.
+    a table row. FOUR of the thirteen are done, in the paragraph below; the
+    rest go one family at a time because a name in the table is a refusal that
+    has to say WHY, which is a per-option decision and not a sweep.
+
+    The FILTER family -- `--exclude`, `--exclude-from`, `--exclude-dir` and
+    `--include` -- is the four, and it had to enter together: `exclude` is a
+    proper prefix of the other two, so tabling one without its siblings repeats
+    the `--binary` mistake above. It also shows this entry's `-D` lesson from
+    the other side, and the sweep is what found it rather than a prediction.
+    Re-run over the same 2,268 spellings, the parent commit answers 51
+    both-ambiguous, 30 identical, 21 by SET, none by ORDER; this one answers
+    60, 36, 24, none. Two families CLOSED -- `--e` and `--ex` are byte-for-byte
+    GNU now, where td-txt had silently resolved them to `--extended-regexp`
+    while GNU called them ambiguous, which is the worst kind of divergence
+    because it differs in what got COMPILED and says nothing. And one was
+    UNCOVERED: `--in` was unambiguous here (only `--invert-match` matched) and
+    is ambiguous now that `--include` is beside it, so it joins `--i` in
+    lacking `--initial-tab`. So the by-SET count went UP by three spellings
+    while the tool moved closer to GNU, and both readings are honest -- what
+    grew is the number of divergences that are VISIBLE as diagnostics, which is
+    what a previously-silent one becomes when the option table stops guessing.
+    That leaves seven names under this sweep, in eight families: `--c`/`--co`
+    want `--color` and `--colour`, `--i`/`--in` want `--initial-tab`, `--l`
+    wants `--label` AND `--line-buffered` while `--li` wants only the second
+    (`--label` is not a `--li` prefix match, so that pair is a union and not a
+    per-family list -- a first draft of this sentence gave both names to both
+    families), and `--n`/`--no` want `--no-group-separator` and
+    `--no-ignore-case`. `--group-separator` and `--perl-regexp` are on the
+    thirteen and NOT here, because `--g` and `--p` are unambiguous in GNU and
+    so never reach this sweep's both-ambiguous bucket at all.
+
+    How much of "GNU's declaration positions" a test can actually hold is
+    narrower than the phrase suggests, and the boundary was measured rather
+    than assumed. A position is observable only through a prefix that matches
+    the moved name AND something declared near it, so: the `exclude` group is
+    pinned to sit after `--extended-regexp` (moving it to the front reds `--e`)
+    and its internal order is pinned, but moving the whole group to the END of
+    the table reds NOTHING -- no spelling matches both an `exclude` and a
+    non-`e` name, so that half of its slot is unobservable by construction and
+    no case can be written for it. `include`'s slot IS observable, through `--i`
+    and `--in` alone, and was pinned by nothing until those two cases were
+    added: moving `include` even ONE slot, past `--ignore-case`, had left the
+    corpus green. Both now red. This is the rule at the end of this entry
+    applied to a new family, and it is why the claim above is that the table
+    MATCHES GNU's order rather than that the tests prove it does.
+
+    Every "byte for byte" in this entry carries ONE unstated precondition, and
+    it is a divergence of its own that nothing here had recorded. GNU prefixes
+    a diagnostic with `argv[0]` VERBATIM, not its basename, so
+    `/usr/bin/grep --e a` opens `/usr/bin/grep: option '--e' is ambiguous`;
+    td-txt hardcodes `grep: `. So the two agree exactly when invoked as plain
+    `grep` and differ by that prefix otherwise. No case can show it -- the
+    harness runs everything with `argv[0]` = `grep` -- which is also why it
+    went unnoticed: the scripts that measured the identity claims above
+    normalised the prefix away before comparing, and a normalisation is easy to
+    mistake for a result. It applies to every diagnostic the crate emits, not
+    to the ambiguity ones alone, and it predates every landing on this branch.
+    Fixing it is a decision rather than an oversight: it means the multicall
+    reporting under whatever name it was invoked by, which for a name that is
+    not an applet is already a different message (`td-txt: unknown applet`),
+    so the change is about the multicall's identity and not about grep.
 
     The ORDER half of this was sed's and is closed: `sed --s` answered
     `'--sandbox' '--separate' '--silent'`, td-txt's alphabetical table order,
@@ -2073,11 +2131,20 @@ td-txt-authored case files
     the dispatch rather than encoded twice. grep's is that declaration too, as
     of the reorder below.
 
-    It stayed alphabetical for a long time because reordering bought nothing
-    measurable, and that was a measurement rather than a guess. What changed is
+    Every number from here to the end of this entry is AS OF THE REORDER
+    LANDING and is left standing as the record of it; the current ones are in
+    the filter-family paragraph above, which is where a re-run goes. Two
+    reviewers have now read the past tense below as a live claim -- one of them
+    filing "the table is alphabetical" as a finding against a commit that only
+    inserted into GNU's order -- so the tense is being marked rather than
+    trusted.
+
+    grep's table stayed alphabetical for a long time because reordering bought
+    nothing measurable, and that was a measurement rather than a guess. What
+    changed is
     worth more than the number. Sweeping 2,268 spellings -- every one- and
     two-character prefix over `a-z` and `-`, bare and with `=1` and `=` -- there
-    are 48 where GNU and td-txt BOTH report an ambiguity. Alphabetical answered
+    were 48 where GNU and td-txt BOTH reported an ambiguity. Alphabetical answered
     12 of them identically, 30 differed by the SET above, and SIX differed by
     ORDER ALONE: `--d` and `--de`, in three spellings each, where td-txt put
     `--dereference-recursive` first and GNU puts it last.
@@ -2091,16 +2158,21 @@ td-txt-authored case files
     is the general shape to expect as options are served, and it is why the
     sweep is re-run rather than cited.
 
-    The table is now GNU's `long_options[]` (grep.c:504) with the unserved
-    options left out and the order intact, which takes those six to ZERO: 18
-    identical, 30 by SET, none by order. GNU's table is not alphabetical in
+    The table became GNU's `long_options[]` (grep.c:504) with the unserved
+    options left out and the order intact -- which it still is, every landing
+    since having inserted into that order rather than re-sorted -- and that
+    took those six to ZERO: 18 identical, 30 by SET, none by order, again as of
+    the reorder. GNU's table is not alphabetical in
     several places and TWO of them show, differently. `--dereference-recursive`
     is declared beside `--recursive`, with seven names after it, rather than
     among the `d`s where it would sort: that moves `--d` and `--de`, and
     both become GNU byte for byte. The regexp-syntax group is hoisted to the
     front, so `--fixed-strings` precedes `--file`: that moves `--f` and `--fi`
     into GNU's arrangement without making them identical, the name in that first
-    slot being `--fixed-regexp` for GNU. A fifth listing changed and shows it
+    slot being `--fixed-regexp` for GNU. (Both ARE identical now -- serving
+    `--fixed-regexp` later put that name in that slot and closed the pair. The
+    sentence stands as what the reorder ALONE bought.) A fifth listing changed
+    and shows it
     most plainly: `--=` splits into an EMPTY name and a value, every option
     prefixes the empty string, so that one diagnostic is the whole table read
     out in order. FIVE in all, and that is an enumeration rather than an
@@ -2792,7 +2864,7 @@ td-txt-authored case files
   oracle against a new case and confirm it does NOT match, comparing status,
   stdout AND stderr: for every refusal here the whole divergence is the
   diagnostic, so a check that reads only status and stdout reports agreement.
-  54 cases, of which 52 differ; the other TWO are counts GNU never finishes, so
+  61 cases, of which 59 differ; the other TWO are counts GNU never finishes, so
   they are not comparable by construction and their divergence is the
   non-finishing itself. This number had gone STALE -- it read 36 while the file
   held 33, five commits having touched the file without re-running it, which is
