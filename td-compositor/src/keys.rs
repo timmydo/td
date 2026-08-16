@@ -491,6 +491,39 @@ impl Viewport {
                 .min(history.lines),
             Action::Scroll(Scroll::Forward) => current.saturating_sub(page_lines(rows)),
         };
+        self.anchor_at(next, history);
+    }
+
+    /// Move by a count of LINES rather than by what a key does. A wheel is
+    /// the caller: a notch is not a key press, so it does not go through
+    /// `Action` — that enum is "what one key press does", and a notch
+    /// arriving as one would be a third thing a key could mean.
+    ///
+    /// `back` is toward older lines, which is the direction a wheel turned
+    /// away from the operator asks for. Signed rather than two methods
+    /// because a wheel reports a signed count and splitting it here would
+    /// put the sign test in every caller.
+    pub fn by_lines(&mut self, back: i32, history: Scrollback) {
+        let current = self.offset(history);
+        let next = if back >= 0 {
+            current
+                .saturating_add(usize::try_from(back).unwrap_or(usize::MAX))
+                .min(history.lines)
+        } else {
+            // `unsigned_abs` rather than `-back`: `i32::MIN` has no positive
+            // counterpart, so negating it overflows — a panic in a debug
+            // build, which this crate does not permit anywhere. Nothing a
+            // wheel reports comes near it; the spelling is what makes that
+            // irrelevant rather than an argument about the input.
+            current.saturating_sub(usize::try_from(back.unsigned_abs()).unwrap_or(usize::MAX))
+        };
+        self.anchor_at(next, history);
+    }
+
+    /// The half both movers share: an OFFSET becomes the anchor that names
+    /// it. Zero is the live bottom and is `None` rather than a line number,
+    /// so the view follows new output instead of pinning to where it was.
+    fn anchor_at(&mut self, next: usize, history: Scrollback) {
         self.anchor = if next == 0 {
             None
         } else {
@@ -1556,6 +1589,61 @@ mod tests {
             pushed,
             lines,
         }
+    }
+
+    #[test]
+    fn a_line_count_moves_the_viewport_and_stops_where_a_page_does() {
+        // A wheel does not go through `Action`, so this is the second way to
+        // move the view and it has to clamp at both ends exactly as the keys
+        // do — a wheel that ran past the oldest line would show blank rows,
+        // and one that ran past the newest would stop following output.
+        let past = history(500, 100);
+        let mut viewport = Viewport::new();
+        viewport.by_lines(3, past);
+        assert_eq!(viewport.offset(past), 3);
+        viewport.by_lines(3, past);
+        assert_eq!(viewport.offset(past), 6);
+        viewport.by_lines(-4, past);
+        assert_eq!(viewport.offset(past), 2);
+
+        // Back to the live bottom is `None`, not line zero: the difference is
+        // whether the view FOLLOWS new output, and a wheel returning to the
+        // bottom must leave it following.
+        viewport.by_lines(-2, past);
+        assert_eq!(viewport.offset(past), 0);
+        assert!(!viewport.viewing(past));
+        viewport.by_lines(-9, past);
+        assert_eq!(viewport.offset(past), 0);
+        assert!(!viewport.viewing(past));
+
+        // And the far end clamps to what history HOLDS rather than to what it
+        // has ever pushed.
+        viewport.by_lines(i32::MAX, past);
+        assert_eq!(viewport.offset(past), past.lines);
+        viewport.by_lines(1, past);
+        assert_eq!(viewport.offset(past), past.lines);
+
+        // The far-end clamp is a WRITE-side one, and `offset` clamps on the
+        // read side too — so it shows only once history GROWS. Without it a
+        // flick past the oldest line writes an anchor beyond history, which
+        // later output brings back into range: the view jumps to a line
+        // nobody scrolled to, seconds after the flick that caused it.
+        let small = history(10, 5);
+        let mut later = Viewport::new();
+        later.by_lines(100, small);
+        assert_eq!(later.offset(small), 5, "clamped to what history holds");
+        let grown = history(50, 50);
+        assert_eq!(
+            later.offset(grown),
+            45,
+            "the anchor was written past history and jumped when it grew"
+        );
+
+        // `i32::MIN` is the value a magnitude cannot be taken of by negating
+        // — `-i32::MIN` overflows. Asserted for the PANIC rather than for the
+        // answer, which saturating either way would also reach.
+        viewport.by_lines(i32::MIN, past);
+        assert_eq!(viewport.offset(past), 0);
     }
 
     #[test]

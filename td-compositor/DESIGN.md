@@ -1825,9 +1825,13 @@ These are the compositor and client proofs. The td-term proof of section 14
 has landed and superseded the demo-specific `TD-UI-CLIENT-READY` requirement;
 the entry-point and image-roster requirements stand, the demo being a launcher
 entry still. Where a bullet below says "the boot client" it now means td-term,
-except the pointer clause: the demo required a seat advertising POINTER and
-KEYBOARD, and the terminal requires only a keyboard, so that clause is the
-demo's alone and is proved from the launcher rather than at boot.
+except the pointer clause. The terminal takes a pointer now, for its wheel,
+and consumes every framed event on it — but that is proved by HOST tests over
+`Surface::dispatch`, not by the boot oracle, which delivers the boot client no
+pointer input. So the clause stays the demo's and stays proved from the
+launcher; moving it would mean claiming a boot proof that does not run.
+Nothing about the terminal REQUIRES the capability either: it binds a pointer
+only where a seat offers one.
 
 The landing must prove:
 
@@ -2104,12 +2108,11 @@ input devices, sockets, clocks, the filesystem, or ambient environment.
 Focused keyboard and pointer delivery now connect the demo client to the
 existing evdev input path, and the launcher has a filterable
 application registry with a terminal entry, and the terminal is the first
-client the BOOT starts, in place of the demo. Pointer axes are landed: a
-wheel reaches clients as `wl_pointer.axis`, with the source and notch count
-version 5 asks for. What is NOT landed is a client acting on one — the
-terminal's scrollback still moves by key alone, so scrolling over it does
-nothing yet. Clipboard, client cursor rendering, hotplug, and real DRM/KMS
-profiles follow. The terminal stack has the separate contract below.
+client the BOOT starts, in place of the demo. Pointer axes are landed on both
+sides: a wheel reaches clients as `wl_pointer.axis`, with the source and notch
+count version 5 asks for, and the terminal binds a `wl_pointer` and scrolls
+its scrollback with one. Clipboard, client cursor rendering, hotplug, and real
+DRM/KMS profiles follow. The terminal stack has the separate contract below.
 
 Of that contract these are built: the parser and terminal model, the native
 corpus including its `key` operations, the keyboard adapter of section 11
@@ -2570,6 +2573,35 @@ one-row grid still scrolls by one rather than not at all. Both stop at the
 ends: there is nothing above the oldest retained line and nothing below the
 live screen, so a chord at either end is inert rather than an error.
 
+A WHEEL moves the same viewport three lines a detent, and reaches it by a
+second route rather than through `Action`: that enum is what one KEY PRESS
+does, and a notch arriving as one would be a third thing a key could mean. It
+is three rather than a page because a wheel is turned in flicks — a page a
+notch overshoots, and a line a notch makes crossing a screenful a dozen
+turns. The count comes from `axis_discrete`, which is the event that carries
+it; deriving it from the axis VALUE would need the compositor's own
+units-per-detent, a number no client is given. An `axis` event arriving with
+no discrete beside it is therefore IGNORED rather than read as one notch: the
+terminal requires its seat at version 5 or above, where a wheel always carries
+its count, so the only source that sends a bare axis is a smooth-scrolling one
+— and each of its many small events becoming a whole notch would make a
+trackpad scroll uncontrollably.
+
+A `wl_pointer.frame` is what APPLIES the accumulated notches, not each axis
+event: the frame is the transaction, so a tilting wheel — which reports both
+axes at once — moves the view once and repaints once for one flick. The
+horizontal axis is read and discarded rather than assumed absent, since a
+terminal has no sideways scrollback and counting the two together would send
+a sideways flick up the history.
+
+The pointer takes a DYNAMIC object id rather than a fixed one, and that is
+forced by the capability gate rather than chosen. Ids are per-client and must
+be DENSE. A fixed id reserved for the pointer is skipped on a keyboard-only
+seat, where the object is never created — precisely the gap a compliant
+compositor disconnects for, and one nothing in td would report, since td's own
+server checks only uniqueness. A dynamic id is dense either way, being handed
+out when the object is actually asked for.
+
 The viewport stores the line it is looking at in a monotonic numbering of
 lines ever pushed to primary history, not a distance from the live bottom,
 because the bottom moves. A stored distance would let a child writing
@@ -2724,7 +2756,12 @@ grid rather than to a rectangle: 80 columns by 24 rows, multiplied out by the
 pinned font's cell, since that is what a terminfo entry and anything drawing a
 box assume when they cannot ask. Each axis declines independently. Its fixed
 object ids run densely to one past the last it creates, which is one lower
-than the demo's: it binds a seat and creates a keyboard, but no pointer.
+than the demo's: it binds a seat and creates a keyboard, and its `wl_pointer`
+is a DYNAMIC object rather than a fixed one because a seat may not offer the
+capability. The density is what matters rather than the number — libwayland's
+object map refuses an insert past the end of its array, so a client that
+skipped an id it never created could be disconnected by a compliant
+compositor.
 
 Safe `Command` cannot call `setsid(2)`, and `pre_exec` would introduce a second
 unsafe surface. The declared td-init input therefore extends `cttyhack` with

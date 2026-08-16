@@ -45,11 +45,13 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const PROC_STATUS: &str = "/proc/self/status";
 const ETC_PASSWD: &str = "/etc/passwd";
 
-/// One past the last fixed id the TERMINAL creates. It binds a seat and
-/// creates a keyboard, but no POINTER — it reads no motion and no buttons —
-/// so its dynamic range starts one lower than the demo's. Starting where the
-/// demo does would SKIP the pointer's id, which Wayland forbids. See `conn`'s
-/// note.
+/// One past the last fixed id the TERMINAL creates: a seat and a keyboard.
+/// Its `wl_pointer` is NOT among them, and that is the whole reason it takes
+/// a DYNAMIC id — the pointer is created only where the seat advertises the
+/// capability, so a fixed id reserved for it would be skipped on a
+/// keyboard-only seat, and Wayland forbids the gap. A dynamic id is dense
+/// either way, being one the connection hands out when it is actually asked
+/// for. See `conn`'s note on why this is per-client.
 const FIRST_DYNAMIC_ID: u32 = KEYBOARD + 1;
 
 /// What an operator sees in a title bar. td's own compositor now KEEPS this
@@ -125,7 +127,12 @@ fn bind_globals(connection: &mut Connection) -> Result<Bound, String> {
         Globals::require(globals.compositor(), "wl_compositor", 4, 4)?;
     let (shm_name, shm_version) = Globals::require(globals.shm(), "wl_shm", 1, 1)?;
     let (xdg_name, xdg_version) = Globals::require(globals.xdg_wm_base(), "xdg_wm_base", 1, 1)?;
-    let (seat_name, seat_version) = Globals::require(globals.seat(), "wl_seat", 5, 7)?;
+    let (seat_name, seat_version) = Globals::require(
+        globals.seat(),
+        "wl_seat",
+        SEAT_VERSION_MINIMUM,
+        SEAT_VERSION_MAXIMUM,
+    )?;
     conn::bind(
         connection,
         compositor_name,
@@ -160,6 +167,38 @@ const XDG_STATE_ACTIVATED: u32 = 4;
 /// number here: a wrong bit is a terminal that never asks for a keyboard, or
 /// one that asks the moment a pointer appears.
 const SEAT_KEYBOARD: u32 = 2;
+
+/// `WL_SEAT_CAPABILITY_POINTER`, pinned for the same reason: a wrong bit is a
+/// terminal that asks for a pointer when a keyboard appears, and Wayland makes
+/// a `get_pointer` on a seat without the capability a protocol error.
+const SEAT_POINTER: u32 = 1;
+
+/// Lines one detent scrolls. Three is the convention every other terminal
+/// follows, and the reason it is not one is that a wheel is turned in flicks:
+/// a notch per line makes reaching the top of a screenful a dozen turns.
+/// A PAGE is what the keys do, and a wheel that paged would overshoot.
+const LINES_PER_NOTCH: i32 = 3;
+
+/// `WL_POINTER_AXIS_VERTICAL_SCROLL`. A terminal has no horizontal
+/// scrollback, so the other axis is read only to be ignored — and it must be
+/// READ rather than assumed absent, since a tilting wheel sends both and
+/// counting them together would scroll a sideways flick up the history.
+const POINTER_AXIS_VERTICAL: u32 = 0;
+
+/// The `wl_seat` version range this binds, and the wheel depends on BOTH ends
+/// of it rather than on either alone. The floor is what guarantees a
+/// `wl_pointer.frame` — the event the accumulated notches are applied on — and
+/// an `axis_discrete` beside every wheel axis; below 5 neither exists, so the
+/// wheel would accumulate forever and never scroll, with nothing failing. The
+/// ceiling is what keeps `axis_value120` and `axis_relative_direction` from
+/// arriving, since this client has no arm for either and its catch-all is
+/// fatal. Named so those are relations rather than two numbers in a call
+/// nobody connects to this module.
+const SEAT_VERSION_MINIMUM: u32 = 5;
+const SEAT_VERSION_MAXIMUM: u32 = 7;
+/// Checked where it cannot be skipped, as the server's deprecation bound is:
+/// both are constants, so a test asserting it would only ever be true.
+const _: () = assert!(SEAT_VERSION_MINIMUM >= 5 && SEAT_VERSION_MAXIMUM <= 7);
 
 /// `WL_KEYBOARD_KEY_STATE_RELEASED` and `_PRESSED`, the only two a version-1
 /// wl_keyboard may send. Checked rather than merely consumed because the
@@ -245,6 +284,16 @@ struct Surface {
     /// capabilities, and a second one into the same object id is a protocol
     /// error rather than a second keyboard.
     keyboard_requested: bool,
+    /// The `wl_pointer`'s id, and the once-only flag in one: a seat may
+    /// re-announce, and a second `get_pointer` is both a wasted id and — into
+    /// the same one — a protocol error. `None` until a seat offers the
+    /// capability, which is also how a keyboard-only seat is served.
+    pointer: Option<u32>,
+    /// Detents accumulated since the last `wl_pointer.frame`. A frame is the
+    /// transaction, so a report that turned the wheel is applied once when it
+    /// closes rather than per axis event — which is also what keeps a tilting
+    /// wheel from repainting twice for one flick.
+    pending_notches: i32,
     /// Whether the compositor's keymap has been received and matched against
     /// td's pinned one. §11 makes this a precondition of the child starting.
     keymap_verified: bool,
@@ -304,6 +353,8 @@ impl Surface {
             stale: false,
             seat_capabilities: None,
             keyboard_requested: false,
+            pointer: None,
+            pending_notches: 0,
             keymap_verified: false,
             modifiers: 0,
             group: 0,
@@ -408,6 +459,13 @@ impl Surface {
                         keyboard.u32(KEYBOARD);
                         connection.send(SEAT, 1, keyboard)?;
                         self.keyboard_requested = true;
+                    }
+                    if capabilities & SEAT_POINTER != 0 && self.pointer.is_none() {
+                        let id = connection.allocate_id()?;
+                        let mut pointer = wire::Builder::new();
+                        pointer.u32(id);
+                        connection.send(SEAT, 0, pointer)?;
+                        self.pointer = Some(id);
                     }
                 }
                 // The seat's name, which nothing here reads.
@@ -539,6 +597,99 @@ impl Surface {
                 _ => {
                     return Err(format!(
                         "unexpected wl_keyboard event opcode={}",
+                        message.opcode
+                    ))
+                }
+            }
+            return Ok(false);
+        }
+        if Some(message.object) == self.pointer {
+            let mut args = wire::Cursor::new(&message.payload);
+            match message.opcode {
+                // enter and leave, whose SURFACE is checked for the reason
+                // the keyboard's is twenty lines up: a mismatch means the
+                // compositor has confused this client with another, and a
+                // terminal acting on another window's pointer would be acting
+                // on that confusion rather than reporting it. Motion and
+                // button carry no surface and are dropped — this client acts
+                // on neither, and they have arms because the catch-all below
+                // is fatal.
+                0 => {
+                    args.u32()?;
+                    let object = args.u32()?;
+                    if object != SURFACE {
+                        return Err(format!("wl_pointer entered unexpected surface {object}"));
+                    }
+                    args.i32()?;
+                    args.i32()?;
+                    args.finish()?;
+                }
+                1 => {
+                    args.u32()?;
+                    let object = args.u32()?;
+                    if object != SURFACE {
+                        return Err(format!("wl_pointer left unexpected surface {object}"));
+                    }
+                    args.finish()?;
+                }
+                2 => {
+                    args.u32()?;
+                    args.i32()?;
+                    args.i32()?;
+                    args.finish()?;
+                }
+                3 => {
+                    args.u32()?;
+                    args.u32()?;
+                    args.u32()?;
+                    args.u32()?;
+                    args.finish()?;
+                }
+                // axis: the DISTANCE, which this client does not read. The
+                // notch count comes from `axis_discrete` instead, that being
+                // the event which carries it — turning a distance back into
+                // notches would need the compositor's own units-per-detent, a
+                // number no client is given. Treating a bare axis as one notch
+                // would be worse than ignoring it: a smooth-scrolling source
+                // sends no discrete at all and many small axis events, and
+                // each would become a whole notch. Nothing is lost by the
+                // silence, since the seat is required at version 5 or above
+                // and a wheel there always carries its count.
+                4 => {
+                    args.u32()?;
+                    args.u32()?;
+                    args.i32()?;
+                    args.finish()?;
+                }
+                // frame: the transaction closes, so the wheel is applied.
+                5 => {
+                    args.finish()?;
+                    let notches = std::mem::take(&mut self.pending_notches);
+                    self.scroll_wheel(notches);
+                }
+                // axis_source and axis_stop, both parsed and dropped: this
+                // terminal treats every scroll the same, and a wheel sends no
+                // stop. axis_discrete is the one that means something.
+                6 => {
+                    args.u32()?;
+                    args.finish()?;
+                }
+                7 => {
+                    args.u32()?;
+                    args.u32()?;
+                    args.finish()?;
+                }
+                8 => {
+                    let axis = args.u32()?;
+                    let discrete = args.i32()?;
+                    args.finish()?;
+                    if axis == POINTER_AXIS_VERTICAL {
+                        self.pending_notches = self.pending_notches.saturating_add(discrete);
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "unexpected wl_pointer event opcode={}",
                         message.opcode
                     ))
                 }
@@ -680,6 +831,22 @@ impl Surface {
         let rows = self.cells.map_or(0, |(rows, _)| usize::from(rows));
         let before = self.viewport.offset(self.history);
         self.viewport.apply(action, rows, self.history);
+        self.stale |= self.viewport.offset(self.history) != before;
+    }
+
+    /// Move the view by a wheel's worth. `notches` is the PROTOCOL's sign,
+    /// where positive is a downward movement of the surface's own content —
+    /// so it scrolls toward the live bottom, and a wheel turned away from the
+    /// operator, which arrives negative, goes back into history.
+    fn scroll_wheel(&mut self, notches: i32) {
+        if notches == 0 {
+            return;
+        }
+        let before = self.viewport.offset(self.history);
+        self.viewport.by_lines(
+            notches.saturating_neg().saturating_mul(LINES_PER_NOTCH),
+            self.history,
+        );
         self.stale |= self.viewport.offset(self.history) != before;
     }
 
@@ -1261,9 +1428,14 @@ fn serve_event(
                         .and_then(|terminal| terminal.mode("application-cursor"))
                         .unwrap_or(false),
                 };
-                // The viewport clamps against this on every read, so it has
-                // to be what history holds NOW rather than when the view was
-                // opened: output and eviction both move it underneath.
+            }
+            // The viewport clamps against this on every read, so it has to be
+            // what history holds NOW rather than when the view was opened:
+            // output and eviction both move it underneath. BOTH input devices
+            // move that view — a wheel reading the cache a keystroke last left
+            // would scroll against a history the child has since written to,
+            // and after a boot with no keys pressed that is no history at all.
+            if message.object == KEYBOARD || Some(message.object) == surface.pointer {
                 surface.history = model.as_ref().map(Terminal::scrollback).unwrap_or_default();
             }
             if !connection.handle_common(&message)? {
@@ -1855,8 +2027,10 @@ mod tests {
     /// Wayland ids must be allocated DENSELY, and td's own server only checks
     /// uniqueness — so nothing at runtime would report a gap. What the
     /// terminal uses has to be exactly 1..FIRST_DYNAMIC_ID with nothing
-    /// skipped, and the demo's higher start would skip the pointer's id,
-    /// the one fixed object this client does not create.
+    /// skipped, and the demo's higher start would skip the pointer's id: the
+    /// terminal's pointer is not a FIXED object, because it exists only where
+    /// a seat offers the capability and an id reserved for one that is never
+    /// created is precisely the gap this guards against.
     #[test]
     fn the_terminal_leaves_no_gap_before_its_first_dynamic_id() {
         let mut used = vec![
@@ -1879,10 +2053,64 @@ mod tests {
             (1..FIRST_DYNAMIC_ID).collect::<Vec<u32>>(),
             "the terminal's fixed ids are not dense up to its dynamic range"
         );
-        // The one it deliberately does not create is the gap the demo's start
-        // would leave. A const block, since both sides are constants and a
-        // build that cannot satisfy it should not produce a test binary.
+        // The demo reserves one for its pointer; this client must not, or a
+        // keyboard-only seat leaves that id created by nobody. A const block,
+        // since both sides are constants and a build that cannot satisfy it
+        // should not produce a test binary.
         const { assert!(POINTER >= FIRST_DYNAMIC_ID) };
+    }
+
+    /// The assertion above is over CONSTANTS, so it cannot see the case that
+    /// actually breaks: a seat offering no pointer. The terminal must still
+    /// have allocated nothing below its dynamic range, and must still hand
+    /// the next object the FIRST id in it — a reserved-and-unused id is the
+    /// gap a compliant compositor refuses, and td's own server would not.
+    #[test]
+    fn a_keyboard_only_seat_leaves_no_id_reserved_and_uncreated() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
+        assert_eq!(connection.next_id_for_test(), FIRST_DYNAMIC_ID);
+        let mut capabilities = Vec::new();
+        capabilities.extend_from_slice(&SEAT_KEYBOARD.to_ne_bytes());
+        surface
+            .dispatch(&mut connection, &message(SEAT, 0, capabilities), fallback)
+            .unwrap();
+        assert!(surface.pointer.is_none());
+        assert_eq!(
+            connection.next_id_for_test(),
+            FIRST_DYNAMIC_ID,
+            "a keyboard-only seat consumed an id"
+        );
+        assert_eq!(connection.allocate_id().unwrap(), FIRST_DYNAMIC_ID);
+
+        // And a seat that DOES offer one spends exactly that id on it, so the
+        // pointer is inside the dense range rather than beside it.
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        let mut capabilities = Vec::new();
+        capabilities.extend_from_slice(&(SEAT_KEYBOARD | SEAT_POINTER).to_ne_bytes());
+        surface
+            .dispatch(&mut connection, &message(SEAT, 0, capabilities), fallback)
+            .unwrap();
+        assert_eq!(surface.pointer, Some(FIRST_DYNAMIC_ID));
+        assert_eq!(
+            connection.allocate_id().unwrap(),
+            FIRST_DYNAMIC_ID.saturating_add(1)
+        );
     }
 
     /// The size arrives on one event and takes effect on another. A toplevel
@@ -3048,6 +3276,91 @@ mod tests {
         assert!(surface.frame_in_flight(), "the redraw produced no frame");
     }
 
+    /// A wheel reads the SCROLLBACK CACHE, and only a keyboard event used to
+    /// refresh it. Driven through `serve_event` rather than by assigning the
+    /// cache, because assigning it is exactly what hides this: after a boot
+    /// with no key pressed the cache is empty, so the child could print a
+    /// screenful and the wheel would still see nothing to scroll. ("See"
+    /// rather than the obvious verb: this file is `include_str!`'d into the
+    /// td-compositor recipe, so its text is scanned as a bootstrap step's and
+    /// that verb is a retired host command.)
+    #[test]
+    fn a_wheel_scrolls_output_that_arrived_without_a_keystroke() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        surface.xrgb = true;
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let fallback = default_size(&font).unwrap();
+        surface.current = Some(fallback);
+        let mut model = None;
+        adopt_size(&mut connection, &mut surface, &mut model, &session).unwrap();
+
+        let mut serve = |surface: &mut Surface, model: &mut Option<Terminal>, event| {
+            serve_event(
+                &mut connection,
+                surface,
+                model,
+                &session,
+                fallback,
+                &mut Child::default(),
+                event,
+            )
+            .unwrap()
+        };
+
+        // The seat offers a pointer. No keystroke anywhere in this test.
+        let mut capabilities = Vec::new();
+        capabilities.extend_from_slice(&(SEAT_KEYBOARD | SEAT_POINTER).to_ne_bytes());
+        serve(
+            &mut surface,
+            &mut model,
+            Event::Wayland(message(SEAT, 0, capabilities)),
+        );
+        let pointer = surface.pointer.expect("the seat offered a pointer");
+
+        // Enough output to push lines into history.
+        let mut written = Vec::new();
+        for line in 0..60u32 {
+            written.extend_from_slice(format!("L{line}\r\n").as_bytes());
+        }
+        serve(&mut surface, &mut model, Event::Output(written));
+        let held = model.as_ref().map(Terminal::scrollback).unwrap_or_default();
+        assert!(held.lines > 0, "the fixture pushed nothing into history");
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_ne_bytes());
+        payload.extend_from_slice(&(-1i32).to_ne_bytes());
+        serve(
+            &mut surface,
+            &mut model,
+            Event::Wayland(message(pointer, 8, payload)),
+        );
+        serve(
+            &mut surface,
+            &mut model,
+            Event::Wayland(message(pointer, 5, Vec::new())),
+        );
+        assert_eq!(
+            surface.viewport.offset(held),
+            usize::try_from(LINES_PER_NOTCH).unwrap(),
+            "the wheel scrolled against a stale history"
+        );
+    }
+
     /// Output before the first configure has nothing to feed. It cannot happen
     /// — the child is started after the terminal is up — so it is a fault
     /// rather than something to swallow.
@@ -3648,12 +3961,222 @@ mod tests {
         ));
     }
 
-    /// The seat's capabilities are what make the terminal ask for a keyboard,
-    /// and it asks exactly once. A seat may re-announce — a device arriving
-    /// makes it — and a second `get_keyboard` into the same object id is a
-    /// protocol error the compositor answers by closing the client.
+    /// Every `wl_pointer` arm, driven with the arguments the protocol says it
+    /// carries. A miscounted argument is silent here and fatal at runtime:
+    /// `finish()` rejects the leftover, `dispatch` returns `Err`, and the
+    /// terminal EXITS — on `enter`, the first time a pointer crosses its
+    /// window. The demo tests all of its own for the same reason.
     #[test]
-    fn a_keyboard_is_requested_once_however_often_the_seat_announces_one() {
+    fn every_pointer_event_is_decoded_with_the_arguments_it_carries() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
+        let mut capabilities = Vec::new();
+        capabilities.extend_from_slice(&(SEAT_KEYBOARD | SEAT_POINTER).to_ne_bytes());
+        surface
+            .dispatch(&mut connection, &message(SEAT, 0, capabilities), fallback)
+            .unwrap();
+        let pointer = surface.pointer.expect("the seat offered a pointer");
+
+        // (opcode, word count). Every one the seat's version range can send:
+        // enter, leave, motion, button, axis, frame, axis_source, axis_stop,
+        // axis_discrete. `wl_fixed` and `int` are both one word, so a count
+        // is what the decode has to agree about.
+        // `surface` is the index of the word carrying a surface id where the
+        // event has one, since enter and leave refuse another client's.
+        for (opcode, words, surface_at) in [
+            (0u16, 4usize, Some(1usize)),
+            (1, 2, Some(1)),
+            (2, 3, None),
+            (3, 4, None),
+            (4, 3, None),
+            (5, 0, None),
+            (6, 1, None),
+            (7, 2, None),
+            (8, 2, None),
+        ] {
+            let word_at = |word: usize| match surface_at {
+                Some(at) if at == word => SURFACE,
+                _ => u32::try_from(word).unwrap(),
+            };
+            let mut payload = Vec::new();
+            for word in 0..words {
+                payload.extend_from_slice(&word_at(word).to_ne_bytes());
+            }
+            surface
+                .dispatch(
+                    &mut connection,
+                    &message(pointer, opcode, payload),
+                    fallback,
+                )
+                .unwrap_or_else(|error| panic!("wl_pointer opcode {opcode}: {error}"));
+
+            // And one word too many is REFUSED rather than ignored, which is
+            // what makes the count above an assertion rather than a lower
+            // bound: a decode reading fewer arguments than arrived would
+            // accept both and drift silently against the compositor.
+            let mut long = Vec::new();
+            for word in 0..words.saturating_add(1) {
+                long.extend_from_slice(&word_at(word).to_ne_bytes());
+            }
+            assert!(
+                surface
+                    .dispatch(&mut connection, &message(pointer, opcode, long), fallback)
+                    .is_err(),
+                "wl_pointer opcode {opcode} accepted an extra argument"
+            );
+        }
+
+        // Another client's surface is REFUSED on the two events that name
+        // one, as the keyboard's are: a compositor confusing this client with
+        // another is a fault to report rather than a pointer to act on.
+        for opcode in [0u16, 1] {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&1u32.to_ne_bytes());
+            payload.extend_from_slice(&SURFACE.saturating_add(1).to_ne_bytes());
+            for _ in 2..if opcode == 0 { 4 } else { 2 } {
+                payload.extend_from_slice(&0u32.to_ne_bytes());
+            }
+            assert!(
+                surface
+                    .dispatch(
+                        &mut connection,
+                        &message(pointer, opcode, payload),
+                        fallback
+                    )
+                    .is_err(),
+                "wl_pointer opcode {opcode} accepted another client's surface"
+            );
+        }
+
+        // An opcode the seat's version range cannot produce is fatal rather
+        // than dropped: `axis_value120` is version 8 and the seat is bound at
+        // 7 or below, so one arriving means the compositor and this client
+        // disagree about the version — which is worse than an event lost.
+        assert!(surface
+            .dispatch(&mut connection, &message(pointer, 9, Vec::new()), fallback)
+            .is_err());
+    }
+
+    #[test]
+    fn a_wheel_scrolls_the_history_and_a_frame_is_what_applies_it() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
+        surface.cells = Some((4, 8));
+        let mut terminal = Terminal::new(4, 8).unwrap();
+        for line in 0..40u32 {
+            terminal.feed(format!("L{line}\r\n").as_bytes());
+        }
+        surface.history = terminal.scrollback();
+        assert_eq!(surface.viewport.offset(surface.history), 0);
+
+        // The seat announces a pointer, which is what gives it an id — a
+        // DYNAMIC one, so nothing here may assume which.
+        let mut capabilities = Vec::new();
+        capabilities.extend_from_slice(&(SEAT_KEYBOARD | SEAT_POINTER).to_ne_bytes());
+        surface
+            .dispatch(&mut connection, &message(SEAT, 0, capabilities), fallback)
+            .unwrap();
+        let pointer = surface.pointer.expect("the seat offered a pointer");
+
+        // One notch AWAY from the operator. The compositor sends that as a
+        // negative discrete count — the protocol's sign, where positive is a
+        // downward movement of the surface's content — so it goes BACK into
+        // history.
+        let discrete = |axis: u32, count: i32| {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&axis.to_ne_bytes());
+            payload.extend_from_slice(&count.to_ne_bytes());
+            message(pointer, 8, payload)
+        };
+        let frame = move || message(pointer, 5, Vec::new());
+        surface
+            .dispatch(&mut connection, &discrete(0, -1), fallback)
+            .unwrap();
+        // Nothing yet: a frame is the transaction, so a tilting wheel does
+        // not move the view twice for one flick.
+        assert_eq!(
+            surface.viewport.offset(surface.history),
+            0,
+            "the wheel moved the view before its frame closed"
+        );
+        surface
+            .dispatch(&mut connection, &frame(), fallback)
+            .unwrap();
+        // The literal, not the constant: every other assertion here
+        // multiplies by the same one, so they would agree at any value.
+        assert_eq!(LINES_PER_NOTCH, 3);
+        assert_eq!(
+            surface.viewport.offset(surface.history),
+            usize::try_from(LINES_PER_NOTCH).unwrap()
+        );
+
+        // Notches accumulate WITHIN a frame rather than each applying: a fast
+        // flick arrives as several in one report.
+        surface
+            .dispatch(&mut connection, &discrete(0, -2), fallback)
+            .unwrap();
+        surface
+            .dispatch(&mut connection, &discrete(0, -1), fallback)
+            .unwrap();
+        surface
+            .dispatch(&mut connection, &frame(), fallback)
+            .unwrap();
+        assert_eq!(
+            surface.viewport.offset(surface.history),
+            usize::try_from(LINES_PER_NOTCH * 4).unwrap()
+        );
+
+        // The other direction returns toward the live bottom.
+        surface
+            .dispatch(&mut connection, &discrete(0, 4), fallback)
+            .unwrap();
+        surface
+            .dispatch(&mut connection, &frame(), fallback)
+            .unwrap();
+        assert_eq!(surface.viewport.offset(surface.history), 0);
+        assert!(!surface.viewport.viewing(surface.history));
+
+        // HORIZONTAL is read and ignored. A terminal has no sideways
+        // scrollback, and a tilting wheel sends both — counted together, a
+        // sideways flick would scroll up the history.
+        surface
+            .dispatch(&mut connection, &discrete(1, -9), fallback)
+            .unwrap();
+        surface
+            .dispatch(&mut connection, &frame(), fallback)
+            .unwrap();
+        assert_eq!(
+            surface.viewport.offset(surface.history),
+            0,
+            "a sideways flick scrolled the history"
+        );
+    }
+
+    /// The seat's capabilities are what make the terminal ask for its
+    /// devices, and it asks exactly once for each. A seat may re-announce — a
+    /// device arriving makes it — and a second `get_keyboard` into the same
+    /// object id is a protocol error the compositor answers by closing the
+    /// client; a second `get_pointer` would burn an id besides.
+    #[test]
+    fn a_seat_is_asked_once_for_each_device_however_often_it_announces_them() {
         let (mut connection, mut peer) = pair();
         let mut surface = Surface::new(Bound {
             compositor: 1,
@@ -3673,26 +4196,36 @@ mod tests {
                 .unwrap();
         }
         assert!(surface.keyboard_requested);
-        // wl_seat.get_keyboard, carrying the id the keyboard's events will
-        // arrive on.
+        // wl_seat.get_keyboard and get_pointer, each carrying the id its own
+        // events will arrive on. Three announcements, two requests.
         let (object, opcode, payload) = said(&mut peer);
         assert_eq!((object, opcode), (SEAT, 1));
         assert_eq!(payload, KEYBOARD.to_ne_bytes());
-        // And nothing after it. `pair` sets a read timeout precisely so a
-        // second request is a failure here rather than a hang.
+        let (object, opcode, payload) = said(&mut peer);
+        assert_eq!((object, opcode), (SEAT, 0));
+        // A DYNAMIC id, and the first one this connection hands out: the
+        // pointer is not a fixed object, so it takes the id after the fixed
+        // range rather than one reserved inside it.
+        assert_eq!(surface.pointer, Some(FIRST_DYNAMIC_ID));
+        assert_eq!(payload, FIRST_DYNAMIC_ID.to_ne_bytes());
+        // And nothing after them. `pair` sets a read timeout precisely so a
+        // repeat request is a failure here rather than a hang.
         peer.set_read_timeout(Some(Duration::from_millis(200)))
             .unwrap();
         let mut spare = [0u8; 1];
         assert!(
             std::io::Read::read_exact(&mut peer, &mut spare).is_err(),
-            "the terminal asked for a second keyboard"
+            "the terminal asked for a device twice"
         );
     }
 
-    /// A seat with no keyboard is not asked for one. The bit is pinned by
-    /// value like every other protocol number here: read as 1 it would be the
-    /// POINTER capability, and the terminal would ask a seat that has no
-    /// keyboard for one and never ask a seat that does.
+    /// Each device is asked for only where the seat OFFERS it, and the two
+    /// bits are pinned by value like every other protocol number here: read
+    /// as each other, the terminal would ask a seat that has no keyboard for
+    /// one and never ask a seat that does. Wayland makes a `get_pointer` on a
+    /// seat without the capability a protocol error, so the pointer half is
+    /// the difference between a terminal that starts and one that is
+    /// disconnected on a keyboard-only seat.
     #[test]
     fn a_seat_without_a_keyboard_is_not_asked_for_one() {
         let (mut connection, _peer) = pair();
@@ -3708,11 +4241,29 @@ mod tests {
         };
         // Pointer only, which is capability 1.
         let mut payload = Vec::new();
-        payload.extend_from_slice(&1u32.to_ne_bytes());
+        payload.extend_from_slice(&SEAT_POINTER.to_ne_bytes());
         surface
             .dispatch(&mut connection, &message(SEAT, 0, payload), fallback)
             .unwrap();
         assert!(!surface.keyboard_requested);
+        assert!(surface.pointer.is_some());
+
+        // And the other way round on a fresh seat: a KEYBOARD-only one is
+        // asked for no pointer, which is what keeps the terminal usable on a
+        // machine with no mouse rather than disconnected from it.
+        let mut keyboard_only = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&SEAT_KEYBOARD.to_ne_bytes());
+        keyboard_only
+            .dispatch(&mut connection, &message(SEAT, 0, payload), fallback)
+            .unwrap();
+        assert!(keyboard_only.keyboard_requested);
+        assert!(keyboard_only.pointer.is_none());
     }
 
     /// A frame is not enough. The terminal is not presented until its keymap
