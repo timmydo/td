@@ -1515,8 +1515,14 @@ fn compile(conf: &Conf, lines: &[Vec<u8>]) -> Result<Patterns, String> {
         // grep warns and compiles where sed refuses: `grep -E '*a'` is `warning: *
         // at start of expression` and a working pattern, which spencer1 pins.
         strict_repeats: false,
-        // grep has no `--posix`; the one rule that reads it is sed's.
+        // grep has no posixicity at all -- neither a `--posix` nor a
+        // POSIXLY_CORRECT reading of a pattern -- so both of sed's levels are
+        // off here. Its own unmatched-`)` answer is neither of sed's, and the
+        // two halves come from different fields: `strict_repeats` above is why
+        // the ERE `)` is a literal, and THIS false is why the BRE `\)` is an
+        // error.
         posix: false,
+        unmatched_rparen_ordinary: false,
         // grep matches with its own dfa, which satisfies a mid-branch `$`. It falls
         // back to glibc for `-o` and for any pattern with a backreference, where GNU
         // then disagrees with itself; td-txt keeps the dfa reading throughout.

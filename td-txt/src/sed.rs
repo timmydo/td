@@ -439,13 +439,14 @@ impl ScriptParser<'_> {
             icase,
             strict_repeats: true,
             posix: self.posix(),
+            unmatched_rparen_ordinary: !self.extended(),
             // sed has only glibc, which never satisfies a mid-branch `$`.
             glibc_engine: true,
             // sed lexes one regex at a time, and has no `-x`/`-w` to wrap it.
             lex_continues: false,
             reg_newline: multiline.then_some(separator_for(self.null_data)),
         };
-        let re = Regex::compile(&normalize_regex(raw, self.posix())?, opts)
+        let re = Regex::compile(&normalize_regex(raw, !self.extended())?, opts)
             .map_err(|e| e.msg)?;
         self.regexes.push(re);
         Ok(Some(self.regexes.len() - 1))
@@ -1048,14 +1049,15 @@ impl ScriptParser<'_> {
         }
         let re = self.add_regex(&pattern, icase, multiline)?;
         // A `\N` naming a group the pattern does not have is a script error, not
-        // an empty expansion -- except under `--posix`, GNU's fourth rule for the
-        // flag, where it is accepted and expands to nothing. Checked only when
+        // an empty expansion -- except under EITHER posix level, where it is
+        // accepted and expands to nothing (regexp.c:122 asks
+        // `posixicity == POSIXLY_EXTENDED`). Checked only when
         // the regex is known here; `s//.../` reuses the LAST one and goes
         // unchecked, which is a DIVERGENCE rather than a shared rule: GNU still
         // refuses when the command carries its own address regex, so
         // `/\(a\)/s//\2/` is an error there and empty here. See spec/README.
         if let Some(groups) = re
-            .filter(|_| !self.posix())
+            .filter(|_| self.extended())
             .and_then(|i| self.regexes.get(i))
             .map(Regex::group_count)
         {
@@ -1227,17 +1229,19 @@ fn escape_byte(raw: &[u8], i: &mut usize) -> Result<Esc, String> {
 /// the metacharacter dot, `[a\x2dz]` is a range, `\x5b` is an unmatched bracket
 /// and `\x5cw` is the word class. That is also why an escape works inside a
 /// bracket expression, where the regex parser itself would take `\` literally.
-fn normalize_regex(raw: &[u8], posix: bool) -> Result<Vec<u8>, String> {
+fn normalize_regex(raw: &[u8], at_posix_level: bool) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(raw.len());
     let mut i = 0usize;
     while let Some(b) = raw.get(i).copied() {
         i += 1;
-        // `--posix` drops the decoding INSIDE a bracket expression, so `[\x41]`
-        // holds four ordinary members there rather than an `A`. GNU judges
-        // "inside" on the pattern TEXT, not on what decoding produces: a `[`
-        // that is itself an escape opens nothing, and `\x5b\x41]` decodes under
-        // the flag exactly as it does without it.
-        if posix && b == b'[' {
+        // EITHER posix level drops the decoding INSIDE a bracket expression, so
+        // `[\x41]` holds four ordinary members there rather than an `A`
+        // (compile.c:1473 asks `posixicity != POSIXLY_EXTENDED`, which is why
+        // this takes the level and not `--posix`). GNU judges "inside" on the
+        // pattern TEXT, not on what decoding produces: a `[` that is itself an
+        // escape opens nothing, and `\x5b\x41]` decodes under either level
+        // exactly as it does without one.
+        if at_posix_level && b == b'[' {
             out.push(b);
             copy_bracket(raw, &mut i, &mut out);
             continue;
@@ -3215,8 +3219,10 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
         null_data: false,
         in_place: None,
         // NOT driven from POSIXLY_CORRECT: that variable and `--posix` are
-        // different switches in GNU, and `conf.posix` is `--posix`'s. See the
-        // POSIXLY_CORRECT gap in spec/README.
+        // different LEVELS of one setting in GNU, and `conf.posix` is the
+        // flag's. What the variable selects reaches the compile and the run
+        // through `Mode::extended` -- bar GNU's one rule that reads the
+        // environment rather than the level, `dfawarn` (see spec/README).
         posix: false,
         unbuffered: false,
         // Read BEFORE the options, as GNU reads it, so `-l` overrides it and not
@@ -4916,6 +4922,41 @@ mod tests {
     /// `EXTENDED` with the one flag a test varies.
     fn mode_with(ere: bool) -> Mode {
         Mode { ere, ..EXTENDED }
+    }
+
+    /// `Options` carries the two posixicity rules as separate bools because GNU
+    /// separates them, but they are LEVELS and not axes: BASIC is below CORRECT,
+    /// so `--posix` implies the paren rule and the pair `(posix, extended) =
+    /// (true, true)` must never be built. Nothing in the type says so. This
+    /// covers the two `Mode` producers and NOT the `Options` construction that
+    /// reads them -- a site spelling the pair by hand is the corpus's to catch,
+    /// which it does.
+    #[test]
+    fn the_paren_rule_is_implied_by_the_extension_rule() {
+        for posix in [false, true] {
+            for posixly in [false, true] {
+                let conf = Conf {
+                    suppress: false,
+                    sandbox: false,
+                    ere: false,
+                    separate: false,
+                    null_data: false,
+                    in_place: None,
+                    posix,
+                    unbuffered: false,
+                    line_wrap: DEFAULT_LINE_WRAP,
+                };
+                let mode = mode_of(&conf, posixly);
+                assert!(!(mode.posix && mode.extended), "mode_of({posix}, {posixly})");
+                // And through the parser's own answer, which a compiled `v` moves.
+                for v_promoted in [false, true] {
+                    assert!(
+                        !(mode.posix && mode.extended_with_v(v_promoted)),
+                        "extended_with_v({posix}, {posixly}, {v_promoted})"
+                    );
+                }
+            }
+        }
     }
 
     /// A `Stream` over bytes. `Stream` reads a DESCRIPTOR now, so the bytes go

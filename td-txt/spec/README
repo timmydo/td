@@ -1180,12 +1180,21 @@ td-txt-authored case files
   than a claim about the flag. What remains under it is `-u`, which is a gap
   of its own (below) and not a `--posix` rule at all.
 
-  - `--posix`: its REGEX half is implemented, in both halves of what that
-    means -- the GNU operator extensions the compiler drops (`\|`, `\+`, `\?`,
-    the class and anchor escapes, and the unmatched `\)`), and the escape
-    decoding `normalize_regex` stops inside a bracket expression, which is a
-    rule of its own and not a consequence of the first. Its COMMAND half is
-    implemented: `N` at EOF followed the flag from the start, and the
+  - `--posix`: its REGEX half is implemented, and it splits in two along a
+    line that is GNU's rather than this reimplementation's. The flag's OWN
+    rules are the GNU operator extensions the compiler drops (`\|`, `\+`,
+    `\?`, and the class and anchor escapes) -- `RE_NO_GNU_OPS`, which
+    regexp.c:77 sets for POSIXLY_BASIC alone, and `RE_LIMITED_OPS`, which
+    additionally wants a BRE (regexp.c:78), so `--posix -E 's/a|b/X/g'` still
+    alternates in both tools. Three more
+    rules look like the flag's and belong to the LEVEL, so the environment
+    variable reaches them too: the unmatched close-paren in both spellings,
+    the escape decoding `normalize_regex` stops inside a bracket expression,
+    and the out-of-range `\N` on an `s` RHS. Those three are `Options`'
+    `unmatched_rparen_ordinary` and `!extended()`, not `posix`; see the
+    POSIXLY_CORRECT entry below. Its COMMAND half is
+    implemented: `N` at EOF followed the flag from the start -- it is a
+    fourth level rule now, and the entry below is where that moved -- and the
     withdrawals now do too -- the eight commands GNU stops knowing (`v`, `Q`,
     `T`, `z`, `F`, `W`, `R`, `e`), the step and `+N`/`~N` addresses, line
     address 0, `l`'s width, `q`'s exit code, the one-line `a text`, a text
@@ -1217,10 +1226,10 @@ td-txt-authored case files
     td-txt does not drive this flag from it at all; that is its own entry
     below. Both halves of `v` are served: it is refused outright under the
     flag (`unknown command: `v'`), and where it is allowed its documented side
-    effect -- clearing posix mode -- now reaches the RUN through
-    `Script.v_promoted`, which is why `-e v -e '$!d;N'` prints the last
-    pattern space under `POSIXLY_CORRECT` and not under a `--posix` given
-    after it.
+    effect -- clearing posix mode -- reaches both the RUN and the regex
+    COMPILER through `Script.v_promoted`, which is why `-e v -e '$!d;N'`
+    prints the last pattern space under `POSIXLY_CORRECT` and not under a
+    `--posix` given after it.
 
   - WHEN a script part is compiled relative to the OPTIONS around it. GNU compiles
     each `-e` and `-f` as it scans the command line, so a flag that follows one is
@@ -1464,68 +1473,100 @@ td-txt-authored case files
     comparing.
 
   - `POSIXLY_CORRECT` selects a POSIX MODE in GNU sed, on top of the option
-    order it now decides. HALF of that mode is served now, and the line
-    between the halves is the shape of GNU's own test rather than anything
-    about the variable. `posixicity` is THREE-valued (sed.h:86-90) --
-    `POSIXLY_EXTENDED` by default, `POSIXLY_CORRECT` under the variable,
-    `POSIXLY_BASIC` under `--posix` -- so a behaviour asking
-    `== POSIXLY_EXTENDED` is one both LOWER levels share, and the variable
-    reaches it without being wired to the flag at all. `N` at end of input is
-    that shape (execute.c:1478) and now drops the pattern space under the
-    variable as GNU does, two xfails with it; `/dev/stdout` (compile.c:402)
-    is a second and was already right, resolving per PART on the same
-    `Mode.extended`. What is NOT served is the same test asked at COMPILE
-    time: the unmatched `)` in an ERE (regexp.c:68-80 clears
-    `RE_UNMATCHED_RIGHT_PAREN_ORD` only in EXTENDED) reaches each regex's
-    `Options` as td-txt's `posix`, which the variable does not set. Worth
-    recording that this entry used to prescribe a SECOND FLAG for the
-    behaviours both spellings share, because there is no second flag in GNU
-    -- there is one level with three values, and asking it the question GNU
-    asks is what closed the run-time half without adding a switch here at
-    all.
-    Driving `--posix` from the variable is still the wrong shortcut, and the
-    reason is measured rather than assumed: across 200 script/input probes
-    the two spellings DISAGREE on 76 of them. The COMMONEST shape is
-    `--posix` refuses a GNU extension outright (`1~2d`, `0~2p`, `l 5`, `v`).
-    An earlier draft said EVERY pure disagreement had that shape; measuring the
-    rules this campaign added shows it does not, and the split runs THROUGH a
-    rule rather than between rules. `POSIXLY_CORRECT` follows `--posix` for the
-    unmatched `\)`, for the bracket escape suppression, and for the
-    out-of-range group reference; it follows the DEFAULT for `\|`, `\w` and
-    the replacement's case operators. So within the operator family the
-    RELAXATION is shared and the DROPS are not, and td-txt -- whose regexes
-    still compile under the flag alone -- is on the default side of all three
-    shared ones.
-    (A further class is rarer still: a script combining a refused extension
-    with a shared rule, like `N;s/^b$/X/M`, differs all three ways.) So
-    `--posix` is the strictly stronger switch, and wiring one flag to
-    both would make td-txt refuse, under a variable build systems routinely
-    set, scripts GNU accepts -- as soon as any `--posix` refusal is
-    implemented. It would also regress `v` TODAY: GNU's `v` CLEARS posix mode,
-    so `POSIXLY_CORRECT=1 sed 'v;$!d;N'` prints `a` in GNU, and a td-txt with
-    the two wired together printed nothing.
-    Both sides of that measurement, as of the landing that took it: over 972
-    argv the wiring FIXED 99 and BROKE 48, and all 48 breaks contain `v`. The
-    `v` side is what has since moved, and not by the wiring: GNU's `v` assigns
-    the LEVEL (compile.c:1079), so `Script.v_promoted` records the promotion
-    and the RUN combines it with the option loop's final value -- which is why
-    `v;$!d;N` prints `a` under the variable here as it does in GNU, and why
-    `-e v -e '$!d;N' --posix` does not. The 99 is stale by however many of them
-    were `N`-at-EOF shapes and has not been re-measured. What would move it
-    again is the compile half, and that wants what this paragraph already
-    described: td-txt's `posix` is an immutable parameter threaded through
-    `compile_script` into each regex's `Options`, while GNU's `v` clears the
-    level mid-COMPILE so later regexes compile differently -- a mutable
-    compile-time level rather than a second constant.
-    What the variable DOES change and `--posix` already gets right here is
-    down to ONE xfail in sed-cli.test.txt, carrying GNU's golden, and it is
-    the sharp one: `POSIXLY_CORRECT=1 sed -E 's/a)/X/'` runs in GNU and is
-    REFUSED at exit 1 here, a worse failure than a wrong line. (The `--posix`
-    bracket case in the entry below is a second sed xfail on this level and
-    NOT a second one of these: `--posix` gets it wrong here too.)
+    order it decides, and that mode is now SERVED but for two families named
+    in this entry, one pre-existing and one a reviewer found -- without td-txt
+    gaining a second flag, and without the variable being wired to `--posix`. The shape
+    of the answer is GNU's rather than this reimplementation's. `posixicity`
+    is THREE-valued (sed.h:86-90): `POSIXLY_EXTENDED` by default,
+    `POSIXLY_CORRECT` under the variable, `POSIXLY_BASIC` under `--posix`.
+    Every behaviour gated on THAT is written `== POSIXLY_EXTENDED` or its
+    negation, so each is one both LOWER levels SHARE, and a level the variable
+    already sets reaches all of them. Six are:
 
-  - `--posix`'s bracket suppression carries across a closed sub-expression in
-    a way td-txt does not model. `sed --posix 's/[::][]\x41]/Z/g'` has GNU
+      `N` at end of input (execute.c:1478) -- the RUN reads the level, which
+      `Sed.extended` carries and `Mode::extended_with_v` computes.
+      `/dev/stdout` special-file resolution (compile.c:402) -- per PART, on
+      the same `Mode.extended`; this one was right before the rest.
+      The unmatched close-paren, both spellings (regexp.c:70) -- `Options`'
+      `unmatched_rparen_ordinary`, split OUT of `posix` for exactly this.
+      The escape decoding inside a bracket expression (compile.c:1473) --
+      `normalize_regex`, which takes the level rather than the flag.
+      The out-of-range `\N` on an `s` RHS (regexp.c:122).
+      `v`, which ASSIGNS the level mid-compile (compile.c:1079) rather than
+      reading it -- `Script.v_promoted`.
+
+    A SEVENTH rule answers to the variable and is not on that list, because it
+    does not read `posixicity` at all: `dfawarn` asks
+    `getenv("POSIXLY_CORRECT")` directly (regexp.c:52), so the confusing-bracket
+    lint -- `[:alpha:]` written without its outer bracket, GNU's one bare exit-4
+    pattern error -- is DISCARDED whenever the variable is present, at any
+    level, `--posix` included, and a `v` cannot bring it back. td-txt refuses
+    regardless, so `POSIXLY_CORRECT=1 sed 's/[:alpha:]/Z/'` is exit 4 here and
+    prints in GNU: four xfails carry it. Recording the METHOD beside it, because
+    it is the reason this was missed rather than found: the roster above came
+    from grepping `posixicity`, and the complete net is
+    `grep POSIXLY_CORRECT sed/*.c` -- exactly two `getenv` sites, sed.c:245 for
+    the level and regexp.c:52 for this. A roster built from the wrong grep looks
+    finished.
+
+    What is NOT shared stays with the flag: `RE_NO_GNU_OPS` (regexp.c:77) and
+    `RE_LIMITED_OPS` are POSIXLY_BASIC's alone, so `\w`, `\<`, the BRE `\|`,
+    `\+` and `\?`, the replacement's case operators, the `I`/`M` modifiers
+    and every command withdrawal are `--posix` and untouched by the variable.
+    That is the whole reason the two are separate fields rather than one:
+    the split runs THROUGH the regex compiler, not between it and the rest.
+
+    Measured after, in two rounds, and the second round is the interesting
+    one. Over 990 script/input/level runs `--posix` diverges from GNU 0 times
+    and the variable 5 -- and those 5 are the SAME five the DEFAULT level
+    shows, the unimplemented `e` command, so none of them is about
+    posixicity. That looked like a closed gap and was not, TWICE over, and
+    both times because the sweep had no script of the shape. One reviewer
+    found the bracket carry: a second sweep of 330 bracket-family runs shows
+    both lower levels diverging on exactly three scripts -- the `[::]`, `[..]`
+    and `[==]` closers followed by a bracket, which is the family the
+    `--posix` bracket entry below already records. Another found `dfawarn`
+    above, which no sweep here had a `[:alpha:]` shape for at all. The variable
+    INHERITS that gap by being routed through the same `copy_bracket`, so it
+    is one defect with two spellings rather than a new one, and it is carried
+    as an xfail under each. The lesson is the sweep's rather than the code's,
+    and is worth more than either finding: a divergence a sweep has no script
+    for reads exactly like a closure. Neither gap is a REGRESSION -- the
+    parent binary answers both identically -- so what the reviews caught was a
+    CLAIM, which is the failure mode this file exists to prevent.
+    Twenty-one corpus cases pin what IS served, five of them guards that
+    assert the variable leaves the flag's own rules alone; eight of the
+    sixteen in the first block are red on the parent commit and eight pass on
+    both, which is the split a guard is supposed to have.
+
+    Two things this entry got WRONG are worth keeping, because both were
+    tidy-sounding and neither survived measurement. It prescribed a SECOND
+    FLAG for the behaviours both spellings share; there is no second flag in
+    GNU, and asking the LEVEL the question GNU asks is what served them with
+    no new switch. And it recorded, correctly, that driving `--posix` from the
+    variable is the wrong shortcut -- across 200 script/input probes the two
+    spellings DISAGREE on 76, the commonest shape being `POSIXLY_CORRECT`
+    behaving like the default while `--posix` refuses a GNU extension outright
+    (`1~2d`, `0~2p`, `l 5`, `v`) -- but it then read that as a reason the
+    variable could not be served at all. It was a reason one FLAG could not
+    serve both, which is a different claim. `--posix` is the strictly stronger
+    switch; wiring one flag to both would make td-txt refuse, under a variable
+    build systems routinely set, scripts GNU accepts. Its own counter-example
+    still stands and is now a passing case: GNU's `v` CLEARS posix mode, so
+    `POSIXLY_CORRECT=1 sed 'v;$!d;N'` prints `a` in GNU, and a td-txt with the
+    two wired together printed nothing.
+    The wiring measurement itself, as of the landing that took it: over 972
+    argv it FIXED 99 and BROKE 48, all 48 breaks containing `v`. Both numbers
+    are stale now and deliberately not re-measured -- the thing they were
+    measuring is a shortcut nobody should take, and what replaced it fixes the
+    99 without the 48.
+
+  - The POSIX levels' bracket suppression carries across a closed
+    sub-expression in a way td-txt does not model. Written here as `--posix`'s
+    while that was the only spelling that reached the rule; compile.c:1473
+    asks `!= POSIXLY_EXTENDED`, so it is the LEVEL's and `POSIXLY_CORRECT`
+    shows it identically -- carried as an xfail under each, one defect with
+    two spellings. `sed --posix 's/[::][]\x41]/Z/g'` has GNU
     suppress the SECOND bracket entirely -- class {], \, x, 4, 1} -- where the
     same `[]\x41]` standing alone stops at its leading `]` in both tools, which
     is the rule the passing cases pin. So GNU carries some state across the
@@ -1665,28 +1706,26 @@ td-txt-authored case files
     other order the question does not arise, `v` being refused outright under the
     flag.
 
-    What is promoted is the level the special-file table reads while it
-    compiles, and the one the RUN reads at end of input; those two are what
-    td-txt gates on it. GNU gates THREE more on the same variable: an unmatched
-    `)` is ordinary in one mode and an error in the other (regexp.c:70/73),
-    `invalid reference \N` on an `s` RHS is diagnosed only under EXTENDED
-    (regexp.c:122), and a regex's escape handling differs (compile.c:1473).
-    Every one of those is written `== POSIXLY_EXTENDED` or its negation, as
-    `N` at end of input (execute.c:1478) is, so BASIC and CORRECT behave ALIKE
-    in all of them and `--posix` shows each exactly as the variable does --
+    What a `v` promotes is now every rule GNU gates on the LEVEL, which it was
+    not (the variable's seventh rule, `dfawarn`, is a `getenv` and no `v`
+    reaches it in GNU either): the level the special-file table reads while it compiles, the one
+    the RUN reads at end of input, an unmatched `)` (regexp.c:70/73), `invalid
+    reference \N` on an `s` RHS (regexp.c:122), and a regex's escape handling
+    inside a bracket (compile.c:1473). Every one is written
+    `== POSIXLY_EXTENDED` or its negation, so BASIC and CORRECT behave ALIKE in
+    all of them and `--posix` shows each exactly as the variable does --
     measured, since an earlier draft of this entry claimed the opposite.
 
-    The three that remain are unreachable to promote here, and the reason is
-    td-txt's own shape rather than GNU's: all three are gated on td-txt's
-    `posix` FLAG and none of them reads `Mode::extended`, which is the only
-    field a `v` moves. `N` at end of input is the one that came OFF that list,
-    and it came off by being asked the way GNU asks it: the run reads
-    `mode.extended || (v_promoted && !mode.posix)` rather than `!posix`, so a
-    `v` reaches it. Closing the other three is the POSIXLY_CORRECT entry's
-    work rather than this one's, each being a compile-time gate on a regex's
-    `Options`. (`Mode::extended` IS driven from the variable --
-    `!conf.posix && !posixly`; what td-txt does not drive from it is the
-    `--posix` flag.)
+    Three of those five were unreachable to promote until the compiler was
+    handed the LEVEL, and the reason was td-txt's shape rather than GNU's: they
+    were gated on the `posix` FLAG, which no `v` moves. They read
+    `Mode::extended` now, through `ScriptParser::extended()`, so a `v` reaches
+    all three -- `POSIXLY_CORRECT=1 sed -E -e v -e 's/a)/X/g'` is the refusal
+    GNU gives where without the `v` it is a literal paren, and a `v` BETWEEN
+    two patterns compiles them at different levels, which the corpus pins.
+    (`Mode::extended` IS driven from the variable -- `!conf.posix && !posixly`;
+    what td-txt does not drive from it is the `--posix` flag, and the entry
+    above is why that distinction is the whole design rather than a quibble.)
 
   - `-z` LOOKS like a fourth member of that class and is a HYBRID, which is what
     an attempt to add it turned up. GNU reads the record separator when it

@@ -60,12 +60,27 @@ pub struct Options {
     /// LITERAL character rather than refused, so `\w` matches a `w` and `a\+`
     /// the text `a+`. Three places read it -- `at_op` for the branch-level `\|`,
     /// `next_op` for the postfix `\+`/`\?`, and `parse_escape` for the class and
-    /// anchor escapes -- plus the unmatched close-paren, ordinary here in BOTH
-    /// spellings. What POSIX itself defines is untouched: `\(`, `\)` around a
-    /// real group, the interval, and backreferences all still work, and
+    /// anchor escapes. What POSIX itself defines is untouched: `\(`, `\)` around
+    /// a real group, the interval, and backreferences all still work, and
     /// `--posix -E 'a{x}'` is still bad content, so this is not a second
     /// `strict_repeats`.
+    ///
+    /// GNU's `RE_NO_GNU_OPS`, which regexp.c:77 sets for POSIXLY_BASIC alone --
+    /// so this is `--posix` and NOT the field below, which the environment
+    /// variable also reaches.
     pub posix: bool,
+    /// Whether a close-paren with nothing open is the ORDINARY character rather
+    /// than an error, in both spellings (`)` in an ERE, `\)` in a BRE).
+    ///
+    /// Split from `posix` because GNU splits it: `RE_UNMATCHED_RIGHT_PAREN_ORD`
+    /// is CLEARED only for POSIXLY_EXTENDED (regexp.c:70), so both of sed's
+    /// lower posixicity levels set it and `POSIXLY_CORRECT=1 sed -E 's/a)/X/'`
+    /// runs where the default refuses. Every `posix` caller sets this too --
+    /// BASIC is a level below CORRECT, not a different axis -- and
+    /// `the_paren_rule_is_implied_by_the_extension_rule` pins that on `Mode`,
+    /// which is where the pair comes from. It does NOT check the construction
+    /// below it: only the corpus catches a site that builds the pair by hand.
+    pub unmatched_rparen_ordinary: bool,
     /// Which of GNU's two engines reads the MID-BRANCH `$` that `stray_anchor`
     /// creates. grep's dfa satisfies one at a true end of line, so `grep 'x$|*'`
     /// selects a line `x`; glibc satisfies one never, so the branch is dead and
@@ -526,7 +541,7 @@ impl<'a> Parser<'a> {
             if depth == 0
                 && self.opts.ere
                 && self.opts.strict_repeats
-                && !self.opts.posix
+                && !self.opts.unmatched_rparen_ordinary
                 && self.at_op(b')')
             {
                 return Err(Error::new("Unmatched ) or \\)"));
@@ -980,9 +995,9 @@ impl<'a> Parser<'a> {
                 Ok(Node::Group(idx, Box::new(inner)))
             }
             // A `\)` with nothing open. Both tools refuse it, unlike the ERE `)`
-            // above that grep reads as the character -- but `--posix` drops the
-            // extension for this spelling too, and then it is ordinary.
-            b')' if !self.opts.ere => match self.opts.posix {
+            // above that grep reads as the character -- but either POSIX level
+            // makes it ordinary for this spelling too.
+            b')' if !self.opts.ere => match self.opts.unmatched_rparen_ordinary {
                 true => Ok(self.literal(b')')),
                 false => Err(Error::new("Unmatched ) or \\)")),
             },
@@ -2174,12 +2189,41 @@ mod tests {
             // `--posix` drops that extension and the character is ordinary again;
             // it does NOT relax the interval rules above.
             let posix =
-                Options { ere: true, strict_repeats: true, posix: true, ..Options::default() };
+                Options {
+                    ere: true,
+                    strict_repeats: true,
+                    posix: true,
+                    unmatched_rparen_ordinary: true,
+                    ..Options::default()
+                };
             assert!(Regex::compile(pat.as_bytes(), posix).is_ok(), "--posix {pat}");
         }
         assert!(sed_ere("()").is_ok(), "an empty group is not an unmatched paren");
-        let posix = Options { ere: true, strict_repeats: true, posix: true, ..Options::default() };
+        let posix = Options {
+            ere: true,
+            strict_repeats: true,
+            posix: true,
+            unmatched_rparen_ordinary: true,
+            ..Options::default()
+        };
         assert!(Regex::compile(b"a{x}", posix).is_err(), "--posix leaves intervals alone");
+        // The paren field ALONE, which is what POSIXLY_CORRECT hands the
+        // compiler: the close-paren goes ordinary and every other extension --
+        // `\w`, `\+`, `\|` -- stays, since `RE_NO_GNU_OPS` is BASIC's alone.
+        let correct = Options {
+            strict_repeats: true,
+            unmatched_rparen_ordinary: true,
+            ..Options::default()
+        };
+        assert!(Regex::compile(b"a\\)", correct).is_ok(), "CORRECT: \\) is ordinary");
+        // Anchored, and judged on text only the OPERATOR reading matches: `\w`
+        // read as the literal `w` still matches a `w`, so only a non-letter
+        // separates the two readings.
+        let basic = Options { posix: true, ..correct };
+        for (pat, operator_only) in [(&b"^\\w$"[..], "4"), (&b"^a\\+$"[..], "aa")] {
+            assert!(matched(&Regex::compile(pat, correct).unwrap(), operator_only));
+            assert!(!matched(&Regex::compile(pat, basic).unwrap(), operator_only));
+        }
         // grep reads every one of them as text, which is why this is a flag and
         // not a fix.
         assert!(matched(&ere("a{"), "a{"));

@@ -52,5 +52,8 @@ xfail sed-cli.test.txt::a [ consumed as a closer test leaves the reader somewher
 xfail sed-cli.test.txt::and the same shape after an earlier sub-expression
 xfail sed-cli.test.txt::the same with a class
 xfail sed-cli.test.txt::and with an equivalence class
-xfail sed-cli.test.txt::POSIX mode makes an unmatched ) ordinary in an ERE, so GNU compiles this
-xfail sed-cli.test.txt::--posix: a bracket AFTER a closed sub-expression keeps suppressing
+xfail sed-cli.test.txt::POSIXLY_CORRECT discards the confusing-bracket lint, and it is not the level
+xfail sed-cli.test.txt::while the variable suppresses it even under --posix
+xfail sed-cli.test.txt::an EMPTY POSIXLY_CORRECT suppresses it too, getenv answering non-NULL
+xfail sed-cli.test.txt::either posix level: a bracket AFTER a closed sub-expression keeps suppressing
+xfail sed-cli.test.txt::and the same shape under POSIXLY_CORRECT, which is the same gap

@@ -7481,15 +7481,12 @@ a
 ## status: 0
 
 #### POSIX mode makes an unmatched ) ordinary in an ERE, so GNU compiles this
-# XFAIL, and the sharp one: td-txt REFUSES at exit 1 a script GNU runs, which is a
-# worse failure than a wrong line. GNU's ERE takes an unmatched `)' as an error by
-# extension and POSIX says it is ordinary; `sed --posix -E s/a)/X/' is already
-# right here -- for THAT spelling only: the BRE `\)' is a second gap, see README.
-# This is the same `== POSIXLY_EXTENDED' test the `N' case above now passes, but
-# asked at COMPILE time rather than at run time: the flag reaches each regex's
-# options as `posix', and what is missing is the level reaching them instead.
-# Not the variable wired to the flag -- the two guard cases at the end of this
-# file are why that shortcut is wrong.
+# GNU's ERE takes an unmatched `)' as an error by extension and POSIX says it is
+# ordinary, and `RE_UNMATCHED_RIGHT_PAREN_ORD' is CLEARED for POSIXLY_EXTENDED
+# alone (regexp.c:70) -- so both lower levels make it ordinary and the variable
+# reaches this without being wired to `--posix'. It was an xfail while the regex
+# compiler was handed the FLAG; it is handed the LEVEL now, in the separate
+# `unmatched_rparen_ordinary' the flag no longer carries.
 ## argv: sed -E s/a)/X/ h
 ## file h:
 a
@@ -7514,8 +7511,265 @@ a
 ## stderr-contains: Unmatched ) or \)
 ## status: 1
 
+#### the same ERE where the literal paren is actually IN the input
+# The case above compiles under the variable and matches nothing, which a
+# compile that silently read the pattern some third way would also do. Here
+# the `)' is in the text, so the golden says WHICH pattern GNU compiled.
+## argv: sed -E 's/a)/X/g' h
+## file-json h: "a)b\nab\na)a)\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: "Xb\nab\nXX\n"
+## stderr-json: ""
+## status: 0
+
+#### the BRE spelling of that paren follows the level too
+# `\)' is the same `RE_UNMATCHED_RIGHT_PAREN_ORD' bit (regexp.c:70), so the
+# variable reaches this spelling as well -- the README recorded it as a
+# second gap while only the ERE half was an xfail.
+## argv: sed 's/a\)/X/g' h
+## file-json h: "a)b\nab\na)a)\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: "Xb\nab\nXX\n"
+## stderr-json: ""
+## status: 0
+
+#### and without the variable that BRE is refused, as the ERE is
+## argv: sed 's/a\)/X/g' h
+## file-json h: "a)b\n"
+## stdout-json: ""
+## stderr-contains: Unmatched ) or \)
+## status: 1
+
+#### a paren with nothing before it at all, both dialects
+# The rule is about the paren having nothing OPEN, not about what precedes
+# it in the branch.
+## argv: sed -E 's/)/X/g' h
+## file-json h: "a)b\n)\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: "aXb\nX\n"
+## stderr-json: ""
+## status: 0
+
+#### and the BRE spelling of that one
+## argv: sed 's/\)/X/g' h
+## file-json h: "a)b\n)\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: "aXb\nX\n"
+## stderr-json: ""
+## status: 0
+
+#### an ADDRESS takes the same compiler, so the level reaches it
+# Addresses and `s' patterns go through one `add_regex' here and one
+# `compile_regex' in GNU, so a rule that reached only the `s' half would be
+# a td-txt invention.
+## argv: sed -nE '/a)/p' h
+## file-json h: "a)b\nab\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: "a)b\n"
+## stderr-json: ""
+## status: 0
+
+#### the bracket-escape decoding follows the level as well
+# GNU's second `!= POSIXLY_EXTENDED' compile rule (compile.c:1473): inside a
+# bracket expression the escape vocabulary is NOT decoded, so `[\x41]' holds
+# the four ordinary members {\, x, 4, 1} rather than an `A'. Under the
+# default it decodes and the class is {A}. This one was never an xfail --
+# nothing in the corpus asked it under the variable, so it was a divergence
+# with no case rather than a known gap.
+## argv: sed 's/[\x41]/Z/g' h
+## file-json h: "A\nx4\nax41\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: "A\nZZ\naZZZ\n"
+## stderr-json: ""
+## status: 0
+
+#### and under the default that same bracket decodes
+# The other side of the pair, which is what makes the rule a SPLIT rather
+# than a rename: the variable changes this and the default does not.
+## argv: sed 's/[\x41]/Z/g' h
+## file-json h: "A\nx4\nax41\n"
+## stdout-json: "Z\nx4\nax41\n"
+## stderr-json: ""
+## status: 0
+
+#### a bracket escape that would open a bracket is left alone under the level
+## argv: sed 's/[\x5b]/Z/g' h
+## file-json h: "A\nx4\n[\nab\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: "A\nZ4\n[\naZ\n"
+## stderr-json: ""
+## status: 0
+
+#### an out-of-range group reference on the RHS is accepted under the level
+# GNU's third: regexp.c:122 diagnoses `invalid reference \N' only under
+# POSIXLY_EXTENDED, so both lower levels accept it and expand it to nothing.
+# td-txt refused under the variable, which is an exit 1 where GNU prints.
+## argv: sed 's/a/[\1]/' h
+## file-json h: "ab\nb\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: "[]b\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### and refuses it under the default
+## argv: sed 's/a/[\1]/' h
+## file-json h: "ab\n"
+## stdout-json: ""
+## stderr-contains: invalid reference \1 on `s' command's RHS
+## status: 1
+
+#### the variable leaves GNU's own regex operators alone: \w
+# `RE_NO_GNU_OPS' is set for POSIXLY_BASIC ALONE (regexp.c:77), so the
+# variable keeps every extension the flag withdraws. These four guard the
+# split from being collapsed back into one flag.
+## argv: sed 's/\w/Z/g' h
+## file-json h: "A\nx4\n.\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: "Z\nZZ\n.\n"
+## stderr-json: ""
+## status: 0
+
+#### nor the BRE postfix operators
+## argv: sed 's/a\+/Z/' h
+## file-json h: "aaa\na+\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: "Z\nZ+\n"
+## stderr-json: ""
+## status: 0
+
+#### nor BRE alternation
+## argv: sed 's/a\|b/Z/g' h
+## file-json h: "ab\na|b\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: "ZZ\nZ|Z\n"
+## stderr-json: ""
+## status: 0
+
+#### nor the replacement's case operators
+## argv: sed 's/a/\Ux/' h
+## file-json h: "ab\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: "Xb\n"
+## stderr-json: ""
+## status: 0
+
+#### nor the I modifier, which --posix refuses outright
+## argv: sed 's/A/Z/I' h
+## file-json h: "ab\nAB\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: "Zb\nZB\n"
+## stderr-json: ""
+## status: 0
+
+#### a v turns the paren rule back OFF for what follows it
+# `v' ASSIGNS POSIXLY_EXTENDED (compile.c:1079), so under the variable it
+# restores the DEFAULT reading of every level rule -- here the ERE paren
+# goes back to being the error it is by extension. This is the direction
+# that catches a level plumbed only as far as the option loop: the flag
+# never changes, and the answer does.
+## argv: sed -E -e 'v' -e 's/a)/X/g' h
+## file-json h: "a)b\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: ""
+## stderr-contains: -e expression #2, char 8: Unmatched ) or \)
+## status: 1
+
+#### and the BRE spelling with it
+## argv: sed -e 'v' -e 's/a\)/X/g' h
+## file-json h: "a)b\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: ""
+## stderr-contains: -e expression #2, char 9: Unmatched ) or \)
+## status: 1
+
+#### a v restores the bracket decoding too
+# The same promotion reaching compile.c:1473's rule: with the `v' the
+# class is {A} again rather than the four ordinary members.
+## argv: sed -e 'v' -e 's/[\x41]/Z/g' h
+## file-json h: "A\nx4\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: "Z\nx4\n"
+## stderr-json: ""
+## status: 0
+
+#### and makes the out-of-range group reference an error again
+## argv: sed -e 'v' -e 's/a/[\1]/' h
+## file-json h: "ab\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: ""
+## stderr-contains: -e expression #2, char 9: invalid reference \1 on `s' command's RHS
+## status: 1
+
+#### a pattern BEFORE the v and one after compile at different levels
+# GNU holds ONE posixicity for the whole compile and `v' moves it PART-WAY
+# through, so the first pattern is compiled under the variable's level and
+# the second under the one the `v' assigned. The first is fine and the
+# second is the error, which is the ordering this pins: a promotion
+# applied to the whole script would refuse the first too, and one applied
+# to nothing would accept the second.
+## argv: sed -E -e 's/a)/X/g' -e 'v' -e 's/b)/Y/g' h
+## file-json h: "a)b\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: ""
+## stderr-contains: -e expression #3, char 8: Unmatched ) or \)
+## status: 1
+
+#### POSIXLY_CORRECT discards the confusing-bracket lint, and it is not the level
+# XFAIL with GNU's golden, and the LAST POSIXLY_CORRECT divergence. This one
+# is not `posixicity' at all: `dfawarn' asks `getenv("POSIXLY_CORRECT")'
+# directly (regexp.c:52), so the lint GNU exits 4 for is DISCARDED whenever
+# the variable is present. td-txt gates it on nothing and still refuses.
+# Found by a reviewer, whose method is worth keeping: the roster for this
+# campaign came from grepping `posixicity', and the complete net is
+# `grep POSIXLY_CORRECT sed/*.c' -- two getenv sites, of which that grep
+# sees one.
+## argv: sed 's/[:alpha:]/Z/' h
+## file-json h: "a\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: "Z\n"
+## stderr-json: ""
+## status: 0
+
+#### and --posix does not suppress it, which is what proves it is the getenv
+# The flag sets POSIXLY_BASIC and the lint still fires, so no reading of the
+# LEVEL explains the case above: only the variable's presence does.
+## argv: sed --posix 's/[:alpha:]/Z/' h
+## file-json h: "a\n"
+## stdout-json: ""
+## stderr-contains: character class syntax is [[:space:]], not [:space:]
+## status: 4
+
+#### while the variable suppresses it even under --posix
+# The other half of that proof, and the shape a level-based fix would get
+# wrong: at GNU's LOWEST posixicity the lint is still discarded.
+## argv: sed --posix 's/[:alpha:]/Z/' h
+## file-json h: "a\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: "Z\n"
+## stderr-json: ""
+## status: 0
+
+#### an EMPTY POSIXLY_CORRECT suppresses it too, getenv answering non-NULL
+# Presence and not value, as the option-permutation half of this variable
+# already is -- `getenv' returns a pointer to an empty string.
+## argv: sed 's/[:alpha:]/Z/' h
+## file-json h: "a\n"
+## env POSIXLY_CORRECT:
+## END
+## stdout-json: "Z\n"
+## stderr-json: ""
+## status: 0
+
+#### and the correctly-spelled class is no lint at any of them
+## argv: sed 's/[[:alpha:]]/Z/' h
+## file-json h: "a\n"
+## env POSIXLY_CORRECT: 1
+## stdout-json: "Z\n"
+## stderr-json: ""
+## status: 0
+
 #### the variable is NOT --posix: v is accepted under it and clears the mode
-# This case exists to stop the xfail above being 'fixed' by wiring the
+# This case exists to stop the paren case above being 'fixed' by wiring the
 # variable to the --posix flag. GNU refuses `v' under --posix but ACCEPTS it under
 # the variable, where its documented side effect is to clear posix mode -- so the
 # `$!d;N' after it runs in DEFAULT mode and prints `a'. One flag driving both
@@ -7915,7 +8169,7 @@ a
 ## stderr-json: ""
 ## status: 0
 
-#### --posix: a bracket AFTER a closed sub-expression keeps suppressing
+#### either posix level: a bracket AFTER a closed sub-expression keeps suppressing
 # The one shape of this rule td-txt does not model, carrying GNU's golden as an
 # xfail. Standalone, `[]\x41]' stops suppressing at its leading `]' -- the case
 # above pins that. Here the same bracket follows a closed `[::]' and GNU does
@@ -7927,6 +8181,25 @@ a
 # pre-existing missing `char N:' offset.
 ## argv: sed --posix 's/[::][]\x41]/Z/g' h
 ## file-json h: ":A\n:x\n:4\n:]\n"
+## stdout-json: ":A\nZ\nZ\nZ\n"
+## stderr-json: ""
+## status: 0
+
+#### and the same shape under POSIXLY_CORRECT, which is the same gap
+# XFAIL with GNU's golden. `--posix' and the variable are two values of one
+# LEVEL and compile.c:1473 asks `!= POSIXLY_EXTENDED', so GNU suppresses under
+# both and so does the gap: this case is not a second defect but the first one
+# seen from the other spelling, and it exists because nothing else would have
+# said so. Found by a reviewer on the commit that gave the compiler the level;
+# the divergence itself predates that commit, which neither caused nor closed
+# it. A sweep of 330 bracket-family runs across the three levels finds exactly
+# this family -- the `[::]', `[..]' and `[==]' closers -- and no other shape of
+# THIS rule, so the case below bounds it rather than sampling it. Not the only
+# bracket shape that diverges under the variable: a class written without its
+# outer bracket is `dfawarn', a different rule with its own cases above.
+## argv: sed 's/[::][]\x41]/Z/g' h
+## file-json h: ":A\n:x\n:4\n:]\n"
+## env POSIXLY_CORRECT: 1
 ## stdout-json: ":A\nZ\nZ\nZ\n"
 ## stderr-json: ""
 ## status: 0
