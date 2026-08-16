@@ -29,9 +29,17 @@ The BOOT path needs a second set, and cannot use these. The sentence above —
 that nothing here has to match the payload bytes a test writes — is exactly
 what makes these unusable for it: a deployment that boots must carry payloads
 that hash to what its manifest names, so its manifest is decided by those
-payload bytes rather than chosen. That set therefore lives beside the fixture
-that writes them, as FIXTURE_PUBLIC_KEY and FIXTURE_SIGNATURES in
-td-boot/src/main.rs, signed the same way and under the same rule: one key,
-every fixture manifest signed with it, the private half discarded. The
-regeneration procedure is recorded there because it is the payload constants
-next to it that force a regeneration.
+payload bytes rather than chosen. That set therefore lives beside the payloads
+that decide it, as PUBLIC_KEY and SIGNATURES in td-boot/src/fixture.rs, signed
+the same way and under the same rule: one key, every fixture manifest signed
+with it, the private half discarded. The regeneration procedure is recorded
+there because it is the payload constants next to it that force a
+regeneration.
+
+That file is its own module rather than part of td-boot's test module because
+the td-install recipe check stages the SAME deployment and needs the same
+signatures: it is #[cfg(test)] in td-boot and #[path]-included as ordinary code
+by recipes/src/recipes/td-install-test.rs. One definition, because a second
+copy of the payload bytes would drift under a signature that still verified for
+the other — and the direction that fails is quiet, a staged deployment td-boot
+refuses and a check that reports a broken installer.

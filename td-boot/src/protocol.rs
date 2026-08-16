@@ -43,6 +43,14 @@ pub const BOOT_DIR: &str = "td/boot";
 pub const ATTEMPTS_DIR: &str = "td/boot/attempts";
 pub const DEPLOYMENTS_DIR: &str = "td/deployments";
 pub const SELECTOR_PREFIX: &str = "../deployments/";
+// The two selector slots, by the names they have on disk. Here rather than as
+// literals in td-boot alone because the installer's recipe check reads one back
+// out of an unmounted image: a check that spelled its own copy would keep
+// passing through a rename, which is the one failure it exists to catch.
+#[allow(dead_code)]
+pub const CURRENT_SLOT: &str = "current";
+#[allow(dead_code)]
+pub const PREVIOUS_SLOT: &str = "previous";
 // The DISK layout, stated here for D1's reason: `td-install` writes it and
 // td-boot reads what sits inside it, and a layout stated twice is a layout that
 // can disagree with itself — at the first boot after an install rather than at

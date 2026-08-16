@@ -1030,19 +1030,42 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    preserves a SYMLINK as one (`type SYMLINK`), which the selector is and
    without which the assertion would be about a file of the same name.
 
-   That recipe check is 7c's THIRD commit and is not landed with the first
-   two, which is worth naming rather than leaving to be noticed. The two
-   before it substitute a shell script for `td-boot`, so what is proven today
-   is td-install's side of the contract — the ordering, the arity, the
-   staging tree, the channels — and not that a target-built `td-boot`
-   authenticates a real bundle that a real `mkfs.btrfs` then carries into the
-   image. What blocks it is the FIXTURE, not the plumbing: the signed bundle
-   committed under `td-boot/tests` names digests that are deliberately never
-   resolved, so it cannot be published. A real end-to-end needs a new triple
-   — manifest, `.sig` and `.pub` — generated with `td-deploy keygen` and
-   `td-deploy sign` over payload bytes that exist, with the private half
-   discarded rather than committed. Until it exists this item is specified
-   and half-checked, which is a worse place to stop than either end.
+   That recipe check is 7c's THIRD commit, and it is what makes the first two
+   more than a claim: they substitute a shell script for `td-boot` on both
+   sides, so a renamed verb or a reordered argument would leave every cargo
+   test green and break every install. Here both programs are the ones that
+   ship, out of `/td/store`, and the bundle is AUTHENTICATED rather than taken
+   on trust — the key is passed, so a signature that does not verify is a
+   failed build.
+
+   The FIXTURE is the part that took the thinking, because a publish this
+   check can authenticate needs a signature, and nothing in the build can
+   make one: td-boot deliberately cannot sign (`affected.rs` refuses any file
+   under `td-boot/src` naming `ed25519_sign`), and no recipe builds
+   `td-deploy`, so it cannot be an input either. The committed triple under
+   `td-boot/tests` cannot serve — its own README says the digests it names
+   are never resolved, which is exactly what a publish needs — so the one
+   usable set is the PAYLOAD-MATCHED one td-boot's own tests carry, and it
+   moved to `td-boot/src/fixture.rs` to be shared by `#[path]`, the way
+   `protocol.rs` already is. One definition rather than two because the
+   signatures are over the manifest those payloads hash to; the recipe
+   COMPUTES that manifest from the shared payloads rather than copying it, so
+   a drifted payload is a signature that stops verifying instead of a fixture
+   nobody rechecked. No private key is added: the rule stays one key, every
+   fixture manifest signed under it, the private half discarded.
+
+   Two things about the check are worth writing down because they were
+   measured rather than assumed. `--rootdir` preserves a SYMLINK as one, which
+   the selector has to be — a regular file of the same name boots nothing.
+   And the volume holds TWO symlinks, `current` and `previous`, each listed
+   twice as a DIR_ITEM and a DIR_INDEX, so a `case` glob asking for `type
+   SYMLINK` before `name: current` can be satisfied by `previous`'s entry. The
+   exact test is therefore done on the STAGING TREE, which is an ordinary
+   directory while the check runs: `-L`, plus the link TARGET read back, which
+   is the only assertion that ties the selector to this deployment rather than
+   to any deployment. The image is then asked only that the entries reached
+   it, the deployment id being conclusive on its own since a 64-character hex
+   name appears nowhere else in a filesystem tree.
 
    **The install-time trust root is settled here, because it is item 7's to
    settle** — `warn_unverifiable_resign` says so in as many words. Today

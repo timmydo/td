@@ -8,6 +8,22 @@
 #![forbid(unsafe_code)]
 
 mod protocol;
+// The committed fixture deployment, in its own file because the `td-install`
+// recipe check stages the SAME one and the signatures are over the manifest
+// its payloads hash to. `cfg(test)` keeps it out of the target binary, which
+// is why td-boot's recipe does not stage it.
+//
+// Written with a redundant `#[path]` — the file is where the module name says
+// — so that `affected.rs`'s staging guard SEES it: that guard reads `#[path]`
+// attributes and is blind to a plain `mod`. Gated, it is skipped; ungated, the
+// guard demands td-boot's recipe stage it. So dropping the `cfg(test)` to
+// reuse this outside tests reds `ready` instead of failing the target build an
+// hour later inside `recipe-checks`, which is the loop that guard exists to
+// close. This is the first file under a target-static crate's `src/` that is
+// deliberately not staged.
+#[cfg(test)]
+#[path = "fixture.rs"]
+mod fixture;
 #[path = "../../engine/src/sha256.rs"]
 #[allow(dead_code)]
 mod sha256;
@@ -2826,6 +2842,8 @@ mod tests {
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
+    use crate::fixture;
+
     /// The one public key every fixture deployment is signed under.
     ///
     /// A committed VECTOR because td-boot cannot sign: `ed25519_sign.rs` is
@@ -2835,91 +2853,40 @@ mod tests {
     /// fixtures cannot serve here, since a deployment that BOOTS needs payloads
     /// that hash to what its manifest says.
     ///
-    /// Regenerate the SET together under one fresh key, private half discarded:
-    ///
-    ///     td-net deploy keygen PRIV PUB
-    ///     td-net deploy sign <manifest> PRIV <out>      # once per tag below
-    ///
-    /// where each manifest is `fixture_manifest(tag)`. A changed payload
-    /// constant invalidates all of them, which
-    /// `every_committed_fixture_signature_verifies_over_its_own_manifest`
-    /// reports.
-    const FIXTURE_PUBLIC_KEY: &str =
-        "9ae001c47ad75dee6349d9355be09f8c19df0fbd6c038258795b10c84c24bbd1";
+    /// The regeneration procedure is `fixture.rs`'s, beside the vectors it
+    /// regenerates.
+    const FIXTURE_PUBLIC_KEY: &str = fixture::PUBLIC_KEY;
 
-    /// A second, UNRELATED public key — a real one from a second `td-deploy
-    /// keygen`, private half likewise discarded.
-    ///
-    /// Generated rather than derived from the key above by flipping a bit,
-    /// which is what this was at first. An ed25519 public key is a compressed
-    /// curve point, so a flipped bit is not reliably a point at all: such a key
-    /// is refused while being DECODED, and a test built on one proves that a
-    /// malformed key is rejected rather than that a signature by somebody
-    /// else's key is. Those are different properties and only the second is
-    /// what fail-closed means.
-    const FIXTURE_OTHER_PUBLIC_KEY: &str =
-        "8f73d78d4c82e12acdcc3d1a8addf056df16518732b235de0a824b0f26c62df2";
+    /// A second, UNRELATED public key — see `fixture.rs` for why it is a real
+    /// generated one rather than this key with a bit flipped.
+    const FIXTURE_OTHER_PUBLIC_KEY: &str = fixture::OTHER_PUBLIC_KEY;
 
     /// Keyed by `source_bundle`'s tag; `""` is `valid_deployment`'s manifest.
-    const FIXTURE_SIGNATURES: [(&str, &str); 8] = [
-        ("", "2e7f46310a09de44bcc2362dd5bf1282d72993fe2608bd92b8b42fd5c7d48378\
-              0aca392552c748994765ef3036ee1d43289a5817c6405dd4abf22f272d41eb09"),
-        ("next", "c4324706c24841f5779c144d67a420174c669bcc2b19e12f3b4258a7eb3cf41a\
-                  d1941c12e9d0e2b72ea3d7f06759c485d55992e7d8251d7259b1c475d2f34805"),
-        ("previous", "debcdd8992e3df4742ac952e3dae6465f03d081af57175a873b216d31026825b\
-                      0e0a08023330b92d952c2e684457e36bfe9d5e05109baa7a6593de344b440603"),
-        ("wrong", "360c0421b77640ffaa274f7207e6f2838348a0e54d6cb2fd74d9816fe9ca6069\
-                   f795322b6b98b9275944f254f5fe34d64fc027e4f4f24c342c4cbe87675c8100"),
-        ("recovery", "9acf3fb487a9affda20b719cc6ab58323aa198c8dfddb3aea080ff7bfea8ee37\
-                      14e8659869f8211f6fdf81c5347ab37c39bf89b305c76e878953fc86c908190d"),
-        ("first", "ef85fb87748d1030c59a0d9433626def520a29bafc5cc368efa3585f23cf89e7\
-                   914a6eae5ad25a68b2fdf74579ff36a2c7938b97b7bea448dadf2d1e7d06960b"),
-        ("current", "ba3956a36ba965e826e44888776ad9b0d0188762e269651650a7e9867252e594\
-                     8c7e25d50e2fc862524c18397ea70ee8fbf5191b1a3a1ab54deac1f8f08c2204"),
-        ("corrupt", "10bd5340cdaa56ed2863fa7b81cb69a5e5a3f28ab9baeaa0c7e23dec66165b25\
-                     3b8656f83332571c05e5e683c13bd92fc53204efc6b0ce450ab3fef34cf2f207"),
-    ];
+    const FIXTURE_SIGNATURES: [(&str, &str); 8] = fixture::SIGNATURES;
+
+    /// The three payloads a fixture deployment carries, keyed by tag.
+    fn fixture_payloads(tag: &str) -> [(&'static str, String); 3] {
+        fixture::payloads(tag)
+    }
+
+    /// The manifest those payloads hash to, under THIS crate's SHA-256.
+    ///
+    /// That is what makes the shared definition a shared FACT rather than a
+    /// shared string: the recipe generator builds the same manifest from the
+    /// same payloads with its own copy of the same digest code, so the two
+    /// agreeing is checked by the signature rather than assumed.
+    fn fixture_manifest(tag: &str) -> String {
+        fixture::manifest(tag, sha256::hex_digest)
+    }
 
     /// The committed signature for a fixture manifest, as the hexadecimal TEXT
     /// a real `manifest.sig` holds — so what the fixture writes goes through
     /// the shipped parser on the way back in, rather than around it.
-    // A loop rather than the searching iterator adaptor: `ladder.rs` refuses
-    // that method's bare name anywhere in a body a recipe stages, this whole
-    // file being one, since the same token is how it catches a bootstrap step
-    // reaching for the host search utility.
-    /// The three payloads a fixture deployment carries, keyed by tag.
-    ///
-    /// One definition because the committed signatures are over the manifest
-    /// these produce: two copies would let a payload drift under a signature
-    /// that still verifies for the other.
-    fn fixture_payloads(tag: &str) -> [(&'static str, String); 3] {
-        let suffix = if tag.is_empty() { "payload" } else { tag };
-        [
-            ("bzImage", format!("kernel-{suffix}\n")),
-            ("initramfs.cpio", format!("initramfs-{suffix}\n")),
-            ("root.erofs", format!("root-{suffix}\n")),
-        ]
-    }
-
-    fn fixture_manifest(tag: &str) -> String {
-        let payloads = fixture_payloads(tag);
-        let mut manifest = String::from("td-deployment-v1\n");
-        for (label, bytes) in &payloads {
-            manifest.push_str(&sha256::hex_digest(bytes.as_bytes()));
-            manifest.push_str("  ");
-            manifest.push_str(label);
-            manifest.push('\n');
-        }
-        manifest
-    }
-
     fn fixture_signature(tag: &str) -> &'static str {
-        for (name, hex) in FIXTURE_SIGNATURES {
-            if name == tag {
-                return hex;
-            }
+        match fixture::signature(tag) {
+            Some(hex) => hex,
+            None => panic!("no committed signature for fixture tag {tag:?}"),
         }
-        panic!("no committed signature for fixture tag {tag:?}")
     }
 
     struct Fixture {
@@ -4363,10 +4330,49 @@ mod tests {
         );
     }
 
+    /// The slot names in `protocol.rs` are the ones a publish actually creates.
+    ///
+    /// `td-install`'s recipe check reads the `current` selector back out of an
+    /// unmounted image, and it must not spell that name itself — a check
+    /// carrying its own copy keeps passing through exactly the rename it exists
+    /// to catch. So the constant is the shared statement, and this ties it to
+    /// BEHAVIOUR rather than to source text: a publish is done and the entry
+    /// the constant names has to be the symlink that appeared.
+    #[test]
+    fn a_publish_creates_the_selector_protocol_names() {
+        // TWO deployments, because one cannot tell the constants apart: a first
+        // publish points both slots at the same id, so `current` and `previous`
+        // are indistinguishable and swapping the two constants passes. The
+        // second publish demotes the first, and only then does each slot have a
+        // target that is wrong for the other.
+        let fixture = Fixture::new();
+        let first = fixture.valid_deployment();
+        // Set up with the LITERALS td-boot's own code uses, and assert through
+        // the constants — so this reds if the constants stop naming these.
+        fixture.selector("current", &first);
+        fixture.selector("previous", &first);
+        let (source, second) = fixture.source_bundle("incoming", "next");
+        install_deployment(&fixture.root, &source, None).unwrap();
+        assert_ne!(first, second, "the two fixtures must differ to tell slots apart");
+
+        let boot = fixture.root.join(protocol::BOOT_DIR);
+        for (slot, want) in [
+            (protocol::CURRENT_SLOT, &second),
+            (protocol::PREVIOUS_SLOT, &first),
+        ] {
+            let target = fs::read_link(boot.join(slot)).unwrap();
+            assert_eq!(
+                target,
+                PathBuf::from(format!("{}{want}", protocol::SELECTOR_PREFIX)),
+                "the {slot} selector does not point where a publish puts it"
+            );
+        }
+    }
+
     /// EVERY committed signature verifies over the manifest the fixture builds
     /// for its tag.
     ///
-    /// The doc on `FIXTURE_SIGNATURES` says a changed payload constant is
+    /// The doc on `fixture::SIGNATURES` says a changed payload constant is
     /// caught because no signature verifies afterwards. That is only true of
     /// the tags some test happens to use — the rest would go stale in the tree
     /// with nothing red, which is the maintenance trap the doc claims not to
@@ -4388,7 +4394,7 @@ mod tests {
             assert!(
                 ed25519::verify(&key, manifest.as_bytes(), &signature),
                 "the committed signature for {tag:?} does not verify — regenerate \
-                 the whole set, see FIXTURE_SIGNATURES"
+                 the whole set, see td-boot/src/fixture.rs"
             );
             assert!(
                 !ed25519::verify(&other, manifest.as_bytes(), &signature),
