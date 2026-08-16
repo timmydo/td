@@ -3962,6 +3962,60 @@ mod tests {
         );
     }
 
+    /// ash NAMES the token a parse stopped on rather than quoting the source at
+    /// it (`tokname`/`raise_error_unexpected_syntax`, ash.c): the four classes
+    /// -- `word`, `newline`, `redirection`, `end of file` -- bare, anything
+    /// with a spelling of its own in quotes, and the token the grammar was owed
+    /// after it where there is one. Which of the two a reserved word gets is
+    /// POSITIONAL: `do` is `"do"` after a list and `word` in a `case` pattern,
+    /// where the lexer was not told to look for keywords.
+    /// Every row measured against busybox ash 1.37.0 and byte-identical to it.
+    #[test]
+    fn a_diagnostic_names_the_token_the_way_ash_does() {
+        for (src, want) in [
+            (";", "syntax error: unexpected \";\""),
+            ("&& echo x", "syntax error: unexpected \"&&\""),
+            ("| cat", "syntax error: unexpected \"|\""),
+            (")", "syntax error: unexpected \")\""),
+            ("echo x ;; y", "syntax error: unexpected \";;\""),
+            ("echo x |& y", "syntax error: unexpected \"&\""),
+            ("if :; then :; fi extra)", "syntax error: unexpected word"),
+            ("if :; then :; fi \"q\"", "syntax error: unexpected word"),
+            ("do echo x", "syntax error: unexpected \"do\""),
+            ("done", "syntax error: unexpected \"done\""),
+            ("{ :; } then", "syntax error: unexpected \"then\""),
+            ("echo > ;", "syntax error: unexpected \";\""),
+            ("echo > <", "syntax error: unexpected redirection"),
+            ("for i in &>; do :; done", "syntax error: unexpected redirection"),
+            ("case ; in x) :;; esac", "syntax error: unexpected \";\" (expecting word)"),
+            ("case && in x) :;; esac", "syntax error: unexpected \"&&\" (expecting word)"),
+            ("case x in x;; esac", "syntax error: unexpected \";;\" (expecting \")\")"),
+            ("case x in x do", "syntax error: unexpected word (expecting \")\")"),
+            ("for i in a; echo x", "syntax error: unexpected word (expecting \"do\")"),
+            ("for i in a do :; done", "syntax error: unexpected \"done\" (expecting \"do\")"),
+            ("for", "syntax error: bad for loop variable"),
+            ("for ; in a; do :; done", "syntax error: bad for loop variable"),
+            // The other arm: a word that is not a NAME, rather than no word.
+            ("for 1x in a; do :; done", "syntax error: bad for loop variable"),
+            // An IO NUMBER and a NEWLINE are classes of their own, and each is
+            // the only token that reaches its arm.
+            ("for i in a 2>f; do :; done", "syntax error: unexpected redirection"),
+            ("echo >\nfoo", "syntax error: unexpected newline"),
+            // An assignment-shaped function name is reported from PAST the
+            // name, so what is named is the token ash stops on.
+            ("function a=1 { :; }", "syntax error: unexpected \"{\""),
+            ("function a=1", "syntax error: unexpected end of file"),
+            ("for \"q\" in a; do :; done", "syntax error: bad for loop variable"),
+            ("function ;", "syntax error: unexpected \";\" (expecting word)"),
+            ("function f function g { :; }", "syntax error: unexpected \"function\""),
+            ("function f echo x", "syntax error: unexpected word"),
+        ] {
+            let (status, out, err) = run(src);
+            assert_eq!((status, out.as_str()), (2, ""), "{src:?}");
+            assert_eq!(err, format!("td-sh: {want}\n"), "{src:?}");
+        }
+    }
+
     /// `function NAME [()] <compound>` is bash's spelling and ash takes it, the
     /// reference build carrying BASH_FUNCTION. It is what lets `}` be a closing
     /// word: without the construct, the brace ending one of these reached a
@@ -5122,10 +5176,12 @@ mod tests {
         // `varnest == 0`, and `&` being a metacharacter is td-sh's equivalent.
         assert_eq!(run("echo \"${x:-a&>b}\"").1, "a&>b\n");
         assert_eq!(run("echo 'a&>b'").1, "a&>b\n");
-        // The operator SPELLS itself in a diagnostic. Nothing else reads that
-        // string, so a transposed `>&` there is invisible to every case above.
-        let (_s, _o, err) = run("for i in &>; do :; done");
-        assert!(err.contains("`&>`"), "{err:?}");
+        // ash names a redirection by its CLASS in a diagnostic, so the
+        // operator's own spelling reaches no output any case above can read:
+        // a transposed `>&` is invisible to all of them, and the text is
+        // pinned where it is written instead.
+        assert_eq!(crate::lexer::Op::AmpGreat.text(), "&>");
+        assert_eq!(run("for i in &>; do :; done").2, "td-sh: syntax error: unexpected redirection\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

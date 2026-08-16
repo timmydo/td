@@ -389,7 +389,7 @@ impl Units {
         if self.at_eof() {
             return Ok(List { items });
         }
-        Err(format!("syntax error near {}", self.describe()))
+        Err(self.unexpected(None))
     }
 
     /// A CHKNL|CHKKWD|CHKALIAS point: a newline is not a token where a command may
@@ -600,6 +600,45 @@ impl Units {
         }
     }
 
+    /// How ash NAMES the token a parse stopped on (`tokname`, ash.c:11895):
+    /// the four classes -- `word`, `newline`, `redirection`, `end of file` --
+    /// bare, and anything with a spelling of its own in quotes. `kw` is whether
+    /// this position recognises keywords, which is what makes `do` `"do"` after
+    /// a list and `word` in a `case` pattern: ash names what was LEXED, and its
+    /// lexer is told per position.
+    fn tokname(&mut self, kw: bool) -> String {
+        match self.peek() {
+            None | Some(Tok::Eof) => "end of file".to_string(),
+            Some(Tok::Newline) => "newline".to_string(),
+            Some(Tok::IoNumber(_)) => "redirection".to_string(),
+            Some(Tok::Op(op)) if op.is_redirect() => "redirection".to_string(),
+            Some(Tok::Op(op)) => format!("\"{}\"", op.text()),
+            Some(Tok::Word(w)) => match w.plain() {
+                Some(t) if kw && is_reserved(t) => format!("\"{t}\""),
+                _ => "word".to_string(),
+            },
+        }
+    }
+
+    /// ash's `raise_error_unexpected_syntax`: the token that stopped the parse,
+    /// and the one the grammar was owed where there is one to name.
+    fn unexpected(&mut self, expecting: Option<&str>) -> String {
+        self.unexpected_named(expecting, true)
+    }
+
+    /// The same from a WORD position, where a reserved word is just a word.
+    fn unexpected_in_word(&mut self, expecting: Option<&str>) -> String {
+        self.unexpected_named(expecting, false)
+    }
+
+    fn unexpected_named(&mut self, expecting: Option<&str>, kw: bool) -> String {
+        let tok = self.tokname(kw);
+        match expecting {
+            Some(want) => format!("syntax error: unexpected {tok} (expecting {want})"),
+            None => format!("syntax error: unexpected {tok}"),
+        }
+    }
+
     fn describe(&mut self) -> String {
         match self.peek() {
             None | Some(Tok::Eof) => "end of input".to_string(),
@@ -620,6 +659,16 @@ impl Units {
     }
 
     fn expect_op(&mut self, want: Op) -> Syn<()> {
+        self.expect_op_named(want, true)
+    }
+
+    /// `expect_op` from a WORD position -- a `case` pattern's `)`, where ash
+    /// names a reserved word `word` because its lexer was not told to look.
+    fn expect_op_in_word(&mut self, want: Op) -> Syn<()> {
+        self.expect_op_named(want, false)
+    }
+
+    fn expect_op_named(&mut self, want: Op, kw: bool) -> Syn<()> {
         if self.peek_op() == Some(want) {
             self.bump();
             return Ok(());
@@ -627,11 +676,8 @@ impl Units {
         if self.at_eof() {
             return Err(format!("{INCOMPLETE}: expected `{}`", want.text()));
         }
-        Err(format!(
-            "syntax error: expected `{}`, found {}",
-            want.text(),
-            self.describe()
-        ))
+        let want = format!("\"{}\"", want.text());
+        Err(self.unexpected_named(Some(&want), kw))
     }
 
     fn expect_reserved(&mut self, want: &str) -> Syn<()> {
@@ -642,13 +688,11 @@ impl Units {
         if self.at_eof() {
             return Err(format!("{INCOMPLETE}: expected `{want}`"));
         }
-        Err(format!(
-            "syntax error: expected `{want}`, found {}",
-            self.describe()
-        ))
+        let want = format!("\"{want}\"");
+        Err(self.unexpected(Some(&want)))
     }
 
-    fn take_word(&mut self) -> Syn<Word> {
+    fn take_word(&mut self, expecting: Option<&str>) -> Syn<Word> {
         // No command starts here (a redirection target, a `case` pattern, a `for`
         // list word), but a blank-terminated replacement still reaches this far.
         self.check_alias(Chk::None)?;
@@ -659,7 +703,10 @@ impl Units {
                 Ok(w)
             }
             None | Some(Tok::Eof) => Err(format!("{INCOMPLETE}: expected a word")),
-            _ => Err(format!("syntax error: expected a word, found {}", self.describe())),
+            // A word POSITION, so a reserved word would be named `word` --
+            // which nothing reaching this arm can be, the `Word` arm above
+            // having matched first.
+            _ => Err(self.unexpected_in_word(expecting)),
         }
     }
 
@@ -1056,19 +1103,16 @@ impl Units {
             return Err(if self.at_eof() {
                 format!("{INCOMPLETE}: expected a function name")
             } else {
-                format!(
-                    "syntax error: expected a function name, found {}",
-                    self.describe()
-                )
+                self.unexpected(Some("word"))
             });
         };
         // ash files an assignment-shaped name as a VARIABLE, leaving `do_func`
         // (ash.c:12163) without the one argument it tests for.
         if assignment {
-            return Err(format!(
-                "syntax error: expected a function name, found {}",
-                self.describe()
-            ));
+            // ash files the word as a VARIABLE and stops on what follows, so
+            // the token it names is the body's, not the name's.
+            self.bump();
+            return Err(self.unexpected(None));
         }
         // A command word with a `/` in it is never a function LOOKUP, so a
         // definition under one is as unreachable as an unspellable name.
@@ -1090,7 +1134,7 @@ impl Units {
             return Err(if self.at_eof() {
                 format!("{INCOMPLETE}: expected a function body")
             } else {
-                format!("syntax error: expected a function body, found {}", self.describe())
+                self.unexpected(None)
             });
         }
         self.func_body(name, line)
@@ -1154,9 +1198,9 @@ impl Units {
         let var = match self.peek() {
             Some(Tok::Word(w)) => match w.plain() {
                 Some(n) if is_name(n) => n.to_string(),
-                _ => return Err("syntax error: `for` requires a variable name".into()),
+                _ => return Err("syntax error: bad for loop variable".into()),
             },
-            _ => return Err("syntax error: `for` requires a variable name".into()),
+            _ => return Err("syntax error: bad for loop variable".into()),
         };
         self.bump();
         self.open_command()?;
@@ -1170,7 +1214,15 @@ impl Units {
                 if !matches!(self.peek(), Some(Tok::Word(_))) {
                     break;
                 }
-                ws.push(self.take_word()?);
+                ws.push(self.take_word(Some("word"))?);
+            }
+            // A list that stopped on something that is neither a separator
+            // nor a newline is the error ITSELF here, before any `do` is owed.
+            let stopped = !matches!(self.peek(), Some(Tok::Newline))
+                && self.peek_op() != Some(Op::Semi)
+                && !self.at_eof();
+            if stopped {
+                return Err(self.unexpected(None));
             }
             Some(ws)
         } else {
@@ -1194,7 +1246,7 @@ impl Units {
 
     fn parse_case(&mut self) -> Syn<Cmd> {
         self.expect_reserved("case")?;
-        let word = self.take_word()?;
+        let word = self.take_word(Some("word"))?;
         self.open_command()?;
         self.expect_reserved("in")?;
         let mut items = Vec::new();
@@ -1210,12 +1262,12 @@ impl Units {
             if self.peek_op() == Some(Op::LParen) {
                 self.bump();
             }
-            let mut patterns = vec![self.take_word()?];
+            let mut patterns = vec![self.take_word(Some("word"))?];
             while self.peek_op() == Some(Op::Pipe) {
                 self.bump();
-                patterns.push(self.take_word()?);
+                patterns.push(self.take_word(Some("word"))?);
             }
-            self.expect_op(Op::RParen)?;
+            self.expect_op_in_word(Op::RParen)?;
             let body = self.parse_list(&["esac"])?;
             items.push(CaseItem { patterns, body });
             if self.peek_op() == Some(Op::DSemi) {
@@ -1283,7 +1335,7 @@ impl Units {
             return Err(if self.at_eof() {
                 format!("{INCOMPLETE}: expected a command")
             } else {
-                format!("syntax error near {}", self.describe())
+                self.unexpected(None)
             });
         }
         Ok(Cmd::Simple {
@@ -1322,7 +1374,7 @@ impl Units {
         if let Op::DLess(id) = op {
             // The delimiter word follows the operator; its body was collected
             // by the lexer at the end of the line.
-            let _delim = self.take_word()?;
+            let _delim = self.take_word(None)?;
             self.ensure_heredoc(id);
             let body = self.scan.heredocs().get(id).cloned().unwrap_or_default();
             return Ok(Redir {
@@ -1342,7 +1394,7 @@ impl Units {
             Op::AmpGreat => RedirKind::OutBoth,
             other => return Err(format!("syntax error near `{}`", other.text())),
         };
-        let word = self.take_word()?;
+        let word = self.take_word(None)?;
         Ok(Redir { fd, kind, word })
     }
 }
