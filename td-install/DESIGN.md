@@ -1321,13 +1321,52 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    with `td-boot/src/main.rs` pinned to select NONE of them: the rule has to
    be about these files rather than about the crate.
 
-   **10c is the residual race that consolidation now makes fixable once.**
-   `File::open` is issued after the type is settled, so an entry swapped for a
-   FIFO in between still blocks — the identity check that would catch it is on
-   the far side of the open. `O_NONBLOCK | O_NOFOLLOW` closes both that and the
-   symlink half, and it is deliberately not in this landing: it changes runtime
-   behaviour on a security path in all three crates, which deserves its own
-   diff rather than riding inside a move.
+   **10c closed the residual race, once, for all three.** The type is settled
+   by `lstat` and the open follows it, so the entry can be replaced in between
+   — and the identity pin catches that only for a swap the open SURVIVES.
+   Two do not. A symlink is followed and the target read, which the pin then
+   notices after the fact rather than preventing; and a FIFO BLOCKS the open,
+   where no check on the far side of a blocking call ever runs. The second is
+   the one that matters: td-boot reads a manifest on the boot path, so it is a
+   machine that hangs with nothing printed rather than one that refuses.
+
+   So the open carries `O_NOFOLLOW | O_NONBLOCK`. Neither flag changes anything
+   for a regular file — reads ignore `O_NONBLOCK` — which is why the identity
+   pin still does the work for a regular-for-regular swap; the flags handle
+   only the two cases it cannot.
+
+   The `lstat` stays in front of the open rather than being replaced by it,
+   and what it buys is narrower than it looks: it keeps this off device nodes
+   in the ORDINARY case, some of them acting merely on being opened, but a
+   node swapped in after it is still opened and the pin only notices
+   afterwards. So that race is NOT closed, and saying otherwise would be the
+   claim this file exists to avoid. Closing it needs `O_PATH | O_NOFOLLOW` —
+   which opens without acting on the file — an `fstat` to type it, and a
+   reopen through `/proc/self/fd/N`. That is refused here for one reason: it
+   would put a `/proc` dependency on the BOOT path, where td-boot reads a
+   manifest from an initramfs that need not have mounted one, and a reader
+   that cannot read is worse than a residual race an attacker must already
+   have write access to the directory to reach.
+
+   Both constants are spelled by value, since these crates have no libc, and
+   pinned in two directions. By what they DO: a symlink opened with
+   `O_NOFOLLOW` must fail AND a regular file must not, which is what separates
+   it from the `O_DIRECTORY` one bit away, and a writerless FIFO opened with
+   `O_NONBLOCK` must return at once. And by WHERE: the target is pinned whole
+   at compile time to x86_64-linux, in the shape `td-svc` and `td-init`
+   already use, because a wrong number here is SILENT rather than loud —
+   `build_open_how` masks flag bits it does not recognise instead of refusing
+   them, so a wrong `O_NOFOLLOW` is an open that quietly follows symlinks
+   again. arm64 is the trap that makes the whole-target form the right one: it
+   overrides the generic header, where `0o400000` is `O_LARGEFILE`.
+
+   The post-`lstat` open is its own function so those flags are tested THROUGH
+   the production path rather than through an `OpenOptions` a test built
+   itself — handed metadata deliberately made stale, which is the race
+   arranged rather than won. The symlink case points back at the file that was
+   typed, same device and inode, so the pin would accept it and `O_NOFOLLOW`
+   is the only thing that refuses. What those tests still do not pin is
+   EXACTNESS: each flag is checked as sufficient, so a superset would pass.
 
    Applying the rule in `td-install` at all is not belt-and-braces, and the
    doc comment says so: this program SNAPSHOTS the key and hands td-boot the

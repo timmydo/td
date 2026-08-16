@@ -9,9 +9,11 @@
 //! - The type is settled by `lstat` BEFORE the open, because opening a FIFO
 //!   read-only BLOCKS until a writer appears — a check that runs afterwards
 //!   never runs at all, and the caller hangs with no diagnostic.
-//! - The device/inode pair is compared ACROSS the open, because the entry
-//!   can be replaced in between: a symlink put there after the `lstat` is
-//!   opened and followed, and the target is a regular file too.
+//! - The open carries `O_NOFOLLOW | O_NONBLOCK`, and the device/inode pair is
+//!   compared ACROSS it, because the entry can be replaced in between. The
+//!   flags make the two replacements that would otherwise WIN harmless — a
+//!   symlink is refused at the open rather than followed, and a FIFO cannot
+//!   block a call no later check can reach — and the pair catches the rest.
 //! - The read takes one byte PAST the limit and refuses if it gets it, because
 //!   a file that grew after the stat would otherwise be cut to exactly the
 //!   limit and carried on as if it had always been that size.
@@ -22,6 +24,23 @@
 use std::fs::{File, Metadata};
 use std::io::{self, Read};
 use std::path::Path;
+
+/// Spelled by VALUE because this crate has no libc. Both are pinned by TEST
+/// rather than by assertion — a symlink opened with `O_NOFOLLOW` must fail and
+/// a FIFO opened with `O_NONBLOCK` must not block — so a wrong number is a red
+/// test rather than a flag that silently does nothing.
+/// These two numbers are per-TARGET, and getting one wrong is silent rather
+/// than loud: `build_open_how` masks flag bits it does not know instead of
+/// refusing them, so a wrong `O_NOFOLLOW` is an open that follows symlinks
+/// again. arm64 is the trap — it overrides the generic header, where
+/// `0o400000` is `O_LARGEFILE` and `O_NOFOLLOW` is `0o100000` — and the BSDs
+/// differ in both. So the target is pinned WHOLE, in the shape `td-svc` and
+/// `td-init` already use for their syscall numbers, rather than by a
+/// whitelist of architectures that look close enough.
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+compile_error!("realfile.rs pins O_NONBLOCK/O_NOFOLLOW for x86_64-linux only");
+const O_NONBLOCK: i32 = 0o4000;
+const O_NOFOLLOW: i32 = 0o400000;
 
 fn refused(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -56,13 +75,44 @@ pub fn open_real_file(path: &Path, label: &str) -> io::Result<(File, Metadata)> 
             path.display()
         )));
     }
-    let file = File::open(path).map_err(|error| {
-        io::Error::new(error.kind(), format!("{label} {}: {error}", path.display()))
-    })?;
+    open_checked(path, &metadata, label)
+}
+
+/// The half of `open_real_file` that runs AFTER the type is settled, split out
+/// so it can be tested against metadata deliberately made stale — which is the
+/// race, arranged rather than won.
+///
+/// Between the `lstat` above and this open the entry can be replaced. The
+/// device/inode pin catches a swap the open survives; the two flags catch the
+/// two it does not. `O_NOFOLLOW` refuses a symlink AT the open, which the pin
+/// cannot do when the symlink points back at the very file that was typed —
+/// same device, same inode, and it would otherwise be followed and read.
+/// `O_NONBLOCK` is the one that matters most: a FIFO blocks this open until a
+/// writer appears, and no check on the far side of a blocking call ever runs.
+/// td-boot reads a manifest on the BOOT path, so that is a machine that hangs
+/// with nothing printed rather than one that refuses.
+///
+/// Neither flag changes anything for a regular file — reads ignore
+/// `O_NONBLOCK` — which is why the pin still does the work for a
+/// regular-for-regular swap.
+///
+/// What the `lstat` buys is the ORDINARY case and not the raced one: it keeps
+/// this off device nodes, some of which act merely on being opened, but a node
+/// swapped in after it is still opened here and neither flag prevents that.
+/// DESIGN §10 item 10c records why the `O_PATH` route that would is refused.
+fn open_checked(path: &Path, expected: &Metadata, label: &str) -> io::Result<(File, Metadata)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .open(path)
+        .map_err(|error| {
+            io::Error::new(error.kind(), format!("{label} {}: {error}", path.display()))
+        })?;
     let opened = file.metadata().map_err(|error| {
         io::Error::new(error.kind(), format!("{label} {}: {error}", path.display()))
     })?;
-    if !opened.file_type().is_file() || !same_file(&metadata, &opened) {
+    if !opened.file_type().is_file() || !same_file(expected, &opened) {
         return Err(refused(format!(
             "{label} changed while opening: {}",
             path.display()
@@ -107,6 +157,20 @@ mod tests {
 
     const LIMIT: u64 = 96;
 
+    /// A FIFO, or a FAILED test. Skipping when `mkfifo` is absent would make
+    /// the two assertions that need one pass on a host that cannot make one —
+    /// and those are the safety net for a hardcoded number, so a silent skip
+    /// is the one outcome they must not have.
+    fn make_fifo(dir: &std::path::Path) -> std::path::PathBuf {
+        let fifo = dir.join("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must exist: these assertions cannot run without a FIFO");
+        assert!(made.success(), "mkfifo failed to create {fifo:?}");
+        fifo
+    }
+
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "td-realfile-{tag}-{}-{:?}",
@@ -138,14 +202,11 @@ mod tests {
     #[test]
     fn a_fifo_is_refused_rather_than_blocking_forever() {
         let dir = scratch("fifo");
-        let fifo = dir.join("fifo");
-        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
-        if made.map(|status| status.success()).unwrap_or(false) {
-            let refused = read_bounded_real_file(&fifo, "key", LIMIT)
-                .unwrap_err()
-                .to_string();
-            assert!(refused.contains("must be a real regular file"), "{refused}");
-        }
+        let fifo = make_fifo(&dir);
+        let refused = read_bounded_real_file(&fifo, "key", LIMIT)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("must be a real regular file"), "{refused}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -207,6 +268,110 @@ mod tests {
         assert!(
             same_file(&ma, &reopened),
             "the same path reopened is the same file"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// THE RACE, ARRANGED. `open_checked` is handed metadata deliberately made
+    /// stale, which is exactly what the window between the `lstat` and the open
+    /// produces — so the two flags are tested THROUGH the production path
+    /// rather than through an `OpenOptions` the test built itself.
+    ///
+    /// The symlink points back at the FILE THAT WAS TYPED, which is the case
+    /// the device/inode pin cannot see: same device, same inode, so following
+    /// it succeeds every check. `O_NOFOLLOW` is the only thing that refuses,
+    /// and removing it from `open_checked` reds this.
+    #[test]
+    fn a_symlink_swapped_in_after_the_type_check_is_not_followed() {
+        let dir = scratch("swap-link");
+        let target = dir.join("target");
+        std::fs::write(&target, b"x").unwrap();
+        let entry = dir.join("entry");
+        // A hard link, so the entry that gets typed and the symlink's target
+        // are ONE inode — the pin has nothing to notice.
+        std::fs::hard_link(&target, &entry).unwrap();
+        let stale = std::fs::symlink_metadata(&entry).unwrap();
+        std::fs::remove_file(&entry).unwrap();
+        std::os::unix::fs::symlink(&target, &entry).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            stale.ino(),
+            std::fs::metadata(&entry).unwrap().ino(),
+            "the fixture only tests O_NOFOLLOW if the pin would accept the target"
+        );
+        assert!(
+            open_checked(&entry, &stale, "key").is_err(),
+            "a symlink to the typed file was followed — O_NOFOLLOW is not set"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The same window with a FIFO. Without `O_NONBLOCK` this does not fail —
+    /// it HANGS, which is the whole of what that flag is for.
+    #[test]
+    fn a_fifo_swapped_in_after_the_type_check_does_not_block() {
+        let dir = scratch("swap-fifo");
+        let entry = dir.join("entry");
+        std::fs::write(&entry, b"x").unwrap();
+        let stale = std::fs::symlink_metadata(&entry).unwrap();
+        std::fs::remove_file(&entry).unwrap();
+        let fifo = make_fifo(&dir);
+        std::fs::rename(&fifo, &entry).unwrap();
+        let refused = open_checked(&entry, &stale, "key").unwrap_err().to_string();
+        assert!(refused.contains("changed while opening"), "{refused}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The two open flags, pinned by what they DO rather than by their
+    /// numbers: this crate has no libc to take them from, so a wrong constant
+    /// would be a flag that silently does nothing. The race they close needs
+    /// interposition to reproduce; that each flag is the flag it claims to be
+    /// does not.
+    #[test]
+    fn the_open_flags_are_the_numbers_they_claim_to_be() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = scratch("flags");
+        let target = dir.join("real");
+        std::fs::write(&target, b"x").unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // O_NOFOLLOW: the symlink itself is refused, where a plain open of the
+        // same path succeeds by following it.
+        assert!(
+            std::fs::File::open(&link).is_ok(),
+            "the fixture must be followable"
+        );
+        assert!(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(O_NOFOLLOW)
+                .open(&link)
+                .is_err(),
+            "O_NOFOLLOW did not refuse a symlink — the constant is wrong"
+        );
+        // ...and REFUSING is not enough: `O_DIRECTORY` sits one bit away and
+        // refuses a symlink too, along with the regular file this must accept.
+        // Without this half the assertion above passes for the wrong flag,
+        // which a mutation to 0o200000 demonstrated.
+        assert!(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(O_NOFOLLOW)
+                .open(&target)
+                .is_ok(),
+            "O_NOFOLLOW refused a regular file — the constant is some other flag"
+        );
+        // O_NONBLOCK: a FIFO with no writer opens AT ONCE. Without the flag
+        // this call blocks forever, so a wrong constant hangs rather than
+        // fails — which is the same signal the FIFO test above carries.
+        let fifo = make_fifo(&dir);
+        assert!(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(O_NONBLOCK)
+                .open(&fifo)
+                .is_ok(),
+            "O_NONBLOCK could not open a writerless FIFO"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
