@@ -2603,6 +2603,21 @@ mod tests {
         assert_eq!(run(src).1, "got=hi\n");
     }
 
+    /// The same depth on the PLAIN path -- no stage, no job -- which the two
+    /// `stack_size` calls beside it never covered. `main` runs on the shell's
+    /// stack now and so does this harness, and the harness is the half that
+    /// could not be taken on trust: libtest gives a test thread 2 MiB, the very
+    /// size that made a stage crash, so before this the assertion below aborted
+    /// the test binary instead of failing.
+    #[test]
+    fn the_plain_path_reaches_the_recursion_guard_rather_than_the_stack_end() {
+        let n = super::MAX_RUN_DEPTH as usize + 50;
+        let param = format!("{}echo 1{}", "${x:-$(".repeat(n), ")}".repeat(n));
+        let (_, out, err) = run(&format!("echo {param}; echo AFTER"));
+        assert!(err.contains("maximum recursion depth exceeded"), "guard: {err:?}");
+        assert!(out.ends_with("AFTER\n"), "the shell did not survive it: {out:?}");
+    }
+
     /// The three unary operators `test` does not serve. `-a` is the interesting
     /// one: in `test` that spelling is the binary AND operator, so `test`'s
     /// roster cannot have it, while inside `[[ ]]` the connective is `&&` and
@@ -5139,21 +5154,26 @@ mod tests {
     /// the same mechanism rather than a case in the environment builder.
     #[test]
     fn an_exported_lineno_carries_the_last_value_read() {
+        // On the shell's stack like every other way into the evaluator: this one
+        // keeps the shell afterwards, so it cannot use `run_capturing`.
         let seen = |src: &str| {
-            let mut sh = super::Shell::new_for_test();
-            super::run_program(&mut sh, src);
-            // A plain loop rather than the searching iterator adaptor: this
-            // file is written into the image by a `WriteFile`, which the
-            // ladder's host-findutils guard scans as a command surface, so
-            // that tool's name may not appear here at all -- not even in a
-            // comment. `recipes/src/recipes/td-sh.rs` states it.
-            let mut got = None;
-            for (k, v) in sh.exported_env() {
-                if k == "LINENO" {
-                    got = Some(v);
+            crate::process::on_shell_stack(|| {
+                let mut sh = super::Shell::new_for_test();
+                super::run_program(&mut sh, src);
+                // A plain loop rather than the searching iterator adaptor: this
+                // file is written into the image by a `WriteFile`, which the
+                // ladder's host-findutils guard scans as a command surface, so
+                // that tool's name may not appear here at all -- not even in a
+                // comment. `recipes/src/recipes/td-sh.rs` states it.
+                let mut got = None;
+                for (k, v) in sh.exported_env() {
+                    if k == "LINENO" {
+                        got = Some(v);
+                    }
                 }
-            }
-            got
+                got
+            })
+            .expect("could not start the shell thread")
         };
         // Set-and-EMPTY before any read, which is what dash's child sees --
         // not absent, and not the line the export is on.

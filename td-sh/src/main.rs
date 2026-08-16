@@ -63,7 +63,16 @@ fn main() -> ExitCode {
     // here, while this thread is the only one.
     process::prime_umask();
     let args: Vec<String> = std::env::args().collect();
-    let code = match run(&args) {
+    // On a stack this crate chose rather than the one the process was launched
+    // with, so `ulimit -s` cannot put the depth guards above where the stack
+    // ends. Spawned AFTER the umask priming above, which needs to be alone.
+    //
+    // A thread the OS REFUSES falls back to the process's own stack rather than
+    // ending the shell: that is what every version before this ran on, and a
+    // guard that may sit above the end of a small stack beats a `/bin/sh` that
+    // exits before reading the script.
+    let started = process::on_shell_stack(|| run(&args)).unwrap_or_else(|_| run(&args));
+    let code = match started {
         Ok(code) => code,
         Err(msg) => {
             // Almost everything here is raised before `run` built a shell, so

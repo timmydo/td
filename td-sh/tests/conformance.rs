@@ -3651,6 +3651,32 @@ fn a_shell_with_a_background_job_can_still_be_interrupted(
 /// so `while :; do cmd & done`, the shape the interrupt work above is all about,
 /// died of SIGABRT in about a second. Reaping the ones already finished is what
 /// bounds it; measured aborting at 40000 before and clean after.
+/// `main` evaluates on a thread of its own, and only the BINARY can show it:
+/// every in-process test goes through a capturing harness, which spawns one
+/// itself, so reverting `main.rs` alone leaves the whole suite green and the
+/// half the `ulimit -s` argument is about uncovered.
+///
+/// The kernel is what to ask. A shell on the process's own stack has one
+/// thread; one that spawned its own has two, `main` being blocked in the join.
+#[test]
+fn the_shell_evaluates_on_a_thread_it_made_itself() -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let out = std::process::Command::new(&shell)
+        .args([
+            "-c",
+            "while read k v; do if [ \"$k\" = Threads: ]; then echo $v; fi; \
+             done < /proc/self/status",
+        ])
+        .output()?;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "2",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(())
+}
+
 #[test]
 fn a_loop_of_jobs_does_not_exhaust_the_process() -> Result<(), Box<dyn std::error::Error>> {
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));

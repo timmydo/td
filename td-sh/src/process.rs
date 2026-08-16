@@ -397,9 +397,35 @@ const BAD_FD_NUMBER: i32 = 2;
 ///
 /// 8 MiB is `ulimit -s`'s usual value rather than a reading of it: asking would
 /// need `getrlimit(2)`, a syscall this crate's surface deliberately does not
-/// have. So the parity holds at that usual value and not below it -- launched
-/// with less, the MAIN thread becomes the shallow one instead.
+/// have. Nothing evaluates on the stack the process was LAUNCHED with -- bar
+/// `main`'s fallback for an OS that refuses a thread at all -- so the size is
+/// this crate's choice everywhere rather than the environment's.
 pub const SHELL_THREAD_STACK: usize = 8 * 1024 * 1024;
+
+/// Run `f` on a thread with that stack. Every entry point into evaluation goes
+/// through here, which is what makes the size a property of the shell rather
+/// than of whoever started it -- `ulimit -s` for the process, and libtest's
+/// 2 MiB for a test.
+///
+/// Scoped so the closure may borrow, and `Builder` rather than `spawn` for the
+/// reason the other two sites use it: `spawn` PANICS when the OS cannot make a
+/// thread, and this crate does not panic on an error path. The error is
+/// therefore a spawn failure and nothing else.
+///
+/// A panic is RE-RAISED rather than reported, so this wrapper is transparent to
+/// one: `scope` propagates a panic itself for a thread it joins, and joining by
+/// hand opts out of that. Reporting it as an error instead would reach the test
+/// harnesses as status 2 -- a status many of them assert.
+pub fn on_shell_stack<T: Send>(f: impl FnOnce() -> T + Send) -> std::io::Result<T> {
+    std::thread::scope(|scope| {
+        let handle =
+            std::thread::Builder::new().stack_size(SHELL_THREAD_STACK).spawn_scoped(scope, f)?;
+        match handle.join() {
+            Ok(v) => Ok(v),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    })
+}
 
 /// The result of applying one command's redirections.
 pub enum RedirOutcome {
@@ -2106,27 +2132,37 @@ fn is_executable(m: &std::fs::Metadata) -> bool {
 
 /// Parse and run a program with stdout and stderr captured to buffers — the
 /// harness used by unit and conformance tests.
+///
+/// On the shell's stack like `main`, and for the same reason rather than for
+/// symmetry: libtest gives each test thread 2 MiB, so without this a test that
+/// recursed as deep as the guards ALLOW took the test binary down with it.
 #[cfg(test)]
 pub fn run_capturing(src: &str) -> (i32, String, String) {
-    let out = Arc::new(Mutex::new(Vec::new()));
-    let err = Arc::new(Mutex::new(Vec::new()));
-    let mut sh = Shell::new_for_test();
-    sh.fds.set(1, Fd::WriteBuf(out.clone()));
-    sh.fds.set(2, Fd::WriteBuf(err.clone()));
-    let status = exec::run_program(&mut sh, src);
-    // Dropped before the buffers are read, as `main` drops the shell before it
-    // returns: that is what joins the background jobs, and their output goes
-    // into these same buffers.
-    drop(sh);
-    let out_s = out
-        .lock()
-        .map(|v| String::from_utf8_lossy(&v).into_owned())
-        .unwrap_or_default();
-    let err_s = err
-        .lock()
-        .map(|v| String::from_utf8_lossy(&v).into_owned())
-        .unwrap_or_default();
-    (status, out_s, err_s)
+    on_shell_stack(|| {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let err = Arc::new(Mutex::new(Vec::new()));
+        let mut sh = Shell::new_for_test();
+        sh.fds.set(1, Fd::WriteBuf(out.clone()));
+        sh.fds.set(2, Fd::WriteBuf(err.clone()));
+        let status = exec::run_program(&mut sh, src);
+        // Dropped before the buffers are read, as `main` drops the shell before
+        // it returns: that is what joins the background jobs, and their output
+        // goes into these same buffers.
+        drop(sh);
+        let out_s = out
+            .lock()
+            .map(|v| String::from_utf8_lossy(&v).into_owned())
+            .unwrap_or_default();
+        let err_s = err
+            .lock()
+            .map(|v| String::from_utf8_lossy(&v).into_owned())
+            .unwrap_or_default();
+        (status, out_s, err_s)
+    })
+    // A thread the OS refused is the environment failing, not the shell
+    // answering: reporting it as a status would be a harness inventing a run
+    // that never happened.
+    .expect("could not start the shell thread")
 }
 
 /// `run_capturing`'s stdout as raw BYTES. `echo`/`printf` escapes can name a
@@ -2134,13 +2170,16 @@ pub fn run_capturing(src: &str) -> (i32, String, String) {
 /// so an assertion about, say, `\377` cannot tell 0xff from any other bad byte.
 #[cfg(test)]
 pub fn run_capturing_bytes(src: &str) -> (i32, Vec<u8>) {
-    let out = Arc::new(Mutex::new(Vec::new()));
-    let mut sh = Shell::new_for_test();
-    sh.fds.set(1, Fd::WriteBuf(out.clone()));
-    let status = exec::run_program(&mut sh, src);
-    drop(sh);
-    let bytes = out.lock().map(|v| v.clone()).unwrap_or_default();
-    (status, bytes)
+    on_shell_stack(|| {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let mut sh = Shell::new_for_test();
+        sh.fds.set(1, Fd::WriteBuf(out.clone()));
+        let status = exec::run_program(&mut sh, src);
+        drop(sh);
+        let bytes = out.lock().map(|v| v.clone()).unwrap_or_default();
+        (status, bytes)
+    })
+    .expect("could not start the shell thread")
 }
 
 /// Drive several units through the INTERACTIVE handler, as the prompt loop does,
@@ -2148,29 +2187,32 @@ pub fn run_capturing_bytes(src: &str) -> (i32, Vec<u8>) {
 /// only this path can show that a shell survives an aborted command.
 #[cfg(test)]
 pub fn run_capturing_interactive_units(units: &[&str]) -> (i32, String, String) {
-    let out = Arc::new(Mutex::new(Vec::new()));
-    let err = Arc::new(Mutex::new(Vec::new()));
-    let mut sh = Shell::new_for_test();
-    sh.interactive = true;
-    sh.fds.set(1, Fd::WriteBuf(out.clone()));
-    sh.fds.set(2, Fd::WriteBuf(err.clone()));
-    for unit in units {
-        match crate::parser::parse_aliased(unit, &sh.aliases) {
-            Ok(list) => {
-                if let Some(code) = exec::run_interactive_unit(&mut sh, &list) {
-                    sh.set_status(code);
-                    break;
+    on_shell_stack(|| {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let err = Arc::new(Mutex::new(Vec::new()));
+        let mut sh = Shell::new_for_test();
+        sh.interactive = true;
+        sh.fds.set(1, Fd::WriteBuf(out.clone()));
+        sh.fds.set(2, Fd::WriteBuf(err.clone()));
+        for unit in units {
+            match crate::parser::parse_aliased(unit, &sh.aliases) {
+                Ok(list) => {
+                    if let Some(code) = exec::run_interactive_unit(&mut sh, &list) {
+                        sh.set_status(code);
+                        break;
+                    }
                 }
+                Err(_) => sh.set_status(2),
             }
-            Err(_) => sh.set_status(2),
         }
-    }
-    let status = sh.status;
-    drop(sh);
-    let text = |b: &Arc<Mutex<Vec<u8>>>| {
-        b.lock().map(|v| String::from_utf8_lossy(&v).into_owned()).unwrap_or_default()
-    };
-    (status, text(&out), text(&err))
+        let status = sh.status;
+        drop(sh);
+        let text = |b: &Arc<Mutex<Vec<u8>>>| {
+            b.lock().map(|v| String::from_utf8_lossy(&v).into_owned()).unwrap_or_default()
+        };
+        (status, text(&out), text(&err))
+    })
+    .expect("could not start the shell thread")
 }
 
 
@@ -2186,6 +2228,18 @@ mod thread_state {
         assert_send::<crate::exec::Shell>();
         assert_send::<super::Subshell>();
         assert_send::<super::Fds>();
+    }
+
+    /// A panic must cross that boundary as a PANIC. The harnesses turn what
+    /// `on_shell_stack` returns into a shell result, so one reported as an
+    /// error would arrive as status 2 and pass every test asserting 2.
+    /// Catching one needs unwinding, which the release `panic = "abort"` does
+    /// not have -- but cargo forces unwinding on a TEST target whatever the
+    /// profile says, so this needs no `cfg` and runs under `--release` too.
+    #[test]
+    #[should_panic(expected = "the evaluator fell over")]
+    fn a_panic_on_the_shell_stack_stays_a_panic() {
+        let _ = super::on_shell_stack(|| panic!("the evaluator fell over"));
     }
 }
 
