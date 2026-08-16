@@ -619,7 +619,12 @@ impl Arith {
         }
         let outer = self.live;
         self.live = outer && cond != 0;
-        let then = self.expr_assign(sh)?;
+        // Both arms recurse and both are bracketed. The THEN arm reaches
+        // `expr_assign` without passing `expr_unary`, so nothing else counts it.
+        self.enter()?;
+        let then = self.expr_assign(sh);
+        self.leave();
+        let then = then?;
         self.live = outer;
         if !self.eat_op(":") {
             return Err(SYNTAX.into());
@@ -1988,16 +1993,29 @@ mod tests {
     fn deeply_nested_exprs_error_instead_of_overflowing() {
         // Past MAX_EXPR_DEPTH the parser errors rather than recursing into a stack
         // overflow. Every recursion site is covered: parentheses and unary chains
-        // (via expr_unary), right-associative assignment (`a=a=…=1`), right-nested
-        // ternary (`0?1:0?1:…`), and `**`, which is right-associative too — the
-        // last three recurse in expr_assign/expr_ternary/expr_exponent, NOT
-        // through expr_unary, so they need their own brackets.
+        // (via expr_unary), right-associative assignment (`a=a=…=1`), BOTH ternary
+        // arms, and `**`, which is right-associative too — all of those but the
+        // first recurse in expr_assign/expr_ternary/expr_exponent, NOT through
+        // expr_unary, so they need their own brackets.
+        //
+        // The two ternary arms are separate rows because they descend by
+        // different routes.
         assert!(ev(&("(".repeat(1000) + "1" + &")".repeat(1000))).is_err());
         assert!(ev(&("!".repeat(1000) + "1")).is_err());
         assert!(ev(&("-".repeat(1000) + "1")).is_err());
         assert!(ev(&("a=".repeat(1000) + "1")).is_err());
         assert!(ev(&("0?1:".repeat(1000) + "1")).is_err());
+        assert!(ev(&("1?".repeat(1000) + "1" + &":0".repeat(1000))).is_err());
         assert!(ev(&("1**".repeat(1000) + "1")).is_err());
+        // Each row is a bound rather than a parse failure: one level under it
+        // evaluates, so a row cannot pass because its shape is malformed.
+        assert_eq!(ev(&("(".repeat(90) + "1" + &")".repeat(90))), Ok(1));
+        assert_eq!(ev(&("!".repeat(90) + "1")), Ok(1));
+        assert_eq!(ev(&("-".repeat(90) + "1")), Ok(1));
+        assert_eq!(ev(&("a=".repeat(90) + "1")), Ok(1));
+        assert_eq!(ev(&("0?1:".repeat(90) + "1")), Ok(1));
+        assert_eq!(ev(&("1?".repeat(90) + "1" + &":0".repeat(90))), Ok(1));
+        assert_eq!(ev(&("1**".repeat(90) + "1")), Ok(1));
     }
 
     #[test]
