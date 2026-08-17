@@ -2766,7 +2766,11 @@ fn restore_substitute(
         .collect();
     let base = output_path.rsplit('/').next().unwrap_or(output_path);
     let dest = newstore.join(base);
-    let _ = std::fs::remove_dir_all(&dest);
+    // Clearing a STALE dest is this caller's own business (`read_nar` refuses one rather
+    // than removing it), and it must succeed: leaving it would turn the restore below into
+    // that refusal. It is also what keeps the two cleanup policies from meeting — dest is
+    // absent when `read_nar` runs, so its own "not mine to delete" arm is unreachable here.
+    nar::remove_any(&dest).map_err(|e| format!("clear stale {}: {e}", dest.display()))?;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -2795,9 +2799,14 @@ fn restore_substitute(
     })();
     let (hash, size, refs) = match restored {
         Ok(v) => v,
+        // `read_nar` already removed anything it left, so what this covers is the OTHER
+        // failure: a NarHash that did not match, where the tree restored in full and is
+        // ours to withdraw. Both failures are reported, as `read_nar` does with its own.
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&dest);
-            return Err(e);
+            return Err(match nar::remove_any(&dest) {
+                Ok(()) => e,
+                Err(c) => format!("{e}\n  and {} could not be removed: {c}", dest.display()),
+            })
         }
     };
     Ok(OutputReg {
@@ -11988,7 +11997,10 @@ daemon build START (2/2 active)
         // Self-discrimination: corrupt the nar's file CONTENTS (structure intact, so
         // read_nar still parses) → restore must reject on the NarHash check specifically.
         let mut bytes = std::fs::read(&narfile).unwrap();
-        let pos = bytes.windows(3).position(|w| w == b"app").expect("payload in nar");
+        // The whole PAYLOAD, not a bare "app": three bytes match inside a length word or
+        // a token too, and the cut would then prove something else.
+        let payload = b"app payload\n";
+        let pos = bytes.windows(payload.len()).position(|w| w == payload).expect("payload in nar");
         bytes[pos] ^= 0xff;
         std::fs::write(&narfile, &bytes).unwrap();
         assert!(
@@ -12022,7 +12034,10 @@ daemon build START (2/2 active)
         // Truncate inside the file contents: read_nar creates dest + the `run` file, then EOFs
         // part way through copy_n — a partial tree exists at the moment the error is returned.
         let bytes = std::fs::read(&narfile).unwrap();
-        let pos = bytes.windows(3).position(|w| w == b"app").expect("payload in nar");
+        // The whole PAYLOAD, not a bare "app": three bytes match inside a length word or
+        // a token too, and the cut would then prove something else.
+        let payload = b"app payload\n";
+        let pos = bytes.windows(payload.len()).position(|w| w == payload).expect("payload in nar");
         let truncated = base.join("truncated.nar");
         std::fs::write(&truncated, &bytes[..pos + 4]).unwrap();
 
@@ -12032,8 +12047,65 @@ daemon build START (2/2 active)
             "a truncated NAR must be rejected"
         );
         assert!(
-            !newstore.join(app_base).exists(),
+            std::fs::symlink_metadata(newstore.join(app_base)).is_err(),
             "a rejected (parse-error) substitute must leave no partial tree under newstore"
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    // A stale regular FILE at dest — what an interrupted restore of a single-file output
+    // leaves, and the one shape `remove_dir_all` cannot clear (it unlinks a stale symlink
+    // but returns ENOTDIR on a file). `read_nar` now refuses an existing destination
+    // outright, so without `nar::remove_any` that leftover would block every later
+    // substitution of itself.
+    #[test]
+    fn restore_substitute_clears_a_stale_file_dest() {
+        let base = std::env::temp_dir().join(format!("td-subst-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let store_path = "/td/store/ffffffffffffffffffffffffffffffff-app";
+        let app_base = "ffffffffffffffffffffffffffffffff-app";
+        let phys = base.join("phys/app");
+        std::fs::create_dir_all(&phys).unwrap();
+        // A SINGLE-FILE output: dest is a regular file, which is the shape
+        // `remove_dir_all` cannot clear and a directory-topped one hides.
+        let phys = phys.join("app");
+        std::fs::write(&phys, b"app payload\n").unwrap();
+
+        let served = base.join("served");
+        subst_export(&served, &[SubstMember { store_path: store_path.into(), physical: phys.clone(), refs: vec![] }]).unwrap();
+        let ni = std::fs::read_to_string(served.join(format!("{app_base}.narinfo"))).unwrap();
+        let narfile = served.join(narinfo_field(&ni, "NarFile").unwrap());
+
+        // Leg 1: a leftover file at dest is cleared, not restored onto. Without this the
+        // fail-closed create refuses and the output can never be substituted again.
+        let newstore = base.join("newstore");
+        std::fs::create_dir_all(&newstore).unwrap();
+        std::fs::write(newstore.join(app_base), b"stale\n").unwrap();
+        let reg = restore_substitute(&ni, &narfile, store_path, &newstore, "x.drv").unwrap();
+        assert_eq!(reg.nar_hash, narinfo_field(&ni, "NarHash").unwrap());
+        assert_eq!(std::fs::read(newstore.join(app_base)).unwrap(), b"app payload\n");
+
+        // Leg 2: the cleanup-on-failure half of the same gap — a truncated single-file
+        // NAR must leave NO partial file under newstore, as the directory case already
+        // asserts for a partial tree.
+        let bytes = std::fs::read(&narfile).unwrap();
+        // The whole PAYLOAD, not a bare "app": three bytes match inside a length word or
+        // a token too, and the cut would then prove something else.
+        let payload = b"app payload\n";
+        let pos = bytes.windows(payload.len()).position(|w| w == payload).expect("payload in nar");
+        let truncated = base.join("truncated.nar");
+        std::fs::write(&truncated, &bytes[..pos + 4]).unwrap();
+        let fresh = base.join("fresh");
+        assert!(
+            restore_substitute(&ni, &truncated, store_path, &fresh, "x.drv").is_err(),
+            "a truncated NAR must be rejected"
+        );
+        assert!(
+            // symlink_metadata, not exists(): the latter stats THROUGH a link and calls a
+            // dangling one absent, which is the residue shape this commit is about.
+            std::fs::symlink_metadata(fresh.join(app_base)).is_err(),
+            "a rejected single-file substitute must leave no partial file under newstore"
         );
 
         std::fs::remove_dir_all(&base).unwrap();
