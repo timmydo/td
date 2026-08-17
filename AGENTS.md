@@ -67,6 +67,66 @@ this does not introduce a Nix dependency. A
 `TD_STORE_DIR=/td/store` build is native: it is hashed for and built at
 `/td/store`, with no post-hoc store-prefix rewrite.
 
+## Sandboxed applications — foreign payloads in the store
+
+A third-party application (Firefox, darktable) is a **foreign prebuilt
+payload** shipped in `/td/store` with the image. It is not the first
+prebuilt thing in the store — the stage0-posix seed and the Rust
+bootstrap snapshot are declared bootstrap trust roots, and the snapshot
+really is an input to what td builds, since stage0 compiles stage1. What
+is new is a prebuilt that is **not** a bootstrap seed and never becomes
+one, so it gets a type of its own rather than joining that trust root.
+
+The marker carries four assertions:
+
+- **Never a tool, compilation or execution input to a source-built
+  output.** Not "never an input" flatly, which is impossible: the image
+  recipe must consume an application to place it in `root.erofs`, and an
+  application must name its runtime. Those travel a separate declared
+  `payload_inputs` channel — staged as data, never executed, never
+  linked against — and the ordinary input channels refuse a marked path.
+- **Its `PT_INTERP` is absent from the image root**, asserted against the
+  built image rather than assumed, so the ordinary path to running an
+  application is the jail. This is NOT a claim that the bytes cannot run
+  outside one: the runtime's `ld.so` is itself a store path and loads a
+  program named as its argument, and a static payload has no `PT_INTERP`
+  to be absent. Applications are RUN behind td's boundaries; nothing here
+  says they can only run there. `APPLICATIONS.md` §B.8 carries the
+  refutation and what a real guarantee would cost.
+- **Excluded from the source-bootstrapped claim checkably**, so a closure
+  query answers "source-bootstrapped apart from these marked paths".
+- **A reviewed pin with a compiled expected digest**, like any other
+  seed, with the mark carried on the source pin so it propagates to
+  everything derived from it.
+
+The first is the load-bearing one and is why this is not a weakening of
+the rule above. The safeguards that rule exists for were built against
+*undeclared* host ingress — build-host bits leaking into recipes, which
+`AssertStatic` reds by refusing a regained `PT_INTERP` or `DT_NEEDED` on
+the pre-libc rungs. A payload that nothing links against, executes at
+build time, or names as a tool cannot leak into anything; it is cargo,
+not a tool. Note this **narrows the "Recipe steps may execute only …
+outputs of earlier recipes" permission above**: a marked output is
+excluded from it.
+
+So the product claim is: **td's bootstrap graph contains no foreign
+binary other than its declared bootstrap seeds, and no foreign
+APPLICATION binary is an input to anything td builds.** Applications are
+RUN behind td-owned namespace, seccomp, D-Bus, portal and Wayland
+boundaries — which is a statement about the path td provides, not a
+guarantee the bytes cannot run any other way; see the interpreter
+assertion above. `APPLICATIONS.md` §B.8 is the normative specification;
+adding an application is a reviewed pin, and adding a *class* of foreign
+output is an amendment here.
+
+Note where this tier does NOT yet meet principle 6. Packages ship inside
+the image, so a machine holds ONE version of an application and rolling
+it back rolls the system back with it — the side-by-side retention
+principle 6 describes is what an application tier of its own would buy,
+and `APPLICATIONS.md` §W.2 specifies it as deferred. The asymmetry
+principle 6 states is the target; store placement is the delivery td
+actually has today.
+
 ## Rust bridge
 
 Rust enters only after the native GCC/glibc build platform and its GNU
@@ -157,7 +217,118 @@ be Rust built with the source-built stage2 `/td/store` toolchain.
    over in one landing. Delete the old mechanism in the same landing.
    We use git. You don't need to put dates in annotations--git blame is
    for that.
-   
+
+5. **No server infrastructure.** td must not require its maintainer to
+   run a service — no package repository, no binary cache, no update
+   server, no mirror. Recipes travel as a git checkout; sources and
+   binary seeds are pinned by URL + `sha256` at **upstream's own**
+   location; everything else is built locally. `td-feed` is a host-side
+   cache shared across worktrees, not a public service, and `td-subst`
+   is a signed binary cache that nothing populates — deliberately, since
+   populating it is the step that would demand hosting.
+
+   The trap this exists to catch: a pin is a URL plus a hash, so
+   **pinning an artifact td produced means publishing it somewhere.**
+   Prefer upstreams that ship plain files. Where one ships only through
+   a repository protocol of its own, the answer is a distro's plain
+   package files or a source build — never a repackaged copy td has to
+   serve. Do not build delta or chunking machinery speculatively; it
+   optimizes repeated pulls from a server that does not exist.
+
+6. **Updates are a git pull, not a download.** The recipe graph IS the
+   distribution, so `update` syncs the checkout and `upgrade` runs the
+   machinery — Gentoo's sync and Nix's channel rather than Debian's
+   fetch-a-package. Retention differs by tier and the asymmetry is the
+   rule: **the system RUNS one thing at a time, applications run many.**
+   A machine cannot half-run two kernels, so a deployment is atomic —
+   two are RETAINED (`current`/`previous`, which is what makes rollback
+   free) and one is booted, for rollback rather than for choice. Nothing
+   stops it holding two versions of an application, so those live side
+   by side with a pointer selecting one and rollback is repointing.
+
+7. **Passwordless, not authorization-less.** td does not ask a human to
+   memorise or type a secret. The user is authenticated by **hardware
+   they hold** — a FIDO2 security key — and secrets at rest are **sealed
+   to hardware** rather than encrypted under a passphrase. No password
+   prompt, no shadow hash standing as the real authenticator, no keyring
+   unlocked by typing something.
+
+   Two precisions, because the loose version of this principle claims
+   more than any hardware delivers. A **TPM attests the machine, not the
+   human**: a TPM-sealed credential proves platform possession and
+   state, so it is an appropriate second factor or a device-binding
+   mechanism and is NOT by itself user authentication — only the
+   security key answers "which person". And "stores no secret it could
+   be made to give up" is **too absolute**: an unsealed key is in RAM on
+   a running system, so what sealing buys is protection at rest and
+   against offline attack, not immunity while the machine is up.
+
+   **Elevation still exists, and it is a CONSENT act rather than a
+   knowledge test.** A user may raise privilege; what they may not do is
+   prove who they are by recalling a string. The distinction is the
+   whole principle: a password answers "does this person know the
+   secret?", which malware holding the person's session can also answer,
+   whereas a consent prompt on a path software cannot reach answers "is
+   a human deliberately approving THIS operation right now?" — which it
+   cannot. Windows' UAC is the shape; the part that matters is its
+   secure desktop, not its dialog. Two things about UAC are worth
+   getting right rather than repeating: its besetting weakness is not a
+   `sudo`-style cached grace window but the **elevated process** it
+   hands back and the auto-elevation of certain signed binaries — which
+   is why td elevates an *operation* and never a process — and its
+   consent-only prompt is what an administrator sees, where a standard
+   user is asked for administrator credentials.
+
+   Three properties any elevation mechanism must have, and td is
+   unusually well placed to give them because it owns its own
+   compositor:
+
+   - **A secure attention path.** The prompt is drawn by the compositor
+     itself, never by a client, on an input path no application can
+     capture, overlay, or inject into. td is well placed for that and
+     does not yet have it: `td-seatd` CHOWNS `/dev/fb0` and the input
+     nodes to the seat account rather than granting exclusivity, so
+     every process at that uid can open them, and there is no
+     ScreenCast to refuse — the compositor implements no capture
+     protocol at all, which is absence rather than policy. But "an
+     observed keystroke came from hardware" must be *built*, not
+     assumed: it needs an enumerated roster of every input source —
+     `uinput`, virtual-keyboard protocols, and td's own automation
+     path — with everything not on it denied.
+   - **Enumerated operations, never a shell.** What is elevated is a
+     NAMED operation with a typed argument schema, performed by the
+     privileged side itself. UAC elevates a process and inherits every
+     bug that follows; td elevates `deploy-publish`, not `bash`.
+   - **Consent bound to the request.** The approval covers one
+     operation, one requester, one argument set, once — with arguments
+     pinned as descriptors rather than re-resolved paths. No remembered
+     answers, no "don't ask again", no time window in which a second
+     request rides the first, and no auto-approval for anything by
+     virtue of what it is.
+
+   What this forbids stays broad: no passphrase-derived disk key, no
+   `sudo`/polkit password prompt, no application asking for a master
+   password, and no recovery path that accepts a memorised secret — a
+   recovery secret IS the authenticator, whatever the primary mechanism
+   claims. **Recovery is a second enrolled token**, and enrolling one is
+   not automatic: a key sealed only to a failed TPM cannot be recovered
+   by producing another token later, so anything that must survive
+   hardware loss is wrapped to **both** credentials at the time it is
+   created, or it is not recoverable at all. Say which, per secret.
+
+   None of this is built, and the current image is the opposite:
+   `SYSTEM` declares `root` and `tester` `passwordless: true`, which
+   writes an EMPTY shadow field — a throwaway-VM convenience, not a
+   policy. `su` and root exist as an administrative escape hatch and
+   must not become the mechanism a user-facing flow assumes. The gap
+   between the image and this principle is deliberate and is why the
+   principle is written down. `APPLICATIONS.md` §L.1 carries the full
+   specification and threat model; `td-login/THREAT-MODEL.md` is where
+   authentication lands when it is built. Enabling a security key (USB
+   HID, CTAP2) or a TPM (its driver, and sealing) is a reviewed kernel-
+   and-userspace landing of its own — neither is in the pinned config
+   today.
+
 # Tests
 
 Run all the tests with the single pass/fail command:
@@ -461,7 +632,7 @@ td's Rust is defensive and minimal-surface.
   The network tools (`fetch`/`feed`/`subst`) are the *only* crates allowed dependencies,
   and only the vendored-through-the-cargo-proxy FSDG set they already have
   (`ureq`/`rustls`/`sha2`/`ring`); a *new* dependency anywhere is a reviewed decision
-  (directive 6 territory), never casual.
+  (principle 2 territory), never casual.
 - **`std`, not `no_std`.** These are OS-driving userspace programs
   (`std::fs`/`std::process`/namespace syscalls); `no_std` is out of scope.
 - **Prefer allocating off the hot path** — set buffers/collections up once rather
