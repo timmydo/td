@@ -94,10 +94,18 @@ this document cannot keep is worse than the weaker one it can.
 The sandbox does not *make* an application trusted; it bounds what a
 compromised one reaches.
 
-## 0. The kernel prerequisite — nothing here runs today
+## 0. The kernel prerequisite — the gate, now landed
 
 This section is first because it gates every other one, and because it
 was not visible from either design brief.
+
+**Read the next few pages as the BASELINE this rung argued against, not
+as the current kernel.** The pins below have landed, so the "today"
+column of the table records what the kernel had before them and the
+mechanism paragraphs explain how it got there — which is the part worth
+keeping, since the same three-step resolution decides every future
+symbol. What the kernel carries NOW is at the end of the section, under
+the pin block.
 
 `recipes/src/recipes/linux-x86-64.rs` resolves the kernel config in
 **three** steps, and reading only the first is how an earlier draft of
@@ -108,9 +116,9 @@ this table got an answer wrong:
    is guarded `if EXPERT` keeps its default instead, because
    `allnoconfig` turns `EXPERT` off and an invisible prompt cannot be
    answered.
-2. **An explicit pin list** (`:491-558`, 68 lines) forces symbols on or
-   off by name.
-3. **`olddefconfig`** (`:566`) then "takes defaults for newly-visible
+2. **An explicit pin list** (`:530-606`, 77 lines since this rung added
+   nine) forces symbols on or off by name.
+3. **`olddefconfig`** (`:614`) then "takes defaults for newly-visible
    symbols" — the recipe's own words. This is the step that matters: a
    symbol invisible at step 1 because its dependency was off becomes
    visible once step 2 pins that dependency, and **olddefconfig takes its
@@ -119,7 +127,7 @@ this table got an answer wrong:
 So a symbol's final value is not "whatever allnoconfig said". Checked
 against the pinned `linux-7.1.4` source and against the resolved config:
 
-| symbol | Kconfig shape | today |
+| symbol | Kconfig shape | before this rung |
 |---|---|---|
 | `NAMESPACES` | `bool "…" if EXPERT`, `default !EXPERT` | **y** — the menu is on |
 | `MULTIUSER`, `SHMEM` | `bool "…" if EXPERT`, `default y` | **y** |
@@ -133,11 +141,12 @@ against the pinned `linux-7.1.4` source and against the resolved config:
 | `OVERLAY_FS` | — | **n**, and the recipe *asserts* it stays off |
 | sound (`CONFIG_SND*`) | — | **n**, nothing enabled |
 
-**`NET_NS` is already on**, and the earlier draft of this table said it
-was off. It is invisible at step 1 (`NET` is off, so its prompt never
-appears), the pin list turns `CONFIG_NET=y` on at `:530`, and step 3 then
-takes its `default y`. Nothing pins `NET_NS` anywhere — it arrives as a
-side effect. That is one fewer symbol to argue for, and more importantly
+**`NET_NS` was already on** before this rung, and the earlier draft of
+this table said it was off. It is invisible at step 1 (`NET` is off, so
+its prompt never appears), the pin list turns `CONFIG_NET=y` on at
+`:569`, and step 3 then takes its `default y`. Nothing pinned `NET_NS` —
+it arrived as a side effect, which is why this rung pins it explicitly.
+That is one fewer symbol to argue for, and more importantly
 it is the mechanism to remember: **pinning a dependency can enable its
 dependants.**
 
@@ -149,8 +158,9 @@ consequence below, and worth knowing before someone pins `SYSVIPC`
 casually.
 
 The conclusions this section exists for survive unchanged: `USER_NS` and
-`SECCOMP` are genuinely off, so `unshare(CLONE_NEWUSER)` returns `EINVAL`
-and `seccomp(2)` returns `ENOSYS` on the shipped kernel. `SECCOMP` is the
+`SECCOMP` were genuinely off, so `unshare(CLONE_NEWUSER)` returned
+`EINVAL` and `seccomp(2)` returned `ENOSYS` on the kernel that shipped
+before this rung — which is what made it the gate. `SECCOMP` is the
 subtle one: its explicit `prompt` line makes an otherwise-`def_bool y`
 symbol answerable, so allnoconfig says no and no later step revisits it.
 Note also that `SECCOMP_FILTER` depends on `NET` as well as `SECCOMP`,
@@ -191,8 +201,9 @@ exactly the trade that deserves its own reviewed commit with its own
 prose. If that argument fails, this design is dead and better to learn it
 in one commit than in twenty.
 
-**APPROVED by the maintainer.** The pin block below is a landing to
-write, not a case still to argue, and §J's first risk retires with it.
+**APPROVED by the maintainer, and LANDED.** The pin block below was a
+landing to write rather than a case still to argue, and §J's first risk
+retired with it.
 Two things the approval does not do, stated so the commit that carries
 it stays honest: it does not make the boot oracle optional — a kernel
 that regresses `USER_NS` or `SECCOMP` must red the image rather than the
@@ -225,13 +236,14 @@ Consequences worth stating separately:
   lines above its own `CONFIG_SND*` pins, which was left over from before
   §K existed.
 
-The pins to add, with `MEMFD_CREATE`/`EPOLL`/`FUTEX`-class symbols
-included defensively in the recipe's existing style even though they are
-EXPERT-gated and already on:
+The pins, with `MEMFD_CREATE`/`EPOLL`/`FUTEX`-class symbols included
+defensively in the recipe's existing style even though they are
+EXPERT-gated and already on. Everything but the audio block has landed;
+the audio pins wait for td-audio at rung 25:
 
 ```
 CONFIG_USER_NS=y  CONFIG_PID_NS=y  CONFIG_NET_NS=y  CONFIG_UTS_NS=y
-CONFIG_SECCOMP=y  CONFIG_SECCOMP_FILTER=y
+CONFIG_SECCOMP=y                   # NOT SECCOMP_FILTER — see below
 CONFIG_INOTIFY_USER=y
 # audio (§K), landing with td-audio rather than with the jail:
 CONFIG_SOUND=y  CONFIG_SND=y  CONFIG_SND_PCM=y
@@ -255,6 +267,76 @@ CLONE_NEWNS)` succeeds and that a trivial allow-all filter installs — so
 a kernel regression reds the image rather than the first app. Failure
 disables application launch with a named diagnostic; it never silently
 selects a weaker sandbox.
+
+**LANDED, in two halves, and the split is worth reading before relying on
+it.** The pins above (minus audio, which waits for td-audio) are in
+`linux-x86-64.rs`, each guarded against the RESOLVED `.config` rather
+than against the pin list; and the greeter carries a kernel-capability
+farm that prints `TD-SANDBOX-KERNEL-OK` once the RUNNING kernel has been
+observed to have every one that can be witnessed from `/proc` — all of
+them but `MEMCG`, for the reason below. What did NOT land is the wording
+above taken literally: the oracle READS `/proc` and does not ISSUE
+`unshare(2)` or `seccomp(2)`. Those two calls are surface #9's, which
+arrives with `td-jail`, and nothing on the image today may issue them —
+so a prober written for this rung would have meant an `unsafe` surface
+added outside the crate that owns it, which §V.4 and `UNSAFE.md` both
+forbid. The functional assertions therefore land with the rungs that
+own the calls: the `unshare` at rung 8, where `td-jail`'s skeleton and
+surface #9 arrive, and the filter install at rung 11, which is where a
+filter exists to install at all.
+
+What the `/proc` reads DO cover, beyond the features themselves, is the
+one class of failure a config guard structurally cannot see: a value.
+Each namespace has a ucount ceiling in `/proc/sys/user/max_*_namespaces`
+that a compiled-in namespace cannot survive being set to zero — the
+feature is present, its `/proc/self/ns/` node is there, and `unshare`
+returns `ENOSPC`. All four td-jail asks for are read, not just the user
+one.
+
+The gap that leaves is narrow and worth stating precisely, because
+"reads `/proc`" sounds much weaker than it is: procfs builds
+`/proc/<pid>/ns/<kind>` from a table whose entries are `#ifdef`ed on
+their namespace symbol, and writes `Seccomp:`/`Seccomp_filters:` into
+`/proc/self/status` only under `CONFIG_SECCOMP`/`CONFIG_SECCOMP_FILTER`
+— so those nodes exist *if and only if* the feature is compiled in. What
+is unproven is the sysctl and LSM policy around the calls rather than
+the features themselves, and `/proc/sys/user/max_user_namespaces` covers
+the one sysctl that turns a compiled-in `USER_NS` into an `EPERM`.
+
+**`SECCOMP_FILTER` must not be pinned, and the block above said to pin
+it.** That line contradicted this section's own prose eight paragraphs
+up and is corrected. `SECCOMP_FILTER` has no prompt at all, so kconfig
+computes it from `SECCOMP && NET` and `olddefconfig` DROPS a line naming
+it — leaving a pin list that reads like a guarantee nothing made. It is
+guarded instead, which is the only place a derived symbol can be
+observed. Resolving the pinned `linux-7.1.4` end to end confirms it:
+with `SECCOMP` pinned and `SECCOMP_FILTER` absent from the list, the
+resolved config carries `CONFIG_SECCOMP_FILTER=y`.
+
+**`IPC_NS` is now guarded OFF rather than merely left out**, which is
+this section's own `NET_NS` lesson applied in the other direction: a
+symbol that is `default y` behind a dependency somebody may pin later
+arrives unasked. `td-jail` omits `CLONE_NEWIPC` on the strength of it
+being off, so the guard is what makes that a decision.
+
+**`MEMCG` has no runtime witness at this rung, and the reason is a trap
+worth carrying into §P.** `/proc/cgroups` is the obvious place to look
+for a controller, and it does not list `memory` on this kernel even
+though `CONFIG_MEMCG=y`: `proc_cgroupstats_show` skips any subsystem
+where `cgroup1_subsys_absent()` holds — no v1 interface but a v2 one —
+and memcg registers its `legacy_cftypes` under `#ifdef CONFIG_MEMCG_V1`,
+which resolves to `n` here. The kernel says as much itself, once, on the
+console: *"/proc/cgroups lists only v1 controllers, use cgroup.controllers
+of root cgroup for v2 info"*. `pids` is listed because it registers v1
+files unconditionally, so the greeter asserts that one — anchored on the
+`enabled` column, since `cgroup_disable=pids` leaves the row and clears
+it, which is the one failure no config guard can see.
+
+The consequence for §P is that **`cgroup.controllers` on a mounted
+cgroup2 is the only interface that answers "is the memory controller
+available"**, so td-svc's delegation landing owns that assertion. A first
+draft of this rung probed `memory` in `/proc/cgroups` and would have
+failed every boot; it was caught in review rather than in QEMU.
 
 ---
 
@@ -2660,7 +2742,7 @@ Each row is one landing or a small family, leaving the tree green.
 
 | # | lands | visible result |
 |---|---|---|
-| 1 | **kernel namespace/seccomp config pins + QEMU readback** (§0) | none — but this is the gate on everything |
+| 1 | **kernel namespace/seccomp/cgroup config pins + QEMU readback** (§0) — **LANDED**, except the functional calls, which need surface #9: the `unshare` at rung 8, the filter install at rung 11 | none — but this is the gate on everything |
 | 2 | `td-login exec-as` with credential readback | none |
 | 3 | **the §B.8 marker**: the recipe-level mark, `payload_inputs` as a declared channel, taint propagation from the source pin, and the planning-time refusals — plus the argv/template scanner, since that assertion is the one that is otherwise silent | none |
 | 4 | the manifest and permission keyfile, name validation and every rejection; the closure query reporting marked paths | none |

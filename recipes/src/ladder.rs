@@ -358,6 +358,42 @@ pub const TD_TERM_RUNTIME_MARKER: &str = "TD-TERM-READY";
 /// recipe pins the source emit to this value.
 pub const TD_POINTER_ABSOLUTE_MARKER: &str = "TD-POINTER-ABSOLUTE";
 
+/// Printed by `/etc/bootsuccess`, as the unprivileged login user, once the RUNNING
+/// kernel has been observed to carry the sandbox features
+/// `recipes/src/recipes/linux-x86-64.rs` pins for APPLICATIONS.md §0 — user, pid,
+/// uts and net namespaces, each with a non-zero ucount ceiling; seccomp with BPF
+/// filtering; inotify; and cgroup v2 with the pids controller enabled.
+///
+/// Not `CONFIG_MEMCG`, which is pinned and guarded in the recipe but has no runtime
+/// witness until something mounts cgroup2: memcg registers its v1 interface only
+/// under `CONFIG_MEMCG_V1`, so `proc_cgroupstats_show` filters `memory` out of
+/// `/proc/cgroups` entirely. `cgroup.controllers` answers it, and that arrives with
+/// td-svc's delegation. This marker therefore means "every symbol with a witness",
+/// which is not the same as "every symbol pinned" — stated because the difference is
+/// exactly one controller and reading it as the stronger claim is the mistake.
+///
+/// The build already greps the resolved `.config`, so this is not that check
+/// repeated. What it adds is that the kernel the image BOOTS is the kernel that
+/// config described: a pin only constrains the producer, and the image's kernel
+/// could be replaced, rebuilt from a stale tree, or selected from a deployment
+/// nobody re-checked. §0 asks for a regression to red the IMAGE rather than the
+/// first application, and only a runtime observation can do that.
+///
+/// It reads `/proc` rather than issuing `unshare(2)` and `seccomp(2)`, and that is
+/// a real limit rather than a preference. Those two calls are surface #9's, which
+/// arrives with td-jail; nothing on the image today may issue them, and inventing
+/// a prober for this rung would mean an `unsafe` surface added outside the crate
+/// that owns it. So this asserts the kernel is CAPABLE and the functional half —
+/// that an unprivileged `unshare(CLONE_NEWUSER|CLONE_NEWNS)` actually returns 0
+/// and a trivial allow-all filter installs — lands with td-jail, where the
+/// syscalls are in the roster. The gap is narrow: `/proc/self/ns/user` exists if
+/// and only if `CONFIG_USER_NS`, and `Seccomp_filters:` appears in
+/// `/proc/self/status` if and only if `CONFIG_SECCOMP_FILTER`, so what is
+/// unproven here is the sysctl and LSM policy around those calls, not the
+/// features themselves. `/proc/sys/user/max_user_namespaces` covers the one
+/// sysctl that can turn a compiled-in USER_NS into an EPERM.
+pub const TD_SANDBOX_KERNEL_MARKER: &str = "TD-SANDBOX-KERNEL-OK";
+
 /// Kernel-cmdline token the headless `qemu-boot-system` oracle appends so the greeter
 /// waits for the root-owned health/update transaction and then exits. `tty-session`
 /// turns that exit into a clean VM poweroff. Without it, the greeter is interactive.

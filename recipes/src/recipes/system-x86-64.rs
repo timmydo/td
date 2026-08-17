@@ -8,8 +8,8 @@ use crate::ladder::{
     SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
     SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
-    TD_INIT_RUNTIME_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER,
-    UUTILS_RUNTIME_MARKER,
+    TD_INIT_RUNTIME_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER,
+    TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -1451,6 +1451,177 @@ fn build_td_txt_probes() -> String {
     p
 }
 
+/// The `/proc` nodes whose mere EXISTENCE is one pinned kernel symbol, with the symbol
+/// each stands for and what a jail loses without it.
+///
+/// Existence is a sound test for exactly these: procfs builds `/proc/<pid>/ns/<kind>`
+/// from a table whose entries are `#ifdef`ed on their namespace symbol, and
+/// `fs/notify/inotify/inotify_user.c` — compiled only under CONFIG_INOTIFY_USER —
+/// is the sole registrant of the `fs/inotify` sysctl directory. So a missing node is a
+/// missing feature and not a permission problem: the reader is the process itself,
+/// which may always stat its own namespace links.
+///
+/// Note what is NOT sound this way, since it looks like it should be:
+/// `/proc/sys/user/max_*_namespaces` exists whatever the namespace symbols say —
+/// `kernel/ucount.c` registers all seven entries under CONFIG_SYSCTL alone. Those are
+/// read for their VALUE in [`SANDBOX_KERNEL_UCOUNTS`] instead.
+const SANDBOX_KERNEL_NODES: [(&str, &str, &str); 6] = [
+    (
+        "/proc/cgroups",
+        "CONFIG_CGROUPS",
+        "no cgroup v2 at all, so an application has no aggregate memory or pid cap",
+    ),
+    (
+        "/proc/self/ns/user",
+        "CONFIG_USER_NS",
+        "unshare(CLONE_NEWUSER) returns EINVAL, so td-jail cannot build a sandbox at all",
+    ),
+    (
+        "/proc/self/ns/pid",
+        "CONFIG_PID_NS",
+        "a jailed app would see, and could signal, every process on the machine",
+    ),
+    (
+        "/proc/self/ns/uts",
+        "CONFIG_UTS_NS",
+        "a jail could not present a hostname of its own",
+    ),
+    (
+        "/proc/self/ns/net",
+        "CONFIG_NET_NS",
+        "an app without shared=network could not be cut off from the network stack",
+    ),
+    (
+        "/proc/sys/fs/inotify/max_user_watches",
+        "CONFIG_INOTIFY_USER",
+        "GLib file monitoring inside a jail degrades to polling",
+    ),
+];
+
+/// The `/proc/self/status` fields procfs emits only under their symbol. `Seccomp:` is
+/// written under CONFIG_SECCOMP and `Seccomp_filters:` under CONFIG_SECCOMP_FILTER, so
+/// these two lines are how a running kernel reports a feature that has no node of its
+/// own — and the second is the only runtime evidence for a symbol that cannot be pinned
+/// (it is `def_bool y` on `SECCOMP && NET`, computed rather than answered).
+const SANDBOX_KERNEL_STATUS_FIELDS: [(&str, &str, &str); 2] = [
+    (
+        "Seccomp:",
+        "CONFIG_SECCOMP",
+        "seccomp(2) returns ENOSYS, so td-jail would ship namespaces with no syscall filter",
+    ),
+    (
+        "Seccomp_filters:",
+        "CONFIG_SECCOMP_FILTER",
+        "no BPF syscall filtering — SECCOMP or NET was taken away underneath it",
+    ),
+];
+
+/// The cgroup controllers `/proc/cgroups` can be made to witness — which is NOT all of
+/// them, and the exclusion is the interesting part.
+///
+/// `proc_cgroupstats_show` skips any subsystem for which `cgroup1_subsys_absent()`
+/// holds: `legacy_cftypes == NULL && dfl_cftypes` — a controller with a v2 interface and
+/// no v1 one. `pids` registers `legacy_cftypes` unconditionally so it is listed, but
+/// memcg registers them under `#ifdef CONFIG_MEMCG_V1`, which resolves to `n` here — so
+/// **`memory` is absent from `/proc/cgroups` on this kernel even though `CONFIG_MEMCG=y`**.
+/// The kernel says so itself, once, on the console: "/proc/cgroups lists only v1
+/// controllers, use cgroup.controllers of root cgroup for v2 info".
+///
+/// So MEMCG has no runtime witness at this rung. Its `cgroup.controllers` reading needs
+/// a mounted cgroup2, which is td-svc's landing with the resource caps; until then the
+/// producer's `.config` guard is the only assertion, and `every_sandbox_symbol_...`
+/// names it as a deliberate exception rather than letting it look covered.
+///
+/// The match is anchored on the `enabled` column and not just the name, because a
+/// `cgroup_disable=pids` on the command line leaves the row in place and clears that
+/// column — the one failure no config guard can see, which is the whole reason a
+/// runtime leg is worth having here at all.
+const SANDBOX_KERNEL_CONTROLLERS: [(&str, &str, &str); 1] = [(
+    "pids",
+    "CONFIG_CGROUP_PIDS",
+    "pids.max never exists, so nothing bounds a fork bomb inside a jail",
+)];
+
+/// The per-namespace ucount ceilings, one per `CLONE_NEW*` td-jail's single `unshare(2)`
+/// asks for. Each is a kill switch a compiled-in namespace cannot survive: set to 0, the
+/// feature is present, its `/proc/self/ns/` node exists, and `unshare` fails `ENOSPC`.
+///
+/// All four are read, not just the user one. An earlier draft checked
+/// `max_user_namespaces` alone, which left three of the four namespaces in §C's
+/// `unshare` unguarded — and the pid one is the sharpest, since `CLONE_NEWPID` failing
+/// leaves an application looking at every process on the machine.
+///
+/// Read for VALUE rather than existence: `kernel/ucount.c` registers the whole `user`
+/// table under CONFIG_SYSCTL, so the FILE is there on a kernel with no namespaces at
+/// all. That is also why the unreadable arm's diagnostic names a missing `/proc/sys`
+/// rather than a missing namespace — the cause it used to name could not produce it.
+const SANDBOX_KERNEL_UCOUNTS: [(&str, &str); 4] = [
+    ("max_user_namespaces", "CLONE_NEWUSER"),
+    ("max_pid_namespaces", "CLONE_NEWPID"),
+    ("max_uts_namespaces", "CLONE_NEWUTS"),
+    ("max_net_namespaces", "CLONE_NEWNET"),
+];
+
+/// The kernel-capability farm (APPLICATIONS.md §0), run as the unprivileged login user
+/// because that is the uid an application will be jailed at.
+///
+/// It observes the RUNNING kernel rather than re-reading the `.config` the producer
+/// already grepped: a config pin constrains what was built, and this asserts that what
+/// BOOTED still has the features — which is what makes a regression red the image
+/// instead of the first application.
+///
+/// It runs ONCE, before the health-retry loop, and not inside it like every other farm.
+/// The others test userland that can plausibly become ready a second later; a kernel's
+/// capabilities are fixed at boot, so re-running only re-proves what cannot have
+/// changed. That is not merely wasteful: on a kernel missing a symbol the loop would
+/// reprint the same diagnostics every second for the whole retry budget, and the
+/// 80-line console tail the oracle's error message tells an operator to read would be
+/// filled with identical repeats — pushing out the other farms' diagnostics.
+fn build_sandbox_kernel_probes() -> String {
+    // NO SINGLE QUOTE may appear below: this string is interpolated INSIDE the greeter's
+    // `su -s /bin/sh USER -c '…'` argument, exactly as build_td_txt_probes is, and one
+    // would close that argument and scatter the rest into the outer shell.
+    let mut p = String::from("k=1; ");
+    for (path, symbol, cost) in SANDBOX_KERNEL_NODES {
+        p.push_str(&format!(
+            "[ -e {path} ] || \
+             {{ echo \"kernel: {path} missing ({symbol} off) — {cost}\"; k=0; }}; "
+        ));
+    }
+    for (field, symbol, cost) in SANDBOX_KERNEL_STATUS_FIELDS {
+        p.push_str(&format!(
+            "/bin/grep -q \"^{field}\" /proc/self/status || \
+             {{ echo \"kernel: no {field} field in /proc/self/status ({symbol} off) — {cost}\"; \
+             k=0; }}; "
+        ));
+    }
+    for (controller, symbol, cost) in SANDBOX_KERNEL_CONTROLLERS {
+        // name, hierarchy, num_cgroups, enabled — the last must be 1, or the controller
+        // is compiled in and switched off.
+        p.push_str(&format!(
+            "/bin/grep -Eq \"^{controller}[[:space:]].*[[:space:]]1$\" /proc/cgroups || \
+             {{ echo \"kernel: /proc/cgroups does not list {controller} as enabled \
+             ({symbol} off, or cgroup_disable={controller}) — {cost}\"; k=0; }}; "
+        ));
+    }
+    for (limit, clone_flag) in SANDBOX_KERNEL_UCOUNTS {
+        // The unreadable arm substitutes 1 rather than 0 so the `case` falls through
+        // silently: it has already reported and cleared `k`, and 0 would make the last
+        // arm print a second, fabricated diagnostic for one cause.
+        p.push_str(&format!(
+            "m=$(/bin/cat /proc/sys/user/{limit} 2>/dev/null) || \
+             {{ echo \"kernel: /proc/sys/user/{limit} unreadable — no /proc/sys, since \
+             the kernel registers this file whatever the namespace symbols say\"; \
+             k=0; m=1; }}; \
+             case \"$m\" in \"\"|*[!0-9]*) \
+             echo \"kernel: {limit} is not a number: $m\"; k=0;; \
+             0) echo \"kernel: {limit} is 0 — unshare({clone_flag}) fails ENOSPC however \
+             the kernel was built\"; k=0;; esac; "
+        ));
+    }
+    p
+}
+
 /// What each td-util health probe is given to work on, if anything.
 ///
 /// Shared with the test that asserts the generated script, which would otherwise
@@ -1497,6 +1668,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
     }
     let td_login_probe = td_login_probe(sys);
     let td_txt_probes = build_td_txt_probes();
+    let sandbox_kernel_probes = build_sandbox_kernel_probes();
     // Named rather than spelled, so a renamed key or a reworded refusal cannot
     // leave the oracle's negative pass quietly satisfied by any failure at all.
     let trusted_key = td_boot_protocol::VOLUME_TRUSTED_KEY;
@@ -1523,6 +1695,10 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          [ \"$wait\" -gt {BOOT_SUCCESS_RETRY_MAX_SECS} ] && wait={BOOT_SUCCESS_RETRY_MAX_SECS}\n\
          n=0\n\
          mu=0; mrf=0; ms=0; mtu=0; mti=0; mtl=0; mtt=0\n\
+         msk=0\n\
+         if /bin/su -s /bin/sh {} -c \
+         '{sandbox_kernel_probes}[ \"$k\" = 1 ]'; then \
+         echo {TD_SANDBOX_KERNEL_MARKER}; msk=1; fi\n\
          while [ \"$n\" -lt \"$wait\" ]; do \
          healthy=1; \
          if /bin/su -s /bin/sh {} -c \
@@ -1564,6 +1740,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          if /bin/su -s /bin/sh {} -c \
          '{td_txt_probes}[ \"$t\" = 1 ]'; then \
          [ \"$mtt\" = 1 ] || {{ echo {TD_TXT_RUNTIME_MARKER}; mtt=1; }}; else healthy=0; fi; \
+         [ \"$msk\" = 1 ] || healthy=0; \
          if [ \"$healthy\" = 1 ] \
          && /bin/td-boot success /dev/vda /run/td-update \"$deployment\" >/run/td-success-id; then \
          if /bin/grep -q -F '{DEPLOY_INSTALL_CMDLINE_TOKEN}' /proc/cmdline; then \
@@ -1613,6 +1790,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          n=$((n+1)); /bin/td-util sleep 1; \
          done\n\
          fail\n",
+        sys.autologin,
         sys.autologin,
         sys.autologin,
         sys.autologin,
@@ -6305,6 +6483,213 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         assert!(
             build_bootsuccess(&SYSTEM).contains(&format!("-c '{probes}")),
             "the greeter must run the td-txt probes verbatim inside its `su -c` argument"
+        );
+    }
+
+    /// The kernel recipe's own source, read so the runtime probes can be tied to the
+    /// pins they exist to observe. These are two different files that must agree, and
+    /// nothing but a test can make them.
+    const LINUX_RECIPE: &str = include_str!("linux-x86-64.rs");
+
+    /// Every kernel symbol APPLICATIONS.md §0 turns on for the application tier, plus
+    /// the one it deliberately does NOT turn on by hand.
+    ///
+    /// Listed here rather than derived from the probe tables so the two can disagree:
+    /// a symbol that gains a pin but no probe, or a probe naming a symbol nothing pins,
+    /// fails below. What this roster cannot catch is a pin added to the kernel recipe
+    /// and to nothing else — the recipe's own `.config` guard is what covers that, and
+    /// it fails the producer build rather than this test.
+    const SANDBOX_SYMBOLS: [&str; 10] = [
+        "CONFIG_USER_NS",
+        "CONFIG_PID_NS",
+        "CONFIG_UTS_NS",
+        "CONFIG_NET_NS",
+        "CONFIG_SECCOMP",
+        "CONFIG_SECCOMP_FILTER",
+        "CONFIG_INOTIFY_USER",
+        "CONFIG_CGROUPS",
+        "CONFIG_MEMCG",
+        "CONFIG_CGROUP_PIDS",
+    ];
+
+    /// The symbols this rung pins but cannot witness at runtime, each with the reason.
+    ///
+    /// An exception list rather than a silent gap: a symbol that is merely missing from
+    /// the probes looks identical to one nobody got round to, and this is the difference
+    /// between the two.
+    const SANDBOX_SYMBOLS_WITHOUT_A_RUNTIME_WITNESS: [(&str, &str); 1] = [(
+        "CONFIG_MEMCG",
+        "memcg registers legacy_cftypes only under CONFIG_MEMCG_V1, which is n here, so \
+         proc_cgroupstats_show's cgroup1_subsys_absent() filter drops `memory` from \
+         /proc/cgroups. Its witness is cgroup.controllers on a mounted cgroup2, which \
+         arrives with td-svc's delegation.",
+    )];
+
+    /// Each pinned symbol is observed at RUNTIME by a probe that names it, and each
+    /// probed symbol is one the kernel recipe actually pins. A pin with no probe ships a
+    /// feature nothing on the image ever confirms; a probe with no pin waits for a
+    /// feature nobody asked the kernel for.
+    ///
+    /// The symbol is matched as `({symbol} off` — the diagnostic's own spelling — and
+    /// never as a bare substring, because `CONFIG_SECCOMP` occurs inside
+    /// `CONFIG_SECCOMP_FILTER`: deleting the whole `Seccomp:` leg would otherwise leave
+    /// this green on the strength of the leg below it. Matching the message is only half
+    /// the test, and `every_sandbox_probe_runs_a_command_not_just_an_echo` is the other:
+    /// a symbol name appears in this string ONLY inside an `echo`, so this assertion
+    /// alone is satisfied by a probe whose command tests the wrong path entirely.
+    #[test]
+    fn every_sandbox_symbol_is_both_pinned_and_probed() {
+        let probes = build_sandbox_kernel_probes();
+        for symbol in SANDBOX_SYMBOLS {
+            let excused = SANDBOX_SYMBOLS_WITHOUT_A_RUNTIME_WITNESS
+                .iter()
+                .any(|(excused, _)| *excused == symbol);
+            assert_eq!(
+                probes.contains(&format!("({symbol} off")),
+                !excused,
+                "{symbol}: a pinned symbol is probed at runtime, or it is on the \
+                 exception list with a reason — never neither, and never both"
+            );
+            assert!(
+                LINUX_RECIPE.contains(&format!("grep -q '^{symbol}=y' .config")),
+                "the kernel recipe does not guard {symbol} over the RESOLVED config"
+            );
+        }
+        let probed: Vec<&str> = SANDBOX_KERNEL_NODES
+            .iter()
+            .chain(SANDBOX_KERNEL_STATUS_FIELDS.iter())
+            .chain(SANDBOX_KERNEL_CONTROLLERS.iter())
+            .map(|(_, symbol, _)| *symbol)
+            .collect();
+        for symbol in &probed {
+            assert!(
+                SANDBOX_SYMBOLS.contains(symbol),
+                "{symbol} is probed but is not one of the symbols §0 pins"
+            );
+        }
+    }
+
+    /// Every leg actually TESTS something, and tests the thing its diagnostic names.
+    ///
+    /// This is the test `every_sandbox_symbol_is_both_pinned_and_probed` cannot be: the
+    /// symbol names live only inside `echo` strings, so renaming `/proc/self/ns/user` to
+    /// a path that does not exist leaves that one green while the farm asserts nothing
+    /// — the probe would simply always fail, which on this image means the boot never
+    /// greens and nobody learns why from a unit test. Matching whole invocations rather
+    /// than message fragments is the same discipline
+    /// `td_txt_probes_survive_the_greeters_quoting` applies next door.
+    #[test]
+    fn every_sandbox_probe_runs_a_command_not_just_an_echo() {
+        let probes = build_sandbox_kernel_probes();
+        for (path, _, _) in SANDBOX_KERNEL_NODES {
+            assert!(
+                probes.contains(&format!("[ -e {path} ] ||")),
+                "no leg tests {path} for existence"
+            );
+        }
+        for (field, _, _) in SANDBOX_KERNEL_STATUS_FIELDS {
+            assert!(
+                probes.contains(&format!("\"^{field}\" /proc/self/status ||")),
+                "no leg greps /proc/self/status for {field}"
+            );
+        }
+        for (controller, _, _) in SANDBOX_KERNEL_CONTROLLERS {
+            assert!(
+                probes.contains(&format!(
+                    "\"^{controller}[[:space:]].*[[:space:]]1$\" /proc/cgroups ||"
+                )),
+                "no leg greps /proc/cgroups for {controller} with its enabled column"
+            );
+        }
+        for (limit, clone_flag) in SANDBOX_KERNEL_UCOUNTS {
+            assert!(
+                probes.contains(&format!("/proc/sys/user/{limit} 2>/dev/null")),
+                "no leg reads /proc/sys/user/{limit}"
+            );
+            assert!(
+                probes.contains(&format!("unshare({clone_flag}) fails ENOSPC")),
+                "the {limit} leg does not say which unshare a zero would break"
+            );
+        }
+    }
+
+    /// SECCOMP is pinned and SECCOMP_FILTER is NOT, and the asymmetry is the whole
+    /// reason this test exists. SECCOMP carries an explicit `prompt` above its
+    /// `def_bool y`, so allnoconfig can answer it `n` and a pin is what restores it.
+    /// SECCOMP_FILTER has no prompt at all — kconfig computes it from `SECCOMP && NET`
+    /// — so a line naming it in the pin list would be silently dropped by olddefconfig
+    /// and would read, to anyone auditing the list, as a guarantee that was never made.
+    ///
+    /// Verified against the pinned linux-7.1.4 by resolving the config: with SECCOMP
+    /// pinned and SECCOMP_FILTER absent from the pin list, the resolved `.config`
+    /// carries `CONFIG_SECCOMP_FILTER=y`.
+    #[test]
+    fn seccomp_filter_is_guarded_but_never_pinned() {
+        assert!(
+            LINUX_RECIPE.contains("'CONFIG_SECCOMP=y'"),
+            "SECCOMP is prompted, so it must be pinned or allnoconfig answers it n"
+        );
+        assert!(
+            !LINUX_RECIPE.contains("'CONFIG_SECCOMP_FILTER=y'"),
+            "SECCOMP_FILTER must not appear in the pin list: it is unprompted, so the \
+             line would be dropped by olddefconfig while looking like a pin that took"
+        );
+        assert!(
+            LINUX_RECIPE.contains("grep -q '^CONFIG_SECCOMP_FILTER=y' .config"),
+            "a derived symbol can only be observed after resolution, so it must be guarded"
+        );
+    }
+
+    /// IPC_NS is refused rather than merely unpinned. It is `default y` behind
+    /// `SYSVIPC || POSIX_MQUEUE`, so the same olddefconfig step that handed td `NET_NS`
+    /// unasked would hand it an IPC namespace the moment somebody pins SysV IPC for an
+    /// unrelated reason — and td-jail omits `CLONE_NEWIPC` on the strength of it being
+    /// off. A negative guard makes that a decision instead of a side effect.
+    #[test]
+    fn ipc_ns_stays_refused_until_someone_argues_for_it() {
+        assert!(
+            LINUX_RECIPE.contains("if grep -q '^CONFIG_IPC_NS=y' .config; then"),
+            "IPC_NS must be guarded OFF, not just left out of the pin list"
+        );
+        for symbol in ["CONFIG_IPC_NS", "CONFIG_SYSVIPC", "CONFIG_FUSE_FS"] {
+            assert!(
+                !LINUX_RECIPE.contains(&format!("'{symbol}=y'")),
+                "{symbol} is deferred by APPLICATIONS.md §0 and must not be pinned on"
+            );
+        }
+    }
+
+    /// Every probe leg can clear the flag, and the farm is quoted so the greeter's
+    /// `su -c '…'` survives it — `td_txt_probes_survive_the_greeters_quoting`'s argument,
+    /// which applies verbatim to any farm added beside it.
+    #[test]
+    fn sandbox_kernel_probes_can_fail_and_survive_the_greeters_quoting() {
+        let probes = build_sandbox_kernel_probes();
+        assert!(
+            !probes.contains('\''),
+            "a single quote in the kernel probes would close the greeter's `su -c` \
+             argument: {probes}"
+        );
+        assert!(
+            build_bootsuccess(&SYSTEM).contains(&format!("-c '{probes}")),
+            "the greeter must run the kernel probes verbatim inside its `su -c` argument"
+        );
+        // One `k=0` per table entry, and THREE per ucount limit — unreadable, not a
+        // number, zero — since each is a distinct way for one file to fail to answer.
+        // A leg that cannot clear `k` reports success whatever the kernel did, which is
+        // the failure this farm exists to make impossible.
+        let legs = SANDBOX_KERNEL_NODES.len()
+            + SANDBOX_KERNEL_STATUS_FIELDS.len()
+            + SANDBOX_KERNEL_CONTROLLERS.len()
+            + SANDBOX_KERNEL_UCOUNTS.len() * 3;
+        assert_eq!(
+            probes.matches("k=0").count(),
+            legs,
+            "each probe leg needs its own `k=0'"
+        );
+        assert!(
+            build_bootsuccess(&SYSTEM).contains(&format!("echo {TD_SANDBOX_KERNEL_MARKER}")),
+            "the greeter must print the sandbox-kernel marker the boot oracle waits for"
         );
     }
 

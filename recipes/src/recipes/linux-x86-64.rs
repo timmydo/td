@@ -399,6 +399,36 @@ pub fn recipe() -> Recipe {
     //    Kconfig default. The VT/fbcon path leaves a visible recovery console
     //    available even though ttyS0 remains the boot console.
     //
+    //    SANDBOXED APPLICATIONS (APPLICATIONS.md §0): the namespace, seccomp and
+    //    cgroup symbols td-jail needs. Every one of them is PROMPTED, so allnoconfig
+    //    answers it `n` regardless of a `default y` — which is why PID_NS and UTS_NS
+    //    are off today despite defaulting on.
+    //
+    //    SECCOMP is pinned; SECCOMP_FILTER is NOT, and must not be. SECCOMP carries an
+    //    explicit `prompt` line above `def_bool y` (arch/Kconfig:643), so allnoconfig
+    //    can answer it and a pin is what turns it back on. SECCOMP_FILTER (:660) has
+    //    NO prompt at all — it is `def_bool y` on `HAVE_ARCH_SECCOMP_FILTER && SECCOMP
+    //    && NET`, so kconfig computes it and a line naming it in this list would be
+    //    dropped by olddefconfig rather than honoured. It is guarded below instead:
+    //    the guard is over the RESOLVED config, which is where a derived symbol can be
+    //    observed at all. NET is already =y above, so the dependency is satisfied —
+    //    stated rather than left to be discovered, since seccomp silently depending on
+    //    the network stack is not a thing anyone guesses.
+    //
+    //    NET_NS is already =y and is pinned anyway, because today it arrives as a SIDE
+    //    EFFECT: its prompt is invisible at allnoconfig (NET is off), CONFIG_NET=y is
+    //    pinned above, and olddefconfig then takes its `default y`. Nothing names it,
+    //    so nothing would notice if a future NET rework took it away. The pin makes an
+    //    incidental symbol a declared one.
+    //
+    //    IPC_NS is NOT enabled and is guarded OFF. It is `default y` on `SYSVIPC ||
+    //    POSIX_MQUEUE`, both off, so it cannot be enabled alone — and the same
+    //    olddefconfig mechanism that handed us NET_NS would hand us an IPC namespace
+    //    the moment somebody pins SYSVIPC for an unrelated reason. td-jail omits
+    //    CLONE_NEWIPC until that is a decision rather than a side effect.
+    //    Audio (CONFIG_SND*) and FUSE_FS are deliberately absent: they land with
+    //    td-audio and the Documents portal respectively, each with its own argument.
+    //
     //    SECURITY_DMESG_RESTRICT (pinned OFF): with it on, an unprivileged
     //    /dev/kmsg open is EPERM, so the /bin/dmesg system-x86-64 ships from
     //    TD_UTIL_APPLETS breaks for ordinary users. Its `menu "Security options"`
@@ -486,7 +516,16 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_DRM_VIRTIO_GPU_KMS[ =]/d; \
                   /^#? *CONFIG_DRM_FBDEV_EMULATION[ =]/d; \
                   /^#? *CONFIG_DRM_CLIENT_DEFAULT_FBDEV[ =]/d; \
-                  /^#? *CONFIG_SECURITY_DMESG_RESTRICT[ =]/d' .config && \
+                  /^#? *CONFIG_SECURITY_DMESG_RESTRICT[ =]/d; \
+                  /^#? *CONFIG_USER_NS[ =]/d; \
+                  /^#? *CONFIG_PID_NS[ =]/d; \
+                  /^#? *CONFIG_UTS_NS[ =]/d; \
+                  /^#? *CONFIG_NET_NS[ =]/d; \
+                  /^#? *CONFIG_SECCOMP[ =]/d; \
+                  /^#? *CONFIG_INOTIFY_USER[ =]/d; \
+                  /^#? *CONFIG_CGROUPS[ =]/d; \
+                  /^#? *CONFIG_MEMCG[ =]/d; \
+                  /^#? *CONFIG_CGROUP_PIDS[ =]/d' .config && \
                  printf '%s\\n' \
                    'CONFIG_UNWINDER_FRAME_POINTER=y' \
                    '# CONFIG_UNWINDER_ORC is not set' \
@@ -555,7 +594,16 @@ pub fn recipe() -> Recipe {
                    'CONFIG_DRM_VIRTIO_GPU_KMS=y' \
                    'CONFIG_DRM_FBDEV_EMULATION=y' \
                    'CONFIG_DRM_CLIENT_DEFAULT_FBDEV=y' \
-                   '# CONFIG_SECURITY_DMESG_RESTRICT is not set' >> .config",
+                   '# CONFIG_SECURITY_DMESG_RESTRICT is not set' \
+                   'CONFIG_USER_NS=y' \
+                   'CONFIG_PID_NS=y' \
+                   'CONFIG_UTS_NS=y' \
+                   'CONFIG_NET_NS=y' \
+                   'CONFIG_SECCOMP=y' \
+                   'CONFIG_INOTIFY_USER=y' \
+                   'CONFIG_CGROUPS=y' \
+                   'CONFIG_MEMCG=y' \
+                   'CONFIG_CGROUP_PIDS=y' >> .config",
             ],
         )
         .env("PATH", &mesboot0_path()),
@@ -620,7 +668,18 @@ pub fn recipe() -> Recipe {
                  if grep -q '^CONFIG_RANDOMIZE_BASE=y' .config; then echo 'RANDOMIZE_BASE (KASLR) on — pinned off for a deterministic kexec boot' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_MODULES=y' .config; then echo 'MODULES on (would need module tooling)' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_DEBUG_INFO_BTF=y' .config; then echo 'BTF on (would need pahole)' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_SECURITY_DMESG_RESTRICT=y' .config; then echo 'SECURITY_DMESG_RESTRICT on — unprivileged /dev/kmsg reads become EPERM, so the shipped /bin/dmesg breaks for ordinary users' >&2; exit 1; fi",
+                 if grep -q '^CONFIG_SECURITY_DMESG_RESTRICT=y' .config; then echo 'SECURITY_DMESG_RESTRICT on — unprivileged /dev/kmsg reads become EPERM, so the shipped /bin/dmesg breaks for ordinary users' >&2; exit 1; fi; \
+                 grep -q '^CONFIG_USER_NS=y' .config || { echo 'USER_NS off — unshare(CLONE_NEWUSER) returns EINVAL, so td-jail cannot build a sandbox at all' >&2; exit 1; }; \
+                 grep -q '^CONFIG_PID_NS=y' .config || { echo 'PID_NS off — a jailed app would see (and could signal) every process on the machine' >&2; exit 1; }; \
+                 grep -q '^CONFIG_UTS_NS=y' .config || { echo 'UTS_NS off — a jail could not present its own hostname' >&2; exit 1; }; \
+                 grep -q '^CONFIG_NET_NS=y' .config || { echo 'NET_NS off — a jail without shared=network could not be cut off from the network stack' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SECCOMP=y' .config || { echo 'SECCOMP off — seccomp(2) returns ENOSYS, so td-jail ships namespaces with no syscall filter' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SECCOMP_FILTER=y' .config || { echo 'SECCOMP_FILTER off — no BPF syscall filtering. It is unprompted (def_bool y on HAVE_ARCH_SECCOMP_FILTER && SECCOMP && NET), so it cannot be pinned: something took SECCOMP or NET away' >&2; exit 1; }; \
+                 grep -q '^CONFIG_INOTIFY_USER=y' .config || { echo 'INOTIFY_USER off — GLib file monitoring in a jailed app degrades to polling' >&2; exit 1; }; \
+                 grep -q '^CONFIG_CGROUPS=y' .config || { echo 'CGROUPS off — no cgroup v2, so an application has no aggregate memory or pid cap' >&2; exit 1; }; \
+                 grep -q '^CONFIG_MEMCG=y' .config || { echo 'MEMCG off — memory.max/memory.high do not exist, so a multi-process app is bounded only per process' >&2; exit 1; }; \
+                 grep -q '^CONFIG_CGROUP_PIDS=y' .config || { echo 'CGROUP_PIDS off — pids.max does not exist, so nothing bounds a fork bomb inside a jail' >&2; exit 1; }; \
+                 if grep -q '^CONFIG_IPC_NS=y' .config; then echo 'IPC_NS on — it is default y behind SYSVIPC||POSIX_MQUEUE, so pinning either brings it along unasked; td-jail omits CLONE_NEWIPC and APPLICATIONS.md §0 defers it deliberately' >&2; exit 1; fi",
             ],
         )
         .env("PATH", &mesboot0_path()),

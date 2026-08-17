@@ -97,6 +97,14 @@ const TD_INIT_RUNTIME_MARKER: &str = td_recipe::ladder::TD_INIT_RUNTIME_MARKER;
 /// `/proc/self/status` and they matched exactly. This is the only marker that asserts the
 /// RESULT of a credential change rather than that something ran.
 const TD_LOGIN_RUNTIME_MARKER: &str = td_recipe::ladder::TD_LOGIN_RUNTIME_MARKER;
+/// Printed by the greeter's kernel-capability farm, as the unprivileged login user,
+/// once the RUNNING kernel has been observed to carry the sandbox features §0 pins
+/// that can be witnessed from `/proc` — every one but `CONFIG_MEMCG`, which needs a
+/// mounted cgroup2 and so waits for td-svc's delegation. The producer already greps
+/// the resolved `.config`; this is what makes a kernel regression red the IMAGE
+/// rather than the first application to be jailed.
+const TD_SANDBOX_KERNEL_MARKER: &str = td_recipe::ladder::TD_SANDBOX_KERNEL_MARKER;
+
 /// Printed after the unprivileged software compositor paints and listens.
 const TD_WAYLAND_RUNTIME_MARKER: &str = td_recipe::ladder::TD_WAYLAND_RUNTIME_MARKER;
 
@@ -236,6 +244,7 @@ struct ConsoleEvidence {
     td_txt_runtime: bool,
     td_init_runtime: bool,
     td_login_runtime: bool,
+    td_sandbox_kernel: bool,
     td_wayland_runtime: bool,
     td_pointer_absolute: bool,
     td_term_runtime: bool,
@@ -818,7 +827,9 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          ({TD_UTIL_RUNTIME_MARKER}), td-txt's grep+sed answering correctly over the live \
          /proc ({TD_TXT_RUNTIME_MARKER}), the td-init boot glue ({TD_INIT_RUNTIME_MARKER}) and a \
          td-login credential switch the switched process read back and confirmed \
-         ({TD_LOGIN_RUNTIME_MARKER}), then assigned the single-user graphical seat and brought \
+         ({TD_LOGIN_RUNTIME_MARKER}), confirmed on the RUNNING kernel that the namespaces, \
+         seccomp filtering, inotify and cgroup pids controller a jail needs are all there \
+         ({TD_SANDBOX_KERNEL_MARKER}), then assigned the single-user graphical seat and brought \
          the software Wayland socket up on virtio-gpu ({TD_WAYLAND_RUNTIME_MARKER}), \
          read an absolute position and its span off the virtio tablet \
          ({TD_POINTER_ABSOLUTE_MARKER}), \
@@ -1197,6 +1208,24 @@ fn validate_system_boot(
              before `setgroups(2)` drops the uid and silently keeps root's supplementary \
              groups, and every other marker here still prints. See \
              td-login/THREAT-MODEL.md. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_sandbox_kernel {
+        return Err(format!(
+            "the userland health checks passed, but the sandbox-kernel marker \
+             ({TD_SANDBOX_KERNEL_MARKER:?}) was absent — the kernel this image BOOTED is \
+             missing at least one feature APPLICATIONS.md §0 pins for the application \
+             tier. The console names the symbol and what a jail loses without it \
+             (`kernel: … (CONFIG_… off) — …`). Nothing else on the image notices: every \
+             other marker here prints on a kernel with no user namespaces and no seccomp, \
+             because nothing yet asks the kernel for either. \
+             The producer's own `.config` guard should have caught this first, so a \
+             failure HERE and not there means the two disagree — an image built against a \
+             different kernel, a deployment selected from an older bookkeeping entry, or a \
+             `cgroup_disable=`/`user.max_user_namespaces=0` on the command line, which no \
+             config guard can see. Read it as a kernel-provenance failure rather than a \
+             Kconfig one. Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -2912,8 +2941,10 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         RIPGREP_FD_RUNTIME_MARKER.len(),
         SSHD_MARKER.len(),
         TD_UTIL_RUNTIME_MARKER.len(),
+        TD_TXT_RUNTIME_MARKER.len(),
         TD_INIT_RUNTIME_MARKER.len(),
         TD_LOGIN_RUNTIME_MARKER.len(),
+        TD_SANDBOX_KERNEL_MARKER.len(),
         TD_WAYLAND_RUNTIME_MARKER.len(),
         TD_POINTER_ABSOLUTE_MARKER.len(),
         TD_TERM_RUNTIME_MARKER.len(),
@@ -3046,6 +3077,11 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         &mut evidence.td_login_runtime,
         buf,
         TD_LOGIN_RUNTIME_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.td_sandbox_kernel,
+        buf,
+        TD_SANDBOX_KERNEL_MARKER.as_bytes(),
     );
     latch_marker(
         &mut evidence.td_wayland_runtime,
@@ -3859,7 +3895,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 35] {
+    fn all_console_markers() -> [&'static str; 36] {
         [
             MARKER,
             EROFS_MARKER,
@@ -3893,6 +3929,7 @@ mod tests {
             TD_TXT_RUNTIME_MARKER,
             TD_INIT_RUNTIME_MARKER,
             TD_LOGIN_RUNTIME_MARKER,
+            TD_SANDBOX_KERNEL_MARKER,
             TD_WAYLAND_RUNTIME_MARKER,
             TD_POINTER_ABSOLUTE_MARKER,
             TD_TERM_RUNTIME_MARKER,
