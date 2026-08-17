@@ -319,11 +319,11 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     ),
 ];
 
-/// ASCII double quote, as a BYTE and not as a char literal. `mod tests`'s
-/// `unlexable` refuses a quote char literal anywhere in the shipped half of a
-/// file that carries a git query — this one does — because it desynchronises
-/// the sibling stripper's string state. Two shipped sites here want a quote,
-/// so they share one name rather than each explaining itself.
+/// ASCII double quote, as a BYTE and not as a char literal. Two shipped sites
+/// here want a quote, so they share one name rather than each spelling it. It
+/// dates from when `mod tests` REFUSED a quote char literal in the shipped
+/// half of a file carrying a git query — this one does — and stays because a
+/// byte is what both sites compare; `lex` neutralises that spelling now.
 const DQUOTE: u8 = 0x22;
 
 /// Crates whose source a RECIPE stages for a target build from a hand-written
@@ -465,10 +465,10 @@ fn collect_rs_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
 ///
 /// `mod tests` carries a SECOND stripper, `strip_comments`, and the two are
 /// deliberately not one. That one also cuts block comments and so must carry
-/// depth ACROSS lines, which desynchronises on a hashed raw string — its own
-/// `unlexable` exists to refuse a file holding one. The files THIS scan reads
-/// are full of them, and a desync here fails the other way: text mis-stripped
-/// is a token that slipped past.
+/// depth ACROSS lines, which desynchronises on a hashed raw string — the git
+/// query scan reads `lex` rather than either of them for that reason. The
+/// files THIS scan reads are full of them, and a desync here fails the other
+/// way: text mis-stripped is a token that slipped past.
 fn strip_line_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for line in text.lines() {
@@ -3149,30 +3149,32 @@ mod tests {
         out
     }
 
-    /// Source with COMMENTS cut away, STRING-AWARE and whole-text.
+    /// Source with COMMENTS cut away, STRING-AWARE, with string state reset
+    /// per LINE.
     ///
     /// String-aware because a `//` inside a literal is not a comment, and
     /// cutting there deletes the rest of the line — including a `--name-only`
     /// this scan exists to see; `git -c url.https://x.insteadOf=y ...` is the
-    /// shape that does it. String state is per LINE; a literal spanning lines
-    /// is therefore read wrong from its second line on, and that is a known
-    /// limit rather than an oversight — see the body for why whole-text is
-    /// worse here.
+    /// shape that does it.
+    ///
+    /// Per line because a plain quote toggle is WRONG about this tree: a
+    /// `'"'` char literal opens a string that never closes, and `builder/src`
+    /// is full of them (`drv.rs`, `oci.rs`, `stage0.rs`, `check_loop.rs`,
+    /// `main.rs`). Resetting bounds what one costs to its own line. The price
+    /// is that a literal genuinely spanning lines is read as CODE from its
+    /// second line on, which callers that can rule those literals out should
+    /// not pay — `lex` is that door.
     ///
     /// BLOCK comments go too, and that is not tidiness: a comment is the one
     /// place `--no-renames` can sit inside an argv without reaching git, so
     /// `/* TODO: add --no-renames */` beside a bare query would satisfy the
     /// rule outright. They NEST in Rust, so the depth is counted rather than
-    /// the first `*/` taken.
+    /// the first `*/` taken. Depth crosses lines in BOTH forms: a block
+    /// comment has no per-line ambiguity to protect against.
     fn strip_comments(text: &str) -> String {
         let mut out = String::with_capacity(text.len());
         let mut depth = 0usize;
         for line in text.lines() {
-            // String state is PER LINE, and deliberately: tracking it whole-text
-            // desynchronises on the first `r#"…"#` — the test modules here are
-            // full of them — and then mis-strips the rest of the file, which
-            // reds a sibling scan that shares this helper. Block-comment DEPTH
-            // is the part that must cross lines, and it does.
             let mut in_str = false;
             let mut esc = false;
             let mut kept = String::with_capacity(line.len());
@@ -3218,52 +3220,559 @@ mod tests {
         out
     }
 
-    /// The construct in `text` that `strip_comments` cannot lex, if any.
+    /// The length in CHARS of the char literal at `at`, or `None` where that
+    /// `'` opens a LIFETIME or a loop label instead.
     ///
-    /// Two desynchronise its ONE string state for the rest of the file, after
-    /// which a span belongs to a different argv than the one being judged: a
-    /// HASHED raw string, whose content may hold an unescaped `"`, and `'"'`,
-    /// which is a char literal and not a string opener. A hashless `r"…"` is
-    /// not among them — it cannot contain a quote, so the plain toggle reads
-    /// it exactly right, and `"-r"` would make a bare `r"` test false-positive
-    /// anyway.
+    /// Both spellings begin with the same character, and telling them apart is
+    /// what lets `lex` rewrite a literal whose CONTENT would desynchronise
+    /// something downstream — `'"'` is a string delimiter to every quote
+    /// toggle that reads `lex`'s output, and `'['`/`']'` are brackets to
+    /// `bracket_spans`, which would hand back a span belonging to a different
+    /// argv.
     ///
-    /// Asked only of a file that CARRIES a query, since a desync judges
-    /// nothing in a file with none, and answered by refusing to judge — the
-    /// same fail-safe direction `bare_name_only` takes for an unreadable span.
-    fn unlexable(text: &str) -> Option<&'static str> {
-        let b = text.as_bytes();
-        // Any hash count: `325-cargo-test.rs` opens its gate body `r##"`, and
-        // a check for `r#"` alone would walk straight past it.
-        for (i, _) in text.match_indices("r#") {
-            let mut j = i.saturating_add(1);
-            while b.get(j) == Some(&b'#') {
-                j = j.saturating_add(1);
-            }
-            if b.get(j) == Some(&b'"') {
-                return Some("a hashed raw string");
-            }
+    /// It is decidable by LOOKAHEAD, which is how rustc decides it: a literal
+    /// is one character or one escape between two quotes, and a lifetime is an
+    /// identifier with no closing quote at all — so `'a'` is a literal and
+    /// `'a` in `&'a str` is not, whatever follows either. The earlier form
+    /// matched four fixed SPELLINGS instead and so had no notion of a closing
+    /// quote, which review walked out through: `'a'['b']` matched `'['` across
+    /// the close of `'a'` and deleted a bracket, which can close an argv span
+    /// early and let a bare query inherit a neighbour's flag. Recognising the
+    /// literal WHOLE is what retires that, and with it the caveat that this
+    /// only held outside a macro token tree.
+    fn char_literal_len(chars: &[char], at: usize) -> Option<usize> {
+        let get = |n: usize| chars.get(at.saturating_add(n)).copied();
+        let hex = |n: usize| get(n).is_some_and(|c| c.is_ascii_hexdigit());
+        if get(0) != Some('\'') {
+            return None;
         }
-        if text.contains("'\"'") {
-            return Some("a quote char literal");
-        }
-        None
+        // The index of the char that must be the CLOSING quote. A lifetime
+        // never begins with a backslash, so `'\` is a literal whatever
+        // follows; what the escape decides is only how long it is.
+        let close = match get(1)? {
+            '\\' => match get(2)? {
+                'x' if hex(3) && hex(4) => 5,
+                'u' => {
+                    if get(3) != Some('{') {
+                        return None;
+                    }
+                    // Six is Rust's own cap on the digits, so a run longer
+                    // than that is not a literal and must not be walked past.
+                    let digits = (4..10).take_while(|n| hex(*n)).count();
+                    let end = 4usize.saturating_add(digits);
+                    if get(end) != Some('}') {
+                        return None;
+                    }
+                    end.saturating_add(1)
+                }
+                'x' => return None,
+                _ => 3,
+            },
+            // `''` is not a literal, and reading it as one would consume the
+            // quote that opens the NEXT one.
+            '\'' | '\n' | '\r' | '\t' => return None,
+            _ => 2,
+        };
+        (get(close) == Some('\'')).then(|| close.saturating_add(1))
     }
+
+    /// Whether the `r` at `at` OPENS a raw string rather than ending an
+    /// identifier.
+    ///
+    /// Asked only from CODE state, which is what makes it answerable: inside a
+    /// string `"-r"` the question never arises, and that is the false red this
+    /// replaced — two rounds of review wrote `"other"` and `"-r"` followed by a
+    /// comment ending in `\"`, and watched a heuristic read the text between
+    /// them as raw content. In code the only remaining question is whether the
+    /// `r` ends an identifier, since `foor"x"` is not a raw string and `foo
+    /// r"x"` is.
+    fn opens_raw(chars: &[char], at: usize) -> bool {
+        let back = |n: usize| at.checked_sub(n).and_then(|p| chars.get(p)).copied();
+        let boundary = match back(1) {
+            // The prefix letters are not the boundary, so it is one further
+            // back; anything else IS the boundary. `f` is here for `lex`'s
+            // reason: it is not a prefix Rust has, and reading one it never
+            // adds costs nothing.
+            Some('b' | 'c' | 'f') => back(2),
+            other => other,
+        };
+        match boundary {
+            None => true,
+            // `#` is part of an identifier here rather than a boundary,
+            // because `r#r"x"` is a RAW IDENTIFIER named `r` followed by an
+            // ordinary string — review read the second `r` as a raw-string
+            // opener, which desynchronises the rest of the file. It costs a
+            // raw string opening immediately after a `#`, which needs either
+            // a just-CLOSED raw string (`r#""#r"`) or a macro token tree, and
+            // no valid Rust in this tree writes either.
+            Some(c) => !c.is_alphanumeric() && c != '_' && c != '#',
+        }
+    }
+
+    /// `rest` past the whitespace and comments that decide nothing, which is
+    /// what rustc skips before asking whether a `#!` opened a shebang or an
+    /// inner attribute.
+    fn past_trivia(rest: &str) -> &str {
+        let mut at = rest.trim_start();
+        loop {
+            at = match at.strip_prefix("//") {
+                Some(line) => match line.split_once('\n') {
+                    Some((_, after)) => after.trim_start(),
+                    None => "",
+                },
+                None => match at.strip_prefix("/*") {
+                    // Not nested: `/*` inside is a comment to rustc too, and
+                    // the only question here is where the FIRST `[` is.
+                    Some(block) => match block.split_once("*/") {
+                        Some((_, after)) => after.trim_start(),
+                        None => "",
+                    },
+                    None => return at,
+                },
+            };
+        }
+    }
+
+    /// `text` with comments cut away and every RAW string rewritten as an
+    /// ordinary one.
+    ///
+    /// TOTAL: there is no text it declines to read. An earlier form returned
+    /// the one construct it could not settle and the caller skipped that file,
+    /// which review showed was the silent skip in a new place — the escape was
+    /// answered by `strip_comments`, a per-line toggle that loses a query for
+    /// three reasons of which prose is only one, so a file carrying both a
+    /// query and a `'"'` went unjudged. Five `builder/src` files carry that
+    /// literal today.
+    ///
+    /// This is a lexer rather than a quote toggle, and it is here because the
+    /// toggle kept being wrong in ways that were silent PASSES. It reads what
+    /// Rust reads: a shebang first line, line and nested block comments,
+    /// ordinary strings with their escapes — across lines, which a toggle
+    /// resetting per line gets wrong — and raw strings by hash count.
+    ///
+    /// It REWRITES rather than merely reads them because `bracket_spans` and
+    /// `string_span` see this output and are quote toggles themselves. A raw
+    /// string's content may hold a bare `"`, which would desynchronise both to
+    /// the end of the file; emitted as an ordinary literal, with `"` and `\`
+    /// escaped, it means the same thing to them. Nothing a query is made of —
+    /// a flag, a subcommand, a path — is changed by that escaping.
+    fn lex(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        // A BOM is not Rust either, and rustc removes it BEFORE looking for a
+        // shebang — so a file carrying both would keep its shebang here and
+        // read it as code.
+        let start = text.strip_prefix('\u{feff}').unwrap_or(text);
+        // A shebang is not Rust and rustc skips it whole. It may hold anything,
+        // an unmatched quote included, and reading one as code carried a string
+        // into the file under it.
+        // `#! [attr]` with a space is an INNER ATTRIBUTE to rustc, which skips
+        // whitespace AND COMMENTS before deciding, so the bracket is looked for
+        // past both. Whitespace alone was not enough: `#!/*` opening a comment
+        // that closes lines later is an attribute to rustc and was a shebang
+        // here, and cutting only its first line left the REST of that comment
+        // to be read as code — an unmatched quote in it then swallowed the
+        // file, silently.
+        let body = match start.strip_prefix("#!") {
+            Some(rest) if !past_trivia(rest).starts_with('[') => match rest.split_once('\n') {
+                Some((_, after)) => {
+                    // Its NEWLINE survives, as a comment's does: what is left
+                    // has the line structure the file had, and a line number
+                    // read off this output is the file's own.
+                    out.push('\n');
+                    after
+                }
+                None => "",
+            },
+            _ => start,
+        };
+        let chars: Vec<char> = body.chars().collect();
+        let mut i = 0usize;
+        while let Some(&c) = chars.get(i) {
+            let next = chars.get(i.saturating_add(1)).copied();
+            // A char literal, in code, is rewritten to a fixed harmless one:
+            // its content is never part of a query, and left alone it can be
+            // a quote or a bracket to something reading this output.
+            // Neutralised rather than refused, since `lex` having no failure
+            // to report is what leaves the scan no path that DECLINES to
+            // judge a file — where its last silent skip lived. Read before
+            // the quote below, since a literal's own quotes are the
+            // misreading being closed.
+            if c == '\'' {
+                if let Some(len) = char_literal_len(&chars, i) {
+                    out.push_str("'x'");
+                    i = i.saturating_add(len);
+                    continue;
+                }
+            }
+            // Comments next: inside neither a string nor a raw one, `//` and
+            // `/*` are the only things that are not code.
+            if c == '/' && next == Some('/') {
+                while chars.get(i).is_some_and(|ch| *ch != '\n') {
+                    i = i.saturating_add(1);
+                }
+                continue;
+            }
+            if c == '/' && next == Some('*') {
+                let mut depth = 1usize;
+                i = i.saturating_add(2);
+                while depth > 0 {
+                    match (chars.get(i).copied(), chars.get(i.saturating_add(1)).copied()) {
+                        (None, _) => break,
+                        (Some('/'), Some('*')) => {
+                            depth = depth.saturating_add(1);
+                            i = i.saturating_add(2);
+                        }
+                        (Some('*'), Some('/')) => {
+                            depth = depth.saturating_sub(1);
+                            i = i.saturating_add(2);
+                        }
+                        // Newlines survive a comment, so what is left still has
+                        // the line structure the file had.
+                        (Some('\n'), _) => {
+                            out.push('\n');
+                            i = i.saturating_add(1);
+                        }
+                        _ => i = i.saturating_add(1),
+                    }
+                }
+                continue;
+            }
+            // `f` is not a prefix Rust has: `fr"x"` is a reserved-prefix ERROR
+            // today, so no valid file holds one. It is here because the cost of
+            // being wrong is asymmetric — an unrecognised prefix is read as an
+            // identifier and then an ordinary string, which for `fr"\"` cuts the
+            // rest of the line and passes a bare query silently — while the cost
+            // of recognising one Rust never adds is nothing, that spelling being
+            // unwritable.
+            if c == 'r' || (matches!(c, 'b' | 'c' | 'f') && next == Some('r')) {
+                let at = if c == 'r' { i } else { i.saturating_add(1) };
+                let mut j = at.saturating_add(1);
+                let mut hashes = 0usize;
+                while chars.get(j) == Some(&'#') {
+                    hashes = hashes.saturating_add(1);
+                    j = j.saturating_add(1);
+                }
+                if chars.get(j) == Some(&'"') && opens_raw(&chars, at) {
+                    out.push('"');
+                    i = j.saturating_add(1);
+                    // A raw string ends at the FIRST `"` followed by its own
+                    // hash count, and holds no escapes at all — which is why a
+                    // toggle read `r"\"` as still open and this does not.
+                    loop {
+                        match chars.get(i).copied() {
+                            None => break,
+                            Some('"') if (1..=hashes)
+                                .all(|k| chars.get(i.saturating_add(k)) == Some(&'#')) =>
+                            {
+                                out.push('"');
+                                i = i.saturating_add(hashes).saturating_add(1);
+                                break;
+                            }
+                            Some(ch) => {
+                                if ch == '"' || ch == '\\' {
+                                    out.push('\\');
+                                }
+                                out.push(ch);
+                                i = i.saturating_add(1);
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+            if c == '"' {
+                out.push(c);
+                i = i.saturating_add(1);
+                let mut esc = false;
+                while let Some(&ch) = chars.get(i) {
+                    out.push(ch);
+                    i = i.saturating_add(1);
+                    match ch {
+                        _ if esc => esc = false,
+                        '\\' => esc = true,
+                        '"' => break,
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+            out.push(c);
+            i = i.saturating_add(1);
+        }
+        out
+    }
+
 
     /// `--no-renames` present as an ARGUMENT of `span` rather than anywhere in
     /// its bytes. `&["diff", "--format=--no-renames", "--name-only"]` names the
     /// flag without ever passing it, and a `contains` reads that as compliance.
-    fn passes_no_renames(span: &str) -> bool {
+    ///
+    /// `--no-renames` present as a WHOLE ARGUMENT of `span` rather than
+    /// anywhere in its bytes. `&["diff", "--format=--no-renames",
+    /// "--name-only"]` names the flag without ever passing it, and a
+    /// `contains` reads that as compliance.
+    ///
+    /// WHAT SPLITS the span into arguments is the difference between the two
+    /// kinds, which is why the caller says which it found, and neither split
+    /// is a rule about the characters ADJACENT to the flag — three rounds of
+    /// review took that apart one adjacency at a time. A SHELL string is
+    /// split by the shell on whitespace, and the quotes that survived Rust's
+    /// own escaping are then removed from each word: `git diff
+    /// \"--no-renames\"` really does pass the flag, while
+    /// `core.pager='--no-renames'` is ONE word forming the config value
+    /// `core.pager=--no-renames`, which git accepts and which is not the
+    /// flag. An ARGV literal is split by Rust at its unescaped quotes, so an
+    /// argument is the whole text between two of them — `"ignored
+    /// --no-renames"` is one argument git never reads the flag out of, and
+    /// the escaped quotes `lex` writes when it rewrites a raw string are
+    /// content rather than a split.
+    fn passes_no_renames(span: &str, needle_at: Option<usize>) -> bool {
         const FLAG: &str = "--no-renames";
-        let b = span.as_bytes();
-        let edge = |c: Option<&u8>| match c {
-            None => true,
-            Some(c) => *c == b'"' || *c == b'\'' || *c == b',' || c.is_ascii_whitespace(),
+        if let Some(at) = needle_at {
+            let command = shell_command_at(span, at);
+            return shell_words(command).iter().any(|word| word == FLAG);
+        }
+        let mut inside = false;
+        let mut argument = String::new();
+        let mut esc = false;
+        // `--` ends git's option parsing, so everything after it is a
+        // pathspec: `&["diff", "--name-only", "--", "--no-renames"]` names a
+        // FILE by that name and passes git no flag at all.
+        let mut pathspecs = false;
+        for (i, c) in span.char_indices() {
+            if esc {
+                argument.push(c);
+                esc = false;
+                continue;
+            }
+            match c {
+                '\\' if inside => {
+                    esc = true;
+                    argument.push(c);
+                }
+                '"' => {
+                    // A DIRECT element of the array, which is what an argument
+                    // is: a literal inside a nested expression is not one, and
+                    // `concat!("core.pager=x ", "--no-renames")` builds a
+                    // single CONFIG VALUE git accepts while lending the argv a
+                    // flag it never receives. Read off what FOLLOWS the
+                    // closing quote, since that is where an element ends.
+                    let after = span
+                        .get(i.saturating_add(1)..)
+                        .and_then(|t| t.trim_start().chars().next());
+                    if inside && matches!(after, Some(',' | ']') | None) {
+                        if argument == "--" {
+                            pathspecs = true;
+                        } else if !pathspecs && argument == FLAG {
+                            return true;
+                        }
+                    }
+                    argument.clear();
+                    inside = !inside;
+                }
+                _ if inside => argument.push(c),
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// The declaration this tree opens its test modules with.
+    const TEST_MOD: &str = "#[cfg(test)]\nmod tests";
+
+    /// `lexed` with its test module CUT OUT, or `None` where the module cannot
+    /// be found whole.
+    ///
+    /// Cut out rather than truncated at, which is the difference between
+    /// scanning a file and scanning the top of one. An earlier form kept
+    /// everything ABOVE the marker and so read a file's tail only when the
+    /// module happened to end it — `recipes/src/recipes/td-sh.rs` declares
+    /// `pub fn recipe()` 32 lines BELOW its tests, and that code went unjudged
+    /// with nothing downstream able to say so: the `checked > 0` control stays
+    /// satisfied by the other files. Review found the hazard by construction;
+    /// the live file was found by looking.
+    ///
+    /// Excluded rather than scanned because the tests below must issue a bare
+    /// `--name-only` as their positive control, and a rule that refused those
+    /// would be a rule against demonstrating itself.
+    ///
+    /// Split at the test MODULE rather than at the first `#[cfg(test)]`: that
+    /// attribute also gates single items — `builder/src/main.rs` has one on a
+    /// `mod` DECLARATION at line 30 — and splitting there discarded the other
+    /// 13 000 lines of that file while the count downstream stayed satisfied
+    /// by other files.
+    ///
+    /// TWICE is refused rather than resolved: nothing in this tree writes two,
+    /// so refusing costs nothing and guessing costs the scan. Both the marker
+    /// and the braces are read off `blank_strings(lexed)`, so a literal
+    /// holding either is data rather than structure — `lex` has already taken
+    /// the comments, which leaves no way to write one that is not code.
+    fn shipped_half(lexed: &str) -> Option<String> {
+        let code = blank_strings(lexed);
+        if code.matches(TEST_MOD).count() > 1 {
+            return None;
+        }
+        let Some(at) = code.find(TEST_MOD) else {
+            return Some(lexed.to_string());
         };
-        span.match_indices(FLAG).any(|(i, _)| {
-            edge(i.checked_sub(1).and_then(|p| b.get(p)))
-                && edge(b.get(i.saturating_add(FLAG.len())))
-        })
+        let body = at.saturating_add(TEST_MOD.len());
+        // `mod tests;` would send the walk below to the next brace group in
+        // the file and cut THAT out instead, which is a silent under-scan of
+        // whatever lies between. Nothing here writes one, so it is refused.
+        if !code.get(body..)?.trim_start().starts_with('{') {
+            return None;
+        }
+        let mut depth = 0usize;
+        let mut end = None;
+        for (n, c) in code.get(body..)?.char_indices() {
+            match c {
+                '{' => depth = depth.saturating_add(1),
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        end = Some(body.saturating_add(n).saturating_add(1));
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (above, below) = (lexed.get(..at)?, lexed.get(end?..)?);
+        Some(format!("{above}{below}"))
+    }
+
+    /// `lexed` with the CONTENT of every string literal blanked, byte offsets
+    /// preserved so a position found in the result indexes the input.
+    ///
+    /// Only sound on `lex`'s output, where every string is an ordinary one
+    /// with its escapes intact: raw strings are already rewritten and comments
+    /// are already gone, so a quote here always delimits. Newlines survive for
+    /// `lex`'s reason — what is left has the line structure the file had.
+    fn blank_strings(lexed: &str) -> String {
+        let mut out = String::with_capacity(lexed.len());
+        let mut chars = lexed.chars();
+        while let Some(c) = chars.next() {
+            out.push(c);
+            if c != '"' {
+                continue;
+            }
+            let mut esc = false;
+            for ch in chars.by_ref() {
+                let closing = !esc && ch == '"';
+                esc = !esc && ch == '\\';
+                match ch {
+                    _ if closing => out.push('"'),
+                    '\n' => out.push('\n'),
+                    // Spaces per BYTE rather than per char: the offsets this
+                    // hands back index the input, which is the whole of why
+                    // the blanking is length-preserving.
+                    other => out.extend(std::iter::repeat_n(' ', other.len_utf8())),
+                }
+                if closing {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// The one COMMAND of `span` that holds the needle at `at`.
+    ///
+    /// A shell string can carry several, and a flag in one of them is not a
+    /// flag in another: `git diff --name-only; git log --no-renames` passes
+    /// git the flag on a query that does not take `--name-only` at all, and
+    /// judging the whole string read that as compliance. Every separator is a
+    /// bound in both directions — `;`, `&`, `|` and a newline sequence
+    /// commands, and `(`, `)` and a backtick open or close a subshell, whose
+    /// contents are a command of their own. Quotes suppress all of them, which
+    /// is what keeps `core.pager='a;b'` one command.
+    ///
+    /// Nothing shipped is multi-command today, so this closes a latent hole
+    /// rather than a live one.
+    fn shell_command_at(span: &str, at: usize) -> &str {
+        const SEPARATORS: [char; 7] = [';', '&', '|', '\n', '(', ')', '`'];
+        let mut start = 0usize;
+        let mut quote: Option<char> = None;
+        let mut chars = span.char_indices();
+        while let Some((i, c)) = chars.next() {
+            if c == '\\' {
+                chars.next();
+                continue;
+            }
+            match quote {
+                Some(open) if c == open => quote = None,
+                Some(_) => {}
+                None if c == '"' || c == '\'' => quote = Some(c),
+                None if SEPARATORS.contains(&c) => {
+                    if i < at {
+                        start = i.saturating_add(c.len_utf8());
+                    } else {
+                        return span.get(start..i).unwrap_or_default();
+                    }
+                }
+                None => {}
+            }
+        }
+        span.get(start..).unwrap_or_default()
+    }
+
+    /// `span` as a shell would split it into WORDS.
+    ///
+    /// Whitespace divides words only OUTSIDE quotes, and the quotes are then
+    /// removed from the word they delimited — which is the whole of why this
+    /// is a walk and not a `split_whitespace`. Both directions matter and a
+    /// splitter without quote state gets one of them wrong whichever way it
+    /// guesses: `core.pager='x --no-renames'` is ONE word, the config value
+    /// git is handed, and `diff "--no-renames"` is two, the second of which
+    /// really is the flag. Review measured both against the simpler rule.
+    ///
+    /// Rust's own escaping survives into the span, so `\"` is a quote the
+    /// SHELL sees rather than a backslash it does.
+    fn shell_words(span: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut word = String::new();
+        let mut quote: Option<char> = None;
+        let mut started = false;
+        let mut chars = span.chars();
+        while let Some(c) = chars.next() {
+            let (c, escaped) = match c {
+                '\\' => match chars.next() {
+                    Some(next) => (next, true),
+                    None => break,
+                },
+                other => (other, false),
+            };
+            match quote {
+                Some(open) if c == open => quote = None,
+                Some(_) => word.push(c),
+                // A `#` beginning a word opens a bash COMMENT, so nothing
+                // after it is passed to anything: `git diff --name-only #
+                // --no-renames` names the flag where the shell will never
+                // read it, which is the same evasion `passes_no_renames`
+                // splits arguments to refuse. Quoted or mid-word it is an
+                // ordinary character, which is why this sits here rather
+                // than at the top of the loop.
+                None if c == '#' && !escaped && !started => break,
+                None if c == '"' || c == '\'' => {
+                    quote = Some(c);
+                    started = true;
+                }
+                None if c.is_ascii_whitespace() => {
+                    if started {
+                        words.push(std::mem::take(&mut word));
+                        started = false;
+                    }
+                }
+                None => {
+                    word.push(c);
+                    started = true;
+                }
+            }
+        }
+        if started {
+            words.push(word);
+        }
+        words
     }
 
     /// `needle` at an identifier boundary. A bare `contains` for a module name
@@ -3452,21 +3961,47 @@ mod tests {
     /// enclosing string literal. Anything with neither yields an empty span and
     /// so reds: a builder chain of `.arg(...)` calls cannot be judged by reading,
     /// and refusing is the fail-safe direction.
+    ///
+    /// WHICH of the two it is travels with it, because that is what says how
+    /// the span is split into arguments — see `passes_no_renames`. An empty
+    /// span is neither and reds whatever it is told.
+    ///
+    /// The LITERAL holding the needle is what decides, rather than whether a
+    /// bracket group encloses it. A string that is EXACTLY `--name-only` is
+    /// one element of an argv, and the span to judge is the argv around it; a
+    /// string holding more is a command LINE, and the only way a command line
+    /// travels as one argument is through a shell. Preferring the bracket
+    /// group made `vec!["git diff --no-renames --name-only"]` a false red —
+    /// no such site exists today, and a false red here stops the whole gate.
     fn bare_name_only(text: &str) -> Option<String> {
         const NEEDLE: &str = "--name-only";
         let spans = bracket_spans(text);
         let mut from = 0usize;
         while let Some(rel) = text.get(from..).and_then(|t| t.find(NEEDLE)) {
             let at = from.saturating_add(rel);
-            let span = spans
-                .iter()
-                .copied()
-                .filter(|(s, e)| *s < at && at < *e)
-                .min_by_key(|(s, e)| e.saturating_sub(*s))
-                .or_else(|| string_span(text, at))
-                .and_then(|(s, e)| text.get(s..e))
-                .unwrap_or("");
-            if !passes_no_renames(span) {
+            let held = string_span(text, at);
+            let literal = held.and_then(|(s, e)| text.get(s..e).map(|t| (t, s)));
+            let (span, shell) = match literal {
+                // A command LINE is a string holding more than the flag AND
+                // naming the program that reads it. Without that second half
+                // an argv ELEMENT holding two flags — `["diff", "--name-only
+                // --no-renames"]` — read as a shell line and passed, where git
+                // gets one argument it rejects; review measured it green.
+                Some((held, s)) if held != NEEDLE && names_at_boundary(held, "git") => {
+                    (held, Some(at.saturating_sub(s)))
+                }
+                _ => (
+                    spans
+                        .iter()
+                        .copied()
+                        .filter(|(s, e)| *s < at && at < *e)
+                        .min_by_key(|(s, e)| e.saturating_sub(*s))
+                        .and_then(|(s, e)| text.get(s..e))
+                        .unwrap_or(""),
+                    None,
+                ),
+            };
+            if !passes_no_renames(span, shell) {
                 return Some(span.split_whitespace().collect::<Vec<_>>().join(" "));
             }
             from = at.saturating_add(NEEDLE.len());
@@ -3528,22 +4063,238 @@ mod tests {
             bare_name_only(&strip_comments(nested_block)).is_some(),
             "{nested_block}"
         );
-        // The two constructs the stripper cannot lex are refused, not guessed.
-        assert_eq!(unlexable("let s = r#\"x\"#;"), Some("a hashed raw string"));
-        assert_eq!(unlexable("let c = '\"';"), Some("a quote char literal"));
-        // A hashless raw string holds no quote, so the plain toggle is right
-        // about it — and `"-r"` must not be mistaken for one.
-        assert_eq!(unlexable("let s = r\"x\";"), None);
+        // A char literal holding a QUOTE is neutralised rather than refused,
+        // in BOTH spellings, since `'\"'` is the same literal. `lex` returning
+        // one and the caller skipping that file is what review walked out
+        // through, so the file is judged now and the literal means `'x'`.
+        let read = lex;
+        assert_eq!(read("let c = '\"';"), "let c = 'x';");
+        assert_eq!(read("let c = '\\\"';"), "let c = 'x';");
+        assert_eq!(read("let c = b'\\\"';"), "let c = b'x';");
+        // …and the QUERY beside one is judged, which is the whole of the fix.
+        // `strip_comments` answered the old escape and loses this query to the
+        // `//` in a URL inside a literal spanning lines, so the file was
+        // skipped whole. Five `builder/src` files carry that char literal.
+        let hidden = "const C: char = '\"';\nrun_shell(root, \"git -c\nurl.https://x.insteadOf=y diff --name-only\");";
+        assert!(!strip_comments(hidden).contains("--name-only"));
+        assert!(bare_name_only(&read(hidden)).is_some(), "{hidden}");
+        // …the same with the literal in an ARGV, and with the char literal
+        // after the query rather than before it.
+        let after = "const Q: &[&str] = &[\"diff\", \"--name-only\"];\nconst C: char = '\"';";
+        assert!(bare_name_only(&read(after)).is_some(), "{after}");
+        // A quote inside a COMMENT or a STRING is data `lex` has consumed by
+        // then, so neither is rewritten and neither ends a literal.
+        assert_eq!(read("let x = 1; // spelled '\"' here"), "let x = 1; ");
+        assert_eq!(read("let s = \"a '\\\"' b\";"), "let s = \"a '\\\"' b\";");
+        // A LIFETIME is left alone, which is what makes the rewrite safe to
+        // do at all: `'` names one, and no lifetime's name starts with `\"`.
         assert_eq!(
-            unlexable(r#"g.run(&["-r", "--no-renames", "--name-only"]);"#),
-            None
+            read("fn f<'a>(s: &'a str) -> &'a str { s }"),
+            "fn f<'a>(s: &'a str) -> &'a str { s }"
         );
-        // Any hash count, or `325-cargo-test.rs`'s `r##"` gate body walks past.
-        assert_eq!(unlexable("let s = r##\"x\"##;"), Some("a hashed raw string"));
-        assert_eq!(unlexable("let s = r#type;"), None);
+        // Everything else `lex` READS, and each of these was a silent PASS
+        // under the quote toggle it replaced. A raw string holding a quote…
+        let hashed = "let s = r#\"a \" b\"#; g.run(&[\"diff\", \"--name-only\"]);";
+        assert!(bare_name_only(&read(hashed)).is_some(), "{hashed}");
+        // …a hashless one ending in a backslash, which closes for rustc and
+        // stayed open for the toggle…
+        let trailing = "let s = r\"\\\"; g.run(&[\"-c\", \"url.https://x\", \
+                        \"diff\", \"--name-only\"]);";
+        assert!(bare_name_only(&read(trailing)).is_some(), "{trailing}");
+        // …an ordinary literal SPANNING LINES, whose second line the per-line
+        // toggle read as code and cut at the `//` in the URL…
+        let spans_lines = "run_shell(root, \"git -c\nurl.https://x.insteadOf=y diff --name-only\");";
+        assert!(!strip_comments(spans_lines).contains("--name-only"));
+        assert!(bare_name_only(&read(spans_lines)).is_some(), "{spans_lines}");
+        let compliant =
+            "run_shell(root, \"git -c\nurl.https://x diff --no-renames --name-only\");";
+        assert_eq!(bare_name_only(&read(compliant)), None);
+        // …and a SHEBANG, which is not Rust, may hold an unmatched quote, and
+        // carried a string into the file under it. A BOM before it is not Rust
+        // either and rustc takes it off FIRST, so the shebang is still one.
+        let shebang = "#!/usr/bin/env \"ignored\nfn f() { g.run(&[\"-c\", \
+                       \"url.https://x\", \"diff\", \"--name-only\"]); }";
+        assert!(bare_name_only(&read(shebang)).is_some(), "{shebang}");
+        let bom = format!("\u{feff}{shebang}");
+        assert!(bare_name_only(&read(&bom)).is_some(), "a BOM hid the shebang");
+        // An inner attribute is not a shebang, and `#![forbid(unsafe_code)]`
+        // opens most of this tree's files — nor is `#! [attr]`, which rustc
+        // reads past the space.
+        assert!(read("#![forbid(unsafe_code)]\nlet x = 1;").contains("forbid"));
+        assert!(read("#! [forbid(unsafe_code)]\nlet x = 1;").contains("forbid"));
+        // The shebang's NEWLINE survives, so a line number read off this output
+        // is the file's own. Review removed the push and watched nothing red.
+        assert_eq!(read("#!/bin/sh\nlet x = 1;"), "\nlet x = 1;");
+        // Block comments NEST here too. Review deleted the depth arm and every
+        // other assertion in this file stayed green: `strip_comments` had this
+        // test and `lex` had none, which is how one gets a silent PASS.
+        let nested = "g.run(&[\"diff\", \"--name-only\", /* a /* b */ --no-renames */]);";
+        assert!(bare_name_only(&read(nested)).is_some(), "{}", read(nested));
+        // …and `lex` must ASK `opens_raw` rather than merely have it. An `r`
+        // ending an identifier opens nothing, so this text is unchanged.
+        assert_eq!(read("let s = foor\"a\\b\";"), "let s = foor\"a\\b\";");
+        // A raw string is rewritten as an ORDINARY one, because the span
+        // helpers downstream are quote toggles: its content keeps its bytes
+        // and gives them back a literal they can lex.
+        assert_eq!(read("let s = r\"a\\b\";"), "let s = \"a\\\\b\";");
+        assert_eq!(read("let s = r#\"a \" b\"#;"), "let s = \"a \\\" b\";");
+        assert_eq!(read("let s = br\"x\";"), "let s = \"x\";");
+        assert_eq!(read("let s = cr\"x\";"), "let s = \"x\";");
+        // `fr` is not a prefix Rust HAS, and is read as one for the asymmetry
+        // named where `opens_raw` takes it: nothing can write that spelling,
+        // and reading it as an identifier plus an ordinary string cuts the
+        // rest of the line. Review deleted both `'f'` arms and every other
+        // assertion here stayed green.
+        assert_eq!(read("let s = fr\"x\";"), "let s = \"x\";");
+        let effed = "let s = fr\"\\\"; g.run(&[\"diff\", \"--name-only\"]);";
+        assert!(bare_name_only(&read(effed)).is_some(), "{}", read(effed));
+        // A RAW IDENTIFIER is not a raw string: rustc reads `r#r` as the
+        // identifier `r`, so the `\"` below is an ordinary escape and not a
+        // raw string's content. Reading it as one desynchronises the rest.
+        let raw_ident = "let _ = sink!(r#r\"\\\"\"); g.run(&[\"diff\", \"--name-only\"]);";
+        assert_eq!(
+            read(raw_ident),
+            "let _ = sink!(r#r\"\\\"\"); g.run(&[\"diff\", \"--name-only\"]);"
+        );
+        assert!(bare_name_only(&read(raw_ident)).is_some(), "{raw_ident}");
+        // `r` ending an IDENTIFIER opens nothing, and neither does one inside
+        // a string. Two rounds of review wrote the second as `"other"` and as
+        // `"-r"` followed by a comment ending in an escaped quote, and watched
+        // a heuristic refuse the whole file for it.
+        assert_eq!(read("let s = \"-r\"; // spell a quote as \\\""), "let s = \"-r\"; ");
+        let prefixed: Vec<char> = "let s = br\"x\";".chars().collect();
+        assert!(opens_raw(&prefixed, 9), "`b` is the prefix, not the boundary");
+        let ident: Vec<char> = "let s = foor\"x\";".chars().collect();
+        assert!(!opens_raw(&ident, 11), "an `r` ending an identifier opens nothing");
         // The flag must be an ARGUMENT, not any occurrence in the span.
         let faked = r#"g.run(&["diff", "--format=--no-renames", "--name-only"]);"#;
         assert!(bare_name_only(faked).is_some(), "a flag named inside another must not pass");
+        // …and an ESCAPED quote is not the boundary that would make it one.
+        // `lex` writes those, rewriting a raw string's inner quote, so a
+        // single argument holding the flag's spelling must not read as two.
+        let inner = "g.run(&[\"diff\", r#\"--output=x\"--no-renames\"#, \"--name-only\"]);";
+        assert!(
+            bare_name_only(&read(inner)).is_some(),
+            "an escaped quote is content, not an argument boundary: {}",
+            read(inner)
+        );
+        // A char literal holding a BRACKET is data too, and `bracket_spans`
+        // counts brackets — so the span judged would be a different argv.
+        let bracketed = "g.run(&[arg(']'), \"--name-only\", arg('[')]);";
+        assert_eq!(read(bracketed), "g.run(&[arg('x'), \"--name-only\", arg('x')]);");
+        assert!(bare_name_only(&read(bracketed)).is_some(), "{bracketed}");
+        // WHITESPACE splits a shell string and not an argv literal. The flag
+        // inside one argument is passed to git as part of that argument, so
+        // the query beside it is bare — including in the form git ACCEPTS,
+        // where the value of `-c` may hold spaces and the run really does
+        // detect renames.
+        let inline = r#"g.run(&["diff", "ignored --no-renames", "--name-only"]);"#;
+        assert!(bare_name_only(inline).is_some(), "{inline}");
+        let config = r#"g.run(&["-c", "core.pager=x --no-renames", "diff", "--name-only"]);"#;
+        assert!(bare_name_only(config).is_some(), "{config}");
+        // …while the shell form, which is what the whitespace split exists
+        // for, still passes: there the shell is what splits the string.
+        assert_eq!(
+            bare_name_only(r#"run_shell(root, "git diff --no-renames --name-only")"#),
+            None
+        );
+        // A SHELL QUOTE is not a word boundary the way whitespace is, and the
+        // two directions of that are a pair. `core.pager='--no-renames'` is
+        // one word bash hands git as a config VALUE — the quotes vanish and
+        // the flag is never passed…
+        let quoted = "run_shell(root, \"git -c core.pager='--no-renames' diff --name-only\")";
+        assert!(bare_name_only(quoted).is_some(), "{quoted}");
+        // …while a quote with WHITESPACE before it delimits a word whose
+        // content is exactly the flag, escaped here because Rust's own
+        // literal needs it. git gets `--no-renames`, so this must pass.
+        let escaped = "run_shell(root, \"git diff \\\"--no-renames\\\" --name-only\")";
+        assert_eq!(bare_name_only(escaped), None, "{escaped}");
+        // …and a quoted word holding MORE than the flag is that same config
+        // value with the quotes moved, which a whitespace split alone reads
+        // as the flag. Review wrote it green against the simpler rule.
+        let inside = "run_shell(root, \"git -c core.pager='x --no-renames' diff --name-only\")";
+        assert!(bare_name_only(inside).is_some(), "{inside}");
+        // A command STRING inside a bracket group is judged by the string it
+        // is, not by the group around it: the literal holding the needle is
+        // the whole command, so the shell splits it. This was a false red.
+        let vectored = r#"let cmds = vec!["git diff --no-renames --name-only"];"#;
+        assert_eq!(bare_name_only(vectored), None, "{vectored}");
+        // …while a literal that IS the flag is one element of an argv, so the
+        // argv around it is the span even though both sit in brackets.
+        let element = r#"let cmds = vec![["diff", "ignored --no-renames", "--name-only"]];"#;
+        assert!(bare_name_only(element).is_some(), "{element}");
+        // A char literal is recognised WHOLE, so its closing quote is never
+        // read as an opening one. Matching fixed SPELLINGS instead deleted a
+        // bracket here, which can close an argv span early and let a bare
+        // query inherit a neighbour's flag.
+        assert_eq!(lex("let c = 'a'['b'];"), "let c = 'x'['x'];");
+        assert_eq!(lex("let q = '\\'';"), "let q = 'x';");
+        assert_eq!(lex("let n = '\\u{7d}';"), "let n = 'x';");
+        // …while a lifetime is not a literal, whatever follows it: the two
+        // spellings share a sigil and only lookahead tells them apart.
+        let borrows = "fn f<'a>(x: &'a str) -> &'a str { x }";
+        assert_eq!(lex(borrows), borrows);
+        // rustc skips COMMENTS as well as whitespace before deciding a `#!`
+        // opened an inner attribute, so one that spans lines is not a shebang
+        // and its content is not code. Cutting only its first line left the
+        // rest to be read as code, quote and all.
+        assert_eq!(lex("#!/*\n\"\n*/[allow(x)]\nq();"), "#!\n\n[allow(x)]\nq();");
+        // A flag in ANOTHER command of the same string is not this query's:
+        // both of these pass git a flag on a query that is not the one asking
+        // for `--name-only`, and judging the whole string read that as
+        // compliance.
+        let sequenced = "run_shell(root, \"git diff --name-only; git log --no-renames\")";
+        assert!(bare_name_only(sequenced).is_some(), "{sequenced}");
+        let substituted = "run_shell(root, \"git diff --name-only $(true --no-renames )\")";
+        assert!(bare_name_only(substituted).is_some(), "{substituted}");
+        // …while a separator inside quotes divides nothing.
+        let quoted_semi = "run_shell(root, \"git -c core.pager='a;b' diff --no-renames --name-only\")";
+        assert_eq!(bare_name_only(quoted_semi), None, "{quoted_semi}");
+        // An argv ELEMENT holding two flags is not a command line: git gets
+        // one argument it rejects. A literal is judged as shell only if it
+        // NAMES the program that would split it.
+        let two_in_one = r#"g.run(&["diff", "--name-only --no-renames"]);"#;
+        assert!(bare_name_only(two_in_one).is_some(), "{two_in_one}");
+        // `--` ends git's options, so what follows names a file rather than
+        // asking for anything.
+        let after_ddash = r#"g.run(&["diff", "--name-only", "--", "--no-renames"]);"#;
+        assert!(bare_name_only(after_ddash).is_some(), "{after_ddash}");
+        // …and a literal inside a NESTED expression is not an argument: this
+        // one builds one config value git accepts, and the flag never reaches
+        // it as an option.
+        let nested = r#"g.run(&["-c", concat!("core.pager=x ", "--no-renames"), "diff", "--name-only"]);"#;
+        assert!(bare_name_only(nested).is_some(), "{nested}");
+        // A `#` beginning a word opens a bash comment, so the flag after one
+        // is never passed. This was a silent pass.
+        let hidden_flag = "run_shell(root, \"git diff --name-only # --no-renames\")";
+        assert!(bare_name_only(hidden_flag).is_some(), "{hidden_flag}");
+        // …and mid-word it is an ordinary character, so the flag beyond it
+        // still counts. Reading every `#` as a comment would false-red here.
+        let hashed = "run_shell(root, \"git diff --pretty=a#b --no-renames --name-only\")";
+        assert_eq!(bare_name_only(hashed), None, "{hashed}");
+        // The SHIPPED half is told from the test half by a marker that must
+        // occur once, and the module is CUT OUT rather than truncated at:
+        // `td-sh.rs` really does declare an item below its tests, and
+        // truncating left that item unjudged with the `checked > 0` control
+        // still satisfied by the other files.
+        let owned = |s: &str| Some(s.to_string());
+        assert_eq!(shipped_half("let x = 1;"), owned("let x = 1;"));
+        let split = format!("shipped();\n{TEST_MOD} {{ let s = \"}}\"; }}");
+        assert_eq!(shipped_half(&split), owned("shipped();\n"));
+        assert_eq!(shipped_half(&format!("{split}\nbelow();")), owned("shipped();\n\nbelow();"));
+        assert_eq!(shipped_half(&format!("{split}\n{TEST_MOD} {{}}")), None);
+        // A marker inside a STRING is data: `lex` has already taken the
+        // comments, so blanking the strings leaves nothing that can spell one
+        // without being code. Both of these used to cut the file short.
+        let quoted = format!("let s = \"{TEST_MOD} {{}}\";\nshipped();");
+        assert_eq!(shipped_half(&quoted), owned(&quoted));
+        let commented = lex(&format!("/* {TEST_MOD} {{}} */\nshipped();"));
+        // Two newlines: the comment's own survives, as it must for a line
+        // number read off this output to be the file's.
+        assert_eq!(shipped_half(&commented), owned("\n\nshipped();"));
+        // …and an unterminated module refuses rather than cutting to the end.
+        assert_eq!(shipped_half(&format!("shipped();\n{TEST_MOD} {{")), None);
+        assert_eq!(shipped_half(&format!("shipped();\n{TEST_MOD};")), None);
     }
 
     /// `--name-only` reports only the DESTINATION of a detected rename, so any
@@ -3564,29 +4315,32 @@ mod tests {
     /// count below stayed satisfied by other files.
     #[test]
     fn no_shipped_name_only_query_lets_git_detect_renames() {
-        const TEST_MOD: &str = "#[cfg(test)]\nmod tests";
         let mut sources = Vec::new();
         collect_rs_files(&repo_root().join("builder/src"), &mut sources);
         assert!(!sources.is_empty(), "no sources to scan");
         let mut checked = 0usize;
         for f in &sources {
             let raw = std::fs::read_to_string(f).unwrap();
-            // Split BEFORE stripping: the tests below must issue a bare
-            // `--name-only` as their positive control, and a rule that refused
-            // those would be a rule against demonstrating itself.
-            let shipped_raw = match raw.find(TEST_MOD) {
-                Some(at) => raw.get(..at).unwrap_or_default(),
-                None => raw.as_str(),
+            // ONE pass, and one that always answers: `lex` reads every file,
+            // so there is no branch here that declines to judge one. The
+            // branch there used to be is what review walked out through — a
+            // refusal answered by `strip_comments`, which cannot see a query
+            // its per-line toggle has lost.
+            //
+            // Lex BEFORE splitting, which is the order the split needs rather
+            // than a tidying: `shipped_half` reads the marker and the braces
+            // as CODE, and only after this pass is a `"…"` in the file
+            // guaranteed to be a string and a `//` guaranteed to be gone.
+            let lexed = lex(&raw);
+            let Some(shipped) = shipped_half(&lexed) else {
+                panic!(
+                    "{f:?} does not carry exactly one whole test module, so \
+                     the shipped half cannot be told from the test half"
+                )
             };
-            if !shipped_raw.contains("--name-only") {
+            if !shipped.contains("--name-only") {
                 continue;
             }
-            assert_eq!(
-                unlexable(shipped_raw),
-                None,
-                "{f:?} carries a construct this scan cannot lex beside a git query — move the query or teach `strip_comments`"
-            );
-            let shipped = strip_comments(shipped_raw);
             checked = checked.saturating_add(shipped.matches("--name-only").count());
             assert_eq!(
                 bare_name_only(&shipped),
@@ -3596,7 +4350,18 @@ mod tests {
         }
         // POSITIVE CONTROL over ARGVS, not files: a scan that reached no query
         // would pass this crate however its git commands were written.
-        assert!(checked > 0, "no shipped --name-only found to check");
+        //
+        // Pinned to the NUMBER rather than to "more than none", which is what
+        // four of this commit's own arguments turn on: every silent skip
+        // above was invisible because the other files kept `checked > 0`
+        // satisfied. A count says which, and the cost of pinning it is one
+        // line whenever a query is added or removed — the same cost every
+        // other pinned count in this tree has, and the same reason.
+        assert_eq!(
+            checked, 5,
+            "{checked} shipped --name-only queries were read, not 5 — a query \
+             that stopped being read looks exactly like one that was deleted"
+        );
         // …and main.rs specifically, which the old split reduced to 30 lines.
         let main = strip_comments(
             &std::fs::read_to_string(repo_root().join("builder/src/main.rs")).unwrap(),
