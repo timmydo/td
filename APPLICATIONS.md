@@ -2469,30 +2469,36 @@ Three corrections to the obvious assumptions, all checked in
   premultiplied alpha is software-blended into the XRGB framebuffer — so
   GTK's client-side decoration shadows and rounded corners have a path.
   This is the single largest piece of good news in the gap analysis.
-- **Pointer axes are implemented**: `axis`, `axis_source`, and
-  `axis_discrete`, version-gated to 5..=7 with the deprecation at v8
-  reasoned about in a comment. **The gate is wrong for one of the three
-  and a review caught it**: `wl_pointer.axis` has existed since
-  *version 1*; only `axis_source` and `axis_discrete` need 5. Gating all
-  three together means a client that binds `wl_pointer` at v1–v4 gets no
-  scroll events at all — a silent loss, since the pointer otherwise
-  works and nothing reports a version mismatch. The gate must be per
-  event: `axis` unconditionally, the other two at ≥5. Verify against
-  `server.rs` before fixing, per §V.4 — this is a §F claim about code,
-  not a specification.
-- **Client cursors are *not*** — against `origin/main`, which is what
-  every state claim in this section is measured against. `set_cursor`
-  validates serial authority and assigns `SurfaceRole::Cursor`, then
-  reads and **discards** both hotspot values and never renders the
-  surface. The protocol plumbing exists; the cursor does not.
-  **Already superseded off-main**: `ui: a client draws its own cursor,
-  where its hotspot says` implements it, so by the time workstream B
-  starts this row is likely to be closed and its ~400-line estimate
-  spent. That is not an erratum in this table — it is the ordinary
-  consequence of writing a state snapshot against a repository that four
-  agents are moving, and it is why §V.3 requires B to re-read `server.rs`
-  rather than trusting this section. Expect the same of any other row
-  here that `ui-rolling` reaches first.
+- **Pointer axes are implemented and the gate is CORRECT**: `axis`,
+  `axis_source`, and `axis_discrete`, with the deprecation at v8
+  reasoned about in a comment. An earlier draft of this bullet claimed
+  the gate got one of the three wrong — that all three were gated at ≥5
+  together, so a client binding `wl_pointer` at v1–v4 would get no
+  scroll at all. **That claim was false and is withdrawn.** The gate is
+  already per event: in `pointer_messages` the `version >=
+  WL_POINTER_AXIS_EVENTS_SINCE` block wraps only `axis_source` and
+  `axis_discrete`, and the bare `axis` is pushed outside it, so every
+  version receives it; the caller gates only `wl_pointer.frame` at ≥5,
+  which is right because `frame` did arrive in v5. It is covered:
+  `pointer_worker_encodes_frames_versions_and_shared_serials` asserts a
+  version-4 pointer receives the bare axis event while a v7 one gets the
+  full triple plus `frame`. Do not "fix" this — the change the old
+  bullet asked for is a no-op at best and a regression at worst. The
+  correction came from the compositor workstream verifying the bullet
+  against `server.rs` exactly as §V.4 asks, which is the process
+  working rather than a defect in it.
+- **Client cursors are DONE.** This row said they were not, measured
+  against `origin/main`: `set_cursor` validated serial authority and
+  assigned `SurfaceRole::Cursor`, then read and **discarded** both
+  hotspot values and never rendered the surface. `ui: a client draws its
+  own cursor, where its hotspot says` (`1c4b7f88`) has since landed on
+  main — rendering at the hotspot, per-surface contents, a per-client
+  1 MiB bound, focus-scoped — so the ~400-line estimate below is spent
+  and the row is closed. That was not an erratum in the table; it is the
+  ordinary consequence of writing a state snapshot against a repository
+  several agents are moving, and it is why §V.3 requires B to re-read
+  `server.rs` rather than trusting this section. Expect the same of any
+  other row here that `ui-rolling` reaches first.
 
 And two hard errors that disconnect a client outright: `create_positioner`
 returns `"xdg_positioner is not supported"` and `get_popup` returns
@@ -2508,7 +2514,7 @@ land offset, but the client survives.
 | `wl_subcompositor` | absent | **B** | 2,500–4,000 |
 | `wl_data_device_manager` v3, selection | absent | **B** | 4,000–6,000 (DnD later, +~900) |
 | `xdg_positioner` + `get_popup` + grabs + constraint solving | **hard error** | **B/U** | 4,500–7,000 |
-| client cursor rendering | role tracked, image ignored | **U** | ~400 |
+| client cursor rendering | **done** (`1c4b7f88`) | — | spent |
 | `zxdg_decoration_manager_v1` (answer `server_side`) | **landed** | **U** | ~500 — spent. Suppresses CSD, fits tiling, and removes most of the geometry problem for cooperating apps. One divergence, deliberate: `destroy` asks the compositor to stop decorating, and td keeps drawing the band because it is layout rather than a decoration td can withdraw |
 | `zxdg_exporter_v2`/`importer_v2` | absent | **portal-blocking** | 1,200–2,000 |
 | `zwp_primary_selection_v1` | absent | C | ~1,000 once data-device exists |
@@ -2868,7 +2874,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 17 | Wayland A: `set_window_geometry`, decoration manager, ARGB golden, single-pixel-buffer; **the GDK and llvmpipe experiments run and their answers land in DESIGN.md** | none |
 | 18 | Wayland B: `wl_subcompositor` | none |
 | 19 | Wayland C: `xdg_positioner`/`xdg_popup`/grabs | menus work |
-| 20 | clipboard (data-device v3), then client cursors | paste and a real I-beam |
+| 20 | clipboard (data-device v3) — client cursors LANDED separately (`1c4b7f88`), so this rung is the clipboard alone | paste, and the I-beam already arrived |
 | 21 | xdg-foreign + private portal socket + dialog placement | modal portal window |
 | 22 | FileChooser, OpenURI, Screenshot, Notification | file dialog visible |
 | 23 | **a pinned small GTK application as a seed package** | **first foreign-toolkit window** |
