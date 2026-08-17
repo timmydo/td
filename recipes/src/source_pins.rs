@@ -508,18 +508,58 @@ const PINS: &[PinDef] = &[
     },
 ];
 
+/// The pins APPLICATIONS.md §B.8 marks FOREIGN: a prebuilt payload that is not a
+/// bootstrap seed and never becomes one.
+///
+/// A roster rather than a field on every `PinDef`, for UNSAFE.md's reason — the
+/// COUNT is what a reviewer reads, and `foreign: false` written fifty-odd times
+/// buries the one entry that matters. The hole a name-keyed roster would
+/// otherwise have is the one this workstream has already refused twice, a
+/// declaration that reaches nothing reading as enforcement: `every_foreign_name_
+/// is_a_pin_key` closes it, and requires a KEY rather than an alias, since
+/// marking an alias would leave the canonical key unmarked.
+///
+/// Empty until the first application lands. Adding an entry is a reviewed pin;
+/// adding a CLASS of foreign output is an AGENTS.md amendment.
+const FOREIGN: &[&str] = &[];
+
 pub fn all() -> Vec<SourcePin> {
-    PINS.iter().map(|pin| materialize(pin, pin.key)).collect()
+    all_with(FOREIGN)
 }
 
 pub fn by_key(key: &str) -> Option<SourcePin> {
-    PINS.iter()
-        .find(|pin| pin.key == key || pin.aliases.iter().any(|alias| *alias == key))
-        .map(|pin| materialize(pin, key))
+    by_key_with(key, FOREIGN)
 }
 
-fn materialize(pin: &PinDef, key: &str) -> SourcePin {
-    SourcePin::new(key, pin.url, pin.sha256, pin.file)
+fn all_with(foreign: &[&str]) -> Vec<SourcePin> {
+    PINS.iter()
+        .map(|pin| materialize_with(pin, pin.key, foreign))
+        .collect()
+}
+
+fn by_key_with(key: &str, foreign: &[&str]) -> Option<SourcePin> {
+    PINS.iter()
+        .find(|pin| pin.key == key || pin.aliases.iter().any(|alias| *alias == key))
+        .map(|pin| materialize_with(pin, key, foreign))
+}
+
+/// Every function above takes its roster as an ARGUMENT, and the public pair
+/// exists only to supply `FOREIGN`. The real roster is EMPTY until the first
+/// application lands, so a test that drove the public pair would observe
+/// nothing — and the wiring that supplies it is exactly what a review found
+/// deletable with the suite green. So the behaviour is tested through the
+/// `_with` pair over a fixture, and the wiring itself is pinned in source by
+/// `the_public_pair_is_the_only_place_the_real_roster_is_read`.
+fn materialize_with(pin: &PinDef, key: &str, foreign: &[&str]) -> SourcePin {
+    let out = SourcePin::new(key, pin.url, pin.sha256, pin.file);
+    // Keyed on the PIN's own key, never on `key` — which may be an ALIAS, and a
+    // pin that is foreign under one name and ordinary under another is the same
+    // bytes admitted twice under two different trust answers.
+    if foreign.contains(&pin.key) {
+        out.mark_foreign()
+    } else {
+        out
+    }
 }
 
 #[cfg(test)]
@@ -549,6 +589,132 @@ mod tests {
         // btrfs-progs 7.0 and util-linux 2.42.2 (the persistent-volume writer
         // and its minimal libuuid/libblkid build closure).
         assert_eq!(all().len(), 56);
+    }
+
+    /// A roster keyed by NAME can name nothing, and this workstream has twice
+    /// refused that shape: a declaration reaching no path reads as enforcement
+    /// and is none. Here it would be worse than a no-op — a misspelt entry
+    /// leaves the payload it meant to mark UNMARKED, which is the answer every
+    /// check downstream then gives.
+    ///
+    /// A KEY and never an alias, because `materialize` marks on `pin.key`: an
+    /// alias listed here would resolve to a pin that is foreign under one name
+    /// and ordinary under another.
+    fn unresolved(foreign: &[&str], pins: &[PinDef]) -> Vec<String> {
+        foreign
+            .iter()
+            .filter(|name| !pins.iter().any(|pin| pin.key == **name))
+            .map(|name| (*name).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn every_foreign_name_is_a_pin_key() {
+        // The real roster is EMPTY, so sweeping it alone is a loop with no
+        // iterations — green with the rule inverted. Drive the check first.
+        let pins = [PinDef {
+            key: "app",
+            aliases: &["app-alias"],
+            url: "u",
+            sha256: "s",
+            file: "f",
+        }];
+        assert!(unresolved(&["app"], &pins).is_empty());
+        assert_eq!(unresolved(&["typo"], &pins), vec!["typo".to_string()]);
+        assert_eq!(
+            unresolved(&["app-alias"], &pins),
+            vec!["app-alias".to_string()],
+            "an alias must not satisfy the check — materialize marks on the key"
+        );
+        assert!(
+            unresolved(FOREIGN, PINS).is_empty(),
+            "a FOREIGN name that resolves to no pin marks nothing, and every \
+             check downstream then answers `not foreign'"
+        );
+        // The count is the reviewable artifact, so it is asserted rather than
+        // left to be read. Adding an application changes this number.
+        assert_eq!(FOREIGN.len(), 0, "no application has landed yet");
+    }
+
+    /// The mark is a property of the PIN, so it must answer the same however the
+    /// pin was asked for — and an ALIAS in the roster must mark nothing, which is
+    /// what makes the key-only rule above load-bearing rather than a convention.
+    #[test]
+    fn the_mark_rides_the_pin_not_the_name_it_was_asked_for() {
+        let pin = PinDef {
+            key: "app",
+            aliases: &["app-alias"],
+            url: "u",
+            sha256: "s",
+            file: "f",
+        };
+        assert!(materialize_with(&pin, "app", &["app"]).foreign());
+        assert!(
+            materialize_with(&pin, "app-alias", &["app"]).foreign(),
+            "asking by alias must not lose the mark"
+        );
+        assert!(!materialize_with(&pin, "app", &["other"]).foreign());
+        assert!(
+            !materialize_with(&pin, "app", &["app-alias"]).foreign(),
+            "an alias in the roster marks nothing — hence the key-only check"
+        );
+        // Everything the catalog actually ships is ordinary, and stays so.
+        assert!(all().iter().all(|pin| !pin.foreign()));
+    }
+
+    /// The PRODUCTION lookup, over a REAL pin key, which is the route every
+    /// shipped recipe takes: no catalog recipe calls `source_pin` directly, so
+    /// the fixture-`PinDef` test above and the shipped code met nowhere until
+    /// this one. Driven through `by_key_with` because the real roster is empty.
+    #[test]
+    fn the_production_lookup_marks_a_real_pin_from_the_roster() {
+        let key = "zlib-x86-64-source";
+        assert!(!by_key(key).unwrap().foreign(), "ordinary as shipped");
+        assert!(by_key_with(key, &[key]).unwrap().foreign());
+        assert_eq!(
+            all_with(&[key])
+                .iter()
+                .filter(|pin| pin.foreign())
+                .map(|pin| pin.key.clone())
+                .collect::<Vec<_>>(),
+            vec![key.to_string()],
+            "exactly the named pin, and no neighbour"
+        );
+    }
+
+    /// The one line joining the real roster to the real materializer had no
+    /// test, and replacing `FOREIGN` with `&[]` there left the whole suite
+    /// green. That is not merely a coverage gap: whoever lands the first
+    /// application must edit the count assertion above anyway, and once they
+    /// do, a tree with this wiring cut is fully green with the payload
+    /// UNMARKED — the exact outcome the roster's key check exists to refuse,
+    /// reached through the wiring instead of through a name.
+    ///
+    /// Pinned in SOURCE because no value observation can see it: with an empty
+    /// roster `all_with(FOREIGN)` and `all_with(&[])` return the same thing.
+    #[test]
+    fn the_public_pair_is_the_only_place_the_real_roster_is_read() {
+        let src = include_str!("source_pins.rs");
+        let shipped = match src.find("\n#[cfg(test)]\nmod tests {") {
+            Some(at) => src.get(..at).unwrap_or(src),
+            None => src,
+        };
+        let reads: Vec<&str> = shipped
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("FOREIGN") && !l.starts_with("///") && !l.starts_with("//"))
+            .collect();
+        assert_eq!(
+            reads,
+            vec![
+                "const FOREIGN: &[&str] = &[];",
+                "all_with(FOREIGN)",
+                "by_key_with(key, FOREIGN)",
+            ],
+            "the roster is declared once and read by exactly the two public \
+             entry points — a third reader, or either of these passing something \
+             else, is how a marked pin comes back unmarked"
+        );
     }
 
     #[test]

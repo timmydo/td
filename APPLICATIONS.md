@@ -952,6 +952,60 @@ the side of the wall where `build_plan_auto` lives. A landing that adds
 the field to the pin and stops has enforced half the rule and will pass
 its own tests.
 
+**Both halves have LANDED**, which is what that last sentence was
+written to prevent: `SourcePin` carries `foreign`, `Recipe` derives its
+own flag from the pins at the single funnel every pin reaches a recipe
+through, and `to_json` emits `"foreign": true` — only when true, so
+every recipe in the tree hashes exactly as it did and landing the mark
+rebuilt nothing. Three things about the shape are worth recording
+because each was a choice with an alternative:
+
+- **The recipe's answer is COMPUTED from its pins, not cached beside
+  them.** A builder method would be a second source of truth for a
+  trust answer; so, it turned out, would a cached field, because
+  `source_pins` is public and consumers hold it — appending to that
+  vector, or flipping a mark on a pin already in it, desyncs a cache
+  silently. Both cross-model reviewers found that independently. There
+  is one source of truth and `is_foreign()` reads it.
+  The taint is also STICKY under the pre-existing dedup: two pins under
+  one key disagreeing about the answer is a conflict either arrival
+  order could hide, so the mark joins the pin that is kept.
+- **The pins name their marks in a ROSTER** rather than carrying
+  `foreign: false` on all fifty-odd `PinDef`s, for UNSAFE.md's reason —
+  the count is what a reviewer reads. A name-keyed roster has the hole
+  this workstream has twice refused, a declaration that reaches nothing
+  reading as enforcement, so the roster is checked to name pin KEYS and
+  never aliases: `materialize` marks on the pin's own key, and a pin
+  foreign under one name and ordinary under another is the same bytes
+  admitted twice under two trust answers.
+- **What the marker defends against is MISTAKE, not a hostile recipe
+  author.** Recipes are compiled Rust in this tree, so anyone able to
+  clear a mark could equally not declare the pin. The mark is a review
+  artifact and a machine-checkable one; it is not a sandbox around the
+  catalog, and reading it as one would be the same overclaim §B.8
+  corrects elsewhere.
+
+The roster is EMPTY until the first application lands, which is exactly
+the condition under which every test over it passes with the rule
+inverted — so the decision functions take their roster as an ARGUMENT
+and are driven with fixtures, including through the production lookup
+over a real pin key. The one thing no value can observe is the wiring
+that supplies the real roster: with an empty one, reading `FOREIGN` and
+reading nothing return the same answer. Review found that deletable with
+the suite green, and it is worse than a coverage gap — whoever lands the
+first application must edit the roster's count assertion anyway, and
+once they do, a tree with the wiring cut is fully green with the payload
+UNMARKED. That is the same outcome the key check refuses, reached
+through the wiring rather than through a name, so the wiring is pinned
+in source.
+
+Taint PROPAGATION, the `contains_payloads` containment edge, the
+planning-time refusal and the closure query are the next increments. One
+thing they will need that this increment does not: the mark does not
+cross into the four-column source-pin TSV that `td-feed` and the
+control-plane bootstrap parse into their own pin types, so the
+fetch/warm side cannot yet tell a foreign pin from an ordinary one.
+
 **The taint starts at the source pin, not at the output.** Marking only
 the finished package would leave the packaging recipe free to execute the
 pinned foreign binary while building it, and would let a second recipe

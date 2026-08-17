@@ -478,6 +478,18 @@ pub struct SourcePin {
     pub url: String,
     pub sha256: String,
     pub file: String,
+    /// APPLICATIONS.md §B.8: a prebuilt payload that is NOT a bootstrap seed and
+    /// never becomes one. The mark rides the SOURCE pin rather than the finished
+    /// package, because marking only the output would leave the packaging recipe
+    /// free to execute the pinned bytes while building it, and would let a second
+    /// recipe consume the same archive and emit an unmarked output.
+    ///
+    /// PRIVATE where the other four are public, so `mark_foreign` is the single
+    /// spelling: a struct literal carrying `foreign: true` would set it without
+    /// naming the thing being done, and the whole argument for a method over a
+    /// fifth constructor argument is that a trust decision should be greppable
+    /// by one token. Every reader is in this crate.
+    foreign: bool,
 }
 
 impl SourcePin {
@@ -487,7 +499,20 @@ impl SourcePin {
             url: url.into(),
             sha256: sha256.into(),
             file: file.into(),
+            foreign: false,
         }
+    }
+
+    /// A method rather than a fifth argument to `new`: a bare `true` at a call
+    /// site is the least reviewable way to spell a trust decision, and this one
+    /// is §B.8's reviewed exception to "no foreign binary in the build graph".
+    pub fn mark_foreign(mut self) -> SourcePin {
+        self.foreign = true;
+        self
+    }
+
+    pub fn foreign(&self) -> bool {
+        self.foreign
     }
 }
 
@@ -901,8 +926,17 @@ impl Recipe {
         Recipe::base(name, version, BuildSystem::RustStage0)
     }
 
+    /// Attaches source pins like `inputs` does, and that is not symmetry for its
+    /// own sake: `check_runner` resolves pin keys out of `inputs`,
+    /// `native_inputs` AND `payload_inputs`, staging each as a seed source — so
+    /// a pin named here had its bytes fetched and interned while the recipe
+    /// carried no record of it. §B.8's table names `nativeInputs` as one of the
+    /// two channels a marked path must be REFUSED on, and a channel the recipe
+    /// cannot see cannot refuse anything. No shipped recipe names a pin key
+    /// here today, so this changes no emitted recipe.
     pub fn native_inputs(mut self, xs: &[&str]) -> Recipe {
         self.native_inputs = Some(vs(xs));
+        self.add_source_pins_for_keys(xs.iter().copied());
         self
     }
     /// Declare DATA inputs — see `Recipe::payload_inputs`. A path named here is
@@ -1022,10 +1056,33 @@ impl Recipe {
 
     fn push_source_pin(&mut self, pin: SourcePin) {
         let pins = self.source_pins.get_or_insert_with(Vec::new);
-        if pins.iter().any(|existing| existing.key == pin.key) {
+        if let Some(existing) = pins.iter_mut().find(|existing| existing.key == pin.key) {
+            // Dedup by key is pre-existing; dropping the newcomer's MARK with it
+            // would not be. Two pins under one key disagreeing about §B.8's
+            // answer is a conflict either order could hide, so the taint sticks
+            // to the pin that is kept.
+            existing.foreign |= pin.foreign();
             return;
         }
         pins.push(pin);
+    }
+
+    /// Whether this recipe's own source is a §B.8 foreign payload.
+    ///
+    /// COMPUTED from the pins rather than cached beside them: `source_pins` is
+    /// public and consumers hold it, so a cache is a second answer that anything
+    /// appending to the vector — or flipping a mark on a pin already in it —
+    /// silently desyncs. There is one source of truth and this reads it.
+    ///
+    /// It has to exist at all because `to_json` deliberately DROPS `source_pins`
+    /// (`source_pins_are_recipe_metadata_not_build_json`): a pin is how a recipe
+    /// was authored, and emitting pins into the build JSON would change every
+    /// derivation hash in the tree. So the mark crosses that wall on its own key,
+    /// or the rule holds in only one of the two places a plan is built.
+    pub fn is_foreign(&self) -> bool {
+        self.source_pins
+            .as_ref()
+            .is_some_and(|pins| pins.iter().any(|pin| pin.foreign()))
     }
 
     /// The build system as its JSON/lowering token ("gnu"/"rust"/"cmake"/"stage0").
@@ -1058,6 +1115,13 @@ impl Recipe {
         // exactly as it did — this key must not rebuild the world to land.
         if let Some(x) = &self.payload_inputs {
             o.push(("payloadInputs".into(), arr(x)));
+        }
+        // Likewise emitted only when TRUE, and never as `false`: the mark must
+        // cross into the build JSON (§B.8 — `build_plan_auto` sees nothing else),
+        // and a `"foreign":false` on every recipe would change every derivation
+        // hash in the tree to say what their absence already says.
+        if self.is_foreign() {
+            o.push(("foreign".into(), Json::Bool(true)));
         }
         if let Some(x) = &self.steps {
             o.push((
@@ -1164,6 +1228,127 @@ mod tests {
             r.to_json().to_canonical(),
             r#"{"buildSystem":"gnu","name":"stage0","sourceInput":"stage0-source","version":"1.9.1"}"#
         );
+    }
+
+    /// §B.8's mark crosses the wall the test above keeps `source_pins` behind.
+    /// The pin is the source of truth and stays out of the build JSON; the
+    /// derived flag is what `build_plan_auto` — which sees the emitted JSON and
+    /// nothing else — has to read, so a landing that marked the pin and stopped
+    /// would enforce the rule in one of the two places a plan is built.
+    #[test]
+    fn a_foreign_pin_marks_the_recipe_and_the_mark_reaches_the_build_json() {
+        let pin = SourcePin::new("app-source", "u", "s", "f").mark_foreign();
+        let r = Recipe::gnu("app", "1.0").source_pin(pin);
+        assert!(r.is_foreign());
+        assert_eq!(
+            r.to_json().to_canonical(),
+            r#"{"buildSystem":"gnu","foreign":true,"name":"app","version":"1.0"}"#
+        );
+        // An ordinary pin attached afterwards describes ITSELF, not the recipe.
+        let both = r.source_pin(SourcePin::new("zlib", "u", "s", "f"));
+        assert!(both.is_foreign(), "an ordinary pin must not clear the mark");
+        // ...and in the other order, since `inputs` attaches pins too.
+        let ordinary_first = Recipe::gnu("app", "1.0")
+            .source_pin(SourcePin::new("zlib", "u", "s", "f"))
+            .source_pin(SourcePin::new("app-source", "u", "s", "f").mark_foreign());
+        assert!(ordinary_first.is_foreign());
+    }
+
+    /// The taint is STICKY under dedup, both orders. `push_source_pin` drops a
+    /// pin whose key it already holds — pre-existing and right — but dropping
+    /// its MARK with it would let the answer depend on which of two pins under
+    /// one key happened to arrive first.
+    #[test]
+    fn deduplicating_two_pins_under_one_key_keeps_the_mark() {
+        let plain = SourcePin::new("k", "u", "s", "f");
+        let marked = SourcePin::new("k", "u", "s", "f").mark_foreign();
+        let marked_second = Recipe::gnu("app", "1.0")
+            .source_pin(plain.clone())
+            .source_pin(marked.clone());
+        assert!(
+            marked_second.is_foreign(),
+            "a foreign pin discarded as a duplicate must still mark the recipe"
+        );
+        let marked_first = Recipe::gnu("app", "1.0")
+            .source_pin(marked)
+            .source_pin(plain);
+        assert!(marked_first.is_foreign());
+        // Still one pin: this is the dedup, not a second entry.
+        assert_eq!(marked_second.source_pins.as_ref().map(Vec::len), Some(1));
+    }
+
+    /// `source_pins` is public and consumers hold it, so the answer must be
+    /// READ from it rather than cached beside it — a cache is a second answer
+    /// that appending to the vector, or flipping a mark on a pin already in it,
+    /// silently desyncs.
+    #[test]
+    fn the_answer_is_read_from_the_pins_not_cached_beside_them() {
+        let mut r = Recipe::gnu("app", "1.0").source_pin(SourcePin::new("k", "u", "s", "f"));
+        assert!(!r.is_foreign());
+        if let Some(pins) = r.source_pins.as_mut() {
+            if let Some(pin) = pins.first_mut() {
+                pin.foreign = true;
+            }
+        }
+        assert!(
+            r.is_foreign(),
+            "mutating a held pin must change the recipe's answer"
+        );
+        assert!(r.to_json().to_canonical().contains(r#""foreign":true"#));
+    }
+
+    /// Landing the mark rebuilds nothing: the key is emitted only when TRUE, so
+    /// every recipe in the tree hashes exactly as it did. `false` would be the
+    /// same statement as the key's absence and would change every hash to make
+    /// it.
+    #[test]
+    fn the_mark_costs_an_ordinary_recipe_nothing_in_the_build_json() {
+        let plain = Recipe::gnu("fixture", "1.0").inputs(&["gcc"]);
+        assert!(!plain.is_foreign());
+        assert_eq!(
+            plain.to_json().to_canonical(),
+            r#"{"buildSystem":"gnu","inputs":["gcc"],"name":"fixture","version":"1.0"}"#
+        );
+        assert!(
+            plain.to_json().get("foreign").is_none(),
+            "no key at all, not `foreign:false'"
+        );
+        // The whole shipped catalog, which is the claim that matters. Asked for
+        // the KEY rather than matched as text: a check-script body containing
+        // the word would otherwise false-red it.
+        for (stem, recipe) in crate::catalog::all() {
+            assert!(
+                recipe.to_json().get("foreign").is_none(),
+                "{stem} emits the mark, but nothing has landed one yet"
+            );
+        }
+    }
+
+    /// Both input channels attach the pin a key resolves to. `native_inputs` did
+    /// NOT before this commit, and `check_runner` resolves pin keys out of that
+    /// list too — so a foreign pin named there would have had its bytes fetched
+    /// and interned while the recipe carried no record of it, the funnel claim
+    /// failing on one of the two channels §B.8's table names explicitly.
+    ///
+    /// `inputs` is asserted beside it because nothing asserted it either:
+    /// deleting its attachment left the whole suite green, and thirty shipped
+    /// recipes reach the fetch/warm surface through it.
+    #[test]
+    fn both_input_channels_attach_the_pin_a_key_resolves_to() {
+        for r in [
+            Recipe::gnu("x", "1").native_inputs(&["zlib-x86-64-source"]),
+            Recipe::gnu("x", "1").inputs(&["zlib-x86-64-source"]),
+        ] {
+            assert_eq!(
+                r.source_pins.as_ref().map(Vec::len),
+                Some(1),
+                "a pin key in an input list must attach its pin"
+            );
+        }
+        // Not a pin key: no pin, and no error either — these lists are mostly
+        // other recipes' outputs.
+        assert!(Recipe::gnu("x", "1").native_inputs(&["gcc"]).source_pins.is_none());
+        assert!(Recipe::gnu("x", "1").inputs(&["gcc"]).source_pins.is_none());
     }
 
     // The wire contract builder::build::run_mesboot dispatches on ("mesBoot"
