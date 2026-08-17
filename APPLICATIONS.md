@@ -2606,13 +2606,16 @@ Three corrections to the obvious assumptions, all checked in
 And two hard errors that disconnect a client outright: `create_positioner`
 returns `"xdg_positioner is not supported"` and `get_popup` returns
 `"xdg_popup is not supported"`. **A GTK app opening its first menu is
-disconnected today.** By contrast `set_window_geometry` is parsed and
-discarded — a true no-op, so CSD margins tile as dead borders and clicks
-land offset, but the client survives.
+disconnected today.** `set_window_geometry` WAS the other of the two, parsed
+and discarded — a true no-op, so CSD margins tiled as dead borders and clicks
+landed offset, though the client survived. That row is closed: `ui: a window
+geometry is the part of a surface td tiles` honours it as a crop on both the
+paint and the hit test, with the two divergences it takes recorded in
+`td-compositor/DESIGN.md` §3.
 
 | interface | td state | class | cost |
 |---|---|---|---|
-| `xdg_surface.set_window_geometry` honoured | parsed, discarded | **B** | ~250 across scene and hit-test |
+| `xdg_surface.set_window_geometry` honoured | **landed** | — | ~250 across scene and hit-test — spent. The geometry is the crop: a tile draws the client's own rectangle from its own origin and a pointer arrives in the client's coordinates. Two deliberate divergences, both in DESIGN.md §3 — the surface intersection is taken where it is used rather than frozen at the applying commit, and a geometry naming no part of the surface leaves the whole surface standing rather than cropping to nothing |
 | `wl_shm` ARGB blending | **present** | — | verify with a golden |
 | `wl_subcompositor` | absent | **B** | 2,500–4,000 |
 | `wl_data_device_manager` v3, selection | absent | **B** | 4,000–6,000 (DnD later, +~900) |

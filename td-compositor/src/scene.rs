@@ -69,6 +69,47 @@ pub struct SurfacePoint {
     pub y: i32,
 }
 
+/// A window's own bounds inside its surface, as `xdg_surface.set_window_geometry`
+/// gave them: surface-local, so the origin is where the client's invisible
+/// margin ends and the window a person sees begins. Signed and unclipped,
+/// because the protocol allows both — a geometry may name a rectangle reaching
+/// outside the surface, and only the surface's own pixels decide what that
+/// means. `Scene::crop_of` is where the two meet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowGeometry {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// The part of a surface that IS the window, in the surface's own pixels: a
+/// window geometry resolved against the pixels a client actually committed.
+/// Unsigned and inside the surface by construction, which is what lets the
+/// renderer take it as a source offset and the hit test as a coordinate shift.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Crop {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+impl Crop {
+    /// All of it, which is what an unmentioned geometry means and what a cursor
+    /// image is: only a toplevel has a window geometry, so the pointer's own
+    /// image is drawn whole by construction rather than by a default nothing
+    /// sets.
+    fn whole(surface: &Surface) -> Crop {
+        Crop {
+            x: 0,
+            y: 0,
+            width: surface.width,
+            height: surface.height,
+        }
+    }
+}
+
 /// What a client asked its pointer to look like while the pointer is over
 /// its own surfaces. One slot for the whole scene rather than one per client:
 /// the protocol makes a cursor undefined again on every `wl_pointer.leave`,
@@ -675,6 +716,12 @@ pub(crate) fn least_output_height(rows: usize) -> usize {
 pub struct Scene {
     surfaces: BTreeMap<SurfaceKey, Surface>,
     input_regions: BTreeMap<SurfaceKey, SharedInputRegion>,
+    /// What each toplevel says its own bounds are, for the surfaces whose
+    /// clients have said. Its lifetime is the xdg_surface OBJECT's, like a
+    /// title and unlike an input region: a client sets it once at startup and
+    /// need never send it again, so dropping it with the pixels would tile a
+    /// remapped window's shadow margins as dead borders again.
+    geometries: BTreeMap<SurfaceKey, WindowGeometry>,
     titles: BTreeMap<SurfaceKey, String>,
     layout: Layout,
     pointer_x: i32,
@@ -707,6 +754,7 @@ impl Scene {
         Scene {
             surfaces: BTreeMap::new(),
             input_regions: BTreeMap::new(),
+            geometries: BTreeMap::new(),
             titles: BTreeMap::new(),
             layout: Layout::new(),
             pointer_x: 0,
@@ -958,6 +1006,67 @@ impl Scene {
         true
     }
 
+    /// The window's own bounds inside its surface, as a commit applied them —
+    /// stored as the client gave them, since resolving one needs the pixels it
+    /// is resolved against and those change under it. `None` goes back to the
+    /// whole surface, which is the xdg_surface's destroy and nothing else: the
+    /// protocol gives a client no way to unset one.
+    ///
+    /// Accepted for a surface that has NOT committed pixels, unlike an input
+    /// region: a toolkit sets its geometry on the commit before its first
+    /// buffer, so refusing it there would lose the geometry of every window
+    /// that opens the ordinary way. Answers whether the stored rectangle
+    /// changed, since a client re-sending the same one owes no repaint.
+    pub fn set_window_geometry(
+        &mut self,
+        key: SurfaceKey,
+        geometry: Option<WindowGeometry>,
+    ) -> bool {
+        let was = self.geometries.get(&key).copied();
+        match geometry {
+            Some(geometry) => self.geometries.insert(key, geometry),
+            None => self.geometries.remove(&key),
+        };
+        was != geometry
+    }
+
+    /// Where this surface's window is inside it. The geometry a client set,
+    /// resolved against the pixels it committed; the whole surface when no
+    /// geometry is set, which the protocol makes the default and which is
+    /// every client that never mentions one.
+    ///
+    /// A geometry naming NO part of the surface leaves the whole surface
+    /// standing rather than cropping to nothing. That is a divergence and a
+    /// deliberate one: the alternative reading of an empty intersection is a
+    /// window with no pixels, which on screen is a black tile the client
+    /// cannot see is its own doing — and the case is reachable without any
+    /// client mistake, since the geometry outlives the buffer it was measured
+    /// against and a later, smaller buffer can fall outside it.
+    fn crop_of(&self, key: SurfaceKey, surface: &Surface) -> Crop {
+        let whole = Crop::whole(surface);
+        let Some(geometry) = self.geometries.get(&key) else {
+            return whole;
+        };
+        let (Ok(width), Ok(height)) = (
+            usize::try_from(geometry.width),
+            usize::try_from(geometry.height),
+        ) else {
+            return whole;
+        };
+        let (Some((x, width)), Some((y, height))) = (
+            clipped_span(geometry.x, width, surface.width),
+            clipped_span(geometry.y, height, surface.height),
+        ) else {
+            return whole;
+        };
+        Crop {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
     /// The toplevel's title, as `xdg_toplevel.set_title` gave it. Accepted for
     /// a surface that has NOT committed yet, unlike an input region: a client
     /// sets its title before its first buffer and need never send it again, so
@@ -995,6 +1104,13 @@ impl Scene {
     /// otherwise inherit the dead one's name until it set its own.
     pub fn forget_title(&mut self, key: SurfaceKey) -> bool {
         self.titles.remove(&key).is_some()
+    }
+
+    /// Test-only, for `title`'s reason: what a geometry DOES is read inside
+    /// this type, by the two functions that draw and aim through it.
+    #[cfg(test)]
+    pub fn window_geometry(&self, key: SurfaceKey) -> Option<WindowGeometry> {
+        self.geometries.get(&key).copied()
     }
 
     /// Test-only: the renderer reads the map directly, inside this type, so a
@@ -1036,6 +1152,7 @@ impl Scene {
     pub fn remove(&mut self, key: SurfaceKey) -> bool {
         let layout_changed = self.layout.contains(key);
         self.discard_pixels(key);
+        self.geometries.remove(&key);
         self.titles.remove(&key);
         self.layout.forget(key);
         self.clear_hint();
@@ -1068,6 +1185,7 @@ impl Scene {
             });
         self.surfaces.retain(|key, _| key.client != client);
         self.input_regions.retain(|key, _| key.client != client);
+        self.geometries.retain(|key, _| key.client != client);
         self.titles.retain(|key, _| key.client != client);
         self.surface_bytes = self.surface_bytes.saturating_sub(removed);
         // Cursor surfaces are not in `surfaces`, so the sweep above misses
@@ -1520,8 +1638,12 @@ impl Scene {
                 continue;
             };
             let rect = placement.rect;
-            let surface_width = surface.width.min(rect.width);
-            let surface_height = surface.height.min(rect.height);
+            // The WINDOW's extent, not the surface's: the drawn part is the
+            // crop, so a pointer over a margin td cropped away is over
+            // whatever is behind the tile rather than over this client.
+            let crop = self.crop_of(placement.key, surface);
+            let surface_width = crop.width.min(rect.width);
+            let surface_height = crop.height.min(rect.height);
             let Some(end_x) = rect.x.checked_add(surface_width) else {
                 continue;
             };
@@ -1531,8 +1653,11 @@ impl Scene {
             if x < rect.x || x >= end_x || y < rect.y || y >= end_y {
                 continue;
             }
-            let local_x = i32::try_from(x.saturating_sub(rect.x)).ok()?;
-            let local_y = i32::try_from(y.saturating_sub(rect.y)).ok()?;
+            // Surface-local, which is the space a client's own input region and
+            // every pointer event are in: the crop's origin is what the tile's
+            // top-left corner shows, so it is added back here.
+            let local_x = i32::try_from(x.saturating_sub(rect.x).saturating_add(crop.x)).ok()?;
+            let local_y = i32::try_from(y.saturating_sub(rect.y).saturating_add(crop.y)).ok()?;
             if self
                 .input_regions
                 .get(&placement.key)
@@ -1571,13 +1696,21 @@ impl Scene {
             .map(|placement| placement.rect)
             .next()
             .and_then(|rect| {
-                self.surfaces.get(&key)?;
+                let crop = self.crop_of(key, self.surfaces.get(&key)?);
                 let origin_x = i32::try_from(rect.x).ok()?;
                 let origin_y = i32::try_from(rect.y).ok()?;
+                let crop_x = i32::try_from(crop.x).ok()?;
+                let crop_y = i32::try_from(crop.y).ok()?;
                 Some(SurfacePoint {
                     key,
-                    x: self.pointer_x.saturating_sub(origin_x),
-                    y: self.pointer_y.saturating_sub(origin_y),
+                    x: self
+                        .pointer_x
+                        .saturating_sub(origin_x)
+                        .saturating_add(crop_x),
+                    y: self
+                        .pointer_y
+                        .saturating_sub(origin_y)
+                        .saturating_add(crop_y),
                 })
             })
     }
@@ -1732,6 +1865,7 @@ impl Scene {
                 stride,
                 ImageRect::tile(placement.rect),
                 surface,
+                self.crop_of(placement.key, surface),
             );
         }
         // Over the windows and under everything that is not one: the block
@@ -1978,6 +2112,17 @@ fn visible_span(origin: i64, length: usize, limit: usize) -> Option<(usize, usiz
     Some((source, visible))
 }
 
+/// The same clipping as `visible_span`, answered as an ABSOLUTE span rather
+/// than as an offset into the rect: a source offset is what the renderer needs
+/// and where the span BEGINS is what a crop needs. One arithmetic rather than
+/// two that have to agree — a crop and a paint that disagreed by a pixel would
+/// put the pointer on a different part of the window than the one drawn.
+fn clipped_span(origin: i32, length: usize, limit: usize) -> Option<(usize, usize)> {
+    let (skipped, visible) = visible_span(i64::from(origin), length, limit)?;
+    let start = i64::from(origin).saturating_add(i64::try_from(skipped).unwrap_or(i64::MAX));
+    Some((usize::try_from(start).ok()?, visible))
+}
+
 fn draw_surface(
     frame: &mut [u8],
     width: usize,
@@ -1985,20 +2130,24 @@ fn draw_surface(
     stride: usize,
     at: ImageRect,
     surface: &Surface,
+    from: Crop,
 ) {
     let (x, y) = (at.x, at.y);
-    let draw_width = surface.width.min(at.width);
-    let draw_height = surface.height.min(at.height);
+    let draw_width = from.width.min(at.width);
+    let draw_height = from.height.min(at.height);
     let Some((source_x_start, visible_columns)) = visible_span(x, draw_width, width) else {
         return;
     };
     let Some((source_y_start, visible_rows)) = visible_span(y, draw_height, height) else {
         return;
     };
+    // `skip` before `enumerate` in both walks: the index has to count from the
+    // CROP's own origin, because that is the pixel the destination starts at.
     for (source_y, row) in surface
         .pixels
         .chunks_exact(surface.width.saturating_mul(4))
         .take(surface.height)
+        .skip(from.y)
         .enumerate()
         .skip(source_y_start)
         .take(visible_rows)
@@ -2008,6 +2157,7 @@ fn draw_surface(
             .as_chunks::<4>()
             .0
             .iter()
+            .skip(from.x)
             .enumerate()
             .skip(source_x_start)
             .take(visible_columns)
@@ -2157,6 +2307,7 @@ fn draw_pointer(
                 height: image.height,
             },
             image,
+            Crop::whole(image),
         ),
         None => draw_cross(frame, width, height, stride, x, y),
     }
@@ -5280,6 +5431,432 @@ mod tests {
             );
             assert!(!scene.hint_is_live(), "the block outlived its base");
         }
+    }
+
+    const SHADOW: [u8; 4] = [9, 9, 9, 0];
+    const WINDOW: [u8; 4] = [1, 2, 3, 0];
+    const MARGIN: usize = 12;
+    const INNER: usize = 40;
+
+    /// What a client-side-decorated toolkit commits: an invisible margin all
+    /// round the window a person sees. The margin is exactly what a window
+    /// geometry exists to take back off, so it is a colour here and the tests
+    /// below count it.
+    fn shadowed() -> Surface {
+        let side = INNER.saturating_add(MARGIN.saturating_mul(2));
+        let mut image = surface(SHADOW, side, side);
+        for y in MARGIN..MARGIN.saturating_add(INNER) {
+            for x in MARGIN..MARGIN.saturating_add(INNER) {
+                let offset = y.saturating_mul(side).saturating_add(x).saturating_mul(4);
+                image
+                    .pixels
+                    .get_mut(offset..offset.saturating_add(4))
+                    .unwrap()
+                    .copy_from_slice(&WINDOW);
+            }
+        }
+        image
+    }
+
+    fn inner_geometry() -> WindowGeometry {
+        WindowGeometry {
+            x: i32::try_from(MARGIN).unwrap(),
+            y: i32::try_from(MARGIN).unwrap(),
+            width: i32::try_from(INNER).unwrap(),
+            height: i32::try_from(INNER).unwrap(),
+        }
+    }
+
+    /// One shadowed window on an output with room to spare all round it, so a
+    /// crop shows up as background rather than as a neighbour.
+    fn shadowed_output() -> (Scene, Vec<u8>, usize, usize, usize, SurfaceKey, Rect) {
+        let key = SurfaceKey {
+            client: 4,
+            object: 9,
+        };
+        let width = 240usize;
+        let height = least_output_height(100);
+        let stride = width.saturating_mul(4);
+        let mut scene = Scene::new();
+        scene.commit(key, shadowed()).unwrap();
+        let rect = scene
+            .tiled_placements(width, height)
+            .first()
+            .map(|placement| placement.rect)
+            .unwrap();
+        (
+            scene,
+            vec![0; stride.saturating_mul(height)],
+            width,
+            height,
+            stride,
+            key,
+            rect,
+        )
+    }
+
+    #[test]
+    fn a_window_geometry_crops_the_margin_a_client_draws_around_itself() {
+        let (mut scene, mut frame, width, height, stride, key, rect) = shadowed_output();
+        scene.render(&mut frame, width, height, stride);
+        // Unset, the whole buffer is the window: the margin tiles as a dead
+        // border and the client's own corner is 12 pixels inside its tile.
+        assert_eq!(pixel(&frame, stride, rect.x, rect.y), SHADOW);
+        assert_eq!(
+            pixel(&frame, stride, rect.x + MARGIN, rect.y + MARGIN),
+            WINDOW
+        );
+
+        assert!(scene.set_window_geometry(key, Some(inner_geometry())));
+        // Answers whether the rectangle CHANGED, since a client re-sending the
+        // one it already sent owes no repaint.
+        assert!(!scene.set_window_geometry(key, Some(inner_geometry())));
+        scene.render(&mut frame, width, height, stride);
+        // The geometry's own origin is what the tile's corner shows now, and
+        // the margin is nowhere in the tile: not shifted off one edge and
+        // still drawn at the other, which is what a crop that offset the
+        // source without shortening the run would leave.
+        assert_eq!(pixel(&frame, stride, rect.x, rect.y), WINDOW);
+        assert_eq!(count_color(&frame, stride, rect, SHADOW), 0);
+        assert_eq!(
+            count_color(&frame, stride, rect, WINDOW),
+            INNER.saturating_mul(INNER)
+        );
+    }
+
+    #[test]
+    fn the_pointer_reaches_a_cropped_window_in_the_clients_own_coordinates() {
+        let (mut scene, _frame, width, height, _stride, key, rect) = shadowed_output();
+        assert!(scene.set_window_geometry(key, Some(inner_geometry())));
+        // A region over the WINDOW and not over the margin, which is what a
+        // toolkit sends: it is read in the surface's own coordinates, so a
+        // pointer that arrived as tile-local would fall outside it and the
+        // press would reach nothing at all.
+        let mut region = InputRegion::new();
+        assert!(region.add(
+            i32::try_from(MARGIN).unwrap(),
+            i32::try_from(MARGIN).unwrap(),
+            i32::try_from(INNER).unwrap(),
+            i32::try_from(INNER).unwrap(),
+        ));
+        assert!(scene.set_input_region(key, Some(Arc::new(region))));
+
+        assert!(scene.move_pointer(
+            i32::try_from(rect.x).unwrap(),
+            i32::try_from(rect.y).unwrap(),
+            width,
+            height,
+        ));
+        assert_eq!(
+            scene.pointer_targets(Some(key), width, height),
+            (
+                Some(SurfacePoint {
+                    key,
+                    x: i32::try_from(MARGIN).unwrap(),
+                    y: i32::try_from(MARGIN).unwrap(),
+                }),
+                Some(SurfacePoint {
+                    key,
+                    x: i32::try_from(MARGIN).unwrap(),
+                    y: i32::try_from(MARGIN).unwrap(),
+                })
+            )
+        );
+
+        // One pixel past the window's own last column, which is inside the
+        // tile and inside the BUFFER — the margin the crop took away. Nothing
+        // is drawn there, so nothing may be aimed there either.
+        assert!(scene.move_pointer(i32::try_from(INNER).unwrap(), 0, width, height));
+        assert_eq!(scene.pointer_targets(None, width, height).0, None);
+    }
+
+    #[test]
+    fn a_geometry_reaching_outside_the_surface_is_clipped_to_what_was_committed() {
+        let (mut scene, mut frame, width, height, stride, key, rect) = shadowed_output();
+        let side = INNER.saturating_add(MARGIN.saturating_mul(2));
+        // Every side outside the buffer, which the protocol allows: a geometry
+        // may name a rectangle reaching past the surface, and only the pixels
+        // that exist can be drawn.
+        assert!(scene.set_window_geometry(
+            key,
+            Some(WindowGeometry {
+                x: -8,
+                y: -8,
+                width: i32::try_from(side).unwrap() + 100,
+                height: i32::try_from(side).unwrap() + 100,
+            })
+        ));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, rect.x, rect.y), SHADOW);
+        assert_eq!(
+            count_color(&frame, stride, rect, WINDOW),
+            INNER.saturating_mul(INNER)
+        );
+        // The other direction: a geometry whose far corner is outside keeps
+        // only the part that is inside, four columns and four rows of margin.
+        assert!(scene.set_window_geometry(
+            key,
+            Some(WindowGeometry {
+                x: i32::try_from(side).unwrap() - 4,
+                y: i32::try_from(side).unwrap() - 4,
+                width: 100,
+                height: 100,
+            })
+        ));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(count_color(&frame, stride, rect, SHADOW), 16);
+        assert_eq!(count_color(&frame, stride, rect, WINDOW), 0);
+        // The clip bounds the AIM as well as the ink: the geometry asked for a
+        // hundred pixels and four exist, so a pointer at the tenth is over
+        // nothing rather than over a window drawn four pixels wide. One probe
+        // per AXIS, each inside the crop on the other one — a diagonal probe is
+        // refused by either bound alone and so cannot tell them apart.
+        for (dx, dy) in [(10, 2), (2, 10)] {
+            let (at_x, at_y) = scene.pointer_at();
+            assert!(scene.move_pointer(
+                i32::try_from(rect.x.saturating_add(dx)).unwrap() - at_x,
+                i32::try_from(rect.y.saturating_add(dy)).unwrap() - at_y,
+                width,
+                height,
+            ));
+            assert_eq!(
+                scene.pointer_targets(None, width, height).0,
+                None,
+                "the aim reached {dx},{dy} into a crop four pixels wide"
+            );
+        }
+
+        // Clipped to the whole surface is the same as no geometry at all, and
+        // the pointer says so: the tile's corner is the buffer's own corner.
+        // Last, because the pointer is drawn where it is and a cross over the
+        // tile would be counted above.
+        assert!(scene.set_window_geometry(
+            key,
+            Some(WindowGeometry {
+                x: -8,
+                y: -8,
+                width: i32::try_from(side).unwrap() + 100,
+                height: i32::try_from(side).unwrap() + 100,
+            })
+        ));
+        // A DELTA, back to the tile's own corner from the last probe above,
+        // since that is what this takes.
+        assert!(scene.move_pointer(-2, -10, width, height));
+        assert_eq!(
+            scene.pointer_targets(None, width, height).0,
+            Some(SurfacePoint { key, x: 0, y: 0 })
+        );
+    }
+
+    #[test]
+    fn a_geometry_naming_no_part_of_the_surface_leaves_the_whole_of_it() {
+        let (mut scene, mut frame, width, height, stride, key, rect) = shadowed_output();
+        let side = i32::try_from(INNER.saturating_add(MARGIN.saturating_mul(2))).unwrap();
+        // Reachable without any client mistake: the geometry outlives the
+        // buffer it was measured against, so a client that commits a smaller
+        // one has said nothing about where its window is. A crop to nothing
+        // would be a black tile with nothing on screen saying why.
+        // The last two are not reachable from the wire — the server refuses a
+        // side that is not positive before recording one — so the guard in
+        // `crop_of` is what stands between this type's own public fields and a
+        // crop running to the far edge of the surface.
+        for away in [
+            WindowGeometry {
+                x: side + 10,
+                y: 0,
+                width: 20,
+                height: 20,
+            },
+            WindowGeometry {
+                x: 0,
+                y: side + 10,
+                width: 20,
+                height: 20,
+            },
+            WindowGeometry {
+                x: 0,
+                y: 0,
+                width: -20,
+                height: 20,
+            },
+            WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: -20,
+            },
+        ] {
+            assert!(scene.set_window_geometry(key, Some(away)));
+            scene.render(&mut frame, width, height, stride);
+            assert_eq!(pixel(&frame, stride, rect.x, rect.y), SHADOW);
+            assert_eq!(
+                count_color(&frame, stride, rect, WINDOW),
+                INNER.saturating_mul(INNER)
+            );
+        }
+    }
+
+    /// A crop wider and taller than the tile it lands in stops at the tile, in
+    /// the ink and in the aim alike. That is what the pair of `min`s against
+    /// `placement.rect` is for, and it is the case the whole feature rests on:
+    /// a client's buffer is routinely bigger than the window inside it, so a
+    /// crop that reached past its tile would paint over the neighbour and
+    /// swallow the neighbour's clicks — the tile list is walked in order, so the
+    /// first match wins.
+    #[test]
+    fn a_crop_larger_than_its_tile_stops_at_the_tile_in_ink_and_in_aim() {
+        let left = SurfaceKey {
+            client: 4,
+            object: 9,
+        };
+        let right = SurfaceKey {
+            client: 4,
+            object: 10,
+        };
+        let width = 240usize;
+        let height = least_output_height(40);
+        let stride = width.saturating_mul(4);
+        let mut scene = Scene::new();
+        scene.commit(left, surface(SHADOW, 200, 200)).unwrap();
+        // SMALLER than its tile, deliberately: a neighbour that fills its own
+        // tile would paint over whatever the left one spilled into it, and the
+        // spill is what this test is looking for.
+        scene.commit(right, surface(WINDOW, 8, 8)).unwrap();
+        // Shifted AND oversized, so the origin the crop adds back and the extent
+        // the tile takes off are both in play.
+        assert!(scene.set_window_geometry(
+            left,
+            Some(WindowGeometry {
+                x: 10,
+                y: 10,
+                width: 180,
+                height: 180,
+            })
+        ));
+        let placements = scene.tiled_placements(width, height);
+        let mut left_rect = None;
+        let mut right_rect = None;
+        for placement in &placements {
+            if placement.key == left {
+                left_rect = Some(placement.rect);
+            }
+            if placement.key == right {
+                right_rect = Some(placement.rect);
+            }
+        }
+        let left_rect = left_rect.unwrap();
+        let right_rect = right_rect.unwrap();
+        assert!(left_rect.x < right_rect.x, "the row came out the other way");
+        assert!(
+            left_rect.width < 180 && left_rect.height < 180,
+            "the tile was big enough to hold the crop, so nothing was clamped"
+        );
+
+        let mut frame = vec![0; stride.saturating_mul(height)];
+        scene.render(&mut frame, width, height, stride);
+        assert!(count_color(&frame, stride, left_rect, SHADOW) > 0);
+        assert_eq!(
+            count_color(&frame, stride, right_rect, SHADOW),
+            0,
+            "the left window's crop painted into its neighbour's tile"
+        );
+        // Below it as well as beside it: the crop is oversized in both axes, and
+        // an axis clamped only across would run down through the gap the
+        // arrangement leaves under the tile.
+        let below = Rect {
+            x: left_rect.x,
+            y: left_rect.y.saturating_add(left_rect.height),
+            width: left_rect.width,
+            height: height.saturating_sub(left_rect.y.saturating_add(left_rect.height)),
+        };
+        assert!(
+            below.height > 0,
+            "nothing was left under the tile to spill into"
+        );
+        assert_eq!(
+            count_color(&frame, stride, below, SHADOW),
+            0,
+            "the left window's crop painted under its own tile"
+        );
+
+        let probe = |scene: &mut Scene, x: usize, y: usize| {
+            let (at_x, at_y) = scene.pointer_at();
+            scene.move_pointer(
+                i32::try_from(x).unwrap() - at_x,
+                i32::try_from(y).unwrap() - at_y,
+                width,
+                height,
+            );
+            scene.pointer_targets(None, width, height).0
+        };
+        assert_eq!(
+            probe(&mut scene, left_rect.x + 2, left_rect.y + 3),
+            Some(SurfacePoint {
+                key: left,
+                x: 12,
+                y: 13,
+            })
+        );
+        assert_eq!(
+            probe(&mut scene, right_rect.x + 2, right_rect.y + 3),
+            Some(SurfacePoint {
+                key: right,
+                x: 2,
+                y: 3,
+            })
+        );
+        // The gaps beside and below the tile, which the left buffer reaches
+        // across both of: over nothing, because a tile is where a window ends.
+        // One probe per axis, each inside the tile on the other, since a probe
+        // outside on both is refused by either clamp alone.
+        assert_eq!(
+            probe(
+                &mut scene,
+                left_rect.x + left_rect.width + 1,
+                left_rect.y + 3
+            ),
+            None,
+            "the aim reached across the gap beside the tile"
+        );
+        assert_eq!(
+            probe(
+                &mut scene,
+                left_rect.x + 2,
+                left_rect.y + left_rect.height + 1
+            ),
+            None,
+            "the aim reached down through the gap under the tile"
+        );
+    }
+
+    #[test]
+    fn a_geometry_dies_with_its_surface_and_with_its_client() {
+        for take in [
+            (|scene: &mut Scene, key: SurfaceKey| scene.remove(key))
+                as fn(&mut Scene, SurfaceKey) -> bool,
+            |scene: &mut Scene, key: SurfaceKey| scene.remove_client(key.client),
+        ] {
+            let (mut scene, mut frame, width, height, stride, key, rect) = shadowed_output();
+            assert!(scene.set_window_geometry(key, Some(inner_geometry())));
+            take(&mut scene, key);
+            // The surface came back — a client reconnecting on the same ids, or
+            // one that destroyed the window and opened another. It has said
+            // nothing about a geometry, so it gets the whole buffer.
+            scene.commit(key, shadowed()).unwrap();
+            scene.render(&mut frame, width, height, stride);
+            assert_eq!(pixel(&frame, stride, rect.x, rect.y), SHADOW);
+        }
+
+        // An UNMAP is the other way round, and deliberately: a null-buffer
+        // attach is the opening of every handshake as well as a transient
+        // unmap, and a client re-mapping does not re-send a geometry it
+        // already sent.
+        let (mut scene, mut frame, width, height, stride, key, rect) = shadowed_output();
+        assert!(scene.set_window_geometry(key, Some(inner_geometry())));
+        scene.unmap(key);
+        scene.commit(key, shadowed()).unwrap();
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, rect.x, rect.y), WINDOW);
     }
 
     #[test]

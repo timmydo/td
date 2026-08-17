@@ -4,8 +4,8 @@ use crate::layout::ViewLayout;
 use crate::pointer::{PointerEvent, PointerSnapshot, RoutedPointerFrame};
 use crate::runtime::{KeyboardDelivery, KeyboardSubscriptionStop, Runtime, SubscriptionStop};
 use crate::scene::{
-    CursorRequest, InputRegion, SharedInputRegion, Surface, SurfaceKey, MAX_CURSOR_DIMENSION,
-    MAX_INPUT_REGION_OPERATIONS, SHM_ARGB8888, SHM_XRGB8888,
+    CursorRequest, InputRegion, SharedInputRegion, Surface, SurfaceKey, WindowGeometry,
+    MAX_CURSOR_DIMENSION, MAX_INPUT_REGION_OPERATIONS, SHM_ARGB8888, SHM_XRGB8888,
 };
 #[cfg(test)]
 use crate::scene::{GAP, TITLE_HEIGHT};
@@ -32,6 +32,17 @@ const GLOBAL_XDG_WM_BASE: u32 = 4;
 const GLOBAL_SEAT: u32 = 5;
 const GLOBAL_DECORATION: u32 = 6;
 const WL_DISPLAY_ERROR_IMPLEMENTATION: u32 = 3;
+/// Two of `xdg_surface.error`, each named by the protocol for exactly the
+/// mistake it is raised for: a `set_window_geometry` whose width or height is
+/// not positive, and any request to an xdg_surface that has no role object yet.
+/// Raised in place of the `implementation` code every other refusal here
+/// carries, because these are mistakes the protocol has words for — and the
+/// word is what tells a toolkit author which of the two it made. The enum
+/// carries no `since`, so neither code is gated on the `xdg_wm_base` version a
+/// client bound; a client that does not recognise the number still reads the
+/// message beside it, which spells the same thing out.
+const XDG_SURFACE_ERROR_NOT_CONSTRUCTED: u32 = 1;
+const XDG_SURFACE_ERROR_INVALID_SIZE: u32 = 5;
 const WL_SEAT_ERROR_MISSING_CAPABILITY: u32 = 0;
 const WL_POINTER_ERROR_ROLE: u32 = 0;
 /// `wl_pointer.axis_source`'s `wheel`. The other three sources — finger,
@@ -163,6 +174,14 @@ enum Object {
         surface: u32,
         toplevel: Option<u32>,
         configure: Arc<Mutex<ConfigureTracker>>,
+        /// The window geometry a client has asked for and no commit has applied
+        /// yet. Double-buffered because the protocol says so, and held on the
+        /// xdg_surface for the decoration's reason: this is the object whose
+        /// state it is, so it dies with the right one and there is no second
+        /// place to leave it stale. Only the PENDING half lives here — what
+        /// took effect is the scene's, which is what draws and hit-tests with
+        /// it.
+        pending_geometry: Option<WindowGeometry>,
     },
     XdgToplevel {
         xdg_surface: u32,
@@ -1646,6 +1665,7 @@ impl Client {
         let was_mapped = self.mapped_bytes.contains_key(&id);
         let cursor = state.role == Some(SurfaceRole::Cursor);
         let mut xdg_configure = None;
+        let mut geometry = None;
         if let Some(SurfaceRole::Xdg(role)) = state.role {
             let xdg = self
                 .objects
@@ -1690,6 +1710,17 @@ impl Client {
                 return Err(format!(
                     "xdg_surface {role} attached a buffer before acknowledging configure"
                 ));
+            }
+            // Taken after the refusals above and pushed after the pixels below,
+            // so it is spent only by a commit that is going to happen and
+            // applied only once the pixels it describes are the scene's. A crop
+            // applied before the buffer it was measured against would draw one
+            // frame of the previous buffer through the new window's bounds.
+            if let Some(Object::XdgSurface {
+                pending_geometry, ..
+            }) = self.objects.get_mut(&role)
+            {
+                geometry = pending_geometry.take();
             }
         } else if state.role.is_none() && attaching_buffer {
             return Err(format!("wl_surface {id} attached a buffer without a role"));
@@ -1762,6 +1793,17 @@ impl Client {
                             }
                         }
                         self.unmap_surface(id)?;
+                        // The one commit shape where the geometry is applied on
+                        // its own, and it needs no atomicity: a surface with no
+                        // pixels is drawn nowhere and aimed at by nothing, so
+                        // the unmap and the crop cannot be told apart from
+                        // outside whichever order they land in.
+                        if geometry.is_some() {
+                            self.runtime
+                                .lock()
+                                .map_err(|_| "runtime lock poisoned".to_string())?
+                                .set_window_geometry(key, geometry)?;
+                        }
                     }
                     PendingBuffer::Buffer { object, buffer } => {
                         let surface_bytes = buffer
@@ -1775,7 +1817,12 @@ impl Client {
                         self.runtime
                             .lock()
                             .map_err(|_| "runtime lock poisoned".to_string())?
-                            .commit_with_input_region(key, surface, input_region.clone())?;
+                            .apply_commit(
+                                key,
+                                Some(surface),
+                                Some(input_region.clone()),
+                                geometry,
+                            )?;
                         self.mapped_bytes.insert(id, surface_bytes);
                         self.mapped_total = next;
                         if matches!(
@@ -1787,16 +1834,21 @@ impl Client {
                     }
                 }
             }
-        } else if input_region_changed && !cursor {
+        } else if (input_region_changed || geometry.is_some()) && !cursor {
+            // No buffer, so the state this commit carries is whichever of the
+            // two arrived — the geometry alone being the ordinary opening
+            // sequence, set on the empty commit before the first frame.
             self.runtime
                 .lock()
                 .map_err(|_| "runtime lock poisoned".to_string())?
-                .set_input_region(
+                .apply_commit(
                     SurfaceKey {
                         client: self.id,
                         object: id,
                     },
-                    input_region.clone(),
+                    None,
+                    input_region_changed.then(|| input_region.clone()),
+                    geometry,
                 )?;
         }
         for callback in state.frame_callbacks {
@@ -2267,6 +2319,7 @@ impl Client {
                             surface,
                             toplevel: None,
                             configure: Arc::new(Mutex::new(ConfigureTracker::new())),
+                            pending_geometry: None,
                         },
                     )?;
                     state.role = Some(SurfaceRole::Xdg(id));
@@ -2287,6 +2340,7 @@ impl Client {
                 surface,
                 toplevel,
                 configure,
+                pending_geometry,
             } => match message.opcode {
                 0 => {
                     args.finish()?;
@@ -2296,7 +2350,24 @@ impl Client {
                             message.object
                         ));
                     }
-                    self.remove_object(message.object)
+                    self.remove_object(message.object)?;
+                    // The geometry was THIS object's, so it goes with it. The
+                    // wl_surface outlives it and keeps its role pointing at the
+                    // dead object, so it can take neither a second xdg_surface
+                    // nor another commit — this is the crop's ownership rather
+                    // than a stale one anything could still draw through.
+                    // Unconditional, because the scene answers whether there
+                    // was one.
+                    self.runtime
+                        .lock()
+                        .map_err(|_| "runtime lock poisoned".to_string())?
+                        .set_window_geometry(
+                            SurfaceKey {
+                                client: self.id,
+                                object: surface,
+                            },
+                            None,
+                        )
                 }
                 1 => {
                     let new_toplevel = args.u32()?;
@@ -2346,15 +2417,63 @@ impl Client {
                             surface,
                             toplevel: Some(new_toplevel),
                             configure,
+                            // Necessarily None — a geometry before this request
+                            // is refused — and carried rather than written as
+                            // None so this write-back states nothing of its own
+                            // about state it does not touch.
+                            pending_geometry,
                         },
                     );
                     Ok(())
                 }
+                // set_window_geometry. Recorded and applied by the next commit
+                // to the wl_surface, which is what "double-buffered state"
+                // means; nothing is answered, since the geometry is a statement
+                // about the client's own buffer rather than a request.
                 3 => {
-                    for _ in 0..4 {
-                        args.i32()?;
+                    let x = args.i32()?;
+                    let y = args.i32()?;
+                    let geometry_width = args.i32()?;
+                    let geometry_height = args.i32()?;
+                    args.finish()?;
+                    // "A role must be assigned before any other requests are
+                    // made to the xdg_surface object" — so a geometry set before
+                    // `get_toplevel` is `not_constructed` rather than state to
+                    // hold for the role that has not been asked for. Checked
+                    // before the arguments are judged, because a client with no
+                    // role has told td nothing about a window yet and that is
+                    // the more useful half of the diagnosis.
+                    if toplevel.is_none() {
+                        return self.fail_protocol(
+                            XDG_SURFACE_ERROR_NOT_CONSTRUCTED,
+                            &format!(
+                                "xdg_surface {} set a window geometry before its role object",
+                                message.object
+                            ),
+                        );
                     }
-                    args.finish()
+                    if geometry_width <= 0 || geometry_height <= 0 {
+                        return self.fail_protocol(
+                            XDG_SURFACE_ERROR_INVALID_SIZE,
+                            &format!(
+                                "xdg_surface {} window geometry {geometry_width}x{geometry_height} is not positive",
+                                message.object
+                            ),
+                        );
+                    }
+                    let Some(Object::XdgSurface {
+                        pending_geometry, ..
+                    }) = self.objects.get_mut(&message.object)
+                    else {
+                        return Err(format!("xdg_surface {} went away", message.object));
+                    };
+                    *pending_geometry = Some(WindowGeometry {
+                        x,
+                        y,
+                        width: geometry_width,
+                        height: geometry_height,
+                    });
+                    Ok(())
                 }
                 4 => {
                     let serial = args.u32()?;
@@ -2397,8 +2516,11 @@ impl Client {
                             ),
                         );
                     }
-                    let Some(Object::XdgSurface { surface, .. }) =
-                        self.objects.get(&xdg_surface).cloned()
+                    let Some(Object::XdgSurface {
+                        surface,
+                        pending_geometry,
+                        ..
+                    }) = self.objects.get(&xdg_surface).cloned()
                     else {
                         return Err(format!(
                             "xdg_toplevel {} lost xdg_surface {xdg_surface}",
@@ -2424,6 +2546,12 @@ impl Client {
                             surface,
                             toplevel: None,
                             configure: Arc::new(Mutex::new(ConfigureTracker::new())),
+                            // Carried where the tracker is replaced: a geometry
+                            // is the xdg_surface's for as long as the object
+                            // lives, and this one is still here. A second
+                            // toplevel on it is a client reusing the window it
+                            // already measured.
+                            pending_geometry,
                         },
                     );
                     Ok(())
@@ -5135,6 +5263,7 @@ mod tests {
                     surface: 5,
                     toplevel: Some(10),
                     configure: Arc::new(Mutex::new(ConfigureTracker::new())),
+                    pending_geometry: None,
                 },
             )
             .unwrap();
@@ -5193,10 +5322,11 @@ mod tests {
     }
 
     /// A client, its runtime, and a toplevel on a surface with no pixels — the
-    /// state every decoration test starts from. The peer is returned so a test
-    /// can read what the compositor sent, and the framebuffer path so it can be
-    /// cleaned up.
-    fn decoration_fixture(stem: &str) -> (Client, UnixStream, Arc<Mutex<Runtime>>, PathBuf) {
+    /// state the decoration and window-geometry tests both start from, which is
+    /// why it is named for the window rather than for either interface. The peer
+    /// is returned so a test can read what the compositor sent, and the
+    /// framebuffer path so it can be cleaned up.
+    fn toplevel_fixture(stem: &str) -> (Client, UnixStream, Arc<Mutex<Runtime>>, PathBuf) {
         let stem = format!(
             "td-wayland-{stem}-{}-{}",
             std::process::id(),
@@ -5219,6 +5349,7 @@ mod tests {
                     surface: 5,
                     toplevel: Some(10),
                     configure: Arc::new(Mutex::new(ConfigureTracker::new())),
+                    pending_geometry: None,
                 },
             )
             .unwrap();
@@ -5330,7 +5461,7 @@ mod tests {
     #[test]
     fn a_toplevel_is_told_the_compositor_draws_its_decorations() {
         let (mut client, mut peer, _runtime, framebuffer_path) =
-            decoration_fixture("decoration-configure");
+            toplevel_fixture("decoration-configure");
 
         get_decoration(&mut client, 12, 10).unwrap();
         assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
@@ -5344,7 +5475,7 @@ mod tests {
     #[test]
     fn a_client_asking_to_draw_its_own_titlebar_is_still_told_server_side() {
         let (mut client, mut peer, _runtime, framebuffer_path) =
-            decoration_fixture("decoration-set-mode");
+            toplevel_fixture("decoration-set-mode");
 
         get_decoration(&mut client, 12, 10).unwrap();
         assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
@@ -5376,7 +5507,7 @@ mod tests {
     #[test]
     fn a_mode_td_already_serves_is_still_answered() {
         let (mut client, mut peer, _runtime, framebuffer_path) =
-            decoration_fixture("decoration-same-mode");
+            toplevel_fixture("decoration-same-mode");
 
         get_decoration(&mut client, 12, 10).unwrap();
         assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
@@ -5397,7 +5528,7 @@ mod tests {
     #[test]
     fn a_decoration_mode_outside_the_enum_is_refused() {
         let (mut client, mut peer, _runtime, framebuffer_path) =
-            decoration_fixture("decoration-bad-mode");
+            toplevel_fixture("decoration-bad-mode");
 
         get_decoration(&mut client, 12, 10).unwrap();
         assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
@@ -5426,7 +5557,7 @@ mod tests {
     #[test]
     fn a_second_decoration_for_one_toplevel_is_refused() {
         let (mut client, mut peer, _runtime, framebuffer_path) =
-            decoration_fixture("decoration-twice");
+            toplevel_fixture("decoration-twice");
 
         get_decoration(&mut client, 12, 10).unwrap();
         assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
@@ -5449,7 +5580,7 @@ mod tests {
     #[test]
     fn destroying_a_decoration_lets_the_toplevel_take_another() {
         let (mut client, mut peer, _runtime, framebuffer_path) =
-            decoration_fixture("decoration-reask");
+            toplevel_fixture("decoration-reask");
 
         get_decoration(&mut client, 12, 10).unwrap();
         assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
@@ -5476,8 +5607,7 @@ mod tests {
     /// scene's.
     #[test]
     fn decorating_a_window_that_already_has_pixels_is_refused() {
-        let (mut client, _peer, runtime, framebuffer_path) =
-            decoration_fixture("decoration-mapped");
+        let (mut client, _peer, runtime, framebuffer_path) = toplevel_fixture("decoration-mapped");
         let key = SurfaceKey {
             client: 88,
             object: 5,
@@ -5514,7 +5644,7 @@ mod tests {
     #[test]
     fn decorating_a_window_with_a_buffer_attached_is_refused_too() {
         let (mut client, _peer, _runtime, framebuffer_path) =
-            decoration_fixture("decoration-attached");
+            toplevel_fixture("decoration-attached");
         let pool_path = framebuffer_path.with_extension("pool");
         fs::write(&pool_path, [1u8, 2, 3, 0]).unwrap();
         client.objects.insert(
@@ -5555,7 +5685,7 @@ mod tests {
     #[test]
     fn a_toplevel_destroyed_under_its_decoration_is_orphaned() {
         let (mut client, mut peer, _runtime, framebuffer_path) =
-            decoration_fixture("decoration-orphan");
+            toplevel_fixture("decoration-orphan");
 
         get_decoration(&mut client, 12, 10).unwrap();
         assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
@@ -5579,7 +5709,7 @@ mod tests {
     #[test]
     fn a_decorated_toplevel_is_destroyed_once_its_decoration_is() {
         let (mut client, mut peer, _runtime, framebuffer_path) =
-            decoration_fixture("decoration-order");
+            toplevel_fixture("decoration-order");
 
         get_decoration(&mut client, 12, 10).unwrap();
         assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
@@ -5609,7 +5739,7 @@ mod tests {
     #[test]
     fn a_creation_error_names_the_decoration_rather_than_the_manager() {
         let (mut client, mut peer, _runtime, framebuffer_path) =
-            decoration_fixture("decoration-error-object");
+            toplevel_fixture("decoration-error-object");
 
         get_decoration(&mut client, 12, 10).unwrap();
         assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
@@ -5642,7 +5772,7 @@ mod tests {
     #[test]
     fn the_orphaned_error_names_the_decoration_and_not_the_toplevel() {
         let (mut client, mut peer, _runtime, framebuffer_path) =
-            decoration_fixture("decoration-orphan-object");
+            toplevel_fixture("decoration-orphan-object");
 
         get_decoration(&mut client, 12, 10).unwrap();
         assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
@@ -5674,7 +5804,7 @@ mod tests {
     #[test]
     fn setting_a_mode_owes_the_surface_configure_the_client_acknowledges() {
         let (mut client, mut peer, _runtime, framebuffer_path) =
-            decoration_fixture("decoration-reconfigure");
+            toplevel_fixture("decoration-reconfigure");
         let Some(Object::XdgSurface { configure, .. }) = client.objects.get(&9).cloned() else {
             panic!("fixture lost its xdg_surface");
         };
@@ -5735,7 +5865,7 @@ mod tests {
     #[test]
     fn creating_a_decoration_after_the_initial_ack_still_owes_a_configure() {
         let (mut client, mut peer, _runtime, framebuffer_path) =
-            decoration_fixture("decoration-late-create");
+            toplevel_fixture("decoration-late-create");
         let Some(Object::XdgSurface { configure, .. }) = client.objects.get(&9).cloned() else {
             panic!("fixture lost its xdg_surface");
         };
@@ -5783,7 +5913,7 @@ mod tests {
     #[test]
     fn destroying_the_manager_leaves_the_decorations_it_made() {
         let (mut client, mut peer, _runtime, framebuffer_path) =
-            decoration_fixture("decoration-manager-destroy");
+            toplevel_fixture("decoration-manager-destroy");
 
         get_decoration(&mut client, 12, 10).unwrap();
         assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
@@ -5814,12 +5944,288 @@ mod tests {
     #[test]
     fn a_decoration_for_something_that_is_not_a_toplevel_is_refused() {
         let (mut client, _peer, _runtime, framebuffer_path) =
-            decoration_fixture("decoration-non-toplevel");
+            toplevel_fixture("decoration-non-toplevel");
 
         let error = get_decoration(&mut client, 12, 5).unwrap_err();
         assert!(error.contains("non-toplevel 5"), "{error}");
         assert!(!client.objects.contains_key(&12));
 
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// `set_window_geometry(x, y, width, height)` on the xdg_surface at 9.
+    fn set_geometry(
+        client: &mut Client,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> Result<(), String> {
+        let mut request_body = wire::Builder::new();
+        request_body.i32(x);
+        request_body.i32(y);
+        request_body.i32(width);
+        request_body.i32(height);
+        client.dispatch(request(9, 3, request_body).unwrap(), &mut VecDeque::new())
+    }
+
+    /// `wl_surface.commit` on the surface at 5, which is what applies the
+    /// double-buffered state above.
+    fn commit(client: &mut Client) -> Result<(), String> {
+        client.dispatch(
+            request(5, 6, wire::Builder::new()).unwrap(),
+            &mut VecDeque::new(),
+        )
+    }
+
+    /// The fixture's surface, told which xdg_surface it is under. The fixture
+    /// leaves the role unset, and a commit skips the whole XDG path without it.
+    fn adopt_role(client: &mut Client) {
+        client.objects.insert(
+            5,
+            Object::Surface(SurfaceState {
+                role: Some(SurfaceRole::Xdg(9)),
+                ..SurfaceState::default()
+            }),
+        );
+    }
+
+    fn surface_key() -> SurfaceKey {
+        SurfaceKey {
+            client: 88,
+            object: 5,
+        }
+    }
+
+    /// The geometry is double-buffered state: the request records it and the
+    /// wl_surface's own commit is what applies it. A compositor that applied it
+    /// on arrival would crop a window to bounds measured for a buffer that has
+    /// not been attached yet.
+    #[test]
+    fn a_window_geometry_waits_for_the_commit_that_applies_it() {
+        let (mut client, _peer, runtime, framebuffer_path) = toplevel_fixture("geometry-pending");
+        adopt_role(&mut client);
+
+        set_geometry(&mut client, 12, 13, 40, 30).unwrap();
+        assert_eq!(runtime.lock().unwrap().window_geometry(surface_key()), None);
+
+        commit(&mut client).unwrap();
+        assert_eq!(
+            runtime.lock().unwrap().window_geometry(surface_key()),
+            Some(WindowGeometry {
+                x: 12,
+                y: 13,
+                width: 40,
+                height: 30,
+            })
+        );
+
+        // The pending slot is spent, so a commit that says nothing about the
+        // geometry leaves the one already in force rather than re-applying it.
+        commit(&mut client).unwrap();
+        assert!(matches!(
+            client.objects.get(&9),
+            Some(Object::XdgSurface {
+                pending_geometry: None,
+                ..
+            })
+        ));
+        assert_eq!(
+            runtime.lock().unwrap().window_geometry(surface_key()),
+            Some(WindowGeometry {
+                x: 12,
+                y: 13,
+                width: 40,
+                height: 30,
+            })
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// `invalid_size`, by the code the protocol names for it. Every side is
+    /// tried in both wrong directions: zero and negative are one refusal in the
+    /// code and two different mistakes in a toolkit.
+    #[test]
+    fn a_window_geometry_with_a_side_that_is_not_positive_is_refused() {
+        let (mut client, _peer, runtime, framebuffer_path) = toplevel_fixture("geometry-invalid");
+        adopt_role(&mut client);
+
+        for (width, height) in [(0, 30), (40, 0), (-1, 30), (40, -1), (0, 0)] {
+            let error = set_geometry(&mut client, 0, 0, width, height).unwrap_err();
+            assert!(error.contains("is not positive"), "{error}");
+            assert_eq!(
+                client.protocol_error_code, XDG_SURFACE_ERROR_INVALID_SIZE,
+                "{width}x{height} was refused under the wrong code"
+            );
+            // Refused before anything was recorded, so a client whose error is
+            // somehow survived is not holding a geometry the compositor also
+            // thinks is pending.
+            assert!(matches!(
+                client.objects.get(&9),
+                Some(Object::XdgSurface {
+                    pending_geometry: None,
+                    ..
+                })
+            ));
+        }
+        commit(&mut client).unwrap();
+        assert_eq!(runtime.lock().unwrap().window_geometry(surface_key()), None);
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// A commit that takes the buffer AWAY still applies the geometry it
+    /// carries. That is the one shape where the crop is applied on its own, and
+    /// it matters for the same reason the unmap keeps the previous one: nothing
+    /// re-sends a geometry, so one dropped here is a window tiled by its shadow
+    /// margins from its next map onwards.
+    #[test]
+    fn an_unmapping_commit_still_applies_its_geometry() {
+        let (mut client, _peer, runtime, framebuffer_path) = toplevel_fixture("geometry-unmap");
+        adopt_role(&mut client);
+        // wl_surface.attach with a null buffer, which is the unmap.
+        let mut attach = wire::Builder::new();
+        attach.u32(0);
+        attach.i32(0);
+        attach.i32(0);
+        client
+            .dispatch(request(5, 1, attach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+
+        set_geometry(&mut client, 7, 8, 21, 22).unwrap();
+        commit(&mut client).unwrap();
+        assert_eq!(
+            runtime.lock().unwrap().window_geometry(surface_key()),
+            Some(WindowGeometry {
+                x: 7,
+                y: 8,
+                width: 21,
+                height: 22,
+            })
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// "A role must be assigned before any other requests are made to the
+    /// xdg_surface object", so a geometry set before `get_toplevel` is
+    /// `not_constructed` rather than state held for a role nobody has asked
+    /// for. It is the FIRST thing checked, before the arguments.
+    #[test]
+    fn a_geometry_before_the_role_object_is_refused() {
+        let (mut client, _peer, runtime, framebuffer_path) = toplevel_fixture("geometry-early");
+        // Back to an xdg_surface with no role object, which is what a client
+        // has if it sets a geometry this early.
+        client.objects.insert(
+            9,
+            Object::XdgSurface {
+                surface: 5,
+                toplevel: None,
+                configure: Arc::new(Mutex::new(ConfigureTracker::new())),
+                pending_geometry: None,
+            },
+        );
+        client.objects.remove(&10);
+
+        let error = set_geometry(&mut client, 6, 6, 20, 20).unwrap_err();
+        assert!(error.contains("before its role object"), "{error}");
+        assert_eq!(
+            client.protocol_error_code,
+            XDG_SURFACE_ERROR_NOT_CONSTRUCTED
+        );
+        // A geometry that is ALSO the wrong size answers for the role first: a
+        // client that has not asked for a window yet is told that rather than
+        // told about its arguments.
+        let error = set_geometry(&mut client, 0, 0, 0, 20).unwrap_err();
+        assert!(error.contains("before its role object"), "{error}");
+        assert_eq!(
+            client.protocol_error_code,
+            XDG_SURFACE_ERROR_NOT_CONSTRUCTED
+        );
+        assert!(matches!(
+            client.objects.get(&9),
+            Some(Object::XdgSurface {
+                pending_geometry: None,
+                ..
+            })
+        ));
+
+        // Nothing to apply once the role does arrive, since nothing was kept.
+        let mut request_body = wire::Builder::new();
+        request_body.u32(10);
+        client
+            .dispatch(request(9, 1, request_body).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        adopt_role(&mut client);
+        commit(&mut client).unwrap();
+        assert_eq!(runtime.lock().unwrap().window_geometry(surface_key()), None);
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// The geometry is the xdg_surface's, so the toplevel going does not take
+    /// it and the xdg_surface going does. The distinction is reachable: a
+    /// client that destroys its toplevel and asks for another on the same
+    /// xdg_surface is reusing the window it already measured.
+    #[test]
+    fn a_geometry_outlives_the_toplevel_and_dies_with_the_xdg_surface() {
+        let (mut client, mut peer, runtime, framebuffer_path) =
+            toplevel_fixture("geometry-destroy");
+        adopt_role(&mut client);
+        set_geometry(&mut client, 4, 4, 24, 24).unwrap();
+        commit(&mut client).unwrap();
+        assert!(runtime
+            .lock()
+            .unwrap()
+            .window_geometry(surface_key())
+            .is_some());
+
+        // A second geometry that no commit has applied, so the destroy below is
+        // asked about both halves of this state at once.
+        set_geometry(&mut client, 5, 5, 25, 25).unwrap();
+        client
+            .dispatch(
+                request(10, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(
+            runtime
+                .lock()
+                .unwrap()
+                .window_geometry(surface_key())
+                .is_some(),
+            "the toplevel took the xdg_surface's geometry with it"
+        );
+        assert!(
+            matches!(
+                client.objects.get(&9),
+                Some(Object::XdgSurface {
+                    pending_geometry: Some(WindowGeometry {
+                        x: 5,
+                        y: 5,
+                        width: 25,
+                        height: 25,
+                    }),
+                    ..
+                })
+            ),
+            "the toplevel took a geometry the client is still owed"
+        );
+
+        client
+            .dispatch(
+                request(9, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(runtime.lock().unwrap().window_geometry(surface_key()), None);
+
+        // Drained rather than asserted about: the destroys above answer with
+        // delete_id, which this test is not the one that checks.
+        let mut scratch = [0u8; 256];
+        let _ = peer.read(&mut scratch);
         let _ = fs::remove_file(&framebuffer_path);
     }
 
@@ -5868,6 +6274,7 @@ mod tests {
                     surface: 5,
                     toplevel: Some(10),
                     configure: Arc::clone(&tracker),
+                    pending_geometry: None,
                 },
             )
             .unwrap();
@@ -6125,6 +6532,7 @@ mod tests {
                     surface: 5,
                     toplevel: Some(10),
                     configure: Arc::new(Mutex::new(configure)),
+                    pending_geometry: None,
                 },
             )
             .unwrap();

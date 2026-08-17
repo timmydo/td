@@ -11,6 +11,7 @@ use crate::pointer::{
 };
 use crate::scene::{
     BandPress, CursorRequest, Fraction, Scene, SharedInputRegion, Surface, SurfaceKey,
+    WindowGeometry,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -283,15 +284,47 @@ impl Runtime {
         self.settle(layout_changed)
     }
 
-    pub fn commit_with_input_region(
+    /// Everything one `wl_surface.commit` applies to the scene, applied
+    /// TOGETHER: the pixels if it attached a buffer, the input region if that
+    /// changed, and the window geometry if one took effect. One lock and one
+    /// settle, because the protocol applies a commit atomically and because
+    /// these three answer the same question between them — which pixels of this
+    /// surface the pointer is over. Applied in halves, the input thread could
+    /// take the lock in the middle and route a click through the new buffer
+    /// under the previous crop, and the frame in that window would be painted
+    /// that way too.
+    ///
+    /// Which of the two settles is owed depends on what arrived, and the
+    /// distinction is the one the separate calls made: pixels and a crop change
+    /// what is DRAWN, where an input region changes only where the pointer
+    /// lands.
+    pub fn apply_commit(
         &mut self,
         key: SurfaceKey,
-        surface: Surface,
-        input_region: Option<SharedInputRegion>,
+        surface: Option<Surface>,
+        input_region: Option<Option<SharedInputRegion>>,
+        geometry: Option<WindowGeometry>,
     ) -> Result<(), String> {
-        let layout_changed = self.scene.commit(key, surface)?;
-        self.scene.set_input_region(key, input_region);
-        self.settle(layout_changed)
+        let mut layout_changed = false;
+        let mut painted = false;
+        let mut aimed = false;
+        if let Some(surface) = surface {
+            layout_changed = self.scene.commit(key, surface)?;
+            painted = true;
+        }
+        if let Some(input_region) = input_region {
+            aimed |= self.scene.set_input_region(key, input_region);
+        }
+        if geometry.is_some() {
+            painted |= self.crop_shows(key, geometry);
+        }
+        if painted {
+            return self.settle(layout_changed);
+        }
+        if aimed {
+            return self.refresh_focus();
+        }
+        Ok(())
     }
 
     /// A client named its cursor: a hotspot, or `None` for a null surface,
@@ -355,15 +388,39 @@ impl Runtime {
         Err(failures.join("; "))
     }
 
-    pub fn set_input_region(
+    /// A window's own bounds inside its surface took effect, or went with the
+    /// xdg_surface that owned them. Both halves of the settle are owed: the
+    /// crop decides which pixels are drawn AND which of them the pointer is
+    /// over, so a geometry that moved without a focus refresh would leave the
+    /// pointer reported at an offset from where it is drawn.
+    ///
+    /// No layout change: a tile's size is the layout's, and the geometry only
+    /// says which part of the client's buffer fills it.
+    pub fn set_window_geometry(
         &mut self,
         key: SurfaceKey,
-        input_region: Option<SharedInputRegion>,
+        geometry: Option<WindowGeometry>,
     ) -> Result<(), String> {
-        if self.scene.set_input_region(key, input_region) {
-            self.refresh_focus()?;
+        if self.crop_shows(key, geometry) {
+            return self.settle(false);
         }
         Ok(())
+    }
+
+    /// Store a geometry, and answer whether the screen can tell. A crop on a
+    /// surface with no pixels is neither drawn nor aimed at, which `set_title`
+    /// skips its repaint for the same way — and both ends of a window's life
+    /// take that path, the geometry set on the commit before the first buffer
+    /// and the one dropped by an xdg_surface destroy after the unmap.
+    fn crop_shows(&mut self, key: SurfaceKey, geometry: Option<WindowGeometry>) -> bool {
+        self.scene.set_window_geometry(key, geometry) && self.scene.is_mapped(key)
+    }
+
+    /// What geometry took effect, for the server's tests: the request is the
+    /// server's and the crop is the scene's, so this is the seam between them.
+    #[cfg(test)]
+    pub fn window_geometry(&self, key: SurfaceKey) -> Option<WindowGeometry> {
+        self.scene.window_geometry(key)
     }
 
     /// Take a toplevel's title, and repaint if the band showing it is on
@@ -1917,6 +1974,269 @@ mod tests {
         second_stop.stop();
         runtime.unsubscribe_keyboard(1);
         runtime.unsubscribe_keyboard(2);
+    }
+
+    /// A commit that carries its input region alongside the pixels that MAP the
+    /// surface keeps it. The scene refuses a region for a surface it holds no
+    /// pixels for, so the order inside one commit is load-bearing here and
+    /// nowhere else: applied first, the region of every window that opens the
+    /// ordinary way would be dropped and the client would answer clicks it had
+    /// asked to be excluded from.
+    #[test]
+    fn a_first_commit_keeps_the_region_it_arrived_with() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-first-region-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 300, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let key = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        // A hole over the corner the probe below aims at, which is the only way
+        // to tell a region that took from one that was dropped.
+        let mut region = crate::scene::InputRegion::new();
+        assert!(region.add(0, 0, 100, 100));
+        assert!(region.subtract(0, 0, 20, 20));
+        runtime
+            .apply_commit(
+                key,
+                Some(surface([1, 2, 3, 0])),
+                Some(Some(Arc::new(region))),
+                None,
+            )
+            .unwrap();
+
+        let rect = runtime.layout_snapshot().get(&key).unwrap().rect;
+        let probe = |runtime: &mut Runtime, x: usize, y: usize| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            runtime
+                .pointer_frame(
+                    10,
+                    i32::try_from(rect.x.saturating_add(x)).unwrap() - at_x,
+                    i32::try_from(rect.y.saturating_add(y)).unwrap() - at_y,
+                    &[],
+                    PointerScroll::default(),
+                )
+                .unwrap();
+            runtime.scene.pointer_targets(None, 240, 300).0
+        };
+        // Inside the region, then inside the hole in it. Both, because a region
+        // that was DROPPED answers everywhere and one that swallowed the whole
+        // surface answers nowhere.
+        assert!(probe(&mut runtime, 40, 40).is_some_and(|point| point.key == key));
+        assert_eq!(
+            probe(&mut runtime, 4, 4),
+            None,
+            "a hole the client asked for answered the pointer anyway"
+        );
+    }
+
+    /// What one commit carries is applied in one go. Before, the pixels settled
+    /// and then the geometry did, so a frame — and any click the input thread
+    /// routed while the lock was free between them — went through the new buffer
+    /// under the PREVIOUS crop. One paint now, and the aim it leaves is already
+    /// the new one.
+    ///
+    /// The other two shapes are asserted here because merging the calls could
+    /// have cost them what they had: an input region moves nothing on screen and
+    /// must still paint nothing, and a crop on a surface with no pixels is on no
+    /// screen yet.
+    #[test]
+    fn one_commit_applies_its_pixels_and_its_crop_in_one_paint() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-atomic-crop-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 300, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let subscription = runtime
+            .subscribe_input_with_activity(
+                1,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .unwrap();
+        let (events, stop) = subscription.split();
+        let key = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+
+        runtime
+            .set_window_geometry(
+                key,
+                Some(WindowGeometry {
+                    x: 20,
+                    y: 20,
+                    width: 30,
+                    height: 30,
+                }),
+            )
+            .unwrap();
+        assert!(
+            runtime.take_writes().is_empty(),
+            "a crop with no pixels under it reached the screen"
+        );
+
+        runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
+        let _ = runtime.take_writes();
+
+        runtime
+            .apply_commit(
+                key,
+                Some(surface([4, 5, 6, 0])),
+                Some(None),
+                Some(WindowGeometry {
+                    x: 10,
+                    y: 12,
+                    width: 60,
+                    height: 60,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.take_writes().len(),
+            1,
+            "one commit painted more than one frame"
+        );
+
+        let rect = runtime.layout_snapshot().get(&key).unwrap().rect;
+        runtime
+            .pointer_frame(
+                10,
+                i32::try_from(rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(rect.y.saturating_add(3)).unwrap(),
+                &[],
+                PointerScroll::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            recv_pointer(&events).events,
+            vec![PointerEvent::Enter {
+                target: PointerTarget {
+                    surface: key,
+                    x: 12,
+                    y: 15,
+                },
+            }]
+        );
+
+        let mut region = crate::scene::InputRegion::new();
+        assert!(region.add(0, 0, 200, 200));
+        let _ = runtime.take_writes();
+        runtime
+            .apply_commit(key, None, Some(Some(Arc::new(region))), None)
+            .unwrap();
+        assert!(
+            runtime.take_writes().is_empty(),
+            "an input region alone repainted the screen"
+        );
+
+        stop.stop();
+        runtime.unsubscribe_keyboard(1);
+    }
+
+    /// A pointer arrives in the coordinates the CLIENT measures itself in,
+    /// which under a window geometry are not the tile's. Proved through the
+    /// runtime rather than only at the scene because DESIGN.md's rule is that
+    /// pointer behaviour is what a client RECEIVES: the shift has to survive
+    /// the hit test, the focus bookkeeping and the published event.
+    #[test]
+    fn a_pointer_enters_a_cropped_window_where_the_clients_own_margin_says() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-geometry-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        // Tall and wide enough for the whole 100x100 buffer to be inside its
+        // tile, since this test aims at pixels a shorter one would not have.
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 300, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let subscription = runtime
+            .subscribe_input_with_activity(
+                1,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .unwrap();
+        let (events, stop) = subscription.split();
+        let key = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
+        let rect = runtime.layout_snapshot().get(&key).unwrap().rect;
+        let goto = |runtime: &mut Runtime, x: usize, y: usize| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            runtime.pointer_frame(
+                10,
+                i32::try_from(rect.x.saturating_add(x)).unwrap() - at_x,
+                i32::try_from(rect.y.saturating_add(y)).unwrap() - at_y,
+                &[],
+                PointerScroll::default(),
+            )
+        };
+        // Over the part of the buffer the crop below takes away, so the
+        // geometry has to reach the aim as well as the paint.
+        goto(&mut runtime, 70, 70).unwrap();
+        assert_eq!(
+            recv_pointer(&events).events,
+            vec![PointerEvent::Enter {
+                target: PointerTarget {
+                    surface: key,
+                    x: 70,
+                    y: 70,
+                },
+            }]
+        );
+
+        // The two margins DIFFER, so an axis swapped anywhere along the way is
+        // a different answer rather than the same one.
+        let _ = runtime.take_writes();
+        runtime
+            .set_window_geometry(
+                key,
+                Some(WindowGeometry {
+                    x: 10,
+                    y: 12,
+                    width: 60,
+                    height: 60,
+                }),
+            )
+            .unwrap();
+        // Both halves of the settle, with nothing else moving: the screen is
+        // repainted, and the pointer is told it left a window it is still
+        // standing on — because the pixels it was over are no longer drawn.
+        assert!(
+            !runtime.take_writes().is_empty(),
+            "a new crop never reached the screen"
+        );
+        assert_eq!(
+            recv_pointer(&events).events,
+            vec![PointerEvent::Leave { surface: key }]
+        );
+
+        goto(&mut runtime, 2, 3).unwrap();
+        assert_eq!(
+            recv_pointer(&events).events,
+            vec![PointerEvent::Enter {
+                target: PointerTarget {
+                    surface: key,
+                    x: 12,
+                    y: 15,
+                },
+            }]
+        );
+
+        stop.stop();
+        runtime.unsubscribe_keyboard(1);
     }
 
     #[test]
@@ -3850,8 +4170,8 @@ mod tests {
         // Both entry points, since they settle separately: the one clients
         // really arrive through, and the shorthand the tests above use.
         under_failed_paint!(
-            "commit_with_input_region",
-            runtime.commit_with_input_region(key(1, 4), surface([7, 8, 9, 0]), None)
+            "apply_commit",
+            runtime.apply_commit(key(1, 4), Some(surface([7, 8, 9, 0])), Some(None), None)
         );
         under_failed_paint!("commit", runtime.commit(key(1, 5), surface([9, 9, 9, 0])));
         // A tiling command. `Move` rather than a presentation chord, which

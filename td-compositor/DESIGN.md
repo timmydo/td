@@ -693,8 +693,8 @@ client waiting on an event that never comes.
 
 Advertising this is what makes a cooperating toolkit stop drawing its own
 titlebar, which is most of the `set_window_geometry` problem: a client with no
-CSD has no shadow margins for td to tile as dead borders. It does not close
-that gap for a client that draws them anyway, which remains its own increment.
+CSD has no shadow margins for td to tile as dead borders. What a client that
+draws them anyway gets is the geometry clauses below.
 
 **One divergence, and it is deliberate.** The protocol's `destroy` means "switch
 back to a mode without any server-side decorations at the next commit", and td
@@ -755,6 +755,77 @@ is READING could see no configure yet; it does not stop one that pipelines the
 request and an `attach` into a single write, having read neither. No reference
 compositor catches that either, and the cost of not catching it is a frame
 drawn against a mode the client had not yet been told.
+
+**A window geometry is what td tiles, not the buffer.**
+`xdg_surface.set_window_geometry` names the part of a surface that is the window
+a person sees; the rest is the invisible margin a client-side-decorated toolkit
+draws its shadow into. td used to parse that rectangle and discard it, which
+tiled the margin as a dead border and put every click that far off its target.
+It is now the CROP: a tile shows the geometry's own rectangle, starting at the
+geometry's origin, and a pointer over that tile arrives in the client's own
+coordinates with the origin added back. The protocol says a compositor may clip
+rendering to the geometry, and a tiling one must — a margin drawn outside the
+tile would be over a neighbour's window. Nothing about the LAYOUT changes: a
+tile's size is the layout's, the configure td sends already means the geometry
+size, and a buffer larger than that is exactly the case this reads.
+
+ONE rectangle answers both questions, and deliberately: the crop the renderer
+takes as a source offset is the crop the hit test adds to a pointer, from one
+function over one clipping arithmetic. Two of them a pixel apart is a click
+landing beside what it was aimed at with the ink saying otherwise, which stays
+invisible until a client changes its margins.
+
+It is double-buffered state, as the protocol requires — the request records a
+rectangle and the wl_surface's own commit applies it, since a geometry applied
+on arrival would crop a window to bounds measured for a buffer not yet
+attached. Everything a commit carries is then applied TOGETHER, under one lock
+and settling once: a commit is atomic in the protocol, and the pixels, the
+input region and the crop answer the same question between them — which pixels
+of this surface the pointer is over. In halves, the input thread could take the
+lock in the middle and route a click through the new buffer under the previous
+crop, and the frame painted in that window would show it that way too. The one
+shape applied on its own is a commit that takes the buffer AWAY, where it can
+be: a surface with no pixels is drawn nowhere and aimed at by nothing, so the
+unmap and the crop cannot be told apart from outside. What each half owes
+differs and is kept: pixels and a crop change what is DRAWN, an input region
+only where the pointer lands, and a crop on a surface with no pixels changes
+neither — which is the ordinary opening sequence, a geometry set on the empty
+commit before the first frame.
+
+A geometry before the role object is REFUSED, with `not_constructed`: the
+protocol says a role must be assigned before any other request is made to the
+xdg_surface, so a rectangle arriving earlier is a client mistake rather than
+state to hold for a role nobody has asked for. The role is checked before the
+arguments are judged, since a client that has not asked for a window yet is
+better told that than told about its arguments.
+
+Its lifetime is the xdg_surface OBJECT's: a toplevel
+destroyed and re-created on the same xdg_surface keeps it, which is a client
+reusing the window it already measured, and destroying the xdg_surface gives
+the whole surface back. An unmap keeps it too, for the title's reason — a
+client re-mapping does not re-send a geometry it sent once at startup.
+
+The rectangle is resolved against the pixels a client committed rather than
+trusted, because it may name coordinates outside the surface and the protocol
+allows that. The effective crop is therefore the intersection, and with no
+`wl_subcompositor` the surface's own bounds ARE the bounding rectangle the
+protocol asks for. Two divergences follow, recorded here rather than found in a
+diff later. The intersection is taken where it is USED rather than frozen by
+the commit that applied it, where the protocol says the effective geometry is
+not recalculated until the next `set_window_geometry`: a geometry outlives the
+buffer it was measured against, so a later, smaller buffer would otherwise
+leave a crop reaching outside the pixels that exist. And a geometry naming NO
+part of the surface leaves the whole surface standing rather than cropping to
+nothing — the protocol makes an effective geometry with a non-positive side an
+`invalid_size` error, but that same shrinking buffer reaches the case with no
+client mistake at all, and a window cropped to nothing is a black tile with
+nothing on screen saying why.
+
+What IS refused is the request: a width or height that is not positive raises
+`invalid_size`, the code the protocol names for it, in place of the generic
+`implementation` every other refusal on this interface carries. Nothing is
+recorded before the refusal, so a client is never left holding a geometry the
+compositor also thinks is pending.
 
 Only wl_shm ARGB8888 and XRGB8888 buffers are accepted. Pool, offset, size,
 stride, and pixel-count arithmetic are checked before allocation or I/O. A
