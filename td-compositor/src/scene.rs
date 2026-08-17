@@ -126,10 +126,15 @@ enum ClientCursor {
     /// being pointed with is the cursor's. A client that pre-renders four
     /// cursor surfaces and switches between them by naming them is asking
     /// for exactly that distinction.
+    ///
+    /// The hotspot is WIDER than the `int` a client names one with, because it
+    /// is an accumulator: every attach decrements it, so a sequence a client
+    /// can send in one breath reaches outside the range any single request
+    /// could ask for, and clamping there would lose the way back.
     Shown {
         surface: u32,
-        hotspot_x: i32,
-        hotspot_y: i32,
+        hotspot_x: i64,
+        hotspot_y: i64,
     },
 }
 
@@ -141,8 +146,8 @@ enum DrawnCursor<'a> {
     Nothing,
     Image {
         image: &'a Surface,
-        hotspot_x: i32,
-        hotspot_y: i32,
+        hotspot_x: i64,
+        hotspot_y: i64,
     },
 }
 
@@ -173,8 +178,8 @@ enum CursorPaint {
     Nothing,
     Image {
         surface: SurfaceKey,
-        hotspot_x: i32,
-        hotspot_y: i32,
+        hotspot_x: i64,
+        hotspot_y: i64,
     },
 }
 
@@ -789,8 +794,8 @@ impl Scene {
                 None => ClientCursor::Hidden,
                 Some(request) => ClientCursor::Shown {
                     surface: request.surface,
-                    hotspot_x: request.hotspot_x,
-                    hotspot_y: request.hotspot_y,
+                    hotspot_x: i64::from(request.hotspot_x),
+                    hotspot_y: i64::from(request.hotspot_y),
                 },
             },
         ));
@@ -844,6 +849,42 @@ impl Scene {
                 total.saturating_add(image.pixels.len())
             });
         held.saturating_add(bytes) <= MAX_CURSOR_BYTES_PER_CLIENT
+    }
+
+    /// An attach carried an offset, so a cursor drawn WITH this surface moves
+    /// its hotspot by it — decremented, as the protocol says, because a cursor
+    /// is drawn at `pointer - hotspot` and so it is the decrement that slides
+    /// the image the way the offset points. A NULL attach carries one too, and
+    /// this is where it lands: the contents go, the hotspot still moves.
+    ///
+    /// Only the surface being pointed with has a hotspot to move: it is the
+    /// pointer's state rather than the surface's, and a client naming this
+    /// surface later supplies one with the request. That is the limit of what
+    /// this can do rather than an approximation of it.
+    ///
+    /// The subtraction saturates because nothing here may panic; at `i64` that
+    /// bound is out of reach, since a client would have to spend billions of
+    /// attaches walking to it.
+    pub fn offset_cursor(&mut self, key: SurfaceKey, offset: (i32, i32)) -> bool {
+        if offset == (0, 0) {
+            return false;
+        }
+        let was = self.cursor_paint();
+        if let Some((
+            client,
+            ClientCursor::Shown {
+                surface,
+                hotspot_x,
+                hotspot_y,
+            },
+        )) = self.cursor.as_mut()
+        {
+            if *client == key.client && *surface == key.object {
+                *hotspot_x = hotspot_x.saturating_sub(i64::from(offset.0));
+                *hotspot_y = hotspot_y.saturating_sub(i64::from(offset.1));
+            }
+        }
+        was != self.cursor_paint()
     }
 
     /// A cursor surface's pixels are taken away by a null attach, leaving the
@@ -926,7 +967,7 @@ impl Scene {
     /// The cursor as the renderer will draw it: the hotspot and the size of
     /// the image behind it, absent while td's own cross stands.
     #[cfg(test)]
-    pub(crate) fn cursor_image(&self) -> Option<(i32, i32, usize, usize)> {
+    pub(crate) fn cursor_image(&self) -> Option<(i64, i64, usize, usize)> {
         match self.drawn_cursor()? {
             DrawnCursor::Image {
                 image,
@@ -2301,8 +2342,8 @@ fn draw_pointer(
                 // `i32::MIN` under a pointer near `i32::MAX` is a difference
                 // no i32 holds, and saturating it would draw the image at an
                 // edge rather than off-screen where it belongs.
-                x: i64::from(x).saturating_sub(i64::from(hotspot_x)),
-                y: i64::from(y).saturating_sub(i64::from(hotspot_y)),
+                x: i64::from(x).saturating_sub(hotspot_x),
+                y: i64::from(y).saturating_sub(hotspot_y),
                 width: image.width,
                 height: image.height,
             },
@@ -4438,6 +4479,121 @@ mod tests {
         assert!(scene.set_cursor(7, Some(aim(3, 0))));
         scene.render(&mut frame, width, height, stride);
         assert_eq!(pixel(&frame, stride, 40, 60), INK);
+    }
+
+    /// An attach's x and y ARE the surface offset at the version td
+    /// advertises — `wl_surface.offset` replaces those arguments only from
+    /// version 5 — so they are what `wl_pointer.set_cursor` decrements the
+    /// hotspot by.
+    #[test]
+    fn an_attach_offset_moves_the_hotspot_of_the_cursor_it_draws() {
+        let (mut scene, mut frame, width, height, stride) = bare_output();
+        scene.pointer_x = 40;
+        scene.pointer_y = 60;
+        scene.set_cursor(7, Some(aim(2, 3)));
+        assert!(scene.commit_cursor(cursor_key(7, CURSOR_SURFACE), surface(INK, 4, 4)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 38, 57), INK);
+
+        // DECREMENTED, so the image moves the way the offset points: the
+        // client slid its contents down and right, and the pointer — which has
+        // not moved — is that much nearer their top-left corner. An offset
+        // ADDED moves the image the same distance the other way, which is why
+        // the corner it left is asserted beside the one it reached.
+        assert!(scene.offset_cursor(cursor_key(7, CURSOR_SURFACE), (1, 2)));
+        assert_eq!(scene.cursor_image(), Some((1, 1, 4, 4)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 39, 59), INK);
+        assert_eq!(pixel(&frame, stride, 38, 57), BACKGROUND);
+
+        // It ACCUMULATES rather than replacing, because an offset is measured
+        // from the buffer it replaces and not from the surface's origin.
+        assert!(scene.offset_cursor(cursor_key(7, CURSOR_SURFACE), (-1, -2)));
+        assert_eq!(scene.cursor_image(), Some((2, 3, 4, 4)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 38, 57), INK);
+    }
+
+    /// A hotspot is the POINTER's state rather than the surface's: it arrives
+    /// with `set_cursor`, so a surface nobody is pointing with has none to
+    /// move. That is the limit of what an offset can reach rather than an
+    /// approximation of it — a client that names such a surface later supplies
+    /// a hotspot with the request.
+    #[test]
+    fn an_offset_to_a_surface_nobody_points_with_moves_no_hotspot() {
+        let (mut scene, mut frame, width, height, stride) = bare_output();
+        scene.pointer_x = 40;
+        scene.pointer_y = 60;
+        scene.set_cursor(7, Some(aim(2, 3)));
+        assert!(scene.commit_cursor(cursor_key(7, CURSOR_SURFACE), surface(INK, 4, 4)));
+        // Another surface of the same client, and the same surface of another
+        // client: a key compared on one half alone would take one of them.
+        assert!(!scene.offset_cursor(cursor_key(7, CURSOR_SURFACE.saturating_add(1)), (1, 2)));
+        assert!(!scene.offset_cursor(cursor_key(9, CURSOR_SURFACE), (1, 2)));
+        // And a zero offset is the ordinary attach, which owes no paint.
+        assert!(!scene.offset_cursor(cursor_key(7, CURSOR_SURFACE), (0, 0)));
+        assert_eq!(scene.cursor_image(), Some((2, 3, 4, 4)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 38, 57), INK);
+
+        // A HIDDEN cursor has no hotspot either, and re-showing the surface
+        // supplies one rather than resuming whatever an offset had left.
+        assert!(scene.set_cursor(7, None));
+        assert!(!scene.offset_cursor(cursor_key(7, CURSOR_SURFACE), (1, 2)));
+        assert!(scene.set_cursor(7, Some(aim(2, 3))));
+        assert_eq!(scene.cursor_image(), Some((2, 3, 4, 4)));
+    }
+
+    /// An offset with no pixels under it owes no paint — td's own cross is
+    /// what is drawn and it does not move — but it is not discarded either:
+    /// the image that arrives next lands where the offset left the hotspot.
+    #[test]
+    fn an_offset_before_the_pixels_owes_no_paint_and_is_not_forgotten() {
+        let (mut scene, mut frame, width, height, stride) = bare_output();
+        scene.pointer_x = 40;
+        scene.pointer_y = 60;
+        scene.set_cursor(7, Some(aim(2, 3)));
+        assert!(!scene.offset_cursor(cursor_key(7, CURSOR_SURFACE), (1, 2)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), CROSS);
+
+        assert!(scene.commit_cursor(cursor_key(7, CURSOR_SURFACE), surface(INK, 4, 4)));
+        assert_eq!(scene.cursor_image(), Some((1, 1, 4, 4)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 39, 59), INK);
+        assert_eq!(pixel(&frame, stride, 38, 57), BACKGROUND);
+    }
+
+    /// The hotspot is an ACCUMULATOR: `set_cursor` names one in the protocol's
+    /// own `int` and every attach after that decrements it, so three attaches a
+    /// client can send in one breath take it outside that range and bring it
+    /// back. It is held wider for exactly this — clamped at the `i32` ends the
+    /// excursion loses a pixel on the way home, and the cursor comes back
+    /// beside where the client put it with nothing saying why.
+    #[test]
+    fn a_hotspot_leaves_the_range_a_client_can_name_and_comes_back_exactly() {
+        let (mut scene, mut frame, width, height, stride) = bare_output();
+        scene.pointer_x = 40;
+        scene.pointer_y = 60;
+        scene.set_cursor(7, Some(aim(0, 0)));
+        assert!(scene.commit_cursor(cursor_key(7, CURSOR_SURFACE), surface(INK, 4, 4)));
+
+        assert!(scene.offset_cursor(cursor_key(7, CURSOR_SURFACE), (i32::MAX, 0)));
+        // Drawn NOWHERE while it is out there, and not as a cross either: a
+        // client's image is what the pointer paints, wherever that lands.
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 40, 60), BACKGROUND);
+        assert_eq!(pixel(&frame, stride, 0, 60), BACKGROUND);
+        assert_eq!(pixel(&frame, stride, width - 1, 60), BACKGROUND);
+
+        // One step further out than the way home, so the exact answer is -1
+        // where a hotspot clamped at the `i32` ends comes back 0.
+        assert!(scene.offset_cursor(cursor_key(7, CURSOR_SURFACE), (2, 0)));
+        assert!(scene.offset_cursor(cursor_key(7, CURSOR_SURFACE), (i32::MIN, 0)));
+        assert_eq!(scene.cursor_image(), Some((-1, 0, 4, 4)));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 41, 60), INK);
+        assert_eq!(pixel(&frame, stride, 40, 60), BACKGROUND);
     }
 
     #[test]

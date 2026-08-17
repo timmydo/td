@@ -125,10 +125,20 @@ struct Buffer {
     format: u32,
 }
 
+/// An `attach` that no commit has applied yet. The OFFSET rides in here rather
+/// than beside it because that is where the protocol puts it: at the version td
+/// advertises there is no way to send one without an attach, and a second field
+/// on the surface would be a second place for it to go stale.
 #[derive(Clone)]
 enum PendingBuffer {
-    Detach,
-    Buffer { object: u32, buffer: Buffer },
+    Detach {
+        offset: (i32, i32),
+    },
+    Buffer {
+        object: u32,
+        buffer: Buffer,
+        offset: (i32, i32),
+    },
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1730,6 +1740,15 @@ impl Client {
                 client: self.id,
                 object: id,
             };
+            // What the attach asked to move by. It travels WITH the contents
+            // rather than in a call of its own, so one commit is one repaint —
+            // and because for a cursor the two are the same statement: the
+            // offset moves the image, and moving the hotspot is how a cursor
+            // says that.
+            let offset = match &pending {
+                PendingBuffer::Detach { offset } => *offset,
+                PendingBuffer::Buffer { offset, .. } => *offset,
+            };
             if cursor {
                 match pending {
                     // A cursor surface with its buffer taken away has no
@@ -1737,12 +1756,12 @@ impl Client {
                     // read as "hide": a client asking for no cursor says so
                     // with a null SURFACE, which cannot be confused with a
                     // client between two frames of an animated one.
-                    PendingBuffer::Detach => self
+                    PendingBuffer::Detach { .. } => self
                         .runtime
                         .lock()
                         .map_err(|_| "runtime lock poisoned".to_string())?
-                        .detach_cursor(key)?,
-                    PendingBuffer::Buffer { object, buffer } => {
+                        .detach_cursor(key, offset)?,
+                    PendingBuffer::Buffer { object, buffer, .. } => {
                         // The dimension bound is applied HERE rather than at
                         // the scene, because `copy_buffer` allocates and
                         // reads the whole image: refusing it afterwards
@@ -1758,7 +1777,7 @@ impl Client {
                             self.runtime
                                 .lock()
                                 .map_err(|_| "runtime lock poisoned".to_string())?
-                                .commit_cursor(key, image)?;
+                                .commit_cursor(key, image, offset)?;
                         } else {
                             // Still a REPLACEMENT: the surface's contents are
                             // now something td will not draw, so the frame it
@@ -1766,7 +1785,7 @@ impl Client {
                             self.runtime
                                 .lock()
                                 .map_err(|_| "runtime lock poisoned".to_string())?
-                                .detach_cursor(key)?;
+                                .detach_cursor(key, offset)?;
                         }
                         // Released whether or not the image was KEPT. A
                         // cursor over the scene's bound is refused, and a
@@ -1782,8 +1801,13 @@ impl Client {
                     }
                 }
             } else {
+                // A TILE ignores the offset, and that is the answer rather
+                // than an omission: the tile fixes where the window is and the
+                // geometry names which part of the buffer fills it, so shifting
+                // the contents on top would move a window inside its own tile
+                // and leave a gap at the edge it moved from.
                 match pending {
-                    PendingBuffer::Detach => {
+                    PendingBuffer::Detach { .. } => {
                         if was_mapped {
                             if let Some(configure) = xdg_configure {
                                 configure
@@ -1805,7 +1829,7 @@ impl Client {
                                 .set_window_geometry(key, geometry)?;
                         }
                     }
-                    PendingBuffer::Buffer { object, buffer } => {
+                    PendingBuffer::Buffer { object, buffer, .. } => {
                         let surface_bytes = buffer
                             .width
                             .checked_mul(buffer.height)
@@ -2090,11 +2114,18 @@ impl Client {
                 }
                 1 => {
                     let buffer = args.u32()?;
-                    args.i32()?;
-                    args.i32()?;
+                    // Where the new buffer's corner lands relative to the one it
+                    // replaces. Kept rather than dropped for the CURSOR, whose
+                    // hotspot the protocol moves by it; a tile ignores it, and
+                    // `commit_surface` is where that division is made. Reading
+                    // it at all depends on the version advertised above: from
+                    // wl_surface 5 a non-zero pair is `invalid_offset` and the
+                    // arguments are ignored, so raising that cap means
+                    // REFUSING here rather than honouring.
+                    let offset = (args.i32()?, args.i32()?);
                     args.finish()?;
                     state.pending_buffer = if buffer == 0 {
-                        Some(PendingBuffer::Detach)
+                        Some(PendingBuffer::Detach { offset })
                     } else {
                         let buffer_state = match self.objects.get(&buffer).cloned() {
                             Some(Object::Buffer(buffer_state)) => buffer_state,
@@ -2107,6 +2138,7 @@ impl Client {
                         Some(PendingBuffer::Buffer {
                             object: buffer,
                             buffer: buffer_state,
+                            offset,
                         })
                     };
                     self.objects.insert(message.object, Object::Surface(state));
@@ -5651,6 +5683,7 @@ mod tests {
             5,
             Object::Surface(SurfaceState {
                 pending_buffer: Some(PendingBuffer::Buffer {
+                    offset: (0, 0),
                     object: 7,
                     buffer: Buffer {
                         serial: 1,
@@ -7032,7 +7065,11 @@ mod tests {
         };
         client.insert(7, Object::Buffer(buffer.clone())).unwrap();
         let state = SurfaceState {
-            pending_buffer: Some(PendingBuffer::Buffer { object: 7, buffer }),
+            pending_buffer: Some(PendingBuffer::Buffer {
+                object: 7,
+                buffer,
+                offset: (0, 0),
+            }),
             role: Some(SurfaceRole::Cursor),
             ..SurfaceState::default()
         };
@@ -7094,7 +7131,10 @@ mod tests {
     /// A cursor td refuses to hold pixels for must still have its buffer
     /// released. The client is entitled to reuse it, and one left waiting
     /// stops drawing altogether — a worse failure than the cursor it asked
-    /// for not appearing.
+    /// for not appearing. Its OFFSET is not refused with it: the pixels are
+    /// td's to decline, where the offset is the client's account of where its
+    /// contents now are, and a hotspot left behind would put the next frame
+    /// — one td does accept — beside where the client asked for it.
     #[test]
     fn an_oversized_cursor_is_refused_with_its_buffer_still_released() {
         let stem = format!(
@@ -7178,8 +7218,8 @@ mod tests {
         let mut set_cursor = wire::Builder::new();
         set_cursor.u32(serial);
         set_cursor.u32(5);
-        set_cursor.i32(0);
-        set_cursor.i32(0);
+        set_cursor.i32(5);
+        set_cursor.i32(9);
         client
             .dispatch(request(6, 0, set_cursor).unwrap(), &mut VecDeque::new())
             .unwrap();
@@ -7195,7 +7235,11 @@ mod tests {
         };
         client.insert(7, Object::Buffer(buffer.clone())).unwrap();
         let state = SurfaceState {
-            pending_buffer: Some(PendingBuffer::Buffer { object: 7, buffer }),
+            pending_buffer: Some(PendingBuffer::Buffer {
+                object: 7,
+                buffer,
+                offset: (3, 4),
+            }),
             role: Some(SurfaceRole::Cursor),
             ..SurfaceState::default()
         };
@@ -7214,8 +7258,320 @@ mod tests {
         assert_eq!(runtime.lock().unwrap().cursor_image(), None);
         assert!(!runtime.lock().unwrap().cursor_is_hidden());
 
+        // The refused commit's offset took, which only a frame td ACCEPTS can
+        // show: this one carries none of its own, so the hotspot it lands at
+        // is the refused attach's and nothing else.
+        let small = Buffer {
+            serial: 2,
+            file: Arc::new(File::open(&pool_path).unwrap()),
+            offset: 0,
+            width: 1,
+            height: 1,
+            stride: 4,
+            format: SHM_XRGB8888,
+        };
+        client.insert(8, Object::Buffer(small.clone())).unwrap();
+        let accepted = SurfaceState {
+            pending_buffer: Some(PendingBuffer::Buffer {
+                object: 8,
+                buffer: small,
+                offset: (0, 0),
+            }),
+            role: Some(SurfaceRole::Cursor),
+            ..SurfaceState::default()
+        };
+        client.objects.insert(5, Object::Surface(accepted.clone()));
+        client.commit_surface(5, accepted).unwrap();
+        assert_eq!(
+            runtime.lock().unwrap().cursor_image(),
+            Some((2, 5, 1, 1)),
+            "a refused cursor frame dropped the offset it arrived with"
+        );
+
         stop.stop();
         runtime.lock().unwrap().unsubscribe_keyboard(2);
+        fs::remove_file(framebuffer_path).unwrap();
+        fs::remove_file(pool_path).unwrap();
+    }
+
+    /// The two `i32`s an attach carries are the surface offset at the version
+    /// td advertises — `wl_surface.offset` replaces them only from version 5 —
+    /// and `wl_pointer.set_cursor` decrements the hotspot by them. Driven over
+    /// the WIRE because the reading is the half that can go wrong: the
+    /// arguments used to be parsed and dropped, and a pair read in the other
+    /// order is a cursor offset diagonally from where the client put it.
+    #[test]
+    fn an_attach_offset_reaches_the_cursor_it_was_sent_for() {
+        let stem = format!(
+            "td-wayland-cursor-offset-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let pool_path = std::env::temp_dir().join(format!("{stem}.pool"));
+        fs::write(&pool_path, [7u8; 2 * 2 * 4]).unwrap();
+        let framebuffer = Framebuffer::test_file(
+            &framebuffer_path,
+            80,
+            crate::scene::least_output_height(8),
+            80 * 4,
+        )
+        .unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let focused = SurfaceKey {
+            client: 2,
+            object: 9,
+        };
+        runtime
+            .lock()
+            .unwrap()
+            .commit(
+                focused,
+                Surface {
+                    width: 32,
+                    height: 32,
+                    pixels: vec![1; 32 * 32 * 4],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        let rect = runtime
+            .lock()
+            .unwrap()
+            .layout_snapshot()
+            .get(&focused)
+            .unwrap()
+            .rect;
+        runtime
+            .lock()
+            .unwrap()
+            .pointer_frame(
+                1,
+                i32::try_from(rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(rect.y.saturating_add(3)).unwrap(),
+                &[],
+                PointerScroll::default(),
+            )
+            .unwrap();
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut client = Client::new(2, server, Arc::clone(&runtime), test_keymap()).unwrap();
+        let subscription = runtime
+            .lock()
+            .unwrap()
+            .subscribe_input_with_activity(
+                2,
+                Arc::clone(&client.keyboard_active),
+                Arc::clone(&client.pointer_active),
+            )
+            .unwrap();
+        let (_receiver, stop) = subscription.split();
+        client
+            .insert(5, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        client.create_pointer(6, 7).unwrap();
+        let enter = receive_messages(&mut peer, 2);
+        let serial = wire::Cursor::new(&enter.first().unwrap().payload)
+            .u32()
+            .unwrap();
+
+        // Deliberately unequal, and unequal to each other's offsets: 5 - 2 and
+        // 9 - 3 differ, so a pair read the other way round would be caught.
+        let mut set_cursor = wire::Builder::new();
+        set_cursor.u32(serial);
+        set_cursor.u32(5);
+        set_cursor.i32(5);
+        set_cursor.i32(9);
+        client
+            .dispatch(request(6, 0, set_cursor).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .insert(
+                7,
+                Object::Buffer(Buffer {
+                    serial: 1,
+                    file: Arc::new(File::open(&pool_path).unwrap()),
+                    offset: 0,
+                    width: 2,
+                    height: 2,
+                    stride: 8,
+                    format: SHM_XRGB8888,
+                }),
+            )
+            .unwrap();
+
+        let mut attach = wire::Builder::new();
+        attach.u32(7);
+        attach.i32(2);
+        attach.i32(3);
+        client
+            .dispatch(request(5, 1, attach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        // Double-buffered like the contents it rides with: the attach alone
+        // moves nothing.
+        assert_eq!(runtime.lock().unwrap().cursor_image(), None);
+
+        client
+            .dispatch(
+                request(5, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.lock().unwrap().cursor_image(),
+            Some((3, 6, 2, 2)),
+            "the attach offset did not reach the hotspot"
+        );
+
+        // A NULL attach carries an offset like any other, and it is the one
+        // that reaches nothing on screen when it is applied: the surface has
+        // no pixels until the next frame arrives, and the move is there when
+        // it does.
+        let mut unmap = wire::Builder::new();
+        unmap.u32(0);
+        unmap.i32(1);
+        unmap.i32(2);
+        client
+            .dispatch(request(5, 1, unmap).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(5, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(runtime.lock().unwrap().cursor_image(), None);
+
+        let mut again = wire::Builder::new();
+        again.u32(7);
+        again.i32(0);
+        again.i32(0);
+        client
+            .dispatch(request(5, 1, again).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(5, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.lock().unwrap().cursor_image(),
+            Some((2, 4, 2, 2)),
+            "a null attach's offset was dropped"
+        );
+
+        stop.stop();
+        runtime.lock().unwrap().unsubscribe_keyboard(2);
+        fs::remove_file(framebuffer_path).unwrap();
+        fs::remove_file(pool_path).unwrap();
+    }
+
+    /// A TILE ignores the offset, which is the answer rather than an omission:
+    /// td places the window and the geometry names which part of the buffer
+    /// fills that place, so shifting the contents on top would move a window
+    /// inside its own tile and leave a gap at the edge it moved from.
+    #[test]
+    fn a_tiles_attach_offset_moves_neither_its_pixels_nor_its_crop() {
+        let stem = format!(
+            "td-wayland-tile-offset-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let pool_path = std::env::temp_dir().join(format!("{stem}.pool"));
+        let pixels = [0x21u8, 0x43, 0x65, 0];
+        fs::write(&pool_path, pixels).unwrap();
+        let framebuffer = Framebuffer::test_file(
+            &framebuffer_path,
+            8,
+            crate::scene::least_output_height(2),
+            32,
+        )
+        .unwrap();
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let mut client = Client::new(2, server, Arc::clone(&runtime), test_keymap()).unwrap();
+        let mut configure = ConfigureTracker::new();
+        configure.initial(44).unwrap();
+        configure.acknowledge(44).unwrap();
+        client
+            .insert(
+                5,
+                Object::Surface(SurfaceState {
+                    role: Some(SurfaceRole::Xdg(9)),
+                    ..SurfaceState::default()
+                }),
+            )
+            .unwrap();
+        client
+            .insert(
+                9,
+                Object::XdgSurface {
+                    surface: 5,
+                    toplevel: Some(10),
+                    configure: Arc::new(Mutex::new(configure)),
+                    pending_geometry: None,
+                },
+            )
+            .unwrap();
+        client
+            .insert(
+                10,
+                Object::XdgToplevel {
+                    xdg_surface: 9,
+                    decoration: None,
+                },
+            )
+            .unwrap();
+        client
+            .insert(
+                7,
+                Object::Buffer(Buffer {
+                    serial: 99,
+                    file: Arc::new(File::open(&pool_path).unwrap()),
+                    offset: 0,
+                    width: 1,
+                    height: 1,
+                    stride: 4,
+                    format: SHM_XRGB8888,
+                }),
+            )
+            .unwrap();
+
+        let mut commit = |x: i32, y: i32| {
+            let mut attach = wire::Builder::new();
+            attach.u32(7);
+            attach.i32(x);
+            attach.i32(y);
+            client
+                .dispatch(request(5, 1, attach).unwrap(), &mut VecDeque::new())
+                .unwrap();
+            client
+                .dispatch(
+                    request(5, 6, wire::Builder::new()).unwrap(),
+                    &mut VecDeque::new(),
+                )
+                .unwrap();
+            fs::read(&framebuffer_path).unwrap()
+        };
+        let square = commit(0, 0);
+        assert!(square.as_chunks::<4>().0.contains(&pixels));
+        // The same pixels attached at an offset paint the same screen. Read off
+        // the framebuffer rather than off the layout, because a tile's rect is
+        // the layout's to choose either way — what an offset could have moved
+        // is the ink inside it.
+        assert_eq!(commit(7, 9), square);
+        // Nor is it a crop: the surface still has no geometry of its own, which
+        // is the other rectangle an offset could have been mistaken for.
+        assert_eq!(
+            runtime.lock().unwrap().window_geometry(SurfaceKey {
+                client: 2,
+                object: 5,
+            }),
+            None
+        );
+
         fs::remove_file(framebuffer_path).unwrap();
         fs::remove_file(pool_path).unwrap();
     }

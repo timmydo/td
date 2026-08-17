@@ -348,16 +348,28 @@ impl Runtime {
     /// client is pointing with it, so only a commit to the surface actually
     /// being pointed with repaints; the caller owes its client the buffer
     /// release regardless of either.
-    pub fn commit_cursor(&mut self, key: SurfaceKey, image: Surface) -> Result<(), String> {
-        if self.scene.commit_cursor(key, image) {
+    ///
+    /// The contents and the offset are the two halves of ONE attach and are
+    /// applied together, since the protocol makes the offset part of the
+    /// attach and either alone would be a repaint of half a commit.
+    pub fn commit_cursor(
+        &mut self,
+        key: SurfaceKey,
+        image: Surface,
+        offset: (i32, i32),
+    ) -> Result<(), String> {
+        let contents = self.scene.commit_cursor(key, image);
+        if self.scene.offset_cursor(key, offset) || contents {
             return self.repaint();
         }
         Ok(())
     }
 
-    /// The pixels behind a named cursor are taken away by a null attach.
-    pub fn detach_cursor(&mut self, key: SurfaceKey) -> Result<(), String> {
-        if self.scene.detach_cursor(key) {
+    /// The pixels behind a named cursor are taken away by a null attach, which
+    /// carries an offset like any other.
+    pub fn detach_cursor(&mut self, key: SurfaceKey, offset: (i32, i32)) -> Result<(), String> {
+        let contents = self.scene.detach_cursor(key);
+        if self.scene.offset_cursor(key, offset) || contents {
             return self.repaint();
         }
         Ok(())
@@ -971,7 +983,7 @@ impl Runtime {
     }
 
     #[cfg(test)]
-    pub fn cursor_image(&self) -> Option<(i32, i32, usize, usize)> {
+    pub fn cursor_image(&self) -> Option<(i64, i64, usize, usize)> {
         self.scene.cursor_image()
     }
 
@@ -1371,6 +1383,7 @@ mod tests {
                     pixels: vec![9; 4 * 4 * 4],
                     format: SHM_XRGB8888,
                 },
+                (0, 0),
             )
             .unwrap();
         assert_eq!(runtime.cursor_image(), Some((0, 0, 4, 4)));
@@ -1378,6 +1391,79 @@ mod tests {
         // No pointer report between the two: the client simply goes away.
         runtime.remove_client(1).unwrap();
         assert_eq!(runtime.cursor_image(), None);
+    }
+
+    /// An attach's contents and its offset are ONE commit, so they reach the
+    /// screen in one paint. Applied in two calls they would draw the new image
+    /// under the old hotspot for a frame — a cursor that jumps and settles,
+    /// which is exactly what double-buffering exists to prevent.
+    #[test]
+    fn one_cursor_commit_applies_its_pixels_and_its_offset_in_one_paint() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-cursor-offset-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 200, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
+        let rect = runtime.layout_snapshot().get(&key).unwrap().rect;
+        runtime
+            .pointer_frame(
+                1,
+                i32::try_from(rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(rect.y.saturating_add(2)).unwrap(),
+                &[],
+                PointerScroll::default(),
+            )
+            .unwrap();
+        let cursor = SurfaceKey {
+            client: 1,
+            object: 2,
+        };
+        runtime
+            .set_cursor(
+                1,
+                Some(CursorRequest {
+                    surface: cursor.object,
+                    hotspot_x: 5,
+                    hotspot_y: 6,
+                }),
+            )
+            .unwrap();
+        let image = || Surface {
+            width: 8,
+            height: 8,
+            pixels: vec![0x5a; 8 * 8 * 4],
+            format: SHM_XRGB8888,
+        };
+        let _ = runtime.take_writes();
+
+        runtime.commit_cursor(cursor, image(), (2, 3)).unwrap();
+        assert_eq!(
+            runtime.take_writes().len(),
+            1,
+            "one cursor commit painted more than one frame"
+        );
+        assert_eq!(runtime.cursor_image(), Some((3, 3, 8, 8)));
+
+        // A NULL attach carries an offset like any other. Nothing is drawn
+        // while the surface has no pixels, so the move is invisible until the
+        // next frame arrives — and it is still there when it does.
+        runtime.detach_cursor(cursor, (1, 1)).unwrap();
+        assert_eq!(runtime.cursor_image(), None);
+        assert_eq!(
+            runtime.take_writes().len(),
+            1,
+            "taking a cursor's pixels away painted more than one frame"
+        );
+        runtime.commit_cursor(cursor, image(), (0, 0)).unwrap();
+        assert_eq!(runtime.cursor_image(), Some((2, 2, 8, 8)));
     }
 
     /// Destroying the cursor surface alone changes NO layout and no focus, so
@@ -1435,6 +1521,7 @@ mod tests {
                     pixels: vec![0x5a; 8 * 8 * 4],
                     format: SHM_XRGB8888,
                 },
+                (0, 0),
             )
             .unwrap();
         runtime.flush_paint().unwrap();

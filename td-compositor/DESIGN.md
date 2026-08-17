@@ -827,6 +827,49 @@ What IS refused is the request: a width or height that is not positive raises
 recorded before the refusal, so a client is never left holding a geometry the
 compositor also thinks is pending.
 
+**An attach's offset is the cursor's to move.** `wl_surface.attach` carries an
+x and a y placing the new buffer's corner relative to the one it replaces. At
+the wl_surface version td advertises they ARE the surface offset —
+`wl_surface.offset` replaces them only from version 5 — so a client with
+contents to move has no other way to say so. td used to parse both and drop
+them.
+
+They now reach the CURSOR, the one role where the protocol makes them a visible
+move: `wl_pointer.set_cursor` says a hotspot is DECREMENTED by an offset
+applied to the pointer surface. A cursor has no anchor but its hotspot — td
+draws the image at `pointer - hotspot` — so decrementing is what slides the
+image the way the offset points, and the pointer, which has not moved, ends up
+that much NEARER the image's own top-left corner. A TILE ignores the offset,
+which is the
+answer rather than an omission — the layout fixes where a window is and the
+geometry above names which part of its buffer fills that place, so shifting the
+contents on top would move a window inside its own tile and leave a gap at the
+edge it moved from.
+
+The offset travels with the contents rather than in a call of its own, for the
+reason the crop does: one commit is one paint. In halves, the frame between
+them draws the new image under the old hotspot — a cursor that jumps and
+settles, which is what double-buffering exists to prevent. A null attach
+carries one like any other and it is kept: nothing is drawn while the surface
+has no pixels, and the image that arrives next lands where the offset left the
+hotspot.
+
+What an offset cannot reach is a surface nobody is pointing with. A hotspot is
+the POINTER's state rather than the surface's — it arrives with `set_cursor`,
+which a client sends on every enter — so there is nothing to move until a
+client names that surface, and the request naming it supplies one. That is the
+limit rather than an approximation of it.
+
+The hotspot is held WIDER than the `int` a client names one with, because it is
+an ACCUMULATOR rather than a value any single request sets: `set_cursor` gives
+it a starting point and every attach after that decrements it, so three
+attaches a client can send in one breath take it outside the `int` range and
+bring it back. Clamped at those ends the excursion loses a pixel on the way
+home and the cursor returns beside where the client put it, with nothing on
+screen saying why. At `i64` the arithmetic is exact over anything a client can
+send in a session; the subtraction still saturates, because nothing may panic,
+but that bound is billions of attaches away rather than three.
+
 Only wl_shm ARGB8888 and XRGB8888 buffers are accepted. Pool, offset, size,
 stride, and pixel-count arithmetic are checked before allocation or I/O. A
 commit copies the declared pixels out of the pool with safe `FileExt`

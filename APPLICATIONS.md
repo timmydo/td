@@ -2611,7 +2611,11 @@ and discarded — a true no-op, so CSD margins tiled as dead borders and clicks
 landed offset, though the client survived. That row is closed: `ui: a window
 geometry is the part of a surface td tiles` honours it as a crop on both the
 paint and the hit test, with the two divergences it takes recorded in
-`td-compositor/DESIGN.md` §3.
+`td-compositor/DESIGN.md` §3. `wl_surface.attach`'s x and y were a second
+no-op of the same kind, parsed and dropped; `ui: an attach's offset is the
+cursor's to move` gives them the one role that has a use for them, the
+cursor whose hotspot the protocol decrements by them, and records why a tile
+ignores them and what an offset cannot reach.
 
 | interface | td state | class | cost |
 |---|---|---|---|
