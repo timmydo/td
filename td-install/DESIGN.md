@@ -222,13 +222,25 @@ whether two files are the same and an unreadable path is not one of them.
 
 The COMPILER holds the first half of that. `clippy.toml` disallows every
 path-taking entry point into the filesystem and `Cargo.toml` denies the
-lint, so a call outside the two choke points does not build; the three
-scoped `#[allow]`s are the whole of the exception, and a test reads where
-they sit. What is left for a test is whether a wrapper puts its path in the
-message, which clippy has no opinion about. A source SCAN held the first
-half before this and lost nine rounds of review to spellings it did not
-model — `clippy.toml` is the roster now, and a new verb is a new wrapper
-rather than a call at the site that wants one.
+lint, so a call outside the two choke points fails CLIPPY — which is a
+gate leg and not `cargo build`, and not the recipe that compiles the
+shipped binary with rustc directly. The three scoped `#[allow]`s are the
+whole of the exception, and a test reads where they sit. What is left for
+a test is whether a wrapper puts its path in the message, which clippy has
+no opinion about. A source SCAN held the first half before this and lost
+nine rounds of review to spellings it did not model — `clippy.toml` is the
+roster now, and a new verb is a new wrapper rather than a call at the site
+that wants one.
+
+Two edges of that are worth stating because neither is visible from the
+code they constrain. The deny reaches every file this crate COMPILES,
+`engine/src/gpt.rs` and the other four included ones among them, so an
+ordinary `std::fs::read` added there fails td-install's clippy while the
+engine's own stays green — and the advice in the message, to use `mod
+paths`, cannot be followed from a crate that has no such module. And an
+entry that does not RESOLVE is inert: clippy warns `does not refer to a
+reachable function` and exits 0, so a typo removes a roster line without
+removing a test's count of it.
 
 One operation is beyond the roster and is a constraint on a WRAPPER
 instead. Reading a directory fails twice: once opening it, which

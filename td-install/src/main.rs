@@ -2298,42 +2298,157 @@ mod tests {
     #[test]
     fn the_lint_is_allowed_only_at_the_choke_points() {
         for (label, source, expected) in compiled_files() {
+            // Every ATTRIBUTE that suppresses ANY lint, rather than every
+            // mention of this one. Review reached the shipped code through
+            // five spellings that never name it: `#[allow(clippy::all)]`,
+            // `#[allow(clippy::style)]` — the group it is IN —
+            // `#[expect(clippy::style)]`, a crate-level `#![allow(clippy::all)]`
+            // and `#[allow(clippy :: disallowed_methods)]`, which rustc accepts
+            // and a search for the name walks past. So the roster is the
+            // ATTRIBUTES this crate permits, spaces removed, and every other
+            // one is refused whatever lint it names.
+            //
+            // Over the UNCOMMENTED source, or the likeliest author of the next
+            // false red is a td-boot developer explaining the allow this crate
+            // put in their file.
+            let text = uncommented(source);
+            let lines: Vec<&str> = text.lines().collect();
             let mut seen = Vec::new();
-            let mut from = 0;
-            // Every mention of the LINT, not of one attribute — an
-            // `#[expect(…)]`, a crate-level `#![allow(…)]` and a
-            // `reason = "…"` beside it each suppress a denied lint just as
-            // well, and none of them is the string the exemption is written
-            // as here. So the line carrying a mention has to BE the permitted
-            // spelling, and the line under it the item it may sit on.
-            while let Some(hit) = source.get(from..).and_then(|rest| index_of(rest, LINT)) {
-                let at = from + hit;
-                from = at + LINT.len();
-                let before = source.get(..at).unwrap_or_default();
-                let start = index_of_last(before, "\n").map_or(0, |nl| nl + 1);
-                let line = source
-                    .get(start..)
-                    .and_then(|rest| rest.lines().next())
-                    .unwrap_or_default()
-                    .trim();
-                assert_eq!(
-                    line, ALLOW,
-                    "{label}: the filesystem lint is suppressed by something \
-                     other than the one permitted attribute"
+            for (unit, item) in units(&lines) {
+                if !suppresses_a_lint(&unit) {
+                    continue;
+                }
+                assert!(
+                    unit == unspaced(ALLOW),
+                    "{label} before line {item}: a lint suppression this crate \
+                     does not permit: {unit}"
                 );
-                let item = source
-                    .get(from..)
-                    .and_then(|rest| rest.lines().nth(1))
-                    .unwrap_or_default()
-                    .trim();
-                seen.push(item);
+                seen.push(lines.get(item).copied().unwrap_or_default().trim());
             }
             assert_eq!(
                 seen, expected,
-                "{label}: the filesystem lint is allowed somewhere other than \
-                 a choke point"
+                "{label}: the allow sits on an item this test does not know — \
+                 either an allow moved, or a choke point's signature changed \
+                 under MAIN_CHOKE/REALFILE_CHOKE"
             );
         }
+    }
+
+    /// Whether `squeezed` — one line with its whitespace removed — is an
+    /// ATTRIBUTE that turns a lint off.
+    ///
+    /// The source as ATTRIBUTE UNITS, whitespace removed, each paired with the
+    /// index of the line AFTER it — the item it sits on.
+    ///
+    /// A line that opens an attribute and does not close it takes the lines
+    /// that finish it. Review spread a suppression over four:
+    ///
+    /// ```ignore
+    /// #[cfg_attr(
+    ///     all(),
+    ///     allow(clippy::all)
+    /// )]
+    /// ```
+    ///
+    /// where the opener carries no `allow(` and the `allow(` carries no
+    /// opener, so a line-at-a-time scan saw neither half.
+    fn units(lines: &[&str]) -> Vec<(String, usize)> {
+        // Brackets OUTSIDE strings, or a `reason = "…[…"` joins the rest of
+        // the file to itself.
+        let unbalanced = |text: &str| {
+            let plain = unstringed(text);
+            plain.matches('[').count() > plain.matches(']').count()
+        };
+        let mut out = Vec::new();
+        let mut index = 0usize;
+        while let Some(line) = lines.get(index) {
+            let mut unit = (*line).to_string();
+            let mut end = index;
+            // A line that BEGINS one, not one that merely mentions `#[` — this
+            // scan reads its own source, where `"#["` appears in a string, and
+            // joining from there swallowed the file. A multiline attribute
+            // sharing a line with code is therefore not joined; that is one
+            // coincidence past what review demonstrated and is a known limit.
+            // UNSPACED, since `# [cfg_attr(` is an attribute to rustc and was
+            // not one to this — the same raw-versus-unspaced split the scan
+            // below had already been taught, one layer up. A line merely
+            // MENTIONING `#[` in a string still does not open one, because
+            // its unspaced form does not start with it.
+            let opener = unspaced(&unit);
+            if opener.starts_with("#[") || opener.starts_with("#![") {
+                while unbalanced(&unit) {
+                    end = end.saturating_add(1);
+                    match lines.get(end) {
+                        None => break,
+                        Some(next) => unit.push_str(next),
+                    }
+                }
+            }
+            index = end.saturating_add(1);
+            // The ITEM an attribute sits on is the next line with anything on
+            // it. A blank line or a comment between the two is legal Rust and
+            // rustc applies the attribute across either, so reporting the
+            // line immediately below reds a file that is correct — and
+            // `uncommented` has already blanked the comments, which makes the
+            // two cases one skip.
+            let mut item = index;
+            while lines.get(item).is_some_and(|line| line.trim().is_empty()) {
+                item = item.saturating_add(1);
+            }
+            out.push((unspaced(&unit), item));
+        }
+        out
+    }
+
+    /// The three words that lower a lint's level. `warn(` is here because
+    /// `#[warn(clippy::disallowed_methods)]` turns the deny into a warning and
+    /// the preflight passes no `-D warnings` — review found it, an eighth
+    /// spelling after the seven the scan was built for.
+    const LOWERS: [&str; 3] = ["allow(", "expect(", "warn("];
+
+    /// The four spellings that can reach THIS lint: itself, the group it is
+    /// in, the group that holds every clippy lint, and rustc's group that
+    /// holds every lint at all. A suppression naming none of them cannot
+    /// touch it.
+    ///
+    /// Named rather than refused wholesale, because the wholesale rule was a
+    /// cross-crate landmine: `#[allow(clippy::too_many_arguments)]` in
+    /// `engine/src/gpt.rs` reds td-install, and its author is an engine
+    /// developer with no reason to know td-install compiles that file.
+    ///
+    /// The first is the SINGULAR, which is a prefix of the plural and so
+    /// covers both in one entry. `clippy::disallowed_method` is the lint's
+    /// pre-1.55 name and still a RENAME ALIAS: rustc resolves it and the
+    /// allow takes effect, which review measured — with the rename note
+    /// itself removable on the same line by
+    /// `#[allow(renamed_and_removed_lints, …)]`, leaving no diagnostic at
+    /// all. So an alias reaches this lint today, and the residual risk is
+    /// not only the clippy release that moves it into another group.
+    const REACHES: [&str; 4] = [
+        concat!("clippy::disallowed", "_method"),
+        "clippy::style",
+        "clippy::all",
+        "warnings",
+    ];
+
+    /// An attribute OPENER anywhere in `squeezed`, a word that LOWERS a level,
+    /// and a name that REACHES this lint. All three, because any two of them
+    /// is a rule about something else: an opener and a word is every
+    /// `#[allow(dead_code)]` in these files, and a word alone is every
+    /// `.expect(` call in the test half.
+    ///
+    /// Anywhere rather than at the start, because an attribute may sit
+    /// mid-line beside code — review wrote `let x = 1; #[cfg_attr(all(),
+    /// allow(…))] File::open(p)`, which begins with neither `#` nor the
+    /// attribute's own opener. The opener is `#[` or `#![` and not the whole
+    /// `#[allow(`, so a suppression NESTED in a `cfg_attr` is caught by the
+    /// same rule rather than by an entry naming it.
+    fn suppresses_a_lint(squeezed: &str) -> bool {
+        let attribute =
+            squeezed.starts_with('#') || squeezed.contains("#[") || squeezed.contains("#![");
+        attribute
+            && LOWERS.iter().any(|word| squeezed.contains(word))
+            && REACHES.iter().any(|name| squeezed.contains(name))
     }
 
     /// THE OTHER TWO PARTS OF THE MECHANISM, which live outside this file and
@@ -2345,11 +2460,56 @@ mod tests {
     /// and looks like nothing.
     #[test]
     fn the_roster_and_the_deny_are_both_still_there() {
+        // The deny must be a real ENTRY and nothing may countermand it, which
+        // are two separate ways the same line stops being in force. A
+        // `manifest.contains` is satisfied by a COMMENT, so the key is looked
+        // for among a table's entries; and review added `all = { level =
+        // "allow", priority = 1 }` beside it, which leaves every assertion
+        // here green and silences the deny for the whole crate, a higher
+        // priority outranking a plain entry whatever it says. BOTH tables,
+        // since `[lints.rust]` can allow the `warnings` group the same way
+        // and reaches clippy's lints too. Every entry in either is a bare
+        // deny or forbid today, so the check is that their shape has not
+        // changed rather than a rule about which levels are permitted.
         let manifest = include_str!("../Cargo.toml");
+        // A `#` starts a TOML comment wherever it sits, so it is cut from
+        // every line rather than only skipped when it opens one: review wrote
+        // `all = { level = "allow", priority = 1 } # = "deny"`, which ends
+        // with the deny's own text and passed the shape check below while
+        // silencing the lint crate-wide.
+        //
+        // And a HEADER is a line of its own, not the first text that spells
+        // one. `split_once` took a header out of a COMMENT, so a decoy
+        // section of denies read as the lint table while the real one below
+        // it allowed the group — review's, and green.
+        let table = |name: &str| -> Vec<&str> {
+            let mut rows = Vec::new();
+            let mut inside = false;
+            for line in manifest.lines() {
+                let bare = line.split('#').next().unwrap_or_default().trim();
+                if bare.starts_with('[') {
+                    inside = bare == name;
+                } else if inside && !bare.is_empty() {
+                    rows.push(bare);
+                }
+            }
+            rows
+        };
+        let clippy = table("[lints.clippy]");
+        let rust = table("[lints.rust]");
+        assert!(!clippy.is_empty(), "Cargo.toml has no [lints.clippy] table");
+        assert!(!rust.is_empty(), "Cargo.toml has no [lints.rust] table");
         assert!(
-            manifest.contains(concat!("disallowed", "_methods = \"deny\"")),
+            clippy.contains(&concat!("disallowed", "_methods = \"deny\"")),
             "Cargo.toml no longer denies the lint, so the roster is advice"
         );
+        for line in clippy.iter().chain(rust.iter()) {
+            assert!(
+                line.ends_with("= \"deny\"") || line.ends_with("= \"forbid\""),
+                "Cargo.toml's lint tables gained an entry that is not a plain \
+                 deny or forbid, which can outrank the deny above: {line}"
+            );
+        }
         let roster = include_str!("../clippy.toml");
         assert_eq!(
             roster.matches("{ path = ").count(),
@@ -2375,19 +2535,13 @@ mod tests {
         }
     }
 
-    /// The lint that carries all of this, spelled in two pieces so this file
-    /// does not match itself: `include_str!("main.rs")` reads the whole of it,
-    /// test half included.
-    const LINT: &str = concat!("clippy::disallowed", "_methods");
-
-    /// The one attribute that may carry it.
-    const ALLOW: &str = concat!("#[allow(clippy::", "disallowed_methods)]");
-
-    /// The last index of `needle`, spelled without the method that names it
-    /// for `index_of`'s reason.
-    fn index_of_last(haystack: &str, needle: &str) -> Option<usize> {
-        haystack.match_indices(needle).last().map(|(index, _)| index)
-    }
+    /// The one attribute that may open a hole in the roster.
+    ///
+    /// Spelled in two pieces so this file does not match itself:
+    /// `include_str!("main.rs")` reads the whole of it, test half included.
+    /// The split is at `#[all`/`ow(` rather than inside the lint name,
+    /// because that is the half the scan below keys on.
+    const ALLOW: &str = concat!("#[all", "ow(clippy::disallowed_methods)]");
 
     /// The six files this binary compiles, with the item each allow in them
     /// must sit on — none, for the four that reach no filesystem.
@@ -2410,6 +2564,178 @@ mod tests {
                 [].as_slice(),
             ),
         ]
+    }
+
+    /// THE LIST ABOVE IS HAND-KEPT, and a seventh file compiled into this
+    /// binary would be read by neither guard — silently, since both count only
+    /// what they were handed. Nothing but this relates it to the `#[path]`
+    /// declarations it mirrors. The marker is split so this file does not
+    /// match itself, as `ALLOW` is: the scan reads its own source.
+    ///
+    /// Over the UNCOMMENTED source, for the reason the allow scan is: a
+    /// comment explaining a `#[path]` declaration is prose, and reading one as
+    /// a declaration reds a file that compiles exactly six.
+    #[test]
+    fn every_compiled_file_is_one_the_guards_read() {
+        // WHITESPACE-INSENSITIVE from the marker on: `#[path="x.rs"]` with no
+        // spaces is the same attribute to rustc and was invisible to a search
+        // for the spelling this file happens to use.
+        const MARKER: &str = concat!("#[pa", "th");
+        // The marker scan is the one view that keeps STRINGS: it reads the
+        // attribute's own path out of one. Everything below reads code
+        // instead, and reads it off `plain_source`, which drops both.
+        let text = uncommented(include_str!("main.rs"));
+        let source = unspaced(&text);
+        let source = source.as_str();
+        let labels: Vec<&str> = compiled_files().iter().map(|(label, _, _)| *label).collect();
+        // The TABLE's own body, because `include_str!` below has to bind a
+        // declaration to the file the guards read and a `contains` over the
+        // whole source binds it to any TEXT: review spelled the missing
+        // include inside a `stringify!`, which satisfied the search while
+        // `compiled_files` went on reading the original.
+        let table_body = {
+            const HEAD: &str = "fn compiled_files() -> [Compiled; 6] {";
+            let Some(at) = index_of(&text, HEAD) else {
+                panic!("the compiled-file table is not where this scan looks for it")
+            };
+            let tail = text.get(at..).unwrap_or_default();
+            let mut depth = 0usize;
+            let mut end = tail.len();
+            for (n, c) in tail.char_indices() {
+                match c {
+                    '{' => depth = depth.saturating_add(1),
+                    '}' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            end = n;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            unspaced(tail.get(..end).unwrap_or_default())
+        };
+        let mut declared = 0usize;
+        let mut from = 0usize;
+        while let Some(at) = source.get(from..).and_then(|rest| index_of(rest, MARKER)) {
+            let start = from.saturating_add(at).saturating_add(MARKER.len());
+            let rest = source.get(start..).unwrap_or_default();
+            // Advanced BEFORE the shape test below, which may skip this
+            // occurrence — a `continue` past the cursor is a loop that never
+            // ends, and this one hung the suite until it was moved up.
+            from = start;
+            // The attribute's own shape, not merely its name: unspaced, a
+            // declaration is `#[path="…"]` and this test's own prose about
+            // `#[path]` is not. Written as a prefix test rather than by
+            // trimming, or the prose matches and the path read is garbage —
+            // which is how this was caught.
+            let Some(quoted) = rest.strip_prefix("=\"") else {
+                continue;
+            };
+            let path = quoted.split('"').next().unwrap_or_default();
+            let name = path.rsplit('/').next().unwrap_or_default();
+            assert!(
+                labels.contains(&name),
+                "{path} is compiled into this binary and scanned by neither guard"
+            );
+            // …and the guard reads THAT file rather than one with the same
+            // basename. `compiled_files` names each by its `include_str!`
+            // argument, so requiring the declared path to appear as one is
+            // what ties the two together: review pointed out that moving a
+            // declaration to `../../alternate/gpt.rs` still matches the
+            // `gpt.rs` label while the guards go on reading the original.
+            assert!(
+                table_body.contains(&format!("include_str!(\"{path}\")")),
+                "{path} is compiled in, but the guards read a different file \
+                 of that name"
+            );
+            declared = declared.saturating_add(1);
+        }
+        // …and the list holds nothing ELSE, or a file could be dropped from
+        // the crate while its entry went on standing in for it.
+        assert_eq!(
+            declared.saturating_add(1),
+            labels.len(),
+            "{declared} `#[path]` declarations against {} scanned files",
+            labels.len()
+        );
+        // …and no file reaches this binary any OTHER way. A `#[path]` is not
+        // how Rust normally names a second file: `mod escape;` compiles
+        // `src/escape.rs` with no attribute to count, and `include!` splices
+        // one into this file outright. Either is a seventh compiled source
+        // carrying a crate-level `#![allow]` and any filesystem call it
+        // likes, with both guards passing — review's, and the reason the loop
+        // below counts DECLARATIONS rather than trusting the attribute.
+        // EVERY compiled file, not this one alone. A seventh file arrives
+        // through whichever of the six declares it, and until review measured
+        // it the three checks below ran over `main.rs` only: an
+        // `include!("spliced.rs")` in `gpt.rs` — which resolves to the same
+        // file for both crates, so it is the realistic shape rather than a
+        // contrivance — spliced in a crate-level allow and a raw
+        // `File::open`, clippy exit 0 and all four guards green. `pub mod
+        // extra;` there did the same. The comment this replaces claimed "no
+        // file reaches this binary any OTHER way"; it did.
+        for (label, text, _) in compiled_files() {
+            // ONE pass, and one that refuses what it cannot lex. A raw string
+            // holding an odd quote desynchronises a composed strip for the
+            // rest of the file, and review measured the silent pass that
+            // follows: `mod escape;` below one is invisible, the module count
+            // still agrees, and the module compiles with an allow of its own.
+            // A BLOCK comment is the other refusal, and it is a twelfth
+            // suppression rather than a lexing nicety —
+            // `#[allow(clippy::/*x*/all)]` resolves for rustc, does not match
+            // the roster, and was measured green over a raw `File::open`.
+            let Some(plain_file) = plain_source(text) else {
+                panic!(
+                    "{label} holds a raw string or a block comment, either of \
+                     which can spell a declaration or a lint path the guards \
+                     below cannot read"
+                )
+            };
+            let unspaced_file = unspaced(&plain_file);
+            // Split like `MARKER` and `ALLOW`: written whole, the assertion is
+            // an instance of what it refuses, since the scan reads its own
+            // source. The bare macro NAME, not one delimiter of it: Rust takes
+            // `(`, `[` and `{` alike, and a check naming the first walks past
+            // the other two. `include_str!` does not match, its `!` sitting
+            // elsewhere.
+            assert!(
+                !unspaced_file.contains(concat!("inclu", "de!")),
+                "{label} splices a file into itself, where neither guard can \
+                 tell it apart from that file's own source"
+            );
+            // A MACRO can assemble an attribute out of pieces no unit holds: a
+            // `#[$attr]` in a definition and `allow(clippy::all)` at the call
+            // site are two texts, and the scan reads text. Nothing here
+            // defines one, and these six files are compiled with no external
+            // crate to import one from, so refusing the DEFINITION closes it.
+            //
+            // Over the UNSPACED, UNSTRINGED file rather than at a line start:
+            // `macro_rules ! wrapped` compiles, defines the macro, and matched
+            // neither the line-start test nor the keyword roster — as did the
+            // same name anywhere but a line start. Dropping the strings is
+            // what keeps the roster naming it above from matching itself, the
+            // line start having been doing that job.
+            assert!(
+                !unspaced_file.contains("macro_rules!"),
+                "{label} defines a macro, which can assemble a lint \
+                 suppression the allow scan cannot read"
+            );
+            // …and no module of its own. `main.rs` declares the five; any
+            // other file declaring one compiles a seventh source.
+            let mods = declarations(&plain_file)
+                .into_iter()
+                .filter(|(keyword, head)| *keyword == "mod" && head.trim_end().ends_with(';'))
+                .count();
+            let want = if label == "main.rs" { declared } else { 0 };
+            assert_eq!(
+                mods, want,
+                "{label} declares {mods} file modules against {want} `#[path]` \
+                 declarations — a module without one compiles a file neither \
+                 guard reads"
+            );
+        }
     }
 
     /// `main.rs`'s one choke point, as the line under its allow reads.
@@ -2439,6 +2765,11 @@ mod tests {
         for (label, source, markers) in compiled_files() {
             for marker in markers {
                 let body = uncommented(region(label, source, marker));
+                // Plainness FIRST: the two below read the region with its
+                // strings dropped, and that strip is only sound once the
+                // constructs it cannot lex have been refused.
+                reads_as_plain_code(label, marker, &body);
+                hands_out_no_capability(label, marker, &body);
                 checked += names_every_path(label, marker, &body);
             }
         }
@@ -2471,7 +2802,7 @@ mod tests {
     fn uncommented(code: &str) -> String {
         let mut out = String::with_capacity(code.len());
         for line in code.lines() {
-            match index_of(line, "//") {
+            match comment_at(line) {
                 Some(at) => out.push_str(line.get(..at).unwrap_or_default()),
                 None => out.push_str(line),
             }
@@ -2480,11 +2811,519 @@ mod tests {
         out
     }
 
+    /// Where `line`'s comment starts, if it has one — the first `//` OUTSIDE a
+    /// string literal.
+    ///
+    /// Outside, because review hid an attribute behind one: in
+    /// `const _: &str = "//"; #[allow(clippy::all)]` the slashes are data, and
+    /// a strip that cut there deleted a suppression rustc sees. The toggle is
+    /// per LINE, so a quote char literal earlier on the same line still fools
+    /// it; that is two deliberate coincidences deep and is a known limit
+    /// rather than a closed one.
+    fn comment_at(line: &str) -> Option<usize> {
+        let mut in_str = false;
+        let mut esc = false;
+        let mut slash = false;
+        for (at, ch) in line.char_indices() {
+            if in_str {
+                match ch {
+                    _ if esc => esc = false,
+                    '\\' => esc = true,
+                    '"' => in_str = false,
+                    _ => {}
+                }
+                slash = false;
+                continue;
+            }
+            if ch == '"' {
+                in_str = true;
+                slash = false;
+                continue;
+            }
+            if ch == '/' && slash {
+                return at.checked_sub(1);
+            }
+            slash = ch == '/';
+        }
+        None
+    }
+
+    /// A CHOKE POINT MAY NOT HAND ITS CAPABILITY OUT.
+    ///
+    /// The allow makes one region able to open any path. Nothing stopped that
+    /// region EXPORTING the ability, and review wrote both spellings green:
+    ///
+    /// ```ignore
+    /// pub fn opener() -> impl Fn(&Path) -> io::Result<File> { |p| File::open(p) }
+    /// pub const OPENER: fn(&Path) -> io::Result<File> = |p| File::open(p);
+    /// ```
+    ///
+    /// Either lets any call site in the crate open any path with the bare
+    /// `io::Error` this whole mechanism exists to replace, and neither
+    /// declares a `Path` PARAMETER — so the naming loop below skips both and
+    /// the wrapper count stays right. A closure can only be NAMED with `Fn`,
+    /// and a function pointer is the only other way to carry one, so refusing
+    /// those spellings refuses the shape rather than two examples of it.
+    ///
+    /// Over the region with its WHITESPACE REMOVED, and the visibility read
+    /// the same way. `fn (&Path)` is the same type as `fn(&Path)`, and
+    /// `pub(crate)` is `pub ` with no space after it — review wrote both and
+    /// walked past a check reading raw text. Every export here is therefore a
+    /// plain `pub fn`, which also refuses `pub(crate)`, `pub unsafe fn` and
+    /// `pub static`: fifteen short wrappers need none of them, and a shape
+    /// that arrives is a decision rather than an accident.
+    fn hands_out_no_capability(label: &str, region: &str, body: &str) {
+        // With STRINGS dropped, so a message naming a shape is data rather
+        // than an export — and read as DECLARATIONS rather than as lines. A
+        // line is not the unit: review put a newline after `impl`, a tab
+        // after it, and an attribute before it on the same line, and all
+        // three walked past a rule anchored at a line start. `rustfmt` writes
+        // the same shape by itself once a signature outgrows the width.
+        let plain = unstringed(body);
+        let squeezed = unspaced(&plain);
+        for shape in ["Fn(", "Fn<", "FnMut(", "FnOnce(", "fn("] {
+            assert!(
+                !squeezed.contains(shape),
+                "{label}: {region} names `{shape}`, so it can hand the \
+                 capability out"
+            );
+        }
+        // A head ends at the `{` or `;` that CLOSES it, not at the first one
+        // in it. `[u8; 4]` supplies a `;` inside brackets, and cutting there
+        // handed the return-type read half a signature — a false red naming
+        // the wrong problem, which review measured on a shape this crate has
+        // every reason to write.
+        // …and a parenthesised parameter TYPE does not end the list, for the
+        // same reason and with a worse consequence: every parameter after it
+        // went unread, so a wrapper could take a path it was never asked to
+        // name.
+        assert_eq!(
+            path_parameters("fn f(pair: (u32, u32), path: &Path) -> io::Result<()> {"),
+            vec!["path".to_string()],
+            "a parenthesised parameter type cuts the argument list short"
+        );
+        let arrayed = "pub fn read_first(path: &Path, buf: &mut [u8; 4]) -> io::Result<()> {";
+        assert!(
+            declarations(arrayed)
+                .iter()
+                .any(|(keyword, head)| *keyword == "pub" && *head == arrayed),
+            "an array type in a parameter cuts a signature short"
+        );
+        for (keyword, head) in declarations(&plain) {
+            let head = unspaced(head);
+            // An ITEM a caller outside can reach carries a capability whether
+            // or not it spells `Fn`, which is what the shapes above missed:
+            // review wrote `impl crate::OpenAnything for crate::AnyOpener`
+            // into the region, with the trait and the type declared outside
+            // it, and every rule here walked past — a trait-impl method has
+            // no visibility of its own, and `&self` plus a `&str` is no
+            // `Path` parameter to check. So the item kinds that can carry one
+            // are pinned WHOLE, and a region declares exactly what it
+            // declares today.
+            if keyword != "pub" {
+                assert!(
+                    PINNED_ITEMS.iter().any(|item| unspaced(item) == head),
+                    "{label}: {region} declares an item this test does not \
+                     know, which may carry a capability with no `Fn` in it: \
+                     {head}"
+                );
+                continue;
+            }
+            assert!(
+                head.starts_with("pubfn"),
+                "{label}: {region} exports something that is not a plain \
+                 `pub fn`: {head}"
+            );
+            // …and every one takes a PATH. `File::open` accepts an
+            // `impl AsRef<Path>`, so review's `pub fn open_named(name: &str)`
+            // is the whole capability with the bare error, declares no path
+            // to name, and is a plain `pub fn` — three checks walked past it.
+            // A wrapper with no `Path` parameter could not name one anyway,
+            // which is why refusing it costs nothing.
+            assert!(
+                head.contains("&Path"),
+                "{label}: {region} exports a wrapper that takes no `&Path`, \
+                 so it has no path to name: {head}"
+            );
+            // …and hands back one of two shapes. An allowlist rather than
+            // more refused spellings, because a capability can be named by
+            // an ALIAS declared outside the region — `type Cap = fn(&Path)
+            // -> io::Result<File>` and a wrapper returning `Cap` spells no
+            // shape above — and no text in the region can tell what a name
+            // means. Read after the LAST `->`, which is the return arrow: a
+            // parameter cannot carry one, since the types that do are the
+            // `Fn`/`fn(` shapes refused above. Over the whole head it was a
+            // check a PARAMETER could satisfy — review wrote `_seed:
+            // io::Result<()>` beside a return type naming an alias. Matched
+            // as a SUFFIX of the type rather than straight after the arrow,
+            // or `-> std::io::Result<File>` reds. What this cannot close is
+            // the same capability smuggled INSIDE an allowed return type;
+            // that is the `AsRef<Path>` limit again, and the compiler is the
+            // thing that could tell.
+            let returns = index_of_last(&head, "->")
+                .and_then(|at| head.get(at..))
+                .unwrap_or_default();
+            assert!(
+                returns.contains("io::Result<") || returns.contains("Option<"),
+                "{label}: {region} exports a wrapper returning something \
+                 other than `io::Result` or `Option`: {head}"
+            );
+            // A `ReadDir` handed back is the one wrapper shape DESIGN.md's
+            // D10 forbids in prose: reading a directory fails once per
+            // ENTRY, and the roster cannot hold `ReadDir::next` because that
+            // path does not resolve. So the rule lands here — a wrapper must
+            // consume the iterator and name the directory itself.
+            assert!(
+                !returns.contains("ReadDir"),
+                "{label}: {region} hands back a `ReadDir`, whose per-entry \
+                 errors name nothing: {head}"
+            );
+        }
+    }
+
+    /// The DECLARATIONS `plain` opens: each keyword at an identifier
+    /// boundary, paired with its head — the text through to the `{` or `;`
+    /// that ends it.
+    ///
+    /// A boundary on BOTH sides, since `mod` is a prefix of `mode`, `impl` of
+    /// `implementation` and `pub` of `public`; and a head rather than a line,
+    /// since a declaration may be written across as many as it likes.
+    fn declarations(plain: &str) -> Vec<(&'static str, &str)> {
+        const KEYWORDS: [&str; 5] = ["impl", "trait", "mod", "macro_rules!", "pub"];
+        let ident = |c: char| c.is_alphanumeric() || c == '_';
+        let mut out = Vec::new();
+        for keyword in KEYWORDS {
+            let mut from = 0usize;
+            while let Some(at) = plain.get(from..).and_then(|rest| index_of(rest, keyword)) {
+                let start = from.saturating_add(at);
+                from = start.saturating_add(keyword.len());
+                let before = plain.get(..start).and_then(|t| t.chars().next_back());
+                let after = plain.get(from..).and_then(|t| t.chars().next());
+                if before.is_some_and(ident) || after.is_some_and(ident) {
+                    continue;
+                }
+                let tail = plain.get(start..).unwrap_or_default();
+                // Walked rather than searched: this file is staged into a
+                // recipe, and the recipe scan refuses the bare token an
+                // iterator search would spell — which is why `index_of` and
+                // `index_of_last` exist here at all.
+                // At BRACKET DEPTH ZERO, or an array type ends the head: the
+                // `;` in `buf: &mut [u8; 4]` cut a signature in half and the
+                // truncated text then failed the return-type read, reporting
+                // a wrapper as exporting the wrong thing. A false red with
+                // the wrong diagnosis, which review measured.
+                let mut end = tail.len();
+                let mut depth = 0usize;
+                for (at, c) in tail.char_indices() {
+                    match c {
+                        '[' | '(' => depth = depth.saturating_add(1),
+                        ']' | ')' => depth = depth.saturating_sub(1),
+                        '{' | ';' if depth == 0 => {
+                            end = at.saturating_add(c.len_utf8());
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                out.push((keyword, tail.get(..end).unwrap_or_default()));
+            }
+        }
+        out
+    }
+
+    /// The three declarations the two choke points open, pinned whole. A
+    /// fourth is a decision someone makes on purpose.
+    ///
+    /// A `use` is not among the keywords that reach this, because `pub use`
+    /// is already refused as a non-`pub fn` export and a private one
+    /// re-exports nothing.
+    const PINNED_ITEMS: [&str; 3] = [
+        "mod paths {",
+        "trait NamePath<T> {",
+        "impl<T> NamePath<T> for io::Result<T> {",
+    ];
+
+    /// The char literals a choke point may not hold, written as escapes so
+    /// this file is not itself an instance of what it refuses.
+    ///
+    /// Each would desynchronise a COUNTER this test runs on the region: the
+    /// two quotes are a delimiter to `unstringed`'s toggle, and the two braces
+    /// are an item boundary to the brace count below. A sibling scan in
+    /// `builder` NEUTRALISES the same literals instead, because it reads whole
+    /// files and cannot refuse one; nineteen short wrappers can afford the
+    /// refusal, and refusing is the smaller thing to be right about.
+    const REFUSED_CHARS: [&str; 4] = ["'\u{22}'", "'\\\u{22}'", "'{'", "'}'"];
+
+    /// `unstringed`'S TOGGLE IS ONLY RIGHT IF THE REGION IS PLAIN, AND THE
+    /// REGION IS ONLY THE ITEM IF NOTHING CUT IT SHORT.
+    ///
+    /// Four constructs break one or the other, and each is refused rather than
+    /// lexed. A RAW string holding a quote ends the literal early, so its
+    /// content is read as code — at ANY hash count, which review found the
+    /// two-spelling check missing: `r##"\"##;` desynchronises the toggle for
+    /// the rest of the region. A `'"'` char literal opens a string that
+    /// swallows the rest of the function. A BLOCK comment can hold a line that
+    /// begins `}`, which is where `region` stops. And a string SPANNING LINES
+    /// can hold one too — that is the truncation, and it is why every line
+    /// must close the strings it opens.
+    ///
+    /// The brace count is what proves the region is the whole item, and on its
+    /// own it does NOT: review appended
+    ///
+    /// ```ignore
+    /// const NOTE: &str = "usage:
+    /// }";
+    /// pub const OPENER: fn(&Path) -> io::Result<File> = |p| File::open(p);
+    /// ```
+    ///
+    /// at MODULE level, where every wrapper before it is balanced, so the
+    /// module's own brace is still the only one left open and the count read
+    /// 1 — with the handout sitting after the cut, scanned by nothing. It
+    /// takes all four refusals for the count to mean anything: with no
+    /// line-spanning string, no block comment and no brace char literal, a
+    /// `}` at column 0 is code closing the one brace the count says is open,
+    /// which is the item's own.
+    fn reads_as_plain_code(label: &str, region: &str, body: &str) {
+        // Over the STRING-STRIPPED body, or every message ending in the
+        // letter `r` is a raw string to this: review found `concat!("cannot
+        // open dir")` refused, and `"for"`, `"error"`, `"other"` and `"/usr"`
+        // with it. The strip is sound for the question — a real raw string
+        // still shows its `r` and its opening quote, since the strip keeps
+        // both delimiters and only drops what is between them.
+        assert!(
+            !opens_a_raw_string(&unstringed(body)),
+            "{label}: {region} holds a raw string, which the string strip \
+             cannot lex"
+        );
+        assert!(
+            !body.contains("/*"),
+            "{label}: {region} holds a block comment, which can hold the line \
+             that ends the item"
+        );
+        for spelling in REFUSED_CHARS {
+            assert!(
+                !body.contains(spelling),
+                "{label}: {region} holds the char literal {spelling}, which \
+                 the string strip or the brace count reads as punctuation"
+            );
+        }
+        // A string that does not close on its own line is what cuts a region
+        // short, and it is visible from the CUT side: the truncated body ends
+        // inside the literal. `unstringed` keeps both delimiters and drops the
+        // content, so an odd count of them is an unclosed one.
+        for (n, line) in body.lines().enumerate() {
+            assert_eq!(
+                unstringed(line).matches('"').count() % 2,
+                0,
+                "{label}: {region} line {} holds a string literal that does \
+                 not close on its own line: {line}",
+                n.saturating_add(1)
+            );
+        }
+        // …and the region is the WHOLE item. `region` cuts at the first line
+        // that is a lone `}`; counting braces outside strings is what notices
+        // a cut anywhere inside a wrapper, and the refusals above are what
+        // make the count sound at module level too.
+        let plain = unstringed(body);
+        let opened = plain.matches('{').count();
+        let closed = plain.matches('}').count();
+        assert_eq!(
+            opened.saturating_sub(closed),
+            1,
+            "{label}: {region} was cut short — {opened} `{{` and {closed} `}}` \
+             where the item's own opening brace should be the only one left"
+        );
+    }
+
+    /// Whether `body` opens a RAW string, at any hash count.
+    ///
+    /// `r"` and `r#"` were checked by name, and `r##"` — which
+    /// `builder`'s own gate bodies use — walked past both.
+    /// `text` with its comments gone and the CONTENT of its strings and char
+    /// literals blanked, in ONE pass — or `None` where it meets a construct it
+    /// does not lex.
+    ///
+    /// Two passes cannot do this soundly and this file had two: stripping
+    /// comments first reads a `//` INSIDE a string as a comment, and stripping
+    /// strings first reads a `"` inside a COMMENT as a string. Both are live
+    /// here — main.rs continues a string across lines — so the composed view
+    /// really was desynchronised, and review measured what that buys: a `mod
+    /// escape;` below the desynchronisation is invisible to the module count,
+    /// which still agrees, while the module compiles with a lint suppression
+    /// of its own.
+    ///
+    /// The region scans still REFUSE rather than lex, and that stays the rule
+    /// for a region: nineteen short wrappers can afford it. A whole FILE
+    /// cannot — main.rs holds sixteen char literals a counter would
+    /// desynchronise on, and refusing them would refuse this file.
+    ///
+    /// What it does not lex is a raw string and a block comment, and neither
+    /// is a caveat: it refuses both, none of the six compiled files holds
+    /// either (measured), and the refusal is what the raw-string check this
+    /// replaces could not state soundly.
+    fn plain_source(text: &str) -> Option<String> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0usize;
+        while let Some(&c) = chars.get(i) {
+            let next = chars.get(i.saturating_add(1)).copied();
+            if c == '/' && next == Some('/') {
+                while chars.get(i).is_some_and(|ch| *ch != '\n') {
+                    i = i.saturating_add(1);
+                }
+                continue;
+            }
+            if c == '/' && next == Some('*') {
+                return None;
+            }
+            // A raw string, at any hash count and under any prefix. The `r`
+            // must open one rather than end an identifier, or `for r"` — an
+            // ordinary string after a variable named `r` — refuses the file.
+            if c == 'r' || (matches!(c, 'b' | 'c') && next == Some('r')) {
+                let at = if c == 'r' { i } else { i.saturating_add(1) };
+                let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+                let opens = !at
+                    .checked_sub(1)
+                    .and_then(|p| chars.get(p))
+                    .is_some_and(|ch| ident(*ch));
+                let mut j = at.saturating_add(1);
+                while chars.get(j) == Some(&'#') {
+                    j = j.saturating_add(1);
+                }
+                if opens && chars.get(j) == Some(&'"') {
+                    return None;
+                }
+            }
+            if c == '\'' {
+                if let Some(len) = char_literal_len(&chars, i) {
+                    out.push_str("'x'");
+                    i = i.saturating_add(len);
+                    continue;
+                }
+            }
+            if c == '"' {
+                out.push('"');
+                i = i.saturating_add(1);
+                let mut esc = false;
+                while let Some(&ch) = chars.get(i) {
+                    i = i.saturating_add(1);
+                    if esc {
+                        esc = false;
+                    } else if ch == '\\' {
+                        esc = true;
+                    } else if ch == '"' {
+                        out.push('"');
+                        break;
+                    }
+                    // Newlines survive so what is left has the line structure
+                    // the file had, a continued string included.
+                    if ch == '\n' {
+                        out.push('\n');
+                    }
+                }
+                continue;
+            }
+            out.push(c);
+            i = i.saturating_add(1);
+        }
+        Some(out)
+    }
+
+    /// The length in CHARS of the char literal at `at`, or `None` where that
+    /// `'` opens a LIFETIME or a label.
+    ///
+    /// Decided by LOOKAHEAD, as rustc decides it: a literal is one character
+    /// or one escape between two quotes, and a lifetime has no closing quote.
+    /// `builder`'s `lex` carries the same function for the same reason —
+    /// neither crate may depend on the other, both being their own workspace.
+    fn char_literal_len(chars: &[char], at: usize) -> Option<usize> {
+        let get = |n: usize| chars.get(at.saturating_add(n)).copied();
+        let hex = |n: usize| get(n).is_some_and(|c| c.is_ascii_hexdigit());
+        if get(0) != Some('\'') {
+            return None;
+        }
+        let close = match get(1)? {
+            '\\' => match get(2)? {
+                'x' if hex(3) && hex(4) => 5,
+                'x' => return None,
+                'u' => {
+                    if get(3) != Some('{') {
+                        return None;
+                    }
+                    let digits = (4..10).take_while(|n| hex(*n)).count();
+                    let end = 4usize.saturating_add(digits);
+                    if get(end) != Some('}') {
+                        return None;
+                    }
+                    end.saturating_add(1)
+                }
+                _ => 3,
+            },
+            '\'' | '\n' | '\r' | '\t' => return None,
+            _ => 2,
+        };
+        (get(close) == Some('\'')).then(|| close.saturating_add(1))
+    }
+
+    fn opens_a_raw_string(body: &str) -> bool {
+        let chars: Vec<char> = body.chars().collect();
+        chars.iter().enumerate().any(|(at, c)| {
+            if *c != 'r' {
+                return false;
+            }
+            let mut j = at.saturating_add(1);
+            while chars.get(j) == Some(&'#') {
+                j = j.saturating_add(1);
+            }
+            chars.get(j) == Some(&'"')
+        })
+    }
+
     /// How many wrappers were checked, so the caller can refuse a run that
     /// checked none.
+    ///
+    /// A marker's PRESENCE is what this reads, not that the error carries it.
+    /// `let _ = path.display(); File::open(path)` names the path and returns
+    /// the bare error, and review wrote it green. Closing that needs the
+    /// naming tied to the value returned, which is a question about
+    /// expressions rather than about text; the limit is recorded rather than
+    /// papered over.
     fn names_every_path(label: &str, region: &str, body: &str) -> usize {
+        let pieces = functions(body);
+        // EVERY `fn` in the region is one of them. Without this the
+        // enumeration counts only what it could parse, so a spelling it stops
+        // at is a wrapper that vanishes rather than one that reds — the same
+        // "count only what they were handed" failure the compiled-file list
+        // has, one layer down, and the shape three separate rounds of review
+        // walked out through (`fn  x`, a name on the next line, `x (`,
+        // `x<T>(`). Pinned against the KEYWORDS rather than against a number,
+        // so it holds however many wrappers there come to be.
+        let keywords = {
+            let plain = unstringed(body);
+            let mut count = 0usize;
+            let mut from = 0usize;
+            while let Some(hit) = plain.get(from..).and_then(|rest| index_of(rest, "fn")) {
+                let at = from.saturating_add(hit);
+                from = at.saturating_add("fn".len());
+                let before = plain.get(..at).and_then(|t| t.chars().next_back());
+                let after = plain.get(from..).and_then(|t| t.chars().next());
+                let ident = |c: char| c.is_alphanumeric() || c == '_';
+                if !before.is_some_and(ident) && !after.is_some_and(ident) {
+                    count = count.saturating_add(1);
+                }
+            }
+            count
+        };
+        assert_eq!(
+            pieces.len(),
+            keywords,
+            "{label}: {region} declares {keywords} functions and this read \
+             {} — a spelling this enumeration stops at is a wrapper nothing \
+             below ever asks to name its path",
+            pieces.len()
+        );
         let mut checked = 0;
-        for piece in functions(body) {
+        for piece in pieces {
             // A trait's method SIGNATURE has no body to name anything in.
             // Its piece runs on to the next declaration, so holding a `{` does
             // not tell the two apart — which comes FIRST does.
@@ -2508,7 +3347,7 @@ mod tests {
                 continue;
             }
             checked += 1;
-            let body = unspaced(piece);
+            let body = unspaced(&unstringed(piece));
             // The one wrapper whose error never becomes a message is exempt
             // BY NAME, because a shape was tried twice and broken twice: a
             // bare `.ok()` anywhere excused every path in the function, and
@@ -2550,19 +3389,78 @@ mod tests {
 
     /// The functions `body` declares, cut at each `fn NAME(` rather than at
     /// each `fn `, so a string or a name ending in `fn` opens nothing.
+    ///
+    /// A RAW identifier is a name too. `pub fn r#open_raw(path: &Path)` is a
+    /// wrapper the enumeration stopped reading at the `#`, so it declared no
+    /// path, was never counted, and could return the bare error while the
+    /// pinned count stayed right — review's, and the same class as every
+    /// spelling that drove the roster to clippy.
     fn functions(body: &str) -> Vec<&str> {
         let mut heads = Vec::new();
         let mut from = 0;
-        while let Some(hit) = body.get(from..).and_then(|rest| index_of(rest, "fn ")) {
-            let after = from + hit + "fn ".len();
+        while let Some(hit) = body.get(from..).and_then(|rest| index_of(rest, "fn")) {
+            let at = from.saturating_add(hit);
+            let after = at.saturating_add("fn".len());
             from = after;
-            let tail = body.get(after..).unwrap_or_default();
+            // `fn` as a WORD, and whatever whitespace follows it. The literal
+            // `fn ` was the keyword plus exactly one space, so `pub fn  name`
+            // and a `fn` with its name on the next line — both valid, and the
+            // second is what `rustfmt` writes for a long one — declared a
+            // wrapper this enumeration never saw: no name, no path, never
+            // counted, and the pinned nineteen still right. Review's.
+            let before = body.get(..at).and_then(|t| t.chars().next_back());
+            if before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                continue;
+            }
+            let spaced = body.get(after..).unwrap_or_default();
+            if !spaced.starts_with(char::is_whitespace) {
+                continue;
+            }
+            let tail = spaced.trim_start();
+            // The piece begins at the NAME, as it did when the keyword and
+            // its one space were matched together.
+            let name_at = after.saturating_add(spaced.len().saturating_sub(tail.len()));
+            let tail = tail.strip_prefix("r#").unwrap_or(tail);
             let name: String = tail
                 .chars()
                 .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
                 .collect();
-            if !name.is_empty() && tail.get(name.len()..).is_some_and(|r| r.starts_with('(')) {
-                heads.push(after);
+            // WHITESPACE and a GENERIC LIST both sit between a name and its
+            // arguments, and requiring the `(` to touch the name stopped this
+            // enumeration at either: `open_spaced (path: &Path)` and
+            // `open_generic<T>(path: &Path, _t: T)` are wrappers it never
+            // saw, so neither declared a path, neither was counted, and both
+            // could hand back the bare error with the pinned count still
+            // right. Review's, and the mirror of the two spellings the round
+            // before — which is why the count below is now pinned to the
+            // `fn`s in the region rather than to what this returns.
+            let rest = tail.get(name.len()..).unwrap_or_default().trim_start();
+            let rest = match rest.strip_prefix('<') {
+                Some(generics) => {
+                    let mut depth = 1usize;
+                    let mut end = generics.len();
+                    let mut prev = '<';
+                    for (i, c) in generics.char_indices() {
+                        match c {
+                            '<' => depth = depth.saturating_add(1),
+                            // Not the `>` of a `->`, which closes nothing.
+                            '>' if prev != '-' => {
+                                depth = depth.saturating_sub(1);
+                                if depth == 0 {
+                                    end = i.saturating_add(1);
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        prev = c;
+                    }
+                    generics.get(end..).unwrap_or_default().trim_start()
+                }
+                None => rest,
+            };
+            if !name.is_empty() && rest.starts_with('(') {
+                heads.push(name_at);
             }
         }
         let mut out = Vec::new();
@@ -2579,21 +3477,75 @@ mod tests {
         code.chars().filter(|ch| !ch.is_whitespace()).collect()
     }
 
+    /// `code` with the CONTENTS of its string literals removed.
+    ///
+    /// A marker inside a MESSAGE answers for the code otherwise. Review wrote
+    /// `format!("open failed, see .at(path) below: {error}")` into a wrapper
+    /// that named nothing and watched it pass: `uncommented` takes comments
+    /// and nothing took strings, so the prose satisfied a check the code did
+    /// not. Every naming this looks for is CODE — `.at(path)`,
+    /// `named(error, path)`, `path.display()` — so dropping string content can
+    /// only lose a fake one.
+    ///
+    /// A plain quote TOGGLE, which is sound only because
+    /// `reads_as_plain_code` has refused the two constructs that break one.
+    fn unstringed(code: &str) -> String {
+        let mut out = String::with_capacity(code.len());
+        let mut in_str = false;
+        let mut esc = false;
+        for ch in code.chars() {
+            if in_str {
+                match ch {
+                    _ if esc => esc = false,
+                    '\\' => esc = true,
+                    '"' => {
+                        in_str = false;
+                        out.push(ch);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            if ch == '"' {
+                in_str = true;
+            }
+            out.push(ch);
+        }
+        out
+    }
+
     /// The path parameters `piece` declares, read off its signature.
     ///
     /// By the TYPE naming `Path`, which is what a wrapper here writes and not
     /// what every path-taking parameter must be: `File::open` accepts an
-    /// `impl AsRef<Path>`, so a `&str` is a path too and this cannot tell.
-    /// The generic form is refused above; the concrete one is a limit, and a
-    /// small one now that it applies to seventeen short functions the
-    /// compiler has already fenced rather than to a whole crate.
+    /// `impl AsRef<Path>`, so a `&str` — or an `&OsStr`, the same class and
+    /// the same blind spot — is a path too and this cannot tell. The generic
+    /// form is refused above; the concrete one is a limit, and a small one now
+    /// that it applies to nineteen short functions the compiler has already
+    /// fenced rather than to a whole crate.
     fn path_parameters(piece: &str) -> Vec<String> {
-        let Some((signature, _)) = piece.split_once(')') else {
+        let Some((_, after)) = piece.split_once('(') else {
             return Vec::new();
         };
-        let Some((_, arguments)) = signature.split_once('(') else {
-            return Vec::new();
-        };
+        // To the paren that CLOSES the list, not the first one inside it. A
+        // parenthesised parameter type — a tuple, or a function type — closes
+        // one of its own, and cutting there dropped every parameter after it,
+        // the `&Path` a wrapper must name included. Review measured a wrapper
+        // that took a path and was never asked to name it.
+        let mut depth = 0usize;
+        let mut end = after.len();
+        for (at, c) in after.char_indices() {
+            match c {
+                '(' => depth = depth.saturating_add(1),
+                ')' if depth == 0 => {
+                    end = at;
+                    break;
+                }
+                ')' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        let arguments = after.get(..end).unwrap_or_default();
         arguments
             .split(',')
             .filter(|argument| argument.contains("Path"))
@@ -2602,9 +3554,6 @@ mod tests {
             .filter(|name| !name.is_empty())
             .collect()
     }
-
-    /// How a path reaches a message.
-    const NAMINGS: [&str; 3] = [".at(", "named(", ".display()"];
 
     /// The ONE wrapper whose error never becomes a message, named rather than
     /// recognised.
@@ -2617,6 +3566,19 @@ mod tests {
     /// the text — the same reason a comment here cannot spell it either.
     fn index_of(haystack: &str, needle: &str) -> Option<usize> {
         haystack.match_indices(needle).next().map(|(index, _)| index)
+    }
+
+    /// The LAST index of `needle`, spelled without its method for the same
+    /// reason — the reverse one leaves a token the catalog scan reds on too.
+    ///
+    /// Walked rather than reversed: `MatchIndices` is only double-ended for a
+    /// pattern whose searcher can run backwards, which a `&str`'s cannot.
+    fn index_of_last(haystack: &str, needle: &str) -> Option<usize> {
+        let mut last = None;
+        for (index, _) in haystack.match_indices(needle) {
+            last = Some(index);
+        }
+        last
     }
 
     /// A KEY THAT IS NOT THERE COSTS NOTHING.
