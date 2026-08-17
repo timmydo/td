@@ -1799,15 +1799,15 @@ impl Scene {
     /// behind a sibling is not drawn either.
     ///
     /// The walk is BOUNDED rather than trusted to end, and the bound is
-    /// load-bearing rather than belt-and-braces: the server checks that a
-    /// popup's parent is an xdg_surface with a role object, which is NOT
-    /// enough to refuse a cycle. Destroying a popup hands its xdg_surface
-    /// back for another role, so a client that gives a menu's surface a fresh
-    /// popup parented on its own submenu closes the loop, and this is what
-    /// stops it — by drawing nothing, which is also what a client asking for
-    /// that deserves. Refusing it at the source is `xdg_wm_base`'s
-    /// `not_the_topmost_popup` and a parent-chain check, neither of which is
-    /// here yet.
+    /// LOAD-BEARING. A popup's parent is a wl_surface id, and ids are recycled
+    /// — td retires them with `wl_display.delete_id` precisely so a client may
+    /// — so a client that destroys the window a menu hangs off, lets its
+    /// surface id be reissued, and parents a fresh popup on that menu's own
+    /// submenu closes the loop. Nothing guards a TOPLEVEL's destroy the way
+    /// `not_the_topmost_popup` guards a popup's, and while a wl_surface's own
+    /// role lock survives its xdg_surface — so the same surface cannot take a
+    /// second one — it dies with the SURFACE, and a reissued id arrives with
+    /// no history at all. This is what stops it, by drawing nothing.
     fn popup_rect(&self, key: SurfaceKey, placements: &[Placement]) -> Option<ImageRect> {
         let mut chain = Vec::with_capacity(MAX_POPUP_DEPTH);
         let mut at = key;

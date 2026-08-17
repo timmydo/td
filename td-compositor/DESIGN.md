@@ -953,13 +953,33 @@ destroyed toplevel does: one left initialised says the first configure has been
 sent, so the next role on that xdg_surface would never get one and a client
 waiting on it hangs with no window.
 
-The chain walk is bounded rather than trusted to terminate, and that bound is
-load-bearing rather than belt-and-braces. td checks that a popup's parent is an
-xdg_surface with a role object, which does NOT refuse a cycle: destroying a
-popup hands its xdg_surface back for another role, so a client can close the
-loop, and the bound is what contains it — by drawing nothing.
+A ROLE is permanent where a role OBJECT is not. A client may destroy an
+xdg_toplevel and build another on the same xdg_surface — reusing the window it
+already measured — but the surface that carried a menu may not come back as a
+window and be tiled, nor a window's as a menu. And a menu may not be destroyed
+while a submenu hangs off it: that is the protocol's `not_the_topmost_popup`,
+which for a tree is a popup with a live child.
 
-Five parts are deliberately NOT here yet, and each is a landing of its own.
+Neither of those makes a popup CYCLE unbuildable, and it is worth writing down
+why not, because the argument that they do is nearly right. A popup's parent
+must already hold a role object when the popup is created, so the edge points
+at something OLDER — which would make the graph a forest if the edge named a
+surface. It names an ID. Ids are recycled, td retires them with
+`wl_display.delete_id` precisely so a client may, and nothing guards a
+TOPLEVEL's destroy the way `not_the_topmost_popup` guards a popup's. So a
+client can destroy the window a menu hangs off, wait for its surface id to come
+back, and parent a fresh popup on that menu's own submenu: the ids close a loop
+that the surfaces never did. The renderer's depth bound is therefore still
+LOAD-BEARING rather than defence in depth.
+
+That stale id is not only a cycle. The same reuse re-parents a menu onto a
+window that never opened it, and makes `not_the_topmost_popup` fire for a popup
+whose "child" is a dead reference to a recycled number — a client disconnected
+for destroying a menu that has nothing hanging off it. Stamping a surface with
+a generation and refusing to place a popup whose parent's generation has moved
+is the fix, and it is its own landing.
+
+Four parts are deliberately NOT here yet, and each is a landing of its own.
 **Constraint adjustment** is recorded and not acted on: every bit of it is
 permission for td to move a popup that does not fit, so a menu near an edge
 extends past it rather than sliding or flipping. **Grabs** are accepted and not
@@ -968,23 +988,23 @@ and a client that expects a click outside to close its menu must notice and
 destroy it. **Dismissal is never SIGNALLED**: nothing sends
 `xdg_popup.popup_done`, so when td stops drawing a menu because its window was
 stacked away or its workspace switched, the client still believes the menu is
-open and it reappears on return. **Refusing a cycle at the source** needs
-`not_the_topmost_popup` on destroy and a parent-chain check at `get_popup`; the
-renderer's bound stands in for both. **Reposition** is version 3 and out of
-reach at the `xdg_wm_base` version td advertises. td also refuses a NULL
-parent, which the protocol permits only so that another protocol may supply one
-before the first commit: td implements no such protocol, so a popup that
-arrived that way could never be placed at all. A zero-area anchor rectangle IS
-accepted, against the protocol's "non-zero anchor rectangle": it names a point
-perfectly well, and disconnecting a client over a rule with a defined answer is
-the worse reading.
+open and it reappears on return. **Reposition** is version 3 and out of reach
+at the `xdg_wm_base` version td advertises. td also refuses a NULL parent,
+which the protocol permits only so that another protocol may supply one before
+the first commit: td implements no such protocol, so a popup that arrived that
+way could never be placed at all. A zero-area anchor rectangle IS accepted,
+against the protocol's "non-zero anchor rectangle": it names a point perfectly
+well, and disconnecting a client over a rule with a defined answer is the worse
+reading.
 
-Two protocol errors are raised on the wrong OBJECT and it is recorded rather
-than hidden: `invalid_popup_parent` and `invalid_positioner` belong to
-`xdg_wm_base`, and td posts them against the xdg_surface, where codes 3 and 5
-are `unconfigured_buffer` and `invalid_size`. The client is disconnected either
-way; what it decodes about why is wrong. Carrying the shell object's id on the
-xdg_surface is the fix and lands with the conformance items above.
+An error is posted against an OBJECT, so an error whose code belongs to another
+interface has to name that interface's object. Five codes are `xdg_wm_base`'s
+and only `defunct_surfaces` is raised from a request that arrives at one:
+`invalid_popup_parent`, `invalid_positioner` and `role` arrive at an
+xdg_surface, where 3 and 5 are `unconfigured_buffer` and `invalid_size`, and
+`not_the_topmost_popup` arrives at an xdg_popup, whose only code is
+`invalid_grab`. Each xdg_surface therefore carries the shell object it was made
+by, and `defunct_surfaces` needs no override at all.
 
 The boot profile starts one `td-term` toplevel; a `td-ui-demo` toplevel is
 reached from the launcher instead, and the conformance below is its. It

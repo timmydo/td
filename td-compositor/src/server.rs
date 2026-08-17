@@ -33,22 +33,28 @@ const GLOBAL_XDG_WM_BASE: u32 = 4;
 const GLOBAL_SEAT: u32 = 5;
 const GLOBAL_DECORATION: u32 = 6;
 const WL_DISPLAY_ERROR_IMPLEMENTATION: u32 = 3;
-/// Two of `xdg_surface.error`, each named by the protocol for exactly the
-/// mistake it is raised for: a `set_window_geometry` whose width or height is
-/// not positive, and any request to an xdg_surface that has no role object yet.
+/// Three of `xdg_surface.error`, each named by the protocol for exactly the
+/// mistake it is raised for: a request to an xdg_surface that has no role
+/// object yet, a second role object on one that already has one, and a
+/// `set_window_geometry` whose width or height is not positive.
 /// Raised in place of the `implementation` code every other refusal here
 /// carries, because these are mistakes the protocol has words for — and the
-/// word is what tells a toolkit author which of the two it made. The enum
+/// word is what tells a toolkit author which of them it made. The enum
 /// carries no `since`, so neither code is gated on the `xdg_wm_base` version a
 /// client bound; a client that does not recognise the number still reads the
 /// message beside it, which spells the same thing out.
 const XDG_SURFACE_ERROR_NOT_CONSTRUCTED: u32 = 1;
+const XDG_SURFACE_ERROR_ALREADY_CONSTRUCTED: u32 = 2;
 const XDG_SURFACE_ERROR_INVALID_SIZE: u32 = 5;
-/// A rule a popup cannot be placed by. `invalid_input` is the positioner's own
-/// error and is raised ON the positioner, since that is the object the client
-/// got wrong; the two `xdg_wm_base` codes belong to the shell object, and both
-/// are about the `get_popup` that used one rather than about the positioner.
+/// `invalid_input` is the positioner's own error and is raised ON the
+/// positioner, since that is the object the client got wrong. The five
+/// `xdg_wm_base` codes belong to the SHELL object and are raised on it
+/// wherever the request that broke the rule arrived — which for all but
+/// `defunct_surfaces` is some other object.
 const XDG_POSITIONER_ERROR_INVALID_INPUT: u32 = 0;
+const XDG_WM_BASE_ERROR_ROLE: u32 = 0;
+const XDG_WM_BASE_ERROR_DEFUNCT_SURFACES: u32 = 1;
+const XDG_WM_BASE_ERROR_NOT_THE_TOPMOST_POPUP: u32 = 2;
 const XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT: u32 = 3;
 const XDG_WM_BASE_ERROR_INVALID_POSITIONER: u32 = 5;
 const XDG_POPUP_CONFIGURE: u16 = 0;
@@ -162,14 +168,38 @@ enum RoleObject {
     Popup(u32),
 }
 
+/// WHICH role an xdg_surface was given, without the object that carried it.
+/// A role is permanent — the protocol says so of a wl_surface's — and the role
+/// object is not: destroying an xdg_toplevel hands the xdg_surface back, and a
+/// client may build another. What it may not do is build a DIFFERENT one, so
+/// this outlives the object and `role_object` cannot answer it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RoleKind {
+    Toplevel,
+    Popup,
+}
+
+impl RoleKind {
+    fn interface(self) -> &'static str {
+        match self {
+            RoleKind::Toplevel => "xdg_toplevel",
+            RoleKind::Popup => "xdg_popup",
+        }
+    }
+}
+
 impl RoleObject {
     /// What a diagnostic calls it. The protocol names the interface in its own
     /// errors, and a client told "before its xdg_toplevel" when it destroyed a
     /// popup has been told about the wrong object.
     fn interface(self) -> &'static str {
+        self.kind().interface()
+    }
+
+    fn kind(self) -> RoleKind {
         match self {
-            RoleObject::Toplevel(_) => "xdg_toplevel",
-            RoleObject::Popup(_) => "xdg_popup",
+            RoleObject::Toplevel(_) => RoleKind::Toplevel,
+            RoleObject::Popup(_) => RoleKind::Popup,
         }
     }
 }
@@ -215,7 +245,20 @@ enum Object {
     XdgWmBase,
     XdgSurface {
         surface: u32,
+        /// The `xdg_wm_base` this came from. Carried because two of the
+        /// protocol errors an xdg_surface request can raise are the SHELL
+        /// object's, and an error is posted against an object: codes 3 and 5
+        /// on an xdg_surface are `unconfigured_buffer` and `invalid_size`, so
+        /// a client decoding one against the object it arrived on is told
+        /// something else entirely.
+        wm_base: u32,
         role_object: Option<RoleObject>,
+        /// Which role this xdg_surface has EVER been given. A role object may
+        /// be destroyed and replaced by another of the same kind — a client
+        /// reusing a window it already measured — but the role itself is
+        /// permanent, so a surface that was a popup may not come back as a
+        /// toplevel and be tiled.
+        assigned: Option<RoleKind>,
         configure: Arc<Mutex<ConfigureTracker>>,
         /// The window geometry a client has asked for and no commit has applied
         /// yet. Double-buffered because the protocol says so, and held on the
@@ -2527,6 +2570,26 @@ impl Client {
             Object::XdgWmBase => match message.opcode {
                 0 => {
                     args.finish()?;
+                    // The shell object outlives what it made. That is the
+                    // protocol's rule, and it is also what keeps the id each
+                    // xdg_surface carries meaningful: destroyed here, it would
+                    // be recycled, and an error raised later against "the
+                    // xdg_wm_base" would name whatever took the number.
+                    let child = self.objects.iter().find_map(|(id, object)| match object {
+                        Object::XdgSurface { wm_base, .. } if *wm_base == message.object => {
+                            Some(*id)
+                        }
+                        _ => None,
+                    });
+                    if let Some(child) = child {
+                        return self.fail_protocol(
+                            XDG_WM_BASE_ERROR_DEFUNCT_SURFACES,
+                            &format!(
+                                "xdg_wm_base {} is destroyed before xdg_surface {child}",
+                                message.object
+                            ),
+                        );
+                    }
                     self.remove_object(message.object)
                 }
                 2 => {
@@ -2548,7 +2611,9 @@ impl Client {
                         id,
                         Object::XdgSurface {
                             surface,
+                            wm_base: message.object,
                             role_object: None,
+                            assigned: None,
                             configure: Arc::new(Mutex::new(ConfigureTracker::new())),
                             pending_geometry: None,
                         },
@@ -2576,7 +2641,9 @@ impl Client {
             },
             Object::XdgSurface {
                 surface,
+                wm_base,
                 role_object,
+                assigned,
                 configure,
                 pending_geometry,
             } => match message.opcode {
@@ -2611,11 +2678,26 @@ impl Client {
                 1 => {
                     let new_toplevel = args.u32()?;
                     args.finish()?;
-                    if role_object.is_some() {
-                        return Err(format!(
-                            "xdg_surface {} already has a role object",
-                            message.object
-                        ));
+                    if let Some(existing) = role_object {
+                        return self.fail_protocol(
+                            XDG_SURFACE_ERROR_ALREADY_CONSTRUCTED,
+                            &format!(
+                                "xdg_surface {} already has an {}",
+                                message.object,
+                                existing.interface()
+                            ),
+                        );
+                    }
+                    if let Some(had) = assigned.filter(|had| *had != RoleKind::Toplevel) {
+                        return self.fail_protocol_on(
+                            wm_base,
+                            XDG_WM_BASE_ERROR_ROLE,
+                            &format!(
+                                "xdg_surface {} was {} and may not become an xdg_toplevel",
+                                message.object,
+                                had.interface()
+                            ),
+                        );
                     }
                     if !matches!(self.objects.get(&surface), Some(Object::Surface(_))) {
                         return Err(format!(
@@ -2654,7 +2736,9 @@ impl Client {
                         message.object,
                         Object::XdgSurface {
                             surface,
+                            wm_base,
                             role_object: Some(RoleObject::Toplevel(new_toplevel)),
+                            assigned: Some(RoleKind::Toplevel),
                             configure,
                             // Necessarily None — a geometry before this request
                             // is refused — and carried rather than written as
@@ -2734,11 +2818,26 @@ impl Client {
                     let parent = args.u32()?;
                     let positioner = args.u32()?;
                     args.finish()?;
-                    if role_object.is_some() {
-                        return Err(format!(
-                            "xdg_surface {} already has a role object",
-                            message.object
-                        ));
+                    if let Some(existing) = role_object {
+                        return self.fail_protocol(
+                            XDG_SURFACE_ERROR_ALREADY_CONSTRUCTED,
+                            &format!(
+                                "xdg_surface {} already has an {}",
+                                message.object,
+                                existing.interface()
+                            ),
+                        );
+                    }
+                    if let Some(had) = assigned.filter(|had| *had != RoleKind::Popup) {
+                        return self.fail_protocol_on(
+                            wm_base,
+                            XDG_WM_BASE_ERROR_ROLE,
+                            &format!(
+                                "xdg_surface {} was {} and may not become an xdg_popup",
+                                message.object,
+                                had.interface()
+                            ),
+                        );
                     }
                     if !matches!(self.objects.get(&surface), Some(Object::Surface(_))) {
                         return Err(format!(
@@ -2755,7 +2854,8 @@ impl Client {
                         ..
                     }) = self.objects.get(&parent).cloned()
                     else {
-                        return self.fail_protocol(
+                        return self.fail_protocol_on(
+                            wm_base,
                             XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT,
                             &format!(
                                 "xdg_popup {id} names {parent}, which is no xdg_surface of this client"
@@ -2766,7 +2866,8 @@ impl Client {
                     // xdg_popup itself" — and a parent with no role object at
                     // all cannot have been.
                     if parent_role.is_none() {
-                        return self.fail_protocol(
+                        return self.fail_protocol_on(
+                            wm_base,
                             XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT,
                             &format!("xdg_popup {id} names unconstructed xdg_surface {parent}"),
                         );
@@ -2781,7 +2882,8 @@ impl Client {
                     // client may reuse or destroy the positioner immediately,
                     // and nothing placed by it may move afterwards.
                     let Some(rect) = rules.resolve() else {
-                        return self.fail_protocol(
+                        return self.fail_protocol_on(
+                            wm_base,
                             XDG_WM_BASE_ERROR_INVALID_POSITIONER,
                             &format!(
                                 "xdg_popup {id} was given an incomplete xdg_positioner {positioner}"
@@ -2800,7 +2902,9 @@ impl Client {
                         message.object,
                         Object::XdgSurface {
                             surface,
+                            wm_base,
                             role_object: Some(RoleObject::Popup(id)),
+                            assigned: Some(RoleKind::Popup),
                             configure,
                             // Carried rather than cleared, for `get_toplevel`'s
                             // reason: this write-back says nothing about state
@@ -2932,14 +3036,32 @@ impl Client {
             Object::XdgPopup { xdg_surface, .. } => match message.opcode {
                 0 => {
                     args.finish()?;
-                    let Some(Object::XdgSurface { surface, .. }) =
-                        self.objects.get(&xdg_surface).cloned()
+                    let Some(Object::XdgSurface {
+                        surface, wm_base, ..
+                    }) = self.objects.get(&xdg_surface).cloned()
                     else {
                         return Err(format!(
                             "xdg_popup {} lost xdg_surface {xdg_surface}",
                             message.object
                         ));
                     };
+                    // The protocol's `not_the_topmost_popup`, which for a TREE
+                    // is a popup with a live child: destroying it would leave a
+                    // submenu hanging off a menu that has gone.
+                    let child = self.objects.iter().find_map(|(id, object)| match object {
+                        Object::XdgPopup { parent, .. } if *parent == surface => Some(*id),
+                        _ => None,
+                    });
+                    if let Some(child) = child {
+                        return self.fail_protocol_on(
+                            wm_base,
+                            XDG_WM_BASE_ERROR_NOT_THE_TOPMOST_POPUP,
+                            &format!(
+                                "xdg_popup {} is destroyed before xdg_popup {child}, which hangs off it",
+                                message.object
+                            ),
+                        );
+                    }
                     self.remove_object(message.object)?;
                     self.unmap_popup(surface)?;
                     let Some(Object::XdgSurface {
@@ -2997,6 +3119,8 @@ impl Client {
                     }
                     let Some(Object::XdgSurface {
                         surface,
+                        wm_base,
+                        assigned,
                         pending_geometry,
                         ..
                     }) = self.objects.get(&xdg_surface).cloned()
@@ -3023,13 +3147,17 @@ impl Client {
                         xdg_surface,
                         Object::XdgSurface {
                             surface,
+                            wm_base,
                             role_object: None,
+                            // The ROLE outlives the role object: a second
+                            // toplevel here is a client reusing the window it
+                            // already measured, and a popup would be a
+                            // different role on a surface that already has one.
+                            assigned,
                             configure: Arc::new(Mutex::new(ConfigureTracker::new())),
                             // Carried where the tracker is replaced: a geometry
                             // is the xdg_surface's for as long as the object
-                            // lives, and this one is still here. A second
-                            // toplevel on it is a client reusing the window it
-                            // already measured.
+                            // lives, and this one is still here.
                             pending_geometry,
                         },
                     );
@@ -5740,7 +5868,9 @@ mod tests {
                 9,
                 Object::XdgSurface {
                     surface: 5,
+                    wm_base: 50,
                     role_object: Some(RoleObject::Toplevel(10)),
+                    assigned: Some(RoleKind::Toplevel),
                     configure: Arc::new(Mutex::new(ConfigureTracker::new())),
                     pending_geometry: None,
                 },
@@ -5821,12 +5951,20 @@ mod tests {
         client
             .insert(5, Object::Surface(SurfaceState::default()))
             .unwrap();
+        // A REAL shell object, and deliberately not 12: the decoration tests
+        // give that id a decoration, so a fixture claiming it as the surface's
+        // xdg_wm_base would have the error tests agreeing with a number that
+        // names the wrong interface. Two fixtures with two shell objects is
+        // also what makes "the error names the surface's OWN one" testable.
+        client.insert(50, Object::XdgWmBase).unwrap();
         client
             .insert(
                 9,
                 Object::XdgSurface {
                     surface: 5,
+                    wm_base: 50,
                     role_object: Some(RoleObject::Toplevel(10)),
+                    assigned: Some(RoleKind::Toplevel),
                     configure: Arc::new(Mutex::new(ConfigureTracker::new())),
                     pending_geometry: None,
                 },
@@ -6601,7 +6739,9 @@ mod tests {
             9,
             Object::XdgSurface {
                 surface: 5,
+                wm_base: 50,
                 role_object: None,
+                assigned: None,
                 configure: Arc::new(Mutex::new(ConfigureTracker::new())),
                 pending_geometry: None,
             },
@@ -6752,7 +6892,9 @@ mod tests {
                 9,
                 Object::XdgSurface {
                     surface: 5,
+                    wm_base: 50,
                     role_object: Some(RoleObject::Toplevel(10)),
+                    assigned: Some(RoleKind::Toplevel),
                     configure: Arc::clone(&tracker),
                     pending_geometry: None,
                 },
@@ -7010,7 +7152,9 @@ mod tests {
                 9,
                 Object::XdgSurface {
                     surface: 5,
+                    wm_base: 50,
                     role_object: Some(RoleObject::Toplevel(10)),
+                    assigned: Some(RoleKind::Toplevel),
                     configure: Arc::new(Mutex::new(configure)),
                     pending_geometry: None,
                 },
@@ -7956,7 +8100,9 @@ mod tests {
                 9,
                 Object::XdgSurface {
                     surface: 5,
+                    wm_base: 50,
                     role_object: Some(RoleObject::Toplevel(10)),
+                    assigned: Some(RoleKind::Toplevel),
                     configure: Arc::new(Mutex::new(configure)),
                     pending_geometry: None,
                 },
@@ -8412,6 +8558,9 @@ mod tests {
             client.protocol_error_code,
             XDG_WM_BASE_ERROR_INVALID_POSITIONER
         );
+        // Raised on the `xdg_wm_base`, which is whose error code this is. On
+        // the xdg_surface the request arrived at, 5 is `invalid_size`.
+        assert_eq!(client.protocol_error_object, Some(12));
         // Nothing was created for a popup that was refused.
         assert!(!client.objects.contains_key(&14));
 
@@ -8433,6 +8582,9 @@ mod tests {
             client.protocol_error_code,
             XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT
         );
+        // The shell object's code, so the shell object's error: 3 on the
+        // xdg_surface would decode as `unconfigured_buffer`.
+        assert_eq!(client.protocol_error_object, Some(12));
 
         // An xdg_surface with no role object of its own cannot have been
         // mapped, so it cannot be a parent either. Object 13 is the popup's own
@@ -8443,6 +8595,341 @@ mod tests {
             client.protocol_error_code,
             XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT
         );
+        assert_eq!(client.protocol_error_object, Some(12));
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// A ROLE is permanent where a role OBJECT is not. A client may destroy an
+    /// xdg_toplevel and build another — reusing the window it already measured
+    /// — but the surface that carried a menu may not come back as a window and
+    /// be tiled, nor a window's as a menu.
+    #[test]
+    fn a_surfaces_role_outlives_the_role_object_that_carried_it() {
+        let (mut client, _peer, _runtime, framebuffer_path) = popup_fixture("popup-role");
+        menu_rules(&mut client);
+        get_popup(&mut client, 14, 9, 30).unwrap();
+        client
+            .dispatch(
+                request(14, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        // The xdg_surface is roleless again — and still a popup's.
+        let mut toplevel = wire::Builder::new();
+        toplevel.u32(15);
+        let error = client
+            .dispatch(request(13, 1, toplevel).unwrap(), &mut VecDeque::new())
+            .unwrap_err();
+        assert!(error.contains("xdg_popup"), "{error}");
+        assert_eq!(client.protocol_error_code, XDG_WM_BASE_ERROR_ROLE);
+        assert_eq!(client.protocol_error_object, Some(12));
+        assert!(!client.objects.contains_key(&15));
+
+        // A second popup on it IS allowed: the role is the same one.
+        get_popup(&mut client, 16, 9, 30).unwrap();
+
+        // Again from a surface made by a DIFFERENT shell object, because the
+        // refusal has to name the one this surface came from rather than
+        // whichever id the fixture happens to use everywhere.
+        client.insert(51, Object::XdgWmBase).unwrap();
+        client
+            .insert(24, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        let mut second = wire::Builder::new();
+        second.u32(25);
+        second.u32(24);
+        client
+            .dispatch(request(51, 2, second).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut popup = wire::Builder::new();
+        popup.u32(26);
+        popup.u32(9);
+        popup.u32(30);
+        client
+            .dispatch(request(25, 2, popup).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(26, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        let mut toplevel = wire::Builder::new();
+        toplevel.u32(27);
+        let error = client
+            .dispatch(request(25, 1, toplevel).unwrap(), &mut VecDeque::new())
+            .unwrap_err();
+        assert!(error.contains("xdg_popup"), "{error}");
+        assert_eq!(client.protocol_error_code, XDG_WM_BASE_ERROR_ROLE);
+        assert_eq!(client.protocol_error_object, Some(51));
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// And the same rule the other way round, which is the direction that
+    /// would put a former menu into the layout.
+    #[test]
+    fn a_windows_surface_may_not_come_back_as_a_menu() {
+        let (mut client, _peer, _runtime, framebuffer_path) = popup_fixture("popup-role-back");
+        // Object 10 is the toplevel on xdg_surface 9; destroying it leaves the
+        // xdg_surface roleless, as a client reusing a window does.
+        client
+            .dispatch(
+                request(10, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        menu_rules(&mut client);
+        let mut popup = wire::Builder::new();
+        popup.u32(14);
+        popup.u32(13);
+        popup.u32(30);
+        let error = client
+            .dispatch(request(9, 2, popup).unwrap(), &mut VecDeque::new())
+            .unwrap_err();
+        assert!(error.contains("xdg_toplevel"), "{error}");
+        assert_eq!(client.protocol_error_code, XDG_WM_BASE_ERROR_ROLE);
+        // xdg_surface 9's own shell object, which is NOT the one the popup
+        // surfaces were made by: the id is the surface's rather than a
+        // constant every error happens to agree with.
+        assert_eq!(client.protocol_error_object, Some(50));
+        assert!(!client.objects.contains_key(&14));
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// The toplevel half of role permanence, driven through `get_toplevel`
+    /// over the wire rather than from a fixture that hand-writes the record.
+    /// Every other test starts from an xdg_surface whose `assigned` was
+    /// inserted by the fixture, so the write in `get_toplevel` itself was
+    /// pinned by nothing and a mutation of it survived the suite.
+    #[test]
+    fn a_toplevel_records_the_role_its_surface_may_come_back_as() {
+        let (mut client, _peer, _runtime, framebuffer_path) = popup_fixture("popup-role-wire");
+        client
+            .insert(20, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        let mut xdg_surface = wire::Builder::new();
+        xdg_surface.u32(21);
+        xdg_surface.u32(20);
+        client
+            .dispatch(request(12, 2, xdg_surface).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut toplevel = wire::Builder::new();
+        toplevel.u32(22);
+        client
+            .dispatch(request(21, 1, toplevel).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(22, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+
+        // Roleless again, and still a window's.
+        menu_rules(&mut client);
+        let mut popup = wire::Builder::new();
+        popup.u32(23);
+        popup.u32(13);
+        popup.u32(30);
+        let error = client
+            .dispatch(request(21, 2, popup).unwrap(), &mut VecDeque::new())
+            .unwrap_err();
+        assert!(error.contains("xdg_toplevel"), "{error}");
+        assert_eq!(client.protocol_error_code, XDG_WM_BASE_ERROR_ROLE);
+        assert_eq!(client.protocol_error_object, Some(12));
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// A role request on an xdg_surface that still HOLDS one is
+    /// `already_constructed`, the xdg_surface's own error — this being the
+    /// case a buggy toolkit actually reaches, where the permanent-role rule
+    /// above is about a surface whose role object has gone.
+    #[test]
+    fn a_second_role_object_on_one_xdg_surface_is_already_constructed() {
+        let (mut client, _peer, _runtime, framebuffer_path) = popup_fixture("popup-second-role");
+        menu_rules(&mut client);
+        get_popup(&mut client, 14, 9, 30).unwrap();
+
+        let mut toplevel = wire::Builder::new();
+        toplevel.u32(15);
+        let error = client
+            .dispatch(request(13, 1, toplevel).unwrap(), &mut VecDeque::new())
+            .unwrap_err();
+        assert!(error.contains("already has an xdg_popup"), "{error}");
+        assert_eq!(
+            client.protocol_error_code,
+            XDG_SURFACE_ERROR_ALREADY_CONSTRUCTED
+        );
+        // The xdg_surface's OWN error, so raised on the xdg_surface: no object
+        // override, which is what `None` here means.
+        assert_eq!(client.protocol_error_object, None);
+        assert!(!client.objects.contains_key(&15));
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// The numbers the shell is spoken in, pinned by VALUE, exactly as
+    /// `the_decoration_protocol_numbers_are_the_protocols` pins the
+    /// decoration's. Every other test compares what went out against these
+    /// same constants, so one that agrees with the code and not with the
+    /// protocol is one they would all still pass — while the client on the
+    /// other end, which knows the real numbers, decodes something else. That
+    /// misdecoding is the whole subject of this commit, so leaving four fresh
+    /// numbers unpinned would be the same bug by another route.
+    #[test]
+    fn the_shell_protocol_numbers_are_the_protocols() {
+        assert_eq!(XDG_WM_BASE_ERROR_ROLE, 0);
+        assert_eq!(XDG_WM_BASE_ERROR_DEFUNCT_SURFACES, 1);
+        assert_eq!(XDG_WM_BASE_ERROR_NOT_THE_TOPMOST_POPUP, 2);
+        assert_eq!(XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT, 3);
+        assert_eq!(XDG_WM_BASE_ERROR_INVALID_POSITIONER, 5);
+        assert_eq!(XDG_SURFACE_ERROR_NOT_CONSTRUCTED, 1);
+        assert_eq!(XDG_SURFACE_ERROR_ALREADY_CONSTRUCTED, 2);
+        assert_eq!(XDG_SURFACE_ERROR_INVALID_SIZE, 5);
+        assert_eq!(XDG_POSITIONER_ERROR_INVALID_INPUT, 0);
+        assert_eq!(XDG_POPUP_CONFIGURE, 0);
+    }
+
+    /// The popup direction of `already_constructed`. Deleting the check is not
+    /// cosmetic: with the role KIND already popup the permanence rule below it
+    /// does not fire either, so a second `get_popup` would insert a second
+    /// xdg_popup and overwrite the role object — leaving the first one live,
+    /// orphaned, and named by nothing.
+    #[test]
+    fn a_second_popup_on_one_xdg_surface_is_already_constructed_too() {
+        let (mut client, _peer, _runtime, framebuffer_path) = popup_fixture("popup-second-popup");
+        menu_rules(&mut client);
+        get_popup(&mut client, 14, 9, 30).unwrap();
+
+        let error = get_popup(&mut client, 15, 9, 30).unwrap_err();
+        assert!(error.contains("already has an xdg_popup"), "{error}");
+        assert_eq!(
+            client.protocol_error_code,
+            XDG_SURFACE_ERROR_ALREADY_CONSTRUCTED
+        );
+        assert_eq!(client.protocol_error_object, None);
+        assert!(!client.objects.contains_key(&15));
+        // The first is untouched, and the xdg_surface still names IT.
+        assert!(matches!(
+            client.objects.get(&13),
+            Some(Object::XdgSurface {
+                role_object: Some(RoleObject::Popup(14)),
+                ..
+            })
+        ));
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// An `xdg_wm_base` outlives the xdg_surfaces it made. That is the
+    /// protocol's `defunct_surfaces`, and it is what keeps the id each
+    /// xdg_surface carries meaningful: destroyed early it would be recycled,
+    /// and an error later raised against "the xdg_wm_base" would name whatever
+    /// took the number — the exact misdecoding naming it exists to prevent.
+    #[test]
+    fn a_shell_object_may_not_be_destroyed_before_its_surfaces() {
+        let (mut client, _peer, _runtime, framebuffer_path) = popup_fixture("popup-defunct");
+        let error = client
+            .dispatch(
+                request(12, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap_err();
+        assert!(error.contains("xdg_surface"), "{error}");
+        assert_eq!(
+            client.protocol_error_code,
+            XDG_WM_BASE_ERROR_DEFUNCT_SURFACES
+        );
+        // No override, so the error lands on the object the request arrived
+        // at — which for this one IS the xdg_wm_base. Posting it on the
+        // xdg_surface instead is the bug the rest of this commit removes.
+        assert_eq!(client.protocol_error_object, None);
+        assert!(client.objects.contains_key(&12));
+
+        // One that made nothing goes, so the refusal is about this shell
+        // object's OWN surfaces rather than about any surface existing.
+        client.insert(40, Object::XdgWmBase).unwrap();
+        client
+            .dispatch(
+                request(40, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(!client.objects.contains_key(&40));
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// A menu may not be destroyed while a submenu hangs off it — the
+    /// protocol's `not_the_topmost_popup`, which for a tree is a popup with a
+    /// live child. It does NOT make a cycle unbuildable; a popup's parent is a
+    /// wl_surface id and ids are recycled, which DESIGN.md §3 carries and the
+    /// renderer's depth bound is what contains.
+    ///
+    /// The protocol's own wording is "tried to map or destroy a non-topmost
+    /// popup", and only the destroy half is here. A naive map check would be
+    /// wrong rather than missing: a menu recommits its buffer whenever the
+    /// item under the pointer changes, so a popup mapping while a submenu is
+    /// open is the ordinary case and not an ordering fault.
+    #[test]
+    fn a_menu_may_not_be_destroyed_before_the_submenu_hanging_off_it() {
+        let (mut client, _peer, _runtime, framebuffer_path) = popup_fixture("popup-topmost");
+        menu_rules(&mut client);
+        get_popup(&mut client, 14, 9, 30).unwrap();
+
+        // A submenu, on a wl_surface and xdg_surface of its own, parented on
+        // the menu's xdg_surface.
+        client
+            .insert(16, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        let mut xdg_surface = wire::Builder::new();
+        xdg_surface.u32(17);
+        xdg_surface.u32(16);
+        client
+            .dispatch(request(12, 2, xdg_surface).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut submenu = wire::Builder::new();
+        submenu.u32(18);
+        submenu.u32(13);
+        submenu.u32(30);
+        client
+            .dispatch(request(17, 2, submenu).unwrap(), &mut VecDeque::new())
+            .unwrap();
+
+        let error = client
+            .dispatch(
+                request(14, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap_err();
+        assert!(error.contains("hangs off it"), "{error}");
+        assert_eq!(
+            client.protocol_error_code,
+            XDG_WM_BASE_ERROR_NOT_THE_TOPMOST_POPUP
+        );
+        assert_eq!(client.protocol_error_object, Some(12));
+        // Refused means REFUSED: the menu is still there, so a client that
+        // ignored the error has not been left with a half-destroyed stack.
+        assert!(client.objects.contains_key(&14));
+
+        // Innermost first is the order the protocol asks for, and it works.
+        client
+            .dispatch(
+                request(18, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        client
+            .dispatch(
+                request(14, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(!client.objects.contains_key(&14));
 
         let _ = fs::remove_file(&framebuffer_path);
     }
