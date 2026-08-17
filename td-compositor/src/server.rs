@@ -30,6 +30,7 @@ const GLOBAL_SHM: u32 = 2;
 const GLOBAL_OUTPUT: u32 = 3;
 const GLOBAL_XDG_WM_BASE: u32 = 4;
 const GLOBAL_SEAT: u32 = 5;
+const GLOBAL_DECORATION: u32 = 6;
 const WL_DISPLAY_ERROR_IMPLEMENTATION: u32 = 3;
 const WL_SEAT_ERROR_MISSING_CAPABILITY: u32 = 0;
 const WL_POINTER_ERROR_ROLE: u32 = 0;
@@ -65,6 +66,24 @@ const SEAT_VERSION: u32 = 7;
 /// the build rather than quietly sending a version-8 client an event the
 /// protocol forbids it.
 const _: () = assert!(SEAT_VERSION <= WL_POINTER_AXIS_DISCRETE_LAST);
+/// `zxdg_toplevel_decoration_v1.mode`. td answers `server_side` and never the
+/// other one: a tile already carries a title band the compositor draws, so a
+/// client drawing its own would be a second title over the same window, inside
+/// the geometry the layout gave it.
+const DECORATION_MODE_SERVER_SIDE: u32 = 2;
+/// The client's own spelling of the mode it would prefer. Read so the request
+/// is validated on the wire and so a `set_mode(server_side)` is not mistaken
+/// for a client asking for something td refuses; the ANSWER does not depend on
+/// it, which is what the protocol allows and what tiling requires.
+const DECORATION_MODE_CLIENT_SIDE: u32 = 1;
+/// `zxdg_toplevel_decoration_v1.error`. Every one is a CLIENT mistake — none
+/// reports anything about the compositor — so each is raised against the
+/// object that made it rather than turned into a disconnect with no code.
+const DECORATION_ERROR_UNCONFIGURED_BUFFER: u32 = 0;
+const DECORATION_ERROR_ALREADY_CONSTRUCTED: u32 = 1;
+const DECORATION_ERROR_ORPHANED: u32 = 2;
+/// `configure`, the interface's only event.
+const DECORATION_CONFIGURE: u16 = 0;
 const MAX_POOL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CLIENT_BUFFER: usize = 256 * 1024;
 const MAX_PENDING_FDS: usize = 64;
@@ -147,6 +166,17 @@ enum Object {
     },
     XdgToplevel {
         xdg_surface: u32,
+        /// The decoration object made for this toplevel, if one has been. Held
+        /// here rather than in a map beside the objects for `XdgSurface`'s
+        /// reason: the pairing is the toplevel's own state, and a second place
+        /// to record it is a second place to leave it stale. It is what makes
+        /// a repeat `get_toplevel_decoration` `already_constructed` and a
+        /// toplevel destroyed under a live decoration `orphaned`.
+        decoration: Option<u32>,
+    },
+    DecorationManager,
+    ToplevelDecoration {
+        toplevel: u32,
     },
 }
 
@@ -240,6 +270,14 @@ struct Client {
     runtime: Arc<Mutex<Runtime>>,
     keymap: KeymapFile,
     protocol_error_code: u32,
+    /// The object an error names, when that is not the one whose request
+    /// raised it. Wayland scopes an error CODE to the INTERFACE of the object
+    /// it is reported against, so a code borrowed from another interface is
+    /// read as whatever that number means on this one — `orphaned` (2) against
+    /// the xdg_toplevel whose destroy raised it is `xdg_toplevel.invalid_size`,
+    /// a different fault on a different object. Cleared per dispatch beside the
+    /// code, so it can only ever describe the request that set it.
+    protocol_error_object: Option<u32>,
     mapped_bytes: BTreeMap<u32, usize>,
     mapped_total: usize,
 }
@@ -936,6 +974,7 @@ impl Client {
             runtime,
             keymap,
             protocol_error_code: WL_DISPLAY_ERROR_IMPLEMENTATION,
+            protocol_error_object: None,
             mapped_bytes: BTreeMap::new(),
             mapped_total: 0,
         })
@@ -1146,6 +1185,142 @@ impl Client {
         Err(error.into())
     }
 
+    /// `fail_protocol` for a code that belongs to an interface OTHER than the
+    /// one whose request raised it — every `zxdg_toplevel_decoration_v1` error
+    /// is one, since two of the three are raised from the manager's request and
+    /// the third from the toplevel's destroy.
+    fn fail_protocol_on(&mut self, object: u32, code: u32, error: &str) -> Result<(), String> {
+        self.protocol_error_object = Some(object);
+        self.fail_protocol(code, error)
+    }
+
+    /// td's whole answer on this interface. Sent on creation and again for
+    /// every `set_mode`/`unset_mode`, because the protocol makes `configure`
+    /// the ONLY way a client learns the mode: one that asked for `client_side`
+    /// and heard nothing back would keep drawing its own titlebar.
+    fn send_decoration_configure(&mut self, decoration: u32) -> Result<(), String> {
+        let mut event = wire::Builder::new();
+        event.u32(DECORATION_MODE_SERVER_SIDE);
+        self.send(decoration, DECORATION_CONFIGURE, event)
+    }
+
+    /// Answer a `set_mode`/`unset_mode` completely.
+    ///
+    /// The mode event alone is half of what the protocol asks for: a client
+    /// applies it on the `xdg_surface.configure` that follows and acknowledges
+    /// THAT serial, so a compositor that sent only the first leaves a mapped
+    /// window waiting and still drawing its own titlebar. The layout has not
+    /// moved, so the configure has to be asked for rather than arising — and it
+    /// is asked for through the ordinary path, which is what keeps the serial
+    /// the one the tracker is accounting for.
+    fn answer_decoration_mode(&mut self, decoration: u32, toplevel: u32) -> Result<(), String> {
+        self.send_decoration_configure(decoration)?;
+        let Some(Object::XdgToplevel { xdg_surface, .. }) = self.objects.get(&toplevel) else {
+            return Ok(());
+        };
+        let Some(Object::XdgSurface { configure, .. }) = self.objects.get(xdg_surface) else {
+            return Ok(());
+        };
+        configure
+            .lock()
+            .map_err(|_| "XDG configure tracker lock poisoned".to_string())?
+            .reconfigure();
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .wake_layout(self.id);
+        Ok(())
+    }
+
+    /// Give the toplevel its decoration slot back, so a client may destroy a
+    /// decoration and make another. Tolerates a toplevel that is already gone:
+    /// the only way to reach that is a client whose toplevel died first, which
+    /// is `orphaned` and has already been raised against it.
+    fn forget_decoration(&mut self, toplevel: u32) -> Result<(), String> {
+        if let Some(Object::XdgToplevel { decoration, .. }) = self.objects.get_mut(&toplevel) {
+            *decoration = None;
+        }
+        Ok(())
+    }
+
+    /// `zxdg_decoration_manager_v1.get_toplevel_decoration`.
+    ///
+    /// The two refusals are both the protocol's, and both are raised before the
+    /// object is created so a client that got it wrong is not left holding an
+    /// id the compositor never made.
+    fn create_toplevel_decoration(&mut self, id: u32, toplevel: u32) -> Result<(), String> {
+        let Some(Object::XdgToplevel {
+            xdg_surface,
+            decoration,
+        }) = self.objects.get(&toplevel)
+        else {
+            return Err(format!(
+                "zxdg_decoration_manager_v1 references non-toplevel {toplevel}"
+            ));
+        };
+        // Both are `Copy`, so the toplevel is read without cloning the variant
+        // — which for a client naming a `wl_surface` here would have copied its
+        // whole pending state to reach a type check.
+        let (xdg_surface, decoration) = (*xdg_surface, *decoration);
+        if let Some(existing) = decoration {
+            return self.fail_protocol_on(
+                id,
+                DECORATION_ERROR_ALREADY_CONSTRUCTED,
+                &format!("xdg_toplevel {toplevel} already has decoration {existing}"),
+            );
+        }
+        if self.toplevel_has_buffer(xdg_surface)? {
+            return self.fail_protocol_on(
+                id,
+                DECORATION_ERROR_UNCONFIGURED_BUFFER,
+                &format!(
+                    "xdg_toplevel {toplevel} had a buffer before its decoration was configured"
+                ),
+            );
+        }
+        self.insert(id, Object::ToplevelDecoration { toplevel })?;
+        let Some(Object::XdgToplevel { decoration, .. }) = self.objects.get_mut(&toplevel) else {
+            return Err(format!(
+                "xdg_toplevel {toplevel} vanished while its decoration was made"
+            ));
+        };
+        *decoration = Some(id);
+        // Answered COMPLETELY, the same way a later `set_mode` is. Usually the
+        // mapping commit's initial configure would follow this anyway, but a
+        // client may commit empty, acknowledge that configure and only then ask
+        // — legal, since it has attached no buffer — and its first frame would
+        // then be drawn with decorations it never got an ack-able serial for.
+        self.answer_decoration_mode(id, toplevel)
+    }
+
+    /// Whether the toplevel's `wl_surface` already has pixels, in either of the
+    /// two senses the protocol means: a buffer ATTACHED and not yet committed,
+    /// which lives in this client's own pending state, and one COMMITTED, which
+    /// left here and is the scene's. Asking only the first would miss the
+    /// ordinary case — a client that mapped its window and asked for
+    /// decorations afterwards.
+    fn toplevel_has_buffer(&self, xdg_surface: u32) -> Result<bool, String> {
+        let Some(Object::XdgSurface { surface, .. }) = self.objects.get(&xdg_surface) else {
+            return Err(format!(
+                "xdg_toplevel lost xdg_surface {xdg_surface} before its decoration"
+            ));
+        };
+        let surface = *surface;
+        if let Some(Object::Surface(state)) = self.objects.get(&surface) {
+            if matches!(state.pending_buffer, Some(PendingBuffer::Buffer { .. })) {
+                return Ok(true);
+            }
+        }
+        Ok(self
+            .runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .is_mapped(SurfaceKey {
+                client: self.id,
+                object: surface,
+            }))
+    }
+
     fn remove_object(&mut self, id: u32) -> Result<(), String> {
         if id <= 1 {
             return Err(format!("refusing to delete reserved object {id}"));
@@ -1208,6 +1383,7 @@ impl Client {
         self.global(registry, GLOBAL_SHM, "wl_shm", 1)?;
         self.global(registry, GLOBAL_OUTPUT, "wl_output", 4)?;
         self.global(registry, GLOBAL_XDG_WM_BASE, "xdg_wm_base", 1)?;
+        self.global(registry, GLOBAL_DECORATION, "zxdg_decoration_manager_v1", 1)?;
         self.global(registry, GLOBAL_SEAT, "wl_seat", SEAT_VERSION)
     }
 
@@ -1237,6 +1413,9 @@ impl Client {
             }
             (GLOBAL_XDG_WM_BASE, "xdg_wm_base") if version == 1 => {
                 self.insert(id, Object::XdgWmBase)
+            }
+            (GLOBAL_DECORATION, "zxdg_decoration_manager_v1") if version == 1 => {
+                self.insert(id, Object::DecorationManager)
             }
             (GLOBAL_SEAT, "wl_seat") if (1..=SEAT_VERSION).contains(&version) => {
                 self.insert(id, Object::Seat { version })?;
@@ -1714,6 +1893,7 @@ impl Client {
         fds: &mut VecDeque<RawFd>,
     ) -> Result<(), String> {
         self.protocol_error_code = WL_DISPLAY_ERROR_IMPLEMENTATION;
+        self.protocol_error_object = None;
         if matches!(self.objects.get(&message.object), Some(Object::Region(_))) {
             return self.dispatch_region(&message);
         }
@@ -2136,6 +2316,7 @@ impl Client {
                         new_toplevel,
                         Object::XdgToplevel {
                             xdg_surface: message.object,
+                            decoration: None,
                         },
                     )?;
                     let key = SurfaceKey {
@@ -2195,9 +2376,27 @@ impl Client {
                     message.opcode
                 )),
             },
-            Object::XdgToplevel { xdg_surface } => match message.opcode {
+            Object::XdgToplevel {
+                xdg_surface,
+                decoration,
+            } => match message.opcode {
                 0 => {
                     args.finish()?;
+                    // The decoration object outliving the thing it decorates is
+                    // the protocol's own `orphaned`, and it is checked BEFORE
+                    // anything is torn down: the client is being told its
+                    // destroy order was wrong, so the toplevel it named must
+                    // still be there to be named in the diagnostic.
+                    if let Some(decoration) = decoration {
+                        return self.fail_protocol_on(
+                            decoration,
+                            DECORATION_ERROR_ORPHANED,
+                            &format!(
+                                "xdg_toplevel {} destroyed before its decoration {decoration}",
+                                message.object
+                            ),
+                        );
+                    }
                     let Some(Object::XdgSurface { surface, .. }) =
                         self.objects.get(&xdg_surface).cloned()
                     else {
@@ -2277,6 +2476,54 @@ impl Client {
                     message.opcode
                 )),
             },
+            Object::DecorationManager => match message.opcode {
+                0 => {
+                    args.finish()?;
+                    self.remove_object(message.object)
+                }
+                1 => {
+                    let id = args.u32()?;
+                    let toplevel = args.u32()?;
+                    args.finish()?;
+                    self.create_toplevel_decoration(id, toplevel)
+                }
+                _ => Err(format!(
+                    "unsupported zxdg_decoration_manager_v1 request {}",
+                    message.opcode
+                )),
+            },
+            Object::ToplevelDecoration { toplevel } => match message.opcode {
+                0 => {
+                    args.finish()?;
+                    self.forget_decoration(toplevel)?;
+                    self.remove_object(message.object)
+                }
+                // set_mode. The client states a PREFERENCE and the compositor
+                // answers with what it will actually do, which the protocol
+                // says need not agree. td's answer never does depend on it, so
+                // the mode is read for wire validity and to refuse a value the
+                // enum does not define — a client that meant `server_side` and
+                // sent 0 should hear about it rather than be told yes.
+                1 => {
+                    let mode = args.u32()?;
+                    args.finish()?;
+                    if mode != DECORATION_MODE_SERVER_SIDE && mode != DECORATION_MODE_CLIENT_SIDE {
+                        return Err(format!(
+                            "zxdg_toplevel_decoration_v1 {} asked for undefined mode {mode}",
+                            message.object
+                        ));
+                    }
+                    self.answer_decoration_mode(message.object, toplevel)
+                }
+                2 => {
+                    args.finish()?;
+                    self.answer_decoration_mode(message.object, toplevel)
+                }
+                _ => Err(format!(
+                    "unsupported zxdg_toplevel_decoration_v1 request {}",
+                    message.opcode
+                )),
+            },
         }
     }
 }
@@ -2303,6 +2550,7 @@ fn dispatch_buffered(
         };
         let object = message.object;
         if let Err(error) = client.dispatch(message, fds) {
+            let object = client.protocol_error_object.unwrap_or(object);
             client.protocol_error(object, client.protocol_error_code, &error);
             return Err(error);
         }
@@ -2598,6 +2846,14 @@ mod tests {
             .unwrap();
     }
 
+    /// How many globals the opening burst carries. Named because the tests read
+    /// that burst by COUNT: a bare number is one nothing relates to
+    /// `advertise_globals`, and a global added without it makes every one of
+    /// them read the next message as a global and hang waiting for it.
+    /// `the_registry_advertises_exactly_the_globals_td_serves` is what ties the
+    /// two together.
+    const GLOBAL_COUNT: usize = 6;
+
     fn receive_messages(stream: &mut UnixStream, count: usize) -> Vec<wire::Message> {
         let mut bytes = Vec::new();
         let mut messages = Vec::new();
@@ -2751,7 +3007,7 @@ mod tests {
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut client = Client::new(12, server, runtime, test_keymap()).unwrap();
         client.advertise_globals(2).unwrap();
-        let globals = receive_messages(&mut peer, 5);
+        let globals = receive_messages(&mut peer, GLOBAL_COUNT);
         let seat = globals.last().unwrap();
         let mut seat_global = wire::Cursor::new(&seat.payload);
         assert_eq!(seat_global.u32().unwrap(), GLOBAL_SEAT);
@@ -3039,7 +3295,7 @@ mod tests {
         let mut get_registry = wire::Builder::new();
         get_registry.u32(2);
         send(&mut peer, 1, 1, get_registry);
-        receive_messages(&mut peer, 5);
+        receive_messages(&mut peer, GLOBAL_COUNT);
 
         let mut bind_compositor = wire::Builder::new();
         bind_compositor.u32(GLOBAL_COMPOSITOR);
@@ -4883,7 +5139,13 @@ mod tests {
             )
             .unwrap();
         client
-            .insert(10, Object::XdgToplevel { xdg_surface: 9 })
+            .insert(
+                10,
+                Object::XdgToplevel {
+                    xdg_surface: 9,
+                    decoration: None,
+                },
+            )
             .unwrap();
 
         let mut title = wire::Builder::new();
@@ -4926,6 +5188,637 @@ mod tests {
             )
             .unwrap();
         assert_eq!(runtime.lock().unwrap().title(key), None);
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// A client, its runtime, and a toplevel on a surface with no pixels — the
+    /// state every decoration test starts from. The peer is returned so a test
+    /// can read what the compositor sent, and the framebuffer path so it can be
+    /// cleaned up.
+    fn decoration_fixture(stem: &str) -> (Client, UnixStream, Arc<Mutex<Runtime>>, PathBuf) {
+        let stem = format!(
+            "td-wayland-{stem}-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut client = Client::new(88, server, Arc::clone(&runtime), test_keymap()).unwrap();
+        client
+            .insert(5, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        client
+            .insert(
+                9,
+                Object::XdgSurface {
+                    surface: 5,
+                    toplevel: Some(10),
+                    configure: Arc::new(Mutex::new(ConfigureTracker::new())),
+                },
+            )
+            .unwrap();
+        client
+            .insert(
+                10,
+                Object::XdgToplevel {
+                    xdg_surface: 9,
+                    decoration: None,
+                },
+            )
+            .unwrap();
+        client.insert(11, Object::DecorationManager).unwrap();
+        (client, peer, runtime, framebuffer_path)
+    }
+
+    /// `get_toplevel_decoration(id, toplevel)` on the manager at object 11.
+    fn get_decoration(client: &mut Client, id: u32, toplevel: u32) -> Result<(), String> {
+        let mut request_body = wire::Builder::new();
+        request_body.u32(id);
+        request_body.u32(toplevel);
+        client.dispatch(request(11, 1, request_body).unwrap(), &mut VecDeque::new())
+    }
+
+    /// The mode carried by the next `configure`, which is the only event this
+    /// interface has — so a message arriving on the decoration object at all is
+    /// one of these.
+    fn configured_mode(peer: &mut UnixStream, decoration: u32) -> u32 {
+        let messages = receive_messages(peer, 1);
+        let message = messages.first().unwrap();
+        assert_eq!(message.object, decoration);
+        assert_eq!(message.opcode, DECORATION_CONFIGURE);
+        let mut payload = wire::Cursor::new(&message.payload);
+        let mode = payload.u32().unwrap();
+        payload.finish().unwrap();
+        mode
+    }
+
+    /// §F of APPLICATIONS.md states td's advertised globals as a fact about
+    /// this function, and a table in a document cannot notice when the code
+    /// moves under it. This is that claim as a test: the SET, the order, the
+    /// name each is advertised under and the version each is offered at.
+    #[test]
+    fn the_registry_advertises_exactly_the_globals_td_serves() {
+        let stem = format!(
+            "td-wayland-globals-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut client = Client::new(88, server, runtime, test_keymap()).unwrap();
+        client.advertise_globals(2).unwrap();
+
+        let globals = receive_messages(&mut peer, GLOBAL_COUNT);
+        let advertised: Vec<(u32, String, u32)> = globals
+            .iter()
+            .map(|message| {
+                let mut payload = wire::Cursor::new(&message.payload);
+                let name = payload.u32().unwrap();
+                let interface = payload.string().unwrap();
+                let version = payload.u32().unwrap();
+                payload.finish().unwrap();
+                (name, interface, version)
+            })
+            .collect();
+        assert_eq!(
+            advertised,
+            vec![
+                (GLOBAL_COMPOSITOR, "wl_compositor".to_string(), 4),
+                (GLOBAL_SHM, "wl_shm".to_string(), 1),
+                (GLOBAL_OUTPUT, "wl_output".to_string(), 4),
+                (GLOBAL_XDG_WM_BASE, "xdg_wm_base".to_string(), 1),
+                (
+                    GLOBAL_DECORATION,
+                    "zxdg_decoration_manager_v1".to_string(),
+                    1
+                ),
+                (GLOBAL_SEAT, "wl_seat".to_string(), SEAT_VERSION),
+            ]
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// The numbers this interface is spoken in, pinned by VALUE. Every other
+    /// test here compares what went out against these same constants, so a
+    /// constant that agrees with the code and not with the protocol is one they
+    /// would all still pass — and the client on the other end, which knows the
+    /// real numbers, would read `server_side` as `client_side` and draw its own
+    /// titlebar anyway.
+    #[test]
+    fn the_decoration_protocol_numbers_are_the_protocols() {
+        assert_eq!(DECORATION_MODE_CLIENT_SIDE, 1);
+        assert_eq!(DECORATION_MODE_SERVER_SIDE, 2);
+        assert_eq!(DECORATION_ERROR_UNCONFIGURED_BUFFER, 0);
+        assert_eq!(DECORATION_ERROR_ALREADY_CONSTRUCTED, 1);
+        assert_eq!(DECORATION_ERROR_ORPHANED, 2);
+        assert_eq!(DECORATION_CONFIGURE, 0);
+    }
+
+    /// The whole point of the interface for a tiling compositor: the client is
+    /// told, before it has drawn anything, that it is not the one drawing the
+    /// titlebar.
+    #[test]
+    fn a_toplevel_is_told_the_compositor_draws_its_decorations() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            decoration_fixture("decoration-configure");
+
+        get_decoration(&mut client, 12, 10).unwrap();
+        assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// `set_mode` is a PREFERENCE, and the compositor's answer need not agree.
+    /// A client asking to draw its own titlebar is told `server_side` anyway —
+    /// which is the case that would double the title band if td deferred to it.
+    #[test]
+    fn a_client_asking_to_draw_its_own_titlebar_is_still_told_server_side() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            decoration_fixture("decoration-set-mode");
+
+        get_decoration(&mut client, 12, 10).unwrap();
+        assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
+
+        let mut set_mode = wire::Builder::new();
+        set_mode.u32(DECORATION_MODE_CLIENT_SIDE);
+        client
+            .dispatch(request(12, 1, set_mode).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
+
+        // unset_mode is the client withdrawing the preference, and is answered
+        // the same way: the answer never depended on it.
+        client
+            .dispatch(
+                request(12, 2, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// Answering EVERY ask is what this pins, rather than answering the first:
+    /// `configure` is the only way the mode is carried, so a compositor that
+    /// stayed silent on a repeat request would leave a client that asked twice
+    /// waiting on an event that never comes.
+    #[test]
+    fn a_mode_td_already_serves_is_still_answered() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            decoration_fixture("decoration-same-mode");
+
+        get_decoration(&mut client, 12, 10).unwrap();
+        assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
+
+        let mut set_mode = wire::Builder::new();
+        set_mode.u32(DECORATION_MODE_SERVER_SIDE);
+        client
+            .dispatch(request(12, 1, set_mode).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// A mode outside the enum is the client's mistake and is refused rather
+    /// than rounded to the answer td was going to give anyway — which would
+    /// tell a client that sent 0 for `server_side` that it had been understood.
+    #[test]
+    fn a_decoration_mode_outside_the_enum_is_refused() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            decoration_fixture("decoration-bad-mode");
+
+        get_decoration(&mut client, 12, 10).unwrap();
+        assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
+
+        let mut set_mode = wire::Builder::new();
+        set_mode.u32(0);
+        let error = client
+            .dispatch(request(12, 1, set_mode).unwrap(), &mut VecDeque::new())
+            .unwrap_err();
+        assert!(error.contains("undefined mode 0"), "{error}");
+        // Refused INSTEAD of answered: a configure beside the error would tell
+        // the client the request it is being disconnected over was understood.
+        peer.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut scratch = [0u8; 64];
+        assert!(
+            peer.read(&mut scratch).is_err(),
+            "a refused mode owes no configure"
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// `already_constructed`, by its own code rather than as a disconnect with
+    /// nothing on it: the client asked for a second decoration on one toplevel.
+    #[test]
+    fn a_second_decoration_for_one_toplevel_is_refused() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            decoration_fixture("decoration-twice");
+
+        get_decoration(&mut client, 12, 10).unwrap();
+        assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
+
+        let error = get_decoration(&mut client, 13, 10).unwrap_err();
+        assert!(error.contains("already has decoration 12"), "{error}");
+        assert_eq!(
+            client.protocol_error_code,
+            DECORATION_ERROR_ALREADY_CONSTRUCTED
+        );
+        // Refused BEFORE the object was made, so the id the client named is
+        // still free — it is holding nothing the compositor also thinks exists.
+        assert!(!client.objects.contains_key(&13));
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// Destroying the decoration gives the slot back, so the refusal above is
+    /// about one being LIVE rather than about one ever having existed.
+    #[test]
+    fn destroying_a_decoration_lets_the_toplevel_take_another() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            decoration_fixture("decoration-reask");
+
+        get_decoration(&mut client, 12, 10).unwrap();
+        assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
+        client
+            .dispatch(
+                request(12, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        // The destroy is acknowledged with wl_display.delete_id before the next
+        // decoration's configure, so the read below must skip it.
+        receive_messages(&mut peer, 1);
+
+        get_decoration(&mut client, 13, 10).unwrap();
+        assert_eq!(configured_mode(&mut peer, 13), DECORATION_MODE_SERVER_SIDE);
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// `unconfigured_buffer`. The protocol refuses a decoration for a window
+    /// that already has pixels, and the ordinary way to reach it is a client
+    /// that mapped itself and asked afterwards — so the buffer this checks for
+    /// is a COMMITTED one, which has left the server's pending state and is the
+    /// scene's.
+    #[test]
+    fn decorating_a_window_that_already_has_pixels_is_refused() {
+        let (mut client, _peer, runtime, framebuffer_path) =
+            decoration_fixture("decoration-mapped");
+        let key = SurfaceKey {
+            client: 88,
+            object: 5,
+        };
+        runtime
+            .lock()
+            .unwrap()
+            .commit(
+                key,
+                Surface {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![1, 2, 3, 0],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        assert!(runtime.lock().unwrap().is_mapped(key));
+
+        let error = get_decoration(&mut client, 12, 10).unwrap_err();
+        assert!(error.contains("had a buffer"), "{error}");
+        assert_eq!(
+            client.protocol_error_code,
+            DECORATION_ERROR_UNCONFIGURED_BUFFER
+        );
+        assert!(!client.objects.contains_key(&12));
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// The same refusal for the other half of "has a buffer": one ATTACHED and
+    /// not yet committed, which never reaches the scene and so is invisible to
+    /// the query above.
+    #[test]
+    fn decorating_a_window_with_a_buffer_attached_is_refused_too() {
+        let (mut client, _peer, _runtime, framebuffer_path) =
+            decoration_fixture("decoration-attached");
+        let pool_path = framebuffer_path.with_extension("pool");
+        fs::write(&pool_path, [1u8, 2, 3, 0]).unwrap();
+        client.objects.insert(
+            5,
+            Object::Surface(SurfaceState {
+                pending_buffer: Some(PendingBuffer::Buffer {
+                    object: 7,
+                    buffer: Buffer {
+                        serial: 1,
+                        file: Arc::new(File::open(&pool_path).unwrap()),
+                        offset: 0,
+                        width: 1,
+                        height: 1,
+                        stride: 4,
+                        format: SHM_XRGB8888,
+                    },
+                }),
+                ..SurfaceState::default()
+            }),
+        );
+
+        let error = get_decoration(&mut client, 12, 10).unwrap_err();
+        assert!(error.contains("had a buffer"), "{error}");
+        assert_eq!(
+            client.protocol_error_code,
+            DECORATION_ERROR_UNCONFIGURED_BUFFER
+        );
+        assert!(!client.objects.contains_key(&12));
+
+        let _ = fs::remove_file(&pool_path);
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// `orphaned`: the decoration must go before the thing it decorates. The
+    /// toplevel is left INTACT by the refusal — it is the object the diagnostic
+    /// names, and tearing it down while telling the client it should not have
+    /// would leave the two disagreeing about what still exists.
+    #[test]
+    fn a_toplevel_destroyed_under_its_decoration_is_orphaned() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            decoration_fixture("decoration-orphan");
+
+        get_decoration(&mut client, 12, 10).unwrap();
+        assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
+
+        let error = client
+            .dispatch(
+                request(10, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap_err();
+        assert!(error.contains("before its decoration 12"), "{error}");
+        assert_eq!(client.protocol_error_code, DECORATION_ERROR_ORPHANED);
+        assert!(client.objects.contains_key(&10));
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// Destroying them in the order the protocol asks for works, which is what
+    /// makes the refusal above about ORDER rather than about decorations
+    /// blocking a toplevel from ever being destroyed.
+    #[test]
+    fn a_decorated_toplevel_is_destroyed_once_its_decoration_is() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            decoration_fixture("decoration-order");
+
+        get_decoration(&mut client, 12, 10).unwrap();
+        assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
+        client
+            .dispatch(
+                request(12, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        client
+            .dispatch(
+                request(10, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(!client.objects.contains_key(&10));
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// Wayland scopes an error CODE to the INTERFACE of the object it names, so
+    /// which object goes out is half the meaning. `already_constructed` is
+    /// raised from the MANAGER's request, and the manager defines no errors at
+    /// all — a client told code 1 against it can only read an undefined error.
+    /// It names the decoration the client just asked for instead, whose proxy
+    /// the client already holds.
+    #[test]
+    fn a_creation_error_names_the_decoration_rather_than_the_manager() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            decoration_fixture("decoration-error-object");
+
+        get_decoration(&mut client, 12, 10).unwrap();
+        assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
+
+        let mut again = wire::Builder::new();
+        again.u32(13);
+        again.u32(10);
+        let mut bytes = again.message(11, 1).unwrap();
+        let error = dispatch_buffered(&mut client, &mut bytes, &mut VecDeque::new()).unwrap_err();
+        assert!(error.contains("already has decoration 12"), "{error}");
+
+        let events = receive_messages(&mut peer, 1);
+        let event = events.first().unwrap();
+        assert_eq!((event.object, event.opcode), (1, 0), "wl_display.error");
+        let mut payload = wire::Cursor::new(&event.payload);
+        assert_eq!(
+            payload.u32().unwrap(),
+            13,
+            "the error names the decoration, not the manager that raised it"
+        );
+        assert_eq!(payload.u32().unwrap(), DECORATION_ERROR_ALREADY_CONSTRUCTED);
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// The same rule, on the case where getting it wrong is not merely
+    /// undefined but WRONG: `orphaned` is 2, and 2 on an `xdg_toplevel` is
+    /// `invalid_size`. Named against the toplevel whose destroy raised it, a
+    /// client would be told its window was the wrong size.
+    #[test]
+    fn the_orphaned_error_names_the_decoration_and_not_the_toplevel() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            decoration_fixture("decoration-orphan-object");
+
+        get_decoration(&mut client, 12, 10).unwrap();
+        assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
+
+        let mut bytes = wire::Builder::new().message(10, 0).unwrap();
+        let error = dispatch_buffered(&mut client, &mut bytes, &mut VecDeque::new()).unwrap_err();
+        assert!(error.contains("before its decoration 12"), "{error}");
+
+        let events = receive_messages(&mut peer, 1);
+        let event = events.first().unwrap();
+        assert_eq!((event.object, event.opcode), (1, 0), "wl_display.error");
+        let mut payload = wire::Cursor::new(&event.payload);
+        assert_eq!(
+            payload.u32().unwrap(),
+            12,
+            "orphaned belongs to the decoration; on the toplevel 2 is invalid_size"
+        );
+        assert_eq!(payload.u32().unwrap(), DECORATION_ERROR_ORPHANED);
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// A mode is applied on the `xdg_surface.configure` that FOLLOWS it, and
+    /// the client acknowledges that serial — so answering `set_mode` with the
+    /// decoration event alone leaves a mapped window waiting and still drawing
+    /// its own titlebar. The layout has not moved, so the tracker would
+    /// deduplicate the configure away; this is the assertion that it is asked
+    /// for anyway.
+    #[test]
+    fn setting_a_mode_owes_the_surface_configure_the_client_acknowledges() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            decoration_fixture("decoration-reconfigure");
+        let Some(Object::XdgSurface { configure, .. }) = client.objects.get(&9).cloned() else {
+            panic!("fixture lost its xdg_surface");
+        };
+
+        get_decoration(&mut client, 12, 10).unwrap();
+        assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
+
+        let mapped = ViewStatus::Visible(ToplevelState {
+            width: 100,
+            height: 100,
+            activated: true,
+            fullscreen: false,
+        });
+        configure.lock().unwrap().initial(1).unwrap();
+        configure.lock().unwrap().acknowledge(1).unwrap();
+        assert!(configure
+            .lock()
+            .unwrap()
+            .update(mapped, 2)
+            .unwrap()
+            .is_some());
+        // Still: the next update is deduplicated, which is what would swallow
+        // the configure the mode answer owes.
+        assert!(configure
+            .lock()
+            .unwrap()
+            .update(mapped, 3)
+            .unwrap()
+            .is_none());
+
+        let mut set_mode = wire::Builder::new();
+        set_mode.u32(DECORATION_MODE_CLIENT_SIDE);
+        client
+            .dispatch(request(12, 1, set_mode).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
+
+        let owed = configure
+            .lock()
+            .unwrap()
+            .update(mapped, 4)
+            .unwrap()
+            .expect("set_mode owes an xdg_surface.configure for the client to ack");
+        assert_eq!(owed.serial, 4);
+        // The layout itself is untouched: a window is not resized because its
+        // titlebar was discussed.
+        assert_eq!((owed.state.width, owed.state.height), (100, 100));
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// The legal-but-unusual ordering that makes creation need the same answer
+    /// `set_mode` does: commit empty, ACKNOWLEDGE the initial configure, and
+    /// only then ask for a decoration. `unconfigured_buffer` permits it — no
+    /// buffer has been attached — so the mapping configure this would otherwise
+    /// ride on has already been spent, and the client would draw its first
+    /// frame against a mode it never got an ack-able serial for.
+    #[test]
+    fn creating_a_decoration_after_the_initial_ack_still_owes_a_configure() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            decoration_fixture("decoration-late-create");
+        let Some(Object::XdgSurface { configure, .. }) = client.objects.get(&9).cloned() else {
+            panic!("fixture lost its xdg_surface");
+        };
+        let mapped = ViewStatus::Visible(ToplevelState {
+            width: 100,
+            height: 100,
+            activated: true,
+            fullscreen: false,
+        });
+        configure.lock().unwrap().initial(1).unwrap();
+        configure.lock().unwrap().acknowledge(1).unwrap();
+        assert!(configure
+            .lock()
+            .unwrap()
+            .update(mapped, 2)
+            .unwrap()
+            .is_some());
+        assert!(configure
+            .lock()
+            .unwrap()
+            .update(mapped, 3)
+            .unwrap()
+            .is_none());
+
+        get_decoration(&mut client, 12, 10).unwrap();
+        assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
+
+        assert!(
+            configure
+                .lock()
+                .unwrap()
+                .update(mapped, 4)
+                .unwrap()
+                .is_some(),
+            "creating a decoration owes the configure its mode is applied on"
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// The protocol says so explicitly, and it is the manager's ONE lifetime
+    /// rule: destroying it is not destroying the decorations it made. A client
+    /// that binds the manager, decorates its window and drops the manager it no
+    /// longer needs must keep the decoration it asked for.
+    #[test]
+    fn destroying_the_manager_leaves_the_decorations_it_made() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            decoration_fixture("decoration-manager-destroy");
+
+        get_decoration(&mut client, 12, 10).unwrap();
+        assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
+
+        client
+            .dispatch(
+                request(11, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        receive_messages(&mut peer, 1);
+        assert!(!client.objects.contains_key(&11));
+
+        // Still a decoration, and still answering.
+        client
+            .dispatch(
+                request(12, 2, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(configured_mode(&mut peer, 12), DECORATION_MODE_SERVER_SIDE);
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// The manager refuses an id that is not a toplevel rather than making a
+    /// decoration that decorates nothing.
+    #[test]
+    fn a_decoration_for_something_that_is_not_a_toplevel_is_refused() {
+        let (mut client, _peer, _runtime, framebuffer_path) =
+            decoration_fixture("decoration-non-toplevel");
+
+        let error = get_decoration(&mut client, 12, 5).unwrap_err();
+        assert!(error.contains("non-toplevel 5"), "{error}");
+        assert!(!client.objects.contains_key(&12));
 
         let _ = fs::remove_file(&framebuffer_path);
     }
@@ -4979,7 +5872,13 @@ mod tests {
             )
             .unwrap();
         client
-            .insert(10, Object::XdgToplevel { xdg_surface: 9 })
+            .insert(
+                10,
+                Object::XdgToplevel {
+                    xdg_surface: 9,
+                    decoration: None,
+                },
+            )
             .unwrap();
         client.configurations.lock().unwrap().insert(
             key,
@@ -5230,7 +6129,13 @@ mod tests {
             )
             .unwrap();
         client
-            .insert(10, Object::XdgToplevel { xdg_surface: 9 })
+            .insert(
+                10,
+                Object::XdgToplevel {
+                    xdg_surface: 9,
+                    decoration: None,
+                },
+            )
             .unwrap();
         client
             .insert(

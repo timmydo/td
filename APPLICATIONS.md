@@ -2263,8 +2263,16 @@ resolves them; the compositor authenticates no token an app supplied.
 ## F. The Wayland protocol gap
 
 Verified against the tree rather than assumed. Today the compositor
-advertises exactly five globals: `wl_compositor` v4, `wl_shm` v1,
-`wl_output` v4, `xdg_wm_base` **v1**, `wl_seat` v7.
+advertises exactly six globals: `wl_compositor` v4, `wl_shm` v1,
+`wl_output` v4, `xdg_wm_base` **v1**,
+`zxdg_decoration_manager_v1` v1, `wl_seat` v7.
+
+That set is no longer only a claim here. `ui: a window is told the
+compositor draws its titlebar` added the sixth and, with it,
+`the_registry_advertises_exactly_the_globals_td_serves`, which pins the
+name, order and version of each against `advertise_globals` — so the next
+change to that list reds a test in the crate rather than silently
+falsifying this paragraph, as that commit itself would have.
 
 Three corrections to the obvious assumptions, all checked in
 `td-compositor/src/server.rs`:
@@ -2313,7 +2321,7 @@ land offset, but the client survives.
 | `wl_data_device_manager` v3, selection | absent | **B** | 4,000–6,000 (DnD later, +~900) |
 | `xdg_positioner` + `get_popup` + grabs + constraint solving | **hard error** | **B/U** | 4,500–7,000 |
 | client cursor rendering | role tracked, image ignored | **U** | ~400 |
-| `zxdg_decoration_manager_v1` (answer `server_side`) | absent | **U** | ~500 — suppresses CSD, fits tiling, and removes most of the geometry problem for cooperating apps |
+| `zxdg_decoration_manager_v1` (answer `server_side`) | **landed** | **U** | ~500 — spent. Suppresses CSD, fits tiling, and removes most of the geometry problem for cooperating apps. One divergence, deliberate: `destroy` asks the compositor to stop decorating, and td keeps drawing the band because it is layout rather than a decoration td can withdraw |
 | `zxdg_exporter_v2`/`importer_v2` | absent | **portal-blocking** | 1,200–2,000 |
 | `zwp_primary_selection_v1` | absent | C | ~1,000 once data-device exists |
 | `xdg_wm_base` v2→v6 | v1 | C | 1,000–1,800 after popups |

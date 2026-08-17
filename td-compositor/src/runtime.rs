@@ -382,6 +382,14 @@ impl Runtime {
         Ok(())
     }
 
+    /// Whether the surface has committed pixels. Asked by the decoration
+    /// manager, which owes `unconfigured_buffer` to a client that maps a window
+    /// and then asks for decorations: the attached-but-uncommitted half of that
+    /// question is the server's own pending state, and this is the other half.
+    pub fn is_mapped(&self, key: SurfaceKey) -> bool {
+        self.scene.is_mapped(key)
+    }
+
     /// The xdg_toplevel went. Its wl_surface may not have.
     pub fn forget_title(&mut self, key: SurfaceKey) -> Result<(), String> {
         self.scene.forget_title(key);

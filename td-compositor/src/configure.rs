@@ -104,6 +104,17 @@ impl ConfigureTracker {
         }))
     }
 
+    /// Make the next `update` emit even though the layout has not moved.
+    ///
+    /// A decoration mode is carried to the client by an `xdg_surface.configure`
+    /// it acknowledges, and this compositor's answer never changes — so the
+    /// deduplication that stops a still window being reconfigured forever would
+    /// also swallow the one event `set_mode` is required to produce, leaving a
+    /// client waiting to apply a mode it has already been told.
+    pub fn reconfigure(&mut self) {
+        self.last_layout = None;
+    }
+
     pub fn acknowledge(&mut self, serial: u32) -> Result<(), String> {
         if let Some(position) = self
             .outstanding
@@ -375,6 +386,43 @@ mod tests {
         assert_eq!(tracker.outstanding(), vec![4]);
         assert!(tracker.acknowledge(2).is_err());
         tracker.acknowledge(4).unwrap();
+    }
+
+    /// A decoration mode is applied on the `xdg_surface.configure` that follows
+    /// it, so `set_mode` on a window nothing has resized must still produce
+    /// one — and the deduplication that keeps a still window still is exactly
+    /// what would swallow it.
+    #[test]
+    fn reconfigure_makes_an_unmoved_layout_configure_again() {
+        let mut tracker = ConfigureTracker::new();
+        tracker.initial(1).unwrap();
+        tracker.acknowledge(1).unwrap();
+        assert!(tracker
+            .update(visible(100, 100, false, false), 2)
+            .unwrap()
+            .is_some());
+        // Unchanged: deduplicated, which is the behaviour being worked around.
+        assert!(tracker
+            .update(visible(100, 100, false, false), 3)
+            .unwrap()
+            .is_none());
+
+        tracker.reconfigure();
+        let configure = tracker
+            .update(visible(100, 100, false, false), 4)
+            .unwrap()
+            .expect("a reconfigure owes a configure for the layout already in force");
+        // The SAME layout, at a fresh serial the client can acknowledge — not a
+        // resize, which would move a window because its titlebar was discussed.
+        assert_eq!(configure.serial, 4);
+        assert_eq!(configure.state.width, 100);
+        assert_eq!(configure.state.height, 100);
+
+        // One re-send, not a permanent end to deduplication.
+        assert!(tracker
+            .update(visible(100, 100, false, false), 5)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

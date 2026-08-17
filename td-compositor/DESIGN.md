@@ -622,7 +622,92 @@ The first protocol surface is:
 - wl_output
 - wl_seat, wl_keyboard, and wl_pointer
 - xdg_wm_base, xdg_surface, and xdg_toplevel
+- zxdg_decoration_manager_v1 and zxdg_toplevel_decoration_v1
 - wl_callback completion and wl_buffer release
+
+Those six globals are the whole of what the registry advertises, and the set is
+a TEST rather than a sentence here: the name, order, and version of each are
+pinned by
+`the_registry_advertises_exactly_the_globals_td_serves`.
+A document cannot notice when the code moves under it, and this list has been
+read as a state claim by work outside this crate.
+
+**Decorations are the compositor's.** td answers every
+`zxdg_toplevel_decoration_v1` with `server_side` and never `client_side`: a
+tile already carries a title band this compositor draws, so a client drawing
+its own would be a second title inside the geometry the layout gave it, and the
+band a drag reaches for would not be the one the operator sees. `set_mode` is a
+PREFERENCE the protocol allows the compositor to disagree with, so it is read —
+a value outside the enum is refused rather than rounded to the answer td was
+going to give anyway — and then answered the same way `unset_mode` is. Every
+ask is answered, including one for the mode already in force: `configure` is
+the only way a client learns the mode, so silence on a repeat request is a
+client waiting on an event that never comes.
+
+Advertising this is what makes a cooperating toolkit stop drawing its own
+titlebar, which is most of the `set_window_geometry` problem: a client with no
+CSD has no shadow margins for td to tile as dead borders. It does not close
+that gap for a client that draws them anyway, which remains its own increment.
+
+**One divergence, and it is deliberate.** The protocol's `destroy` means "switch
+back to a mode without any server-side decorations at the next commit", and td
+does not: the title band is drawn for every tile whether or not a decoration
+object exists. The band is LAYOUT rather than decoration — it sits outside the
+client's geometry, the client is placed under it, and it is the handle a drag
+takes hold of — so there is nothing for td to withdraw, and withdrawing it would
+leave a tile that cannot be dragged and a gap where its neighbours expect a
+band. A client that destroys the object and resumes drawing its own titlebar
+therefore gets the double title this interface exists to prevent, and td cannot
+stop it. Closing that properly means making the band optional per window, which
+is a layout question and not this one. In practice a toolkit creates the
+decoration with the window and destroys it with the window, so the path is
+reachable rather than ordinary.
+
+Two things follow from the mode being carried by a configure. `set_mode` and
+`unset_mode` are answered with the decoration event AND an `xdg_surface`
+configure, because the client applies the mode on that configure and
+acknowledges ITS serial — the decoration event alone leaves a mapped window
+waiting and still drawing its own titlebar. The layout has not moved, so that
+configure is asked for rather than arising: the tracker's deduplication, which
+is what keeps a still window still, is exactly what would swallow it. CREATION
+is answered the same way, and by the same code. It is tempting to argue it need
+not be — the mapping commit's initial configure would follow it — but that is
+an argument about the ordinary sequence rather than about every legal one: a
+client may commit empty, acknowledge that configure, and only then ask for a
+decoration, which `unconfigured_buffer` permits because it has attached no
+buffer. Its first frame would be drawn against a mode it never received an
+ack-able serial for.
+
+The interface's three errors are all client mistakes and each is raised with
+its own code rather than as a disconnect carrying nothing: a second decoration
+for one toplevel is `already_constructed`, a toplevel destroyed while its
+decoration still lives is `orphaned`, and asking for a decoration for a window
+that already has pixels is `unconfigured_buffer`. That last is checked in both
+senses the protocol means it — a buffer ATTACHED and not yet committed, which
+is still the server's pending state, and one COMMITTED, which has left it and
+is the scene's — because the ordinary way to reach it is a client that mapped
+its window and asked afterwards. The refusals are raised BEFORE the decoration
+is created, so a client that got it wrong is not left holding an id the
+compositor never made; `orphaned` likewise leaves the toplevel standing, since
+it is the object the diagnostic names.
+
+Each error names the DECORATION object, which is not the object whose request
+raised it in any of the three cases — two come from the manager and one from the
+toplevel's destroy. Wayland scopes an error code to the interface of the object
+it is reported against, so the alternative is not merely untidy: the manager
+defines no errors at all, and `orphaned` is 2, which on an `xdg_toplevel` is
+`invalid_size`. A client would be told its window was the wrong size. The
+decoration is a safe object to name even where td refused to create one, because
+the client allocated that id and holds a proxy of the right interface for it.
+
+The protocol's other half of `unconfigured_buffer` — "any attempt to attach a
+buffer before the first configure" — has no check behind it, and that is worth
+stating as the limit it is rather than as a guarantee. Answering inside
+`get_toplevel_decoration` means td never leaves a window in which a client that
+is READING could see no configure yet; it does not stop one that pipelines the
+request and an `attach` into a single write, having read neither. No reference
+compositor catches that either, and the cost of not catching it is a frame
+drawn against a mode the client had not yet been told.
 
 Only wl_shm ARGB8888 and XRGB8888 buffers are accepted. Pool, offset, size,
 stride, and pixel-count arithmetic are checked before allocation or I/O. A
