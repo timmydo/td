@@ -4676,12 +4676,9 @@ fn payload_names(
             ));
         }
     }
-    for channel in ["inputs", "nativeInputs"] {
-        let Some(arr) = alist.get(channel).and_then(json::Json::as_arr) else {
-            continue;
-        };
-        for name in arr.iter().filter_map(json::Json::as_str) {
-            if names.contains(name) {
+    for channel in TOOL_CHANNELS {
+        for name in names_in_channel(alist, channel)? {
+            if names.contains(name.as_str()) {
                 return Err(format!(
                     "recipe: `{name}' is declared in both `payloadInputs' and `{channel}' \
                      — a payload is staged as DATA and must not also travel the tool, \
@@ -5572,22 +5569,130 @@ fn seed_gate_key<'a>(entry_name: &'a str, src_key: &str, alist: &'a json::Json) 
 /// the build may DO with the path, decided later by `payload_names` and
 /// `sandbox::extra_bind_flags`. Omitting it here would leave a payload with no
 /// lock entry and those refusals with nothing to partition.
-fn inputs_from_recipe_json(alist: &json::Json) -> Vec<String> {
+fn inputs_from_recipe_json(alist: &json::Json) -> Result<Vec<String>, String> {
     let mut xs: Vec<String> = Vec::new();
-    for key in ["inputs", "nativeInputs", "payloadInputs"] {
-        if let Some(a) = alist.get(key).and_then(json::Json::as_arr) {
-            xs.extend(a.iter().filter_map(json::Json::as_str).map(str::to_string));
-        }
+    for key in CHANNELS {
+        xs.extend(names_in_channel(alist, key)?);
     }
-    xs
+    Ok(xs)
+}
+
+/// Every declaration channel, in the order `inputs_from_recipe_json` flattens
+/// them. Named so the TOOL channels below cannot drift from the full set: a
+/// fourth channel added to one list and not the other is either a path the plan
+/// never resolves or a path §B.8's table never rules on.
+const CHANNELS: [&str; 3] = ["inputs", "nativeInputs", "payloadInputs"];
+
+/// The two channels §B.8's table calls "the tool, compilation and execution
+/// channel — refused" for a marked path. `payloadInputs` is deliberately absent:
+/// that is the DATA channel, and an image consuming an application through it is
+/// the arrangement the marker exists to permit.
+const TOOL_CHANNELS: [&str; 2] = ["inputs", "nativeInputs"];
+
+/// ABSENT is empty; PRESENT AND MALFORMED is an ERROR. A channel that is not an
+/// array, or that holds a non-string, must not read as "no names": the tool
+/// channels are what §B.8's refusal reads through, so a `"inputs":"firefox"`
+/// silently becoming absent is the restriction failing open on the very list it
+/// polices. Same rule `payload_names` states in this file — a malformed
+/// declaration of a restriction is never an absent one.
+fn names_in_channel(alist: &json::Json, key: &str) -> Result<Vec<String>, String> {
+    let Some(value) = alist.get(key) else {
+        return Ok(Vec::new());
+    };
+    let arr = value
+        .as_arr()
+        .ok_or_else(|| format!("recipe: `{key}' is present but is not an array"))?;
+    arr.iter()
+        .map(|x| {
+            x.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("recipe: `{key}' holds a non-string entry"))
+        })
+        .collect()
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-fn auto_inputs(recipe_dir: &str, name: &str) -> Result<Vec<String>, String> {
+fn auto_recipe_json(recipe_dir: &str, name: &str) -> Result<json::Json, String> {
     let p = format!("{recipe_dir}/{name}.json");
     let text = std::fs::read_to_string(&p).map_err(|e| format!("read recipe {p}: {e}"))?;
-    let alist = json::parse(&text).map_err(|e| format!("recipe JSON {p}: {e}"))?;
-    Ok(inputs_from_recipe_json(&alist))
+    json::parse(&text).map_err(|e| format!("recipe JSON {p}: {e}"))
+}
+
+/// APPLICATIONS.md §B.8's table, enforced where the plan is WALKED — which is the
+/// only place `build_plan_auto` can enforce anything, since it sees the emitted
+/// recipe JSON and nothing else.
+///
+/// A marked path on `inputs`/`nativeInputs` is refused; on `payloadInputs` it is
+/// the arrangement the marker exists to permit. `auto_inputs` deliberately
+/// flattens the three because dependency ORDER does not care why an input is
+/// there — this does, so it reads the channels apart.
+///
+/// Only an OWNED input can be marked: a name the plan resolves through the map is
+/// a seed or a pinned source, and a pin's own mark is answered at eval by
+/// `Recipe::is_foreign`, which is what put `"foreign"` in this JSON.
+fn refuse_foreign_on_the_tool_channel(
+    recipe_dir: &str,
+    name: &str,
+    alist: &json::Json,
+    marks: &mut std::collections::BTreeMap<String, bool>,
+) -> Result<(), String> {
+    // The node's OWN mark is read first, and not for its value: reading it is
+    // what validates it. A node whose `foreign` is present but malformed would
+    // otherwise plan cleanly unless some other recipe happened to name it as a
+    // tool — so a damaged mark on the target itself, or on a payload-only
+    // dependency, would never be looked at. Read from the `alist` the caller
+    // already parsed, so the self-check cannot disagree with the walk about
+    // what this recipe says.
+    marks.insert(name.to_string(), mark_of(name, alist)?);
+    for channel in TOOL_CHANNELS {
+        for inp in names_in_channel(alist, channel)? {
+            if !auto_is_owned(recipe_dir, &inp) {
+                continue;
+            }
+            if auto_is_foreign(recipe_dir, &inp, marks)? {
+                return Err(format!(
+                    "--auto: recipe `{name}' names `{inp}' in `{channel}', but `{inp}' is a \
+                     marked foreign payload — a payload may be staged as DATA through \
+                     `payloadInputs' and is refused on the tool, compilation and execution \
+                     channel (APPLICATIONS.md section B.8)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// ABSENT is not foreign — the ordinary case, and what keeps every existing
+/// recipe's JSON byte-identical. PRESENT AND NOT A BOOLEAN is an ERROR rather
+/// than "not foreign": a mark is a restriction, and a restriction read from a
+/// damaged declaration must not fail open.
+///
+/// Memoised, because the question is asked once per EDGE while the walk visits
+/// each node once: a widely-reused recipe would otherwise be read and parsed
+/// again for every consumer. It also makes the walk see one answer per recipe
+/// rather than re-reading a file that could change under it.
+fn auto_is_foreign(
+    recipe_dir: &str,
+    name: &str,
+    marks: &mut std::collections::BTreeMap<String, bool>,
+) -> Result<bool, String> {
+    if let Some(known) = marks.get(name) {
+        return Ok(*known);
+    }
+    let mark = mark_of(name, &auto_recipe_json(recipe_dir, name)?)?;
+    marks.insert(name.to_string(), mark);
+    Ok(mark)
+}
+
+fn mark_of(name: &str, alist: &json::Json) -> Result<bool, String> {
+    match alist.get("foreign") {
+        None => Ok(false),
+        Some(json::Json::Bool(b)) => Ok(*b),
+        Some(_) => Err(format!(
+            "recipe `{name}': `foreign' is present but is not a boolean \
+             (APPLICATIONS.md section B.8)"
+        )),
+    }
 }
 
 /// An input is OWNED (td reconstructs it) iff its recipe JSON exists in RECIPE-DIR;
@@ -5607,6 +5712,7 @@ fn auto_topo(
     order: &mut Vec<String>,
     seen: &mut std::collections::BTreeSet<String>,
     stack: &mut Vec<String>,
+    marks: &mut std::collections::BTreeMap<String, bool>,
 ) -> Result<(), String> {
     if seen.contains(name) {
         return Ok(());
@@ -5615,9 +5721,11 @@ fn auto_topo(
         return Err(format!("--auto: dependency cycle through `{name}'"));
     }
     stack.push(name.to_string());
-    for inp in auto_inputs(recipe_dir, name)? {
+    let alist = auto_recipe_json(recipe_dir, name)?;
+    refuse_foreign_on_the_tool_channel(recipe_dir, name, &alist, marks)?;
+    for inp in inputs_from_recipe_json(&alist)? {
         if auto_is_owned(recipe_dir, &inp) {
-            auto_topo(recipe_dir, &inp, order, seen, stack)?;
+            auto_topo(recipe_dir, &inp, order, seen, stack, marks)?;
         }
     }
     stack.pop();
@@ -5863,7 +5971,7 @@ fn auto_synthesize_lock(
         // build-plan re-gate from the recipe's own sourceInput (see the Seed|Source arm).
         out.push_str(&format!("{name}-source {path} source\n"));
     }
-    for inp in inputs_from_recipe_json(&alist) {
+    for inp in inputs_from_recipe_json(&alist)? {
         if auto_is_owned(recipe_dir, &inp) {
             out.push_str(&format!("{inp} /td/store/pending-{inp} td-recipe-output\n"));
         } else {
@@ -5920,7 +6028,8 @@ fn build_plan_auto(
     let mut order: Vec<String> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     let mut stack: Vec<String> = Vec::new();
-    auto_topo(recipe_dir, target, &mut order, &mut seen, &mut stack)?;
+    let mut marks = std::collections::BTreeMap::new();
+    auto_topo(recipe_dir, target, &mut order, &mut seen, &mut stack, &mut marks)?;
     eprintln!(
         "td-builder: build-plan --auto {target}: derived a {}-step plan from the recipe graph: {}",
         order.len(),
@@ -10584,9 +10693,140 @@ daemon build START (2/2 active)
         let mut order = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         let mut stack = Vec::new();
-        auto_topo(&rjs, "bash", &mut order, &mut seen, &mut stack).unwrap();
+        auto_topo(&rjs, "bash", &mut order, &mut seen, &mut stack, &mut Default::default()).unwrap();
         assert_eq!(order, vec!["ncurses", "readline", "bash"]);
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// §B.8's table where `build_plan_auto` can enforce it — over the emitted
+    /// recipe JSON, which is all this side sees. Driven through the real
+    /// `auto_topo` on real files, so unlike the eval-side mirror this one needs
+    /// no injected question: the mark is a key in a file the test writes.
+    #[test]
+    fn auto_topo_refuses_a_marked_payload_on_the_tool_channel() {
+        let d = std::env::temp_dir().join(format!("td-auto-foreign-{}", std::process::id()));
+        let rj = d.join("rj");
+        std::fs::create_dir_all(&rj).unwrap();
+        let put = |name: &str, json: &str| {
+            std::fs::write(rj.join(format!("{name}.json")), json).unwrap();
+        };
+        put("firefox", r#"{"name":"firefox","foreign":true}"#);
+        put("gcc", r#"{"name":"gcc"}"#);
+        let rjs = rj.to_string_lossy().to_string();
+        let walk = |target: &str| {
+            let (mut order, mut seen, mut stack) =
+                (Vec::new(), std::collections::BTreeSet::new(), Vec::new());
+            auto_topo(&rjs, target, &mut order, &mut seen, &mut stack, &mut Default::default()).map(|()| order)
+        };
+
+        for (stem, json) in [
+            ("tool", r#"{"name":"tool","inputs":["gcc","firefox"]}"#),
+            ("native", r#"{"name":"native","nativeInputs":["firefox"]}"#),
+        ] {
+            put(stem, json);
+            let e = walk(stem).expect_err("a marked payload on the tool channel must refuse");
+            assert!(e.contains("firefox") && e.contains("section B.8"), "{e}");
+        }
+
+        // The DATA channel is what the marker exists to permit — an image must be
+        // able to consume an application to place it in root.erofs — and the
+        // payload is still a NODE, so the plan builds it.
+        put("image", r#"{"name":"image","inputs":["gcc"],"payloadInputs":["firefox"]}"#);
+        let order = walk("image").expect("a payload may be staged as data");
+        assert!(order.contains(&"firefox".to_string()), "{order:?}");
+
+        // Marked-ness travels by RECIPE, so a consumer two edges down is refused
+        // as well: `mid` names the payload, `top` names `mid`.
+        put("mid", r#"{"name":"mid","inputs":["firefox"]}"#);
+        put("top", r#"{"name":"top","inputs":["mid"]}"#);
+        let e = walk("top").expect_err("the refusal must reach a deeper consumer");
+        assert!(
+            e.contains("`mid' names `firefox'"),
+            "and for the right reason, not a cycle or a missing file: {e}"
+        );
+
+        // The memo must answer for the NAME it was asked about. A payload reached
+        // first over the DATA channel is memoised there, and a sibling naming it
+        // as a tool afterwards must still red — a memo keyed loosely would hand
+        // back the first answer and let the second edge through.
+        put("both", r#"{"name":"both","inputs":["image","mid"]}"#);
+        let e = walk("both").expect_err("a memoised payload is still refused as a tool");
+        assert!(e.contains("`mid' names `firefox'"), "{e}");
+
+        // A `foreign` key that is not a boolean is an ERROR, never "not marked":
+        // a restriction read from a damaged declaration must not fail open.
+        put("bad", r#"{"name":"bad","foreign":"true"}"#);
+        put("uses-bad", r#"{"name":"uses-bad","inputs":["bad"]}"#);
+        let e = walk("uses-bad").expect_err("a malformed mark must refuse");
+        assert!(e.contains("not a boolean"), "{e}");
+
+        // ...and on a node NOTHING names as a tool, which is where reading the
+        // mark only for tool-channel children left it unlooked-at: the target
+        // itself, and a dependency reached over the DATA channel.
+        assert!(walk("bad").is_err(), "the target's own mark must be read");
+        put("data-bad", r#"{"name":"data-bad","payloadInputs":["bad"]}"#);
+        assert!(
+            walk("data-bad").is_err(),
+            "a payload-channel dependency's mark must be read too"
+        );
+
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A channel is the list §B.8's refusal READS THROUGH, so a malformed one
+    /// must not read as absent: `"inputs":"firefox"` becoming "no names" is the
+    /// restriction failing open on the very list it polices. Same rule
+    /// `payload_names` already states in this file.
+    #[test]
+    fn a_malformed_channel_is_an_error_not_an_absent_one() {
+        let parse = |t: &str| json::parse(t).unwrap();
+        assert!(names_in_channel(&parse(r#"{"name":"x"}"#), "inputs")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            names_in_channel(&parse(r#"{"inputs":["a","b"]}"#), "inputs").unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        for bad in [r#"{"inputs":"firefox"}"#, r#"{"inputs":[{"n":"x"}]}"#, r#"{"inputs":7}"#] {
+            let e = names_in_channel(&parse(bad), "inputs")
+                .expect_err("a malformed channel must refuse");
+            assert!(e.contains("inputs"), "{e}");
+        }
+        // ...and it reaches the walk, rather than being a refusal nothing calls.
+        let d = std::env::temp_dir().join(format!("td-badchan-{}", std::process::id()));
+        let rj = d.join("rj");
+        std::fs::create_dir_all(&rj).unwrap();
+        std::fs::write(rj.join("s.json"), r#"{"name":"s","inputs":"firefox"}"#).unwrap();
+        let (mut o, mut s2, mut st) =
+            (Vec::new(), std::collections::BTreeSet::new(), Vec::new());
+        assert!(auto_topo(
+            &rj.to_string_lossy(),
+            "s",
+            &mut o,
+            &mut s2,
+            &mut st,
+            &mut Default::default()
+        )
+        .is_err());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// The two channel rosters must partition the same set: a fourth channel
+    /// added to `CHANNELS` alone is a path §B.8's table never rules on, and one
+    /// added to `TOOL_CHANNELS` alone is a path the plan never resolves.
+    #[test]
+    fn the_tool_channels_are_a_subset_of_every_channel() {
+        for c in TOOL_CHANNELS {
+            assert!(CHANNELS.contains(&c), "{c} is not a declaration channel");
+        }
+        assert_eq!(
+            CHANNELS
+                .iter()
+                .filter(|c| !TOOL_CHANNELS.contains(c))
+                .collect::<Vec<_>>(),
+            vec![&"payloadInputs"],
+            "exactly one channel is exempt, and it is the DATA one"
+        );
     }
 
     // --auto MAP file: `NAME PATH` per line, blank/`#`-comment lines skipped, and the

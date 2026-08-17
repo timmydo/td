@@ -999,9 +999,10 @@ UNMARKED. That is the same outcome the key check refuses, reached
 through the wiring rather than through a name, so the wiring is pinned
 in source.
 
-Taint PROPAGATION, the `contains_payloads` containment edge, the
-planning-time refusal and the closure query are the next increments. One
-thing they will need that this increment does not: the mark does not
+The `contains_payloads` containment edge and the closure query are the
+next increments; the planning-time refusal that reads this mark landed
+after it and is described below. One thing they will need that neither
+increment has: the mark does not
 cross into the four-column source-pin TSV that `td-feed` and the
 control-plane bootstrap parse into their own pin types, so the
 fetch/warm side cannot yet tell a foreign pin from an ordinary one.
@@ -1014,6 +1015,54 @@ property of the fixed-output source pin, it propagates to every output
 derived from it, and an unmarked descendant of a marked source is a
 planning-time refusal in the shape `seed_digests.rs` already uses for
 `provenance rejected`.
+
+**The refusal has LANDED, in both places a plan is built**, and what it
+enforces is the table below rather than the sentence above — because
+those turn out to say different things. "An unmarked descendant of a
+marked source" suggests the taint should SPREAD to the consumer; the
+table says a marked path on `inputs`/`native_inputs` is *refused*, which
+means there is no unmarked descendant to catch. A consumer that names a
+payload as a tool does not become foreign, it does not build. The
+sentence describes what would be needed if the tool channel admitted a
+payload; the table is why it does not.
+
+So marked-ness travels by RECIPE and the refusal reaches as far as the
+graph does: `mid` naming a payload in `inputs` is refused, and so is
+`top` naming `mid`, because `mid` never builds. Both plan builders
+enforce it, which is the reason the derived flag had to reach the build
+JSON at all: at eval, `classify_graph_inputs` refuses in the
+`provenance rejected` shape; in `td-builder`, `auto_topo` refuses while
+walking the emitted JSON, which is all that side ever sees. A `foreign`
+key present but not a boolean is an ERROR there rather than "not
+marked" — a restriction read from a damaged declaration must not fail
+open.
+
+The two channel rosters are named constants and asserted to partition
+the same set, so a fourth declaration channel cannot be added to one
+alone: added to the walk only, it is a path the table never rules on;
+added to the refusal only, it is a path the plan never resolves.
+
+**A marked PIN named as a tool is refused too**, and review is what
+found that a recipe-level check alone missed the case this section names
+FIRST. A recipe writing `.inputs(&["app-archive"])` for a marked pin has
+the payload's own bytes staged as a seed source and builds from them —
+and the pin attaches, so 3b-i marks the recipe for it. Nothing refused
+the recipe that actually runs the payload; only a *consumer* of it would
+have been, and there need not be one. That is precisely "the packaging
+recipe free to execute the pinned foreign binary while building it",
+arriving through the tool channel rather than through the output. So the
+question asked per edge is "is this name a marked recipe OR a marked
+pin". `source_input` is deliberately untouched: that channel is how a
+payload enters the store at all, and the recipe it marks is the
+packaging recipe.
+
+That half is enforced where the CATALOG is known — at eval, plus a
+catalog sweep — and **not** in `td-builder`, which cannot enforce it: a
+pin's mark does not cross into the build JSON, so a non-owned input is
+just a name the map resolves. It is the same gap as the source-pin TSV
+above and closes with it. Until then the division is: `td-builder`
+refuses a marked RECIPE on the tool channel, and the pin case is refused
+before any recipe JSON exists.
 
 **"Propagates to every output derived from it" cannot be read over the
 `payload_inputs` edge, and review caught the two rules colliding exactly
@@ -2797,11 +2846,11 @@ packaged selftest, boot oracle — with **network never in the gate**.
 8. **The §B.8 marker's own tests, which are the ones this design most
    depends on** and which nothing else in this list covers:
    - a recipe naming a marked path in `inputs`/`native_inputs` rather
-     than `payload_inputs` is a planning-time refusal;
+     than `payload_inputs` is a planning-time refusal — **landed**, in
+     both plan builders, for a marked recipe and a marked pin alike;
    - a `Step::Run` argv expanding a `payload_inputs` path is a refusal —
      the argv/template scanner, since this is the assertion whose
      violation is otherwise silent;
-   - an unmarked output derived from a marked source pin is a refusal;
    - the interpreter assertion: the payload's `PT_INTERP` is absent from
      the built image tree, so a direct `execve` outside a jail fails
      `ENOENT`. Asserted against the image, not assumed;

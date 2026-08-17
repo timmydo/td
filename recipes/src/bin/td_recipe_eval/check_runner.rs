@@ -2863,9 +2863,90 @@ fn push_seed_input(inputs: &mut Vec<SeedInput>, seen: &mut HashSet<String>, inpu
 /// filesystem — so the entry points run it BEFORE any ambient execution
 /// (stage0 placement, interning): a rejected graph executes NOTHING.
 pub(crate) fn classify_graph_inputs(nodes: &[RecipeNode]) -> Result<Vec<SeedInput>, String> {
+    // Built ONCE per call. `catalog::lookup` CONSTRUCTS every recipe in the
+    // catalog and then searches linearly, and the marked-ness question is asked
+    // once per tool-channel edge — of which the shipped graph has hundreds — so
+    // asking it through `lookup` measurably doubled this pass.
+    let marked = marked_names();
+    classify_graph_inputs_with(nodes, |name| marked.contains(name))
+}
+
+/// APPLICATIONS.md §B.8's table: a marked path is permitted on `payload_inputs`
+/// and REFUSED on `inputs`/`native_inputs`. In the `provenance rejected` shape
+/// because that is what it is — a foreign payload reaching the tool, compilation
+/// and execution channel is the ingress the marker exists to name.
+fn refuse_foreign_on_the_tool_channel(
+    node: &RecipeNode,
+    is_marked: &impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    refuse_foreign_with(&node.stem, &node.recipe, is_marked)
+}
+
+/// Every name §B.8 marks: marked RECIPES (built from a payload) and marked PINS
+/// (the payload's own bytes).
+///
+/// The pin half is the one §B.8 names first and the one a recipe-only check
+/// misses: a recipe naming a marked pin in `inputs` has that pin's bytes staged
+/// as a seed source, builds from them, and is merely MARKED for it — so the
+/// packaging recipe is "free to execute the pinned foreign binary while building
+/// it", which is the exact failure the pin-level mark exists to prevent. Only a
+/// later consumer would have been refused, and there need not be one.
+///
+/// `source_input` is deliberately NOT covered: that channel is how a payload
+/// enters the store at all, and the recipe it marks is the packaging recipe.
+fn marked_names() -> HashSet<String> {
+    catalog::all()
+        .into_iter()
+        .filter(|(_, recipe)| recipe.is_foreign())
+        .map(|(stem, _)| stem.to_string())
+        .chain(
+            source_pins::all()
+                .into_iter()
+                .filter(|pin| pin.foreign())
+                .map(|pin| pin.key),
+        )
+        .collect()
+}
+
+/// Takes the marked-ness question as an ARGUMENT because the shipped catalog has
+/// no foreign recipe in it: a check that could only ask the real catalog would
+/// pass with the rule inverted, the trap this workstream keeps finding. The
+/// wiring that supplies the real question is pinned in source instead.
+fn refuse_foreign_with(
+    stem: &str,
+    recipe: &Recipe,
+    is_foreign: impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    for (channel, names) in [
+        ("inputs", &recipe.inputs),
+        ("native_inputs", &recipe.native_inputs),
+    ] {
+        for input in names.iter().flatten() {
+            if is_foreign(input) {
+                return Err(format!(
+                    "{PROVENANCE_REJECTED}recipe {stem}: `{input}' is a marked foreign payload \
+                     (APPLICATIONS.md section B.8) and is named in `{channel}'. A payload is \
+                     staged as DATA through `payload_inputs'; the tool, compilation and \
+                     execution channel refuses one."
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Takes the marked-ness question as an ARGUMENT so the LOOP is observable: the
+/// shipped catalog marks nothing, so a check that could only ask it observes
+/// nothing, and a source-text pin on the call site cannot tell "runs for every
+/// node" from "runs for the first" or from "returns early".
+fn classify_graph_inputs_with(
+    nodes: &[RecipeNode],
+    is_marked: impl Fn(&str) -> bool,
+) -> Result<Vec<SeedInput>, String> {
     let mut seen = HashSet::new();
     let mut seed_inputs = Vec::new();
     for node in nodes {
+        refuse_foreign_on_the_tool_channel(node, &is_marked)?;
         if let Some(key) = &node.recipe.source_input {
             let input = seed_input_for_recipe_source(key, &node.recipe)?;
             push_seed_input(&mut seed_inputs, &mut seen, input);
@@ -3760,6 +3841,137 @@ fn tail_bytes(bytes: &[u8], lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §B.8's table at eval. The catalog has no foreign recipe, so the question
+    /// is supplied here — a check that could only ask the real catalog would
+    /// pass with the rule spelled backwards.
+    #[test]
+    fn a_marked_payload_is_refused_on_the_tool_channel_and_allowed_as_data() {
+        let marked = |name: &str| name == "firefox";
+        let on = |r: Recipe| refuse_foreign_with("image", &r, marked);
+
+        for channel in [
+            Recipe::gnu("image", "1").inputs(&["gcc", "firefox"]),
+            Recipe::gnu("image", "1").native_inputs(&["firefox"]),
+        ] {
+            let e = on(channel).expect_err("a marked path on the tool channel must refuse");
+            assert!(e.starts_with(PROVENANCE_REJECTED), "{e}");
+            assert!(e.contains("firefox"), "{e}");
+        }
+        // The DATA channel is the arrangement the marker exists to PERMIT: an
+        // image recipe must be able to consume an application to place it in
+        // root.erofs, which is why this is a channel and not a ban.
+        assert!(on(Recipe::gnu("image", "1").payload_inputs(&["firefox"])).is_ok());
+        // ...and an unmarked input on the tool channel is the ordinary case.
+        assert!(on(Recipe::gnu("image", "1").inputs(&["gcc", "bash"])).is_ok());
+    }
+
+    /// The wiring that supplies the real question, pinned in source: with no
+    /// marked recipe in the catalog, asking it and asking nothing return the
+    /// same answer, so no value observation can see this line.
+    #[test]
+    fn the_refusal_asks_the_catalog_for_the_mark() {
+        let src = include_str!("check_runner.rs");
+        let shipped = match src.find("\n#[cfg(test)]\nmod tests {") {
+            Some(at) => src.get(..at).unwrap_or(src),
+            None => src,
+        };
+        let asks: Vec<&str> = shipped
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("is_foreign()") || l.contains("pin.foreign()"))
+            .collect();
+        assert_eq!(
+            asks,
+            vec![
+                ".filter(|(_, recipe)| recipe.is_foreign())",
+                ".filter(|pin| pin.foreign())",
+            ],
+            "the marked set is built from BOTH the catalog and the pins — a \
+             recipe-only question misses the payload's own bytes named as a tool"
+        );
+        assert!(
+            shipped.contains("classify_graph_inputs_with(nodes, |name| marked.contains(name))"),
+            "the shipped entry point must supply the REAL marked set — the \
+             behavioural tests inject their own, and cannot see this line"
+        );
+    }
+
+    /// The PIN half, which a recipe-only check missed entirely: a recipe naming
+    /// a marked pin in `inputs` has the payload's bytes staged as a seed source
+    /// and builds from them, and 3b-i marks it for that — so nothing refused the
+    /// recipe that actually runs the payload, only a consumer it need not have.
+    #[test]
+    fn a_marked_pin_named_as_a_tool_is_refused_like_a_marked_recipe() {
+        let marked_pin = |name: &str| name == "app-archive";
+        let on = |r: Recipe| refuse_foreign_with("packager", &r, marked_pin);
+        for r in [
+            Recipe::gnu("packager", "1").inputs(&["app-archive"]),
+            Recipe::gnu("packager", "1").native_inputs(&["app-archive"]),
+        ] {
+            let e = on(r).expect_err("a marked pin on the tool channel must refuse");
+            assert!(e.starts_with(PROVENANCE_REJECTED), "{e}");
+        }
+        // `source_input` is how a payload ENTERS the store, so it is untouched:
+        // the packaging recipe names its pin there and is marked for it.
+        assert!(on(Recipe::gnu("packager", "1").source_input("app-archive")).is_ok());
+    }
+
+    /// Nothing in the catalog may name a marked pin or recipe as a tool. Vacuous
+    /// today by construction — nothing is marked — so it is a REGRESSION gate for
+    /// the landing that marks the first one, not evidence the rule works; the
+    /// fixture-driven tests above are that.
+    #[test]
+    fn no_shipped_recipe_names_a_marked_path_as_a_tool() {
+        let marked = marked_names();
+        for (stem, recipe) in catalog::all() {
+            refuse_foreign_with(stem, &recipe, |n| marked.contains(n)).unwrap();
+        }
+    }
+
+    /// The refusal runs for EVERY node, which no source-text pin can establish:
+    /// a grep for the call site cannot tell "runs for every node" from "runs for
+    /// the first" or from a guard that returns early. Driven over a multi-node
+    /// graph with the marked-ness question injected, because the shipped catalog
+    /// marks nothing.
+    #[test]
+    fn the_planning_pass_refuses_a_marked_path_on_any_node_not_just_the_first() {
+        let node = |stem: &str, recipe: Recipe| RecipeNode {
+            stem: stem.to_string(),
+            recipe,
+        };
+        // The marked name is a REAL catalog recipe, so ordinary provenance
+        // classification accepts it and this refusal is the only thing that can
+        // red. A made-up name would be rejected anyway, for a different reason,
+        // and the test would pass with the refusal deleted.
+        const MARKED: &str = "gcc-mesboot0";
+        let clean = || node("clean", Recipe::mesboot("clean", "0").inputs(&["binutils-mesboot0"]));
+        let dirty = || node("dirty", Recipe::mesboot("dirty", "0").inputs(&[MARKED]));
+        let marked = |n: &str| n == MARKED;
+        let unmarked = |_: &str| false;
+
+        // Unmarked, the same graph classifies cleanly — which is what makes the
+        // refusal below attributable to the mark and to nothing else.
+        assert!(classify_graph_inputs_with(&[clean(), dirty()], unmarked).is_ok());
+        assert!(classify_graph_inputs_with(&[clean()], marked).is_ok());
+        // FIRST and LAST: a first-node-only check would miss one of these.
+        for nodes in [vec![clean(), dirty()], vec![dirty(), clean()]] {
+            let e = classify_graph_inputs_with(&nodes, marked)
+                .expect_err("a marked path on any node must refuse");
+            assert!(e.starts_with(PROVENANCE_REJECTED), "{e}");
+            assert!(
+                e.contains("marked foreign payload") && e.contains(MARKED),
+                "and for the B.8 reason, not ordinary provenance: {e}"
+            );
+        }
+        // The DATA channel stays permitted through the whole pass.
+        let data = node(
+            "image",
+            Recipe::mesboot("image", "0").payload_inputs(&[MARKED]),
+        );
+        assert!(classify_graph_inputs_with(&[data], marked).is_ok());
+        assert!(classify_graph_inputs_with(&[], marked).is_ok());
+    }
 
     /// A fake `cargo` at `path`: `body` runs with the real cargo's argv, so a test
     /// can make it produce the binary, exit 0 producing nothing, or fail.
