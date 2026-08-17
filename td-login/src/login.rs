@@ -160,7 +160,14 @@ fn start(name: &str, forced: bool, mode: Env, status: &Status) -> Result<u8, Str
 
 /// The DECISION half: resolve the account and apply the policy. Nothing here
 /// changes any state, which is what makes it safe for the prompt loop to retry.
-fn authorize(name: &str, forced: bool) -> Result<Account, String> {
+///
+/// `pub(crate)` because it is the crate's ONE authentication decision and every
+/// front end reaches it: `login` through `start` and the prompt loop, `su` and
+/// `exec-as` with `forced`. `su` used to carry its own copy of four of these
+/// five steps — one policy in two places, with the compiler checking only the
+/// `match` — and `the_session_policy_is_decided_in_one_place` is what stops a
+/// third appearing.
+pub(crate) fn authorize(name: &str, forced: bool) -> Result<Account, String> {
     if !plausible_name(name) {
         return Err(format!("{name:?} is not a plausible user name"));
     }

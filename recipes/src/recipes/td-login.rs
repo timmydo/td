@@ -55,7 +55,7 @@ use crate::types::{Recipe, Step};
 // single `rustc src/main.rs` pulls them all in — but only if every module file is
 // present next to it in {src}. MODULES is held to those `mod` lines by
 // `the_recipe_writes_out_exactly_the_modules_the_crate_declares` below rather than
-// by a comment asking; the crate's own `src_holds_exactly_the_nine_scanned_modules`
+// by a comment asking; the crate's own `src_holds_exactly_the_ten_scanned_modules`
 // is the other half of the pin, from the directory side.
 //
 // Every source below is written out with a WriteFile, which the ladder
@@ -71,6 +71,7 @@ const MAIN_RS: &str = include_str!("../../../td-login/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
     ("creds", include_str!("../../../td-login/src/creds.rs")),
     ("db", include_str!("../../../td-login/src/db.rs")),
+    ("exec_as", include_str!("../../../td-login/src/exec_as.rs")),
     ("login", include_str!("../../../td-login/src/login.rs")),
     ("session", include_str!("../../../td-login/src/session.rs")),
     ("status", include_str!("../../../td-login/src/status.rs")),

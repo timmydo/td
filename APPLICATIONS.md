@@ -348,7 +348,7 @@ failed every boot; it was caught in review rather than in QEMU.
 | `td-busd` | `/bin/td-busd` | none | surface **#10** | the session D-Bus broker; SCM_RIGHTS forces the surface |
 | `td-portal` | `td-portal -> td-compositor` | none | **none** (first landing) | a fourth `argv[0]` personality of the compositor multicall, in its own process (§E) |
 | `td-audio` | `/bin/td-audio` | none | surface **#11** | the PulseAudio-protocol sound server (§K), running as its own `audio` uid |
-| `td-login` | new `exec-as` applet | none | no new syscalls | launch a literal argv as another uid without a shell |
+| `td-login` | new `exec-as` subcommand (§A's Supervision — NOT an applet, so no `/bin/exec-as`) | none | no new syscalls | launch a literal argv as another uid without a shell |
 
 There is **no application-manager binary**. With packages in the image
 there is no install, no uid allocation in v1, and no launch plan to
@@ -480,6 +480,26 @@ restart=always
 both the bus and the compositor. Both are `restart=always`: a crashed
 broker must return before the next portal call, and td-svc's backoff
 bounds the loop.
+
+**`exec-as` has LANDED** (rung 2), with three details this sketch did not
+settle. It is a SUBCOMMAND rather than an applet — `td-login exec-as`,
+never a `/bin/exec-as` symlink — for the reason `verify-credentials` is
+one: the units above spell it out in full and never invoke it by
+basename, so a symlink would put an unaccounted name in `/bin`, and this
+particular name is one a reader could mistake for a general-purpose "run
+this as anyone". The `--` is REQUIRED, which is the whole parser: with no
+options of its own, a mandatory separator removes the only ambiguity
+available and keeps a later option from colliding with an argument that
+already works. And the environment is EMPTIED — not merely `su -`'s
+fresh one, which keeps `TERM`, but the five identity variables and
+nothing else. A supervised daemon's environment should be a property of
+its unit and td-svc has no `env=` key to make it one, so anything
+carried across makes what a daemon sees a function of the boot path;
+`TERM` is the case that proves the rule rather than an exception to it,
+since a process with no terminal has no use for one and its value
+changes program output between boots. That is why the units above pass
+every path as an explicit argument, and adding a variable is a
+unit-level key rather than a flag on `exec-as`.
 
 **No setuid helper and no new root daemon of its own.** One dependency is
 not this design's: `td-authd` (§L.1), for elevation and, in v2, for the
@@ -2743,7 +2763,7 @@ Each row is one landing or a small family, leaving the tree green.
 | # | lands | visible result |
 |---|---|---|
 | 1 | **kernel namespace/seccomp/cgroup config pins + QEMU readback** (§0) — **LANDED**, except the functional calls, which need surface #9: the `unshare` at rung 8, the filter install at rung 11 | none — but this is the gate on everything |
-| 2 | `td-login exec-as` with credential readback | none |
+| 2 | `td-login exec-as` with credential readback — **LANDED** | none |
 | 3 | **the §B.8 marker**: the recipe-level mark, `payload_inputs` as a declared channel, taint propagation from the source pin, and the planning-time refusals — plus the argv/template scanner, since that assertion is the one that is otherwise silent | none |
 | 4 | the manifest and permission keyfile, name validation and every rejection; the closure query reporting marked paths | none |
 | 5 | first seed recipe — a pinned upstream artifact becomes a store package with §B.3's checks and §B.8's assertions | none |
@@ -4025,7 +4045,7 @@ tables, and every one is a line four agents will edit at once:
 |---|---|---|---|
 | **A** | `td-jail-rolling` | `recipes/src/recipes/linux-x86-64.rs`; `td-jail/**` and its recipes | td-compositor, td-audio |
 | **B** | `td-busd-rolling`, and `ui-rolling` for compositor work | `td-busd/**` and its recipes; the portal personality and the Wayland protocol gap inside `td-compositor/**` | td-jail, td-audio |
-| **C** | `td-audio-rolling`, `td-identity-rolling` | `td-audio/**` and its recipes; the uid-allocation registry; the `td-login exec-as` applet | td-compositor, td-jail, td-busd |
+| **C** | `td-audio-rolling`, `td-identity-rolling` | `td-audio/**` and its recipes; the uid-allocation registry; the `td-login exec-as` subcommand (landed) | td-compositor, td-jail, td-busd |
 | **D** | `td-pkg-rolling` | every seed recipe, one file per application; the package format and spec compiler | everything above |
 
 A's kernel commit is the only true blocking edge, and it is small.

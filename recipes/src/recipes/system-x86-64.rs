@@ -1401,6 +1401,45 @@ fn td_login_probe(sys: &SystemDef) -> String {
     )
 }
 
+/// The `exec-as` half of the td-login farm, which runs as ROOT rather than through `su`.
+///
+/// It has to: `exec-as` changes credentials, so a copy running as the unprivileged user
+/// would fail `setgroups(2)` with EPERM and prove nothing about the applet. That is also
+/// why it cannot join `td_login_probe` above — the two legs need different privilege.
+///
+/// What it exercises is the whole path a supervisor unit will take, end to end and on the
+/// real image: the parser, the shared `authorize` policy, the credential switch, and the
+/// `exec`. It does that by pointing `exec-as` at the READBACK — `exec-as USER --
+/// td-login verify-credentials …` — so the process that reports whether the switch took
+/// is the process `exec-as` itself started. Without this leg `exec-as` ships entirely
+/// unexecuted: nothing else on the image invokes it, and `parse` plus `session_for` are
+/// the only parts a unit test can reach.
+///
+/// Single quotes are fine here, unlike every probe inside the greeter's `su -c '…'`:
+/// this one is a root-level command in the generated script rather than an argument to
+/// one.
+fn td_login_exec_as_probe(sys: &SystemDef) -> String {
+    let Some(user) = sys.users.iter().find(|user| user.name == sys.autologin) else {
+        // Fail CLOSED, for `td_login_probe`'s reason: an empty command would be a
+        // success the marker gate cannot tell from a real one.
+        return "{ echo \"td-login: no autologin user to exec-as\"; false; }".into();
+    };
+    let groups: Vec<String> = supplementary_gids(sys, user.name)
+        .iter()
+        .map(|gid| gid.to_string())
+        .collect();
+    format!(
+        "{{ /bin/td-login exec-as {name} -- /bin/td-login verify-credentials \
+         --uid {uid} --gid {gid} --groups \"{groups}\" || \
+         {{ echo \"td-login: exec-as {name} did not produce uid {uid} gid {gid} \
+         groups [{groups}]\"; false; }}; }}",
+        name = user.name,
+        uid = user.uid,
+        gid = user.gid,
+        groups = groups.join(",")
+    )
+}
+
 /// Each component marker is emitted by its OWN leg, not from one block gated on every leg
 /// passing. Emitting them together meant any single failure withheld every marker, so the oracle
 /// reported whichever it checked first — uutils — and the diagnostics the other farms went to
@@ -1667,6 +1706,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
         td_init_probes.push_str(&td_init_probe(applet, probe, sys));
     }
     let td_login_probe = td_login_probe(sys);
+    let td_login_exec_as_probe = td_login_exec_as_probe(sys);
     let td_txt_probes = build_td_txt_probes();
     let sandbox_kernel_probes = build_sandbox_kernel_probes();
     // Named rather than spelled, so a renamed key or a reworded refusal cannot
@@ -1735,7 +1775,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          {td_init_probes}[ \"$i\" = 1 ]'; then \
          [ \"$mti\" = 1 ] || {{ echo {TD_INIT_RUNTIME_MARKER}; mti=1; }}; else healthy=0; fi; \
          if /bin/su -s /bin/sh {} -c \
-         '{td_login_probe}'; then \
+         '{td_login_probe}' && {td_login_exec_as_probe}; then \
          [ \"$mtl\" = 1 ] || {{ echo {TD_LOGIN_RUNTIME_MARKER}; mtl=1; }}; else healthy=0; fi; \
          if /bin/su -s /bin/sh {} -c \
          '{td_txt_probes}[ \"$t\" = 1 ]'; then \
@@ -2655,6 +2695,8 @@ fn shape_check() -> String {
          printf '%s\\n' \"$tdllist\" | grep -q -x -F \"$a\" || { echo \"td-login does not serve applet '$a' - its packed /bin/$a symlink would dispatch to nothing (usage, exit 2)\" >&2; exit 1; }; \
      done; \
      [ -e \"$root/bin/verify-credentials\" ] && { echo 'root tree: verify-credentials is a readback PROBE, not an applet; a /bin symlink for it is a name no farm list accounts for' >&2; exit 1; }; \
+     [ -e \"$root/bin/exec-as\" ] && { echo 'root tree: exec-as is a SUBCOMMAND, not an applet; a /bin/exec-as symlink would be a name no farm list in system-x86-64.rs accounts for, and one a reader could mistake for a general-purpose run-as-anyone tool beside su. It is not a privilege boundary - creds::may_switch is - so this refuses an unaccounted NAME, not a reachable capability' >&2; exit 1; }; \
+     \"$tdl\" exec-as 2>/dev/null && { echo 'td-login exec-as ACCEPTED an argv with no user and no program - its parser is what keeps a supervisor unit from starting something nobody named' >&2; exit 1; }; \
      \"$tdl\" verify-credentials --uid 4294967294 --gid 4294967294 >/dev/null 2>&1 && { echo 'td-login verify-credentials ACCEPTED credentials this build process cannot have - the readback the TD-LOGIN-RUN-OK marker gates on proves nothing' >&2; exit 1; }; \
      set -- $(ls -l \"$tdl\"); case \"$1\" in *[sS]*) echo \"root tree: the packed td-login carries a setuid/setgid bit (mode $1). td-login is NEVER installed setuid-root (td-login/THREAT-MODEL.md section 4): with one, an unprivileged caller starts with euid 0 and 'su root' becomes root without authenticating\" >&2; exit 1;; esac; \
      tditab=$(\"$tdi\" init --dry-run -f \"$root/etc/inittab\" 2>&1) || { echo 'td-init init --dry-run REJECTED the inittab this image ships - PID 1 would come up having understood only part of its table. Its per-line diagnostics:' >&2; printf '%s\\n' \"$tditab\" >&2; exit 1; }; \
@@ -7036,12 +7078,16 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
                 "/bin/{applet} must resolve to the staged td-login multicall"
             );
         }
-        // The readback PROBE gets no /bin name: it is not an applet, and a farm-less /bin
+        // Neither SUBCOMMAND gets a /bin name: neither is an applet, and a farm-less /bin
         // entry is one no list in this file accounts for and no shape check verifies.
-        assert!(
-            !packed_bin_names().iter().any(|n| n == "verify-credentials"),
-            "verify-credentials is a probe, not an applet; it must not be packed into /bin"
-        );
+        // Roster hygiene rather than a boundary — `/bin/td-login` is a shipped symlink,
+        // so the subcommand is reachable either way; `creds::may_switch` is the gate.
+        for subcommand in ["verify-credentials", "exec-as"] {
+            assert!(
+                !packed_bin_names().iter().any(|n| n == subcommand),
+                "{subcommand} is a subcommand, not an applet; it must not be packed into /bin"
+            );
+        }
 
         // The health target must RUN the readback through /bin/su — the shipped symlink and
         // the real credential switch — and clear the marker gate when it disagrees.
@@ -7118,14 +7164,54 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             bootsuccess.contains("l=0; }; [ \"$l\" = 1 ]"),
             "a failed readback must clear the marker gate"
         );
+        // Both halves gate the ONE marker: the unprivileged readback through `su`, and
+        // the root-side `exec-as` that starts a session of its own. They are `&&`ed
+        // rather than given a marker each because they prove the same thing — that this
+        // crate's credential switch produced the credentials it named — through the two
+        // front ends a supervised image actually uses.
         assert!(
             bootsuccess.contains(&format!(
-                "[ \"$l\" = 1 ]'; then [ \"$mtl\" = 1 ] || {{ echo {TD_LOGIN_RUNTIME_MARKER}; \
-                 mtl=1; }}; else healthy=0; fi"
+                "[ \"$l\" = 1 ]' && {}; then [ \"$mtl\" = 1 ] || {{ echo \
+                 {TD_LOGIN_RUNTIME_MARKER}; mtl=1; }}; else healthy=0; fi",
+                td_login_exec_as_probe(&SYSTEM)
             )),
             "the health target must emit the td-login marker from that leg alone, so an \
              absent TD-LOGIN-RUN-OK names the credential switch rather than some component \
              upstream of it"
+        );
+        // `exec-as` is otherwise never run on the image: no unit uses it yet and no other
+        // probe names it, so without this leg it would ship with only `parse` and
+        // `session_for` covered. Its ROOT placement is already pinned by the whole-leg
+        // assertion above — which spells the text either side of it — so nothing here
+        // repeats that.
+        let exec_as = td_login_exec_as_probe(&SYSTEM);
+        assert!(
+            exec_as.contains("/bin/td-login exec-as tester -- /bin/td-login verify-credentials"),
+            "the exec-as leg must point exec-as at the readback, so the process reporting \
+             the switch is the one exec-as started: {exec_as}"
+        );
+        // The empty supplementary set, for `td_login_probe`'s reason and against this
+        // probe's own independent copy of the formatting: an unquoted empty value
+        // vanishes from the argv, leaving `--groups` with no argument, and rung 5's
+        // `audio` uid is exactly the account that will have none.
+        assert!(
+            td_login_exec_as_probe(&lone).contains("--groups \"\" ||"),
+            "exec-as must quote an empty group list too: {}",
+            td_login_exec_as_probe(&lone)
+        );
+        // Fail-closed, asserted on the DIAGNOSTIC rather than on `false`: the success
+        // path ends `…; false; }; }` too, so a `contains("false")` here would be
+        // satisfied by either branch and would green a probe that resolved a
+        // non-existent user to the ordinary text.
+        let unresolvable = td_login_exec_as_probe(&SystemDef {
+            autologin: "nobody-here",
+            ..SYSTEM
+        });
+        assert!(
+            unresolvable.contains("no autologin user to exec-as")
+                && !unresolvable.contains("exec-as nobody-here"),
+            "an unresolvable autologin user must yield a failing exec-as leg that says \
+             so, not an empty one and not an ordinary one: {unresolvable}"
         );
         // ...and the group set must be DERIVED from the generated /etc/group, not a constant
         // that quietly stops matching it. wheel is the membership the stock SYSTEM grants.

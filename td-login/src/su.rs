@@ -10,7 +10,8 @@
 //! reaches its markers has exercised this applet several times over.
 
 use crate::creds::Credentials;
-use crate::db::{self, Denied};
+use crate::db;
+use crate::login;
 use crate::session::{self, Env, Session};
 use crate::{emit_err, ROOT};
 
@@ -88,15 +89,11 @@ pub fn run(args: &[String]) -> Result<u8, String> {
     let opts = parse(args)
         .map_err(|e| format!("{e}\nusage: su [-] [-l] [-m|-p] [-s SHELL] [-c CMD] [USER [ARG…]]"))?;
     let name = opts.user.as_deref().unwrap_or(ROOT);
-    let account = db::account(name)?;
-    // `su` is a forced path: reaching the switch at all needs root, and root has
-    // already established the right to become anyone. A LOCKED account is still
-    // refused — see THREAT-MODEL.md section 3.
-    let secret = db::secret(name)?;
-    db::may_start_session(secret, true).map_err(|denial| match denial {
-        Denied::Locked => format!("account {name:?} is locked"),
-        Denied::NeedsPassword => format!("account {name:?} cannot start a session"),
-    })?;
+    // FORCED, and through the crate's one decision rather than a copy of it:
+    // `su` had its own version of four of `authorize`'s five steps, which is a
+    // policy that has to be changed in two places with the compiler checking
+    // neither. A LOCKED account is still refused — THREAT-MODEL.md section 3.
+    let account = login::authorize(name, true)?;
     let groups = db::supplementary(name)?;
     let creds = Credentials::new(account.uid, account.gid, &groups);
 
@@ -131,7 +128,7 @@ pub fn run(args: &[String]) -> Result<u8, String> {
     let arg0 = if opts.login {
         session::login_arg0(&program)
     } else {
-        program.rsplit('/').next().unwrap_or(&program).to_string()
+        crate::basename(&program).to_string()
     };
     let env = session::environment(&account, &program, mode, &session::inherited());
     let session = Session {

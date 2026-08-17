@@ -305,6 +305,14 @@ pub const TD_INIT_RUNTIME_MARKER: &str = "TD-INIT-RUN-OK";
 /// silently keeps root's supplementary groups; every marker on this image still
 /// prints. So this one asserts the RESULT: all four uid columns, all four gid
 /// columns, and the supplementary set exactly. See td-login/THREAT-MODEL.md.
+///
+/// It now gates on `exec-as` as well, and that half needed a leg of its own for a
+/// reason worth recording: `exec-as` is the front end a SUPERVISOR uses, so it runs
+/// as root and drops, where every other unprivileged health leg has already dropped
+/// by the time it runs. A copy inside the greeter's `su` would fail `setgroups(2)`
+/// with EPERM and prove nothing. Both legs point at the same readback, so the marker
+/// still means one thing — this crate's credential switch produced the credentials
+/// it named — proven now through both front ends the image has rather than one.
 pub const TD_LOGIN_RUNTIME_MARKER: &str = "TD-LOGIN-RUN-OK";
 
 /// Printed by the unprivileged compositor only after its first framebuffer

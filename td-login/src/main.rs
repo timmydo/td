@@ -32,6 +32,7 @@
 
 mod creds;
 mod db;
+mod exec_as;
 mod login;
 mod session;
 mod status;
@@ -59,6 +60,17 @@ const APPLETS: &[(&str, Applet)] = &[("login", login::run), ("su", su::run)];
 /// asked for — the one regression every other check on the image would pass.
 const VERIFY: &str = "verify-credentials";
 
+/// `exec-as USER -- PROGRAM [ARG…]`: run a literal argv as another user, with no
+/// shell between the supervisor and the program.
+///
+/// A SUBCOMMAND rather than an applet, for the reason `verify-credentials` is
+/// one: APPLICATIONS.md's units spell it `/bin/td-login exec-as tester -- …` and
+/// never invoke it by basename, so a `/bin/exec-as` symlink would put a name on
+/// the image that nothing calls and no farm list accounts for. It is also a
+/// name a person could mistake for a general-purpose "run this as anyone" tool,
+/// which is worth not hanging in `/bin` beside `su`.
+const EXEC_AS: &str = "exec-as";
+
 /// A plain loop rather than an iterator search: this file is embedded verbatim
 /// into the recipe, and the ladder guard scans step content for host-tool names
 /// that the search combinator happens to share.
@@ -75,7 +87,7 @@ fn names() -> Vec<&'static str> {
     APPLETS.iter().map(|(n, _)| *n).collect()
 }
 
-fn basename(path: &str) -> &str {
+pub(crate) fn basename(path: &str) -> &str {
     // `rsplit` always yields at least one item, so the fallback is unreachable;
     // `unwrap_or` states that without an `unwrap` the lint would reject.
     path.rsplit('/').next().unwrap_or(path)
@@ -108,7 +120,8 @@ fn usage() -> String {
     format!(
         "td-login: static multicall; applets: {}\n\
          usage: td-login <applet> [args]  (or invoke through a /bin/<applet> symlink)\n\
-         usage: td-login {VERIFY} --uid U --gid G [--groups G[,G…]]",
+         usage: td-login {VERIFY} --uid U --gid G [--groups G[,G…]]\n\
+         usage: td-login {EXEC_AS} USER -- PROGRAM [ARG…]",
         names().join(" ")
     )
 }
@@ -120,6 +133,8 @@ enum Route<'a> {
     Applet { name: &'a str, args_from: usize },
     /// Read this process's credentials back and compare.
     Verify { args_from: usize },
+    /// Run a literal argv as another user.
+    ExecAs { args_from: usize },
     /// Print the applet roster.
     List,
     /// Print usage and exit 2.
@@ -130,9 +145,11 @@ enum Route<'a> {
 /// shipped `/bin/login` and `/bin/su` symlinks arrive), then the explicit
 /// `td-login <applet>` form.
 ///
-/// `verify-credentials` is deliberately NOT reachable by basename. It is a probe,
-/// not an applet; a `/bin/verify-credentials` symlink would be a name on the
-/// image that no farm list accounts for.
+/// NEITHER subcommand is reachable by basename; see `VERIFY` and `EXEC_AS` for
+/// why. That is roster hygiene and NOT a boundary: `/bin/td-login` is itself a
+/// shipped symlink, so anything on the image can already spell
+/// `td-login exec-as`. What stops an unprivileged caller is `creds::may_switch`
+/// over all four uid columns — never the absence of a second symlink.
 fn route(argv: &[String]) -> Route<'_> {
     let prog = argv.first().map(String::as_str).unwrap_or("td-login");
     if lookup(basename(prog)).is_some() {
@@ -147,6 +164,7 @@ fn route(argv: &[String]) -> Route<'_> {
             args_from: 2,
         },
         Some(v) if v == VERIFY => Route::Verify { args_from: 2 },
+        Some(v) if v == EXEC_AS => Route::ExecAs { args_from: 2 },
         Some("--list") => Route::List,
         _ => Route::Usage,
     }
@@ -252,6 +270,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         Route::Verify { args_from } => (VERIFY, verify(argv.get(args_from..).unwrap_or(&[]))),
+        Route::ExecAs { args_from } => (
+            EXEC_AS,
+            exec_as::run(argv.get(args_from..).unwrap_or(&[])),
+        ),
         Route::Applet { name, args_from } => {
             let args = argv.get(args_from..).unwrap_or(&[]);
             let run = match lookup(name) {
@@ -303,10 +325,10 @@ mod tests {
         }
         assert!(lookup("nosuch").is_none());
         assert!(lookup("").is_none());
-        assert!(
-            lookup(VERIFY).is_none(),
-            "the readback probe is not an applet and must never get a /bin symlink"
-        );
+        // Both subcommands are held out of the roster by
+        // `the_subcommands_are_not_in_the_applet_roster`, which owns that rule
+        // for `verify-credentials` and `exec-as` together — stated once rather
+        // than half here and half there.
     }
 
     /// The roster is the shipped /bin symlink farm, so a rename is a visible
@@ -347,13 +369,35 @@ mod tests {
             route(&argv(&["td-login", VERIFY, "--uid", "0"])),
             Route::Verify { args_from: 2 }
         );
+        assert_eq!(
+            route(&argv(&["td-login", EXEC_AS, "tester", "--", "/bin/td-busd"])),
+            Route::ExecAs { args_from: 2 }
+        );
         assert_eq!(route(&argv(&["td-login", "--list"])), Route::List);
         assert_eq!(route(&argv(&["td-login"])), Route::Usage);
         assert_eq!(route(&argv(&["td-login", "nosuch"])), Route::Usage);
         assert_eq!(route(&[]), Route::Usage);
-        // The probe has no basename route: a /bin/verify-credentials symlink
-        // must dispatch to usage, not to the probe.
+        // Neither subcommand has a basename route: a `/bin/verify-credentials`
+        // or `/bin/exec-as` symlink must dispatch to usage, not to the
+        // subcommand. `exec-as` matters more than the probe here — it is the
+        // one that changes credentials, and a name in `/bin` is a name any
+        // caller can reach without spelling `td-login` at all.
         assert_eq!(route(&argv(&[&format!("/bin/{VERIFY}")])), Route::Usage);
+        assert_eq!(route(&argv(&[&format!("/bin/{EXEC_AS}")])), Route::Usage);
+    }
+
+    /// The subcommands are not applets, so they must be absent from the roster
+    /// `--list` prints and the shipped `/bin` symlink farm is built from.
+    #[test]
+    fn the_subcommands_are_not_in_the_applet_roster() {
+        for name in [VERIFY, EXEC_AS] {
+            assert!(
+                !names().contains(&name),
+                "{name} is a subcommand, so a /bin/{name} symlink would be an \
+                 unaccounted name on the image"
+            );
+            assert!(lookup(name).is_none(), "{name} must not resolve as an applet");
+        }
     }
 
     /// The probe's argv, including the forms the generated boot script uses.
@@ -789,8 +833,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            8,
-            "expected eight modules beside the crate root"
+            9,
+            "expected nine modules beside the crate root"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model.
@@ -802,7 +846,7 @@ mod confinement {
         }
     }
 
-    /// `src/` holds these nine files and nothing else.
+    /// `src/` holds these ten files and nothing else.
     ///
     /// The scan above proves every `mod` line has a file and every file has a
     /// `mod` line, which is a closed loop that says nothing about WHICH files:
@@ -813,20 +857,82 @@ mod confinement {
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and
     /// compiles perfectly well through the constructs refused below.
     #[test]
-    fn src_holds_exactly_the_nine_scanned_modules() {
+    fn src_holds_exactly_the_ten_scanned_modules() {
         let (rs, other) = walk();
         let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
             paths,
             [
-                "creds.rs", "db.rs", "login.rs", "main.rs", "session.rs", "status.rs", "su.rs",
-                "sys.rs", "tty.rs",
+                "creds.rs", "db.rs", "exec_as.rs", "login.rs", "main.rs", "session.rs",
+                "status.rs", "su.rs", "sys.rs", "tty.rs",
             ],
             "the crate's file set changed"
         );
         assert!(
             other.is_empty(),
             "src/ holds a non-.rs file no scan here reads: {other:?}"
+        );
+    }
+
+    /// Every credential switch is a front end that decided it may.
+    ///
+    /// `creds::apply` is pinned to one call site below, which is the switch
+    /// itself. `session::enter` is the thing that CALLS it — switch, then exec —
+    /// so "no second way to become somebody" is a claim about `enter`'s callers
+    /// and nothing else asserts it. A future module that built a `Session` by
+    /// hand and called `enter` would name neither `apply` nor
+    /// `may_start_session`, so every other scan in this file stays green while
+    /// the crate grows a switch nobody authorized.
+    ///
+    /// Two halves, and the second is the point: exactly the three front ends
+    /// call it, AND each of them reaches `authorize`.
+    #[test]
+    fn every_credential_switch_is_a_front_end_that_authorized_first() {
+        let enter = concat!("session::", "enter(");
+        let decide = concat!("authorize", "(");
+        let callers: Vec<(String, String)> = sources()
+            .into_iter()
+            .filter(|(_, text)| text.contains(enter))
+            .collect();
+        let paths: Vec<&str> = callers.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["exec_as.rs", "login.rs", "su.rs"],
+            "`session::enter` switches credentials and execs; its callers are the \
+             front ends and adding one is a reviewed change"
+        );
+        for (path, text) in &callers {
+            assert!(
+                text.contains(decide),
+                "{path} switches credentials without naming `authorize`, so it \
+                 decided for itself whether the session may start"
+            );
+        }
+    }
+
+    /// One authentication decision, asserted rather than claimed.
+    ///
+    /// `db::may_start_session` answers whether an account may start a session at
+    /// all — the locked and needs-a-password refusals — so a front end naming it
+    /// is one deciding that policy for itself. It may be named in its own module
+    /// and in `login.rs`, where `authorize` lives, and nowhere else. `su` carried
+    /// its own copy of four of `authorize`'s five steps until this landing: two
+    /// places to change one policy, with the compiler checking neither.
+    ///
+    /// The name is assembled rather than spelled, as the unsafe-lint scan's is —
+    /// written whole, this test's own source would make `main.rs` a caller.
+    #[test]
+    fn the_session_policy_is_decided_in_one_place() {
+        let call = concat!("may_start_", "session");
+        let namers: Vec<String> = sources()
+            .into_iter()
+            .filter(|(_, text)| text.contains(call))
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(
+            namers,
+            ["db.rs", "login.rs"],
+            "the session policy must be reached through login::authorize alone"
         );
     }
 

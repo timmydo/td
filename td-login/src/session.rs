@@ -32,6 +32,22 @@ pub enum Env {
     /// `su` without `-`, or `login -p`: keep it, but still restate the five
     /// variables that describe WHO the session belongs to.
     Preserve,
+    /// `exec-as`: discard ALL of it, `TERM` included, leaving exactly the five
+    /// identity variables.
+    ///
+    /// A mode rather than "`Fresh` over an empty list", which computes the same
+    /// environment, because the decision is then a TYPE the caller states and a
+    /// test can hand a populated environment to. Written the other way, nothing
+    /// distinguishes this from `Fresh` — or from `Preserve` — once the list is
+    /// empty, so a regression that restored inheritance would be invisible to
+    /// any test whose own environment happened to be bare.
+    ///
+    /// `TERM` is what separates it from `Fresh`, and the difference is not
+    /// stylistic: a login session keeps it because a terminal type is a
+    /// property of the terminal rather than of the caller, and a supervised
+    /// daemon has no terminal — so there it is the SUPERVISOR's value, and one
+    /// that quietly changes a program's output between one boot and the next.
+    Service,
 }
 
 /// A ready-to-enter session. Built entirely while privileged; `enter` consumes
@@ -70,6 +86,10 @@ pub fn environment(
 ) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = Vec::with_capacity(inherited.len() + 5);
     for (key, value) in inherited {
+        // A service keeps nothing at all; see `Env::Service`.
+        if mode == Env::Service {
+            continue;
+        }
         // TERM survives a reset because the terminal type is a property of the
         // terminal, not of whoever called us — a fresh session on a vt100 that
         // thinks it is on a dumb terminal is unusable.
@@ -131,8 +151,7 @@ pub fn inherited() -> Vec<(String, String)> {
 /// argv[0] for a login shell: the shell's basename with a `-` in front, which is
 /// how every Bourne shell learns to source the login profile.
 pub fn login_arg0(shell: &str) -> String {
-    let base = shell.rsplit('/').next().unwrap_or(shell);
-    format!("-{base}")
+    format!("-{}", crate::basename(shell))
 }
 
 /// Drop privilege, then exec. Never returns on success.
@@ -247,6 +266,33 @@ mod tests {
         let env = environment(&account(), "/bin/sh", Env::Fresh, &pairs(&[("PATH", "/x")]));
         assert_eq!(value(&env, "TERM"), None);
         assert_eq!(env.len(), 5);
+    }
+
+    /// A service session keeps NOTHING of the caller's, `TERM` included, and is
+    /// the only mode that does. Asserted against a populated environment
+    /// rather than an empty one, which is the whole point of it being a mode:
+    /// over an empty list every mode agrees, so a test that passed one would
+    /// green whatever the mode did.
+    #[test]
+    fn a_service_environment_keeps_nothing_of_the_callers() {
+        let caller = pairs(&[
+            ("TERM", "vt100"),
+            ("PATH", "/tmp/evil"),
+            ("HOME", "/tmp"),
+            ("XDG_RUNTIME_DIR", "/run/user/0"),
+            ("LD_PRELOAD", "/tmp/x.so"),
+        ]);
+        let env = environment(&account(), "/bin/sh", Env::Service, &caller);
+        assert_eq!(value(&env, "TERM"), None, "a daemon has no terminal");
+        assert_eq!(value(&env, "XDG_RUNTIME_DIR"), None);
+        assert_eq!(value(&env, "LD_PRELOAD"), None);
+        // Exactly the five identity variables, all describing the account.
+        assert_eq!(value(&env, "PATH"), Some(PATH));
+        assert_eq!(value(&env, "HOME"), Some("/home/tester"));
+        assert_eq!(value(&env, "SHELL"), Some("/bin/sh"));
+        assert_eq!(value(&env, "USER"), Some("tester"));
+        assert_eq!(value(&env, "LOGNAME"), Some("tester"));
+        assert_eq!(env.len(), 5, "unexpected environment: {env:?}");
     }
 
     /// A name may appear TWICE in an environment — `environ` is an array, not a
