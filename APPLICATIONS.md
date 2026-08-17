@@ -2630,9 +2630,11 @@ stacked away is still open as far as its client knows. All are named in
 xdg_surface the request arrived at, that shell object may not be destroyed
 before the surfaces it made, a second role object on one xdg_surface is
 `already_constructed`, a surface's role kind outlives the role object that
-carried it, and a menu may not be destroyed while a submenu hangs off it. What
-those do NOT buy is a refused popup cycle: a popup's parent is a wl_surface id
-and ids are recycled, so the renderer's depth bound is still what contains one.
+carried it, and a menu may not be destroyed while a submenu hangs off it. A
+popup's parent edge is also broken rather than left holding a number when the
+surface it names is destroyed, so a reissued id cannot re-parent a menu onto a
+window that never opened it. The renderer's depth bound stays regardless: it is
+termination, where the rules above are only a reason to expect no cycle.
 `set_window_geometry` WAS the other of the two, parsed and discarded — a true
 no-op, so CSD margins tiled as dead borders and clicks landed offset, though
 the client survived. That row is closed: `ui: a window geometry is the part of
@@ -2652,7 +2654,7 @@ by them, and records why a tile ignores them and what an offset cannot reach.
 | `xdg_positioner` + `get_popup` | **landed** | — | ~900 — spent. Rules recorded and copied at `get_popup`; anchor, gravity and offset resolved on independent axes; the popup floats over its parent, above the tiles and below td's own bar, hit-tested first (though never over the bar), placed by its window geometry, required to abut its parent, stacked by td's own order, and relative to the parent so a submenu hangs off the menu that opened it. A null parent is refused (td implements no protocol that could supply one later) and a zero-area anchor rectangle is accepted as a point |
 | popup grabs + dismissal | absent | **U** | 1,200–2,000 — `grab` is accepted and does nothing, so a click outside a menu does not close it; `popup_done` is never sent, so a menu td stops drawing stays open to its client |
 | popup protocol conformance (error object, permanent role, `not_the_topmost_popup`, `defunct_surfaces`, `already_constructed`) | **landed** | — | ~350 — spent. `xdg_wm_base`'s errors name the shell object rather than the xdg_surface they arrived at, and it outlives the surfaces it made so that id stays meaningful; a surface's role kind outlives its role object, so a former menu cannot come back as a tiled window; and a menu may not be destroyed before the submenu hanging off it |
-| popup parent identity across id reuse | absent | C | 400–700 — a popup's parent is a raw wl_surface id, so a client that lets a destroyed parent's id be reissued can re-parent a menu onto an unrelated window, build a cycle the renderer's depth bound contains, or trip a spurious `not_the_topmost_popup`. A surface generation stamped on the parent edge is the fix |
+| shell edges across id reuse | **landed** | — | ~600 — spent. Neither shell edge keeps a number the client has back: a popup's parent edge is broken when the surface it names is destroyed, and a wl_surface's role edge is retired when its xdg_surface is. So a reissued id cannot re-parent a menu onto an unrelated window, commit a surface through a stranger's role object, close a popup cycle, or answer a `not_the_topmost_popup` scan for a submenu that does not exist. Per surface rather than a sweep, so one window closing leaves other windows' menus alone. Byte accounting for popups dropped with their window is not yet refunded |
 | popup constraint solving (slide/flip/resize) | absent | **U** | 1,500–2,500 — the adjustment bits are recorded; a menu near an edge runs past it |
 | client cursor rendering | **done** (`1c4b7f88`) | — | spent |
 | `zxdg_decoration_manager_v1` (answer `server_side`) | **landed** | **U** | ~500 — spent. Suppresses CSD, fits tiling, and removes most of the geometry problem for cooperating apps. One divergence, deliberate: `destroy` asks the compositor to stop decorating, and td keeps drawing the band because it is layout rather than a decoration td can withdraw |

@@ -960,24 +960,110 @@ window and be tiled, nor a window's as a menu. And a menu may not be destroyed
 while a submenu hangs off it: that is the protocol's `not_the_topmost_popup`,
 which for a tree is a popup with a live child.
 
-Neither of those makes a popup CYCLE unbuildable, and it is worth writing down
-why not, because the argument that they do is nearly right. A popup's parent
-must already hold a role object when the popup is created, so the edge points
-at something OLDER — which would make the graph a forest if the edge named a
-surface. It names an ID. Ids are recycled, td retires them with
-`wl_display.delete_id` precisely so a client may, and nothing guards a
-TOPLEVEL's destroy the way `not_the_topmost_popup` guards a popup's. So a
-client can destroy the window a menu hangs off, wait for its surface id to come
-back, and parent a fresh popup on that menu's own submenu: the ids close a loop
-that the surfaces never did. The renderer's depth bound is therefore still
-LOAD-BEARING rather than defence in depth.
+A popup's parent edge is BROKEN when the surface it names is destroyed, rather
+than left holding the number. An id is not an identity: Wayland recycles them
+and td retires them with `wl_display.delete_id` precisely so a client may, so
+an edge that kept the number would come to name whatever took it next. The
+symptom is not subtle — a menu drawn on, and taking the clicks of, a window
+that never opened it — and it has a second face, since the scan behind
+`not_the_topmost_popup` looks for a popup naming this one's surface and a stale
+edge answers for a submenu that does not exist, disconnecting a client for
+destroying a menu with nothing hanging off it. The break is per surface, not a
+sweep: one window closing must not shut the menus on every other.
 
-That stale id is not only a cycle. The same reuse re-parents a menu onto a
-window that never opened it, and makes `not_the_topmost_popup` fire for a popup
-whose "child" is a dead reference to a recycled number — a client disconnected
-for destroying a menu that has nothing hanging off it. Stamping a surface with
-a generation and refusing to place a popup whose parent's generation has moved
-is the fix, and it is its own landing.
+The OTHER shell edge is the same bug and is broken the same way. A wl_surface
+names its xdg_surface by number, and that number goes back to the client when
+the xdg_surface is destroyed, so a role still holding it resolves on the
+surface's next commit to whatever the client made next. That is worse than a
+misplaced menu: the old surface takes a STRANGER's role object and configure
+tracker — so it answers `initial_sent` and `can_attach` for a window that is
+not it, and a detach unmaps that stranger's tracker. So destroying an
+xdg_surface RETIRES the role — `SurfaceRole::XdgRetired` — which keeps
+everything the role was for while keeping none of the number.
+
+Retiring also repairs a refusal in the other direction. `wl_surface.destroy`
+is an error while the role object lives, and asking that question by looking
+the id up meant a client that tore its shell objects down in the right order
+and then reused the number was refused for a role object already gone. A
+retired role answers it without a lookup: `Xdg` now names a LIVE xdg_surface
+and nothing else, so the check is the role itself.
+
+What that role then FORBIDS is a divergence, and stricter than the protocol
+rather than looser. `wayland.xml` says destroying a role object does not
+remove the role but may stop the surface playing it, and explicitly permits
+taking the SAME role again; td refuses a second xdg_surface on that surface
+and makes a later commit fatal, where wlroots lets the surface go inert. The
+cost is a client disconnected for something legal, and the shape that reaches
+it is not exotic: destroy the role object and the xdg_surface, keep the
+wl_surface, then attach a null buffer and commit. That is the ordinary
+hide-a-window path — GTK4's `gdk_wayland_surface_hide_surface` is exactly it,
+and its `unmap_popups_for_surface` recurses first, so a window hidden with a
+menu open reaches the same refusal through the MENU. Going inert instead is
+the fix and it is not here; what this commit changed is which number the role
+holds, and the refusal predates it. That is a deferral rather than a defence,
+and it should be read as the next thing this area owes.
+
+What none of it closes is the ACCOUNTING, which is one mechanism rather than a
+list of cases. Taking a surface down cascades — `drop_popups_of` discards the
+pixels of every popup over it, and theirs in turn — while only the surface
+NAMED gives its bytes back. So `wl_surface.destroy`, `xdg_toplevel.destroy`,
+and a null-buffer commit on a window or on a menu all leave a client charged
+for descendants td no longer holds; an orphan's own submenu is the same shape
+seen from the orphan. Nothing accumulates, because a repaint REPLACES a
+surface's charge rather than adding to it, and four paths refund — repainting
+the surface, `xdg_popup.destroy`, `wl_surface.destroy`, and a null commit on
+the popup itself. What is left is a standing charge for as long as a client
+abandons a surface, and what it can cost is that client's own ceiling.
+
+With that, a popup CYCLE is unbuildable — and the argument is written out
+because review has had to correct it THREE times, so the conclusion is worth
+less than the ability to check each leg. Read it in two halves, because the
+halves are about different graphs: the rules below are about popup OBJECTS,
+and what the renderer walks is a graph of SURFACES.
+
+Over objects, "points at" is a strict order by creation. A popup's parent is
+fixed when it is created and never re-pointed. The parent must already hold a
+role object at that moment, and a surface's role KIND is permanent, so where
+the parent is itself a menu the object answering for it is a popup and stays
+one. A popup cannot be destroyed while a popup names its surface, which is the
+leg that does the work: the edge PINS the popup it points at, so the object
+answering for a parent is the one that was there when the edge was made rather
+than a later one standing in the same place. That pin has two halves and the
+quiet one is `already_constructed` — an xdg_surface holds one role object at a
+time, so a second popup cannot be added ALONGSIDE the pinned one and leave the
+edge naming something else. And NEITHER shell edge survives
+the thing it names — a popup's parent edge is broken when its wl_surface is
+destroyed, a surface's role edge is retired when its xdg_surface is — so no id
+can smuggle a younger object in behind an older name. Every popup was
+therefore constructed before the one naming it, and a cycle would need one
+constructed before itself.
+
+The SIXTH leg is the bridge to the graph that matters, and it is the one an
+enumeration keeps losing because it is not a rule about popups at all: a
+surface's placement leaves the scene when its popup role object is destroyed.
+Placements are keyed per surface and written only by that surface's own
+commit, so without this one a destroyed popup's placement would sit there
+until the surface committed again — and a surface can hold a stale edge from a
+dead popup while a fresh popup points back at it, which is a cycle built
+entirely out of objects that each obeyed the five rules above. It is
+`xdg_popup.destroy`'s `unmap_popup`, and deleting that one line builds the
+cycle.
+
+Take any leg away and a loop can be built; all three corrections were a leg
+that was missing or misstated. The pinning is worth stating as pinning rather
+than as age, because "the parent is older" was the first wrong version: that
+orders only the objects standing there at the moment you look, and a destroy
+plus a rebuild puts a NEWER popup at an older popup's address. The role edge
+above was the second, a real route rather than a misstatement. The sixth leg
+was the third, and note what it does to the first: "a popup's parent is fixed
+at creation" is true of the OBJECT and false of the menu a user sees, since
+destroying a popup and building another on the same xdg_surface re-points that
+surface wherever the client likes.
+
+That is a reason to expect no cycle, not a guarantee of termination, so the
+renderer's depth bound stays. Six rules across two modules is exactly the kind
+of conjunction that has now been corrected three times, and what it costs to be
+wrong is a compositor that never paints again.
 
 Four parts are deliberately NOT here yet, and each is a landing of its own.
 **Constraint adjustment** is recorded and not acted on: every bit of it is

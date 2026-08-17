@@ -1798,16 +1798,15 @@ impl Scene {
     /// screen: a menu whose window is on another workspace or stacked away
     /// behind a sibling is not drawn either.
     ///
-    /// The walk is BOUNDED rather than trusted to end, and the bound is
-    /// LOAD-BEARING. A popup's parent is a wl_surface id, and ids are recycled
-    /// — td retires them with `wl_display.delete_id` precisely so a client may
-    /// — so a client that destroys the window a menu hangs off, lets its
-    /// surface id be reissued, and parents a fresh popup on that menu's own
-    /// submenu closes the loop. Nothing guards a TOPLEVEL's destroy the way
-    /// `not_the_topmost_popup` guards a popup's, and while a wl_surface's own
-    /// role lock survives its xdg_surface — so the same surface cannot take a
-    /// second one — it dies with the SURFACE, and a reissued id arrives with
-    /// no history at all. This is what stops it, by drawing nothing.
+    /// The walk is BOUNDED rather than trusted to end. The server should not
+    /// be able to hand it a cycle — DESIGN.md §3 sets out the six rules that
+    /// between them PIN each parent edge to the popup that was already there
+    /// when the edge was made, so a chain only ever runs back through popups
+    /// constructed before it — but that is an argument across two modules
+    /// which review has had to correct three times, twice for a leg that was
+    /// missing outright, and what it protects is a compositor that never
+    /// paints again. So the bound stays and draws nothing, rather than
+    /// trusting the reasoning.
     fn popup_rect(&self, key: SurfaceKey, placements: &[Placement]) -> Option<ImageRect> {
         let mut chain = Vec::with_capacity(MAX_POPUP_DEPTH);
         let mut at = key;

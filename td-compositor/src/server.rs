@@ -207,6 +207,10 @@ impl RoleObject {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum SurfaceRole {
     Xdg(u32),
+    /// The xdg_surface this role named is destroyed. The ROLE stays, since a
+    /// wl_surface takes one ever; the ID does not, because the client has that
+    /// number back and may put anything behind it.
+    XdgRetired,
     Cursor,
 }
 
@@ -279,7 +283,14 @@ enum Object {
         /// The PARENT's wl_surface, which is what the scene needs — a placement
         /// is measured from that surface's window geometry, and the parent's
         /// own xdg_surface is only how the client named it.
-        parent: u32,
+        ///
+        /// `None` once that surface is destroyed, and the option is the whole
+        /// point rather than tidiness: an id is not an identity. Wayland
+        /// recycles them — td retires them with `wl_display.delete_id`
+        /// precisely so a client may — so an edge left holding the number
+        /// would come to name whatever took it next, which is a menu placed
+        /// on a window that never opened it.
+        parent: Option<u32>,
         /// Where the rules put it, resolved once at `get_popup` and copied here
         /// for the reason above.
         rect: PositionerRect,
@@ -1351,6 +1362,21 @@ impl Client {
             })
     }
 
+    /// Break the parent edge of every popup that named this wl_surface. Only
+    /// the surfaces that named it: a submenu's own edge points at the ORPHAN,
+    /// which still exists, so it keeps that edge and never resolves to a rect
+    /// — the walk ends at a surface no layout has. It does keep its pixels,
+    /// which is the accounting gap DESIGN.md §3 records.
+    fn orphan_popups_of(&mut self, surface: u32) {
+        for object in self.objects.values_mut() {
+            if let Object::XdgPopup { parent, .. } = object {
+                if *parent == Some(surface) {
+                    *parent = None;
+                }
+            }
+        }
+    }
+
     fn fail_protocol(&mut self, code: u32, error: &str) -> Result<(), String> {
         self.protocol_error_code = code;
         Err(error.into())
@@ -1816,11 +1842,17 @@ impl Client {
         let attaching_buffer = matches!(state.pending_buffer, Some(PendingBuffer::Buffer { .. }));
         let was_mapped = self.mapped_bytes.contains_key(&id);
         let cursor = state.role == Some(SurfaceRole::Cursor);
+        if state.role == Some(SurfaceRole::XdgRetired) {
+            return Err(format!(
+                "wl_surface {id} was committed after its xdg_surface was destroyed"
+            ));
+        }
         let mut xdg_configure = None;
         let mut geometry = None;
         // Where this surface goes if it is a POPUP, which is what tells the
         // buffer path below to float it over its parent rather than tile it.
         let mut popup: Option<PopupPlacement> = None;
+        let mut is_popup = false;
         if let Some(SurfaceRole::Xdg(role)) = state.role {
             let xdg = self
                 .objects
@@ -1890,7 +1922,14 @@ impl Client {
                         "xdg_surface {role} names a missing xdg_popup {popup_object}"
                     ));
                 };
-                popup = Some(PopupPlacement {
+                // Tracked apart from the placement, because a popup with no
+                // parent still has to take the POPUP path: `popup` is what
+                // every branch below asks whether this surface is one, so an
+                // orphan that answered `None` would fall through to the tile
+                // arm and join the arrangement — a menu given a share of the
+                // screen, a title band and a drag handle.
+                is_popup = true;
+                popup = parent.map(|parent| PopupPlacement {
                     parent: SurfaceKey {
                         client: self.id,
                         object: parent,
@@ -1906,11 +1945,18 @@ impl Client {
             // applied only once the pixels it describes are the scene's. A crop
             // applied before the buffer it was measured against would draw one
             // frame of the previous buffer through the new window's bounds.
-            if let Some(Object::XdgSurface {
-                pending_geometry, ..
-            }) = self.objects.get_mut(&role)
-            {
-                geometry = pending_geometry.take();
+            //
+            // An ORPHAN is the one commit that happens and applies nothing, so
+            // it does not spend one either: `get_popup` carries a pending
+            // geometry across a rebuilt role object, and a menu rebuilt on this
+            // xdg_surface is entitled to the size its client last set.
+            if !(is_popup && popup.is_none()) {
+                if let Some(Object::XdgSurface {
+                    pending_geometry, ..
+                }) = self.objects.get_mut(&role)
+                {
+                    geometry = pending_geometry.take();
+                }
             }
         } else if state.role.is_none() && attaching_buffer {
             return Err(format!("wl_surface {id} attached a buffer without a role"));
@@ -1980,14 +2026,14 @@ impl Client {
                         }
                     }
                 }
-            } else if let Some(placement) = popup {
+            } else if is_popup {
                 // A popup is neither tiled nor counted against the layout: it
                 // floats over its parent where the client's own rules put it.
                 // Its BYTES are still the client's, since the ceiling is about
                 // what one connection can make td hold rather than about
                 // windows.
-                match pending {
-                    PendingBuffer::Detach { .. } => {
+                match (pending, popup) {
+                    (PendingBuffer::Detach { .. }, _) => {
                         if was_mapped {
                             if let Some(configure) = xdg_configure {
                                 configure
@@ -1998,7 +2044,34 @@ impl Client {
                         }
                         self.unmap_popup(id)?;
                     }
-                    PendingBuffer::Buffer { object, buffer, .. } => {
+                    // The parent surface is gone, so there is nowhere to put
+                    // this. Taken DOWN rather than left as it was: the menu is
+                    // no longer on screen and its pixels are no longer the
+                    // client's to be charged for. Not an error either — the
+                    // client broke nothing by closing a window with a menu up,
+                    // and the protocol gives td no way to say the menu is
+                    // defunct, since `popup_done` is that and td sends none.
+                    (PendingBuffer::Buffer { object, buffer, .. }, None) => {
+                        // The configure tracker is left MAPPED, unlike the
+                        // detach above. Unmapping it clears `initial_sent`, and
+                        // a buffer on a surface without one is a protocol
+                        // error — so a client repainting its abandoned menu a
+                        // second time would be disconnected for it. Clearing
+                        // the bytes leaves `was_mapped` false from here on, so
+                        // a later detach does not reset it either — and what
+                        // makes that unreadable is not that the surface is
+                        // finished (destroy this popup and build another on the
+                        // same xdg_surface and it maps) but that destroying the
+                        // popup replaces the tracker.
+                        self.unmap_popup(id)?;
+                        if matches!(
+                            self.objects.get(&object),
+                            Some(Object::Buffer(current)) if current.serial == buffer.serial
+                        ) {
+                            self.send(object, 0, wire::Builder::new())?;
+                        }
+                    }
+                    (PendingBuffer::Buffer { object, buffer, .. }, Some(placement)) => {
                         let surface_bytes = buffer
                             .width
                             .checked_mul(buffer.height)
@@ -2100,7 +2173,7 @@ impl Client {
                     input_region_changed.then(|| input_region.clone()),
                     geometry,
                 )?;
-        } else if (input_region_changed || geometry.is_some()) && !cursor && popup.is_none() {
+        } else if (input_region_changed || geometry.is_some()) && !cursor && !is_popup {
             // No buffer, so the state this commit carries is whichever of the
             // two arrived — the geometry alone being the ordinary opening
             // sequence, set on the empty commit before the first frame.
@@ -2342,15 +2415,20 @@ impl Client {
             Object::Surface(mut state) => match message.opcode {
                 0 => {
                     args.finish()?;
-                    if state.role.is_some_and(|role| {
-                        matches!(role, SurfaceRole::Xdg(object) if self.objects.contains_key(&object))
-                    })
-                    {
+                    // `Xdg` names a LIVE xdg_surface — destroying one retires
+                    // the role — so this asks the role rather than looking the
+                    // id up, and a client that tore its shell objects down in
+                    // the right order is not refused by a number it reused.
+                    if matches!(state.role, Some(SurfaceRole::Xdg(_))) {
                         return Err(format!(
                             "wl_surface {} was destroyed before its role object",
                             message.object
                         ));
                     }
+                    // Every popup that named this surface as its parent loses
+                    // that edge HERE, while the id still means what it meant.
+                    // A moment later it is back in the client's pool.
+                    self.orphan_popups_of(message.object);
                     self.remove_surface(message.object)?;
                     self.remove_surface_object(message.object)
                 }
@@ -2543,7 +2621,7 @@ impl Client {
                     match state.role {
                         None => state.role = Some(SurfaceRole::Cursor),
                         Some(SurfaceRole::Cursor) => {}
-                        Some(SurfaceRole::Xdg(_)) => {
+                        Some(SurfaceRole::Xdg(_) | SurfaceRole::XdgRetired) => {
                             drop(runtime);
                             return self.fail_protocol(
                                 WL_POINTER_ERROR_ROLE,
@@ -2657,13 +2735,22 @@ impl Client {
                         ));
                     }
                     self.remove_object(message.object)?;
-                    // The geometry was THIS object's, so it goes with it. The
-                    // wl_surface outlives it and keeps its role pointing at the
-                    // dead object, so it can take neither a second xdg_surface
-                    // nor another commit — this is the crop's ownership rather
-                    // than a stale one anything could still draw through.
-                    // Unconditional, because the scene answers whether there
-                    // was one.
+                    // The wl_surface outlives its xdg_surface and keeps the
+                    // role, so it can take neither a second one nor another
+                    // commit. What it must not keep is the NUMBER: that id is
+                    // back in the client's pool, and a role still holding it
+                    // would answer with whatever is put there next.
+                    let Some(Object::Surface(state)) = self.objects.get_mut(&surface) else {
+                        return Err(format!(
+                            "xdg_surface {} lost wl_surface {surface}",
+                            message.object
+                        ));
+                    };
+                    state.role = Some(SurfaceRole::XdgRetired);
+                    // The geometry was THIS object's, so it goes with it — the
+                    // crop's ownership rather than a stale one anything could
+                    // still draw through. Unconditional, because the scene
+                    // answers whether there was one.
                     self.runtime
                         .lock()
                         .map_err(|_| "runtime lock poisoned".to_string())?
@@ -2894,7 +2981,7 @@ impl Client {
                         id,
                         Object::XdgPopup {
                             xdg_surface: message.object,
-                            parent: parent_surface,
+                            parent: Some(parent_surface),
                             rect,
                         },
                     )?;
@@ -3049,7 +3136,7 @@ impl Client {
                     // is a popup with a live child: destroying it would leave a
                     // submenu hanging off a menu that has gone.
                     let child = self.objects.iter().find_map(|(id, object)| match object {
-                        Object::XdgPopup { parent, .. } if *parent == surface => Some(*id),
+                        Object::XdgPopup { parent, .. } if *parent == Some(surface) => Some(*id),
                         _ => None,
                     });
                     if let Some(child) = child {
@@ -3602,6 +3689,36 @@ mod tests {
             }
         }
         assert_eq!(messages.len(), count);
+        messages
+    }
+
+    /// Everything the compositor has sent and nothing more. `receive_messages`
+    /// needs a count, which a test that only cares whether ONE particular
+    /// event arrived would have to derive from every other event the sequence
+    /// happens to produce.
+    fn drain_messages(stream: &mut UnixStream) -> Vec<wire::Message> {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut messages = Vec::new();
+        let mut scratch = [0u8; 4096];
+        while let Ok(received) = stream.read(&mut scratch) {
+            if received == 0 {
+                break;
+            }
+            bytes.extend_from_slice(scratch.get(..received).unwrap());
+            while let Some(message) = wire::take(&mut bytes).unwrap() {
+                messages.push(message);
+            }
+        }
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        // Leftover bytes are a message split across the timeout. Nothing here
+        // writes one in pieces, and a drain that dropped it would be a test
+        // failing for a message that WAS sent.
+        assert!(bytes.is_empty(), "the drain timed out mid-message");
         messages
     }
 
@@ -7644,6 +7761,34 @@ mod tests {
             .dispatch(request(6, 0, conflict).unwrap(), &mut VecDeque::new())
             .is_err());
         assert_eq!(client.protocol_error_code, WL_POINTER_ERROR_ROLE);
+        // A surface whose xdg_surface has been destroyed is refused too: what
+        // a wl_surface takes once is the ROLE, and the object that carried it
+        // going away does not hand the surface back.
+        client
+            .insert(
+                13,
+                Object::Surface(SurfaceState {
+                    role: Some(SurfaceRole::XdgRetired),
+                    ..SurfaceState::default()
+                }),
+            )
+            .unwrap();
+        let mut retired = wire::Builder::new();
+        retired.u32(serial);
+        retired.u32(13);
+        retired.i32(0);
+        retired.i32(0);
+        // Cleared first: the refusal above left the same code behind, and an
+        // `Err` does not reset it, so the assertion would hold for any failure.
+        client.protocol_error_code = 0;
+        let error = client
+            .dispatch(request(6, 0, retired).unwrap(), &mut VecDeque::new())
+            .unwrap_err();
+        assert!(
+            error.contains("already has an incompatible role"),
+            "{error}"
+        );
+        assert_eq!(client.protocol_error_code, WL_POINTER_ERROR_ROLE);
 
         let buffer = Buffer {
             serial: 1,
@@ -8277,7 +8422,11 @@ mod tests {
             .unwrap();
         assert!(matches!(
             client.objects.get(&14),
-            Some(Object::XdgPopup { rect, parent: 5, .. })
+            Some(Object::XdgPopup {
+                rect,
+                parent: Some(5),
+                ..
+            })
                 if *rect == PositionerRect { x: 10, y: 26, width: 40, height: 20 }
         ));
 
@@ -8770,6 +8919,633 @@ mod tests {
         assert!(!client.objects.contains_key(&15));
 
         let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// Destroy the window a menu hangs off, in the order the protocol asks
+    /// for: the role object, then the xdg_surface, then the wl_surface.
+    fn destroy_the_parent_window(client: &mut Client) {
+        for object in [10u32, 9, 5] {
+            client
+                .dispatch(
+                    request(object, 0, wire::Builder::new()).unwrap(),
+                    &mut VecDeque::new(),
+                )
+                .unwrap();
+        }
+    }
+
+    /// A menu whose window is destroyed does not follow the id that window's
+    /// surface leaves behind. An id is not an identity: Wayland recycles them
+    /// and td retires them with `wl_display.delete_id` precisely so a client
+    /// may, so an edge left holding the NUMBER comes to name whatever takes it
+    /// next — a menu drawn on, and taking the clicks of, a window that never
+    /// opened it.
+    #[test]
+    fn a_menu_whose_window_is_destroyed_does_not_follow_a_reissued_id() {
+        let (mut client, mut peer, runtime, framebuffer_path, pool_path) =
+            mapped_popup("popup-reissued");
+        assert!(runtime.lock().unwrap().popup_placement(POPUP_KEY).is_some());
+
+        // A SECOND window with a menu of its own, which the destroy below must
+        // leave alone: the sweep is about one surface, and one that cleared
+        // every edge would shut every menu in the client when any window
+        // closed.
+        client
+            .insert(70, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        let mut other = wire::Builder::new();
+        other.u32(71);
+        other.u32(70);
+        client
+            .dispatch(request(12, 2, other).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut other_toplevel = wire::Builder::new();
+        other_toplevel.u32(72);
+        client
+            .dispatch(
+                request(71, 1, other_toplevel).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        client
+            .insert(73, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        let mut other_xdg = wire::Builder::new();
+        other_xdg.u32(74);
+        other_xdg.u32(73);
+        client
+            .dispatch(request(12, 2, other_xdg).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut other_popup = wire::Builder::new();
+        other_popup.u32(75);
+        other_popup.u32(71);
+        other_popup.u32(30);
+        client
+            .dispatch(request(74, 2, other_popup).unwrap(), &mut VecDeque::new())
+            .unwrap();
+
+        destroy_the_parent_window(&mut client);
+        assert!(matches!(
+            client.objects.get(&14),
+            Some(Object::XdgPopup { parent: None, .. })
+        ));
+        assert!(matches!(
+            client.objects.get(&75),
+            Some(Object::XdgPopup {
+                parent: Some(70),
+                ..
+            })
+        ));
+        // The scene dropped it when its parent surface went.
+        assert_eq!(runtime.lock().unwrap().popup_placement(POPUP_KEY), None);
+
+        // The id is back in the client's pool, and something else takes it.
+        client
+            .insert(5, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        let mut reissued = wire::Builder::new();
+        reissued.u32(60);
+        reissued.u32(5);
+        client
+            .dispatch(request(12, 2, reissued).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut toplevel = wire::Builder::new();
+        toplevel.u32(61);
+        client
+            .dispatch(request(60, 1, toplevel).unwrap(), &mut VecDeque::new())
+            .unwrap();
+
+        // The menu recommits its buffer, which is what a repaint is. It is
+        // placed NOWHERE rather than onto the window that now holds id 5.
+        drain_messages(&mut peer);
+        let mut attach = wire::Builder::new();
+        attach.u32(7);
+        attach.i32(0);
+        attach.i32(0);
+        client
+            .dispatch(request(6, 1, attach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(runtime.lock().unwrap().popup_placement(POPUP_KEY), None);
+        // NOWHERE means the layout too, and this is the half that assertion
+        // cannot see: a surface that joined the arrangement is absent from the
+        // popup map exactly as an unplaced one is, so a menu tiled as a window
+        // would pass the line above.
+        let snapshot = runtime.lock().unwrap().layout_snapshot();
+        assert!(
+            !snapshot.contains_key(&POPUP_KEY),
+            "an orphaned menu joined the layout"
+        );
+        // The buffer comes BACK. td is not holding it, so a client left
+        // waiting for the release would stall on its own next frame — and the
+        // bytes stop being charged for the same reason.
+        assert!(
+            drain_messages(&mut peer)
+                .iter()
+                .any(|message| (message.object, message.opcode) == (7, 0)),
+            "an orphaned menu kept the buffer it was given"
+        );
+        assert_eq!(client.mapped_bytes.get(&6), None);
+
+        // Again, because once is not the interesting case: a client that has
+        // not noticed its window is gone repaints on a timer, and an orphan
+        // that could only be taken down once would fail on the second.
+        let mut again = wire::Builder::new();
+        again.u32(7);
+        again.i32(0);
+        again.i32(0);
+        client
+            .dispatch(request(6, 1, again).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(runtime.lock().unwrap().popup_placement(POPUP_KEY), None);
+
+        // A geometry set while orphaned is not SPENT by these commits. They
+        // happen and apply nothing, and `get_popup` carries a pending geometry
+        // across a rebuilt role object — so spending it would leave a menu
+        // rebuilt on this xdg_surface without the size its client last set,
+        // with nothing having reported the loss.
+        let mut measured = wire::Builder::new();
+        for value in [1, 1, 4, 4] {
+            measured.i32(value);
+        }
+        client
+            .dispatch(request(13, 3, measured).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut once_more = wire::Builder::new();
+        once_more.u32(7);
+        once_more.i32(0);
+        once_more.i32(0);
+        client
+            .dispatch(request(6, 1, once_more).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                client.objects.get(&13),
+                Some(Object::XdgSurface {
+                    pending_geometry: Some(_),
+                    ..
+                })
+            ),
+            "an orphan's commit spent a geometry it could not apply"
+        );
+
+        // A bufferless commit does not reach the tile path either: an orphan
+        // is a POPUP with nowhere to go, not a surface that has stopped being
+        // one, so its geometry is not stored as a window's would be.
+        let mut geometry = wire::Builder::new();
+        for value in [1, 1, 4, 4] {
+            geometry.i32(value);
+        }
+        client
+            .dispatch(request(13, 3, geometry).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(runtime.lock().unwrap().window_geometry(POPUP_KEY), None);
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// The edge breaks with the SURFACE, not with the role objects above it.
+    /// While the wl_surface lives its id still means what it meant, and a
+    /// client may destroy an xdg_toplevel and build another on the same
+    /// xdg_surface — so breaking the edge any earlier would orphan a menu
+    /// whose window is about to come back.
+    ///
+    /// It also breaks EVERY edge naming that surface: two popups on one parent
+    /// is ordinary — a menu and a tooltip — and one that stopped at the first
+    /// would leave the other holding a number the client is free to reuse.
+    #[test]
+    fn a_menus_edge_breaks_with_its_parents_surface_and_no_sooner() {
+        let (mut client, _peer, _runtime, framebuffer_path, pool_path) =
+            mapped_popup("popup-edge-timing");
+
+        // A second popup on the SAME parent surface.
+        client
+            .insert(80, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        let mut second = wire::Builder::new();
+        second.u32(81);
+        second.u32(80);
+        client
+            .dispatch(request(12, 2, second).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut tooltip = wire::Builder::new();
+        tooltip.u32(82);
+        tooltip.u32(9);
+        tooltip.u32(30);
+        client
+            .dispatch(request(81, 2, tooltip).unwrap(), &mut VecDeque::new())
+            .unwrap();
+
+        for above in [10u32, 9] {
+            client
+                .dispatch(
+                    request(above, 0, wire::Builder::new()).unwrap(),
+                    &mut VecDeque::new(),
+                )
+                .unwrap();
+            assert!(
+                matches!(
+                    client.objects.get(&14),
+                    Some(Object::XdgPopup {
+                        parent: Some(5),
+                        ..
+                    })
+                ),
+                "the edge broke at object {above} rather than at the surface"
+            );
+        }
+
+        client
+            .dispatch(
+                request(5, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        for popup in [14u32, 82] {
+            assert!(
+                matches!(
+                    client.objects.get(&popup),
+                    Some(Object::XdgPopup { parent: None, .. })
+                ),
+                "xdg_popup {popup} kept an edge to a destroyed surface"
+            );
+        }
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// A cycle cannot be BUILT through the protocol, which is the claim
+    /// DESIGN.md §3 argues and nothing at this level had checked — the scene's
+    /// own cycle test hands the renderer one directly, which says the bound
+    /// holds rather than that the server refuses to produce one.
+    ///
+    /// This is the shape that gets closest, and it turns on the sixth leg: a
+    /// surface's placement leaves the scene when its popup role object is
+    /// destroyed. Placements are keyed per surface and written only by that
+    /// surface's own commit, so a placement that outlived its popup would sit
+    /// there while a NEW popup on the other surface pointed back — two live
+    /// edges, each made under all five object rules, closing a loop.
+    #[test]
+    fn a_recreated_popup_role_object_cannot_close_a_cycle() {
+        let (mut client, mut peer, runtime, framebuffer_path, pool_path) =
+            mapped_popup("popup-cycle");
+        let submenu_key = SurfaceKey {
+            client: 88,
+            object: 20,
+        };
+
+        // A submenu hanging off the menu: surface 20, its xdg_surface, and a
+        // popup parented on the menu's xdg_surface. Mapped, so the scene holds
+        // an edge 20 -> 6.
+        client
+            .insert(20, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        let mut shell = wire::Builder::new();
+        shell.u32(21);
+        shell.u32(20);
+        client
+            .dispatch(request(12, 2, shell).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut hanging = wire::Builder::new();
+        hanging.u32(22);
+        hanging.u32(13);
+        hanging.u32(30);
+        client
+            .dispatch(request(21, 2, hanging).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        map_popup_surface(&mut client, &mut peer, 20, 21, 27, &pool_path);
+        assert_eq!(
+            runtime
+                .lock()
+                .unwrap()
+                .popup_placement(submenu_key)
+                .map(|placement| placement.parent),
+            Some(POPUP_KEY),
+            "the submenu is not hanging off the menu"
+        );
+
+        // The submenu's popup object goes. Its PLACEMENT must go with it —
+        // this is the leg.
+        client
+            .dispatch(
+                request(22, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.lock().unwrap().popup_placement(submenu_key),
+            None,
+            "a destroyed popup left its placement in the scene"
+        );
+
+        // Surface 20 takes a popup role object again, parented on the WINDOW
+        // this time, and is left uncommitted: what it is for is to be a legal
+        // parent below, since a parent with no role object is refused.
+        let mut rebuilt = wire::Builder::new();
+        rebuilt.u32(23);
+        rebuilt.u32(9);
+        rebuilt.u32(30);
+        client
+            .dispatch(request(21, 2, rebuilt).unwrap(), &mut VecDeque::new())
+            .unwrap();
+
+        // Now the menu's own popup goes — allowed, since the only popup that
+        // named its surface was the one destroyed above — and the menu takes a
+        // new one pointing the other way, at the submenu's surface.
+        client
+            .dispatch(
+                request(14, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        let mut reversed = wire::Builder::new();
+        reversed.u32(24);
+        reversed.u32(21);
+        reversed.u32(30);
+        client
+            .dispatch(request(13, 2, reversed).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        map_popup_surface(&mut client, &mut peer, 6, 13, 28, &pool_path);
+
+        // The edge really did reverse — so the refusal is not what stopped
+        // this — and the other one is gone, so there is no loop.
+        assert_eq!(
+            runtime
+                .lock()
+                .unwrap()
+                .popup_placement(POPUP_KEY)
+                .map(|placement| placement.parent),
+            Some(submenu_key),
+            "the menu did not re-point at the submenu's surface"
+        );
+        assert_eq!(
+            runtime.lock().unwrap().popup_placement(submenu_key),
+            None,
+            "both edges are live at once, which is a cycle"
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// Take a popup surface through the whole map: the bufferless commit that
+    /// asks for a configure, the acknowledgement, and the buffer.
+    ///
+    /// Wants a FRESH configure tracker — an already-configured surface is sent
+    /// no initial pair, and the serial scan below then matches nothing. Both
+    /// callers have one because `xdg_popup.destroy` replaces the tracker. The
+    /// LAST configure is the one taken, which is unambiguous only because the
+    /// drain empties the socket first.
+    fn map_popup_surface(
+        client: &mut Client,
+        peer: &mut UnixStream,
+        surface: u32,
+        xdg_surface: u32,
+        buffer: u32,
+        pool_path: &PathBuf,
+    ) {
+        client
+            .dispatch(
+                request(surface, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        let serial = drain_messages(peer)
+            .iter()
+            .rev()
+            .find_map(|message| {
+                ((message.object, message.opcode) == (xdg_surface, 0))
+                    .then(|| wire::Cursor::new(&message.payload).u32().unwrap())
+            })
+            .unwrap();
+        let mut ack = wire::Builder::new();
+        ack.u32(serial);
+        client
+            .dispatch(request(xdg_surface, 4, ack).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .insert(
+                buffer,
+                Object::Buffer(Buffer {
+                    serial: u64::from(buffer),
+                    file: Arc::new(File::open(pool_path).unwrap()),
+                    offset: 0,
+                    width: 1,
+                    height: 1,
+                    stride: 4,
+                    format: SHM_XRGB8888,
+                }),
+            )
+            .unwrap();
+        let mut attach = wire::Builder::new();
+        attach.u32(buffer);
+        attach.i32(0);
+        attach.i32(0);
+        client
+            .dispatch(request(surface, 1, attach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(surface, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+    }
+
+    /// The OTHER edge that named a raw id. A wl_surface points at its
+    /// xdg_surface by number, and that number goes back to the client when the
+    /// xdg_surface is destroyed — so a role still holding it would resolve, on
+    /// the surface's next commit, to whatever the client made next. Not a
+    /// refusal but a CROSS-WIRING: the old surface would take a stranger's
+    /// role object and configure tracker, and where that stranger is a menu it
+    /// would join the popup graph — the one place a parent edge can be made to
+    /// point at something younger, which is how a cycle gets built.
+    #[test]
+    fn a_surface_does_not_commit_through_a_reissued_xdg_surface_id() {
+        let (mut client, _peer, _runtime, framebuffer_path) = toplevel_fixture("role-reissued");
+
+        // A surface of its own, given a real role through the real request so
+        // the role edge is the one the server writes.
+        client
+            .insert(60, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        let mut shell = wire::Builder::new();
+        shell.u32(61);
+        shell.u32(60);
+        client
+            .dispatch(request(50, 2, shell).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert!(matches!(
+            client.objects.get(&60),
+            Some(Object::Surface(SurfaceState {
+                role: Some(SurfaceRole::Xdg(61)),
+                ..
+            }))
+        ));
+
+        // The xdg_surface goes, and with it the id — but not the role.
+        client
+            .dispatch(
+                request(61, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(matches!(
+            client.objects.get(&60),
+            Some(Object::Surface(SurfaceState {
+                role: Some(SurfaceRole::XdgRetired),
+                ..
+            }))
+        ));
+
+        // Another surface takes that number for an xdg_surface of its own.
+        client
+            .insert(70, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        let mut reissued = wire::Builder::new();
+        reissued.u32(61);
+        reissued.u32(70);
+        client
+            .dispatch(request(50, 2, reissued).unwrap(), &mut VecDeque::new())
+            .unwrap();
+
+        let error = client
+            .dispatch(
+                request(60, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("after its xdg_surface was destroyed"),
+            "{error}"
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// The half a stale id got WRONG in the other direction. Destroying the
+    /// wl_surface is refused while its role object lives, and that question
+    /// used to be asked by looking the id up — so a client that tore its shell
+    /// objects down in the right order and then reused the number was refused
+    /// for a role object that was already gone. A retired role answers it
+    /// without a lookup, and a surface holding one is still not a cursor:
+    /// the role is what is permanent, not the object that carried it.
+    #[test]
+    fn a_surface_outlives_its_xdg_surface_without_inheriting_its_id() {
+        let (mut client, _peer, _runtime, framebuffer_path) =
+            toplevel_fixture("role-retired-destroy");
+
+        client
+            .insert(60, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        let mut shell = wire::Builder::new();
+        shell.u32(61);
+        shell.u32(60);
+        client
+            .dispatch(request(50, 2, shell).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(61, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+
+        // The number comes back as somebody else's xdg_surface.
+        client
+            .insert(70, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        let mut reissued = wire::Builder::new();
+        reissued.u32(61);
+        reissued.u32(70);
+        client
+            .dispatch(request(50, 2, reissued).unwrap(), &mut VecDeque::new())
+            .unwrap();
+
+        // A second xdg_surface is still refused — the role outlives the object
+        // — and the destroy is not.
+        let mut again = wire::Builder::new();
+        again.u32(62);
+        again.u32(60);
+        let error = client
+            .dispatch(request(50, 2, again).unwrap(), &mut VecDeque::new())
+            .unwrap_err();
+        assert!(error.contains("already has a role"), "{error}");
+        client
+            .dispatch(
+                request(60, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(!client.objects.contains_key(&60));
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// The same stale edge seen from the other side: it must not make a NEW
+    /// menu undestroyable. `not_the_topmost_popup` scans for a popup naming
+    /// this one's wl_surface, so an orphan still holding a recycled number
+    /// would answer for a submenu that does not exist — and the client is
+    /// disconnected for destroying a menu with nothing hanging off it.
+    #[test]
+    fn a_stale_parent_id_does_not_make_a_new_menu_undestroyable() {
+        let (mut client, _peer, _runtime, framebuffer_path, pool_path) =
+            mapped_popup("popup-stale-scan");
+        destroy_the_parent_window(&mut client);
+
+        // A fresh surface takes the dead window's id, and a menu of its own.
+        client
+            .insert(5, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        let mut reissued = wire::Builder::new();
+        reissued.u32(60);
+        reissued.u32(5);
+        client
+            .dispatch(request(12, 2, reissued).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut popup = wire::Builder::new();
+        popup.u32(61);
+        popup.u32(13);
+        popup.u32(30);
+        client
+            .dispatch(request(60, 2, popup).unwrap(), &mut VecDeque::new())
+            .unwrap();
+
+        client
+            .dispatch(
+                request(61, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(!client.objects.contains_key(&61));
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
     }
 
     /// The numbers the shell is spoken in, pinned by VALUE, exactly as
