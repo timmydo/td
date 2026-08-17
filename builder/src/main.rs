@@ -4558,16 +4558,147 @@ fn derive_native_rust_link_env(entries: &[lock::Entry]) -> Option<NativeRustLink
 /// parser in the builder subprocess, so a duplicate name is ambiguous (and would emit
 /// duplicate JSON keys the parser rejects) — reject it here with a clear message rather
 /// than let it fail cryptically downstream. `lock::parse` does not enforce uniqueness.
-fn input_map_json(entries: &[lock::Entry]) -> Result<json::Json, String> {
+///
+/// `payload` names are WITHHELD (APPLICATIONS.md §B.8): they go to TD_PAYLOAD_MAP
+/// instead, which only the typed data operations read. That is the resolution half of
+/// the channel — a step that runs a command has no name for a payload at all, rather
+/// than being scanned for one afterwards.
+fn input_map_json(
+    entries: &[lock::Entry],
+    payload: &std::collections::BTreeSet<String>,
+) -> Result<json::Json, String> {
+    map_json(entries, |name| !payload.contains(name))
+}
+
+/// The TD_PAYLOAD_MAP object — the same shape, over exactly the withheld names.
+fn payload_map_json(
+    entries: &[lock::Entry],
+    payload: &std::collections::BTreeSet<String>,
+) -> Result<json::Json, String> {
+    map_json(entries, |name| payload.contains(name))
+}
+
+/// Duplicate detection runs over ALL entries, not just the selected ones: a name
+/// repeated across the two maps is exactly the ambiguity this refuses, and checking
+/// per-map would let it through.
+fn map_json(
+    entries: &[lock::Entry],
+    keep: impl Fn(&str) -> bool,
+) -> Result<json::Json, String> {
     let mut seen = std::collections::BTreeSet::new();
     let mut kvs = Vec::with_capacity(entries.len());
     for e in entries {
         if !seen.insert(e.name.as_str()) {
             return Err(format!("duplicate input name `{}' in lock", e.name));
         }
-        kvs.push((e.name.clone(), json::Json::Str(e.path.clone())));
+        if keep(&e.name) {
+            kvs.push((e.name.clone(), json::Json::Str(e.path.clone())));
+        }
     }
     Ok(json::Json::Obj(kvs))
+}
+
+/// The two maps must be disjoint by PATH, not merely by name.
+///
+/// Every refusal in `payload_names` partitions NAMES, and the sandbox keys its
+/// noexec bind on PATHS. A lock holding `firefox` and `firefox-data` at the SAME
+/// store path satisfies all of them: the recipe declares `firefox` as a payload and
+/// `firefox-data` as an input, and `{in:firefox-data}` then hands a `Step::Run` the
+/// payload's path. `noexec` still refuses an exec, so what lapses is exactly what
+/// §B.8's table calls "the tool, compilation and execution channel — refused":
+/// `gcc -I<payload>/include` is a compilation input to a source-built output.
+/// Reads the LOCK rather than the two emitted maps: a `Json` argument needs a
+/// not-an-object arm, and the only safe thing such an arm can do is refuse —
+/// while the obvious one returns "no paths" and disables the check.
+fn refuse_shared_paths(
+    entries: &[lock::Entry],
+    payload: &std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    let tool: std::collections::BTreeSet<&str> = entries
+        .iter()
+        .filter(|e| !payload.contains(&e.name))
+        .map(|e| e.path.as_str())
+        .collect();
+    for e in entries.iter().filter(|e| payload.contains(&e.name)) {
+        if tool.contains(e.path.as_str()) {
+            return Err(format!(
+                "recipe: payload `{}' resolves to {}, which another input also \
+                 names — a second name for one path puts a payload back on the tool, \
+                 compilation and execution channel (APPLICATIONS.md section B.8)",
+                e.name, e.path
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The declared payload names, and the two refusals that make the channel a channel
+/// rather than a label (APPLICATIONS.md §B.8).
+///
+/// A name in BOTH lists is the whole rule defeated by declaring it twice, so it is
+/// refused rather than resolved by precedence; and a payload no lock entry resolves is
+/// a declaration that does nothing, which would read as enforcement and be none.
+fn payload_names(
+    alist: &json::Json,
+    entries: &[lock::Entry],
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let mut names = std::collections::BTreeSet::new();
+    let Some(declared) = alist.get("payloadInputs") else {
+        return Ok(names);
+    };
+    // TYPED, not filtered. A `"payloadInputs":"firefox"` — a string where an array
+    // belongs — read through `as_arr().and_then()` would yield NO payloads, leaving
+    // the name in TD_INPUT_MAP, mounted executable, and past the duplicate-channel
+    // refusal below. A malformed declaration of a restriction must never be read as
+    // an absent one.
+    let arr = declared.as_arr().ok_or_else(|| {
+        "recipe: `payloadInputs' must be an ARRAY of input names — a malformed one \
+         would otherwise read as no payload at all (APPLICATIONS.md section B.8)"
+            .to_string()
+    })?;
+    for value in arr {
+        let name = value.as_str().ok_or_else(|| {
+            "recipe: `payloadInputs' holds a non-string entry; every element names a \
+             declared input (APPLICATIONS.md section B.8)"
+                .to_string()
+        })?;
+        names.insert(name.to_string());
+    }
+    // `sourceInput` is the third declaration channel and reaches the build as TD_SRC,
+    // so a name in both would be withheld from TD_INPUT_MAP while still arriving as
+    // the recipe's own source — the channel crossed by a different door.
+    if let Some(src) = alist.get("sourceInput").and_then(json::Json::as_str) {
+        if names.contains(src) {
+            return Err(format!(
+                "recipe: `{src}' is declared in both `payloadInputs' and `sourceInput' \
+                 — a payload is staged as DATA and cannot also be this recipe's own \
+                 source (APPLICATIONS.md section B.8)"
+            ));
+        }
+    }
+    for channel in ["inputs", "nativeInputs"] {
+        let Some(arr) = alist.get(channel).and_then(json::Json::as_arr) else {
+            continue;
+        };
+        for name in arr.iter().filter_map(json::Json::as_str) {
+            if names.contains(name) {
+                return Err(format!(
+                    "recipe: `{name}' is declared in both `payloadInputs' and `{channel}' \
+                     — a payload is staged as DATA and must not also travel the tool, \
+                     compilation and execution channel (APPLICATIONS.md section B.8)"
+                ));
+            }
+        }
+    }
+    for name in &names {
+        if !entries.iter().any(|e| &e.name == name) {
+            return Err(format!(
+                "recipe: `payloadInputs' names `{name}', which no lock entry resolves — a \
+                 declared payload that reaches no path enforces nothing"
+            ));
+        }
+    }
+    Ok(names)
 }
 
 /// Shared by `build-recipe` (which then realizes it daemon-free) and `assemble-recipe`
@@ -4606,6 +4737,17 @@ fn assemble_recipe_drv(
         "rust-stage0" => "rust-stage0-build",
         other => return Err(format!("recipe: unknown buildSystem `{other}' (known: gnu, rust, cmake, stage0, mesboot, rust-stage0)")),
     };
+    // Only `mesboot` has the typed data operations that read a payload, so declaring
+    // one anywhere else would stage bytes nothing can reach. Accepting that silently
+    // is the shape section B.8 warns about — a declaration that reads as enforcement
+    // and is none — so it is an error, like every other misplaced key here.
+    if build_system != "mesboot" && alist.get("payloadInputs").is_some() {
+        return Err(format!(
+            "recipe: buildSystem \"{build_system}\" has no typed data steps, so a \
+             `payloadInputs' declared here would never be readable — the payload \
+             channel is mesboot-only (APPLICATIONS.md section B.8)"
+        ));
+    }
     // configure flags + phases (both optional) -> JSON array string. A configure
     // flag may itself contain whitespace (e.g. `CFLAGS=-O2 -g -Wno-foo`), so the
     // list is carried as JSON — each element stays ONE ./configure argument — the
@@ -4763,8 +4905,27 @@ fn assemble_recipe_drv(
                 );
             }
             spec.push_str(&format!("env TD_STEPS={}\n", steps.to_json_string()));
-            let map = input_map_json(&entries)?;
-            spec.push_str(&format!("env TD_INPUT_MAP={}\n", map.to_json_string()));
+            let payload = payload_names(&alist, &entries)?;
+            let map = input_map_json(&entries, &payload)?;
+            // The refusals in `payload_names` partition NAMES; the sandbox keys its
+            // noexec bind on PATHS. Two names for one store path satisfy every one of
+            // them and still hand a `Step::Run` the payload's path through the other
+            // name — `noexec` would stop an exec, but a COMPILATION input to a
+            // source-built output is exactly what section B.8's table refuses. So the
+            // two maps are checked disjoint by VALUE as well.
+            if !payload.is_empty() {
+                refuse_shared_paths(&entries, &payload)?;
+                let payload_map = payload_map_json(&entries, &payload)?;
+                spec.push_str(&format!("env TD_INPUT_MAP={}\n", map.to_json_string()));
+                spec.push_str(&format!(
+                    "env TD_PAYLOAD_MAP={}\n",
+                    payload_map.to_json_string()
+                ));
+            } else {
+                // Emitted only when a payload is DECLARED, so a recipe with none
+                // produces the byte-identical spec it always did and keeps its hash.
+                spec.push_str(&format!("env TD_INPUT_MAP={}\n", map.to_json_string()));
+            }
         }
         // rust-stage0: the exact upstream bootstrap-component ELF-retarget transform.
         // TD_SRC is the rustc component; rust-std/Cargo sources and the td runtime
@@ -4784,7 +4945,7 @@ fn assemble_recipe_drv(
                     "recipe: buildSystem \"rust-stage0\" takes no vendored crates — the transform extracts prebuilt bootstrap components, it does not compile".into(),
                 );
             }
-            let map = input_map_json(&entries)?;
+            let map = input_map_json(&entries, &std::collections::BTreeSet::new())?;
             spec.push_str(&format!("env TD_INPUT_MAP={}\n", map.to_json_string()));
         }
         // rust: the cargo phase runner installs the named binaries (TD_RUST_BINS) and,
@@ -5406,9 +5567,14 @@ fn seed_gate_key<'a>(entry_name: &'a str, src_key: &str, alist: &'a json::Json) 
     }
 }
 
+/// Every name this recipe depends on, whatever the CHANNEL. Dependency ORDER and
+/// the lock do not care why an input is there; what the channel changes is what
+/// the build may DO with the path, decided later by `payload_names` and
+/// `sandbox::extra_bind_flags`. Omitting it here would leave a payload with no
+/// lock entry and those refusals with nothing to partition.
 fn inputs_from_recipe_json(alist: &json::Json) -> Vec<String> {
     let mut xs: Vec<String> = Vec::new();
-    for key in ["inputs", "nativeInputs"] {
+    for key in ["inputs", "nativeInputs", "payloadInputs"] {
         if let Some(a) = alist.get(key).and_then(json::Json::as_arr) {
             xs.extend(a.iter().filter_map(json::Json::as_str).map(str::to_string));
         }
@@ -12554,6 +12720,71 @@ daemon build START (2/2 active)
     // build path runs (not just the helper). Asserts the produced drv's TD_INPUTS + input-srcs reflect the
     // swap, and that the default (env unset) is unchanged. This is the reusable-mechanism analog of the
     // per-gate lock-rewrite: a build-recipe with TD_GCC_TOOLCHAIN set compiles with td's /td/store toolchain.
+    /// The SPEC half of "landing this rebuilds nothing"; the recipe-JSON half is
+    /// `the_payload_channel_is_its_own_key_and_costs_nothing_unset` in the recipes
+    /// crate. A regression HERE rebuilds the whole distribution, so it is pinned
+    /// where it happens rather than argued from the code's shape.
+    ///
+    /// The load-bearing assertion is the drv PATH, which is the input-addressed
+    /// hash of the spec: declaring an EMPTY `payloadInputs` must produce the same
+    /// path as not declaring the key at all, and declaring a real one must produce
+    /// a different path — the channel is hashed data, not a comment.
+    #[test]
+    fn the_payload_channel_costs_an_unset_recipe_nothing_in_the_drv() {
+        let dir = std::env::temp_dir().join(format!("td-payload-spec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("fixture.lock");
+        std::fs::write(
+            &lock,
+            "fixture-source /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fixture-1.0.tar.gz source\n\
+             mes /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-mes-0.24 td-recipe-output\n\
+             firefox /gnu/store/cccccccccccccccccccccccccccccccc-firefox-1.0 td-recipe-output\n",
+        )
+        .unwrap();
+        let lockp = lock.to_str().unwrap();
+        let base = r#""name":"fixture","version":"1.0","buildSystem":"mesboot","steps":[],"sourceInput":"fixture-source""#;
+        let assemble = |json: String| {
+            let (path, _f, drv, _s) = assemble_recipe_drv(&json, lockp, &dir, None).unwrap();
+            let get = |k: &str| drv.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+            (path, get("TD_INPUT_MAP"), get("TD_PAYLOAD_MAP"))
+        };
+
+        let (bare_path, bare_inputs, bare_payload) = assemble(format!("{{{base}}}"));
+        assert!(bare_payload.is_none(), "no key, no TD_PAYLOAD_MAP line");
+        let inputs = bare_inputs.expect("a mesboot recipe carries TD_INPUT_MAP");
+        assert!(inputs.contains("firefox") && inputs.contains("mes"));
+
+        // An EMPTY declaration is byte-identical, hash included.
+        let (empty_path, empty_inputs, empty_payload) =
+            assemble(format!(r#"{{{base},"payloadInputs":[]}}"#));
+        assert!(empty_payload.is_none(), "an empty payload list emits no line");
+        assert_eq!(empty_inputs.as_deref(), Some(inputs.as_str()));
+        assert_eq!(
+            empty_path, bare_path,
+            "an empty payloadInputs must not change the derivation hash"
+        );
+
+        // A real one withholds the name, carries it in its own map, and CHANGES
+        // the hash — which is what makes the channel part of the derivation.
+        let (full_path, full_inputs, full_payload) =
+            assemble(format!(r#"{{{base},"payloadInputs":["firefox"]}}"#));
+        let full_inputs = full_inputs.expect("TD_INPUT_MAP survives");
+        assert!(
+            !full_inputs.contains("firefox") && full_inputs.contains("mes"),
+            "the payload is withheld from the tool channel: {full_inputs}"
+        );
+        assert!(
+            full_payload.is_some_and(|m| m.contains("firefox")),
+            "and present in its own"
+        );
+        assert_ne!(
+            full_path, bare_path,
+            "declaring a payload must change the derivation"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn assemble_recipe_drv_honors_td_gcc_toolchain() {
         let dir = std::env::temp_dir().join(format!("td-gcctc-{}", std::process::id()));
@@ -13057,13 +13288,111 @@ daemon build START (2/2 active)
     fn input_map_json_rejects_duplicate_names() {
         // Unique names build the NAME->PATH object (whose canonical emit sorts keys).
         let ok = lock::parse("a /td/store/pa\nb /td/store/pb\n", "").unwrap();
-        let map = input_map_json(&ok).expect("unique names build a map");
+        let none = std::collections::BTreeSet::new();
+        let map = input_map_json(&ok, &none).expect("unique names build a map");
         assert_eq!(map.to_json_string(), r#"{"a":"/td/store/pa","b":"/td/store/pb"}"#);
         // A duplicate input name is ambiguous for {in:NAME} resolution and would emit
         // duplicate JSON keys the parser rejects — caught here with a clear message.
         let dup = lock::parse("a /td/store/pa\na /td/store/pb\n", "").unwrap();
-        let err = input_map_json(&dup).expect_err("duplicate name must be rejected");
+        let err = input_map_json(&dup, &none).expect_err("duplicate name must be rejected");
         assert!(err.contains("duplicate input name"), "got: {err}");
+        // A duplicate is refused whichever map it would land in: the scan runs over
+        // every entry, so selecting per map cannot hide one.
+        let err = payload_map_json(&dup, &none).expect_err("duplicate name must be rejected");
+        assert!(err.contains("duplicate input name"), "got: {err}");
+    }
+
+    /// The two maps PARTITION the lock: a payload is withheld from TD_INPUT_MAP and
+    /// appears only in TD_PAYLOAD_MAP, so `{in:}` has no name for it in the builder
+    /// (APPLICATIONS.md §B.8). Asserted on both halves, because a payload that stayed
+    /// in the input map would leave the whole channel decorative.
+    #[test]
+    fn a_payload_is_withheld_from_the_input_map_and_present_in_its_own() {
+        let entries = lock::parse("gcc /td/store/pg\nfirefox /td/store/pf\n", "").unwrap();
+        let payload: std::collections::BTreeSet<String> = ["firefox".to_string()].into();
+        assert_eq!(
+            input_map_json(&entries, &payload).unwrap().to_json_string(),
+            r#"{"gcc":"/td/store/pg"}"#
+        );
+        assert_eq!(
+            payload_map_json(&entries, &payload).unwrap().to_json_string(),
+            r#"{"firefox":"/td/store/pf"}"#
+        );
+    }
+
+    /// Every other refusal partitions NAMES while the sandbox keys its bind on
+    /// PATHS, so a lock holding two names for one store path satisfies all of
+    /// them and still hands a command-bearing step the payload's path under the
+    /// other name. `noexec` refuses an exec of it; `gcc -I<payload>/include` is
+    /// the compilation input §B.8's table refuses, and nothing else catches it.
+    #[test]
+    fn two_names_for_one_path_may_not_split_across_the_two_channels() {
+        let payload: std::collections::BTreeSet<String> = ["firefox".to_string()].into();
+        let shared = lock::parse(
+            "gcc /td/store/pg\nfirefox /td/store/pf\nfirefox-data /td/store/pf\n",
+            "",
+        )
+        .unwrap();
+        let err = refuse_shared_paths(&shared, &payload)
+            .expect_err("one path under a payload name and an input name must refuse");
+        assert!(err.contains("/td/store/pf"), "names the path: {err}");
+        assert!(err.contains("firefox"), "names the payload: {err}");
+        // Distinct paths are the ordinary case, and so is a second name for one
+        // path when BOTH are payloads — nothing crosses the channel there.
+        let ok = lock::parse("gcc /td/store/pg\nfirefox /td/store/pf\n", "").unwrap();
+        assert!(refuse_shared_paths(&ok, &payload).is_ok());
+        let both: std::collections::BTreeSet<String> =
+            ["firefox".to_string(), "firefox-data".to_string()].into();
+        assert!(refuse_shared_paths(&shared, &both).is_ok());
+    }
+
+    /// The declaration-time refusals. Both are about a rule that would otherwise be
+    /// satisfiable by writing the name twice, or by writing it once and having it
+    /// resolve to nothing.
+    #[test]
+    fn a_payload_may_not_also_be_a_tool_and_may_not_resolve_to_nothing() {
+        let entries = lock::parse("gcc /td/store/pg\nfirefox /td/store/pf\n", "").unwrap();
+        let both = json::parse(
+            r#"{"inputs":["gcc","firefox"],"payloadInputs":["firefox"]}"#,
+        )
+        .unwrap();
+        let err = payload_names(&both, &entries).expect_err("both channels must be refused");
+        assert!(err.contains("both `payloadInputs' and `inputs'"), "got: {err}");
+        // ...and through nativeInputs, which is the same channel by another name.
+        let native = json::parse(
+            r#"{"nativeInputs":["firefox"],"payloadInputs":["firefox"]}"#,
+        )
+        .unwrap();
+        let err = payload_names(&native, &entries).expect_err("nativeInputs too");
+        assert!(err.contains("`nativeInputs'"), "got: {err}");
+        // ...and through sourceInput, which reaches the build as TD_SRC.
+        let src = json::parse(
+            r#"{"sourceInput":"firefox","payloadInputs":["firefox"]}"#,
+        )
+        .unwrap();
+        let err = payload_names(&src, &entries).expect_err("sourceInput too");
+        assert!(err.contains("`sourceInput'"), "got: {err}");
+        // A payload nothing resolves would read as enforcement and be none.
+        let ghost = json::parse(r#"{"payloadInputs":["nowhere"]}"#).unwrap();
+        let err = payload_names(&ghost, &entries).expect_err("an unresolved payload");
+        assert!(err.contains("no lock entry resolves"), "got: {err}");
+        // A MALFORMED declaration is refused rather than read as an absent one. This
+        // is the sharpest of the lot: `"payloadInputs":"firefox"` through a filtering
+        // read yields NO payloads, so the name stays in TD_INPUT_MAP, mounts
+        // executable, and sails past the duplicate-channel refusal above.
+        let scalar =
+            json::parse(r#"{"inputs":["firefox"],"payloadInputs":"firefox"}"#).unwrap();
+        let err = payload_names(&scalar, &entries).expect_err("a string is not a list");
+        assert!(err.contains("must be an ARRAY"), "got: {err}");
+        let mixed = json::parse(r#"{"payloadInputs":["firefox",7]}"#).unwrap();
+        let err = payload_names(&mixed, &entries).expect_err("a non-string element");
+        assert!(err.contains("non-string entry"), "got: {err}");
+        // The ordinary case still passes, or every assertion above is vacuous.
+        let fine = json::parse(r#"{"inputs":["gcc"],"payloadInputs":["firefox"]}"#).unwrap();
+        assert_eq!(
+            payload_names(&fine, &entries).unwrap(),
+            ["firefox".to_string()].into()
+        );
     }
 
     // The --auto crate gate: every checksummed committed-lock entry must be present in the

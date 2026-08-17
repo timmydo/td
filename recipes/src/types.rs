@@ -774,6 +774,22 @@ pub struct Recipe {
     /// this rung's COMPILER/tools — the prior rung's output used to build this
     /// one (guix's native-inputs). `build-plan --auto` chains them like inputs.
     pub native_inputs: Option<Vec<String>>,
+    /// DATA inputs (APPLICATIONS.md §B.8): declared to be copied or named rather
+    /// than built with. `inputs`/`native_inputs` are the tool, compilation and
+    /// execution channel; this is the other one, and the split exists because an
+    /// edge carried no label saying WHY an input was there — so a check could
+    /// see "image recipe → firefox" and not tell payload from compiler.
+    ///
+    /// It is a channel rather than a predicate over the existing list because
+    /// the difference has to be enforceable, not merely readable. What is
+    /// ENFORCED is exactly two things: a payload resolves only through its own
+    /// `{payload:NAME}` template, which the expander for a step that runs a
+    /// command has no name for, and its sandbox bind is `noexec` so it cannot
+    /// be executed where it lies. Neither stops a step COPYING a payload and
+    /// running or linking the copy; §B.8 carries that concession and what
+    /// closing it would cost, and this doc deliberately claims no more than the
+    /// two properties above.
+    pub payload_inputs: Option<Vec<String>>,
     /// The `mesboot` build system's typed step list (#378 slices 2+3).
     pub steps: Option<Vec<Step>>,
     pub configure_flags: Option<Vec<String>>,
@@ -843,6 +859,7 @@ impl Recipe {
             build_system: bs,
             inputs: None,
             native_inputs: None,
+            payload_inputs: None,
             steps: None,
             configure_flags: None,
             make_flags: None,
@@ -886,6 +903,13 @@ impl Recipe {
 
     pub fn native_inputs(mut self, xs: &[&str]) -> Recipe {
         self.native_inputs = Some(vs(xs));
+        self
+    }
+    /// Declare DATA inputs — see `Recipe::payload_inputs`. A path named here is
+    /// staged for `CopyTree`/`StageRuntimeClosure` to read and is unreachable
+    /// from any step that runs a command.
+    pub fn payload_inputs(mut self, xs: &[&str]) -> Recipe {
+        self.payload_inputs = Some(vs(xs));
         self
     }
     pub fn steps(mut self, xs: Vec<Step>) -> Recipe {
@@ -1030,6 +1054,11 @@ impl Recipe {
         if let Some(x) = &self.native_inputs {
             o.push(("nativeInputs".into(), arr(x)));
         }
+        // Emitted only when declared, so every recipe that has none hashes
+        // exactly as it did — this key must not rebuild the world to land.
+        if let Some(x) = &self.payload_inputs {
+            o.push(("payloadInputs".into(), arr(x)));
+        }
         if let Some(x) = &self.steps {
             o.push((
                 "steps".into(),
@@ -1093,6 +1122,28 @@ mod tests {
         assert_eq!(
             r.to_json().to_canonical(),
             r#"{"bins":["cat"],"buildSystem":"rust","name":"cat","version":"0.9.0"}"#
+        );
+    }
+
+    /// The payload channel is a SEPARATE key, and its absence is byte-identical
+    /// to the shape that existed before it — otherwise landing §B.8's channel
+    /// would change every derivation hash in the tree for a metadata reason,
+    /// which is the same argument that keeps `source_pins` out of this JSON.
+    #[test]
+    fn the_payload_channel_is_its_own_key_and_costs_nothing_unset() {
+        let plain = Recipe::gnu("fixture", "1.0").inputs(&["gcc"]);
+        assert_eq!(
+            plain.to_json().to_canonical(),
+            r#"{"buildSystem":"gnu","inputs":["gcc"],"name":"fixture","version":"1.0"}"#,
+            "a recipe declaring no payload must hash exactly as it did before"
+        );
+        // Declared, it is neither merged into `inputs` nor able to displace one:
+        // the two lists travel side by side, which is the whole point of the
+        // channel — an edge that says WHY it is there.
+        let with = plain.clone().payload_inputs(&["firefox"]);
+        assert_eq!(
+            with.to_json().to_canonical(),
+            r#"{"buildSystem":"gnu","inputs":["gcc"],"name":"fixture","payloadInputs":["firefox"],"version":"1.0"}"#
         );
     }
 

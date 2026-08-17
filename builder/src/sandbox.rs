@@ -447,6 +447,108 @@ fn plan_staged_item(
     Ok(vec![(on_disk.to_string(), target)])
 }
 
+/// The store paths a drv declared through the DATA channel (APPLICATIONS.md §B.8),
+/// read out of `TD_PAYLOAD_MAP` in the drv's own env.
+///
+/// ABSENT is none; PRESENT AND MALFORMED is an ERROR. The two are
+/// indistinguishable in the result, and reading a corrupt map as "no payloads"
+/// would mount a payload executable on a JSON slip.
+///
+/// Only the DECLARED payloads, not their closure: §B.8 rests on a payload being
+/// self-contained, and one that dragged td-built dependencies in would leave those
+/// binds executable.
+fn payload_paths(drv: &Derivation) -> io::Result<Vec<String>> {
+    let Some((_, map)) = drv.env.iter().find(|(k, _)| k == "TD_PAYLOAD_MAP") else {
+        return Ok(Vec::new());
+    };
+    let parsed = crate::json::parse(map)
+        .map_err(|e| err(format!("TD_PAYLOAD_MAP is not JSON ({e}): {map}")))?;
+    let crate::json::Json::Obj(kvs) = parsed else {
+        return Err(err(format!("TD_PAYLOAD_MAP is not a JSON object: {map}")));
+    };
+    let mut paths = Vec::with_capacity(kvs.len());
+    for (name, value) in &kvs {
+        let path = value
+            .as_str()
+            .ok_or_else(|| err(format!("TD_PAYLOAD_MAP entry `{name}' is not a string")))?;
+        paths.push(path.to_string());
+    }
+    Ok(paths)
+}
+
+/// The remount flags an item takes BEYOND the read-only lock every closure item
+/// gets. Keyed on CANONICAL — the path the build sees, and the one the payload map
+/// names — never on the on-disk path, which differs for a td-interned item and
+/// would silently match nothing.
+fn extra_bind_flags(payloads: &[String], canonical: &str) -> usize {
+    if payloads.iter().any(|p| p == canonical) {
+        sys::MS_NOEXEC
+    } else {
+        0
+    }
+}
+
+/// The whole flag PLAN for a closure: one `(canonical, on_disk, extra)` per entry,
+/// plus the two refusals that need the whole closure in view.
+///
+/// Takes the DERIVATION rather than a payload list because the staging loop needs
+/// a namespace and so cannot be tested: a payload argument there is one an
+/// untestable caller could pass empty. Pure otherwise, so the flag a payload gets
+/// is a value an assertion can hold.
+fn plan_bind_flags<'a>(
+    drv: &Derivation,
+    closure: &'a [String],
+) -> io::Result<Vec<(&'a str, &'a str, usize)>> {
+    // The DATA channel's paths, read off the drv's own env — hashed drv data, so
+    // the set cannot change without changing the derivation.
+    let payloads = &payload_paths(drv)?;
+    let mut plan = Vec::with_capacity(closure.len());
+    for entry in closure {
+        let (canonical, on_disk) = split_closure_entry(entry);
+        plan.push((canonical, on_disk, extra_bind_flags(payloads, canonical)));
+    }
+    // Items are staged flat under `newstore/<basename>`, so two entries sharing a
+    // basename bind onto ONE target and the second stacks over the first. That
+    // shadowing predates the payload channel; what is new is that it can drop a
+    // restriction, so the case where the two disagree about flags is refused.
+    for (i, (canonical, _, extra)) in plan.iter().enumerate() {
+        let base = canonical.rsplit('/').next().unwrap_or(canonical);
+        for (other, _, other_extra) in plan.iter().skip(i + 1) {
+            if other.rsplit('/').next().unwrap_or(other) == base && other_extra != extra {
+                return Err(err(format!(
+                    "closure items {canonical} and {other} stage onto the same name but \
+                     take different mount flags — the later bind would shadow the \
+                     earlier one's restriction (APPLICATIONS.md section B.8)"
+                )));
+            }
+        }
+    }
+    // A payload the closure never offered is a restriction that matched NOTHING,
+    // and nothing observable would distinguish that from one that applied: the
+    // build runs with every bind executable and exits 0. Same argument as
+    // `losetup`'s read-only readback. The two sets really can diverge — the maps
+    // are built from the parsed lock while the closure comes from the drv's
+    // input-srcs, which `substitute_gcc_toolchain` rewrites after that parse.
+    for path in payloads {
+        if !plan.iter().any(|(canonical, _, _)| canonical == path) {
+            return Err(err(format!(
+                "TD_PAYLOAD_MAP names {path}, which is not in this build's input \
+                 closure — the noexec restriction would apply to nothing and the \
+                 build would look identical (APPLICATIONS.md section B.8)"
+            )));
+        }
+    }
+    Ok(plan)
+}
+
+/// The flag word the child's SECOND mount issues — the remount that locks a staged
+/// item. A function so a test can hold it: re-composing the same `|` chain in an
+/// assertion observes nothing. The creating BIND deliberately does not take it,
+/// since bind creation ignores the flag word entirely.
+fn remount_flags(extra: usize) -> usize {
+    sys::MS_REMOUNT | sys::MS_BIND | sys::MS_RDONLY | extra
+}
+
 /// Run the drv's builder inside the namespace sandbox. `closure` lists every
 /// store path the build may see (the staged store's contents); `scratch` is
 /// a writable host directory. `manifest` is the #469 staging gate — REQUIRED,
@@ -482,11 +584,11 @@ pub fn build(
     // the mounts themselves happen in the child's namespace.
     let newstore = scratch.join("newstore");
     fs::create_dir_all(&newstore)?;
-    let mut binds: Vec<(CString, CString)> = Vec::with_capacity(closure.len());
-    for entry in closure {
-        // CANONICAL is the store path the build SEES; ON-DISK is where to bind FROM
-        // (== canonical for daemon-resident items, a td store dir for td-interned ones).
-        let (canonical, on_disk) = split_closure_entry(entry);
+    let plan = plan_bind_flags(drv, closure)?;
+    let mut binds: Vec<(CString, CString, usize)> = Vec::with_capacity(closure.len());
+    // CANONICAL is the store path the build SEES; ON-DISK is where to bind FROM
+    // (== canonical for daemon-resident items, a td store dir for td-interned ones).
+    for (canonical, on_disk, extra) in plan {
         verify_staged_item(manifest, canonical, on_disk)?;
         let meta = fs::symlink_metadata(on_disk)
             .map_err(|e| err(format!("closure item {canonical} (on disk {on_disk}): {e}")))?;
@@ -495,6 +597,7 @@ pub fn build(
                 CString::new(src.as_str()).map_err(|_| err(format!("{src}: NUL in path")))?,
                 CString::new(dst.as_os_str().as_encoded_bytes())
                     .map_err(|_| err(format!("{}: NUL in path", dst.display())))?,
+                extra,
             ));
         }
     }
@@ -713,15 +816,9 @@ pub fn build(
             // writable — outputs land as NEW entries beside the binds, never
             // through one — and the /gnu/store rbind below carries each
             // child's ro flag along.
-            for (src, dst) in &binds {
+            for (src, dst, extra) in &binds {
                 sys::mount(Some(src), dst, None, sys::MS_BIND, None)?;
-                sys::mount(
-                    None,
-                    dst,
-                    None,
-                    sys::MS_REMOUNT | sys::MS_BIND | sys::MS_RDONLY,
-                    None,
-                )?;
+                sys::mount(None, dst, None, remount_flags(*extra), None)?;
             }
             // The fresh minimal root, then its skeleton dirs.
             sys::mount(Some(&tmpfs_c), &newroot_c, Some(&tmpfs_c), 0, None)?;
@@ -1439,6 +1536,274 @@ mod tests {
 
     // A closure item binds WHOLE: `plan_staged_item` returns one `(on-disk, target)`
     // pair keyed by the store basename, whatever runnable programs the tree ships.
+    /// The DATA channel's mount half (APPLICATIONS.md §B.8). Three properties, and
+    /// the third is the one a reader should check first: `MS_NOEXEC` is pinned by
+    /// VALUE, because it reaches the kernel as a bit in a flag word and a wrong
+    /// constant is a mount that succeeds having promised something else.
+    #[test]
+    fn a_payload_binds_noexec_and_nothing_else_does() {
+        assert_eq!(sys::MS_NOEXEC, 0x8, "MS_NOEXEC is the kernel's, not ours");
+        let payloads = vec!["/td/store/def-firefox".to_string()];
+        assert_eq!(
+            extra_bind_flags(&payloads, "/td/store/def-firefox"),
+            sys::MS_NOEXEC
+        );
+        // An ordinary input keeps exactly the flags it always had — this landing
+        // must not quietly make the whole store non-executable, which would break
+        // every build rather than confine one payload.
+        assert_eq!(extra_bind_flags(&payloads, "/td/store/abc-gcc"), 0);
+        assert_eq!(extra_bind_flags(&[], "/td/store/def-firefox"), 0);
+        // The word the child ACTUALLY issues, through the same function the call
+        // site calls. Re-composing the `|` chain here instead would assert
+        // nothing — `(A|B|C|X) & X == X` for any values — and deleting `extra`
+        // from the production remount would leave it green.
+        assert_eq!(
+            remount_flags(extra_bind_flags(&payloads, "/td/store/def-firefox")),
+            sys::MS_REMOUNT | sys::MS_BIND | sys::MS_RDONLY | sys::MS_NOEXEC
+        );
+        assert_eq!(
+            remount_flags(extra_bind_flags(&payloads, "/td/store/abc-gcc")),
+            sys::MS_REMOUNT | sys::MS_BIND | sys::MS_RDONLY,
+            "an ordinary item must gain nothing"
+        );
+    }
+
+    /// A drv declaring `paths` through the payload channel and nothing else.
+    fn drv_with_payloads(paths: &[&str]) -> Derivation {
+        let map = paths
+            .iter()
+            .map(|p| {
+                let name = p.rsplit('-').next().unwrap_or("p");
+                format!("\"{name}\":\"{p}\"")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        Derivation {
+            outputs: Vec::new(),
+            input_drvs: Vec::new(),
+            input_srcs: Vec::new(),
+            platform: "x86_64-linux".into(),
+            builder: "/b".into(),
+            args: Vec::new(),
+            env: if paths.is_empty() {
+                Vec::new()
+            } else {
+                vec![("TD_PAYLOAD_MAP".into(), format!("{{{map}}}"))]
+            },
+        }
+    }
+
+    /// The assertions above reach the LEAVES; this one reaches the SEAM, which is
+    /// where the flag is actually derived. Replacing the staging loop's per-item
+    /// `extra` with a literal `0` left every leaf assertion green, because none
+    /// of them observed what that loop was handed — so the plan is a value now,
+    /// derived from the drv rather than from an argument the untestable caller
+    /// supplies, and this holds it.
+    #[test]
+    fn the_bind_plan_carries_noexec_to_exactly_the_declared_payloads() {
+        let closure = vec![
+            "/td/store/abc-gcc".to_string(),
+            "/td/store/def-firefox".to_string(),
+            // A td-interned item: canonical is what the build sees, on-disk is
+            // where the bytes are. The flag must key on the FORMER.
+            "/gnu/store/ghi-bash\t/td/store/ghi-bash".to_string(),
+        ];
+        let plan = plan_bind_flags(&drv_with_payloads(&["/td/store/def-firefox"]), &closure).unwrap();
+        assert_eq!(
+            plan,
+            vec![
+                ("/td/store/abc-gcc", "/td/store/abc-gcc", 0),
+                ("/td/store/def-firefox", "/td/store/def-firefox", sys::MS_NOEXEC),
+                ("/gnu/store/ghi-bash", "/td/store/ghi-bash", 0),
+            ]
+        );
+        // A drv declaring no payload is exactly what every build is today.
+        assert!(plan_bind_flags(&drv_with_payloads(&[]), &closure)
+            .unwrap()
+            .iter()
+            .all(|(_, _, extra)| *extra == 0));
+    }
+
+    /// A declared payload the closure never offers is a restriction that applied
+    /// to NOTHING, which no observation distinguishes from one that applied: the
+    /// build runs with every bind executable and exits 0.
+    #[test]
+    fn a_payload_missing_from_the_closure_is_an_error_not_a_no_op() {
+        let closure = vec!["/td/store/abc-gcc".to_string()];
+        let e = plan_bind_flags(&drv_with_payloads(&["/td/store/def-firefox"]), &closure)
+            .expect_err("a payload outside the closure must refuse");
+        assert!(e.to_string().contains("def-firefox"), "{e}");
+        assert!(e.to_string().contains("apply to nothing"), "{e}");
+        // The on-disk half of an interned entry is NOT what the map names, so
+        // matching against it would let the restriction pass while applying to
+        // a path the build never sees.
+        let interned = vec!["/gnu/store/def-firefox\t/td/store/def-firefox".to_string()];
+        assert!(plan_bind_flags(&drv_with_payloads(&["/td/store/def-firefox"]), &interned).is_err());
+        assert!(plan_bind_flags(&drv_with_payloads(&["/gnu/store/def-firefox"]), &interned).is_ok());
+    }
+
+    /// Items stage flat under `newstore/<basename>`, so two entries sharing one
+    /// basename bind onto a single target and the second stacks over the first.
+    /// That shadowing predates this channel; dropping a restriction through it
+    /// does not, so a disagreement about flags is refused.
+    #[test]
+    fn a_basename_collision_may_not_silently_drop_a_restriction() {
+        let collide = vec![
+            "/gnu/store/abc-x".to_string(),
+            "/td/store/abc-x".to_string(),
+        ];
+        let e = plan_bind_flags(&drv_with_payloads(&["/td/store/abc-x"]), &collide)
+            .expect_err("one payload and one ordinary item on one target must refuse");
+        assert!(e.to_string().contains("shadow"), "{e}");
+        // Agreeing entries are the pre-existing case and are left as they were.
+        assert!(plan_bind_flags(&drv_with_payloads(&[]), &collide).is_ok());
+    }
+
+    /// `payload_paths` is how a plan learns what is restricted, so a SECOND
+    /// caller would be a second place the answer could be obtained — and one
+    /// that could then be handed to something that ignores it. One production
+    /// caller, and it is the planner.
+    #[test]
+    fn the_payload_set_is_read_in_exactly_one_place() {
+        let src = include_str!("sandbox.rs");
+        let shipped = match src.find("\nmod tests {") {
+            Some(at) => src.get(..at).unwrap_or(src),
+            None => src,
+        };
+        let calls: Vec<&str> = shipped
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("payload_paths(drv)") || l.contains("plan_bind_flags("))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                "let payloads = &payload_paths(drv)?;",
+                "let plan = plan_bind_flags(drv, closure)?;",
+            ],
+            "one reader of the payload set, one planner, and the planner is what \
+             the staging loop consumes (APPLICATIONS.md section B.8)"
+        );
+    }
+
+    /// The remount is the ONLY place `extra` may reach the kernel, asserted over
+    /// this file's own source because no runtime test in this crate enters a
+    /// namespace.
+    ///
+    /// Two failures it exists for, both of which leave every other test green:
+    /// dropping `extra` from the remount, and moving it to the `MS_BIND` call that
+    /// CREATES the mount — where the kernel ignores the flag word entirely, so a
+    /// payload would bind executable while the call site reads correctly.
+    #[test]
+    fn the_payload_flag_reaches_the_kernel_only_through_the_remount() {
+        let src = include_str!("sandbox.rs");
+        let shipped = match src.find("\nmod tests {") {
+            Some(at) => src.get(..at).unwrap_or(src),
+            None => src,
+        };
+        let calls: Vec<&str> = shipped
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("sys::mount(") && l.contains("extra"))
+            .collect();
+        assert_eq!(
+            calls,
+            ["sys::mount(None, dst, None, remount_flags(*extra), None)?;"],
+            "the payload flag must reach the kernel through the remount and nowhere \
+             else (APPLICATIONS.md section B.8)"
+        );
+        // The creating bind must stay a bare MS_BIND: a flag word there applies
+        // nothing, so the mistake is invisible at the call site.
+        assert!(
+            shipped.contains("sys::mount(Some(src), dst, None, sys::MS_BIND, None)?;"),
+            "the creating bind must carry MS_BIND alone"
+        );
+        // ...and the scan must be able to SEE the loop, or it passes for nothing.
+        assert!(
+            shipped.contains("fn remount_flags") && shipped.len() < src.len(),
+            "the shipped-half split stopped working"
+        );
+        // The last seam a type cannot hold: the staging loop copies the plan's
+        // flag word into the bind it pushes, and writing a literal `0` there
+        // leaves every value assertion in this file green — the plan is still
+        // right, it is just no longer what the child is handed. So the push is
+        // pinned in text, since nothing here can enter a namespace to observe it.
+        let pushes: Vec<&str> = shipped
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("binds.push(("))
+            .collect();
+        assert_eq!(pushes.len(), 1, "one bind push: {pushes:?}");
+        let tail = shipped
+            .split_once("binds.push((")
+            .map(|(_, rest)| rest)
+            .unwrap_or_default();
+        let flag_arg = tail
+            .lines()
+            .map(str::trim)
+            .take_while(|l| !l.starts_with("));"))
+            .last();
+        assert_eq!(
+            flag_arg,
+            Some("extra,"),
+            "the bind must carry the PLAN's flag word, not a literal"
+        );
+    }
+
+    /// The payload set is read off the drv's OWN env, so it is hashed drv data and
+    /// cannot be changed without changing the derivation. ABSENT is none — the
+    /// ordinary case — and MALFORMED is an error, because reading a corrupt map as
+    /// "no payloads" would mount a payload executable on a JSON slip.
+    #[test]
+    fn payload_paths_come_from_the_drvs_own_env() {
+        let drv = |env: Vec<(String, String)>| Derivation {
+            outputs: Vec::new(),
+            input_drvs: Vec::new(),
+            input_srcs: Vec::new(),
+            platform: "x86_64-linux".into(),
+            builder: "/b".into(),
+            args: Vec::new(),
+            env,
+        };
+        assert!(
+            payload_paths(&drv(Vec::new())).unwrap().is_empty(),
+            "absent is none"
+        );
+        assert_eq!(
+            payload_paths(&drv(vec![(
+                "TD_PAYLOAD_MAP".into(),
+                r#"{"firefox":"/td/store/def-firefox"}"#.into()
+            )]))
+            .unwrap(),
+            vec!["/td/store/def-firefox".to_string()]
+        );
+        // PRESENT AND MALFORMED is an error, never "no payloads". Reading a corrupt
+        // map as absent would mount a payload EXECUTABLE on the strength of a JSON
+        // slip — a restriction that fails open when its input is damaged.
+        for bad in [
+            "not json",
+            "[\"/td/store/def-firefox\"]",
+            r#"{"firefox":7}"#,
+        ] {
+            let e = payload_paths(&drv(vec![("TD_PAYLOAD_MAP".into(), bad.into())]))
+                .expect_err("a malformed payload map must refuse, not fail open");
+            assert!(
+                e.to_string().contains("TD_PAYLOAD_MAP"),
+                "the refusal must name the variable: {e}"
+            );
+        }
+        // A neighbouring variable must not be mistaken for it.
+        assert!(
+            payload_paths(&drv(vec![(
+                "TD_INPUT_MAP".into(),
+                r#"{"gcc":"/td/store/abc-gcc"}"#.into()
+            )]))
+            .unwrap()
+            .is_empty(),
+            "the tool channel is not the data one"
+        );
+    }
+
     #[test]
     fn plan_staged_item_stages_a_dir_whole() {
         let root = std::env::temp_dir().join(format!("td-stage-whole-{}", std::process::id()));

@@ -188,7 +188,10 @@ pub fn parse(input: &[u8]) -> Result<Derivation, ParseError> {
         args.push(p.string()?);
     }
 
-    let mut env = Vec::new();
+    // A repeated key is refused, not resolved: asking for one by name answers with
+    // the FIRST, while the environment handed to a build keeps the LAST, so a
+    // duplicate is two answers to one question rather than a shape to support.
+    let mut env: Vec<(String, String)> = Vec::new();
     p.expect(",[")?;
     while !p.end_of_list()? {
         p.expect("(")?;
@@ -196,6 +199,9 @@ pub fn parse(input: &[u8]) -> Result<Derivation, ParseError> {
         p.expect(",")?;
         let value = p.string()?;
         p.expect(")")?;
+        if env.iter().any(|(k, _)| *k == name) {
+            return p.fail(format!("environment key `{name}' appears more than once"));
+        }
         env.push((name, value));
     }
     p.expect(")")?;
@@ -366,6 +372,22 @@ mod tests {
         assert!(drv.input_srcs.is_empty());
         assert!(drv.args.is_empty());
         assert!(drv.env.is_empty());
+    }
+
+    /// The env list is read two ways — by name, which takes the first match, and
+    /// by handing it to a child, where the last write wins — so a repeated key is
+    /// two different answers to one question rather than a tidiness matter.
+    #[test]
+    fn a_repeated_environment_key_is_refused() {
+        let one = r#"Derive([("out","/gnu/store/aaa-x","","")],[],[],"s","/b",[],[("TD_PAYLOAD_MAP","{}")])"#;
+        assert!(parse(one.as_bytes()).is_ok());
+        let twice = r#"Derive([("out","/gnu/store/aaa-x","","")],[],[],"s","/b",[],[("TD_PAYLOAD_MAP","{}"),("TD_PAYLOAD_MAP","{\"f\":\"/td/store/def-f\"}")])"#;
+        let err = parse(twice.as_bytes()).unwrap_err();
+        assert!(err.what.contains("TD_PAYLOAD_MAP"), "must name the key: {}", err.what);
+        assert!(err.what.contains("more than once"), "{}", err.what);
+        // Not special-cased to that one variable: any repeat is malformed.
+        let other = r#"Derive([("out","/gnu/store/aaa-x","","")],[],[],"s","/b",[],[("A","1"),("B","2"),("A","3")])"#;
+        assert!(parse(other.as_bytes()).is_err());
     }
 
     #[test]

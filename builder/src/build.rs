@@ -1834,10 +1834,60 @@ struct StepCtx {
     tools: String,
     jobs: String,
     inputs: Vec<(String, String)>,
+    /// TD_PAYLOAD_MAP — the DATA channel (APPLICATIONS.md §B.8), disjoint from
+    /// `inputs` by construction: assembly refuses a name in both and withholds
+    /// every payload from TD_INPUT_MAP.
+    payloads: Vec<(String, String)>,
 }
 
 impl StepCtx {
+    /// The COMMAND expander: every step's templates but the two data ones. A
+    /// `{payload:…}` here is an error rather than a miss, and `{in:…}` cannot name
+    /// a payload because assembly withheld it from TD_INPUT_MAP.
     fn expand(&self, s: &str) -> Result<String, String> {
+        self.expand_with(s, false)
+    }
+
+    /// A `glob:` pattern may only read the build's OWN trees. Splicing directory
+    /// entries into argv gives a step names it never spelled, and `{in:x}/..` is
+    /// the store directory — so `glob:{in:mes}/../*-firefox-140` puts a payload
+    /// on a command line with no `{payload:}` (refused there) and no `{in:}`
+    /// (withheld from the map): the resolution half of §B.8, defeated by a
+    /// template that resolves something else. Every `glob:` in the tree already
+    /// reads `{root}`.
+    fn check_glob_dir(&self, pat: &str) -> Result<(), String> {
+        let dir = match pat.rfind('/') {
+            Some(i) => pat.get(..i).unwrap_or("."),
+            None => ".",
+        };
+        let resolved = fs::canonicalize(dir)
+            .map_err(|e| format!("glob:{pat}: resolve {dir}: {e}"))?;
+        for allowed in [&self.root, &self.out] {
+            let base = fs::canonicalize(allowed)
+                .map_err(|e| format!("glob:{pat}: resolve {allowed}: {e}"))?;
+            if resolved.starts_with(&base) {
+                return Ok(());
+            }
+        }
+        Err(format!(
+            "glob:{pat} reads {} — a glob may only read the build's own tree \
+             ({} or {}), never a staged input (APPLICATIONS.md section B.8)",
+            resolved.display(),
+            self.root,
+            self.out
+        ))
+    }
+
+    /// The DATA expander: the same tokens plus `{payload:NAME}`, and used ONLY by
+    /// the operations the builder performs itself — `CopyTree`'s source and
+    /// `StageRuntimeClosure`'s roots. This is the resolution half of §B.8's
+    /// channel: a step that runs a program the recipe chose has no name for a
+    /// payload at all, which is a property rather than a scan for one.
+    fn expand_data(&self, s: &str) -> Result<String, String> {
+        self.expand_with(s, true)
+    }
+
+    fn expand_with(&self, s: &str, payloads_visible: bool) -> Result<String, String> {
         let mut r = String::with_capacity(s.len());
         let mut rest = s;
         while let Some(i) = rest.find('{') {
@@ -1856,18 +1906,51 @@ impl StepCtx {
                         "out" => Some(self.out.as_str()),
                         "tools" => Some(self.tools.as_str()),
                         "jobs" => Some(self.jobs.as_str()),
-                        _ => match tok.strip_prefix("in:") {
-                            Some(name) => Some(
-                                self.inputs
-                                    .iter()
-                                    .find(|(n, _)| n == name)
-                                    .map(|(_, p)| p.as_str())
-                                    .ok_or_else(|| {
-                                        format!("mesboot step template: no input `{name}' in TD_INPUT_MAP (token {{{tok}}})")
-                                    })?,
-                            ),
-                            None => None,
-                        },
+                        _ => {
+                            if let Some(name) = tok.strip_prefix("in:") {
+                                // A payload reached through `{in:}` is the channel being
+                                // crossed, not a typo, so it says which rule refused it —
+                                // the plain "no input" below would send a reader looking
+                                // for a missing lock entry.
+                                if self.payloads.iter().any(|(n, _)| n == name) {
+                                    return Err(format!(
+                                        "mesboot step template: `{name}' is a payloadInput \
+                                         and is not reachable through {{in:}} — it is staged \
+                                         as data for copyTree/stageRuntimeClosure only \
+                                         (APPLICATIONS.md section B.8)"
+                                    ));
+                                }
+                                Some(
+                                    self.inputs
+                                        .iter()
+                                        .find(|(n, _)| n == name)
+                                        .map(|(_, p)| p.as_str())
+                                        .ok_or_else(|| {
+                                            format!("mesboot step template: no input `{name}' in TD_INPUT_MAP (token {{{tok}}})")
+                                        })?,
+                                )
+                            } else if let Some(name) = tok.strip_prefix("payload:") {
+                                if !payloads_visible {
+                                    return Err(format!(
+                                        "mesboot step template: {{payload:{name}}} resolves \
+                                         only in copyTree's `from' and stageRuntimeClosure's \
+                                         `roots' — a payload is never named by a step that \
+                                         runs a command (APPLICATIONS.md section B.8)"
+                                    ));
+                                }
+                                Some(
+                                    self.payloads
+                                        .iter()
+                                        .find(|(n, _)| n == name)
+                                        .map(|(_, p)| p.as_str())
+                                        .ok_or_else(|| {
+                                            format!("mesboot step template: no payload `{name}' in TD_PAYLOAD_MAP (token {{{tok}}})")
+                                        })?,
+                                )
+                            } else {
+                                None
+                            }
+                        }
                     };
                     match repl {
                         Some(v) => {
@@ -1885,6 +1968,9 @@ impl StepCtx {
         }
         r.push_str(rest);
         Ok(r)
+    }
+    fn expand_data_all(&self, xs: &[String]) -> Result<Vec<String>, String> {
+        xs.iter().map(|x| self.expand_data(x)).collect()
     }
     fn expand_all(&self, xs: &[String]) -> Result<Vec<String>, String> {
         xs.iter().map(|x| self.expand(x)).collect()
@@ -2129,9 +2215,16 @@ fn runtime_candidate_index(
 /// Walk the loader-visible graph only. `runtime_link_search` projects each
 /// ELF's PT_INTERP, RUNPATH/RPATH, and DT_NEEDED plus symlink targets into the
 /// daemon-compatible hash scanner, excluding unrelated build-provenance strings.
+/// `roots_declared` gates what a step may NAME as a root; `refs_declared` gates
+/// what the walk may FOLLOW out of the bytes it stages. They differ by exactly the
+/// payloads (APPLICATIONS.md §B.8), and keeping them apart is the point: a payload
+/// is a legitimate root because a step named it, and a payload REACHED from an
+/// ordinary input is a td-built output embedding a foreign path, which is the case
+/// §B.8 exists to red rather than to stage silently.
 fn runtime_store_closure(
     candidates: &BTreeMap<String, PathBuf>,
-    declared: &BTreeSet<String>,
+    roots_declared: &BTreeSet<String>,
+    refs_declared: &BTreeSet<String>,
     roots: &[String],
     target_store: &str,
 ) -> Result<BTreeSet<String>, String> {
@@ -2140,7 +2233,7 @@ fn runtime_store_closure(
     }
     let target_store = Path::new(target_store);
     for root in roots {
-        if !declared.contains(root) {
+        if !roots_declared.contains(root) {
             return Err(format!(
                 "stageRuntimeClosure: root {root} is not a declared recipe input"
             ));
@@ -2176,8 +2269,21 @@ fn runtime_store_closure(
         let absolute_refs = scan_runtime_store_refs(&mut scanner, physical, target_store)?;
         let mut references: BTreeSet<String> = scanner.refs().into_iter().collect();
         references.extend(absolute_refs);
+        // An item declared ONLY as a root — nameable, but not an ordinary input —
+        // may reach the whole declared set; an ordinary input may reach only
+        // ordinary inputs. Today the two sets differ by exactly the payloads, so
+        // this is §B.8's rule stated without naming it: an application may name
+        // its runtime and its own store path (an absolute RUNPATH into itself is
+        // the ordinary shape), while an ordinary input dragging a payload into
+        // the staged tree still reds. For a build with no payload the sets are
+        // equal, the difference is empty, and nothing changes.
+        let reachable = if roots_declared.contains(&path) && !refs_declared.contains(&path) {
+            roots_declared
+        } else {
+            refs_declared
+        };
         for reference in references {
-            if !declared.contains(&reference) {
+            if !reachable.contains(&reference) {
                 return Err(format!(
                     "stageRuntimeClosure: {path} references undeclared recipe input {reference}"
                 ));
@@ -2350,25 +2456,66 @@ fn copy_store_item_writable(from: &Path, to: &Path) -> Result<(), String> {
         .map_err(|e| format!("stageRuntimeClosure: chmod {}: {e}", to.display()))
 }
 
+/// The two declared sets `stageRuntimeClosure` gates on: what a step may NAME as
+/// a root, and what an ORDINARY item may reach.
+///
+/// §B.8 names this step a permitted payload consumer, so payloads join the ROOT
+/// set. They stay out of the REFERENCE set, or an ordinary input embedding a
+/// payload's store path would drag it into the staged tree with no step naming
+/// it — `copy_store_item_writable` writes it out with its exec bits on a
+/// writable mount, `noexec` undone by a different door.
+///
+/// Split out because `stage_runtime_closure` reads the real store dir and so
+/// cannot be unit-tested; this is where the two sets are decided.
+fn declared_sets(
+    inputs: &[(String, String)],
+    payloads: &[(String, String)],
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    (
+        inputs
+            .iter()
+            .chain(payloads)
+            .map(|(_, path)| path.clone())
+            .collect(),
+        inputs.iter().map(|(_, path)| path.clone()).collect(),
+    )
+}
+
 fn stage_runtime_closure(
     inputs: &[(String, String)],
+    payloads: &[(String, String)],
     roots: &[String],
     dest: &Path,
 ) -> Result<BTreeSet<String>, String> {
     let target_store = crate::store::store_dir();
-    let candidates = runtime_candidate_index(inputs, &target_store)?;
-    let declared: BTreeSet<String> = inputs.iter().map(|(_, path)| path.clone()).collect();
-    stage_runtime_closure_from_index(&candidates, &declared, roots, &target_store, dest)
+    let all: Vec<(String, String)> = inputs.iter().chain(payloads).cloned().collect();
+    let candidates = runtime_candidate_index(&all, &target_store)?;
+    let (roots_declared, refs_declared) = declared_sets(inputs, payloads);
+    stage_runtime_closure_from_index(
+        &candidates,
+        &roots_declared,
+        &refs_declared,
+        roots,
+        &target_store,
+        dest,
+    )
 }
 
 fn stage_runtime_closure_from_index(
     candidates: &BTreeMap<String, PathBuf>,
-    declared: &BTreeSet<String>,
+    roots_declared: &BTreeSet<String>,
+    refs_declared: &BTreeSet<String>,
     roots: &[String],
     target_store: &str,
     dest: &Path,
 ) -> Result<BTreeSet<String>, String> {
-    let closure = runtime_store_closure(candidates, declared, roots, target_store)?;
+    let closure = runtime_store_closure(
+        candidates,
+        roots_declared,
+        refs_declared,
+        roots,
+        target_store,
+    )?;
     for path in &closure {
         let relative = Path::new(path)
             .strip_prefix("/")
@@ -2507,6 +2654,48 @@ pub(crate) fn consume_mesboot_steps_file(path: &Path) -> Result<String, String> 
     Ok(steps)
 }
 
+/// Read `TD_PAYLOAD_MAP` (payload name → store path) STRICTLY, where
+/// `TD_INPUT_MAP`'s read filters non-strings out.
+///
+/// The map carries a RESTRICTION, so a dropped entry is a payload with no name
+/// in the data expander — silently fail-closed, and one refactor from failing
+/// open. `sandbox::payload_paths` refuses the identical malformation, and two
+/// readers of one variable must not disagree about what it may contain.
+fn parse_payload_map(text: &str) -> Result<Vec<(String, String)>, String> {
+    let parsed = crate::json::parse(text).map_err(|e| format!("TD_PAYLOAD_MAP JSON: {e}"))?;
+    let Json::Obj(kvs) = &parsed else {
+        return Err("TD_PAYLOAD_MAP is not a JSON object".into());
+    };
+    let mut out = Vec::with_capacity(kvs.len());
+    for (name, value) in kvs {
+        let path = value
+            .as_str()
+            .ok_or_else(|| format!("TD_PAYLOAD_MAP entry `{name}' is not a string"))?;
+        out.push((name.clone(), path.to_string()));
+    }
+    Ok(out)
+}
+
+/// Assembly partitions the two maps by PATH; this is that same refusal made
+/// where they are READ, because a drv could reach the builder some other way.
+/// A payload aliased into `TD_INPUT_MAP` resolves through `{in:ALIAS}` for a
+/// command-bearing step, and the resolver below compares only NAMES — `noexec`
+/// still refuses an exec, but not `gcc -I<payload>/include`.
+fn refuse_aliased_payloads(
+    inputs: &[(String, String)],
+    payloads: &[(String, String)],
+) -> Result<(), String> {
+    for (pname, ppath) in payloads {
+        if let Some((iname, _)) = inputs.iter().find(|(_, ipath)| ipath == ppath) {
+            return Err(format!(
+                "payload `{pname}' is also reachable as input `{iname}' ({ppath}): the payload \
+                 channel is disjoint from the input channel (APPLICATIONS.md section B.8)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// mesboot-build — td's bootstrap-RUNG build "system" (#378 slices 2+3; sibling
 /// of `run`/`run_rust`/`run_cmake`/`run_stage0`). Executes the recipe's typed
 /// steps (materialized from the drv's `TD_STEPS` data; see recipes/src/types.rs
@@ -2540,6 +2729,14 @@ pub fn run_mesboot() -> Result<(), String> {
             .collect(),
         _ => return Err("TD_INPUT_MAP is not a JSON object".into()),
     };
+    // ABSENT is the ordinary case and means no payload: assembly emits this only for
+    // a recipe that declares one, which is what keeps every existing derivation's
+    // spec byte-identical.
+    let payloads = match env::var("TD_PAYLOAD_MAP") {
+        Err(_) => Vec::new(),
+        Ok(text) => parse_payload_map(&text)?,
+    };
+    refuse_aliased_payloads(&inputs, &payloads)?;
     let root = env::current_dir()
         .map_err(|e| format!("cwd: {e}"))?
         .to_string_lossy()
@@ -2554,6 +2751,7 @@ pub fn run_mesboot() -> Result<(), String> {
         out: out.clone(),
         root,
         inputs,
+        payloads,
     };
     for d in [&ctx.src, &ctx.tools, &ctx.out] {
         fs::create_dir_all(d).map_err(|e| format!("mkdir {d}: {e}"))?;
@@ -2594,6 +2792,7 @@ pub fn run_mesboot() -> Result<(), String> {
                 match a.strip_prefix("glob:") {
                     None => argv.push(a),
                     Some(pat) => {
+                        ctx.check_glob_dir(pat).map_err(err)?;
                         let mut hits = glob_one_star(pat).map_err(err)?;
                         if hits.is_empty() {
                             return Err(err(format!("glob:{pat} matched nothing")));
@@ -2664,13 +2863,16 @@ pub fn run_mesboot() -> Result<(), String> {
                 copy_file_writable(Path::new(&f), Path::new(&dest)).map_err(err)?;
             }
         } else if let Some(o) = step.get("copyTree") {
-            let from = ctx.expand(&field(o, "from")?).map_err(err)?;
+            // `from` is the DATA side and may name a payload; `dest` is inside this
+            // build's own output and may not.
+            let from = ctx.expand_data(&field(o, "from")?).map_err(err)?;
             let dest = ctx.expand(&field(o, "dest")?).map_err(err)?;
             copy_tree_writable(Path::new(&from), Path::new(&dest)).map_err(err)?;
         } else if let Some(o) = step.get("stageRuntimeClosure") {
-            let roots = ctx.expand_all(&strs(o, "roots")?).map_err(err)?;
+            let roots = ctx.expand_data_all(&strs(o, "roots")?).map_err(err)?;
             let dest = ctx.expand(&field(o, "dest")?).map_err(err)?;
-            stage_runtime_closure(&ctx.inputs, &roots, Path::new(&dest)).map_err(err)?;
+            stage_runtime_closure(&ctx.inputs, &ctx.payloads, &roots, Path::new(&dest))
+                .map_err(err)?;
         } else if let Some(o) = step.get("packErofs") {
             let root = ctx.expand(&field(o, "root")?).map_err(err)?;
             let output = ctx.expand(&field(o, "output")?).map_err(err)?;
@@ -2978,6 +3180,7 @@ mod tests {
             tools: "/r/tools".into(),
             jobs: "4".into(),
             inputs: vec![("mes".into(), "/td/store/abc-mes".into())],
+            payloads: Vec::new(),
         };
         let o = crate::json::parse(
             r#"{"file":"{src}/x.c","edits":[{"from":"a{in:mes}b","to":"c{src}d","expect":"1"}]}"#,
@@ -3078,6 +3281,7 @@ mod tests {
             tools: "/r/tools".into(),
             jobs: "4".into(),
             inputs: vec![("mes".into(), "/td/store/abc-mes".into())],
+            payloads: Vec::new(),
         };
         assert_eq!(
             ctx.expand("{in:mes}/bin -j{jobs} {src}").unwrap(),
@@ -3089,6 +3293,212 @@ mod tests {
         );
         let err = ctx.expand("{in:nope}/bin").expect_err("unknown input reds");
         assert!(err.contains("nope"), "{err}");
+    }
+
+    /// The two readers of `TD_PAYLOAD_MAP` must agree about what it may contain.
+    /// `sandbox::payload_paths` refuses a non-string entry before the build runs;
+    /// this one is what the STEPS read, and filtering here would drop a payload's
+    /// name silently instead.
+    #[test]
+    fn the_payload_map_is_read_strictly() {
+        assert_eq!(
+            parse_payload_map(r#"{"firefox":"/td/store/def-firefox"}"#).unwrap(),
+            vec![("firefox".to_string(), "/td/store/def-firefox".to_string())]
+        );
+        assert!(parse_payload_map("{}").unwrap().is_empty());
+        for bad in ["not json", "[\"a\"]", r#"{"firefox":7}"#, r#"{"a":null}"#] {
+            let e = parse_payload_map(bad).expect_err("a malformed map must refuse");
+            assert!(e.contains("TD_PAYLOAD_MAP"), "must name the variable: {e}");
+        }
+    }
+
+    /// The escape a review found in the RESOLUTION half: `glob:` splices
+    /// directory entries straight into argv, and `{in:<any input>}/..` is the
+    /// store directory — so a step could name a payload with no `{payload:}`
+    /// (an error there) and no `{in:PAYLOAD}` (withheld from the map), which
+    /// `noexec` does not cover for `-I`/`-L`.
+    #[test]
+    fn a_glob_may_not_read_its_way_out_of_the_build_tree() {
+        let d = std::env::temp_dir().join(format!("td-globdir-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let root = d.join("build");
+        let out = d.join("out");
+        let store = d.join("store");
+        fs::create_dir_all(root.join("tg")).unwrap();
+        fs::create_dir_all(&out).unwrap();
+        fs::create_dir_all(store.join("aaa-mes")).unwrap();
+        fs::create_dir_all(store.join("bbb-firefox-140")).unwrap();
+        fs::write(root.join("tg/a.o"), b"o").unwrap();
+        let ctx = StepCtx {
+            root: root.to_string_lossy().into_owned(),
+            src: root.join("src").to_string_lossy().into_owned(),
+            out: out.to_string_lossy().into_owned(),
+            tools: root.join("tools").to_string_lossy().into_owned(),
+            jobs: "1".into(),
+            inputs: vec![(
+                "mes".to_string(),
+                store.join("aaa-mes").to_string_lossy().into_owned(),
+            )],
+            payloads: vec![(
+                "firefox".to_string(),
+                store.join("bbb-firefox-140").to_string_lossy().into_owned(),
+            )],
+        };
+        // The shape every rung in the tree uses.
+        assert!(ctx.check_glob_dir(&format!("{}/tg/*.o", ctx.root)).is_ok());
+        assert!(ctx.check_glob_dir(&format!("{}/*.a", ctx.out)).is_ok());
+        // The escape: `{in:mes}/..` is the store dir, reached without naming a
+        // payload at all. `..` is resolved, so the check cannot be walked past.
+        let escape = format!("{}/aaa-mes/../*-firefox-140", store.to_string_lossy());
+        let e = ctx
+            .check_glob_dir(&escape)
+            .expect_err("a glob out of the store must refuse");
+        assert!(e.contains("build's own tree"), "{e}");
+        // ...and it really would have matched, or this proves nothing.
+        assert_eq!(glob_one_star(&escape).unwrap().len(), 1);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Assembly partitions the two channels; this is the same partition checked
+    /// where the maps are READ, since a derivation that reached the builder with
+    /// a payload aliased under an input name would resolve it for a step that
+    /// runs a command. The runtime resolver compares names, so it would not
+    /// notice, and the alias is the whole exploit.
+    #[test]
+    fn a_payload_aliased_as_an_input_is_refused_at_the_map() {
+        let payloads = vec![("firefox".to_string(), "/td/store/def-firefox".to_string())];
+        let ok = vec![("bash".to_string(), "/td/store/abc-bash".to_string())];
+        assert!(refuse_aliased_payloads(&ok, &payloads).is_ok());
+        assert!(refuse_aliased_payloads(&ok, &[]).is_ok());
+        let aliased = vec![
+            ("bash".to_string(), "/td/store/abc-bash".to_string()),
+            ("alias".to_string(), "/td/store/def-firefox".to_string()),
+        ];
+        let e = refuse_aliased_payloads(&aliased, &payloads)
+            .expect_err("the same path under two names must refuse");
+        assert!(e.contains("firefox"), "names the payload: {e}");
+        assert!(e.contains("alias"), "names the input it was reachable as: {e}");
+    }
+
+    /// Both map guards are functions a test can call directly, which is what
+    /// makes them testable and also what would let either be left UNWIRED with
+    /// every assertion above still green. `run_mesboot` is reached only through
+    /// the `mesboot-build` argv, so this scans the shipped source for the two
+    /// calls and for their ORDER: a check that ran after the steps did would be
+    /// a check of nothing.
+    #[test]
+    fn the_map_guards_are_wired_into_the_runner_before_any_step() {
+        let src = include_str!("build.rs");
+        let shipped = match src.find("\n#[cfg(test)]\nmod tests {") {
+            Some(at) => src.get(..at).unwrap_or(src),
+            None => src,
+        };
+        let body = shipped
+            .find("pub fn run_mesboot()")
+            .and_then(|at| shipped.get(at..))
+            .expect("run_mesboot is in this file");
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle} is not called by run_mesboot"));
+        let parse = at("parse_payload_map(&text)");
+        let alias = at("refuse_aliased_payloads(&inputs, &payloads)");
+        let steps = at("for (i, step) in steps.iter().enumerate()");
+        assert!(parse < alias, "the map is parsed before it is checked");
+        assert!(alias < steps, "both guards run before the first step does");
+        // The glob guard is inside the step loop and per-pattern, so its position
+        // is the other way round — but it must still run BEFORE the expansion it
+        // gates, or it reports on matches already spliced into argv.
+        let check = at("ctx.check_glob_dir(pat).map_err(err)?;");
+        let expand = at("glob_one_star(pat).map_err(err)?;");
+        assert!(steps < check && check < expand, "the glob is gated before it reads");
+    }
+
+    /// The data expander's CALLERS are pinned, because the channel is only as
+    /// narrow as its call sites.
+    ///
+    /// `expand_data` resolving `{payload:}` is the whole permission §B.8 grants,
+    /// and the compiler has nothing to say about which expander a step picked — a
+    /// new step that reached for it, or an existing one changed to, would widen
+    /// the channel with every other test in this file still green. Two sites, and
+    /// which FIELD each serves, since `copyTree`'s `dest` taking it would put a
+    /// payload path on the writable side of a copy.
+    #[test]
+    fn only_the_two_typed_data_operations_use_the_data_expander() {
+        let src = include_str!("build.rs");
+        let shipped = match src.find("\n#[cfg(test)]\nmod tests {") {
+            Some(at) => src.get(..at).unwrap_or(src),
+            None => src,
+        };
+        let calls: Vec<&str> = shipped
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("ctx.expand_data"))
+            .collect();
+        assert_eq!(
+            calls.len(),
+            2,
+            "only copyTree's `from' and stageRuntimeClosure's `roots' may resolve a \
+             payload (APPLICATIONS.md section B.8): {calls:?}"
+        );
+        assert!(
+            calls.first().is_some_and(|l| l.contains("\"from\"")),
+            "the first data site must be copyTree's `from': {calls:?}"
+        );
+        assert!(
+            calls.get(1).is_some_and(|l| l.contains("\"roots\"")),
+            "the second must be stageRuntimeClosure's `roots': {calls:?}"
+        );
+        // The scan is only worth anything if it can SEE the call sites — a renamed
+        // helper or a moved test module would leave it counting zero and passing
+        // for the wrong reason.
+        assert!(
+            shipped.contains("fn expand_data") && shipped.len() < src.len(),
+            "the shipped-half split stopped working"
+        );
+    }
+
+    /// The payload channel's resolution boundary (APPLICATIONS.md §B.8): a payload
+    /// has a name in the DATA expander and none in the command one.
+    ///
+    /// All four arms matter and each fails differently if it is wrong. A
+    /// `{payload:}` that merely MISSED in a command context would fall through to
+    /// the unknown-token branch and be emitted as a literal brace — silently, which
+    /// is how a recipe would ship pointing a compiler at a string. And `{in:}`
+    /// naming a payload has to say WHICH rule refused it, or the ordinary "no input"
+    /// sends a reader looking for a lock entry that was withheld on purpose.
+    #[test]
+    fn a_payload_resolves_for_data_steps_and_is_nameless_to_a_command() {
+        let ctx = StepCtx {
+            root: "/r".into(),
+            src: "/r/src".into(),
+            out: "/o".into(),
+            tools: "/r/tools".into(),
+            jobs: "4".into(),
+            inputs: vec![("mes".into(), "/td/store/abc-mes".into())],
+            payloads: vec![("firefox".into(), "/td/store/def-firefox".into())],
+        };
+        assert_eq!(
+            ctx.expand_data("{payload:firefox}/lib").unwrap(),
+            "/td/store/def-firefox/lib"
+        );
+        let err = ctx
+            .expand("{payload:firefox}/lib")
+            .expect_err("a command step must not name a payload");
+        assert!(err.contains("runs a command"), "{err}");
+        let err = ctx
+            .expand("{in:firefox}/lib")
+            .expect_err("the tool channel must not reach a payload");
+        assert!(err.contains("is a payloadInput"), "{err}");
+        // ...and the same refusal from the data expander, which may resolve
+        // `{payload:}` but must not launder a payload through `{in:}` either.
+        let err = ctx.expand_data("{in:firefox}/lib").expect_err("still refused");
+        assert!(err.contains("is a payloadInput"), "{err}");
+        // An ordinary input is unaffected in both, or the assertions above would
+        // pass for an expander that refused everything.
+        for got in [ctx.expand("{in:mes}"), ctx.expand_data("{in:mes}")] {
+            assert_eq!(got.unwrap(), "/td/store/abc-mes");
+        }
+        // A payload NAME that is not declared reds rather than resolving to nothing.
+        let err = ctx.expand_data("{payload:nope}").expect_err("unknown payload");
+        assert!(err.contains("TD_PAYLOAD_MAP"), "{err}");
     }
 
     #[test]
@@ -3284,6 +3694,7 @@ mod tests {
         let closure = stage_runtime_closure_from_index(
             &candidates,
             &declared,
+            &declared,
             &[a.clone(), c],
             "/td/store",
             &dest,
@@ -3318,6 +3729,7 @@ mod tests {
             runtime_store_closure(
                 &candidates,
                 &declared,
+                &declared,
                 &[app_path.clone()],
                 "/td/store",
             )
@@ -3328,6 +3740,7 @@ mod tests {
         std::os::unix::fs::symlink(&undeclared, app_disk.join("runtime-ref")).unwrap();
         let error = runtime_store_closure(
             &candidates,
+            &declared,
             &declared,
             &[app_path.clone()],
             "/td/store",
@@ -3348,7 +3761,8 @@ mod tests {
         ]);
         let declared = BTreeSet::from([app_path.clone(), foreign.clone()]);
         let error =
-            runtime_store_closure(&candidates, &declared, &[app_path], "/td/store").unwrap_err();
+            runtime_store_closure(&candidates, &declared, &declared, &[app_path], "/td/store")
+                .unwrap_err();
         assert!(
             error.contains("outside active store") && error.contains(&foreign),
             "{error}"
@@ -3362,11 +3776,136 @@ mod tests {
         let error = runtime_store_closure(
             &BTreeMap::new(),
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &[path],
             "/td/store",
         )
         .unwrap_err();
         assert!(error.contains("root") && error.contains("not a declared recipe input"), "{error}");
+    }
+
+    /// The two gates differ by exactly the payloads, and the difference is the
+    /// finding: adding payloads to `declared` for the ROOT check silently widened
+    /// the REFERENCE walk too, so an ordinary input embedding a payload's store
+    /// path would drag it into the staged tree with no step naming it — and
+    /// `copy_store_item_writable` writes it out with its exec bits, on a writable
+    /// mount, which is the `noexec` bind undone by another door.
+    #[test]
+    fn a_payload_may_be_a_root_but_may_not_be_reached_from_an_ordinary_input() {
+        let d = std::env::temp_dir().join(format!("td-payload-refs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let hash_app = "a".repeat(32);
+        let hash_pay = "b".repeat(32);
+        let (app_path, app_disk) = runtime_test_item(&d, &hash_app, "app", None);
+        let (pay_path, pay_disk) = runtime_test_item(&d, &hash_pay, "payload", None);
+        let candidates = BTreeMap::from([
+            (app_path.clone(), app_disk.clone()),
+            (pay_path.clone(), pay_disk),
+        ]);
+        let inputs_only = BTreeSet::from([app_path.clone()]);
+        let with_payload = BTreeSet::from([app_path.clone(), pay_path.clone()]);
+
+        // As a ROOT, a payload is fine — a step named it.
+        assert!(
+            runtime_store_closure(
+                &candidates,
+                &with_payload,
+                &inputs_only,
+                &[pay_path.clone()],
+                "/td/store",
+            )
+            .is_ok(),
+            "a step may name a payload as a runtime root"
+        );
+        // REACHED from an ordinary input, it must red rather than be staged.
+        std::os::unix::fs::symlink(&pay_path, app_disk.join("runtime-ref")).unwrap();
+        let error = runtime_store_closure(
+            &candidates,
+            &with_payload,
+            &inputs_only,
+            &[app_path.clone()],
+            "/td/store",
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("references undeclared recipe input") && error.contains(&pay_path),
+            "{error}"
+        );
+        // ...and it WOULD have been staged silently with one shared gate, which is
+        // what this test exists to keep from coming back.
+        assert!(
+            runtime_store_closure(
+                &candidates,
+                &with_payload,
+                &with_payload,
+                &[app_path],
+                "/td/store",
+            )
+            .is_ok_and(|c| c.contains(&pay_path)),
+            "the one-gate form must be the thing that stages it, or this proves nothing"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// The other direction, which the inputs-only reference gate got WRONG: it
+    /// applied to every walked item, so a payload could not reach its own store
+    /// path or a second declared payload. AGENTS.md has an application NAME its
+    /// runtime through this channel, and an absolute RUNPATH into its own path
+    /// is the ordinary shape of a self-contained payload — so both errored on
+    /// the exact arrangement §B.8 describes, and rung 5 would have hit it first.
+    #[test]
+    fn a_payload_may_reach_itself_and_a_second_payload() {
+        let d = std::env::temp_dir().join(format!("td-payload-self-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let hash_app = "a".repeat(32);
+        let hash_pay = "b".repeat(32);
+        let hash_rt = "c".repeat(32);
+        let (app_path, app_disk) = runtime_test_item(&d, &hash_app, "app", None);
+        let (rt_path, rt_disk) = runtime_test_item(&d, &hash_rt, "runtime", None);
+        let (pay_path, pay_disk) = runtime_test_item(&d, &hash_pay, "payload", None);
+        // A payload naming its own path (RUNPATH into itself) and its runtime.
+        std::os::unix::fs::symlink(&pay_path, pay_disk.join("self-ref")).unwrap();
+        std::os::unix::fs::symlink(&rt_path, pay_disk.join("runtime-ref")).unwrap();
+        let candidates = BTreeMap::from([
+            (app_path.clone(), app_disk),
+            (rt_path.clone(), rt_disk),
+            (pay_path.clone(), pay_disk),
+        ]);
+        // The sets the CALLER builds, not sets composed for this assertion.
+        let (roots, refs) = declared_sets(
+            &[("app".to_string(), app_path)],
+            &[
+                ("firefox".to_string(), pay_path.clone()),
+                ("runtime".to_string(), rt_path.clone()),
+            ],
+        );
+        let closure =
+            runtime_store_closure(&candidates, &roots, &refs, &[pay_path.clone()], "/td/store")
+                .expect("a payload may name its runtime and itself");
+        assert!(closure.contains(&pay_path) && closure.contains(&rt_path), "{closure:?}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// The split asserted at the point it is MADE. Re-widening the reference set
+    /// to the union inside the caller left the parameter-level test above green,
+    /// because that one passes an inputs-only set in explicitly.
+    #[test]
+    fn the_declared_sets_differ_by_exactly_the_payloads() {
+        let inputs = [("gcc".to_string(), "/td/store/aaa-gcc".to_string())];
+        let payloads = [("firefox".to_string(), "/td/store/bbb-firefox".to_string())];
+        let (roots, refs) = declared_sets(&inputs, &payloads);
+        assert_eq!(
+            roots,
+            BTreeSet::from([
+                "/td/store/aaa-gcc".to_string(),
+                "/td/store/bbb-firefox".to_string()
+            ])
+        );
+        assert_eq!(refs, BTreeSet::from(["/td/store/aaa-gcc".to_string()]));
+        // With no payload the two are equal, which is why landing the split
+        // changed nothing for any recipe in the tree.
+        let (roots, refs) = declared_sets(&inputs, &[]);
+        assert_eq!(roots, refs);
     }
 
     #[test]

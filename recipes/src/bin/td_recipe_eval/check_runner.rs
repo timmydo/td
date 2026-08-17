@@ -593,10 +593,16 @@ fn catalog_seed_universe() -> Result<Vec<SeedInput>, String> {
         if let Some(key) = &recipe.source_input {
             push_seed_input(&mut seeds, &mut seen, seed_input_for_recipe_source(key, &recipe)?);
         }
+        // `payload_inputs` walks with the other two: a payload declared as an
+        // external pinned input needs its compiled digest row like any seed, and
+        // omitting the channel here would classify it at planning time and then
+        // fail it at the digest gate — passing the generator's own workflow and
+        // still refusing the build.
         for input in recipe
             .inputs
             .iter()
             .chain(recipe.native_inputs.iter())
+            .chain(recipe.payload_inputs.iter())
             .flatten()
         {
             if catalog::lookup(input).is_some() {
@@ -2808,6 +2814,17 @@ fn visit_recipe(
             }
         }
     }
+    // The DATA channel is followed too. A payload is not a tool, but it is still a
+    // recipe that has to be BUILT before the one that stages it — omitting it here
+    // would leave an image declaring a payload emitting no recipe for it, and
+    // `build-plan --auto` failing to resolve a name the catalog plainly has.
+    if let Some(payload_inputs) = &recipe.payload_inputs {
+        for dep in payload_inputs {
+            if catalog::lookup(dep).is_some() {
+                visit_recipe(dep, visiting, emitted, out)?;
+            }
+        }
+    }
     visiting.remove(stem);
     emitted.insert(stem.to_string());
     out.push(RecipeNode {
@@ -2834,8 +2851,13 @@ fn push_seed_input(inputs: &mut Vec<SeedInput>, seen: &mut HashSet<String>, inpu
 ///
 /// ANYTHING else is rejected HERE, during planning — there is no host-tool
 /// class, no lock of store paths, no PATH lookup, and no store discovery.
-/// Every declaration channel is classified: `sourceInput`, `inputs`, AND
-/// `nativeInputs`. A rung that declares scaffolding the chain has not built
+/// Every declaration channel is classified: `sourceInput`, `inputs`,
+/// `nativeInputs` AND `payload_inputs`. The last is a DATA channel
+/// (APPLICATIONS.md §B.8) and what travels it is restricted elsewhere — but it
+/// is still a declared dependency, so it is classified here like any other. A
+/// channel that skipped this would be one whose paths reach a build with no
+/// provenance class at all, which is precisely the ingress #469 exists to stop.
+/// A rung that declares scaffolding the chain has not built
 /// (bash, coreutils, make, …) fails closed with `PROVENANCE_REJECTED` until
 /// that tool exists as a recipe output. Deliberately pure — no subprocess, no
 /// filesystem — so the entry points run it BEFORE any ambient execution
@@ -2853,6 +2875,7 @@ pub(crate) fn classify_graph_inputs(nodes: &[RecipeNode]) -> Result<Vec<SeedInpu
             .inputs
             .iter()
             .chain(node.recipe.native_inputs.iter())
+            .chain(node.recipe.payload_inputs.iter())
             .flatten()
         {
             if catalog::lookup(input).is_some() {

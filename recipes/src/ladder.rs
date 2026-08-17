@@ -924,12 +924,18 @@ mod tests {
         }
     }
 
+    /// The DATA channel walks with the other two. This is a guard rather than a
+    /// build path, which is exactly why it must: `post_bootstrap_back_edges` asks
+    /// whether a post-bootstrap recipe reaches into the bootstrap interior, and a
+    /// back edge spelled `payload_inputs` is still a back edge — one the guard
+    /// would simply not see (APPLICATIONS.md §B.8).
     fn direct_recipe_inputs(recipe: &Recipe) -> Vec<&str> {
         recipe
             .inputs
             .iter()
             .flatten()
             .chain(recipe.native_inputs.iter().flatten())
+            .chain(recipe.payload_inputs.iter().flatten())
             .map(String::as_str)
             .collect()
     }
@@ -1498,6 +1504,44 @@ mod tests {
     /// ltmain.sh glob-loop swap) must not be flagged as reintroducing the tool.
     /// The guard scans only `to`, so a `find` in `from` with a tool-free `to` is
     /// allowed. Exercised against the actual helper so the two cannot drift.
+    /// A `payload_inputs` on a recipe whose build system cannot READ one is caught
+    /// here, at eval, rather than at drv assembly.
+    ///
+    /// `td-builder` refuses it too — that refusal is the enforcement — but only
+    /// once a build is attempted. `Recipe::gnu("x", "1").payload_inputs(&["y"])`
+    /// otherwise compiles, emits, round-trips and passes every check in this crate,
+    /// so the author learns at build time about a mistake visible at eval time.
+    /// `mesboot` is the only build system with the typed data steps
+    /// (`copyTree`/`stageRuntimeClosure`) that resolve `{payload:NAME}`.
+    fn payload_is_misplaced(recipe: &crate::types::Recipe) -> bool {
+        recipe.payload_inputs.is_some()
+            && !matches!(recipe.build_system, crate::types::BuildSystem::Mesboot)
+    }
+
+    #[test]
+    fn only_a_mesboot_recipe_may_declare_a_payload() {
+        // The predicate first, over recipes built for it. Nothing in the catalog
+        // declares a payload yet, so sweeping the catalog alone filters an EMPTY
+        // set and would pass with the rule spelled backwards.
+        assert!(payload_is_misplaced(
+            &crate::types::Recipe::gnu("x", "1").payload_inputs(&["y"])
+        ));
+        assert!(!payload_is_misplaced(
+            &crate::types::Recipe::mesboot("x", "1").payload_inputs(&["y"])
+        ));
+        assert!(!payload_is_misplaced(&crate::types::Recipe::gnu("x", "1")));
+        let misplaced: Vec<&str> = catalog::all()
+            .iter()
+            .filter(|(_, recipe)| payload_is_misplaced(recipe))
+            .map(|(stem, _)| *stem)
+            .collect();
+        assert!(
+            misplaced.is_empty(),
+            "payload_inputs is mesboot-only — no other build system has a step that \
+             can read one (APPLICATIONS.md section B.8): {misplaced:?}"
+        );
+    }
+
     #[test]
     fn guard_ignores_find_on_the_removed_from_side() {
         let removes_find = super::libtool_extract_without_find("{src}/ltmain.sh");

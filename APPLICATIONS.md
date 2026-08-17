@@ -1035,6 +1035,92 @@ mistake — a recipe naming a payload where it meant a tool — and reports
 it at planning time with a name and a line, rather than as a step that
 fails inside a sandbox for no visible reason.
 
+**The channel has LANDED (rung 3), and the paragraph above needed one
+correction to become code.** "Never staged into a `Step::Run` sandbox at
+all" is not implementable as written: every step of a build runs inside
+ONE sandbox invocation, and `CopyTree`/`StageRuntimeClosure` are
+performed by `td-builder` *in that same sandbox* — so a payload the data
+operations can read is necessarily mounted while a `Step::Run` also
+runs. Per-step mount manipulation would close that, and it would mean a
+new `unsafe` call site in `build.rs` outside the one the control plane
+records. So the enforcement is split in two, and neither half is a scan:
+
+- **Resolution.** A payload is withheld from `TD_INPUT_MAP` at assembly
+  and placed in `TD_PAYLOAD_MAP`, reached by a template token of its
+  own, `{payload:NAME}`, which resolves ONLY in `CopyTree`'s `from` and
+  `StageRuntimeClosure`'s `roots`. A command-bearing step has no name
+  for a payload — `{payload:…}` there is an error, not a miss, and
+  `{in:PAYLOAD}` is an error naming the rule rather than the ordinary
+  "no such input", which would send a reader hunting a lock entry that
+  was withheld on purpose. **A `glob:` argv element is confined to the
+  build's own tree** as part of the same half, and review is what found
+  that it had to be: `glob:` splices directory entries straight into
+  argv, and `{in:<any input>}/..` is the store directory — so
+  `glob:{in:mes}/../*-firefox-140` names a payload on a command line
+  with no `{payload:}` and no `{in:PAYLOAD}`, defeating this bullet
+  through a template that resolves something else entirely. Every
+  `glob:` in the tree already reads `{root}`, so the confinement costs
+  nothing; what it shows is that "has no name for a payload" is a claim
+  about EVERY way argv is built, not only about the expander.
+- **Execution.** A declared payload's sandbox bind is `ro,noexec`. That
+  is the half the scanner could not be for DIRECT execution:
+  concatenating the path, reading it out of a file, or walking the store
+  all still find the bytes, and the kernel refuses to run them from
+  there.
+
+**`noexec` is not the whole property, and saying so is the point of
+writing it here.** A `Step::Run` can copy the payload into `{out}` or
+`/tmp` — both writable and executable — and run the copy; a script can
+be handed to an interpreter, which never execs the file at all. So the
+enforceable claim is *narrower* than "cannot be executed": it is that a
+recipe cannot NAME a payload in a command, and cannot execute one where
+it lies. What defeats the copy is the payload not being in the
+filesystem during a Run step at all — the mechanism §B.8 originally
+specified, which needs the per-step mount masking above and a new
+`unsafe` call site to implement. Until that lands, the three mechanisms
+are in DEPTH rather than complete: resolution stops the accident,
+`noexec` stops the shortcut, and the marker plus the closure query
+(rung 3's other half) are what make the remaining case auditable rather
+than prevented. This is the same shape as §B.8's own "direct execution
+outside a jail is not prevented" — a claim about the path td provides,
+not about what the bytes cannot be made to do.
+
+Refusals hold the channel shut at both ends, and they are at both ends
+because a rule enforced only where a recipe is WRITTEN is a rule a
+damaged derivation walks around. At declaration: a name in both
+`payloadInputs` and `inputs`/`nativeInputs` is refused outright rather
+than resolved by precedence, and so is one shared with `sourceInput`,
+which reaches the build as `TD_SRC` — the same channel through another
+door; a `payloadInputs` that is not an array, or holds a non-string, is
+refused rather than filtered, since a malformed declaration of a
+restriction must never be read as an absent one; and an entry no lock
+entry resolves is refused, because a declaration that reaches no path
+reads as enforcement and is none. At the builder: a `TD_PAYLOAD_MAP`
+present but malformed is an error rather than "no payloads", an entry
+matching no closure item is an error, and the two maps are checked
+disjoint by PATH — a payload aliased under an input name would resolve
+for a command-bearing step, since the runtime resolver compares names.
+The drv's environment is refused outright if any key repeats, because
+its readers disagree about which copy wins: a variable asked for by
+name answers with the first, while the environment handed to the build
+keeps the last, so a `TD_PAYLOAD_MAP` written twice would plan the
+mounts from one map and resolve `{payload:…}` from the other. The
+channel is `mesboot`-only, since no other build system has the typed
+data steps that read one.
+
+State the limits, since this section's whole method is to. `noexec`
+stops execution and NOT linking — a compiler handed the path could still
+link against what is there, which is why the mount plan (§C) rather than
+this is what makes "never linked against" true at run time. Only the
+DECLARED payload roots are marked, not their transitive closure: §B.8's
+case rests on a foreign payload being self-contained, carrying none of
+td's store hashes, and a marked runtime being its own declared payload —
+a payload that did drag td-built dependencies in would leave those binds
+executable. And the payload set travels in the drv's own `env`, so it is
+hashed derivation data and cannot change without changing the
+derivation; every new key is omitted when unset, so landing the channel
+left every existing derivation hash byte-identical.
+
 Two things about the shape it was going to borrow, because they are the
 measure of how far a scanner falls short. `ladder.rs`'s `command_texts`
 covers **four of eighteen `Step` variants** and returns nothing for the
@@ -2764,7 +2850,7 @@ Each row is one landing or a small family, leaving the tree green.
 |---|---|---|
 | 1 | **kernel namespace/seccomp/cgroup config pins + QEMU readback** (§0) — **LANDED**, except the functional calls, which need surface #9: the `unshare` at rung 8, the filter install at rung 11 | none — but this is the gate on everything |
 | 2 | `td-login exec-as` with credential readback — **LANDED** | none |
-| 3 | **the §B.8 marker**: the recipe-level mark, `payload_inputs` as a declared channel, taint propagation from the source pin, and the planning-time refusals — plus the argv/template scanner, since that assertion is the one that is otherwise silent | none |
+| 3 | **the §B.8 marker**: the recipe-level mark, `payload_inputs` as a declared channel, taint propagation from the source pin, and the planning-time refusals — plus the argv/template scanner, since that assertion is the one that is otherwise silent. The **channel has LANDED** (see §B.8: `{payload:NAME}` resolution plus `ro,noexec` binds, replacing the un-implementable "never staged at all"); the MARK — `foreign` on the source pin, the derived recipe flag, taint propagation and `contains_payloads` — is the remaining half | none |
 | 4 | the manifest and permission keyfile, name validation and every rejection; the closure query reporting marked paths | none |
 | 5 | first seed recipe — a pinned upstream artifact becomes a store package with §B.3's checks and §B.8's assertions | none |
 | 6 | the spec compiler: runtime resolution by full store path, mounts, grants, entry point | none |

@@ -86,6 +86,11 @@ pub const CLONE_NEWPID: usize = 0x2000_0000;
 pub const CLONE_NEWNET: usize = 0x4000_0000;
 
 pub const MS_RDONLY: usize = 0x1;
+/// APPLICATIONS.md §B.8: a declared `payloadInputs` item binds `ro,noexec`, so
+/// "never executed" is refused by the kernel rather than by a scan of the
+/// recipe's argv — which a build tool that can see the path defeats by
+/// concatenating it, reading it out of a file, or walking the store.
+pub const MS_NOEXEC: usize = 0x8;
 pub const MS_REMOUNT: usize = 0x20;
 pub const MS_BIND: usize = 0x1000;
 pub const MS_REC: usize = 0x4000;
