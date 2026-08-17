@@ -230,6 +230,17 @@ half before this and lost nine rounds of review to spellings it did not
 model — `clippy.toml` is the roster now, and a new verb is a new wrapper
 rather than a call at the site that wants one.
 
+One operation is beyond the roster and is a constraint on a WRAPPER
+instead. Reading a directory fails twice: once opening it, which
+`std::fs::read_dir` reports, and once per entry, since each `ReadDir`
+`next()` is a fallible `readdir` whose `io::Error` names nothing. The
+roster cannot hold the second — `std::fs::ReadDir::next` does not resolve
+as a path, so an entry for it would warn once and refuse nothing. A
+`paths::read_dir` must therefore CONSUME the iterator and name the
+directory on each entry's error rather than hand a bare `ReadDir` back.
+This crate reads no directory today, which is why that wrapper does not
+exist and why its rule is written down before it does.
+
 ## 4. Disk layout
 
 Positions are in SECTORS of the destination's own logical size, not in

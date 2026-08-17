@@ -41,6 +41,15 @@ disallowed-methods = [
     { path = "std::fs::OpenOptions::open", reason = "use td-install's `paths` module, which names the path in the error" },
     { path = "std::fs::DirBuilder::create", reason = "use td-install's `paths` module, which names the path in the error" },
 
+    # A directory ENTRY carries the path it was read from, so its two fallible
+    # methods fail with an error naming nothing — the same shape as `Path`'s
+    # below, reached from a value rather than from a path. `metadata` is a real
+    # `statx`/`fstatat64`; `file_type` usually answers from the cached `d_type`
+    # and only falls back to a syscall on `DT_UNKNOWN`, so it is here for the
+    # error rather than for the call.
+    { path = "std::fs::DirEntry::metadata", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::fs::DirEntry::file_type", reason = "use td-install's `paths` module, which names the path in the error" },
+
     # `std::os::unix::fs`, the three this platform adds.
     { path = "std::os::unix::fs::symlink", reason = "use td-install's `paths` module, which names the path in the error" },
     { path = "std::os::unix::fs::chown", reason = "use td-install's `paths` module, which names the path in the error" },
@@ -61,11 +70,43 @@ disallowed-methods = [
     { path = "std::path::Path::try_exists", reason = "use td-install's `paths` module, which names the path in the error" },
 
     # Path-taking calls that are not `std::fs` at all: a working directory is
-    # a `chdir(2)`, and a Unix socket address is a filesystem entry.
+    # a `chdir(2)`, an absolute path is resolved against one, and a Unix socket
+    # address is a filesystem entry.
     { path = "std::env::set_current_dir", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::path::absolute", reason = "use td-install's `paths` module, which names the path in the error" },
     { path = "std::os::unix::net::UnixListener::bind", reason = "use td-install's `paths` module, which names the path in the error" },
     { path = "std::os::unix::net::UnixStream::connect", reason = "use td-install's `paths` module, which names the path in the error" },
     { path = "std::os::unix::net::UnixDatagram::bind", reason = "use td-install's `paths` module, which names the path in the error" },
     { path = "std::os::unix::net::UnixDatagram::connect", reason = "use td-install's `paths` module, which names the path in the error" },
     { path = "std::os::unix::net::UnixDatagram::send_to", reason = "use td-install's `paths` module, which names the path in the error" },
+    # …and the FIVE `*_addr` forms take a `SocketAddr` rather than a path.
+    # The constructor that turns a path into one is not enough on its own:
+    # `local_addr`, `peer_addr` and `recv_from` hand back an address the
+    # KERNEL built, so a pathname address can reach these five without ever
+    # passing through `from_pathname`. Both are on the roster, and a wrapper
+    # is where an ABSTRACT address — not a filesystem entry at all — gets
+    # whatever different treatment it deserves.
+    { path = "std::os::unix::net::SocketAddr::from_pathname", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::os::unix::net::UnixListener::bind_addr", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::os::unix::net::UnixStream::connect_addr", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::os::unix::net::UnixDatagram::bind_addr", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::os::unix::net::UnixDatagram::connect_addr", reason = "use td-install's `paths` module, which names the path in the error" },
+    { path = "std::os::unix::net::UnixDatagram::send_to_addr", reason = "use td-install's `paths` module, which names the path in the error" },
 ]
+
+# SPAWNING a program is not here, and that is a boundary rather than an
+# oversight. `Command::new` and `Command::current_dir` take paths and a spawn
+# failure is an `io::Error` naming nothing, but a spawn is not a filesystem
+# operation and this crate's two call sites already name the program by hand
+# (`cannot run {}`). Putting them on the roster would mean a wrapper for a
+# different kind of failure; if one is ever wanted, it is its own decision.
+#
+# NOT here, and each for a reason. A DESCRIPTOR call — `File::metadata`,
+# `File::set_permissions`, `File::sync_all`, `fchown` — has no path to name:
+# whoever opened the file named it, and this crate's wrappers did. And
+# `ReadDir`'s own iteration is a gap rather than a decision: each `next()`
+# is a fallible `readdir` whose error names nothing, but `disallowed-methods`
+# cannot hold it — `std::fs::ReadDir::next` does not resolve, so the entry
+# would warn once and refuse nothing. A `paths::read_dir` must therefore
+# CONSUME the iterator and name the directory itself; DESIGN.md D10 records
+# that as the constraint on the wrapper this crate does not yet have.

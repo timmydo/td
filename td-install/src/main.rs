@@ -2353,16 +2353,23 @@ mod tests {
         let roster = include_str!("../clippy.toml");
         assert_eq!(
             roster.matches("{ path = ").count(),
-            44,
+            53,
             "the disallowed-path roster is not the length it was"
         );
-        // The four that are not `std::fs` at all are the easiest to lose to a
-        // tidy-up, since they do not look like filesystem calls.
+        // The ones that are not `std::fs` at all are the easiest to lose to a
+        // tidy-up, since they do not look like filesystem calls — and the two
+        // `DirEntry` methods are easier still, because nothing in this crate
+        // calls them yet and a roster entry for an absent call looks dead.
         for entry in [
             "std::env::set_current_dir",
+            "std::path::absolute",
             "std::os::unix::net::UnixListener::bind",
             "std::os::unix::net::UnixDatagram::connect",
+            "std::os::unix::net::SocketAddr::from_pathname",
+            "std::os::unix::net::UnixDatagram::send_to_addr",
             "std::path::Path::try_exists",
+            "std::fs::DirEntry::metadata",
+            "std::fs::DirEntry::file_type",
         ] {
             assert!(roster.contains(entry), "the roster no longer holds {entry}");
         }
