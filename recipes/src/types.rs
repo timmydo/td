@@ -1211,6 +1211,27 @@ mod tests {
         );
     }
 
+    /// §B.8's containment edge must attach NO pin, and that is what keeps the
+    /// taint off it: `inputs`, `native_inputs` and `source_input` all attach, so
+    /// an image naming a payload as DATA would otherwise be marked for the
+    /// payload's own pin — making `root.erofs`, the deployment and td foreign
+    /// outputs, which §B.8 calls absurd and the end of the closure query.
+    #[test]
+    fn the_containment_edge_attaches_no_source_pin() {
+        // A REAL pin key: with a made-up one nothing attaches on any channel and
+        // the test cannot tell a channel that attaches from one that does not.
+        const REAL: &str = "stage0-source";
+        assert!(crate::source_pins::by_key(REAL).is_some(), "fixture guard");
+        let data = Recipe::gnu("image", "1").payload_inputs(&[REAL]);
+        assert!(
+            data.source_pins.is_none(),
+            "the DATA channel must not attach a pin"
+        );
+        assert!(!data.is_foreign());
+        let tool = Recipe::gnu("builder", "1").inputs(&[REAL]);
+        assert_eq!(tool.source_pins.as_ref().map(Vec::len), Some(1));
+    }
+
     #[test]
     fn recipe_checks_are_not_build_json() {
         let r = Recipe::gnu("fixture", "1.0").checks(vec![RecipeCheck::new("echo ok")]);

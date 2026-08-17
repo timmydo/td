@@ -2777,17 +2777,22 @@ impl RecipeCheckRunner {
 }
 
 pub(crate) fn recipe_closure(targets: &[&str]) -> Result<Vec<RecipeNode>, String> {
+    // The catalog is CONSTRUCTED once and then indexed. `catalog::lookup` builds
+    // all 98 recipes and searches linearly, and this walk asked it once per node
+    // and once more per EDGE, which is most of what a pure graph question costs.
+    let catalog: BTreeMap<&str, Recipe> = catalog::all().into_iter().collect();
     let mut visiting = HashSet::new();
     let mut emitted = HashSet::new();
     let mut out = Vec::new();
     for target in targets {
-        visit_recipe(target, &mut visiting, &mut emitted, &mut out)?;
+        visit_recipe(target, &catalog, &mut visiting, &mut emitted, &mut out)?;
     }
     Ok(out)
 }
 
 fn visit_recipe(
     stem: &str,
+    catalog: &BTreeMap<&str, Recipe>,
     visiting: &mut HashSet<String>,
     emitted: &mut HashSet<String>,
     out: &mut Vec<RecipeNode>,
@@ -2798,19 +2803,21 @@ fn visit_recipe(
     if !visiting.insert(stem.to_string()) {
         return Err(format!("ladder: cycle in recipe nativeInputs at `{stem}'"));
     }
-    let recipe =
-        catalog::lookup(stem).ok_or_else(|| format!("ladder: no td recipe for `{stem}'"))?;
+    let recipe = catalog
+        .get(stem)
+        .ok_or_else(|| format!("ladder: no td recipe for `{stem}'"))?
+        .clone();
     if let Some(native_inputs) = &recipe.native_inputs {
         for dep in native_inputs {
-            if catalog::lookup(dep).is_some() {
-                visit_recipe(dep, visiting, emitted, out)?;
+            if catalog.contains_key(dep.as_str()) {
+                visit_recipe(dep, catalog, visiting, emitted, out)?;
             }
         }
     }
     if let Some(inputs) = &recipe.inputs {
         for dep in inputs {
-            if catalog::lookup(dep).is_some() {
-                visit_recipe(dep, visiting, emitted, out)?;
+            if catalog.contains_key(dep.as_str()) {
+                visit_recipe(dep, catalog, visiting, emitted, out)?;
             }
         }
     }
@@ -2820,8 +2827,8 @@ fn visit_recipe(
     // `build-plan --auto` failing to resolve a name the catalog plainly has.
     if let Some(payload_inputs) = &recipe.payload_inputs {
         for dep in payload_inputs {
-            if catalog::lookup(dep).is_some() {
-                visit_recipe(dep, visiting, emitted, out)?;
+            if catalog.contains_key(dep.as_str()) {
+                visit_recipe(dep, catalog, visiting, emitted, out)?;
             }
         }
     }
@@ -2894,17 +2901,17 @@ fn refuse_foreign_on_the_tool_channel(
 ///
 /// `source_input` is deliberately NOT covered: that channel is how a payload
 /// enters the store at all, and the recipe it marks is the packaging recipe.
+///
+/// The pin half asks for every NAME a marked pin answers to rather than for its
+/// key, because `by_key` resolves an ALIAS — so a key-only set would answer "not
+/// marked" for a name that materializes marked, and neither the refusal nor the
+/// query would see it.
 fn marked_names() -> HashSet<String> {
     catalog::all()
         .into_iter()
         .filter(|(_, recipe)| recipe.is_foreign())
         .map(|(stem, _)| stem.to_string())
-        .chain(
-            source_pins::all()
-                .into_iter()
-                .filter(|pin| pin.foreign())
-                .map(|pin| pin.key),
-        )
+        .chain(source_pins::foreign_names())
         .collect()
 }
 
@@ -2943,6 +2950,11 @@ fn classify_graph_inputs_with(
     nodes: &[RecipeNode],
     is_marked: impl Fn(&str) -> bool,
 ) -> Result<Vec<SeedInput>, String> {
+    // Built ONCE, for `marked_names`' reason and with the same measurement
+    // behind it: `catalog::lookup` CONSTRUCTS all 98 recipes and then searches
+    // linearly, and this asks it once per INPUT across the whole graph. It only
+    // ever tests existence, so a stem set answers the same question.
+    let catalog_stems: HashSet<&str> = catalog::all().into_iter().map(|(stem, _)| stem).collect();
     let mut seen = HashSet::new();
     let mut seed_inputs = Vec::new();
     for node in nodes {
@@ -2959,7 +2971,7 @@ fn classify_graph_inputs_with(
             .chain(node.recipe.payload_inputs.iter())
             .flatten()
         {
-            if catalog::lookup(input).is_some() {
+            if catalog_stems.contains(input.as_str()) {
                 continue;
             }
             match seed_input_for_recipe_input(input)? {
@@ -2969,6 +2981,175 @@ fn classify_graph_inputs_with(
         }
     }
     Ok(seed_inputs)
+}
+
+/// APPLICATIONS.md §B.8's containment answer for one closure: the marked paths
+/// it holds, so a caller can say "source-bootstrapped apart from these".
+#[derive(Debug)]
+pub(crate) struct PayloadClosure {
+    /// Every recipe the targets' closure reaches.
+    pub(crate) members: usize,
+    /// Distinct audited SEED INPUTS the closure declares — the pinned sources,
+    /// stage0 artifacts, seed patches and local sources the planning pass
+    /// classified. Reported because the count above it must not be read as
+    /// "nothing prebuilt is in here": `rust-stage0` transforms an upstream
+    /// binary snapshot and is a member of this very closure, and stage0-posix
+    /// is a seed. Both are td's declared bootstrap trust roots, which
+    /// AGENTS.md's claim names as its exception; §B.8's mark is about
+    /// APPLICATION payloads and says nothing about them.
+    pub(crate) seeds: usize,
+    /// The members DERIVED from a payload — excluded from the claim, sorted.
+    pub(crate) foreign_members: Vec<String>,
+    /// Marked source PINS the closure stages: the payload's own bytes, named by
+    /// the packaging recipe as its source or by an image as data. Not members —
+    /// a pin is bytes rather than a recipe — so they are counted apart from the
+    /// number the claim divides.
+    pub(crate) pins: Vec<String>,
+}
+
+impl PayloadClosure {
+    /// Members §B.8's mark does not cover.
+    ///
+    /// Deliberately NOT called `source_bootstrapped`, which review caught the
+    /// wire label claiming: the two prebuilt trust roots above are inside this
+    /// number, so a line spelled that way denies something td declares.
+    pub(crate) fn unmarked(&self) -> usize {
+        self.members.saturating_sub(self.foreign_members.len())
+    }
+
+    /// The answer as lines, tab-separated and fixed-arity. The COUNTS come
+    /// first and out of the same walk on purpose: "N of N" is what a working
+    /// query prints over a graph with nothing marked, and "0 of 0" is what a
+    /// broken one prints, so the empty roster cannot make the two look alike.
+    pub(crate) fn report(&self) -> String {
+        let mut out = format!(
+            "members\t{}\nunmarked\t{}\naudited-seeds\t{}\n",
+            self.members,
+            self.unmarked(),
+            self.seeds
+        );
+        for stem in &self.foreign_members {
+            out.push_str(&format!("payload\trecipe\t{stem}\n"));
+        }
+        for key in &self.pins {
+            out.push_str(&format!("payload\tpin\t{key}\n"));
+        }
+        out
+    }
+}
+
+/// The target `payload-closure` answers for when asked about none.
+const PAYLOAD_CLOSURE_DEFAULT: &str = "system-x86-64";
+
+/// `td-recipe-eval payload-closure [TARGET...]` — print §B.8's answer for a
+/// target (default the shipped deployment), as `report` spells it. PURE: it
+/// reads the catalog and builds nothing, so it is a question anyone can ask of
+/// a checkout.
+pub(crate) fn payload_closure_cli(args: &[String]) -> Result<(), String> {
+    print!("{}", payload_closure_report(args)?);
+    Ok(())
+}
+
+/// The command's whole behaviour bar the `print!`, split out so it is
+/// OBSERVABLE. Review gutted `payload_closure_cli` to `Ok(())` and pointed it
+/// at a different default, and the suite stayed green both times: the units
+/// under it were watched closely and the product entry point not at all.
+fn payload_closure_report(args: &[String]) -> Result<String, String> {
+    let targets: Vec<&str> = if args.is_empty() {
+        vec![PAYLOAD_CLOSURE_DEFAULT]
+    } else {
+        args.iter().map(String::as_str).collect()
+    };
+    Ok(payload_closure(&targets)?.report())
+}
+
+/// §B.8's closure query: what a target's closure CONTAINS that the
+/// source-bootstrapped claim does not cover.
+///
+/// Containment is COMPUTED from the graph rather than declared beside it, for
+/// `is_foreign`'s reason — a declared set is a second source of truth for a
+/// trust answer, and the graph already carries the edge, since §B.8's
+/// containment edge is exactly `payload_inputs` and nothing else.
+pub(crate) fn payload_closure(targets: &[&str]) -> Result<PayloadClosure, String> {
+    let nodes = recipe_closure(targets)?;
+    let marked = marked_names();
+    payload_closure_of(&nodes, |name| marked.contains(name))
+}
+
+/// CLASSIFY, then report — which is the difference between a report and a
+/// claim. "Source-bootstrapped apart from these" is only true if every OTHER
+/// input has an admissible provenance, and that is exactly what the planning
+/// pass decides. Review found the query issuing that sentence over a graph it
+/// had never classified: a recipe naming an undeclared input was reported clean
+/// while the planner refused to build it.
+///
+/// That pass is also where the tool-channel refusal happens, so "everything
+/// reported here arrived over a containment edge" is a property this function
+/// ESTABLISHES rather than one `contains_payloads` re-checks. A second copy of
+/// the refusal below would never fire.
+fn payload_closure_of(
+    nodes: &[RecipeNode],
+    is_marked: impl Fn(&str) -> bool,
+) -> Result<PayloadClosure, String> {
+    let seeds = classify_graph_inputs_with(nodes, &is_marked)?;
+    Ok(contains_payloads(nodes, seeds.len(), &is_marked))
+}
+
+/// §B.8's containment answer, computed. DERIVING and CONTAINING are the two it
+/// keeps apart, and §B.8 needs them apart here rather than anywhere else: a
+/// recipe built FROM a payload is foreign, while one that merely stages a
+/// payload as data is not — or `root.erofs`, and with it the deployment and td,
+/// would be a foreign output, which is both absurd and the end of the query.
+///
+/// A member is classified by its OWN recipe and a non-member by the injected
+/// question, which is not a shortcut but the only sound reading: the two
+/// namespaces are unioned by `marked_names`, so asking it about a stem would
+/// call a source-built recipe foreign for colliding with a pin's name.
+/// `no_pin_name_is_a_recipe_stem` is what keeps that union sound at all.
+///
+/// Takes the marked-ness question as an ARGUMENT for the reason the refusal
+/// does: the shipped catalog marks nothing, so a test that could only ask it
+/// would pass with either answer wired in.
+fn contains_payloads(
+    nodes: &[RecipeNode],
+    seeds: usize,
+    is_marked: impl Fn(&str) -> bool,
+) -> PayloadClosure {
+    let members: HashSet<&str> = nodes.iter().map(|node| node.stem.as_str()).collect();
+    let mut foreign_members = Vec::new();
+    let mut pins = Vec::new();
+    for node in nodes {
+        if node.recipe.is_foreign() {
+            foreign_members.push(node.stem.clone());
+        }
+        // A marked pin is reported beside the output built from it rather than
+        // instead of it: the archive's bytes are a store path of their own, so
+        // the two are two paths the claim does not cover.
+        for key in node
+            .recipe
+            .source_input
+            .iter()
+            .chain(node.recipe.payload_inputs.iter().flatten())
+        {
+            if !members.contains(key.as_str()) && is_marked(key) {
+                pins.push(key.clone());
+            }
+        }
+    }
+    foreign_members.sort();
+    foreign_members.dedup();
+    pins.sort();
+    pins.dedup();
+    PayloadClosure {
+        // The DISTINCT stems rather than `nodes.len()`: a repeated node would
+        // otherwise inflate the number the claim divides while the sets it is
+        // divided by are deduped, and a trust count that clamps is worse than
+        // one that is simply right.
+        members: members.len(),
+        seeds,
+        foreign_members,
+        pins,
+    }
 }
 
 fn seed_input_for_recipe_source(key: &str, recipe: &Recipe) -> Result<SeedInput, String> {
@@ -3879,22 +4060,45 @@ mod tests {
         let asks: Vec<&str> = shipped
             .lines()
             .map(str::trim)
-            .filter(|l| l.contains("is_foreign()") || l.contains("pin.foreign()"))
+            // Doc comments are stripped, as `source_pins.rs`'s equivalent scan
+            // does: a future comment naming one of these would otherwise red an
+            // exact-list assertion with a message about the marked set. The
+            // `.foreign()` arm stays alongside the new one so a re-added
+            // `pins.filter(|pin| pin.foreign())` is still caught.
+            .filter(|l| !l.starts_with("//"))
+            .filter(|l| {
+                l.contains("is_foreign()") || l.contains(".foreign()") || l.contains("foreign_names()")
+            })
             .collect();
         assert_eq!(
             asks,
             vec![
                 ".filter(|(_, recipe)| recipe.is_foreign())",
-                ".filter(|pin| pin.foreign())",
+                ".chain(source_pins::foreign_names())",
+                // The closure query's member rule. Listed rather than exempted:
+                // it asks the NODE it was handed, so a fixture can observe it,
+                // but an exact list is what stops a fourth read being added
+                // where no test looks.
+                "if node.recipe.is_foreign() {",
             ],
             "the marked set is built from BOTH the catalog and the pins — a \
-             recipe-only question misses the payload's own bytes named as a tool"
+             recipe-only question misses the payload's own bytes named as a \
+             tool, and `foreign_names' rather than the keys, since a pin \
+             answers to its aliases too"
         );
-        assert!(
-            shipped.contains("classify_graph_inputs_with(nodes, |name| marked.contains(name))"),
-            "the shipped entry point must supply the REAL marked set — the \
-             behavioural tests inject their own, and cannot see this line"
-        );
+        for wiring in [
+            "classify_graph_inputs_with(nodes, |name| marked.contains(name))",
+            "payload_closure_of(&nodes, |name| marked.contains(name))",
+            // The one line of the command a test cannot observe: everything
+            // else it does is `payload_closure_report`, which the tests drive.
+            "print!(\"{}\", payload_closure_report(args)?);",
+        ] {
+            assert!(
+                shipped.contains(wiring),
+                "the shipped entry points must supply the REAL marked set — the \
+                 behavioural tests inject their own, and cannot see `{wiring}'"
+            );
+        }
     }
 
     /// The PIN half, which a recipe-only check missed entirely: a recipe naming
@@ -3971,6 +4175,260 @@ mod tests {
         );
         assert!(classify_graph_inputs_with(&[data], marked).is_ok());
         assert!(classify_graph_inputs_with(&[], marked).is_ok());
+    }
+
+    /// A recipe carrying a MARKED pin of its own — §B.8's payload as it enters
+    /// the store. Built here rather than asked of `source_pins`, whose foreign
+    /// roster is empty until the first application lands.
+    fn packaged_payload(stem: &str, pin_key: &str) -> Recipe {
+        Recipe::gnu(stem, "1")
+            .source_input(pin_key)
+            .source_pins(vec![SourcePin::new(
+                pin_key,
+                "https://example.invalid/app.tar.xz",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                "app.tar.xz",
+            )
+            .mark_foreign()])
+    }
+
+    /// §B.8's derive/contain split, which is the whole of the containment rule:
+    /// an image that STAGES a payload as data must not become a foreign output,
+    /// or `root.erofs` — and with it the deployment, and td — is one, and the
+    /// query this answers has nothing left to say.
+    #[test]
+    fn containing_a_payload_is_not_deriving_from_one() {
+        let payload = packaged_payload("app", "app-archive");
+        assert!(payload.is_foreign(), "built FROM a payload: foreign");
+        let image = Recipe::gnu("image", "1")
+            .inputs(&["glibc"])
+            .payload_inputs(&["app"]);
+        assert!(
+            !image.is_foreign(),
+            "an image CONTAINS a payload; the taint travels by source pin, and \
+             `payload_inputs' is not one"
+        );
+
+        let node = |stem: &str, recipe: Recipe| RecipeNode {
+            stem: stem.to_string(),
+            recipe,
+        };
+        let nodes = vec![
+            node("glibc", Recipe::gnu("glibc", "1")),
+            node("app", payload),
+            node("image", image),
+        ];
+        // The question names only the PIN: the packaging recipe is found to be
+        // foreign by its own pins, which is the propagation 3b-i landed, so this
+        // half of the classification cannot ride on the injected answer.
+        let answer = contains_payloads(&nodes, 0, |name| name == "app-archive");
+        assert_eq!(answer.members, 3);
+        assert_eq!(answer.foreign_members, vec!["app".to_string()]);
+        // The archive is reported BESIDE the output built from it: two store
+        // paths the claim does not cover, not one.
+        assert_eq!(answer.pins, vec!["app-archive".to_string()]);
+        assert_eq!(answer.unmarked(), 2);
+        assert_eq!(
+            answer.report(),
+            "members\t3\nunmarked\t2\naudited-seeds\t0\npayload\trecipe\tapp\npayload\tpin\tapp-archive\n"
+        );
+    }
+
+    /// The query answers over a whole closure and reports what it finds THERE:
+    /// a marked pin an image stages directly as data is a payload the claim does
+    /// not cover, and an unmarked graph is covered entirely.
+    #[test]
+    fn the_closure_query_counts_every_marked_path_and_nothing_else() {
+        let node = |stem: &str, recipe: Recipe| RecipeNode {
+            stem: stem.to_string(),
+            recipe,
+        };
+        let nodes = || {
+            vec![
+                node("glibc", Recipe::gnu("glibc", "1")),
+                node(
+                    "image",
+                    Recipe::gnu("image", "1").payload_inputs(&["app-archive", "glibc"]),
+                ),
+            ]
+        };
+        // An image may stage the payload's own BYTES, with no packaging recipe
+        // between: the pin is not a closure member, so it is counted apart.
+        let answer = contains_payloads(&nodes(), 0, |name| name == "app-archive");
+        assert_eq!(answer.pins, vec!["app-archive".to_string()]);
+        assert!(answer.foreign_members.is_empty());
+        assert_eq!(answer.unmarked(), 2);
+        assert_eq!(answer.members, 2);
+
+        // Nothing marked: the claim covers the whole closure, and the counts
+        // agreeing at 2 rather than at 0 is what tells that from a broken walk.
+        let clean = contains_payloads(&nodes(), 0, |_| false);
+        assert!(clean.pins.is_empty() && clean.foreign_members.is_empty());
+        assert_eq!(clean.unmarked(), 2);
+        assert_eq!(clean.report(), "members\t2\nunmarked\t2\naudited-seeds\t0\n");
+
+        // A closure MEMBER is classified by its OWN recipe, never by the name
+        // question: the two namespaces are unioned, so a stem that collided
+        // with a marked pin's name would otherwise report a source-built
+        // recipe as a payload. `glibc` is "marked" here and is neither.
+        let both = contains_payloads(&nodes(), 0, |name| name == "glibc");
+        assert!(both.foreign_members.is_empty() && both.pins.is_empty());
+        assert_eq!(both.unmarked(), 2);
+    }
+
+    /// The union `marked_names` builds is only sound while the two namespaces
+    /// are disjoint: a pin name that was also a recipe stem would refuse every
+    /// legal use of that recipe once the pin were marked. Not vacuous — 98
+    /// stems against 56 pin names, both non-empty today.
+    #[test]
+    fn no_pin_name_is_a_recipe_stem() {
+        let stems: HashSet<&str> = catalog::all().into_iter().map(|(stem, _)| stem).collect();
+        assert!(stems.len() > 50 && !stems.is_empty());
+        let mut names = 0;
+        for pin in source_pins::all() {
+            names += 1;
+            assert!(
+                !stems.contains(pin.key.as_str()),
+                "pin `{}' is also a recipe stem",
+                pin.key
+            );
+        }
+        assert!(names > 40, "{names} pins — the sweep must have something to do");
+        // The ALIASES too, since `by_key` resolves one to the pin and
+        // `foreign_names` marks it.
+        for alias in ["linux-headers", "linux-headers-x86-64"] {
+            assert!(!stems.contains(alias), "alias `{alias}' is also a stem");
+        }
+    }
+
+    /// The query REFUSES rather than reporting when a marked path reached the
+    /// closure over a tool edge. Driven through the COMPOSED path, because that
+    /// is where the refusal now lives — in the planning pass the query runs
+    /// first — and in both orders, since a check that ran for the first node
+    /// only would pass with the offender last.
+    #[test]
+    fn the_closure_query_refuses_a_payload_that_arrived_as_a_tool() {
+        let node = |stem: &str, recipe: Recipe| RecipeNode {
+            stem: stem.to_string(),
+            recipe,
+        };
+        // Real catalog stems, so the graph classifies cleanly and the refusal
+        // is the only thing that can red it. A made-up name reds anyway.
+        const MARKED: &str = "gcc-mesboot0";
+        let clean = || node("clean", Recipe::mesboot("clean", "0").inputs(&["binutils-mesboot0"]));
+        let dirty = || node("consumer", Recipe::mesboot("consumer", "0").inputs(&[MARKED]));
+        for nodes in [vec![clean(), dirty()], vec![dirty(), clean()]] {
+            let e = payload_closure_of(&nodes, |name| name == MARKED)
+                .expect_err("a marked path on the tool channel must refuse");
+            assert!(e.starts_with(PROVENANCE_REJECTED), "{e}");
+            assert!(
+                e.contains("marked foreign payload") && e.contains(MARKED),
+                "{e}"
+            );
+        }
+        // Unmarked, the same graph answers — which is what makes the refusal
+        // attributable to the mark and to nothing else.
+        assert_eq!(
+            payload_closure_of(&[clean(), dirty()], |_| false)
+                .unwrap()
+                .members,
+            2
+        );
+    }
+
+    /// A marked PIN reported through the composed path, over a real pin key so
+    /// the graph classifies: the unit tests above drive fixtures the planner
+    /// would refuse, which leaves the product path proving only that it runs.
+    #[test]
+    fn a_marked_pin_is_reported_through_the_classified_path() {
+        const PIN: &str = "zlib-x86-64-source";
+        let nodes = vec![RecipeNode {
+            stem: "packager".to_string(),
+            recipe: Recipe::gnu("packager", "1").source_input(PIN),
+        }];
+        let answer = payload_closure_of(&nodes, |name| name == PIN).unwrap();
+        assert_eq!(answer.pins, vec![PIN.to_string()]);
+        assert_eq!(answer.members, 1);
+        // Unmarked, the same real pin is ordinary source and is not reported.
+        assert!(payload_closure_of(&nodes, |_| false).unwrap().pins.is_empty());
+    }
+
+    /// The shipped COMMAND, which review gutted to `Ok(())` and pointed at a
+    /// different default with the whole suite green: the units were watched and
+    /// the product entry point was not. Both halves of its argument handling
+    /// are observed here — no argument means the deployment, and an argument is
+    /// actually read.
+    #[test]
+    fn the_command_answers_for_the_deployment_by_default_and_reads_its_argument() {
+        let members = |report: &str| -> usize {
+            report
+                .lines()
+                .next()
+                .and_then(|line| line.strip_prefix("members\t"))
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0)
+        };
+        let default = payload_closure_report(&[]).unwrap();
+        assert_eq!(
+            default,
+            payload_closure_report(&[PAYLOAD_CLOSURE_DEFAULT.to_string()]).unwrap(),
+            "no argument must mean the shipped deployment"
+        );
+        // A SMALLER target answers with fewer members, which is what tells a
+        // query that reads its argument from one that answers the same thing
+        // whatever it is asked.
+        let smaller = payload_closure_report(&["binutils-mesboot0".to_string()]).unwrap();
+        assert!(
+            members(&smaller) > 0 && members(&smaller) < members(&default),
+            "{smaller}"
+        );
+    }
+
+    /// The claim is CLASSIFIED before it is issued: a graph the planner would
+    /// refuse must not be reported as source-bootstrapped, which is what a
+    /// query that only counted marked paths did.
+    #[test]
+    fn the_query_classifies_the_graph_before_claiming_it_is_source_bootstrapped() {
+        let node = |stem: &str, recipe: Recipe| RecipeNode {
+            stem: stem.to_string(),
+            recipe,
+        };
+        // Neither a catalog recipe nor a pin, so it has no admissible
+        // provenance and the planner refuses the graph outright.
+        let bad = vec![node(
+            "rung",
+            Recipe::gnu("rung", "1").inputs(&["undeclared-host-tool"]),
+        )];
+        let e = payload_closure_of(&bad, |_| false)
+            .expect_err("an unclassifiable graph must not be claimed clean");
+        assert!(e.starts_with(PROVENANCE_REJECTED), "{e}");
+        assert!(e.contains("undeclared-host-tool"), "{e}");
+        // The same shape with a DECLARED input answers, which is what makes the
+        // refusal attributable to the provenance and not to the fixture.
+        let good = vec![node(
+            "rung",
+            Recipe::gnu("rung", "1").inputs(&["binutils-mesboot0"]),
+        )];
+        assert_eq!(payload_closure_of(&good, |_| false).unwrap().members, 1);
+    }
+
+    /// The shipped deployment's answer. Vacuous in its LIST today — nothing is
+    /// marked — but not in its counts: a query that walked nothing would report
+    /// "0 of 0", so this is what stops the empty roster and a broken walk
+    /// looking alike. It is also the regression gate for the first application.
+    #[test]
+    fn the_shipped_deployment_holds_no_marked_payload() {
+        let answer = payload_closure(&[PAYLOAD_CLOSURE_DEFAULT]).unwrap();
+        // Both counts tied to the WALK rather than to a floor: `> 50` is
+        // satisfied by the whole catalog as easily as by the deployment's
+        // closure, so it could not tell one target from another.
+        let nodes = recipe_closure(&[PAYLOAD_CLOSURE_DEFAULT]).unwrap();
+        assert!(nodes.len() > 50, "{} members", nodes.len());
+        assert_eq!(answer.members, nodes.len());
+        assert_eq!(answer.seeds, classify_graph_inputs(&nodes).unwrap().len());
+        assert!(answer.seeds > 20, "{} seeds", answer.seeds);
+        assert_eq!(answer.unmarked(), answer.members);
+        assert!(answer.foreign_members.is_empty() && answer.pins.is_empty());
     }
 
     /// A fake `cargo` at `path`: `body` runs with the real cargo's argv, so a test

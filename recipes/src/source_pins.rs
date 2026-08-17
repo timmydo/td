@@ -531,9 +531,30 @@ pub fn by_key(key: &str) -> Option<SourcePin> {
     by_key_with(key, FOREIGN)
 }
 
+/// Every NAME a §B.8-marked pin answers to — its key AND its aliases.
+///
+/// A set built from keys alone is a hole rather than an approximation, and
+/// review is what found it: `by_key` RESOLVES an alias, so a recipe naming a
+/// marked pin by one gets the payload's bytes with the mark intact, while a
+/// key-only set answers "not marked" for that same name. The tool-channel
+/// refusal and the closure query both ask that set, so the pin would be neither
+/// refused nor reported. Two shipped pin names are aliases today, so this is
+/// reachable rather than hypothetical.
+pub fn foreign_names() -> Vec<String> {
+    foreign_names_with(FOREIGN)
+}
+
 fn all_with(foreign: &[&str]) -> Vec<SourcePin> {
     PINS.iter()
         .map(|pin| materialize_with(pin, pin.key, foreign))
+        .collect()
+}
+
+fn foreign_names_with(foreign: &[&str]) -> Vec<String> {
+    PINS.iter()
+        .filter(|pin| foreign.contains(&pin.key))
+        .flat_map(|pin| std::iter::once(pin.key).chain(pin.aliases.iter().copied()))
+        .map(str::to_string)
         .collect()
 }
 
@@ -710,11 +731,41 @@ mod tests {
                 "const FOREIGN: &[&str] = &[];",
                 "all_with(FOREIGN)",
                 "by_key_with(key, FOREIGN)",
+                "foreign_names_with(FOREIGN)",
             ],
-            "the roster is declared once and read by exactly the two public \
-             entry points — a third reader, or either of these passing something \
+            "the roster is declared once and read by exactly the three public \
+             entry points — a fourth reader, or any of these passing something \
              else, is how a marked pin comes back unmarked"
         );
+    }
+
+    /// A marked pin answers to its ALIASES too, which is what `by_key` does and
+    /// what a key-only set silently disagreed with. Driven over the real
+    /// `linux-source` pin, whose two aliases are the reachable case.
+    #[test]
+    fn a_marked_pins_aliases_are_marked_with_it() {
+        const KEY: &str = "linux-source";
+        let mut names = foreign_names_with(&[KEY]);
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "linux-headers".to_string(),
+                "linux-headers-x86-64".to_string(),
+                KEY.to_string(),
+            ],
+            "every name `by_key' resolves to a marked pin must be marked"
+        );
+        // A pin with no alias contributes exactly its key, and a neighbour's
+        // names are not swept in with it.
+        assert_eq!(
+            foreign_names_with(&["zlib-x86-64-source"]),
+            vec!["zlib-x86-64-source".to_string()]
+        );
+        assert!(foreign_names_with(&[]).is_empty());
+        // A name that resolves to no pin contributes nothing, which is what
+        // `every_foreign_name_is_a_pin_key` refuses at the roster instead.
+        assert!(foreign_names_with(&["linux-headers"]).is_empty());
     }
 
     #[test]

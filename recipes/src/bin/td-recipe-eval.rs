@@ -22,6 +22,12 @@
 //!                         the caches lack (default system-x86-64), building
 //!                         nothing. The host-side operator commands (`run`,
 //!                         `qemu-boot*`) do this for themselves from a terminal
+//!   payload-closure [TARGET...]
+//!                         print APPLICATIONS.md §B.8's closure answer for
+//!                         TARGET (default system-x86-64): how many recipes
+//!                         the closure holds, how many of them §B.8's mark does
+//!                         not cover, how many audited seed inputs they declare,
+//!                         and every marked foreign payload by name
 //!   source-pins           print recipe-owned fixed-output source pins as:
 //!                         <key>\t<url>\t<sha256>\t<file>
 //!   source-pin STEM       print the fixed-output source pin(s) owned by STEM
@@ -268,6 +274,12 @@ fn main() {
                 die_runner(&e);
             }
         }
+        Some("payload-closure") => {
+            let rest = args.get(2..).unwrap_or(&[]);
+            if let Err(e) = check_runner::payload_closure_cli(rest) {
+                die_runner(&e);
+            }
+        }
         Some("source-pins") => {
             if args.get(2).is_some() {
                 die("usage: source-pins");
@@ -301,7 +313,7 @@ fn main() {
                 die(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-boot|qemu-boot-erofs|qemu-boot-system|qemu-boot-net|qemu-boot-kexec|run|warm|verify-store|source-pins|source-pin|seed-digests|local-source-digests ..."),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-boot|qemu-boot-erofs|qemu-boot-system|qemu-boot-net|qemu-boot-kexec|run|warm|verify-store|payload-closure|source-pins|source-pin|seed-digests|local-source-digests ..."),
     }
 }
 

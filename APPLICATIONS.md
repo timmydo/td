@@ -999,10 +999,9 @@ UNMARKED. That is the same outcome the key check refuses, reached
 through the wiring rather than through a name, so the wiring is pinned
 in source.
 
-The `contains_payloads` containment edge and the closure query are the
-next increments; the planning-time refusal that reads this mark landed
-after it and is described below. One thing they will need that neither
-increment has: the mark does not
+The planning-time refusal that reads this mark landed after it, and the
+containment edge and closure query after that; both are described below.
+One thing none of them closes: the mark does not
 cross into the four-column source-pin TSV that `td-feed` and the
 control-plane bootstrap parse into their own pin types, so the
 fetch/warm side cannot yet tell a foreign pin from an ordinary one.
@@ -1079,6 +1078,81 @@ A containment edge is exactly `payload_inputs` and nothing else, which
 is why the channel had to exist before this rule could be stated: the
 graph could not otherwise tell the two apart, and neither could a
 reader.
+
+**Both have LANDED over the recipe graph**, as `td-recipe-eval
+payload-closure [TARGET…]` (default `system-x86-64`). It is PURE — it
+reads the catalog and builds nothing — so it is a question anyone can ask
+of a checkout. What that does NOT give is the store-level answer this
+section's "The closure query, and the edge it would otherwise miss"
+specifies, and the difference is recorded there rather than glossed: a
+graph query cannot see an edge that exists only in built bytes.
+
+`contains_payloads` is the ANSWER rather than a declared key — no output
+carries a `{paths}` field, and grepping for one finds this paragraph and
+the Rust function that computes it. It is COMPUTED from the graph for the
+reason `is_foreign` is: a declared set is a second source of truth for a
+trust answer, and the graph already carries the edge. What it names are
+recipe NAMES, not store paths — a name resolves to a path only in a plan,
+and a query that had to build one would not be answerable of a checkout.
+The answer is two counts and a line per marked path, TAB-separated and
+fixed-arity — shown aligned here, and a parser should split on tabs:
+
+```text
+members	66
+unmarked	66
+audited-seeds	59
+payload	recipe	firefox
+payload	pin	firefox-archive
+```
+
+The counts come out of one walk on purpose. With nothing marked the list
+is empty, which is exactly what a query that walked nothing prints — so
+`66 of 66` is what tells a true answer from a broken one, and `0 of 0`
+is the shape a test refuses. It is the same empty-roster trap the mark
+itself had, answered with a number rather than with a fixture.
+
+**The second line is NOT spelled `source-bootstrapped`, and that is a
+correction review forced rather than a wording preference.** The count is
+members minus marked payloads, and two members of this very closure are
+prebuilt: `rust-stage0` transforms an upstream binary snapshot, and
+`stage0` is the stage0-posix seed. Both are td's declared bootstrap trust
+roots, which AGENTS.md's claim names as its own exception — "no foreign
+binary other than its declared bootstrap seeds" — and §B.8's mark is
+about APPLICATION payloads and says nothing about them. A line spelled
+`source-bootstrapped 66` would therefore deny something td declares, and
+a reader parsing it as "nothing prebuilt is in here" would be wrong. So
+the wire says `unmarked`, the design sentence stays what it is, and
+`audited-seeds` — the distinct seed inputs the planning pass classified —
+is printed beside it so the seeds are visible rather than absent.
+
+A marked pin is reported BESIDE the output built from it rather than
+instead of it: the archive's bytes are a store path of their own, so the
+two are two paths the claim does not cover. Neither is a closure MEMBER
+in the count — a pin is bytes, not a recipe — so pins are listed and
+members are divided.
+
+The query REFUSES rather than reports when a marked path reached the
+closure over a tool edge, and it does so by RUNNING the planning pass
+rather than by re-checking after it: the same `classify_graph_inputs`
+that decides provenance also carries the tool-channel refusal, so
+"everything reported here arrived over a containment edge" is
+established by the pass the query runs first. An earlier draft checked
+it a second time in the reporting function, which after the
+classification landed was a line the product could never reach.
+
+What keeps the taint off the containment edge is one absence, and it is
+asserted rather than assumed: `inputs`, `native_inputs` and
+`source_input` all attach the named key's source pin to the recipe, and
+`payload_inputs` does not. An image naming a payload as DATA is
+therefore marked for nothing, which is what stops `root.erofs` — and the
+deployment, and td — being a foreign output. The test uses a REAL pin
+key, because with a made-up one nothing attaches on any channel and it
+could not tell a channel that attaches from one that does not.
+
+`td-builder` has no equivalent and is not getting one here, for the
+reason 3b-ii recorded: a pin's mark does not cross into the build JSON,
+so that side cannot answer the pin half at all. The query lives where
+the catalog is known.
 
 #### What "never a build input" can and cannot mean
 
@@ -1336,6 +1410,25 @@ application→runtime edge therefore exists only if the recipe-generated
 spec spells the runtime's **full store path** — so it must, and §A.0 says
 so. A spec naming the runtime by short name would leave the closure
 under-reporting and a future collector free to reclaim a live runtime.
+
+**What landed answers this question over the RECIPE GRAPH and not over
+the store**, and the two reviewers who each caught the difference are why
+it is written here rather than left for a reader to discover.
+`payload-closure` walks declared edges in the catalog; it never opens the
+store DB and never scans a byte. Everything that follows from that:
+
+- It is answerable of a checkout, with nothing built — which is what
+  makes it useful before the first application exists, and is why it is
+  the half taken first.
+- It cannot see the edge above. A spec that named its runtime by short
+  name would still be *declared* as a `payload_inputs` edge, so this
+  query counts the runtime while the built closure omits it. The recipe
+  answer and the store answer would disagree, and only the store one is
+  about what a collector will do.
+- Assertion 3 is therefore **half met**: the recipe-level answer exists
+  and the store-level one is still owed. It belongs with the first
+  application, since that is when a built closure with a payload in it
+  first exists to query.
 
 #### Metadata, exports, and what the marker does not do
 
@@ -2896,7 +2989,10 @@ packaged selftest, boot oracle — with **network never in the gate**.
    - the closure query reports every marked path, and the set matches
      the reviewed pin list exactly — including the application→runtime
      edge, which exists only because the spec carries the runtime's full
-     store path;
+     store path. The RECIPE-GRAPH query has **landed**; the STORE-level
+     one — the only one that can see that edge — and the comparison
+     against a reviewed list both arrive with the first application,
+     there being no built closure and no list until then;
    - metadata normalization: no setuid/setgid bit, file capability,
      security xattr, device node or escaping symlink survives packaging;
    - a package's launcher name collides with no applet farm.
@@ -2998,8 +3094,8 @@ Each row is one landing or a small family, leaving the tree green.
 |---|---|---|
 | 1 | **kernel namespace/seccomp/cgroup config pins + QEMU readback** (§0) — **LANDED**, except the functional calls, which need surface #9: the `unshare` at rung 8, the filter install at rung 11 | none — but this is the gate on everything |
 | 2 | `td-login exec-as` with credential readback — **LANDED** | none |
-| 3 | **the §B.8 marker**: the recipe-level mark, `payload_inputs` as a declared channel, taint propagation from the source pin, and the planning-time refusals — plus the argv/template scanner, since that assertion is the one that is otherwise silent. The **channel has LANDED** (see §B.8: `{payload:NAME}` resolution plus `ro,noexec` binds, replacing the un-implementable "never staged at all"); the MARK — `foreign` on the source pin, the derived recipe flag, taint propagation and `contains_payloads` — is the remaining half | none |
-| 4 | the manifest and permission keyfile, name validation and every rejection; the closure query reporting marked paths | none |
+| 3 | **the §B.8 marker**: the recipe-level mark, `payload_inputs` as a declared channel, taint propagation from the source pin, and the planning-time refusals — plus the argv/template scanner, since that assertion is the one that is otherwise silent. The **channel has LANDED** (see §B.8: `{payload:NAME}` resolution plus `ro,noexec` binds, replacing the un-implementable "never staged at all"); the MARK has landed with it — `foreign` on the source pin, the derived recipe flag, the tool-channel refusal in both plan builders, and the computed `contains_payloads` answer with the recipe-graph closure query that reads it. What is LEFT of this rung is the argv/template scanner, downgraded to the cheap pure pass §B.8 describes | none |
+| 4 | the manifest and permission keyfile, name validation and every rejection; the STORE-level closure query, which needs a built closure with a payload in it | none |
 | 5 | first seed recipe — a pinned upstream artifact becomes a store package with §B.3's checks and §B.8's assertions | none |
 | 6 | the spec compiler: runtime resolution by full store path, mounts, grants, entry point | none |
 | 7 | the `/bin/<name>` farm through `real_root_steps` + `bin_farms()`, the launcher table, the state directory | none |
