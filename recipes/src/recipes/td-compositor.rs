@@ -42,6 +42,10 @@ const MODULES: &[(&str, &str)] = &[
         "pointer",
         include_str!("../../../td-compositor/src/pointer.rs"),
     ),
+    (
+        "positioner",
+        include_str!("../../../td-compositor/src/positioner.rs"),
+    ),
     ("pty", include_str!("../../../td-compositor/src/pty.rs")),
     ("ready", include_str!("../../../td-compositor/src/ready.rs")),
     (

@@ -14,6 +14,7 @@ mod keys;
 mod launcher;
 mod layout;
 mod pointer;
+mod positioner;
 mod pty;
 mod ready;
 mod render;
@@ -495,6 +496,7 @@ mod confinement {
         ("launcher.rs", include_str!("launcher.rs")),
         ("layout.rs", include_str!("layout.rs")),
         ("pointer.rs", include_str!("pointer.rs")),
+        ("positioner.rs", include_str!("positioner.rs")),
         ("pty.rs", include_str!("pty.rs")),
         ("ready.rs", include_str!("ready.rs")),
         ("render.rs", include_str!("render.rs")),

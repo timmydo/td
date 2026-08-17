@@ -69,6 +69,31 @@ pub struct SurfacePoint {
     pub y: i32,
 }
 
+/// Where a popup sits, in its PARENT's window-geometry coordinates — which is
+/// where the positioner resolved it and exactly what the client was told in
+/// `xdg_popup.configure`. Kept relative rather than resolved to the output
+/// once: a parent that moves takes its menu with it, and an absolute rectangle
+/// would need recomputing by everything that can move a tile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PopupPlacement {
+    pub parent: SurfaceKey,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// A popup and where it sits in the stack. The order is the SCENE's own
+/// counter, not anything the client chose: a submenu has to be drawn over —
+/// and asked before — the menu it hangs off, and object ids cannot say which
+/// came first, because a client may reuse an id the moment td retires it with
+/// `wl_display.delete_id`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlacedPopup {
+    placement: PopupPlacement,
+    order: u64,
+}
+
 /// A window's own bounds inside its surface, as `xdg_surface.set_window_geometry`
 /// gave them: surface-local, so the origin is where the client's invisible
 /// margin ends and the window a person sees begins. Signed and unclipped,
@@ -718,6 +743,11 @@ pub(crate) fn least_output_height(rows: usize) -> usize {
         .saturating_add(rows)
 }
 
+/// How deep a chain of popups is drawn. A menu opening a submenu opening a
+/// submenu is three; anything past this is a client fault or a cycle, and the
+/// bound is what stops the walk rather than a guarantee about the chain.
+const MAX_POPUP_DEPTH: usize = 32;
+
 pub struct Scene {
     surfaces: BTreeMap<SurfaceKey, Surface>,
     input_regions: BTreeMap<SurfaceKey, SharedInputRegion>,
@@ -727,6 +757,12 @@ pub struct Scene {
     /// need never send it again, so dropping it with the pixels would tile a
     /// remapped window's shadow margins as dead borders again.
     geometries: BTreeMap<SurfaceKey, WindowGeometry>,
+    /// The popups a client has mapped, and where each one goes. Separate from
+    /// `layout` because a popup is NOT tiled: it floats over its parent by the
+    /// rules the client gave, and the arrangement neither makes room for it nor
+    /// is disturbed by it.
+    popups: BTreeMap<SurfaceKey, PlacedPopup>,
+    popup_order: u64,
     titles: BTreeMap<SurfaceKey, String>,
     layout: Layout,
     pointer_x: i32,
@@ -760,6 +796,8 @@ impl Scene {
             surfaces: BTreeMap::new(),
             input_regions: BTreeMap::new(),
             geometries: BTreeMap::new(),
+            popups: BTreeMap::new(),
+            popup_order: 0,
             titles: BTreeMap::new(),
             layout: Layout::new(),
             pointer_x: 0,
@@ -1008,6 +1046,79 @@ impl Scene {
     }
 
     pub fn commit(&mut self, key: SurfaceKey, surface: Surface) -> Result<bool, String> {
+        let is_new = self.store_surface(key, surface)?;
+        if is_new {
+            self.layout.map(key);
+            self.hint = None;
+        }
+        Ok(is_new)
+    }
+
+    /// A popup's pixels and where they go. It shares `surfaces` with the tiles
+    /// — the byte ceiling is the whole scene's, and a client cannot be allowed
+    /// to spend it through menus instead of windows — but it never enters the
+    /// LAYOUT, which is the whole difference between a popup and a window.
+    pub fn commit_popup(
+        &mut self,
+        key: SurfaceKey,
+        surface: Surface,
+        placement: PopupPlacement,
+    ) -> Result<(), String> {
+        self.store_surface(key, surface)?;
+        // A popup already up keeps the place it was given: a client that
+        // recommits its menu has not raised it over a submenu opened since.
+        let order = match self.popups.get(&key) {
+            Some(placed) => placed.order,
+            None => {
+                self.popup_order = self.popup_order.saturating_add(1);
+                self.popup_order
+            }
+        };
+        self.popups.insert(key, PlacedPopup { placement, order });
+        Ok(())
+    }
+
+    /// A popup taken down, by a null attach or by its role object going away.
+    /// Its pixels go with it: an unmapped popup is not a window that might come
+    /// back to the same tile, it is a menu that has been dismissed. Its
+    /// SUBMENUS go too — a menu that has gone leaves nothing for a submenu to
+    /// hang off, and one left behind would be spending the scene's byte
+    /// ceiling on a rectangle no chain can reach.
+    pub fn unmap_popup(&mut self, key: SurfaceKey) -> bool {
+        let drawn = self.popups.remove(&key).is_some();
+        self.discard_pixels(key);
+        self.drop_popups_of(key);
+        drawn
+    }
+
+    /// Every popup hanging off this surface, and theirs in turn, pixels
+    /// included. No depth bound, and none needed: each round REMOVES what it
+    /// finds, so the map strictly shrinks and even a cycle runs out.
+    fn drop_popups_of(&mut self, key: SurfaceKey) {
+        let mut parents = vec![key];
+        while let Some(parent) = parents.pop() {
+            let children: Vec<SurfaceKey> = self
+                .popups
+                .iter()
+                .filter(|(_, placed)| placed.placement.parent == parent)
+                .map(|(child, _)| *child)
+                .collect();
+            for child in children {
+                self.popups.remove(&child);
+                self.discard_pixels(child);
+                parents.push(child);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn popup_placement(&self, key: SurfaceKey) -> Option<PopupPlacement> {
+        self.popups.get(&key).map(|placed| placed.placement)
+    }
+
+    /// The pixels alone, byte-accounted, without saying what they are FOR.
+    /// Answers whether the surface is one td had not seen before.
+    fn store_surface(&mut self, key: SurfaceKey, surface: Surface) -> Result<bool, String> {
         let is_new = !self.surfaces.contains_key(&key);
         let prior = self
             .surfaces
@@ -1028,10 +1139,6 @@ impl Scene {
         }
         self.surfaces.insert(key, surface);
         self.surface_bytes = next;
-        if is_new {
-            self.layout.map(key);
-            self.hint = None;
-        }
         Ok(is_new)
     }
 
@@ -1179,6 +1286,8 @@ impl Scene {
 
     pub fn unmap(&mut self, key: SurfaceKey) -> bool {
         let layout_changed = self.layout.contains(key);
+        self.popups.remove(&key);
+        self.drop_popups_of(key);
         self.discard_pixels(key);
         self.layout.unmap(key);
         // A block is drawn over the arrangement rather than replacing it, so
@@ -1194,6 +1303,12 @@ impl Scene {
         let layout_changed = self.layout.contains(key);
         self.discard_pixels(key);
         self.geometries.remove(&key);
+        self.popups.remove(&key);
+        // Every popup this surface was the PARENT of goes too, and their
+        // submenus with them. A menu whose window has gone is a rectangle
+        // floating over whatever tile the layout gives that space to next, and
+        // the client that owns it has been told nothing.
+        self.drop_popups_of(key);
         self.titles.remove(&key);
         self.layout.forget(key);
         self.clear_hint();
@@ -1227,6 +1342,7 @@ impl Scene {
         self.surfaces.retain(|key, _| key.client != client);
         self.input_regions.retain(|key, _| key.client != client);
         self.geometries.retain(|key, _| key.client != client);
+        self.popups.retain(|key, _| key.client != client);
         self.titles.retain(|key, _| key.client != client);
         self.surface_bytes = self.surface_bytes.saturating_sub(removed);
         // Cursor surfaces are not in `surfaces`, so the sweep above misses
@@ -1554,6 +1670,13 @@ impl Scene {
     /// the same target.
     pub fn window_at_pointer(&self, width: usize, height: usize) -> Option<SurfaceKey> {
         let placements = self.tiled_placements(width, height);
+        // A pointer over a menu is over the WINDOW that opened it. Answering
+        // the tile underneath would hand focus-follows-mouse to whatever the
+        // menu overhangs, and a toolkit told its window was deactivated closes
+        // the menu — so the menu would shut as the pointer moved onto it.
+        if let Some(popup) = self.popup_target_from(&placements) {
+            return self.popup_root(popup.key);
+        }
         let (x, y) = self.pointer_at_usize()?;
         Some(placements.get(tile_at(&placements, x, y)?)?.key)
     }
@@ -1668,9 +1791,136 @@ impl Scene {
         Some((placement, zone_of(placement.rect, x, y)))
     }
 
+    /// Where a popup lands on the OUTPUT. Its placement is measured from its
+    /// PARENT's window geometry, and that parent may be another popup — a
+    /// submenu hangs off the menu that opened it — so the chain is walked back
+    /// to the tile it ultimately belongs to. `None` where that tile is not on
+    /// screen: a menu whose window is on another workspace or stacked away
+    /// behind a sibling is not drawn either.
+    ///
+    /// The walk is BOUNDED rather than trusted to end, and the bound is
+    /// load-bearing rather than belt-and-braces: the server checks that a
+    /// popup's parent is an xdg_surface with a role object, which is NOT
+    /// enough to refuse a cycle. Destroying a popup hands its xdg_surface
+    /// back for another role, so a client that gives a menu's surface a fresh
+    /// popup parented on its own submenu closes the loop, and this is what
+    /// stops it — by drawing nothing, which is also what a client asking for
+    /// that deserves. Refusing it at the source is `xdg_wm_base`'s
+    /// `not_the_topmost_popup` and a parent-chain check, neither of which is
+    /// here yet.
+    fn popup_rect(&self, key: SurfaceKey, placements: &[Placement]) -> Option<ImageRect> {
+        let mut chain = Vec::with_capacity(MAX_POPUP_DEPTH);
+        let mut at = key;
+        let root = loop {
+            let Some(placed) = self.popups.get(&at) else {
+                break at;
+            };
+            if chain.len() == MAX_POPUP_DEPTH {
+                return None;
+            }
+            chain.push(placed.placement);
+            at = placed.placement.parent;
+        };
+        let mut rect = None;
+        for candidate in placements {
+            if candidate.key == root && candidate.visible {
+                rect = Some(ImageRect::tile(candidate.rect));
+                break;
+            }
+        }
+        let mut rect = rect?;
+        // Resolved parent-first, which is what lets each one be CHECKED
+        // against what it was placed on.
+        for placement in chain.iter().rev() {
+            let on = ImageRect {
+                x: rect.x.saturating_add(i64::from(placement.x)),
+                y: rect.y.saturating_add(i64::from(placement.y)),
+                width: usize::try_from(placement.width).ok()?,
+                height: usize::try_from(placement.height).ok()?,
+            };
+            if !abuts(on, rect) {
+                return None;
+            }
+            rect = on;
+        }
+        Some(rect)
+    }
+
+    /// The window at the end of a popup's parent chain. Bounded as the walk
+    /// above is, and for the same reason.
+    fn popup_root(&self, key: SurfaceKey) -> Option<SurfaceKey> {
+        let mut at = key;
+        for _ in 0..=MAX_POPUP_DEPTH {
+            let Some(placed) = self.popups.get(&at) else {
+                return Some(at);
+            };
+            at = placed.placement.parent;
+        }
+        None
+    }
+
+    /// The popups bottom-first. ONE order for both passes: whichever is drawn
+    /// last is what a click has to land on, and two orders free to disagree
+    /// are a menu you can see and cannot press.
+    fn popups_stacked(&self) -> Vec<SurfaceKey> {
+        let mut stack: Vec<(u64, SurfaceKey)> = self
+            .popups
+            .iter()
+            .map(|(key, placed)| (placed.order, *key))
+            .collect();
+        stack.sort_unstable();
+        stack.into_iter().map(|(_, key)| key).collect()
+    }
+
+    /// A popup under the pointer, topmost first. Popups are asked BEFORE the
+    /// tiles: a menu is drawn over the window it belongs to, and a click that
+    /// went to the window under it would activate whatever the menu is
+    /// covering.
+    ///
+    /// Topmost is the scene's own stacking order, which is creation order: a
+    /// submenu is created after the menu it hangs off and the protocol stacks
+    /// it above.
+    fn popup_target_from(&self, placements: &[Placement]) -> Option<SurfacePoint> {
+        // Under the bar here because it is under the bar on screen. The bar is
+        // painted after the popups, so a menu reaching into that strip is
+        // already invisible there — and one that still answered for it would
+        // take clicks over pixels that are td's own. It is the same rule the
+        // tiles get for free: `tiled_placements` offsets every rect below the
+        // bar, so `tile_at` never answers there either.
+        if self.pointer_y < i32::try_from(BAR_HEIGHT).ok()? {
+            return None;
+        }
+        for key in self.popups_stacked().into_iter().rev() {
+            let Some(surface) = self.surfaces.get(&key) else {
+                continue;
+            };
+            let Some(rect) = self.popup_rect(key, placements) else {
+                continue;
+            };
+            let crop = self.crop_of(key, surface);
+            let Some(point) = inside(rect, crop, self.pointer_x, self.pointer_y) else {
+                continue;
+            };
+            if self
+                .input_regions
+                .get(&key)
+                .is_some_and(|region| !region.contains(point.0, point.1))
+            {
+                continue;
+            }
+            return Some(SurfacePoint {
+                key,
+                x: point.0,
+                y: point.1,
+            });
+        }
+        None
+    }
+
     fn pointer_target_from(&self, placements: &[Placement]) -> Option<SurfacePoint> {
-        let x = usize::try_from(self.pointer_x).ok()?;
-        let y = usize::try_from(self.pointer_y).ok()?;
+        if let Some(popup) = self.popup_target_from(placements) {
+            return Some(popup);
+        }
         for placement in placements {
             if !placement.visible {
                 continue;
@@ -1678,27 +1928,18 @@ impl Scene {
             let Some(surface) = self.surfaces.get(&placement.key) else {
                 continue;
             };
-            let rect = placement.rect;
             // The WINDOW's extent, not the surface's: the drawn part is the
             // crop, so a pointer over a margin td cropped away is over
             // whatever is behind the tile rather than over this client.
             let crop = self.crop_of(placement.key, surface);
-            let surface_width = crop.width.min(rect.width);
-            let surface_height = crop.height.min(rect.height);
-            let Some(end_x) = rect.x.checked_add(surface_width) else {
+            let Some((local_x, local_y)) = inside(
+                ImageRect::tile(placement.rect),
+                crop,
+                self.pointer_x,
+                self.pointer_y,
+            ) else {
                 continue;
             };
-            let Some(end_y) = rect.y.checked_add(surface_height) else {
-                continue;
-            };
-            if x < rect.x || x >= end_x || y < rect.y || y >= end_y {
-                continue;
-            }
-            // Surface-local, which is the space a client's own input region and
-            // every pointer event are in: the crop's origin is what the tile's
-            // top-left corner shows, so it is added back here.
-            let local_x = i32::try_from(x.saturating_sub(rect.x).saturating_add(crop.x)).ok()?;
-            let local_y = i32::try_from(y.saturating_sub(rect.y).saturating_add(crop.y)).ok()?;
             if self
                 .input_regions
                 .get(&placement.key)
@@ -1731,29 +1972,37 @@ impl Scene {
         key: SurfaceKey,
         placements: &[Placement],
     ) -> Option<SurfacePoint> {
-        placements
-            .iter()
-            .filter(|placement| placement.key == key && placement.visible)
-            .map(|placement| placement.rect)
-            .next()
-            .and_then(|rect| {
-                let crop = self.crop_of(key, self.surfaces.get(&key)?);
-                let origin_x = i32::try_from(rect.x).ok()?;
-                let origin_y = i32::try_from(rect.y).ok()?;
-                let crop_x = i32::try_from(crop.x).ok()?;
-                let crop_y = i32::try_from(crop.y).ok()?;
-                Some(SurfacePoint {
-                    key,
-                    x: self
-                        .pointer_x
-                        .saturating_sub(origin_x)
-                        .saturating_add(crop_x),
-                    y: self
-                        .pointer_y
-                        .saturating_sub(origin_y)
-                        .saturating_add(crop_y),
-                })
-            })
+        // A grab that a press established on a POPUP is resolved against the
+        // popup, through the rectangle the paint uses. Answering for tiles
+        // alone reported the grabbed surface as gone on the very next frame,
+        // and `Pointer::reconcile_grab` reads that as the press having nothing
+        // left to release against: the menu got a press and never the release
+        // a toolkit activates on.
+        let rect = match self.popups.contains_key(&key) {
+            true => self.popup_rect(key, placements)?,
+            false => placements
+                .iter()
+                .filter(|placement| placement.key == key && placement.visible)
+                .map(|placement| ImageRect::tile(placement.rect))
+                .next()?,
+        };
+        let crop = self.crop_of(key, self.surfaces.get(&key)?);
+        // Deliberately NOT bounded by that rectangle, for either kind: a grab
+        // follows the pointer wherever it goes, and a drag that left the
+        // surface still reports to the surface it started on.
+        let local = |pointer: i32, origin: i64, crop: usize| -> Option<i32> {
+            i32::try_from(
+                i64::from(pointer)
+                    .saturating_sub(origin)
+                    .saturating_add(i64::try_from(crop).ok()?),
+            )
+            .ok()
+        };
+        Some(SurfacePoint {
+            key,
+            x: local(self.pointer_x, rect.x, crop.x)?,
+            y: local(self.pointer_y, rect.y, crop.y)?,
+        })
     }
 
     pub fn pointer_targets(
@@ -1889,7 +2138,7 @@ impl Scene {
                 placement.focused,
             );
         }
-        for placement in placements {
+        for placement in &placements {
             // The CLIENT area here, where the border pass above wants the
             // frame: a tile too short to hold a band has no client pixels to
             // draw, and `draw_surface` was already a no-op for one.
@@ -1907,6 +2156,29 @@ impl Scene {
                 ImageRect::tile(placement.rect),
                 surface,
                 self.crop_of(placement.key, surface),
+            );
+        }
+        // Popups go over every window and under everything that is not one.
+        // Over, because a menu belongs on top of the window that opened it;
+        // under the bar and the overlays, because those are td's own surfaces
+        // and a client cannot be allowed to cover them. Bottom of the stack
+        // first, so a submenu lands on the menu it hangs off rather than under
+        // it.
+        for key in self.popups_stacked() {
+            let Some(surface) = self.surfaces.get(&key) else {
+                continue;
+            };
+            let Some(rect) = self.popup_rect(key, &placements) else {
+                continue;
+            };
+            draw_surface(
+                frame,
+                width,
+                height,
+                stride,
+                rect,
+                surface,
+                self.crop_of(key, surface),
             );
         }
         // Over the windows and under everything that is not one: the block
@@ -2352,6 +2624,60 @@ fn draw_pointer(
         ),
         None => draw_cross(frame, width, height, stride, x, y),
     }
+}
+
+/// Whether a point is on a drawn rectangle, and where in the SURFACE's own
+/// coordinates it lands if so. The crop is what the rectangle shows, so its
+/// origin is added back exactly as the tile hit test adds it — one arithmetic
+/// for both, since a popup and a tile differ in where they are rather than in
+/// how a point maps into them.
+fn inside(rect: ImageRect, crop: Crop, x: i32, y: i32) -> Option<(i32, i32)> {
+    let width = i64::try_from(crop.width.min(rect.width)).ok()?;
+    let height = i64::try_from(crop.height.min(rect.height)).ok()?;
+    let local_x = i64::from(x).checked_sub(rect.x)?;
+    let local_y = i64::from(y).checked_sub(rect.y)?;
+    if local_x < 0 || local_x >= width || local_y < 0 || local_y >= height {
+        return None;
+    }
+    let local_x = local_x.checked_add(i64::try_from(crop.x).ok()?)?;
+    let local_y = local_y.checked_add(i64::try_from(crop.y).ok()?)?;
+    Some((i32::try_from(local_x).ok()?, i32::try_from(local_y).ok()?))
+}
+
+/// Whether two drawn rectangles share a pixel. A rectangle with no area shares
+/// none, which is the answer that matters where this is used: a rectangle of
+/// no size touches nothing.
+fn overlaps(a: ImageRect, b: ImageRect) -> bool {
+    if a.width == 0 || a.height == 0 || b.width == 0 || b.height == 0 {
+        return false;
+    }
+    let end = |at: i64, span: usize| at.saturating_add(i64::try_from(span).unwrap_or(i64::MAX));
+    a.x < end(b.x, b.width)
+        && b.x < end(a.x, a.width)
+        && a.y < end(b.y, b.height)
+        && b.y < end(a.y, a.height)
+}
+
+/// Whether a popup may hang off this parent — the protocol's requirement that
+/// a child surface "intersect with or be at least partially adjacent to" its
+/// parent, which is one pixel of slack on every side rather than an overlap.
+/// The ADJACENT half is the ordinary case and not a corner: a submenu is hung
+/// off the menu's right edge, touching it and overlapping it by nothing.
+///
+/// Checking it at all is what stops a client placing a menu somewhere it has
+/// no business being. Popups are asked before tiles, so an unanchored one
+/// would take the clicks of whatever window it was dropped over — another
+/// client's, since a rectangle free of its parent is free of everything.
+fn abuts(child: ImageRect, parent: ImageRect) -> bool {
+    overlaps(
+        child,
+        ImageRect {
+            x: parent.x.saturating_sub(1),
+            y: parent.y.saturating_sub(1),
+            width: parent.width.saturating_add(2),
+            height: parent.height.saturating_add(2),
+        },
+    )
 }
 
 fn draw_cross(frame: &mut [u8], width: usize, height: usize, stride: usize, x: i32, y: i32) {
@@ -6013,6 +6339,654 @@ mod tests {
         scene.commit(key, shadowed()).unwrap();
         scene.render(&mut frame, width, height, stride);
         assert_eq!(pixel(&frame, stride, rect.x, rect.y), WINDOW);
+    }
+
+    const MENU: [u8; 4] = [0x0b, 0x0c, 0x0d, 0];
+    const SUBMENU: [u8; 4] = [0x1b, 0x1c, 0x1d, 0];
+
+    fn popup_key(object: u32) -> SurfaceKey {
+        SurfaceKey { client: 4, object }
+    }
+
+    /// One PLAIN window with room round it — no shadow margin, so a popup drawn
+    /// over it shows as its own colour against a single flat parent and the
+    /// placement arithmetic is the only thing under test.
+    fn popup_output() -> (Scene, Vec<u8>, usize, usize, usize, SurfaceKey, Rect) {
+        let key = SurfaceKey {
+            client: 4,
+            object: 9,
+        };
+        let width = 240usize;
+        let height = least_output_height(100);
+        let stride = width.saturating_mul(4);
+        let mut scene = Scene::new();
+        scene.commit(key, surface(WINDOW, width, 100)).unwrap();
+        let rect = scene
+            .tiled_placements(width, height)
+            .first()
+            .map(|placement| placement.rect)
+            .unwrap();
+        (
+            scene,
+            vec![0; stride.saturating_mul(height)],
+            width,
+            height,
+            stride,
+            key,
+            rect,
+        )
+    }
+
+    fn placed(parent: SurfaceKey, x: i32, y: i32, side: usize) -> PopupPlacement {
+        PopupPlacement {
+            parent,
+            x,
+            y,
+            width: i32::try_from(side).unwrap(),
+            height: i32::try_from(side).unwrap(),
+        }
+    }
+
+    /// A popup is drawn OVER the window it belongs to, at the offset its client
+    /// was told, and the window keeps the whole tile underneath: a popup that
+    /// entered the layout would have taken half the screen off its parent.
+    #[test]
+    fn a_popup_floats_over_its_parents_tile_without_joining_the_layout() {
+        let (mut scene, mut frame, width, height, stride, key, rect) = popup_output();
+        let menu = popup_key(20);
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        // The arrangement is untouched: still one placement, still the same
+        // rectangle it had before the menu existed.
+        let placements = scene.tiled_placements(width, height);
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements.first().unwrap().rect, rect);
+
+        scene.render(&mut frame, width, height, stride);
+        // Measured from the parent's TILE, which is where its window geometry
+        // starts — the placement is in the parent's own coordinates.
+        assert_eq!(pixel(&frame, stride, rect.x + 5, rect.y + 7), MENU);
+        assert_eq!(pixel(&frame, stride, rect.x + 14, rect.y + 16), MENU);
+        // And it stops where it said it would, in both directions: the pixel
+        // past each far edge is the parent's own.
+        assert_eq!(pixel(&frame, stride, rect.x + 15, rect.y + 7), WINDOW);
+        assert_eq!(pixel(&frame, stride, rect.x + 5, rect.y + 17), WINDOW);
+        // The corner BEFORE it too, which an offset dropped or applied to the
+        // wrong axis would have covered.
+        assert_eq!(pixel(&frame, stride, rect.x + 4, rect.y + 6), WINDOW);
+    }
+
+    /// A submenu hangs off the menu that opened it, so its placement is
+    /// measured from THAT popup rather than from the tile: the chain is walked
+    /// back and the offsets accumulate.
+    #[test]
+    fn a_popups_own_popup_is_placed_from_the_popup_it_hangs_off() {
+        let (mut scene, mut frame, width, height, stride, key, rect) = popup_output();
+        let menu = popup_key(20);
+        let submenu = popup_key(21);
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        scene
+            .commit_popup(submenu, surface(SUBMENU, 6, 6), placed(menu, 10, 2, 6))
+            .unwrap();
+        scene.render(&mut frame, width, height, stride);
+        // 5 + 10 and 7 + 2: hung off the menu's right edge, where a submenu
+        // goes — touching the menu and overlapping it by nothing, which is the
+        // ADJACENT half of what the protocol allows. A chain that stopped at
+        // the tile would put it at (10, 2), above the menu entirely.
+        assert_eq!(pixel(&frame, stride, rect.x + 15, rect.y + 9), SUBMENU);
+        // The pixel before it is the menu's last column, so the two abut with
+        // nothing between them.
+        assert_eq!(pixel(&frame, stride, rect.x + 14, rect.y + 9), MENU);
+        // A submenu is created after the menu, so its key is higher and it is
+        // drawn LAST. Overlapping them is what makes that observable.
+        let over = popup_key(22);
+        scene
+            .commit_popup(over, surface(SUBMENU, 4, 4), placed(menu, 0, 0, 4))
+            .unwrap();
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, rect.x + 5, rect.y + 7), SUBMENU);
+        // And the pointer reaches the one on TOP, which is the same order read
+        // the other way: whichever is drawn last is what a click lands on, and
+        // the two answers disagreeing is a menu you can see but cannot press.
+        scene.move_pointer(
+            i32::try_from(rect.x + 6).unwrap(),
+            i32::try_from(rect.y + 8).unwrap(),
+            width,
+            height,
+        );
+        assert_eq!(
+            scene.pointer_target(width, height),
+            Some(SurfacePoint {
+                key: over,
+                x: 1,
+                y: 1
+            })
+        );
+    }
+
+    /// The pointer reaches a popup BEFORE the window under it, in the popup's
+    /// own surface coordinates. A menu the click went through would activate
+    /// whatever it is covering.
+    #[test]
+    fn the_pointer_reaches_a_popup_before_the_window_it_covers() {
+        let (mut scene, _frame, width, height, _stride, key, rect) = popup_output();
+        let menu = popup_key(20);
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        scene.move_pointer(
+            i32::try_from(rect.x + 6).unwrap(),
+            i32::try_from(rect.y + 9).unwrap(),
+            width,
+            height,
+        );
+        assert_eq!(
+            scene.pointer_target(width, height),
+            Some(SurfacePoint {
+                key: menu,
+                x: 1,
+                y: 2
+            })
+        );
+        // One pixel off the menu is the window again, and in the WINDOW's
+        // coordinates — the crop's origin added back, as for any tile.
+        scene.move_pointer(-1, -3, width, height);
+        assert_eq!(
+            scene.pointer_target(width, height),
+            Some(SurfacePoint { key, x: 5, y: 6 })
+        );
+    }
+
+    /// A popup goes when it is unmapped, when its parent is destroyed, and when
+    /// its client leaves. The middle one is the one worth having: a menu whose
+    /// window has gone would float over whatever tile the layout gives that
+    /// space to next.
+    #[test]
+    fn a_popup_dies_with_its_unmap_with_its_parent_and_with_its_client() {
+        let (mut scene, mut frame, width, height, stride, key, rect) = popup_output();
+        let menu = popup_key(20);
+        let place = placed(key, 5, 7, 10);
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), place)
+            .unwrap();
+        assert_eq!(scene.popup_placement(menu), Some(place));
+        let held = scene.surface_bytes;
+        assert!(scene.unmap_popup(menu));
+        assert_eq!(scene.popup_placement(menu), None);
+        // Its PIXELS go with it, which nothing on screen would show: a menu
+        // that kept them would spend the scene's byte ceiling on every popup a
+        // client ever opened.
+        assert_eq!(scene.surface_bytes, held.saturating_sub(10 * 10 * 4));
+        // Nothing left to draw either: an unmapped popup is a dismissed menu
+        // rather than a window that might come back to the same tile.
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, rect.x + 5, rect.y + 7), WINDOW);
+        // And a second unmap takes nothing, so it owes no paint.
+        assert!(!scene.unmap_popup(menu));
+
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), place)
+            .unwrap();
+        scene.remove(key);
+        assert_eq!(scene.popup_placement(menu), None);
+
+        let (mut scene, _frame, _width, _height, _stride, key, _rect) = popup_output();
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        scene.remove_client(key.client);
+        assert_eq!(scene.popup_placement(menu), None);
+    }
+
+    /// A popup whose parent is not on screen is not drawn. The parent may be on
+    /// another workspace or stacked away behind a sibling, and a menu drawn
+    /// over the tile that took its place would belong to a window nobody can
+    /// see.
+    #[test]
+    fn a_popup_whose_parent_is_not_on_screen_is_drawn_nowhere() {
+        let (mut scene, mut frame, width, height, stride, key, rect) = popup_output();
+        let menu = popup_key(20);
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, rect.x + 5, rect.y + 7), MENU);
+
+        // STACKED AWAY is the case worth having, because the parent is still
+        // in the arrangement: it has a placement and a rectangle, and only its
+        // `visible` says the sibling in front of it is what that space shows.
+        // A menu drawn over it would be painted across another window.
+        scene.command(Command::SetPresentation(
+            crate::layout::Presentation::Stacked,
+        ));
+        let sibling = SurfaceKey {
+            client: 4,
+            object: 10,
+        };
+        scene.commit(sibling, surface(SUBMENU, 40, 40)).unwrap();
+        let hidden = scene
+            .tiled_placements(width, height)
+            .into_iter()
+            .fold(None, |found, placement| {
+                if placement.key == key {
+                    return Some(placement);
+                }
+                found
+            })
+            .expect("the parent is still in the arrangement");
+        assert!(!hidden.visible, "the parent was not stacked away");
+        scene.render(&mut frame, width, height, stride);
+        assert_ne!(
+            pixel(&frame, stride, hidden.rect.x + 5, hidden.rect.y + 7),
+            MENU
+        );
+
+        // And with the parent's pixels gone entirely — a workspace switch
+        // leaves it in the same state — there is nothing to draw or aim at.
+        let (mut scene, mut frame, width, height, stride, key, rect) = popup_output();
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        scene.unmap(key);
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, rect.x + 5, rect.y + 7), BACKGROUND);
+        scene.move_pointer(
+            i32::try_from(rect.x + 6).unwrap(),
+            i32::try_from(rect.y + 9).unwrap(),
+            width,
+            height,
+        );
+        assert_eq!(scene.pointer_target(width, height), None);
+    }
+
+    /// A menu as a toolkit commits one: an invisible margin all round the part
+    /// a person sees, which the window geometry takes back off.
+    fn shadowed_menu() -> Surface {
+        let side = 18usize;
+        let mut image = surface(SUBMENU, side, side);
+        for y in 4..14usize {
+            for x in 4..14usize {
+                let offset = y.saturating_mul(side).saturating_add(x).saturating_mul(4);
+                image
+                    .pixels
+                    .get_mut(offset..offset.saturating_add(4))
+                    .unwrap()
+                    .copy_from_slice(&MENU);
+            }
+        }
+        image
+    }
+
+    /// What the placement puts at its corner is the WINDOW GEOMETRY's origin,
+    /// not the buffer's. A toolkit draws its menu's shadow outside that
+    /// rectangle, so a popup that ignored the geometry would anchor the
+    /// SHADOW's corner where the client asked the menu to be — the menu itself
+    /// offset down and right by the margin, and clipped away at the far edge
+    /// by a rectangle the positioner sized for the menu alone.
+    #[test]
+    fn a_menus_window_geometry_is_what_its_placement_puts_at_the_corner() {
+        let (mut scene, mut frame, width, height, stride, key, rect) = popup_output();
+        let menu = popup_key(20);
+        scene.set_window_geometry(
+            menu,
+            Some(WindowGeometry {
+                x: 4,
+                y: 4,
+                width: 10,
+                height: 10,
+            }),
+        );
+        scene
+            .commit_popup(menu, shadowed_menu(), placed(key, 5, 7, 10))
+            .unwrap();
+        scene.render(&mut frame, width, height, stride);
+        // The menu's own top-left corner, at the point the client was told.
+        assert_eq!(pixel(&frame, stride, rect.x + 5, rect.y + 7), MENU);
+        // And its far corner, nine pixels on: the whole 10x10 is there rather
+        // than the seven columns a buffer anchored by its shadow would leave.
+        assert_eq!(pixel(&frame, stride, rect.x + 14, rect.y + 16), MENU);
+        // The margin is drawn nowhere: it is not part of the window.
+        assert_eq!(pixel(&frame, stride, rect.x + 4, rect.y + 6), WINDOW);
+        assert_eq!(pixel(&frame, stride, rect.x + 15, rect.y + 17), WINDOW);
+        // The pointer agrees with the paint, and reports the menu in the
+        // SURFACE's coordinates — the crop's origin added back, so a click on
+        // the menu's own corner is (4, 4) to the client and not (0, 0).
+        scene.move_pointer(
+            i32::try_from(rect.x + 5).unwrap(),
+            i32::try_from(rect.y + 7).unwrap(),
+            width,
+            height,
+        );
+        assert_eq!(
+            scene.pointer_target(width, height),
+            Some(SurfacePoint {
+                key: menu,
+                x: 4,
+                y: 4
+            })
+        );
+    }
+
+    /// Stacking is the scene's own order, not the object id's. libwayland
+    /// recycles ids — td retires them with `wl_display.delete_id` precisely so
+    /// a client may — so a submenu opened after its menu can arrive on a LOWER
+    /// id, and one stacked by id would be drawn under the menu it hangs off
+    /// and lose every click to it.
+    #[test]
+    fn a_submenu_is_stacked_over_its_menu_whatever_id_it_got() {
+        let (mut scene, mut frame, width, height, stride, key, rect) = popup_output();
+        let menu = popup_key(20);
+        let submenu = popup_key(19);
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        scene
+            .commit_popup(submenu, surface(SUBMENU, 4, 4), placed(menu, 0, 0, 4))
+            .unwrap();
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, rect.x + 5, rect.y + 7), SUBMENU);
+        scene.move_pointer(
+            i32::try_from(rect.x + 6).unwrap(),
+            i32::try_from(rect.y + 8).unwrap(),
+            width,
+            height,
+        );
+        assert_eq!(
+            scene.pointer_target(width, height).map(|point| point.key),
+            Some(submenu)
+        );
+    }
+
+    /// A menu that repaints keeps its place in the stack. Nothing about a
+    /// buffer says the menu was RAISED — and a toolkit recommits one on every
+    /// hover, to draw the item under the pointer — so an order taken afresh on
+    /// each commit would put the menu over the submenu it opened, which then
+    /// vanishes behind it and stops taking clicks.
+    #[test]
+    fn a_menu_that_repaints_does_not_rise_over_its_own_submenu() {
+        let (mut scene, mut frame, width, height, stride, key, rect) = popup_output();
+        let menu = popup_key(20);
+        let submenu = popup_key(21);
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        scene
+            .commit_popup(submenu, surface(SUBMENU, 4, 4), placed(menu, 0, 0, 4))
+            .unwrap();
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, rect.x + 5, rect.y + 7), SUBMENU);
+        scene.move_pointer(
+            i32::try_from(rect.x + 6).unwrap(),
+            i32::try_from(rect.y + 8).unwrap(),
+            width,
+            height,
+        );
+        assert_eq!(
+            scene.pointer_target(width, height).map(|point| point.key),
+            Some(submenu)
+        );
+    }
+
+    /// A menu that goes takes its submenus and their pixels with it. One left
+    /// behind holds the scene's byte ceiling for a rectangle no chain reaches,
+    /// and comes back the moment anything remaps its parent.
+    #[test]
+    fn an_unmapped_menu_takes_its_submenus_and_their_pixels_with_it() {
+        let (mut scene, _, _, _, _, key, _) = popup_output();
+        let menu = popup_key(20);
+        let submenu = popup_key(21);
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        scene
+            .commit_popup(submenu, surface(SUBMENU, 6, 6), placed(menu, 10, 2, 6))
+            .unwrap();
+        let held = scene.surface_bytes;
+        assert!(scene.unmap_popup(menu));
+        assert_eq!(scene.popup_placement(menu), None);
+        assert_eq!(scene.popup_placement(submenu), None);
+        assert_eq!(
+            scene.surface_bytes,
+            held.saturating_sub(10 * 10 * 4 + 6 * 6 * 4)
+        );
+
+        // And the same from the other end: a WINDOW that unmaps takes the
+        // whole chain hanging off it, not just the menu one level down.
+        let (mut scene, _, _, _, _, key, _) = popup_output();
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        scene
+            .commit_popup(submenu, surface(SUBMENU, 6, 6), placed(menu, 10, 2, 6))
+            .unwrap();
+        let held = scene.surface_bytes;
+        scene.unmap(key);
+        assert_eq!(scene.popup_placement(submenu), None);
+        assert_eq!(
+            scene.surface_bytes,
+            held.saturating_sub(10 * 10 * 4 + 6 * 6 * 4 + 240 * 100 * 4)
+        );
+    }
+
+    /// A menu tall enough to reach into the status bar takes no clicks there.
+    /// The bar is painted after the popups, so those pixels are td's own and
+    /// a popup answering for them would take clicks over something nothing on
+    /// screen says is its. Tiles get that for free — every rect is offset
+    /// below the bar — and popups are placed by their client instead.
+    #[test]
+    fn a_menu_reaching_into_the_bar_takes_no_clicks_there() {
+        let (mut scene, _, width, height, _, key, rect) = popup_output();
+        let menu = popup_key(20);
+        let up = i32::try_from(rect.y).unwrap();
+        // From four pixels into the bar down past the tile's own top, so it
+        // really does overlap its parent and is not refused as adrift.
+        let side = rect.y.saturating_add(10);
+        scene
+            .commit_popup(
+                menu,
+                surface(MENU, side, side),
+                placed(key, 5, -up.saturating_add(4), side),
+            )
+            .unwrap();
+        scene.move_pointer(
+            i32::try_from(rect.x + 6).unwrap(),
+            i32::try_from(BAR_HEIGHT - 1).unwrap(),
+            width,
+            height,
+        );
+        assert_eq!(scene.pointer_target(width, height), None);
+        // One row lower is the menu, so the refusal above is the bar's edge
+        // rather than the menu being missing.
+        scene.move_pointer(0, 1, width, height);
+        assert_eq!(
+            scene.pointer_target(width, height).map(|point| point.key),
+            Some(menu)
+        );
+    }
+
+    /// The protocol requires a popup to intersect its parent or be adjacent to
+    /// it, and td checks it. Without the check a client may drop an
+    /// input-taking rectangle anywhere on screen — and since popups are asked
+    /// BEFORE the tiles, over another client's window, whose clicks it would
+    /// then take.
+    #[test]
+    fn a_menu_adrift_of_its_parent_is_drawn_nowhere_and_takes_no_clicks() {
+        let (mut scene, mut frame, width, height, stride, key, rect) = popup_output();
+        let menu = popup_key(20);
+        let adrift = popup_key(21);
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        // Clear of the menu it names as its parent by thirty pixels.
+        scene
+            .commit_popup(adrift, surface(SUBMENU, 10, 10), placed(menu, 40, 40, 10))
+            .unwrap();
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, rect.x + 46, rect.y + 48), WINDOW);
+        scene.move_pointer(
+            i32::try_from(rect.x + 46).unwrap(),
+            i32::try_from(rect.y + 48).unwrap(),
+            width,
+            height,
+        );
+        assert_eq!(
+            scene.pointer_target(width, height).map(|point| point.key),
+            Some(key)
+        );
+        // Moved back against the menu's edge it is placed as any submenu is,
+        // so what the check refuses is the DISTANCE rather than the shape.
+        scene
+            .commit_popup(adrift, surface(SUBMENU, 10, 10), placed(menu, 10, 0, 10))
+            .unwrap();
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, rect.x + 15, rect.y + 7), SUBMENU);
+    }
+
+    /// A press on a menu establishes a grab on the menu, and the grab has to
+    /// keep resolving to it or `Pointer::reconcile_grab` reads the surface as
+    /// gone: it drops the grab and both button sets, and the RELEASE — which
+    /// is what a toolkit activates a menu item on — is never delivered.
+    #[test]
+    fn a_grab_on_a_menu_resolves_to_the_menu_rather_than_reporting_it_gone() {
+        let (mut scene, _, width, height, _, key, rect) = popup_output();
+        let menu = popup_key(20);
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        scene.move_pointer(
+            i32::try_from(rect.x + 6).unwrap(),
+            i32::try_from(rect.y + 9).unwrap(),
+            width,
+            height,
+        );
+        assert_eq!(
+            scene.pointer_target_for(menu, width, height),
+            Some(SurfacePoint {
+                key: menu,
+                x: 1,
+                y: 2
+            })
+        );
+        // And it keeps resolving with the pointer OUTSIDE the menu, which is
+        // what a drag down a menu and off it is: a grab follows the pointer
+        // wherever it goes.
+        scene.move_pointer(54, 51, width, height);
+        assert_eq!(
+            scene.pointer_target_for(menu, width, height),
+            Some(SurfacePoint {
+                key: menu,
+                x: 55,
+                y: 53
+            })
+        );
+    }
+
+    /// The pointer over a menu is over the WINDOW that opened it. Focus
+    /// follows the mouse, so answering the tile the menu happens to overhang
+    /// would deactivate the window that owns the menu — and a toolkit told its
+    /// window was deactivated closes the menu, so it would shut as the pointer
+    /// moved onto it.
+    #[test]
+    fn hovering_a_menu_is_hovering_the_window_that_opened_it() {
+        let (mut scene, _, width, height, _, key, _) = popup_output();
+        let neighbour = SurfaceKey {
+            client: 4,
+            object: 10,
+        };
+        scene.commit(neighbour, surface(SUBMENU, 40, 40)).unwrap();
+        let placements = scene.tiled_placements(width, height);
+        let rect_of = |wanted: SurfaceKey| {
+            placements
+                .iter()
+                .fold(None, |found, placement| {
+                    if placement.key == wanted {
+                        return Some(placement.rect);
+                    }
+                    found
+                })
+                .unwrap()
+        };
+        let mine = rect_of(key);
+        let theirs = rect_of(neighbour);
+        // Wide enough to reach out of its own tile and into the neighbour's,
+        // which is what a menu bigger than a small window does.
+        let over = theirs.x.saturating_sub(mine.x).saturating_add(20);
+        let menu = popup_key(20);
+        scene
+            .commit_popup(menu, surface(MENU, over, 20), placed(key, 0, 0, over))
+            .unwrap();
+        scene.move_pointer(
+            i32::try_from(theirs.x + 10).unwrap(),
+            i32::try_from(mine.y + 5).unwrap(),
+            width,
+            height,
+        );
+        // The pointer is over the neighbour's TILE and over the menu.
+        assert_eq!(
+            scene.pointer_target(width, height).map(|point| point.key),
+            Some(menu)
+        );
+        assert_eq!(scene.window_at_pointer(width, height), Some(key));
+    }
+
+    /// A chain deeper than the bound is drawn nowhere rather than walked
+    /// forever. The bound is load-bearing: the server does not yet refuse a
+    /// popup parented on its own descendant, so a cycle is constructible and
+    /// this is what contains it.
+    #[test]
+    fn a_chain_of_menus_past_the_bound_is_drawn_nowhere() {
+        let (mut scene, _, width, height, _, key, rect) = popup_output();
+        let mut parent = key;
+        for step in 0..40u32 {
+            let popup = popup_key(100u32.saturating_add(step));
+            scene
+                .commit_popup(popup, surface(MENU, 10, 10), placed(parent, 0, 0, 10))
+                .unwrap();
+            parent = popup;
+        }
+        // The last one is forty deep, past the bound, so nothing places it.
+        scene.move_pointer(
+            i32::try_from(rect.x + 2).unwrap(),
+            i32::try_from(rect.y + 2).unwrap(),
+            width,
+            height,
+        );
+        assert_eq!(
+            scene.pointer_target(width, height).map(|point| point.key),
+            Some(popup_key(131))
+        );
+
+        // A CYCLE terminates too, and by the same bound.
+        let (mut scene, mut frame, width, height, stride, key, rect) = popup_output();
+        let first = popup_key(20);
+        let second = popup_key(21);
+        scene
+            .commit_popup(first, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        scene
+            .commit_popup(second, surface(SUBMENU, 10, 10), placed(first, 0, 0, 10))
+            .unwrap();
+        scene
+            .commit_popup(first, surface(MENU, 10, 10), placed(second, 0, 0, 10))
+            .unwrap();
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, rect.x + 5, rect.y + 7), WINDOW);
+        scene.move_pointer(
+            i32::try_from(rect.x + 6).unwrap(),
+            i32::try_from(rect.y + 8).unwrap(),
+            width,
+            height,
+        );
+        assert_eq!(
+            scene.pointer_target(width, height).map(|point| point.key),
+            Some(key)
+        );
     }
 
     #[test]

@@ -2603,10 +2603,33 @@ Three corrections to the obvious assumptions, all checked in
   `server.rs` rather than trusting this section. Expect the same of any
   other row here that `ui-rolling` reaches first.
 
-And two hard errors that disconnect a client outright: `create_positioner`
-returns `"xdg_positioner is not supported"` and `get_popup` returns
-`"xdg_popup is not supported"`. **A GTK app opening its first menu is
-disconnected today.** `set_window_geometry` WAS the other of the two, parsed
+Those two hard errors are gone. `create_positioner` and `get_popup` returned
+`"xdg_positioner is not supported"` and `"xdg_popup is not supported"`, so **a
+GTK app opening its first menu was disconnected outright.** `ui: a menu is
+placed where its client asked and floated over its window` implements both: the
+positioner's rules are recorded and copied at `get_popup`, the popup is placed
+by anchor, gravity and offset — by its window GEOMETRY's corner, so a toolkit's
+shadow margin does not displace the menu — and it floats over its parent rather
+than joining the layout: drawn above every window, hit-tested before the tiles
+but not over td's own bar, held to the protocol's requirement that it abut its
+parent, stacked by td's own order rather than by an object id libwayland
+recycles, and dying with its parent along with any submenus hanging off it.
+Hovering a menu counts as hovering the window that opened it, since
+focus-follows-mouse deactivating that window is how a toolkit is told to close
+the menu.
+
+What is deliberately still absent is the part that makes a menu *behave*:
+constraint adjustment is recorded and not acted on, so a popup near a screen
+edge runs past it instead of sliding or flipping; `xdg_popup.grab` is accepted
+without td dismissing anything, so a click outside a menu does not close it —
+the client must notice and destroy it; and nothing ever sends
+`xdg_popup.popup_done`, so a menu td stops drawing because its window was
+stacked away is still open as far as its client knows. All are named in
+`td-compositor/DESIGN.md` §3, which also records two conformance gaps that do
+not stop an application working: `invalid_popup_parent` and
+`invalid_positioner` are posted on the xdg_surface rather than on the
+`xdg_wm_base` they belong to, and a cycle of popups is contained by the
+renderer's depth bound rather than refused at `get_popup`. `set_window_geometry` WAS the other of the two, parsed
 and discarded — a true no-op, so CSD margins tiled as dead borders and clicks
 landed offset, though the client survived. That row is closed: `ui: a window
 geometry is the part of a surface td tiles` honours it as a crop on both the
@@ -2623,7 +2646,10 @@ ignores them and what an offset cannot reach.
 | `wl_shm` ARGB blending | **present** | — | verify with a golden |
 | `wl_subcompositor` | absent | **B** | 2,500–4,000 |
 | `wl_data_device_manager` v3, selection | absent | **B** | 4,000–6,000 (DnD later, +~900) |
-| `xdg_positioner` + `get_popup` + grabs + constraint solving | **hard error** | **B/U** | 4,500–7,000 |
+| `xdg_positioner` + `get_popup` | **landed** | — | ~900 — spent. Rules recorded and copied at `get_popup`; anchor, gravity and offset resolved on independent axes; the popup floats over its parent, above the tiles and below td's own bar, hit-tested first (though never over the bar), placed by its window geometry, required to abut its parent, stacked by td's own order, and relative to the parent so a submenu hangs off the menu that opened it. A null parent is refused (td implements no protocol that could supply one later) and a zero-area anchor rectangle is accepted as a point |
+| popup grabs + dismissal | absent | **U** | 1,200–2,000 — `grab` is accepted and does nothing, so a click outside a menu does not close it; `popup_done` is never sent, so a menu td stops drawing stays open to its client |
+| popup protocol conformance (error object, `not_the_topmost_popup`, cycle refusal) | partial | C | 300–600 — the two `xdg_wm_base` errors are posted on the xdg_surface, and a popup cycle is contained by the renderer's bound rather than refused |
+| popup constraint solving (slide/flip/resize) | absent | **U** | 1,500–2,500 — the adjustment bits are recorded; a menu near an edge runs past it |
 | client cursor rendering | **done** (`1c4b7f88`) | — | spent |
 | `zxdg_decoration_manager_v1` (answer `server_side`) | **landed** | **U** | ~500 — spent. Suppresses CSD, fits tiling, and removes most of the geometry problem for cooperating apps. One divergence, deliberate: `destroy` asks the compositor to stop decorating, and td keeps drawing the band because it is layout rather than a decoration td can withdraw |
 | `zxdg_exporter_v2`/`importer_v2` | absent | **portal-blocking** | 1,200–2,000 |
@@ -2983,7 +3009,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 16 | `td-portal` personality: Request/Session core, Settings, Account | GTK settings call works |
 | 17 | Wayland A: `set_window_geometry`, decoration manager, ARGB golden, single-pixel-buffer; **the GDK and llvmpipe experiments run and their answers land in DESIGN.md** | none |
 | 18 | Wayland B: `wl_subcompositor` | none |
-| 19 | Wayland C: `xdg_positioner`/`xdg_popup`/grabs | menus work |
+| 19 | Wayland C: `xdg_positioner`/`xdg_popup` LANDED — grabs and constraint solving are what is left of this rung | a menu appears where its client asked; it does not yet close on a click outside or slide clear of a screen edge |
 | 20 | clipboard (data-device v3) — client cursors LANDED separately (`1c4b7f88`), so this rung is the clipboard alone | paste, and the I-beam already arrived |
 | 21 | xdg-foreign + private portal socket + dialog placement | modal portal window |
 | 22 | FileChooser, OpenURI, Screenshot, Notification | file dialog visible |

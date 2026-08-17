@@ -10,8 +10,8 @@ use crate::pointer::{
     PointerTarget, RoutedPointerFrame,
 };
 use crate::scene::{
-    BandPress, CursorRequest, Fraction, Scene, SharedInputRegion, Surface, SurfaceKey,
-    WindowGeometry,
+    BandPress, CursorRequest, Fraction, PopupPlacement, Scene, SharedInputRegion, Surface,
+    SurfaceKey, WindowGeometry,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -323,6 +323,57 @@ impl Runtime {
         }
         if aimed {
             return self.refresh_focus();
+        }
+        Ok(())
+    }
+
+    /// A popup's pixels and where they go, applied together for `apply_commit`'s
+    /// reason. Settling rather than repainting: the LAYOUT does not change — a
+    /// popup is in no arrangement — but a menu appearing changes what the
+    /// pointer is over, and `settle` is what re-answers that and publishes it.
+    pub fn commit_popup(
+        &mut self,
+        key: SurfaceKey,
+        surface: Option<Surface>,
+        placement: PopupPlacement,
+        input_region: Option<Option<SharedInputRegion>>,
+        geometry: Option<WindowGeometry>,
+    ) -> Result<(), String> {
+        let mut painted = false;
+        if let Some(surface) = surface {
+            self.scene.commit_popup(key, surface, placement)?;
+            painted = true;
+        }
+        let mut aimed = false;
+        if let Some(input_region) = input_region {
+            aimed |= self.scene.set_input_region(key, input_region);
+        }
+        // A menu's geometry is what a toolkit draws its SHADOW outside, so a
+        // popup that ignored one would anchor the shadow's corner at the
+        // positioner's point and clip the menu itself away at the far edge.
+        if geometry.is_some() {
+            painted |= self.crop_shows(key, geometry);
+        }
+        if painted {
+            return self.settle(false);
+        }
+        if aimed {
+            return self.refresh_focus();
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn popup_placement(&self, key: SurfaceKey) -> Option<PopupPlacement> {
+        self.scene.popup_placement(key)
+    }
+
+    /// A popup taken down — by a null attach, by its role object going away, or
+    /// by the surface being destroyed. Settles for the reason above: the
+    /// pointer may have been over it.
+    pub fn unmap_popup(&mut self, key: SurfaceKey) -> Result<(), String> {
+        if self.scene.unmap_popup(key) {
+            return self.settle(false);
         }
         Ok(())
     }

@@ -2,10 +2,11 @@ use crate::configure::{Configure, ConfigureTracker, ToplevelState, ViewStatus};
 use crate::keyboard::{KeyboardEvent, KeyboardSnapshot, XKB_KEYMAP};
 use crate::layout::ViewLayout;
 use crate::pointer::{PointerEvent, PointerSnapshot, RoutedPointerFrame};
+use crate::positioner::{Anchor, Gravity, Positioner, Rect as PositionerRect};
 use crate::runtime::{KeyboardDelivery, KeyboardSubscriptionStop, Runtime, SubscriptionStop};
 use crate::scene::{
-    CursorRequest, InputRegion, SharedInputRegion, Surface, SurfaceKey, WindowGeometry,
-    MAX_CURSOR_DIMENSION, MAX_INPUT_REGION_OPERATIONS, SHM_ARGB8888, SHM_XRGB8888,
+    CursorRequest, InputRegion, PopupPlacement, SharedInputRegion, Surface, SurfaceKey,
+    WindowGeometry, MAX_CURSOR_DIMENSION, MAX_INPUT_REGION_OPERATIONS, SHM_ARGB8888, SHM_XRGB8888,
 };
 #[cfg(test)]
 use crate::scene::{GAP, TITLE_HEIGHT};
@@ -43,6 +44,14 @@ const WL_DISPLAY_ERROR_IMPLEMENTATION: u32 = 3;
 /// message beside it, which spells the same thing out.
 const XDG_SURFACE_ERROR_NOT_CONSTRUCTED: u32 = 1;
 const XDG_SURFACE_ERROR_INVALID_SIZE: u32 = 5;
+/// A rule a popup cannot be placed by. `invalid_input` is the positioner's own
+/// error and is raised ON the positioner, since that is the object the client
+/// got wrong; the two `xdg_wm_base` codes belong to the shell object, and both
+/// are about the `get_popup` that used one rather than about the positioner.
+const XDG_POSITIONER_ERROR_INVALID_INPUT: u32 = 0;
+const XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT: u32 = 3;
+const XDG_WM_BASE_ERROR_INVALID_POSITIONER: u32 = 5;
+const XDG_POPUP_CONFIGURE: u16 = 0;
 const WL_SEAT_ERROR_MISSING_CAPABILITY: u32 = 0;
 const WL_POINTER_ERROR_ROLE: u32 = 0;
 /// `wl_pointer.axis_source`'s `wheel`. The other three sources — finger,
@@ -141,6 +150,30 @@ enum PendingBuffer {
     },
 }
 
+/// The role object an xdg_surface has been given. It is the whole of what
+/// "constructed" means for one — the protocol refuses every other request
+/// until a role is assigned — and the two arms are placed by entirely
+/// different rules: a toplevel is tiled by td, a popup is placed by the
+/// client's own positioner. One field rather than two `Option`s, so "has a
+/// role object" is one question with one answer.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RoleObject {
+    Toplevel(u32),
+    Popup(u32),
+}
+
+impl RoleObject {
+    /// What a diagnostic calls it. The protocol names the interface in its own
+    /// errors, and a client told "before its xdg_toplevel" when it destroyed a
+    /// popup has been told about the wrong object.
+    fn interface(self) -> &'static str {
+        match self {
+            RoleObject::Toplevel(_) => "xdg_toplevel",
+            RoleObject::Popup(_) => "xdg_popup",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum SurfaceRole {
     Xdg(u32),
@@ -182,7 +215,7 @@ enum Object {
     XdgWmBase,
     XdgSurface {
         surface: u32,
-        toplevel: Option<u32>,
+        role_object: Option<RoleObject>,
         configure: Arc<Mutex<ConfigureTracker>>,
         /// The window geometry a client has asked for and no commit has applied
         /// yet. Double-buffered because the protocol says so, and held on the
@@ -192,6 +225,21 @@ enum Object {
         /// took effect is the scene's, which is what draws and hit-tests with
         /// it.
         pending_geometry: Option<WindowGeometry>,
+    },
+    /// The rules for a popup that has not been placed yet. Plain data: the
+    /// protocol says a compositor COPIES them at `get_popup`, so this object is
+    /// free to be reused or destroyed straight afterwards and nothing that has
+    /// already been placed may look at it again.
+    Positioner(Positioner),
+    XdgPopup {
+        xdg_surface: u32,
+        /// The PARENT's wl_surface, which is what the scene needs — a placement
+        /// is measured from that surface's window geometry, and the parent's
+        /// own xdg_surface is only how the client named it.
+        parent: u32,
+        /// Where the rules put it, resolved once at `get_popup` and copied here
+        /// for the reason above.
+        rect: PositionerRect,
     },
     XdgToplevel {
         xdg_surface: u32,
@@ -393,6 +441,40 @@ fn send_initial_configure(
     let sent = send_configure(outbound, registration, configure);
     drop(tracker);
     sent
+}
+
+/// A popup's initial configure: where it was placed and how big, then the
+/// xdg_surface serial that makes the pair one atomic configuration. The
+/// rectangle rather than a size alone is what distinguishes this from a
+/// toplevel's — a popup is placed by its client's own rules, and the client is
+/// told the answer it will be drawn at.
+fn send_popup_configure(
+    outbound: &Arc<Mutex<Outbound>>,
+    xdg_surface: u32,
+    popup: u32,
+    rect: PositionerRect,
+    tracker: &Arc<Mutex<ConfigureTracker>>,
+) -> Result<(), String> {
+    let configure = tracker
+        .lock()
+        .map_err(|_| "XDG configure tracker lock poisoned".to_string())?
+        .initial(next_serial())?;
+    let mut placed = wire::Builder::new();
+    placed.i32(rect.x);
+    placed.i32(rect.y);
+    placed.i32(rect.width);
+    placed.i32(rect.height);
+    let placed = placed.message(popup, XDG_POPUP_CONFIGURE)?;
+
+    let mut surface = wire::Builder::new();
+    surface.u32(configure.serial);
+    let surface = surface.message(xdg_surface, 0)?;
+
+    let mut outbound = outbound
+        .lock()
+        .map_err(|_| "Wayland outbound lock poisoned".to_string())?;
+    outbound.send(&placed)?;
+    outbound.send(&surface)
 }
 
 fn view_status(
@@ -1209,6 +1291,23 @@ impl Client {
         }
     }
 
+    /// Take a popup off the screen. Named by its wl_surface, which is what the
+    /// scene knows it by.
+    /// Clears the surface's bytes as `unmap_surface` does. A popup's pixels
+    /// are the client's ceiling like any other, and a menu that gave them back
+    /// to the scene and not to the accounting would have a client opening and
+    /// dismissing menus disconnected for buffers td is not holding.
+    fn unmap_popup(&mut self, surface: u32) -> Result<(), String> {
+        self.clear_surface_bytes(surface);
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .unmap_popup(SurfaceKey {
+                client: self.id,
+                object: surface,
+            })
+    }
+
     fn fail_protocol(&mut self, code: u32, error: &str) -> Result<(), String> {
         self.protocol_error_code = code;
         Err(error.into())
@@ -1676,6 +1775,9 @@ impl Client {
         let cursor = state.role == Some(SurfaceRole::Cursor);
         let mut xdg_configure = None;
         let mut geometry = None;
+        // Where this surface goes if it is a POPUP, which is what tells the
+        // buffer path below to float it over its parent rather than tile it.
+        let mut popup: Option<PopupPlacement> = None;
         if let Some(SurfaceRole::Xdg(role)) = state.role {
             let xdg = self
                 .objects
@@ -1683,15 +1785,15 @@ impl Client {
                 .cloned()
                 .ok_or_else(|| format!("wl_surface {id} has a destroyed xdg_surface role"))?;
             let Object::XdgSurface {
-                toplevel,
+                role_object,
                 configure,
                 ..
             } = xdg
             else {
                 return Err(format!("wl_surface {id} has a non-XDG role object"));
             };
-            let toplevel =
-                toplevel.ok_or_else(|| format!("xdg_surface {role} has no role object"))?;
+            let role_object =
+                role_object.ok_or_else(|| format!("xdg_surface {role} has no role object"))?;
             xdg_configure = Some(Arc::clone(&configure));
             let initial_sent = configure
                 .lock()
@@ -1703,14 +1805,30 @@ impl Client {
                         "xdg_surface {role} attached a buffer before its initial configure"
                     ));
                 }
-                send_initial_configure(
-                    &self.outbound,
-                    &ConfigureRegistration {
-                        xdg_surface: role,
-                        toplevel,
-                        tracker: Arc::clone(&configure),
-                    },
-                )?;
+                match role_object {
+                    RoleObject::Toplevel(toplevel) => send_initial_configure(
+                        &self.outbound,
+                        &ConfigureRegistration {
+                            xdg_surface: role,
+                            toplevel,
+                            tracker: Arc::clone(&configure),
+                        },
+                    )?,
+                    // A popup is told WHERE as well as how big, and is not
+                    // registered for layout updates: it is in no arrangement,
+                    // so the publisher that answers "what tile do you have
+                    // now" has nothing to say about one.
+                    RoleObject::Popup(popup_object) => {
+                        let Some(Object::XdgPopup { rect, .. }) =
+                            self.objects.get(&popup_object).cloned()
+                        else {
+                            return Err(format!(
+                                "xdg_surface {role} names a missing xdg_popup {popup_object}"
+                            ));
+                        };
+                        send_popup_configure(&self.outbound, role, popup_object, rect, &configure)?;
+                    }
+                }
             } else if attaching_buffer
                 && !configure
                     .lock()
@@ -1720,6 +1838,25 @@ impl Client {
                 return Err(format!(
                     "xdg_surface {role} attached a buffer before acknowledging configure"
                 ));
+            }
+            if let RoleObject::Popup(popup_object) = role_object {
+                let Some(Object::XdgPopup { parent, rect, .. }) =
+                    self.objects.get(&popup_object).cloned()
+                else {
+                    return Err(format!(
+                        "xdg_surface {role} names a missing xdg_popup {popup_object}"
+                    ));
+                };
+                popup = Some(PopupPlacement {
+                    parent: SurfaceKey {
+                        client: self.id,
+                        object: parent,
+                    },
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                });
             }
             // Taken after the refusals above and pushed after the pixels below,
             // so it is spent only by a commit that is going to happen and
@@ -1800,6 +1937,53 @@ impl Client {
                         }
                     }
                 }
+            } else if let Some(placement) = popup {
+                // A popup is neither tiled nor counted against the layout: it
+                // floats over its parent where the client's own rules put it.
+                // Its BYTES are still the client's, since the ceiling is about
+                // what one connection can make td hold rather than about
+                // windows.
+                match pending {
+                    PendingBuffer::Detach { .. } => {
+                        if was_mapped {
+                            if let Some(configure) = xdg_configure {
+                                configure
+                                    .lock()
+                                    .map_err(|_| "XDG configure tracker lock poisoned".to_string())?
+                                    .unmap()?;
+                            }
+                        }
+                        self.unmap_popup(id)?;
+                    }
+                    PendingBuffer::Buffer { object, buffer, .. } => {
+                        let surface_bytes = buffer
+                            .width
+                            .checked_mul(buffer.height)
+                            .and_then(|pixels| pixels.checked_mul(4))
+                            .ok_or_else(|| "client surface byte count overflow".to_string())?;
+                        let prior = self.mapped_bytes.get(&id).copied().unwrap_or(0);
+                        let next = client_surface_total(self.mapped_total, prior, surface_bytes)?;
+                        let surface = Self::copy_buffer(&buffer)?;
+                        self.runtime
+                            .lock()
+                            .map_err(|_| "runtime lock poisoned".to_string())?
+                            .commit_popup(
+                                key,
+                                Some(surface),
+                                placement,
+                                Some(input_region.clone()),
+                                geometry,
+                            )?;
+                        self.mapped_bytes.insert(id, surface_bytes);
+                        self.mapped_total = next;
+                        if matches!(
+                            self.objects.get(&object),
+                            Some(Object::Buffer(current)) if current.serial == buffer.serial
+                        ) {
+                            self.send(object, 0, wire::Builder::new())?;
+                        }
+                    }
+                }
             } else {
                 // A TILE ignores the offset, and that is the answer rather
                 // than an omission: the tile fixes where the window is and the
@@ -1858,7 +2042,22 @@ impl Client {
                     }
                 }
             }
-        } else if (input_region_changed || geometry.is_some()) && !cursor {
+        } else if let (Some(placement), true) = (popup, input_region_changed || geometry.is_some())
+        {
+            self.runtime
+                .lock()
+                .map_err(|_| "runtime lock poisoned".to_string())?
+                .commit_popup(
+                    SurfaceKey {
+                        client: self.id,
+                        object: id,
+                    },
+                    None,
+                    placement,
+                    input_region_changed.then(|| input_region.clone()),
+                    geometry,
+                )?;
+        } else if (input_region_changed || geometry.is_some()) && !cursor && popup.is_none() {
             // No buffer, so the state this commit carries is whichever of the
             // two arrived — the geometry alone being the ordinary opening
             // sequence, set on the empty commit before the first frame.
@@ -2349,7 +2548,7 @@ impl Client {
                         id,
                         Object::XdgSurface {
                             surface,
-                            toplevel: None,
+                            role_object: None,
                             configure: Arc::new(Mutex::new(ConfigureTracker::new())),
                             pending_geometry: None,
                         },
@@ -2362,7 +2561,14 @@ impl Client {
                     args.u32()?;
                     args.finish()
                 }
-                1 => Err("xdg_positioner is not supported".into()),
+                // create_positioner. Empty: a positioner is INCOMPLETE until
+                // the client sets a size and an anchor rectangle, and
+                // `get_popup` is where that is checked.
+                1 => {
+                    let id = args.u32()?;
+                    args.finish()?;
+                    self.insert(id, Object::Positioner(Positioner::default()))
+                }
                 _ => Err(format!(
                     "unsupported xdg_wm_base request {}",
                     message.opcode
@@ -2370,16 +2576,17 @@ impl Client {
             },
             Object::XdgSurface {
                 surface,
-                toplevel,
+                role_object,
                 configure,
                 pending_geometry,
             } => match message.opcode {
                 0 => {
                     args.finish()?;
-                    if toplevel.is_some() {
+                    if let Some(role_object) = role_object {
                         return Err(format!(
-                            "xdg_surface {} was destroyed before its xdg_toplevel",
-                            message.object
+                            "xdg_surface {} was destroyed before its {}",
+                            message.object,
+                            role_object.interface()
                         ));
                     }
                     self.remove_object(message.object)?;
@@ -2404,7 +2611,7 @@ impl Client {
                 1 => {
                     let new_toplevel = args.u32()?;
                     args.finish()?;
-                    if toplevel.is_some() {
+                    if role_object.is_some() {
                         return Err(format!(
                             "xdg_surface {} already has a role object",
                             message.object
@@ -2447,7 +2654,7 @@ impl Client {
                         message.object,
                         Object::XdgSurface {
                             surface,
-                            toplevel: Some(new_toplevel),
+                            role_object: Some(RoleObject::Toplevel(new_toplevel)),
                             configure,
                             // Necessarily None — a geometry before this request
                             // is refused — and carried rather than written as
@@ -2475,7 +2682,7 @@ impl Client {
                     // before the arguments are judged, because a client with no
                     // role has told td nothing about a window yet and that is
                     // the more useful half of the diagnosis.
-                    if toplevel.is_none() {
+                    if role_object.is_none() {
                         return self.fail_protocol(
                             XDG_SURFACE_ERROR_NOT_CONSTRUCTED,
                             &format!(
@@ -2521,11 +2728,251 @@ impl Client {
                         .wake_layout(self.id);
                     Ok(())
                 }
-                2 => Err("xdg_popup is not supported".into()),
+                // get_popup(id, parent, positioner)
+                2 => {
+                    let id = args.u32()?;
+                    let parent = args.u32()?;
+                    let positioner = args.u32()?;
+                    args.finish()?;
+                    if role_object.is_some() {
+                        return Err(format!(
+                            "xdg_surface {} already has a role object",
+                            message.object
+                        ));
+                    }
+                    if !matches!(self.objects.get(&surface), Some(Object::Surface(_))) {
+                        return Err(format!(
+                            "xdg_surface refers to missing wl_surface {surface}"
+                        ));
+                    }
+                    // A null parent is allowed by the protocol only so that
+                    // another protocol can supply one before the first commit.
+                    // td implements no such protocol, so a popup that arrived
+                    // this way could never be placed.
+                    let Some(Object::XdgSurface {
+                        surface: parent_surface,
+                        role_object: parent_role,
+                        ..
+                    }) = self.objects.get(&parent).cloned()
+                    else {
+                        return self.fail_protocol(
+                            XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT,
+                            &format!(
+                                "xdg_popup {id} names {parent}, which is no xdg_surface of this client"
+                            ),
+                        );
+                    };
+                    // "The parent of an xdg_popup must be mapped before the
+                    // xdg_popup itself" — and a parent with no role object at
+                    // all cannot have been.
+                    if parent_role.is_none() {
+                        return self.fail_protocol(
+                            XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT,
+                            &format!("xdg_popup {id} names unconstructed xdg_surface {parent}"),
+                        );
+                    }
+                    let Some(Object::Positioner(rules)) = self.objects.get(&positioner).cloned()
+                    else {
+                        return Err(format!(
+                            "xdg_popup {id} names {positioner}, which is no xdg_positioner"
+                        ));
+                    };
+                    // The rules are COPIED here, as the protocol requires: the
+                    // client may reuse or destroy the positioner immediately,
+                    // and nothing placed by it may move afterwards.
+                    let Some(rect) = rules.resolve() else {
+                        return self.fail_protocol(
+                            XDG_WM_BASE_ERROR_INVALID_POSITIONER,
+                            &format!(
+                                "xdg_popup {id} was given an incomplete xdg_positioner {positioner}"
+                            ),
+                        );
+                    };
+                    self.insert(
+                        id,
+                        Object::XdgPopup {
+                            xdg_surface: message.object,
+                            parent: parent_surface,
+                            rect,
+                        },
+                    )?;
+                    self.objects.insert(
+                        message.object,
+                        Object::XdgSurface {
+                            surface,
+                            role_object: Some(RoleObject::Popup(id)),
+                            configure,
+                            // Carried rather than cleared, for `get_toplevel`'s
+                            // reason: this write-back says nothing about state
+                            // it does not touch.
+                            pending_geometry,
+                        },
+                    );
+                    Ok(())
+                }
                 _ => Err(format!(
                     "unsupported xdg_surface request {}",
                     message.opcode
                 )),
+            },
+            Object::Positioner(mut positioner) => match message.opcode {
+                0 => {
+                    args.finish()?;
+                    self.remove_object(message.object)
+                }
+                // set_size
+                1 => {
+                    let width = args.i32()?;
+                    let height = args.i32()?;
+                    args.finish()?;
+                    if width <= 0 || height <= 0 {
+                        return self.fail_protocol(
+                            XDG_POSITIONER_ERROR_INVALID_INPUT,
+                            &format!(
+                                "xdg_positioner {} size {width}x{height} is not positive",
+                                message.object
+                            ),
+                        );
+                    }
+                    positioner.set_size(width, height);
+                    self.objects
+                        .insert(message.object, Object::Positioner(positioner));
+                    Ok(())
+                }
+                // set_anchor_rect. A zero-area rectangle is ACCEPTED and names
+                // a point; only a negative side is a mistake, which is the one
+                // the protocol gives an error for.
+                2 => {
+                    let x = args.i32()?;
+                    let y = args.i32()?;
+                    let width = args.i32()?;
+                    let height = args.i32()?;
+                    args.finish()?;
+                    if width < 0 || height < 0 {
+                        return self.fail_protocol(
+                            XDG_POSITIONER_ERROR_INVALID_INPUT,
+                            &format!(
+                                "xdg_positioner {} anchor rectangle {width}x{height} is negative",
+                                message.object
+                            ),
+                        );
+                    }
+                    positioner.set_anchor_rect(PositionerRect {
+                        x,
+                        y,
+                        width,
+                        height,
+                    });
+                    self.objects
+                        .insert(message.object, Object::Positioner(positioner));
+                    Ok(())
+                }
+                // set_anchor
+                3 => {
+                    let anchor = args.u32()?;
+                    args.finish()?;
+                    let Some(anchor) = Anchor::from_wire(anchor) else {
+                        return self.fail_protocol(
+                            XDG_POSITIONER_ERROR_INVALID_INPUT,
+                            &format!(
+                                "xdg_positioner {} anchor {anchor} is not one of the nine",
+                                message.object
+                            ),
+                        );
+                    };
+                    positioner.set_anchor(anchor);
+                    self.objects
+                        .insert(message.object, Object::Positioner(positioner));
+                    Ok(())
+                }
+                // set_gravity
+                4 => {
+                    let gravity = args.u32()?;
+                    args.finish()?;
+                    let Some(gravity) = Gravity::from_wire(gravity) else {
+                        return self.fail_protocol(
+                            XDG_POSITIONER_ERROR_INVALID_INPUT,
+                            &format!(
+                                "xdg_positioner {} gravity {gravity} is not one of the nine",
+                                message.object
+                            ),
+                        );
+                    };
+                    positioner.set_gravity(gravity);
+                    self.objects
+                        .insert(message.object, Object::Positioner(positioner));
+                    Ok(())
+                }
+                // set_constraint_adjustment. Recorded and not yet acted on:
+                // every bit is permission for td to move a popup that does not
+                // fit, and td does not move one yet.
+                5 => {
+                    let adjustment = args.u32()?;
+                    args.finish()?;
+                    positioner.set_constraint_adjustment(adjustment);
+                    self.objects
+                        .insert(message.object, Object::Positioner(positioner));
+                    Ok(())
+                }
+                // set_offset
+                6 => {
+                    let x = args.i32()?;
+                    let y = args.i32()?;
+                    args.finish()?;
+                    positioner.set_offset((x, y));
+                    self.objects
+                        .insert(message.object, Object::Positioner(positioner));
+                    Ok(())
+                }
+                _ => Err(format!(
+                    "unsupported xdg_positioner request {}",
+                    message.opcode
+                )),
+            },
+            Object::XdgPopup { xdg_surface, .. } => match message.opcode {
+                0 => {
+                    args.finish()?;
+                    let Some(Object::XdgSurface { surface, .. }) =
+                        self.objects.get(&xdg_surface).cloned()
+                    else {
+                        return Err(format!(
+                            "xdg_popup {} lost xdg_surface {xdg_surface}",
+                            message.object
+                        ));
+                    };
+                    self.remove_object(message.object)?;
+                    self.unmap_popup(surface)?;
+                    let Some(Object::XdgSurface {
+                        role_object,
+                        configure,
+                        ..
+                    }) = self.objects.get_mut(&xdg_surface)
+                    else {
+                        return Err(format!(
+                            "xdg_popup {} lost xdg_surface {xdg_surface}",
+                            message.object
+                        ));
+                    };
+                    // The xdg_surface outlives its role object and may be given
+                    // another, exactly as a destroyed toplevel leaves one — and
+                    // the tracker is replaced for that reason rather than
+                    // tidiness. One left initialised says the surface has
+                    // already had its first configure, so the NEXT role would
+                    // never be sent one and a client waiting on it hangs with
+                    // no window.
+                    *role_object = None;
+                    *configure = Arc::new(Mutex::new(ConfigureTracker::new()));
+                    Ok(())
+                }
+                // grab. Accepted and not yet acted on: td dismisses no popup of
+                // its own, so a grab it recorded would be a promise about
+                // keyboard and pointer routing that nothing here keeps.
+                1 => {
+                    args.u32()?;
+                    args.u32()?;
+                    args.finish()
+                }
+                _ => Err(format!("unsupported xdg_popup request {}", message.opcode)),
             },
             Object::XdgToplevel {
                 xdg_surface,
@@ -2576,7 +3023,7 @@ impl Client {
                         xdg_surface,
                         Object::XdgSurface {
                             surface,
-                            toplevel: None,
+                            role_object: None,
                             configure: Arc::new(Mutex::new(ConfigureTracker::new())),
                             // Carried where the tracker is replaced: a geometry
                             // is the xdg_surface's for as long as the object
@@ -5293,7 +5740,7 @@ mod tests {
                 9,
                 Object::XdgSurface {
                     surface: 5,
-                    toplevel: Some(10),
+                    role_object: Some(RoleObject::Toplevel(10)),
                     configure: Arc::new(Mutex::new(ConfigureTracker::new())),
                     pending_geometry: None,
                 },
@@ -5379,7 +5826,7 @@ mod tests {
                 9,
                 Object::XdgSurface {
                     surface: 5,
-                    toplevel: Some(10),
+                    role_object: Some(RoleObject::Toplevel(10)),
                     configure: Arc::new(Mutex::new(ConfigureTracker::new())),
                     pending_geometry: None,
                 },
@@ -6154,7 +6601,7 @@ mod tests {
             9,
             Object::XdgSurface {
                 surface: 5,
-                toplevel: None,
+                role_object: None,
                 configure: Arc::new(Mutex::new(ConfigureTracker::new())),
                 pending_geometry: None,
             },
@@ -6305,7 +6752,7 @@ mod tests {
                 9,
                 Object::XdgSurface {
                     surface: 5,
-                    toplevel: Some(10),
+                    role_object: Some(RoleObject::Toplevel(10)),
                     configure: Arc::clone(&tracker),
                     pending_geometry: None,
                 },
@@ -6563,7 +7010,7 @@ mod tests {
                 9,
                 Object::XdgSurface {
                     surface: 5,
-                    toplevel: Some(10),
+                    role_object: Some(RoleObject::Toplevel(10)),
                     configure: Arc::new(Mutex::new(configure)),
                     pending_geometry: None,
                 },
@@ -6626,7 +7073,7 @@ mod tests {
         assert!(!frame.as_chunks::<4>().0.contains(&pixels));
         let reset = match client.objects.get(&9) {
             Some(Object::XdgSurface {
-                toplevel: None,
+                role_object: None,
                 configure,
                 ..
             }) => Some(Arc::clone(configure)),
@@ -6656,7 +7103,7 @@ mod tests {
             .unwrap();
         let configured = match client.objects.get(&9) {
             Some(Object::XdgSurface {
-                toplevel: Some(11),
+                role_object: Some(RoleObject::Toplevel(11)),
                 configure,
                 ..
             }) => Some(Arc::clone(configure)),
@@ -7509,7 +7956,7 @@ mod tests {
                 9,
                 Object::XdgSurface {
                     surface: 5,
-                    toplevel: Some(10),
+                    role_object: Some(RoleObject::Toplevel(10)),
                     configure: Arc::new(Mutex::new(configure)),
                     pending_geometry: None,
                 },
@@ -7574,6 +8021,460 @@ mod tests {
 
         fs::remove_file(framebuffer_path).unwrap();
         fs::remove_file(pool_path).unwrap();
+    }
+
+    /// `xdg_wm_base` at 12, a positioner at 30, and a second wl_surface (6)
+    /// with its own xdg_surface (13) for the popup to be. The fixture's own
+    /// xdg_surface 9 is the parent, and it already has a toplevel.
+    fn popup_fixture(stem: &str) -> (Client, UnixStream, Arc<Mutex<Runtime>>, PathBuf) {
+        let (mut client, peer, runtime, framebuffer_path) = toplevel_fixture(stem);
+        client.insert(12, Object::XdgWmBase).unwrap();
+        client
+            .insert(6, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        // Through the WIRE rather than inserted, so the wl_surface's own role
+        // is set the way a client sets it — a surface with no role skips the
+        // whole XDG path at commit, and the popup would never be configured.
+        let mut xdg_surface = wire::Builder::new();
+        xdg_surface.u32(13);
+        xdg_surface.u32(6);
+        client
+            .dispatch(request(12, 2, xdg_surface).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut create = wire::Builder::new();
+        create.u32(30);
+        client
+            .dispatch(request(12, 1, create).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        (client, peer, runtime, framebuffer_path)
+    }
+
+    /// The two rules a positioner is INCOMPLETE without, plus an anchor and a
+    /// gravity: a menu anchored to the bottom-left of a 4x6 item and dropping
+    /// down-right from it.
+    fn menu_rules(client: &mut Client) {
+        let mut size = wire::Builder::new();
+        size.i32(40);
+        size.i32(20);
+        client
+            .dispatch(request(30, 1, size).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut anchor_rect = wire::Builder::new();
+        for value in [10, 20, 4, 6] {
+            anchor_rect.i32(value);
+        }
+        client
+            .dispatch(request(30, 2, anchor_rect).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut anchor = wire::Builder::new();
+        anchor.u32(6);
+        client
+            .dispatch(request(30, 3, anchor).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut gravity = wire::Builder::new();
+        gravity.u32(8);
+        client
+            .dispatch(request(30, 4, gravity).unwrap(), &mut VecDeque::new())
+            .unwrap();
+    }
+
+    /// `get_popup(id, parent, positioner)` on the xdg_surface at 13.
+    fn get_popup(client: &mut Client, id: u32, parent: u32, positioner: u32) -> Result<(), String> {
+        let mut request_body = wire::Builder::new();
+        request_body.u32(id);
+        request_body.u32(parent);
+        request_body.u32(positioner);
+        client.dispatch(request(13, 2, request_body).unwrap(), &mut VecDeque::new())
+    }
+
+    /// A client opening a menu is no longer disconnected: the positioner's
+    /// rules place it, and the placement is what the client is told in
+    /// `xdg_popup.configure` before the `xdg_surface.configure` that makes the
+    /// pair one configuration.
+    #[test]
+    fn a_popup_is_placed_by_its_positioner_and_told_where() {
+        let (mut client, mut peer, _runtime, framebuffer_path) = popup_fixture("popup-place");
+        menu_rules(&mut client);
+        get_popup(&mut client, 14, 9, 30).unwrap();
+
+        // Double-buffered like every other xdg role: the request creates the
+        // object and the wl_surface's own commit is what configures it.
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        let messages = receive_messages(&mut peer, 2);
+        let placed = messages.first().unwrap();
+        assert_eq!((placed.object, placed.opcode), (14, XDG_POPUP_CONFIGURE));
+        let mut payload = wire::Cursor::new(&placed.payload);
+        // Anchored bottom-left of (10, 20, 4x6) is (10, 26); a bottom-right
+        // gravity hangs the surface off that point by nothing.
+        assert_eq!(payload.i32().unwrap(), 10);
+        assert_eq!(payload.i32().unwrap(), 26);
+        assert_eq!(payload.i32().unwrap(), 40);
+        assert_eq!(payload.i32().unwrap(), 20);
+        payload.finish().unwrap();
+        // The xdg_surface serial comes SECOND: it is what makes the placement
+        // above one atomic configuration rather than a size on its own.
+        let serial = messages.get(1).unwrap();
+        assert_eq!((serial.object, serial.opcode), (13, 0));
+
+        // The positioner may be destroyed straight after, because the rules
+        // were COPIED: the popup keeps where it was put.
+        client
+            .dispatch(
+                request(30, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(matches!(
+            client.objects.get(&14),
+            Some(Object::XdgPopup { rect, parent: 5, .. })
+                if *rect == PositionerRect { x: 10, y: 26, width: 40, height: 20 }
+        ));
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// One popup, MAPPED: a real parent window, a menu placed by `menu_rules`,
+    /// its configure acknowledged, and a one-pixel buffer committed. Both
+    /// paths are the caller's to remove.
+    fn mapped_popup(stem: &str) -> (Client, UnixStream, Arc<Mutex<Runtime>>, PathBuf, PathBuf) {
+        let pool_name = format!(
+            "td-wayland-{stem}-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let pool_path = std::env::temp_dir().join(format!("{pool_name}.pool"));
+        fs::write(&pool_path, [0x21u8, 0x43, 0x65, 0]).unwrap();
+        let (mut client, mut peer, runtime, framebuffer_path) = popup_fixture(stem);
+        // The parent has to be a real window for the layout to hold anything.
+        adopt_role(&mut client);
+        commit(&mut client).unwrap();
+
+        menu_rules(&mut client);
+        get_popup(&mut client, 14, 9, 30).unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        // Four: the PARENT's own initial configure pair from its commit above,
+        // then the popup's. The popup's xdg_surface serial is the last of them.
+        let configured = receive_messages(&mut peer, 4);
+        let serial = wire::Cursor::new(&configured.get(3).unwrap().payload)
+            .u32()
+            .unwrap();
+        let mut ack = wire::Builder::new();
+        ack.u32(serial);
+        client
+            .dispatch(request(13, 4, ack).unwrap(), &mut VecDeque::new())
+            .unwrap();
+
+        client
+            .insert(
+                7,
+                Object::Buffer(Buffer {
+                    serial: 1,
+                    file: Arc::new(File::open(&pool_path).unwrap()),
+                    offset: 0,
+                    width: 1,
+                    height: 1,
+                    stride: 4,
+                    format: SHM_XRGB8888,
+                }),
+            )
+            .unwrap();
+        let mut attach = wire::Builder::new();
+        attach.u32(7);
+        attach.i32(0);
+        attach.i32(0);
+        client
+            .dispatch(request(6, 1, attach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        (client, peer, runtime, framebuffer_path, pool_path)
+    }
+
+    /// The parent window's surface, and the popup's.
+    const POPUP_PARENT_KEY: SurfaceKey = SurfaceKey {
+        client: 88,
+        object: 5,
+    };
+    const POPUP_KEY: SurfaceKey = SurfaceKey {
+        client: 88,
+        object: 6,
+    };
+
+    /// A popup's buffer floats over its parent rather than joining the
+    /// arrangement. A menu that entered the layout would take half the screen
+    /// off the window it belongs to.
+    #[test]
+    fn a_popups_buffer_floats_over_its_parent_rather_than_tiling() {
+        let (mut client, _peer, runtime, framebuffer_path, pool_path) = mapped_popup("popup-float");
+        let parent_key = POPUP_PARENT_KEY;
+        let popup_key = POPUP_KEY;
+        let snapshot = runtime.lock().unwrap().layout_snapshot();
+        assert!(
+            !snapshot.contains_key(&popup_key),
+            "a popup joined the layout"
+        );
+        assert_eq!(
+            runtime.lock().unwrap().popup_placement(popup_key),
+            Some(PopupPlacement {
+                parent: parent_key,
+                x: 10,
+                y: 26,
+                width: 40,
+                height: 20,
+            })
+        );
+
+        // Destroying the popup takes it off the screen and hands the
+        // xdg_surface back, which may be given another role.
+        client
+            .dispatch(
+                request(14, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(runtime.lock().unwrap().popup_placement(popup_key), None);
+        assert!(matches!(
+            client.objects.get(&13),
+            Some(Object::XdgSurface {
+                role_object: None,
+                ..
+            })
+        ));
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// Destroying a popup gives back its BYTES and its CONFIGURE. Neither is
+    /// visible on screen, and both are the kind of thing a menu-heavy
+    /// application hits within a minute: the bytes because a client that opens
+    /// and dismisses menus is disconnected for buffers td is not holding, and
+    /// the tracker because one left initialised says the first configure has
+    /// already been sent — so the next role on that xdg_surface never gets
+    /// one, and a client waiting on it hangs with no window.
+    #[test]
+    fn a_destroyed_popup_gives_back_its_bytes_and_its_configure() {
+        let (mut client, _peer, _runtime, framebuffer_path, pool_path) =
+            mapped_popup("popup-bytes");
+        assert_eq!(client.mapped_bytes.get(&6).copied(), Some(4));
+        let held = client.mapped_total;
+        client
+            .dispatch(
+                request(14, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(client.mapped_bytes.get(&6), None);
+        assert_eq!(client.mapped_total, held.saturating_sub(4));
+        let Some(Object::XdgSurface { configure, .. }) = client.objects.get(&13) else {
+            panic!("the xdg_surface went with its role object");
+        };
+        let tracker = configure.lock().unwrap();
+        assert!(!tracker.initial_sent());
+        assert!(!tracker.can_attach());
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// A NULL attach takes a popup down the other way — the client keeping the
+    /// role object and dropping the pixels — and owes the same two things back
+    /// as the destroy above, plus the placement.
+    #[test]
+    fn a_null_attach_takes_a_popup_down_and_unconfigures_it() {
+        let (mut client, _peer, runtime, framebuffer_path, pool_path) =
+            mapped_popup("popup-detach");
+        let held = client.mapped_total;
+        let mut attach = wire::Builder::new();
+        attach.u32(0);
+        attach.i32(0);
+        attach.i32(0);
+        client
+            .dispatch(request(6, 1, attach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(runtime.lock().unwrap().popup_placement(POPUP_KEY), None);
+        assert_eq!(client.mapped_bytes.get(&6), None);
+        assert_eq!(client.mapped_total, held.saturating_sub(4));
+        let Some(Object::XdgSurface { configure, .. }) = client.objects.get(&13) else {
+            panic!("the xdg_surface went with its buffer");
+        };
+        assert!(!configure.lock().unwrap().can_attach());
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// A popup's window geometry reaches the scene. A menu's is what a toolkit
+    /// draws its shadow OUTSIDE, so one dropped on the way would anchor the
+    /// shadow's corner where the client asked the menu to be and clip the menu
+    /// away at the far edge.
+    #[test]
+    fn a_popups_window_geometry_reaches_the_scene() {
+        let (mut client, _peer, runtime, framebuffer_path, pool_path) =
+            mapped_popup("popup-geometry");
+        // No buffer behind this one: the commit arm that carries a popup's
+        // state when nothing was attached.
+        let mut geometry = wire::Builder::new();
+        for value in [4, 4, 10, 10] {
+            geometry.i32(value);
+        }
+        client
+            .dispatch(request(13, 3, geometry).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.lock().unwrap().window_geometry(POPUP_KEY),
+            Some(WindowGeometry {
+                x: 4,
+                y: 4,
+                width: 10,
+                height: 10,
+            })
+        );
+
+        // And again on a commit that DOES attach, which is the ordinary shape:
+        // a toolkit sends the geometry with the frame it belongs to.
+        let mut geometry = wire::Builder::new();
+        for value in [6, 6, 8, 8] {
+            geometry.i32(value);
+        }
+        client
+            .dispatch(request(13, 3, geometry).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut attach = wire::Builder::new();
+        attach.u32(7);
+        attach.i32(0);
+        attach.i32(0);
+        client
+            .dispatch(request(6, 1, attach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.lock().unwrap().window_geometry(POPUP_KEY),
+            Some(WindowGeometry {
+                x: 6,
+                y: 6,
+                width: 8,
+                height: 8,
+            })
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// An incomplete positioner is `invalid_positioner` rather than a guess: a
+    /// popup placed by rules the client never finished would appear somewhere
+    /// it never asked for.
+    #[test]
+    fn an_incomplete_positioner_is_refused_at_get_popup() {
+        let (mut client, _peer, _runtime, framebuffer_path) = popup_fixture("popup-incomplete");
+        let mut size = wire::Builder::new();
+        size.i32(40);
+        size.i32(20);
+        client
+            .dispatch(request(30, 1, size).unwrap(), &mut VecDeque::new())
+            .unwrap();
+
+        let error = get_popup(&mut client, 14, 9, 30).unwrap_err();
+        assert!(error.contains("incomplete"), "{error}");
+        assert_eq!(
+            client.protocol_error_code,
+            XDG_WM_BASE_ERROR_INVALID_POSITIONER
+        );
+        // Nothing was created for a popup that was refused.
+        assert!(!client.objects.contains_key(&14));
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// The parent must be an xdg_surface of this client that has a role object.
+    /// A null parent is legal only so another protocol can supply one, and td
+    /// implements no such protocol — so a popup that arrived that way could
+    /// never be placed at all.
+    #[test]
+    fn a_popup_parent_that_could_never_be_mapped_is_refused() {
+        let (mut client, _peer, _runtime, framebuffer_path) = popup_fixture("popup-parent");
+        menu_rules(&mut client);
+
+        let error = get_popup(&mut client, 14, 0, 30).unwrap_err();
+        assert!(error.contains("no xdg_surface"), "{error}");
+        assert_eq!(
+            client.protocol_error_code,
+            XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT
+        );
+
+        // An xdg_surface with no role object of its own cannot have been
+        // mapped, so it cannot be a parent either. Object 13 is the popup's own
+        // xdg_surface, which has none.
+        let error = get_popup(&mut client, 15, 13, 30).unwrap_err();
+        assert!(error.contains("unconstructed"), "{error}");
+        assert_eq!(
+            client.protocol_error_code,
+            XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// Every rule a positioner refuses, each with the protocol's own
+    /// `invalid_input` and each raised on the POSITIONER, which is the object
+    /// the client got wrong.
+    #[test]
+    fn a_positioner_rule_outside_its_range_is_refused_as_invalid_input() {
+        let refusals: [(u16, Vec<i32>, &str); 5] = [
+            (1, vec![0, 20], "not positive"),
+            (1, vec![40, -1], "not positive"),
+            (2, vec![0, 0, -1, 6], "negative"),
+            (3, vec![9], "not one of the nine"),
+            (4, vec![9], "not one of the nine"),
+        ];
+        for (opcode, values, expected) in refusals {
+            let (mut client, _peer, _runtime, framebuffer_path) = popup_fixture("popup-rule");
+            let mut body = wire::Builder::new();
+            for value in &values {
+                body.i32(*value);
+            }
+            let error = client
+                .dispatch(request(30, opcode, body).unwrap(), &mut VecDeque::new())
+                .unwrap_err();
+            assert!(error.contains(expected), "{opcode}: {error}");
+            assert_eq!(
+                client.protocol_error_code, XDG_POSITIONER_ERROR_INVALID_INPUT,
+                "{opcode}"
+            );
+            let _ = fs::remove_file(&framebuffer_path);
+        }
     }
 
     #[test]

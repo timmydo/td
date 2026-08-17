@@ -882,6 +882,110 @@ required empty initial wl_surface commit and acknowledges the resulting
 xdg_surface configure serial. A buffer attached before that handshake is a
 client protocol failure.
 
+**A popup is placed by its client and floated, not tiled.** `xdg_positioner`
+and `get_popup` were hard errors that disconnected the client outright, so an
+application opening its first menu died. They are implemented: a positioner
+records the rules — size, anchor rectangle, anchor, gravity, constraint
+adjustment and offset — and `get_popup` derives a rectangle from them, which is
+what the client is told in `xdg_popup.configure`, before the
+`xdg_surface.configure` that makes the pair one configuration.
+
+The rules are COPIED at `get_popup`, as the protocol requires, so the client may
+reuse or destroy the positioner immediately and nothing already placed moves.
+The derivation is an anchor point on the anchor rectangle, the surface hung off
+that point by its gravity, and the client's own offset translating the result —
+the protocol's worked example is that an anchor at (x, y) with a bottom-right
+gravity and an offset (ox, oy) gives (x + ox, y + oy). Both axes resolve
+independently through one function, which is what stops one of the eighteen
+enum arms reading the other axis's field.
+
+An xdg_surface holds ONE role object, a toplevel or a popup, in a single field:
+"has a role object" is one question, and two `Option`s would be two places for
+it to disagree. A popup is not in the layout at all — it floats over its parent
+at the offset the client was told, is drawn above every window and below td's
+own bar and overlays, and is hit-tested BEFORE the tiles so a click on a menu
+does not reach the window it is covering. Its placement is kept RELATIVE to the
+parent, so a parent that moves takes its menu with it; a submenu's parent is the
+menu that opened it, and the chain is walked back to the tile it belongs to.
+A popup whose parent is not on screen is drawn nowhere.
+
+What the placement puts at its corner is the popup's WINDOW GEOMETRY, not its
+buffer's corner, exactly as a tile's is: a toolkit draws a menu's shadow outside
+that rectangle, so a popup that ignored the geometry would anchor the shadow
+where the client asked the menu to be and clip the menu away at the far edge.
+
+Four properties are worth stating because none of them follows from "floats over
+its parent", and each was a defect before it was a rule.
+
+- **A popup abuts its parent.** The protocol requires a child surface to
+  intersect its parent or be at least partially adjacent to it, and td checks it
+  — the ADJACENT half being the ordinary case, since a submenu is hung off the
+  menu's right edge and overlaps it by nothing. The check is what stops a client
+  dropping an input-taking rectangle anywhere on screen: popups are asked before
+  the tiles, so an unanchored one would take the clicks of whatever window it
+  was placed over, including another client's.
+- **A popup takes no clicks over the bar.** td's own surfaces are painted after
+  the popups, so a menu reaching into that strip is already invisible there, and
+  one still answering for it would take clicks over pixels that are td's. Tiles
+  get this for free — every rect is offset below the bar — and a popup is placed
+  by its client instead.
+- **Stacking is td's own order, not the object id's.** A submenu is created
+  after the menu it hangs off and the protocol stacks it above, but ids cannot
+  say which came first: libwayland recycles them, and td retires them with
+  `wl_display.delete_id` precisely so a client may. One order serves both the
+  paint and the hit test, because whichever is drawn last is what a click has to
+  land on. A popup that recommits keeps its place — a toolkit repaints a menu on
+  every hover, and a raise there would put the menu over its own submenu.
+- **The pointer over a menu is over the WINDOW that opened it.** Focus follows
+  the mouse, so answering the tile a menu overhangs would deactivate the window
+  that owns the menu — and a toolkit told its window was deactivated closes the
+  menu, which would then shut as the pointer moved onto it.
+
+A popup dies with its own unmap, with its parent, and with its client, and its
+SUBMENUS die with it in each case: pixels included, since a chain nothing can
+reach would otherwise hold the scene's byte ceiling, and one left behind comes
+back the moment anything remaps its parent. Its bytes are given back to the
+CLIENT's accounting too, on the destroy as well as the null attach — a menu that
+returned its pixels to the scene and not to the ledger would have an
+application that opens and dismisses menus disconnected for buffers td is not
+holding. A destroyed popup also leaves a FRESH configure tracker behind, as a
+destroyed toplevel does: one left initialised says the first configure has been
+sent, so the next role on that xdg_surface would never get one and a client
+waiting on it hangs with no window.
+
+The chain walk is bounded rather than trusted to terminate, and that bound is
+load-bearing rather than belt-and-braces. td checks that a popup's parent is an
+xdg_surface with a role object, which does NOT refuse a cycle: destroying a
+popup hands its xdg_surface back for another role, so a client can close the
+loop, and the bound is what contains it — by drawing nothing.
+
+Five parts are deliberately NOT here yet, and each is a landing of its own.
+**Constraint adjustment** is recorded and not acted on: every bit of it is
+permission for td to move a popup that does not fit, so a menu near an edge
+extends past it rather than sliding or flipping. **Grabs** are accepted and not
+acted on — `xdg_popup.grab` records nothing, td dismisses no popup of its own,
+and a client that expects a click outside to close its menu must notice and
+destroy it. **Dismissal is never SIGNALLED**: nothing sends
+`xdg_popup.popup_done`, so when td stops drawing a menu because its window was
+stacked away or its workspace switched, the client still believes the menu is
+open and it reappears on return. **Refusing a cycle at the source** needs
+`not_the_topmost_popup` on destroy and a parent-chain check at `get_popup`; the
+renderer's bound stands in for both. **Reposition** is version 3 and out of
+reach at the `xdg_wm_base` version td advertises. td also refuses a NULL
+parent, which the protocol permits only so that another protocol may supply one
+before the first commit: td implements no such protocol, so a popup that
+arrived that way could never be placed at all. A zero-area anchor rectangle IS
+accepted, against the protocol's "non-zero anchor rectangle": it names a point
+perfectly well, and disconnecting a client over a rule with a defined answer is
+the worse reading.
+
+Two protocol errors are raised on the wrong OBJECT and it is recorded rather
+than hidden: `invalid_popup_parent` and `invalid_positioner` belong to
+`xdg_wm_base`, and td posts them against the xdg_surface, where codes 3 and 5
+are `unconfigured_buffer` and `invalid_size`. The client is disconnected either
+way; what it decodes about why is wrong. Carrying the shell object's id on the
+xdg_surface is the fix and lands with the conformance items above.
+
 The boot profile starts one `td-term` toplevel; a `td-ui-demo` toplevel is
 reached from the launcher instead, and the conformance below is its. It
 discovers and binds
