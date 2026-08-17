@@ -681,6 +681,85 @@ impl Layout {
             .collect()
     }
 
+    /// An empty workspace to send a window TO, and the reason the strip can be
+    /// dragged onto at all: without it the bar names only workspaces that
+    /// already exist, so on a machine using one there is nowhere to drop a
+    /// window that is not where it already is, and a second desktop can be
+    /// reached only by the keyboard.
+    ///
+    /// The LOWEST free number rather than one past the last, so a gap left by
+    /// emptying a workspace is offered again before the range is walked
+    /// further along, and the answer stays inside `INITIAL..=FINAL` instead of
+    /// running off the end of it.
+    ///
+    /// Never the ACTIVE workspace, even when that one is empty: a window can
+    /// only be dragged from the workspace being looked at, so a cell naming it
+    /// is a drop that moves nothing, and offering it as the spare would leave
+    /// an operator on an empty desktop with no way to reach a new one.
+    ///
+    /// `None` only when every workspace in the range holds something except
+    /// the active one, which is nine windows deep and the one case where the
+    /// strip cannot grow.
+    pub fn spare_workspace(&self) -> Option<u8> {
+        for number in INITIAL_WORKSPACE..=FINAL_WORKSPACE {
+            let empty = self
+                .workspaces
+                .get(&number)
+                .is_none_or(|workspace| workspace.root.is_none());
+            if number != self.active && empty {
+                return Some(number);
+            }
+        }
+        None
+    }
+
+    /// The workspace a window lives on, which is not always the one in view: a
+    /// drop asks so it can decline to promise a move to where the window
+    /// already is.
+    pub fn workspace_of(&self, key: SurfaceKey) -> Option<u8> {
+        self.homes.get(&key).copied()
+    }
+
+    /// Send ONE window to a workspace, which is what a drop on the strip does.
+    ///
+    /// `move_to_workspace` moves whatever is focused, because a keyboard
+    /// command has no other way to say which window it means. A drag names its
+    /// own, and the two are not always the same: a press on a band focuses it
+    /// today, so this is the same window in practice, but a drop that moved
+    /// the FOCUSED one would be a different gesture the moment that stops
+    /// being true.
+    ///
+    /// The source is the window's own home rather than the active workspace,
+    /// so nothing here depends on the dragged window being on the workspace in
+    /// view. Answers whether anything moved.
+    pub fn move_key_to_workspace(&mut self, key: SurfaceKey, number: u8) -> bool {
+        if !valid_workspace(number) {
+            return false;
+        }
+        let Some(source) = self.homes.get(&key).copied() else {
+            return false;
+        };
+        if source == number {
+            return false;
+        }
+        // `homes` deliberately REMEMBERS an unmapped window, so that a client
+        // which maps again lands where it was. That makes it the wrong
+        // question to ask alone: moving one would put a window with no surface
+        // into a tree, and `check_invariants` does not catch it. `drop_onto`
+        // asks the tree it is about to change, so this asks the same.
+        if !self
+            .workspaces
+            .get(&source)
+            .is_some_and(|workspace| workspace.leaves().contains(&key))
+        {
+            return false;
+        }
+        self.workspace_mut(source).unmap(key);
+        self.workspace_mut(number).map(key);
+        self.homes.insert(key, number);
+        true
+    }
+
     pub fn focused(&self) -> Option<SurfaceKey> {
         self.workspaces
             .get(&self.active)
@@ -715,10 +794,21 @@ impl Layout {
         parent_axis(root, key)
     }
 
-    /// Whether dragging this window could reach anywhere at all: a workspace
-    /// that is not fullscreen, and a second window to land beside. Asked
-    /// BEFORE a gesture takes a button, since one that cannot move anything
-    /// would swallow the click with nothing to show for it.
+    /// Whether dragging this window could reach anywhere at all. Asked BEFORE
+    /// a gesture takes a button, since one that cannot move anything would
+    /// swallow the click with nothing to show for it.
+    ///
+    /// A second window to land beside, OR a DESKTOP to send it to. The second
+    /// arm is what the workspace strip added: a lone window had nowhere to go
+    /// and so could not be picked up, and now the bar always names an empty
+    /// workspace that is not this one. Without this the two ways of picking a
+    /// window up disagree — its title band would drag it to the bar while the
+    /// same drag held by Alt never started.
+    ///
+    /// Fullscreen still refuses, and for its own reason rather than for want
+    /// of a destination: the one placement covers the output, so claiming the
+    /// modifier would take every Alt click in that client. A fullscreen window
+    /// keeps `Super+Shift+N`.
     pub fn can_drag(&self, key: SurfaceKey) -> bool {
         let Some(workspace) = self.workspaces.get(&self.active) else {
             return false;
@@ -727,7 +817,23 @@ impl Layout {
             return false;
         }
         let leaves = workspace.leaves();
-        leaves.len() > 1 && leaves.contains(&key)
+        if !leaves.contains(&key) {
+            return false;
+        }
+        leaves.len() > 1 || self.workspace_elsewhere()
+    }
+
+    /// Whether the strip names a workspace that is not the active one — which
+    /// is a destination for a drag, occupied or not. Stated as a search rather
+    /// than as "there is always one": it happens to be true while the range
+    /// holds more than one number, and that is an arithmetic coincidence for a
+    /// gesture to rest on.
+    fn workspace_elsewhere(&self) -> bool {
+        self.spare_workspace().is_some()
+            || self
+                .workspaces
+                .iter()
+                .any(|(number, workspace)| *number != self.active && workspace.root.is_some())
     }
 
     /// Drop a dragged window onto a target one — the pointer half of a move,
@@ -1853,6 +1959,96 @@ mod tests {
 
     fn key(object: u32) -> SurfaceKey {
         SurfaceKey { client: 1, object }
+    }
+
+    #[test]
+    fn a_spare_workspace_is_always_offered_and_is_never_the_active_one() {
+        let mut layout = Layout::new();
+        // Nothing open: workspace 1 is active, so the spare is 2 — the active
+        // one is refused even though it is empty, because a window can only be
+        // dragged from the workspace in view and a cell naming it moves
+        // nothing.
+        assert_eq!(layout.active_workspace(), 1);
+        assert_eq!(layout.spare_workspace(), Some(2));
+
+        layout.map(key(1));
+        assert_eq!(layout.occupied_workspaces(), [1]);
+        assert_eq!(layout.spare_workspace(), Some(2));
+
+        // A gap is offered again before the range is walked further along, so
+        // emptying a workspace makes its number reusable rather than stranding
+        // it. 1 and 3 in use, active 1 → the spare is the hole at 2.
+        assert!(layout.move_key_to_workspace(key(1), 3));
+        layout.map(key(2));
+        assert_eq!(layout.occupied_workspaces(), [1, 3]);
+        assert_eq!(layout.spare_workspace(), Some(2));
+
+        // The one case with no spare: everything in the range holds a window
+        // except the active one, which cannot be its own drop target.
+        let mut full = Layout::new();
+        for number in 1..=9u8 {
+            full.map(key(u32::from(number)));
+            if number != 9 {
+                assert!(full.move_key_to_workspace(key(u32::from(number)), number + 1));
+            }
+        }
+        // Windows on 2..=9, active 1 and empty: 1 is the only free number and
+        // it is the active one.
+        assert_eq!(full.active_workspace(), 1);
+        assert_eq!(full.spare_workspace(), None);
+    }
+
+    #[test]
+    fn a_lone_window_can_be_dragged_once_there_is_a_desktop_to_send_it_to() {
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        // The only window on the workspace, which had nowhere to land before
+        // the strip named a spare desktop and now has one. Both ways of
+        // picking a window up must agree about this: the band drags it either
+        // way, and a refusal here would make Alt the odd one out.
+        assert_eq!(layout.spare_workspace(), Some(2));
+        assert!(layout.can_drag(key(1)));
+
+        // A window on ANOTHER workspace is not draggable from this one: the
+        // gesture is about what is under the pointer, and nothing off the
+        // active workspace is on screen to be under it.
+        assert!(layout.move_key_to_workspace(key(1), 2));
+        assert!(!layout.can_drag(key(1)));
+
+        // Fullscreen still refuses, and for its own reason rather than for
+        // want of a destination — a spare desktop exists throughout.
+        layout.apply(Command::SwitchWorkspace(2));
+        assert_eq!(layout.active_workspace(), 2);
+        assert!(layout.can_drag(key(1)));
+        layout.apply(Command::ToggleFullscreen);
+        assert!(layout.spare_workspace().is_some());
+        assert!(!layout.can_drag(key(1)));
+    }
+
+    #[test]
+    fn a_window_moves_to_a_workspace_by_name_rather_than_by_focus() {
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.map(key(2));
+        // `key(2)` is what a keyboard command would move, being focused. This
+        // one names the OTHER window, which is the whole difference between a
+        // drag and `move_to_workspace`.
+        assert_eq!(layout.focused(), Some(key(2)));
+        assert!(layout.move_key_to_workspace(key(1), 4));
+        assert_eq!(layout.workspace_of(key(1)), Some(4));
+        assert_eq!(layout.workspace_of(key(2)), Some(1));
+        assert_eq!(layout.occupied_workspaces(), [1, 4]);
+
+        // Moving one to where it already is changes nothing and says so, which
+        // is what stops a drop onto the active cell reporting a repaint.
+        assert!(!layout.move_key_to_workspace(key(1), 4));
+        // Outside the range is refused rather than creating a tenth desktop.
+        assert!(!layout.move_key_to_workspace(key(1), 0));
+        assert!(!layout.move_key_to_workspace(key(1), 10));
+        assert_eq!(layout.workspace_of(key(1)), Some(4));
+        // A window nothing knows about has no home to move out of.
+        assert!(!layout.move_key_to_workspace(key(99), 2));
+        layout.check_invariants().unwrap();
     }
 
     #[test]

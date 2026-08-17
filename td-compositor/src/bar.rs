@@ -379,11 +379,64 @@ pub fn line(readings: &Readings) -> String {
 /// — it does, `Layout` keeping its workspaces in a `BTreeMap` — because the
 /// order this returns is the order they are DRAWN in, and nine numbers cost
 /// nothing to sort beside depending on the container type of another module.
-pub fn desks(mut occupied: Vec<u8>, active: u8) -> Vec<u8> {
+/// `spare` is an empty workspace to drag ONTO, named by the layout because the
+/// range of workspace numbers is its business rather than the bar's. Merged
+/// like the active one — the strip is a set of numbers in order, and where each
+/// came from stops mattering once it is in.
+pub fn desks(mut occupied: Vec<u8>, active: u8, spare: Option<u8>) -> Vec<u8> {
     occupied.push(active);
+    occupied.extend(spare);
     occupied.sort_unstable();
     occupied.dedup();
     occupied
+}
+
+/// Each cell as `(number, left, width)`, in the order they are drawn.
+///
+/// Shared by the painting and the hit test rather than walked twice: a drop
+/// lands on the cell an operator aimed at, and two walks that disagreed about
+/// where a cell starts would put the window on the workspace NEXT to the one
+/// they were pointing at, with the ink saying otherwise.
+fn cells(desks: &[u8]) -> impl Iterator<Item = (u8, usize, usize)> + '_ {
+    let mut left = 0usize;
+    desks.iter().map(move |number| {
+        let width = desk_width(*number);
+        let at = left;
+        left = left.saturating_add(width);
+        (*number, at, width)
+    })
+}
+
+/// The workspace whose cell contains the point, if the strip does at all.
+///
+/// The bar spans the output's whole width, but only the cells are a workspace:
+/// the status line beside them names nothing to drop onto, so a release there
+/// answers `None` and is a cancelled drag rather than a move to whichever
+/// workspace happens to be last.
+pub fn desk_at(desks: &[u8], x: usize, y: usize) -> Option<u8> {
+    if y >= BAR_HEIGHT {
+        return None;
+    }
+    // A loop rather than the iterator method that would read more naturally:
+    // the bootstrap ladder's guard scans this source for that name and cannot
+    // tell an iterator from GNU findutils.
+    for (number, left, width) in cells(desks) {
+        if x >= left && x < left.saturating_add(width) {
+            return Some(number);
+        }
+    }
+    None
+}
+
+/// The cell a workspace is drawn in, for a caller that has to draw something
+/// else over it.
+pub fn desk_cell(desks: &[u8], number: u8) -> Option<(usize, usize)> {
+    for (candidate, left, width) in cells(desks) {
+        if candidate == number {
+            return Some((left, width));
+        }
+    }
+    None
 }
 
 /// `number` in decimal, written into a caller's buffer. The compositor draws
@@ -461,32 +514,32 @@ pub fn paint(
     ui::fill(frame, width, height, stride, bar, BACKGROUND);
     let mut left = 0usize;
     let mut label = [0u8; 3];
-    for number in desks {
-        let cell = (left, 0, desk_width(*number), BAR_HEIGHT);
+    for (number, at, cell_width) in cells(desks) {
+        let cell = (at, 0, cell_width, BAR_HEIGHT);
         // The active workspace is the strip's own two colours EXCHANGED. It
         // needs no third colour and no glyph beside the number, and inverse
         // video says "you are here" without the operator being told which of
         // two shades of one hue means what.
-        let ink = if *number == active {
+        let ink = if number == active {
             ui::fill(frame, width, height, stride, cell, INK);
             BACKGROUND
         } else {
             INK
         };
-        let written = decimal(*number, &mut label);
+        let written = decimal(number, &mut label);
         ui::draw_text_clipped(
             frame,
             width,
             height,
             stride,
-            left.saturating_add(label_inset(cell.2, written)),
+            at.saturating_add(label_inset(cell.2, written)),
             TEXT_TOP,
             SCALE,
             written,
             ink,
             cell,
         );
-        left = left.saturating_add(cell.2);
+        left = at.saturating_add(cell.2);
     }
     // What keeps the status line off the cells TODAY is where it starts: a
     // line is drawn rightwards from there and cannot reach back. The clip
@@ -1099,12 +1152,54 @@ Local:
         // An EMPTY active workspace is the case this exists for: switching to
         // one leaves a bare screen, and without its number on the strip the
         // operator has no way to tell that from the workspace they left.
-        assert_eq!(desks(Vec::new(), 4), [4]);
-        assert_eq!(desks(vec![1, 3], 4), [1, 3, 4]);
+        assert_eq!(desks(Vec::new(), 4, None), [4]);
+        assert_eq!(desks(vec![1, 3], 4, None), [1, 3, 4]);
         // Sorted whatever the active one is, and named ONCE when it holds
         // windows of its own — it is in both lists and is one place on screen.
-        assert_eq!(desks(vec![2, 9], 5), [2, 5, 9]);
-        assert_eq!(desks(vec![1, 2, 3], 2), [1, 2, 3]);
+        assert_eq!(desks(vec![2, 9], 5, None), [2, 5, 9]);
+        assert_eq!(desks(vec![1, 2, 3], 2, None), [1, 2, 3]);
+    }
+
+    #[test]
+    fn the_strip_carries_a_spare_workspace_to_drag_onto() {
+        // The ordinary machine: one workspace in use, and a second named so
+        // there is somewhere to drop a window that is not where it already is.
+        assert_eq!(desks(vec![1], 1, Some(2)), [1, 2]);
+        // Merged in ORDER rather than appended: a spare filling a gap belongs
+        // where its number puts it, or the strip would read 1 3 2.
+        assert_eq!(desks(vec![1, 3], 1, Some(2)), [1, 2, 3]);
+        // Deduplicated like the active one, so a spare that somehow names a
+        // workspace already on the strip is still one cell.
+        assert_eq!(desks(vec![1, 2], 1, Some(2)), [1, 2]);
+        // No spare is the strip as it was: nine workspaces deep, there is none
+        // to offer and the bar says so by not growing.
+        assert_eq!(desks(vec![1, 2], 1, None), [1, 2]);
+    }
+
+    #[test]
+    fn a_point_on_the_strip_names_the_workspace_under_it() {
+        let desks = [1u8, 2, 3];
+        // Every cell answers over its own span, and the walk that places them
+        // is the one `paint` draws with.
+        let mut left = 0usize;
+        for number in desks {
+            let width = desk_width(number);
+            assert_eq!(desk_at(&desks, left, 0), Some(number), "cell {number} left");
+            assert_eq!(
+                desk_at(&desks, left + width - 1, BAR_HEIGHT - 1),
+                Some(number),
+                "cell {number} right"
+            );
+            assert_eq!(desk_cell(&desks, number), Some((left, width)));
+            left += width;
+        }
+        // Past the last cell is the status line, which names no workspace: a
+        // release there is a cancelled drag rather than a move to whichever
+        // number happened to be drawn last.
+        assert_eq!(desk_at(&desks, left, 0), None);
+        // Below the bar is a window, however far right or left.
+        assert_eq!(desk_at(&desks, 0, BAR_HEIGHT), None);
+        assert_eq!(desk_cell(&desks, 9), None);
     }
 
     #[test]

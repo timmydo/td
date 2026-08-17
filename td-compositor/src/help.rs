@@ -81,6 +81,15 @@ pub const ROWS: &[Row] = &[
         keys: "DRAG A TITLE",
         action: "MOVE A TILE / SPLIT OUT",
     },
+    // The strip always shows one empty workspace, so this gesture always has a
+    // target — but a drop zone nothing points at is invisible in a way a key
+    // chord is not, since there is no key to press by accident and discover it.
+    // Named as `Super+Shift+N` is: one effect, two ways to reach it, as HOVER
+    // and CLICK already share their words.
+    Row {
+        keys: "DRAG TO THE BAR",
+        action: "MOVE TO WORKSPACE",
+    },
 ];
 
 /// What the input layer asks of the sheet. `Close` is what a key press while

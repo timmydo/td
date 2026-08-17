@@ -121,10 +121,54 @@ command repaints unconditionally, which is what makes a switch between two
 EMPTY workspaces — where the strip is the only thing that changes — reach the
 screen at all.
 
-They are not CLICKABLE. The strip's rows already answer no press (§3's hit
-test stops at the tiling area), and making one region of it answer is a
-pointer surface of its own rather than a label; the keys reach every
-workspace meanwhile.
+Beside those the strip always names one SPARE workspace: the lowest-numbered
+one holding nothing, which is never the active one. That cell is the only way
+the pointer can reach a workspace that does not exist yet. Without it the strip
+names only what is already there, so a machine using one workspace offers
+nowhere to drop a window except where it already is, and a second workspace can
+be reached solely from the keyboard. The lowest free number rather than one
+past the last, so a workspace emptied by moving its last window away is offered
+again instead of the range walking off its end; and never the ACTIVE one even
+when it is empty, because a window can only be dragged from the workspace in
+view, so a cell naming it is a drop that moves nothing — which would leave an
+operator standing on an empty workspace with no way to reach a new one. There is
+no spare only when every workspace in 1..=9 holds something except the active
+one, and the strip says so by not growing.
+
+They are not CLICKABLE, and that is still true: the strip answers no press
+(§3's hit test stops at the tiling area), so nothing starts there and a click
+on a number switches nothing. What they now answer is a RELEASE — the end of a
+drag that began on a title band, which is a different gesture with a window
+already in hand. Making a region of the bar answer a PRESS would be a pointer
+surface of its own rather than a label; answering a drop adds no such surface,
+because the drag is already in flight and the strip is only being asked where
+it ends. The keys reach every workspace meanwhile, and `Super+Shift+N` remains
+the way to send a window to one without the mouse.
+
+A drop on a cell moves the DRAGGED window rather than the focused one. A press
+on a band focuses it, so the two name the same window today; they are separate
+questions all the same, and a drop that moved whatever happened to be focused
+would be a different gesture the moment that stops being true. The workspace
+the window is already on promises nothing, for the same reason its own tile
+does: there is no move to make, so no block goes up and the release is a
+cancelled drag. Only the CELLS answer — the status line beside them names no
+workspace, so a release there cancels rather than falling through to whichever
+number was drawn last, or to the window the bar is covering.
+
+A drop on the strip is NOT refused under fullscreen, where a drop on a tile
+is, and the asymmetry is deliberate rather than an oversight. `drop_onto`
+refuses because a fullscreen window has no tile to land beside and pulling it
+into an arrangement is incoherent; sending it to another workspace is perfectly
+coherent, and is exactly what `Super+Shift+N` already does to one. The gesture
+is reachable only mid-drag — a band press, then `Super+f`, then a release on a
+cell — since a fullscreen window's band is zero-height and cannot be pressed,
+and Alt-drag refuses it outright. The window arrives on the other workspace
+having given up fullscreen, which is what the keyboard does too.
+
+The block for a workspace drop is the one thing drawn OVER the bar. Every other
+block goes under it, deliberately: a block that hid the bar would be a worse
+lie than the one it answers. This block IS the bar, so drawn in that order it
+would be painted away by the very strip it is promising.
 
 The NETWORK field is leftmost of the readings, as the ethernet stanza is in
 the config this follows. It names the interface, whether it is up, and the
@@ -309,7 +353,10 @@ is proved where it happens, in the runtime's hover, click, and band-drag
 tests. The drag row is on the sheet for the reason the move chord's wording
 changed: the mouse's way out of a container is a title dragged against the
 side of another tile, and a sheet naming neither left an operator with a
-column of windows and no way to find either. The limit of
+column of windows and no way to find either. The drag-to-the-bar row is there
+for a sharper version of the same argument: a drop zone is invisible in a way a
+chord is not, since there is no key to press by accident and discover it, and
+the spare workspace it aims at exists only to be dropped on. The limit of
 that check is worth stating: it links the table to the DISPATCH, not to the
 keymap, so the glyph names (`?`, `V`, `T`) are literals — remapping a key in
 `keys.rs` would make the sheet lie with the suite green. The card is
@@ -1141,10 +1188,17 @@ press lands on a client area where a band press does not.
 A press that could move NOTHING is not claimed. Under fullscreen the one
 placement covers the output, so every Alt click anywhere in that client would
 be taken and none of them could ever land — an application silently losing the
-modifier everywhere. A lone window is the same case for a different reason:
-there is nothing to land it beside. So the claim asks whether a drag of the
-window under the pointer could reach anywhere, and leaves the click to its
-client when it could not. That is also what keeps this gesture from reaching
+modifier everywhere. A lone window USED to be the same case for a different
+reason, there being nothing to land it beside, and is not one since the strip
+began naming a spare workspace: the only window on one can still be sent
+to another, so refusing the claim would leave its title band dragging it to the
+bar while the same drag held by Alt never started. So the claim asks whether a
+drag of the window under the pointer could reach anywhere — a second window OR
+a workspace that is not this one — and leaves the click to its client when it
+could not. That the strip always names such a workspace while the range holds
+more than one number is an arithmetic coincidence rather than a reason, so the
+question is asked instead of assumed. That is also what keeps this gesture
+from reaching
 around the rule the tiling commands already have, where `Move` refuses to pull
 a fullscreen window into an arrangement nobody asked for.
 

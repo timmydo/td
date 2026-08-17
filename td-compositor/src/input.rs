@@ -2766,6 +2766,7 @@ mod tests {
     enum Pointing {
         Focus,
         Move,
+        Send,
     }
 
     impl Bound {
@@ -2783,7 +2784,13 @@ mod tests {
                     "MOVE A TILE / SPLIT OUT"
                 }
                 Bound::Command(Command::SwitchWorkspace(_)) => "SWITCH WORKSPACE",
-                Bound::Command(Command::MoveToWorkspace(_)) => "MOVE TO WORKSPACE",
+                // The pointer reaches the same effect by a different route:
+                // `Super+Shift+N` names a NUMBER, a drop names wherever it
+                // landed. One effect, so one wording — the card would
+                // otherwise carry two vocabularies for one object.
+                Bound::Command(Command::MoveToWorkspace(_)) | Bound::Pointer(_, Pointing::Send) => {
+                    "MOVE TO WORKSPACE"
+                }
                 Bound::Command(Command::SetPresentation(Presentation::Stacked)) => "STACK A COLUMN",
                 Bound::Command(Command::SetPresentation(Presentation::Tabbed)) => "TAB A COLUMN",
                 // Not bound to a chord: `Super+s` ungroups, and a second way
@@ -2890,6 +2897,7 @@ mod tests {
             (&[], 0, Bound::Pointer("HOVER", Pointing::Focus)),
             (&[], 0, Bound::Pointer("CLICK", Pointing::Focus)),
             (&[], 0, Bound::Pointer("DRAG A TITLE", Pointing::Move)),
+            (&[], 0, Bound::Pointer("DRAG TO THE BAR", Pointing::Send)),
         ];
         assert_eq!(
             probes.len(),

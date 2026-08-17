@@ -452,12 +452,21 @@ fn tile_at(placements: &[Placement], x: usize, y: usize) -> Option<usize> {
     })
 }
 
+/// Where a release would put the dragged window. A tile drop names a window to
+/// go beside or into; a workspace drop names a desktop to leave for. Both are
+/// promised the same way — a block over what the release would use — which is
+/// what keeps `aim_drop`'s "did the promise move" question one comparison.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DropDestination {
+    Tile { target: SurfaceKey, kind: DropKind },
+    Workspace(u8),
+}
+
 /// What a release would do, and the block that says so. Held for the whole
 /// gesture so the release applies exactly what was drawn.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DropHint {
-    target: SurfaceKey,
-    kind: DropKind,
+    destination: DropDestination,
     area: Rect,
 }
 
@@ -1269,6 +1278,16 @@ impl Scene {
     }
 
     fn drop_hint(&self, dragged: SurfaceKey, width: usize, height: usize) -> Option<DropHint> {
+        // The bar's rows are the strip's ALONE: on them a release is a
+        // workspace or a cancelled drag, and never the tiles. Nothing is laid
+        // out under the bar — `tiled_placements` offsets every rect and band
+        // past it — so falling through would reach nothing anyway; asking here
+        // is what keeps that a property of this function rather than of a
+        // distant offset, and it keeps the strip's own walk off the path every
+        // ordinary tile drag takes, which is a `Vec` per motion frame.
+        if usize::try_from(self.pointer_y).is_ok_and(|y| y < BAR_HEIGHT) {
+            return self.workspace_hint(dragged);
+        }
         let placements = self.tiled_placements(width, height);
         let (placement, kind) = self.drop_target_in(&placements)?;
         // Its own tile lands nothing — a window cannot be moved beside itself
@@ -1280,7 +1299,46 @@ impl Scene {
             return None;
         }
         let area = hint_area(placement, kind, self.layout.run_direction(target));
-        Some(DropHint { target, kind, area })
+        Some(DropHint {
+            destination: DropDestination::Tile { target, kind },
+            area,
+        })
+    }
+
+    /// A drop on the workspace strip, if that is where the pointer is.
+    ///
+    /// The workspace the window is ALREADY on lands nothing, for the reason its
+    /// own tile does: there is no move to promise, so no block goes up and the
+    /// release is a cancelled drag rather than a repaint that changed nothing.
+    fn workspace_hint(&self, dragged: SurfaceKey) -> Option<DropHint> {
+        let x = usize::try_from(self.pointer_x).ok()?;
+        let y = usize::try_from(self.pointer_y).ok()?;
+        let desks = self.desks();
+        let number = bar::desk_at(&desks, x, y)?;
+        if self.layout.workspace_of(dragged) == Some(number) {
+            return None;
+        }
+        let (left, width) = bar::desk_cell(&desks, number)?;
+        Some(DropHint {
+            destination: DropDestination::Workspace(number),
+            area: Rect {
+                x: left,
+                y: 0,
+                width,
+                height: BAR_HEIGHT,
+            },
+        })
+    }
+
+    /// The strip the bar is showing, which the hit test and the painting must
+    /// agree on. Small enough that recomputing it per pointer frame during a
+    /// drag costs nothing worth caching: nine numbers and a `Vec` of them.
+    pub(crate) fn desks(&self) -> Vec<u8> {
+        bar::desks(
+            self.layout.occupied_workspaces(),
+            self.layout.active_workspace(),
+            self.layout.spare_workspace(),
+        )
     }
 
     #[cfg(test)]
@@ -1306,7 +1364,12 @@ impl Scene {
     /// the caller then had nothing left to clear and no reason to paint.
     pub fn commit_drop(&mut self, dragged: SurfaceKey) -> Option<bool> {
         let hint = self.hint.take()?;
-        Some(self.layout.drop_onto(dragged, hint.target, hint.kind))
+        Some(match hint.destination {
+            DropDestination::Tile { target, kind } => self.layout.drop_onto(dragged, target, kind),
+            DropDestination::Workspace(number) => {
+                self.layout.move_key_to_workspace(dragged, number)
+            }
+        })
     }
 
     /// Take the block down. Answers whether the screen moves, which it does
@@ -1675,11 +1738,23 @@ impl Scene {
         // says where a release would land, and a bar or an overlay it hid
         // would be a worse lie than the one it answers.
         if let Some(hint) = self.hint {
-            draw_hint(frame, width, height, stride, hint.area);
+            if !matches!(hint.destination, DropDestination::Workspace(_)) {
+                draw_hint(frame, width, height, stride, hint.area);
+            }
         }
         let active = self.layout.active_workspace();
-        let desks = bar::desks(self.layout.occupied_workspaces(), active);
+        let desks = self.desks();
         bar::paint(frame, width, height, stride, &desks, active, &self.status);
+        // A workspace block is the one that goes OVER the bar rather than
+        // under it. The rule above — a block must not hide the bar — is about
+        // a block that would obscure something it is not talking about; this
+        // one IS the bar, and drawn in the same order would be painted away by
+        // the strip it is promising.
+        if let Some(hint) = self.hint {
+            if matches!(hint.destination, DropDestination::Workspace(_)) {
+                draw_hint(frame, width, height, stride, hint.area);
+            }
+        }
         self.launcher.paint(frame, width, height, stride);
         self.help.paint(frame, width, height, stride);
         draw_pointer(
@@ -4649,6 +4724,179 @@ mod tests {
         assert!(!scene.hint_is_live());
         assert_ne!(painted(&scene, width, height), aiming);
         scene.layout.check_invariants().unwrap();
+    }
+
+    /// The middle of the cell the strip draws for `number`, which is where an
+    /// operator dragging to a desktop aims.
+    fn aim_at_desk(scene: &mut Scene, number: u8) {
+        let desks = scene.desks();
+        let (left, width) = bar::desk_cell(&desks, number)
+            .unwrap_or_else(|| panic!("the strip is not showing workspace {number}: {desks:?}"));
+        scene.pointer_x = i32::try_from(left + width / 2).unwrap();
+        scene.pointer_y = i32::try_from(BAR_HEIGHT / 2).unwrap();
+    }
+
+    #[test]
+    fn a_window_dragged_onto_the_strip_moves_to_that_workspace() {
+        // The whole feature, end to end: a machine using ONE workspace still
+        // offers a second on the bar, and dropping a window there sends it —
+        // which before this was reachable only from the keyboard.
+        let mut scene = a_window_beside_a_column();
+        let (width, height) = (240, 600);
+        let dragged = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        assert_eq!(scene.layout.occupied_workspaces(), [1]);
+        assert_eq!(
+            scene.desks(),
+            [1, 2],
+            "one workspace in use, and a spare to drag to"
+        );
+
+        let before = tile_order(&scene, width, height);
+        assert!(before.contains(&1), "the window starts on the workspace");
+
+        aim_at_desk(&mut scene, 2);
+        assert!(scene.aim_drop(dragged, width, height), "no block went up");
+        // Aiming promises and moves nothing, as it does over a tile.
+        assert_eq!(tile_order(&scene, width, height), before, "aiming moved it");
+
+        assert_eq!(scene.commit_drop(dragged), Some(true));
+        assert_eq!(scene.layout.workspace_of(dragged), Some(2));
+        assert!(
+            !tile_order(&scene, width, height).contains(&1),
+            "the window is still on the workspace it was dragged off"
+        );
+        assert_eq!(scene.layout.occupied_workspaces(), [1, 2]);
+        // And the strip has grown a NEW spare, so the next window has
+        // somewhere to go too.
+        assert_eq!(scene.desks(), [1, 2, 3]);
+        scene.layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_drop_on_the_workspace_a_window_is_already_on_promises_nothing() {
+        // The strip's version of "a window cannot be moved beside itself": the
+        // active cell names where the window already is, so there is no move
+        // to promise and no block to take down.
+        let mut scene = a_window_beside_a_column();
+        let (width, height) = (240, 600);
+        let dragged = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        aim_at_desk(&mut scene, 1);
+        assert!(!scene.aim_drop(dragged, width, height));
+        assert!(!scene.hint_is_live(), "a block promised a move to nowhere");
+        assert_eq!(scene.commit_drop(dragged), None);
+    }
+
+    #[test]
+    fn a_release_beside_the_cells_is_a_cancelled_drag() {
+        // The bar spans the output but only its cells are workspaces. A drop
+        // on the status line must not fall through to the last number drawn —
+        // nor to the window the bar is covering.
+        let mut scene = a_window_beside_a_column();
+        let (width, height) = (240, 600);
+        let dragged = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        let desks = scene.desks();
+        let (left, cell) = bar::desk_cell(&desks, 2).unwrap();
+        scene.pointer_x = i32::try_from(left + cell + 1).unwrap();
+        scene.pointer_y = i32::try_from(BAR_HEIGHT / 2).unwrap();
+        assert!(!scene.aim_drop(dragged, width, height));
+        assert_eq!(scene.commit_drop(dragged), None);
+        assert_eq!(scene.layout.workspace_of(dragged), Some(1));
+    }
+
+    #[test]
+    fn the_bar_covers_no_tile_so_a_drop_beside_the_cells_reaches_none() {
+        // `drop_hint` asks the strip and, when it answers nothing, falls
+        // through to the tiles. That is a CANCELLED drag on the status line
+        // only because there is no tile up there to reach — which is
+        // `tiled_placements` offsetting every rect and band past the bar, a
+        // different function from the one the behaviour is claimed in. So the
+        // invariant is asserted where the drop depends on it.
+        //
+        // A FULLSCREEN window is the case that would otherwise reach: the
+        // layout gives it the whole output, and only the offset keeps it out
+        // from under the bar.
+        let mut scene = a_window_beside_a_column();
+        let (width, height) = (240, 600);
+        scene.command(Command::ToggleFullscreen);
+        let placements = scene.tiled_placements(width, height);
+        assert!(!placements.is_empty(), "nothing to check");
+        for placement in &placements {
+            assert!(
+                placement.rect.y >= BAR_HEIGHT,
+                "a tile reaches under the bar: {:?}",
+                placement.rect
+            );
+            assert!(
+                placement.band.y >= BAR_HEIGHT,
+                "a band reaches under the bar: {:?}",
+                placement.band
+            );
+        }
+
+        // And the drop agrees, with the fullscreen window up: the status line
+        // is past every cell, so it names no workspace and finds no tile.
+        let dragged = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        let desks = scene.desks();
+        let last = desks.last().copied().unwrap();
+        let (left, cell) = bar::desk_cell(&desks, last).unwrap();
+        scene.pointer_x = i32::try_from(left + cell + 1).unwrap();
+        scene.pointer_y = i32::try_from(BAR_HEIGHT / 2).unwrap();
+        assert!(!scene.aim_drop(dragged, width, height));
+        assert!(!scene.hint_is_live());
+    }
+
+    #[test]
+    fn the_block_for_a_workspace_drop_is_drawn_over_the_bar() {
+        // The one thing a workspace block does differently from a tile block,
+        // and it is the difference between a promise and an invisible one: the
+        // bar is painted after the tile hint deliberately, so a block drawn in
+        // that order would be painted away by the very strip it is promising.
+        let mut scene = a_window_beside_a_column();
+        let (width, height) = (240, 600);
+        let dragged = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        // The control frame is painted with the pointer ALREADY on the cell,
+        // so the only thing that differs is the block. Painting it before the
+        // pointer moved would compare the cursor against itself: an earlier
+        // version of this test did, and passed with the block deleted.
+        aim_at_desk(&mut scene, 2);
+        let quiet = painted(&scene, width, height);
+        assert!(scene.aim_drop(dragged, width, height));
+        let aiming = painted(&scene, width, height);
+
+        let desks = scene.desks();
+        let (left, cell) = bar::desk_cell(&desks, 2).unwrap();
+        let stride = width.saturating_mul(4);
+        // Scanned over the whole cell rather than at one pixel, because the
+        // cursor is drawn last and over the block: any single pixel might be
+        // under it, and under it the two frames agree.
+        let mut tinted = 0usize;
+        for y in 0..BAR_HEIGHT {
+            for x in left..left.saturating_add(cell) {
+                let at = y.saturating_mul(stride).saturating_add(x.saturating_mul(4));
+                if aiming.get(at..at + 3) != quiet.get(at..at + 3) {
+                    tinted = tinted.saturating_add(1);
+                }
+            }
+        }
+        assert!(
+            tinted > 0,
+            "the block never reached the cell it was promising"
+        );
     }
 
     #[test]

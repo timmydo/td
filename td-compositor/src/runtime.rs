@@ -2310,6 +2310,116 @@ mod tests {
     }
 
     #[test]
+    fn dragging_a_band_onto_the_strip_sends_the_window_to_that_workspace() {
+        // The gesture proved where DESIGN.md says pointer behaviour is proved:
+        // through the real driver, not by calling the scene's aim and commit
+        // directly. Everything between a band press and a release on the bar
+        // has to hold — the drag threshold, the hit test, focus-follows-mouse
+        // on the way up, and the pointer being allowed into the bar's rows at
+        // all — and none of that is visible to a scene-level test.
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-strip-drop-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let height = 600;
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, height, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let keys: Vec<SurfaceKey> = (1..=2)
+            .map(|object| SurfaceKey { client: 1, object })
+            .collect();
+        runtime
+            .commit(*keys.first().unwrap(), surface([1, 2, 3, 0]))
+            .unwrap();
+        runtime
+            .commit(*keys.get(1).unwrap(), surface([4, 5, 6, 0]))
+            .unwrap();
+
+        let press = |time| PointerButtonInput {
+            time,
+            button: 272,
+            state: PointerButtonState::Pressed,
+        };
+        let release = |time| PointerButtonInput {
+            time,
+            button: 272,
+            state: PointerButtonState::Released,
+        };
+        let goto = |runtime: &mut Runtime, x: usize, y: usize, buttons: &[PointerButtonInput]| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            let (dx, dy) = (
+                i32::try_from(x).unwrap() - at_x,
+                i32::try_from(y).unwrap() - at_y,
+            );
+            runtime
+                .pointer_frame(1, dx, dy, buttons, PointerScroll::default())
+                .unwrap()
+        };
+        let band = |runtime: &Runtime, object: u32| {
+            let placements = runtime.scene.tiled_placements(240, height);
+            let at = placements
+                .iter()
+                .position(|placement| placement.key.object == object)
+                .unwrap();
+            placements.get(at).unwrap().band
+        };
+
+        let moved = *keys.first().unwrap();
+        assert_eq!(runtime.scene.layout().workspace_of(moved), Some(1));
+        assert_eq!(runtime.scene.layout().occupied_workspaces(), [1]);
+
+        // The spare the strip is showing, which is where an operator with one
+        // workspace in use has to be able to aim.
+        let desks = runtime.scene.desks();
+        assert_eq!(desks, [1, 2], "no spare workspace to drag to");
+        let (left, cell) = crate::bar::desk_cell(&desks, 2).unwrap();
+
+        let handle = band(&runtime, moved.object);
+        // The band's LEFT, which is the drag handle: its right carries the
+        // presentation buttons, and a press on one of those starts no drag.
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(1)]);
+        assert!(
+            runtime.dragging.is_some(),
+            "the band press picked nothing up"
+        );
+
+        // Up into the cell, which is a real journey across the tiling area and
+        // past the threshold rather than a teleport.
+        goto(
+            &mut runtime,
+            left + cell / 2,
+            crate::bar::BAR_HEIGHT / 2,
+            &[],
+        );
+        assert!(
+            runtime.scene.hint_is_live(),
+            "no block promised the workspace under the pointer"
+        );
+
+        goto(
+            &mut runtime,
+            left + cell / 2,
+            crate::bar::BAR_HEIGHT / 2,
+            &[release(2)],
+        );
+        assert!(runtime.dragging.is_none(), "the drag outlived its release");
+        assert_eq!(runtime.scene.layout().workspace_of(moved), Some(2));
+        assert_eq!(runtime.scene.layout().occupied_workspaces(), [1, 2]);
+        // Gone from the workspace in view, and the one left behind is what the
+        // clients are now configured for.
+        let visible: Vec<u32> = runtime
+            .scene
+            .tiled_placements(240, height)
+            .iter()
+            .map(|placement| placement.key.object)
+            .collect();
+        assert_eq!(visible, [2]);
+        assert!(!runtime.scene.hint_is_live(), "the block was stranded");
+        runtime.scene.layout().check_invariants().unwrap();
+    }
+
+    #[test]
     fn dragging_a_title_band_drops_the_window_beside_where_it_was_released() {
         let path = std::env::temp_dir().join(format!(
             "td-runtime-band-drag-{}-{}",
@@ -3610,21 +3720,24 @@ mod tests {
         assert_eq!(geometry(&runtime), full);
         runtime.command(Command::ToggleFullscreen).unwrap();
 
-        // A LONE window is the other case: there is nothing to land beside,
-        // so the gesture could not move it either.
+        // A LONE window USED to be the other case — nothing to land beside —
+        // and is not one any more. The strip always names an empty desktop, so
+        // the only window on a workspace can still be sent somewhere, and a
+        // gesture that refused would leave its title band dragging it to the
+        // bar while the same drag held by Alt never started.
         runtime.remove(*keys.get(1).unwrap()).unwrap();
         runtime.remove(*keys.get(2).unwrap()).unwrap();
         let alone = at(&runtime, *order(&runtime).first().unwrap()).rect;
         buttons_seen(&events);
         goto(&mut runtime, alone.x + 2, alone.y + 2, &[press(26)]);
         assert!(
-            runtime.dragging.is_none(),
-            "an alt press picked up the only window"
+            runtime.dragging.is_some(),
+            "an alt press could not pick up the only window"
         );
         assert_eq!(
             buttons_seen(&events).len(),
-            1,
-            "the only window lost its alt click"
+            0,
+            "the claimed press reached the client anyway"
         );
         goto(&mut runtime, alone.x + 2, alone.y + 2, &[release(27)]);
         alt(&mut runtime, false);
