@@ -1206,11 +1206,16 @@ and becomes one the sandbox cannot express. That is the same move
 `AssertStatic` makes: not "did anyone link against the host libc" but
 "the host libc is not in there to link against".
 
-The argv scan is still worth having, downgraded to what it is worth: a
+**The argv/template scan has LANDED**, downgraded to what it is worth: a
 cheap pure pass in `classify_graph_inputs` that catches the honest
 mistake — a recipe naming a payload where it meant a tool — and reports
-it at planning time with a name and a line, rather than as a step that
-fails inside a sandbox for no visible reason.
+it at planning time with the recipe, step, field, payload name and line,
+rather than as a step that fails inside a sandbox for no visible reason.
+It is deliberately described as an audit rather than enforcement: the
+separate input map and the `noexec` bind below remain the boundaries.
+The pass is at `td-recipe-eval`'s production planning boundary; invoking
+the runner-private `td-builder build-plan --auto` backend directly is
+outside that boundary and still gets the expander's fail-closed error.
 
 **The channel has LANDED (rung 3), and the paragraph above needed one
 correction to become code.** "Never staged into a `Step::Run` sandbox at
@@ -1298,18 +1303,20 @@ hashed derivation data and cannot change without changing the
 derivation; every new key is omitted when unset, so landing the channel
 left every existing derivation hash byte-identical.
 
-Two things about the shape it was going to borrow, because they are the
-measure of how far a scanner falls short. `ladder.rs`'s `command_texts`
-covers **four of eighteen `Step` variants** and returns nothing for the
-rest — so `Step::Require { exec: true }`, `PatchShebangs`, `Unpack`,
-`CopyTree` and ten others name paths it never sees. And it does not read
-`Step::Run`'s `env`, which is exactly how the image recipe supplies a
-search path today (`.env("PATH", &post_bootstrap_path())`), so
-`PATH={in:payload}/bin` puts every bare command in the step inside the
-payload with the scan clean. It is also `#[cfg(test)]`, so the precedent
-is a test rather than a planning gate. A scanner that fixed all three
-would still be syntax; the point of the paragraph above is that it does
-not have to be the mechanism.
+The pass does not borrow `ladder.rs`'s `command_texts`: that helper
+covers four of eighteen `Step` variants, is `#[cfg(test)]`, and omits
+`Step::Run`'s `env` — exactly where an image recipe supplies `PATH`.
+Instead an exhaustive match visits every field the builder's template
+expander visits, including environment values, and deliberately skips
+literal labels and `SubstituteText` edit text that the builder does not
+expand. `{payload:NAME}` is admitted only in `CopyTree.from` and
+`StageRuntimeClosure.roots`; `{in:NAME}` cannot launder a declared
+payload through those fields either. That exhaustiveness makes a new
+`Step` variant or field a compile failure until its template visibility
+is decided, and the test table is checked against the production field
+visitor and the builder's ordinary/data expansion-site counts. It is
+still syntax; the point of the paragraph above is that it does not have
+to be the mechanism.
 
 #### Direct execution outside a jail is not prevented
 
@@ -2981,8 +2988,9 @@ packaged selftest, boot oracle — with **network never in the gate**.
      than `payload_inputs` is a planning-time refusal — **landed**, in
      both plan builders, for a marked recipe and a marked pin alike;
    - a `Step::Run` argv expanding a `payload_inputs` path is a refusal —
-     the argv/template scanner, since this is the assertion whose
-     violation is otherwise silent;
+     **landed** as the pure argv/template audit, over every field the
+     builder expands (including `Run` environment values), since this is
+     the assertion whose violation is otherwise silent;
    - the interpreter assertion: the payload's `PT_INTERP` is absent from
      the built image tree, so a direct `execve` outside a jail fails
      `ENOENT`. Asserted against the image, not assumed;
@@ -3094,7 +3102,7 @@ Each row is one landing or a small family, leaving the tree green.
 |---|---|---|
 | 1 | **kernel namespace/seccomp/cgroup config pins + QEMU readback** (§0) — **LANDED**, except the functional calls, which need surface #9: the `unshare` at rung 8, the filter install at rung 11 | none — but this is the gate on everything |
 | 2 | `td-login exec-as` with credential readback — **LANDED** | none |
-| 3 | **the §B.8 marker**: the recipe-level mark, `payload_inputs` as a declared channel, taint propagation from the source pin, and the planning-time refusals — plus the argv/template scanner, since that assertion is the one that is otherwise silent. The **channel has LANDED** (see §B.8: `{payload:NAME}` resolution plus `ro,noexec` binds, replacing the un-implementable "never staged at all"); the MARK has landed with it — `foreign` on the source pin, the derived recipe flag, the tool-channel refusal in both plan builders, and the computed `contains_payloads` answer with the recipe-graph closure query that reads it. What is LEFT of this rung is the argv/template scanner, downgraded to the cheap pure pass §B.8 describes | none |
+| 3 | **the §B.8 marker — LANDED**: the recipe-level mark, `payload_inputs` as a declared channel, taint propagation from the source pin, and the planning-time refusals — including the argv/template audit at `td-recipe-eval`'s production planning boundary for the otherwise-silent assertion. The channel is `{payload:NAME}` resolution plus `ro,noexec` binds, replacing the un-implementable "never staged at all"; the mark is `foreign` on the source pin, the derived recipe flag, the tool-channel refusal in both plan builders, and the computed `contains_payloads` answer with the recipe-graph closure query that reads it | none |
 | 4 | the manifest and permission keyfile, name validation and every rejection; the STORE-level closure query, which needs a built closure with a payload in it | none |
 | 5 | first seed recipe — a pinned upstream artifact becomes a store package with §B.3's checks and §B.8's assertions | none |
 | 6 | the spec compiler: runtime resolution by full store path, mounts, grants, entry point | none |

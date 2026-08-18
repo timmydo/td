@@ -10,7 +10,7 @@ use std::process::{self, Command, Stdio};
 
 use td_recipe::{
     catalog, source_pins,
-    types::{CheckRunner, Recipe, SourcePin},
+    types::{CheckRunner, Recipe, SourcePin, Step},
 };
 
 pub(crate) const TD_STORE_DIR: &str = "/td/store";
@@ -2889,6 +2889,195 @@ fn refuse_foreign_on_the_tool_channel(
     refuse_foreign_with(&node.stem, &node.recipe, is_marked)
 }
 
+/// Report a payload template where the command expander would refuse it, before
+/// the build reaches a sandbox. This is a syntax audit, not §B.8's enforcement:
+/// the separate input map and `noexec` bind remain the boundaries.
+fn check_payload_template(
+    stem: &str,
+    step: usize,
+    field: &str,
+    text: &str,
+    payloads: &HashSet<&str>,
+    payloads_visible: bool,
+) -> Result<(), String> {
+    let reject = |name: &str, at: usize, reason: &str| {
+        let line = text
+            .get(..at)
+            .map_or(1, |prefix| prefix.bytes().filter(|byte| *byte == b'\n').count() + 1);
+        let excerpt = text.lines().nth(line.saturating_sub(1)).unwrap_or(text);
+        format!(
+            "{PROVENANCE_REJECTED}recipe {stem}: step {step} `{field}' line {line} names \
+             payload `{name}': {reason}: {excerpt:?} (APPLICATIONS.md section B.8)"
+        )
+    };
+    let mut offset = 0;
+    while let Some(rest) = text.get(offset..) {
+        let Some(open_in_rest) = rest.find('{') else {
+            break;
+        };
+        let open = offset + open_in_rest;
+        let Some(after_open) = text.get(open + 1..) else {
+            break;
+        };
+        let Some(close_in_rest) = after_open.find('}') else {
+            break;
+        };
+        let token = after_open.get(..close_in_rest).unwrap_or("");
+        let recognized = token.starts_with("in:") || token.starts_with("payload:");
+        if let Some(name) = token.strip_prefix("in:") {
+            if payloads.contains(name) {
+                return Err(reject(
+                    name,
+                    open,
+                    "`{in:NAME}' is the tool channel; use `{payload:NAME}' only in \
+                     copyTree's `from' or stageRuntimeClosure's `roots'",
+                ));
+            }
+        } else if let Some(name) = token.strip_prefix("payload:") {
+            if !payloads_visible {
+                return Err(reject(
+                    name,
+                    open,
+                    "`{payload:NAME}' is visible only in copyTree's `from' or \
+                     stageRuntimeClosure's `roots'",
+                ));
+            }
+            if !payloads.contains(name) {
+                return Err(reject(
+                    name,
+                    open,
+                    "the name is absent from this recipe's `payload_inputs'",
+                ));
+            }
+        }
+        offset = if recognized {
+            open + close_in_rest + 2
+        } else {
+            open + 1
+        };
+    }
+    Ok(())
+}
+
+/// Visit every string the builder expands. Literal labels and `SubstituteText`
+/// edits are absent because the builder does not expand them either.
+fn visit_step_templates(
+    step: &Step,
+    mut visit: impl FnMut(&'static str, &str, bool) -> Result<(), String>,
+) -> Result<(), String> {
+    match step {
+        Step::Run { argv, env, dir } => {
+            for arg in argv {
+                visit("run.argv", arg, false)?;
+            }
+            for (_, value) in env {
+                visit("run.env value", value, false)?;
+            }
+            visit("run.dir", dir, false)?;
+        }
+        Step::ToolFarm { links } => {
+            for (_, target) in links {
+                visit("toolFarm target", target, false)?;
+            }
+        }
+        Step::WriteFile {
+            path,
+            content,
+            exec: _,
+        } => {
+            visit("writeFile.path", path, false)?;
+            visit("writeFile.content", content, false)?;
+        }
+        Step::Unpack {
+            input,
+            dest,
+            keep_top: _,
+        } => {
+            visit("unpack.input", input, false)?;
+            visit("unpack.dest", dest, false)?;
+        }
+        Step::MesBoot { source, nyacc, stage0 } => {
+            visit("mesBoot.source", source, false)?;
+            visit("mesBoot.nyacc", nyacc, false)?;
+            visit("mesBoot.stage0", stage0, false)?;
+        }
+        Step::CopyFiles { files, dest } => {
+            for file in files {
+                visit("copyFiles.files", file, false)?;
+            }
+            visit("copyFiles.dest", dest, false)?;
+        }
+        Step::CopyTree { from, dest } => {
+            visit("copyTree.from", from, true)?;
+            visit("copyTree.dest", dest, false)?;
+        }
+        Step::StageRuntimeClosure { roots, dest } => {
+            for root in roots {
+                visit("stageRuntimeClosure.roots", root, true)?;
+            }
+            visit("stageRuntimeClosure.dest", dest, false)?;
+        }
+        Step::PackErofs { root, output } => {
+            visit("packErofs.root", root, false)?;
+            visit("packErofs.output", output, false)?;
+        }
+        Step::Sha256Manifest { output, entries } => {
+            visit("sha256Manifest.output", output, false)?;
+            for (_, path) in entries {
+                visit("sha256Manifest entry path", path, false)?;
+            }
+        }
+        Step::Symlink { target, link } => {
+            visit("symlink.target", target, false)?;
+            visit("symlink.link", link, false)?;
+        }
+        Step::MkDir { path } => visit("mkDir.path", path, false)?,
+        Step::Truncate { path, bytes: _ } => visit("truncate.path", path, false)?,
+        Step::PatchShebangs { dir, shell } => {
+            visit("patchShebangs.dir", dir, false)?;
+            visit("patchShebangs.shell", shell, false)?;
+        }
+        Step::RelocateLdScripts { dir, prefix } => {
+            visit("relocateLdScripts.dir", dir, false)?;
+            visit("relocateLdScripts.prefix", prefix, false)?;
+        }
+        Step::Require { paths, exec: _ } => {
+            for path in paths {
+                visit("require.paths", path, false)?;
+            }
+        }
+        Step::SubstituteText { file, edits: _ } => {
+            visit("substituteText.file", file, false)?;
+        }
+        Step::AssertStatic { paths } => {
+            for path in paths {
+                visit("assertStatic.paths", path, false)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// APPLICATIONS.md §B.8's cheap, pure template audit.
+fn refuse_payload_templates(stem: &str, recipe: &Recipe) -> Result<(), String> {
+    let payloads: HashSet<&str> = recipe
+        .payload_inputs
+        .iter()
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    let Some(steps) = &recipe.steps else {
+        return Ok(());
+    };
+    for (index, step) in steps.iter().enumerate() {
+        let step_number = index + 1;
+        visit_step_templates(step, |field, text, visible| {
+            check_payload_template(stem, step_number, field, text, &payloads, visible)
+        })?;
+    }
+    Ok(())
+}
+
 /// Every name §B.8 marks: marked RECIPES (built from a payload) and marked PINS
 /// (the payload's own bytes).
 ///
@@ -2958,6 +3147,7 @@ fn classify_graph_inputs_with(
     let mut seen = HashSet::new();
     let mut seed_inputs = Vec::new();
     for node in nodes {
+        refuse_payload_templates(&node.stem, &node.recipe)?;
         refuse_foreign_on_the_tool_channel(node, &is_marked)?;
         if let Some(key) = &node.recipe.source_input {
             let input = seed_input_for_recipe_source(key, &node.recipe)?;
@@ -4022,6 +4212,221 @@ fn tail_bytes(bytes: &[u8], lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn payload_template_recipe(step: Step) -> Recipe {
+        Recipe::mesboot("image", "1")
+            .payload_inputs(&["firefox"])
+            .steps(vec![step])
+    }
+
+    fn payload_template_error(step: Step) -> String {
+        refuse_payload_templates("image", &payload_template_recipe(step))
+            .expect_err("a payload on this template surface must refuse")
+    }
+
+    /// The production match is exhaustive over `Step`; this table drives every
+    /// expanded field within each variant, including `Run`'s environment.
+    #[test]
+    fn every_command_template_surface_refuses_a_payload() {
+        const BAD: &str = "{payload:firefox}";
+        let bad = |s: &str| s.to_string();
+        let cases = vec![
+            ("run.argv", Step::Run { argv: vec![bad(BAD)], env: Vec::new(), dir: "{root}".into() }),
+            ("run.env value", Step::Run { argv: vec!["true".into()], env: vec![("PATH".into(), bad(BAD))], dir: "{root}".into() }),
+            ("run.dir", Step::Run { argv: vec!["true".into()], env: Vec::new(), dir: bad(BAD) }),
+            ("toolFarm target", Step::ToolFarm { links: vec![("tool".into(), bad(BAD))] }),
+            ("writeFile.path", Step::WriteFile { path: bad(BAD), content: "ok".into(), exec: false }),
+            ("writeFile.content", Step::WriteFile { path: "{out}/x".into(), content: bad(BAD), exec: false }),
+            ("unpack.input", Step::Unpack { input: bad(BAD), dest: "{src}".into(), keep_top: false }),
+            ("unpack.dest", Step::Unpack { input: "{src}".into(), dest: bad(BAD), keep_top: false }),
+            ("mesBoot.source", Step::MesBoot { source: bad(BAD), nyacc: "{in:nyacc}".into(), stage0: "{in:stage0}".into() }),
+            ("mesBoot.nyacc", Step::MesBoot { source: "{src}".into(), nyacc: bad(BAD), stage0: "{in:stage0}".into() }),
+            ("mesBoot.stage0", Step::MesBoot { source: "{src}".into(), nyacc: "{in:nyacc}".into(), stage0: bad(BAD) }),
+            ("copyFiles.files", Step::CopyFiles { files: vec![bad(BAD)], dest: "{root}".into() }),
+            ("copyFiles.dest", Step::CopyFiles { files: vec!["{src}/x".into()], dest: bad(BAD) }),
+            ("copyTree.dest", Step::CopyTree { from: "{src}".into(), dest: bad(BAD) }),
+            ("stageRuntimeClosure.dest", Step::StageRuntimeClosure { roots: vec!["{in:glibc}".into()], dest: bad(BAD) }),
+            ("packErofs.root", Step::PackErofs { root: bad(BAD), output: "{out}/root.erofs".into() }),
+            ("packErofs.output", Step::PackErofs { root: "{root}".into(), output: bad(BAD) }),
+            ("sha256Manifest.output", Step::Sha256Manifest { output: bad(BAD), entries: Vec::new() }),
+            ("sha256Manifest entry path", Step::Sha256Manifest { output: "{out}/manifest".into(), entries: vec![("item".into(), bad(BAD))] }),
+            ("symlink.target", Step::Symlink { target: bad(BAD), link: "{out}/link".into() }),
+            ("symlink.link", Step::Symlink { target: "target".into(), link: bad(BAD) }),
+            ("mkDir.path", Step::MkDir { path: bad(BAD) }),
+            ("truncate.path", Step::Truncate { path: bad(BAD), bytes: 1 }),
+            ("patchShebangs.dir", Step::PatchShebangs { dir: bad(BAD), shell: "{in:bash}/bin/bash".into() }),
+            ("patchShebangs.shell", Step::PatchShebangs { dir: "{src}".into(), shell: bad(BAD) }),
+            ("relocateLdScripts.dir", Step::RelocateLdScripts { dir: bad(BAD), prefix: "{out}".into() }),
+            ("relocateLdScripts.prefix", Step::RelocateLdScripts { dir: "{out}/lib".into(), prefix: bad(BAD) }),
+            ("require.paths", Step::Require { paths: vec![bad(BAD)], exec: true }),
+            ("substituteText.file", Step::SubstituteText { file: bad(BAD), edits: Vec::new() }),
+            ("assertStatic.paths", Step::AssertStatic { paths: vec![bad(BAD)] }),
+        ];
+        assert_eq!(cases.len(), 30, "every expanded, non-data field is listed");
+        let mut expected: HashSet<(&'static str, bool)> =
+            cases.iter().map(|(field, _)| (*field, false)).collect();
+        assert_eq!(expected.len(), cases.len(), "field labels must be distinct");
+        assert!(expected.insert(("copyTree.from", true)));
+        assert!(expected.insert(("stageRuntimeClosure.roots", true)));
+        let mut visited = HashSet::new();
+        for (_, step) in &cases {
+            visit_step_templates(step, |field, _, visible| {
+                visited.insert((field, visible));
+                Ok(())
+            })
+            .expect("the field visitor cannot fail while collecting labels");
+        }
+        assert_eq!(
+            visited, expected,
+            "the refusal table and production field visitor must cover the same surface"
+        );
+        let builder = include_str!("../../../../builder/src/build.rs");
+        let (_, dispatch) = builder
+            .split_once("    for (i, step) in steps.iter().enumerate() {")
+            .expect("builder step dispatch must remain identifiable");
+        let (dispatch, _) = dispatch
+            .split_once("\n    Ok(())\n}\n\n#[cfg(test)]")
+            .expect("builder step dispatch must remain bounded");
+        let (_, edits) = builder
+            .split_once("fn parse_substitute_edits(")
+            .expect("builder substituteText parser must remain identifiable");
+        let (edits, _) = edits
+            .split_once("\n}\n\n")
+            .expect("builder substituteText parser must remain bounded");
+        let count = |text: &str, methods: &[&str]| {
+            methods
+                .iter()
+                .map(|method| text.match_indices(method).count())
+                .sum::<usize>()
+        };
+        let methods = [
+            ".expand(",
+            ".expand_all(",
+            ".expand_data(",
+            ".expand_data_all(",
+        ];
+        assert_eq!(
+            count(dispatch, &methods) + count(edits, &methods),
+            expected.len(),
+            "the builder and audit must expose the same number of template fields"
+        );
+        let data_methods = [".expand_data(", ".expand_data_all("];
+        assert_eq!(
+            count(dispatch, &data_methods),
+            expected.iter().filter(|(_, visible)| *visible).count(),
+            "the builder and audit must expose the same number of data fields"
+        );
+        for site in [
+            "ctx.expand_data(&field(o, \"from\")?)",
+            "ctx.expand_data_all(&strs(o, \"roots\")?)",
+        ] {
+            assert!(dispatch.contains(site), "missing builder data site {site:?}");
+        }
+        for (field, step) in cases {
+            let error = payload_template_error(step);
+            assert!(error.starts_with(PROVENANCE_REJECTED), "{field}: {error}");
+            assert!(error.contains("recipe image"), "{field}: {error}");
+            assert!(error.contains("payload `firefox'"), "{field}: {error}");
+            assert!(error.contains(&format!("`{field}'")), "{field}: {error}");
+        }
+    }
+
+    /// The two data fields see `{payload:NAME}`. They still refuse the
+    /// tool-channel spelling and a name the recipe did not declare.
+    #[test]
+    fn only_copy_tree_sources_and_runtime_roots_see_payload_templates() {
+        for step in [
+            Step::CopyTree { from: "{payload:firefox}".into(), dest: "{out}/app".into() },
+            Step::StageRuntimeClosure { roots: vec!["{payload:firefox}".into()], dest: "{out}/root".into() },
+        ] {
+            assert!(refuse_payload_templates("image", &payload_template_recipe(step)).is_ok());
+        }
+        for step in [
+            Step::CopyTree { from: "{in:firefox}".into(), dest: "{out}/app".into() },
+            Step::StageRuntimeClosure { roots: vec!["{in:firefox}".into()], dest: "{out}/root".into() },
+        ] {
+            let error = payload_template_error(step);
+            assert!(error.contains("`{in:NAME}' is the tool channel"), "{error}");
+        }
+        let unknown = Recipe::mesboot("image", "1")
+            .payload_inputs(&["firefox"])
+            .steps(vec![Step::CopyTree {
+                from: "{payload:thunderbird}".into(),
+                dest: "{out}/app".into(),
+            }]);
+        let error = refuse_payload_templates("image", &unknown)
+            .expect_err("an undeclared payload template must refuse during planning");
+        assert!(error.contains("thunderbird"), "{error}");
+        assert!(error.contains("absent from this recipe's `payload_inputs'"), "{error}");
+    }
+
+    /// Labels and literal edit text are not template-expanded by the builder,
+    /// so treating their braces as references would be a false refusal.
+    #[test]
+    fn literal_step_fields_are_not_scanned_as_templates() {
+        const LITERAL: &str = "{payload:firefox}";
+        for step in [
+            Step::Run { argv: vec!["true".into()], env: vec![(LITERAL.into(), "ok".into())], dir: "{root}".into() },
+            Step::ToolFarm { links: vec![(LITERAL.into(), "{in:gcc}/bin/gcc".into())] },
+            Step::Sha256Manifest { output: "{out}/manifest".into(), entries: vec![(LITERAL.into(), "{out}/file".into())] },
+            Step::SubstituteText { file: "{src}/file".into(), edits: vec![td_recipe::types::TextEdit::new(LITERAL, LITERAL, 1)] },
+        ] {
+            assert!(refuse_payload_templates("image", &payload_template_recipe(step)).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_template_refusal_names_its_recipe_step_field_and_line() {
+        let error = payload_template_error(Step::WriteFile {
+            path: "{out}/script".into(),
+            content: "first\n{payload:firefox}/bin/firefox\nthird\n".into(),
+            exec: true,
+        });
+        for part in [
+            "recipe image",
+            "step 1",
+            "`writeFile.content' line 2",
+            "payload `firefox'",
+            "{payload:firefox}/bin/firefox",
+        ] {
+            assert!(error.contains(part), "missing {part:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn every_shipped_recipe_passes_the_payload_template_audit() {
+        for (stem, recipe) in catalog::all() {
+            let outcome = refuse_payload_templates(stem, &recipe);
+            assert!(outcome.is_ok(), "catalog recipe {stem}: {outcome:?}");
+        }
+    }
+
+    /// Drive the production composition over two node orders. The catalog has
+    /// no declared payload yet, so its sweep cannot drive the `{in:NAME}` half
+    /// or prove `classify_graph_inputs` calls the audit for every closure node.
+    #[test]
+    fn the_planning_pass_audits_payload_templates_on_every_node() {
+        const PAYLOAD: &str = "gcc-mesboot0";
+        let clean = || RecipeNode {
+            stem: "clean".into(),
+            recipe: Recipe::mesboot("clean", "1"),
+        };
+        let dirty = || RecipeNode {
+            stem: "image".into(),
+            recipe: Recipe::mesboot("image", "1")
+                .payload_inputs(&[PAYLOAD])
+                .steps(vec![Step::run("{root}", &["{in:gcc-mesboot0}/bin/gcc"])]),
+        };
+        for nodes in [vec![clean(), dirty()], vec![dirty(), clean()]] {
+            let error = classify_graph_inputs_with(&nodes, |_| false)
+                .expect_err("a payload template on any node must refuse");
+            assert!(error.starts_with(PROVENANCE_REJECTED), "{error}");
+            assert!(error.contains("recipe image"), "{error}");
+            assert!(error.contains("step 1 `run.argv'"), "{error}");
+            assert!(error.contains(PAYLOAD), "{error}");
+        }
+        assert!(classify_graph_inputs_with(&[clean()], |_| false).is_ok());
+    }
 
     /// §B.8's table at eval. The catalog has no foreign recipe, so the question
     /// is supplied here — a check that could only ask the real catalog would
