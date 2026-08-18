@@ -4698,6 +4698,66 @@ fn payload_names(
     Ok(names)
 }
 
+// Every phase runner makes an explicit choice about application manifests.
+const APPLICATION_PHASE_RUNNERS: [&str; 4] = [
+    "autotools-build",
+    "rust-build",
+    "cmake-build",
+    "mesboot-build",
+];
+const NON_APPLICATION_PHASE_RUNNERS: [&str; 2] = ["stage0-build", "rust-stage0-build"];
+
+fn push_drv_field(spec: &mut String, directive: &str, value: &str) -> Result<(), String> {
+    if directive
+        .bytes()
+        .chain(value.bytes())
+        .any(|byte| matches!(byte, b'\n' | b'\r'))
+    {
+        return Err(format!(
+            "recipe: derivation {directive} field contains a line break"
+        ));
+    }
+    spec.push_str(directive);
+    spec.push(' ');
+    spec.push_str(value);
+    spec.push('\n');
+    Ok(())
+}
+
+fn push_drv_env(spec: &mut String, name: &str, value: &str) -> Result<(), String> {
+    if name == "TD_APPLICATION_MANIFEST" {
+        return Err("recipe: TD_APPLICATION_MANIFEST is reserved for assembled metadata".into());
+    }
+    push_drv_env_line(spec, name, value)
+}
+
+fn push_application_manifest_env(spec: &mut String, value: &str) -> Result<(), String> {
+    push_drv_env_line(spec, "TD_APPLICATION_MANIFEST", value)
+}
+
+fn push_drv_env_line(spec: &mut String, name: &str, value: &str) -> Result<(), String> {
+    if name.contains('=') {
+        return Err(format!(
+            "recipe: derivation env name {name:?} contains `='"
+        ));
+    }
+    if name
+        .bytes()
+        .chain(value.bytes())
+        .any(|byte| matches!(byte, b'\n' | b'\r'))
+    {
+        return Err(format!(
+            "recipe: derivation env {name} field contains a line break"
+        ));
+    }
+    spec.push_str("env ");
+    spec.push_str(name);
+    spec.push('=');
+    spec.push_str(value);
+    spec.push('\n');
+    Ok(())
+}
+
 /// Shared by `build-recipe` (which then realizes it daemon-free) and `assemble-recipe`
 /// (assemble-only, so a SEPARATE process — the build daemon — realizes the td-assembled
 /// drv). Splitting assembly from realization is what lets td's own daemon, not a `guix
@@ -4733,6 +4793,45 @@ fn assemble_recipe_drv(
         // components and retarget them to td's declared runtime closure.
         "rust-stage0" => "rust-stage0-build",
         other => return Err(format!("recipe: unknown buildSystem `{other}' (known: gnu, rust, cmake, stage0, mesboot, rust-stage0)")),
+    };
+    let application_capable = APPLICATION_PHASE_RUNNERS.contains(&phase_runner);
+    if !application_capable && !NON_APPLICATION_PHASE_RUNNERS.contains(&phase_runner) {
+        return Err(format!(
+            "recipe: phase runner \"{phase_runner}\" has no application-manifest policy"
+        ));
+    }
+    if alist.get("application").is_some() && !application_capable {
+        return Err(format!(
+            "recipe: buildSystem \"{build_system}\" does not admit application metadata"
+        ));
+    }
+    let application_manifest = match alist.get("application") {
+        Some(value) => {
+            let declaration = td_engine::application::ApplicationDeclaration::from_json(value)
+                .map_err(|error| format!("recipe application: {error}"))?;
+            let contains_payload = match alist.get("payloadInputs") {
+                None => false,
+                Some(json::Json::Arr(inputs)) => !inputs.is_empty(),
+                Some(_) => {
+                    return Err(
+                        "recipe: `payloadInputs' must be an ARRAY of input names — a malformed one cannot determine application provenance"
+                            .into(),
+                    )
+                }
+            };
+            let provenance = if mark_of(name, &alist)? || contains_payload {
+                td_engine::application::ApplicationProvenance::Foreign
+            } else {
+                td_engine::application::ApplicationProvenance::Source
+            };
+            Some(
+                declaration
+                    .manifest(name, version, provenance)
+                    .map_err(|error| format!("recipe application: {error}"))?
+                    .to_keyfile(),
+            )
+        }
+        None => None,
     };
     // Only `mesboot` has the typed data operations that read a payload, so declaring
     // one anywhere else would stage bytes nothing can reach. Accepting that silently
@@ -4825,45 +4924,49 @@ fn assemble_recipe_drv(
     // Assemble the .drv spec: inputs as input-SOURCES (already-realized seed paths,
     // no input-derivations — so this diverges from guix's nano, by design).
     let mut spec = String::new();
-    spec.push_str(&format!("name {full}\n"));
+    push_drv_field(&mut spec, "name", &full)?;
     spec.push_str("system x86_64-linux\n");
-    spec.push_str(&format!("builder {builder}\n"));
-    spec.push_str(&format!("arg {phase_runner}\n"));
+    push_drv_field(&mut spec, "builder", &builder)?;
+    push_drv_field(&mut spec, "arg", phase_runner)?;
     if !source.is_empty() {
-        spec.push_str(&format!("input-src {source}\n"));
+        push_drv_field(&mut spec, "input-src", &source)?;
     }
     // The builder input-src is the SAME stable identity path (not the real builder Cb):
     // it makes the builder a closure ROOT so realize stages it, and it enters the hash as
     // the ABI token. realize substitutes the real builder for it when computing the
     // closure, then re-keys that entry back to this path so the real bytes bind here.
-    spec.push_str(&format!("input-src {builder_id}\n"));
+    push_drv_field(&mut spec, "input-src", &builder_id)?;
     for p in &inputs {
-        spec.push_str(&format!("input-src {p}\n"));
+        push_drv_field(&mut spec, "input-src", p)?;
     }
     // Vendored crates are also staged into the build (input-srcs); a gnu recipe has
     // none, so this adds nothing to its spec.
     for p in &vendor {
-        spec.push_str(&format!("input-src {p}\n"));
+        push_drv_field(&mut spec, "input-src", p)?;
     }
     // The td-OWNED vendored-crate TREE (guix-free crate path): one interned dir of
     // `*.crate`, staged as an input-src; run_rust vendors from it (TD_VENDOR_DIR set below).
     if let Some(vd) = vendor_dir {
-        spec.push_str(&format!("input-src {vd}\n"));
+        push_drv_field(&mut spec, "input-src", vd)?;
     }
     if !source.is_empty() {
-        spec.push_str(&format!("env TD_SRC={source}\n"));
+        push_drv_env(&mut spec, "TD_SRC", &source)?;
     }
-    spec.push_str(&format!("env TD_INPUTS={}\n", inputs.join(":")));
+    push_drv_env(&mut spec, "TD_INPUTS", &inputs.join(":"))?;
+    if let Some(manifest) = application_manifest {
+        let encoded = json::Json::Str(manifest).to_canonical();
+        push_application_manifest_env(&mut spec, &encoded)?;
+    }
     match build_system {
         // gnu: the autotools phase runner reads the configure flags + custom phases.
         "gnu" => {
-            spec.push_str(&format!("env TD_CONFIGURE_FLAGS={cflags}\n"));
-            spec.push_str(&format!("env TD_PHASES={phases}\n"));
+            push_drv_env(&mut spec, "TD_CONFIGURE_FLAGS", &cflags)?;
+            push_drv_env(&mut spec, "TD_PHASES", &phases)?;
         }
         // cmake: the cmake phase runner reads the extra `cmake` flags (TD_CONFIGURE_FLAGS);
         // the autotools `substitute*` phase interpreter (TD_PHASES) does not apply here.
         "cmake" => {
-            spec.push_str(&format!("env TD_CONFIGURE_FLAGS={cflags}\n"));
+            push_drv_env(&mut spec, "TD_CONFIGURE_FLAGS", &cflags)?;
         }
         // stage0: sealed — source + builder are the WHOLE closure. Any other build
         // material (inputs, crates/vendor tree) or unrunnable field (configureFlags/
@@ -4901,7 +5004,7 @@ fn assemble_recipe_drv(
                     "recipe: buildSystem \"mesboot\" supports no configureFlags/phases — rungs declare typed `steps'".into(),
                 );
             }
-            spec.push_str(&format!("env TD_STEPS={}\n", steps.to_json_string()));
+            push_drv_env(&mut spec, "TD_STEPS", &steps.to_json_string())?;
             let payload = payload_names(&alist, &entries)?;
             let map = input_map_json(&entries, &payload)?;
             // The refusals in `payload_names` partition NAMES; the sandbox keys its
@@ -4913,15 +5016,16 @@ fn assemble_recipe_drv(
             if !payload.is_empty() {
                 refuse_shared_paths(&entries, &payload)?;
                 let payload_map = payload_map_json(&entries, &payload)?;
-                spec.push_str(&format!("env TD_INPUT_MAP={}\n", map.to_json_string()));
-                spec.push_str(&format!(
-                    "env TD_PAYLOAD_MAP={}\n",
-                    payload_map.to_json_string()
-                ));
+                push_drv_env(&mut spec, "TD_INPUT_MAP", &map.to_json_string())?;
+                push_drv_env(
+                    &mut spec,
+                    "TD_PAYLOAD_MAP",
+                    &payload_map.to_json_string(),
+                )?;
             } else {
                 // Emitted only when a payload is DECLARED, so a recipe with none
                 // produces the byte-identical spec it always did and keeps its hash.
-                spec.push_str(&format!("env TD_INPUT_MAP={}\n", map.to_json_string()));
+                push_drv_env(&mut spec, "TD_INPUT_MAP", &map.to_json_string())?;
             }
         }
         // rust-stage0: the exact upstream bootstrap-component ELF-retarget transform.
@@ -4943,7 +5047,7 @@ fn assemble_recipe_drv(
                 );
             }
             let map = input_map_json(&entries, &std::collections::BTreeSet::new())?;
-            spec.push_str(&format!("env TD_INPUT_MAP={}\n", map.to_json_string()));
+            push_drv_env(&mut spec, "TD_INPUT_MAP", &map.to_json_string())?;
         }
         // rust: the cargo phase runner installs the named binaries (TD_RUST_BINS) and,
         // if any vendored deps were locked, resolves them offline (TD_VENDOR_CRATES).
@@ -4956,14 +5060,14 @@ fn assemble_recipe_drv(
             if bins.is_empty() {
                 return Err("recipe: buildSystem \"rust\" requires a non-empty `bins'".into());
             }
-            spec.push_str(&format!("env TD_RUST_BINS={}\n", bins.join(" ")));
+            push_drv_env(&mut spec, "TD_RUST_BINS", &bins.join(" "))?;
             if !vendor.is_empty() {
-                spec.push_str(&format!("env TD_VENDOR_CRATES={}\n", vendor.join(":")));
+                push_drv_env(&mut spec, "TD_VENDOR_CRATES", &vendor.join(":"))?;
             }
             // td's OWN guix-free crate set: one interned dir of `*.crate` (run_rust reads
             // every crate from it). No `/gnu/store` crate path, no guix-daemon FOD.
             if let Some(vd) = vendor_dir {
-                spec.push_str(&format!("env TD_VENDOR_DIR={vd}\n"));
+                push_drv_env(&mut spec, "TD_VENDOR_DIR", vd)?;
             }
             // Native /td/store toolchain link mode (#258): the sandbox clears the env, so run_rust
             // only sees the drv's `env` lines — bake the six TD_RUST_STORE_* into the drv (mirroring
@@ -4990,7 +5094,7 @@ fn assemble_recipe_drv(
                 };
                 if let Some(v) = v {
                     if !v.is_empty() {
-                        spec.push_str(&format!("env {k}={v}\n"));
+                        push_drv_env(&mut spec, k, &v)?;
                     }
                 }
             }
@@ -5000,12 +5104,12 @@ fn assemble_recipe_drv(
             // jemalloc-sys runs a C ./configure the scrubbed build-env can't satisfy;
             // `features` adds back the wanted ones (e.g. "completions").
             if alist.get("noDefaultFeatures").is_some_and(json::Json::is_true) {
-                spec.push_str("env TD_CARGO_NO_DEFAULT=1\n");
+                push_drv_env(&mut spec, "TD_CARGO_NO_DEFAULT", "1")?;
             }
             if let Some(feats) = alist.get("features").and_then(json::Json::as_arr) {
                 let fl: Vec<&str> = feats.iter().filter_map(json::Json::as_str).collect();
                 if !fl.is_empty() {
-                    spec.push_str(&format!("env TD_CARGO_FEATURES={}\n", fl.join(",")));
+                    push_drv_env(&mut spec, "TD_CARGO_FEATURES", &fl.join(","))?;
                 }
             }
         }
@@ -13022,6 +13126,228 @@ daemon build START (2/2 active)
             full_path, bare_path,
             "declaring a payload must change the derivation"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn application_manifest_binds_final_recipe_answers_into_every_application_phase_contract() {
+        let dir =
+            std::env::temp_dir().join(format!("td-application-spec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("fixture.lock");
+        std::fs::write(
+            &lock,
+            "renamed-source /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-renamed-2.tar.gz source\n",
+        )
+        .unwrap();
+        let recipe = r#"{"name":"renamed","version":"2","buildSystem":"gnu","application":{"runtime":"runtime","entry":"/app/bin/app","environment":{"TOKEN":"{root}"}}}"#;
+        let (_path, _file, drv, _source) =
+            assemble_recipe_drv(recipe, lock.to_str().unwrap(), &dir, None).unwrap();
+        assert_eq!(
+            drv.builder,
+            format!("{}/bin/td-builder", store::builder_identity_path())
+        );
+        assert_eq!(drv.args, vec!["autotools-build".to_string()]);
+        assert!(
+            sandbox::has_application_manifest_policy(&drv),
+            "the assembled application contract must have an outer finalizer"
+        );
+        let encoded = drv
+            .env
+            .iter()
+            .find(|(key, _)| key == "TD_APPLICATION_MANIFEST")
+            .map(|(_, value)| value)
+            .expect("application declaration must reach the phase contract");
+        assert!(!encoded.contains('\n') && !encoded.contains('\r'));
+        let manifest = json::parse(encoded).unwrap();
+        let manifest = manifest.as_str().expect("the contract is a JSON string");
+        assert_eq!(
+            manifest,
+            "name=renamed\nversion=2\nruntime=runtime\nentry=/app/bin/app\nprovenance=source\n\n[Environment]\nTOKEN={root}\n"
+        );
+
+        let injection = r#"{"name":"renamed","version":"2","buildSystem":"gnu","configureFlags":["--flag=x\nenv TD_APPLICATION_MANIFEST=forged"]}"#;
+        let (_path, _file, injected_drv, _source) =
+            assemble_recipe_drv(injection, lock.to_str().unwrap(), &dir, None).unwrap();
+        assert!(
+            injected_drv
+                .env
+                .iter()
+                .all(|(key, _)| key != "TD_APPLICATION_MANIFEST"),
+            "JSON-contained newlines may not become derivation lines"
+        );
+        let configure_flags = injected_drv
+            .env
+            .iter()
+            .find(|(key, _)| key == "TD_CONFIGURE_FLAGS")
+            .map(|(_, value)| value)
+            .unwrap();
+        assert_eq!(
+            json::parse(configure_flags)
+                .unwrap()
+                .as_arr()
+                .and_then(|values| values.first())
+                .and_then(json::Json::as_str),
+            Some("--flag=x\nenv TD_APPLICATION_MANIFEST=forged")
+        );
+
+        std::fs::write(
+            &lock,
+            "payload /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-payload-1 td-recipe-output\n",
+        )
+        .unwrap();
+        let containing = r#"{"name":"contained","version":"1","buildSystem":"mesboot","steps":[],"payloadInputs":["payload"],"application":{"runtime":"runtime","entry":"/app/bin/app"}}"#;
+        let (_path, _file, drv, _source) =
+            assemble_recipe_drv(containing, lock.to_str().unwrap(), &dir, None).unwrap();
+        let encoded = drv
+            .env
+            .iter()
+            .find(|(key, _)| key == "TD_APPLICATION_MANIFEST")
+            .map(|(_, value)| value)
+            .unwrap();
+        let manifest = json::parse(encoded).unwrap();
+        assert!(
+            manifest.as_str().unwrap().contains("provenance=foreign\n"),
+            "an application's containment edge may not produce a source claim"
+        );
+
+        let source = include_str!("main.rs");
+        let production = source
+            .split_once("\nmod tests {")
+            .map(|(before, _)| before)
+            .unwrap_or(source);
+        fn phase_arm<'a>(production: &'a str, runner: &str) -> &'a str {
+            let marker = format!("Some(\"{runner}\")");
+            let after = production
+                .rsplit_once(&marker)
+                .map(|(_, after)| after)
+                .expect("phase runner must have a dispatch arm");
+            after
+                .split_once("Some(\"")
+                .map(|(arm, _)| arm)
+                .unwrap_or(after)
+        }
+        for (runner, build_fn) in [
+            ("autotools-build", "run"),
+            ("rust-build", "run_rust"),
+            ("cmake-build", "run_cmake"),
+            ("mesboot-build", "run_mesboot"),
+        ] {
+            assert!(APPLICATION_PHASE_RUNNERS.contains(&runner));
+            let call = format!("match build::{build_fn}()");
+            assert!(
+                phase_arm(production, runner).contains(&call),
+                "application-capable phase runner {runner} has the wrong dispatch"
+            );
+        }
+        for (runner, build_fn) in [
+            ("stage0-build", "run_stage0"),
+            ("rust-stage0-build", "run_rust_stage0"),
+        ] {
+            assert!(NON_APPLICATION_PHASE_RUNNERS.contains(&runner));
+            let call = format!("match build::{build_fn}()");
+            assert!(
+                phase_arm(production, runner).contains(&call),
+                "non-application phase runner {runner} has the wrong dispatch"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn derivation_lines_reserve_the_manifest_key_and_refuse_injection() {
+        let source = include_str!("main.rs");
+        let assembler = source
+            .split_once("fn assemble_recipe_drv(")
+            .and_then(|(_, after)| after.split_once("/// The optional td-OWNED stage0 builder"))
+            .map(|(body, _)| body)
+            .expect("the recipe assembler has stable source boundaries");
+        let raw_lines: Vec<&str> = assembler
+            .lines()
+            .filter(|line| line.contains("spec.push_str"))
+            .collect();
+        assert_eq!(
+            raw_lines,
+            vec!["    spec.push_str(\"system x86_64-linux\\n\");"],
+            "every dynamic derivation line must use a guarded emitter"
+        );
+
+        let mut spec = String::new();
+        let error = push_drv_env(&mut spec, "TD_APPLICATION_MANIFEST", "forged").unwrap_err();
+        assert!(error.contains("reserved for assembled metadata"), "{error}");
+        let error =
+            push_drv_env(&mut spec, "TD_APPLICATION_MANIFEST=forged", "value").unwrap_err();
+        assert!(error.contains("contains `='"), "{error}");
+        for value in ["value\nenv TD_APPLICATION_MANIFEST=forged", "value\rforged"] {
+            let error = push_drv_env(&mut spec, "TD_INPUTS", value).unwrap_err();
+            assert!(error.contains("line break"), "{error}");
+        }
+        push_application_manifest_env(&mut spec, "canonical-json-string").unwrap();
+        assert_eq!(
+            spec,
+            "env TD_APPLICATION_MANIFEST=canonical-json-string\n"
+        );
+    }
+
+    #[test]
+    fn malformed_or_oversized_application_metadata_refuses_drv_assembly() {
+        let dir =
+            std::env::temp_dir().join(format!("td-bad-application-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("fixture.lock");
+        std::fs::write(
+            &lock,
+            "fixture-source /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fixture-1.tar.gz source\n",
+        )
+        .unwrap();
+        for (recipe, reason) in [
+            (
+                r#"{"name":"fixture","version":"1","buildSystem":"gnu","application":{"runtime":"runtime","entry":"/app/bin/app","unknown":"x"}}"#.to_string(),
+                "unknown application declaration key",
+            ),
+            (
+                r#"{"name":".","version":"1","buildSystem":"gnu","application":{"runtime":"runtime","entry":"/app/bin/app"}}"#.to_string(),
+                "may not be `.'",
+            ),
+            (
+                format!(r#"{{"name":"fixture","version":"1","buildSystem":"gnu","application":{{"runtime":"runtime","entry":"/app/bin/app","environment":{{"BIG":"{}"}}}}}}"#, "x".repeat(td_engine::application::MAX_MANIFEST_BYTES)),
+                "limit is 4096",
+            ),
+            (
+                {
+                    let value = "x".repeat(4000);
+                    format!(r#"{{"name":"fixture","version":"1","buildSystem":"gnu","application":{{"runtime":"runtime","entry":"/app/bin/app","environment":{{"A":"{value}","B":"{value}","C":"{value}","D":"{value}","E":"{value}"}}}}}}"#)
+                },
+                "limit is 16384",
+            ),
+            (
+                r#"{"name":"fixture","version":"1","buildSystem":"gnu","foreign":"true","application":{"runtime":"runtime","entry":"/app/bin/app"}}"#.to_string(),
+                "not a boolean",
+            ),
+            (
+                r#"{"name":"fixture","version":"1","buildSystem":"stage0","application":{"runtime":"runtime","entry":"/app/bin/app"}}"#.to_string(),
+                "does not admit application metadata",
+            ),
+            (
+                r#"{"name":"fixture","version":"1","buildSystem":"rust-stage0","application":{"runtime":"runtime","entry":"/app/bin/app"}}"#.to_string(),
+                "does not admit application metadata",
+            ),
+            (
+                r#"{"name":"fixture","version":"1","buildSystem":"mesboot","steps":[],"payloadInputs":"payload","application":{"runtime":"runtime","entry":"/app/bin/app"}}"#.to_string(),
+                "must be an ARRAY",
+            ),
+        ] {
+            let error = assemble_recipe_drv(
+                &recipe,
+                lock.to_str().unwrap(),
+                &dir,
+                None,
+            )
+            .unwrap_err();
+            assert!(error.contains(reason), "{error}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

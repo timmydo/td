@@ -31,6 +31,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 #![allow(unsafe_code)] // confined raw-syscall / low-level layer (UNSAFE.md)
 
+use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::fs;
 use std::io;
@@ -59,6 +60,10 @@ fn err(what: String) -> io::Error {
     io::Error::new(io::ErrorKind::Other, what)
 }
 
+fn trusted_recipe_builder(builder: &str) -> bool {
+    builder == format!("{}/bin/td-builder", crate::store::builder_identity_path())
+}
+
 /// Replace the trusted mesboot runner's hashed `TD_STEPS` data with the
 /// sandbox-local file path that `run_mesboot` consumes.
 fn configure_builder_env(
@@ -71,19 +76,36 @@ fn configure_builder_env(
     let mesboot = args.len() == 1
         && args.first().is_some_and(|arg| arg == "mesboot-build")
         && builder.ends_with("/bin/td-builder");
-    if mesboot {
-        let stable_builder =
-            builder == format!("{}/bin/td-builder", crate::store::builder_identity_path());
-        if !stable_builder {
-            return Err(err(format!(
-                "mesboot derivation builder {builder} is not the stable td-builder identity"
-            )));
-        }
+    if mesboot && !trusted_recipe_builder(builder) {
+        return Err(err(format!(
+            "mesboot derivation builder {builder} is not the stable td-builder identity"
+        )));
+    }
+    let application_policy = application_manifest_policy_for(builder, args);
+    let application_manifest = if trusted_recipe_builder(builder) {
+        unique_env(env, "TD_APPLICATION_MANIFEST")?
+    } else {
+        None
+    };
+    if application_manifest.is_some() && application_policy.is_none() {
+        return Err(err(
+            "trusted td-builder invocation with application metadata has no manifest policy"
+                .to_string(),
+        ));
+    }
+    if application_manifest.is_some()
+        && application_policy == Some(ApplicationManifestPolicy::Reserve)
+    {
+        return Err(err(
+            "non-application phase received application metadata".to_string(),
+        ));
     }
     let mut steps = None;
     for (key, value) in env {
         if mesboot && key == "TD_STEPS" {
             steps = Some(value.clone());
+        } else if application_policy.is_some() && key == "TD_APPLICATION_MANIFEST" {
+            continue;
         } else {
             command.env(key, value);
         }
@@ -104,6 +126,118 @@ fn write_mesboot_steps_file(path: &Path, steps: Option<&str>) -> io::Result<()> 
         fs::write(path, steps)?;
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApplicationManifestPolicy {
+    Materialize,
+    Reserve,
+}
+
+fn application_manifest_policy_for(
+    builder: &str,
+    args: &[String],
+) -> Option<ApplicationManifestPolicy> {
+    if !trusted_recipe_builder(builder) || args.len() != 1 {
+        return None;
+    }
+    let runner = args.first()?.as_str();
+    if crate::APPLICATION_PHASE_RUNNERS.contains(&runner) {
+        Some(ApplicationManifestPolicy::Materialize)
+    } else if crate::NON_APPLICATION_PHASE_RUNNERS.contains(&runner) {
+        Some(ApplicationManifestPolicy::Reserve)
+    } else {
+        None
+    }
+}
+
+fn application_manifest_policy(drv: &Derivation) -> Option<ApplicationManifestPolicy> {
+    application_manifest_policy_for(&drv.builder, &drv.args)
+}
+
+#[cfg(test)]
+pub(crate) fn has_application_manifest_policy(drv: &Derivation) -> bool {
+    application_manifest_policy(drv).is_some()
+}
+
+fn unique_env<'a>(env: &'a [(String, String)], key: &str) -> io::Result<Option<&'a str>> {
+    let mut found = None;
+    for (name, value) in env {
+        if name == key {
+            if found.is_some() {
+                return Err(err(format!(
+                    "derivation carries duplicate environment key {key:?}"
+                )));
+            }
+            found = Some(value.as_str());
+        }
+    }
+    Ok(found)
+}
+
+fn unique_drv_env<'a>(drv: &'a Derivation, key: &str) -> io::Result<Option<&'a str>> {
+    unique_env(&drv.env, key)
+}
+
+fn finalize_application_output(
+    drv: &Derivation,
+    outputs: &[(String, PathBuf)],
+) -> io::Result<()> {
+    let Some(policy) = application_manifest_policy(drv) else {
+        if trusted_recipe_builder(&drv.builder)
+            && unique_drv_env(drv, "TD_APPLICATION_MANIFEST")?.is_some()
+        {
+            return Err(err(
+                "trusted td-builder invocation with application metadata has no manifest policy"
+                    .to_string(),
+            ));
+        }
+        return Ok(());
+    };
+    let encoded = unique_drv_env(drv, "TD_APPLICATION_MANIFEST")?;
+    if policy == ApplicationManifestPolicy::Reserve && encoded.is_some() {
+        return Err(err(
+            "non-application phase received application metadata".to_string(),
+        ));
+    }
+    let mut output_names = BTreeSet::new();
+    let mut output_paths = BTreeSet::new();
+    for (name, path) in outputs {
+        if !output_names.insert(name.as_str()) {
+            return Err(err(format!(
+                "application-manifest phase has duplicate output name {name:?}"
+            )));
+        }
+        if !output_paths.insert(path.as_path()) {
+            return Err(err(format!(
+                "application-manifest phase has duplicate output path {}",
+                path.display()
+            )));
+        }
+    }
+    let out = outputs
+        .iter()
+        .find(|(name, _)| name == "out")
+        .map(|(_, path)| path);
+    for (name, path) in outputs {
+        if name != "out" {
+            crate::build::materialize_application_manifest_at(path, None)
+                .map_err(|error| err(format!("application manifest finalization: {error}")))?;
+        }
+    }
+    let out_manifest = if policy == ApplicationManifestPolicy::Materialize {
+        encoded
+    } else {
+        None
+    };
+    match (out, out_manifest) {
+        (Some(path), manifest) => crate::build::materialize_application_manifest_at(path, manifest)
+            .map_err(|error| err(format!("application manifest finalization: {error}"))),
+        (None, Some(_)) => Err(err(
+            "application declaration requires an `out' output".to_string(),
+        )),
+        (None, None) => Ok(()),
+    }
 }
 
 /// Map exactly one uid/gid pair into a user namespace already entered via
@@ -889,6 +1023,9 @@ pub fn build(
         })?;
         outputs.push((o.name.clone(), host));
     }
+    // `cmd` is the outer trampoline that waits for PID 1. Namespace teardown
+    // prevents package code from running before the trampoline returns here.
+    finalize_application_output(drv, &outputs)?;
     Ok(outputs)
 }
 
@@ -1412,8 +1549,32 @@ mod tests {
         let builder = format!("{builder_store}/bin/td-builder");
         let args = vec!["mesboot-build".to_string()];
         let large = "x".repeat(300 * 1024);
+        let value = "x".repeat(4000);
+        let application_manifest = td_engine::application::ApplicationDeclaration::new(
+            "runtime",
+            "/app/bin/application",
+        )
+        .unwrap()
+        .with_environment("TOKEN", "{root}")
+        .unwrap()
+        .with_environment("BIG_A", &value)
+        .unwrap()
+        .with_environment("BIG_B", &value)
+        .unwrap()
+        .with_environment("BIG_C", &value)
+        .unwrap()
+        .manifest(
+            "application",
+            "1",
+            td_engine::application::ApplicationProvenance::Source,
+        )
+        .unwrap()
+        .to_keyfile();
+        let application = crate::json::Json::Str(application_manifest).to_canonical();
+        assert!(application.len() > 12_000);
         let env = vec![
             ("TD_INPUT_MAP".to_string(), "{}".to_string()),
+            ("TD_APPLICATION_MANIFEST".to_string(), application.clone()),
             ("TD_STEPS".to_string(), large.clone()),
         ];
         let mut command = Command::new(&builder);
@@ -1440,6 +1601,12 @@ mod tests {
                 .any(|(key, value)| key == std::ffi::OsStr::new("TD_INPUT_MAP")
                     && value == Some(std::ffi::OsStr::new("{}"))),
             "ordinary derivation environment entries remain environment entries"
+        );
+        assert!(
+            command
+                .get_envs()
+                .all(|(key, _)| key != std::ffi::OsStr::new("TD_APPLICATION_MANIFEST")),
+            "the sandbox parent, not the package PID namespace, owns application metadata"
         );
         assert!(
             command.get_envs().any(|(key, value)| {
@@ -1482,6 +1649,13 @@ mod tests {
                     && value == Some(std::ffi::OsStr::new(&large))),
             "another builder's environment ABI must remain unchanged"
         );
+        assert!(
+            other_builder.get_envs().any(|(key, value)| {
+                key == std::ffi::OsStr::new("TD_APPLICATION_MANIFEST")
+                    && value == Some(std::ffi::OsStr::new(application.as_str()))
+            }),
+            "the filter applies only to trusted recipe runners"
+        );
         let mut untrusted_td_builder = Command::new("/td/store/other/bin/td-builder");
         untrusted_td_builder.env_clear();
         assert!(
@@ -1497,30 +1671,65 @@ mod tests {
             .contains("not the stable td-builder identity"),
             "a td-builder-shaped mesboot invocation must fail before execve"
         );
-        for other_args in [
-            vec!["autotools-build".to_string()],
-            vec!["mesboot-build".to_string(), "extra".to_string()],
-        ] {
-            let mut other_command = Command::new(&builder);
-            other_command.env_clear();
-            assert!(
-                configure_builder_env(
-                    &mut other_command,
-                    &builder,
-                    &other_args,
-                    &env,
-                    steps_file,
-                )
-                .unwrap()
-                .is_none()
-            );
-            assert!(
-                other_command
-                    .get_envs()
-                    .any(|(key, _)| key == std::ffi::OsStr::new("TD_STEPS")),
-                "only the exact mesboot invocation uses the file handoff"
-            );
-        }
+        let mut other_command = Command::new(&builder);
+        other_command.env_clear();
+        assert!(
+            configure_builder_env(
+                &mut other_command,
+                &builder,
+                &["autotools-build".to_string()],
+                &env,
+                steps_file,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            other_command
+                .get_envs()
+                .any(|(key, _)| key == std::ffi::OsStr::new("TD_STEPS")),
+            "only the exact mesboot invocation uses the file handoff"
+        );
+        let mut malformed_phase = Command::new(&builder);
+        malformed_phase.env_clear();
+        let error = configure_builder_env(
+            &mut malformed_phase,
+            &builder,
+            &["mesboot-build".to_string(), "extra".to_string()],
+            &env,
+            steps_file,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("has no manifest policy"), "{error}");
+        let mut manifest_free_phase = Command::new(&builder);
+        manifest_free_phase.env_clear();
+        let manifest_free_env = vec![("TD_STEPS".to_string(), large.clone())];
+        assert!(
+            configure_builder_env(
+                &mut manifest_free_phase,
+                &builder,
+                &["mesboot-build".to_string(), "extra".to_string()],
+                &manifest_free_env,
+                steps_file,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(manifest_free_phase.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new("TD_STEPS")
+                && value == Some(std::ffi::OsStr::new(&large))
+        }));
+        let mut bootstrap_application = Command::new(&builder);
+        bootstrap_application.env_clear();
+        let error = configure_builder_env(
+            &mut bootstrap_application,
+            &builder,
+            &["stage0-build".to_string()],
+            &env,
+            steps_file,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("non-application phase"), "{error}");
         let dir =
             std::env::temp_dir().join(format!("td-mesboot-steps-file-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -1532,6 +1741,182 @@ mod tests {
         );
         assert!(!path.exists(), "the composed handoff consumes its input file");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    fn phase_drv(runner: &str, env: Vec<(String, String)>) -> Derivation {
+        Derivation {
+            outputs: Vec::new(),
+            input_drvs: Vec::new(),
+            input_srcs: Vec::new(),
+            platform: "x86_64-linux".into(),
+            builder: format!(
+                "{}/bin/td-builder",
+                crate::store::builder_identity_path()
+            ),
+            args: vec![runner.to_string()],
+            env,
+        }
+    }
+
+    #[test]
+    fn every_recipe_runner_has_one_outer_manifest_policy() {
+        assert!(
+            crate::store::BUILDER_ABI >= 2,
+            "manifest reservation must not reuse outputs built before the policy existed"
+        );
+        for runner in crate::APPLICATION_PHASE_RUNNERS {
+            assert_eq!(
+                application_manifest_policy(&phase_drv(runner, Vec::new())),
+                Some(ApplicationManifestPolicy::Materialize)
+            );
+        }
+        for runner in crate::NON_APPLICATION_PHASE_RUNNERS {
+            assert_eq!(
+                application_manifest_policy(&phase_drv(runner, Vec::new())),
+                Some(ApplicationManifestPolicy::Reserve)
+            );
+        }
+        let mut untrusted = phase_drv("autotools-build", Vec::new());
+        untrusted.builder = "/td/store/untrusted/bin/td-builder".into();
+        assert_eq!(application_manifest_policy(&untrusted), None);
+    }
+
+    #[test]
+    fn application_finalization_uses_the_drv_contract_after_namespace_teardown() {
+        let source = include_str!("sandbox.rs");
+        let production = source
+            .split_once("\nmod tests {")
+            .map(|(before, _)| before)
+            .unwrap_or(source);
+        let waited = production
+            .find("let status = cmd.status();")
+            .expect("sandbox build must wait for its PID namespace");
+        let finalized = production
+            .find("finalize_application_output(drv, &outputs)?;")
+            .expect("sandbox parent must finalize application metadata");
+        assert!(
+            waited < finalized,
+            "a detached output mutator must be unable to run before finalization"
+        );
+
+        let build = include_str!("build.rs");
+        let build_production = build
+            .split_once("\nmod tests {")
+            .map(|(before, _)| before)
+            .unwrap_or(build);
+        assert_eq!(
+            build_production
+                .matches("materialize_application_manifest_at(")
+                .count(),
+            1,
+            "only the outer sandbox may call the materializer"
+        );
+        assert_eq!(
+            build_production
+                .matches("write_application_manifest(")
+                .count(),
+            2,
+            "the fixed writer may only be defined and called by the materializer"
+        );
+    }
+
+    #[test]
+    fn outer_finalizer_reads_only_the_hashed_drv_value() {
+        let directory =
+            std::env::temp_dir().join(format!("td-outer-app-finalizer-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let text = td_engine::application::ApplicationDeclaration::new(
+            "runtime",
+            "/app/bin/application",
+        )
+        .unwrap()
+        .manifest(
+            "application",
+            "1",
+            td_engine::application::ApplicationProvenance::Source,
+        )
+        .unwrap()
+        .to_keyfile();
+        let encoded = crate::json::Json::Str(text.clone()).to_canonical();
+        let drv = phase_drv(
+            "autotools-build",
+            vec![("TD_APPLICATION_MANIFEST".into(), encoded)],
+        );
+        finalize_application_output(&drv, &[("out".into(), directory.clone())]).unwrap();
+        assert_eq!(fs::read_to_string(directory.join("manifest")).unwrap(), text);
+
+        let duplicate = phase_drv(
+            "autotools-build",
+            vec![
+                ("TD_APPLICATION_MANIFEST".into(), "one".into()),
+                ("TD_APPLICATION_MANIFEST".into(), "two".into()),
+            ],
+        );
+        let other = directory.join("duplicate");
+        fs::create_dir_all(&other).unwrap();
+        let error = finalize_application_output(&duplicate, &[("out".into(), other)]).unwrap_err();
+        assert!(error.to_string().contains("duplicate environment key"), "{error}");
+
+        let primary = directory.join("multi-out");
+        let secondary = directory.join("multi-dev");
+        fs::create_dir_all(&primary).unwrap();
+        fs::create_dir_all(&secondary).unwrap();
+        fs::write(secondary.join("manifest"), "package-authored").unwrap();
+        let error = finalize_application_output(
+            &drv,
+            &[("out".into(), primary.clone()), ("dev".into(), secondary)],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reserved for builder-authenticated metadata"),
+            "{error}"
+        );
+        assert!(
+            !primary.join("manifest").exists(),
+            "secondary outputs are reserved before the authenticated file is written"
+        );
+
+        let named_output = directory.join("named-output");
+        fs::create_dir_all(&named_output).unwrap();
+        let plain = phase_drv("autotools-build", Vec::new());
+        finalize_application_output(&plain, &[("bin".into(), named_output.clone())]).unwrap();
+        assert!(!named_output.join("manifest").exists());
+        let missing_out = directory.join("missing-out");
+        fs::create_dir_all(&missing_out).unwrap();
+        let error = finalize_application_output(&drv, &[("bin".into(), missing_out)]).unwrap_err();
+        assert!(error.to_string().contains("requires an `out' output"), "{error}");
+
+        let duplicate_out_a = directory.join("duplicate-out-a");
+        let duplicate_out_b = directory.join("duplicate-out-b");
+        fs::create_dir_all(&duplicate_out_a).unwrap();
+        fs::create_dir_all(&duplicate_out_b).unwrap();
+        let error = finalize_application_output(
+            &drv,
+            &[
+                ("out".into(), duplicate_out_a.clone()),
+                ("out".into(), duplicate_out_b.clone()),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("duplicate output name"), "{error}");
+        assert!(!duplicate_out_a.join("manifest").exists());
+        assert!(!duplicate_out_b.join("manifest").exists());
+
+        let duplicate_path = directory.join("duplicate-path");
+        fs::create_dir_all(&duplicate_path).unwrap();
+        let error = finalize_application_output(
+            &plain,
+            &[
+                ("bin".into(), duplicate_path.clone()),
+                ("dev".into(), duplicate_path),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("duplicate output path"), "{error}");
+        fs::remove_dir_all(&directory).ok();
     }
 
     // A closure item binds WHOLE: `plan_staged_item` returns one `(on-disk, target)`

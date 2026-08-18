@@ -11,8 +11,8 @@ use crate::types::{Recipe, Step, TextEdit};
 //
 // The build tools resolve through the td-built `-mesboot0` providers —
 // mesboot0_path()/mesboot0_inputs() supply coreutils/sed/grep/gawk/diffutils, the
-// `awk` ToolFarm points at gawk-mesboot0, the binutils link_bins farm
-// uses coreutils-mesboot0's `ln`, and the two config.make fixups run
+// `awk` ToolFarm points at gawk-mesboot0, the engine-native binutils farm uses a
+// closed roster, and the two config.make fixups run
 // sed_i (sed-mesboot0's `sed -i`).
 pub fn recipe() -> Recipe {
     let path = mesboot0_path();
@@ -48,7 +48,7 @@ pub fn recipe() -> Recipe {
             ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
         ],
     });
-    steps.push(link_bins("binutils-mesboot0"));
+    steps.push(link_bins(crate::ladder::BinutilsRung::Mesboot0));
     steps.push(
         Step::run(
             "{src}",

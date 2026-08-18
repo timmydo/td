@@ -10,8 +10,9 @@ use crate::types::{Recipe, Step, TextEdit};
 //
 // Host-tool ingress closed (re #469): cut over to the td-built `-mesboot0`
 // providers — mesboot0_path()/mesboot0_inputs() supply coreutils/sed/grep/gawk/
-// diffutils, the `awk` ToolFarm points at gawk-mesboot0, and `rm`/`cp`/the
-// binutils link_bins farm use coreutils-mesboot0. The one host tool this
+// diffutils, the `awk` ToolFarm points at gawk-mesboot0, `rm`/`cp` come from
+// coreutils-mesboot0, and the engine-native binutils farm uses a closed roster.
+// The one host tool this
 // rung depended on was `tar` (install-headers-tar), replaced below with `cp -a`.
 // `make install` also NAMES host `find` in install-headers' fix-symlinks step,
 // but that is a dead edge like flex/bison: the line is error-ignored + `$?`-gated
@@ -70,8 +71,8 @@ pub fn recipe() -> Recipe {
             ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
         ],
     });
-    // binutils' whole bin dir onto the farm (as/ld/ar/ranlib/nm/strip/…).
-    steps.push(link_bins("binutils-mesboot0"));
+    // The closed binutils roster onto the farm (as/ld/ar/ranlib/nm/strip/…).
+    steps.push(link_bins(crate::ladder::BinutilsRung::Mesboot0));
     steps.push(Step::WriteFile {
         path: "{src}/config.cache".into(),
         content: "ac_cv_c_float_format='IEEE (little-endian)'\n".into(),

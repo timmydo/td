@@ -57,7 +57,7 @@ pub fn recipe() -> Recipe {
             ("gawk".into(), "{in:gawk-mesboot}/bin/gawk".into()),
         ],
     });
-    steps.push(link_bins("binutils-mesboot"));
+    steps.push(link_bins(crate::ladder::BinutilsRung::Mesboot));
     steps.push(Step::PatchShebangs {
         dir: "{src}".into(),
         shell: SH.into(),

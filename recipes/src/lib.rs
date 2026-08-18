@@ -7,6 +7,7 @@
 //! the same shape the Guile lowering bridge already consumes from boa, so no bridge
 //! change is needed (the consumer cutover is a follow-up).
 
+pub mod application;
 pub mod catalog;
 // JSON value/parser/canonical writer lives in the shared, std-only td-engine
 // (one copy for td-recipe-eval + td-builder). Re-exported so `crate::json::` /

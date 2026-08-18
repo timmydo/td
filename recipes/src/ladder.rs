@@ -64,21 +64,60 @@ pub fn mesboot0_inputs(extras: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// The tool-farm step that symlinks a prior binutils rung's whole `bin/` into
-/// `{tools}` (as/ld/ar/ranlib/nm/strip/…) with the td-built `coreutils-mesboot0`
-/// `ln`, on `mesboot0_path()`. The `glob:` argv element expands sorted in the
-/// engine.
-pub fn link_bins(binutils_rung: &str) -> Step {
-    Step::run(
-        "{root}",
-        &[
-            "{in:coreutils-mesboot0}/bin/ln",
-            "-sf",
-            &format!("glob:{{in:{binutils_rung}}}/bin/*"),
-            "{tools}",
-        ],
-    )
-    .env("PATH", &mesboot0_path())
+/// The tool-farm step that symlinks a prior binutils rung's executables into
+/// `{tools}` (as/ld/ar/ranlib/nm/strip/…). These names are explicit because a
+/// command glob may not enumerate a staged input (APPLICATIONS.md section B.8).
+#[derive(Clone, Copy)]
+pub enum BinutilsRung {
+    Mesboot0,
+    Mesboot1,
+    Mesboot,
+    V244,
+}
+
+impl BinutilsRung {
+    fn catalog_stem(self) -> &'static str {
+        match self {
+            BinutilsRung::Mesboot0 => "binutils-mesboot0",
+            BinutilsRung::Mesboot1 => "binutils-mesboot1",
+            BinutilsRung::Mesboot => "binutils-mesboot",
+            BinutilsRung::V244 => "binutils-244",
+        }
+    }
+}
+
+pub fn link_bins(rung: BinutilsRung) -> Step {
+    let mut names = vec![
+        "addr2line",
+        "ar",
+        "as",
+        "c++filt",
+        "gprof",
+        "ld",
+        "nm",
+        "objcopy",
+        "objdump",
+        "ranlib",
+        "readelf",
+        "size",
+        "strings",
+        "strip",
+    ];
+    if matches!(rung, BinutilsRung::V244) {
+        names.extend(["elfedit", "ld.bfd"]);
+    }
+    let binutils_rung = rung.catalog_stem();
+    Step::ToolFarm {
+        links: names
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    format!("{{in:{binutils_rung}}}/bin/{name}"),
+                )
+            })
+            .collect(),
+    }
 }
 
 /// The declared shell (the sandbox has no /bin/sh): the td-built `bash-mesboot`
@@ -970,6 +1009,42 @@ mod tests {
             );
         }
         (bootstrap_recipes, bootstrap_interior)
+    }
+
+    fn command_glob_is_build_local(pattern: &str) -> bool {
+        ["{root}/", "{src}/", "{out}/", "{tools}/"]
+            .iter()
+            .any(|prefix| pattern.starts_with(prefix))
+            && !pattern.split('/').any(|component| component == "..")
+    }
+
+    #[test]
+    fn command_globs_only_read_the_build_tree() {
+        for (stem, recipe) in catalog::all() {
+            let Some(steps) = recipe.steps else {
+                continue;
+            };
+            for step in steps {
+                let Step::Run { argv, .. } = step else {
+                    continue;
+                };
+                for arg in argv {
+                    let Some(pattern) = arg.strip_prefix("glob:") else {
+                        continue;
+                    };
+                    assert!(
+                        command_glob_is_build_local(pattern),
+                        "recipe `{stem}' command glob reads outside its own tree: {pattern}"
+                    );
+                }
+            }
+        }
+        assert!(!command_glob_is_build_local("{root}/../input/*"));
+        assert!(!command_glob_is_build_local(
+            "{in:binutils-mesboot0}/bin/*"
+        ));
+        assert!(command_glob_is_build_local("{src}/objects/*.o"));
+        assert!(command_glob_is_build_local("{tools}/wrappers/*"));
     }
 
     #[test]

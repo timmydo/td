@@ -24,7 +24,7 @@ pub fn recipe() -> Recipe {
             ("make".into(), "{in:make-mesboot}/bin/make".into()),
         ],
     });
-    steps.push(link_bins("binutils-mesboot1"));
+    steps.push(link_bins(crate::ladder::BinutilsRung::Mesboot1));
     steps.push(
         Step::run(
             "{src}",

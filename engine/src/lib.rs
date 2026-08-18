@@ -30,6 +30,7 @@
 // is how a per-run trusted key reaches td-boot without any recipe being
 // parameterized (DESIGN.md §6). Host-side only: it produces bytes for a check
 // to write, and no target binary includes it.
+pub mod application;
 pub mod cpio;
 pub mod crc32;
 pub mod ed25519;

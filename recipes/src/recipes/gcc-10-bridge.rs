@@ -54,7 +54,7 @@ pub fn recipe() -> Recipe {
             ("gawk".into(), "{in:gawk-mesboot}/bin/gawk".into()),
         ],
     });
-    steps.push(link_bins("binutils-244"));
+    steps.push(link_bins(crate::ladder::BinutilsRung::V244));
     // Single-token static wrappers survive GCC's CC_FOR_BUILD/CXX_FOR_BUILD
     // munging. GCC 4.9 defaults C to gnu90, while the in-tree GMP 6.3 build
     // tools use C99 declarations, so give C a gnu11 default before the build's

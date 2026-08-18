@@ -50,7 +50,7 @@ pub fn recipe() -> Recipe {
             ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
         ],
     });
-    steps.push(link_bins("binutils-mesboot1"));
+    steps.push(link_bins(crate::ladder::BinutilsRung::Mesboot1));
     steps.push(Step::PatchShebangs {
         dir: "{src}".into(),
         shell: SH.into(),

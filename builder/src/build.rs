@@ -39,6 +39,7 @@ use crate::json::Json;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1046,6 +1047,67 @@ fn configure_log_tails(srcdir: &Path) -> String {
         ));
     }
     out
+}
+
+fn write_application_manifest(out: &Path, encoded: &str) -> Result<(), String> {
+    let value = crate::json::parse(encoded)
+        .map_err(|error| format!("TD_APPLICATION_MANIFEST JSON: {error}"))?;
+    let text = value
+        .as_str()
+        .ok_or("TD_APPLICATION_MANIFEST is not a JSON string")?;
+    let manifest = td_engine::application::ApplicationManifest::parse(text)
+        .map_err(|error| format!("TD_APPLICATION_MANIFEST: {error}"))?;
+    if manifest.to_keyfile() != text {
+        return Err("TD_APPLICATION_MANIFEST is not canonical".into());
+    }
+    let path = out.join("manifest");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "application manifest collision: {} is reserved for builder-authenticated metadata",
+                    path.display()
+                )
+            } else {
+                format!("create {}: {error}", path.display())
+            }
+        })?;
+    file.write_all(text.as_bytes())
+        .map_err(|error| format!("write {}: {error}", path.display()))?;
+    file.set_permissions(fs::Permissions::from_mode(0o644))
+        .map_err(|error| format!("chmod {}: {error}", path.display()))
+}
+
+pub(crate) fn materialize_application_manifest_at(
+    out: &Path,
+    encoded: Option<&str>,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(out)
+        .map_err(|error| format!("stat application output {}: {error}", out.display()))?;
+    if !metadata.file_type().is_dir() {
+        if encoded.is_none() && metadata.file_type().is_file() {
+            return Ok(());
+        }
+        return Err(format!(
+            "application output {} is not a directory",
+            out.display()
+        ));
+    }
+    if let Some(encoded) = encoded {
+        return write_application_manifest(out, encoded);
+    }
+    let path = out.join("manifest");
+    match fs::symlink_metadata(&path) {
+        Ok(_) => Err(format!(
+            "undeclared application manifest: {} is reserved for builder-authenticated metadata",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("stat {}: {error}", path.display())),
+    }
 }
 
 pub fn run() -> Result<(), String> {
@@ -2654,6 +2716,15 @@ pub(crate) fn consume_mesboot_steps_file(path: &Path) -> Result<String, String> 
     Ok(steps)
 }
 
+fn create_tool_farm_link(tools: &Path, name: &str, target: &Path) -> Result<(), String> {
+    fs::metadata(target)
+        .map_err(|e| format!("toolFarm target {}: {e}", target.display()))?;
+    let link = tools.join(name);
+    let _ = fs::remove_file(&link);
+    std::os::unix::fs::symlink(target, &link)
+        .map_err(|e| format!("symlink {name} -> {}: {e}", target.display()))
+}
+
 /// Read `TD_PAYLOAD_MAP` (payload name → store path) STRICTLY, where
 /// `TD_INPUT_MAP`'s read filters non-strings out.
 ///
@@ -2822,10 +2893,8 @@ pub fn run_mesboot() -> Result<(), String> {
                     (Some(a), Some(b)) => (a.to_string(), ctx.expand(b).map_err(err)?),
                     _ => return Err(err("toolFarm: non-string pair".into())),
                 };
-                let link = Path::new(&ctx.tools).join(&name);
-                let _ = fs::remove_file(&link);
-                std::os::unix::fs::symlink(&target, &link)
-                    .map_err(|e| err(format!("symlink {name} -> {target}: {e}")))?;
+                create_tool_farm_link(Path::new(&ctx.tools), &name, Path::new(&target))
+                    .map_err(err)?;
             }
         } else if let Some(o) = step.get("writeFile") {
             let path = ctx.expand(&field(o, "path")?).map_err(err)?;
@@ -3271,6 +3340,59 @@ mod tests {
     }
 
     #[test]
+    fn application_manifest_finalizer_is_literal_fixed_and_non_overwriting() {
+        let directory =
+            std::env::temp_dir().join(format!("td-application-manifest-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let text = "name=firefox\nversion=1\nruntime=runtime\nentry=/app/bin/firefox\nprovenance=foreign\n\n[Environment]\nTOKEN={root}\n";
+        let encoded = Json::Str(text.into()).to_canonical();
+        materialize_application_manifest_at(&directory, Some(&encoded)).unwrap();
+        let path = directory.join("manifest");
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        let error = write_application_manifest(&directory, &encoded).unwrap_err();
+        assert!(
+            error.contains("reserved for builder-authenticated metadata"),
+            "an existing manifest must not be replaced: {error}"
+        );
+
+        let plain = directory.join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        materialize_application_manifest_at(&plain, None).unwrap();
+        fs::write(plain.join("manifest"), "provenance=source\n").unwrap();
+        let error = materialize_application_manifest_at(&plain, None).unwrap_err();
+        assert!(error.contains("undeclared application manifest"), "{error}");
+
+        let missing = directory.join("missing");
+        let error = materialize_application_manifest_at(&missing, Some(&encoded)).unwrap_err();
+        assert!(error.contains("stat application output"), "{error}");
+        let file = directory.join("file-output");
+        fs::write(&file, "not a directory").unwrap();
+        materialize_application_manifest_at(&file, None).unwrap();
+        let error = materialize_application_manifest_at(&file, Some(&encoded)).unwrap_err();
+        assert!(error.contains("is not a directory"), "{error}");
+
+        let linked_target = directory.join("linked-target");
+        fs::create_dir_all(&linked_target).unwrap();
+        let linked_output = directory.join("linked-output");
+        std::os::unix::fs::symlink(&linked_target, &linked_output).unwrap();
+        let error =
+            materialize_application_manifest_at(&linked_output, Some(&encoded)).unwrap_err();
+        assert!(error.contains("is not a directory"), "{error}");
+        assert!(!linked_target.join("manifest").exists());
+
+        let noncanonical = Json::Str(format!("# comment\n{text}")).to_canonical();
+        let other = directory.join("other");
+        let error = write_application_manifest(&other, &noncanonical).unwrap_err();
+        assert!(error.contains("not canonical"), "{error}");
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
     fn mesboot_template_expands_tokens_and_passes_foreign_braces_verbatim() {
         // The rung seds carry brace text (`${vdso_symver//./_}`) that must NOT
         // expand; recognised tokens must; an unknown {in:X} is a hard error.
@@ -3356,6 +3478,25 @@ mod tests {
         assert!(e.contains("build's own tree"), "{e}");
         // ...and it really would have matched, or this proves nothing.
         assert_eq!(glob_one_star(&escape).unwrap().len(), 1);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_tool_farm_refuses_a_missing_target_before_linking_it() {
+        let d = std::env::temp_dir().join(format!("td-tool-farm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let tools = d.join("tools");
+        let target = d.join("input/bin/as");
+        fs::create_dir_all(&tools).unwrap();
+        let error = create_tool_farm_link(&tools, "as", &target)
+            .expect_err("a missing tool target must refuse");
+        assert!(error.contains("toolFarm target"), "{error}");
+        assert!(!tools.join("as").exists());
+
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"tool").unwrap();
+        create_tool_farm_link(&tools, "as", &target).unwrap();
+        assert_eq!(fs::read_link(tools.join("as")).unwrap(), target);
         fs::remove_dir_all(&d).unwrap();
     }
 

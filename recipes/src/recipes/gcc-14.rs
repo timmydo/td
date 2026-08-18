@@ -50,7 +50,7 @@ pub fn recipe() -> Recipe {
             ("make".into(), "{in:make-mesboot}/bin/make".into()),
         ],
     });
-    steps.push(link_bins("binutils-244"));
+    steps.push(link_bins(crate::ladder::BinutilsRung::V244));
     // Single-token static wrappers (see header): CC/CXX survive GCC's munging.
     // -idirafter preserves libstdc++'s #include_next ordering while exposing
     // only the declared glibc and kernel-header inputs to build-host programs.

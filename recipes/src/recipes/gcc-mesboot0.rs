@@ -46,7 +46,7 @@ pub fn recipe() -> Recipe {
             ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
         ],
     });
-    steps.push(link_bins("binutils-mesboot0"));
+    steps.push(link_bins(crate::ladder::BinutilsRung::Mesboot0));
     steps.push(Step::WriteFile {
         path: "{src}/config.cache".into(),
         content: "ac_cv_c_float_format='IEEE (little-endian)'\n".into(),

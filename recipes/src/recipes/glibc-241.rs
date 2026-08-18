@@ -39,7 +39,7 @@ pub fn recipe() -> Recipe {
             ("python3".into(), "{in:python-mesboot}/bin/python3".into()),
         ],
     });
-    steps.push(link_bins("binutils-244"));
+    steps.push(link_bins(crate::ladder::BinutilsRung::V244));
     steps.push(Step::WriteFile {
         path: "{root}/wb/gcc".into(),
         content: format!(

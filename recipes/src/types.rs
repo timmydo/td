@@ -19,6 +19,7 @@
     clippy::indexing_slicing
 )] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
+use crate::application::ApplicationDeclaration;
 use crate::json::Json;
 
 fn vs(xs: &[&str]) -> Vec<String> {
@@ -815,6 +816,11 @@ pub struct Recipe {
     /// closing it would cost, and this doc deliberately claims no more than the
     /// two properties above.
     pub payload_inputs: Option<Vec<String>>,
+    /// Immutable application-package metadata. The declaration omits identity,
+    /// version and provenance; the derivation assembler binds those from this
+    /// final Recipe and materializes `{out}/manifest` for application-capable
+    /// build systems; bootstrap trust-root systems refuse the declaration.
+    pub application: Option<ApplicationDeclaration>,
     /// The `mesboot` build system's typed step list (#378 slices 2+3).
     pub steps: Option<Vec<Step>>,
     pub configure_flags: Option<Vec<String>>,
@@ -885,6 +891,7 @@ impl Recipe {
             inputs: None,
             native_inputs: None,
             payload_inputs: None,
+            application: None,
             steps: None,
             configure_flags: None,
             make_flags: None,
@@ -944,6 +951,10 @@ impl Recipe {
     /// from any step that runs a command.
     pub fn payload_inputs(mut self, xs: &[&str]) -> Recipe {
         self.payload_inputs = Some(vs(xs));
+        self
+    }
+    pub fn application(mut self, declaration: ApplicationDeclaration) -> Recipe {
+        self.application = Some(declaration);
         self
     }
     pub fn steps(mut self, xs: Vec<Step>) -> Recipe {
@@ -1123,6 +1134,9 @@ impl Recipe {
         if self.is_foreign() {
             o.push(("foreign".into(), Json::Bool(true)));
         }
+        if let Some(application) = &self.application {
+            o.push(("application".into(), application.to_json()));
+        }
         if let Some(x) = &self.steps {
             o.push((
                 "steps".into(),
@@ -1209,6 +1223,25 @@ mod tests {
             with.to_json().to_canonical(),
             r#"{"buildSystem":"gnu","inputs":["gcc"],"name":"fixture","payloadInputs":["firefox"],"version":"1.0"}"#
         );
+    }
+
+    #[test]
+    fn an_application_declaration_carries_no_snapshot_of_final_recipe_answers() {
+        let declaration = ApplicationDeclaration::new("runtime", "/app/bin/app").unwrap();
+        let mut recipe = Recipe::gnu("before", "1")
+            .application(declaration)
+            .source_pin(SourcePin::new("app-source", "u", "s", "f").mark_foreign());
+        recipe.name = "after".into();
+        recipe.version = "2".into();
+        let json = recipe.to_json();
+        assert_eq!(
+            json.to_canonical(),
+            r#"{"application":{"entry":"/app/bin/app","runtime":"runtime"},"buildSystem":"gnu","foreign":true,"name":"after","version":"2"}"#
+        );
+        let application = json.get("application").unwrap();
+        assert!(application.get("name").is_none());
+        assert!(application.get("version").is_none());
+        assert!(application.get("provenance").is_none());
     }
 
     /// §B.8's containment edge must attach NO pin, and that is what keeps the

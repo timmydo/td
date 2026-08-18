@@ -613,16 +613,23 @@ buys nothing back.
 The name is the identity everywhere td owns the namespace: the launcher
 symlink, the store path, the per-app uid allocation, the permission file,
 the state directory, the D-Bus `td.AppId` credential, the cgroup, and the
-launcher table. It is constrained like a `td-login` account name — a
-bounded character set, a length limit, no leading dash, no path separator
-— and validated once, at build.
+launcher table. Its build-time language has **LANDED**: 1–32 ASCII bytes,
+each an alphanumeric, `.`, `_` or `-`, with no leading dash and no `..`.
+The single name `.` is also refused. That is the `td-login` account language
+narrowed for an open path key, and it excludes path separators without a
+second rule. Runtime package names use the same language. The later launcher
+resolver still re-validates its caller-controlled `argv[0]`; build-time
+validation is not authentication.
 
 **Foreign applications still announce reverse DNS on wires td does not
-own**, so the manifest records those strings as **aliases**, used only
-where a foreign protocol demands one: matching a toplevel to its launcher
+own**, so each manifest records at most one such string as its optional
+**alias**, used only where a foreign protocol demands one: matching a toplevel
+to its launcher
 entry, scoping bus-name policy, resolving a `.desktop` reference. The
 alias never becomes the identity, and an application with no alias is
 ordinary rather than special.
+The alias names the package on a foreign application protocol; additional
+well-known bus names are permissions, not package identities.
 
 `/.flatpak-info` and `FLATPAK_ID` keep their upstream spelling for one
 reason: **the application reads them.** GIO decides whether to route
@@ -738,6 +745,63 @@ runtime=freedesktop-sdk-24.08   the runtime package it needs
 entry=/app/bin/firefox
 provenance=foreign              or `source`
 ```
+
+**That format and its recipe-side generator have LANDED.** The file is at
+most 16 KiB, UTF-8 with a trailing LF, and contains no CR or NUL. Blank
+lines, `#` comment lines and layout whitespace around keys and values are
+accepted and canonicalized away. The six declaration keys above are the
+whole root vocabulary: `name`, `version`, `runtime`, `entry` and
+`provenance` are required exactly once, `alias` is optional, and an unknown
+or duplicate key is a refusal. Provenance has exactly the two spellings
+shown. An alias has at least three non-empty reverse-DNS components; the
+entry is an absolute child of `/app/`, with no empty, `.` or `..` component.
+
+The only section is optional `[Environment]`. Its keys are bounded POSIX
+environment names, its values are bounded single-line strings, duplicates
+are refused, and at most 128 entries are admitted. The canonical writer
+sorts them, so recipe construction order cannot change a package hash.
+At this rung those entries are immutable package content, not process
+environment: the rung-6 spec compiler must refuse loader-control names such as
+`LD_PRELOAD`, `LD_AUDIT` and `LD_LIBRARY_PATH`, and construct the jailed
+environment from its own allowlist before any remaining entries apply. The
+manifest validator already reserves td's own `TD_*` namespace.
+`td_recipe::application::ApplicationDeclaration` carries only the authored
+runtime, entry, optional alias and environment. `Recipe::application` attaches
+that declaration to the package; it has no fields for identity, version or
+provenance. The derivation assembler takes those three answers from the final
+recipe JSON and **derives** provenance from its source-pin mark, then renders
+the canonical manifest into the outer build contract; it is not passed into the
+package PID namespace. An application declaration that contains a direct
+`payload_inputs` edge is foreign too: containment deliberately does not taint an
+image recipe, but it cannot make the contained application's own manifest claim
+`source`. This provenance is deliberately an answer about the recipe's direct
+staging, not its transitive runtime closure; the planned store-level closure
+query answers that separate question. After PID-namespace teardown prevents any
+package descendant from running further code, the outer sandbox parent recognizes the four
+application-capable runners and materializes that contract as the one
+non-executable `{out}/manifest`. The sealed `stage0` seed and downloaded
+`rust-stage0` trust root refuse application metadata at assembly; their outer
+post-build verifier only reserves the root name and can never write metadata.
+This is not a `Step`: applications built with GNU, CMake or Cargo get the same
+declaration as a mesboot recipe, and there is no second generic file writer that
+can evade step-level guards. The fixed writer
+decodes and re-parses the declaration, requires canonical bytes, refuses to
+replace an existing manifest, and writes content verbatim, so an environment
+value that resembles a build token cannot turn into a store path. Keyfile
+parsing and derivation assembly enforce the aggregate byte bound; recipe JSON
+shares the typed, per-entry and entry-count validators, and assembly refuses an
+oversized declaration before it reaches the derivation.
+The root `manifest` name is reserved in every output built by the six standard
+recipe phase runners: an application declaration creates it only in `out`, and
+its absence everywhere else requires that the package build did not create one.
+Presence is therefore authenticated by the hashed derivation contract rather
+than by self-asserted package bytes.
+
+This is deliberately **not** a generic parser shared with the permission
+file. The manifest is immutable package content; the permission file is a
+separate policy language with filesystem, bus, socket, device and resource
+semantics. Its typed schema is the remaining format half of rung 4, rather
+than unknown policy keys being admitted through a reusable string map.
 
 Permissions are a **separate file**, deliberately not part of the
 manifest, because they have a different lifecycle: the manifest is
@@ -2920,10 +2984,12 @@ of memory bandwidth. **"Draws a window" does not imply watchable video.**
 Layered as the compositor's tests are — pure models, adapter fixtures,
 packaged selftest, boot oracle — with **network never in the gate**.
 
-1. **Host tests**: manifest and permission-file round-trips and
-   refusals; identity-name validation, including every rejection
-   (path separators, leading dash, over-length, empty); alias mapping;
-   the D-Bus codec in both endian modes with malformed bodies, spoofed
+1. **Host tests**: manifest round-trips, refusals, and identity-name
+   validation, including every rejection (path separators, leading dash,
+   `.`, `..`, over-length, empty), have **LANDED** with the build-time manifest
+   API. Alias validation is part of that manifest surface. Permission-file
+   round-trips and refusals remain to land with that format's typed schema.
+   The D-Bus codec must cover both endian modes with malformed bodies, spoofed
    senders and serial-wrap boundaries; the auth state machine;
    name-queue transitions; match-rule evaluation; portal Request/Session
    lifetimes; the popup constraint solver, table-driven; and the BPF
@@ -3103,7 +3169,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 1 | **kernel namespace/seccomp/cgroup config pins + QEMU readback** (§0) — **LANDED**, except the functional calls, which need surface #9: the `unshare` at rung 8, the filter install at rung 11 | none — but this is the gate on everything |
 | 2 | `td-login exec-as` with credential readback — **LANDED** | none |
 | 3 | **the §B.8 marker — LANDED**: the recipe-level mark, `payload_inputs` as a declared channel, taint propagation from the source pin, and the planning-time refusals — including the argv/template audit at `td-recipe-eval`'s production planning boundary for the otherwise-silent assertion. The channel is `{payload:NAME}` resolution plus `ro,noexec` binds, replacing the un-implementable "never staged at all"; the mark is `foreign` on the source pin, the derived recipe flag, the tool-channel refusal in both plan builders, and the computed `contains_payloads` answer with the recipe-graph closure query that reads it | none |
-| 4 | the manifest and permission keyfile, name validation and every rejection; the STORE-level closure query, which needs a built closure with a payload in it | none |
+| 4 | the canonical manifest, its recipe-side generator/parser, and short-name validation with every rejection — **LANDED**. Remaining: the typed permission keyfile and the STORE-level closure query, which needs a built closure with a payload in it | none |
 | 5 | first seed recipe — a pinned upstream artifact becomes a store package with §B.3's checks and §B.8's assertions | none |
 | 6 | the spec compiler: runtime resolution by full store path, mounts, grants, entry point | none |
 | 7 | the `/bin/<name>` farm through `real_root_steps` + `bin_farms()`, the launcher table, the state directory | none |
