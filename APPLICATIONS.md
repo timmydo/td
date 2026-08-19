@@ -1,10 +1,11 @@
 # Applications on td
 
-**Status: proposal.** Nothing here is built. This is the normative design
-for running third-party graphical applications (Firefox, darktable, GNOME
-apps) inside td's own Wayland compositor: the package format, identity,
-confinement, permission model and state contract, and the components that
-implement them — `td-jail`, `td-busd`, `td-portal` and `td-audio`.
+**Status: incremental implementation.** The milestone ladder records what has
+landed; the remaining text is the normative design for running third-party
+graphical applications (Firefox, darktable, GNOME apps) inside td's own Wayland
+compositor: the package format, identity, confinement, permission model and
+state contract, and the components that implement them — `td-jail`, `td-busd`,
+`td-portal` and `td-audio`.
 
 The one compatibility claim, deliberately narrow, which no commit message
 may widen by accident:
@@ -726,6 +727,11 @@ and a runtime is shared by every account instead of copied per home.
   exports/            launcher entry, icons, mime associations
 ```
 
+Rung 5's first seed is deliberately not shipped or launchable yet: it has the
+generated manifest and `files/`, while rung 6 adds `spec` from the compiler that
+owns the full runtime path and mount policy. There is no provisional spec format
+for the first seed to write and then migrate away one landing later.
+
 **`manifest` and `spec` are two files with two jobs**, and keeping them
 apart matters because they have different readers. The manifest is the
 *declaration* — what this package is, written for a human and for the
@@ -908,14 +914,36 @@ fetch, so pinning one would require td to host it, which §Z refuses.
    mechanism the kernel tarball and Rust bootstrap snapshot already use,
    fetched by `td-net`, verified the same way. The pin carries the
    `foreign` taint (§B.8).
-2. **A recipe transforms it** into a package: unpack, lay out `files/`,
-   write the manifest, emit the spec. Deterministic, and living in the
+2. **A recipe transforms it** into a package: unpack, lay out `files/`, and
+   write the manifest. Rung 6's compiler emits the spec once it can resolve the
+   runtime's full store path. Both operations are deterministic and live in the
    recipe, so the artifact is a build output rather than a thing needing
    distribution.
 3. **The recipe's checks are ordinary recipe checks**: the entry point
    exists and is executable, the declared runtime resolves, the metadata
-   normalization of §B.8 holds, and the interpreter assertions there are
-   made.
+   normalization of §B.8 holds, and the entry is either proved fully static or
+   its interpreter and needed-library assertions are made against the runtime.
+
+**The first seed has LANDED.** `ripgrep-seed` packages upstream's pinned x86-64
+musl release without executing it and names the td-built `empty-runtime` by
+the payload-only channel. The native validation step resolves that runtime only
+from `TD_PAYLOAD_MAP`, checks that the exact `/app/bin/rg` entry is an x86-64
+world-executable `ET_EXEC` or static PIE whose entry point is in an executable
+load segment,
+proves it has no interpreter, needed library or run path, and rejects special
+file types, special mode bits and every symlink. It also requires every
+root-owned package directory to be world-traversable by the uid-1000 application.
+Every foreign-source application requires exactly one check whose entry and
+runtime are bound to the builder-authenticated manifest. Assembly admits only
+native unpack/mkdir/copy steps before that terminal validation, so package code
+cannot race or mutate the approved tree. The native archive reader and copy step
+do not materialize device entries or xattrs, and the copy step refuses a symlink
+in any source-path component or any special-file source rather than
+dereferencing it; final validation rejects
+setuid, setgid and sticky mode bits.
+
+This is the cheapest complete exercise of the seed/trust path; it deliberately
+does not answer E1/E1b for a graphical toolkit runtime.
 
 **Which upstream artifact, per application, is a real question**, and it
 is E1b's (§V.0) rather than this document's to answer:
@@ -1124,19 +1152,14 @@ because each was a choice with an alternative:
   catalog, and reading it as one would be the same overclaim §B.8
   corrects elsewhere.
 
-The roster is EMPTY until the first application lands, which is exactly
-the condition under which every test over it passes with the rule
-inverted — so the decision functions take their roster as an ARGUMENT
-and are driven with fixtures, including through the production lookup
-over a real pin key. The one thing no value can observe is the wiring
-that supplies the real roster: with an empty one, reading `FOREIGN` and
-reading nothing return the same answer. Review found that deletable with
-the suite green, and it is worse than a coverage gap — whoever lands the
-first application must edit the roster's count assertion anyway, and
-once they do, a tree with the wiring cut is fully green with the payload
-UNMARKED. That is the same outcome the key check refuses, reached
-through the wiring rather than through a name, so the wiring is pinned
-in source.
+The roster was empty until the first application landed, which was exactly the
+condition under which every test over it passed with the rule inverted. The
+decision functions therefore still take their roster as an argument and are
+driven with fixtures, including through the production lookup over a real pin
+key. The real roster now contains exactly `ripgrep-seed-source`; tests assert
+both the count and that this is the sole marked pin. The wiring that supplies
+that roster remains pinned in source, so replacing `FOREIGN` with an empty slice
+cannot silently return the seed to the ordinary trust class.
 
 The planning-time refusal that reads this mark landed after it, and the
 containment edge and closure query after that; both are described below.
@@ -1190,9 +1213,14 @@ have been, and there need not be one. That is precisely "the packaging
 recipe free to execute the pinned foreign binary while building it",
 arriving through the tool channel rather than through the output. So the
 question asked per edge is "is this name a marked recipe OR a marked
-pin". `source_input` is deliberately untouched: that channel is how a
-payload enters the store at all, and the recipe it marks is the
-packaging recipe.
+pin". `source_input` is admitted only for the owning packaging recipe:
+the recipe JSON carries a separate `foreignSource` mark, the assembler
+withholds that archive from `TD_INPUT_MAP`, and `Unpack.input` reads it
+through the local `{payload:<recipe>-source}` entry. That name is distinct from
+the `sourceInput` pin key when a recipe renames or shares a source. The
+entry may not also be listed explicitly in `payloadInputs`; only the
+source-specific mark moves it to DATA. The aggregate `foreign` mark cannot make
+that decision because it may come from some other attached pin.
 
 That half is enforced where the CATALOG is known — at eval, plus a
 catalog sweep — and **not** in `td-builder`, which cannot enforce it: a
@@ -1335,10 +1363,11 @@ store to find it, or exec something an earlier step already copied. Every
 one of those satisfies the scanner.
 
 **What actually enforces it is visibility: a marked payload is never
-staged into a `Step::Run` sandbox at all.** `payload_inputs` resolve only
-for the typed data operations — `CopyTree`, `StageRuntimeClosure`, and
-whatever spells a runtime path into a spec — which are performed by the
-builder itself rather than by a program the recipe chose. A step that
+staged into a `Step::Run` sandbox at all.** Payload data resolve only for
+the typed data operations — `Unpack`, `CopyTree`,
+`StageRuntimeClosure`, and whatever spells a runtime path into a spec —
+which are performed by the builder itself rather than by a program the
+recipe chose. A step that
 runs a command simply does not have the path in its filesystem, so
 "never executed, never linked against" stops being a property to check
 and becomes one the sandbox cannot express. That is the same move
@@ -1359,7 +1388,7 @@ outside that boundary and still gets the expander's fail-closed error.
 **The channel has LANDED (rung 3), and the paragraph above needed one
 correction to become code.** "Never staged into a `Step::Run` sandbox at
 all" is not implementable as written: every step of a build runs inside
-ONE sandbox invocation, and `CopyTree`/`StageRuntimeClosure` are
+ONE sandbox invocation, and `Unpack`/`CopyTree`/`StageRuntimeClosure` are
 performed by `td-builder` *in that same sandbox* — so a payload the data
 operations can read is necessarily mounted while a `Step::Run` also
 runs. Per-step mount manipulation would close that, and it would mean a
@@ -1368,8 +1397,9 @@ records. So the enforcement is split in two, and neither half is a scan:
 
 - **Resolution.** A payload is withheld from `TD_INPUT_MAP` at assembly
   and placed in `TD_PAYLOAD_MAP`, reached by a template token of its
-  own, `{payload:NAME}`, which resolves ONLY in `CopyTree`'s `from` and
-  `StageRuntimeClosure`'s `roots`. A command-bearing step has no name
+  own, `{payload:NAME}`, which resolves ONLY in `Unpack`'s `input`,
+  `CopyTree`'s `from`, and `StageRuntimeClosure`'s `roots`. A
+  command-bearing step has no name
   for a payload — `{payload:…}` there is an error, not a miss, and
   `{in:PAYLOAD}` is an error naming the rule rather than the ordinary
   "no such input", which would send a reader hunting a lock entry that
@@ -1410,9 +1440,11 @@ Refusals hold the channel shut at both ends, and they are at both ends
 because a rule enforced only where a recipe is WRITTEN is a rule a
 damaged derivation walks around. At declaration: a name in both
 `payloadInputs` and `inputs`/`nativeInputs` is refused outright rather
-than resolved by precedence, and so is one shared with `sourceInput`,
-which reaches the build as `TD_SRC` — the same channel through another
-door; a `payloadInputs` that is not an array, or holds a non-string, is
+than resolved by precedence. An explicitly duplicated `sourceInput` is
+also refused: a marked source joins the data map from `foreignSource`,
+while an ordinary source would still reach the build as `TD_SRC` — the
+same channel through another door. A `payloadInputs` that is not an
+array, or holds a non-string, is
 refused rather than filtered, since a malformed declaration of a
 restriction must never be read as an absent one; and an entry no lock
 entry resolves is refused, because a declaration that reaches no path
@@ -1448,8 +1480,9 @@ covers four of eighteen `Step` variants, is `#[cfg(test)]`, and omits
 Instead an exhaustive match visits every field the builder's template
 expander visits, including environment values, and deliberately skips
 literal labels and `SubstituteText` edit text that the builder does not
-expand. `{payload:NAME}` is admitted only in `CopyTree.from` and
-`StageRuntimeClosure.roots`; `{in:NAME}` cannot launder a declared
+expand. `{payload:NAME}` is admitted only in `Unpack.input`,
+`CopyTree.from`, and `StageRuntimeClosure.roots`; `{in:NAME}` cannot
+launder a declared
 payload through those fields either. That exhaustiveness makes a new
 `Step` variant or field a compile failure until its template visibility
 is decided, and the test table is checked against the production field
@@ -1571,10 +1604,12 @@ store DB and never scans a byte. Everything that follows from that:
   query counts the runtime while the built closure omits it. The recipe
   answer and the store answer would disagree, and only the store one is
   about what a collector will do.
-- Assertion 3 is therefore **half met**: the recipe-level answer exists
-  and the store-level one is still owed. It belongs with the first
-  application, since that is when a built closure with a payload in it
-  first exists to query.
+- Assertion 3 is therefore **half met**: the recipe-level answer exists and the
+  store-level one is still owed. Rung 5 now supplies a built application and
+  runtime, but intentionally no provisional spec; the store cannot see their
+  edge until rung 6 writes the runtime's full path. The store query and the spec
+  therefore land atomically at rung 6 rather than measuring a known-incomplete
+  closure one rung earlier.
 
 #### Metadata, exports, and what the marker does not do
 
@@ -3075,14 +3110,16 @@ packaged selftest, boot oracle — with **network never in the gate**.
    name-queue transitions; match-rule evaluation; portal Request/Session
    lifetimes; the popup constraint solver, table-driven; and the BPF
    program through the test interpreter.
-2. **Recipe-side seed tests.** The repository fixture corpus is gone
-   with the repository client; what replaces it is much smaller and
-   sits where the work now happens. A seed recipe's checks assert that
-   the pinned archive unpacks to the declared tree shape, that the entry
-   point exists and is executable, that the declared runtime resolves,
-   that no setuid bit or device node survives, and that the ELF
-   interpreter named is the runtime's rather than the host's. These are
-   ordinary recipe checks and run in the ordinary recipe gate.
+2. **Recipe-side seed tests.** The static seed path has **LANDED**. The
+   repository fixture corpus is gone with the repository client; what replaces
+   it is much smaller and sits where the work now happens. A seed recipe's
+   checks assert that the pinned archive unpacks to the declared tree shape,
+   that the entry point exists and is executable, that the declared runtime
+   resolves, that no setuid bit or device node survives, and that the ELF is
+   fully static or names the runtime's interpreter rather than the host's. The
+   first seed takes the static branch; the dynamic interpreter/library branch
+   arrives with the first toolkit seed. These are ordinary recipe checks and run
+   in the ordinary recipe gate.
 3. **Jail**: the three seccomp layers of §C, plus in-QEMU assertions from
    *inside* a jail — `getuid()==1000`, `/proc/1/exe` is td-jail, host
    processes absent, `/app` and `/usr` reject writes, host `/usr` and
@@ -3133,23 +3170,28 @@ packaged selftest, boot oracle — with **network never in the gate**.
    depends on** and which nothing else in this list covers:
    - a recipe naming a marked path in `inputs`/`native_inputs` rather
      than `payload_inputs` is a planning-time refusal — **landed**, in
-     both plan builders, for a marked recipe and a marked pin alike;
+     both plan builders for a marked recipe output, with a marked source
+     pin refused earlier at the recipe-eval/catalog boundary before the
+     private builder backend;
    - a `Step::Run` argv expanding a `payload_inputs` path is a refusal —
      **landed** as the pure argv/template audit, over every field the
      builder expands (including `Run` environment values), since this is
      the assertion whose violation is otherwise silent;
-   - the interpreter assertion: the payload's `PT_INTERP` is absent from
-     the built image tree, so a direct `execve` outside a jail fails
-     `ENOENT`. Asserted against the image, not assumed;
+   - the interpreter assertion: the first seed is proved fully static, which is
+     also a concrete demonstration that an interpreter cannot prevent direct
+     execution outside a jail. The later dynamic payload's `PT_INTERP` must be
+     absent from the built image tree and is asserted against the image, not
+     assumed;
    - the closure query reports every marked path, and the set matches
      the reviewed pin list exactly — including the application→runtime
      edge, which exists only because the spec carries the runtime's full
      store path. The RECIPE-GRAPH query has **landed**; the STORE-level
-     one — the only one that can see that edge — and the comparison
-     against a reviewed list both arrive with the first application,
-     there being no built closure and no list until then;
-   - metadata normalization: no setuid/setgid bit, file capability,
-     security xattr, device node or escaping symlink survives packaging;
+     one — the only one that can see that edge — and the comparison against the
+     reviewed list arrive with rung 6's spec. Rung 5 has the built closure but
+     deliberately no temporary spec, so its store bytes cannot carry the edge;
+   - metadata normalization — **landed for the first seed**: no
+     setuid/setgid bit, file capability, security xattr, device node or escaping
+     symlink survives packaging;
    - a package's launcher name collides with no applet farm.
 
 ### Before anyone writes "Firefox runs"
@@ -3250,8 +3292,8 @@ Each row is one landing or a small family, leaving the tree green.
 | 1 | **kernel namespace/seccomp/cgroup config pins + QEMU readback** (§0) — **LANDED**, except the functional calls, which need surface #9: the `unshare` at rung 8, the filter install at rung 11 | none — but this is the gate on everything |
 | 2 | `td-login exec-as` with credential readback — **LANDED** | none |
 | 3 | **the §B.8 marker — LANDED**: the recipe-level mark, `payload_inputs` as a declared channel, taint propagation from the source pin, and the planning-time refusals — including the argv/template audit at `td-recipe-eval`'s production planning boundary for the otherwise-silent assertion. The channel is `{payload:NAME}` resolution plus `ro,noexec` binds, replacing the un-implementable "never staged at all"; the mark is `foreign` on the source pin, the derived recipe flag, the tool-channel refusal in both plan builders, and the computed `contains_payloads` answer with the recipe-graph closure query that reads it | none |
-| 4 | the canonical manifest, its recipe-side generator/parser, short-name validation, and the typed permission keyfile with every rejection — **LANDED**. Remaining: the STORE-level closure query, which needs a built closure with a payload in it | none |
-| 5 | first seed recipe — a pinned upstream artifact becomes a store package with §B.3's checks and §B.8's assertions | none |
+| 4 | the canonical manifest, its recipe-side generator/parser, short-name validation, and the typed permission keyfile with every rejection — **LANDED**. Remaining: the STORE-level closure query, which lands with rung 6's full-path spec rather than a provisional reference | none |
+| 5 | **first seed recipe — LANDED**: upstream's pinned static ripgrep release becomes an unshipped store package with an empty runtime, generated manifest, payload-only edge, compiled source digest, and native §B.3/§B.8 checks | none |
 | 6 | the spec compiler: runtime resolution by full store path, mounts, grants, entry point | none |
 | 7 | the `/bin/<name>` farm through `real_root_steps` + `bin_farms()`, the launcher table, the state directory | none |
 | 8 | `td-jail` crate + surface #9 skeleton + stage-1/stage-2 transition | none |

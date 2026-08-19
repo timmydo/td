@@ -1687,6 +1687,130 @@ pub(crate) fn copy_tree_writable(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_application_files(files: &Path) -> Result<(), String> {
+    let root = fs::symlink_metadata(files)
+        .map_err(|e| format!("application files root {}: {e}", files.display()))?;
+    if !root.is_dir() {
+        return Err(format!(
+            "application files root {} is not a directory",
+            files.display()
+        ));
+    }
+    let root_mode = root.permissions().mode();
+    if root_mode & 0o7000 != 0 {
+        return Err(format!(
+            "application files root {} retains special mode bits",
+            files.display()
+        ));
+    }
+    if root_mode & 0o001 == 0 {
+        return Err(format!(
+            "application files root {} is not traversable by the application uid",
+            files.display()
+        ));
+    }
+    let mut pending = vec![files.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let mut entries = fs::read_dir(&directory)
+            .map_err(|e| format!("read application directory {}: {e}", directory.display()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("read application directory {}: {e}", directory.display()))?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|e| format!("stat application path {}: {e}", path.display()))?;
+            let file_type = metadata.file_type();
+            if file_type.is_dir() {
+                let mode = metadata.permissions().mode();
+                if mode & 0o7000 != 0 {
+                    return Err(format!(
+                        "application directory {} retains special mode bits",
+                        path.display()
+                    ));
+                }
+                if mode & 0o001 == 0 {
+                    return Err(format!(
+                        "application directory {} is not traversable by the application uid",
+                        path.display()
+                    ));
+                }
+                pending.push(path);
+            } else if file_type.is_file() {
+                if metadata.permissions().mode() & 0o7000 != 0 {
+                    return Err(format!(
+                        "application file {} retains setuid, setgid, or sticky mode bits",
+                        path.display()
+                    ));
+                }
+            } else if file_type.is_symlink() {
+                return Err(format!(
+                    "application path {} is a symlink; static foreign application files \
+                     must contain only directories and regular files",
+                    path.display()
+                ));
+            } else {
+                return Err(format!(
+                    "application path {} is not a directory, regular file, or symlink",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_static_application(out: &Path, entry: &str, runtime: &Path) -> Result<(), String> {
+    let runtime_files = runtime.join("files");
+    let runtime_metadata = fs::symlink_metadata(&runtime_files).map_err(|e| {
+        format!(
+            "application runtime {} has no files directory: {e}",
+            runtime.display()
+        )
+    })?;
+    if !runtime_metadata.is_dir() {
+        return Err(format!(
+            "application runtime files {} is not a directory",
+            runtime_files.display()
+        ));
+    }
+    let files = out.join("files");
+    validate_application_files(&files)?;
+    let relative = Path::new(entry)
+        .strip_prefix("/app")
+        .map_err(|_| format!("application entry {entry:?} is not an absolute child of /app"))?;
+    let mut entry_path = files.clone();
+    let mut components = relative.components();
+    let first = components.next().ok_or_else(|| {
+        format!("application entry {entry:?} is not an absolute child of /app")
+    })?;
+    let std::path::Component::Normal(name) = first else {
+        return Err(format!(
+            "application entry {entry:?} escapes or aliases the /app tree"
+        ));
+    };
+    entry_path.push(name);
+    for component in components {
+        let std::path::Component::Normal(name) = component else {
+            return Err(format!(
+                "application entry {entry:?} escapes or aliases the /app tree"
+            ));
+        };
+        entry_path.push(name);
+    }
+    let metadata = fs::symlink_metadata(&entry_path)
+        .map_err(|e| format!("application entry {}: {e}", entry_path.display()))?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o001 == 0 {
+        return Err(format!(
+            "application entry {} is not a world-executable regular file",
+            entry_path.display()
+        ));
+    }
+    crate::elf::assert_x86_64_executable(&entry_path)
+        .and_then(|()| crate::elf::assert_static(&entry_path))
+        .map_err(|e| format!("application entry {}: {e}", entry_path.display()))
+}
+
 /// Scan a tree for `/gnu/store` in any regular file's CONTENTS or any symlink's
 /// TARGET (a grep-style content walk misses a dangling guix symlink); first hit
 /// errors. The stage0 seal's output half, enforced in the ENGINE per build.
@@ -1903,7 +2027,7 @@ struct StepCtx {
 }
 
 impl StepCtx {
-    /// The COMMAND expander: every step's templates but the two data ones. A
+    /// The COMMAND expander: every step's templates but the three data ones. A
     /// `{payload:…}` here is an error rather than a miss, and `{in:…}` cannot name
     /// a payload because assembly withheld it from TD_INPUT_MAP.
     fn expand(&self, s: &str) -> Result<String, String> {
@@ -1941,9 +2065,10 @@ impl StepCtx {
     }
 
     /// The DATA expander: the same tokens plus `{payload:NAME}`, and used ONLY by
-    /// the operations the builder performs itself — `CopyTree`'s source and
-    /// `StageRuntimeClosure`'s roots. This is the resolution half of §B.8's
-    /// channel: a step that runs a program the recipe chose has no name for a
+    /// the operations the builder performs itself — `Unpack`'s input,
+    /// `CopyTree`'s source and `StageRuntimeClosure`'s roots. This is the
+    /// resolution half of §B.8's channel: a step that runs a program the recipe
+    /// chose has no name for a
     /// payload at all, which is a property rather than a scan for one.
     fn expand_data(&self, s: &str) -> Result<String, String> {
         self.expand_with(s, true)
@@ -1978,7 +2103,7 @@ impl StepCtx {
                                     return Err(format!(
                                         "mesboot step template: `{name}' is a payloadInput \
                                          and is not reachable through {{in:}} — it is staged \
-                                         as data for copyTree/stageRuntimeClosure only \
+                                         as data for unpack/copyTree/stageRuntimeClosure only \
                                          (APPLICATIONS.md section B.8)"
                                     ));
                                 }
@@ -1995,8 +2120,9 @@ impl StepCtx {
                                 if !payloads_visible {
                                     return Err(format!(
                                         "mesboot step template: {{payload:{name}}} resolves \
-                                         only in copyTree's `from' and stageRuntimeClosure's \
-                                         `roots' — a payload is never named by a step that \
+                                         only in unpack's `input', copyTree's `from', and \
+                                         stageRuntimeClosure's `roots' — a payload is never \
+                                         named by a step that \
                                          runs a command (APPLICATIONS.md section B.8)"
                                     ));
                                 }
@@ -2186,20 +2312,65 @@ fn glob_one_star(pat: &str) -> Result<Vec<String>, String> {
     Ok(hits)
 }
 
-/// Copy one file to dest dir (keeping its basename), exec bit preserved, owner-
-/// write added (the rungs copy crt/libs INTO writable build trees).
+fn regular_file_without_symlink_components(path: &Path) -> Result<fs::Metadata, String> {
+    let mut current = PathBuf::new();
+    let mut final_metadata = None;
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => current.push("/"),
+            std::path::Component::CurDir => continue,
+            std::path::Component::Normal(name) => current.push(name),
+            std::path::Component::ParentDir => {
+                return Err(format!(
+                    "copyFiles: {} contains a parent-directory component",
+                    path.display()
+                ));
+            }
+            std::path::Component::Prefix(_) => {
+                return Err(format!(
+                    "copyFiles: {} contains an unsupported path prefix",
+                    path.display()
+                ));
+            }
+        }
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|e| format!("lstat {}: {e}", current.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "copyFiles: {} traverses symlink {}; symlinks are refused",
+                path.display(),
+                current.display()
+            ));
+        }
+        final_metadata = Some(metadata);
+    }
+    let metadata = final_metadata.ok_or_else(|| {
+        format!(
+            "copyFiles: {} has no regular file component",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "copyFiles: {} is not a regular file; special files are refused",
+            path.display()
+        ));
+    }
+    Ok(metadata)
+}
+
+/// Copy one regular file to dest dir (keeping its basename), exec bit preserved,
+/// owner-write added. Refuse a symlink anywhere in the source path.
 fn copy_file_writable(from: &Path, dest_dir: &Path) -> Result<(), String> {
     let base = from
         .file_name()
         .ok_or_else(|| format!("copyFiles: {} has no basename", from.display()))?;
+    let metadata = regular_file_without_symlink_components(from)?;
     fs::create_dir_all(dest_dir).map_err(|e| format!("mkdir {}: {e}", dest_dir.display()))?;
     let to = dest_dir.join(base);
     fs::copy(from, &to)
         .map_err(|e| format!("copy {} -> {}: {e}", from.display(), to.display()))?;
-    let mode = fs::metadata(from)
-        .map_err(|e| format!("stat {}: {e}", from.display()))?
-        .permissions()
-        .mode();
+    let mode = metadata.permissions().mode();
     fs::set_permissions(&to, fs::Permissions::from_mode((mode & 0o777) | 0o200))
         .map_err(|e| format!("chmod {}: {e}", to.display()))
 }
@@ -2913,7 +3084,7 @@ pub fn run_mesboot() -> Result<(), String> {
             // packages, so `{in:tar}`-shaped host edges are gone from the
             // graph. keepTop=false strips the unique top-level dir
             // (`--strip-components=1`); anything else is a hard error.
-            let input = ctx.expand(&field(o, "input")?).map_err(err)?;
+            let input = ctx.expand_data(&field(o, "input")?).map_err(err)?;
             let dest = ctx.expand(&field(o, "dest")?).map_err(err)?;
             let keep_top = o.get("keepTop").is_some_and(Json::is_true);
             crate::tar::unpack_archive(Path::new(&input), Path::new(&dest), keep_top)
@@ -3019,6 +3190,21 @@ pub fn run_mesboot() -> Result<(), String> {
             for p in ctx.expand_all(&strs(o, "paths")?).map_err(err)? {
                 crate::elf::assert_static(Path::new(&p)).map_err(err)?;
             }
+        } else if let Some(o) = step.get("validateStaticApplication") {
+            let entry = field(o, "entry")?;
+            let runtime_name = field(o, "runtime")?;
+            let runtime = ctx
+                .payloads
+                .iter()
+                .find(|(name, _)| name == &runtime_name)
+                .map(|(_, path)| path)
+                .ok_or_else(|| {
+                    err(format!(
+                        "application runtime {runtime_name:?} is not a declared payload"
+                    ))
+                })?;
+            validate_static_application(Path::new(&ctx.out), &entry, Path::new(runtime))
+                .map_err(err)?;
         } else if let Some(o) = step.get("substituteText") {
             // Host-free `patch`/`sed` (re #469): literal, fail-closed text edits
             // in pure Rust. `parse_substitute_edits` expands ONLY `file`; the
@@ -3046,9 +3232,163 @@ pub fn run_mesboot() -> Result<(), String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
 
     fn test_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("td-build-{tag}-{}", std::process::id()))
+    }
+
+    fn minimal_static_elf() -> Vec<u8> {
+        let total = 64 + 56;
+        let mut bytes = vec![0u8; total];
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[0x10..0x12].copy_from_slice(&2u16.to_le_bytes());
+        bytes[0x12..0x14].copy_from_slice(&62u16.to_le_bytes());
+        bytes[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        bytes[0x18..0x20].copy_from_slice(&64u64.to_le_bytes());
+        bytes[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+        bytes[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+        bytes[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        bytes[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes());
+        bytes[64..68].copy_from_slice(&1u32.to_le_bytes());
+        bytes[68..72].copy_from_slice(&1u32.to_le_bytes());
+        bytes[80..88].copy_from_slice(&0u64.to_le_bytes());
+        bytes[96..104].copy_from_slice(&(total as u64).to_le_bytes());
+        bytes[104..112].copy_from_slice(&(total as u64).to_le_bytes());
+        bytes
+    }
+
+    fn static_application_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let directory = test_dir(tag);
+        let _ = fs::remove_dir_all(&directory);
+        let out = directory.join("out");
+        let entry = out.join("files/bin/app");
+        let runtime = directory.join("runtime");
+        fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        fs::create_dir_all(runtime.join("files")).unwrap();
+        fs::write(&entry, minimal_static_elf()).unwrap();
+        fs::set_permissions(&entry, fs::Permissions::from_mode(0o755)).unwrap();
+        (directory, out, runtime)
+    }
+
+    #[test]
+    fn copy_files_refuses_an_archive_symlink_to_an_outside_executable() {
+        let directory = test_dir("copy-files-symlink");
+        let _ = fs::remove_dir_all(&directory);
+        let unpacked = directory.join("unpacked");
+        let outside = directory.join("outside");
+        let dest = directory.join("out/files/bin");
+        fs::create_dir_all(&unpacked).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let executable = outside.join("outside-app");
+        fs::write(&executable, minimal_static_elf()).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let archive_entry = unpacked.join("rg");
+        std::os::unix::fs::symlink(&executable, &archive_entry).unwrap();
+
+        let error = copy_file_writable(&archive_entry, &dest)
+            .expect_err("copyFiles must not dereference a foreign archive symlink");
+        assert!(error.contains("symlinks") && error.contains("refused"), "{error}");
+        assert!(!dest.join("rg").exists());
+
+        let nested = unpacked.join("nested");
+        std::os::unix::fs::symlink(&outside, &nested).unwrap();
+        let nested_entry = nested.join("outside-app");
+        let error = copy_file_writable(&nested_entry, &dest)
+            .expect_err("copyFiles must not traverse an intermediate archive symlink");
+        assert!(
+            error.contains("traverses symlink") && error.contains("refused"),
+            "{error}"
+        );
+        assert!(!dest.join("outside-app").exists());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn static_application_validation_binds_entry_runtime_and_tree() {
+        let (directory, out, runtime) = static_application_fixture("static-app-good");
+        assert!(validate_static_application(&out, "/app/bin/app", &runtime).is_ok());
+        for entry in ["/app", "/app/../../bin/app", "/usr/bin/app"] {
+            let error = validate_static_application(&out, entry, &runtime).unwrap_err();
+            assert!(error.contains("application entry"), "{entry}: {error}");
+        }
+
+        let entry = out.join("files/bin/app");
+        fs::set_permissions(&entry, fs::Permissions::from_mode(0o644)).unwrap();
+        let error = validate_static_application(&out, "/app/bin/app", &runtime).unwrap_err();
+        assert!(error.contains("not a world-executable regular file"), "{error}");
+        fs::set_permissions(&entry, fs::Permissions::from_mode(0o100)).unwrap();
+        let error = validate_static_application(&out, "/app/bin/app", &runtime).unwrap_err();
+        assert!(error.contains("not a world-executable regular file"), "{error}");
+        fs::set_permissions(&entry, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let missing_runtime = directory.join("missing-runtime");
+        let error = validate_static_application(&out, "/app/bin/app", &missing_runtime).unwrap_err();
+        assert!(error.contains("has no files directory"), "{error}");
+
+        fs::write(&entry, b"not an ELF").unwrap();
+        let error = validate_static_application(&out, "/app/bin/app", &runtime).unwrap_err();
+        assert!(error.contains("not an ELF file"), "{error}");
+
+        let mut wrong_machine = minimal_static_elf();
+        wrong_machine[0x12..0x14].copy_from_slice(&3u16.to_le_bytes());
+        fs::write(&entry, wrong_machine).unwrap();
+        let error = validate_static_application(&out, "/app/bin/app", &runtime).unwrap_err();
+        assert!(error.contains("expected EM_X86_64"), "{error}");
+
+        let mut relocatable = minimal_static_elf();
+        relocatable[0x10..0x12].copy_from_slice(&1u16.to_le_bytes());
+        fs::write(&entry, relocatable).unwrap();
+        let error = validate_static_application(&out, "/app/bin/app", &runtime).unwrap_err();
+        assert!(error.contains("ET_EXEC or ET_DYN"), "{error}");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn application_tree_refuses_special_bits_nodes_and_all_symlinks() {
+        let (directory, out, runtime) = static_application_fixture("static-app-metadata");
+        let files = out.join("files");
+        fs::set_permissions(&files, fs::Permissions::from_mode(0o2755)).unwrap();
+        let error = validate_static_application(&out, "/app/bin/app", &runtime).unwrap_err();
+        assert!(error.contains("files root") && error.contains("mode bits"), "{error}");
+        fs::set_permissions(&files, fs::Permissions::from_mode(0o755)).unwrap();
+
+        fs::set_permissions(&files, fs::Permissions::from_mode(0o700)).unwrap();
+        let error = validate_static_application(&out, "/app/bin/app", &runtime).unwrap_err();
+        assert!(error.contains("files root") && error.contains("not traversable"), "{error}");
+        fs::set_permissions(&files, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let bin = files.join("bin");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+        let error = validate_static_application(&out, "/app/bin/app", &runtime).unwrap_err();
+        assert!(error.contains("application directory") && error.contains("not traversable"), "{error}");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let data = files.join("data");
+        fs::write(&data, b"data").unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o4644)).unwrap();
+        let error = validate_static_application(&out, "/app/bin/app", &runtime).unwrap_err();
+        assert!(error.contains("mode bits"), "{error}");
+
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o644)).unwrap();
+        let socket = files.join("socket");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let error = validate_static_application(&out, "/app/bin/app", &runtime).unwrap_err();
+        assert!(
+            error.contains("is not a directory, regular file, or symlink"),
+            "{error}"
+        );
+        drop(listener);
+        fs::remove_file(&socket).unwrap();
+
+        let escaping = files.join("bin/link");
+        std::os::unix::fs::symlink("../data", &escaping).unwrap();
+        let error = validate_static_application(&out, "/app/bin/app", &runtime).unwrap_err();
+        assert!(error.contains("is a symlink") && error.contains("regular files"), "{error}");
+        let _ = fs::remove_dir_all(directory);
     }
 
     fn edit(from: &str, to: &str, expect: usize) -> (String, String, usize) {
@@ -3558,11 +3898,11 @@ mod tests {
     /// `expand_data` resolving `{payload:}` is the whole permission §B.8 grants,
     /// and the compiler has nothing to say about which expander a step picked — a
     /// new step that reached for it, or an existing one changed to, would widen
-    /// the channel with every other test in this file still green. Two sites, and
+    /// the channel with every other test in this file still green. Three sites, and
     /// which FIELD each serves, since `copyTree`'s `dest` taking it would put a
     /// payload path on the writable side of a copy.
     #[test]
-    fn only_the_two_typed_data_operations_use_the_data_expander() {
+    fn only_the_three_typed_data_operations_use_the_data_expander() {
         let src = include_str!("build.rs");
         let shipped = match src.find("\n#[cfg(test)]\nmod tests {") {
             Some(at) => src.get(..at).unwrap_or(src),
@@ -3575,17 +3915,21 @@ mod tests {
             .collect();
         assert_eq!(
             calls.len(),
-            2,
-            "only copyTree's `from' and stageRuntimeClosure's `roots' may resolve a \
-             payload (APPLICATIONS.md section B.8): {calls:?}"
+            3,
+            "only unpack's `input', copyTree's `from', and stageRuntimeClosure's \
+             `roots' may resolve a payload (APPLICATIONS.md section B.8): {calls:?}"
         );
         assert!(
-            calls.first().is_some_and(|l| l.contains("\"from\"")),
-            "the first data site must be copyTree's `from': {calls:?}"
+            calls.first().is_some_and(|l| l.contains("\"input\"")),
+            "the first data site must be unpack's `input': {calls:?}"
         );
         assert!(
-            calls.get(1).is_some_and(|l| l.contains("\"roots\"")),
-            "the second must be stageRuntimeClosure's `roots': {calls:?}"
+            calls.get(1).is_some_and(|l| l.contains("\"from\"")),
+            "the second data site must be copyTree's `from': {calls:?}"
+        );
+        assert!(
+            calls.get(2).is_some_and(|l| l.contains("\"roots\"")),
+            "the third must be stageRuntimeClosure's `roots': {calls:?}"
         );
         // The scan is only worth anything if it can SEE the call sites — a renamed
         // helper or a moved test module would leave it counting zero and passing

@@ -210,6 +210,14 @@ pub enum Step {
     AssertStatic {
         paths: Vec<String>,
     },
+    /// Validate the complete `files/` tree of a static seeded application.
+    /// `entry` is the manifest's `/app/...` path and `runtime` is the declared
+    /// payload name, not a template: the builder resolves it only through the
+    /// payload map, so this check cannot accidentally reopen the tool channel.
+    ValidateStaticApplication {
+        entry: String,
+        runtime: String,
+    },
 }
 
 /// One literal edit within a [`Step::SubstituteText`]: replace every occurrence
@@ -261,6 +269,12 @@ impl Step {
     /// Assert `paths` are fully static ELF binaries (no host loader/libc/run-path).
     pub fn assert_static(paths: &[&str]) -> Step {
         Step::AssertStatic { paths: vs(paths) }
+    }
+    pub fn validate_static_application(declaration: &ApplicationDeclaration) -> Step {
+        Step::ValidateStaticApplication {
+            entry: declaration.entry().to_string(),
+            runtime: declaration.runtime().to_string(),
+        }
     }
     fn to_json(&self) -> Json {
         let pair_arr = |xs: &[(String, String)]| {
@@ -394,6 +408,13 @@ impl Step {
             Step::AssertStatic { paths } => Json::Obj(vec![(
                 "assertStatic".into(),
                 Json::Obj(vec![("paths".into(), arr(paths))]),
+            )]),
+            Step::ValidateStaticApplication { entry, runtime } => Json::Obj(vec![(
+                "validateStaticApplication".into(),
+                Json::Obj(vec![
+                    ("entry".into(), Json::Str(entry.clone())),
+                    ("runtime".into(), Json::Str(runtime.clone())),
+                ]),
             )]),
             Step::SubstituteText { file, edits } => Json::Obj(vec![(
                 "substituteText".into(),
@@ -947,8 +968,8 @@ impl Recipe {
         self
     }
     /// Declare DATA inputs — see `Recipe::payload_inputs`. A path named here is
-    /// staged for `CopyTree`/`StageRuntimeClosure` to read and is unreachable
-    /// from any step that runs a command.
+    /// staged for `Unpack`/`CopyTree`/`StageRuntimeClosure` to read and is
+    /// unreachable from any step that runs a command.
     pub fn payload_inputs(mut self, xs: &[&str]) -> Recipe {
         self.payload_inputs = Some(vs(xs));
         self
@@ -1096,6 +1117,21 @@ impl Recipe {
             .is_some_and(|pins| pins.iter().any(|pin| pin.foreign()))
     }
 
+    /// Whether `source_input` itself resolves to a foreign pin. A recipe may be
+    /// foreign because some other attached pin is foreign, so the aggregate mark
+    /// cannot decide how its own source is staged.
+    pub fn is_foreign_source(&self) -> bool {
+        let Some(source) = &self.source_input else {
+            return false;
+        };
+        let canonical = crate::source_pins::by_key(source)
+            .map(|pin| pin.key)
+            .unwrap_or_else(|| source.clone());
+        self.source_pins
+            .as_ref()
+            .is_some_and(|pins| pins.iter().any(|pin| pin.key == canonical && pin.foreign()))
+    }
+
     /// The build system as its JSON/lowering token ("gnu"/"rust"/"cmake"/"stage0").
     pub fn build_system_name(&self) -> &'static str {
         self.build_system.as_str()
@@ -1133,6 +1169,12 @@ impl Recipe {
         // hash in the tree to say what their absence already says.
         if self.is_foreign() {
             o.push(("foreign".into(), Json::Bool(true)));
+        }
+        // Source-specific because the aggregate `foreign` mark can come from a
+        // different attached pin. The builder uses this to withhold only the
+        // prebuilt source from its command-visible map.
+        if self.is_foreign_source() {
+            o.push(("foreignSource".into(), Json::Bool(true)));
         }
         if let Some(application) = &self.application {
             o.push(("application".into(), application.to_json()));
@@ -1308,6 +1350,24 @@ mod tests {
         assert!(ordinary_first.is_foreign());
     }
 
+    #[test]
+    fn the_source_specific_mark_distinguishes_an_own_source_from_another_pin() {
+        let seed = Recipe::mesboot("seed", "1").source_input("ripgrep-seed-source");
+        assert!(seed.is_foreign());
+        assert!(seed.is_foreign_source());
+        assert_eq!(
+            seed.to_json().to_canonical(),
+            r#"{"buildSystem":"mesboot","foreign":true,"foreignSource":true,"name":"seed","sourceInput":"ripgrep-seed-source","version":"1"}"#
+        );
+
+        let other = Recipe::mesboot("other", "1")
+            .source_input("stage0-source")
+            .inputs(&["ripgrep-seed-source"]);
+        assert!(other.is_foreign(), "the aggregate mark still sees the other pin");
+        assert!(!other.is_foreign_source());
+        assert!(other.to_json().get("foreignSource").is_none());
+    }
+
     /// The taint is STICKY under dedup, both orders. `push_source_pin` drops a
     /// pin whose key it already holds — pre-existing and right — but dropping
     /// its MARK with it would let the answer depend on which of two pins under
@@ -1367,14 +1427,20 @@ mod tests {
             plain.to_json().get("foreign").is_none(),
             "no key at all, not `foreign:false'"
         );
-        // The whole shipped catalog, which is the claim that matters. Asked for
-        // the KEY rather than matched as text: a check-script body containing
-        // the word would otherwise false-red it.
+        // The whole ordinary catalog, which is the claim that matters. Asked for
+        // the KEY rather than matched as text: a check-script body containing the
+        // word would otherwise false-red it.
         for (stem, recipe) in crate::catalog::all() {
+            if stem == "ripgrep-seed" {
+                assert!(recipe.to_json().get("foreign").is_some());
+                assert!(recipe.to_json().get("foreignSource").is_some());
+                continue;
+            }
             assert!(
                 recipe.to_json().get("foreign").is_none(),
-                "{stem} emits the mark, but nothing has landed one yet"
+                "ordinary recipe {stem} emits the mark"
             );
+            assert!(recipe.to_json().get("foreignSource").is_none());
         }
     }
 

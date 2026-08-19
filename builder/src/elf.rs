@@ -38,7 +38,12 @@ const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
 const PT_INTERP: u32 = 3;
 const PT_NOTE: u32 = 4;
+const PF_X: u32 = 1; // segment executable
 const PF_R: u32 = 4; // segment readable
+const ET_EXEC: u16 = 2;
+const ET_DYN: u16 = 3;
+const EM_X86_64: u16 = 62;
+const EV_CURRENT: u32 = 1;
 const DT_NULL: u64 = 0; // end of the dynamic array
 // Backs the `read_needed`/`assert_static` DT_NEEDED query. assert_static is now
 // live in-crate: the bootstrap rungs' `Step::AssertStatic` calls it to reject a
@@ -50,29 +55,53 @@ const DT_RPATH: u64 = 15; // legacy run-path (string offset into .dynstr)
 const DT_RUNPATH: u64 = 29; // run-path, takes precedence over DT_RPATH at load time
 
 fn u16le(b: &[u8], off: usize) -> Result<u16, String> {
-    b.get(off..off + 2)
-        .map(|s| u16::from_le_bytes([s[0], s[1]]))
-        .ok_or_else(|| format!("ELF truncated at u16 offset {off}"))
+    let end = off
+        .checked_add(2)
+        .ok_or_else(|| format!("ELF u16 offset {off} overflows"))?;
+    let bytes = b
+        .get(off..end)
+        .ok_or_else(|| format!("ELF truncated at u16 offset {off}"))?
+        .try_into()
+        .map_err(|_| format!("ELF invalid u16 width at offset {off}"))?;
+    Ok(u16::from_le_bytes(bytes))
 }
 fn u32le(b: &[u8], off: usize) -> Result<u32, String> {
-    b.get(off..off + 4)
-        .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-        .ok_or_else(|| format!("ELF truncated at u32 offset {off}"))
+    let end = off
+        .checked_add(4)
+        .ok_or_else(|| format!("ELF u32 offset {off} overflows"))?;
+    let bytes = b
+        .get(off..end)
+        .ok_or_else(|| format!("ELF truncated at u32 offset {off}"))?
+        .try_into()
+        .map_err(|_| format!("ELF invalid u32 width at offset {off}"))?;
+    Ok(u32::from_le_bytes(bytes))
 }
 fn u64le(b: &[u8], off: usize) -> Result<u64, String> {
-    b.get(off..off + 8)
-        .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
-        .ok_or_else(|| format!("ELF truncated at u64 offset {off}"))
+    let end = off
+        .checked_add(8)
+        .ok_or_else(|| format!("ELF u64 offset {off} overflows"))?;
+    let bytes = b
+        .get(off..end)
+        .ok_or_else(|| format!("ELF truncated at u64 offset {off}"))?
+        .try_into()
+        .map_err(|_| format!("ELF invalid u64 width at offset {off}"))?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 /// Write a class-width word (u64 on ELF64, low u32 on ELF32) at `off`, little-endian.
 fn put_word(b: &mut [u8], off: usize, v: u64, is64: bool) -> Result<(), String> {
     if is64 {
-        b.get_mut(off..off + 8)
+        let end = off
+            .checked_add(8)
+            .ok_or_else(|| format!("ELF u64 write offset {off} overflows"))?;
+        b.get_mut(off..end)
             .ok_or_else(|| format!("ELF truncated writing u64 at {off}"))?
             .copy_from_slice(&v.to_le_bytes());
     } else {
-        b.get_mut(off..off + 4)
+        let end = off
+            .checked_add(4)
+            .ok_or_else(|| format!("ELF u32 write offset {off} overflows"))?;
+        b.get_mut(off..end)
             .ok_or_else(|| format!("ELF truncated writing u32 at {off}"))?
             .copy_from_slice(&(v as u32).to_le_bytes());
     }
@@ -112,12 +141,20 @@ fn ph_field(f: &PField, is64: bool) -> usize {
     }
 }
 fn set_ph_word(b: &mut [u8], ph: usize, is64: bool, f: PField, v: u64) -> Result<(), String> {
-    put_word(b, ph + ph_field(&f, is64), v, is64)
+    let off = ph
+        .checked_add(ph_field(&f, is64))
+        .ok_or("ELF program-header field offset overflow")?;
+    put_word(b, off, v, is64)
 }
 /// Write a 4-byte program-header field (`p_type`/`p_flags`, which are u32 in BOTH classes).
 fn set_ph_u32(b: &mut [u8], ph: usize, is64: bool, f: PField, v: u32) -> Result<(), String> {
-    let off = ph + ph_field(&f, is64);
-    b.get_mut(off..off + 4)
+    let off = ph
+        .checked_add(ph_field(&f, is64))
+        .ok_or("ELF program-header field offset overflow")?;
+    let end = off
+        .checked_add(4)
+        .ok_or_else(|| format!("ELF ph u32 write offset {off} overflows"))?;
+    b.get_mut(off..end)
         .ok_or_else(|| format!("ELF truncated writing ph u32 at {off}"))?
         .copy_from_slice(&v.to_le_bytes());
     Ok(())
@@ -165,13 +202,26 @@ impl<'a> Elf<'a> {
         } else {
             (0x1C, 0x2A, 0x2C, 0x20)
         };
-        let phoff = self.word(off)? as usize;
+        let phoff = usize::try_from(self.word(off)?)
+            .map_err(|_| "ELF program-header offset does not fit this architecture")?;
         let phentsize = u16le(self.b, ents)? as usize;
         let phnum = u16le(self.b, num)? as usize;
         if phnum != 0 && phentsize < min_ents {
             return Err(format!("implausible e_phentsize {phentsize}"));
         }
         Ok((phoff, phentsize, phnum))
+    }
+
+    fn phdr_offset(&self, phoff: usize, phentsize: usize, index: usize) -> Result<usize, String> {
+        index
+            .checked_mul(phentsize)
+            .and_then(|offset| phoff.checked_add(offset))
+            .ok_or_else(|| format!("ELF program-header {index} offset overflow"))
+    }
+
+    fn field_offset(ph: usize, field: usize, what: &str) -> Result<usize, String> {
+        ph.checked_add(field)
+            .ok_or_else(|| format!("ELF {what} field offset overflow"))
     }
 
     /// `(p_offset, p_vaddr, p_filesz)` field offsets within a program-header entry.
@@ -189,11 +239,16 @@ impl<'a> Elf<'a> {
         let (phoff, phentsize, phnum) = self.phdr_table()?;
         let (p_off, _p_vaddr, p_filesz) = self.ph_fields();
         for i in 0..phnum {
-            let ph = phoff + i * phentsize;
+            let ph = self.phdr_offset(phoff, phentsize, i)?;
             if u32le(self.b, ph)? == pt {
-                let off = self.word(ph + p_off)? as usize;
-                let sz = self.word(ph + p_filesz)? as usize;
-                if off + sz > self.b.len() {
+                let off = usize::try_from(self.word(Self::field_offset(ph, p_off, what)?)?)
+                    .map_err(|_| format!("{what} offset does not fit this architecture"))?;
+                let sz = usize::try_from(self.word(Self::field_offset(ph, p_filesz, what)?)?)
+                    .map_err(|_| format!("{what} size does not fit this architecture"))?;
+                let end = off
+                    .checked_add(sz)
+                    .ok_or_else(|| format!("{what} file range overflows"))?;
+                if end > self.b.len() {
                     return Err(format!("{what} runs past end of file"));
                 }
                 return Ok(Some((off, sz)));
@@ -208,15 +263,26 @@ impl<'a> Elf<'a> {
         let (phoff, phentsize, phnum) = self.phdr_table()?;
         let (p_off, p_vaddr, p_filesz) = self.ph_fields();
         for i in 0..phnum {
-            let ph = phoff + i * phentsize;
+            let ph = self.phdr_offset(phoff, phentsize, i)?;
             if u32le(self.b, ph)? != PT_LOAD {
                 continue;
             }
-            let off = self.word(ph + p_off)?;
-            let va = self.word(ph + p_vaddr)?;
-            let fsz = self.word(ph + p_filesz)?;
-            if vaddr >= va && vaddr < va + fsz {
-                return Ok(Some((off + (vaddr - va)) as usize));
+            let off = self.word(Self::field_offset(ph, p_off, "PT_LOAD offset")?)?;
+            let va = self.word(Self::field_offset(ph, p_vaddr, "PT_LOAD address")?)?;
+            let fsz = self.word(Self::field_offset(ph, p_filesz, "PT_LOAD size")?)?;
+            let va_end = va
+                .checked_add(fsz)
+                .ok_or("PT_LOAD virtual address range overflow")?;
+            if vaddr >= va && vaddr < va_end {
+                let file_offset = off
+                    .checked_add(vaddr - va)
+                    .ok_or("PT_LOAD file offset overflow")?;
+                let file_offset = usize::try_from(file_offset)
+                    .map_err(|_| "PT_LOAD file offset does not fit this architecture")?;
+                if file_offset >= self.b.len() {
+                    return Err("PT_LOAD mapped address runs past end of file".into());
+                }
+                return Ok(Some(file_offset));
             }
         }
         Ok(None)
@@ -238,11 +304,24 @@ fn interp_ph_entry(b: &[u8]) -> Result<Option<(usize, usize, usize, bool)>, Stri
     let (phoff, phentsize, phnum) = elf.phdr_table()?;
     let (p_off, _pv, p_filesz) = elf.ph_fields();
     for i in 0..phnum {
-        let ph = phoff + i * phentsize;
+        let ph = elf.phdr_offset(phoff, phentsize, i)?;
         if u32le(b, ph)? == PT_INTERP {
-            let off = elf.word(ph + p_off)? as usize;
-            let sz = elf.word(ph + p_filesz)? as usize;
-            if off + sz > b.len() {
+            let off = usize::try_from(elf.word(Elf::field_offset(
+                ph,
+                p_off,
+                "PT_INTERP offset",
+            )?)?)
+            .map_err(|_| "PT_INTERP string offset does not fit this architecture")?;
+            let sz = usize::try_from(elf.word(Elf::field_offset(
+                ph,
+                p_filesz,
+                "PT_INTERP size",
+            )?)?)
+            .map_err(|_| "PT_INTERP string size does not fit this architecture")?;
+            let end = off
+                .checked_add(sz)
+                .ok_or("PT_INTERP string file range overflows")?;
+            if end > b.len() {
                 return Err("PT_INTERP string runs past end of file".into());
             }
             return Ok(Some((ph, off, sz, elf.is64)));
@@ -269,9 +348,15 @@ fn rpath_slots(b: &[u8]) -> Result<Option<RpathSlots>, String> {
     let mut strtab_vaddr: Option<u64> = None;
     let mut entries: Vec<(u64, u64)> = Vec::new();
     for i in 0..(dsize / entsize) {
-        let e = doff + i * entsize;
+        let e = i
+            .checked_mul(entsize)
+            .and_then(|offset| doff.checked_add(offset))
+            .ok_or("PT_DYNAMIC entry offset overflow")?;
         let tag = elf.word(e)?;
-        let val = elf.word(e + d_un)?;
+        let val = elf.word(
+            e.checked_add(d_un)
+                .ok_or("PT_DYNAMIC value offset overflow")?,
+        )?;
         match tag {
             DT_NULL => break,
             DT_STRTAB => strtab_vaddr = Some(val),
@@ -309,9 +394,15 @@ fn needed_slots(b: &[u8]) -> Result<Option<NeededSlots>, String> {
     let mut strtab_vaddr: Option<u64> = None;
     let mut offsets: Vec<u64> = Vec::new();
     for i in 0..(dsize / entsize) {
-        let e = doff + i * entsize;
+        let e = i
+            .checked_mul(entsize)
+            .and_then(|offset| doff.checked_add(offset))
+            .ok_or("PT_DYNAMIC entry offset overflow")?;
         let tag = elf.word(e)?;
-        let val = elf.word(e + d_un)?;
+        let val = elf.word(
+            e.checked_add(d_un)
+                .ok_or("PT_DYNAMIC value offset overflow")?,
+        )?;
         match tag {
             DT_NULL => break,
             DT_STRTAB => strtab_vaddr = Some(val),
@@ -336,7 +427,12 @@ pub fn read_interp(path: &Path) -> Result<Option<String>, String> {
     match interp_slot(&b)? {
         None => Ok(None),
         Some((off, sz)) => {
-            let raw = &b[off..off + sz];
+            let end = off
+                .checked_add(sz)
+                .ok_or("PT_INTERP string file range overflows")?;
+            let raw = b
+                .get(off..end)
+                .ok_or("PT_INTERP string runs past end of file")?;
             let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
             Ok(Some(String::from_utf8_lossy(&raw[..end]).into_owned()))
         }
@@ -364,7 +460,13 @@ pub fn set_interp(path: &Path, new_interp: &str) -> Result<(), String> {
     }
     if nb.len() + 1 <= sz {
         // fits — overwrite in place, NUL-padding the tail of the old slot.
-        for (i, slot) in b[off..off + sz].iter_mut().enumerate() {
+        let end = off
+            .checked_add(sz)
+            .ok_or("PT_INTERP string file range overflows")?;
+        let raw = b
+            .get_mut(off..end)
+            .ok_or("PT_INTERP string runs past end of file")?;
+        for (i, slot) in raw.iter_mut().enumerate() {
             *slot = if i < nb.len() { nb[i] } else { 0 };
         }
     } else {
@@ -383,13 +485,16 @@ pub fn set_interp(path: &Path, new_interp: &str) -> Result<(), String> {
             let mut note: Option<usize> = None;
             let mut end: u64 = 0;
             for i in 0..phnum {
-                let e = phoff + i * phentsize;
+                let e = elf.phdr_offset(phoff, phentsize, i)?;
                 match u32le(&b, e)? {
                     PT_NOTE if note.is_none() => note = Some(e),
                     PT_LOAD => {
-                        let va = elf.word(e + pv)?;
-                        let msz = elf.word(e + pm)?;
-                        end = end.max(va + msz);
+                        let va = elf.word(Elf::field_offset(e, pv, "PT_LOAD address")?)?;
+                        let msz = elf.word(Elf::field_offset(e, pm, "PT_LOAD size")?)?;
+                        let segment_end = va
+                            .checked_add(msz)
+                            .ok_or("PT_LOAD virtual address range overflow")?;
+                        end = end.max(segment_end);
                     }
                     _ => {}
                 }
@@ -443,8 +548,13 @@ pub fn read_rpath(path: &Path) -> Result<Option<String>, String> {
         .iter()
         .find(|(t, _)| *t == DT_RUNPATH)
         .or_else(|| slots.entries.first())
-        .unwrap();
-    let off = slots.strtab_off + pick.1 as usize;
+        .ok_or("run-path slot set is unexpectedly empty")?;
+    let string_offset = usize::try_from(pick.1)
+        .map_err(|_| "DT_RPATH/DT_RUNPATH string offset does not fit this architecture")?;
+    let off = slots
+        .strtab_off
+        .checked_add(string_offset)
+        .ok_or("DT_RPATH/DT_RUNPATH string offset overflow")?;
     let raw = b.get(off..).ok_or("DT_RPATH/DT_RUNPATH string offset past end of file")?;
     let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
     Ok(Some(String::from_utf8_lossy(&raw[..end]).into_owned()))
@@ -476,8 +586,16 @@ pub fn set_rpath(path: &Path, new_rpath: &str) -> Result<(), String> {
     let mut offsets: Vec<usize> = slots
         .entries
         .iter()
-        .map(|(_, v)| slots.strtab_off + *v as usize)
-        .collect();
+        .map(|(_, value)| {
+            let value = usize::try_from(*value).map_err(|_| {
+                "DT_RPATH/DT_RUNPATH string offset does not fit this architecture"
+            })?;
+            slots
+                .strtab_off
+                .checked_add(value)
+                .ok_or_else(|| "DT_RPATH/DT_RUNPATH string offset overflow".to_string())
+        })
+        .collect::<Result<_, _>>()?;
     offsets.sort_unstable();
     offsets.dedup();
     let mut terms: Vec<(usize, usize)> = Vec::with_capacity(offsets.len());
@@ -543,7 +661,12 @@ pub fn runtime_link_search(
     let interp = match interp_slot(&b)? {
         None => None,
         Some((off, sz)) => {
-            let raw = b.get(off..off + sz).unwrap_or(&[]);
+            let end = off
+                .checked_add(sz)
+                .ok_or("PT_INTERP string file range overflows")?;
+            let raw = b
+                .get(off..end)
+                .ok_or("PT_INTERP string runs past end of file")?;
             let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
             Some(String::from_utf8_lossy(&raw[..end]).into_owned())
         }
@@ -553,7 +676,13 @@ pub fn runtime_link_search(
         // Every DT_RPATH and DT_RUNPATH slot (the loader prefers RUNPATH, but a closure over
         // ALL run-path store dirs is the safe superset — it never DROPS a real provider dir).
         for (_tag, v) in &slots.entries {
-            let off = slots.strtab_off + *v as usize;
+            let string_offset = usize::try_from(*v).map_err(|_| {
+                "DT_RPATH/DT_RUNPATH string offset does not fit this architecture"
+            })?;
+            let off = slots
+                .strtab_off
+                .checked_add(string_offset)
+                .ok_or("DT_RPATH/DT_RUNPATH string offset overflow")?;
             let raw = b
                 .get(off..)
                 .ok_or("DT_RPATH/DT_RUNPATH string offset past end of file")?;
@@ -596,6 +725,124 @@ fn needed_names(b: &[u8]) -> Result<Vec<String>, String> {
 pub fn read_needed(path: &Path) -> Result<Vec<String>, String> {
     let b = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     needed_names(&b)
+}
+
+/// Assert that PATH has the executable structure the x86-64 application launcher
+/// needs. Static PIE is `ET_DYN`; a traditional static binary is `ET_EXEC`.
+pub fn assert_x86_64_executable(path: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let elf = Elf::parse(&bytes)?;
+    if !elf.is64 {
+        return Err(format!(
+            "{}: application entry is not ELFCLASS64",
+            path.display()
+        ));
+    }
+    let kind = u16le(&bytes, 0x10)?;
+    if !matches!(kind, ET_EXEC | ET_DYN) {
+        return Err(format!(
+            "{}: application entry has ELF type {kind}, expected ET_EXEC or ET_DYN",
+            path.display()
+        ));
+    }
+    let machine = u16le(&bytes, 0x12)?;
+    if machine != EM_X86_64 {
+        return Err(format!(
+            "{}: application entry has ELF machine {machine}, expected EM_X86_64",
+            path.display()
+        ));
+    }
+    if bytes.get(6).copied() != Some(1) || u32le(&bytes, 0x14)? != EV_CURRENT {
+        return Err(format!(
+            "{}: application entry has an unsupported ELF version",
+            path.display()
+        ));
+    }
+    if u16le(&bytes, 0x34)? != 64 {
+        return Err(format!(
+            "{}: application entry has an invalid ELF64 header size",
+            path.display()
+        ));
+    }
+    let entry = elf.word(0x18)?;
+    if entry == 0 {
+        return Err(format!(
+            "{}: application entry has a zero ELF entry point",
+            path.display()
+        ));
+    }
+    let (phoff, phentsize, phnum) = elf.phdr_table()?;
+    if phnum == 0 || phentsize != 56 {
+        return Err(format!(
+            "{}: application entry has no canonical ELF64 program-header table",
+            path.display()
+        ));
+    }
+    let table_size = phentsize
+        .checked_mul(phnum)
+        .ok_or_else(|| format!("{}: ELF program-header table size overflow", path.display()))?;
+    let table_end = phoff
+        .checked_add(table_size)
+        .ok_or_else(|| format!("{}: ELF program-header table offset overflow", path.display()))?;
+    if table_end > bytes.len() {
+        return Err(format!(
+            "{}: ELF program-header table runs past end of file",
+            path.display()
+        ));
+    }
+    let mut entry_is_executable = false;
+    for index in 0..phnum {
+        let offset = index
+            .checked_mul(phentsize)
+            .and_then(|value| phoff.checked_add(value))
+            .ok_or_else(|| format!("{}: ELF program-header offset overflow", path.display()))?;
+        if u32le(&bytes, offset)? != PT_LOAD {
+            continue;
+        }
+        let flags_offset = offset
+            .checked_add(4)
+            .ok_or_else(|| format!("{}: PT_LOAD flags offset overflow", path.display()))?;
+        let flags = u32le(&bytes, flags_offset)?;
+        let file_offset = elf.word(Elf::field_offset(offset, 0x08, "PT_LOAD file offset")?)?;
+        let virtual_address = elf.word(Elf::field_offset(
+            offset,
+            0x10,
+            "PT_LOAD virtual address",
+        )?)?;
+        let file_size = elf.word(Elf::field_offset(offset, 0x20, "PT_LOAD file size")?)?;
+        let memory_size = elf.word(Elf::field_offset(offset, 0x28, "PT_LOAD memory size")?)?;
+        if file_size > memory_size {
+            return Err(format!(
+                "{}: PT_LOAD has p_filesz larger than p_memsz",
+                path.display()
+            ));
+        }
+        let file_end = file_offset.checked_add(file_size).ok_or_else(|| {
+            format!("{}: PT_LOAD file range overflow", path.display())
+        })?;
+        if file_end > bytes.len() as u64 {
+            return Err(format!(
+                "{}: PT_LOAD runs past end of file",
+                path.display()
+            ));
+        }
+        virtual_address.checked_add(memory_size).ok_or_else(|| {
+            format!("{}: PT_LOAD memory address range overflow", path.display())
+        })?;
+        let file_backed_end = virtual_address.checked_add(file_size).ok_or_else(|| {
+            format!("{}: PT_LOAD file-backed address range overflow", path.display())
+        })?;
+        if flags & PF_X != 0 && entry >= virtual_address && entry < file_backed_end {
+            entry_is_executable = true;
+        }
+    }
+    if !entry_is_executable {
+        return Err(format!(
+            "{}: ELF entry point is not covered by a file-backed executable PT_LOAD",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Assert an ELF is FULLY STATIC — no program interpreter (`PT_INTERP`), no `DT_NEEDED`
@@ -802,13 +1049,26 @@ mod tests {
         b[0..4].copy_from_slice(EI_MAG);
         b[EI_CLASS] = if is64 { 2 } else { 1 };
         b[EI_DATA] = 1;
+        b[6] = 1;
+        b[0x10..0x12].copy_from_slice(&ET_EXEC.to_le_bytes());
+        b[0x12..0x14].copy_from_slice(
+            &(if is64 { EM_X86_64 } else { 3u16 }).to_le_bytes(),
+        );
+        b[0x14..0x18].copy_from_slice(&EV_CURRENT.to_le_bytes());
+        put_word(&mut b, 0x18, ehdr as u64, is64);
+        let ehsize = if is64 { 0x34 } else { 0x28 };
+        b[ehsize..ehsize + 2].copy_from_slice(&(ehdr as u16).to_le_bytes());
         put_phdr_header(&mut b, ehdr, phentsize, phnum, is64);
         let (p_off, p_vaddr, p_filesz) = ph_field_offsets(is64);
         let p0 = ehdr;
         b[p0..p0 + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        let flags = if is64 { p0 + 0x04 } else { p0 + 0x18 };
+        b[flags..flags + 4].copy_from_slice(&PF_X.to_le_bytes());
         put_word(&mut b, p0 + p_off, 0, is64);
         put_word(&mut b, p0 + p_vaddr, 0, is64);
         put_word(&mut b, p0 + p_filesz, total as u64, is64);
+        let p_memsz = if is64 { p0 + 0x28 } else { p0 + 0x14 };
+        put_word(&mut b, p_memsz, total as u64, is64);
         b
     }
 
@@ -842,9 +1102,9 @@ mod tests {
     #[test]
     fn grows_interp_that_does_not_fit() {
         // A path LONGER than the original slot is no longer refused: it is appended to the end
-        // of the file and PT_INTERP is repointed at it (the interp is read from the file at
-        // p_offset by the kernel, so no LOAD segment is needed). This is what lets rustc/cargo
-        // point at the full hashed /td/store/<hash>-glibc.../ld-linux-x86-64.so.2 loader.
+        // of the file, a PT_NOTE is repurposed as the covering PT_LOAD, and PT_INTERP is
+        // repointed at both its file offset and mapped address. This is what lets rustc/cargo
+        // name the full hashed /td/store/<hash>-glibc.../ld-linux-x86-64.so.2 loader.
         let dir = std::env::temp_dir().join(format!("elf-test-l-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a");
@@ -1058,6 +1318,82 @@ mod tests {
         std::fs::write(&f, synth_static_elf(false)).unwrap();
         assert!(assert_static(&f).is_ok());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn application_executable_requires_x86_64_kind_and_file_backed_entry() {
+        let dir = std::env::temp_dir().join(format!("elf-app-exec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("app");
+        let valid = synth_static_elf(true);
+        std::fs::write(&file, &valid).unwrap();
+        assert!(assert_x86_64_executable(&file).is_ok());
+
+        for (bytes, expected) in [
+            ({
+                let mut bytes = valid.clone();
+                bytes[0x10..0x12].copy_from_slice(&1u16.to_le_bytes());
+                bytes
+            }, "ET_EXEC or ET_DYN"),
+            ({
+                let mut bytes = valid.clone();
+                bytes[0x12..0x14].copy_from_slice(&3u16.to_le_bytes());
+                bytes
+            }, "EM_X86_64"),
+            ({
+                let mut bytes = valid.clone();
+                bytes[0x18..0x20].copy_from_slice(&0u64.to_le_bytes());
+                bytes
+            }, "zero ELF entry point"),
+            ({
+                let mut bytes = valid.clone();
+                bytes[64 + 4..64 + 8].copy_from_slice(&0u32.to_le_bytes());
+                bytes
+            }, "not covered"),
+        ] {
+            std::fs::write(&file, &bytes).unwrap();
+            let error = assert_x86_64_executable(&file).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+
+        let mut malformed_second_load = valid.clone();
+        let second = malformed_second_load.len();
+        malformed_second_load.resize(second + 56, 0);
+        malformed_second_load[0x38..0x3a].copy_from_slice(&2u16.to_le_bytes());
+        malformed_second_load[second..second + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        malformed_second_load[second + 0x20..second + 0x28]
+            .copy_from_slice(&1u64.to_le_bytes());
+        std::fs::write(&file, malformed_second_load).unwrap();
+        let error = assert_x86_64_executable(&file).unwrap_err();
+        assert!(error.contains("p_filesz larger than p_memsz"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn static_assertion_refuses_overflowing_segment_metadata_without_panicking() {
+        let dir = std::env::temp_dir().join(format!("elf-static-ranges-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("app");
+        let valid = synth_static_elf(true);
+
+        for (kind, expected) in [
+            (PT_INTERP, "PT_INTERP string file range overflows"),
+            (PT_DYNAMIC, "PT_DYNAMIC file range overflows"),
+        ] {
+            let mut malformed = valid.clone();
+            let second = malformed.len();
+            malformed.resize(second + 56, 0);
+            malformed[0x38..0x3a].copy_from_slice(&2u16.to_le_bytes());
+            malformed[second..second + 4].copy_from_slice(&kind.to_le_bytes());
+            malformed[second + 0x08..second + 0x10]
+                .copy_from_slice(&u64::MAX.to_le_bytes());
+            malformed[second + 0x20..second + 0x28]
+                .copy_from_slice(&1u64.to_le_bytes());
+            std::fs::write(&file, malformed).unwrap();
+            let error = assert_static(&file).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

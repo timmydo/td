@@ -399,6 +399,15 @@ const PINS: &[PinDef] = &[
         file: "Python-3.11.1.tar.xz",
     },
     PinDef {
+        key: "ripgrep-seed-source",
+        aliases: &[],
+        // The upstream x86-64 musl release is a static PIE and is admitted only
+        // as the first sandboxed-application seed. It is never a build tool.
+        url: "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz",
+        sha256: "33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c",
+        file: "ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz",
+    },
+    PinDef {
         key: "ripgrep-source",
         aliases: &[],
         url: "https://static.crates.io/crates/ripgrep/ripgrep-14.1.1.crate",
@@ -519,9 +528,9 @@ const PINS: &[PinDef] = &[
 /// is_a_pin_key` closes it, and requires a KEY rather than an alias, since
 /// marking an alias would leave the canonical key unmarked.
 ///
-/// Empty until the first application lands. Adding an entry is a reviewed pin;
-/// adding a CLASS of foreign output is an AGENTS.md amendment.
-const FOREIGN: &[&str] = &[];
+/// Adding an entry is a reviewed pin; adding a CLASS of foreign output is an
+/// AGENTS.md amendment.
+const FOREIGN: &[&str] = &["ripgrep-seed-source"];
 
 pub fn all() -> Vec<SourcePin> {
     all_with(FOREIGN)
@@ -564,12 +573,11 @@ fn by_key_with(key: &str, foreign: &[&str]) -> Option<SourcePin> {
         .map(|pin| materialize_with(pin, key, foreign))
 }
 
-/// Every function above takes its roster as an ARGUMENT, and the public pair
-/// exists only to supply `FOREIGN`. The real roster is EMPTY until the first
-/// application lands, so a test that drove the public pair would observe
-/// nothing — and the wiring that supplies it is exactly what a review found
-/// deletable with the suite green. So the behaviour is tested through the
-/// `_with` pair over a fixture, and the wiring itself is pinned in source by
+/// Every function above takes its roster as an ARGUMENT, and the public entry
+/// points exist only to supply `FOREIGN`. The behavior remains tested through the
+/// `_with` pair over fixtures so misspellings, aliases and an empty roster stay
+/// observable independently of the reviewed production entry. The wiring is
+/// pinned in source by
 /// `the_public_pair_is_the_only_place_the_real_roster_is_read`.
 fn materialize_with(pin: &PinDef, key: &str, foreign: &[&str]) -> SourcePin {
     let out = SourcePin::new(key, pin.url, pin.sha256, pin.file);
@@ -608,8 +616,9 @@ mod tests {
         // coreutils-0.9.0, ripgrep 14.1.1, and fd 10.2.0 (the Rust userland
         // `.crate` sources) +
         // btrfs-progs 7.0 and util-linux 2.42.2 (the persistent-volume writer
-        // and its minimal libuuid/libblkid build closure).
-        assert_eq!(all().len(), 56);
+        // and its minimal libuuid/libblkid build closure) + the first reviewed
+        // foreign application seed, upstream ripgrep 15.2.0.
+        assert_eq!(all().len(), 57);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice
@@ -631,8 +640,8 @@ mod tests {
 
     #[test]
     fn every_foreign_name_is_a_pin_key() {
-        // The real roster is EMPTY, so sweeping it alone is a loop with no
-        // iterations — green with the rule inverted. Drive the check first.
+        // This fixture keeps the misspelling and alias cases observable without
+        // depending on whichever reviewed pins the real roster currently names.
         let pins = [PinDef {
             key: "app",
             aliases: &["app-alias"],
@@ -654,7 +663,7 @@ mod tests {
         );
         // The count is the reviewable artifact, so it is asserted rather than
         // left to be read. Adding an application changes this number.
-        assert_eq!(FOREIGN.len(), 0, "no application has landed yet");
+        assert_eq!(FOREIGN.len(), 1, "exactly one application seed is admitted");
     }
 
     /// The mark is a property of the PIN, so it must answer the same however the
@@ -679,14 +688,19 @@ mod tests {
             !materialize_with(&pin, "app", &["app-alias"]).foreign(),
             "an alias in the roster marks nothing — hence the key-only check"
         );
-        // Everything the catalog actually ships is ordinary, and stays so.
-        assert!(all().iter().all(|pin| !pin.foreign()));
+        let marked: Vec<String> = all()
+            .into_iter()
+            .filter(|pin| pin.foreign())
+            .map(|pin| pin.key)
+            .collect();
+        assert_eq!(marked, vec!["ripgrep-seed-source".to_string()]);
     }
 
     /// The PRODUCTION lookup, over a REAL pin key, which is the route every
     /// shipped recipe takes: no catalog recipe calls `source_pin` directly, so
     /// the fixture-`PinDef` test above and the shipped code met nowhere until
-    /// this one. Driven through `by_key_with` because the real roster is empty.
+    /// this one. Driven through `by_key_with` so the fixture can mark an ordinary
+    /// production pin without changing the reviewed roster.
     #[test]
     fn the_production_lookup_marks_a_real_pin_from_the_roster() {
         let key = "zlib-x86-64-source";
@@ -703,16 +717,9 @@ mod tests {
         );
     }
 
-    /// The one line joining the real roster to the real materializer had no
-    /// test, and replacing `FOREIGN` with `&[]` there left the whole suite
-    /// green. That is not merely a coverage gap: whoever lands the first
-    /// application must edit the count assertion above anyway, and once they
-    /// do, a tree with this wiring cut is fully green with the payload
-    /// UNMARKED — the exact outcome the roster's key check exists to refuse,
-    /// reached through the wiring instead of through a name.
-    ///
-    /// Pinned in SOURCE because no value observation can see it: with an empty
-    /// roster `all_with(FOREIGN)` and `all_with(&[])` return the same thing.
+    /// Pin the one production read of the reviewed roster. Value tests prove
+    /// the current seed is marked; this source assertion also refuses a second
+    /// bypassing materializer or an alternate roster read.
     #[test]
     fn the_public_pair_is_the_only_place_the_real_roster_is_read() {
         let src = include_str!("source_pins.rs");
@@ -728,7 +735,7 @@ mod tests {
         assert_eq!(
             reads,
             vec![
-                "const FOREIGN: &[&str] = &[];",
+                "const FOREIGN: &[&str] = &[\"ripgrep-seed-source\"];",
                 "all_with(FOREIGN)",
                 "by_key_with(key, FOREIGN)",
                 "foreign_names_with(FOREIGN)",

@@ -4632,8 +4632,8 @@ fn refuse_shared_paths(
     Ok(())
 }
 
-/// The declared payload names, and the two refusals that make the channel a channel
-/// rather than a label (APPLICATIONS.md §B.8).
+/// The declared payload names plus a source-specific local source entry, and the
+/// refusals that make the channel a channel rather than a label (APPLICATIONS.md §B.8).
 ///
 /// A name in BOTH lists is the whole rule defeated by declaring it twice, so it is
 /// refused rather than resolved by precedence; and a payload no lock entry resolves is
@@ -4641,47 +4641,64 @@ fn refuse_shared_paths(
 fn payload_names(
     alist: &json::Json,
     entries: &[lock::Entry],
+    source_entry: Option<&str>,
+    foreign_source: bool,
 ) -> Result<std::collections::BTreeSet<String>, String> {
     let mut names = std::collections::BTreeSet::new();
-    let Some(declared) = alist.get("payloadInputs") else {
-        return Ok(names);
-    };
-    // TYPED, not filtered. A `"payloadInputs":"firefox"` — a string where an array
-    // belongs — read through `as_arr().and_then()` would yield NO payloads, leaving
-    // the name in TD_INPUT_MAP, mounted executable, and past the duplicate-channel
-    // refusal below. A malformed declaration of a restriction must never be read as
-    // an absent one.
-    let arr = declared.as_arr().ok_or_else(|| {
-        "recipe: `payloadInputs' must be an ARRAY of input names — a malformed one \
-         would otherwise read as no payload at all (APPLICATIONS.md section B.8)"
-            .to_string()
-    })?;
-    for value in arr {
-        let name = value.as_str().ok_or_else(|| {
-            "recipe: `payloadInputs' holds a non-string entry; every element names a \
-             declared input (APPLICATIONS.md section B.8)"
+    if let Some(declared) = alist.get("payloadInputs") {
+        // TYPED, not filtered. A `"payloadInputs":"firefox"` — a string where an
+        // array belongs — read through `as_arr().and_then()` would yield NO payloads,
+        // leaving the name in TD_INPUT_MAP, mounted executable, and past the
+        // duplicate-channel refusal below. A malformed declaration of a restriction
+        // must never be read as an absent one.
+        let arr = declared.as_arr().ok_or_else(|| {
+            "recipe: `payloadInputs' must be an ARRAY of input names — a malformed one \
+             would otherwise read as no payload at all (APPLICATIONS.md section B.8)"
                 .to_string()
         })?;
-        names.insert(name.to_string());
+        for value in arr {
+            let name = value.as_str().ok_or_else(|| {
+                "recipe: `payloadInputs' holds a non-string entry; every element names a \
+                 declared input (APPLICATIONS.md section B.8)"
+                    .to_string()
+            })?;
+            names.insert(name.to_string());
+        }
     }
-    // `sourceInput` is the third declaration channel and reaches the build as TD_SRC,
-    // so a name in both would be withheld from TD_INPUT_MAP while still arriving as
-    // the recipe's own source — the channel crossed by a different door.
+    // An explicitly duplicated sourceInput pin key creates a second data alias for a
+    // marked source. For an ordinary source it would withhold that alias from
+    // TD_INPUT_MAP while still exposing the source as TD_SRC — the channel crossed by
+    // a different door.
     if let Some(src) = alist.get("sourceInput").and_then(json::Json::as_str) {
         if names.contains(src) {
             return Err(format!(
                 "recipe: `{src}' is declared in both `payloadInputs' and `sourceInput' \
-                 — a payload is staged as DATA and cannot also be this recipe's own \
-                 source (APPLICATIONS.md section B.8)"
+                 — the source-specific mark alone controls whether a recipe source \
+                 is staged as DATA (APPLICATIONS.md section B.8)"
             ));
         }
+    }
+    if let Some(entry) = source_entry {
+        if names.contains(entry) {
+            return Err(format!(
+                "recipe: local source entry `{entry}' is declared explicitly in \
+                 `payloadInputs'; only the source-specific `foreignSource' mark may \
+                 move a recipe source onto DATA (APPLICATIONS.md section B.8)"
+            ));
+        }
+    }
+    if foreign_source {
+        let entry = source_entry.ok_or_else(|| {
+            "recipe: foreignSource has no local source lock entry".to_string()
+        })?;
+        names.insert(entry.to_string());
     }
     for channel in TOOL_CHANNELS {
         for name in names_in_channel(alist, channel)? {
             if names.contains(name.as_str()) {
                 return Err(format!(
-                    "recipe: `{name}' is declared in both `payloadInputs' and `{channel}' \
-                     — a payload is staged as DATA and must not also travel the tool, \
+                    "recipe: `{name}' is present on both the DATA channel and `{channel}' \
+                     — a payload must not also travel the tool, \
                      compilation and execution channel (APPLICATIONS.md section B.8)"
                 ));
             }
@@ -4690,12 +4707,134 @@ fn payload_names(
     for name in &names {
         if !entries.iter().any(|e| &e.name == name) {
             return Err(format!(
-                "recipe: `payloadInputs' names `{name}', which no lock entry resolves — a \
+                "recipe: payload channel names `{name}', which no lock entry resolves — a \
                  declared payload that reaches no path enforces nothing"
             ));
         }
     }
     Ok(names)
+}
+
+fn sole_object_field(value: &json::Json) -> Option<(&str, &json::Json)> {
+    let json::Json::Obj(fields) = value else {
+        return None;
+    };
+    if fields.len() != 1 {
+        return None;
+    }
+    fields.first().map(|(name, value)| (name.as_str(), value))
+}
+
+/// Bind the native static seed check to the manifest and to a quiescent output.
+/// The only steps before it are builder-native and spawn no package process, and
+/// the check is terminal, so nothing can race or mutate the tree after approval.
+fn validate_static_application_step_contract(
+    name: &str,
+    alist: &json::Json,
+    declaration: Option<&td_engine::application::ApplicationDeclaration>,
+    foreign_source: bool,
+) -> Result<(), String> {
+    let requires_validator = foreign_source && declaration.is_some();
+    let Some(steps) = alist.get("steps").and_then(json::Json::as_arr) else {
+        if requires_validator {
+            return Err(format!(
+                "recipe `{name}': a foreign-source application requires exactly one \
+                 validateStaticApplication step"
+            ));
+        }
+        return Ok(());
+    };
+    let mut marker_index = None;
+    for (index, step) in steps.iter().enumerate() {
+        if step.get("validateStaticApplication").is_none() {
+            continue;
+        }
+        if marker_index.is_some() {
+            return Err(format!(
+                "recipe `{name}': validateStaticApplication must occur exactly once"
+            ));
+        }
+        marker_index = Some(index);
+    }
+    let Some(marker_index) = marker_index else {
+        if requires_validator {
+            return Err(format!(
+                "recipe `{name}': a foreign-source application requires exactly one \
+                 validateStaticApplication step"
+            ));
+        }
+        return Ok(());
+    };
+    let declaration = declaration.ok_or_else(|| {
+        format!(
+            "recipe `{name}': validateStaticApplication requires an application declaration"
+        )
+    })?;
+    if marker_index.checked_add(1) != Some(steps.len()) {
+        return Err(format!(
+            "recipe `{name}': validateStaticApplication must be the terminal step"
+        ));
+    }
+    for step in steps.iter().take(marker_index) {
+        let Some((operation, _)) = sole_object_field(step) else {
+            return Err(format!(
+                "recipe `{name}': a static application seed step must name one operation"
+            ));
+        };
+        if !matches!(operation, "unpack" | "mkDir" | "copyFiles") {
+            return Err(format!(
+                "recipe `{name}': validateStaticApplication may follow only native unpack, \
+                 mkDir and copyFiles steps; `{operation}' could leave package code able to \
+                 race validation"
+            ));
+        }
+    }
+    let Some((operation, value)) = sole_object_field(steps.get(marker_index).ok_or_else(|| {
+        format!("recipe `{name}': static application marker index is missing")
+    })?) else {
+        return Err(format!(
+            "recipe `{name}': validateStaticApplication must be the marker step's only operation"
+        ));
+    };
+    if operation != "validateStaticApplication" {
+        return Err(format!(
+            "recipe `{name}': validateStaticApplication must be the marker step's only operation"
+        ));
+    }
+    let marker_value = value;
+    let json::Json::Obj(fields) = marker_value else {
+        return Err(format!(
+            "recipe `{name}': validateStaticApplication must be an object"
+        ));
+    };
+    if fields.len() != 2
+        || fields
+            .iter()
+            .any(|(key, _)| !matches!(key.as_str(), "entry" | "runtime"))
+    {
+        return Err(format!(
+            "recipe `{name}': validateStaticApplication accepts exactly entry and runtime"
+        ));
+    }
+    let entry = marker_value
+        .get("entry")
+        .and_then(json::Json::as_str)
+        .ok_or_else(|| {
+            format!("recipe `{name}': validateStaticApplication entry is not a string")
+        })?;
+    let runtime = marker_value
+        .get("runtime")
+        .and_then(json::Json::as_str)
+        .ok_or_else(|| {
+            format!("recipe `{name}': validateStaticApplication runtime is not a string")
+        })?;
+    if entry != declaration.entry() || runtime != declaration.runtime() {
+        return Err(format!(
+            "recipe `{name}': validateStaticApplication entry/runtime must exactly match the \
+             builder-authenticated application declaration"
+        ));
+    }
+    Ok(())
 }
 
 // Every phase runner makes an explicit choice about application manifests.
@@ -4772,11 +4911,17 @@ fn assemble_recipe_drv(
     let alist = json::parse(recipe_json).map_err(|e| format!("recipe JSON: {e}"))?;
     let name = alist.get("name").and_then(json::Json::as_str).ok_or("recipe: no name")?;
     let version = alist.get("version").and_then(json::Json::as_str).ok_or("recipe: no version")?;
+    let source_input = match alist.get("sourceInput") {
+        None => None,
+        Some(json::Json::Str(value)) => Some(value.as_str()),
+        Some(_) => return Err("recipe: `sourceInput' must be a string".into()),
+    };
     let full = format!("{name}-{version}");
     // The build system selects the td-builder phase runner. "gnu" (default) is the
     // autotools path; "rust" is the cargo path (build::run_rust), used to SELF-HOST
     // td-builder itself off Guile-construction + the daemon.
     let build_system = alist.get("buildSystem").and_then(json::Json::as_str).unwrap_or("gnu");
+    let foreign_source = foreign_source_of(name, &alist)?;
     let phase_runner = match build_system {
         "gnu" => "autotools-build",
         "rust" => "rust-build",
@@ -4805,10 +4950,22 @@ fn assemble_recipe_drv(
             "recipe: buildSystem \"{build_system}\" does not admit application metadata"
         ));
     }
-    let application_manifest = match alist.get("application") {
+    let application_declaration = match alist.get("application") {
         Some(value) => {
             let declaration = td_engine::application::ApplicationDeclaration::from_json(value)
                 .map_err(|error| format!("recipe application: {error}"))?;
+            Some(declaration)
+        }
+        None => None,
+    };
+    validate_static_application_step_contract(
+        name,
+        &alist,
+        application_declaration.as_ref(),
+        foreign_source,
+    )?;
+    let application_manifest = match application_declaration.as_ref() {
+        Some(declaration) => {
             let contains_payload = match alist.get("payloadInputs") {
                 None => false,
                 Some(json::Json::Arr(inputs)) => !inputs.is_empty(),
@@ -4842,6 +4999,12 @@ fn assemble_recipe_drv(
             "recipe: buildSystem \"{build_system}\" has no typed data steps, so a \
              `payloadInputs' declared here would never be readable — the payload \
              channel is mesboot-only (APPLICATIONS.md section B.8)"
+        ));
+    }
+    if build_system != "mesboot" && foreign_source {
+        return Err(format!(
+            "recipe: buildSystem \"{build_system}\" cannot stage a foreign source as typed \
+             data — foreignSource is mesboot-only (APPLICATIONS.md section B.8)"
         ));
     }
     // configure flags + phases (both optional) -> JSON array string. A configure
@@ -4890,7 +5053,7 @@ fn assemble_recipe_drv(
     // still hard-errors here if its lock ends up missing the source line — catching that
     // mistake immediately at drv-assembly time instead of a confusing failure deep in step
     // execution when a `{in:<name>-source}` template has nothing to resolve.
-    let declares_no_source = build_system == "mesboot" && alist.get("sourceInput").is_none();
+    let declares_no_source = build_system == "mesboot" && source_input.is_none();
     if source.is_empty() && !declares_no_source {
         return Err(format!("lock has no `{src_key}' entry (the recipe source)"));
     }
@@ -4993,7 +5156,7 @@ fn assemble_recipe_drv(
         // steps are hashed as drv data; the sandbox materializes them as the
         // builder's steps file rather than forwarding them through execve.
         // {in:NAME} templates resolve through TD_INPUT_MAP (lock entry name ->
-        // canonical store path, source entry included).
+        // canonical store path). A marked source is withheld with other payloads.
         // configureFlags/phases have no runner here — hard error, never ignored.
         "mesboot" => {
             let steps = alist
@@ -5005,7 +5168,8 @@ fn assemble_recipe_drv(
                 );
             }
             push_drv_env(&mut spec, "TD_STEPS", &steps.to_json_string())?;
-            let payload = payload_names(&alist, &entries)?;
+            let source_entry = (!source.is_empty()).then_some(src_key.as_str());
+            let payload = payload_names(&alist, &entries, source_entry, foreign_source)?;
             let map = input_map_json(&entries, &payload)?;
             // The refusals in `payload_names` partition NAMES; the sandbox keys its
             // noexec bind on PATHS. Two names for one store path satisfy every one of
@@ -5797,6 +5961,36 @@ fn mark_of(name: &str, alist: &json::Json) -> Result<bool, String> {
              (APPLICATIONS.md section B.8)"
         )),
     }
+}
+
+/// The source-specific half of the foreign mark. `foreign` alone is aggregate:
+/// it can be inherited from some other attached pin and therefore cannot decide
+/// whether this recipe's own source belongs on the DATA channel.
+fn foreign_source_of(name: &str, alist: &json::Json) -> Result<bool, String> {
+    let marked = match alist.get("foreignSource") {
+        None => false,
+        Some(json::Json::Bool(value)) => *value,
+        Some(_) => {
+            return Err(format!(
+                "recipe `{name}': `foreignSource' is present but is not a boolean \
+                 (APPLICATIONS.md section B.8)"
+            ));
+        }
+    };
+    if !marked {
+        return Ok(false);
+    }
+    if !mark_of(name, alist)? {
+        return Err(format!(
+            "recipe `{name}': `foreignSource' requires the aggregate `foreign' mark"
+        ));
+    }
+    if alist.get("sourceInput").and_then(json::Json::as_str).is_none() {
+        return Err(format!(
+            "recipe `{name}': `foreignSource' requires a string `sourceInput'"
+        ));
+    }
+    Ok(true)
 }
 
 /// An input is OWNED (td reconstructs it) iff its recipe JSON exists in RECIPE-DIR;
@@ -13126,6 +13320,46 @@ daemon build START (2/2 active)
             full_path, bare_path,
             "declaring a payload must change the derivation"
         );
+
+        // The source-specific mark places the pinned prebuilt archive on the same
+        // DATA map without requiring an impossible duplicate source declaration.
+        // Auto lock synthesis names that entry after the local recipe, not after
+        // the pin key in sourceInput.
+        std::fs::write(
+            &lock,
+            "seed-source /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fixture-1.0.tar.gz source\n\
+             mes /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-mes-0.24 td-recipe-output\n\
+             firefox /gnu/store/cccccccccccccccccccccccccccccccc-firefox-1.0 td-recipe-output\n",
+        )
+        .unwrap();
+        for marks in ["", r#","foreign":true,"foreignSource":true"#] {
+            let damaged = format!(
+                r#"{{"name":"seed","version":"1","buildSystem":"mesboot","steps":[],"sourceInput":"fixture-source","payloadInputs":["seed-source"]{marks}}}"#
+            );
+            let error = assemble_recipe_drv(&damaged, lockp, &dir, None)
+                .expect_err("the local source entry may not be declared as payload data");
+            assert!(error.contains("local source entry `seed-source'"), "{error}");
+        }
+        let absent_source_input =
+            r#"{"name":"seed","version":"1","buildSystem":"mesboot","steps":[],"payloadInputs":["seed-source"]}"#;
+        let error = assemble_recipe_drv(absent_source_input, lockp, &dir, None)
+            .expect_err("an undeclared local source entry may not be payload data");
+        assert!(error.contains("local source entry `seed-source'"), "{error}");
+
+        let malformed_source_input = r#"{"name":"seed","version":"1","buildSystem":"mesboot","steps":[],"sourceInput":7,"payloadInputs":["seed-source"]}"#;
+        let error = assemble_recipe_drv(malformed_source_input, lockp, &dir, None)
+            .expect_err("a malformed sourceInput must not bypass source-channel checks");
+        assert!(error.contains("`sourceInput' must be a string"), "{error}");
+        let foreign = r#"{"name":"seed","version":"1","buildSystem":"mesboot","steps":[],"sourceInput":"fixture-source","payloadInputs":["firefox"],"foreign":true,"foreignSource":true}"#;
+        let (_path, foreign_inputs, foreign_payload) = assemble(foreign.to_string());
+        let foreign_inputs = foreign_inputs.expect("the tool map remains present");
+        assert!(!foreign_inputs.contains("seed-source"));
+        assert!(!foreign_inputs.contains("firefox"));
+        assert!(foreign_inputs.contains("mes"));
+        let foreign_payload = foreign_payload.expect("the DATA map is emitted");
+        assert!(foreign_payload.contains("seed-source"));
+        assert!(!foreign_payload.contains("fixture-source"));
+        assert!(foreign_payload.contains("firefox"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -13252,6 +13486,85 @@ daemon build START (2/2 active)
                 "non-application phase runner {runner} has the wrong dispatch"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn static_application_validation_is_manifest_bound_terminal_and_non_spawning() {
+        let dir = std::env::temp_dir().join(format!(
+            "td-static-application-spec-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("fixture.lock");
+        std::fs::write(
+            &lock,
+            "fixture-source /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fixture.tar.gz source\n\
+             runtime /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-runtime-1 td-recipe-output\n",
+        )
+        .unwrap();
+        let prefix = r#"{"name":"fixture","version":"1","buildSystem":"mesboot","sourceInput":"fixture-pin","payloadInputs":["runtime"],"application":{"runtime":"runtime","entry":"/app/bin/app"},"steps":["#;
+        let native = r#"{"unpack":{"input":"{in:fixture-source}","dest":"{root}/seed","keepTop":false}},{"mkDir":"{out}/files/bin"},{"copyFiles":{"files":["{root}/seed/app"],"dest":"{out}/files/bin"}}"#;
+        let marker = r#"{"validateStaticApplication":{"entry":"/app/bin/app","runtime":"runtime"}}"#;
+        let assemble = |steps: &str| {
+            let recipe = format!("{prefix}{steps}]}}");
+            assemble_recipe_drv(&recipe, lock.to_str().unwrap(), &dir, None)
+        };
+
+        assert!(assemble(&format!("{native},{marker}")).is_ok());
+        for (steps, reason) in [
+            (
+                format!(
+                    "{native},{{\"validateStaticApplication\":{{\"entry\":\"/app/bin/other\",\"runtime\":\"runtime\"}}}}"
+                ),
+                "exactly match",
+            ),
+            (
+                format!("{native},{marker},{{\"mkDir\":\"{{out}}/later\"}}"),
+                "terminal step",
+            ),
+            (
+                format!(
+                    "{{\"run\":{{\"cwd\":\"{{root}}\",\"argv\":[\"/bin/true\"],\"env\":[]}}}},{marker}"
+                ),
+                "could leave package code able to race validation",
+            ),
+            (
+                format!("{native},{marker},{marker}"),
+                "exactly once",
+            ),
+        ] {
+            let error = assemble(&steps).expect_err("invalid static contract must refuse");
+            assert!(error.contains(reason), "{error}");
+        }
+
+        let no_application = format!(
+            r#"{{"name":"fixture","version":"1","buildSystem":"mesboot","sourceInput":"fixture-pin","steps":[{marker}]}}"#
+        );
+        let error = assemble_recipe_drv(
+            &no_application,
+            lock.to_str().unwrap(),
+            &dir,
+            None,
+        )
+        .expect_err("a validation marker without an application must refuse");
+        assert!(error.contains("requires an application declaration"), "{error}");
+
+        let missing_marker = format!(
+            r#"{{"name":"fixture","version":"1","buildSystem":"mesboot","sourceInput":"fixture-pin","foreign":true,"foreignSource":true,"payloadInputs":["runtime"],"application":{{"runtime":"runtime","entry":"/app/bin/app"}},"steps":[{native},{{"run":{{"cwd":"{{out}}","argv":["{{out}}/files/bin/app"],"environment":[]}}}}]}}"#
+        );
+        let error = assemble_recipe_drv(
+            &missing_marker,
+            lock.to_str().unwrap(),
+            &dir,
+            None,
+        )
+        .expect_err("a damaged foreign application must not omit its validator");
+        assert!(
+            error.contains("foreign-source application requires exactly one"),
+            "{error}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -13922,25 +14235,27 @@ daemon build START (2/2 active)
             r#"{"inputs":["gcc","firefox"],"payloadInputs":["firefox"]}"#,
         )
         .unwrap();
-        let err = payload_names(&both, &entries).expect_err("both channels must be refused");
-        assert!(err.contains("both `payloadInputs' and `inputs'"), "got: {err}");
+        let err =
+            payload_names(&both, &entries, None, false).expect_err("both channels must be refused");
+        assert!(err.contains("both the DATA channel and `inputs'"), "got: {err}");
         // ...and through nativeInputs, which is the same channel by another name.
         let native = json::parse(
             r#"{"nativeInputs":["firefox"],"payloadInputs":["firefox"]}"#,
         )
         .unwrap();
-        let err = payload_names(&native, &entries).expect_err("nativeInputs too");
+        let err = payload_names(&native, &entries, None, false).expect_err("nativeInputs too");
         assert!(err.contains("`nativeInputs'"), "got: {err}");
         // ...and through sourceInput, which reaches the build as TD_SRC.
         let src = json::parse(
             r#"{"sourceInput":"firefox","payloadInputs":["firefox"]}"#,
         )
         .unwrap();
-        let err = payload_names(&src, &entries).expect_err("sourceInput too");
+        let err = payload_names(&src, &entries, None, false).expect_err("sourceInput too");
         assert!(err.contains("`sourceInput'"), "got: {err}");
         // A payload nothing resolves would read as enforcement and be none.
         let ghost = json::parse(r#"{"payloadInputs":["nowhere"]}"#).unwrap();
-        let err = payload_names(&ghost, &entries).expect_err("an unresolved payload");
+        let err = payload_names(&ghost, &entries, None, false)
+            .expect_err("an unresolved payload");
         assert!(err.contains("no lock entry resolves"), "got: {err}");
         // A MALFORMED declaration is refused rather than read as an absent one. This
         // is the sharpest of the lot: `"payloadInputs":"firefox"` through a filtering
@@ -13948,17 +14263,62 @@ daemon build START (2/2 active)
         // executable, and sails past the duplicate-channel refusal above.
         let scalar =
             json::parse(r#"{"inputs":["firefox"],"payloadInputs":"firefox"}"#).unwrap();
-        let err = payload_names(&scalar, &entries).expect_err("a string is not a list");
+        let err =
+            payload_names(&scalar, &entries, None, false).expect_err("a string is not a list");
         assert!(err.contains("must be an ARRAY"), "got: {err}");
         let mixed = json::parse(r#"{"payloadInputs":["firefox",7]}"#).unwrap();
-        let err = payload_names(&mixed, &entries).expect_err("a non-string element");
+        let err = payload_names(&mixed, &entries, None, false)
+            .expect_err("a non-string element");
         assert!(err.contains("non-string entry"), "got: {err}");
         // The ordinary case still passes, or every assertion above is vacuous.
         let fine = json::parse(r#"{"inputs":["gcc"],"payloadInputs":["firefox"]}"#).unwrap();
         assert_eq!(
-            payload_names(&fine, &entries).unwrap(),
+            payload_names(&fine, &entries, None, false).unwrap(),
             ["firefox".to_string()].into()
         );
+
+        let entries = lock::parse(
+            "seed-source /td/store/pa source\nruntime /td/store/pr td-recipe-output\n",
+            "seed-source",
+        )
+        .unwrap();
+        let seed = json::parse(
+            r#"{"sourceInput":"archive","payloadInputs":["runtime"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            payload_names(&seed, &entries, Some("seed-source"), true).unwrap(),
+            ["runtime".to_string(), "seed-source".to_string()].into(),
+            "the local source entry joins DATA even when the pin key differs"
+        );
+    }
+
+    #[test]
+    fn the_source_specific_mark_is_typed_and_consistent() {
+        let good = json::parse(
+            r#"{"name":"seed","sourceInput":"archive","foreign":true,"foreignSource":true}"#,
+        )
+        .unwrap();
+        assert!(foreign_source_of("seed", &good).unwrap());
+
+        for (text, expected) in [
+            (
+                r#"{"name":"seed","sourceInput":"archive","foreign":true,"foreignSource":"yes"}"#,
+                "not a boolean",
+            ),
+            (
+                r#"{"name":"seed","sourceInput":"archive","foreignSource":true}"#,
+                "aggregate `foreign' mark",
+            ),
+            (
+                r#"{"name":"seed","foreign":true,"foreignSource":true}"#,
+                "string `sourceInput'",
+            ),
+        ] {
+            let recipe = json::parse(text).unwrap();
+            let error = foreign_source_of("seed", &recipe).expect_err("must refuse");
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     // The --auto crate gate: every checksummed committed-lock entry must be present in the

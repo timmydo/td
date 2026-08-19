@@ -2930,7 +2930,7 @@ fn check_payload_template(
                     name,
                     open,
                     "`{in:NAME}' is the tool channel; use `{payload:NAME}' only in \
-                     copyTree's `from' or stageRuntimeClosure's `roots'",
+                     unpack's `input', copyTree's `from', or stageRuntimeClosure's `roots'",
                 ));
             }
         } else if let Some(name) = token.strip_prefix("payload:") {
@@ -2938,15 +2938,15 @@ fn check_payload_template(
                 return Err(reject(
                     name,
                     open,
-                    "`{payload:NAME}' is visible only in copyTree's `from' or \
-                     stageRuntimeClosure's `roots'",
+                    "`{payload:NAME}' is visible only in unpack's `input', copyTree's \
+                     `from', or stageRuntimeClosure's `roots'",
                 ));
             }
             if !payloads.contains(name) {
                 return Err(reject(
                     name,
                     open,
-                    "the name is absent from this recipe's `payload_inputs'",
+                    "the name is absent from this recipe's DATA inputs",
                 ));
             }
         }
@@ -2993,7 +2993,7 @@ fn visit_step_templates(
             dest,
             keep_top: _,
         } => {
-            visit("unpack.input", input, false)?;
+            visit("unpack.input", input, true)?;
             visit("unpack.dest", dest, false)?;
         }
         Step::MesBoot { source, nyacc, stage0 } => {
@@ -3054,18 +3054,27 @@ fn visit_step_templates(
                 visit("assertStatic.paths", path, false)?;
             }
         }
+        // These are validated manifest values, not templates. The builder
+        // resolves `runtime` only through TD_PAYLOAD_MAP.
+        Step::ValidateStaticApplication { .. } => {}
     }
     Ok(())
 }
 
 /// APPLICATIONS.md §B.8's cheap, pure template audit.
 fn refuse_payload_templates(stem: &str, recipe: &Recipe) -> Result<(), String> {
-    let payloads: HashSet<&str> = recipe
+    let mut payloads: HashSet<&str> = recipe
         .payload_inputs
         .iter()
         .flatten()
         .map(String::as_str)
         .collect();
+    let foreign_source_entry = recipe
+        .is_foreign_source()
+        .then(|| format!("{}-source", recipe.name));
+    if let Some(source) = foreign_source_entry.as_deref() {
+        payloads.insert(source);
+    }
     let Some(steps) = &recipe.steps else {
         return Ok(());
     };
@@ -3088,8 +3097,9 @@ fn refuse_payload_templates(stem: &str, recipe: &Recipe) -> Result<(), String> {
 /// it", which is the exact failure the pin-level mark exists to prevent. Only a
 /// later consumer would have been refused, and there need not be one.
 ///
-/// `source_input` is deliberately NOT covered: that channel is how a payload
-/// enters the store at all, and the recipe it marks is the packaging recipe.
+/// `source_input` is deliberately admitted for its owning packaging recipe. Its
+/// source-specific mark moves the bytes onto the same typed DATA surface before
+/// any step can name them.
 ///
 /// The pin half asks for every NAME a marked pin answers to rather than for its
 /// key, because `by_key` resolves an ALIAS — so a key-only set would answer "not
@@ -3104,10 +3114,9 @@ fn marked_names() -> HashSet<String> {
         .collect()
 }
 
-/// Takes the marked-ness question as an ARGUMENT because the shipped catalog has
-/// no foreign recipe in it: a check that could only ask the real catalog would
-/// pass with the rule inverted, the trap this workstream keeps finding. The
-/// wiring that supplies the real question is pinned in source instead.
+/// Takes the marked-ness question as an ARGUMENT so the refusal can be driven
+/// over names and channels independently of the one reviewed catalog seed. The
+/// wiring that supplies the real question is pinned in source too.
 fn refuse_foreign_with(
     stem: &str,
     recipe: &Recipe,
@@ -3131,10 +3140,10 @@ fn refuse_foreign_with(
     Ok(())
 }
 
-/// Takes the marked-ness question as an ARGUMENT so the LOOP is observable: the
-/// shipped catalog marks nothing, so a check that could only ask it observes
-/// nothing, and a source-text pin on the call site cannot tell "runs for every
-/// node" from "runs for the first" or from "returns early".
+/// Takes the marked-ness question as an ARGUMENT so the LOOP is observable
+/// independently of the one reviewed catalog seed. A source-text pin on the
+/// call site cannot tell "runs for every node" from "runs for the first" or
+/// from "returns early".
 fn classify_graph_inputs_with(
     nodes: &[RecipeNode],
     is_marked: impl Fn(&str) -> bool,
@@ -3297,9 +3306,9 @@ fn payload_closure_of(
 /// call a source-built recipe foreign for colliding with a pin's name.
 /// `no_pin_name_is_a_recipe_stem` is what keeps that union sound at all.
 ///
-/// Takes the marked-ness question as an ARGUMENT for the reason the refusal
-/// does: the shipped catalog marks nothing, so a test that could only ask it
-/// would pass with either answer wired in.
+/// Takes the marked-ness question as an ARGUMENT for the same reason as the
+/// refusal: tests must exercise arbitrary graph positions and name collisions,
+/// not only the one reviewed catalog seed.
 fn contains_payloads(
     nodes: &[RecipeNode],
     seeds: usize,
@@ -4237,7 +4246,6 @@ mod tests {
             ("toolFarm target", Step::ToolFarm { links: vec![("tool".into(), bad(BAD))] }),
             ("writeFile.path", Step::WriteFile { path: bad(BAD), content: "ok".into(), exec: false }),
             ("writeFile.content", Step::WriteFile { path: "{out}/x".into(), content: bad(BAD), exec: false }),
-            ("unpack.input", Step::Unpack { input: bad(BAD), dest: "{src}".into(), keep_top: false }),
             ("unpack.dest", Step::Unpack { input: "{src}".into(), dest: bad(BAD), keep_top: false }),
             ("mesBoot.source", Step::MesBoot { source: bad(BAD), nyacc: "{in:nyacc}".into(), stage0: "{in:stage0}".into() }),
             ("mesBoot.nyacc", Step::MesBoot { source: "{src}".into(), nyacc: bad(BAD), stage0: "{in:stage0}".into() }),
@@ -4262,10 +4270,11 @@ mod tests {
             ("substituteText.file", Step::SubstituteText { file: bad(BAD), edits: Vec::new() }),
             ("assertStatic.paths", Step::AssertStatic { paths: vec![bad(BAD)] }),
         ];
-        assert_eq!(cases.len(), 30, "every expanded, non-data field is listed");
+        assert_eq!(cases.len(), 29, "every expanded, non-data field is listed");
         let mut expected: HashSet<(&'static str, bool)> =
             cases.iter().map(|(field, _)| (*field, false)).collect();
         assert_eq!(expected.len(), cases.len(), "field labels must be distinct");
+        assert!(expected.insert(("unpack.input", true)));
         assert!(expected.insert(("copyTree.from", true)));
         assert!(expected.insert(("stageRuntimeClosure.roots", true)));
         let mut visited = HashSet::new();
@@ -4317,6 +4326,7 @@ mod tests {
             "the builder and audit must expose the same number of data fields"
         );
         for site in [
+            "ctx.expand_data(&field(o, \"input\")?)",
             "ctx.expand_data(&field(o, \"from\")?)",
             "ctx.expand_data_all(&strs(o, \"roots\")?)",
         ] {
@@ -4331,17 +4341,19 @@ mod tests {
         }
     }
 
-    /// The two data fields see `{payload:NAME}`. They still refuse the
+    /// The three data fields see `{payload:NAME}`. They still refuse the
     /// tool-channel spelling and a name the recipe did not declare.
     #[test]
-    fn only_copy_tree_sources_and_runtime_roots_see_payload_templates() {
+    fn only_typed_data_sources_see_payload_templates() {
         for step in [
+            Step::Unpack { input: "{payload:firefox}".into(), dest: "{src}".into(), keep_top: false },
             Step::CopyTree { from: "{payload:firefox}".into(), dest: "{out}/app".into() },
             Step::StageRuntimeClosure { roots: vec!["{payload:firefox}".into()], dest: "{out}/root".into() },
         ] {
             assert!(refuse_payload_templates("image", &payload_template_recipe(step)).is_ok());
         }
         for step in [
+            Step::Unpack { input: "{in:firefox}".into(), dest: "{src}".into(), keep_top: false },
             Step::CopyTree { from: "{in:firefox}".into(), dest: "{out}/app".into() },
             Step::StageRuntimeClosure { roots: vec!["{in:firefox}".into()], dest: "{out}/root".into() },
         ] {
@@ -4357,7 +4369,43 @@ mod tests {
         let error = refuse_payload_templates("image", &unknown)
             .expect_err("an undeclared payload template must refuse during planning");
         assert!(error.contains("thunderbird"), "{error}");
-        assert!(error.contains("absent from this recipe's `payload_inputs'"), "{error}");
+        assert!(error.contains("absent from this recipe's DATA inputs"), "{error}");
+    }
+
+    #[test]
+    fn a_foreign_source_is_data_only_without_a_duplicate_declaration() {
+        let pin = "ripgrep-seed-source";
+        let local_source = "seed-source";
+        let unpack = Recipe::mesboot("seed", "1")
+            .source_input(pin)
+            .steps(vec![Step::Unpack {
+                input: format!("{{payload:{local_source}}}"),
+                dest: "{src}".into(),
+                keep_top: false,
+            }]);
+        assert!(unpack.is_foreign_source());
+        assert!(refuse_payload_templates("seed", &unpack).is_ok());
+
+        let command = Recipe::mesboot("seed", "1")
+            .source_input(pin)
+            .steps(vec![Step::run(
+                "{root}",
+                &[&format!("{{in:{local_source}}}")],
+            )]);
+        let error = refuse_payload_templates("seed", &command)
+            .expect_err("the marked source must not cross onto the command channel");
+        assert!(error.contains("`{in:NAME}' is the tool channel"), "{error}");
+
+        let pin_spelling = Recipe::mesboot("seed", "1")
+            .source_input(pin)
+            .steps(vec![Step::Unpack {
+                input: format!("{{payload:{pin}}}"),
+                dest: "{src}".into(),
+                keep_top: false,
+            }]);
+        let error = refuse_payload_templates("seed", &pin_spelling)
+            .expect_err("the pin key is not the local source entry name");
+        assert!(error.contains("absent from this recipe's DATA inputs"), "{error}");
     }
 
     /// Labels and literal edit text are not template-expanded by the builder,
@@ -4401,9 +4449,9 @@ mod tests {
         }
     }
 
-    /// Drive the production composition over two node orders. The catalog has
-    /// no declared payload yet, so its sweep cannot drive the `{in:NAME}` half
-    /// or prove `classify_graph_inputs` calls the audit for every closure node.
+    /// Drive the production composition over two node orders. The catalog's one
+    /// payload is correctly confined, so its sweep cannot drive the `{in:NAME}`
+    /// refusal or prove the audit runs over every closure node.
     #[test]
     fn the_planning_pass_audits_payload_templates_on_every_node() {
         const PAYLOAD: &str = "gcc-mesboot0";
@@ -4428,9 +4476,8 @@ mod tests {
         assert!(classify_graph_inputs_with(&[clean()], |_| false).is_ok());
     }
 
-    /// §B.8's table at eval. The catalog has no foreign recipe, so the question
-    /// is supplied here — a check that could only ask the real catalog would
-    /// pass with the rule spelled backwards.
+    /// §B.8's table at eval. The question is supplied here so both directions of
+    /// the rule stay observable independently of the one shipped foreign recipe.
     #[test]
     fn a_marked_payload_is_refused_on_the_tool_channel_and_allowed_as_data() {
         let marked = |name: &str| name == "firefox";
@@ -4526,10 +4573,9 @@ mod tests {
         assert!(on(Recipe::gnu("packager", "1").source_input("app-archive")).is_ok());
     }
 
-    /// Nothing in the catalog may name a marked pin or recipe as a tool. Vacuous
-    /// today by construction — nothing is marked — so it is a REGRESSION gate for
-    /// the landing that marks the first one, not evidence the rule works; the
-    /// fixture-driven tests above are that.
+    /// Nothing in the catalog may name a marked pin or recipe as a tool. The one
+    /// reviewed seed makes this a production-catalog gate; the fixture-driven
+    /// tests above exercise arbitrary marked names and both tool channels.
     #[test]
     fn no_shipped_recipe_names_a_marked_path_as_a_tool() {
         let marked = marked_names();
@@ -4541,8 +4587,8 @@ mod tests {
     /// The refusal runs for EVERY node, which no source-text pin can establish:
     /// a grep for the call site cannot tell "runs for every node" from "runs for
     /// the first" or from a guard that returns early. Driven over a multi-node
-    /// graph with the marked-ness question injected, because the shipped catalog
-    /// marks nothing.
+    /// graph with the marked-ness question injected, because one fixed catalog
+    /// mark cannot exercise arbitrary graph positions.
     #[test]
     fn the_planning_pass_refuses_a_marked_path_on_any_node_not_just_the_first() {
         let node = |stem: &str, recipe: Recipe| RecipeNode {
@@ -4583,8 +4629,8 @@ mod tests {
     }
 
     /// A recipe carrying a MARKED pin of its own — §B.8's payload as it enters
-    /// the store. Built here rather than asked of `source_pins`, whose foreign
-    /// roster is empty until the first application lands.
+    /// the store. Built here so fixtures can choose their identity independently
+    /// of the reviewed production roster.
     fn packaged_payload(stem: &str, pin_key: &str) -> Recipe {
         Recipe::gnu(stem, "1")
             .source_input(pin_key)
@@ -4684,7 +4730,7 @@ mod tests {
     /// The union `marked_names` builds is only sound while the two namespaces
     /// are disjoint: a pin name that was also a recipe stem would refuse every
     /// legal use of that recipe once the pin were marked. Not vacuous — 98
-    /// stems against 56 pin names, both non-empty today.
+    /// stems against 57 pin names, both non-empty today.
     #[test]
     fn no_pin_name_is_a_recipe_stem() {
         let stems: HashSet<&str> = catalog::all().into_iter().map(|(stem, _)| stem).collect();

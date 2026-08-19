@@ -56,6 +56,7 @@ patch-glibc-bootstrap-system-2.16.0 nggbvl93zgr74xf9x50331yfgsw4hh0r-patch-glibc
 patch-glibc-bootstrap-system-2.2.5 wjhcnyy2wspd9bf312ql84gfmvivixs2-patch-glibc-bootstrap-system-2.2.5
 patch-mesboot-source r3w1jmlradg89l3av29y1ifp7y312pk9-patch-mesboot-source
 python-mesboot-source 460ch0an5nlsgs5i9ppdk6b890fnvw1y-python-mesboot-source
+ripgrep-seed-source vg4gdaxl18mqlbhybnn2pq7lpwm3wm2q-ripgrep-seed-source
 ripgrep-source ma4kmnnyn1hlimj2rw6hq7p07h8g2p3x-ripgrep-source
 rust-source cm16nyx12gdvnbm868xrrfcyaij9xqi1-rust-source
 rust-stage0-cargo-source gsd6q27xf6sv3js5hy0ngi3d5hp0s73l-rust-stage0-cargo-source

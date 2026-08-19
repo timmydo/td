@@ -1586,10 +1586,10 @@ mod tests {
     /// once a build is attempted. `Recipe::gnu("x", "1").payload_inputs(&["y"])`
     /// otherwise compiles, emits, round-trips and passes every check in this crate,
     /// so the author learns at build time about a mistake visible at eval time.
-    /// `mesboot` is the only build system with the typed data steps
-    /// (`copyTree`/`stageRuntimeClosure`) that resolve `{payload:NAME}`.
+    /// `mesboot` is the only build system with the typed data steps (`unpack`,
+    /// `copyTree`, and `stageRuntimeClosure`) that resolve `{payload:NAME}`.
     fn payload_is_misplaced(recipe: &crate::types::Recipe) -> bool {
-        recipe.payload_inputs.is_some()
+        (recipe.payload_inputs.is_some() || recipe.is_foreign_source())
             && !matches!(recipe.build_system, crate::types::BuildSystem::Mesboot)
     }
 
@@ -1603,6 +1603,9 @@ mod tests {
         ));
         assert!(!payload_is_misplaced(
             &crate::types::Recipe::mesboot("x", "1").payload_inputs(&["y"])
+        ));
+        assert!(payload_is_misplaced(
+            &crate::types::Recipe::gnu("x", "1").source_input("ripgrep-seed-source")
         ));
         assert!(!payload_is_misplaced(&crate::types::Recipe::gnu("x", "1")));
         let misplaced: Vec<&str> = catalog::all()

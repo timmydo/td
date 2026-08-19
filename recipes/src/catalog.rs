@@ -55,4 +55,38 @@ mod tests {
         sorted.dedup();
         assert_eq!(stems, sorted, "catalog stems are not sorted+unique");
     }
+
+    #[test]
+    fn first_seed_binds_one_foreign_pin_to_one_payload_runtime() {
+        let seed = lookup("ripgrep-seed").expect("ripgrep seed recipe");
+        assert!(seed.is_foreign(), "the prebuilt source pin must mark its recipe");
+        assert!(seed.is_foreign_source());
+        assert_eq!(seed.name, "ripgrep-seed");
+        assert_eq!(seed.version, "15.2.0");
+        assert_eq!(seed.source_input.as_deref(), Some("ripgrep-seed-source"));
+        assert_eq!(seed.payload_inputs, Some(vec!["empty-runtime".to_string()]));
+        let declaration = seed.application.as_ref().expect("application declaration");
+        assert_eq!(declaration.runtime(), "empty-runtime");
+        assert_eq!(declaration.entry(), "/app/bin/rg");
+        assert!(seed.steps.as_ref().is_some_and(|steps| {
+            steps.last().is_some_and(|step| {
+                matches!(
+                    step,
+                    crate::types::Step::ValidateStaticApplication { entry, runtime }
+                        if entry == declaration.entry() && runtime == declaration.runtime()
+                )
+            }) && steps.iter().any(|step| {
+                matches!(
+                    step,
+                    crate::types::Step::Unpack { input, .. }
+                        if input == "{payload:ripgrep-seed-source}"
+                )
+            })
+        }));
+
+        let runtime = lookup("empty-runtime").expect("empty runtime recipe");
+        assert!(!runtime.is_foreign());
+        assert!(runtime.application.is_none());
+        assert!(runtime.source_input.is_none());
+    }
 }

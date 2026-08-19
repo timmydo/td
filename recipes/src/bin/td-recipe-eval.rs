@@ -392,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn source_pins_cli_surface_has_the_legacy_lock_count() {
+    fn source_pins_cli_surface_has_the_reviewed_count() {
         let pins = td_recipe::source_pins::all();
         // 32 migrated legacy locks + oyacc-6.6 (the bash shell's `yacc`) +
         // bash-2.05b (the from-source bootstrap shell, re #469) + sed-4.2.2
@@ -411,8 +411,8 @@ mod tests {
         // three-component Rust 1.95.0 stage0 snapshot + coreutils-0.9.0 (the
         // uutils, ripgrep, and fd userland `.crate` sources) + btrfs-progs 7.0
         // and util-linux 2.42.2 (the persistent-volume writer and its minimal
-        // libraries).
-        assert_eq!(pins.len(), 56);
+        // libraries) + the ripgrep 15.2.0 static application seed.
+        assert_eq!(pins.len(), 57);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
         assert!(pins.iter().any(|pin| pin.key == "cmake-x86-64-source"));
         assert!(pins.iter().any(|pin| pin.key == "rust-source"));
@@ -422,6 +422,9 @@ mod tests {
         assert!(pins.iter().any(|pin| pin.key == "oyacc-source"));
         assert!(pins.iter().any(|pin| pin.key == "bash-mesboot-source"));
         assert!(pins.iter().any(|pin| pin.key == "uutils-source"));
+        assert!(pins
+            .iter()
+            .any(|pin| pin.key == "ripgrep-seed-source" && pin.foreign()));
         assert!(pins
             .iter()
             .any(|pin| pin.key == "btrfs-progs-x86-64-source"));
