@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
@@ -579,6 +579,33 @@ pub fn build_cli(args: &[String]) -> Result<(), String> {
         lock_ladder_for_run(&runner)?
     };
     runner.build_recipe_target(target, &outputs)
+}
+
+/// Build one application and prove its registered store closure agrees with
+/// the runtime edge compiled into its immutable spec.
+pub fn application_closure_cli(args: &[String]) -> Result<(), String> {
+    let target = args
+        .first()
+        .ok_or_else(|| "usage: application-closure TARGET".to_string())?
+        .as_str();
+    if args.get(1).is_some() {
+        return Err("usage: application-closure TARGET".to_string());
+    }
+    let recipe = catalog::lookup(target)
+        .ok_or_else(|| format!("unknown recipe stem '{target}' (try `list`)"))?;
+    if recipe.application.is_none() {
+        return Err(format!("recipe '{target}' is not an application"));
+    }
+    ensure_targets_provenance(&[target])?;
+
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    let scratch_name = scratch_name("application-closure", &[target]);
+    let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
+    let _lock = lock_ladder_for_run(&runner)?;
+    runner.prepare_recipe_target(target)?;
+    let build_out = runner.build_plan(target)?;
+    print!("{}", runner.application_store_closure(target, &build_out)?);
+    Ok(())
 }
 
 /// The full pinned-seed universe of the catalog: every seed input ANY recipe
@@ -2387,6 +2414,62 @@ impl RecipeCheckRunner {
         Ok(self.scratch.join("tdstore").join(base))
     }
 
+    /// Ask the store database for the application's realized closure and bind
+    /// that answer back to the compiled spec and the reviewed payload marks.
+    pub(crate) fn application_store_closure(
+        &self,
+        target: &str,
+        build_out: &Path,
+    ) -> Result<String, String> {
+        let recipe = catalog::lookup(target)
+            .ok_or_else(|| format!("unknown recipe stem '{target}' (try `list`)"))?;
+        let declaration = recipe
+            .application
+            .as_ref()
+            .ok_or_else(|| format!("recipe '{target}' is not an application"))?;
+        let build_text = fs::read_to_string(build_out)
+            .map_err(|e| format!("read {}: {e}", build_out.display()))?;
+        let steps = parse_step_map(&build_text);
+        let app_path = step_store_path(target, &steps)?;
+
+        let staged_app = self.ladder_out_from(build_out, target)?;
+        let spec_path = staged_app.join("spec");
+        let spec_text = fs::read_to_string(&spec_path)
+            .map_err(|e| format!("read {}: {e}", spec_path.display()))?;
+        let spec = td_engine::application_spec::ApplicationSpec::parse(&spec_text)
+            .map_err(|e| format!("parse {}: {e}", spec_path.display()))?;
+
+        let (_, cache_db) = self.build_cache_paths();
+        if !cache_db.is_file() {
+            return Err(format!(
+                "application closure database {} is missing after a successful build",
+                cache_db.display()
+            ));
+        }
+        let mut cmd = self.clean_builder_command();
+        cmd.arg("store-closure")
+            .arg(path_str(&cache_db)?)
+            .arg(&app_path);
+        let store_text = command_output(&mut cmd, "store-closure")?;
+        let store_paths = parse_store_closure(&store_text)?;
+        let seed_paths = parse_named_store_paths(
+            &fs::read_to_string(self.auto_map_path(target))
+                .map_err(|e| format!("read application seed map: {e}"))?,
+        )?;
+        let payloads = payload_closure(&[target])?;
+
+        application_store_closure_report(
+            target,
+            &recipe.name,
+            declaration,
+            &spec,
+            &steps,
+            &seed_paths,
+            &store_paths,
+            &payloads,
+        )
+    }
+
     /// Typed provenance databases written by every recipe step in BUILD_OUT.
     /// A product-level follow-up build (the `td shell` Rust-userland proof)
     /// consumes the already-built platform through these exact databases rather
@@ -3235,6 +3318,170 @@ impl PayloadClosure {
         }
         out
     }
+}
+
+fn step_store_path(stem: &str, steps: &BTreeMap<String, String>) -> Result<String, String> {
+    let base = steps
+        .get(stem)
+        .ok_or_else(|| format!("application closure build recorded no STEP for '{stem}'"))?;
+    if !is_plain_basename(base) {
+        return Err(format!(
+            "application closure STEP for '{stem}' has invalid store basename {base:?}"
+        ));
+    }
+    Ok(format!("{TD_STORE_DIR}/{base}"))
+}
+
+fn validate_store_path(path: &str) -> Result<(), String> {
+    let prefix = format!("{TD_STORE_DIR}/");
+    let Some(base) = path.strip_prefix(&prefix) else {
+        return Err(format!(
+            "application closure path {path:?} is outside {TD_STORE_DIR}"
+        ));
+    };
+    if !is_plain_basename(base) {
+        return Err(format!(
+            "application closure path {path:?} is not one canonical store child"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_store_closure(text: &str) -> Result<BTreeSet<String>, String> {
+    let mut paths = BTreeSet::new();
+    for line in text.lines() {
+        let path = line.trim();
+        if path.is_empty() {
+            continue;
+        }
+        validate_store_path(path)?;
+        if !paths.insert(path.to_string()) {
+            return Err(format!("store-closure returned duplicate path {path:?}"));
+        }
+    }
+    if paths.is_empty() {
+        return Err("store-closure returned no paths for the application".to_string());
+    }
+    Ok(paths)
+}
+
+fn parse_named_store_paths(text: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut paths = BTreeMap::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let name = fields
+            .next()
+            .ok_or_else(|| "application seed map contains an empty row".to_string())?;
+        let path = fields
+            .next()
+            .ok_or_else(|| format!("application seed map row for {name:?} has no store path"))?;
+        if fields.next().is_some() {
+            return Err(format!(
+                "application seed map row for {name:?} has extra fields"
+            ));
+        }
+        validate_store_path(path)?;
+        if paths.insert(name.to_string(), path.to_string()).is_some() {
+            return Err(format!("application seed map repeats input name {name:?}"));
+        }
+    }
+    Ok(paths)
+}
+
+fn application_store_closure_report(
+    target: &str,
+    package_name: &str,
+    declaration: &td_recipe::application::ApplicationDeclaration,
+    spec: &td_engine::application_spec::ApplicationSpec,
+    steps: &BTreeMap<String, String>,
+    seed_paths: &BTreeMap<String, String>,
+    store_paths: &BTreeSet<String>,
+    payloads: &PayloadClosure,
+) -> Result<String, String> {
+    let application_path = step_store_path(target, steps)?;
+    let runtime_path = step_store_path(declaration.runtime(), steps)?;
+    if spec.name() != package_name {
+        return Err(format!(
+            "application spec names {:?}, expected package {package_name:?}",
+            spec.name(),
+        ));
+    }
+    if spec.entry() != declaration.entry() {
+        return Err(format!(
+            "application spec entry {:?} does not match declaration {:?}",
+            spec.entry(),
+            declaration.entry()
+        ));
+    }
+    if spec.runtime() != runtime_path {
+        return Err(format!(
+            "application spec runtime {:?} does not match built runtime {runtime_path:?}",
+            spec.runtime()
+        ));
+    }
+    for (role, path) in [
+        ("application", application_path.as_str()),
+        ("runtime", runtime_path.as_str()),
+    ] {
+        if !store_paths.contains(path) {
+            return Err(format!(
+                "registered {role} closure rooted at {application_path} omits {path}"
+            ));
+        }
+    }
+
+    let mut marked_retained = BTreeSet::new();
+    let mut recipe_marks = Vec::new();
+    for stem in &payloads.foreign_members {
+        let path = step_store_path(stem, steps)?;
+        let retained = store_paths.contains(&path);
+        if retained {
+            marked_retained.insert(path.clone());
+        }
+        recipe_marks.push((stem.as_str(), path, retained));
+    }
+    let mut pin_marks = Vec::new();
+    for pin in &payloads.pins {
+        let path = seed_paths.get(pin).ok_or_else(|| {
+            format!("application seed map has no path for reviewed payload pin {pin:?}")
+        })?;
+        let retained = store_paths.contains(path);
+        if retained {
+            marked_retained.insert(path.clone());
+        }
+        pin_marks.push((pin.as_str(), path.as_str(), retained));
+    }
+    let unmarked = store_paths
+        .len()
+        .checked_sub(marked_retained.len())
+        .ok_or_else(|| "application closure marked-path count exceeds its members".to_string())?;
+
+    let mut out = format!(
+        "members\t{}\nunmarked\t{unmarked}\nrecipe-members\t{}\naudited-seeds\t{}\n",
+        store_paths.len(),
+        payloads.members,
+        payloads.seeds
+    );
+    out.push_str(&format!("application\t{target}\t{application_path}\n"));
+    out.push_str(&format!(
+        "runtime\t{}\t{runtime_path}\n",
+        declaration.runtime()
+    ));
+    for path in store_paths {
+        out.push_str(&format!("store\t{path}\n"));
+    }
+    for (stem, path, retained) in recipe_marks {
+        let disposition = if retained { "retained" } else { "build-only" };
+        out.push_str(&format!("payload\trecipe\t{stem}\t{path}\t{disposition}\n"));
+    }
+    for (pin, path, retained) in pin_marks {
+        let disposition = if retained { "retained" } else { "build-only" };
+        out.push_str(&format!("payload\tpin\t{pin}\t{path}\t{disposition}\n"));
+    }
+    Ok(out)
 }
 
 /// The target `payload-closure` answers for when asked about none.
@@ -4802,6 +5049,143 @@ mod tests {
         assert_eq!(answer.members, 1);
         // Unmarked, the same real pin is ordinary source and is not reported.
         assert!(payload_closure_of(&nodes, |_| false).unwrap().pins.is_empty());
+    }
+
+    #[test]
+    fn application_store_query_binds_spec_runtime_and_payload_dispositions() {
+        let recipe = catalog::lookup("ripgrep-seed").unwrap();
+        let declaration = recipe.application.as_ref().unwrap();
+        let package_name = "packaged-ripgrep";
+        let application_base = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ripgrep-seed-15.2.0";
+        let runtime_base = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-empty-runtime-1";
+        let pin_path = "/td/store/cccccccccccccccccccccccccccccccc-ripgrep-seed-source";
+        let application_path = format!("{TD_STORE_DIR}/{application_base}");
+        let runtime_path = format!("{TD_STORE_DIR}/{runtime_base}");
+        let manifest = declaration
+            .manifest(
+                package_name,
+                &recipe.version,
+                td_engine::application::ApplicationProvenance::Foreign,
+            )
+            .unwrap();
+        let spec = td_engine::application_spec::ApplicationSpec::compile(
+            &manifest,
+            &runtime_path,
+            recipe.application_permissions.clone().unwrap(),
+        )
+        .unwrap();
+        let steps = BTreeMap::from([
+            ("empty-runtime".to_string(), runtime_base.to_string()),
+            ("ripgrep-seed".to_string(), application_base.to_string()),
+        ]);
+        let seeds = BTreeMap::from([("ripgrep-seed-source".to_string(), pin_path.to_string())]);
+        let store = BTreeSet::from([application_path.clone(), runtime_path.clone()]);
+        let payloads = payload_closure(&["ripgrep-seed"]).unwrap();
+
+        let report = application_store_closure_report(
+            "ripgrep-seed",
+            package_name,
+            declaration,
+            &spec,
+            &steps,
+            &seeds,
+            &store,
+            &payloads,
+        )
+        .unwrap();
+        assert!(
+            report.starts_with("members\t2\nunmarked\t1\nrecipe-members\t2\naudited-seeds\t1\n")
+        );
+        assert!(report.contains(&format!("runtime\tempty-runtime\t{runtime_path}\n")));
+        assert!(report.contains(&format!(
+            "payload\trecipe\tripgrep-seed\t{application_path}\tretained\n"
+        )));
+        assert!(report.contains(&format!(
+            "payload\tpin\tripgrep-seed-source\t{pin_path}\tbuild-only\n"
+        )));
+
+        let missing_runtime = BTreeSet::from([application_path]);
+        let error = application_store_closure_report(
+            "ripgrep-seed",
+            package_name,
+            declaration,
+            &spec,
+            &steps,
+            &seeds,
+            &missing_runtime,
+            &payloads,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("omits") && error.contains(&runtime_path),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn application_store_query_refuses_a_short_or_mismatched_runtime_edge() {
+        let recipe = catalog::lookup("ripgrep-seed").unwrap();
+        let declaration = recipe.application.as_ref().unwrap();
+        let application_base = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ripgrep-seed-15.2.0";
+        let runtime_base = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-empty-runtime-1";
+        let application_path = format!("{TD_STORE_DIR}/{application_base}");
+        let runtime_path = format!("{TD_STORE_DIR}/{runtime_base}");
+        let wrong_runtime = "/td/store/dddddddddddddddddddddddddddddddd-empty-runtime-1";
+        let manifest = declaration
+            .manifest(
+                &recipe.name,
+                &recipe.version,
+                td_engine::application::ApplicationProvenance::Foreign,
+            )
+            .unwrap();
+        let spec = td_engine::application_spec::ApplicationSpec::compile(
+            &manifest,
+            wrong_runtime,
+            recipe.application_permissions.clone().unwrap(),
+        )
+        .unwrap();
+        let steps = BTreeMap::from([
+            ("empty-runtime".to_string(), runtime_base.to_string()),
+            ("ripgrep-seed".to_string(), application_base.to_string()),
+        ]);
+        let seeds = BTreeMap::from([(
+            "ripgrep-seed-source".to_string(),
+            "/td/store/cccccccccccccccccccccccccccccccc-ripgrep-seed-source".to_string(),
+        )]);
+        let store = BTreeSet::from([application_path, runtime_path]);
+        let payloads = payload_closure(&["ripgrep-seed"]).unwrap();
+        let error = application_store_closure_report(
+            "ripgrep-seed",
+            &recipe.name,
+            declaration,
+            &spec,
+            &steps,
+            &seeds,
+            &store,
+            &payloads,
+        )
+        .unwrap_err();
+        assert!(error.contains("does not match built runtime"), "{error}");
+
+        assert!(parse_store_closure("empty-runtime\n").is_err());
+        assert!(parse_store_closure(
+            "/td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-app-1\n/td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-app-1\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn application_store_command_requires_exactly_one_application_target() {
+        let error = application_closure_cli(&[]).unwrap_err();
+        assert!(error.contains("usage: application-closure TARGET"), "{error}");
+        let error = application_closure_cli(&["empty-runtime".to_string()]).unwrap_err();
+        assert!(error.contains("is not an application"), "{error}");
+        let error = application_closure_cli(&[
+            "ripgrep-seed".to_string(),
+            "empty-runtime".to_string(),
+        ])
+        .unwrap_err();
+        assert!(error.contains("usage: application-closure TARGET"), "{error}");
     }
 
     /// The shipped COMMAND, which review gutted to `Ok(())` and pointed at a

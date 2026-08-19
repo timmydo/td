@@ -1049,7 +1049,7 @@ fn configure_log_tails(srcdir: &Path) -> String {
     out
 }
 
-fn write_application_manifest(out: &Path, encoded: &str) -> Result<(), String> {
+fn decode_application_manifest(encoded: &str) -> Result<String, String> {
     let value = crate::json::parse(encoded)
         .map_err(|error| format!("TD_APPLICATION_MANIFEST JSON: {error}"))?;
     let text = value
@@ -1060,7 +1060,25 @@ fn write_application_manifest(out: &Path, encoded: &str) -> Result<(), String> {
     if manifest.to_keyfile() != text {
         return Err("TD_APPLICATION_MANIFEST is not canonical".into());
     }
-    let path = out.join("manifest");
+    Ok(text.to_string())
+}
+
+fn decode_application_spec(encoded: &str) -> Result<String, String> {
+    let value = crate::json::parse(encoded)
+        .map_err(|error| format!("TD_APPLICATION_SPEC JSON: {error}"))?;
+    let text = value
+        .as_str()
+        .ok_or("TD_APPLICATION_SPEC is not a JSON string")?;
+    let spec = td_engine::application_spec::ApplicationSpec::parse(text)
+        .map_err(|error| format!("TD_APPLICATION_SPEC: {error}"))?;
+    if spec.to_keyfile() != text {
+        return Err("TD_APPLICATION_SPEC is not canonical".into());
+    }
+    Ok(text.to_string())
+}
+
+fn write_application_metadata_file(out: &Path, name: &str, text: &str) -> Result<(), String> {
+    let path = out.join(name);
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1068,7 +1086,7 @@ fn write_application_manifest(out: &Path, encoded: &str) -> Result<(), String> {
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::AlreadyExists {
                 format!(
-                    "application manifest collision: {} is reserved for builder-authenticated metadata",
+                    "application metadata collision: {} is reserved for builder-authenticated metadata",
                     path.display()
                 )
             } else {
@@ -1081,14 +1099,18 @@ fn write_application_manifest(out: &Path, encoded: &str) -> Result<(), String> {
         .map_err(|error| format!("chmod {}: {error}", path.display()))
 }
 
-pub(crate) fn materialize_application_manifest_at(
+pub(crate) fn materialize_application_metadata_at(
     out: &Path,
-    encoded: Option<&str>,
+    manifest: Option<&str>,
+    spec: Option<&str>,
 ) -> Result<(), String> {
+    if manifest.is_some() != spec.is_some() {
+        return Err("application metadata requires both the manifest and compiled spec".into());
+    }
     let metadata = fs::symlink_metadata(out)
         .map_err(|error| format!("stat application output {}: {error}", out.display()))?;
     if !metadata.file_type().is_dir() {
-        if encoded.is_none() && metadata.file_type().is_file() {
+        if manifest.is_none() && metadata.file_type().is_file() {
             return Ok(());
         }
         return Err(format!(
@@ -1096,17 +1118,30 @@ pub(crate) fn materialize_application_manifest_at(
             out.display()
         ));
     }
-    if let Some(encoded) = encoded {
-        return write_application_manifest(out, encoded);
+    for name in ["manifest", "spec"] {
+        let path = out.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(format!(
+                    "undeclared application metadata: {} is reserved for builder-authenticated metadata",
+                    path.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("stat {}: {error}", path.display())),
+        }
     }
-    let path = out.join("manifest");
-    match fs::symlink_metadata(&path) {
-        Ok(_) => Err(format!(
-            "undeclared application manifest: {} is reserved for builder-authenticated metadata",
-            path.display()
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("stat {}: {error}", path.display())),
+    match (manifest, spec) {
+        (Some(manifest), Some(spec)) => {
+            // Parse both before writing either, so malformed trusted metadata
+            // cannot leave a half-materialized package in the scratch output.
+            let manifest_text = decode_application_manifest(manifest)?;
+            let spec_text = decode_application_spec(spec)?;
+            write_application_metadata_file(out, "manifest", &manifest_text)?;
+            write_application_metadata_file(out, "spec", &spec_text)
+        }
+        (None, None) => Ok(()),
+        _ => Err("application metadata is incomplete".into()),
     }
 }
 
@@ -3680,21 +3715,37 @@ mod tests {
     }
 
     #[test]
-    fn application_manifest_finalizer_is_literal_fixed_and_non_overwriting() {
+    fn application_metadata_finalizer_is_literal_fixed_and_non_overwriting() {
         let directory =
             std::env::temp_dir().join(format!("td-application-manifest-{}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).unwrap();
-        let text = "name=firefox\nversion=1\nruntime=runtime\nentry=/app/bin/firefox\nprovenance=foreign\n\n[Environment]\nTOKEN={root}\n";
+        let text = "name=firefox\nversion=1\nruntime=empty-runtime\nentry=/app/bin/firefox\nprovenance=foreign\n\n[Environment]\nTOKEN={root}\n";
         let encoded = Json::Str(text.into()).to_canonical();
-        materialize_application_manifest_at(&directory, Some(&encoded)).unwrap();
+        let manifest = td_engine::application::ApplicationManifest::parse(text).unwrap();
+        let spec = td_engine::application_spec::ApplicationSpec::compile(
+            &manifest,
+            "/td/store/0123456789abcdfghijklmnpqrsvwxyz-empty-runtime-1",
+            td_engine::permissions::PermissionPolicy::new(),
+        )
+        .unwrap()
+        .to_keyfile();
+        let spec_encoded = Json::Str(spec.clone()).to_canonical();
+        materialize_application_metadata_at(&directory, Some(&encoded), Some(&spec_encoded))
+            .unwrap();
         let path = directory.join("manifest");
         assert_eq!(fs::read_to_string(&path).unwrap(), text);
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o644
         );
-        let error = write_application_manifest(&directory, &encoded).unwrap_err();
+        let spec_path = directory.join("spec");
+        assert_eq!(fs::read_to_string(&spec_path).unwrap(), spec);
+        assert_eq!(
+            fs::metadata(&spec_path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        let error = write_application_metadata_file(&directory, "manifest", text).unwrap_err();
         assert!(
             error.contains("reserved for builder-authenticated metadata"),
             "an existing manifest must not be replaced: {error}"
@@ -3702,33 +3753,51 @@ mod tests {
 
         let plain = directory.join("plain");
         fs::create_dir_all(&plain).unwrap();
-        materialize_application_manifest_at(&plain, None).unwrap();
+        materialize_application_metadata_at(&plain, None, None).unwrap();
         fs::write(plain.join("manifest"), "provenance=source\n").unwrap();
-        let error = materialize_application_manifest_at(&plain, None).unwrap_err();
-        assert!(error.contains("undeclared application manifest"), "{error}");
+        let error = materialize_application_metadata_at(&plain, None, None).unwrap_err();
+        assert!(error.contains("undeclared application metadata"), "{error}");
+        let plain_spec = directory.join("plain-spec");
+        fs::create_dir_all(&plain_spec).unwrap();
+        fs::write(plain_spec.join("spec"), "format=1\n").unwrap();
+        let error = materialize_application_metadata_at(&plain_spec, None, None).unwrap_err();
+        assert!(error.contains("undeclared application metadata"), "{error}");
 
         let missing = directory.join("missing");
-        let error = materialize_application_manifest_at(&missing, Some(&encoded)).unwrap_err();
+        let error =
+            materialize_application_metadata_at(&missing, Some(&encoded), Some(&spec_encoded))
+                .unwrap_err();
         assert!(error.contains("stat application output"), "{error}");
         let file = directory.join("file-output");
         fs::write(&file, "not a directory").unwrap();
-        materialize_application_manifest_at(&file, None).unwrap();
-        let error = materialize_application_manifest_at(&file, Some(&encoded)).unwrap_err();
+        materialize_application_metadata_at(&file, None, None).unwrap();
+        let error = materialize_application_metadata_at(&file, Some(&encoded), Some(&spec_encoded))
+            .unwrap_err();
         assert!(error.contains("is not a directory"), "{error}");
 
         let linked_target = directory.join("linked-target");
         fs::create_dir_all(&linked_target).unwrap();
         let linked_output = directory.join("linked-output");
         std::os::unix::fs::symlink(&linked_target, &linked_output).unwrap();
-        let error =
-            materialize_application_manifest_at(&linked_output, Some(&encoded)).unwrap_err();
+        let error = materialize_application_metadata_at(
+            &linked_output,
+            Some(&encoded),
+            Some(&spec_encoded),
+        )
+        .unwrap_err();
         assert!(error.contains("is not a directory"), "{error}");
         assert!(!linked_target.join("manifest").exists());
+        assert!(!linked_target.join("spec").exists());
 
         let noncanonical = Json::Str(format!("# comment\n{text}")).to_canonical();
         let other = directory.join("other");
-        let error = write_application_manifest(&other, &noncanonical).unwrap_err();
+        let error = decode_application_manifest(&noncanonical).unwrap_err();
         assert!(error.contains("not canonical"), "{error}");
+        let error =
+            decode_application_spec(&Json::Str(format!("#\n{spec}")).to_canonical()).unwrap_err();
+        assert!(error.contains("TD_APPLICATION_SPEC"), "{error}");
+        let error = materialize_application_metadata_at(&other, Some(&encoded), None).unwrap_err();
+        assert!(error.contains("requires both"), "{error}");
         fs::remove_dir_all(&directory).unwrap();
     }
 

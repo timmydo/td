@@ -68,6 +68,13 @@ mod tests {
         let declaration = seed.application.as_ref().expect("application declaration");
         assert_eq!(declaration.runtime(), "empty-runtime");
         assert_eq!(declaration.entry(), "/app/bin/rg");
+        assert_eq!(
+            seed.application_permissions
+                .as_ref()
+                .map(td_engine::permissions::PermissionPolicy::to_keyfile)
+                .as_deref(),
+            Some("format=1\n")
+        );
         assert!(seed.steps.as_ref().is_some_and(|steps| {
             steps.last().is_some_and(|step| {
                 matches!(

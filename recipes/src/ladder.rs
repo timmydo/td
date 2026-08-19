@@ -1586,15 +1586,29 @@ mod tests {
     /// once a build is attempted. `Recipe::gnu("x", "1").payload_inputs(&["y"])`
     /// otherwise compiles, emits, round-trips and passes every check in this crate,
     /// so the author learns at build time about a mistake visible at eval time.
-    /// `mesboot` is the only build system with the typed data steps (`unpack`,
-    /// `copyTree`, and `stageRuntimeClosure`) that resolve `{payload:NAME}`.
+    /// `mesboot` has the typed data steps (`unpack`, `copyTree`, and
+    /// `stageRuntimeClosure`) that resolve `{payload:NAME}`. Every application
+    /// build system also has the outer spec compiler as one typed consumer.
     fn payload_is_misplaced(recipe: &crate::types::Recipe) -> bool {
-        (recipe.payload_inputs.is_some() || recipe.is_foreign_source())
-            && !matches!(recipe.build_system, crate::types::BuildSystem::Mesboot)
+        let mesboot = matches!(recipe.build_system, crate::types::BuildSystem::Mesboot);
+        let application_payload_is_misplaced = match (
+            recipe.application.as_ref(),
+            recipe.payload_inputs.as_ref(),
+        ) {
+            (Some(application), Some(payloads)) if !mesboot => {
+                payloads.len() != 1
+                    || payloads.first().map(String::as_str) != Some(application.runtime())
+            }
+            (Some(_), None) if !mesboot => true,
+            (None, Some(_)) if !mesboot => true,
+            _ => false,
+        };
+        (recipe.is_foreign_source() && !mesboot)
+            || application_payload_is_misplaced
     }
 
     #[test]
-    fn only_a_mesboot_recipe_may_declare_a_payload() {
+    fn payloads_require_mesboot_data_steps_or_the_application_compiler() {
         // The predicate first, over recipes built for it. Nothing in the catalog
         // declares a payload yet, so sweeping the catalog alone filters an EMPTY
         // set and would pass with the rule spelled backwards.
@@ -1603,6 +1617,24 @@ mod tests {
         ));
         assert!(!payload_is_misplaced(
             &crate::types::Recipe::mesboot("x", "1").payload_inputs(&["y"])
+        ));
+        let application = td_engine::application::ApplicationDeclaration::new(
+            "empty-runtime",
+            "/app/bin/x",
+        )
+        .unwrap();
+        assert!(!payload_is_misplaced(
+            &crate::types::Recipe::gnu("x", "1")
+                .payload_inputs(&["empty-runtime"])
+                .application(application.clone())
+        ));
+        assert!(payload_is_misplaced(
+            &crate::types::Recipe::gnu("x", "1")
+                .payload_inputs(&["empty-runtime", "extra"])
+                .application(application.clone())
+        ));
+        assert!(payload_is_misplaced(
+            &crate::types::Recipe::gnu("x", "1").application(application)
         ));
         assert!(payload_is_misplaced(
             &crate::types::Recipe::gnu("x", "1").source_input("ripgrep-seed-source")
@@ -1615,8 +1647,8 @@ mod tests {
             .collect();
         assert!(
             misplaced.is_empty(),
-            "payload_inputs is mesboot-only — no other build system has a step that \
-             can read one (APPLICATIONS.md section B.8): {misplaced:?}"
+            "payload_inputs requires mesboot typed data steps or an application spec compiler \
+             (APPLICATIONS.md section B.8): {misplaced:?}"
         );
     }
 

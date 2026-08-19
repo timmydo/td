@@ -45,6 +45,15 @@ impl Class {
             )),
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Class::Source => "source",
+            Class::Seed => "seed",
+            Class::TdRecipeOutput => "td-recipe-output",
+            Class::Crate => "crate",
+        }
+    }
 }
 
 /// One parsed lock entry.
@@ -127,6 +136,20 @@ ncurses /gnu/store/ccc-ncurses-6.2
         assert_eq!(e[0].class, Class::TdRecipeOutput);
         assert_eq!(e[0].name, "pcre2");
         assert_eq!(e[0].path, "/gnu/store/ddd-pcre2-10.42");
+    }
+
+    #[test]
+    fn explicit_class_spelling_round_trips_for_resolved_locks() {
+        for class in [
+            Class::Source,
+            Class::Seed,
+            Class::TdRecipeOutput,
+            Class::Crate,
+        ] {
+            let text = format!("input /td/store/aaaaaaaa-input {}\n", class.as_str());
+            let parsed = parse(&text, "different-source").unwrap();
+            assert_eq!(parsed.first().map(|entry| entry.class), Some(class));
+        }
     }
 
     #[test]

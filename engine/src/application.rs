@@ -352,7 +352,7 @@ fn validate_alias(alias: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_entry(entry: &str) -> Result<(), String> {
+pub(crate) fn validate_entry(entry: &str) -> Result<(), String> {
     validate_scalar("entry", entry, MAX_ENTRY_BYTES, false)?;
     let Some(relative) = entry.strip_prefix("/app/") else {
         return Err("entry must be an absolute path below `/app/'".into());
@@ -412,7 +412,7 @@ fn insert_environment(
     Ok(())
 }
 
-fn validate_environment_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_environment_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("environment name is empty".into());
     }
@@ -442,7 +442,7 @@ fn validate_environment_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_environment_value(value: &str) -> Result<(), String> {
+pub(crate) fn validate_environment_value(value: &str) -> Result<(), String> {
     validate_scalar(
         "environment value",
         value,

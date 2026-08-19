@@ -31,6 +31,7 @@
 // parameterized (DESIGN.md §6). Host-side only: it produces bytes for a check
 // to write, and no target binary includes it.
 pub mod application;
+pub mod application_spec;
 pub mod cpio;
 pub mod crc32;
 pub mod ed25519;

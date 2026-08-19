@@ -1,5 +1,6 @@
 use crate::application::ApplicationDeclaration;
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
+use td_engine::permissions::PermissionPolicy;
 
 // The first foreign application seed is intentionally static and small. It
 // exercises the package/trust boundary without choosing Firefox's runtime for
@@ -34,6 +35,7 @@ pub fn recipe() -> Recipe {
         .payload_inputs(&["empty-runtime"])
         .steps(steps)
         .application(declaration)
+        .application_permissions(PermissionPolicy::new())
         .checks(vec![RecipeCheck::new(
             r#"
 echo ">> recipe-check ripgrep-seed: package the pinned static upstream payload without executing it"

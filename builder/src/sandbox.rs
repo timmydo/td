@@ -87,13 +87,25 @@ fn configure_builder_env(
     } else {
         None
     };
-    if application_manifest.is_some() && application_policy.is_none() {
+    let application_spec = if trusted_recipe_builder(builder) {
+        unique_env(env, "TD_APPLICATION_SPEC")?
+    } else {
+        None
+    };
+    if (application_manifest.is_some() || application_spec.is_some())
+        && application_policy.is_none()
+    {
         return Err(err(
-            "trusted td-builder invocation with application metadata has no manifest policy"
+            "trusted td-builder invocation with application metadata has no metadata policy"
                 .to_string(),
         ));
     }
-    if application_manifest.is_some()
+    if application_manifest.is_some() != application_spec.is_some() {
+        return Err(err(
+            "application metadata requires both manifest and compiled spec".to_string(),
+        ));
+    }
+    if (application_manifest.is_some() || application_spec.is_some())
         && application_policy == Some(ApplicationManifestPolicy::Reserve)
     {
         return Err(err(
@@ -104,7 +116,17 @@ fn configure_builder_env(
     for (key, value) in env {
         if mesboot && key == "TD_STEPS" {
             steps = Some(value.clone());
-        } else if application_policy.is_some() && key == "TD_APPLICATION_MANIFEST" {
+        } else if !mesboot && application_policy.is_some() && key == "TD_PAYLOAD_MAP" {
+            // A non-mesboot application payload is consumed only by the outer
+            // spec compiler. Keep its bind noexec through the drv contract, but
+            // do not hand the package process the name-to-path map.
+            continue;
+        } else if application_policy.is_some()
+            && matches!(
+                key.as_str(),
+                "TD_APPLICATION_MANIFEST" | "TD_APPLICATION_SPEC"
+            )
+        {
             continue;
         } else {
             command.env(key, value);
@@ -185,17 +207,24 @@ fn finalize_application_output(
 ) -> io::Result<()> {
     let Some(policy) = application_manifest_policy(drv) else {
         if trusted_recipe_builder(&drv.builder)
-            && unique_drv_env(drv, "TD_APPLICATION_MANIFEST")?.is_some()
+            && (unique_drv_env(drv, "TD_APPLICATION_MANIFEST")?.is_some()
+                || unique_drv_env(drv, "TD_APPLICATION_SPEC")?.is_some())
         {
             return Err(err(
-                "trusted td-builder invocation with application metadata has no manifest policy"
+                "trusted td-builder invocation with application metadata has no metadata policy"
                     .to_string(),
             ));
         }
         return Ok(());
     };
-    let encoded = unique_drv_env(drv, "TD_APPLICATION_MANIFEST")?;
-    if policy == ApplicationManifestPolicy::Reserve && encoded.is_some() {
+    let manifest = unique_drv_env(drv, "TD_APPLICATION_MANIFEST")?;
+    let spec = unique_drv_env(drv, "TD_APPLICATION_SPEC")?;
+    if manifest.is_some() != spec.is_some() {
+        return Err(err(
+            "application metadata requires both manifest and compiled spec".to_string(),
+        ));
+    }
+    if policy == ApplicationManifestPolicy::Reserve && (manifest.is_some() || spec.is_some()) {
         return Err(err(
             "non-application phase received application metadata".to_string(),
         ));
@@ -221,22 +250,25 @@ fn finalize_application_output(
         .map(|(_, path)| path);
     for (name, path) in outputs {
         if name != "out" {
-            crate::build::materialize_application_manifest_at(path, None)
-                .map_err(|error| err(format!("application manifest finalization: {error}")))?;
+            crate::build::materialize_application_metadata_at(path, None, None)
+                .map_err(|error| err(format!("application metadata finalization: {error}")))?;
         }
     }
-    let out_manifest = if policy == ApplicationManifestPolicy::Materialize {
-        encoded
+    let (out_manifest, out_spec) = if policy == ApplicationManifestPolicy::Materialize {
+        (manifest, spec)
     } else {
-        None
+        (None, None)
     };
-    match (out, out_manifest) {
-        (Some(path), manifest) => crate::build::materialize_application_manifest_at(path, manifest)
-            .map_err(|error| err(format!("application manifest finalization: {error}"))),
-        (None, Some(_)) => Err(err(
-            "application declaration requires an `out' output".to_string(),
+    match (out, out_manifest, out_spec) {
+        (Some(path), manifest, spec) => {
+            crate::build::materialize_application_metadata_at(path, manifest, spec)
+                .map_err(|error| err(format!("application metadata finalization: {error}")))
+        }
+        (None, Some(_), Some(_)) => Err(err(
+            "application declaration requires an `out' output".to_string()
         )),
-        (None, None) => Ok(()),
+        (None, None, None) => Ok(()),
+        _ => Err(err("application metadata is incomplete".to_string())),
     }
 }
 
@@ -1550,8 +1582,8 @@ mod tests {
         let args = vec!["mesboot-build".to_string()];
         let large = "x".repeat(300 * 1024);
         let value = "x".repeat(4000);
-        let application_manifest = td_engine::application::ApplicationDeclaration::new(
-            "runtime",
+        let manifest = td_engine::application::ApplicationDeclaration::new(
+            "empty-runtime",
             "/app/bin/application",
         )
         .unwrap()
@@ -1568,13 +1600,21 @@ mod tests {
             "1",
             td_engine::application::ApplicationProvenance::Source,
         )
+        .unwrap();
+        let application_spec = td_engine::application_spec::ApplicationSpec::compile(
+            &manifest,
+            "/td/store/0123456789abcdfghijklmnpqrsvwxyz-empty-runtime-1",
+            td_engine::permissions::PermissionPolicy::new(),
+        )
         .unwrap()
         .to_keyfile();
-        let application = crate::json::Json::Str(application_manifest).to_canonical();
+        let application = crate::json::Json::Str(manifest.to_keyfile()).to_canonical();
+        let application_spec = crate::json::Json::Str(application_spec).to_canonical();
         assert!(application.len() > 12_000);
         let env = vec![
             ("TD_INPUT_MAP".to_string(), "{}".to_string()),
             ("TD_APPLICATION_MANIFEST".to_string(), application.clone()),
+            ("TD_APPLICATION_SPEC".to_string(), application_spec.clone()),
             ("TD_STEPS".to_string(), large.clone()),
         ];
         let mut command = Command::new(&builder);
@@ -1607,6 +1647,12 @@ mod tests {
                 .get_envs()
                 .all(|(key, _)| key != std::ffi::OsStr::new("TD_APPLICATION_MANIFEST")),
             "the sandbox parent, not the package PID namespace, owns application metadata"
+        );
+        assert!(
+            command
+                .get_envs()
+                .all(|(key, _)| key != std::ffi::OsStr::new("TD_APPLICATION_SPEC")),
+            "the compiled spec must stay in the outer sandbox too"
         );
         assert!(
             command.get_envs().any(|(key, value)| {
@@ -1656,6 +1702,10 @@ mod tests {
             }),
             "the filter applies only to trusted recipe runners"
         );
+        assert!(other_builder.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new("TD_APPLICATION_SPEC")
+                && value == Some(std::ffi::OsStr::new(application_spec.as_str()))
+        }));
         let mut untrusted_td_builder = Command::new("/td/store/other/bin/td-builder");
         untrusted_td_builder.env_clear();
         assert!(
@@ -1700,7 +1750,7 @@ mod tests {
             steps_file,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("has no manifest policy"), "{error}");
+        assert!(error.to_string().contains("has no metadata policy"), "{error}");
         let mut manifest_free_phase = Command::new(&builder);
         manifest_free_phase.env_clear();
         let manifest_free_env = vec![("TD_STEPS".to_string(), large.clone())];
@@ -1764,6 +1814,10 @@ mod tests {
             crate::store::BUILDER_ABI >= 2,
             "manifest reservation must not reuse outputs built before the policy existed"
         );
+        assert!(
+            crate::store::BUILDER_ABI >= 3,
+            "spec reservation must not reuse outputs built before the policy existed"
+        );
         for runner in crate::APPLICATION_PHASE_RUNNERS {
             assert_eq!(
                 application_manifest_policy(&phase_drv(runner, Vec::new())),
@@ -1806,17 +1860,29 @@ mod tests {
             .unwrap_or(build);
         assert_eq!(
             build_production
-                .matches("materialize_application_manifest_at(")
+                .matches("materialize_application_metadata_at(")
                 .count(),
             1,
             "only the outer sandbox may call the materializer"
         );
         assert_eq!(
             build_production
-                .matches("write_application_manifest(")
+                .matches("decode_application_manifest(")
                 .count(),
             2,
-            "the fixed writer may only be defined and called by the materializer"
+            "the manifest decoder may only be defined and called by the materializer"
+        );
+        assert_eq!(
+            build_production.matches("decode_application_spec(").count(),
+            2,
+            "the spec decoder may only be defined and called by the materializer"
+        );
+        assert_eq!(
+            build_production
+                .matches("write_application_metadata_file(")
+                .count(),
+            3,
+            "only the materializer may call the fixed metadata writer"
         );
     }
 
@@ -1826,8 +1892,8 @@ mod tests {
             std::env::temp_dir().join(format!("td-outer-app-finalizer-{}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).unwrap();
-        let text = td_engine::application::ApplicationDeclaration::new(
-            "runtime",
+        let manifest = td_engine::application::ApplicationDeclaration::new(
+            "empty-runtime",
             "/app/bin/application",
         )
         .unwrap()
@@ -1836,21 +1902,37 @@ mod tests {
             "1",
             td_engine::application::ApplicationProvenance::Source,
         )
+        .unwrap();
+        let text = manifest.to_keyfile();
+        let spec_text = td_engine::application_spec::ApplicationSpec::compile(
+            &manifest,
+            "/td/store/0123456789abcdfghijklmnpqrsvwxyz-empty-runtime-1",
+            td_engine::permissions::PermissionPolicy::new(),
+        )
         .unwrap()
         .to_keyfile();
         let encoded = crate::json::Json::Str(text.clone()).to_canonical();
+        let encoded_spec = crate::json::Json::Str(spec_text.clone()).to_canonical();
         let drv = phase_drv(
             "autotools-build",
-            vec![("TD_APPLICATION_MANIFEST".into(), encoded)],
+            vec![
+                ("TD_APPLICATION_MANIFEST".into(), encoded),
+                ("TD_APPLICATION_SPEC".into(), encoded_spec),
+            ],
         );
         finalize_application_output(&drv, &[("out".into(), directory.clone())]).unwrap();
         assert_eq!(fs::read_to_string(directory.join("manifest")).unwrap(), text);
+        assert_eq!(
+            fs::read_to_string(directory.join("spec")).unwrap(),
+            spec_text
+        );
 
         let duplicate = phase_drv(
             "autotools-build",
             vec![
                 ("TD_APPLICATION_MANIFEST".into(), "one".into()),
                 ("TD_APPLICATION_MANIFEST".into(), "two".into()),
+                ("TD_APPLICATION_SPEC".into(), "spec".into()),
             ],
         );
         let other = directory.join("duplicate");

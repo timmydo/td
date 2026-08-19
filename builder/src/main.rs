@@ -4837,7 +4837,7 @@ fn validate_static_application_step_contract(
     Ok(())
 }
 
-// Every phase runner makes an explicit choice about application manifests.
+// Every phase runner makes an explicit choice about application metadata.
 const APPLICATION_PHASE_RUNNERS: [&str; 4] = [
     "autotools-build",
     "rust-build",
@@ -4864,14 +4864,87 @@ fn push_drv_field(spec: &mut String, directive: &str, value: &str) -> Result<(),
 }
 
 fn push_drv_env(spec: &mut String, name: &str, value: &str) -> Result<(), String> {
-    if name == "TD_APPLICATION_MANIFEST" {
-        return Err("recipe: TD_APPLICATION_MANIFEST is reserved for assembled metadata".into());
+    if matches!(name, "TD_APPLICATION_MANIFEST" | "TD_APPLICATION_SPEC") {
+        return Err(format!("recipe: {name} is reserved for assembled metadata"));
     }
     push_drv_env_line(spec, name, value)
 }
 
 fn push_application_manifest_env(spec: &mut String, value: &str) -> Result<(), String> {
     push_drv_env_line(spec, "TD_APPLICATION_MANIFEST", value)
+}
+
+fn push_application_spec_env(spec: &mut String, value: &str) -> Result<(), String> {
+    push_drv_env_line(spec, "TD_APPLICATION_SPEC", value)
+}
+
+fn parse_application_permissions(
+    alist: &json::Json,
+    has_application: bool,
+) -> Result<Option<td_engine::permissions::PermissionPolicy>, String> {
+    let Some(value) = alist.get("applicationPermissions") else {
+        if has_application {
+            return Err(
+                "recipe: an application declaration requires typed `applicationPermissions' defaults"
+                    .into(),
+            );
+        }
+        return Ok(None);
+    };
+    if !has_application {
+        return Err("recipe: `applicationPermissions' requires an application declaration".into());
+    }
+    let text = value
+        .as_str()
+        .ok_or("recipe: `applicationPermissions' must be a canonical keyfile string")?;
+    let policy = td_engine::permissions::PermissionPolicy::parse(text)
+        .map_err(|error| format!("recipe application permissions: {error}"))?;
+    if policy.to_keyfile() != text {
+        return Err("recipe: `applicationPermissions' is not canonical".into());
+    }
+    Ok(Some(policy))
+}
+
+fn resolve_application_runtime<'a>(
+    declaration: &td_engine::application::ApplicationDeclaration,
+    payloads: &std::collections::BTreeSet<String>,
+    entries: &'a [lock::Entry],
+) -> Result<&'a str, String> {
+    let runtime = declaration.runtime();
+    if !payloads.contains(runtime) {
+        return Err(format!(
+            "recipe: application runtime {runtime:?} must be a declared payload"
+        ));
+    }
+    let mut matches = entries.iter().filter(|entry| entry.name == runtime);
+    let entry = matches
+        .next()
+        .ok_or_else(|| format!("recipe: application runtime {runtime:?} has no lock entry"))?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "recipe: application runtime {runtime:?} has duplicate lock entries"
+        ));
+    }
+    if entry.class != lock::Class::TdRecipeOutput {
+        return Err(format!(
+            "recipe: application runtime {runtime:?} is not a td recipe output"
+        ));
+    }
+    let prefix = format!("{}/", store::store_dir().trim_end_matches('/'));
+    let Some(basename) = entry.path.strip_prefix(&prefix) else {
+        return Err(format!(
+            "recipe: application runtime {runtime:?} path {} is outside the active store {}",
+            entry.path,
+            store::store_dir()
+        ));
+    };
+    if basename.contains('/') || store::hash_from_store_path(&entry.path).is_none() {
+        return Err(format!(
+            "recipe: application runtime {runtime:?} path {} is not a canonical store path",
+            entry.path
+        ));
+    }
+    Ok(&entry.path)
 }
 
 fn push_drv_env_line(spec: &mut String, name: &str, value: &str) -> Result<(), String> {
@@ -4958,6 +5031,8 @@ fn assemble_recipe_drv(
         }
         None => None,
     };
+    let application_permissions =
+        parse_application_permissions(&alist, application_declaration.is_some())?;
     validate_static_application_step_contract(
         name,
         &alist,
@@ -4984,21 +5059,23 @@ fn assemble_recipe_drv(
             Some(
                 declaration
                     .manifest(name, version, provenance)
-                    .map_err(|error| format!("recipe application: {error}"))?
-                    .to_keyfile(),
+                    .map_err(|error| format!("recipe application: {error}"))?,
             )
         }
         None => None,
     };
-    // Only `mesboot` has the typed data operations that read a payload, so declaring
-    // one anywhere else would stage bytes nothing can reach. Accepting that silently
-    // is the shape section B.8 warns about — a declaration that reads as enforcement
-    // and is none — so it is an error, like every other misplaced key here.
-    if build_system != "mesboot" && alist.get("payloadInputs").is_some() {
+    // Outside mesboot's typed data operations, the spec compiler is the only
+    // payload consumer: it resolves an application's runtime without exposing
+    // that path to package commands. A non-application declaration would still
+    // stage bytes nothing can reach and is refused.
+    if build_system != "mesboot"
+        && alist.get("payloadInputs").is_some()
+        && application_declaration.is_none()
+    {
         return Err(format!(
-            "recipe: buildSystem \"{build_system}\" has no typed data steps, so a \
-             `payloadInputs' declared here would never be readable — the payload \
-             channel is mesboot-only (APPLICATIONS.md section B.8)"
+            "recipe: buildSystem \"{build_system}\" has no typed data steps and no \
+             application spec compiler, so `payloadInputs' would never be readable \
+             (APPLICATIONS.md section B.8)"
         ));
     }
     if build_system != "mesboot" && foreign_source {
@@ -5057,6 +5134,48 @@ fn assemble_recipe_drv(
     if source.is_empty() && !declares_no_source {
         return Err(format!("lock has no `{src_key}' entry (the recipe source)"));
     }
+    let source_entry = (!source.is_empty()).then_some(src_key.as_str());
+    let payloads = payload_names(&alist, &entries, source_entry, foreign_source)?;
+    if build_system != "mesboot" {
+        if let Some(declaration) = application_declaration.as_ref() {
+            let extras: Vec<&str> = payloads
+                .iter()
+                .map(String::as_str)
+                .filter(|name| *name != declaration.runtime())
+                .collect();
+            if !extras.is_empty() {
+                return Err(format!(
+                    "recipe: non-mesboot application payloads may name only runtime {:?}; unconsumed payloads: {}",
+                    declaration.runtime(),
+                    extras.join(", ")
+                ));
+            }
+        }
+    }
+    let application_spec = match (
+        application_declaration.as_ref(),
+        application_manifest.as_ref(),
+        application_permissions.as_ref(),
+    ) {
+        (Some(declaration), Some(manifest), Some(permissions)) => {
+            let runtime = resolve_application_runtime(declaration, &payloads, &entries)?;
+            Some(
+                td_engine::application_spec::ApplicationSpec::compile(
+                    manifest,
+                    runtime,
+                    permissions.clone(),
+                )
+                .map_err(|error| format!("recipe application spec: {error}"))?,
+            )
+        }
+        (None, None, None) => None,
+        _ => {
+            return Err(
+                "recipe: application declaration, manifest, permissions and spec must be complete"
+                    .into(),
+            );
+        }
+    };
     // Default corpus toolchain (corpus-toolchain-default): when TD_GCC_TOOLCHAIN names a /td/store
     // gcc-toolchain-shaped tree, SUBSTITUTE it for the lock's guix `gcc-toolchain-15.2.0` input — so the
     // corpus package is compiled by td's OWN /td/store toolchain (no guix gcc-toolchain bytes) instead of
@@ -5076,6 +5195,16 @@ fn assemble_recipe_drv(
     // Dedup: the override collapses any (today single, but defensively >1) gcc-toolchain inputs to the
     // same path; the input-src loop + TD_INPUTS below must not carry it twice.
     inputs.dedup();
+    let payload_paths: std::collections::BTreeSet<&str> = entries
+        .iter()
+        .filter(|entry| payloads.contains(&entry.name))
+        .map(|entry| entry.path.as_str())
+        .collect();
+    let tool_inputs: Vec<&str> = inputs
+        .iter()
+        .map(String::as_str)
+        .filter(|path| !payload_paths.contains(path))
+        .collect();
     vendor.sort();
     // The drv's builder identity is the STABLE ABI-token path, NOT the builder binary's
     // content-addressed store path — so the recipe's drv AND output hash are keyed on the
@@ -5115,10 +5244,19 @@ fn assemble_recipe_drv(
     if !source.is_empty() {
         push_drv_env(&mut spec, "TD_SRC", &source)?;
     }
-    push_drv_env(&mut spec, "TD_INPUTS", &inputs.join(":"))?;
-    if let Some(manifest) = application_manifest {
-        let encoded = json::Json::Str(manifest).to_canonical();
+    push_drv_env(&mut spec, "TD_INPUTS", &tool_inputs.join(":"))?;
+    if !payloads.is_empty() {
+        refuse_shared_paths(&entries, &payloads)?;
+        let payload_map = payload_map_json(&entries, &payloads)?;
+        push_drv_env(&mut spec, "TD_PAYLOAD_MAP", &payload_map.to_json_string())?;
+    }
+    if let Some(manifest) = application_manifest.as_ref() {
+        let encoded = json::Json::Str(manifest.to_keyfile()).to_canonical();
         push_application_manifest_env(&mut spec, &encoded)?;
+    }
+    if let Some(application_spec) = application_spec.as_ref() {
+        let encoded = json::Json::Str(application_spec.to_keyfile()).to_canonical();
+        push_application_spec_env(&mut spec, &encoded)?;
     }
     match build_system {
         // gnu: the autotools phase runner reads the configure flags + custom phases.
@@ -5168,24 +5306,15 @@ fn assemble_recipe_drv(
                 );
             }
             push_drv_env(&mut spec, "TD_STEPS", &steps.to_json_string())?;
-            let source_entry = (!source.is_empty()).then_some(src_key.as_str());
-            let payload = payload_names(&alist, &entries, source_entry, foreign_source)?;
-            let map = input_map_json(&entries, &payload)?;
+            let map = input_map_json(&entries, &payloads)?;
             // The refusals in `payload_names` partition NAMES; the sandbox keys its
             // noexec bind on PATHS. Two names for one store path satisfy every one of
             // them and still hand a `Step::Run` the payload's path through the other
             // name — `noexec` would stop an exec, but a COMPILATION input to a
             // source-built output is exactly what section B.8's table refuses. So the
             // two maps are checked disjoint by VALUE as well.
-            if !payload.is_empty() {
-                refuse_shared_paths(&entries, &payload)?;
-                let payload_map = payload_map_json(&entries, &payload)?;
+            if !payloads.is_empty() {
                 push_drv_env(&mut spec, "TD_INPUT_MAP", &map.to_json_string())?;
-                push_drv_env(
-                    &mut spec,
-                    "TD_PAYLOAD_MAP",
-                    &payload_map.to_json_string(),
-                )?;
             } else {
                 // Emitted only when a payload is DECLARED, so a recipe with none
                 // produces the byte-identical spec it always did and keeps its hash.
@@ -5733,10 +5862,10 @@ fn build_plan(
                     ));
                 }
             };
-            // Re-emit 2-field; build_recipe re-infers the class. A substituted td
-            // path infers `seed` → an input-src, exactly the intent (it IS now a
-            // realized input — just td's, not guix's).
-            resolved.push_str(&format!("{} {}\n", e.name, path));
+            // Preserve the planner-authenticated class across substitution. The
+            // application spec compiler needs to distinguish its runtime recipe
+            // output from an audited seed at the final assembly boundary.
+            resolved.push_str(&format!("{} {} {}\n", e.name, path, e.class.as_str()));
         }
         let resolved_lock = step_scratch.join("resolved.lock");
         std::fs::write(&resolved_lock, &resolved).map_err(|e| e.to_string())?;
@@ -13364,7 +13493,7 @@ daemon build START (2/2 active)
     }
 
     #[test]
-    fn application_manifest_binds_final_recipe_answers_into_every_application_phase_contract() {
+    fn application_metadata_binds_final_recipe_answers_into_every_application_phase_contract() {
         let dir =
             std::env::temp_dir().join(format!("td-application-spec-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -13372,10 +13501,11 @@ daemon build START (2/2 active)
         let lock = dir.join("fixture.lock");
         std::fs::write(
             &lock,
-            "renamed-source /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-renamed-2.tar.gz source\n",
+            "renamed-source /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-renamed-2.tar.gz source\n\
+             empty-runtime /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-empty-runtime-1 td-recipe-output\n",
         )
         .unwrap();
-        let recipe = r#"{"name":"renamed","version":"2","buildSystem":"gnu","application":{"runtime":"runtime","entry":"/app/bin/app","environment":{"TOKEN":"{root}"}}}"#;
+        let recipe = r#"{"name":"renamed","version":"2","buildSystem":"gnu","payloadInputs":["empty-runtime"],"application":{"runtime":"empty-runtime","entry":"/app/bin/app","environment":{"TOKEN":"{root}"}},"applicationPermissions":"format=1\n"}"#;
         let (_path, _file, drv, _source) =
             assemble_recipe_drv(recipe, lock.to_str().unwrap(), &dir, None).unwrap();
         assert_eq!(
@@ -13398,7 +13528,27 @@ daemon build START (2/2 active)
         let manifest = manifest.as_str().expect("the contract is a JSON string");
         assert_eq!(
             manifest,
-            "name=renamed\nversion=2\nruntime=runtime\nentry=/app/bin/app\nprovenance=source\n\n[Environment]\nTOKEN={root}\n"
+            "name=renamed\nversion=2\nruntime=empty-runtime\nentry=/app/bin/app\nprovenance=foreign\n\n[Environment]\nTOKEN={root}\n"
+        );
+        let encoded_spec = drv
+            .env
+            .iter()
+            .find(|(key, _)| key == "TD_APPLICATION_SPEC")
+            .map(|(_, value)| value)
+            .expect("compiled spec must reach the phase contract");
+        let spec_text = json::parse(encoded_spec)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        let spec = td_engine::application_spec::ApplicationSpec::parse(&spec_text).unwrap();
+        assert_eq!(
+            spec.runtime(),
+            "/td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-empty-runtime-1"
+        );
+        assert_eq!(
+            spec.environment().find(|(name, _)| *name == "TOKEN"),
+            Some(("TOKEN", "{root}"))
         );
 
         let injection = r#"{"name":"renamed","version":"2","buildSystem":"gnu","configureFlags":["--flag=x\nenv TD_APPLICATION_MANIFEST=forged"]}"#;
@@ -13428,10 +13578,10 @@ daemon build START (2/2 active)
 
         std::fs::write(
             &lock,
-            "payload /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-payload-1 td-recipe-output\n",
+            "empty-runtime /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-empty-runtime-1 td-recipe-output\n",
         )
         .unwrap();
-        let containing = r#"{"name":"contained","version":"1","buildSystem":"mesboot","steps":[],"payloadInputs":["payload"],"application":{"runtime":"runtime","entry":"/app/bin/app"}}"#;
+        let containing = r#"{"name":"contained","version":"1","buildSystem":"mesboot","steps":[],"payloadInputs":["empty-runtime"],"application":{"runtime":"empty-runtime","entry":"/app/bin/app"},"applicationPermissions":"format=1\n"}"#;
         let (_path, _file, drv, _source) =
             assemble_recipe_drv(containing, lock.to_str().unwrap(), &dir, None).unwrap();
         let encoded = drv
@@ -13501,12 +13651,12 @@ daemon build START (2/2 active)
         std::fs::write(
             &lock,
             "fixture-source /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fixture.tar.gz source\n\
-             runtime /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-runtime-1 td-recipe-output\n",
+             empty-runtime /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-empty-runtime-1 td-recipe-output\n",
         )
         .unwrap();
-        let prefix = r#"{"name":"fixture","version":"1","buildSystem":"mesboot","sourceInput":"fixture-pin","payloadInputs":["runtime"],"application":{"runtime":"runtime","entry":"/app/bin/app"},"steps":["#;
+        let prefix = r#"{"name":"fixture","version":"1","buildSystem":"mesboot","sourceInput":"fixture-pin","payloadInputs":["empty-runtime"],"application":{"runtime":"empty-runtime","entry":"/app/bin/app"},"applicationPermissions":"format=1\n","steps":["#;
         let native = r#"{"unpack":{"input":"{in:fixture-source}","dest":"{root}/seed","keepTop":false}},{"mkDir":"{out}/files/bin"},{"copyFiles":{"files":["{root}/seed/app"],"dest":"{out}/files/bin"}}"#;
-        let marker = r#"{"validateStaticApplication":{"entry":"/app/bin/app","runtime":"runtime"}}"#;
+        let marker = r#"{"validateStaticApplication":{"entry":"/app/bin/app","runtime":"empty-runtime"}}"#;
         let assemble = |steps: &str| {
             let recipe = format!("{prefix}{steps}]}}");
             assemble_recipe_drv(&recipe, lock.to_str().unwrap(), &dir, None)
@@ -13516,7 +13666,7 @@ daemon build START (2/2 active)
         for (steps, reason) in [
             (
                 format!(
-                    "{native},{{\"validateStaticApplication\":{{\"entry\":\"/app/bin/other\",\"runtime\":\"runtime\"}}}}"
+                    "{native},{{\"validateStaticApplication\":{{\"entry\":\"/app/bin/other\",\"runtime\":\"empty-runtime\"}}}}"
                 ),
                 "exactly match",
             ),
@@ -13552,7 +13702,7 @@ daemon build START (2/2 active)
         assert!(error.contains("requires an application declaration"), "{error}");
 
         let missing_marker = format!(
-            r#"{{"name":"fixture","version":"1","buildSystem":"mesboot","sourceInput":"fixture-pin","foreign":true,"foreignSource":true,"payloadInputs":["runtime"],"application":{{"runtime":"runtime","entry":"/app/bin/app"}},"steps":[{native},{{"run":{{"cwd":"{{out}}","argv":["{{out}}/files/bin/app"],"environment":[]}}}}]}}"#
+            r#"{{"name":"fixture","version":"1","buildSystem":"mesboot","sourceInput":"fixture-pin","foreign":true,"foreignSource":true,"payloadInputs":["empty-runtime"],"application":{{"runtime":"empty-runtime","entry":"/app/bin/app"}},"applicationPermissions":"format=1\n","steps":[{native},{{"run":{{"cwd":"{{out}}","argv":["{{out}}/files/bin/app"],"environment":[]}}}}]}}"#
         );
         let error = assemble_recipe_drv(
             &missing_marker,
@@ -13589,6 +13739,8 @@ daemon build START (2/2 active)
         let mut spec = String::new();
         let error = push_drv_env(&mut spec, "TD_APPLICATION_MANIFEST", "forged").unwrap_err();
         assert!(error.contains("reserved for assembled metadata"), "{error}");
+        let error = push_drv_env(&mut spec, "TD_APPLICATION_SPEC", "forged").unwrap_err();
+        assert!(error.contains("reserved for assembled metadata"), "{error}");
         let error =
             push_drv_env(&mut spec, "TD_APPLICATION_MANIFEST=forged", "value").unwrap_err();
         assert!(error.contains("contains `='"), "{error}");
@@ -13597,9 +13749,11 @@ daemon build START (2/2 active)
             assert!(error.contains("line break"), "{error}");
         }
         push_application_manifest_env(&mut spec, "canonical-json-string").unwrap();
+        push_application_spec_env(&mut spec, "canonical-spec-string").unwrap();
         assert_eq!(
             spec,
-            "env TD_APPLICATION_MANIFEST=canonical-json-string\n"
+            "env TD_APPLICATION_MANIFEST=canonical-json-string\n\
+             env TD_APPLICATION_SPEC=canonical-spec-string\n"
         );
     }
 
@@ -13617,26 +13771,34 @@ daemon build START (2/2 active)
         .unwrap();
         for (recipe, reason) in [
             (
-                r#"{"name":"fixture","version":"1","buildSystem":"gnu","application":{"runtime":"runtime","entry":"/app/bin/app","unknown":"x"}}"#.to_string(),
+                r#"{"name":"fixture","version":"1","buildSystem":"gnu","application":{"runtime":"runtime","entry":"/app/bin/app"}}"#.to_string(),
+                "requires typed `applicationPermissions'",
+            ),
+            (
+                r#"{"name":"fixture","version":"1","buildSystem":"gnu","applicationPermissions":"format=1\n"}"#.to_string(),
+                "requires an application declaration",
+            ),
+            (
+                r#"{"name":"fixture","version":"1","buildSystem":"gnu","application":{"runtime":"runtime","entry":"/app/bin/app","unknown":"x"},"applicationPermissions":"format=1\n"}"#.to_string(),
                 "unknown application declaration key",
             ),
             (
-                r#"{"name":".","version":"1","buildSystem":"gnu","application":{"runtime":"runtime","entry":"/app/bin/app"}}"#.to_string(),
+                r#"{"name":".","version":"1","buildSystem":"gnu","application":{"runtime":"runtime","entry":"/app/bin/app"},"applicationPermissions":"format=1\n"}"#.to_string(),
                 "may not be `.'",
             ),
             (
-                format!(r#"{{"name":"fixture","version":"1","buildSystem":"gnu","application":{{"runtime":"runtime","entry":"/app/bin/app","environment":{{"BIG":"{}"}}}}}}"#, "x".repeat(td_engine::application::MAX_MANIFEST_BYTES)),
+                format!(r#"{{"name":"fixture","version":"1","buildSystem":"gnu","application":{{"runtime":"runtime","entry":"/app/bin/app","environment":{{"BIG":"{}"}}}},"applicationPermissions":"format=1\n"}}"#, "x".repeat(td_engine::application::MAX_MANIFEST_BYTES)),
                 "limit is 4096",
             ),
             (
                 {
                     let value = "x".repeat(4000);
-                    format!(r#"{{"name":"fixture","version":"1","buildSystem":"gnu","application":{{"runtime":"runtime","entry":"/app/bin/app","environment":{{"A":"{value}","B":"{value}","C":"{value}","D":"{value}","E":"{value}"}}}}}}"#)
+                    format!(r#"{{"name":"fixture","version":"1","buildSystem":"gnu","application":{{"runtime":"runtime","entry":"/app/bin/app","environment":{{"A":"{value}","B":"{value}","C":"{value}","D":"{value}","E":"{value}"}}}},"applicationPermissions":"format=1\n"}}"#)
                 },
                 "limit is 16384",
             ),
             (
-                r#"{"name":"fixture","version":"1","buildSystem":"gnu","foreign":"true","application":{"runtime":"runtime","entry":"/app/bin/app"}}"#.to_string(),
+                r#"{"name":"fixture","version":"1","buildSystem":"gnu","foreign":"true","application":{"runtime":"runtime","entry":"/app/bin/app"},"applicationPermissions":"format=1\n"}"#.to_string(),
                 "not a boolean",
             ),
             (
@@ -13648,7 +13810,7 @@ daemon build START (2/2 active)
                 "does not admit application metadata",
             ),
             (
-                r#"{"name":"fixture","version":"1","buildSystem":"mesboot","steps":[],"payloadInputs":"payload","application":{"runtime":"runtime","entry":"/app/bin/app"}}"#.to_string(),
+                r#"{"name":"fixture","version":"1","buildSystem":"mesboot","steps":[],"payloadInputs":"payload","application":{"runtime":"runtime","entry":"/app/bin/app"},"applicationPermissions":"format=1\n"}"#.to_string(),
                 "must be an ARRAY",
             ),
         ] {
@@ -13661,6 +13823,74 @@ daemon build START (2/2 active)
             .unwrap_err();
             assert!(error.contains(reason), "{error}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn application_runtime_resolution_requires_one_declared_typed_store_output() {
+        let declaration = td_engine::application::ApplicationDeclaration::new(
+            "empty-runtime",
+            "/app/bin/app",
+        )
+        .unwrap();
+        let payloads = ["empty-runtime".to_string()].into();
+        let good = lock::parse(
+            "empty-runtime /td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-empty-runtime-1 td-recipe-output\n",
+            "fixture-source",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_application_runtime(&declaration, &payloads, &good).unwrap(),
+            "/td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-empty-runtime-1"
+        );
+
+        let no_payload = std::collections::BTreeSet::new();
+        let error = resolve_application_runtime(&declaration, &no_payload, &good).unwrap_err();
+        assert!(error.contains("must be a declared payload"), "{error}");
+        for (text, reason) in [
+            (
+                "empty-runtime /td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-empty-runtime-1 seed\n",
+                "not a td recipe output",
+            ),
+            (
+                "empty-runtime /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-empty-runtime-1 td-recipe-output\n",
+                "outside the active store",
+            ),
+            (
+                "empty-runtime /td/store/nested/runtime td-recipe-output\n",
+                "not a canonical store path",
+            ),
+            (
+                "empty-runtime /td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-empty-runtime-1 td-recipe-output\n\
+                 empty-runtime /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-empty-runtime-1 td-recipe-output\n",
+                "duplicate lock entries",
+            ),
+        ] {
+            let entries = lock::parse(text, "fixture-source").unwrap();
+            let error = resolve_application_runtime(&declaration, &payloads, &entries).unwrap_err();
+            assert!(error.contains(reason), "{reason}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_non_mesboot_application_may_stage_only_its_compiled_runtime_payload() {
+        let dir = std::env::temp_dir().join(format!(
+            "td-application-extra-payload-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("fixture.lock");
+        std::fs::write(
+            &lock,
+            "fixture-source /gnu/store/cccccccccccccccccccccccccccccccc-fixture-source source\n\
+             empty-runtime /td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-empty-runtime-1 td-recipe-output\n\
+             extra /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-extra-1 td-recipe-output\n",
+        )
+        .unwrap();
+        let recipe = r#"{"name":"fixture","version":"1","buildSystem":"gnu","payloadInputs":["empty-runtime","extra"],"application":{"runtime":"empty-runtime","entry":"/app/bin/app"},"applicationPermissions":"format=1\n"}"#;
+        let error = assemble_recipe_drv(recipe, lock.to_str().unwrap(), &dir, None).unwrap_err();
+        assert!(error.contains("unconsumed payloads: extra"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

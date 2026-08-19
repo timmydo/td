@@ -21,6 +21,7 @@
 
 use crate::application::ApplicationDeclaration;
 use crate::json::Json;
+use td_engine::permissions::PermissionPolicy;
 
 fn vs(xs: &[&str]) -> Vec<String> {
     xs.iter().map(|x| x.to_string()).collect()
@@ -842,6 +843,10 @@ pub struct Recipe {
     /// final Recipe and materializes `{out}/manifest` for application-capable
     /// build systems; bootstrap trust-root systems refuse the declaration.
     pub application: Option<ApplicationDeclaration>,
+    /// Immutable permission defaults compiled into the jail spec. Kept beside,
+    /// not inside, the package manifest because an operator override has a
+    /// separate lifecycle and the manifest is not a mount plan.
+    pub application_permissions: Option<PermissionPolicy>,
     /// The `mesboot` build system's typed step list (#378 slices 2+3).
     pub steps: Option<Vec<Step>>,
     pub configure_flags: Option<Vec<String>>,
@@ -913,6 +918,7 @@ impl Recipe {
             native_inputs: None,
             payload_inputs: None,
             application: None,
+            application_permissions: None,
             steps: None,
             configure_flags: None,
             make_flags: None,
@@ -976,6 +982,10 @@ impl Recipe {
     }
     pub fn application(mut self, declaration: ApplicationDeclaration) -> Recipe {
         self.application = Some(declaration);
+        self
+    }
+    pub fn application_permissions(mut self, permissions: PermissionPolicy) -> Recipe {
+        self.application_permissions = Some(permissions);
         self
     }
     pub fn steps(mut self, xs: Vec<Step>) -> Recipe {
@@ -1178,6 +1188,12 @@ impl Recipe {
         }
         if let Some(application) = &self.application {
             o.push(("application".into(), application.to_json()));
+        }
+        if let Some(permissions) = &self.application_permissions {
+            o.push((
+                "applicationPermissions".into(),
+                Json::Str(permissions.to_keyfile()),
+            ));
         }
         if let Some(x) = &self.steps {
             o.push((

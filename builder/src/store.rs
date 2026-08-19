@@ -267,7 +267,7 @@ pub fn input_addressed_path(key_hex: &str, name: &str) -> String {
 /// burden of dropping the content hash: forgetting to bump on an output-affecting change
 /// yields stale reuse. The `tree_fingerprint` builder-source drift record and the
 /// rebuild-the-world are the backstops.
-pub const BUILDER_ABI: u64 = 2;
+pub const BUILDER_ABI: u64 = 3;
 
 /// The ABI token string, `td-builder-abi-<rev>`. `TD_BUILDER_ABI` (set + non-empty)
 /// OVERRIDES the compiled revision — an escape hatch to force a distinct builder
