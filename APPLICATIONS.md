@@ -800,13 +800,88 @@ than by self-asserted package bytes.
 This is deliberately **not** a generic parser shared with the permission
 file. The manifest is immutable package content; the permission file is a
 separate policy language with filesystem, bus, socket, device and resource
-semantics. Its typed schema is the remaining format half of rung 4, rather
-than unknown policy keys being admitted through a reusable string map.
+semantics. Unknown policy keys are not admitted through a reusable string map.
 
 Permissions are a **separate file**, deliberately not part of the
 manifest, because they have a different lifecycle: the manifest is
 content and changes only when the package does, while a permission grant
 is a decision an operator revisits without rebuilding anything.
+
+**The typed permission keyfile has LANDED.** `td_engine::permissions` owns its
+parser, canonical writer and construction API. This is the complete version-1
+vocabulary:
+
+```ini
+format=1
+
+[Context]
+shared=network
+sockets=wayland;pulseaudio
+features=allow-devel
+
+[Filesystem]
+/mnt/archive=ro
+xdg-download=rw:create
+xdg-pictures=deny
+~/Projects=rw:create
+
+[Session Bus Policy]
+org.freedesktop.FileManager1=talk
+org.mozilla.firefox=own
+
+[Resources]
+memory-high=1073741824
+memory-max=1342177280
+pids-max=1024
+```
+
+The authored file and its canonical rendering are each at most 16 KiB, UTF-8
+with a trailing LF and no CR or NUL. `format=1` is required before the first
+section. Full-line `#` comments, blank lines and ASCII space/tab layout are
+accepted and canonicalized away; sections, keys and list members may not
+repeat, unknown intent is refused, and the writer fixes section/key/list order.
+Empty sections disappear. A compact boundary input whose normalized rendering
+would cross the same cap is refused rather than producing an oversized policy.
+
+`shared` admits only `network`; `sockets` admits `wayland` and `pulseaudio`;
+and `features` admits only `allow-devel`. `devices=dri` is recognized but
+refused until §M's hardware-rendering policy lands, while `devices=tty` names
+the missing controlling-terminal amendment. This makes both future changes a
+policy-table decision rather than an unknown key becoming active by accident.
+
+Filesystem keys are exactly the six `xdg-*` names §C lists, a lexical `~/`
+subpath of the launching user's real home, or an absolute path. `~/` never
+names the private `/home/td` assembled inside the jail. Their value is `deny`,
+`ro`, `rw`, `ro:create` or `rw:create`; `create` is confined to XDG and
+home-relative locations, and the keyfile delimiter `=` is not a path character
+in this language. Blanket `host`/`home`, the Flatpak repositories,
+`/.flatpak-info`, and the
+`/app`, `/usr`, `/bin`, `/run`, `/proc`, `/sys`, `/dev`, `/tmp`, `/home`,
+`/root`, `/var/home`, `/var/root`, `/var/run`, `/var/tmp`, `/etc`, `/boot`, and
+td's `/var/lib/td` system state are refused here. The refusal includes a
+recursive grant above one of those fixed trees — `/var/lib` cannot smuggle the
+system Flatpak repository or td system state in, and `~/.local` cannot smuggle
+the per-user repository in.
+The package and application-state roots remain configuration, not paths baked
+into this context-free parser. Rung 6 resolves `~/`, XDG names and absolute
+sources against the current configuration, then refuses every alias or overlap
+with those roots before file-type checks, mount-target separation and deny-wins
+merging within the policy and against immutable defaults. The format does not
+pretend a lexical parser performed those filesystem operations.
+
+Session-bus keys are exact well-known names, never unique names or wildcards,
+and their values are the ordered capabilities `see`, `talk` and `own`.
+Applications cannot own the broker or reserved `org.freedesktop.portal.*` and
+`org.freedesktop.impl.portal.*` names. Resource values are bounded positive
+decimal integers. Memory is a byte count capped at
+9,223,372,036,854,771,711, one below the first value the pinned kernel rounds
+to its unlimited page-counter sentinel, and `pids-max` is a task/TID count
+capped at the kernel's 4,194,304-task limit. `cpu-max` is
+recognized but refused until td enables and guards the kernel CPU bandwidth
+controller. `memory-high` must be below `memory-max` when both appear, and the
+format has no spelling for an unlimited resource.
+Applying defaults, overrides and the documented non-unlimited baseline belongs
+to the spec compiler; this rung fixes the values it will receive.
 
 **The runtime/application split is the one piece of flatpak's
 architecture worth adopting wholesale.** A runtime is just another
@@ -1755,16 +1830,21 @@ argument as `losetup` re-reading its read-only flag out of sysfs.
 ### Filesystem grants
 
 Implemented: `xdg-download`, `xdg-documents`, `xdg-pictures`,
-`xdg-music`, `xdg-videos`, `xdg-desktop`, subpaths of the app's home, and
-explicit absolute paths, each with `:ro`/`:rw`, and `:create` only below
-the user's home. Deny entries override grants. td creates a granted xdg
-directory on first use, since a fresh td image has no `~/Downloads`.
+`xdg-music`, `xdg-videos`, `xdg-desktop`, subpaths of the launching user's
+real home, and explicit absolute paths, each with `:ro`/`:rw`, and `:create`
+only below that real home. `~/` does not name the app-private `/home/td`.
+Deny entries override grants. td creates a granted xdg directory on first use,
+since a fresh td image has no `~/Downloads`.
 
 **Refused, deliberately stricter than upstream:** `filesystem=host`,
-`filesystem=home`, `/`, `/usr`, `/app`, `/run`, `/proc`, `/sys`, the
-flatpak repo itself, any `/td/store` path, socket paths, and device
-trees. An app that genuinely needs blanket home access gets a reviewed
-per-app override rather than a default. Sources are canonicalized before
+`filesystem=home`, `/`, `/usr`, `/bin`, `/app`, `/run`, `/proc`, `/sys`,
+`/tmp`, `/home`, `/root`, `/var/home`, `/var/root`, `/var/run`, `/var/tmp`,
+`/etc`, `/boot`, `/.flatpak-info`, the flatpak repo itself, td's
+`/var/lib/td` system state, socket paths, and device trees. The configured
+package and application-state roots are also refused after source resolution,
+whatever their spelling. An app that genuinely needs blanket home access gets
+a reviewed per-app override rather than a default.
+Sources are canonicalized before
 the app starts and targets checked component by component; no mount
 target may be an ancestor or descendant of `/app`, `/usr`,
 `/.flatpak-info`, the bus, or the private portal socket.
@@ -2988,7 +3068,8 @@ packaged selftest, boot oracle — with **network never in the gate**.
    validation, including every rejection (path separators, leading dash,
    `.`, `..`, over-length, empty), have **LANDED** with the build-time manifest
    API. Alias validation is part of that manifest surface. Permission-file
-   round-trips and refusals remain to land with that format's typed schema.
+   round-trips, canonicalization, typed construction, bounds and every closed-
+   vocabulary refusal have **LANDED** with that format's typed schema.
    The D-Bus codec must cover both endian modes with malformed bodies, spoofed
    senders and serial-wrap boundaries; the auth state machine;
    name-queue transitions; match-rule evaluation; portal Request/Session
@@ -3169,7 +3250,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 1 | **kernel namespace/seccomp/cgroup config pins + QEMU readback** (§0) — **LANDED**, except the functional calls, which need surface #9: the `unshare` at rung 8, the filter install at rung 11 | none — but this is the gate on everything |
 | 2 | `td-login exec-as` with credential readback — **LANDED** | none |
 | 3 | **the §B.8 marker — LANDED**: the recipe-level mark, `payload_inputs` as a declared channel, taint propagation from the source pin, and the planning-time refusals — including the argv/template audit at `td-recipe-eval`'s production planning boundary for the otherwise-silent assertion. The channel is `{payload:NAME}` resolution plus `ro,noexec` binds, replacing the un-implementable "never staged at all"; the mark is `foreign` on the source pin, the derived recipe flag, the tool-channel refusal in both plan builders, and the computed `contains_payloads` answer with the recipe-graph closure query that reads it | none |
-| 4 | the canonical manifest, its recipe-side generator/parser, and short-name validation with every rejection — **LANDED**. Remaining: the typed permission keyfile and the STORE-level closure query, which needs a built closure with a payload in it | none |
+| 4 | the canonical manifest, its recipe-side generator/parser, short-name validation, and the typed permission keyfile with every rejection — **LANDED**. Remaining: the STORE-level closure query, which needs a built closure with a payload in it | none |
 | 5 | first seed recipe — a pinned upstream artifact becomes a store package with §B.3's checks and §B.8's assertions | none |
 | 6 | the spec compiler: runtime resolution by full store path, mounts, grants, entry point | none |
 | 7 | the `/bin/<name>` farm through `real_root_steps` + `bin_farms()`, the launcher table, the state directory | none |
@@ -4286,9 +4367,10 @@ rather than deferring them. The shape:
   different failure from the `ENOENT` above and, unlike it, one that
   points at the file rather than at the design.
 - `td-jail` creates one cgroup per instance, writes `memory.max`,
-  `memory.high`, `pids.max` and optionally `cpu.max` from the app's
-  permission file, then moves stage 2 into it *before* spawning the app,
-  so every descendant is inside by construction.
+  `memory.high` and `pids.max` from the app's permission file, then moves
+  stage 2 into it *before* spawning the app, so every descendant is inside by
+  construction. Version 1 refuses `cpu-max`; a later format may write
+  `cpu.max` only after td enables and guards the kernel bandwidth controller.
 - Writes are ordinary file writes to `cgroup.procs` and the limit
   attributes — **no new syscall, no roster amendment**. This is the
   rare case where the capable mechanism is also the safe one.
