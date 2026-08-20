@@ -4864,7 +4864,10 @@ fn push_drv_field(spec: &mut String, directive: &str, value: &str) -> Result<(),
 }
 
 fn push_drv_env(spec: &mut String, name: &str, value: &str) -> Result<(), String> {
-    if matches!(name, "TD_APPLICATION_MANIFEST" | "TD_APPLICATION_SPEC") {
+    if matches!(
+        name,
+        "TD_APPLICATION_MANIFEST" | "TD_APPLICATION_SPEC" | "TD_APPLICATION_LAUNCHER"
+    ) {
         return Err(format!("recipe: {name} is reserved for assembled metadata"));
     }
     push_drv_env_line(spec, name, value)
@@ -4876,6 +4879,28 @@ fn push_application_manifest_env(spec: &mut String, value: &str) -> Result<(), S
 
 fn push_application_spec_env(spec: &mut String, value: &str) -> Result<(), String> {
     push_drv_env_line(spec, "TD_APPLICATION_SPEC", value)
+}
+
+fn push_application_launcher_env(spec: &mut String, value: &str) -> Result<(), String> {
+    push_drv_env_line(spec, "TD_APPLICATION_LAUNCHER", value)
+}
+
+fn parse_application_launcher(
+    alist: &json::Json,
+    has_application: bool,
+) -> Result<Option<td_engine::launcher::LauncherDeclaration>, String> {
+    let Some(value) = alist.get("applicationLauncher") else {
+        if has_application {
+            return Err("recipe: an application declaration requires `applicationLauncher'".into());
+        }
+        return Ok(None);
+    };
+    if !has_application {
+        return Err("recipe: `applicationLauncher' requires an application declaration".into());
+    }
+    td_engine::launcher::LauncherDeclaration::from_json(value)
+        .map(Some)
+        .map_err(|error| format!("recipe application launcher: {error}"))
 }
 
 fn parse_application_permissions(
@@ -5033,6 +5058,8 @@ fn assemble_recipe_drv(
     };
     let application_permissions =
         parse_application_permissions(&alist, application_declaration.is_some())?;
+    let application_launcher =
+        parse_application_launcher(&alist, application_declaration.is_some())?;
     validate_static_application_step_contract(
         name,
         &alist,
@@ -5062,6 +5089,14 @@ fn assemble_recipe_drv(
                     .map_err(|error| format!("recipe application: {error}"))?,
             )
         }
+        None => None,
+    };
+    let application_launcher_export = match application_launcher.as_ref() {
+        Some(launcher) => Some(
+            launcher
+                .bind(name)
+                .map_err(|error| format!("recipe application launcher: {error}"))?,
+        ),
         None => None,
     };
     // Outside mesboot's typed data operations, the spec compiler is the only
@@ -5156,8 +5191,9 @@ fn assemble_recipe_drv(
         application_declaration.as_ref(),
         application_manifest.as_ref(),
         application_permissions.as_ref(),
+        application_launcher_export.as_ref(),
     ) {
-        (Some(declaration), Some(manifest), Some(permissions)) => {
+        (Some(declaration), Some(manifest), Some(permissions), Some(_)) => {
             let runtime = resolve_application_runtime(declaration, &payloads, &entries)?;
             Some(
                 td_engine::application_spec::ApplicationSpec::compile(
@@ -5168,10 +5204,10 @@ fn assemble_recipe_drv(
                 .map_err(|error| format!("recipe application spec: {error}"))?,
             )
         }
-        (None, None, None) => None,
+        (None, None, None, None) => None,
         _ => {
             return Err(
-                "recipe: application declaration, manifest, permissions and spec must be complete"
+                "recipe: application declaration, manifest, launcher, permissions and spec must be complete"
                     .into(),
             );
         }
@@ -5257,6 +5293,10 @@ fn assemble_recipe_drv(
     if let Some(application_spec) = application_spec.as_ref() {
         let encoded = json::Json::Str(application_spec.to_keyfile()).to_canonical();
         push_application_spec_env(&mut spec, &encoded)?;
+    }
+    if let Some(launcher) = application_launcher_export.as_ref() {
+        let encoded = json::Json::Str(launcher.to_tsv()).to_canonical();
+        push_application_launcher_env(&mut spec, &encoded)?;
     }
     match build_system {
         // gnu: the autotools phase runner reads the configure flags + custom phases.
@@ -13505,7 +13545,7 @@ daemon build START (2/2 active)
              empty-runtime /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-empty-runtime-1 td-recipe-output\n",
         )
         .unwrap();
-        let recipe = r#"{"name":"renamed","version":"2","buildSystem":"gnu","payloadInputs":["empty-runtime"],"application":{"runtime":"empty-runtime","entry":"/app/bin/app","environment":{"TOKEN":"{root}"}},"applicationPermissions":"format=1\n"}"#;
+        let recipe = r#"{"name":"renamed","version":"2","buildSystem":"gnu","payloadInputs":["empty-runtime"],"application":{"runtime":"empty-runtime","entry":"/app/bin/app","environment":{"TOKEN":"{root}"}},"applicationLauncher":{"displayName":"Renamed","searchTerms":["renamed"]},"applicationPermissions":"format=1\n"}"#;
         let (_path, _file, drv, _source) =
             assemble_recipe_drv(recipe, lock.to_str().unwrap(), &dir, None).unwrap();
         assert_eq!(
@@ -13550,6 +13590,16 @@ daemon build START (2/2 active)
             spec.environment().find(|(name, _)| *name == "TOKEN"),
             Some(("TOKEN", "{root}"))
         );
+        let encoded_launcher = drv
+            .env
+            .iter()
+            .find(|(key, _)| key == "TD_APPLICATION_LAUNCHER")
+            .map(|(_, value)| value)
+            .expect("compiled launcher export must reach the phase contract");
+        assert_eq!(
+            json::parse(encoded_launcher).unwrap().as_str(),
+            Some("renamed\tRenamed\trenamed\n")
+        );
 
         let injection = r#"{"name":"renamed","version":"2","buildSystem":"gnu","configureFlags":["--flag=x\nenv TD_APPLICATION_MANIFEST=forged"]}"#;
         let (_path, _file, injected_drv, _source) =
@@ -13581,7 +13631,7 @@ daemon build START (2/2 active)
             "empty-runtime /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-empty-runtime-1 td-recipe-output\n",
         )
         .unwrap();
-        let containing = r#"{"name":"contained","version":"1","buildSystem":"mesboot","steps":[],"payloadInputs":["empty-runtime"],"application":{"runtime":"empty-runtime","entry":"/app/bin/app"},"applicationPermissions":"format=1\n"}"#;
+        let containing = r#"{"name":"contained","version":"1","buildSystem":"mesboot","steps":[],"payloadInputs":["empty-runtime"],"application":{"runtime":"empty-runtime","entry":"/app/bin/app"},"applicationLauncher":{"displayName":"Contained","searchTerms":[]},"applicationPermissions":"format=1\n"}"#;
         let (_path, _file, drv, _source) =
             assemble_recipe_drv(containing, lock.to_str().unwrap(), &dir, None).unwrap();
         let encoded = drv
@@ -13654,7 +13704,7 @@ daemon build START (2/2 active)
              empty-runtime /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-empty-runtime-1 td-recipe-output\n",
         )
         .unwrap();
-        let prefix = r#"{"name":"fixture","version":"1","buildSystem":"mesboot","sourceInput":"fixture-pin","payloadInputs":["empty-runtime"],"application":{"runtime":"empty-runtime","entry":"/app/bin/app"},"applicationPermissions":"format=1\n","steps":["#;
+        let prefix = r#"{"name":"fixture","version":"1","buildSystem":"mesboot","sourceInput":"fixture-pin","payloadInputs":["empty-runtime"],"application":{"runtime":"empty-runtime","entry":"/app/bin/app"},"applicationLauncher":{"displayName":"Fixture","searchTerms":[]},"applicationPermissions":"format=1\n","steps":["#;
         let native = r#"{"unpack":{"input":"{in:fixture-source}","dest":"{root}/seed","keepTop":false}},{"mkDir":"{out}/files/bin"},{"copyFiles":{"files":["{root}/seed/app"],"dest":"{out}/files/bin"}}"#;
         let marker = r#"{"validateStaticApplication":{"entry":"/app/bin/app","runtime":"empty-runtime"}}"#;
         let assemble = |steps: &str| {
@@ -13702,7 +13752,7 @@ daemon build START (2/2 active)
         assert!(error.contains("requires an application declaration"), "{error}");
 
         let missing_marker = format!(
-            r#"{{"name":"fixture","version":"1","buildSystem":"mesboot","sourceInput":"fixture-pin","foreign":true,"foreignSource":true,"payloadInputs":["empty-runtime"],"application":{{"runtime":"empty-runtime","entry":"/app/bin/app"}},"applicationPermissions":"format=1\n","steps":[{native},{{"run":{{"cwd":"{{out}}","argv":["{{out}}/files/bin/app"],"environment":[]}}}}]}}"#
+            r#"{{"name":"fixture","version":"1","buildSystem":"mesboot","sourceInput":"fixture-pin","foreign":true,"foreignSource":true,"payloadInputs":["empty-runtime"],"application":{{"runtime":"empty-runtime","entry":"/app/bin/app"}},"applicationLauncher":{{"displayName":"Fixture","searchTerms":[]}},"applicationPermissions":"format=1\n","steps":[{native},{{"run":{{"cwd":"{{out}}","argv":["{{out}}/files/bin/app"],"environment":[]}}}}]}}"#
         );
         let error = assemble_recipe_drv(
             &missing_marker,
@@ -13741,6 +13791,8 @@ daemon build START (2/2 active)
         assert!(error.contains("reserved for assembled metadata"), "{error}");
         let error = push_drv_env(&mut spec, "TD_APPLICATION_SPEC", "forged").unwrap_err();
         assert!(error.contains("reserved for assembled metadata"), "{error}");
+        let error = push_drv_env(&mut spec, "TD_APPLICATION_LAUNCHER", "forged").unwrap_err();
+        assert!(error.contains("reserved for assembled metadata"), "{error}");
         let error =
             push_drv_env(&mut spec, "TD_APPLICATION_MANIFEST=forged", "value").unwrap_err();
         assert!(error.contains("contains `='"), "{error}");
@@ -13750,10 +13802,12 @@ daemon build START (2/2 active)
         }
         push_application_manifest_env(&mut spec, "canonical-json-string").unwrap();
         push_application_spec_env(&mut spec, "canonical-spec-string").unwrap();
+        push_application_launcher_env(&mut spec, "canonical-launcher-string").unwrap();
         assert_eq!(
             spec,
             "env TD_APPLICATION_MANIFEST=canonical-json-string\n\
-             env TD_APPLICATION_SPEC=canonical-spec-string\n"
+             env TD_APPLICATION_SPEC=canonical-spec-string\n\
+             env TD_APPLICATION_LAUNCHER=canonical-launcher-string\n"
         );
     }
 
@@ -13779,26 +13833,38 @@ daemon build START (2/2 active)
                 "requires an application declaration",
             ),
             (
+                r#"{"name":"fixture","version":"1","buildSystem":"gnu","application":{"runtime":"runtime","entry":"/app/bin/app"},"applicationPermissions":"format=1\n"}"#.to_string(),
+                "requires `applicationLauncher'",
+            ),
+            (
+                r#"{"name":"fixture","version":"1","buildSystem":"gnu","applicationLauncher":{"displayName":"Fixture","searchTerms":[]}}"#.to_string(),
+                "requires an application declaration",
+            ),
+            (
+                r#"{"name":"fixture","version":"1","buildSystem":"gnu","application":{"runtime":"runtime","entry":"/app/bin/app"},"applicationLauncher":{"displayName":"Fixture","searchTerms":["two words"]},"applicationPermissions":"format=1\n"}"#.to_string(),
+                "search term \"two words\" contains whitespace",
+            ),
+            (
                 r#"{"name":"fixture","version":"1","buildSystem":"gnu","application":{"runtime":"runtime","entry":"/app/bin/app","unknown":"x"},"applicationPermissions":"format=1\n"}"#.to_string(),
                 "unknown application declaration key",
             ),
             (
-                r#"{"name":".","version":"1","buildSystem":"gnu","application":{"runtime":"runtime","entry":"/app/bin/app"},"applicationPermissions":"format=1\n"}"#.to_string(),
+                r#"{"name":".","version":"1","buildSystem":"gnu","application":{"runtime":"runtime","entry":"/app/bin/app"},"applicationLauncher":{"displayName":"Fixture","searchTerms":[]},"applicationPermissions":"format=1\n"}"#.to_string(),
                 "may not be `.'",
             ),
             (
-                format!(r#"{{"name":"fixture","version":"1","buildSystem":"gnu","application":{{"runtime":"runtime","entry":"/app/bin/app","environment":{{"BIG":"{}"}}}},"applicationPermissions":"format=1\n"}}"#, "x".repeat(td_engine::application::MAX_MANIFEST_BYTES)),
+                format!(r#"{{"name":"fixture","version":"1","buildSystem":"gnu","application":{{"runtime":"runtime","entry":"/app/bin/app","environment":{{"BIG":"{}"}}}},"applicationLauncher":{{"displayName":"Fixture","searchTerms":[]}},"applicationPermissions":"format=1\n"}}"#, "x".repeat(td_engine::application::MAX_MANIFEST_BYTES)),
                 "limit is 4096",
             ),
             (
                 {
                     let value = "x".repeat(4000);
-                    format!(r#"{{"name":"fixture","version":"1","buildSystem":"gnu","application":{{"runtime":"runtime","entry":"/app/bin/app","environment":{{"A":"{value}","B":"{value}","C":"{value}","D":"{value}","E":"{value}"}}}},"applicationPermissions":"format=1\n"}}"#)
+                    format!(r#"{{"name":"fixture","version":"1","buildSystem":"gnu","application":{{"runtime":"runtime","entry":"/app/bin/app","environment":{{"A":"{value}","B":"{value}","C":"{value}","D":"{value}","E":"{value}"}}}},"applicationLauncher":{{"displayName":"Fixture","searchTerms":[]}},"applicationPermissions":"format=1\n"}}"#)
                 },
                 "limit is 16384",
             ),
             (
-                r#"{"name":"fixture","version":"1","buildSystem":"gnu","foreign":"true","application":{"runtime":"runtime","entry":"/app/bin/app"},"applicationPermissions":"format=1\n"}"#.to_string(),
+                r#"{"name":"fixture","version":"1","buildSystem":"gnu","foreign":"true","application":{"runtime":"runtime","entry":"/app/bin/app"},"applicationLauncher":{"displayName":"Fixture","searchTerms":[]},"applicationPermissions":"format=1\n"}"#.to_string(),
                 "not a boolean",
             ),
             (
@@ -13810,7 +13876,7 @@ daemon build START (2/2 active)
                 "does not admit application metadata",
             ),
             (
-                r#"{"name":"fixture","version":"1","buildSystem":"mesboot","steps":[],"payloadInputs":"payload","application":{"runtime":"runtime","entry":"/app/bin/app"},"applicationPermissions":"format=1\n"}"#.to_string(),
+                r#"{"name":"fixture","version":"1","buildSystem":"mesboot","steps":[],"payloadInputs":"payload","application":{"runtime":"runtime","entry":"/app/bin/app"},"applicationLauncher":{"displayName":"Fixture","searchTerms":[]},"applicationPermissions":"format=1\n"}"#.to_string(),
                 "must be an ARRAY",
             ),
         ] {
@@ -13888,7 +13954,7 @@ daemon build START (2/2 active)
              extra /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-extra-1 td-recipe-output\n",
         )
         .unwrap();
-        let recipe = r#"{"name":"fixture","version":"1","buildSystem":"gnu","payloadInputs":["empty-runtime","extra"],"application":{"runtime":"empty-runtime","entry":"/app/bin/app"},"applicationPermissions":"format=1\n"}"#;
+        let recipe = r#"{"name":"fixture","version":"1","buildSystem":"gnu","payloadInputs":["empty-runtime","extra"],"application":{"runtime":"empty-runtime","entry":"/app/bin/app"},"applicationLauncher":{"displayName":"Fixture","searchTerms":[]},"applicationPermissions":"format=1\n"}"#;
         let error = assemble_recipe_drv(recipe, lock.to_str().unwrap(), &dir, None).unwrap_err();
         assert!(error.contains("unconsumed payloads: extra"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);

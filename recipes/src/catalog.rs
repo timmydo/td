@@ -68,6 +68,15 @@ mod tests {
         let declaration = seed.application.as_ref().expect("application declaration");
         assert_eq!(declaration.runtime(), "empty-runtime");
         assert_eq!(declaration.entry(), "/app/bin/rg");
+        let launcher = seed
+            .application_launcher
+            .as_ref()
+            .expect("application launcher declaration");
+        assert_eq!(launcher.display_name(), "Ripgrep");
+        assert_eq!(
+            launcher.search_terms().collect::<Vec<_>>(),
+            vec!["ripgrep", "rg", "search", "text", "files"]
+        );
         assert_eq!(
             seed.application_permissions
                 .as_ref()

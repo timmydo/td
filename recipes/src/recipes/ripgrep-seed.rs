@@ -1,5 +1,6 @@
 use crate::application::ApplicationDeclaration;
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
+use td_engine::launcher::LauncherDeclaration;
 use td_engine::permissions::PermissionPolicy;
 
 // The first foreign application seed is intentionally static and small. It
@@ -11,6 +12,17 @@ pub fn recipe() -> Recipe {
             .source_input("ripgrep-seed-source")
             .steps(vec![Step::Require {
                 paths: vec!["{out}/invalid-application-declaration".into()],
+                exec: false,
+            }]);
+    };
+    let Ok(launcher) = LauncherDeclaration::new(
+        "Ripgrep",
+        &["ripgrep", "rg", "search", "text", "files"],
+    ) else {
+        return Recipe::mesboot("ripgrep-seed", "15.2.0")
+            .source_input("ripgrep-seed-source")
+            .steps(vec![Step::Require {
+                paths: vec!["{out}/invalid-launcher-declaration".into()],
                 exec: false,
             }]);
     };
@@ -35,6 +47,7 @@ pub fn recipe() -> Recipe {
         .payload_inputs(&["empty-runtime"])
         .steps(steps)
         .application(declaration)
+        .application_launcher(launcher)
         .application_permissions(PermissionPolicy::new())
         .checks(vec![RecipeCheck::new(
             r#"

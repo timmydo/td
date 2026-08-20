@@ -3013,7 +3013,8 @@ fn check_payload_template(
                     name,
                     open,
                     "`{in:NAME}' is the tool channel; use `{payload:NAME}' only in \
-                     unpack's `input', copyTree's `from', or stageRuntimeClosure's `roots'",
+                     unpack's `input', copyTree's `from', stageRuntimeClosure's `roots', \
+                     or compileApplicationTables' `packages' or `runtimes'",
                 ));
             }
         } else if let Some(name) = token.strip_prefix("payload:") {
@@ -3022,7 +3023,8 @@ fn check_payload_template(
                     name,
                     open,
                     "`{payload:NAME}' is visible only in unpack's `input', copyTree's \
-                     `from', or stageRuntimeClosure's `roots'",
+                     `from', stageRuntimeClosure's `roots', or \
+                     compileApplicationTables' `packages' or `runtimes'",
                 ));
             }
             if !payloads.contains(name) {
@@ -3099,6 +3101,22 @@ fn visit_step_templates(
                 visit("stageRuntimeClosure.roots", root, true)?;
             }
             visit("stageRuntimeClosure.dest", dest, false)?;
+        }
+        Step::CompileApplicationTables {
+            names: _,
+            packages,
+            runtimes,
+            registry,
+            launcher,
+        } => {
+            for package in packages {
+                visit("compileApplicationTables.packages", package, true)?;
+            }
+            for runtime in runtimes {
+                visit("compileApplicationTables.runtimes", runtime, true)?;
+            }
+            visit("compileApplicationTables.registry", registry, false)?;
+            visit("compileApplicationTables.launcher", launcher, false)?;
         }
         Step::PackErofs { root, output } => {
             visit("packErofs.root", root, false)?;
@@ -4471,7 +4489,7 @@ mod tests {
 
     fn payload_template_recipe(step: Step) -> Recipe {
         Recipe::mesboot("image", "1")
-            .payload_inputs(&["firefox"])
+            .payload_inputs(&["firefox", "runtime"])
             .steps(vec![step])
     }
 
@@ -4501,6 +4519,8 @@ mod tests {
             ("copyFiles.dest", Step::CopyFiles { files: vec!["{src}/x".into()], dest: bad(BAD) }),
             ("copyTree.dest", Step::CopyTree { from: "{src}".into(), dest: bad(BAD) }),
             ("stageRuntimeClosure.dest", Step::StageRuntimeClosure { roots: vec!["{in:glibc}".into()], dest: bad(BAD) }),
+            ("compileApplicationTables.registry", Step::CompileApplicationTables { names: vec!["firefox".into()], packages: vec!["{payload:firefox}".into()], runtimes: vec!["{payload:runtime}".into()], registry: bad(BAD), launcher: "{out}/launcher.tsv".into() }),
+            ("compileApplicationTables.launcher", Step::CompileApplicationTables { names: vec!["firefox".into()], packages: vec!["{payload:firefox}".into()], runtimes: vec!["{payload:runtime}".into()], registry: "{out}/registry.tsv".into(), launcher: bad(BAD) }),
             ("packErofs.root", Step::PackErofs { root: bad(BAD), output: "{out}/root.erofs".into() }),
             ("packErofs.output", Step::PackErofs { root: "{root}".into(), output: bad(BAD) }),
             ("sha256Manifest.output", Step::Sha256Manifest { output: bad(BAD), entries: Vec::new() }),
@@ -4517,13 +4537,15 @@ mod tests {
             ("substituteText.file", Step::SubstituteText { file: bad(BAD), edits: Vec::new() }),
             ("assertStatic.paths", Step::AssertStatic { paths: vec![bad(BAD)] }),
         ];
-        assert_eq!(cases.len(), 29, "every expanded, non-data field is listed");
+        assert_eq!(cases.len(), 31, "every expanded, non-data field is listed");
         let mut expected: HashSet<(&'static str, bool)> =
             cases.iter().map(|(field, _)| (*field, false)).collect();
         assert_eq!(expected.len(), cases.len(), "field labels must be distinct");
         assert!(expected.insert(("unpack.input", true)));
         assert!(expected.insert(("copyTree.from", true)));
         assert!(expected.insert(("stageRuntimeClosure.roots", true)));
+        assert!(expected.insert(("compileApplicationTables.packages", true)));
+        assert!(expected.insert(("compileApplicationTables.runtimes", true)));
         let mut visited = HashSet::new();
         for (_, step) in &cases {
             visit_step_templates(step, |field, _, visible| {
@@ -4572,12 +4594,18 @@ mod tests {
             expected.iter().filter(|(_, visible)| *visible).count(),
             "the builder and audit must expose the same number of data fields"
         );
+        let compact_dispatch: String = dispatch.split_whitespace().collect();
         for site in [
-            "ctx.expand_data(&field(o, \"input\")?)",
-            "ctx.expand_data(&field(o, \"from\")?)",
-            "ctx.expand_data_all(&strs(o, \"roots\")?)",
+            "ctx.expand_data(&field(o,\"input\")?)",
+            "ctx.expand_data(&field(o,\"from\")?)",
+            "ctx.expand_data_all(&string_array(o,\"roots\").map_err(err)?)",
+            "ctx.expand_data_all(&string_array(o,\"packages\").map_err(err)?)",
+            "ctx.expand_data_all(&string_array(o,\"runtimes\").map_err(err)?)",
         ] {
-            assert!(dispatch.contains(site), "missing builder data site {site:?}");
+            assert!(
+                compact_dispatch.contains(site),
+                "missing builder data site {site:?}"
+            );
         }
         for (field, step) in cases {
             let error = payload_template_error(step);
@@ -4588,7 +4616,7 @@ mod tests {
         }
     }
 
-    /// The three data fields see `{payload:NAME}`. They still refuse the
+    /// The five data fields see `{payload:NAME}`. They still refuse the
     /// tool-channel spelling and a name the recipe did not declare.
     #[test]
     fn only_typed_data_sources_see_payload_templates() {
@@ -4596,6 +4624,7 @@ mod tests {
             Step::Unpack { input: "{payload:firefox}".into(), dest: "{src}".into(), keep_top: false },
             Step::CopyTree { from: "{payload:firefox}".into(), dest: "{out}/app".into() },
             Step::StageRuntimeClosure { roots: vec!["{payload:firefox}".into()], dest: "{out}/root".into() },
+            Step::CompileApplicationTables { names: vec!["firefox".into()], packages: vec!["{payload:firefox}".into()], runtimes: vec!["{payload:runtime}".into()], registry: "{out}/registry".into(), launcher: "{out}/launcher".into() },
         ] {
             assert!(refuse_payload_templates("image", &payload_template_recipe(step)).is_ok());
         }
@@ -4603,6 +4632,7 @@ mod tests {
             Step::Unpack { input: "{in:firefox}".into(), dest: "{src}".into(), keep_top: false },
             Step::CopyTree { from: "{in:firefox}".into(), dest: "{out}/app".into() },
             Step::StageRuntimeClosure { roots: vec!["{in:firefox}".into()], dest: "{out}/root".into() },
+            Step::CompileApplicationTables { names: vec!["firefox".into()], packages: vec!["{in:firefox}".into()], runtimes: vec!["{payload:runtime}".into()], registry: "{out}/registry".into(), launcher: "{out}/launcher".into() },
         ] {
             let error = payload_template_error(step);
             assert!(error.contains("`{in:NAME}' is the tool channel"), "{error}");

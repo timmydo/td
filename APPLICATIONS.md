@@ -359,14 +359,16 @@ work that would have justified one is either gone or happens earlier.
 ### A.0 The launcher
 
 **`/bin/firefox` is a symlink to `td-jail`, which reads its own `argv[0]`
-and looks the name up in a build-time table in the store.** `td-init`,
+and looks the name up in the immutable build-time application registry.**
+`/etc/td-applications.tsv` maps the validated name to the exact
+content-addressed package path; `td-init`,
 `td-util`, `td-login` and `td-sh` are all multicalls keyed on `argv[0]`;
 this is a fifth.
 
 **`argv[0]` selects, it does not authenticate.** A caller controls
 `argv[0]`, so the only thing it can do is name a *different shipped
 application* — which that caller could have launched directly anyway. The
-security property comes from the table being in the read-only store and
+security property comes from the table being in the read-only image and
 from the entry point resolving the spec itself.
 
 **But this `argv[0]` is an OPEN key, unlike the four multicalls above**,
@@ -379,8 +381,9 @@ it is used to build a path. The identity was validated once at build
 (§A); that is the wrong place to rely on, because the string arriving
 here did not come from there.
 
-**The `/bin/<name>` symlinks are a seventh applet farm and must be
-registered as one.** `bin_farms()` enumerates six, and
+**The `/bin/<name>` symlinks are a seventh applet farm and are now
+registered as one.** `bin_farms()` enumerates the six closed farms plus this
+open one, and
 `applet_farms_are_disjoint_and_boot_names_stay_static` exists because a
 name in two farms packs two conflicting symlinks for one applet.
 Application names are a new, open-ended, recipe-authored class in the
@@ -400,7 +403,8 @@ descriptor it passes, and is not a documented entry point. No
 per-instance copy of the spec is written and then re-read — that would
 put a writable file back on the path this rule exists to keep immutable.
 
-That spec names the runtime by its **full store path**, not by short
+The registry names the package by its full path and the package's spec names
+the runtime by its **full store path**, not by short
 name, because td discovers closure edges by scanning output bytes for
 store hashes (§B.8): a short name leaves the application→runtime edge
 invisible to the closure query and to any future collector.
@@ -640,15 +644,54 @@ confusingly. It is a compatibility surface td writes, not a name td uses.
 
 ### Launcher integration
 
-The build emits a bounded `td-launcher.tsv` of
-`name<TAB>display-name<TAB>search-terms`, merged from every shipped
-package's `exports/` and read by the compositor's launcher. Activation is
-always the literal argv `/bin/<name>`.
+**The image-side contract has LANDED.** Each application recipe supplies a
+typed display name and bounded list of search terms. The outer builder binds
+the final recipe identity and writes one canonical
+`exports/launcher.tsv` row as builder-authenticated metadata:
 
-Launcher names are checked at build against reserved names and against
-the `/bin` applet farm — `applet_farms_are_disjoint_and_boot_names_stay_static`
-already refuses a second provider of a name, and a foreign package must
-not be able to claim `sh`.
+```
+name<TAB>display-name<TAB>space-separated-search-terms
+```
+
+Names keep §A's 32-byte application grammar. A display name is 1–128 UTF-8
+bytes with no control character or edge whitespace. There are at most 32
+distinct search terms, each 1–64 UTF-8 bytes with no control or whitespace.
+An export is at most 4 KiB. Unknown JSON fields, duplicate keys and every
+noncanonical TSV form are refused.
+
+The native `compileApplicationTables` recipe step takes a literal expected
+application identity plus package and paired runtime paths named through its
+typed data channel. The expected identity is separate from the catalog key and
+must equal the builder-authenticated recipe name. The compiler refuses symlinks
+in each metadata path,
+parses the canonical manifest, spec and export, and requires all three
+identities to agree. The package itself and the exact runtime named by its spec
+must both be declared payloads, and the spec's exact runtime must equal the
+runtime paired with that package. It then emits two sorted, duplicate-free
+immutable files:
+
+- `/etc/td-launcher.tsv` keeps the three columns above for the compositor;
+- `/etc/td-applications.tsv` carries `name<TAB>exact-package-store-path` for
+  `td-jail`'s resolver.
+
+Each table admits at most 256 applications and 1 MiB. Keeping the path out of
+the presentation table gives each reader only its own input and closes the
+previous design gap where a three-column row gave `td-jail` no way to locate a
+content-addressed package. Both tables are presently empty because no
+application is selected before the jail exists. Activation will always be the
+literal argv `/bin/<name>`.
+
+An image selection names the authenticated application identity plus its
+package catalog key and runtime catalog key. The latter two are data inputs.
+`StageRuntimeClosure` follows the exact runtime path embedded in the
+spec and refuses it unless that runtime was declared; shared runtime roots are
+deduplicated. Only application package roots feed `compileApplicationTables`.
+
+Launcher names are checked at build against every `/bin` provider, including
+the six closed applet farms and direct links such as `rg` and `td-netd`.
+`applet_farms_are_disjoint_and_boot_names_stay_static` includes the open
+application farm and refuses a second provider of a name, and a foreign
+package must not be able to claim `sh`.
 
 **The compositor never executes an upstream `Desktop Entry` `Exec=`
 line.** Field codes are parsed only to learn file-forwarding intent;
@@ -727,10 +770,10 @@ and a runtime is shared by every account instead of copied per home.
   exports/            launcher entry, icons, mime associations
 ```
 
-The first seed is still deliberately not shipped or launchable: rung 6 has now
-added its compiled `spec`, but the launcher table and jail do not exist yet.
-Putting it in the image before those boundaries land would make an ordinary
-unconfined package path look like an application path.
+The first seed is still deliberately not shipped or launchable: rung 7 has now
+added its authenticated launcher export and the empty image tables, but the jail
+does not exist yet. Putting it in the image before that boundary lands would
+make an ordinary unconfined package path look like an application path.
 
 **`manifest` and `spec` are two files with two jobs**, and keeping them
 apart matters because they have different readers. The manifest is the
@@ -785,6 +828,12 @@ image recipe, but it cannot make the contained application's own manifest claim
 staging, not its transitive runtime closure; the landed store-level closure
 query answers that separate question.
 
+`Recipe::application_launcher` separately carries the typed display name and
+search terms. The derivation assembler binds the final recipe name into its TSV
+row. Keeping presentation out of the manifest preserves the manifest's package
+identity job, while making `exports/launcher.tsv` builder-authenticated rather
+than a command-authored claim from a foreign package.
+
 **The canonical compiled spec has LANDED.** It is a builder-owned keyfile of at
 most 48 KiB, not an authored compatibility grammar:
 
@@ -812,25 +861,26 @@ compiler's canonical bytes, including the full `/td/store` runtime path.
 
 After PID-namespace teardown prevents any package descendant from running
 further code, the outer sandbox parent recognizes the four application-capable
-runners and materializes both non-executable files as mode 0644 in `{out}`.
-Neither metadata value is passed into the package PID namespace. The sealed
+runners and materializes the manifest, spec and `exports/launcher.tsv` as mode
+0644 metadata. It creates `exports/` as mode 0755 without following a symlink.
+None of the three values is passed into the package PID namespace. The sealed
 `stage0` seed and downloaded `rust-stage0` trust root refuse application
 metadata at assembly; their outer post-build verifier only reserves the root
 names and can never write metadata.
 This is not a `Step`: applications built with GNU, CMake or Cargo get the same
 declaration as a mesboot recipe, and there is no second generic file writer that
-can evade step-level guards. The fixed writer decodes and re-parses both values,
-requires canonical bytes, refuses to replace either file, and writes content
-verbatim, so an environment
+can evade step-level guards. The fixed writer decodes and re-parses all three
+values, requires canonical bytes and equal identities, refuses to replace any
+reserved path, and writes content verbatim, so an environment
 value that resembles a build token cannot turn into a store path. Keyfile
 parsing and derivation assembly enforce the aggregate byte bound; recipe JSON
 shares the typed, per-entry and entry-count validators, and assembly refuses an
 oversized declaration before it reaches the derivation.
-The root `manifest` and `spec` names are reserved in every output built by the
-six standard recipe phase runners: an application declaration creates them only
-in `out`, and their absence everywhere else requires that the package build did
-not create either one. Builder ABI 3 invalidates realizations from before the
-second reservation existed.
+The root `manifest` and `spec` names plus nested `exports/launcher.tsv` are
+reserved in every output built by the six standard recipe phase runners: an
+application declaration creates them only in `out`, and their absence
+everywhere else requires that the package build did not create one. Builder ABI
+4 invalidates realizations from before the launcher reservation existed.
 Presence is therefore authenticated by the hashed derivation contract rather
 than by self-asserted package bytes.
 
@@ -948,10 +998,11 @@ fetch, so pinning one would require td to host it, which §Z refuses.
    fetched by `td-net`, verified the same way. The pin carries the
    `foreign` taint (§B.8).
 2. **A recipe transforms it** into a package: unpack, lay out `files/`, and
-   declare the manifest and typed permission defaults. The builder now emits
-   the manifest and compiled full-runtime-path spec only after the package PID
-   namespace is gone. Both operations are deterministic derivation work, so the
-   artifact is a build output rather than a thing needing distribution.
+   declare the manifest, launcher presentation and typed permission defaults.
+   The builder now emits the manifest, compiled full-runtime-path spec and
+   launcher export only after the package PID namespace is gone. All three are
+   deterministic derivation work, so the artifact is a build output rather
+   than a thing needing distribution.
 3. **The recipe's checks are ordinary recipe checks**: the entry point
    exists and is executable, the declared runtime resolves, the metadata
    normalization of §B.8 holds, and the entry is either proved fully static or
@@ -1053,6 +1104,19 @@ start is exactly the fatigue §L.1's threat table refuses.
 The state root is a **configuration value from the first landing**, never
 a path baked into a manifest or into jail policy, so relocating it later
 is not a migration. §X relies on that, and so does the package root.
+The immutable `/etc/td-app.conf` now records the version-1 image contract:
+
+```ini
+format=1
+package-root=/td/store
+state-root=.td/app
+registry=/etc/td-applications.tsv
+launcher-table=/etc/td-launcher.tsv
+```
+
+The relative state root is resolved beneath the real user's home. Rung 7
+does not create that writable directory; `td-jail` does so on first launch
+once the ownership and confinement boundary exists.
 
 
 ### B.5 Activation and state — there is no install
@@ -1066,7 +1130,7 @@ an installer for now happens in two other places:
 |---|---|
 | identity allocation | build time, in the recipe |
 | the permission defaults | build time — part of the jail spec (§A.0) |
-| the launcher table | build time, merged from every shipped package's `exports/` |
+| the launcher and resolver tables | build time, compiled from every shipped package's builder-authenticated metadata |
 | the state directory `~/.td/app/<name>/` | first launch, by `td-jail` |
 | the per-user permission *override* | on demand, at first edit — a separate file, so the default stays immutable |
 
@@ -1422,12 +1486,13 @@ outside that boundary and still gets the expander's fail-closed error.
 **The channel has LANDED (rung 3), and the paragraph above needed one
 correction to become code.** "Never staged into a `Step::Run` sandbox at
 all" is not implementable as written: every step of a build runs inside
-ONE sandbox invocation, and `Unpack`/`CopyTree`/`StageRuntimeClosure` are
-performed by `td-builder` *in that same sandbox* — so a payload the data
-operations can read is necessarily mounted while a `Step::Run` also
-runs. Per-step mount manipulation would close that, and it would mean a
-new `unsafe` call site in `build.rs` outside the one the control plane
-records. So the enforcement is split in two, and neither half is a scan:
+ONE sandbox invocation, and `Unpack`/`CopyTree`/`StageRuntimeClosure`/
+`CompileApplicationTables` are performed by `td-builder` *in that same
+sandbox* — so a payload the data operations can read is necessarily mounted
+while a `Step::Run` also runs. Per-step mount manipulation would close that,
+and it would mean a new `unsafe` call site in `build.rs` outside the one the
+control plane records. So the enforcement is split in two, and neither half is
+a scan:
 
 - **Resolution.** A payload is withheld from `TD_INPUT_MAP` at assembly
   and placed in `TD_PAYLOAD_MAP`. The outer spec compiler resolves an
@@ -1437,7 +1502,8 @@ records. So the enforcement is split in two, and neither half is a scan:
   that runtime payload and no extra; mesboot reaches other payload data by a
   template token of its
   own, `{payload:NAME}`, which resolves ONLY in `Unpack`'s `input`,
-  `CopyTree`'s `from`, and `StageRuntimeClosure`'s `roots`. A
+  `CopyTree`'s `from`, `StageRuntimeClosure`'s `roots`, and
+  `CompileApplicationTables`' `packages` and `runtimes`. A
   command-bearing step has no name
   for a payload — `{payload:…}` there is an error, not a miss, and
   `{in:PAYLOAD}` is an error naming the rule rather than the ordinary
@@ -1521,7 +1587,8 @@ Instead an exhaustive match visits every field the builder's template
 expander visits, including environment values, and deliberately skips
 literal labels and `SubstituteText` edit text that the builder does not
 expand. `{payload:NAME}` is admitted only in `Unpack.input`,
-`CopyTree.from`, and `StageRuntimeClosure.roots`; `{in:NAME}` cannot
+`CopyTree.from`, `StageRuntimeClosure.roots`, and
+`CompileApplicationTables.packages` and `runtimes`; `{in:NAME}` cannot
 launder a declared
 payload through those fields either. That exhaustiveness makes a new
 `Step` variant or field a compile failure until its template visibility
@@ -1677,9 +1744,11 @@ payload	pin	ripgrep-seed-source	/td/store/<hash>-ripgrep-seed-source	build-only
 
 The payload's metadata is normalized at build: no setuid or setgid bits,
 no file capabilities, no security xattrs, no device nodes, no symlink
-escaping the tree. `exports/` is not trusted either — launcher names come
-from the recipe's own metadata and are checked against reserved names and
-the `/bin` applet farms (§A.0), so a foreign package cannot claim `sh`.
+escaping the tree. Foreign `exports/` bytes are not trusted. The launcher row
+is the first exception only because the outer builder creates it from typed
+recipe metadata after the package namespace has gone; its name is checked
+against reserved names and the `/bin` applet farms (§A.0), so a foreign package
+cannot claim `sh`.
 
 The fourth assertion is the ordinary one: a **reviewed pin with a
 compiled expected digest**, so adding an application is a reviewed line
@@ -3356,8 +3425,8 @@ Each row is one landing or a small family, leaving the tree green.
 | 3 | **the §B.8 marker — LANDED**: the recipe-level mark, `payload_inputs` as a declared channel, taint propagation from the source pin, and the planning-time refusals — including the argv/template audit at `td-recipe-eval`'s production planning boundary for the otherwise-silent assertion. The channel is `{payload:NAME}` resolution plus `ro,noexec` binds, replacing the un-implementable "never staged at all"; the mark is `foreign` on the source pin, the derived recipe flag, the tool-channel refusal in both plan builders, and the computed `contains_payloads` answer with the recipe-graph closure query that reads it | none |
 | 4 | the canonical manifest, its recipe-side generator/parser, short-name validation, and the typed permission keyfile with every rejection — **LANDED** | none |
 | 5 | **first seed recipe — LANDED**: upstream's pinned static ripgrep release becomes an unshipped store package with an empty runtime, generated manifest, payload-only edge, compiled source digest, and native §B.3/§B.8 checks | none |
-| 6 | **spec compiler — LANDED**: runtime resolution by full store path, fixed effective environment, typed grants/defaults and entry point; both metadata roots are builder-authenticated, and the registered-store closure query proves the app→runtime collector edge | none |
-| 7 | the `/bin/<name>` farm through `real_root_steps` + `bin_farms()`, the launcher table, the state directory | none |
+| 6 | **spec compiler — LANDED**: runtime resolution by full store path, fixed effective environment, typed grants/defaults and entry point; the manifest and spec are builder-authenticated, and the registered-store closure query proves the app→runtime collector edge | none |
+| 7 | **image application index — LANDED**: typed launcher metadata, the builder-authenticated export, immutable resolver/launcher tables, `/etc/td-app.conf`, and the empty `/bin/<name>` farm through `real_root_steps` + `bin_farms()`; no application is selected until the jail lands | none |
 | 8 | `td-jail` crate + surface #9 skeleton + stage-1/stage-2 transition | none |
 | 9 | mount plan, pivot, fresh proc/dev/tmp | none |
 | 10 | capability drop/readback + PID-1 reaper | none |

@@ -35,6 +35,7 @@ pub mod application_spec;
 pub mod cpio;
 pub mod crc32;
 pub mod ed25519;
+pub mod launcher;
 pub mod permissions;
 // SIGNING is a separate module because, of the two ed25519 files, td-boot
 // `#[path]`-includes only the VERIFIER: keeping the signer out of that file is

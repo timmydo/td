@@ -39,7 +39,7 @@ use crate::json::Json;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1049,7 +1049,9 @@ fn configure_log_tails(srcdir: &Path) -> String {
     out
 }
 
-fn decode_application_manifest(encoded: &str) -> Result<String, String> {
+fn decode_application_manifest(
+    encoded: &str,
+) -> Result<td_engine::application::ApplicationManifest, String> {
     let value = crate::json::parse(encoded)
         .map_err(|error| format!("TD_APPLICATION_MANIFEST JSON: {error}"))?;
     let text = value
@@ -1060,10 +1062,12 @@ fn decode_application_manifest(encoded: &str) -> Result<String, String> {
     if manifest.to_keyfile() != text {
         return Err("TD_APPLICATION_MANIFEST is not canonical".into());
     }
-    Ok(text.to_string())
+    Ok(manifest)
 }
 
-fn decode_application_spec(encoded: &str) -> Result<String, String> {
+fn decode_application_spec(
+    encoded: &str,
+) -> Result<td_engine::application_spec::ApplicationSpec, String> {
     let value = crate::json::parse(encoded)
         .map_err(|error| format!("TD_APPLICATION_SPEC JSON: {error}"))?;
     let text = value
@@ -1074,7 +1078,23 @@ fn decode_application_spec(encoded: &str) -> Result<String, String> {
     if spec.to_keyfile() != text {
         return Err("TD_APPLICATION_SPEC is not canonical".into());
     }
-    Ok(text.to_string())
+    Ok(spec)
+}
+
+fn decode_application_launcher(
+    encoded: &str,
+) -> Result<td_engine::launcher::LauncherExport, String> {
+    let value = crate::json::parse(encoded)
+        .map_err(|error| format!("TD_APPLICATION_LAUNCHER JSON: {error}"))?;
+    let text = value
+        .as_str()
+        .ok_or("TD_APPLICATION_LAUNCHER is not a JSON string")?;
+    let launcher = td_engine::launcher::LauncherExport::parse(text)
+        .map_err(|error| format!("TD_APPLICATION_LAUNCHER: {error}"))?;
+    if launcher.to_tsv() != text {
+        return Err("TD_APPLICATION_LAUNCHER is not canonical".into());
+    }
+    Ok(launcher)
 }
 
 fn write_application_metadata_file(out: &Path, name: &str, text: &str) -> Result<(), String> {
@@ -1103,9 +1123,12 @@ pub(crate) fn materialize_application_metadata_at(
     out: &Path,
     manifest: Option<&str>,
     spec: Option<&str>,
+    launcher: Option<&str>,
 ) -> Result<(), String> {
-    if manifest.is_some() != spec.is_some() {
-        return Err("application metadata requires both the manifest and compiled spec".into());
+    if manifest.is_some() != spec.is_some() || manifest.is_some() != launcher.is_some() {
+        return Err(
+            "application metadata requires the manifest, compiled spec and launcher export".into(),
+        );
     }
     let metadata = fs::symlink_metadata(out)
         .map_err(|error| format!("stat application output {}: {error}", out.display()))?;
@@ -1131,16 +1154,73 @@ pub(crate) fn materialize_application_metadata_at(
             Err(error) => return Err(format!("stat {}: {error}", path.display())),
         }
     }
-    match (manifest, spec) {
-        (Some(manifest), Some(spec)) => {
-            // Parse both before writing either, so malformed trusted metadata
-            // cannot leave a half-materialized package in the scratch output.
-            let manifest_text = decode_application_manifest(manifest)?;
-            let spec_text = decode_application_spec(spec)?;
-            write_application_metadata_file(out, "manifest", &manifest_text)?;
-            write_application_metadata_file(out, "spec", &spec_text)
+    let exports = out.join("exports");
+    match fs::symlink_metadata(&exports) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            let path = exports.join("launcher.tsv");
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    return Err(format!(
+                        "undeclared application metadata: {} is reserved for builder-authenticated metadata",
+                        path.display()
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("stat {}: {error}", path.display())),
+            }
         }
-        (None, None) => Ok(()),
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "application metadata collision: {} is a symlink",
+                exports.display()
+            ));
+        }
+        Ok(_) if launcher.is_some() => {
+            return Err(format!(
+                "application metadata collision: {} is not a directory",
+                exports.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("stat {}: {error}", exports.display())),
+    }
+    match (manifest, spec, launcher) {
+        (Some(manifest), Some(spec), Some(launcher)) => {
+            // Parse all three before writing any, so malformed trusted metadata
+            // cannot leave a partly materialized package in scratch.
+            let manifest = decode_application_manifest(manifest)?;
+            let spec = decode_application_spec(spec)?;
+            let launcher = decode_application_launcher(launcher)?;
+            if manifest.name() != spec.name() || manifest.name() != launcher.name() {
+                return Err(format!(
+                    "application metadata identities disagree: manifest={:?}, spec={:?}, launcher={:?}",
+                    manifest.name(),
+                    spec.name(),
+                    launcher.name()
+                ));
+            }
+            write_application_metadata_file(out, "manifest", &manifest.to_keyfile())?;
+            write_application_metadata_file(out, "spec", &spec.to_keyfile())?;
+            match fs::symlink_metadata(&exports) {
+                Ok(metadata) if metadata.file_type().is_dir() => {}
+                Ok(_) => {
+                    return Err(format!(
+                        "application metadata collision: {} is not a directory",
+                        exports.display()
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(&exports)
+                        .map_err(|error| format!("mkdir {}: {error}", exports.display()))?;
+                }
+                Err(error) => return Err(format!("stat {}: {error}", exports.display())),
+            }
+            fs::set_permissions(&exports, fs::Permissions::from_mode(0o755))
+                .map_err(|error| format!("chmod {}: {error}", exports.display()))?;
+            write_application_metadata_file(&exports, "launcher.tsv", &launcher.to_tsv())
+        }
+        (None, None, None) => Ok(()),
         _ => Err("application metadata is incomplete".into()),
     }
 }
@@ -2062,7 +2142,7 @@ struct StepCtx {
 }
 
 impl StepCtx {
-    /// The COMMAND expander: every step's templates but the three data ones. A
+    /// The COMMAND expander: every step's templates but the five data fields. A
     /// `{payload:…}` here is an error rather than a miss, and `{in:…}` cannot name
     /// a payload because assembly withheld it from TD_INPUT_MAP.
     fn expand(&self, s: &str) -> Result<String, String> {
@@ -2101,10 +2181,10 @@ impl StepCtx {
 
     /// The DATA expander: the same tokens plus `{payload:NAME}`, and used ONLY by
     /// the operations the builder performs itself — `Unpack`'s input,
-    /// `CopyTree`'s source and `StageRuntimeClosure`'s roots. This is the
-    /// resolution half of §B.8's channel: a step that runs a program the recipe
-    /// chose has no name for a
-    /// payload at all, which is a property rather than a scan for one.
+    /// `CopyTree`'s source, `StageRuntimeClosure`'s roots, and
+    /// `CompileApplicationTables`' package/runtime pairs. This is the resolution
+    /// half of §B.8's channel: a step that runs a program the recipe chose has
+    /// no name for a payload at all. That is a property, not a scan for one.
     fn expand_data(&self, s: &str) -> Result<String, String> {
         self.expand_with(s, true)
     }
@@ -2138,7 +2218,7 @@ impl StepCtx {
                                     return Err(format!(
                                         "mesboot step template: `{name}' is a payloadInput \
                                          and is not reachable through {{in:}} — it is staged \
-                                         as data for unpack/copyTree/stageRuntimeClosure only \
+                                         as data for unpack/copyTree/stageRuntimeClosure/compileApplicationTables only \
                                          (APPLICATIONS.md section B.8)"
                                     ));
                                 }
@@ -2155,8 +2235,9 @@ impl StepCtx {
                                 if !payloads_visible {
                                     return Err(format!(
                                         "mesboot step template: {{payload:{name}}} resolves \
-                                         only in unpack's `input', copyTree's `from', and \
-                                         stageRuntimeClosure's `roots' — a payload is never \
+                                         only in unpack's `input', copyTree's `from', \
+                                         stageRuntimeClosure's `roots', and \
+                                         compileApplicationTables' `packages' or `runtimes' — a payload is never \
                                          named by a step that \
                                          runs a command (APPLICATIONS.md section B.8)"
                                     ));
@@ -2796,6 +2877,264 @@ fn stage_runtime_closure_from_index(
     Ok(closure)
 }
 
+fn read_application_metadata(
+    package: &Path,
+    relative: &str,
+    limit: usize,
+) -> Result<String, String> {
+    let package_metadata = fs::symlink_metadata(package).map_err(|error| {
+        format!(
+            "compileApplicationTables: stat {}: {error}",
+            package.display()
+        )
+    })?;
+    if !package_metadata.file_type().is_dir() {
+        return Err(format!(
+            "compileApplicationTables: package {} is not a directory",
+            package.display()
+        ));
+    }
+    let mut path = package.to_path_buf();
+    for component in Path::new(relative).components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(format!(
+                "compileApplicationTables: metadata path {relative:?} is not relative"
+            ));
+        };
+        path.push(name);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            format!("compileApplicationTables: stat {}: {error}", path.display())
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "compileApplicationTables: {} traverses a symlink",
+                path.display()
+            ));
+        }
+    }
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| format!("compileApplicationTables: stat {}: {error}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "compileApplicationTables: {} is not a regular file",
+            path.display()
+        ));
+    }
+    if metadata.len() > limit as u64 {
+        return Err(format!(
+            "compileApplicationTables: {} is {} bytes; the limit is {limit}",
+            path.display(),
+            metadata.len()
+        ));
+    }
+    let file = fs::File::open(&path)
+        .map_err(|error| format!("compileApplicationTables: open {}: {error}", path.display()))?;
+    let mut text = String::new();
+    file.take(limit as u64 + 1)
+        .read_to_string(&mut text)
+        .map_err(|error| format!("compileApplicationTables: read {}: {error}", path.display()))?;
+    if text.len() > limit {
+        return Err(format!(
+            "compileApplicationTables: {} grew beyond the {limit}-byte limit while being read",
+            path.display()
+        ));
+    }
+    Ok(text)
+}
+
+fn write_application_table(path: &Path, text: &str) -> Result<(), String> {
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "compileApplicationTables: output {} has no parent",
+            path.display()
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "compileApplicationTables: mkdir {}: {error}",
+            parent.display()
+        )
+    })?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            format!(
+                "compileApplicationTables: create {} without replacing it: {error}",
+                path.display()
+            )
+        })?;
+    file.write_all(text.as_bytes()).map_err(|error| {
+        format!(
+            "compileApplicationTables: write {}: {error}",
+            path.display()
+        )
+    })?;
+    file.set_permissions(fs::Permissions::from_mode(0o644))
+        .map_err(|error| {
+            format!(
+                "compileApplicationTables: chmod {}: {error}",
+                path.display()
+            )
+        })
+}
+
+fn compile_application_tables(
+    names: &[String],
+    packages: &[String],
+    runtimes: &[String],
+    payloads: &[(String, String)],
+    registry_path: &Path,
+    launcher_path: &Path,
+) -> Result<(), String> {
+    compile_application_tables_in(
+        names,
+        packages,
+        runtimes,
+        payloads,
+        registry_path,
+        launcher_path,
+        &crate::store::store_dir(),
+    )
+}
+
+fn compile_application_tables_in(
+    names: &[String],
+    packages: &[String],
+    runtimes: &[String],
+    payloads: &[(String, String)],
+    registry_path: &Path,
+    launcher_path: &Path,
+    store: &str,
+) -> Result<(), String> {
+    if registry_path == launcher_path {
+        return Err("compileApplicationTables: registry and launcher outputs are the same".into());
+    }
+    if names.len() != packages.len() || packages.len() != runtimes.len() {
+        return Err(format!(
+            "compileApplicationTables: {} names, {} packages and {} runtimes",
+            names.len(),
+            packages.len(),
+            runtimes.len()
+        ));
+    }
+    if packages.len() > td_engine::launcher::MAX_APPLICATIONS {
+        return Err(format!(
+            "compileApplicationTables: {} packages; the limit is {}",
+            packages.len(),
+            td_engine::launcher::MAX_APPLICATIONS
+        ));
+    }
+    let prefix = format!("{}/", store.trim_end_matches('/'));
+    let payload_paths: BTreeSet<&str> = payloads.iter().map(|(_, path)| path.as_str()).collect();
+    let mut seen_paths = BTreeSet::new();
+    let mut registry_entries = Vec::with_capacity(packages.len());
+    let mut launcher_entries = Vec::with_capacity(packages.len());
+    for ((expected_name, package), expected_runtime) in names.iter().zip(packages).zip(runtimes) {
+        td_engine::application::validate_application_name(expected_name)
+            .map_err(|error| format!("compileApplicationTables: selected name: {error}"))?;
+        let Some(basename) = package.strip_prefix(&prefix) else {
+            return Err(format!(
+                "compileApplicationTables: package {package} is outside the active store {store}"
+            ));
+        };
+        if basename.contains('/')
+            || crate::store::hash_from_store_path(package).is_none()
+            || crate::store::name_from_store_path(package).is_none()
+        {
+            return Err(format!(
+                "compileApplicationTables: package {package} is not one canonical store child"
+            ));
+        }
+        if !seen_paths.insert(package.as_str()) {
+            return Err(format!(
+                "compileApplicationTables: duplicate package path {package}"
+            ));
+        }
+        if !payload_paths.contains(package.as_str()) {
+            return Err(format!(
+                "compileApplicationTables: package {package} is not a declared payload"
+            ));
+        }
+        let root = Path::new(package);
+        let manifest_text = read_application_metadata(
+            root,
+            "manifest",
+            td_engine::application::MAX_MANIFEST_BYTES,
+        )?;
+        let spec_text = read_application_metadata(
+            root,
+            "spec",
+            td_engine::application_spec::MAX_APPLICATION_SPEC_BYTES,
+        )?;
+        let launcher_text = read_application_metadata(
+            root,
+            "exports/launcher.tsv",
+            td_engine::launcher::MAX_LAUNCHER_EXPORT_BYTES,
+        )?;
+        let manifest = td_engine::application::ApplicationManifest::parse(&manifest_text)
+            .map_err(|error| format!("compileApplicationTables: {package}/manifest: {error}"))?;
+        let spec = td_engine::application_spec::ApplicationSpec::parse(&spec_text)
+            .map_err(|error| format!("compileApplicationTables: {package}/spec: {error}"))?;
+        let launcher =
+            td_engine::launcher::LauncherExport::parse(&launcher_text).map_err(|error| {
+                format!("compileApplicationTables: {package}/exports/launcher.tsv: {error}")
+            })?;
+        if manifest.to_keyfile() != manifest_text || spec.to_keyfile() != spec_text {
+            return Err(format!(
+                "compileApplicationTables: package {package} metadata is not canonical"
+            ));
+        }
+        if !payload_paths.contains(expected_runtime.as_str()) {
+            return Err(format!(
+                "compileApplicationTables: runtime {expected_runtime} is not a declared payload"
+            ));
+        }
+        if spec.runtime() != expected_runtime {
+            return Err(format!(
+                "compileApplicationTables: package {package} names runtime {}, not selected runtime {expected_runtime}",
+                spec.runtime()
+            ));
+        }
+        if manifest.name() != expected_name
+            || manifest.name() != spec.name()
+            || manifest.name() != launcher.name()
+        {
+            return Err(format!(
+                "compileApplicationTables: package {package} identities disagree: selected={expected_name:?}, manifest={:?}, spec={:?}, launcher={:?}",
+                manifest.name(),
+                spec.name(),
+                launcher.name()
+            ));
+        }
+        registry_entries.push((manifest.name().to_string(), package.clone()));
+        launcher_entries.push(launcher);
+    }
+    let registry = td_engine::launcher::ApplicationRegistry::new(registry_entries)
+        .map_err(|error| format!("compileApplicationTables: {error}"))?;
+    let launcher = td_engine::launcher::LauncherTable::new(launcher_entries)
+        .map_err(|error| format!("compileApplicationTables: {error}"))?;
+    write_application_table(registry_path, &registry.to_tsv())?;
+    write_application_table(launcher_path, &launcher.to_tsv())
+}
+
+fn string_array(object: &Json, key: &str) -> Result<Vec<String>, String> {
+    let values = object
+        .get(key)
+        .and_then(Json::as_arr)
+        .ok_or_else(|| format!("`{key}' not an array"))?;
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("`{key}' contains a non-string"))
+        })
+        .collect()
+}
+
 fn bytes_contains(hay: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
 }
@@ -3052,11 +3391,6 @@ pub fn run_mesboot() -> Result<(), String> {
             })
             .collect()
     };
-    let strs = |o: &Json, k: &str| -> Result<Vec<String>, String> {
-        let a = o.get(k).and_then(Json::as_arr).ok_or_else(|| format!("mesboot step: `{k}' not an array"))?;
-        Ok(a.iter().filter_map(Json::as_str).map(str::to_string).collect())
-    };
-
     for (i, step) in steps.iter().enumerate() {
         let err = |m: String| format!("mesboot step {}: {m}", i + 1);
         if let Some(o) = step.get("run") {
@@ -3065,7 +3399,10 @@ pub fn run_mesboot() -> Result<(), String> {
             // without any shell. Zero matches is a hard error (a silent empty
             // splice would turn an install step into a no-op).
             let mut argv: Vec<String> = Vec::new();
-            for a in ctx.expand_all(&strs(o, "argv")?).map_err(err)? {
+            for a in ctx
+                .expand_all(&string_array(o, "argv").map_err(err)?)
+                .map_err(err)?
+            {
                 match a.strip_prefix("glob:") {
                     None => argv.push(a),
                     Some(pat) => {
@@ -3134,7 +3471,10 @@ pub fn run_mesboot() -> Result<(), String> {
             crate::mes_boot::run(&source, &nyacc, &stage0, &ctx.out).map_err(err)?;
         } else if let Some(o) = step.get("copyFiles") {
             let dest = ctx.expand(&field(o, "dest")?).map_err(err)?;
-            for f in ctx.expand_all(&strs(o, "files")?).map_err(err)? {
+            for f in ctx
+                .expand_all(&string_array(o, "files").map_err(err)?)
+                .map_err(err)?
+            {
                 copy_file_writable(Path::new(&f), Path::new(&dest)).map_err(err)?;
             }
         } else if let Some(o) = step.get("copyTree") {
@@ -3144,9 +3484,30 @@ pub fn run_mesboot() -> Result<(), String> {
             let dest = ctx.expand(&field(o, "dest")?).map_err(err)?;
             copy_tree_writable(Path::new(&from), Path::new(&dest)).map_err(err)?;
         } else if let Some(o) = step.get("stageRuntimeClosure") {
-            let roots = ctx.expand_data_all(&strs(o, "roots")?).map_err(err)?;
+            let roots = ctx
+                .expand_data_all(&string_array(o, "roots").map_err(err)?)
+                .map_err(err)?;
             let dest = ctx.expand(&field(o, "dest")?).map_err(err)?;
             stage_runtime_closure(&ctx.inputs, &ctx.payloads, &roots, Path::new(&dest))
+                .map_err(err)?;
+        } else if let Some(o) = step.get("compileApplicationTables") {
+            let names = string_array(o, "names").map_err(err)?;
+            let packages = ctx
+                .expand_data_all(&string_array(o, "packages").map_err(err)?)
+                .map_err(err)?;
+            let runtimes = ctx
+                .expand_data_all(&string_array(o, "runtimes").map_err(err)?)
+                .map_err(err)?;
+            let registry = ctx.expand(&field(o, "registry")?).map_err(err)?;
+            let launcher = ctx.expand(&field(o, "launcher")?).map_err(err)?;
+            compile_application_tables(
+                &names,
+                &packages,
+                &runtimes,
+                &ctx.payloads,
+                Path::new(&registry),
+                Path::new(&launcher),
+            )
                 .map_err(err)?;
         } else if let Some(o) = step.get("packErofs") {
             let root = ctx.expand(&field(o, "root")?).map_err(err)?;
@@ -3210,7 +3571,10 @@ pub fn run_mesboot() -> Result<(), String> {
             relocate_ld_scripts(Path::new(&dir), &prefix).map_err(err)?;
         } else if let Some(o) = step.get("require") {
             let exec = o.get("exec").is_some_and(Json::is_true);
-            for p in ctx.expand_all(&strs(o, "paths")?).map_err(err)? {
+            for p in ctx
+                .expand_all(&string_array(o, "paths").map_err(err)?)
+                .map_err(err)?
+            {
                 let meta = fs::metadata(&p)
                     .map_err(|_| err(format!("required product missing: {p}")))?;
                 if exec && (!meta.is_file() || meta.permissions().mode() & 0o111 == 0) {
@@ -3222,7 +3586,10 @@ pub fn run_mesboot() -> Result<(), String> {
             // static ELF -- no host loader (PT_INTERP), no host libc (DT_NEEDED),
             // no run-path. A dynamically linked tcc/make/yacc would pull a host
             // loader + glibc in at run time; fail closed here naming the leak.
-            for p in ctx.expand_all(&strs(o, "paths")?).map_err(err)? {
+            for p in ctx
+                .expand_all(&string_array(o, "paths").map_err(err)?)
+                .map_err(err)?
+            {
                 crate::elf::assert_static(Path::new(&p)).map_err(err)?;
             }
         } else if let Some(o) = step.get("validateStaticApplication") {
@@ -3266,6 +3633,19 @@ pub fn run_mesboot() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn compact_mesboot_dispatch() -> String {
+        let source = include_str!("build.rs");
+        let (_, dispatch) = source
+            .split_once("    for (i, step) in steps.iter().enumerate() {")
+            .expect("mesboot dispatch must remain identifiable");
+        let (dispatch, _) = dispatch
+            .split_once("\n    Ok(())\n}")
+            .expect("mesboot dispatch must remain bounded");
+        crate::affected::strip_line_comments(dispatch)
+            .split_whitespace()
+            .collect()
+    }
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
 
@@ -3731,8 +4111,15 @@ mod tests {
         .unwrap()
         .to_keyfile();
         let spec_encoded = Json::Str(spec.clone()).to_canonical();
-        materialize_application_metadata_at(&directory, Some(&encoded), Some(&spec_encoded))
-            .unwrap();
+        let launcher = "firefox\tFirefox\tbrowser web\n";
+        let launcher_encoded = Json::Str(launcher.into()).to_canonical();
+        materialize_application_metadata_at(
+            &directory,
+            Some(&encoded),
+            Some(&spec_encoded),
+            Some(&launcher_encoded),
+        )
+        .unwrap();
         let path = directory.join("manifest");
         assert_eq!(fs::read_to_string(&path).unwrap(), text);
         assert_eq!(
@@ -3745,6 +4132,12 @@ mod tests {
             fs::metadata(&spec_path).unwrap().permissions().mode() & 0o777,
             0o644
         );
+        let launcher_path = directory.join("exports/launcher.tsv");
+        assert_eq!(fs::read_to_string(&launcher_path).unwrap(), launcher);
+        assert_eq!(
+            fs::metadata(&launcher_path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
         let error = write_application_metadata_file(&directory, "manifest", text).unwrap_err();
         assert!(
             error.contains("reserved for builder-authenticated metadata"),
@@ -3753,26 +4146,49 @@ mod tests {
 
         let plain = directory.join("plain");
         fs::create_dir_all(&plain).unwrap();
-        materialize_application_metadata_at(&plain, None, None).unwrap();
+        materialize_application_metadata_at(&plain, None, None, None).unwrap();
         fs::write(plain.join("manifest"), "provenance=source\n").unwrap();
-        let error = materialize_application_metadata_at(&plain, None, None).unwrap_err();
+        let error = materialize_application_metadata_at(&plain, None, None, None).unwrap_err();
         assert!(error.contains("undeclared application metadata"), "{error}");
         let plain_spec = directory.join("plain-spec");
         fs::create_dir_all(&plain_spec).unwrap();
         fs::write(plain_spec.join("spec"), "format=1\n").unwrap();
-        let error = materialize_application_metadata_at(&plain_spec, None, None).unwrap_err();
+        let error = materialize_application_metadata_at(&plain_spec, None, None, None).unwrap_err();
         assert!(error.contains("undeclared application metadata"), "{error}");
+        let plain_launcher = directory.join("plain-launcher");
+        fs::create_dir_all(plain_launcher.join("exports")).unwrap();
+        fs::write(plain_launcher.join("exports/launcher.tsv"), launcher).unwrap();
+        let error =
+            materialize_application_metadata_at(&plain_launcher, None, None, None).unwrap_err();
+        assert!(error.contains("undeclared application metadata"), "{error}");
+        let linked_exports = directory.join("linked-exports");
+        let linked_exports_target = directory.join("linked-exports-target");
+        fs::create_dir_all(&linked_exports).unwrap();
+        fs::create_dir_all(&linked_exports_target).unwrap();
+        std::os::unix::fs::symlink(&linked_exports_target, linked_exports.join("exports")).unwrap();
+        let error =
+            materialize_application_metadata_at(&linked_exports, None, None, None).unwrap_err();
+        assert!(error.contains("exports is a symlink"), "{error}");
 
         let missing = directory.join("missing");
-        let error =
-            materialize_application_metadata_at(&missing, Some(&encoded), Some(&spec_encoded))
-                .unwrap_err();
+        let error = materialize_application_metadata_at(
+            &missing,
+            Some(&encoded),
+            Some(&spec_encoded),
+            Some(&launcher_encoded),
+        )
+        .unwrap_err();
         assert!(error.contains("stat application output"), "{error}");
         let file = directory.join("file-output");
         fs::write(&file, "not a directory").unwrap();
-        materialize_application_metadata_at(&file, None, None).unwrap();
-        let error = materialize_application_metadata_at(&file, Some(&encoded), Some(&spec_encoded))
-            .unwrap_err();
+        materialize_application_metadata_at(&file, None, None, None).unwrap();
+        let error = materialize_application_metadata_at(
+            &file,
+            Some(&encoded),
+            Some(&spec_encoded),
+            Some(&launcher_encoded),
+        )
+        .unwrap_err();
         assert!(error.contains("is not a directory"), "{error}");
 
         let linked_target = directory.join("linked-target");
@@ -3783,6 +4199,7 @@ mod tests {
             &linked_output,
             Some(&encoded),
             Some(&spec_encoded),
+            Some(&launcher_encoded),
         )
         .unwrap_err();
         assert!(error.contains("is not a directory"), "{error}");
@@ -3796,9 +4213,211 @@ mod tests {
         let error =
             decode_application_spec(&Json::Str(format!("#\n{spec}")).to_canonical()).unwrap_err();
         assert!(error.contains("TD_APPLICATION_SPEC"), "{error}");
-        let error = materialize_application_metadata_at(&other, Some(&encoded), None).unwrap_err();
-        assert!(error.contains("requires both"), "{error}");
+        let error =
+            materialize_application_metadata_at(&other, Some(&encoded), None, None).unwrap_err();
+        assert!(error.contains("requires the manifest"), "{error}");
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn application_tables_bind_exports_to_exact_package_paths() {
+        let directory =
+            std::env::temp_dir().join(format!("td-application-tables-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        let store = directory.join("store");
+        let package = store.join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ripgrep-seed-15.2.0");
+        fs::create_dir_all(package.join("exports")).unwrap();
+        let manifest =
+            td_engine::application::ApplicationDeclaration::new("empty-runtime", "/app/bin/rg")
+                .unwrap()
+                .manifest(
+                    "ripgrep-seed",
+                    "15.2.0",
+                    td_engine::application::ApplicationProvenance::Foreign,
+                )
+                .unwrap();
+        let spec = td_engine::application_spec::ApplicationSpec::compile(
+            &manifest,
+            "/td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-empty-runtime-1",
+            td_engine::permissions::PermissionPolicy::new(),
+        )
+        .unwrap();
+        let launcher =
+            td_engine::launcher::LauncherDeclaration::new("Ripgrep", &["ripgrep", "rg", "search"])
+                .unwrap()
+                .bind("ripgrep-seed")
+                .unwrap();
+        fs::write(package.join("manifest"), manifest.to_keyfile()).unwrap();
+        fs::write(package.join("spec"), spec.to_keyfile()).unwrap();
+        fs::write(package.join("exports/launcher.tsv"), launcher.to_tsv()).unwrap();
+
+        let registry = directory.join("image/etc/td-applications.tsv");
+        let table = directory.join("image/etc/td-launcher.tsv");
+        let payloads = vec![
+            (
+                "ripgrep-seed".into(),
+                package.to_string_lossy().into_owned(),
+            ),
+            (
+                "empty-runtime".into(),
+                "/td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-empty-runtime-1".into(),
+            ),
+        ];
+        compile_application_tables_in(
+            &["ripgrep-seed".into()],
+            &[package.to_string_lossy().into_owned()],
+            &["/td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-empty-runtime-1".into()],
+            &payloads,
+            &registry,
+            &table,
+            &store.to_string_lossy(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&registry).unwrap(),
+            format!("ripgrep-seed\t{}\n", package.display())
+        );
+        assert_eq!(
+            fs::read_to_string(&table).unwrap(),
+            "ripgrep-seed\tRipgrep\tripgrep rg search\n"
+        );
+        assert_eq!(
+            fs::metadata(&registry).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        let missing_runtime_registry = directory.join("missing-runtime/registry.tsv");
+        let missing_runtime_table = directory.join("missing-runtime/launcher.tsv");
+        let error = compile_application_tables_in(
+            &["ripgrep-seed".into()],
+            &[package.to_string_lossy().into_owned()],
+            &["/td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-empty-runtime-1".into()],
+            std::slice::from_ref(payloads.first().unwrap()),
+            &missing_runtime_registry,
+            &missing_runtime_table,
+            &store.to_string_lossy(),
+        )
+        .unwrap_err();
+        assert!(error.contains("is not a declared payload"), "{error}");
+
+        let mismatched_runtime =
+            "/td/store/cccccccccccccccccccccccccccccccc-other-runtime-1".to_string();
+        let mut mismatched_payloads = payloads.clone();
+        mismatched_payloads.push(("other-runtime".into(), mismatched_runtime.clone()));
+        let error = compile_application_tables_in(
+            &["ripgrep-seed".into()],
+            &[package.to_string_lossy().into_owned()],
+            &[mismatched_runtime],
+            &mismatched_payloads,
+            &directory.join("mismatched-runtime/registry.tsv"),
+            &directory.join("mismatched-runtime/launcher.tsv"),
+            &store.to_string_lossy(),
+        )
+        .unwrap_err();
+        assert!(error.contains("not selected runtime"), "{error}");
+
+        let error = compile_application_tables_in(
+            &["catalog-stem".into()],
+            &[package.to_string_lossy().into_owned()],
+            &["/td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-empty-runtime-1".into()],
+            &payloads,
+            &directory.join("mismatched-name/registry.tsv"),
+            &directory.join("mismatched-name/launcher.tsv"),
+            &store.to_string_lossy(),
+        )
+        .unwrap_err();
+        assert!(error.contains("selected=\"catalog-stem\""), "{error}");
+
+        let noncanonical_registry = directory.join("noncanonical/registry.tsv");
+        let noncanonical_table = directory.join("noncanonical/launcher.tsv");
+        fs::write(
+            package.join("manifest"),
+            format!("# comment\n{}", manifest.to_keyfile()),
+        )
+        .unwrap();
+        let error = compile_application_tables_in(
+            &["ripgrep-seed".into()],
+            &[package.to_string_lossy().into_owned()],
+            &["/td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-empty-runtime-1".into()],
+            &payloads,
+            &noncanonical_registry,
+            &noncanonical_table,
+            &store.to_string_lossy(),
+        )
+        .unwrap_err();
+        assert!(error.contains("metadata is not canonical"), "{error}");
+        fs::write(package.join("manifest"), manifest.to_keyfile()).unwrap();
+
+        let second_registry = directory.join("second/registry.tsv");
+        let second_table = directory.join("second/launcher.tsv");
+        fs::remove_file(package.join("exports/launcher.tsv")).unwrap();
+        std::os::unix::fs::symlink(
+            directory.join("image/etc/td-launcher.tsv"),
+            package.join("exports/launcher.tsv"),
+        )
+        .unwrap();
+        let error = compile_application_tables_in(
+            &["ripgrep-seed".into()],
+            &[package.to_string_lossy().into_owned()],
+            &["/td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-empty-runtime-1".into()],
+            &payloads,
+            &second_registry,
+            &second_table,
+            &store.to_string_lossy(),
+        )
+        .unwrap_err();
+        assert!(error.contains("traverses a symlink"), "{error}");
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn mesboot_string_arrays_refuse_non_strings() {
+        let object = Json::Obj(vec![(
+            "packages".into(),
+            Json::Arr(vec![Json::Str("package".into()), Json::Bool(false)]),
+        )]);
+        let error = string_array(&object, "packages").unwrap_err();
+        assert_eq!(error, "`packages' contains a non-string");
+    }
+
+    #[test]
+    fn every_mesboot_string_array_error_gets_its_step_number() {
+        let compact = compact_mesboot_dispatch();
+        assert_eq!(
+            compact.match_indices("string_array(o,").count(),
+            8,
+            "every production array call must remain pinned"
+        );
+        for (field, count) in [
+            ("argv", 1),
+            ("files", 1),
+            ("roots", 1),
+            ("names", 1),
+            ("packages", 1),
+            ("runtimes", 1),
+            ("paths", 2),
+        ] {
+            let site = format!("string_array(o,\"{field}\").map_err(err)?");
+            assert_eq!(
+                compact.match_indices(&site).count(),
+                count,
+                "array field {field:?} bypasses or duplicates the numbered wrapper"
+            );
+        }
+    }
+
+    #[test]
+    fn source_site_audits_ignore_line_comments_and_layout() {
+        let source = "// ctx.expand_data string_array(o,\"fake\")\n\
+                      string_array( o,\n \"roots\" )\n .map_err(err)?;";
+        let compact: String = crate::affected::strip_line_comments(source)
+            .split_whitespace()
+            .collect();
+        assert!(!compact.contains("ctx.expand_data"), "{compact}");
+        assert_eq!(
+            compact,
+            "string_array(o,\"roots\").map_err(err)?;"
+        );
     }
 
     #[test]
@@ -3967,45 +4586,37 @@ mod tests {
     /// `expand_data` resolving `{payload:}` is the whole permission §B.8 grants,
     /// and the compiler has nothing to say about which expander a step picked — a
     /// new step that reached for it, or an existing one changed to, would widen
-    /// the channel with every other test in this file still green. Three sites, and
+    /// the channel with every other test in this file still green. Five sites, and
     /// which FIELD each serves, since `copyTree`'s `dest` taking it would put a
     /// payload path on the writable side of a copy.
     #[test]
-    fn only_the_three_typed_data_operations_use_the_data_expander() {
-        let src = include_str!("build.rs");
-        let shipped = match src.find("\n#[cfg(test)]\nmod tests {") {
-            Some(at) => src.get(..at).unwrap_or(src),
-            None => src,
-        };
-        let calls: Vec<&str> = shipped
-            .lines()
-            .map(str::trim)
-            .filter(|l| l.contains("ctx.expand_data"))
-            .collect();
+    fn only_the_five_typed_data_fields_use_the_data_expander() {
+        let compact = compact_mesboot_dispatch();
+        let sites = [
+            "ctx.expand_data(&field(o,\"input\")?)",
+            "ctx.expand_data(&field(o,\"from\")?)",
+            "ctx.expand_data_all(&string_array(o,\"roots\").map_err(err)?)",
+            "ctx.expand_data_all(&string_array(o,\"packages\").map_err(err)?)",
+            "ctx.expand_data_all(&string_array(o,\"runtimes\").map_err(err)?)",
+        ];
         assert_eq!(
-            calls.len(),
-            3,
-            "only unpack's `input', copyTree's `from', and stageRuntimeClosure's \
-             `roots' may resolve a payload (APPLICATIONS.md section B.8): {calls:?}"
+            compact.match_indices("ctx.expand_data").count(),
+            5,
+            "only unpack's `input', copyTree's `from', stageRuntimeClosure's `roots', \
+             and compileApplicationTables' `packages' and `runtimes' may resolve a payload \
+             (APPLICATIONS.md section B.8)"
         );
+        let positions: Vec<usize> = sites
+            .iter()
+            .map(|site| {
+                compact
+                    .find(site)
+                    .unwrap_or_else(|| panic!("missing exact data-expander site {site:?}"))
+            })
+            .collect();
         assert!(
-            calls.first().is_some_and(|l| l.contains("\"input\"")),
-            "the first data site must be unpack's `input': {calls:?}"
-        );
-        assert!(
-            calls.get(1).is_some_and(|l| l.contains("\"from\"")),
-            "the second data site must be copyTree's `from': {calls:?}"
-        );
-        assert!(
-            calls.get(2).is_some_and(|l| l.contains("\"roots\"")),
-            "the third must be stageRuntimeClosure's `roots': {calls:?}"
-        );
-        // The scan is only worth anything if it can SEE the call sites — a renamed
-        // helper or a moved test module would leave it counting zero and passing
-        // for the wrong reason.
-        assert!(
-            shipped.contains("fn expand_data") && shipped.len() < src.len(),
-            "the shipped-half split stopped working"
+            positions.windows(2).all(|pair| pair.first() < pair.get(1)),
+            "the five data-expander fields changed order: {positions:?}"
         );
     }
 

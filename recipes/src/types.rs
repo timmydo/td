@@ -21,6 +21,7 @@
 
 use crate::application::ApplicationDeclaration;
 use crate::json::Json;
+use td_engine::launcher::LauncherDeclaration;
 use td_engine::permissions::PermissionPolicy;
 
 fn vs(xs: &[&str]) -> Vec<String> {
@@ -130,6 +131,16 @@ pub enum Step {
     StageRuntimeClosure {
         roots: Vec<String>,
         dest: String,
+    },
+    /// Compile builder-authenticated package exports into the image's resolver
+    /// registry and compositor launcher table. Expected names are literal
+    /// labels; package and runtime paths use the data channel.
+    CompileApplicationTables {
+        names: Vec<String>,
+        packages: Vec<String>,
+        runtimes: Vec<String>,
+        registry: String,
+        launcher: String,
     },
     /// Pack `root` as a deterministic EROFS image at `output` using the
     /// control-plane engine's dependency-free image writer.
@@ -350,6 +361,22 @@ impl Step {
                 Json::Obj(vec![
                     ("roots".into(), arr(roots)),
                     ("dest".into(), Json::Str(dest.clone())),
+                ]),
+            )]),
+            Step::CompileApplicationTables {
+                names,
+                packages,
+                runtimes,
+                registry,
+                launcher,
+            } => Json::Obj(vec![(
+                "compileApplicationTables".into(),
+                Json::Obj(vec![
+                    ("names".into(), arr(names)),
+                    ("packages".into(), arr(packages)),
+                    ("runtimes".into(), arr(runtimes)),
+                    ("registry".into(), Json::Str(registry.clone())),
+                    ("launcher".into(), Json::Str(launcher.clone())),
                 ]),
             )]),
             Step::PackErofs { root, output } => Json::Obj(vec![(
@@ -843,6 +870,9 @@ pub struct Recipe {
     /// final Recipe and materializes `{out}/manifest` for application-capable
     /// build systems; bootstrap trust-root systems refuse the declaration.
     pub application: Option<ApplicationDeclaration>,
+    /// Authored launcher presentation. The derivation assembler binds the final
+    /// recipe name and materializes the canonical export beside the manifest.
+    pub application_launcher: Option<LauncherDeclaration>,
     /// Immutable permission defaults compiled into the jail spec. Kept beside,
     /// not inside, the package manifest because an operator override has a
     /// separate lifecycle and the manifest is not a mount plan.
@@ -918,6 +948,7 @@ impl Recipe {
             native_inputs: None,
             payload_inputs: None,
             application: None,
+            application_launcher: None,
             application_permissions: None,
             steps: None,
             configure_flags: None,
@@ -974,14 +1005,19 @@ impl Recipe {
         self
     }
     /// Declare DATA inputs — see `Recipe::payload_inputs`. A path named here is
-    /// staged for `Unpack`/`CopyTree`/`StageRuntimeClosure` to read and is
-    /// unreachable from any step that runs a command.
+    /// staged for `Unpack`, `CopyTree`, `StageRuntimeClosure`, or
+    /// `CompileApplicationTables` to read and has no name in command-step
+    /// template expansion.
     pub fn payload_inputs(mut self, xs: &[&str]) -> Recipe {
         self.payload_inputs = Some(vs(xs));
         self
     }
     pub fn application(mut self, declaration: ApplicationDeclaration) -> Recipe {
         self.application = Some(declaration);
+        self
+    }
+    pub fn application_launcher(mut self, launcher: LauncherDeclaration) -> Recipe {
+        self.application_launcher = Some(launcher);
         self
     }
     pub fn application_permissions(mut self, permissions: PermissionPolicy) -> Recipe {
@@ -1188,6 +1224,9 @@ impl Recipe {
         }
         if let Some(application) = &self.application {
             o.push(("application".into(), application.to_json()));
+        }
+        if let Some(launcher) = &self.application_launcher {
+            o.push(("applicationLauncher".into(), launcher.to_json()));
         }
         if let Some(permissions) = &self.application_permissions {
             o.push((

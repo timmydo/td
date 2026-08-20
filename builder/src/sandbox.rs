@@ -92,7 +92,14 @@ fn configure_builder_env(
     } else {
         None
     };
-    if (application_manifest.is_some() || application_spec.is_some())
+    let application_launcher = if trusted_recipe_builder(builder) {
+        unique_env(env, "TD_APPLICATION_LAUNCHER")?
+    } else {
+        None
+    };
+    if (application_manifest.is_some()
+        || application_spec.is_some()
+        || application_launcher.is_some())
         && application_policy.is_none()
     {
         return Err(err(
@@ -100,12 +107,16 @@ fn configure_builder_env(
                 .to_string(),
         ));
     }
-    if application_manifest.is_some() != application_spec.is_some() {
+    if application_manifest.is_some() != application_spec.is_some()
+        || application_manifest.is_some() != application_launcher.is_some()
+    {
         return Err(err(
-            "application metadata requires both manifest and compiled spec".to_string(),
+            "application metadata requires manifest, compiled spec and launcher export".to_string(),
         ));
     }
-    if (application_manifest.is_some() || application_spec.is_some())
+    if (application_manifest.is_some()
+        || application_spec.is_some()
+        || application_launcher.is_some())
         && application_policy == Some(ApplicationManifestPolicy::Reserve)
     {
         return Err(err(
@@ -124,7 +135,7 @@ fn configure_builder_env(
         } else if application_policy.is_some()
             && matches!(
                 key.as_str(),
-                "TD_APPLICATION_MANIFEST" | "TD_APPLICATION_SPEC"
+                "TD_APPLICATION_MANIFEST" | "TD_APPLICATION_SPEC" | "TD_APPLICATION_LAUNCHER"
             )
         {
             continue;
@@ -208,7 +219,8 @@ fn finalize_application_output(
     let Some(policy) = application_manifest_policy(drv) else {
         if trusted_recipe_builder(&drv.builder)
             && (unique_drv_env(drv, "TD_APPLICATION_MANIFEST")?.is_some()
-                || unique_drv_env(drv, "TD_APPLICATION_SPEC")?.is_some())
+                || unique_drv_env(drv, "TD_APPLICATION_SPEC")?.is_some()
+                || unique_drv_env(drv, "TD_APPLICATION_LAUNCHER")?.is_some())
         {
             return Err(err(
                 "trusted td-builder invocation with application metadata has no metadata policy"
@@ -219,12 +231,15 @@ fn finalize_application_output(
     };
     let manifest = unique_drv_env(drv, "TD_APPLICATION_MANIFEST")?;
     let spec = unique_drv_env(drv, "TD_APPLICATION_SPEC")?;
-    if manifest.is_some() != spec.is_some() {
+    let launcher = unique_drv_env(drv, "TD_APPLICATION_LAUNCHER")?;
+    if manifest.is_some() != spec.is_some() || manifest.is_some() != launcher.is_some() {
         return Err(err(
-            "application metadata requires both manifest and compiled spec".to_string(),
+            "application metadata requires manifest, compiled spec and launcher export".to_string(),
         ));
     }
-    if policy == ApplicationManifestPolicy::Reserve && (manifest.is_some() || spec.is_some()) {
+    if policy == ApplicationManifestPolicy::Reserve
+        && (manifest.is_some() || spec.is_some() || launcher.is_some())
+    {
         return Err(err(
             "non-application phase received application metadata".to_string(),
         ));
@@ -250,24 +265,25 @@ fn finalize_application_output(
         .map(|(_, path)| path);
     for (name, path) in outputs {
         if name != "out" {
-            crate::build::materialize_application_metadata_at(path, None, None)
+            crate::build::materialize_application_metadata_at(path, None, None, None)
                 .map_err(|error| err(format!("application metadata finalization: {error}")))?;
         }
     }
-    let (out_manifest, out_spec) = if policy == ApplicationManifestPolicy::Materialize {
-        (manifest, spec)
+    let (out_manifest, out_spec, out_launcher) = if policy == ApplicationManifestPolicy::Materialize
+    {
+        (manifest, spec, launcher)
     } else {
-        (None, None)
+        (None, None, None)
     };
-    match (out, out_manifest, out_spec) {
-        (Some(path), manifest, spec) => {
-            crate::build::materialize_application_metadata_at(path, manifest, spec)
+    match (out, out_manifest, out_spec, out_launcher) {
+        (Some(path), manifest, spec, launcher) => {
+            crate::build::materialize_application_metadata_at(path, manifest, spec, launcher)
                 .map_err(|error| err(format!("application metadata finalization: {error}")))
         }
-        (None, Some(_), Some(_)) => Err(err(
+        (None, Some(_), Some(_), Some(_)) => Err(err(
             "application declaration requires an `out' output".to_string()
         )),
-        (None, None, None) => Ok(()),
+        (None, None, None, None) => Ok(()),
         _ => Err(err("application metadata is incomplete".to_string())),
     }
 }
@@ -1610,11 +1626,18 @@ mod tests {
         .to_keyfile();
         let application = crate::json::Json::Str(manifest.to_keyfile()).to_canonical();
         let application_spec = crate::json::Json::Str(application_spec).to_canonical();
+        let application_launcher =
+            crate::json::Json::Str("application\tApplication\tapplication fixture\n".into())
+                .to_canonical();
         assert!(application.len() > 12_000);
         let env = vec![
             ("TD_INPUT_MAP".to_string(), "{}".to_string()),
             ("TD_APPLICATION_MANIFEST".to_string(), application.clone()),
             ("TD_APPLICATION_SPEC".to_string(), application_spec.clone()),
+            (
+                "TD_APPLICATION_LAUNCHER".to_string(),
+                application_launcher.clone(),
+            ),
             ("TD_STEPS".to_string(), large.clone()),
         ];
         let mut command = Command::new(&builder);
@@ -1653,6 +1676,12 @@ mod tests {
                 .get_envs()
                 .all(|(key, _)| key != std::ffi::OsStr::new("TD_APPLICATION_SPEC")),
             "the compiled spec must stay in the outer sandbox too"
+        );
+        assert!(
+            command
+                .get_envs()
+                .all(|(key, _)| key != std::ffi::OsStr::new("TD_APPLICATION_LAUNCHER")),
+            "the launcher export must stay in the outer sandbox too"
         );
         assert!(
             command.get_envs().any(|(key, value)| {
@@ -1705,6 +1734,10 @@ mod tests {
         assert!(other_builder.get_envs().any(|(key, value)| {
             key == std::ffi::OsStr::new("TD_APPLICATION_SPEC")
                 && value == Some(std::ffi::OsStr::new(application_spec.as_str()))
+        }));
+        assert!(other_builder.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new("TD_APPLICATION_LAUNCHER")
+                && value == Some(std::ffi::OsStr::new(application_launcher.as_str()))
         }));
         let mut untrusted_td_builder = Command::new("/td/store/other/bin/td-builder");
         untrusted_td_builder.env_clear();
@@ -1881,7 +1914,7 @@ mod tests {
             build_production
                 .matches("write_application_metadata_file(")
                 .count(),
-            3,
+            4,
             "only the materializer may call the fixed metadata writer"
         );
     }
@@ -1913,11 +1946,14 @@ mod tests {
         .to_keyfile();
         let encoded = crate::json::Json::Str(text.clone()).to_canonical();
         let encoded_spec = crate::json::Json::Str(spec_text.clone()).to_canonical();
+        let launcher_text = "application\tApplication\tapplication fixture\n";
+        let encoded_launcher = crate::json::Json::Str(launcher_text.into()).to_canonical();
         let drv = phase_drv(
             "autotools-build",
             vec![
                 ("TD_APPLICATION_MANIFEST".into(), encoded),
                 ("TD_APPLICATION_SPEC".into(), encoded_spec),
+                ("TD_APPLICATION_LAUNCHER".into(), encoded_launcher),
             ],
         );
         finalize_application_output(&drv, &[("out".into(), directory.clone())]).unwrap();
@@ -1926,6 +1962,10 @@ mod tests {
             fs::read_to_string(directory.join("spec")).unwrap(),
             spec_text
         );
+        assert_eq!(
+            fs::read_to_string(directory.join("exports/launcher.tsv")).unwrap(),
+            launcher_text
+        );
 
         let duplicate = phase_drv(
             "autotools-build",
@@ -1933,6 +1973,7 @@ mod tests {
                 ("TD_APPLICATION_MANIFEST".into(), "one".into()),
                 ("TD_APPLICATION_MANIFEST".into(), "two".into()),
                 ("TD_APPLICATION_SPEC".into(), "spec".into()),
+                ("TD_APPLICATION_LAUNCHER".into(), "launcher".into()),
             ],
         );
         let other = directory.join("duplicate");

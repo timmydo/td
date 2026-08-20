@@ -101,6 +101,17 @@ struct User {
     passwordless: bool,
 }
 
+/// One application selected into this immutable deployment. The package is a
+/// data input: image composition may copy and read its authenticated export,
+/// but no recipe command receives its path.
+struct ShippedApplication {
+    /// Builder-authenticated recipe identity and `/bin` launcher key. This is
+    /// distinct from `package`, which is a catalog dependency key.
+    name: &'static str,
+    package: &'static str,
+    runtime: &'static str,
+}
+
 /// The distro definition. EDIT THIS to tailor the system, then rebuild and
 /// `td-recipe-eval run`.
 struct SystemDef {
@@ -114,7 +125,14 @@ struct SystemDef {
     /// `passwordless` — `system_def_is_self_consistent` holds that.
     autologin: &'static str,
     users: &'static [User],
+    applications: &'static [ShippedApplication],
 }
+
+const APPLICATION_PACKAGE_ROOT: &str = "/td/store";
+const APPLICATION_STATE_ROOT: &str = ".td/app";
+const APPLICATION_REGISTRY: &str = "/etc/td-applications.tsv";
+const APPLICATION_LAUNCHER_TABLE: &str = "/etc/td-launcher.tsv";
+const APPLICATION_CONFIG: &str = "/etc/td-app.conf";
 
 /// Account names are embedded UNQUOTED in generated root shell — `/bin/su -s /bin/sh
 /// <name> -c …` in rootcheck and every health leg, and `/bin/login -f <name>` in
@@ -189,6 +207,10 @@ const SYSTEM: SystemDef = SystemDef {
             passwordless: true,
         },
     ],
+    // Rung 7 establishes the image contract while the jail is still absent.
+    // The first package is selected only after /bin/td-jail is a confinement
+    // boundary; until then no application-shaped path is exposed on the image.
+    applications: &[],
 };
 
 const UI_USER: &str = "tester";
@@ -196,7 +218,8 @@ const UI_UID: u32 = 1000;
 const UI_GID: u32 = 1000;
 // ────────────────────────────────────────────────────────────────────────────────
 
-/// The real-root `/bin` is a symlink farm split across SIX binaries, each dispatching
+/// The real-root `/bin` is split across six closed applet farms plus the
+/// open-ended application farm. The closed farms dispatch
 /// on argv[0]'s basename except td-sh, which answers to both its names with one
 /// program: the static Rust **td-sh** (the shell — see `TD_SH_APPLETS`), the static
 /// Rust **td-init** (the boot glue and the tty setup — see `TD_INIT_FARM`), the static
@@ -206,7 +229,8 @@ const UI_GID: u32 = 1000;
 /// file/text userland — #547's cutover). A name goes in exactly one list;
 /// `shape_check` asserts the owning binary actually provides it.
 ///
-/// SIX rather than seven because BUSYBOX IS GONE. `getty` was the last name it held,
+/// The application farm is empty until the jail exists. BusyBox is gone: `getty` was
+/// the last name it held,
 /// and it moved to td-init with the `TCGETS`/`TCSETS` amendment that lets the multicall
 /// set a line's speed and put it back in canonical mode. The binary went with the name:
 /// nothing packs it, `/bin/busybox` is not a symlink any more, and
@@ -2144,6 +2168,31 @@ fn build_mutable_state() -> String {
     s
 }
 
+fn build_application_config() -> String {
+    format!(
+        "format=1\npackage-root={APPLICATION_PACKAGE_ROOT}\nstate-root={APPLICATION_STATE_ROOT}\n\
+         registry={APPLICATION_REGISTRY}\nlauncher-table={APPLICATION_LAUNCHER_TABLE}\n"
+    )
+}
+
+fn application_etc_name(path: &'static str) -> &'static str {
+    match path.strip_prefix("/etc/") {
+        Some(name) => name,
+        None => path,
+    }
+}
+
+fn application_payload_inputs(sys: &SystemDef) -> Vec<&'static str> {
+    let mut inputs: Vec<&str> = sys
+        .applications
+        .iter()
+        .flat_map(|application| [application.package, application.runtime])
+        .collect();
+    inputs.sort_unstable();
+    inputs.dedup();
+    inputs
+}
+
 /// The generated /etc files (config + the login-glue and boot-check scripts). `exec`
 /// marks the ones getty/init reference as executables. Shared by the real-root staging
 /// (written under `{root}/real-root/etc`) and the shape check (which asserts they landed).
@@ -2155,6 +2204,11 @@ fn etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
         ("hostname", format!("{}\n", sys.hostname), false),
         ("os-release", build_os_release(sys), false),
         ("mutable-state", build_mutable_state(), false),
+        (
+            application_etc_name(APPLICATION_CONFIG),
+            build_application_config(),
+            false,
+        ),
         ("inittab", build_inittab(), false),
         (td_svc_conf_etc_name(), build_td_svc_conf(), false),
         ("profile", build_profile(sys), false),
@@ -2371,14 +2425,39 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     // sshd additionally pulls the aws-lc crypto C lib. The engine admits only direct recipe
     // inputs, so a Rust bootstrap or other build-only reference fails closed rather than
     // entering the EROFS image.
+    let mut runtime_roots = vec![
+        "{in:uutils}".into(),
+        "{in:ripgrep}".into(),
+        "{in:fd}".into(),
+        "{in:sshd}".into(),
+    ];
+    runtime_roots.extend(
+        application_payload_inputs(sys)
+            .into_iter()
+            .map(|input| format!("{{payload:{input}}}")),
+    );
     steps.push(Step::StageRuntimeClosure {
-        roots: vec![
-            "{in:uutils}".into(),
-            "{in:ripgrep}".into(),
-            "{in:fd}".into(),
-            "{in:sshd}".into(),
-        ],
+        roots: runtime_roots,
         dest: "{root}/real-root".into(),
+    });
+    steps.push(Step::CompileApplicationTables {
+        names: sys
+            .applications
+            .iter()
+            .map(|application| application.name.to_string())
+            .collect(),
+        packages: sys
+            .applications
+            .iter()
+            .map(|application| format!("{{payload:{}}}", application.package))
+            .collect(),
+        runtimes: sys
+            .applications
+            .iter()
+            .map(|application| format!("{{payload:{}}}", application.runtime))
+            .collect(),
+        registry: format!("{{root}}/real-root{APPLICATION_REGISTRY}"),
+        launcher: format!("{{root}}/real-root{APPLICATION_LAUNCHER_TABLE}"),
     });
     // The shell. Two names, ONE static binary — td-sh is not a multicall and does not
     // dispatch on argv[0]; `ash` runs the same program `sh` does, which is what makes a
@@ -2402,6 +2481,12 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         steps.push(Step::Symlink {
             target: target.into(),
             link: format!("{{root}}/real-root/bin/{name}"),
+        });
+    }
+    for application in sys.applications {
+        steps.push(Step::Symlink {
+            target: "/bin/td-jail".into(),
+            link: format!("{{root}}/real-root/bin/{}", application.name),
         });
     }
     // /init is PID 1 on the real root, and it is td-init. switch_root execs it under the
@@ -2611,9 +2696,14 @@ fn shape_check() -> String {
      [ -f \"$root/init\" ] || [ -L \"$root/init\" ] || { echo 'root tree: /init missing' >&2; exit 1; }; \
      case $(readlink \"$root/init\") in /td/store/*) : ;; *) echo 'root tree: /init is not a symlink into /td/store' >&2; exit 1;; esac; \
      case $(readlink \"$root/bin/sh\") in /td/store/*) : ;; *) echo 'root tree: /bin/sh is not a symlink into /td/store - the store-native /bin farm regressed' >&2; exit 1;; esac; \
-     for f in passwd group shadow hostname os-release mutable-state inittab @TD_SVC_CONF_NAME@ profile autologin tty-session shutdown rootcheck netup bootsuccess bootfail; do \
+     for f in passwd group shadow hostname os-release mutable-state inittab @TD_SVC_CONF_NAME@ @APPLICATION_CONFIG_NAME@ profile autologin tty-session shutdown rootcheck netup bootsuccess bootfail; do \
          [ -f \"$root/etc/$f\" ] || { echo \"root tree: /etc/$f missing\" >&2; exit 1; }; \
          if [ -L \"$root/etc/$f\" ]; then echo \"root tree: /etc/$f is a symlink - immutable image config must be a regular file in the erofs, not a hole in the read-only /etc\" >&2; exit 1; fi; \
+     done; \
+     for f in @APPLICATION_REGISTRY_NAME@ @APPLICATION_LAUNCHER_NAME@; do \
+         [ -f \"$root/etc/$f\" ] || { echo \"root tree: /etc/$f missing - compileApplicationTables did not materialize the application image contract\" >&2; exit 1; }; \
+         if [ -L \"$root/etc/$f\" ]; then echo \"root tree: /etc/$f is a symlink - application selection must be immutable image content\" >&2; exit 1; fi; \
+         [ \"$(wc -l < \"$root/etc/$f\")\" -eq @APPLICATION_COUNT@ ] || { echo \"root tree: /etc/$f does not have one row per shipped application\" >&2; exit 1; }; \
      done; \
      for pair in @MUTABLE_ETC@; do \
          l=${pair%%=*}; t=${pair#*=}; \
@@ -2788,6 +2878,19 @@ fn shape_check() -> String {
         .replace("@TD_SVC_UNITS@", &TD_SVC_UNITS.join(" "))
         .replace("@TD_SVC_CONF@", TD_SVC_CONF)
         .replace("@TD_SVC_CONF_NAME@", td_svc_conf_etc_name())
+        .replace(
+            "@APPLICATION_CONFIG_NAME@",
+            application_etc_name(APPLICATION_CONFIG),
+        )
+        .replace(
+            "@APPLICATION_REGISTRY_NAME@",
+            application_etc_name(APPLICATION_REGISTRY),
+        )
+        .replace(
+            "@APPLICATION_LAUNCHER_NAME@",
+            application_etc_name(APPLICATION_LAUNCHER_TABLE),
+        )
+        .replace("@APPLICATION_COUNT@", &SYSTEM.applications.len().to_string())
 
         // `<etc path>=<target>` pairs, and the etc paths alone. Both lists are
         // space-joined and unquoted in the script, which
@@ -2972,7 +3075,7 @@ pub fn recipe() -> Recipe {
             .env("PATH", &post_bootstrap_path()),
     );
 
-    Recipe::mesboot("system-x86-64", "0.2")
+    let recipe = Recipe::mesboot("system-x86-64", "0.2")
         // busybox: a BUILD TOOL ONLY since `getty` moved to td-init — this recipe's own
         // steps run under `busybox sh` (POST_BOOTSTRAP_SH) and shape_check parses both
         // cpio archives with it. Nothing it provides is packed; `nothing_on_the_image_is_
@@ -3028,7 +3131,13 @@ pub fn recipe() -> Recipe {
             "td-seatd",
             "td-compositor",
         ])
-        .steps(steps)
+        .steps(steps);
+    let application_inputs = application_payload_inputs(&SYSTEM);
+    if application_inputs.is_empty() {
+        recipe
+    } else {
+        recipe.payload_inputs(&application_inputs)
+    }
 }
 
 #[cfg(test)]
@@ -3844,6 +3953,53 @@ mod tests {
                 );
             }
         }
+        assert!(
+            SYSTEM.applications.len() <= td_engine::launcher::MAX_APPLICATIONS,
+            "the image selects {} applications; the launcher/registry limit is {}",
+            SYSTEM.applications.len(),
+            td_engine::launcher::MAX_APPLICATIONS
+        );
+        for application in SYSTEM.applications {
+            assert!(
+                td_engine::application::validate_application_name(application.name).is_ok(),
+                "shipped application name {:?} is not a valid launcher key",
+                application.name
+            );
+            assert!(
+                td_engine::application::validate_application_name(application.package).is_ok(),
+                "shipped application package {:?} is not a plain catalog key",
+                application.package
+            );
+            assert_eq!(
+                SYSTEM
+                    .applications
+                    .iter()
+                    .filter(|candidate| candidate.name == application.name)
+                    .count(),
+                1,
+                "shipped application name {:?} must be unique",
+                application.name
+            );
+            assert_eq!(
+                SYSTEM
+                    .applications
+                    .iter()
+                    .filter(|candidate| candidate.package == application.package)
+                    .count(),
+                1,
+                "shipped application package {:?} must be unique",
+                application.package
+            );
+            assert!(
+                td_engine::application::validate_application_name(application.runtime).is_ok(),
+                "shipped application runtime {:?} is not a plain recipe key",
+                application.runtime
+            );
+            assert_ne!(
+                application.package, application.runtime,
+                "an application package and runtime must be distinct inputs"
+            );
+        }
     }
 
     /// The `tty` group's gid is written into the mount options in td-init and
@@ -4017,15 +4173,97 @@ mod tests {
     /// is not which static binary serves them but that uutils never does.
     /// Every /bin farm, name-tagged. ONE table: two tests consume it, and an eighth
     /// farm added to only one of them would leave the other silently narrower.
-    fn bin_farms<'a>(td_init: &'a [&'static str]) -> [(&'static str, &'a [&'static str]); 6] {
-        [
+    fn application_names(sys: &SystemDef) -> Vec<&'static str> {
+        sys.applications
+            .iter()
+            .map(|application| application.name)
+            .collect()
+    }
+
+    fn bin_farms<'a>(
+        td_init: &'a [&'static str],
+        applications: &'a [&'static str],
+    ) -> Vec<(&'static str, &'a [&'static str])> {
+        vec![
             ("uutils", UUTILS_APPLETS),
             ("td-util", TD_UTIL_APPLETS),
             ("td-txt", TD_TXT_APPLETS),
             ("td-init", td_init),
             ("td-login", TD_LOGIN_APPLETS),
             ("td-sh", TD_SH_APPLETS),
+            ("applications", applications),
         ]
+    }
+
+    #[test]
+    fn application_layout_is_configured_and_composed_by_typed_steps() {
+        assert_eq!(
+            build_application_config(),
+            "format=1\npackage-root=/td/store\nstate-root=.td/app\n\
+             registry=/etc/td-applications.tsv\nlauncher-table=/etc/td-launcher.tsv\n"
+        );
+        for path in [
+            APPLICATION_CONFIG,
+            APPLICATION_REGISTRY,
+            APPLICATION_LAUNCHER_TABLE,
+        ] {
+            assert!(
+                path.starts_with("/etc/") && !application_etc_name(path).contains('/'),
+                "application image config path must be one immutable /etc file: {path}"
+            );
+        }
+
+        const APPLICATIONS: &[ShippedApplication] = &[ShippedApplication {
+            name: "fixture",
+            package: "fixture-package",
+            runtime: "fixture-runtime",
+        }];
+        let fixture = SystemDef {
+            hostname: SYSTEM.hostname,
+            os_name: SYSTEM.os_name,
+            os_version: SYSTEM.os_version,
+            motd: SYSTEM.motd,
+            autologin: SYSTEM.autologin,
+            users: SYSTEM.users,
+            applications: APPLICATIONS,
+        };
+        let steps = real_root_steps(&fixture);
+        assert_eq!(
+            application_payload_inputs(&fixture),
+            vec!["fixture-package", "fixture-runtime"]
+        );
+        assert!(steps.iter().any(|step| matches!(
+            step,
+            Step::StageRuntimeClosure { roots, dest }
+                if dest == "{root}/real-root"
+                    && roots.contains(&"{payload:fixture-package}".to_string())
+                    && roots.contains(&"{payload:fixture-runtime}".to_string())
+        )));
+        assert!(steps.iter().any(|step| matches!(
+            step,
+            Step::CompileApplicationTables { names, packages, runtimes, registry, launcher }
+                if names == &["fixture".to_string()]
+                    && packages == &["{payload:fixture-package}".to_string()]
+                    && runtimes == &["{payload:fixture-runtime}".to_string()]
+                    && registry == "{root}/real-root/etc/td-applications.tsv"
+                    && launcher == "{root}/real-root/etc/td-launcher.tsv"
+        )));
+        assert!(steps.iter().any(|step| matches!(
+            step,
+            Step::Symlink { target, link }
+                if target == "/bin/td-jail"
+                    && link == "{root}/real-root/bin/fixture"
+        )));
+
+        assert!(
+            SYSTEM.applications.is_empty(),
+            "no application may be selected into the image before td-jail exists"
+        );
+        let system_recipe = recipe();
+        assert!(
+            system_recipe.payload_inputs.is_none(),
+            "the empty application selection must not create a nominal payload channel"
+        );
     }
 
     #[test]
@@ -4033,7 +4271,9 @@ mod tests {
         // Check every pair: a name served twice emits two Symlink steps for one link and the
         // LAST one silently wins.
         let td_init = td_init_applets();
-        let farms = bin_farms(&td_init);
+        let applications = application_names(&SYSTEM);
+        let farms = bin_farms(&td_init, &applications);
+        assert_eq!(farms.len(), 7, "the open application farm must stay registered");
         for (i, (a_name, a_set)) in farms.iter().enumerate() {
             for (b_name, b_set) in farms.iter().skip(i + 1) {
                 for a in a_set.iter() {
@@ -4045,6 +4285,11 @@ mod tests {
                 }
             }
         }
+        let collisions = application_name_collisions(&SYSTEM);
+        assert!(
+            collisions.is_empty(),
+            "application names collide with existing direct or farmed /bin providers: {collisions:?}"
+        );
         for a in [
             "hostname", "mount", "umount", "sh", "init", "switch_root", "login", "su",
         ] {
@@ -4078,7 +4323,8 @@ mod tests {
              here) or the guard was hollowed out"
         );
         let td_init = td_init_applets();
-        let farms = bin_farms(&td_init);
+        let applications = application_names(&SYSTEM);
+        let farms = bin_farms(&td_init, &applications);
         let packed = packed_bin_names();
         for a in DROPPED_APPLETS {
             for (farm, set) in &farms {
@@ -4572,10 +4818,10 @@ mod tests {
     /// Every name `real_root_steps` actually links into the real root's /bin, DERIVED from
     /// the steps rather than restated: both farms plus each binary packed by hand. A list
     /// spelled out here would silently rot behind a newly packed daemon.
-    fn packed_bin_names() -> Vec<String> {
+    fn packed_bin_names_for(sys: &SystemDef) -> Vec<String> {
         const LINK_PREFIX: &str = "{root}/real-root/bin/";
         let mut names = Vec::new();
-        for step in real_root_steps(&SYSTEM) {
+        for step in real_root_steps(sys) {
             if let Step::Symlink { link, .. } = step {
                 if let Some(name) = link.strip_prefix(LINK_PREFIX) {
                     names.push(name.to_string());
@@ -4583,6 +4829,58 @@ mod tests {
             }
         }
         names
+    }
+
+    fn packed_bin_names() -> Vec<String> {
+        packed_bin_names_for(&SYSTEM)
+    }
+
+    fn application_name_collisions(sys: &SystemDef) -> Vec<&'static str> {
+        let without_applications = SystemDef {
+            hostname: sys.hostname,
+            os_name: sys.os_name,
+            os_version: sys.os_version,
+            motd: sys.motd,
+            autologin: sys.autologin,
+            users: sys.users,
+            applications: &[],
+        };
+        let existing = packed_bin_names_for(&without_applications);
+        sys.applications
+            .iter()
+            .filter_map(|application| {
+                existing
+                    .iter()
+                    .any(|name| name == application.name)
+                    .then_some(application.name)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn application_names_cannot_shadow_direct_bin_links() {
+        const COLLIDING: &[ShippedApplication] = &[
+            ShippedApplication {
+                name: "rg",
+                package: "catalog-rg",
+                runtime: "runtime-rg",
+            },
+            ShippedApplication {
+                name: "td-netd",
+                package: "catalog-netd",
+                runtime: "runtime-netd",
+            },
+        ];
+        let fixture = SystemDef {
+            hostname: SYSTEM.hostname,
+            os_name: SYSTEM.os_name,
+            os_version: SYSTEM.os_version,
+            motd: SYSTEM.motd,
+            autologin: SYSTEM.autologin,
+            users: SYSTEM.users,
+            applications: COLLIDING,
+        };
+        assert_eq!(application_name_collisions(&fixture), vec!["rg", "td-netd"]);
     }
 
     /// The mirror of the busybox-multiplexer ban, for the form this commit actually
@@ -6160,9 +6458,10 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             }
         }
         let td_init = td_init_applets();
+        let applications = application_names(&SYSTEM);
         let packed = packed_bin_names();
         for name in ["find", "xargs"] {
-            for (farm, set) in &bin_farms(&td_init) {
+            for (farm, set) in &bin_farms(&td_init, &applications) {
                 assert!(
                     !set.contains(&name),
                     "'{name}' is in the {farm} farm - it left with busybox, and bringing \
@@ -6222,6 +6521,18 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
                 Step::StageRuntimeClosure { roots, dest } => {
                     roots.into_iter().chain(std::iter::once(dest)).collect()
                 }
+                Step::CompileApplicationTables {
+                    names,
+                    packages,
+                    runtimes,
+                    registry,
+                    launcher,
+                } => names
+                    .into_iter()
+                    .chain(packages)
+                    .chain(runtimes)
+                    .chain([registry, launcher])
+                    .collect(),
                 Step::MkDir { path } => vec![path],
                 Step::WriteFile { path, content, .. } => vec![path, content],
                 // Not a variant real_root_steps emits today. Failing beats

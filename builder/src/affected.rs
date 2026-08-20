@@ -469,7 +469,7 @@ fn collect_rs_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
 /// query scan reads `lex` rather than either of them for that reason. The
 /// files THIS scan reads are full of them, and a desync here fails the other
 /// way: text mis-stripped is a token that slipped past.
-fn strip_line_comments(text: &str) -> String {
+pub(crate) fn strip_line_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for line in text.lines() {
         let mut quotes = 0usize;
