@@ -579,7 +579,7 @@ td's Rust is defensive and minimal-surface.
   raw-syscall layer (`builder/src/sys.rs` and its callers `nar.rs`/`sandbox.rs`),
   which carry `#![allow(unsafe_code)]` so `builder` can be `libc`-free. Every other
   engine crate (the shared `engine` lib and `recipes`/`fetch`/`feed`/`subst`)
-  `forbid`s `unsafe_code`. There are EIGHT target-side exceptions, each a standalone
+  `forbid`s `unsafe_code`. There are NINE target-side exceptions, each a standalone
   crate OUTSIDE the `builder`/`recipes`/`engine` workspace whose only `unsafe` is that
   same `syscall`-instruction layer under a scoped `#[allow]` (the crate itself
   `#![deny(unsafe_code)]`s):
@@ -594,6 +594,7 @@ td's Rust is defensive and minimal-surface.
   | 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `ioctl(2)` |
   | 7 | `td-util` | `ioctl(2)`, three value-pinned requests |
   | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
+  | 9 | `td-jail` | `unshare(2)` with two value-pinned namespace sets |
 
   **`UNSAFE.md` is the normative record** and carries each surface's roster,
   its confinement contract, and what is deliberately NOT in it. Do not add
@@ -610,7 +611,7 @@ td's Rust is defensive and minimal-surface.
   `[[package]]` entries (the known path members) AND no external `source = ` line
   (path members carry none), so a new registry/git dep OR a new path member both red it.
   The target-side `td-kexec`, `td-sh`, `td-txt`, `td-netd`, `td-boot`,
-  `td-install`, `td-util`, `td-init`, `td-firstboot`, `td-login`, `td-svc`,
+  `td-install`, `td-util`, `td-init`, `td-firstboot`, `td-login`, `td-svc`, `td-jail`,
   `td-seatd`, and `td-compositor`
   crates outside the workspace each keep their own 1-package lock; `td-txt`,
   `td-boot`, `td-install`, `td-firstboot`, and `td-seatd` contain no `unsafe`,

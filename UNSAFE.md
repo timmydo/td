@@ -3,7 +3,7 @@
 This file is the normative record of every `unsafe` in td. It exists
 because the roster is the point: the value of writing these down is being
 able to count them and see each one's justification beside the others,
-which is exactly what stops a ninth being added quietly. Where this file
+which is exactly what stops a tenth being added quietly. Where this file
 and the code disagree, one of them is a bug.
 
 ## The rule
@@ -12,7 +12,7 @@ In the control-plane engine the only `unsafe` is the raw-syscall layer
 (`builder/src/sys.rs` and its callers `nar.rs`/`sandbox.rs`), which carry
 `#![allow(unsafe_code)]` so `builder` can be `libc`-free. Every other
 engine crate (the shared `engine` lib and
-`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are EIGHT
+`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are NINE
 target-side exceptions, each a standalone crate OUTSIDE the
 `builder`/`recipes`/`engine` workspace whose only `unsafe` is that same
 `syscall`-instruction layer under a scoped `#[allow]` (the crate itself
@@ -46,6 +46,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `ioctl(2)` |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
+| 9 | `td-jail` | `unshare(2)` with two value-pinned namespace sets |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering: it is host-side, and no
@@ -970,3 +971,46 @@ install.
 Every other primitive td-sh needs — pipes, process spawn, `exec`, the
 virtual fd table that stands in for `dup2` — is reachable through safe
 `std`, which is what keeps that surface at four.
+
+## 9. `td-jail` — the application sandbox
+
+The first `td-jail` increment carries exactly ONE syscall: `unshare(2)`
+on x86-64, through one `syscall5` body. Its wrapper accepts only the two
+compiled namespace sets the application design permits:
+`CLONE_NEWUSER|CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWUTS`, with
+`CLONE_NEWNET` either absent for a declared shared network or present for
+an isolated one. There is no caller-provided flags word.
+
+Stage 1 is single-threaded when it issues the call, writes `setgroups`
+deny before the identity gid map, reads both maps back, and checks that
+the user, mount and UTS namespaces changed. The isolated probe also
+checks its network namespace. A safe `Command` spawn creates stage 2;
+before releasing it, stage 1 verifies `/proc/<child>/ns/pid` differs
+from its own original PID namespace. Stage 2 refuses unless its
+namespace PID is 1 and a fresh 32-byte proof arrives on the stdin
+descriptor stage 1 explicitly installed. No
+application is launched in this increment: ordinary entry remains a
+refusal until mount isolation, capability removal, reaping, and seccomp
+have landed.
+
+That zero-capability exec is the rung-8 baseline, not the target mount
+mechanism. Stage 1 cannot mount a procfs for the child PID namespace it
+does not itself inhabit. The mount rung must therefore add the reviewed
+`capset(2)` and `prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_SYS_ADMIN)`
+bridge: stage 1 makes exactly that capability inheritable and ambient;
+while `CAP_SETPCAP` is still effective it drops and reads back every
+bounding bit. Stage 2 verifies the exact one-capability state and empty
+bounding set, pivots, and mounts its own procfs. Application launch
+remains disabled until the following rung clears and reads back the
+ambient, effective, permitted and inheritable sets. There is no `fork`,
+`pre_exec`, or `setns` escape hatch hidden behind the safe `Command`
+boundary.
+
+Deliberately NOT in this surface yet are the other eleven calls in
+`APPLICATIONS.md`'s target-state draft: `mount`, `umount2`,
+`pivot_root`, `capset`, `capget`, `prctl`, `seccomp`, `wait4`, `kill`,
+`prlimit64`, and `ioctl`. Each arrives only with the rung that uses and
+tests it; the roadmap is not advance authorization for dormant wrappers.
+There is likewise no `fork`, `pre_exec`, `clone`, `setns`, or caller-
+supplied namespace set. A second syscall or a third unshare flag set is
+an amendment here.

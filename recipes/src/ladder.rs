@@ -427,19 +427,22 @@ pub const TD_POINTER_ABSOLUTE_MARKER: &str = "TD-POINTER-ABSOLUTE";
 /// first application, and only a runtime observation can do that.
 ///
 /// It reads `/proc` rather than issuing `unshare(2)` and `seccomp(2)`, and that is
-/// a real limit rather than a preference. Those two calls are surface #9's, which
-/// arrives with td-jail; nothing on the image today may issue them, and inventing
-/// a prober for this rung would mean an `unsafe` surface added outside the crate
-/// that owns it. So this asserts the kernel is CAPABLE and the functional half —
-/// that an unprivileged `unshare(CLONE_NEWUSER|CLONE_NEWNS)` actually returns 0
-/// and a trivial allow-all filter installs — lands with td-jail, where the
-/// syscalls are in the roster. The gap is narrow: `/proc/self/ns/user` exists if
+/// a real limit rather than a preference. Those two calls belong to surface #9;
+/// inventing a prober for this rung would mean an `unsafe` surface added outside
+/// the crate that owns it. So this asserts the kernel is CAPABLE; the functional
+/// `unshare` probe lands with td-jail's transition rung and the filter-install
+/// probe with its seccomp rung, where each syscall joins the roster. The gap is
+/// narrow: `/proc/self/ns/user` exists if
 /// and only if `CONFIG_USER_NS`, and `Seccomp_filters:` appears in
 /// `/proc/self/status` if and only if `CONFIG_SECCOMP_FILTER`, so what is
 /// unproven here is the sysctl and LSM policy around those calls, not the
 /// features themselves. `/proc/sys/user/max_user_namespaces` covers the one
 /// sysctl that can turn a compiled-in USER_NS into an EPERM.
 pub const TD_SANDBOX_KERNEL_MARKER: &str = "TD-SANDBOX-KERNEL-OK";
+
+/// Emitted by td-jail stage 1 only after its child is PID 1 in the fresh namespace,
+/// both identity maps read back exactly, and the post-exec capability check passes.
+pub const TD_JAIL_TRANSITION_MARKER: &str = "TD-JAIL-TRANSITION-OK";
 
 /// Kernel-cmdline token the headless `qemu-boot-system` oracle appends so the greeter
 /// waits for the root-owned health/update transaction and then exits. `tty-session`

@@ -9,6 +9,8 @@
 #                     closure must not mix into the engine's dependency-free lock.
 #   td-kexec/       — a target-side guest helper, deliberately outside the
 #                     builder/recipes trust boundary (its own confined unsafe).
+#   td-jail/        — the target-side application confinement boundary; its
+#                     raw-syscall surface is confined and recorded in UNSAFE.md.
 #   td-sh/          — the target-built POSIX /bin/sh (busybox-sh replacement),
 #                     a standalone std-only crate like td-kexec: the shipped
 #                     binary is src/main.rs compiled directly by rustc, and its
@@ -51,7 +53,7 @@
 [workspace]
 resolver = "2"
 members = ["builder", "recipes", "engine"]
-exclude = ["net", "td-kexec", "td-sh", "td-txt", "td-netd", "td-boot", "td-install", "td-util", "td-init", "td-firstboot", "td-seatd", "td-compositor", "td-review", "td-svc", "tests/sshd"]
+exclude = ["net", "td-kexec", "td-jail", "td-sh", "td-txt", "td-netd", "td-boot", "td-install", "td-util", "td-init", "td-firstboot", "td-seatd", "td-compositor", "td-review", "td-svc", "tests/sshd"]
 
 [profile.release]
 # Keep the release profile explicit and minimal so the reproducibility oracle

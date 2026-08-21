@@ -44,8 +44,9 @@ Settled by the maintainer; these are premises, not conclusions.
    lives in `~/.td/app`. There is no install step and no privileged
    installer — choosing which shipped application to run needs no
    authority beyond a user's own launcher table.
-2. **`td-jail` carries seccomp from the first landing**, as a new
-   `UNSAFE.md` surface — not namespaces now and a filter later.
+2. **The first application-capable `td-jail` carries seccomp**, as part
+   of the same `UNSAFE.md` surface. The preceding skeleton and mount
+   rungs launch no application; their public entry point fails closed.
 3. **Portals are `td-busd` + `td-portal`**, outside the compositor
    process (§E).
 4. **Per-app uids are the identity direction — v2, not v1.** An
@@ -263,11 +264,17 @@ per-process and inherited, so a browser's content processes multiply the
 cap rather than share it. Since the kernel landing is one reviewed
 commit either way, the cgroup symbols belong in it.
 
-The boot oracle asserts, as uid 1000, that `unshare(CLONE_NEWUSER|
-CLONE_NEWNS)` succeeds and that a trivial allow-all filter installs — so
-a kernel regression reds the image rather than the first app. Failure
-disables application launch with a named diagnostic; it never silently
-selects a weaker sandbox.
+The functional namespace probe has two deliberately different homes.
+`td-jail`'s own recipe test runs the target-static binary against the
+build host as a policy smoke test. The authoritative image assertion is
+the QEMU boot oracle: as uid 1000 on the target kernel it creates the
+complete user, mount, pid, UTS and isolated-network set, reads the
+identity maps back, proves stage 2 is PID 1 with no effective
+capabilities after exec, and gates boot success on
+`TD-JAIL-TRANSITION-OK`. The filter-install half remains with rung 11,
+where a compiled filter exists to install. Failure disables application
+launch with a named diagnostic; it never silently selects a weaker
+sandbox.
 
 **LANDED, in two halves, and the split is worth reading before relying on
 it.** The pins above (minus audio, which waits for td-audio) are in
@@ -275,16 +282,13 @@ it.** The pins above (minus audio, which waits for td-audio) are in
 than against the pin list; and the greeter carries a kernel-capability
 farm that prints `TD-SANDBOX-KERNEL-OK` once the RUNNING kernel has been
 observed to have every one that can be witnessed from `/proc` — all of
-them but `MEMCG`, for the reason below. What did NOT land is the wording
-above taken literally: the oracle READS `/proc` and does not ISSUE
-`unshare(2)` or `seccomp(2)`. Those two calls are surface #9's, which
-arrives with `td-jail`, and nothing on the image today may issue them —
-so a prober written for this rung would have meant an `unsafe` surface
-added outside the crate that owns it, which §V.4 and `UNSAFE.md` both
-forbid. The functional assertions therefore land with the rungs that
-own the calls: the `unshare` at rung 8, where `td-jail`'s skeleton and
-surface #9 arrive, and the filter install at rung 11, which is where a
-filter exists to install at all.
+them but `MEMCG`, for the reason below. What did NOT land in the kernel
+rung is the wording above taken literally: the image oracle READS
+`/proc` and does not ISSUE `unshare(2)` or `seccomp(2)`. Those two calls
+are surface #9's, and inventing an earlier prober would have meant an
+`unsafe` surface outside the crate that owns it. The functional
+`unshare` assertion has now landed with rung 8 in `td-jail` and the
+target-system QEMU oracle; the filter install remains at rung 11.
 
 What the `/proc` reads DO cover, beyond the features themselves, is the
 one class of failure a config guard structurally cannot see: a value.
@@ -398,8 +402,12 @@ its union with the applet farms.
 pathname from an untrusted caller would let anyone hand `td-jail` a
 handcrafted mount plan, which is the whole sandbox. Stage 1 resolves the
 spec **by store path** from the table and reads it there; the stage-2
-re-exec is internal, reached by a nonce stage 1 generates and a
-descriptor it passes, and is not a documented entry point. No
+re-exec is internal, reached by a random synchronization token stage 1
+sends over a descriptor, and is not a documented entry point. The token
+detects a broken handoff; it is not launch authority, because the same
+uid controls argv and can create its own namespaces. Stage 0's broker
+registration supplies that authority before application launch is
+enabled. No
 per-instance copy of the spec is written and then re-read — that would
 put a writable file back on the path this rule exists to keep immutable.
 
@@ -526,10 +534,14 @@ td-term ─ /bin/sh                          uid 1000, host pid ns
       │                                    unshare(NEWUSER|NEWNS|NEWPID|
       │                                    NEWUTS[|NEWIPC][|NEWNET]);
       │                                    setgroups=deny, then uid_map
-      │                                    and gid_map "1000 1000 1"
-      └─ td-jail [stage 2] <nonce>         PID 1 of the new pid ns.
-         │                                 mount plan, pivot_root, drop
-         │                                 caps, NO_NEW_PRIVS, seccomp,
+      │                                    and gid_map "1000 1000 1";
+      │                                    prepare root + loopback; carry
+      │                                    only ambient CAP_SYS_ADMIN;
+      │                                    drop/read bounding set
+      └─ td-jail [stage 2] <token>         PID 1 of the new pid ns;
+         │                                 exact caps + CapBnd=0; pivot;
+         │                                 fresh proc; drop/read caps;
+         │                                 NO_NEW_PRIVS, seccomp,
          │                                 readback, then spawn and reap
          └─ firefox                        PID 2; interpreter is the
             └─ content processes           RUNTIME's ld.so
@@ -543,8 +555,17 @@ refuses. So the process boundary is the fork instead: stage 1 unshares in
 its own still-single-threaded `main` (`CLONE_NEWUSER` requires a
 single-threaded process, so stage 1 spawns no thread before it), and the
 first child it spawns through safe `Command` lands as PID 1 of the new
-pid namespace with the mount namespace inherited. Stage 2 then does
-everything a bwrap child does as ordinary safe code.
+pid namespace with the prepared mount namespace inherited. Rung 8 proves
+the default nonzero-identity exec strips every effective capability.
+Rung 9 must deliberately replace that default for the real jail: stage 1
+puts only `CAP_SYS_ADMIN` in the inheritable and ambient sets, drops and
+reads back every bounding-set bit while `CAP_SETPCAP` is still effective,
+then execs. Stage 2 reads back that exact one-capability state plus an
+empty bounding set, pivots, and mounts the procfs for the PID namespace
+it actually inhabits. Rung 10 then clears and reads back the ambient,
+effective, permitted and inheritable sets before `NO_NEW_PRIVS`, seccomp,
+application spawn, and descendant reaping. Application launch remains
+disabled across both intermediate states.
 
 **Stage 2 does not exec the app over itself.** A PID 1 that is Firefox
 reaps only its own children, and orphaned grandchildren pile up as
@@ -571,7 +592,11 @@ namespace, so its parent is invisible and `getppid(2)` and
 lives. The mechanism that works needs no syscall: **stage 1 holds the
 write end of a pipe** and stage 2 the read end. If stage 1 dies the write
 end closes and stage 2's read returns EOF; if stage 1 lives the read
-blocks. The descriptor is inherited across the ordinary `Command` spawn.
+blocks. Stage 1 maps the read end onto stage 2's stdin with `Stdio`; an
+ordinary `Command` performs an exec and the anonymous pipe is
+close-on-exec by default, so merely leaving its original descriptor open
+would lose the proof. Stage 2 consumes the fixed-size proof before stdin is
+replaced by the application's declared stream in the mount-plan rung.
 
 **The read is on a WATCHER THREAD, and that is what makes it a check
 rather than a deadlock** — a draft had stage 2 read inline to close the
@@ -1790,8 +1815,16 @@ ordering is ported verbatim from `map_userns_id`.
 
 ### Mount plan
 
-Stage 2, in order; every bind read-only unless marked **rw**, and a
-failed read-only remount on a load-bearing bind is fatal, never degraded:
+Stage 1 prepares the new root and performs the privileged entries below
+that do not depend on inhabiting the child PID namespace. Before the
+safe-`Command` re-exec it makes exactly `CAP_SYS_ADMIN` inheritable and
+ambient, then drops and reads back the complete bounding set while
+`CAP_SETPCAP` remains effective. Stage 2 reads back the exact one-capability
+state and empty bounding set, pivots into the prepared root, mounts the
+fresh procfs for its own PID namespace, then drops every remaining
+capability before policy finalization. Every bind is read-only unless
+marked **rw**, and a failed read-only remount on a load-bearing bind is
+fatal, never degraded:
 
 ```
  0  CLOSE every inherited descriptor above 2, and REPLACE 0/1/2 with
@@ -1808,8 +1841,10 @@ failed read-only remount on a load-bearing bind is fatal, never degraded:
         hostname, machine-id, resolv.conf, nsswitch.conf,
         ssl/certs/ca-certificates.crt
  7  extension mounts at authenticated extension-point directories
- 8  /proc  fresh procfs (stage 2 is PID 1 of the new ns), nosuid/nodev/noexec
-        then mask sys, sysrq-trigger, irq, bus, acpi, scsi, kcore, keys,
+ 8  /proc  mount point prepared by stage 1; after step 15, stage 2 mounts
+        a fresh procfs for the namespace where it is PID 1,
+        nosuid/nodev/noexec, then masks sys, sysrq-trigger, irq, bus,
+        acpi, scsi, kcore, keys,
         timer_list, sched_debug, latency_stats -- as step 9 masks, and
         for step 9's reason. Most are already closed by DAC here (uid 0
         is unmapped by the identity map), but this section enumerates
@@ -1863,17 +1898,19 @@ failed read-only remount on a load-bearing bind is fatal, never degraded:
         would leave all five unreachable and every XDG_* pointing at
         a fresh empty dotdir, which an earlier draft of this step did)
         plus one bind per granted --filesystem
-15  mkdir <newroot>/oldroot  (pivot_root requires put_old to EXIST and to
+15  stage 1 makes exactly `CAP_SYS_ADMIN` inheritable and ambient, drops
+    every bounding bit while `CAP_SETPCAP` remains effective, reads the
+    bounding set back empty, then spawns stage 2. Stage 2 reads back
+    effective/permitted/inheritable/ambient = exactly `CAP_SYS_ADMIN`
+    and bounding = empty; mkdir <newroot>/oldroot (pivot_root requires
+    put_old to EXIST and to
     be under new_root; newroot is a fresh tmpfs, so nothing else makes it)
     pivot_root(newroot, newroot/oldroot); chdir /; umount2(/oldroot,
-    MNT_DETACH); rmdir /oldroot
-16  PR_CAP_AMBIENT_CLEAR_ALL; PR_CAPBSET_DROP per bit; THEN capset the
-    permitted/effective/inheritable sets empty -- that order, because
-    PR_CAPBSET_DROP needs CAP_SETPCAP still EFFECTIVE and a capset
-    first takes it away; then three readbacks, one per set that has
-    one: capget (effective/permitted/inheritable), PR_CAPBSET_READ per
-    bit, and PR_CAP_AMBIENT_GET -- capget does NOT return the ambient
-    set, so it is the one that needs its own question
+    MNT_DETACH); rmdir /oldroot; perform step 8's procfs mount and masks
+16  PR_CAP_AMBIENT_CLEAR_ALL; capset permitted/effective/inheritable
+    empty; then read back capget, PR_CAPBSET_READ per bit, and
+    PR_CAP_AMBIENT_GET -- capget does NOT return the ambient set, so it
+    is the one that needs its own question
 17  PR_SET_NO_NEW_PRIVS, then PR_GET_NO_NEW_PRIVS readback
 18  seccomp(SECCOMP_SET_MODE_FILTER, 0, &prog)
 19  READBACK: /proc/self/status says NoNewPrivs: 1 and Seccomp: 2,
@@ -1914,10 +1951,12 @@ it; a pipe made before the sweep is a pipe the sweep closes, and stage 2
 then reads EOF and concludes its parent is dead before it has done
 anything. The broker connection is the other, and it goes the other way:
 it must be closed BEFORE stage 2 is spawned, and not merely marked
-`CLOEXEC`, because stage 2 does not `exec` — it is a `Command` child that
-inherits an open table. Leaking it would hand the confined side the
-channel that completes registrations, which is the one channel in this
-design whose whole authority is that only stage 1 has it. So: sweep,
+`CLOEXEC`. A safe `Command` does exec stage 2 and close-on-exec is a
+backstop, but closing the broker connection before spawn makes the
+authority absent even if process creation fails before that boundary.
+Leaking it would hand the confined side the channel that completes
+registrations, which is the one channel in this design whose whole
+authority is that only stage 1 has it. So: sweep,
 create the pipe, register, close the broker connection, spawn. Stage 2
 performs no sweep of its own — the pipe is the only descriptor it is
 given above stdio, and a second blind loop would have to exempt it.
@@ -1968,25 +2007,28 @@ this bug is ever caught.
 nodes anyway; binding the host's nodes is both how that is avoided and a
 guarantee the jail cannot produce a node the host does not already have.
 
-**Capabilities are dropped and read back** (step 16). Mount setup needs
+**Capabilities are dropped and read back** (steps 15–16). Mount setup needs
 namespace-local `CAP_SYS_ADMIN`; the app must not inherit it. Each
 `capset` is followed by `capget` and each `PR_CAPBSET_DROP` by
 `PR_CAPBSET_READ`, with any surviving capability fatal. The design does
-not rely on `exec` incidentally clearing anything.
+not rely on `exec` incidentally clearing anything. The stage-1 bridge
+sets only `CAP_SYS_ADMIN` inheritable and raises only that ambient bit,
+then drops and reads back the bounding set while `CAP_SETPCAP` is still
+effective. Stage 2 reads effective, permitted, inheritable, ambient and
+bounding state before using `CAP_SYS_ADMIN`, then step 16 explicitly
+removes and re-reads the four remaining sets.
 
-**The ORDER inside that step is not arrangement, it is the difference
+**The ORDER across those steps is not arrangement, it is the difference
 between working and `EPERM`**, and the step list spells it out because a
 plausible reading of "drop the capability sets" fails: `PR_CAPBSET_DROP`
-requires `CAP_SETPCAP` in the caller's EFFECTIVE set, so a `capset` that
-empties permitted/effective first has thrown away the privilege the
-bounding drops need, and every one of them then fails. Bounding set
-first, `capset` last. The ambient set is cleared before either, because
-it is the one set whose bits survive an `exec`, and it is cleared
-EXPLICITLY rather than left to the side effect that clearing the
-permitted set has: the side effect is real, but the readback that would
-confirm it is not — `capget(2)` returns effective, permitted and
-inheritable and never ambient — so relying on it would leave the only
-set that outlives an `exec` as the only one nothing observes.
+requires `CAP_SETPCAP` in the caller's EFFECTIVE set. Stage 1 therefore
+drops and reads back the complete bounding set before exec reduces stage
+2 to `CAP_SYS_ADMIN`; asking stage 2 to do it would fail every drop.
+After the mounts, stage 2 explicitly clears and reads back the ambient
+set before emptying permitted/effective/inheritable. The explicit clear
+matters because `capget(2)` never returns ambient state, so relying on
+the permitted-set side effect would leave the only set that outlives an
+`exec` as the only one nothing observes.
 
 Steps 16–19 are four readbacks in a row and that is the point: nothing
 observable distinguishes a jail whose filter did not load from one whose
@@ -2171,7 +2213,12 @@ real flatpak, run `flatpak run --command=sh org.mozilla.firefox -c
 stock flatpak Firefox. That is a ten-minute check and it decides whether
 td ships one filter or two. Record the answer here when it is known.
 
-### `UNSAFE.md` surface #9 (draft)
+### `UNSAFE.md` surface #9 (target-state draft)
+
+The normative `UNSAFE.md` roster grows with the implementation. Rung 8
+has landed the single `unshare(2)` entry; the remaining calls below are
+not authorized until their own mount, capability/reaper, and seccomp
+rungs land with callers and tests.
 
 > ## 9. `td-jail` — the application sandbox
 >
@@ -2179,13 +2226,15 @@ td ships one filter or two. Record the answer here when it is known.
 > `td-jail/src/sys.rs` carries EXACTLY TWELVE syscalls — `unshare(2)` with
 > a value-pinned namespace set, `mount(2)`, `umount2(2)` and
 > `pivot_root(2)` for the validated mount plan, `capset(2)` with
-> `capget(2)` for the capability drop and its readback, `prctl(2)` with
+> `capget(2)` for the one-capability exec bridge, capability drop and
+> their readbacks, `prctl(2)` with
 > SIX value-pinned operations (`PR_SET_NO_NEW_PRIVS`=38,
 > `PR_GET_NO_NEW_PRIVS`=39, `PR_SET_PDEATHSIG`=1, `PR_CAPBSET_DROP`=24,
 > `PR_CAPBSET_READ`=23 — the readback mount-plan step 16 requires,
 > which an earlier draft mandated in the plan while forbidding it in the
-> roster — and `PR_CAP_AMBIENT`=47 with its own two pinned
-> sub-operations, `PR_CAP_AMBIENT_CLEAR_ALL` and `PR_CAP_AMBIENT_GET`.
+> roster — and `PR_CAP_AMBIENT`=47 with its own three pinned
+> sub-operations, `PR_CAP_AMBIENT_RAISE`,
+> `PR_CAP_AMBIENT_CLEAR_ALL`, and `PR_CAP_AMBIENT_GET`.
 > That last one is a correction: a draft left 47 out on the grounds that
 > clearing the permitted set clears the ambient set "which the `capget`
 > readback confirms", and `capget(2)` does not RETURN the ambient set —
@@ -2279,11 +2328,11 @@ td ships one filter or two. Record the answer here when it is known.
 > of them. A THIRTEENTH syscall — `setsid(2)` is the one already
 > anticipated, if a terminal policy is ever served — a third ioctl
 > request, a seventh prctl
-> operation, a third `PR_CAP_AMBIENT` sub-operation, a second seccomp
+> operation, a fourth `PR_CAP_AMBIENT` sub-operation, a second seccomp
 > flag, an arch
 > beyond x86-64, or a caller-supplied BPF program is an amendment here;
 > `td-jail/src/main.rs`'s confinement tests assert the roster and its
-> TWELVE value-pinned numbers, the five prctl and one seccomp operation
+> TWELVE value-pinned numbers, the six prctl and one seccomp operation
 > values, the namespace and mount flag rosters, the whole `asm!` block
 > including which register each argument lands in and that
 > `options(nomem)` stays absent (the kernel reads the filter program and
@@ -3427,8 +3476,8 @@ Each row is one landing or a small family, leaving the tree green.
 | 5 | **first seed recipe — LANDED**: upstream's pinned static ripgrep release becomes an unshipped store package with an empty runtime, generated manifest, payload-only edge, compiled source digest, and native §B.3/§B.8 checks | none |
 | 6 | **spec compiler — LANDED**: runtime resolution by full store path, fixed effective environment, typed grants/defaults and entry point; the manifest and spec are builder-authenticated, and the registered-store closure query proves the app→runtime collector edge | none |
 | 7 | **image application index — LANDED**: typed launcher metadata, the builder-authenticated export, immutable resolver/launcher tables, `/etc/td-app.conf`, and the empty `/bin/<name>` farm through `real_root_steps` + `bin_farms()`; no application is selected until the jail lands | none |
-| 8 | `td-jail` crate + surface #9 skeleton + stage-1/stage-2 transition | none |
-| 9 | mount plan, pivot, fresh proc/dev/tmp | none |
+| 8 | **`td-jail` crate + surface #9 skeleton + stage-1/stage-2 transition — LANDED**: one value-pinned `unshare(2)` wrapper, exact identity-map and fresh-namespace readback, a token-synchronized safe-`Command` transition to PID 1, post-exec zero-capability readback for the nonroot app identity, a build-host policy smoke test, and an authoritative target-kernel QEMU probe from the packed static binary; ordinary application launch still refuses | none |
+| 9 | mount plan, zero bounding set, exact ambient `CAP_SYS_ADMIN` exec bridge, pivot, fresh proc/dev/tmp | none |
 | 10 | capability drop/readback + PID-1 reaper | none |
 | 11 | const BPF assembler, standard filter, interpreter tests, target probe | none |
 | 12 | **fixture package shipped in the image and launched by `/bin/<fixture>`** | **first jailed pixels on the QEMU screen** |

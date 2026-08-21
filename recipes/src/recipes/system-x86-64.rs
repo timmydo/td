@@ -8,8 +8,9 @@ use crate::ladder::{
     SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
     SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
-    TD_INIT_RUNTIME_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER,
-    TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
+    TD_INIT_RUNTIME_MARKER, TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER,
+    TD_SANDBOX_KERNEL_MARKER, TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER,
+    UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -207,9 +208,8 @@ const SYSTEM: SystemDef = SystemDef {
             passwordless: true,
         },
     ],
-    // Rung 7 establishes the image contract while the jail is still absent.
-    // The first package is selected only after /bin/td-jail is a confinement
-    // boundary; until then no application-shaped path is exposed on the image.
+    // Rung 8 packs td-jail and proves its namespace transition, but ordinary
+    // launch remains disabled until the confinement boundary is complete.
     applications: &[],
 };
 
@@ -1759,10 +1759,16 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          [ \"$wait\" -gt {BOOT_SUCCESS_RETRY_MAX_SECS} ] && wait={BOOT_SUCCESS_RETRY_MAX_SECS}\n\
          n=0\n\
          mu=0; mrf=0; ms=0; mtu=0; mti=0; mtl=0; mtt=0\n\
-         msk=0\n\
+         msk=0; mtj=0\n\
          if /bin/su -s /bin/sh {} -c \
          '{sandbox_kernel_probes}[ \"$k\" = 1 ]'; then \
          echo {TD_SANDBOX_KERNEL_MARKER}; msk=1; fi\n\
+         if /bin/su -s /bin/sh {} -c \
+         'j=$(/bin/td-jail --probe-transition 2>&1) || \
+         {{ echo \"td-jail: target transition probe failed: $j\"; exit 1; }}; \
+         [ \"$j\" = \"{TD_JAIL_TRANSITION_MARKER} pid=1\" ] || \
+         {{ echo \"td-jail: target transition returned unexpected output: $j\"; \
+         exit 1; }}'; then echo {TD_JAIL_TRANSITION_MARKER}; mtj=1; fi\n\
          while [ \"$n\" -lt \"$wait\" ]; do \
          healthy=1; \
          if /bin/su -s /bin/sh {} -c \
@@ -1805,6 +1811,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          '{td_txt_probes}[ \"$t\" = 1 ]'; then \
          [ \"$mtt\" = 1 ] || {{ echo {TD_TXT_RUNTIME_MARKER}; mtt=1; }}; else healthy=0; fi; \
          [ \"$msk\" = 1 ] || healthy=0; \
+         [ \"$mtj\" = 1 ] || healthy=0; \
          if [ \"$healthy\" = 1 ] \
          && /bin/td-boot success /dev/vda /run/td-update \"$deployment\" >/run/td-success-id; then \
          if /bin/grep -q -F '{DEPLOY_INSTALL_CMDLINE_TOKEN}' /proc/cmdline; then \
@@ -1854,6 +1861,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          n=$((n+1)); /bin/td-util sleep 1; \
          done\n\
          fail\n",
+        sys.autologin,
         sys.autologin,
         sys.autologin,
         sys.autologin,
@@ -2411,6 +2419,12 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         from: "{in:td-svc}".into(),
         dest: "{root}/real-root{in:td-svc}".into(),
     });
+    // td-jail is static so the running-kernel transition oracle does not depend
+    // on the dynamic userland it helps confine.
+    steps.push(Step::CopyTree {
+        from: "{in:td-jail}".into(),
+        dest: "{root}/real-root{in:td-jail}".into(),
+    });
     // The software UI is static and owns no dynamic runtime closure.
     steps.push(Step::CopyTree {
         from: "{in:td-seatd}".into(),
@@ -2520,6 +2534,10 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     steps.push(Step::Symlink {
         target: "{in:td-svc}/bin/td-svc".into(),
         link: "{root}/real-root/bin/td-svc".into(),
+    });
+    steps.push(Step::Symlink {
+        target: "{in:td-jail}/bin/td-jail".into(),
+        link: "{root}/real-root/bin/td-jail".into(),
     });
     steps.push(Step::Symlink {
         target: "{in:td-seatd}/bin/td-seatd".into(),
@@ -2792,6 +2810,8 @@ fn shape_check() -> String {
      tditab=$(\"$tdi\" init --dry-run -f \"$root/etc/inittab\" 2>&1) || { echo 'td-init init --dry-run REJECTED the inittab this image ships - PID 1 would come up having understood only part of its table. Its per-line diagnostics:' >&2; printf '%s\\n' \"$tditab\" >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-svc\" 2>/dev/null)\" = \"{in:td-svc}/bin/td-svc\" ] || { echo 'root tree: /bin/td-svc is not a symlink to the staged service supervisor - PID 1s only respawn line would exec nothing and the machine would have no userland at all' >&2; exit 1; }; \
      tds=\"{root}/real-root{in:td-svc}/bin/td-svc\"; { [ -f \"$tds\" ] && [ -x \"$tds\" ]; } || { echo 'root tree: the td-svc binary is not packed/executable at real-root{in:td-svc}/bin/td-svc - no identity, no network, no sshd and no console' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/td-jail\" 2>/dev/null)\" = \"{in:td-jail}/bin/td-jail\" ] || { echo 'root tree: /bin/td-jail is not a symlink to the staged confinement boundary' >&2; exit 1; }; \
+     tdj=\"{root}/real-root{in:td-jail}/bin/td-jail\"; { [ -f \"$tdj\" ] && [ -x \"$tdj\" ]; } || { echo 'root tree: td-jail is not packed and executable, so the running-kernel transition oracle cannot run' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-seatd\" 2>/dev/null)\" = \"{in:td-seatd}/bin/td-seatd\" ] || { echo 'root tree: /bin/td-seatd is not a symlink to the staged single-user seat assigner' >&2; exit 1; }; \
      seat=\"{root}/real-root{in:td-seatd}/bin/td-seatd\"; { [ -f \"$seat\" ] && [ -x \"$seat\" ]; } || { echo 'root tree: td-seatd is not packed and executable' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-compositor\" 2>/dev/null)\" = \"{in:td-compositor}/bin/td-compositor\" ] || { echo 'root tree: /bin/td-compositor is not a symlink to the staged software Wayland compositor' >&2; exit 1; }; \
@@ -3108,6 +3128,8 @@ pub fn recipe() -> Recipe {
         //   probe-only like td-util: `login -f` is how the greeter is reached and `su` is
         //   how every unprivileged health leg runs. See td-login/THREAT-MODEL.md.
         // td-svc: the static service supervisor that starts every real-root job.
+        // td-jail: the static application boundary; its target-kernel transition probe
+        //   runs at boot even while ordinary application launch remains disabled.
         // td-seatd/td-compositor: the static single-user UI substrate and demo client,
         // copied directly.
         .native_inputs(&[
@@ -3128,6 +3150,7 @@ pub fn recipe() -> Recipe {
             "td-firstboot",
             "td-login",
             "td-svc",
+            "td-jail",
             "td-seatd",
             "td-compositor",
         ])
@@ -4257,7 +4280,7 @@ mod tests {
 
         assert!(
             SYSTEM.applications.is_empty(),
-            "no application may be selected into the image before td-jail exists"
+            "no application may be selected before td-jail confinement is complete"
         );
         let system_recipe = recipe();
         assert!(
@@ -5889,6 +5912,11 @@ mod tests {
                 && bootsuccess.contains("/bin/sshd selftest")
                 && bootsuccess.contains("/bin/td-util --list")
                 && bootsuccess.contains(TD_UTIL_RUNTIME_MARKER)
+                && bootsuccess.contains("/bin/td-jail --probe-transition")
+                && bootsuccess.contains(&format!(
+                    "\"{TD_JAIL_TRANSITION_MARKER} pid=1\""
+                ))
+                && bootsuccess.contains("[ \"$mtj\" = 1 ] || healthy=0")
                 && bootsuccess
                     .contains("td-boot success /dev/vda /run/td-update \"$deployment\"")
                 && bootsuccess.contains(SYSTEM_BOOT_SUCCESS_MARKER)
@@ -7043,6 +7071,41 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         assert!(
             build_bootsuccess(&SYSTEM).contains(&format!("echo {TD_SANDBOX_KERNEL_MARKER}")),
             "the greeter must print the sandbox-kernel marker the boot oracle waits for"
+        );
+    }
+
+    #[test]
+    fn td_jail_is_packed_and_its_target_probe_gates_boot_success() {
+        let steps = real_root_steps(&SYSTEM);
+        assert!(steps.iter().any(|step| matches!(
+            step,
+            Step::CopyTree { from, dest }
+                if from == "{in:td-jail}" && dest == "{root}/real-root{in:td-jail}"
+        )));
+        assert!(steps.iter().any(|step| matches!(
+            step,
+            Step::Symlink { target, link }
+                if target == "{in:td-jail}/bin/td-jail"
+                    && link == "{root}/real-root/bin/td-jail"
+        )));
+        assert!(recipe()
+            .native_inputs
+            .as_ref()
+            .is_some_and(|inputs| inputs.contains(&"td-jail".to_string())));
+
+        let bootsuccess = build_bootsuccess(&SYSTEM);
+        let probe = bootsuccess
+            .find("/bin/td-jail --probe-transition")
+            .expect("target transition probe missing");
+        let gate = bootsuccess
+            .find("[ \"$mtj\" = 1 ] || healthy=0")
+            .expect("target transition health gate missing");
+        let success = bootsuccess
+            .find(&format!("echo {SYSTEM_BOOT_SUCCESS_MARKER}"))
+            .expect("boot success marker missing");
+        assert!(
+            probe < gate && gate < success,
+            "target transition must run and gate the boot-success marker"
         );
     }
 
