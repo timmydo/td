@@ -208,7 +208,7 @@ const SYSTEM: SystemDef = SystemDef {
             passwordless: true,
         },
     ],
-    // Rung 9 proves td-jail's immutable-root transition, but ordinary launch
+    // Rung 10 proves td-jail's zero-capability PID-1 transition, but ordinary launch
     // remains disabled until the confinement boundary is complete.
     applications: &[],
 };

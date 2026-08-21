@@ -269,15 +269,15 @@ The functional namespace probe has two deliberately different homes.
 build host as a policy smoke test. The authoritative image assertion is
 the QEMU boot oracle: as uid 1000 on the target kernel it creates the
 complete user, mount, pid, UTS and isolated-network set, reads the
-identity maps back, proves stage 2 is PID 1 with exactly the one-capability
-mount bridge and an empty bounding set, enters the fresh immutable root,
-and gates boot success on
+identity maps back, proves stage 2 is PID 1, uses exactly the one-capability
+mount bridge, enters the fresh immutable root, clears and reads back every
+capability set, reaps a reparented descendant, and gates boot success on
 `TD-JAIL-TRANSITION-OK`. The filter-install half remains with rung 11,
 where a compiled filter exists to install. Failure disables application
 launch with a named diagnostic; it never silently selects a weaker
 sandbox.
 
-**LANDED, in two halves, and the split is worth reading before relying on
+**LANDED, in staged halves, and the split is worth reading before relying on
 it.** The pins above (minus audio, which waits for td-audio) are in
 `linux-x86-64.rs`, each guarded against the RESOLVED `.config` rather
 than against the pin list; and the greeter carries a kernel-capability
@@ -290,7 +290,8 @@ are surface #9's, and inventing an earlier prober would have meant an
 `unsafe` surface outside the crate that owns it. The functional
 namespace assertion landed with rung 8; rung 9 adds the mount,
 capability-bridge, pivot and readback assertion in `td-jail` and the
-target-system QEMU oracle. The filter install remains at rung 11.
+target-system QEMU oracle. Rung 10 adds final capability removal and the
+orphan-reaping assertion. The filter install remains at rung 11.
 
 What the `/proc` reads DO cover, beyond the features themselves, is the
 one class of failure a config guard structurally cannot see: a value.
@@ -567,11 +568,12 @@ empty bounding set, mounts the procfs for the PID namespace it actually
 inhabits, pivots, and detaches the old root. That order is load-bearing:
 an unprivileged user namespace may mount procfs only while another procfs
 is fully visible in its mount tree (`mount_too_revealing`), so mounting
-after detaching the old root fails `EPERM`. Rung 10 then clears and reads
-back the ambient,
-effective, permitted and inheritable sets before `NO_NEW_PRIVS`, seccomp,
-application spawn, and descendant reaping. Application launch remains
-disabled across both intermediate states.
+after detaching the old root fails `EPERM`. Rung 10 clears and reads back
+ambient, effective, permitted and inheritable, then exercises `wait4(-1)`
+with a zero-capability internal child that leaves an orphan for PID 1.
+`NO_NEW_PRIVS`, seccomp, application spawn, and survivor termination
+remain later steps. Application launch stays disabled across all three
+intermediate states.
 
 **Stage 2 does not exec the app over itself.** A PID 1 that is Firefox
 reaps only its own children, and orphaned grandchildren pile up as
@@ -2229,9 +2231,14 @@ td ships one filter or two. Record the answer here when it is known.
 ### `UNSAFE.md` surface #9 (target-state draft)
 
 The normative `UNSAFE.md` roster grows with the implementation. Rung 9
-has landed the namespace, descriptor, mount and capability-bridge calls;
-the remaining calls below are not authorized until their own
-capability/reaper and seccomp rungs land with callers and tests.
+landed the namespace, descriptor, mount and capability-bridge calls, and
+rung 10 adds `wait4(2)` with final capability removal and its reparented-
+orphan oracle. The remaining calls below are not authorized until their
+own seccomp, launch and policy rungs land with callers and tests.
+The quoted block is the completed target, not the current roster; it
+intentionally retains the future thirteen-call count and `jail.rs`
+caller. Only the unquoted, implemented roster in `UNSAFE.md` authorizes
+today's nine calls and `transition.rs` caller.
 
 > ## 9. `td-jail` — the application sandbox
 >
@@ -3492,7 +3499,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 7 | **image application index — LANDED**: typed launcher metadata, the builder-authenticated export, immutable resolver/launcher tables, `/etc/td-app.conf`, and the empty `/bin/<name>` farm through `real_root_steps` + `bin_farms()`; no application is selected until the jail lands | none |
 | 8 | **`td-jail` crate + surface #9 skeleton + stage-1/stage-2 transition — LANDED**: one value-pinned `unshare(2)` wrapper, exact identity-map and fresh-namespace readback, a token-synchronized safe-`Command` transition to PID 1, post-exec zero-capability readback for the nonroot app identity, a build-host policy smoke test, and an authoritative target-kernel QEMU probe from the packed static binary; ordinary application launch still refuses | none |
 | 9 | **mount transition — LANDED**: inherited-FD closure, a private compiled tmpfs root with individually read-only allowlisted device binds and immutable metadata, fresh devpts/shm/tmp/var-tmp, capability-v3 set/get readbacks, an exact ambient/inheritable `CAP_SYS_ADMIN` exec bridge, an empty/read-back bounding set, stage-2 procfs for its own PID namespace, pivot + old-root detach, mountinfo/device/mode/writability readbacks, and host plus target-kernel probes; application launch still refuses | none |
-| 10 | capability drop/readback + PID-1 reaper | none |
+| 10 | **capability drop/readback + PID-1 reaper — LANDED**: ambient is explicitly cleared before effective/permitted/inheritable become empty, all five sets are read back zero, and a copied static internal helper leaves a zero-capability grandchild for PID 1's bounded `wait4(-1)` oracle; ordinary application launch still refuses | none |
 | 11 | const BPF assembler, standard filter, interpreter tests, target probe | none |
 | 12 | **fixture package shipped in the image and launched by `/bin/<fixture>`** | **first jailed pixels on the QEMU screen** |
 | 12a | the same fixture under `--host`, asserting the degradation report (§X.5) | host mode works, and says what it could not enforce |

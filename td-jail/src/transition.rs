@@ -5,11 +5,14 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::IntoRawFd;
 use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 pub const PROBE_ARG: &str = "--probe-transition";
 const STAGE2_ARG: &str = "--internal-stage-2";
+const REAPER_CHILD_ARG: &str = "--internal-reaper-child";
+const REAPER_ORPHAN_ARG: &str = "--internal-reaper-orphan";
 pub const TRANSITION_MARKER: &str = "TD-JAIL-TRANSITION-OK";
 const STAGE2_MARKER: &str = "TD-JAIL-STAGE2-OK";
 const TOKEN_LEN: usize = 32;
@@ -22,6 +25,10 @@ const SCRATCH_ROOT: &str = "/tmp";
 const NEW_ROOT: &str = "/tmp/td-jail-root";
 const PUT_OLD: &str = "/tmp/td-jail-root/oldroot";
 const OLD_ROOT: &str = "/oldroot";
+const REAPER_PROBE_PATH: &str = "/tmp/td-jail-reaper-probe";
+const REAPER_TIMEOUT: Duration = Duration::from_secs(2);
+const REAPER_POLL: Duration = Duration::from_millis(5);
+const STAGE2_OUTPUT_LIMIT: usize = 4096;
 
 const DEVICE_NODES: &[(&str, u64, u64)] = &[
     ("null", 1, 3),
@@ -93,6 +100,8 @@ pub enum Mode {
         token: [u8; TOKEN_LEN],
         identity: Identity,
     },
+    ReaperChild,
+    ReaperOrphan,
 }
 
 pub fn parse_mode<I>(mut args: I) -> io::Result<Mode>
@@ -117,6 +126,18 @@ where
             token: decode_token(&encoded)?,
             identity: Identity { uid, gid },
         });
+    }
+    if mode == REAPER_CHILD_ARG {
+        if args.next().is_some() {
+            return Err(usage_error());
+        }
+        return Ok(Mode::ReaperChild);
+    }
+    if mode == REAPER_ORPHAN_ARG {
+        if args.next().is_some() {
+            return Err(usage_error());
+        }
+        return Ok(Mode::ReaperOrphan);
     }
     Err(usage_error())
 }
@@ -404,7 +425,7 @@ fn remount_read_only(path: &str, flags: usize) -> io::Result<()> {
     .map_err(|e| io::Error::other(format!("remount {path} read-only: {e}")))
 }
 
-fn prepare_mount_plan(identity: Identity) -> io::Result<()> {
+fn prepare_mount_plan(identity: Identity, executable: &Path) -> io::Result<()> {
     let root = cstring("/")?;
     sys::mount(None, &root, None, sys::MS_REC | sys::MS_PRIVATE, None)
         .map_err(|e| io::Error::other(format!("make mount tree private: {e}")))?;
@@ -477,7 +498,29 @@ fn prepare_mount_plan(identity: Identity) -> io::Result<()> {
         sys::MS_NOSUID | sys::MS_NODEV,
         "mode=1777",
     )?;
+    install_reaper_probe(executable)?;
     remount_read_only(&dev, sys::MS_NOSUID | sys::MS_NOEXEC)
+}
+
+fn install_reaper_probe(executable: &Path) -> io::Result<()> {
+    let target = format!("{NEW_ROOT}{REAPER_PROBE_PATH}");
+    if fs::symlink_metadata(&target).is_ok() {
+        return Err(io::Error::other("fresh reaper-probe path already exists"));
+    }
+    let expected_len = fs::metadata(executable)?.len();
+    let copied = fs::copy(executable, &target)?;
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o500))?;
+    let metadata = fs::metadata(&target)?;
+    if copied != expected_len
+        || metadata.len() != expected_len
+        || !metadata.file_type().is_file()
+        || metadata.mode() & 0o7777 != 0o500
+    {
+        return Err(io::Error::other(
+            "reaper-probe copy does not match the current executable",
+        ));
+    }
+    Ok(())
 }
 
 fn last_capability() -> io::Result<u32> {
@@ -596,6 +639,27 @@ fn require_stage2_capabilities() -> io::Result<()> {
     require_empty_bounding(last)?;
     let status = fs::read_to_string("/proc/self/status")?;
     require_capability_rows(&status, expected, SYS_ADMIN_MASK, 0)
+}
+
+fn clear_and_require_empty_capabilities() -> io::Result<()> {
+    let last = last_capability()?;
+    sys::clear_ambient_capabilities()?;
+    require_ambient(last, 0)?;
+    let empty = sys::CapabilitySets {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    };
+    sys::set_capabilities(empty)?;
+    if sys::capabilities()? != empty {
+        return Err(io::Error::other(
+            "stage 2 retained a capability after the final capset",
+        ));
+    }
+    require_ambient(last, 0)?;
+    require_empty_bounding(last)?;
+    let status = fs::read_to_string("/proc/self/status")?;
+    require_capability_rows(&status, empty, 0, 0)
 }
 
 fn enter_mount_plan() -> io::Result<()> {
@@ -923,6 +987,129 @@ fn require_mount_plan() -> io::Result<()> {
     require_stage2_capabilities()
 }
 
+fn require_empty_child_capabilities() -> io::Result<()> {
+    let empty = sys::CapabilitySets {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    };
+    let last = last_capability()?;
+    if sys::capabilities()? != empty {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "reaper probe inherited a live capability",
+        ));
+    }
+    require_ambient(last, 0)?;
+    require_empty_bounding(last)?;
+    let status = fs::read_to_string("/proc/self/status")?;
+    require_capability_rows(&status, empty, 0, 0)
+}
+
+pub fn run_reaper_child() -> io::Result<()> {
+    if std::process::id() == 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "reaper child unexpectedly became PID 1",
+        ));
+    }
+    require_empty_child_capabilities()?;
+    let child = Command::new(REAPER_PROBE_PATH)
+        .arg(REAPER_ORPHAN_ARG)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| io::Error::other(format!("spawn zero-capability reaper orphan: {e}")))?;
+    writeln!(io::stdout(), "{}", child.id())?;
+    // Return without waiting so the grandchild reparents to PID 1.
+    drop(child);
+    Ok(())
+}
+
+pub fn run_reaper_orphan() -> io::Result<()> {
+    if std::process::id() == 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "reaper orphan unexpectedly became PID 1",
+        ));
+    }
+    require_empty_child_capabilities()?;
+    std::thread::sleep(Duration::from_millis(100));
+    Ok(())
+}
+
+fn probe_pid1_reaper() -> io::Result<()> {
+    let mut child = Command::new(REAPER_PROBE_PATH)
+        .arg(REAPER_CHILD_ARG)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| io::Error::other(format!("spawn zero-capability reaper child: {e}")))?;
+    let deadline = Instant::now() + REAPER_TIMEOUT;
+    let direct_pid = i32::try_from(child.id())
+        .map_err(|e| io::Error::other(format!("reaper child PID is invalid: {e}")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("reaper child stdout pipe was not created"))?;
+    // The oracle must collect both descendants through wait4(-1).
+    drop(child);
+
+    let mut reaped = BTreeSet::new();
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "PID 1 did not empty the probe child table before the deadline: {reaped:?}"
+            )));
+        }
+        match sys::wait_any(true)? {
+            sys::Reaped::Child { pid, status } => {
+                if status != 0 {
+                    return Err(io::Error::other(format!(
+                        "reaper probe child {pid} returned raw status {status:#x}"
+                    )));
+                }
+                if !reaped.insert(pid) || reaped.len() > 2 {
+                    return Err(io::Error::other(format!(
+                        "PID 1 reaped an invalid initial child set {reaped:?}"
+                    )));
+                }
+            }
+            sys::Reaped::NotYet => std::thread::sleep(REAPER_POLL),
+            sys::Reaped::NoChildren => break,
+        }
+    }
+
+    // ECHILD guarantees no descendant can retain the report pipe writer.
+    let mut report = String::new();
+    stdout.take(33).read_to_string(&mut report)?;
+    let encoded = report
+        .strip_suffix('\n')
+        .ok_or_else(|| io::Error::other("reaper child report lacks its line terminator"))?;
+    if encoded.is_empty() || !encoded.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(io::Error::other(format!(
+            "reaper child returned an invalid orphan PID: {report:?}"
+        )));
+    }
+    let orphan_pid = encoded
+        .parse::<i32>()
+        .map_err(|e| io::Error::other(format!("reaper orphan PID is invalid: {e}")))?;
+    if direct_pid <= 1 || orphan_pid <= 1 || direct_pid == orphan_pid {
+        return Err(io::Error::other(format!(
+            "reaper probe PIDs are direct={direct_pid}, orphan={orphan_pid}"
+        )));
+    }
+    let expected = BTreeSet::from([direct_pid, orphan_pid]);
+    if reaped != expected {
+        return Err(io::Error::other(format!(
+            "PID 1 reaped {reaped:?}, expected {expected:?}"
+        )));
+    }
+    fs::remove_file(REAPER_PROBE_PATH)
+}
+
 pub fn probe_transition() -> io::Result<()> {
     let identity = current_identity()?;
     if identity.uid == 0 || identity.gid == 0 {
@@ -943,18 +1130,20 @@ pub fn probe_transition() -> io::Result<()> {
     if let Some(descriptor) = test_leak {
         require_descriptor_closed(descriptor)?;
     }
-    prepare_mount_plan(identity)?;
+    prepare_mount_plan(identity, &executable)?;
     prepare_capability_bridge()?;
 
     let (proof_reader, mut proof_writer) = io::pipe()?;
+    let (stage2_output, stage2_writer) = io::pipe()?;
+    let stage2_error_writer = stage2_writer.try_clone()?;
     let mut child = Command::new(executable)
         .arg(STAGE2_ARG)
         .arg(encode_token(&token))
         .arg(identity.uid.to_string())
         .arg(identity.gid.to_string())
         .stdin(Stdio::from(proof_reader))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stage2_writer))
+        .stderr(Stdio::from(stage2_error_writer))
         .spawn()?;
 
     if let Err(error) = require_child_pid_namespace_changed(&before, child.id()) {
@@ -968,52 +1157,36 @@ pub fn probe_transition() -> io::Result<()> {
         let _ = child.wait();
         return Err(error);
     }
+    drop(proof_writer);
 
     let expected = format!("{STAGE2_MARKER} pid=1\n");
-    let mut output = String::new();
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("stage-2 stdout pipe was not created"))?;
-    if let Err(error) = stdout
-        .take(u64::try_from(expected.len()).unwrap_or(u64::MAX) + 1)
-        .read_to_string(&mut output)
+    let mut response = Vec::new();
+    if let Err(error) = stage2_output
+        .take((STAGE2_OUTPUT_LIMIT + 1) as u64)
+        .read_to_end(&mut response)
     {
         let _ = child.kill();
         let _ = child.wait();
         return Err(error);
     }
-    let mut errors = String::new();
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| io::Error::other("stage-2 stderr pipe was not created"))?;
-    if let Err(error) = stderr.take(4097).read_to_string(&mut errors) {
+    if response.len() > STAGE2_OUTPUT_LIMIT {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(error);
-    }
-    if errors.len() > 4096 {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(io::Error::other("stage-2 diagnostic exceeded 4096 bytes"));
+        return Err(io::Error::other("stage-2 output exceeded 4096 bytes"));
     }
     let status = child.wait()?;
-    drop(proof_writer);
+    let response = String::from_utf8(response)
+        .map_err(|e| io::Error::other(format!("stage-2 output is not UTF-8: {e}")))?;
     if !status.success() {
         return Err(io::Error::other(format!(
-            "stage 2 refused the namespace transition: {status}: {}",
-            errors.trim()
+            "stage 2 refused the namespace transition: {}: {}",
+            status,
+            response.trim()
         )));
     }
-    if !errors.is_empty() {
+    if response != expected {
         return Err(io::Error::other(format!(
-            "stage 2 wrote a diagnostic on success: {errors:?}"
-        )));
-    }
-    if output != expected {
-        return Err(io::Error::other(format!(
-            "stage 2 returned an unexpected transition response: {output:?}"
+            "stage 2 returned an unexpected transition response: {response:?}"
         )));
     }
     writeln!(io::stdout(), "{TRANSITION_MARKER} pid=1")
@@ -1054,6 +1227,8 @@ pub fn run_stage2(expected: [u8; TOKEN_LEN], expected_identity: Identity) -> io:
     require_stage2_capabilities()?;
     enter_mount_plan()?;
     require_mount_plan()?;
+    clear_and_require_empty_capabilities()?;
+    probe_pid1_reaper()?;
     writeln!(io::stdout(), "{STAGE2_MARKER} pid=1")
 }
 
@@ -1072,11 +1247,21 @@ mod tests {
     }
 
     #[test]
-    fn public_mode_is_only_the_transition_probe() {
+    fn public_mode_is_only_probe_and_internal_modes_are_exact() {
         assert_eq!(parse_mode(args(&[PROBE_ARG])).unwrap(), Mode::Probe);
         assert!(parse_mode(args(&[])).is_err());
         assert!(parse_mode(args(&["firefox"])).is_err());
         assert!(parse_mode(args(&[PROBE_ARG, "extra"])).is_err());
+        assert_eq!(
+            parse_mode(args(&[REAPER_CHILD_ARG])).unwrap(),
+            Mode::ReaperChild
+        );
+        assert_eq!(
+            parse_mode(args(&[REAPER_ORPHAN_ARG])).unwrap(),
+            Mode::ReaperOrphan
+        );
+        assert!(parse_mode(args(&[REAPER_CHILD_ARG, "extra"])).is_err());
+        assert!(parse_mode(args(&[REAPER_ORPHAN_ARG, "extra"])).is_err());
     }
 
     #[test]

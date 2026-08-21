@@ -441,7 +441,8 @@ pub const TD_POINTER_ABSOLUTE_MARKER: &str = "TD-POINTER-ABSOLUTE";
 pub const TD_SANDBOX_KERNEL_MARKER: &str = "TD-SANDBOX-KERNEL-OK";
 
 /// Emitted by td-jail stage 1 only after its child is PID 1 in the fresh namespace,
-/// both identity maps read back exactly, and the post-exec capability check passes.
+/// both identity maps read back exactly, every capability is removed and read back,
+/// and PID 1 reaps a reparented zero-capability descendant.
 pub const TD_JAIL_TRANSITION_MARKER: &str = "TD-JAIL-TRANSITION-OK";
 
 /// Kernel-cmdline token the headless `qemu-boot-system` oracle appends so the greeter

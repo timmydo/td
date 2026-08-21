@@ -832,7 +832,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          ({TD_LOGIN_RUNTIME_MARKER}), confirmed on the RUNNING kernel that the namespaces, \
          seccomp filtering, inotify and cgroup pids controller a jail needs are all there \
          ({TD_SANDBOX_KERNEL_MARKER}), exercised td-jail's unprivileged namespace transition \
-         on that target kernel ({TD_JAIL_TRANSITION_MARKER}), then assigned the single-user \
+         on that target kernel, removed every capability and reaped a reparented descendant \
+         as PID 1 ({TD_JAIL_TRANSITION_MARKER}), then assigned the single-user \
          graphical seat and brought \
          the software Wayland socket up on virtio-gpu ({TD_WAYLAND_RUNTIME_MARKER}), \
          read an absolute position and its span off the virtio tablet \
@@ -1239,7 +1240,8 @@ fn validate_system_boot(
              ({TD_JAIL_TRANSITION_MARKER:?}) was absent — the booted kernel or its runtime \
              policy refused the unprivileged user/mount/PID/UTS/network namespace transition, \
              its exact identity maps, inherited-descriptor closure, the PID-1 re-exec, the \
-             exact capability bridge, empty bounding set, or immutable-root pivot. \
+             exact capability bridge, immutable-root pivot, final zero-capability readback, \
+             or PID-1 orphan reaping. \
              The build-host recipe probe is only a host-policy smoke test; this marker is the \
              authoritative target-kernel result. Last serial output:\n{}",
             tail(&result.console, 80)

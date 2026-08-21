@@ -1,8 +1,8 @@
 //! td-jail — td's application confinement boundary.
 //!
-//! The transition probe enters a fresh immutable root as PID 1 with only the
-//! mount capability. Application launch remains disabled until capability
-//! clearing, reaping, and seccomp have landed.
+//! The transition probe enters a fresh immutable root, clears every capability,
+//! and reaps a reparented descendant as PID 1. Application launch remains
+//! disabled until seccomp has landed.
 #![deny(unsafe_code)]
 
 mod sys;
@@ -15,6 +15,8 @@ fn run() -> std::io::Result<()> {
     match transition::parse_mode(std::env::args_os().skip(1))? {
         transition::Mode::Probe => transition::probe_transition(),
         transition::Mode::Stage2 { token, identity } => transition::run_stage2(token, identity),
+        transition::Mode::ReaperChild => transition::run_reaper_child(),
+        transition::Mode::ReaperOrphan => transition::run_reaper_orphan(),
     }
 }
 
@@ -51,6 +53,7 @@ mod confinement {
     fn syscall_and_argument_rosters_are_pinned() {
         for syscall in [
             "const SYS_CLOSE: usize = 3;",
+            "const SYS_WAIT4: usize = 61;",
             "const SYS_CAPGET: usize = 125;",
             "const SYS_CAPSET: usize = 126;",
             "const SYS_PIVOT_ROOT: usize = 155;",
@@ -61,7 +64,7 @@ mod confinement {
         ] {
             assert!(SYS.contains(syscall), "missing syscall pin: {syscall}");
         }
-        assert_eq!(SYS.matches("const SYS_").count(), 8);
+        assert_eq!(SYS.matches("const SYS_").count(), 9);
         assert!(SYS.contains("const BASE_NAMESPACE_FLAGS: usize ="));
         assert!(SYS.contains("const ISOLATED_NETWORK_FLAGS: usize ="));
         for flag in [
@@ -99,6 +102,7 @@ mod confinement {
         assert_eq!(TRANSITION.matches("sys::unshare_namespaces(").count(), 1);
         for call in [
             "sys::close(",
+            "sys::wait_any(",
             "sys::mount(",
             "sys::pivot_root(",
             "sys::umount_detach(",
@@ -119,6 +123,8 @@ mod confinement {
         assert!(TRANSITION.contains("const TEST_LEAK_ENV: &str = \"TD_JAIL_TEST_LEAK_FD\";"));
         assert!(TRANSITION.contains(".into_raw_fd()"));
         assert!(TRANSITION.contains("require_descriptor_closed(descriptor)?;"));
+        assert!(TRANSITION.contains("clear_and_require_empty_capabilities()?;"));
+        assert!(TRANSITION.contains("probe_pid1_reaper()?;"));
     }
 
     #[test]

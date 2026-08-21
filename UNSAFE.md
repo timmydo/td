@@ -46,7 +46,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `ioctl(2)` |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
-| 9 | `td-jail` | `unshare(2)` with two value-pinned namespace sets |
+| 9 | `td-jail` | `close(2)`, `wait4(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering: it is host-side, and no
@@ -974,9 +974,10 @@ virtual fd table that stands in for `dup2` — is reachable through safe
 
 ## 9. `td-jail` — the application sandbox
 
-The second `td-jail` increment carries exactly EIGHT syscalls on x86-64
-through one `syscall5` body: `unshare(2)`, `close(2)`, `mount(2)`,
-`umount2(2)`, `pivot_root(2)`, `capset(2)`, `capget(2)`, and `prctl(2)`.
+The third `td-jail` increment carries exactly NINE syscalls on x86-64
+through one `syscall5` body: `unshare(2)`, `close(2)`, `wait4(2)`,
+`mount(2)`, `umount2(2)`, `pivot_root(2)`, `capset(2)`, `capget(2)`, and
+`prctl(2)`.
 The unshare wrapper accepts only the two compiled namespace sets the
 application design permits:
 `CLONE_NEWUSER|CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWUTS`, with
@@ -1031,15 +1032,25 @@ namespace PID is 1 and a fresh 32-byte proof arrives on the stdin
 descriptor stage 1 explicitly installed. Before mounting it requires
 effective, permitted, inheritable and ambient to equal exactly
 `CAP_SYS_ADMIN`, the bounding set to be empty, and the syscall and
-`/proc/self/status` readbacks to agree. No
-application is launched in this increment: ordinary entry remains a
-refusal until capability removal, reaping, and seccomp have landed.
+`/proc/self/status` readbacks to agree. After the mount readback, stage 2
+clears ambient first, empties effective, permitted and inheritable, and
+requires all five capability rows to be zero.
 
-Deliberately NOT in this surface yet are the other five calls in
-`APPLICATIONS.md`'s target-state draft: `seccomp`, `wait4`, `kill`,
-`prlimit64`, and `ioctl`. Each arrives only with the rung that uses and
-tests it; the roadmap is not advance authorization for dormant wrappers.
+`wait4(2)` is pinned to pid -1, a null rusage pointer, and either zero or
+`WNOHANG`. The transition probe copies the static td-jail into its fresh
+`/tmp`, launches a zero-capability child that creates a grandchild and
+exits without waiting, then requires PID 1 to reap both the direct child
+and the reparented orphan with successful raw statuses under one bounded
+deadline. Only after `ECHILD` makes the report pipe nonblocking does it
+read the orphan PID, verify the exact collected set, and remove the copy.
+This is an internal confinement oracle, not application launch; ordinary
+entry remains a refusal until seccomp has landed.
+
+Deliberately NOT in this surface yet are the other four calls in
+`APPLICATIONS.md`'s target-state draft: `seccomp`, `kill`, `prlimit64`,
+and `ioctl`. Each arrives only with the rung that uses and tests it; the
+roadmap is not advance authorization for dormant wrappers.
 There is likewise no `fork`, `pre_exec`, `clone`, `setns`, or caller-
-supplied namespace or mount set. A ninth syscall, a fourth prctl
+supplied namespace or mount set. A tenth syscall, a fourth prctl
 operation, a fourth ambient sub-operation, or a third unshare flag set
 is an amendment here.

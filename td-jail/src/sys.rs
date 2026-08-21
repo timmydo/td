@@ -7,6 +7,7 @@ use std::io;
 compile_error!("td-jail is x86_64-linux only (raw syscall ABI)");
 
 const SYS_CLOSE: usize = 3;
+const SYS_WAIT4: usize = 61;
 const SYS_CAPGET: usize = 125;
 const SYS_CAPSET: usize = 126;
 const SYS_PIVOT_ROOT: usize = 155;
@@ -45,11 +46,23 @@ const PR_CAP_AMBIENT_IS_SET: usize = 1;
 const PR_CAP_AMBIENT_RAISE: usize = 2;
 const PR_CAP_AMBIENT_CLEAR_ALL: usize = 4;
 
+const PID_ANY: usize = -1_isize as usize;
+const WNOHANG: usize = 1;
+const EINTR: i32 = 4;
+const ECHILD: i32 = 10;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CapabilitySets {
     pub effective: u64,
     pub permitted: u64,
     pub inheritable: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Reaped {
+    Child { pid: i32, status: i32 },
+    NotYet,
+    NoChildren,
 }
 
 #[repr(C)]
@@ -135,6 +148,36 @@ fn check(ret: isize) -> io::Result<()> {
 
 pub fn close(fd: u32) -> io::Result<()> {
     check(syscall5(SYS_CLOSE, fd as usize, 0, 0, 0, 0))
+}
+
+pub fn wait_any(nohang: bool) -> io::Result<Reaped> {
+    let mut status = 0_i32;
+    let options = if nohang { WNOHANG } else { 0 };
+    let ret = syscall5(
+        SYS_WAIT4,
+        PID_ANY,
+        std::ptr::from_mut(&mut status) as usize,
+        options,
+        0,
+        0,
+    );
+    classify_wait(ret, status)
+}
+
+fn classify_wait(ret: isize, status: i32) -> io::Result<Reaped> {
+    if ret > 0 {
+        return Ok(Reaped::Child {
+            pid: ret as i32,
+            status,
+        });
+    }
+    if ret == 0 || ret == -(EINTR as isize) {
+        return Ok(Reaped::NotYet);
+    }
+    if ret == -(ECHILD as isize) {
+        return Ok(Reaped::NoChildren);
+    }
+    Err(io::Error::from_raw_os_error(-ret as i32))
 }
 
 pub fn unshare_namespaces(isolate_network: bool) -> io::Result<()> {
@@ -331,6 +374,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<CapabilityHeader>(), 8);
         assert_eq!(std::mem::size_of::<CapabilityData>(), 12);
         assert_eq!(std::mem::size_of::<CapabilityDataPair>(), 24);
+        assert_eq!(PID_ANY, usize::MAX);
+        assert_eq!(WNOHANG, 1);
     }
 
     #[test]
@@ -362,5 +407,23 @@ mod tests {
     fn check_preserves_errno() {
         assert!(check(0).is_ok());
         assert_eq!(check(-1).unwrap_err().raw_os_error(), Some(1));
+    }
+
+    #[test]
+    fn wait_results_cover_child_poll_interrupt_and_empty_table() {
+        assert_eq!(
+            classify_wait(7, 3 << 8).unwrap(),
+            Reaped::Child {
+                pid: 7,
+                status: 3 << 8
+            }
+        );
+        assert_eq!(classify_wait(0, 0).unwrap(), Reaped::NotYet);
+        assert_eq!(classify_wait(-(EINTR as isize), 0).unwrap(), Reaped::NotYet);
+        assert_eq!(
+            classify_wait(-(ECHILD as isize), 0).unwrap(),
+            Reaped::NoChildren
+        );
+        assert_eq!(classify_wait(-22, 0).unwrap_err().raw_os_error(), Some(22));
     }
 }
