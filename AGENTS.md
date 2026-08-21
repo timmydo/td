@@ -594,7 +594,7 @@ td's Rust is defensive and minimal-surface.
   | 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `ioctl(2)` |
   | 7 | `td-util` | `ioctl(2)`, three value-pinned requests |
   | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
-  | 9 | `td-jail` | `unshare(2)` with two value-pinned namespace sets |
+  | 9 | `td-jail` | `close(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` |
 
   **`UNSAFE.md` is the normative record** and carries each surface's roster,
   its confinement contract, and what is deliberately NOT in it. Do not add

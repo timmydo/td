@@ -208,8 +208,8 @@ const SYSTEM: SystemDef = SystemDef {
             passwordless: true,
         },
     ],
-    // Rung 8 packs td-jail and proves its namespace transition, but ordinary
-    // launch remains disabled until the confinement boundary is complete.
+    // Rung 9 proves td-jail's immutable-root transition, but ordinary launch
+    // remains disabled until the confinement boundary is complete.
     applications: &[],
 };
 
@@ -1764,7 +1764,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          '{sandbox_kernel_probes}[ \"$k\" = 1 ]'; then \
          echo {TD_SANDBOX_KERNEL_MARKER}; msk=1; fi\n\
          if /bin/su -s /bin/sh {} -c \
-         'j=$(/bin/td-jail --probe-transition 2>&1) || \
+         'j=$(TD_JAIL_TEST_LEAK_FD=1 /bin/td-jail --probe-transition 2>&1) || \
          {{ echo \"td-jail: target transition probe failed: $j\"; exit 1; }}; \
          [ \"$j\" = \"{TD_JAIL_TRANSITION_MARKER} pid=1\" ] || \
          {{ echo \"td-jail: target transition returned unexpected output: $j\"; \
@@ -7097,6 +7097,9 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         let probe = bootsuccess
             .find("/bin/td-jail --probe-transition")
             .expect("target transition probe missing");
+        let leaked_fd = bootsuccess
+            .find("TD_JAIL_TEST_LEAK_FD=1 /bin/td-jail")
+            .expect("target transition descriptor-leak control missing");
         let gate = bootsuccess
             .find("[ \"$mtj\" = 1 ] || healthy=0")
             .expect("target transition health gate missing");
@@ -7104,8 +7107,8 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             .find(&format!("echo {SYSTEM_BOOT_SUCCESS_MARKER}"))
             .expect("boot success marker missing");
         assert!(
-            probe < gate && gate < success,
-            "target transition must run and gate the boot-success marker"
+            leaked_fd < probe && probe < gate && gate < success,
+            "target transition must close a leaked descriptor and gate boot success"
         );
     }
 

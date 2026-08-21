@@ -34,7 +34,9 @@ pub fn recipe() -> Recipe {
                 POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
-                    "o=$('{bin}' --probe-transition 2>&1) || {{ echo \"td-jail namespace transition probe failed: $o\" >&2; exit 1; }}; \
+                    "exec 9</proc/self/status; \
+                     o=$(TD_JAIL_TEST_LEAK_FD=1 '{bin}' --probe-transition 2>&1) || {{ exec 9<&-; echo \"td-jail namespace transition probe failed: $o\" >&2; exit 1; }}; \
+                     exec 9<&-; \
                      [ \"$o\" = '{TD_JAIL_TRANSITION_MARKER} pid=1' ] || {{ echo \"td-jail transition returned the wrong proof: $o\" >&2; exit 1; }}; \
                      '{bin}' >/dev/null 2>&1 && {{ echo 'td-jail launched without a complete confinement path' >&2; exit 1; }}; :"
                 ),
@@ -49,7 +51,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
         content: format!(
-            "PASS: td-jail is a static ELF64 x86-64 executable; the build-host policy permits fresh user, mount, PID, UTS and network namespaces, stage 1 observes stage 2 as PID 1 before emitting {TD_JAIL_TRANSITION_MARKER}, identity maps read back exactly, non-root stage 2 has no effective capabilities after exec, and application launch remains disabled; system-x86-64's QEMU oracle supplies the authoritative target-kernel proof\n"
+            "PASS: td-jail is a static ELF64 x86-64 executable; the build-host policy permits the complete namespace transition, stage 1 closes inherited descriptors and installs an exact CAP_SYS_ADMIN exec bridge with an empty bounding set, stage 2 enters a read-back immutable tmpfs root with fresh proc/dev/devpts/shm/tmp/var-tmp and no old root, and application launch remains disabled; system-x86-64's QEMU oracle supplies the authoritative target-kernel proof through {TD_JAIL_TRANSITION_MARKER}\n"
         ),
         exec: false,
     });
@@ -63,7 +65,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-jail-test: build-plan --auto builds the static target td-jail, smoke-tests the build host's unprivileged namespace policy and stage-1/stage-2 PID-1 handoff, checks exact identity maps and post-exec capability removal, and keeps application launch disabled; the system QEMU oracle proves the target kernel"
+echo ">> recipe-check td-jail-test: build-plan --auto builds the static target td-jail, smoke-tests the build host's namespace/mount/capability policy and immutable-root transition, and keeps application launch disabled; the system QEMU oracle proves the target kernel"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-jail-test 1
 "#,

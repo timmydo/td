@@ -1,8 +1,8 @@
 //! td-jail — td's application confinement boundary.
 //!
-//! This first increment proves only the single-threaded namespace transition
-//! into a stage-2 process that is PID 1. Application launch remains disabled
-//! until the mount, capability, reaper, and seccomp increments have landed.
+//! The transition probe enters a fresh immutable root as PID 1 with only the
+//! mount capability. Application launch remains disabled until capability
+//! clearing, reaping, and seccomp have landed.
 #![deny(unsafe_code)]
 
 mod sys;
@@ -49,21 +49,76 @@ mod confinement {
 
     #[test]
     fn syscall_and_argument_rosters_are_pinned() {
-        assert!(SYS.contains("const SYS_UNSHARE: usize = 272;"));
+        for syscall in [
+            "const SYS_CLOSE: usize = 3;",
+            "const SYS_CAPGET: usize = 125;",
+            "const SYS_CAPSET: usize = 126;",
+            "const SYS_PIVOT_ROOT: usize = 155;",
+            "const SYS_PRCTL: usize = 157;",
+            "const SYS_MOUNT: usize = 165;",
+            "const SYS_UMOUNT2: usize = 166;",
+            "const SYS_UNSHARE: usize = 272;",
+        ] {
+            assert!(SYS.contains(syscall), "missing syscall pin: {syscall}");
+        }
+        assert_eq!(SYS.matches("const SYS_").count(), 8);
         assert!(SYS.contains("const BASE_NAMESPACE_FLAGS: usize ="));
         assert!(SYS.contains("const ISOLATED_NETWORK_FLAGS: usize ="));
-        assert_eq!(SYS.matches("check(syscall5(").count(), 1);
+        for flag in [
+            "pub const MS_RDONLY: usize = 0x1;",
+            "pub const MS_NOSUID: usize = 0x2;",
+            "pub const MS_NODEV: usize = 0x4;",
+            "pub const MS_NOEXEC: usize = 0x8;",
+            "pub const MS_REMOUNT: usize = 0x20;",
+            "pub const MS_BIND: usize = 0x1000;",
+            "pub const MS_REC: usize = 0x4000;",
+            "pub const MS_PRIVATE: usize = 0x4_0000;",
+            "pub const MNT_DETACH: usize = 0x2;",
+        ] {
+            assert!(SYS.contains(flag), "missing mount flag pin: {flag}");
+        }
+        assert_eq!(SYS.matches("pub const MS_").count(), 8);
+        assert!(SYS.contains("const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;"));
+        assert!(SYS.contains("const PR_CAPBSET_READ: usize = 23;"));
+        assert!(SYS.contains("const PR_CAPBSET_DROP: usize = 24;"));
+        assert!(SYS.contains("const PR_CAP_AMBIENT: usize = 47;"));
+        assert!(SYS.contains("const PR_CAP_AMBIENT_IS_SET: usize = 1;"));
+        assert!(SYS.contains("const PR_CAP_AMBIENT_RAISE: usize = 2;"));
+        assert!(SYS.contains("const PR_CAP_AMBIENT_CLEAR_ALL: usize = 4;"));
+        assert!(SYS.contains("pub const CAP_SETPCAP: u32 = 8;"));
+        assert!(SYS.contains("pub const CAP_SYS_ADMIN: u32 = 21;"));
+        assert!(SYS.contains("std::ptr::from_mut(&mut data) as usize"));
+        assert!(SYS.contains("std::ptr::from_ref(&data) as usize"));
         assert!(SYS.contains("check(syscall5(SYS_UNSHARE, flags, 0, 0, 0, 0))"));
+        assert!(TRANSITION.contains("sys::MS_REC | sys::MS_PRIVATE"));
     }
 
     #[test]
     fn transition_is_the_only_syscall_caller() {
         let shipped_main = MAIN.split_once("#[cfg(test)]").unwrap().0;
         assert_eq!(TRANSITION.matches("sys::unshare_namespaces(").count(), 1);
+        for call in [
+            "sys::close(",
+            "sys::mount(",
+            "sys::pivot_root(",
+            "sys::umount_detach(",
+            "sys::capabilities(",
+            "sys::set_capabilities(",
+            "sys::clear_ambient_capabilities(",
+            "sys::raise_ambient_sys_admin(",
+            "sys::ambient_capability(",
+            "sys::drop_bounding_capability(",
+            "sys::bounding_capability(",
+        ] {
+            assert!(TRANSITION.contains(call), "missing syscall caller: {call}");
+        }
         assert!(!shipped_main.contains("sys::"));
         assert!(!TRANSITION.contains("pre_exec"));
         assert!(!TRANSITION.contains("CommandExt"));
         assert!(!TRANSITION.contains("fork("));
+        assert!(TRANSITION.contains("const TEST_LEAK_ENV: &str = \"TD_JAIL_TEST_LEAK_FD\";"));
+        assert!(TRANSITION.contains(".into_raw_fd()"));
+        assert!(TRANSITION.contains("require_descriptor_closed(descriptor)?;"));
     }
 
     #[test]

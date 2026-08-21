@@ -1238,7 +1238,8 @@ fn validate_system_boot(
             "the running-kernel feature checks passed, but td-jail's target transition marker \
              ({TD_JAIL_TRANSITION_MARKER:?}) was absent — the booted kernel or its runtime \
              policy refused the unprivileged user/mount/PID/UTS/network namespace transition, \
-             its exact identity maps, the PID-1 re-exec, or the post-exec capability drop. \
+             its exact identity maps, inherited-descriptor closure, the PID-1 re-exec, the \
+             exact capability bridge, empty bounding set, or immutable-root pivot. \
              The build-host recipe probe is only a host-policy smoke test; this marker is the \
              authoritative target-kernel result. Last serial output:\n{}",
             tail(&result.console, 80)

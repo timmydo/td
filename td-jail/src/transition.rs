@@ -1,7 +1,10 @@
 use crate::sys;
-use std::ffi::OsString;
-use std::fs;
+use std::collections::BTreeSet;
+use std::ffi::{CString, OsString};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::fd::IntoRawFd;
+use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -10,6 +13,23 @@ const STAGE2_ARG: &str = "--internal-stage-2";
 pub const TRANSITION_MARKER: &str = "TD-JAIL-TRANSITION-OK";
 const STAGE2_MARKER: &str = "TD-JAIL-STAGE2-OK";
 const TOKEN_LEN: usize = 32;
+const TEST_LEAK_ENV: &str = "TD_JAIL_TEST_LEAK_FD";
+const MAX_CAPABILITY: u32 = 63;
+const SYS_ADMIN_MASK: u64 = 1_u64 << sys::CAP_SYS_ADMIN;
+const SETPCAP_MASK: u64 = 1_u64 << sys::CAP_SETPCAP;
+
+const SCRATCH_ROOT: &str = "/tmp";
+const NEW_ROOT: &str = "/tmp/td-jail-root";
+const PUT_OLD: &str = "/tmp/td-jail-root/oldroot";
+const OLD_ROOT: &str = "/oldroot";
+
+const DEVICE_NODES: &[(&str, u64, u64)] = &[
+    ("null", 1, 3),
+    ("zero", 1, 5),
+    ("full", 1, 7),
+    ("random", 1, 8),
+    ("urandom", 1, 9),
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Identity {
@@ -135,14 +155,14 @@ fn current_identity() -> io::Result<Identity> {
     })
 }
 
-fn effective_capabilities(status: &str) -> io::Result<u64> {
+fn capability_row(status: &str, key: &str) -> io::Result<u64> {
     let value = status
         .lines()
-        .find_map(|line| line.strip_prefix("CapEff:"))
-        .ok_or_else(|| io::Error::other("/proc/self/status has no CapEff row"))?
+        .find_map(|line| line.strip_prefix(key))
+        .ok_or_else(|| io::Error::other(format!("/proc/self/status has no {key} row")))?
         .trim();
     u64::from_str_radix(value, 16)
-        .map_err(|e| io::Error::other(format!("invalid /proc/self/status CapEff: {e}")))
+        .map_err(|e| io::Error::other(format!("invalid /proc/self/status {key}: {e}")))
 }
 
 fn effective_id(status: &str, key: &str) -> io::Result<u32> {
@@ -257,17 +277,676 @@ fn tokens_equal(left: &[u8; TOKEN_LEN], right: &[u8; TOKEN_LEN]) -> bool {
         == 0
 }
 
+fn cstring(value: &str) -> io::Result<CString> {
+    CString::new(value).map_err(|_| io::Error::other(format!("path contains NUL: {value:?}")))
+}
+
+fn close_inherited_descriptors() -> io::Result<()> {
+    let mut descriptors = Vec::new();
+    for entry in fs::read_dir("/proc/self/fd")? {
+        let name = entry?
+            .file_name()
+            .into_string()
+            .map_err(|_| io::Error::other("/proc/self/fd contained a non-UTF-8 descriptor name"))?;
+        let descriptor = name.parse::<u32>().map_err(|e| {
+            io::Error::other(format!(
+                "/proc/self/fd contained nonnumeric entry {name:?}: {e}"
+            ))
+        })?;
+        if descriptor > 2 {
+            descriptors.push(descriptor);
+        }
+    }
+    descriptors.sort_unstable();
+    descriptors.dedup();
+    for descriptor in descriptors {
+        if let Err(error) = sys::close(descriptor) {
+            if error.raw_os_error() != Some(9) {
+                return Err(io::Error::other(format!(
+                    "close inherited descriptor {descriptor}: {error}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn install_test_leak_if_requested() -> io::Result<Option<u32>> {
+    let Some(value) = std::env::var_os(TEST_LEAK_ENV) else {
+        return Ok(None);
+    };
+    if value != "1" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{TEST_LEAK_ENV} must be 1 when present"),
+        ));
+    }
+    let raw = fs::File::open("/proc/self/status")?.into_raw_fd();
+    let descriptor = u32::try_from(raw)
+        .map_err(|e| io::Error::other(format!("test leak descriptor is invalid: {e}")))?;
+    if descriptor <= 2 || fs::symlink_metadata(format!("/proc/self/fd/{descriptor}")).is_err() {
+        return Err(io::Error::other(
+            "test leak did not create a live descriptor above stderr",
+        ));
+    }
+    Ok(Some(descriptor))
+}
+
+fn require_descriptor_closed(descriptor: u32) -> io::Result<()> {
+    match fs::symlink_metadata(format!("/proc/self/fd/{descriptor}")) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(_) => Err(io::Error::other(format!(
+            "descriptor closure sweep left test descriptor {descriptor} open"
+        ))),
+    }
+}
+
+fn require_only_stdio_descriptors() -> io::Result<()> {
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir("/proc/self/fd")? {
+        let name = entry?
+            .file_name()
+            .into_string()
+            .map_err(|_| io::Error::other("stage-2 descriptor name is not UTF-8"))?;
+        let descriptor = name.parse::<u32>().map_err(|e| {
+            io::Error::other(format!("stage-2 descriptor name {name:?} is invalid: {e}"))
+        })?;
+        if descriptor > 2 {
+            candidates.push(descriptor);
+        }
+    }
+    for descriptor in candidates {
+        match fs::symlink_metadata(format!("/proc/self/fd/{descriptor}")) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("stage 2 inherited descriptor {descriptor} above stderr"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn create_dir(path: &str, mode: u32) -> io::Result<()> {
+    fs::create_dir(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+fn mount_tmpfs(path: &str, flags: usize, data: &str) -> io::Result<()> {
+    let tmpfs = cstring("tmpfs")?;
+    let target = cstring(path)?;
+    let data = cstring(data)?;
+    sys::mount(Some(&tmpfs), &target, Some(&tmpfs), flags, Some(&data))
+        .map_err(|e| io::Error::other(format!("mount tmpfs at {path}: {e}")))
+}
+
+fn mount_bind_read_only(source: &str, target: &str) -> io::Result<()> {
+    let source_c = cstring(source)?;
+    let target_c = cstring(target)?;
+    sys::mount(Some(&source_c), &target_c, None, sys::MS_BIND, None)
+        .map_err(|e| io::Error::other(format!("bind {source} at {target}: {e}")))?;
+    remount_read_only(target, sys::MS_BIND | sys::MS_NOSUID | sys::MS_NOEXEC)
+}
+
+fn remount_read_only(path: &str, flags: usize) -> io::Result<()> {
+    let target = cstring(path)?;
+    sys::mount(
+        None,
+        &target,
+        None,
+        sys::MS_REMOUNT | sys::MS_RDONLY | flags,
+        None,
+    )
+    .map_err(|e| io::Error::other(format!("remount {path} read-only: {e}")))
+}
+
+fn prepare_mount_plan(identity: Identity) -> io::Result<()> {
+    let root = cstring("/")?;
+    sys::mount(None, &root, None, sys::MS_REC | sys::MS_PRIVATE, None)
+        .map_err(|e| io::Error::other(format!("make mount tree private: {e}")))?;
+
+    mount_tmpfs(
+        SCRATCH_ROOT,
+        sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC,
+        "mode=0700",
+    )?;
+    create_dir(NEW_ROOT, 0o755)?;
+    mount_tmpfs(NEW_ROOT, sys::MS_NOSUID | sys::MS_NODEV, "mode=0755")?;
+
+    for (path, mode) in [
+        (format!("{NEW_ROOT}/dev"), 0o755),
+        (format!("{NEW_ROOT}/proc"), 0o555),
+        (format!("{NEW_ROOT}/tmp"), 0o1777),
+        (format!("{NEW_ROOT}/var"), 0o755),
+        (PUT_OLD.to_string(), 0o700),
+    ] {
+        create_dir(&path, mode)?;
+    }
+    create_dir(&format!("{NEW_ROOT}/var/tmp"), 0o1777)?;
+
+    let dev = format!("{NEW_ROOT}/dev");
+    mount_tmpfs(&dev, sys::MS_NOSUID | sys::MS_NOEXEC, "mode=0755")?;
+    create_dir(&format!("{dev}/pts"), 0o755)?;
+    create_dir(&format!("{dev}/shm"), 0o1777)?;
+    for (name, _, _) in DEVICE_NODES {
+        let target = format!("{dev}/{name}");
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)?;
+        mount_bind_read_only(&format!("/dev/{name}"), &target)?;
+    }
+
+    mount_tmpfs(
+        &format!("{dev}/shm"),
+        sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC,
+        "mode=1777,size=536870912",
+    )?;
+    let devpts = cstring("devpts")?;
+    let pts = cstring(&format!("{dev}/pts"))?;
+    let pts_data = cstring(&format!(
+        "newinstance,ptmxmode=0666,mode=0620,gid={}",
+        identity.gid
+    ))?;
+    sys::mount(
+        Some(&devpts),
+        &pts,
+        Some(&devpts),
+        sys::MS_NOSUID | sys::MS_NOEXEC,
+        Some(&pts_data),
+    )
+    .map_err(|e| io::Error::other(format!("mount fresh devpts: {e}")))?;
+
+    symlink("pts/ptmx", format!("{dev}/ptmx"))?;
+    symlink("/proc/self/fd", format!("{dev}/fd"))?;
+    symlink("/proc/self/fd/0", format!("{dev}/stdin"))?;
+    symlink("/proc/self/fd/1", format!("{dev}/stdout"))?;
+    symlink("/proc/self/fd/2", format!("{dev}/stderr"))?;
+
+    mount_tmpfs(
+        &format!("{NEW_ROOT}/tmp"),
+        sys::MS_NOSUID | sys::MS_NODEV,
+        "mode=1777",
+    )?;
+    mount_tmpfs(
+        &format!("{NEW_ROOT}/var/tmp"),
+        sys::MS_NOSUID | sys::MS_NODEV,
+        "mode=1777",
+    )?;
+    remount_read_only(&dev, sys::MS_NOSUID | sys::MS_NOEXEC)
+}
+
+fn last_capability() -> io::Result<u32> {
+    let last = fs::read_to_string("/proc/sys/kernel/cap_last_cap")?
+        .trim()
+        .parse::<u32>()
+        .map_err(|e| io::Error::other(format!("invalid kernel cap_last_cap: {e}")))?;
+    if last > MAX_CAPABILITY {
+        return Err(io::Error::other(format!(
+            "kernel capability {last} exceeds td-jail's 64-bit capability ABI"
+        )));
+    }
+    Ok(last)
+}
+
+fn require_ambient(last: u32, expected: u64) -> io::Result<()> {
+    for capability in 0..=last {
+        let mask = 1_u64 << capability;
+        if sys::ambient_capability(capability)? != (expected & mask != 0) {
+            return Err(io::Error::other(format!(
+                "ambient capability {capability} did not match the compiled set"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn require_empty_bounding(last: u32) -> io::Result<()> {
+    for capability in 0..=last {
+        if sys::bounding_capability(capability)? {
+            return Err(io::Error::other(format!(
+                "bounding capability {capability} survived the stage-1 drop"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn require_capability_rows(
+    status: &str,
+    sets: sys::CapabilitySets,
+    ambient: u64,
+    bounding: u64,
+) -> io::Result<()> {
+    for (key, expected) in [
+        ("CapEff:", sets.effective),
+        ("CapPrm:", sets.permitted),
+        ("CapInh:", sets.inheritable),
+        ("CapAmb:", ambient),
+        ("CapBnd:", bounding),
+    ] {
+        if capability_row(status, key)? != expected {
+            return Err(io::Error::other(format!(
+                "/proc capability row {key} did not match its syscall readback"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn prepare_capability_bridge() -> io::Result<()> {
+    let last = last_capability()?;
+    let current = sys::capabilities()?;
+    let required = SYS_ADMIN_MASK | SETPCAP_MASK;
+    if current.effective & required != required || current.permitted & required != required {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "new user namespace did not grant CAP_SYS_ADMIN and CAP_SETPCAP",
+        ));
+    }
+
+    sys::clear_ambient_capabilities()?;
+    require_ambient(last, 0)?;
+    let bridge = sys::CapabilitySets {
+        effective: current.effective,
+        permitted: current.permitted,
+        inheritable: SYS_ADMIN_MASK,
+    };
+    sys::set_capabilities(bridge)?;
+    if sys::capabilities()? != bridge {
+        return Err(io::Error::other(
+            "capset did not install the exact stage-1 inheritable bridge",
+        ));
+    }
+    sys::raise_ambient_sys_admin()?;
+    require_ambient(last, SYS_ADMIN_MASK)?;
+
+    for capability in 0..=last {
+        sys::drop_bounding_capability(capability)?;
+        if sys::bounding_capability(capability)? {
+            return Err(io::Error::other(format!(
+                "bounding capability {capability} survived its drop"
+            )));
+        }
+    }
+    require_empty_bounding(last)?;
+    let status = fs::read_to_string("/proc/self/status")?;
+    require_capability_rows(&status, bridge, SYS_ADMIN_MASK, 0)
+}
+
+fn require_stage2_capabilities() -> io::Result<()> {
+    let expected = sys::CapabilitySets {
+        effective: SYS_ADMIN_MASK,
+        permitted: SYS_ADMIN_MASK,
+        inheritable: SYS_ADMIN_MASK,
+    };
+    let actual = sys::capabilities()?;
+    if actual != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("stage 2 capability sets are {actual:?}, expected {expected:?}"),
+        ));
+    }
+    let last = last_capability()?;
+    require_ambient(last, SYS_ADMIN_MASK)?;
+    require_empty_bounding(last)?;
+    let status = fs::read_to_string("/proc/self/status")?;
+    require_capability_rows(&status, expected, SYS_ADMIN_MASK, 0)
+}
+
+fn enter_mount_plan() -> io::Result<()> {
+    let procfs = cstring("proc")?;
+    let proc_target = cstring(&format!("{NEW_ROOT}/proc"))?;
+    sys::mount(
+        Some(&procfs),
+        &proc_target,
+        Some(&procfs),
+        sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC,
+        None,
+    )
+    .map_err(|e| io::Error::other(format!("mount fresh PID-namespace procfs: {e}")))?;
+
+    let new_root = cstring(NEW_ROOT)?;
+    let put_old = cstring(PUT_OLD)?;
+    sys::pivot_root(&new_root, &put_old)
+        .map_err(|e| io::Error::other(format!("pivot into fresh root: {e}")))?;
+    std::env::set_current_dir("/")?;
+    let old_root = cstring(OLD_ROOT)?;
+    sys::umount_detach(&old_root).map_err(|e| io::Error::other(format!("detach old root: {e}")))?;
+    fs::remove_dir(OLD_ROOT)?;
+    remount_read_only("/", sys::MS_NOSUID | sys::MS_NODEV)
+}
+
+fn read_dir_names(path: &str) -> io::Result<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    for entry in fs::read_dir(path)? {
+        let name = entry?
+            .file_name()
+            .into_string()
+            .map_err(|_| io::Error::other(format!("{path} contains a non-UTF-8 entry name")))?;
+        names.insert(name);
+    }
+    Ok(names)
+}
+
+fn require_names(path: &str, expected: &[&str]) -> io::Result<()> {
+    let expected = expected
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<BTreeSet<_>>();
+    let actual = read_dir_names(path)?;
+    if actual != expected {
+        return Err(io::Error::other(format!(
+            "{path} entries are {actual:?}, expected {expected:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_mode(path: &str, expected: u32) -> io::Result<()> {
+    let actual = fs::metadata(path)?.mode() & 0o7777;
+    if actual != expected {
+        return Err(io::Error::other(format!(
+            "{path} mode is {actual:#o}, expected {expected:#o}"
+        )));
+    }
+    Ok(())
+}
+
+fn device_numbers(raw: u64) -> (u64, u64) {
+    let major = ((raw >> 8) & 0xfff) | ((raw >> 32) & 0xffff_f000);
+    let minor = (raw & 0xff) | ((raw >> 12) & 0xffff_ff00);
+    (major, minor)
+}
+
+fn require_devices() -> io::Result<()> {
+    require_names(
+        "/dev",
+        &[
+            "fd", "full", "null", "ptmx", "pts", "random", "shm", "stderr", "stdin", "stdout",
+            "urandom", "zero",
+        ],
+    )?;
+    for (name, expected_major, expected_minor) in DEVICE_NODES {
+        let path = format!("/dev/{name}");
+        let metadata = fs::metadata(&path)?;
+        if !metadata.file_type().is_char_device() {
+            return Err(io::Error::other(format!(
+                "{path} is not a character device"
+            )));
+        }
+        let (major, minor) = device_numbers(metadata.rdev());
+        if (major, minor) != (*expected_major, *expected_minor) {
+            return Err(io::Error::other(format!(
+                "{path} is device {major}:{minor}, expected {expected_major}:{expected_minor}"
+            )));
+        }
+    }
+    for (path, target) in [
+        ("/dev/ptmx", "pts/ptmx"),
+        ("/dev/fd", "/proc/self/fd"),
+        ("/dev/stdin", "/proc/self/fd/0"),
+        ("/dev/stdout", "/proc/self/fd/1"),
+        ("/dev/stderr", "/proc/self/fd/2"),
+    ] {
+        if fs::read_link(path)? != *target {
+            return Err(io::Error::other(format!(
+                "{path} does not target the compiled descriptor path"
+            )));
+        }
+    }
+    OpenOptions::new()
+        .write(true)
+        .open("/dev/null")?
+        .write_all(b"td-jail-device-probe")?;
+
+    let ptmx = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/ptmx")?;
+    let slave = fs::metadata("/dev/pts/0")?;
+    let identity = current_identity()?;
+    if !slave.file_type().is_char_device()
+        || slave.uid() != identity.uid
+        || slave.gid() != identity.gid
+        || slave.mode() & 0o7777 != 0o620
+    {
+        return Err(io::Error::other(
+            "fresh devpts did not create the compiled 0620 application-owned slave",
+        ));
+    }
+    drop(ptmx);
+    Ok(())
+}
+
+fn require_mount(
+    mountinfo: &str,
+    target: &str,
+    filesystem: Option<&str>,
+    required: &[&str],
+    forbidden: &[&str],
+) -> io::Result<()> {
+    let mut found = None;
+    for line in mountinfo.lines() {
+        let (left, right) = line
+            .split_once(" - ")
+            .ok_or_else(|| io::Error::other("mountinfo row has no separator"))?;
+        let mut fields = left.split_whitespace();
+        let mountpoint = fields
+            .nth(4)
+            .ok_or_else(|| io::Error::other("mountinfo row has no mount point"))?;
+        let options = fields
+            .next()
+            .ok_or_else(|| io::Error::other("mountinfo row has no mount options"))?;
+        if mountpoint != target {
+            continue;
+        }
+        if found.is_some() {
+            return Err(io::Error::other(format!(
+                "mountinfo contains duplicate {target} mounts"
+            )));
+        }
+        let actual_filesystem = right
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| io::Error::other("mountinfo row has no filesystem"))?;
+        let options = options.split(',').collect::<BTreeSet<_>>();
+        found = Some((actual_filesystem, options));
+    }
+    let (actual_filesystem, options) =
+        found.ok_or_else(|| io::Error::other(format!("mountinfo contains no {target} mount")))?;
+    if let Some(expected) = filesystem {
+        if actual_filesystem != expected {
+            return Err(io::Error::other(format!(
+                "{target} uses {actual_filesystem}, expected {expected}"
+            )));
+        }
+    }
+    for option in required {
+        if !options.contains(option) {
+            return Err(io::Error::other(format!(
+                "{target} mount lacks required option {option}"
+            )));
+        }
+    }
+    for option in forbidden {
+        if options.contains(option) {
+            return Err(io::Error::other(format!(
+                "{target} mount carries forbidden option {option}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn require_mount_super_option(mountinfo: &str, target: &str, required: &str) -> io::Result<()> {
+    for line in mountinfo.lines() {
+        let (left, right) = line
+            .split_once(" - ")
+            .ok_or_else(|| io::Error::other("mountinfo row has no separator"))?;
+        let mountpoint = left
+            .split_whitespace()
+            .nth(4)
+            .ok_or_else(|| io::Error::other("mountinfo row has no mount point"))?;
+        if mountpoint != target {
+            continue;
+        }
+        let super_options = right
+            .split_whitespace()
+            .nth(2)
+            .ok_or_else(|| io::Error::other("mountinfo row has no superblock options"))?;
+        if super_options.split(',').any(|option| option == required) {
+            return Ok(());
+        }
+        return Err(io::Error::other(format!(
+            "{target} mount lacks required superblock option {required}"
+        )));
+    }
+    Err(io::Error::other(format!(
+        "mountinfo contains no {target} mount"
+    )))
+}
+
+fn require_writable_tmp(path: &str) -> io::Result<()> {
+    let probe = format!("{path}/td-jail-write-probe");
+    fs::write(&probe, b"ok")?;
+    fs::remove_file(probe)
+}
+
+fn require_mount_plan() -> io::Result<()> {
+    if fs::symlink_metadata(OLD_ROOT).is_ok() || fs::symlink_metadata("/etc").is_ok() {
+        return Err(io::Error::other(
+            "detached host root remains reachable in the fresh root",
+        ));
+    }
+    require_names("/", &["dev", "proc", "tmp", "var"])?;
+    require_names("/var", &["tmp"])?;
+    require_mode("/", 0o755)?;
+    require_mode("/dev", 0o755)?;
+    require_mode("/dev/shm", 0o1777)?;
+    require_mode("/tmp", 0o1777)?;
+    require_mode("/var/tmp", 0o1777)?;
+    require_devices()?;
+
+    let numeric = read_dir_names("/proc")?
+        .into_iter()
+        .filter(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
+        .collect::<BTreeSet<_>>();
+    if numeric != BTreeSet::from(["1".to_string()]) {
+        return Err(io::Error::other(format!(
+            "fresh procfs exposes PIDs {numeric:?}, expected only PID 1"
+        )));
+    }
+    if fs::read_link("/proc/self")?.as_os_str() != "1" {
+        return Err(io::Error::other(
+            "fresh procfs does not resolve self to PID 1",
+        ));
+    }
+
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    require_mount(
+        &mountinfo,
+        "/",
+        Some("tmpfs"),
+        &["ro", "nosuid", "nodev"],
+        &["rw"],
+    )?;
+    require_mount(
+        &mountinfo,
+        "/proc",
+        Some("proc"),
+        &["rw", "nosuid", "nodev", "noexec"],
+        &["ro"],
+    )?;
+    require_mount(
+        &mountinfo,
+        "/dev",
+        Some("tmpfs"),
+        &["ro", "nosuid", "noexec"],
+        &["rw", "nodev"],
+    )?;
+    for path in ["/tmp", "/var/tmp"] {
+        require_mount(
+            &mountinfo,
+            path,
+            Some("tmpfs"),
+            &["rw", "nosuid", "nodev"],
+            &["ro"],
+        )?;
+        require_writable_tmp(path)?;
+    }
+    require_mount(
+        &mountinfo,
+        "/dev/shm",
+        Some("tmpfs"),
+        &["rw", "nosuid", "nodev", "noexec"],
+        &["ro"],
+    )?;
+    require_mount_super_option(&mountinfo, "/dev/shm", "size=524288k")?;
+    require_mount(
+        &mountinfo,
+        "/dev/pts",
+        Some("devpts"),
+        &["rw", "nosuid", "noexec"],
+        &["ro", "nodev"],
+    )?;
+    for (name, _, _) in DEVICE_NODES {
+        require_mount(
+            &mountinfo,
+            &format!("/dev/{name}"),
+            None,
+            &["ro", "nosuid", "noexec"],
+            &["rw", "nodev"],
+        )?;
+    }
+
+    if OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open("/root-write-probe")
+        .is_ok()
+    {
+        return Err(io::Error::other("fresh root remained writable"));
+    }
+    if OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open("/dev/write-probe")
+        .is_ok()
+    {
+        return Err(io::Error::other("fresh /dev remained mutable"));
+    }
+    require_stage2_capabilities()
+}
+
 pub fn probe_transition() -> io::Result<()> {
     let identity = current_identity()?;
+    if identity.uid == 0 || identity.gid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "td-jail requires the nonzero application identity",
+        ));
+    }
     let before = NamespaceSnapshot::read()?;
     let token = random_token()?;
+    let executable = std::env::current_exe()?;
 
     sys::unshare_namespaces(true)?;
     install_identity_maps(identity)?;
     NamespaceSnapshot::read()?.require_all_changed(&before)?;
+    let test_leak = install_test_leak_if_requested()?;
+    close_inherited_descriptors()?;
+    if let Some(descriptor) = test_leak {
+        require_descriptor_closed(descriptor)?;
+    }
+    prepare_mount_plan(identity)?;
+    prepare_capability_bridge()?;
 
     let (proof_reader, mut proof_writer) = io::pipe()?;
-    let executable = std::env::current_exe()?;
     let mut child = Command::new(executable)
         .arg(STAGE2_ARG)
         .arg(encode_token(&token))
@@ -275,6 +954,7 @@ pub fn probe_transition() -> io::Result<()> {
         .arg(identity.gid.to_string())
         .stdin(Stdio::from(proof_reader))
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()?;
 
     if let Err(error) = require_child_pid_namespace_changed(&before, child.id()) {
@@ -303,11 +983,32 @@ pub fn probe_transition() -> io::Result<()> {
         let _ = child.wait();
         return Err(error);
     }
+    let mut errors = String::new();
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("stage-2 stderr pipe was not created"))?;
+    if let Err(error) = stderr.take(4097).read_to_string(&mut errors) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    if errors.len() > 4096 {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(io::Error::other("stage-2 diagnostic exceeded 4096 bytes"));
+    }
     let status = child.wait()?;
     drop(proof_writer);
     if !status.success() {
         return Err(io::Error::other(format!(
-            "stage 2 refused the namespace transition: {status}"
+            "stage 2 refused the namespace transition: {status}: {}",
+            errors.trim()
+        )));
+    }
+    if !errors.is_empty() {
+        return Err(io::Error::other(format!(
+            "stage 2 wrote a diagnostic on success: {errors:?}"
         )));
     }
     if output != expected {
@@ -335,6 +1036,7 @@ pub fn run_stage2(expected: [u8; TOKEN_LEN], expected_identity: Identity) -> io:
             "internal stage-2 proof does not match",
         ));
     }
+    require_only_stdio_descriptors()?;
 
     let status = fs::read_to_string("/proc/self/status")?;
     let identity = Identity {
@@ -349,12 +1051,9 @@ pub fn run_stage2(expected: [u8; TOKEN_LEN], expected_identity: Identity) -> io:
     }
     require_single_map("/proc/self/uid_map", identity.uid)?;
     require_single_map("/proc/self/gid_map", identity.gid)?;
-    if identity.uid != 0 && effective_capabilities(&status)? != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "stage 2 retained effective capabilities after exec",
-        ));
-    }
+    require_stage2_capabilities()?;
+    enter_mount_plan()?;
+    require_mount_plan()?;
     writeln!(io::stdout(), "{STAGE2_MARKER} pid=1")
 }
 
@@ -400,9 +1099,9 @@ mod tests {
         let status = "Name:\ttd-jail\nUid:\t1000\t1001\t1002\t1003\nGid:\t10\t11\t12\t13\nCapEff:\t0000000000200000\n";
         assert_eq!(effective_id(status, "Uid:").unwrap(), 1001);
         assert_eq!(effective_id(status, "Gid:").unwrap(), 11);
-        assert_eq!(effective_capabilities(status).unwrap(), 1 << 21);
+        assert_eq!(capability_row(status, "CapEff:").unwrap(), 1 << 21);
         assert!(effective_id(status, "Groups:").is_err());
-        assert!(effective_capabilities("Name:\ttd-jail\n").is_err());
+        assert!(capability_row("Name:\ttd-jail\n", "CapEff:").is_err());
     }
 
     #[test]
@@ -412,5 +1111,39 @@ mod tests {
         let mut changed = token;
         changed[TOKEN_LEN - 1] = 8;
         assert!(!tokens_equal(&token, &changed));
+    }
+
+    #[test]
+    fn device_number_decoder_matches_the_compiled_roster() {
+        fn encode(major: u64, minor: u64) -> u64 {
+            ((major & 0xfff) << 8)
+                | ((major & 0xffff_f000) << 32)
+                | (minor & 0xff)
+                | ((minor & 0xffff_ff00) << 12)
+        }
+
+        for (_, major, minor) in DEVICE_NODES {
+            assert_eq!(device_numbers(encode(*major, *minor)), (*major, *minor));
+        }
+    }
+
+    #[test]
+    fn mountinfo_parser_requires_type_and_options() {
+        let mountinfo = "1 0 0:1 / / ro,nosuid,nodev - tmpfs tmpfs rw\n\
+                         2 1 0:2 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw,size=524288k\n";
+        assert!(require_mount(
+            mountinfo,
+            "/",
+            Some("tmpfs"),
+            &["ro", "nosuid", "nodev"],
+            &["rw"]
+        )
+        .is_ok());
+        assert!(require_mount(mountinfo, "/", Some("proc"), &["ro"], &[]).is_err());
+        assert!(require_mount(mountinfo, "/tmp", Some("tmpfs"), &["ro"], &[]).is_err());
+        assert!(require_mount(mountinfo, "/tmp", None, &["rw"], &["ro"]).is_ok());
+        assert!(require_mount(mountinfo, "/missing", Some("tmpfs"), &[], &[]).is_err());
+        assert!(require_mount_super_option(mountinfo, "/tmp", "size=524288k").is_ok());
+        assert!(require_mount_super_option(mountinfo, "/tmp", "size=1k").is_err());
     }
 }

@@ -974,9 +974,11 @@ virtual fd table that stands in for `dup2` — is reachable through safe
 
 ## 9. `td-jail` — the application sandbox
 
-The first `td-jail` increment carries exactly ONE syscall: `unshare(2)`
-on x86-64, through one `syscall5` body. Its wrapper accepts only the two
-compiled namespace sets the application design permits:
+The second `td-jail` increment carries exactly EIGHT syscalls on x86-64
+through one `syscall5` body: `unshare(2)`, `close(2)`, `mount(2)`,
+`umount2(2)`, `pivot_root(2)`, `capset(2)`, `capget(2)`, and `prctl(2)`.
+The unshare wrapper accepts only the two compiled namespace sets the
+application design permits:
 `CLONE_NEWUSER|CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWUTS`, with
 `CLONE_NEWNET` either absent for a declared shared network or present for
 an isolated one. There is no caller-provided flags word.
@@ -984,33 +986,60 @@ an isolated one. There is no caller-provided flags word.
 Stage 1 is single-threaded when it issues the call, writes `setgroups`
 deny before the identity gid map, reads both maps back, and checks that
 the user, mount and UTS namespaces changed. The isolated probe also
-checks its network namespace. A safe `Command` spawn creates stage 2;
+checks its network namespace. It enumerates `/proc/self/fd` and closes
+every inherited descriptor above 2 before opening the proof pipe. The
+`close(2)` entry is a reviewed amendment: safe `std` cannot take
+ownership of an arbitrary inherited descriptor, while leaving one open
+would preserve an old-root handle across `pivot_root`. An iterator's
+already-closed directory descriptor is the sole tolerated `EBADF`.
+The build-host recipe leaks a real caller fd 9. Target `td-sh` cannot
+forward virtual descriptors above 2, so the target oracle instead asks
+the probe to open `/proc/self/status`, transfer its live descriptor with
+safe `IntoRawFd`, verify that it is above stderr, and feed it through the
+same sweep before stage 2 proves that only stdio survived.
+
+The mount wrapper is reached only with the compiled probe plan. Stage 1
+makes the tree private, replaces its scratch `/tmp` with a fresh tmpfs,
+builds another tmpfs as the root, binds only null/zero/full/random/urandom
+as individually read-only mounts into a fresh nosuid/noexec `/dev`, mounts
+fresh devpts and `/dev/shm`, mounts fresh `/tmp` and `/var/tmp`, and
+remounts `/dev` read-only. Stage 2 mounts a
+fresh procfs for the PID namespace it inhabits while the old procfs is
+still visible (the kernel's `mount_too_revealing` rule requires that),
+pivots, changes directory to `/`, detaches the old root, removes its
+mount point, and remounts the new root read-only. It reads mountinfo back,
+requires only PID 1 in procfs, checks the exact root and device entries,
+device numbers, modes and every device-bind flag, and proves the base
+root, `/dev`, and device binds are read-only while procfs, devpts,
+bounded `/dev/shm`, `/tmp`, and `/var/tmp` carry their compiled writable
+flags. Read-only bind metadata does not prevent the compiled character
+devices from performing their device operations; the probe writes to
+`/dev/null` after the remounts.
+
+`capset(2)` and `capget(2)` use capability ABI v3 and a compiled
+two-word structure. `prctl(2)` has exactly THREE operations:
+`PR_CAPBSET_DROP`=24, `PR_CAPBSET_READ`=23, and `PR_CAP_AMBIENT`=47;
+the last has exactly THREE sub-operations, `IS_SET`=1, `RAISE`=2 and
+`CLEAR_ALL`=4. Stage 1 preserves its current effective and permitted
+sets while making only `CAP_SYS_ADMIN` inheritable, clears then raises
+that one ambient bit, drops every capability named by the kernel's
+bounded `cap_last_cap`, and reads all of it back. A safe `Command` spawn
+creates stage 2;
 before releasing it, stage 1 verifies `/proc/<child>/ns/pid` differs
 from its own original PID namespace. Stage 2 refuses unless its
 namespace PID is 1 and a fresh 32-byte proof arrives on the stdin
-descriptor stage 1 explicitly installed. No
+descriptor stage 1 explicitly installed. Before mounting it requires
+effective, permitted, inheritable and ambient to equal exactly
+`CAP_SYS_ADMIN`, the bounding set to be empty, and the syscall and
+`/proc/self/status` readbacks to agree. No
 application is launched in this increment: ordinary entry remains a
-refusal until mount isolation, capability removal, reaping, and seccomp
-have landed.
+refusal until capability removal, reaping, and seccomp have landed.
 
-That zero-capability exec is the rung-8 baseline, not the target mount
-mechanism. Stage 1 cannot mount a procfs for the child PID namespace it
-does not itself inhabit. The mount rung must therefore add the reviewed
-`capset(2)` and `prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_SYS_ADMIN)`
-bridge: stage 1 makes exactly that capability inheritable and ambient;
-while `CAP_SETPCAP` is still effective it drops and reads back every
-bounding bit. Stage 2 verifies the exact one-capability state and empty
-bounding set, pivots, and mounts its own procfs. Application launch
-remains disabled until the following rung clears and reads back the
-ambient, effective, permitted and inheritable sets. There is no `fork`,
-`pre_exec`, or `setns` escape hatch hidden behind the safe `Command`
-boundary.
-
-Deliberately NOT in this surface yet are the other eleven calls in
-`APPLICATIONS.md`'s target-state draft: `mount`, `umount2`,
-`pivot_root`, `capset`, `capget`, `prctl`, `seccomp`, `wait4`, `kill`,
+Deliberately NOT in this surface yet are the other five calls in
+`APPLICATIONS.md`'s target-state draft: `seccomp`, `wait4`, `kill`,
 `prlimit64`, and `ioctl`. Each arrives only with the rung that uses and
 tests it; the roadmap is not advance authorization for dormant wrappers.
 There is likewise no `fork`, `pre_exec`, `clone`, `setns`, or caller-
-supplied namespace set. A second syscall or a third unshare flag set is
-an amendment here.
+supplied namespace or mount set. A ninth syscall, a fourth prctl
+operation, a fourth ambient sub-operation, or a third unshare flag set
+is an amendment here.
