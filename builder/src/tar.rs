@@ -1,12 +1,16 @@
 use std::fs::{self, File};
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, BufReader, Cursor, Read, Write};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::time::{Duration, SystemTime};
 
 const BLOCK: usize = 512;
 const MAX_TAR_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_GNU_LONG_FIELD_BYTES: u64 = 1024 * 1024;
+const MAX_TAR_ENTRIES: u64 = 1_000_000;
+const MAX_TAR_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 pub fn extract_tar(tar: &Path, dest: &Path) -> Result<(), String> {
     let mut file = File::open(tar).map_err(|e| format!("open {}: {e}", tar.display()))?;
@@ -25,11 +29,186 @@ pub fn extract_tar_bz2(tar_bz2: &Path, dest: &Path) -> Result<(), String> {
     extract_tar_reader(&mut reader, &tar_bz2.display().to_string(), dest)
 }
 
+fn remove_temp_path(path: &Path) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("stat temporary tree {}: {e}", path.display())),
+    };
+    if metadata.file_type().is_dir() {
+        fs::remove_dir_all(path).map_err(|e| format!("clear {}: {e}", path.display()))
+    } else {
+        fs::remove_file(path).map_err(|e| format!("clear {}: {e}", path.display()))
+    }
+}
+
+/// Best-effort cleanup on every error path. Successful paths remove the tree
+/// explicitly so a cleanup failure is still returned to the caller.
+struct TempTree(PathBuf);
+
+static TEMP_TREE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+impl TempTree {
+    fn create_sibling(dest: &Path, suffix: &str) -> Result<Self, String> {
+        let name = dest.file_name().ok_or_else(|| {
+            format!(
+                "destination {} has no file name to place a temporary tree beside",
+                dest.display()
+            )
+        })?;
+        if let Some(parent) = dest.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "create destination parent {} for temporary extraction: {e}",
+                    parent.display()
+                )
+            })?;
+        }
+        for _ in 0..128 {
+            let sequence = TEMP_TREE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let mut temp_name = name.to_os_string();
+            temp_name.push(format!("{suffix}-{}-{sequence}", std::process::id()));
+            let path = dest.with_file_name(temp_name);
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(format!(
+                        "create temporary tree beside {}: {e}",
+                        dest.display()
+                    ))
+                }
+            }
+        }
+        Err(format!(
+            "cannot allocate a unique temporary tree beside {} after 128 attempts",
+            dest.display()
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempTree {
+    fn drop(&mut self) {
+        let _ = remove_temp_path(&self.0);
+    }
+}
+
+fn finish_xz_tar(
+    extracted: Result<(), String>,
+    decoded: Result<(), String>,
+    drained: Result<(), String>,
+) -> Result<(), String> {
+    match (extracted, decoded) {
+        (Err(tar), Err(xz)) if xz.contains("tar extractor stopped") => Err(tar),
+        (_, Err(xz)) => Err(xz),
+        (Err(tar), Ok(())) => Err(tar),
+        (Ok(()), Ok(())) => drained,
+    }
+}
+
 pub fn extract_tar_xz(tar_xz: &Path, dest: &Path) -> Result<(), String> {
-    let data = fs::read(tar_xz).map_err(|e| format!("read {}: {e}", tar_xz.display()))?;
-    let bytes = crate::xz::decompress(&data)?;
-    let mut reader = Cursor::new(bytes);
-    extract_tar_reader(&mut reader, &tar_xz.display().to_string(), dest)
+    // Tar entries arrive before the XZ block check/index/footer. Keep them in
+    // a disposable sibling until the decoder validates the COMPLETE stream;
+    // otherwise a corrupt fixed-output source can leave an apparently usable
+    // partial tree behind even though extraction returned Err.
+    let verified = TempTree::create_sibling(dest, ".xz-verify-tmp")?;
+    let file = File::open(tar_xz).map_err(|e| format!("open {}: {e}", tar_xz.display()))?;
+    let source = tar_xz.display().to_string();
+    // The decoder and extractor run concurrently over a two-chunk bounded
+    // channel. XZ retains only its declared dictionary; tar retains only its
+    // current entry. Drain after tar's zero block so the decoder can validate
+    // the XZ index/footer/check without blocking on trailing tar padding.
+    std::thread::scope(|scope| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+        let decoder = std::thread::Builder::new()
+            .name("td-xz-decoder".to_string())
+            .spawn_scoped(scope, move || {
+                let mut input = BufReader::new(file);
+                let mut writer = XzChunkWriter { sender };
+                crate::xz::decompress_reader_to(&mut input, &mut writer).map(|_| ())
+            })
+            .map_err(|e| format!("spawn xz decoder for {source}: {e}"))?;
+        let mut reader = XzChunkReader {
+            receiver,
+            chunk: Vec::new(),
+            offset: 0,
+        };
+        let extracted = extract_tar_reader(&mut reader, &source, verified.path());
+        let drained = if extracted.is_ok() {
+            io::copy(&mut reader, &mut io::sink())
+                .map(|_| ())
+                .map_err(|e| format!("drain decompressed xz stream from {source}: {e}"))
+        } else {
+            Ok(())
+        };
+        // On a tar error this closes the channel immediately, making the
+        // decoder stop at its next bounded write instead of burning through a
+        // multi-gigabyte remainder. Preserve that first, actionable tar error.
+        drop(reader);
+        let decoded = match decoder.join() {
+            Ok(result) => result,
+            Err(_) => Err(format!("xz decoder thread panicked for {source}")),
+        };
+        finish_xz_tar(extracted, decoded, drained)
+    })?;
+    fs::create_dir_all(dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
+    merge_move(verified.path(), dest)?;
+    remove_temp_path(verified.path())
+}
+
+struct XzChunkWriter {
+    sender: SyncSender<Vec<u8>>,
+}
+
+impl Write for XzChunkWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.sender
+            .send(buf.to_vec())
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "tar extractor stopped"))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct XzChunkReader {
+    receiver: Receiver<Vec<u8>>,
+    chunk: Vec<u8>,
+    offset: usize,
+}
+
+impl Read for XzChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        while self.offset >= self.chunk.len() {
+            match self.receiver.recv() {
+                Ok(chunk) => {
+                    self.chunk = chunk;
+                    self.offset = 0;
+                }
+                Err(_) => return Ok(0),
+            }
+        }
+        let available = self.chunk.get(self.offset..).unwrap_or(&[]);
+        let n = available.len().min(buf.len());
+        let Some(src) = available.get(..n) else {
+            return Ok(0);
+        };
+        let Some(dst) = buf.get_mut(..n) else {
+            return Ok(0);
+        };
+        dst.copy_from_slice(src);
+        self.offset += n;
+        Ok(n)
+    }
 }
 
 /// Unpack a tarball by MAGIC BYTES (gzip 1f8b, bzip2 "BZh", xz fd377a585a00;
@@ -59,28 +238,13 @@ pub fn unpack_archive(tarball: &Path, dest: &Path, keep_top: bool) -> Result<(),
     // `with_extension` would replace an existing extension, letting two
     // distinct dests collide on one tmp path (and the pre-clean below would
     // then delete the other unpack's tree).
-    let tmp = match dest.file_name() {
-        Some(name) => {
-            let mut t = name.to_os_string();
-            t.push(".unpack-tmp");
-            dest.with_file_name(t)
-        }
-        None => {
-            return Err(format!(
-                "unpack {}: destination {} has no file name to place a tmp dir beside",
-                tarball.display(),
-                dest.display()
-            ))
-        }
-    };
-    if tmp.exists() {
-        fs::remove_dir_all(&tmp).map_err(|e| format!("clear {}: {e}", tmp.display()))?;
-    }
-    extract_into(&tmp)?;
-    let mut tops = fs::read_dir(&tmp)
-        .map_err(|e| format!("read {}: {e}", tmp.display()))?
+    let tmp = TempTree::create_sibling(dest, ".unpack-tmp")
+        .map_err(|e| format!("unpack {}: {e}", tarball.display()))?;
+    extract_into(tmp.path())?;
+    let mut tops = fs::read_dir(tmp.path())
+        .map_err(|e| format!("read {}: {e}", tmp.path().display()))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("read {}: {e}", tmp.display()))?;
+        .map_err(|e| format!("read {}: {e}", tmp.path().display()))?;
     // The sole top entry must be a REAL directory — `file_type()` does not
     // follow symlinks. A symlink-to-dir top would make the hoist read and
     // rename through the link's target, moving files out of a tree OUTSIDE
@@ -96,8 +260,7 @@ pub fn unpack_archive(tarball: &Path, dest: &Path, keep_top: bool) -> Result<(),
     };
     fs::create_dir_all(dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
     merge_move(&top, dest)?;
-    fs::remove_dir_all(&tmp).map_err(|e| format!("clear {}: {e}", tmp.display()))?;
-    Ok(())
+    remove_temp_path(tmp.path())
 }
 
 /// Move FROM's children into DEST, MERGING into existing directories (the
@@ -150,18 +313,20 @@ pub fn extract_tar_reader<R: Read>(
     // otherwise pass unnoticed. A global ('g') header is archive-wide and does
     // NOT require a following entry, so it never sets this.
     let mut pending_extended = false;
+    let mut budget = ArchiveBudget::default();
     loop {
         let mut header = [0u8; BLOCK];
-        match file.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                ensure_no_dangling_header(&pending_path, &pending_link, pending_extended)?;
-                break;
-            }
-            Err(e) => return Err(format!("read tar header from {source_name}: {e}")),
-        }
+        read_tar_block(file, &mut header, source_name)?;
         if header.iter().all(|b| *b == 0) {
             ensure_no_dangling_header(&pending_path, &pending_link, pending_extended)?;
+            let mut second = [0u8; BLOCK];
+            read_tar_block(file, &mut second, source_name)?;
+            if second.iter().any(|byte| *byte != 0) {
+                return Err(format!(
+                    "tar archive {source_name} has only one zero end marker"
+                ));
+            }
+            validate_zero_padding(file, source_name)?;
             break;
         }
         validate_header_checksum(&header)
@@ -169,6 +334,10 @@ pub fn extract_tar_reader<R: Read>(
 
         let mut entry = Entry::parse(&header)?;
         validate_entry_size(&entry)?;
+        // Charge the header before reading its body or creating its path. In
+        // particular, metadata records count too: hostile GNU/PAX headers
+        // must not bypass the aggregate archive budget.
+        budget.account(&entry)?;
         match &entry.kind {
             EntryKind::LongName => {
                 pending_path =
@@ -327,6 +496,93 @@ pub fn extract_tar_reader<R: Read>(
             .map_err(|e| format!("skip padding after {}: {e}", entry.path.display()))?;
     }
     Ok(())
+}
+
+fn read_tar_block<R: Read>(
+    file: &mut R,
+    block: &mut [u8; BLOCK],
+    source_name: &str,
+) -> Result<(), String> {
+    let mut filled = 0usize;
+    while filled < BLOCK {
+        let remaining = block
+            .get_mut(filled..)
+            .ok_or_else(|| "internal tar header offset exceeded its block".to_string())?;
+        match file.read(remaining) {
+            Ok(0) => {
+                return Err(format!(
+                    "truncated tar header from {source_name}: read {filled} of {BLOCK} bytes"
+                ));
+            }
+            Ok(count) => {
+                filled = filled
+                    .checked_add(count)
+                    .ok_or_else(|| "tar header byte count overflowed usize".to_string())?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(format!("read tar header from {source_name}: {e}")),
+        }
+    }
+    Ok(())
+}
+
+fn validate_zero_padding<R: Read>(file: &mut R, source_name: &str) -> Result<(), String> {
+    let mut padding = [0u8; 8192];
+    loop {
+        match file.read(&mut padding) {
+            Ok(0) => return Ok(()),
+            Ok(count) => {
+                let bytes = padding
+                    .get(..count)
+                    .ok_or_else(|| "tar padding read exceeded its fixed buffer".to_string())?;
+                if bytes.iter().any(|byte| *byte != 0) {
+                    return Err(format!(
+                        "tar archive {source_name} has nonzero data after its end markers"
+                    ));
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                return Err(format!(
+                    "read trailing tar padding from {source_name}: {e}"
+                ))
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct ArchiveBudget {
+    entries: u64,
+    payload: u64,
+}
+
+impl ArchiveBudget {
+    fn account(&mut self, entry: &Entry) -> Result<(), String> {
+        let entries = self
+            .entries
+            .checked_add(1)
+            .ok_or_else(|| "tar entry count exceeds u64".to_string())?;
+        if entries > MAX_TAR_ENTRIES {
+            return Err(format!(
+                "tar archive has more than {MAX_TAR_ENTRIES} entries"
+            ));
+        }
+        let payload = self
+            .payload
+            .checked_add(entry.size)
+            .ok_or_else(|| "tar payload length exceeds u64".to_string())?;
+        if payload > MAX_TAR_PAYLOAD_BYTES {
+            return Err(format!(
+                "tar archive payload exceeds {MAX_TAR_PAYLOAD_BYTES} byte limit"
+            ));
+        }
+        // Commit only after every check succeeds so an error cannot leave a
+        // reusable budget object in a misleading partially-accounted state.
+        self.entries = entries;
+        self.payload = payload;
+        Ok(())
+    }
 }
 
 struct Entry {
@@ -775,6 +1031,84 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
+    fn xz_root_cause_wins_unless_tar_closed_the_channel_first() {
+        assert_eq!(
+            finish_xz_tar(
+                Err("tar EOF".to_string()),
+                Err("xz CRC64 mismatch".to_string()),
+                Ok(()),
+            ),
+            Err("xz CRC64 mismatch".to_string())
+        );
+        assert_eq!(
+            finish_xz_tar(
+                Err("unsafe tar path".to_string()),
+                Err("write decompressed xz output: tar extractor stopped".to_string()),
+                Ok(()),
+            ),
+            Err("unsafe tar path".to_string())
+        );
+    }
+
+    #[test]
+    fn temporary_extraction_creates_a_missing_destination_parent() {
+        let tmp = temp_dir("td-tar-temp-parent");
+        let dest = tmp.join("missing/nested/output");
+        let tree = TempTree::create_sibling(&dest, ".test-tmp").unwrap();
+        let temporary = tree.path().to_path_buf();
+        assert!(dest.parent().unwrap().is_dir());
+        assert!(temporary.is_dir());
+        drop(tree);
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn corrupt_xz_never_publishes_unverified_tar_entries() {
+        // `visible`, an empty ustar file, compressed with XZ Utils 5.4.5
+        // (`xz -0 --check=crc64`). Byte 124 is in the block CRC64, after the
+        // complete tar stream, so extraction has created the entry before the
+        // decoder discovers the corruption.
+        let mut archive = [
+            0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x04, 0xe6, 0xd6, 0xb4, 0x46,
+            0x02, 0x00, 0x21, 0x01, 0x0c, 0x00, 0x00, 0x00, 0x8f, 0x98, 0x41, 0x9c,
+            0xe0, 0x27, 0xff, 0x00, 0x5c, 0x5d, 0x00, 0x3b, 0x1a, 0x4a, 0xcd, 0x37,
+            0xbe, 0xc0, 0x61, 0xb2, 0x3a, 0x7a, 0xf5, 0x32, 0xe0, 0xa9, 0x81, 0xd3,
+            0x13, 0xd9, 0x3e, 0x5f, 0xc4, 0x81, 0x95, 0xb8, 0xa4, 0x8c, 0xc1, 0xfb,
+            0x85, 0x1d, 0xe8, 0xbc, 0x8f, 0xbc, 0x0e, 0xf7, 0x81, 0x50, 0xa0, 0xf2,
+            0x60, 0xdd, 0xd1, 0xbb, 0x8c, 0x92, 0xa9, 0x86, 0x5d, 0x72, 0x0f, 0xd1,
+            0x80, 0x64, 0x10, 0xe1, 0xc5, 0xc8, 0x47, 0x0e, 0x1a, 0x06, 0xe5, 0xcf,
+            0xec, 0xbc, 0x6e, 0x7e, 0x11, 0xfb, 0xfe, 0xda, 0x5b, 0xd8, 0x0c, 0x88,
+            0xf8, 0xe7, 0x30, 0x79, 0x09, 0xc6, 0x2b, 0x6f, 0xa9, 0x23, 0x4e, 0xfd,
+            0xd1, 0x7a, 0x00, 0x00, 0xcd, 0xa5, 0x88, 0x7d, 0xee, 0x27, 0x1e, 0xeb,
+            0x00, 0x01, 0x78, 0x80, 0x50, 0x00, 0x00, 0x00, 0x41, 0xe4, 0xcf, 0x5e,
+            0xb1, 0xc4, 0x67, 0xfb, 0x02, 0x00, 0x00, 0x00, 0x00, 0x04, 0x59, 0x5a,
+        ];
+        let Some(check_byte) = archive.get_mut(124) else {
+            panic!("fixture must contain its block check");
+        };
+        *check_byte ^= 0xff;
+        let tmp = temp_dir("td-tar-corrupt-xz");
+        let dest = tmp.join("published");
+        // This is the old predictable temporary name. It is deliberately the
+        // INPUT: allocation must skip any pre-existing path, never pre-clean it.
+        let source = tmp.join("published.xz-verify-tmp");
+        fs::write(&source, archive).unwrap();
+
+        let err = extract_tar_xz(&source, &dest).expect_err("bad XZ check must red");
+
+        assert!(err.contains("CRC64 mismatch"), "got: {err}");
+        assert!(source.is_file(), "temporary allocation deleted the input archive");
+        assert!(!dest.exists(), "unverified destination must not be published");
+        let leaked_temp = fs::read_dir(&tmp).unwrap().flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("published.xz-verify-tmp-")
+        });
+        assert!(!leaked_temp, "unverified temporary tree must be removed");
+    }
+
+    #[test]
     fn refuses_parent_components() {
         let err = safe_join(Path::new("/tmp/root"), Path::new("../x")).expect_err("unsafe path");
         assert!(err.contains("unsafe tar path"));
@@ -873,6 +1207,60 @@ mod tests {
 
         assert!(err.contains("too large"), "got: {err}");
         assert!(!out.join("huge").exists());
+    }
+
+    #[test]
+    fn aggregate_archive_budget_rejects_entries_and_payload_before_accounting() {
+        let entry = Entry {
+            path: PathBuf::from("small"),
+            size: 1,
+            mode: 0o644,
+            mtime: None,
+            kind: EntryKind::Regular,
+        };
+        let mut entries = ArchiveBudget {
+            entries: MAX_TAR_ENTRIES,
+            payload: 0,
+        };
+        assert!(entries.account(&entry).is_err());
+        assert_eq!(entries.entries, MAX_TAR_ENTRIES);
+        assert_eq!(entries.payload, 0);
+
+        let mut payload = ArchiveBudget {
+            entries: 0,
+            payload: MAX_TAR_PAYLOAD_BYTES,
+        };
+        assert!(payload.account(&entry).is_err());
+        assert_eq!(payload.entries, 0);
+        assert_eq!(payload.payload, MAX_TAR_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn refuses_empty_partial_and_single_marker_archives() {
+        let tmp = temp_dir("td-tar-truncated-header-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+
+        fs::write(&tar, []).unwrap();
+        let empty = extract_tar(&tar, &out).expect_err("empty input is not a tar archive");
+        assert!(empty.contains("read 0 of 512 bytes"), "got: {empty}");
+
+        fs::write(&tar, [b'x'; 17]).unwrap();
+        let partial = extract_tar(&tar, &out).expect_err("partial header must fail");
+        assert!(partial.contains("read 17 of 512 bytes"), "got: {partial}");
+
+        fs::write(&tar, [0u8; BLOCK]).unwrap();
+        let marker = extract_tar(&tar, &out).expect_err("one zero marker must fail");
+        assert!(marker.contains("read 0 of 512 bytes"), "got: {marker}");
+
+        let mut trailing = vec![0u8; BLOCK * 2];
+        trailing.extend_from_slice(b"not-zero-padding");
+        fs::write(&tar, trailing).unwrap();
+        let nonzero = extract_tar(&tar, &out).expect_err("nonzero trailing data must fail");
+        assert!(nonzero.contains("nonzero data"), "got: {nonzero}");
+
+        fs::write(&tar, vec![0u8; BLOCK * 3]).unwrap();
+        extract_tar(&tar, &out).expect("additional zero padding is valid");
     }
 
     #[test]

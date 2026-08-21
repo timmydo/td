@@ -12,17 +12,43 @@
 
 use std::sync::OnceLock;
 
+/// Incremental CRC-32, used when an XZ block is decoded directly into its
+/// consumer instead of retained as one byte slice.
+pub struct Crc32 {
+    state: u32,
+}
+
+impl Default for Crc32 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Crc32 {
+    pub fn new() -> Self {
+        Self { state: 0xffff_ffff }
+    }
+
+    pub fn update(&mut self, input: &[u8]) {
+        let table = table();
+        for b in input {
+            // Masked to a byte, so the lookup is always in range.
+            let idx = ((self.state ^ u32::from(*b)) & 0xff) as usize;
+            self.state = (self.state >> 8) ^ table.get(idx).copied().unwrap_or(0);
+        }
+    }
+
+    pub fn finalize(self) -> u32 {
+        !self.state
+    }
+}
+
 /// CRC-32 of `input`, initial value all-ones and final complement — the form
 /// GPT §5.3 and xz both specify.
 pub fn crc32(input: &[u8]) -> u32 {
-    let table = table();
-    let mut crc = 0xffff_ffffu32;
-    for b in input {
-        // Masked to a byte, so the lookup is always in range.
-        let idx = ((crc ^ u32::from(*b)) & 0xff) as usize;
-        crc = (crc >> 8) ^ table.get(idx).copied().unwrap_or(0);
-    }
-    !crc
+    let mut crc = Crc32::new();
+    crc.update(input);
+    crc.finalize()
 }
 
 fn table() -> &'static [u32; 256] {
@@ -46,7 +72,7 @@ fn table() -> &'static [u32; 256] {
 
 #[cfg(test)]
 mod tests {
-    use super::crc32;
+    use super::{crc32, Crc32};
 
     /// The check value every CRC-32/ISO-HDLC catalogue entry publishes.
     #[test]
@@ -68,6 +94,15 @@ mod tests {
         assert_eq!(crc32(b"abc"), 0x3524_41c2);
         assert_eq!(crc32(&[0u8; 32]), 0x190a_55ad);
         assert_eq!(crc32(&[0xffu8; 32]), 0xff6c_ab0b);
+    }
+
+    #[test]
+    fn chunks_have_the_same_crc_as_one_slice() {
+        let mut crc = Crc32::new();
+        crc.update(b"123");
+        crc.update(b"456");
+        crc.update(b"789");
+        assert_eq!(crc.finalize(), crc32(b"123456789"));
     }
 
     /// A buffer long enough to walk the whole table, against zlib's answer for

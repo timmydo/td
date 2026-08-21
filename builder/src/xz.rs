@@ -14,13 +14,19 @@
 //! BCJ/delta filters are rejected by id with an error naming the filter —
 //! GNU and kernel.org release tarballs are plain LZMA2.
 
-use crate::crc32::crc32;
+use crate::crc32::{crc32, Crc32};
 use crate::sha256::Sha256;
+use std::io::{self, BufRead, Write};
 
 const XZ_MAGIC: [u8; 6] = [0xfd, b'7', b'z', b'X', b'Z', 0x00];
 const XZ_FOOTER_MAGIC: [u8; 2] = [b'Y', b'Z'];
 const MAX_DICT_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_XZ_OUTPUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
+// Two u64 values per block. Real release archives have orders of magnitude
+// fewer blocks; the explicit cap keeps a hostile many-block index from turning
+// the validation roster into an unbounded allocation.
+const MAX_BLOCK_RECORDS: usize = 1 << 20;
+const MAX_DECODED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 // Range coder model (LZMA): 11-bit probabilities, renormalized at 2^24.
 const RC_TOP: u32 = 1 << 24;
@@ -44,39 +50,151 @@ const LEN_SYMBOLS: usize = 8;
 
 /// Decode a complete .xz file (one or more concatenated streams with
 /// optional stream padding) to its uncompressed bytes.
+#[cfg(test)]
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
-    decompress_with_limit(data, MAX_XZ_OUTPUT_BYTES)
+    let mut out = Vec::new();
+    decompress_to(data, &mut out)?;
+    Ok(out)
 }
 
-fn decompress_with_limit(data: &[u8], max_output_bytes: u64) -> Result<Vec<u8>, String> {
-    if data.is_empty() {
+/// Decode an in-memory XZ stream directly into `writer`.
+#[cfg(test)]
+pub fn decompress_to<W: Write>(data: &[u8], writer: &mut W) -> Result<u64, String> {
+    let mut reader = std::io::Cursor::new(data);
+    decompress_reader_to(&mut reader, writer)
+}
+
+/// Decode a buffered XZ input directly into `writer`. Memory is bounded by the
+/// declared XZ dictionary, one compressed LZMA2 chunk, one small output
+/// chunk, and the capped block-index roster; output is capped before it can
+/// exhaust the disk-backed extraction scratch.
+pub fn decompress_reader_to<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<u64, String> {
+    let mut input = XzInput::new(reader);
+    if input.peek_byte()?.is_none() {
         return Err("empty xz input".to_string());
     }
-    let mut out = Vec::new();
-    let mut pos = 0usize;
     let mut decoded_any = false;
-    while pos < data.len() {
+    let mut total = 0u64;
+    let mut writer = CappedWriter {
+        inner: writer,
+        written: 0,
+    };
+    while input.peek_byte()?.is_some() {
         if decoded_any {
             // Stream Padding: a four-byte-aligned run of null bytes may
             // separate (or follow) streams.
-            let pad_start = pos;
-            while data.get(pos) == Some(&0) {
-                pos = pos
+            let mut pad = 0u64;
+            while input.peek_byte()? == Some(0) {
+                input.read_byte("xz stream padding")?;
+                pad = pad
                     .checked_add(1)
-                    .ok_or_else(|| "xz stream padding offset overflow".to_string())?;
+                    .ok_or_else(|| "xz stream padding length overflow".to_string())?;
             }
-            let pad = pos.saturating_sub(pad_start);
             if !pad.is_multiple_of(4) {
                 return Err("xz stream padding is not a multiple of four bytes".to_string());
             }
-            if pos == data.len() {
+            if input.peek_byte()?.is_none() {
                 break;
             }
         }
-        pos = decode_stream(data, pos, &mut out, max_output_bytes)?;
+        let produced = decode_stream(&mut input, &mut writer)?;
+        total = total
+            .checked_add(produced)
+            .ok_or_else(|| "xz output length exceeds u64".to_string())?;
         decoded_any = true;
     }
-    Ok(out)
+    Ok(total)
+}
+
+struct CappedWriter<'a, W> {
+    inner: &'a mut W,
+    written: u64,
+}
+
+impl<W: Write> Write for CappedWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if self.written.saturating_add(len) > MAX_DECODED_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("xz output exceeds {MAX_DECODED_BYTES} byte limit"),
+            ));
+        }
+        let written = self.inner.write(bytes)?;
+        self.written = self
+            .written
+            .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct XzInput<'a, R: BufRead> {
+    reader: &'a mut R,
+    position: u64,
+}
+
+impl<'a, R: BufRead> XzInput<'a, R> {
+    fn new(reader: &'a mut R) -> Self {
+        Self {
+            reader,
+            position: 0,
+        }
+    }
+
+    fn position(&self) -> u64 {
+        self.position
+    }
+
+    fn peek_byte(&mut self) -> Result<Option<u8>, String> {
+        self.reader
+            .fill_buf()
+            .map(|bytes| bytes.first().copied())
+            .map_err(|e| format!("read xz input: {e}"))
+    }
+
+    fn read_byte(&mut self, what: &str) -> Result<u8, String> {
+        let byte = self
+            .reader
+            .fill_buf()
+            .map_err(|e| format!("read {what}: {e}"))?
+            .first()
+            .copied()
+            .ok_or_else(|| format!("truncated {what}"))?;
+        self.reader.consume(1);
+        self.position = self
+            .position
+            .checked_add(1)
+            .ok_or_else(|| "xz input position exceeds u64".to_string())?;
+        Ok(byte)
+    }
+
+    fn read_exact_into(&mut self, bytes: &mut [u8], what: &str) -> Result<(), String> {
+        std::io::Read::read_exact(self.reader, bytes).map_err(|e| format!("read {what}: {e}"))?;
+        self.position = self
+            .position
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| "xz input position exceeds u64".to_string())?;
+        Ok(())
+    }
+
+    fn read_vec(&mut self, len: usize, what: &str) -> Result<Vec<u8>, String> {
+        let mut bytes = vec![0u8; len];
+        self.read_exact_into(&mut bytes, what)?;
+        Ok(bytes)
+    }
+
+    fn read_u16_be(&mut self, what: &str) -> Result<u16, String> {
+        let mut bytes = [0u8; 2];
+        self.read_exact_into(&mut bytes, what)?;
+        u16_be(&bytes, 0)
+    }
 }
 
 /// Sizes recorded per block while decoding, checked against the index.
@@ -85,18 +203,16 @@ struct BlockRecord {
     uncompressed: u64,
 }
 
-fn decode_stream(
-    data: &[u8],
-    start: usize,
-    out: &mut Vec<u8>,
-    max_output_bytes: u64,
-) -> Result<usize, String> {
-    let header = range(data, start, 12).map_err(|_| "truncated xz stream header".to_string())?;
+fn decode_stream<R: BufRead, W: Write>(
+    input: &mut XzInput<'_, R>,
+    writer: &mut W,
+) -> Result<u64, String> {
+    let header = input.read_vec(12, "xz stream header")?;
     if header.get(..6) != Some(&XZ_MAGIC[..]) {
         return Err("bad xz magic".to_string());
     }
-    let flag0 = byte(header, 6)?;
-    let flag1 = byte(header, 7)?;
+    let flag0 = byte(&header, 6)?;
+    let flag1 = byte(&header, 7)?;
     if flag0 != 0 || flag1 & 0xf0 != 0 {
         return Err(format!(
             "xz stream flags reserved bits set: 0x{flag0:02x}{flag1:02x}"
@@ -106,45 +222,54 @@ fn decode_stream(
     // Validate the check type up front so unsupported ids fail before any
     // block work.
     let _ = check_size(check_id)?;
-    let flag_bytes = range(header, 6, 2)?;
+    let flag_bytes = range(&header, 6, 2)?;
     let got_crc = crc32(flag_bytes);
-    let want_crc = u32_le(header, 8)?;
+    let want_crc = u32_le(&header, 8)?;
     if got_crc != want_crc {
         return Err(format!(
             "xz stream header CRC32 mismatch: got {got_crc:08x}, want {want_crc:08x}"
         ));
     }
 
-    let mut pos = start
-        .checked_add(12)
-        .ok_or_else(|| "xz stream offset overflow".to_string())?;
     let mut records: Vec<BlockRecord> = Vec::new();
+    let mut produced = 0u64;
     loop {
-        let first = byte(data, pos).map_err(|_| "truncated xz stream (missing index)".to_string())?;
+        let first = input
+            .peek_byte()?
+            .ok_or_else(|| "truncated xz stream (missing index)".to_string())?;
         if first == 0x00 {
             break; // index indicator
         }
-        let (next, record) = decode_block(data, pos, check_id, out, max_output_bytes)?;
-        pos = next;
+        if records.len() >= MAX_BLOCK_RECORDS {
+            return Err(format!(
+                "xz stream has more than {MAX_BLOCK_RECORDS} blocks"
+            ));
+        }
+        let record = decode_block(input, check_id, writer)?;
+        produced = produced
+            .checked_add(record.uncompressed)
+            .ok_or_else(|| "xz stream output length exceeds u64".to_string())?;
         records.push(record);
     }
 
     // Index: indicator, record count, per-block (unpadded, uncompressed)
     // sizes, padding to a multiple of four, CRC32.
-    let index_start = pos;
-    let mut ipos = pos
-        .checked_add(1)
-        .ok_or_else(|| "xz index offset overflow".to_string())?;
-    let count = read_vli(data, &mut ipos)?;
-    if count != records.len() as u64 {
+    let mut index_crc = Crc32::new();
+    let mut index_size = 0u64;
+    let indicator = read_index_byte(input, &mut index_crc, &mut index_size)?;
+    if indicator != 0 {
+        return Err("xz index indicator is not zero".to_string());
+    }
+    let count = read_index_vli(input, &mut index_crc, &mut index_size)?;
+    if count != u64::try_from(records.len()).unwrap_or(u64::MAX) {
         return Err(format!(
             "xz index record count {count} does not match {} decoded blocks",
             records.len()
         ));
     }
     for record in &records {
-        let unpadded = read_vli(data, &mut ipos)?;
-        let uncompressed = read_vli(data, &mut ipos)?;
+        let unpadded = read_index_vli(input, &mut index_crc, &mut index_size)?;
+        let uncompressed = read_index_vli(input, &mut index_crc, &mut index_size)?;
         if unpadded != record.unpadded {
             return Err(format!(
                 "xz index unpadded size mismatch: index {unpadded}, block {}",
@@ -158,72 +283,105 @@ fn decode_stream(
             ));
         }
     }
-    while ipos.saturating_sub(index_start) % 4 != 0 {
-        if byte(data, ipos)? != 0 {
+    while !index_size.is_multiple_of(4) {
+        if read_index_byte(input, &mut index_crc, &mut index_size)? != 0 {
             return Err("xz index padding is not zero".to_string());
         }
-        ipos = ipos
-            .checked_add(1)
-            .ok_or_else(|| "xz index offset overflow".to_string())?;
     }
-    let index_body = data
-        .get(index_start..ipos)
-        .ok_or_else(|| "xz index out of bounds".to_string())?;
-    let got_icrc = crc32(index_body);
-    let want_icrc = u32_le(data, ipos)?;
+    let got_icrc = index_crc.finalize();
+    let stored_icrc = input.read_vec(4, "xz index CRC32")?;
+    let want_icrc = u32_le(&stored_icrc, 0)?;
     if got_icrc != want_icrc {
         return Err(format!(
             "xz index CRC32 mismatch: got {got_icrc:08x}, want {want_icrc:08x}"
         ));
     }
-    ipos = ipos
+    index_size = index_size
         .checked_add(4)
-        .ok_or_else(|| "xz index offset overflow".to_string())?;
-    let index_size = ipos.saturating_sub(index_start) as u64;
+        .ok_or_else(|| "xz index size exceeds u64".to_string())?;
 
     // Stream footer: CRC32, backward size, stream flags, footer magic.
-    let footer = range(data, ipos, 12).map_err(|_| "truncated xz stream footer".to_string())?;
-    let want_fcrc = u32_le(footer, 0)?;
-    let got_fcrc = crc32(range(footer, 4, 6)?);
+    let footer = input.read_vec(12, "xz stream footer")?;
+    let want_fcrc = u32_le(&footer, 0)?;
+    let got_fcrc = crc32(range(&footer, 4, 6)?);
     if got_fcrc != want_fcrc {
         return Err(format!(
             "xz stream footer CRC32 mismatch: got {got_fcrc:08x}, want {want_fcrc:08x}"
         ));
     }
-    let backward = (u64::from(u32_le(footer, 4)?) + 1) * 4;
+    let backward = (u64::from(u32_le(&footer, 4)?) + 1) * 4;
     if backward != index_size {
         return Err(format!(
             "xz backward size {backward} does not match index size {index_size}"
         ));
     }
-    if byte(footer, 8)? != 0 || byte(footer, 9)? != check_id {
+    if byte(&footer, 8)? != 0 || byte(&footer, 9)? != check_id {
         return Err("xz stream footer flags do not match the stream header".to_string());
     }
     if footer.get(10..12) != Some(&XZ_FOOTER_MAGIC[..]) {
         return Err("bad xz footer magic".to_string());
     }
-    ipos
-        .checked_add(12)
-        .ok_or_else(|| "xz stream offset overflow".to_string())
+    Ok(produced)
 }
 
-fn decode_block(
-    data: &[u8],
-    start: usize,
+fn read_index_byte<R: BufRead>(
+    input: &mut XzInput<'_, R>,
+    crc: &mut Crc32,
+    size: &mut u64,
+) -> Result<u8, String> {
+    let byte = input.read_byte("xz index")?;
+    crc.update(std::slice::from_ref(&byte));
+    *size = size
+        .checked_add(1)
+        .ok_or_else(|| "xz index size exceeds u64".to_string())?;
+    Ok(byte)
+}
+
+fn read_index_vli<R: BufRead>(
+    input: &mut XzInput<'_, R>,
+    crc: &mut Crc32,
+    size: &mut u64,
+) -> Result<u64, String> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = read_index_byte(input, crc, size)?;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            if byte == 0 && shift != 0 {
+                return Err("non-minimal xz varint encoding".to_string());
+            }
+            return Ok(value);
+        }
+        shift += 7;
+        if shift == 63 {
+            return Err("xz varint too long".to_string());
+        }
+    }
+}
+
+fn decode_block<R: BufRead, W: Write>(
+    input: &mut XzInput<'_, R>,
     check_id: u8,
-    out: &mut Vec<u8>,
-    max_output_bytes: u64,
-) -> Result<(usize, BlockRecord), String> {
-    let size_byte = byte(data, start)?; // caller guarantees != 0
+    writer: &mut W,
+) -> Result<BlockRecord, String> {
+    let size_byte = input.read_byte("xz block header")?; // caller guarantees != 0
     let header_size = (usize::from(size_byte) + 1) * 4;
-    let header =
-        range(data, start, header_size).map_err(|_| "truncated xz block header".to_string())?;
+    let mut header = vec![0u8; header_size];
+    let first = header
+        .first_mut()
+        .ok_or_else(|| "xz block header is empty".to_string())?;
+    *first = size_byte;
+    let rest = header
+        .get_mut(1..)
+        .ok_or_else(|| "xz block header range is invalid".to_string())?;
+    input.read_exact_into(rest, "xz block header")?;
     let body_len = header_size.saturating_sub(4);
     let body = header
         .get(..body_len)
         .ok_or_else(|| "xz block header out of bounds".to_string())?;
     let got_crc = crc32(body);
-    let want_crc = u32_le(header, body_len)?;
+    let want_crc = u32_le(&header, body_len)?;
     if got_crc != want_crc {
         return Err(format!(
             "xz block header CRC32 mismatch: got {got_crc:08x}, want {want_crc:08x}"
@@ -296,14 +454,14 @@ fn decode_block(
         }
     }
 
-    let data_start = start
-        .checked_add(header_size)
-        .ok_or_else(|| "xz block offset overflow".to_string())?;
-    let out_start = out.len();
-    let comp_len = lzma2_decode(data, data_start, dict_size, out, max_output_bytes)?;
-    let produced = out.len().saturating_sub(out_start) as u64;
+    let mut out = StreamOutput::new(writer, dict_size, check_id)?;
+    let comp_start = input.position();
+    lzma2_decode(input, &mut out)?;
+    let comp_len = input.position().saturating_sub(comp_start);
+    out.flush_pending()?;
+    let produced = out.produced;
     if let Some(declared) = declared_comp {
-        if declared != comp_len as u64 {
+        if declared != comp_len {
             return Err(format!(
                 "xz block compressed size mismatch: header {declared}, decoded {comp_len}"
             ));
@@ -319,38 +477,29 @@ fn decode_block(
 
     // Block padding: null bytes until the compressed data size is a
     // multiple of four (the header size already is one).
-    let mut pos = data_start
-        .checked_add(comp_len)
-        .ok_or_else(|| "xz block offset overflow".to_string())?;
     let mut padded = comp_len;
-    while padded % 4 != 0 {
-        if byte(data, pos).map_err(|_| "truncated xz block padding".to_string())? != 0 {
+    while !padded.is_multiple_of(4) {
+        if input.read_byte("xz block padding")? != 0 {
             return Err("xz block padding is not zero".to_string());
         }
-        pos = pos
+        padded = padded
             .checked_add(1)
-            .ok_or_else(|| "xz block offset overflow".to_string())?;
-        padded += 1;
+            .ok_or_else(|| "xz block padded size exceeds u64".to_string())?;
     }
 
     let check_len = check_size(check_id)?;
-    let stored = range(data, pos, check_len).map_err(|_| "truncated xz block check".to_string())?;
-    let content = out
-        .get(out_start..)
-        .ok_or_else(|| "xz block output out of bounds".to_string())?;
-    verify_check(check_id, content, stored)?;
-    pos = pos
-        .checked_add(check_len)
-        .ok_or_else(|| "xz block offset overflow".to_string())?;
+    let stored = input.read_vec(check_len, "xz block check")?;
+    out.verify(&stored)?;
 
-    let unpadded = header_size as u64 + comp_len as u64 + check_len as u64;
-    Ok((
-        pos,
-        BlockRecord {
-            unpadded,
-            uncompressed: produced,
-        },
-    ))
+    let unpadded = u64::try_from(header_size)
+        .unwrap_or(u64::MAX)
+        .checked_add(comp_len)
+        .and_then(|size| size.checked_add(check_len as u64))
+        .ok_or_else(|| "xz block unpadded size exceeds u64".to_string())?;
+    Ok(BlockRecord {
+        unpadded,
+        uncompressed: produced,
+    })
 }
 
 fn filter_name(id: u64) -> &'static str {
@@ -378,70 +527,199 @@ fn check_size(check_id: u8) -> Result<usize, String> {
     }
 }
 
-fn verify_check(check_id: u8, content: &[u8], stored: &[u8]) -> Result<(), String> {
-    match check_id {
-        0x00 => Ok(()),
-        0x01 => {
-            let got = crc32(content);
-            let want = u32_le(stored, 0)?;
-            if got != want {
-                return Err(format!(
-                    "xz block CRC32 mismatch: got {got:08x}, want {want:08x}"
-                ));
-            }
-            Ok(())
+enum BlockCheck {
+    None,
+    Crc32(Crc32),
+    Crc64(Crc64),
+    Sha256(Sha256),
+}
+
+impl BlockCheck {
+    fn new(check_id: u8) -> Result<Self, String> {
+        match check_id {
+            0x00 => Ok(Self::None),
+            0x01 => Ok(Self::Crc32(Crc32::new())),
+            0x04 => Ok(Self::Crc64(Crc64::new())),
+            0x0a => Ok(Self::Sha256(Sha256::new())),
+            other => Err(format!("unsupported xz check type 0x{other:02x}")),
         }
-        0x04 => {
-            let got = crc64(content);
-            let want = u64_le(stored, 0)?;
-            if got != want {
-                return Err(format!(
-                    "xz block CRC64 mismatch: got {got:016x}, want {want:016x}"
-                ));
-            }
-            Ok(())
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Self::None => {}
+            Self::Crc32(crc) => crc.update(bytes),
+            Self::Crc64(crc) => crc.update(bytes),
+            Self::Sha256(hash) => hash.update(bytes),
         }
-        0x0a => {
-            let mut hasher = Sha256::new();
-            hasher.update(content);
-            if hasher.finalize() != *stored {
-                return Err("xz block SHA-256 mismatch".to_string());
+    }
+
+    fn verify(self, stored: &[u8]) -> Result<(), String> {
+        match self {
+            Self::None => Ok(()),
+            Self::Crc32(crc) => {
+                let got = crc.finalize();
+                let want = u32_le(stored, 0)?;
+                if got != want {
+                    return Err(format!(
+                        "xz block CRC32 mismatch: got {got:08x}, want {want:08x}"
+                    ));
+                }
+                Ok(())
             }
-            Ok(())
+            Self::Crc64(crc) => {
+                let got = crc.finalize();
+                let want = u64_le(stored, 0)?;
+                if got != want {
+                    return Err(format!(
+                        "xz block CRC64 mismatch: got {got:016x}, want {want:016x}"
+                    ));
+                }
+                Ok(())
+            }
+            Self::Sha256(hasher) => {
+                if hasher.finalize().as_slice() != stored {
+                    return Err("xz block SHA-256 mismatch".to_string());
+                }
+                Ok(())
+            }
         }
-        other => Err(format!("unsupported xz check type 0x{other:02x}")),
+    }
+}
+
+/// Bounded LZMA dictionary plus a small write buffer. The dictionary is a
+/// circular history window; bytes older than the declared dictionary are sent
+/// onward and forgotten instead of pinning the whole archive in a Vec.
+struct StreamOutput<'a, W: Write> {
+    writer: &'a mut W,
+    dict: Vec<u8>,
+    dict_cap: usize,
+    dict_next: usize,
+    dict_len: usize,
+    since_reset: u64,
+    pending: Vec<u8>,
+    produced: u64,
+    check: BlockCheck,
+}
+
+impl<'a, W: Write> StreamOutput<'a, W> {
+    fn new(writer: &'a mut W, dict_size: u32, check_id: u8) -> Result<Self, String> {
+        let dict_cap = usize::try_from(dict_size)
+            .map_err(|_| "LZMA2 dictionary size did not fit usize".to_string())?;
+        if dict_cap == 0 {
+            return Err("LZMA2 dictionary size is zero".to_string());
+        }
+        Ok(Self {
+            writer,
+            // The header's cap may be 256 MiB even when this block emits only
+            // a few bytes. Grow on actual history demand instead of reserving
+            // the entire attacker-controlled cap up front for every block.
+            dict: Vec::new(),
+            dict_cap,
+            dict_next: 0,
+            dict_len: 0,
+            since_reset: 0,
+            pending: Vec::with_capacity(OUTPUT_CHUNK_BYTES),
+            produced: 0,
+            check: BlockCheck::new(check_id)?,
+        })
+    }
+
+    fn reset_dictionary(&mut self) {
+        self.dict.clear();
+        self.dict_next = 0;
+        self.dict_len = 0;
+        self.since_reset = 0;
+    }
+
+    fn byte_back(&self, dist_m1: u32) -> Result<u8, String> {
+        let distance = u64::from(dist_m1) + 1;
+        if distance > self.since_reset || distance > self.dict_len as u64 {
+            return Err(format!("LZMA match distance {distance} exceeds dictionary"));
+        }
+        let distance = usize::try_from(distance)
+            .map_err(|_| "LZMA match distance did not fit usize".to_string())?;
+        let index = if self.dict_next >= distance {
+            self.dict_next - distance
+        } else {
+            self.dict_cap - (distance - self.dict_next)
+        };
+        self.dict
+            .get(index)
+            .copied()
+            .ok_or_else(|| "LZMA dictionary index out of bounds".to_string())
+    }
+
+    fn push(&mut self, byte: u8) -> Result<(), String> {
+        if self.dict_len < self.dict_cap {
+            self.dict.push(byte);
+            self.dict_len += 1;
+        } else {
+            let slot = self
+                .dict
+                .get_mut(self.dict_next)
+                .ok_or_else(|| "LZMA dictionary write out of bounds".to_string())?;
+            *slot = byte;
+        }
+        self.dict_next = if self.dict_next + 1 == self.dict_cap {
+            0
+        } else {
+            self.dict_next + 1
+        };
+        self.since_reset = self
+            .since_reset
+            .checked_add(1)
+            .ok_or_else(|| "LZMA dictionary position exceeds u64".to_string())?;
+        self.produced = self
+            .produced
+            .checked_add(1)
+            .ok_or_else(|| "xz block output length exceeds u64".to_string())?;
+        self.pending.push(byte);
+        if self.pending.len() >= OUTPUT_CHUNK_BYTES {
+            self.flush_pending()?;
+        }
+        Ok(())
+    }
+
+    fn flush_pending(&mut self) -> Result<(), String> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        self.check.update(&self.pending);
+        self.writer
+            .write_all(&self.pending)
+            .map_err(|e| format!("write decompressed xz output: {e}"))?;
+        self.pending.clear();
+        Ok(())
+    }
+
+    fn verify(self, stored: &[u8]) -> Result<(), String> {
+        self.check.verify(stored)
     }
 }
 
 /// Decode one LZMA2 compressed-data field (a chunk sequence ending with a
 /// 0x00 control byte) starting at `start`, appending to `out`. Returns the
 /// number of compressed bytes consumed, terminator included.
-fn lzma2_decode(
-    data: &[u8],
-    start: usize,
-    dict_size: u32,
-    out: &mut Vec<u8>,
-    max_output_bytes: u64,
-) -> Result<usize, String> {
+fn lzma2_decode<R: BufRead, W: Write>(
+    input: &mut XzInput<'_, R>,
+    out: &mut StreamOutput<'_, W>,
+) -> Result<(), String> {
     let mut st = LzmaState::new();
     let mut need_dict_reset = true;
     let mut need_props = true;
-    let mut dict_base = out.len();
-    let mut pos = start;
+    let mut chunk = Vec::new();
     loop {
-        let control = byte(data, pos).map_err(|_| "truncated LZMA2 stream".to_string())?;
-        pos = pos
-            .checked_add(1)
-            .ok_or_else(|| "LZMA2 offset overflow".to_string())?;
+        let control = input.read_byte("LZMA2 stream")?;
         if control == 0x00 {
-            return Ok(pos.saturating_sub(start));
+            return Ok(());
         }
         if control >= 0xe0 || control == 0x01 {
             // Dictionary reset. The next LZMA chunk must carry new
             // properties (0xe0 does so itself).
             need_props = true;
             need_dict_reset = false;
-            dict_base = out.len();
+            out.reset_dictionary();
         } else if need_dict_reset {
             return Err("LZMA2 stream does not start with a dictionary reset".to_string());
         }
@@ -450,51 +728,28 @@ fn lzma2_decode(
             // then unpacked-size low bits, compressed size, and (for
             // control >= 0xc0) a properties byte.
             let unpacked = (usize::from(control & 0x1f) << 16)
-                + usize::from(u16_be(data, pos)?)
+                + usize::from(input.read_u16_be("LZMA2 uncompressed size")?)
                 + 1;
-            let comp = usize::from(u16_be(
-                data,
-                pos.checked_add(2)
-                    .ok_or_else(|| "LZMA2 offset overflow".to_string())?,
-            )?) + 1;
-            pos = pos
-                .checked_add(4)
-                .ok_or_else(|| "LZMA2 offset overflow".to_string())?;
+            let comp = usize::from(input.read_u16_be("LZMA2 compressed size")?) + 1;
             if control >= 0xc0 {
-                st.set_props(byte(data, pos)?)?;
+                st.set_props(input.read_byte("LZMA2 properties")?)?;
                 need_props = false;
-                pos = pos
-                    .checked_add(1)
-                    .ok_or_else(|| "LZMA2 offset overflow".to_string())?;
             } else if need_props {
                 return Err("LZMA2 chunk reuses properties before any were set".to_string());
             } else if control >= 0xa0 {
                 st.reset();
             }
-            let chunk = range(data, pos, comp)
-                .map_err(|_| "truncated LZMA2 compressed chunk".to_string())?;
-            if out.len() as u64 + unpacked as u64 > max_output_bytes {
-                return Err(format!("xz output exceeds {max_output_bytes} byte limit"));
-            }
-            lzma_run_chunk(chunk, &mut st, out, dict_base, dict_size, unpacked)?;
-            pos = pos
-                .checked_add(comp)
-                .ok_or_else(|| "LZMA2 offset overflow".to_string())?;
+            chunk.resize(comp, 0);
+            input.read_exact_into(&mut chunk, "LZMA2 compressed chunk")?;
+            lzma_run_chunk(&chunk, &mut st, out, unpacked)?;
         } else if control <= 0x02 {
             // Uncompressed chunk (0x01 with dictionary reset, 0x02 without).
-            let size = usize::from(u16_be(data, pos)?) + 1;
-            pos = pos
-                .checked_add(2)
-                .ok_or_else(|| "LZMA2 offset overflow".to_string())?;
-            let chunk = range(data, pos, size)
-                .map_err(|_| "truncated LZMA2 uncompressed chunk".to_string())?;
-            if out.len() as u64 + size as u64 > max_output_bytes {
-                return Err(format!("xz output exceeds {max_output_bytes} byte limit"));
+            let size = usize::from(input.read_u16_be("LZMA2 uncompressed chunk size")?) + 1;
+            chunk.resize(size, 0);
+            input.read_exact_into(&mut chunk, "LZMA2 uncompressed chunk")?;
+            for byte in &chunk {
+                out.push(*byte)?;
             }
-            out.extend_from_slice(chunk);
-            pos = pos
-                .checked_add(size)
-                .ok_or_else(|| "LZMA2 offset overflow".to_string())?;
         } else {
             return Err(format!("invalid LZMA2 control byte 0x{control:02x}"));
         }
@@ -633,22 +888,20 @@ impl LzmaState {
 /// Decode one LZMA chunk (`unpacked` output bytes from `chunk`). The output
 /// buffer doubles as the dictionary: `dict_base` marks the last dictionary
 /// reset, so match distances may not reach behind it.
-fn lzma_run_chunk(
+fn lzma_run_chunk<W: Write>(
     chunk: &[u8],
     st: &mut LzmaState,
-    out: &mut Vec<u8>,
-    dict_base: usize,
-    dict_size: u32,
+    out: &mut StreamOutput<'_, W>,
     unpacked: usize,
 ) -> Result<(), String> {
     let mut rc = RangeDecoder::new(chunk)?;
     let chunk_end = out
-        .len()
-        .checked_add(unpacked)
+        .produced
+        .checked_add(unpacked as u64)
         .ok_or_else(|| "LZMA chunk length overflow".to_string())?;
-    while out.len() < chunk_end {
-        // dict_base <= out.len() by construction (it is a saved out.len()).
-        let pos_abs = out.len().saturating_sub(dict_base);
+    while out.produced < chunk_end {
+        let pos_abs = usize::try_from(out.since_reset)
+            .map_err(|_| "LZMA dictionary position did not fit usize".to_string())?;
         let pos_state = pos_abs & st.pos_mask;
         let match_idx = st.state * POS_STATES_MAX + pos_state;
         if rc.bit(prob_at(&mut st.is_match, match_idx)?)? == 0 {
@@ -663,7 +916,7 @@ fn lzma_run_chunk(
                 if rc.bit(prob_at(&mut st.is_rep0_long, match_idx)?)? == 0 {
                     // Short rep: a single byte at distance rep0.
                     st.state = if st.state < 7 { 9 } else { 11 };
-                    copy_match(out, st.rep0, 1, dict_base, dict_size, chunk_end)?;
+                    copy_match(out, st.rep0, 1, chunk_end)?;
                     continue;
                 }
                 dist_m1 = st.rep0;
@@ -696,7 +949,7 @@ fn lzma_run_chunk(
             st.state = if st.state < 7 { 7 } else { 10 };
             dist_m1 = st.rep0;
         }
-        copy_match(out, dist_m1, len, dict_base, dict_size, chunk_end)?;
+        copy_match(out, dist_m1, len, chunk_end)?;
     }
     // One trailing normalization keeps byte consumption in lockstep with
     // the encoder, so a valid chunk ends exactly at its compressed size
@@ -712,16 +965,16 @@ fn lzma_run_chunk(
     Ok(())
 }
 
-fn decode_literal(
+fn decode_literal<W: Write>(
     rc: &mut RangeDecoder<'_>,
     st: &mut LzmaState,
-    out: &mut Vec<u8>,
+    out: &mut StreamOutput<'_, W>,
     pos_abs: usize,
 ) -> Result<(), String> {
     let prev = if pos_abs == 0 {
         0u32
     } else {
-        out.last().map(|b| u32::from(*b)).unwrap_or(0)
+        u32::from(out.byte_back(0)?)
     };
     let lit_idx =
         ((pos_abs & st.lit_pos_mask) << st.lc) + ((prev >> (8 - st.lc)) as usize);
@@ -739,15 +992,10 @@ fn decode_literal(
     } else {
         // Matched literal: fold in the byte at distance rep0 until the
         // decoded bits diverge from it.
-        let dist = st.rep0 as usize;
-        if dist >= pos_abs {
+        if u64::from(st.rep0) >= pos_abs as u64 {
             return Err("LZMA matched-literal distance out of range".to_string());
         }
-        let src = out.len() - 1 - dist;
-        let mut match_byte = u32::from(
-            *out.get(src)
-                .ok_or_else(|| "LZMA matched-literal source out of bounds".to_string())?,
-        ) << 1;
+        let mut match_byte = u32::from(out.byte_back(st.rep0)?) << 1;
         let mut offset = 0x100u32;
         while symbol < 0x100 {
             let match_bit = match_byte & offset;
@@ -763,7 +1011,7 @@ fn decode_literal(
             }
         }
     }
-    out.push((symbol & 0xff) as u8);
+    out.push((symbol & 0xff) as u8)?;
     st.state = if st.state < 4 {
         0
     } else if st.state < 10 {
@@ -839,45 +1087,24 @@ fn decode_distance(
 /// past the declared dictionary size, and the copy may not overrun the
 /// chunk's uncompressed size. This also rejects the LZMA end-of-stream
 /// marker (distance 0xffffffff), which LZMA2 chunks never contain.
-fn copy_match(
-    out: &mut Vec<u8>,
+fn copy_match<W: Write>(
+    out: &mut StreamOutput<'_, W>,
     dist_m1: u32,
     len: usize,
-    dict_base: usize,
-    dict_size: u32,
-    chunk_end: usize,
+    chunk_end: u64,
 ) -> Result<(), String> {
-    let avail = out.len().saturating_sub(dict_base);
-    if u64::from(dist_m1) >= avail as u64 || u64::from(dist_m1) >= u64::from(dict_size) {
-        return Err(format!(
-            "LZMA match distance {} exceeds dictionary",
-            u64::from(dist_m1) + 1
-        ));
-    }
     let new_len = out
-        .len()
-        .checked_add(len)
+        .produced
+        .checked_add(len as u64)
         .ok_or_else(|| "LZMA output length overflow".to_string())?;
     if new_len > chunk_end {
         return Err("LZMA match overruns the chunk's uncompressed size".to_string());
     }
-    let dist = dist_m1 as usize + 1;
-    // dist <= avail <= out.len(), so src is in bounds and the
-    // extend_from_within ranges below never leave the buffer.
-    let src = out.len() - dist;
-    if dist >= len {
-        out.extend_from_within(src..src + len);
-        return Ok(());
-    }
-    // Overlapping copy: the appended bytes repeat the last `dist` bytes.
-    // Every round copies a whole number of periods (the window is always a
-    // multiple of `dist` until the final partial round), doubling the
-    // window instead of copying byte by byte.
-    let mut remaining = len;
-    while remaining > 0 {
-        let n = (out.len() - src).min(remaining);
-        out.extend_from_within(src..src + n);
-        remaining -= n;
+    // Reading after every push naturally implements LZMA's overlapping match
+    // copies while retaining only the declared circular dictionary.
+    for _ in 0..len {
+        let byte = out.byte_back(dist_m1)?;
+        out.push(byte)?;
     }
     Ok(())
 }
@@ -1077,39 +1304,66 @@ fn u64_le(input: &[u8], pos: usize) -> Result<u64, String> {
     Ok(lo | (hi << 32))
 }
 
-/// CRC64/ECMA-182 as used by xz (reflected, init/xorout all-ones).
-fn crc64(input: &[u8]) -> u64 {
-    let table = crc64_table();
-    let mut crc = u64::MAX;
-    for b in input {
-        let idx = ((crc ^ u64::from(*b)) & 0xff) as usize;
-        let table_value = table.get(idx).copied().unwrap_or(0);
-        crc = (crc >> 8) ^ table_value;
-    }
-    !crc
+/// Incremental CRC64/ECMA-182 as used by xz (reflected, init/xorout
+/// all-ones).
+struct Crc64 {
+    state: u64,
 }
 
-fn crc64_table() -> [u64; 256] {
-    let mut table = [0u64; 256];
-    for i in 0..256usize {
-        let mut crc = u64::try_from(i).unwrap_or(0);
-        for _ in 0..8 {
-            if crc & 1 == 0 {
-                crc >>= 1;
-            } else {
-                crc = (crc >> 1) ^ 0xc96c_5795_d787_0f42;
-            }
-        }
-        if let Some(slot) = table.get_mut(i) {
-            *slot = crc;
+impl Crc64 {
+    fn new() -> Self {
+        Self { state: u64::MAX }
+    }
+
+    fn update(&mut self, input: &[u8]) {
+        let table = crc64_table();
+        for b in input {
+            let idx = ((self.state ^ u64::from(*b)) & 0xff) as usize;
+            let table_value = table.get(idx).copied().unwrap_or(0);
+            self.state = (self.state >> 8) ^ table_value;
         }
     }
-    table
+
+    fn finalize(self) -> u64 {
+        !self.state
+    }
+}
+
+fn crc64_table() -> &'static [u64; 256] {
+    static TABLE: std::sync::OnceLock<[u64; 256]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = [0u64; 256];
+        for i in 0..256usize {
+            let mut crc = u64::try_from(i).unwrap_or(0);
+            for _ in 0..8 {
+                if crc & 1 == 0 {
+                    crc >>= 1;
+                } else {
+                    crc = (crc >> 1) ^ 0xc96c_5795_d787_0f42;
+                }
+            }
+            if let Some(slot) = table.get_mut(i) {
+                *slot = crc;
+            }
+        }
+        table
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoded_output_cap_rejects_before_forwarding_more_bytes() {
+        let mut sink = Vec::new();
+        let mut writer = CappedWriter {
+            inner: &mut sink,
+            written: MAX_DECODED_BYTES,
+        };
+        assert!(writer.write_all(&[1]).is_err());
+        assert!(sink.is_empty());
+    }
 
     // Vectors produced once with XZ Utils 5.4.5 (see each test for the
     // exact invocation) and embedded so the tests run offline.
@@ -1449,9 +1703,47 @@ mod tests {
     }
 
     #[test]
-    fn output_limit_errors() {
-        let err = decompress_with_limit(&BIG3M_XZ, 1000).unwrap_err();
-        assert!(err.contains("byte limit"), "got: {err}");
+    fn decoder_writes_bounded_chunks() {
+        struct Reads<'a> {
+            cursor: std::io::Cursor<&'a [u8]>,
+            largest: usize,
+        }
+        impl std::io::Read for Reads<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.largest = self.largest.max(buf.len());
+                std::io::Read::read(&mut self.cursor, buf)
+            }
+        }
+        struct Chunks {
+            bytes: usize,
+            largest: usize,
+        }
+        impl std::io::Write for Chunks {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.bytes += buf.len();
+                self.largest = self.largest.max(buf.len());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut chunks = Chunks {
+            bytes: 0,
+            largest: 0,
+        };
+        let reads = Reads {
+            cursor: std::io::Cursor::new(&BIG3M_XZ),
+            largest: 0,
+        };
+        let mut reader = std::io::BufReader::with_capacity(1024, reads);
+        let written = decompress_reader_to(&mut reader, &mut chunks).unwrap();
+        let reads = reader.into_inner();
+        assert_eq!(written, chunks.bytes as u64);
+        assert_eq!(chunks.bytes, big3m().len());
+        assert!(chunks.largest <= OUTPUT_CHUNK_BYTES);
+        assert!(reads.largest <= 64 * 1024);
     }
 
     #[test]
