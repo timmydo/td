@@ -1,4 +1,4 @@
-use crate::sys;
+use crate::{seccomp, sys};
 use std::collections::BTreeSet;
 use std::ffi::{CString, OsString};
 use std::fs::{self, OpenOptions};
@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub const PROBE_ARG: &str = "--probe-transition";
+const FILTER_ARG: &str = "--internal-write-seccomp-filter";
 const STAGE2_ARG: &str = "--internal-stage-2";
 const REAPER_CHILD_ARG: &str = "--internal-reaper-child";
 const REAPER_ORPHAN_ARG: &str = "--internal-reaper-orphan";
@@ -96,6 +97,7 @@ fn require_child_pid_namespace_changed(before: &NamespaceSnapshot, child: u32) -
 #[derive(Debug, Eq, PartialEq)]
 pub enum Mode {
     Probe,
+    WriteFilter,
     Stage2 {
         token: [u8; TOKEN_LEN],
         identity: Identity,
@@ -114,6 +116,12 @@ where
             return Err(usage_error());
         }
         return Ok(Mode::Probe);
+    }
+    if mode == FILTER_ARG {
+        if args.next().is_some() {
+            return Err(usage_error());
+        }
+        return Ok(Mode::WriteFilter);
     }
     if mode == STAGE2_ARG {
         let encoded = args.next().ok_or_else(usage_error)?;
@@ -196,6 +204,16 @@ fn effective_id(status: &str, key: &str) -> io::Result<u32> {
         .nth(1)
         .ok_or_else(|| io::Error::other(format!("/proc/self/status {key} has no effective id")))?
         .parse()
+        .map_err(|e| io::Error::other(format!("invalid /proc/self/status {key}: {e}")))
+}
+
+fn decimal_status_row(status: &str, key: &str) -> io::Result<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(key))
+        .ok_or_else(|| io::Error::other(format!("/proc/self/status has no {key} row")))?
+        .trim()
+        .parse::<u32>()
         .map_err(|e| io::Error::other(format!("invalid /proc/self/status {key}: {e}")))
 }
 
@@ -662,6 +680,42 @@ fn clear_and_require_empty_capabilities() -> io::Result<()> {
     require_capability_rows(&status, empty, 0, 0)
 }
 
+fn require_runtime_confinement() -> io::Result<()> {
+    if !sys::no_new_privileges()? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "PR_GET_NO_NEW_PRIVS did not read back the installed restriction",
+        ));
+    }
+    let status = fs::read_to_string("/proc/self/status")?;
+    if decimal_status_row(&status, "NoNewPrivs:")? != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "/proc/self/status did not read back NoNewPrivs: 1",
+        ));
+    }
+    if decimal_status_row(&status, "Seccomp:")? != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "/proc/self/status did not read back seccomp filter mode",
+        ));
+    }
+    Ok(())
+}
+
+fn install_standard_seccomp_filter() -> io::Result<()> {
+    let program = seccomp::standard_program()?;
+    sys::set_no_new_privileges()?;
+    if !sys::no_new_privileges()? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "PR_SET_NO_NEW_PRIVS succeeded without changing its readback",
+        ));
+    }
+    sys::install_seccomp_filter(program.instructions())?;
+    require_runtime_confinement()
+}
+
 fn enter_mount_plan() -> io::Result<()> {
     let procfs = cstring("proc")?;
     let proc_target = cstring(&format!("{NEW_ROOT}/proc"))?;
@@ -1003,7 +1057,8 @@ fn require_empty_child_capabilities() -> io::Result<()> {
     require_ambient(last, 0)?;
     require_empty_bounding(last)?;
     let status = fs::read_to_string("/proc/self/status")?;
-    require_capability_rows(&status, empty, 0, 0)
+    require_capability_rows(&status, empty, 0, 0)?;
+    require_runtime_confinement()
 }
 
 pub fn run_reaper_child() -> io::Result<()> {
@@ -1228,8 +1283,13 @@ pub fn run_stage2(expected: [u8; TOKEN_LEN], expected_identity: Identity) -> io:
     enter_mount_plan()?;
     require_mount_plan()?;
     clear_and_require_empty_capabilities()?;
+    install_standard_seccomp_filter()?;
     probe_pid1_reaper()?;
     writeln!(io::stdout(), "{STAGE2_MARKER} pid=1")
+}
+
+pub fn write_standard_filter() -> io::Result<()> {
+    seccomp::write_standard_filter(io::stdout().lock())
 }
 
 #[cfg(test)]
@@ -1252,6 +1312,8 @@ mod tests {
         assert!(parse_mode(args(&[])).is_err());
         assert!(parse_mode(args(&["firefox"])).is_err());
         assert!(parse_mode(args(&[PROBE_ARG, "extra"])).is_err());
+        assert_eq!(parse_mode(args(&[FILTER_ARG])).unwrap(), Mode::WriteFilter);
+        assert!(parse_mode(args(&[FILTER_ARG, "extra"])).is_err());
         assert_eq!(
             parse_mode(args(&[REAPER_CHILD_ARG])).unwrap(),
             Mode::ReaperChild
@@ -1281,12 +1343,15 @@ mod tests {
 
     #[test]
     fn status_parser_uses_the_effective_column() {
-        let status = "Name:\ttd-jail\nUid:\t1000\t1001\t1002\t1003\nGid:\t10\t11\t12\t13\nCapEff:\t0000000000200000\n";
+        let status = "Name:\ttd-jail\nUid:\t1000\t1001\t1002\t1003\nGid:\t10\t11\t12\t13\nCapEff:\t0000000000200000\nNoNewPrivs:\t1\nSeccomp:\t2\n";
         assert_eq!(effective_id(status, "Uid:").unwrap(), 1001);
         assert_eq!(effective_id(status, "Gid:").unwrap(), 11);
         assert_eq!(capability_row(status, "CapEff:").unwrap(), 1 << 21);
+        assert_eq!(decimal_status_row(status, "NoNewPrivs:").unwrap(), 1);
+        assert_eq!(decimal_status_row(status, "Seccomp:").unwrap(), 2);
         assert!(effective_id(status, "Groups:").is_err());
         assert!(capability_row("Name:\ttd-jail\n", "CapEff:").is_err());
+        assert!(decimal_status_row(status, "Missing:").is_err());
     }
 
     #[test]

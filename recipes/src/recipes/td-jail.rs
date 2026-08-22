@@ -2,6 +2,7 @@ use crate::types::{Recipe, Step};
 
 const MAIN_RS: &str = include_str!("../../../td-jail/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
+    ("seccomp", include_str!("../../../td-jail/src/seccomp.rs")),
     ("sys", include_str!("../../../td-jail/src/sys.rs")),
     (
         "transition",

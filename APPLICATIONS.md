@@ -271,10 +271,11 @@ the QEMU boot oracle: as uid 1000 on the target kernel it creates the
 complete user, mount, pid, UTS and isolated-network set, reads the
 identity maps back, proves stage 2 is PID 1, uses exactly the one-capability
 mount bridge, enters the fresh immutable root, clears and reads back every
-capability set, reaps a reparented descendant, and gates boot success on
-`TD-JAIL-TRANSITION-OK`. The filter-install half remains with rung 11,
-where a compiled filter exists to install. Failure disables application
-launch with a named diagnostic; it never silently selects a weaker
+capability set, installs and reads back no-new-privileges and the compiled
+filter, reaps a filtered reparented descendant, and gates boot success on
+`TD-JAIL-TRANSITION-OK`. A non-shipped target probe staged only into the QEMU
+fixture exercises the exact filter's errno and kill actions. Failure disables
+application launch with a named diagnostic; it never silently selects a weaker
 sandbox.
 
 **LANDED, in staged halves, and the split is worth reading before relying on
@@ -291,7 +292,9 @@ are surface #9's, and inventing an earlier prober would have meant an
 namespace assertion landed with rung 8; rung 9 adds the mount,
 capability-bridge, pivot and readback assertion in `td-jail` and the
 target-system QEMU oracle. Rung 10 adds final capability removal and the
-orphan-reaping assertion. The filter install remains at rung 11.
+orphan-reaping assertion. Rung 11 installs and reads back the compiled filter
+and proves its behavior with an interpreter, build-host probe, and target QEMU
+probe.
 
 What the `/proc` reads DO cover, beyond the features themselves, is the
 one class of failure a config guard structurally cannot see: a value.
@@ -2097,11 +2100,11 @@ unless authenticated extension metadata requires one.
 
 ### The seccomp filter
 
-**A deny list, matching upstream's, not an allow list.** This diverges
-from td's instincts and is argued rather than slipped in: an allow list
-over the runtime glibc's whole syscall surface breaks every time that
-glibc updates — a new `*_time64` or `statx` variant appears and every app
-dies — and td does not control that glibc, Freedesktop SDK does. The deny
+**A Flatpak-derived, deliberately stricter deny list, not an allow list.**
+This diverges from td's instincts and is argued rather than slipped in:
+an allow list over the runtime glibc's whole syscall surface breaks every
+time that glibc updates — a new `*_time64` or `statx` variant appears and
+every app dies — and td does not control that glibc, Freedesktop SDK does. The deny
 list is the part upstream has kept stable for a decade, it is small
 enough to roster, and td pins it the way it pins ioctl requests: by
 value, in one table, emitted by one function.
@@ -2117,7 +2120,7 @@ flag check applies; `EPERM` would be believed and break thread creation.
 |---|---|
 | `arch != AUDIT_ARCH_X86_64` (0xC000003E) → KILL | a filter keyed on numbers is meaningless under another table |
 | `(nr & 0xC0000000) == 0x40000000` (`__X32_SYSCALL_BIT` set, sign bit clear) → KILL | the x32 ABI aliases numbers past the filter. **TWO bits, not one, and not a magnitude compare** — both simpler forms kill `-1`, and review caught the second one after the first had been corrected to it. `nr >= 0x40000000` kills it because `0xFFFFFFFF` compares greater; `nr & 0x40000000` kills it because `0xFFFFFFFF & 0x40000000` is *also* nonzero. An x32 number is a small positive number with bit 30 set, so bit 31 is clear, and the two-bit mask names exactly that set. An invalid syscall number is something libraries genuinely probe with, and the kernel's own answer to it is `ENOSYS`; turning that into `SIGSYS` is a filter that kills for something the ABI permits. The interpreter test below asserts `-1` survives, which is what would have caught either draft |
-| `socket` with `arg0` outside `{AF_UNIX, AF_INET, AF_INET6, AF_NETLINK}` → EAFNOSUPPORT | **upstream filters address families and an earlier draft of this table did not**, which made "matching upstream's" false in the permissive direction: without it a jail reaches `AF_VSOCK`, `AF_XDP`, `AF_PACKET` and the rest of a large and unevenly audited surface. `EAFNOSUPPORT` rather than `EPERM` because it is the answer a kernel without the family gives, and every library already handles it. `AF_CAN`/`AF_BLUETOOTH` are upstream's permission-gated pair and neither has a td permission to gate them, so they are simply out |
+| `socket` with `arg0` outside `{AF_UNIX, AF_INET, AF_INET6, AF_NETLINK}` → EAFNOSUPPORT | Flatpak's family filtering is the starting point, but td does not carry its `AF_UNSPEC`, `AF_CAN`, or `AF_BLUETOOTH` cases because td has no permission that needs them. Without this rule a jail reaches `AF_VSOCK`, `AF_XDP`, `AF_PACKET` and the rest of a large and unevenly audited surface. `EAFNOSUPPORT` is the answer a kernel without the family gives, and libraries already handle it |
 | `ptrace`, `perf_event_open` → EPERM (dropped under `allow-devel`) | cross-process inspection; kernel attack surface |
 | `userfaultfd` → EPERM | pause-kernel-paths primitive used by exploit chains |
 | `personality` with arg0 outside `{0, 0xFFFFFFFF}` → EPERM | `READ_IMPLIES_EXEC` and historical bypasses. **`0xFFFFFFFF` must be allowed**: it is not a personality to set but the standard *query* form, which returns the current value and changes nothing, and glibc and several runtimes use it during startup. An earlier draft denied every nonzero argument and would have `EPERM`ed a read-only question |
@@ -2126,17 +2129,34 @@ flag check applies; `EPERM` would be believed and break thread creation.
 | `clone` with `arg0 & CLONE_NEWUSER` → EPERM | see the open question below |
 | `clone3` → ENOSYS | as above |
 | `unshare`, `setns`, `chroot` → EPERM | namespace creation and joining |
-| `mount`, `umount`, `umount2`, `pivot_root`, `move_mount`, `open_tree`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `mount_setattr` → EPERM | the whole mount surface, old and new API — filtering only the old one is a hole |
+| `mount`, `umount`, `umount2`, `pivot_root`, `move_mount`, `open_tree`, `open_tree_attr`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `mount_setattr` → EPERM | the whole mount surface, old and new API — filtering only the old one is a hole; `open_tree_attr` is the Linux 7.1 addition |
 | `open_by_handle_at` → EPERM | the Shocker escape primitive |
 | `add_key`, `request_key`, `keyctl` → EPERM | shared kernel keyring |
 | `move_pages`, `mbind`, `get_mempolicy`, `set_mempolicy`, `migrate_pages` → EPERM | NUMA policy on other processes' pages |
-| `kexec_load`, `kexec_file_load`, `swapon`, `swapoff`, `reboot`, `sethostname`, `setdomainname`, `init_module`, `finit_module`, `delete_module`, `acct`, `quotactl`, `syslog`, `uselib`, `vhangup`, `modify_ldt`, and the obsolete set → EPERM | privileged or obsolete; denied so the answer never depends on capability arithmetic |
-| `bpf`, `io_uring_setup`, `io_uring_enter`, `io_uring_register`, `pidfd_getfd`, `process_vm_readv`, `process_vm_writev` → EPERM | **td additions beyond upstream**, each recorded as such: bpf and io_uring are the two largest post-2015 kernel attack surfaces, `pidfd_getfd` steals descriptors, `process_vm_*` is ptrace by another number |
+| `kexec_load`, `kexec_file_load`, `swapon`, `swapoff`, `reboot`, `sethostname`, `setdomainname`, `init_module`, `finit_module`, `delete_module`, `acct`, `quotactl`, `syslog`, `uselib`, `vhangup`, `modify_ldt`, `ustat`, `sysfs`, `_sysctl`, `create_module`, `get_kernel_syms`, `query_module`, `nfsservctl`, `getpmsg`, `putpmsg`, `afs_syscall`, `tuxcall`, `security`, `set_thread_area`, `get_thread_area`, `epoll_ctl_old`, `epoll_wait_old`, and `vserver` → EPERM | privileged or the exact named obsolete x86-64 table slots; denied so the answer never depends on capability arithmetic |
+| `bpf`, `io_uring_setup`, `io_uring_enter`, `io_uring_register`, `pidfd_getfd`, `process_vm_readv`, `process_vm_writev` → EPERM | **td additions beyond Flatpak**, each recorded as such: bpf and io_uring are the two largest post-2015 kernel attack surfaces, `pidfd_getfd` steals descriptors, and `process_vm_*` is ptrace by another number |
+
+This is a policy lineage, not a byte-for-byte compatibility claim. Current
+Flatpak also admits `AF_UNSPEC`, handles `personality` differently, and returns
+`ENOSYS` for newer mount APIs. td keeps only the two query-only personality
+values, returns `EPERM` across the mount surface, and adds the
+`userfaultfd`, `open_by_handle_at`, privileged/obsolete, bpf, io_uring,
+`pidfd_getfd`, and `process_vm_*` denials rostered above. Those stricter deltas
+are deliberate and tested rather than inherited accidentally.
 
 Everything else is allowed, including `seccomp(2)` and
 `prctl(PR_SET_SECCOMP)` — Firefox installs its own filters in every
 content process, and filter stacking under `NO_NEW_PRIVS` is exactly what
 the kernel provides. A nested filter can only narrow.
+
+Linux 7.1's `uretprobe`=335 and `uprobe`=336 entries are not ordinary
+application syscalls and are not claimed as filter rules. The pinned kernel
+unconditionally treats both as seccomp exceptions before running cBPF so an
+external tracer can inject its kernel-owned trampoline; a direct `uretprobe`
+call is rejected with `SIGILL` and a direct `uprobe` call with `ENXIO`.
+Putting either number in the array would describe a denial the kernel does not
+enforce. The ordinary tracing entry points remain denied through
+`perf_event_open`, `ptrace`, and `bpf`.
 
 **Expressing BPF with no dependencies.** `struct sock_filter` is
 `{u16 code; u8 jt; u8 jf; u32 k}` — 8 bytes, built by one `insn()` whose
@@ -2167,20 +2187,26 @@ two ioctls the truncation *is* the point.
    `ENOSYS`, not `SIGSYS`), `personality(0xFFFFFFFF)` (allowed) beside
    `personality(READ_IMPLIES_EXEC)` (denied), and an x32 number whose
    low bits collide with an allowed x86-64 one.
-2. A **declared, non-shipped target probe** — built by td's GCC, never in
-   the closure — installs the production filter and issues the real
+2. A **declared, non-shipped target probe recipe** — built by td's GCC, never
+   in the closure — installs the production filter and issues the real
    syscalls in children, checking exact errno and termination status.
    This is where `ptrace` and `TIOCSTI` get proved, since safe td code
    cannot issue them; it is why the probe is a C-side test binary rather
    than a `cfg`-gated widening of `sys.rs`.
-3. The **QEMU boot oracle** runs the same probe on the booted image,
+3. The **QEMU boot oracle** builds that helper-only recipe, rather than the
+   host-policy smoke-test recipe, and runs the probe on the booted image,
    because layer 1 proves the program and layer 2 proves *a* kernel
    loaded it — only the target kernel proves the pinned config supports
    every piece.
 
 Plus negative tests: omitting `NO_NEW_PRIVS` must make installation fail,
 and a corrupted-jump or wrong-length program must be refused before
-`seccomp(2)`.
+`seccomp(2)`. A build host that inherited no-new-privileges but no filter may
+skip only that impossible negative leg. If it already has a seccomp filter,
+the probe validates the bounded artifact but skips host behavior: filters
+stack and the outer policy could change any result. The QEMU invocation passes
+no allowance, requires both states to begin at zero, and always runs the exact
+behavior checks on the target kernel.
 
 ### The open question: Firefox's nested sandbox
 
@@ -2233,12 +2259,14 @@ td ships one filter or two. Record the answer here when it is known.
 The normative `UNSAFE.md` roster grows with the implementation. Rung 9
 landed the namespace, descriptor, mount and capability-bridge calls, and
 rung 10 adds `wait4(2)` with final capability removal and its reparented-
-orphan oracle. The remaining calls below are not authorized until their
-own seccomp, launch and policy rungs land with callers and tests.
+orphan oracle. Rung 11 adds `seccomp(2)` plus no-new-privileges operations,
+the exact compiled policy and its interpreter, build-host, and target-kernel
+oracles. The remaining calls below are not authorized until their own launch
+and policy rungs land with callers and tests.
 The quoted block is the completed target, not the current roster; it
 intentionally retains the future thirteen-call count and `jail.rs`
 caller. Only the unquoted, implemented roster in `UNSAFE.md` authorizes
-today's nine calls and `transition.rs` caller.
+today's ten calls and `transition.rs` caller.
 
 > ## 9. `td-jail` — the application sandbox
 >
@@ -3490,7 +3518,7 @@ Each row is one landing or a small family, leaving the tree green.
 
 | # | lands | visible result |
 |---|---|---|
-| 1 | **kernel namespace/seccomp/cgroup config pins + QEMU readback** (§0) — **LANDED**, except the functional calls, which need surface #9: the `unshare` at rung 8, the filter install at rung 11 | none — but this is the gate on everything |
+| 1 | **kernel namespace/seccomp/cgroup config pins + QEMU readback** (§0) — **LANDED**; the functional `unshare` and filter calls subsequently landed with surface #9 at rungs 8 and 11 | none — but this is the gate on everything |
 | 2 | `td-login exec-as` with credential readback — **LANDED** | none |
 | 3 | **the §B.8 marker — LANDED**: the recipe-level mark, `payload_inputs` as a declared channel, taint propagation from the source pin, and the planning-time refusals — including the argv/template audit at `td-recipe-eval`'s production planning boundary for the otherwise-silent assertion. The channel is `{payload:NAME}` resolution plus `ro,noexec` binds, replacing the un-implementable "never staged at all"; the mark is `foreign` on the source pin, the derived recipe flag, the tool-channel refusal in both plan builders, and the computed `contains_payloads` answer with the recipe-graph closure query that reads it | none |
 | 4 | the canonical manifest, its recipe-side generator/parser, short-name validation, and the typed permission keyfile with every rejection — **LANDED** | none |
@@ -3500,7 +3528,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 8 | **`td-jail` crate + surface #9 skeleton + stage-1/stage-2 transition — LANDED**: one value-pinned `unshare(2)` wrapper, exact identity-map and fresh-namespace readback, a token-synchronized safe-`Command` transition to PID 1, post-exec zero-capability readback for the nonroot app identity, a build-host policy smoke test, and an authoritative target-kernel QEMU probe from the packed static binary; ordinary application launch still refuses | none |
 | 9 | **mount transition — LANDED**: inherited-FD closure, a private compiled tmpfs root with individually read-only allowlisted device binds and immutable metadata, fresh devpts/shm/tmp/var-tmp, capability-v3 set/get readbacks, an exact ambient/inheritable `CAP_SYS_ADMIN` exec bridge, an empty/read-back bounding set, stage-2 procfs for its own PID namespace, pivot + old-root detach, mountinfo/device/mode/writability readbacks, and host plus target-kernel probes; application launch still refuses | none |
 | 10 | **capability drop/readback + PID-1 reaper — LANDED**: ambient is explicitly cleared before effective/permitted/inheritable become empty, all five sets are read back zero, and a copied static internal helper leaves a zero-capability grandchild for PID 1's bounded `wait4(-1)` oracle; ordinary application launch still refuses | none |
-| 11 | const BPF assembler, standard filter, interpreter tests, target probe | none |
+| 11 | **const BPF assembler, standard filter, interpreter tests, build-host and target probes — LANDED**: stage 2 sets and reads back no-new-privileges, validates and installs the constant policy, requires `Seccomp: 2`, and its filtered PID-1 descendants inherit the same restriction; the non-shipped td-GCC probe is injected only into the disposable QEMU volume | none |
 | 12 | **fixture package shipped in the image and launched by `/bin/<fixture>`** | **first jailed pixels on the QEMU screen** |
 | 12a | the same fixture under `--host`, asserting the degradation report (§X.5) | host mode works, and says what it could not enforce |
 | 13 | `td-busd` codec, auth, surface #10 | none |

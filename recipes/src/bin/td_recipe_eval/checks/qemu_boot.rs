@@ -105,6 +105,8 @@ const TD_LOGIN_RUNTIME_MARKER: &str = td_recipe::ladder::TD_LOGIN_RUNTIME_MARKER
 /// rather than the first application to be jailed.
 const TD_SANDBOX_KERNEL_MARKER: &str = td_recipe::ladder::TD_SANDBOX_KERNEL_MARKER;
 const TD_JAIL_TRANSITION_MARKER: &str = td_recipe::ladder::TD_JAIL_TRANSITION_MARKER;
+const TD_JAIL_SECCOMP_PROBE_MARKER: &str = td_recipe::ladder::TD_JAIL_SECCOMP_PROBE_MARKER;
+const TD_JAIL_SECCOMP_PROBE_PATH: &str = "@var/lib/td-test/td-jail-seccomp-probe";
 
 /// Printed after the unprivileged software compositor paints and listens.
 const TD_WAYLAND_RUNTIME_MARKER: &str = td_recipe::ladder::TD_WAYLAND_RUNTIME_MARKER;
@@ -247,6 +249,7 @@ struct ConsoleEvidence {
     td_login_runtime: bool,
     td_sandbox_kernel: bool,
     td_jail_transition: bool,
+    td_jail_seccomp: bool,
     td_wayland_runtime: bool,
     td_pointer_absolute: bool,
     td_term_runtime: bool,
@@ -393,6 +396,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     let qemu = find_qemu()?;
     let (bzimage, selector, deployment) = build_system(runner)?;
     let (mkfs, btrfs) = build_btrfs_tools(runner)?;
+    let seccomp_probe = build_td_jail_seccomp_probe(runner)?;
     // One trust root for the run: its public half rides the selector this boots,
     // its private half signs every deployment reaching the volume below.
     let trust = RunTrust::generate()?;
@@ -405,6 +409,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &volume,
         VolumeLayout::Transactional,
         &trust,
+        Some(&seccomp_probe),
     )?;
     if fixture.initial_id == fixture.alternate_id {
         return Err("transaction fixture candidate did not change the deployment id".to_string());
@@ -597,6 +602,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &volume,
         VolumeLayout::Transactional,
         &trust,
+        Some(&seccomp_probe),
     )?;
     if failure_fixture.initial_id != fixture.initial_id
         || failure_fixture.alternate_id != fixture.alternate_id
@@ -772,6 +778,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &volume,
         VolumeLayout::CorruptCurrent,
         &trust,
+        Some(&seccomp_probe),
     )?;
     if fallback_fixture.initial_id != failure_fixture.initial_id
         || fallback_fixture.alternate_id == fallback_fixture.initial_id
@@ -832,8 +839,10 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          ({TD_LOGIN_RUNTIME_MARKER}), confirmed on the RUNNING kernel that the namespaces, \
          seccomp filtering, inotify and cgroup pids controller a jail needs are all there \
          ({TD_SANDBOX_KERNEL_MARKER}), exercised td-jail's unprivileged namespace transition \
-         on that target kernel, removed every capability and reaped a reparented descendant \
-         as PID 1 ({TD_JAIL_TRANSITION_MARKER}), then assigned the single-user \
+         on that target kernel, removed every capability, installed and read back its filter, \
+         and reaped a filtered descendant as PID 1 ({TD_JAIL_TRANSITION_MARKER}); a \
+         non-shipped target probe exercised its errno and kill actions \
+         ({TD_JAIL_SECCOMP_PROBE_MARKER}), then assigned the single-user \
          graphical seat and brought \
          the software Wayland socket up on virtio-gpu ({TD_WAYLAND_RUNTIME_MARKER}), \
          read an absolute position and its span off the virtio tablet \
@@ -1223,8 +1232,8 @@ fn validate_system_boot(
              missing at least one feature APPLICATIONS.md §0 pins for the application \
              tier. The console names the symbol and what a jail loses without it \
              (`kernel: … (CONFIG_… off) — …`). Nothing else on the image notices: every \
-             other marker here prints on a kernel with no user namespaces and no seccomp, \
-             because nothing yet asks the kernel for either. \
+             the later td-jail transition and filter markers cannot print on a kernel with no \
+             user namespaces or seccomp. \
              The producer's own `.config` guard should have caught this first, so a \
              failure HERE and not there means the two disagree — an image built against a \
              different kernel, a deployment selected from an older bookkeeping entry, or a \
@@ -1241,9 +1250,21 @@ fn validate_system_boot(
              policy refused the unprivileged user/mount/PID/UTS/network namespace transition, \
              its exact identity maps, inherited-descriptor closure, the PID-1 re-exec, the \
              exact capability bridge, immutable-root pivot, final zero-capability readback, \
-             or PID-1 orphan reaping. \
+             no-new-privileges/filter installation and readback, or filtered PID-1 orphan \
+             reaping. \
              The build-host recipe probe is only a host-policy smoke test; this marker is the \
              authoritative target-kernel result. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_jail_seccomp {
+        return Err(format!(
+            "td-jail completed its transition, but the non-shipped target seccomp probe marker \
+             ({TD_JAIL_SECCOMP_PROBE_MARKER:?}) was absent - the booted kernel did not load \
+             td-jail's exported constant filter or return its pinned errno/SIGSYS actions. \
+             The Rust interpreter proves the program's bytes and the build-host run is only a \
+             host-policy smoke test; this marker is the target-kernel behavior proof. Last \
+             serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -1889,11 +1910,35 @@ fn build_persistent_system(
 ) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf), String> {
     let (bzimage, selector, deployment) = build_system(runner)?;
     let (mkfs, btrfs) = build_btrfs_tools(runner)?;
+    let seccomp_probe = build_td_jail_seccomp_probe(runner)?;
     let trust = RunTrust::generate()?;
     let initramfs = provision_selector(&selector, runner.scratch_dir(), &trust)?;
     let volume = runner.scratch_dir().join("system-volume.btrfs");
-    create_persistent_volume(&deployment, &mkfs, &btrfs, &volume, &trust)?;
+    create_persistent_volume_layout(
+        &deployment,
+        &mkfs,
+        &btrfs,
+        &volume,
+        VolumeLayout::Basic,
+        &trust,
+        Some(&seccomp_probe),
+    )?;
     Ok((bzimage, initramfs, volume, btrfs))
+}
+
+fn build_td_jail_seccomp_probe(runner: &RecipeCheckRunner) -> Result<PathBuf, String> {
+    // Keep the target oracle independent of td-jail-test's host-policy smoke legs.
+    runner.prepare_recipe_target("td-jail-seccomp-probe")?;
+    let build_out = runner.build_plan("td-jail-seccomp-probe")?;
+    let tree = runner.ladder_out_from(&build_out, "td-jail-seccomp-probe")?;
+    let probe = tree.join("bin/td-jail-seccomp-probe");
+    if !is_executable(&probe) {
+        return Err(format!(
+            "td-jail-seccomp-probe output is missing executable helper ({})",
+            probe.display()
+        ));
+    }
+    Ok(probe)
 }
 
 pub(crate) fn build_btrfs_tools(runner: &RecipeCheckRunner) -> Result<(PathBuf, PathBuf), String> {
@@ -1924,8 +1969,16 @@ pub(crate) fn create_persistent_volume(
     output: &Path,
     trust: &RunTrust,
 ) -> Result<(), String> {
-    create_persistent_volume_layout(deployment, mkfs, btrfs, output, VolumeLayout::Basic, trust)
-        .map(|_| ())
+    create_persistent_volume_layout(
+        deployment,
+        mkfs,
+        btrfs,
+        output,
+        VolumeLayout::Basic,
+        trust,
+        None,
+    )
+    .map(|_| ())
 }
 
 enum VolumeLayout {
@@ -1939,17 +1992,11 @@ struct VolumeFixture {
     alternate_id: String,
 }
 
-fn create_persistent_volume_layout(
+fn persistent_fixture_payload_bytes(
     deployment: &Path,
-    mkfs: &Path,
-    btrfs: &Path,
-    output: &Path,
-    layout: VolumeLayout,
-    trust: &RunTrust,
-) -> Result<VolumeFixture, String> {
-    let manifest = deployment.join("manifest");
-    let deployment_id = crate::sha256::sha256_file(&manifest)
-        .map_err(|e| format!("hash deployment manifest {}: {e}", manifest.display()))?;
+    copies: u64,
+    seccomp_probe: Option<&Path>,
+) -> Result<u64, String> {
     let mut payload_bytes = 0u64;
     for name in ["manifest", "bzImage", "initramfs.cpio", "root.erofs"] {
         let path = deployment.join(name);
@@ -1960,18 +2007,43 @@ fn create_persistent_volume_layout(
             .checked_add(bytes)
             .ok_or_else(|| "persistent fixture payload size overflow".to_string())?;
     }
-    let copies = match layout {
+    let deployment_bytes = payload_bytes
+        .checked_mul(copies)
+        .ok_or_else(|| "persistent fixture payload size overflow".to_string())?;
+    let probe_bytes = match seccomp_probe {
+        Some(probe) => fs::metadata(probe)
+            .map_err(|e| format!("stat td-jail seccomp probe {}: {e}", probe.display()))?
+            .len(),
+        None => 0,
+    };
+    deployment_bytes
+        .checked_add(probe_bytes)
+        .ok_or_else(|| "persistent fixture payload size overflow".to_string())
+}
+
+fn create_persistent_volume_layout(
+    deployment: &Path,
+    mkfs: &Path,
+    btrfs: &Path,
+    output: &Path,
+    layout: VolumeLayout,
+    trust: &RunTrust,
+    seccomp_probe: Option<&Path>,
+) -> Result<VolumeFixture, String> {
+    let manifest = deployment.join("manifest");
+    let deployment_id = crate::sha256::sha256_file(&manifest)
+        .map_err(|e| format!("hash deployment manifest {}: {e}", manifest.display()))?;
+    let copies: u64 = match layout {
         VolumeLayout::Basic => 1,
         VolumeLayout::Transactional => 3,
         VolumeLayout::CorruptCurrent => 2,
     };
-    let fixture_payload_bytes = payload_bytes
-        .checked_mul(copies)
-        .ok_or_else(|| "persistent fixture payload size overflow".to_string())?;
+    let fixture_payload_bytes =
+        persistent_fixture_payload_bytes(deployment, copies, seccomp_probe)?;
     let payload_limit = PERSISTENT_VOLUME_BYTES.saturating_sub(PERSISTENT_VOLUME_HEADROOM);
     if fixture_payload_bytes > payload_limit {
         return Err(format!(
-            "persistent fixture deployments are {fixture_payload_bytes} bytes, exceeding the \
+            "persistent fixture payloads are {fixture_payload_bytes} bytes, exceeding the \
              {payload_limit}-byte payload limit for the {PERSISTENT_VOLUME_BYTES}-byte volume"
         ));
     }
@@ -1995,6 +2067,9 @@ fn create_persistent_volume_layout(
     let _seed_cleanup = Scratch { dir: seed.clone() };
 
     populate_persistent_seed(deployment, &seed, &deployment_id, trust)?;
+    if let Some(probe) = seccomp_probe {
+        stage_td_jail_seccomp_probe(&seed, probe)?;
+    }
     let alternate_id = match layout {
         VolumeLayout::Basic => deployment_id.clone(),
         VolumeLayout::Transactional => {
@@ -2059,6 +2134,45 @@ fn create_persistent_volume_layout(
         initial_id: deployment_id,
         alternate_id,
     })
+}
+
+fn stage_td_jail_seccomp_probe(seed: &Path, probe: &Path) -> Result<(), String> {
+    if !is_executable(probe) {
+        return Err(format!(
+            "td-jail seccomp probe is not executable: {}",
+            probe.display()
+        ));
+    }
+    let target = seed.join(TD_JAIL_SECCOMP_PROBE_PATH);
+    let parent = target.parent().ok_or_else(|| {
+        format!(
+            "td-jail seccomp probe target has no parent: {}",
+            target.display()
+        )
+    })?;
+    for directory in [seed.join("@var/lib"), parent.to_path_buf()] {
+        fs::create_dir_all(&directory).map_err(|e| {
+            format!(
+                "create td-jail seccomp probe directory {}: {e}",
+                directory.display()
+            )
+        })?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).map_err(|e| {
+            format!(
+                "chmod td-jail seccomp probe directory {}: {e}",
+                directory.display()
+            )
+        })?;
+    }
+    fs::copy(probe, &target).map_err(|e| {
+        format!(
+            "stage td-jail seccomp probe {} -> {}: {e}",
+            probe.display(),
+            target.display()
+        )
+    })?;
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("chmod td-jail seccomp probe {}: {e}", target.display()))
 }
 
 fn copy_candidate_payload(source: &Path, destination: &Path) -> Result<(), String> {
@@ -2964,6 +3078,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_LOGIN_RUNTIME_MARKER.len(),
         TD_SANDBOX_KERNEL_MARKER.len(),
         TD_JAIL_TRANSITION_MARKER.len(),
+        TD_JAIL_SECCOMP_PROBE_MARKER.len() + 2,
         TD_WAYLAND_RUNTIME_MARKER.len(),
         TD_POINTER_ABSOLUTE_MARKER.len(),
         TD_TERM_RUNTIME_MARKER.len(),
@@ -3107,6 +3222,11 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         buf,
         TD_JAIL_TRANSITION_MARKER.as_bytes(),
     );
+    latch_line_marker(
+        &mut evidence.td_jail_seccomp,
+        buf,
+        TD_JAIL_SECCOMP_PROBE_MARKER.as_bytes(),
+    );
     latch_marker(
         &mut evidence.td_wayland_runtime,
         buf,
@@ -3174,6 +3294,30 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
 fn latch_marker(found: &mut bool, haystack: &[u8], marker: &[u8]) {
     if !*found {
         *found = contains(haystack, marker);
+    }
+}
+
+fn latch_line_marker(found: &mut bool, haystack: &[u8], marker: &[u8]) {
+    if *found {
+        return;
+    }
+    for start in 1..haystack.len() {
+        if haystack.get(start - 1) != Some(&b'\n') {
+            continue;
+        }
+        let Some(after) = start.checked_add(marker.len()) else {
+            return;
+        };
+        if haystack.get(start..after) != Some(marker) {
+            continue;
+        }
+        let after_cr = after.checked_add(1).and_then(|index| haystack.get(index));
+        if haystack.get(after) == Some(&b'\n')
+            || (haystack.get(after) == Some(&b'\r') && after_cr == Some(&b'\n'))
+        {
+            *found = true;
+            return;
+        }
     }
 }
 
@@ -3875,6 +4019,62 @@ mod tests {
     }
 
     #[test]
+    fn seccomp_probe_is_injected_only_into_the_disposable_var_fixture() {
+        let seq = AtomicU64::new(2300);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        let source = dir.join("probe");
+        fs::write(&source, b"target-probe").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        let seed = dir.join("seed");
+        fs::create_dir(&seed).unwrap();
+        let td_test = seed.join("@var/lib/td-test");
+        fs::create_dir_all(&td_test).unwrap();
+        fs::set_permissions(&seed.join("@var/lib"), fs::Permissions::from_mode(0o700))
+            .unwrap();
+        fs::set_permissions(&td_test, fs::Permissions::from_mode(0o700)).unwrap();
+
+        stage_td_jail_seccomp_probe(&seed, &source).unwrap();
+        let target = seed.join(TD_JAIL_SECCOMP_PROBE_PATH);
+        assert_eq!(fs::read(&target).unwrap(), b"target-probe");
+        assert_eq!(fs::metadata(target).unwrap().permissions().mode() & 0o777, 0o755);
+        for directory in [seed.join("@var/lib"), td_test] {
+            assert_eq!(
+                fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_fixture_capacity_accounts_for_the_injected_probe() {
+        let seq = AtomicU64::new(2400);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        let deployment = dir.join("deployment");
+        fs::create_dir(&deployment).unwrap();
+        for (name, bytes) in [
+            ("manifest", 1usize),
+            ("bzImage", 2),
+            ("initramfs.cpio", 3),
+            ("root.erofs", 4),
+        ] {
+            fs::write(deployment.join(name), vec![0; bytes]).unwrap();
+        }
+        let probe = dir.join("probe");
+        fs::write(&probe, vec![0; 7]).unwrap();
+
+        assert_eq!(
+            persistent_fixture_payload_bytes(&deployment, 3, Some(&probe)).unwrap(),
+            37
+        );
+        assert_eq!(
+            persistent_fixture_payload_bytes(&deployment, 3, None).unwrap(),
+            30
+        );
+    }
+
+    #[test]
     fn erofs_marker_is_distinct_from_the_userland_marker() {
         // Both boot modes must key on different lines: the plain check kills qemu on
         // MARKER (printed first), the erofs check waits for EROFS_MARKER (printed only
@@ -3919,7 +4119,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 37] {
+    fn all_console_markers() -> [&'static str; 38] {
         [
             MARKER,
             EROFS_MARKER,
@@ -3955,6 +4155,7 @@ mod tests {
             TD_LOGIN_RUNTIME_MARKER,
             TD_SANDBOX_KERNEL_MARKER,
             TD_JAIL_TRANSITION_MARKER,
+            TD_JAIL_SECCOMP_PROBE_MARKER,
             TD_WAYLAND_RUNTIME_MARKER,
             TD_POINTER_ABSOLUTE_MARKER,
             TD_TERM_RUNTIME_MARKER,
@@ -4017,6 +4218,55 @@ mod tests {
             "a marker split across a read boundary must still latch - the rescan overlap \
              regressed"
         );
+    }
+
+    #[test]
+    fn seccomp_evidence_requires_an_exact_console_line() {
+        let mut evidence = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut evidence,
+            format!(
+                "\ntd-jail: probe printed {TD_JAIL_SECCOMP_PROBE_MARKER} before failing\n"
+            )
+            .as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_jail_seccomp);
+
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_JAIL_SECCOMP_PROBE_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_jail_seccomp);
+    }
+
+    #[test]
+    fn exact_seccomp_marker_line_survives_a_read_boundary() {
+        const CHUNK: usize = 8192;
+        let seq = AtomicU64::new(2500);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        let path = dir.join("console.log");
+        let start = CHUNK - (TD_JAIL_SECCOMP_PROBE_MARKER.len() - 1);
+        let mut bytes = vec![b'x'; start];
+        *bytes.last_mut().unwrap() = b'\n';
+        bytes.extend_from_slice(TD_JAIL_SECCOMP_PROBE_MARKER.as_bytes());
+        bytes.push(b'\n');
+        fs::write(&path, bytes).unwrap();
+
+        let mut file = None;
+        let mut buffer = Vec::new();
+        let mut evidence = ConsoleEvidence::default();
+        drain_console_to_eof(
+            &path,
+            &mut file,
+            &mut buffer,
+            b"target-never-appears",
+            &mut evidence,
+        )
+        .unwrap();
+        assert!(evidence.td_jail_seccomp);
     }
 
     #[test]
@@ -4093,6 +4343,7 @@ mod tests {
             TD_UTIL_RUNTIME_MARKER,
             TD_TXT_RUNTIME_MARKER,
             TD_JAIL_TRANSITION_MARKER,
+            TD_JAIL_SECCOMP_PROBE_MARKER,
             SYSTEM_PERSIST_WRITE_MARKER,
             SYSTEM_PERSIST_READ_MARKER,
             SYSTEM_BOOT_SUCCESS_MARKER,
@@ -4146,6 +4397,7 @@ mod tests {
         assert!(evidence.td_util_runtime);
         assert!(evidence.td_txt_runtime);
         assert!(evidence.td_jail_transition);
+        assert!(evidence.td_jail_seccomp);
         assert!(evidence.persist_write);
         assert!(evidence.persist_read);
         assert!(evidence.boot_success);

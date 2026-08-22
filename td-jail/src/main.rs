@@ -1,10 +1,11 @@
 //! td-jail — td's application confinement boundary.
 //!
 //! The transition probe enters a fresh immutable root, clears every capability,
-//! and reaps a reparented descendant as PID 1. Application launch remains
-//! disabled until seccomp has landed.
+//! installs the compiled syscall filter, and reaps a reparented descendant as
+//! PID 1. Application launch remains disabled until the authority path lands.
 #![deny(unsafe_code)]
 
+mod seccomp;
 mod sys;
 mod transition;
 
@@ -14,6 +15,7 @@ use std::process::ExitCode;
 fn run() -> std::io::Result<()> {
     match transition::parse_mode(std::env::args_os().skip(1))? {
         transition::Mode::Probe => transition::probe_transition(),
+        transition::Mode::WriteFilter => transition::write_standard_filter(),
         transition::Mode::Stage2 { token, identity } => transition::run_stage2(token, identity),
         transition::Mode::ReaperChild => transition::run_reaper_child(),
         transition::Mode::ReaperOrphan => transition::run_reaper_orphan(),
@@ -35,6 +37,7 @@ mod confinement {
     #![allow(clippy::unwrap_used)]
 
     const MAIN: &str = include_str!("main.rs");
+    const SECCOMP: &str = include_str!("seccomp.rs");
     const SYS: &str = include_str!("sys.rs");
     const TRANSITION: &str = include_str!("transition.rs");
 
@@ -45,6 +48,8 @@ mod confinement {
         assert_eq!(SYS.matches("#[allow(unsafe_code)]").count(), 1);
         assert_eq!(SYS.matches("unsafe {").count(), 1);
         assert_eq!(shipped_main.matches("#[allow(unsafe_code)]").count(), 0);
+        assert_eq!(SECCOMP.matches("#[allow(unsafe_code)]").count(), 0);
+        assert_eq!(SECCOMP.matches("unsafe {").count(), 0);
         assert_eq!(TRANSITION.matches("#[allow(unsafe_code)]").count(), 0);
         assert_eq!(TRANSITION.matches("unsafe {").count(), 0);
     }
@@ -61,10 +66,11 @@ mod confinement {
             "const SYS_MOUNT: usize = 165;",
             "const SYS_UMOUNT2: usize = 166;",
             "const SYS_UNSHARE: usize = 272;",
+            "const SYS_SECCOMP: usize = 317;",
         ] {
             assert!(SYS.contains(syscall), "missing syscall pin: {syscall}");
         }
-        assert_eq!(SYS.matches("const SYS_").count(), 9);
+        assert_eq!(SYS.matches("const SYS_").count(), 10);
         assert!(SYS.contains("const BASE_NAMESPACE_FLAGS: usize ="));
         assert!(SYS.contains("const ISOLATED_NETWORK_FLAGS: usize ="));
         for flag in [
@@ -84,6 +90,8 @@ mod confinement {
         assert!(SYS.contains("const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;"));
         assert!(SYS.contains("const PR_CAPBSET_READ: usize = 23;"));
         assert!(SYS.contains("const PR_CAPBSET_DROP: usize = 24;"));
+        assert!(SYS.contains("const PR_SET_NO_NEW_PRIVS: usize = 38;"));
+        assert!(SYS.contains("const PR_GET_NO_NEW_PRIVS: usize = 39;"));
         assert!(SYS.contains("const PR_CAP_AMBIENT: usize = 47;"));
         assert!(SYS.contains("const PR_CAP_AMBIENT_IS_SET: usize = 1;"));
         assert!(SYS.contains("const PR_CAP_AMBIENT_RAISE: usize = 2;"));
@@ -93,6 +101,8 @@ mod confinement {
         assert!(SYS.contains("std::ptr::from_mut(&mut data) as usize"));
         assert!(SYS.contains("std::ptr::from_ref(&data) as usize"));
         assert!(SYS.contains("check(syscall5(SYS_UNSHARE, flags, 0, 0, 0, 0))"));
+        assert!(SYS.contains("const SECCOMP_SET_MODE_FILTER: usize = 1;"));
+        assert!(SYS.contains("SYS_SECCOMP,\n        SECCOMP_SET_MODE_FILTER,\n        0,"));
         assert!(TRANSITION.contains("sys::MS_REC | sys::MS_PRIVATE"));
     }
 
@@ -113,6 +123,9 @@ mod confinement {
             "sys::ambient_capability(",
             "sys::drop_bounding_capability(",
             "sys::bounding_capability(",
+            "sys::set_no_new_privileges(",
+            "sys::no_new_privileges(",
+            "sys::install_seccomp_filter(",
         ] {
             assert!(TRANSITION.contains(call), "missing syscall caller: {call}");
         }
@@ -124,7 +137,13 @@ mod confinement {
         assert!(TRANSITION.contains(".into_raw_fd()"));
         assert!(TRANSITION.contains("require_descriptor_closed(descriptor)?;"));
         assert!(TRANSITION.contains("clear_and_require_empty_capabilities()?;"));
+        assert!(TRANSITION.contains("install_standard_seccomp_filter()?;"));
         assert!(TRANSITION.contains("probe_pid1_reaper()?;"));
+        assert!(SECCOMP.contains("pub(crate) const STANDARD_FILTER:"));
+        assert!(SECCOMP.contains("const OFFSET_NR: u32 = 0;"));
+        assert!(SECCOMP.contains("const OFFSET_ARCH: u32 = 4;"));
+        assert!(SECCOMP.contains("const OFFSET_ARG0_LOW: u32 = 16;"));
+        assert!(SECCOMP.contains("const OFFSET_ARG1_LOW: u32 = 24;"));
     }
 
     #[test]

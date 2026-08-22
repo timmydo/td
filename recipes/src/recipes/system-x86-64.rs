@@ -8,9 +8,9 @@ use crate::ladder::{
     SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
     SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
-    TD_INIT_RUNTIME_MARKER, TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER,
-    TD_SANDBOX_KERNEL_MARKER, TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER,
-    UUTILS_RUNTIME_MARKER,
+    TD_INIT_RUNTIME_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER, TD_JAIL_TRANSITION_MARKER,
+    TD_LOGIN_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_TXT_RUNTIME_MARKER,
+    TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -1079,6 +1079,13 @@ fn build_deployment_init(sys: &SystemDef) -> String {
          /bin/td-util chown 0:0 /sysroot/var /sysroot/var/log /sysroot/var/home /sysroot/var/root\n\
          /bin/td-util chmod 0755 /sysroot/var /sysroot/var/log /sysroot/var/home\n\
          /bin/td-util chmod 0700 /sysroot/var/root\n\
+         if /bin/td-util test -e /sysroot/var/lib/td-test/td-jail-seccomp-probe; then\n\
+         /bin/td-util test -f /sysroot/var/lib/td-test/td-jail-seccomp-probe\n\
+         /bin/td-util chown 0:0 /sysroot/var/lib /sysroot/var/lib/td-test \
+         /sysroot/var/lib/td-test/td-jail-seccomp-probe\n\
+         /bin/td-util chmod 0755 /sysroot/var/lib /sysroot/var/lib/td-test\n\
+         /bin/td-util chmod 0555 /sysroot/var/lib/td-test/td-jail-seccomp-probe\n\
+         fi\n\
          exec /bin/switch_root /sysroot /init\n",
     );
     init
@@ -1759,7 +1766,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          [ \"$wait\" -gt {BOOT_SUCCESS_RETRY_MAX_SECS} ] && wait={BOOT_SUCCESS_RETRY_MAX_SECS}\n\
          n=0\n\
          mu=0; mrf=0; ms=0; mtu=0; mti=0; mtl=0; mtt=0\n\
-         msk=0; mtj=0\n\
+         msk=0; mtj=0; mts=1\n\
          if /bin/su -s /bin/sh {} -c \
          '{sandbox_kernel_probes}[ \"$k\" = 1 ]'; then \
          echo {TD_SANDBOX_KERNEL_MARKER}; msk=1; fi\n\
@@ -1769,6 +1776,33 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          [ \"$j\" = \"{TD_JAIL_TRANSITION_MARKER} pid=1\" ] || \
          {{ echo \"td-jail: target transition returned unexpected output: $j\"; \
          exit 1; }}'; then echo {TD_JAIL_TRANSITION_MARKER}; mtj=1; fi\n\
+         if [ -e /var/lib/td-test/td-jail-seccomp-probe ]; then \
+         mts=0; /bin/rm -rf /run/td-jail-seccomp-probe; \
+         if [ -f /var/lib/td-test/td-jail-seccomp-probe ] \
+         && /bin/mkdir /run/td-jail-seccomp-probe \
+         && /bin/cp /var/lib/td-test/td-jail-seccomp-probe \
+         /run/td-jail-seccomp-probe/probe \
+         && /bin/td-jail --internal-write-seccomp-filter \
+         >/run/td-jail-seccomp-probe/filter.bpf \
+         && /bin/chown 0:0 /run/td-jail-seccomp-probe \
+         /run/td-jail-seccomp-probe/probe /run/td-jail-seccomp-probe/filter.bpf \
+         && /bin/chmod 0555 /run/td-jail-seccomp-probe \
+         /run/td-jail-seccomp-probe/probe \
+         && /bin/chmod 0444 /run/td-jail-seccomp-probe/filter.bpf; then \
+         if /bin/su -s /bin/sh {} -c \
+         '[ -x /run/td-jail-seccomp-probe/probe ] \
+         && [ ! -w /run/td-jail-seccomp-probe/probe ] \
+         && [ -r /run/td-jail-seccomp-probe/filter.bpf ] \
+         && [ ! -w /run/td-jail-seccomp-probe/filter.bpf ] \
+         && [ ! -w /run/td-jail-seccomp-probe ] || \
+         {{ echo \"td-jail: target seccomp inputs are not immutable\"; exit 1; }}; \
+         p=$(/run/td-jail-seccomp-probe/probe \
+         /run/td-jail-seccomp-probe/filter.bpf 2>&1) || \
+         {{ echo \"td-jail: target seccomp behavior probe failed\"; exit 1; }}; \
+         [ \"$p\" = {TD_JAIL_SECCOMP_PROBE_MARKER} ] || \
+         {{ echo \"td-jail: target seccomp behavior returned unexpected output\"; \
+         exit 1; }}'; then echo {TD_JAIL_SECCOMP_PROBE_MARKER}; mts=1; fi; \
+         else echo \"td-jail: could not prepare immutable target seccomp inputs\"; fi; fi\n\
          while [ \"$n\" -lt \"$wait\" ]; do \
          healthy=1; \
          if /bin/su -s /bin/sh {} -c \
@@ -1812,6 +1846,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          [ \"$mtt\" = 1 ] || {{ echo {TD_TXT_RUNTIME_MARKER}; mtt=1; }}; else healthy=0; fi; \
          [ \"$msk\" = 1 ] || healthy=0; \
          [ \"$mtj\" = 1 ] || healthy=0; \
+         [ \"$mts\" = 1 ] || healthy=0; \
          if [ \"$healthy\" = 1 ] \
          && /bin/td-boot success /dev/vda /run/td-update \"$deployment\" >/run/td-success-id; then \
          if /bin/grep -q -F '{DEPLOY_INSTALL_CMDLINE_TOKEN}' /proc/cmdline; then \
@@ -1861,6 +1896,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          n=$((n+1)); /bin/td-util sleep 1; \
          done\n\
          fail\n",
+        sys.autologin,
         sys.autologin,
         sys.autologin,
         sys.autologin,
@@ -5760,7 +5796,13 @@ mod tests {
         assert!(
             init.contains("chown 0:0 /sysroot/var")
                 && init.contains("chmod 0755 /sysroot/var")
-                && init.contains("chmod 0700 /sysroot/var/root"),
+                && init.contains("chmod 0700 /sysroot/var/root")
+                && init.contains(
+                    "chown 0:0 /sysroot/var/lib /sysroot/var/lib/td-test"
+                )
+                && init.contains(
+                    "chmod 0555 /sysroot/var/lib/td-test/td-jail-seccomp-probe"
+                ),
             "selected init must normalize persistent state ownership and modes"
         );
         assert!(
@@ -5916,7 +5958,13 @@ mod tests {
                 && bootsuccess.contains(&format!(
                     "\"{TD_JAIL_TRANSITION_MARKER} pid=1\""
                 ))
+                && bootsuccess.contains("/bin/td-jail --internal-write-seccomp-filter")
+                && bootsuccess.contains("/var/lib/td-test/td-jail-seccomp-probe")
+                && bootsuccess.contains("/run/td-jail-seccomp-probe/probe")
+                && bootsuccess.contains("[ ! -w /run/td-jail-seccomp-probe/filter.bpf ]")
+                && bootsuccess.contains(TD_JAIL_SECCOMP_PROBE_MARKER)
                 && bootsuccess.contains("[ \"$mtj\" = 1 ] || healthy=0")
+                && bootsuccess.contains("[ \"$mts\" = 1 ] || healthy=0")
                 && bootsuccess
                     .contains("td-boot success /dev/vda /run/td-update \"$deployment\"")
                 && bootsuccess.contains(SYSTEM_BOOT_SUCCESS_MARKER)
@@ -7103,12 +7151,28 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         let gate = bootsuccess
             .find("[ \"$mtj\" = 1 ] || healthy=0")
             .expect("target transition health gate missing");
+        let seccomp = bootsuccess
+            .find("/run/td-jail-seccomp-probe/probe ")
+            .expect("target seccomp behavior probe missing");
+        let seccomp_gate = bootsuccess
+            .find("[ \"$mts\" = 1 ] || healthy=0")
+            .expect("target seccomp behavior health gate missing");
+        assert!(
+            !bootsuccess.contains("probe failed: $p")
+                && !bootsuccess.contains("unexpected output: $p"),
+            "a failing target probe must not reflect a success marker into console evidence"
+        );
         let success = bootsuccess
             .find(&format!("echo {SYSTEM_BOOT_SUCCESS_MARKER}"))
             .expect("boot success marker missing");
         assert!(
-            leaked_fd < probe && probe < gate && gate < success,
-            "target transition must close a leaked descriptor and gate boot success"
+            leaked_fd < probe
+                && probe < seccomp
+                && seccomp < gate
+                && gate < seccomp_gate
+                && seccomp_gate < success,
+            "target transition must close a leaked descriptor, run the optional target filter \
+             oracle, and gate boot success"
         );
     }
 

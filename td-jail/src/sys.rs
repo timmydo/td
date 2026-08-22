@@ -15,6 +15,7 @@ const SYS_PRCTL: usize = 157;
 const SYS_MOUNT: usize = 165;
 const SYS_UMOUNT2: usize = 166;
 const SYS_UNSHARE: usize = 272;
+const SYS_SECCOMP: usize = 317;
 
 const CLONE_NEWNS: usize = 0x0002_0000;
 const CLONE_NEWUTS: usize = 0x0400_0000;
@@ -41,6 +42,8 @@ pub const CAP_SYS_ADMIN: u32 = 21;
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 const PR_CAPBSET_READ: usize = 23;
 const PR_CAPBSET_DROP: usize = 24;
+const PR_SET_NO_NEW_PRIVS: usize = 38;
+const PR_GET_NO_NEW_PRIVS: usize = 39;
 const PR_CAP_AMBIENT: usize = 47;
 const PR_CAP_AMBIENT_IS_SET: usize = 1;
 const PR_CAP_AMBIENT_RAISE: usize = 2;
@@ -50,6 +53,8 @@ const PID_ANY: usize = -1_isize as usize;
 const WNOHANG: usize = 1;
 const EINTR: i32 = 4;
 const ECHILD: i32 = 10;
+const SECCOMP_SET_MODE_FILTER: usize = 1;
+pub(crate) const SECCOMP_MAX_FILTER_INSNS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CapabilitySets {
@@ -63,6 +68,21 @@ pub enum Reaped {
     Child { pid: i32, status: i32 },
     NotYet,
     NoChildren,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub(crate) struct SockFilter {
+    pub(crate) code: u16,
+    pub(crate) jt: u8,
+    pub(crate) jf: u8,
+    pub(crate) k: u32,
+}
+
+#[repr(C)]
+struct SockFprog {
+    len: u16,
+    filter: *const SockFilter,
 }
 
 #[repr(C)]
@@ -327,12 +347,60 @@ pub fn bounding_capability(capability: u32) -> io::Result<bool> {
     ))
 }
 
+pub fn set_no_new_privileges() -> io::Result<()> {
+    check(syscall5(SYS_PRCTL, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))
+}
+
+pub fn no_new_privileges() -> io::Result<bool> {
+    strict_bool(
+        syscall5(SYS_PRCTL, PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0),
+        "no-new-privileges readback",
+    )
+}
+
+pub fn install_seccomp_filter(instructions: &[SockFilter]) -> io::Result<()> {
+    if instructions.len() > SECCOMP_MAX_FILTER_INSNS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "seccomp filter exceeds the kernel instruction-count limit",
+        ));
+    }
+    let len = u16::try_from(instructions.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "seccomp filter exceeds the kernel instruction-count ABI",
+        )
+    })?;
+    if len == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "seccomp filter must contain an instruction",
+        ));
+    }
+    let program = SockFprog {
+        len,
+        filter: instructions.as_ptr(),
+    };
+    check(syscall5(
+        SYS_SECCOMP,
+        SECCOMP_SET_MODE_FILTER,
+        0,
+        std::ptr::from_ref(&program) as usize,
+        0,
+        0,
+    ))
+}
+
 fn bool_result(ret: isize) -> io::Result<bool> {
+    strict_bool(ret, "capability readback")
+}
+
+fn strict_bool(ret: isize, name: &str) -> io::Result<bool> {
     match value(ret)? {
         0 => Ok(false),
         1 => Ok(true),
         other => Err(io::Error::other(format!(
-            "capability readback returned {other}, not zero or one"
+            "{name} returned {other}, not zero or one"
         ))),
     }
 }
@@ -367,6 +435,8 @@ mod tests {
         assert_eq!(CAP_SYS_ADMIN, 21);
         assert_eq!(PR_CAPBSET_READ, 23);
         assert_eq!(PR_CAPBSET_DROP, 24);
+        assert_eq!(PR_SET_NO_NEW_PRIVS, 38);
+        assert_eq!(PR_GET_NO_NEW_PRIVS, 39);
         assert_eq!(PR_CAP_AMBIENT, 47);
         assert_eq!(PR_CAP_AMBIENT_IS_SET, 1);
         assert_eq!(PR_CAP_AMBIENT_RAISE, 2);
@@ -374,8 +444,24 @@ mod tests {
         assert_eq!(std::mem::size_of::<CapabilityHeader>(), 8);
         assert_eq!(std::mem::size_of::<CapabilityData>(), 12);
         assert_eq!(std::mem::size_of::<CapabilityDataPair>(), 24);
+        assert_eq!(std::mem::size_of::<SockFilter>(), 8);
+        assert_eq!(std::mem::size_of::<SockFprog>(), 16);
+        assert_eq!(SECCOMP_SET_MODE_FILTER, 1);
+        assert_eq!(SECCOMP_MAX_FILTER_INSNS, 4096);
         assert_eq!(PID_ANY, usize::MAX);
         assert_eq!(WNOHANG, 1);
+    }
+
+    #[test]
+    fn seccomp_wrapper_refuses_more_than_the_kernel_instruction_limit() {
+        let instruction = SockFilter {
+            code: 0x06,
+            jt: 0,
+            jf: 0,
+            k: 0x7fff_0000,
+        };
+        let oversized = vec![instruction; SECCOMP_MAX_FILTER_INSNS + 1];
+        assert!(install_seccomp_filter(&oversized).is_err());
     }
 
     #[test]

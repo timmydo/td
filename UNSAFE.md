@@ -46,7 +46,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `ioctl(2)` |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
-| 9 | `td-jail` | `close(2)`, `wait4(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets |
+| 9 | `td-jail` | `close(2)`, `wait4(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `seccomp(2)` with one value-pinned operation |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering: it is host-side, and no
@@ -974,10 +974,11 @@ virtual fd table that stands in for `dup2` — is reachable through safe
 
 ## 9. `td-jail` — the application sandbox
 
-The third `td-jail` increment carries exactly NINE syscalls on x86-64
+The fourth `td-jail` increment carries exactly TEN syscalls on x86-64
 through one `syscall5` body: `unshare(2)`, `close(2)`, `wait4(2)`,
 `mount(2)`, `umount2(2)`, `pivot_root(2)`, `capset(2)`, `capget(2)`, and
-`prctl(2)`.
+`prctl(2)`, plus `seccomp(2)` with exactly one operation:
+`SECCOMP_SET_MODE_FILTER`=1 and flags zero.
 The unshare wrapper accepts only the two compiled namespace sets the
 application design permits:
 `CLONE_NEWUSER|CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWUTS`, with
@@ -1018,8 +1019,10 @@ devices from performing their device operations; the probe writes to
 `/dev/null` after the remounts.
 
 `capset(2)` and `capget(2)` use capability ABI v3 and a compiled
-two-word structure. `prctl(2)` has exactly THREE operations:
-`PR_CAPBSET_DROP`=24, `PR_CAPBSET_READ`=23, and `PR_CAP_AMBIENT`=47;
+two-word structure. `prctl(2)` has exactly FIVE operations:
+`PR_CAPBSET_DROP`=24, `PR_CAPBSET_READ`=23,
+`PR_SET_NO_NEW_PRIVS`=38, `PR_GET_NO_NEW_PRIVS`=39, and
+`PR_CAP_AMBIENT`=47;
 the last has exactly THREE sub-operations, `IS_SET`=1, `RAISE`=2 and
 `CLEAR_ALL`=4. Stage 1 preserves its current effective and permitted
 sets while making only `CAP_SYS_ADMIN` inheritable, clears then raises
@@ -1036,6 +1039,29 @@ effective, permitted, inheritable and ambient to equal exactly
 clears ambient first, empties effective, permitted and inheritable, and
 requires all five capability rows to be zero.
 
+After capability removal, stage 2 validates the compiled constant cBPF
+program, sets and reads back no-new-privileges, installs that exact program,
+and requires `/proc/self/status` to report `NoNewPrivs: 1` and `Seccomp: 2`.
+The filter's instruction count is derived from its array, and a safe validator
+refuses unknown opcodes, offsets, actions, out-of-range jumps, wrong lengths,
+more than the kernel's 4096 instructions, and programs without a final return
+before the raw syscall sees them. The program is policy, never caller data.
+Its test interpreter executes the exact
+array over every rostered syscall and the argument-sensitive rules. A separate
+td-GCC-built, non-shipped C probe recipe consumes a bounded serialized copy and
+checks the real kernel's errno and kill behavior on an unconstrained build host
+and in the QEMU target fixture. QEMU builds that helper directly, so host-policy
+smoke tests cannot prevent the target oracle from booting. A host with no
+filter but inherited no-new-privileges
+may skip the impossible pre-install negative leg. One with an inherited filter
+validates the artifact but skips behavior because filters cannot be removed and
+the outer policy could alter results. The target invocation allows neither case
+and requires both initial states to be zero.
+QEMU copies both inputs into a root-owned, non-writable `/run` tree before
+dropping identity, gates guest health on the exact result, and recognizes only
+an exact marker line. Reaper descendants require the installed restriction
+and filter readbacks too.
+
 `wait4(2)` is pinned to pid -1, a null rusage pointer, and either zero or
 `WNOHANG`. The transition probe copies the static td-jail into its fresh
 `/tmp`, launches a zero-capability child that creates a grandchild and
@@ -1044,13 +1070,14 @@ and the reparented orphan with successful raw statuses under one bounded
 deadline. Only after `ECHILD` makes the report pipe nonblocking does it
 read the orphan PID, verify the exact collected set, and remove the copy.
 This is an internal confinement oracle, not application launch; ordinary
-entry remains a refusal until seccomp has landed.
+entry remains a refusal until its authority path lands.
 
-Deliberately NOT in this surface yet are the other four calls in
-`APPLICATIONS.md`'s target-state draft: `seccomp`, `kill`, `prlimit64`,
-and `ioctl`. Each arrives only with the rung that uses and tests it; the
+Deliberately NOT in this surface yet are the other three calls in
+`APPLICATIONS.md`'s target-state draft: `kill`, `prlimit64`, and `ioctl`.
+Each arrives only with the rung that uses and tests it; the
 roadmap is not advance authorization for dormant wrappers.
 There is likewise no `fork`, `pre_exec`, `clone`, `setns`, or caller-
-supplied namespace or mount set. A tenth syscall, a fourth prctl
-operation, a fourth ambient sub-operation, or a third unshare flag set
+supplied namespace, mount set, or BPF program. An eleventh syscall, a sixth
+prctl operation, a second seccomp operation or nonzero seccomp flag, a fourth
+ambient sub-operation, or a third unshare flag set
 is an amendment here.

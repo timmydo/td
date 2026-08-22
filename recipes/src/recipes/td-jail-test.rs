@@ -4,6 +4,7 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 pub fn recipe() -> Recipe {
     let bin = "{in:td-jail}/bin/td-jail";
     let readelf = "{in:binutils-x86-64-self}/bin/readelf";
+    let probe = "{in:td-jail-seccomp-probe}/bin/td-jail-seccomp-probe";
     let mut steps = Vec::new();
 
     steps.push(
@@ -45,13 +46,28 @@ pub fn recipe() -> Recipe {
         .env("PATH", &post_bootstrap_path()),
     );
 
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                POST_BOOTSTRAP_SH,
+                "-c",
+                &format!(
+                    "'{bin}' --internal-write-seccomp-filter >'{{root}}/filter.bpf' || {{ echo 'td-jail could not export its compiled seccomp filter' >&2; exit 1; }}; \
+                     '{probe}' --allow-inherited-confinement '{{root}}/filter.bpf'"
+                ),
+            ],
+        )
+        .env("PATH", &post_bootstrap_path()),
+    );
+
     steps.push(Step::MkDir {
         path: "{out}".into(),
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
         content: format!(
-            "PASS: td-jail is a static ELF64 x86-64 executable; the build-host policy permits the complete namespace transition, stage 1 closes inherited descriptors and installs an exact CAP_SYS_ADMIN exec bridge with an empty bounding set, stage 2 enters a read-back immutable tmpfs root with fresh proc/dev/devpts/shm/tmp/var-tmp and no old root, clears and reads back every capability set, and reaps a reparented zero-capability descendant as PID 1 while application launch remains disabled; system-x86-64's QEMU oracle supplies the authoritative target-kernel proof through {TD_JAIL_TRANSITION_MARKER}\n"
+            "PASS: td-jail is a static ELF64 x86-64 executable; the build-host policy permits the complete namespace transition, stage 1 closes inherited descriptors and installs an exact CAP_SYS_ADMIN exec bridge with an empty bounding set, stage 2 enters a read-back immutable tmpfs root with fresh proc/dev/devpts/shm/tmp/var-tmp and no old root, clears every capability, sets and reads back no-new-privileges, installs and reads back the compiled seccomp filter, and reaps filtered descendants as PID 1; the td-GCC-built non-shipped probe is capable of checking real filter errno and kill behavior while application launch remains disabled; the host smoke leg may skip behavior under an inherited filter, and system-x86-64's QEMU oracle always supplies the authoritative target-kernel proof through {TD_JAIL_TRANSITION_MARKER}\n"
         ),
         exec: false,
     });
@@ -59,13 +75,17 @@ pub fn recipe() -> Recipe {
         paths: vec!["{out}/result".into()],
         exec: false,
     });
-
     Recipe::mesboot("td-jail-test", "1.0")
-        .native_inputs(&["td-jail", "binutils-x86-64-self", "busybox-x86-64"])
+        .native_inputs(&[
+            "td-jail",
+            "td-jail-seccomp-probe",
+            "binutils-x86-64-self",
+            "busybox-x86-64",
+        ])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-jail-test: build-plan --auto builds the static target td-jail, smoke-tests the build host's namespace/mount/capability policy, immutable-root transition, final capability removal, and PID-1 orphan reaping, and keeps application launch disabled; the system QEMU oracle proves the target kernel"
+echo ">> recipe-check td-jail-test: build-plan --auto builds the static target td-jail and a non-shipped td-GCC seccomp probe, smoke-tests namespace/mount/capability transition, installs and reads back no-new-privileges plus the compiled filter, attempts real errno/kill behavior only when the host has no inherited seccomp filter, verifies filtered PID-1 orphan reaping, and keeps application launch disabled; the system QEMU oracle always proves the target kernel"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-jail-test 1
 "#,

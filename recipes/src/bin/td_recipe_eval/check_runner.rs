@@ -366,7 +366,11 @@ pub fn qemu_boot_system_cli(args: &[String]) -> Result<(), String> {
     }
     // Provenance planning FIRST — before the runner exists (re #469), matching
     // `qemu_boot_cli`: a rejected graph spawns no subprocess.
-    let targets = [stem, "btrfs-progs-x86-64"];
+    let targets = [
+        stem,
+        "btrfs-progs-x86-64",
+        "td-jail-seccomp-probe",
+    ];
     ensure_targets_provenance(&targets)?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
@@ -398,7 +402,11 @@ pub fn qemu_boot_net_cli(args: &[String]) -> Result<(), String> {
     }
     // Provenance planning FIRST — before the runner exists (re #469), matching
     // `qemu_boot_cli`: a rejected graph spawns no subprocess.
-    let targets = [stem, "btrfs-progs-x86-64"];
+    let targets = [
+        stem,
+        "btrfs-progs-x86-64",
+        "td-jail-seccomp-probe",
+    ];
     ensure_targets_provenance(&targets)?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
