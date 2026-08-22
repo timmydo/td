@@ -37,6 +37,10 @@
 #                     through one reviewed symlink each). Pure safe std: it
 #                     delegates ed25519 generation to `sshd keygen` and reads
 #                     its entropy from /dev/urandom as an ordinary file.
+#   td-busd/        — the target-built session D-Bus broker: the wire codec, and
+#                     eventually the socket, auth and per-connection policy that
+#                     APPLICATIONS.md §D specifies. Pure std with no syscall
+#                     surface until surface #10 lands with the transport.
 #   td-seatd/       — the target-built single-user framebuffer/evdev seat
 #                     assigner; pure safe std with no broker daemon.
 #   td-compositor/  — the target-built software Wayland compositor; its only
@@ -53,7 +57,7 @@
 [workspace]
 resolver = "2"
 members = ["builder", "recipes", "engine"]
-exclude = ["net", "td-kexec", "td-jail", "td-sh", "td-txt", "td-netd", "td-boot", "td-install", "td-util", "td-init", "td-firstboot", "td-seatd", "td-compositor", "td-review", "td-svc", "tests/sshd"]
+exclude = ["net", "td-kexec", "td-jail", "td-busd", "td-sh", "td-txt", "td-netd", "td-boot", "td-install", "td-util", "td-init", "td-firstboot", "td-seatd", "td-compositor", "td-review", "td-svc", "tests/sshd"]
 
 [profile.release]
 # Keep the release profile explicit and minimal so the reproducibility oracle

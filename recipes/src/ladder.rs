@@ -934,14 +934,245 @@ mod tests {
     /// by this, and without the exception `outcomes.iter().find_map(…)` is a
     /// recipe invoking `find`.
     ///
-    /// It frees the IDENTIFIER and nothing else. A bare `find` in a comment is
-    /// still an invocation, deliberately: the token is what a quoted
-    /// `Command::new("find")` leaves behind too, and this cannot tell the two
-    /// apart. So a shipped module may say `find_map` but still not the bare
-    /// English word.
+    /// It frees the IDENTIFIER and nothing else: to this scan a bare `find` in
+    /// a comment reads exactly as a quoted `Command::new("find")` does. That
+    /// remains true of every SCRIPT body, which is what this is applied to now
+    /// — a `.rs` body goes through `rust_source_invokes`, which can tell the
+    /// two apart because Rust has string literals to look inside.
     fn invokes(s: &str, cmd: &str) -> bool {
         s.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
             .any(|t| t == cmd)
+    }
+
+    /// `invokes`'s word rule over a byte slice, so it can be applied to one
+    /// string literal rather than to a whole file.
+    fn invokes_in(bytes: &[u8], cmd: &str) -> bool {
+        let needle = cmd.as_bytes();
+        if needle.is_empty() || bytes.len() < needle.len() {
+            return false;
+        }
+        let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+        for start in 0..=bytes.len() - needle.len() {
+            if bytes.get(start..start + needle.len()) != Some(needle) {
+                continue;
+            }
+            let before = start.checked_sub(1).and_then(|i| bytes.get(i)).copied();
+            let after = bytes.get(start + needle.len()).copied();
+            if !before.is_some_and(word) && !after.is_some_and(word) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The length of the char literal at `at`, or `None` where that quote
+    /// opens a LIFETIME instead.
+    ///
+    /// The two are told apart by whether a quote closes within the longest
+    /// form Rust allows — `'\u{10FFFF}'`, ten bytes — since a lifetime has no
+    /// closing quote at all. Getting this wrong is not cosmetic: `'\"'` holds
+    /// a quote, and skipping only the three-byte form leaves that quote to
+    /// open a string, whose contents then run to the NEXT quote — so the real
+    /// literal after it is read as ordinary text and its command name is never
+    /// seen. That is a false NEGATIVE, which is the direction a guard cannot
+    /// afford to be wrong in.
+    fn char_literal_len(bytes: &[u8], at: usize) -> Option<usize> {
+        match bytes.get(at + 1).copied()? {
+            // `'\''` closes on the quote AFTER the escaped one, so the scan
+            // starts past it.
+            b'\\' => {
+                let mut end = at + 3;
+                while end < bytes.len() && end <= at + 11 {
+                    if bytes.get(end) == Some(&b'\'') {
+                        return end.checked_sub(at).map(|len| len + 1);
+                    }
+                    end += 1;
+                }
+                None
+            }
+            b'\'' => None,
+            _ => (bytes.get(at + 2) == Some(&b'\'')).then_some(3),
+        }
+    }
+
+    /// The escape at `at` as the byte it denotes, and how many source bytes it
+    /// spans.
+    ///
+    /// The BYTE matters rather than merely the boundary: mapping every escape
+    /// to a space leaves `Command::new("\x66ind")` — a compile-time spelling of
+    /// `find`, not a run-time one — unseen. Anything undecodable or non-ASCII
+    /// becomes a space, which is a boundary and so can only end a token rather
+    /// than complete one.
+    fn unescape(bytes: &[u8], at: usize) -> (u8, usize) {
+        let hex = |from: usize, len: usize| -> Option<u8> {
+            let digits = bytes.get(from..from.checked_add(len)?)?;
+            let text = std::str::from_utf8(digits).ok()?;
+            u32::from_str_radix(text, 16)
+                .ok()
+                .and_then(|value| u8::try_from(value).ok())
+                .filter(u8::is_ascii)
+        };
+        match bytes.get(at + 1).copied() {
+            Some(b'n') => (b'\n', 2),
+            Some(b'r') => (b'\r', 2),
+            Some(b't') => (b'\t', 2),
+            Some(b'0') => (0, 2),
+            Some(b'\\') => (b'\\', 2),
+            Some(b'\'') => (b'\'', 2),
+            Some(b'"') => (b'"', 2),
+            Some(b'x') => (hex(at + 2, 2).unwrap_or(b' '), 4),
+            // `\u{…}` takes at most six hex digits, so the brace is within ten
+            // bytes. Searching further would let a MALFORMED `\u` swallow the
+            // span up to some later brace — dropping the text between, which
+            // is the false-negative direction.
+            Some(b'u') => {
+                let width = bytes
+                    .get(at..(at + 10).min(bytes.len()))
+                    .and_then(|rest| rest.iter().position(|c| *c == b'}'))
+                    .map_or(2, |n| n + 1);
+                let digits = width.checked_sub(4).unwrap_or(0);
+                (hex(at + 3, digits).unwrap_or(b' '), width)
+            }
+            _ => (b' ', 2),
+        }
+    }
+
+    /// The contents of every string literal in a Rust source.
+    ///
+    /// Comments are skipped rather than scanned, because a `"` in one would
+    /// otherwise open a literal that swallows the rest of the file. Raw strings
+    /// are recognised so their bodies are read as text rather than as escapes,
+    /// and char literals — `'\"'` included — are skipped whole, since a quote
+    /// inside one that opened a string would shift every literal after it.
+    ///
+    /// Escapes are DECODED rather than skipped, which is what makes the word
+    /// rule mean the same thing inside a literal as outside it. In
+    /// `"set -e\nfind /x"` the raw byte before `find` is the `n` of the escape,
+    /// so a scan over the source bytes would read `\nfind` as one word and miss
+    /// the invocation; and `"\x66ind"` spells `find` at compile time, so an
+    /// escape reduced to a boundary would miss that too.
+    fn rust_string_literals(text: &str) -> Vec<Vec<u8>> {
+        let bytes = text.as_bytes();
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let byte = bytes.get(i).copied().unwrap_or(0);
+            let next = bytes.get(i + 1).copied();
+            match byte {
+                b'/' if next == Some(b'/') => {
+                    i = match bytes.get(i..).and_then(|r| r.iter().position(|c| *c == b'\n')) {
+                        Some(n) => i + n + 1,
+                        None => bytes.len(),
+                    };
+                }
+                b'/' if next == Some(b'*') => {
+                    // Rust nests block comments, so the close has to be counted.
+                    let mut depth = 1usize;
+                    i += 2;
+                    while i < bytes.len() && depth > 0 {
+                        match (bytes.get(i).copied(), bytes.get(i + 1).copied()) {
+                            (Some(b'/'), Some(b'*')) => {
+                                depth += 1;
+                                i += 2;
+                            }
+                            (Some(b'*'), Some(b'/')) => {
+                                depth -= 1;
+                                i += 2;
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                }
+                b'\'' => {
+                    let _ = next;
+                    i += char_literal_len(bytes, i).unwrap_or(1);
+                }
+                b'r' => {
+                    let mut hashes = 0usize;
+                    let mut open = i + 1;
+                    while bytes.get(open) == Some(&b'#') {
+                        hashes += 1;
+                        open += 1;
+                    }
+                    if bytes.get(open) != Some(&b'"') {
+                        i += 1;
+                        continue;
+                    }
+                    let start = open + 1;
+                    let mut end = start;
+                    while end < bytes.len() {
+                        if bytes.get(end) == Some(&b'"')
+                            && bytes
+                                .get(end + 1..end + 1 + hashes)
+                                .is_some_and(|tail| tail.iter().all(|c| *c == b'#'))
+                        {
+                            break;
+                        }
+                        end += 1;
+                    }
+                    // A raw string carries no escapes, so its bytes stand.
+                    if let Some(literal) = bytes.get(start..end.min(bytes.len())) {
+                        out.push(literal.to_vec());
+                    }
+                    i = (end + 1 + hashes).max(i + 1);
+                }
+                b'"' => {
+                    let mut literal: Vec<u8> = Vec::new();
+                    let mut end = i + 1;
+                    while end < bytes.len() {
+                        match bytes.get(end).copied() {
+                            Some(b'"') => break,
+                            Some(b'\\') => {
+                                let (byte, width) = unescape(bytes, end);
+                                literal.push(byte);
+                                end += width;
+                            }
+                            Some(byte) => {
+                                literal.push(byte);
+                                end += 1;
+                            }
+                            None => break,
+                        }
+                    }
+                    out.push(literal);
+                    i = (end + 1).max(i + 1);
+                }
+                _ => i += 1,
+            }
+        }
+        out
+    }
+
+    /// A staged Rust source is COMPILED rather than interpreted, so a bare
+    /// token in one is an identifier, a method name or an English word —
+    /// `xs.find(…)`, or a comment saying where to find something. Scanning it
+    /// the way a shell script is scanned reds every crate that uses
+    /// `Iterator::find`, which is a false positive rather than a host tool.
+    ///
+    /// What WOULD be a host tool is a command name reaching `Command`, and a
+    /// name reaching one has to be spelled in a STRING LITERAL — so a `.rs`
+    /// body is scanned only there, with the same word rule scripts get.
+    /// `Command::new("find")`, `["xargs", …]`, `"/usr/bin/find"` and a name
+    /// buried in an argument to `sh -c` all still red; an identifier and a
+    /// comment do not.
+    ///
+    /// What escapes it is a name ASSEMBLED rather than spelled, and not only at
+    /// run time: `concat!("fi", "nd")` and `stringify!` build one at COMPILE
+    /// time and are scanned as two literals neither of which is the word. It is
+    /// the same blind spot the token scan already has for `$TOOL` in a script.
+    fn rust_source_invokes(text: &str, cmd: &str) -> bool {
+        rust_string_literals(text)
+            .iter()
+            .any(|literal| invokes_in(literal, cmd))
+    }
+
+    fn step_invokes(step: &Step, text: &str, cmd: &str) -> bool {
+        match step {
+            Step::WriteFile { path, .. } if path.ends_with(".rs") => {
+                rust_source_invokes(text, cmd)
+            }
+            _ => invokes(text, cmd),
+        }
     }
 
     /// Every catalog-authored text of a step that becomes a command or an
@@ -1500,7 +1731,7 @@ mod tests {
                                     })
                             );
                         assert!(
-                            !invokes(text, cmd) || declared_busybox_tool,
+                            !step_invokes(step, text, cmd) || declared_busybox_tool,
                             "recipe `{stem}' invokes `{cmd}' in `{text}' — \
                              GNU findutils was retired from the tool tier; a rung \
                              must expose this command through a ToolFarm link to \
@@ -1510,6 +1741,87 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The `.rs` rule above is narrow in the direction that matters: a staged
+    /// Rust source that SPAWNS the host tool still reds, and the rule reaches
+    /// no file type but `.rs`.
+    #[test]
+    fn a_rust_body_is_scanned_for_a_spawned_name_and_not_for_a_word() {
+        let rust = |content: &str| Step::WriteFile {
+            path: "{src}/main.rs".into(),
+            content: content.into(),
+            exec: false,
+        };
+        let scan = |step: &Step, text: &str| step_invokes(step, text, "find");
+
+        for benign in [
+            "SOURCES.iter().find(|(name, _)| *name == module)",
+            "// the peer is the worst place to find out",
+            "let found = xs.iter().position(|x| *x == needle);",
+            // A quote in a comment must not open a literal that swallows the
+            // rest of the body, and a lifetime must not read as a char.
+            "// a \" in a comment\nlet s: &'a [u8] = b\"ok\";\nxs.find(&y)",
+            "/* find */ let n = xs.iter().find(|x| **x == 1);",
+        ] {
+            assert!(
+                !scan(&rust(benign), benign),
+                "a Rust body must not red on `{benign}'"
+            );
+        }
+
+        // The command is named beside each body rather than sniffed out of it:
+        // an escaped spelling is exactly what the source text does NOT contain.
+        for (spawning, cmd) in [
+            (r#"Command::new("find").arg("/").status()"#, "find"),
+            (r#"let argv = ["find", "."];"#, "find"),
+            (r#"Command::new("/usr/bin/find")"#, "find"),
+            (r#"Command::new("xargs")"#, "xargs"),
+            // Buried in a longer string rather than against a quote: spawning
+            // `sh -c` with a host tool inside it is the ingress this exists
+            // for, and a rule that only looked next to a quote missed it.
+            (
+                r#"Command::new("sh").arg("-c").arg("cd /x && find . -delete")"#,
+                "find",
+            ),
+            (r#"let script = "set -e\nfind /x -type f\n";"#, "find"),
+            (r#"let script = "ls | xargs rm";"#, "xargs"),
+            // A comment sits above a real invocation often enough that the two
+            // must not be able to mask each other.
+            ("// nothing to find here\nCommand::new(\"find\")", "find"),
+            // A char literal holding a quote must not open a string: if it
+            // does, the literal after it is read as ordinary text and its
+            // command name is never seen.
+            ("let _ = '\\\"'; Command::new(\"find\");", "find"),
+            (
+                "let q = '\\''; let r = '\\\\'; Command::new(\"find\");",
+                "find",
+            ),
+            // Spelled in escapes rather than assembled, so the name IS one
+            // literal and the scan has to decode it to see it.
+            (r#"Command::new("\x66ind")"#, "find"),
+            (r#"Command::new("\u{78}args")"#, "xargs"),
+            // A malformed `\u` must not swallow the text up to some later
+            // brace: the escape is bounded, so the name after it still reads.
+            (r#"let s = "\u no brace"; Command::new("find"); let t = "}";"#, "find"),
+        ] {
+            assert!(
+                step_invokes(&rust(spawning), spawning, cmd),
+                "a Rust body must red on `{spawning}'"
+            );
+        }
+
+        // The same text in a Makefile gets the bare-token scan, unchanged.
+        let method = "clean:\n\tfind . -name '*.o' -delete\n";
+        let makefile = Step::WriteFile {
+            path: "Makefile".into(),
+            content: method.into(),
+            exec: false,
+        };
+        assert!(
+            scan(&makefile, method),
+            "the Rust rule must not reach a non-Rust body"
+        );
     }
 
     /// Proof that `command_texts` — the extraction the guard above runs — covers
@@ -1567,8 +1879,9 @@ mod tests {
         }
         // ...and every spelling that IS one still is: a bare word, an absolute
         // PATH, after a pipe, after a separator, as the head of a line, and in
-        // a substitution. The bare English word in a comment is one of them,
-        // which is the limit this fix deliberately keeps.
+        // a substitution. A bare English word in a comment is one of them, and
+        // in a SCRIPT it has to be: nothing there separates the two. A `.rs`
+        // body does, which is what `rust_source_invokes` is for.
         for (text, cmd) in [
             ("find . -name '*.o' -delete", "find"),
             ("/usr/bin/find . -type f", "find"),
