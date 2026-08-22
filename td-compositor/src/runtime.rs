@@ -371,11 +371,15 @@ impl Runtime {
     /// A popup taken down — by a null attach, by its role object going away, or
     /// by the surface being destroyed. Settles for the reason above: the
     /// pointer may have been over it.
-    pub fn unmap_popup(&mut self, key: SurfaceKey) -> Result<(), String> {
-        if self.scene.unmap_popup(key) {
-            return self.settle(false);
+    ///
+    /// Returns the submenus that went with it, which a caller keeping its own
+    /// account of these pixels has to give back.
+    pub fn unmap_popup(&mut self, key: SurfaceKey) -> Result<Vec<SurfaceKey>, String> {
+        let (drawn, dropped) = self.scene.unmap_popup(key);
+        if drawn {
+            self.settle(false)?;
         }
-        Ok(())
+        Ok(dropped)
     }
 
     /// A client named its cursor: a hotspot, or `None` for a null surface,
@@ -531,16 +535,20 @@ impl Runtime {
         }
     }
 
-    pub fn remove(&mut self, key: SurfaceKey) -> Result<(), String> {
+    // Both of these return the popups that went down with the surface, for
+    // `unmap_popup`'s reason above.
+    pub fn remove(&mut self, key: SurfaceKey) -> Result<Vec<SurfaceKey>, String> {
         self.forget_drag(|dragged| dragged == key);
-        let layout_changed = self.scene.remove(key);
-        self.settle(layout_changed)
+        let (layout_changed, dropped) = self.scene.remove(key);
+        self.settle(layout_changed)?;
+        Ok(dropped)
     }
 
-    pub fn unmap(&mut self, key: SurfaceKey) -> Result<(), String> {
+    pub fn unmap(&mut self, key: SurfaceKey) -> Result<Vec<SurfaceKey>, String> {
         self.forget_drag(|dragged| dragged == key);
-        let layout_changed = self.scene.unmap(key);
-        self.settle(layout_changed)
+        let (layout_changed, dropped) = self.scene.unmap(key);
+        self.settle(layout_changed)?;
+        Ok(dropped)
     }
 
     pub fn remove_client(&mut self, client: u64) -> Result<(), String> {
@@ -4340,8 +4348,8 @@ mod tests {
         // into the cases below.
         goto(&mut runtime, 0, 0, &[release(3)]).unwrap();
         // A surface unmapping, and one being destroyed outright.
-        under_failed_paint!("unmap", runtime.unmap(key(1, 4)));
-        under_failed_paint!("remove", runtime.remove(key(1, 3)));
+        under_failed_paint!("unmap", runtime.unmap(key(1, 4)).map(|_| ()));
+        under_failed_paint!("remove", runtime.remove(key(1, 3)).map(|_| ()));
         // A whole client leaving, which is the path a crash takes: the
         // survivors are owed their new size whatever the screen did.
         under_failed_paint!("remove_client", runtime.remove_client(1));

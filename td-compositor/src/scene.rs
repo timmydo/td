@@ -1084,19 +1084,31 @@ impl Scene {
     /// SUBMENUS go too — a menu that has gone leaves nothing for a submenu to
     /// hang off, and one left behind would be spending the scene's byte
     /// ceiling on a rectangle no chain can reach.
-    pub fn unmap_popup(&mut self, key: SurfaceKey) -> bool {
+    pub fn unmap_popup(&mut self, key: SurfaceKey) -> (bool, Vec<SurfaceKey>) {
         let drawn = self.popups.remove(&key).is_some();
         self.discard_pixels(key);
-        self.drop_popups_of(key);
-        drawn
+        (drawn, self.drop_popups_of(key))
     }
 
     /// Every popup hanging off this surface, and theirs in turn, pixels
     /// included. No depth bound, and none needed: each round REMOVES what it
     /// finds, so the map strictly shrinks and even a cycle runs out.
-    fn drop_popups_of(&mut self, key: SurfaceKey) {
-        let mut parents = vec![key];
-        while let Some(parent) = parents.pop() {
+    ///
+    /// They are RETURNED because the scene is not the only ledger these pixels
+    /// are on. A caller keeping a second one has to give back exactly what
+    /// went, and the only account of that is the walk that did it: a walk of
+    /// the parent edges made anywhere else can answer differently, since by
+    /// then the edges it would read are the ones this removed.
+    fn drop_popups_of(&mut self, key: SurfaceKey) -> Vec<SurfaceKey> {
+        // The dropped list IS the worklist — each menu taken down is then
+        // asked for its own submenus — so a cursor over it replaces the
+        // separate stack this kept. Termination has two halves: the list
+        // grows only by removals from a shrinking map, and the cursor
+        // advances every round, so it reaches the end of whatever grew.
+        let mut dropped: Vec<SurfaceKey> = Vec::new();
+        let mut scanned = 0usize;
+        let mut parent = key;
+        loop {
             let children: Vec<SurfaceKey> = self
                 .popups
                 .iter()
@@ -1106,9 +1118,15 @@ impl Scene {
             for child in children {
                 self.popups.remove(&child);
                 self.discard_pixels(child);
-                parents.push(child);
+                dropped.push(child);
             }
+            let Some(&next) = dropped.get(scanned) else {
+                break;
+            };
+            parent = next;
+            scanned = scanned.saturating_add(1);
         }
+        dropped
     }
 
     #[cfg(test)]
@@ -1284,10 +1302,10 @@ impl Scene {
         false
     }
 
-    pub fn unmap(&mut self, key: SurfaceKey) -> bool {
+    pub fn unmap(&mut self, key: SurfaceKey) -> (bool, Vec<SurfaceKey>) {
         let layout_changed = self.layout.contains(key);
         self.popups.remove(&key);
-        self.drop_popups_of(key);
+        let dropped = self.drop_popups_of(key);
         self.discard_pixels(key);
         self.layout.unmap(key);
         // A block is drawn over the arrangement rather than replacing it, so
@@ -1296,10 +1314,10 @@ impl Scene {
         // — saying otherwise would ask for a round of configures for pixels no
         // client was ever told about.
         self.clear_hint();
-        layout_changed
+        (layout_changed, dropped)
     }
 
-    pub fn remove(&mut self, key: SurfaceKey) -> bool {
+    pub fn remove(&mut self, key: SurfaceKey) -> (bool, Vec<SurfaceKey>) {
         let layout_changed = self.layout.contains(key);
         self.discard_pixels(key);
         self.geometries.remove(&key);
@@ -1308,12 +1326,12 @@ impl Scene {
         // submenus with them. A menu whose window has gone is a rectangle
         // floating over whatever tile the layout gives that space to next, and
         // the client that owns it has been told nothing.
-        self.drop_popups_of(key);
+        let dropped = self.drop_popups_of(key);
         self.titles.remove(&key);
         self.layout.forget(key);
         self.clear_hint();
         self.forget_cursor_surface(key);
-        layout_changed
+        (layout_changed, dropped)
     }
 
     /// Destroying a surface takes its pixels with it wherever td holds them —
@@ -5202,12 +5220,12 @@ mod tests {
         };
         scene.commit(key, surface([1, 2, 3, 0], 1, 1)).unwrap();
         scene.command(Command::MoveToWorkspace(2));
-        assert!(scene.unmap(key));
-        assert!(!scene.unmap(key));
+        assert!(scene.unmap(key).0);
+        assert!(!scene.unmap(key).0);
         scene.commit(key, surface([1, 2, 3, 0], 1, 1)).unwrap();
         assert!(scene.layout.placements(100, 100, 0, 0).is_empty());
-        assert!(scene.remove(key));
-        assert!(!scene.remove(key));
+        assert!(scene.remove(key).0);
+        assert!(!scene.remove(key).0);
         scene.commit(key, surface([1, 2, 3, 0], 1, 1)).unwrap();
         assert_eq!(scene.layout.placements(100, 100, 0, 0).len(), 1);
         assert!(scene.layout.check_invariants().is_ok());
@@ -5796,10 +5814,11 @@ mod tests {
 
         let mut scene = a_window_beside_a_column();
         aim(&mut scene);
-        assert!(scene.unmap(SurfaceKey {
+        let neighbour = SurfaceKey {
             client: 1,
-            object: 2
-        }));
+            object: 2,
+        };
+        assert!(scene.unmap(neighbour).0);
         assert!(!scene.hint_is_live(), "the block outlived an unmap");
 
         let mut scene = a_window_beside_a_column();
@@ -5895,9 +5914,9 @@ mod tests {
         // A surface that is not in the layout at all, so the mutation itself
         // moves nothing and the block is the only thing that changes.
         for mutate in [
-            (|scene: &mut Scene, key: SurfaceKey| scene.unmap(key))
+            (|scene: &mut Scene, key: SurfaceKey| scene.unmap(key).0)
                 as fn(&mut Scene, SurfaceKey) -> bool,
-            |scene: &mut Scene, key: SurfaceKey| scene.remove(key),
+            |scene: &mut Scene, key: SurfaceKey| scene.remove(key).0,
             |scene: &mut Scene, key: SurfaceKey| scene.remove_client(key.client),
         ] {
             let mut scene = a_window_beside_a_column();
@@ -6313,7 +6332,7 @@ mod tests {
     #[test]
     fn a_geometry_dies_with_its_surface_and_with_its_client() {
         for take in [
-            (|scene: &mut Scene, key: SurfaceKey| scene.remove(key))
+            (|scene: &mut Scene, key: SurfaceKey| scene.remove(key).0)
                 as fn(&mut Scene, SurfaceKey) -> bool,
             |scene: &mut Scene, key: SurfaceKey| scene.remove_client(key.client),
         ] {
@@ -6513,7 +6532,7 @@ mod tests {
             .unwrap();
         assert_eq!(scene.popup_placement(menu), Some(place));
         let held = scene.surface_bytes;
-        assert!(scene.unmap_popup(menu));
+        assert!(scene.unmap_popup(menu).0);
         assert_eq!(scene.popup_placement(menu), None);
         // Its PIXELS go with it, which nothing on screen would show: a menu
         // that kept them would spend the scene's byte ceiling on every popup a
@@ -6524,7 +6543,7 @@ mod tests {
         scene.render(&mut frame, width, height, stride);
         assert_eq!(pixel(&frame, stride, rect.x + 5, rect.y + 7), WINDOW);
         // And a second unmap takes nothing, so it owes no paint.
-        assert!(!scene.unmap_popup(menu));
+        assert!(!scene.unmap_popup(menu).0);
 
         scene
             .commit_popup(menu, surface(MENU, 10, 10), place)
@@ -6747,7 +6766,7 @@ mod tests {
             .commit_popup(submenu, surface(SUBMENU, 6, 6), placed(menu, 10, 2, 6))
             .unwrap();
         let held = scene.surface_bytes;
-        assert!(scene.unmap_popup(menu));
+        assert!(scene.unmap_popup(menu).0);
         assert_eq!(scene.popup_placement(menu), None);
         assert_eq!(scene.popup_placement(submenu), None);
         assert_eq!(

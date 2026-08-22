@@ -1003,17 +1003,30 @@ the fix and it is not here; what this commit changed is which number the role
 holds, and the refusal predates it. That is a deferral rather than a defence,
 and it should be read as the next thing this area owes.
 
-What none of it closes is the ACCOUNTING, which is one mechanism rather than a
-list of cases. Taking a surface down cascades — `drop_popups_of` discards the
-pixels of every popup over it, and theirs in turn — while only the surface
-NAMED gives its bytes back. So `wl_surface.destroy`, `xdg_toplevel.destroy`,
-and a null-buffer commit on a window or on a menu all leave a client charged
-for descendants td no longer holds; an orphan's own submenu is the same shape
-seen from the orphan. Nothing accumulates, because a repaint REPLACES a
-surface's charge rather than adding to it, and four paths refund — repainting
-the surface, `xdg_popup.destroy`, `wl_surface.destroy`, and a null commit on
-the popup itself. What is left is a standing charge for as long as a client
-abandons a surface, and what it can cost is that client's own ceiling.
+The ACCOUNTING follows that cascade rather than the surface named. Taking a
+surface down discards the pixels of every popup over it and theirs in turn, and
+the scene REPORTS what it dropped — so the client's ledger gives back exactly
+what went, rather than what a second walk of the parent edges made here would
+say, which by then would be reading the edges that walk removed. Before this,
+`wl_surface.destroy`, `xdg_toplevel.destroy` and a null-buffer commit on a
+window or on a menu each left a client charged for descendants td no longer
+held; an orphan's own submenu was the same shape seen from the orphan. Nothing
+accumulated, because a repaint REPLACES a surface's charge rather than adding
+to it, but the charge stood for as long as the client abandoned the surface,
+and what it cost was that client's own ceiling.
+
+Of the three take-downs that refund, the one at `wl_surface.destroy` looks
+unreachable and is not. `get_popup` refuses a parent xdg_surface with no role
+object, so no NEW menu can be hung off a window whose toplevel has gone — but
+an existing menu does not have to be created, only REPAINTED. Its popup object,
+its xdg_surface and its configure tracker all outlive the toplevel, so a second
+buffer attaches with no fresh acknowledgement and the placement goes back into
+the scene naming a parent that is no longer a window. The destroy then reaches
+`remove_surface` with a live tree under it, and its refund is the only thing
+that gives those bytes back. This paragraph claimed the opposite until review
+built the sequence; the correction is recorded rather than quietly swapped,
+because a wrong unreachability claim is the kind that gets a live refund
+deleted later as dead code.
 
 With that, a popup CYCLE is unbuildable — and the argument is written out
 because review has had to correct it THREE times, so the conclusion is worth

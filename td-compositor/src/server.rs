@@ -1153,24 +1153,53 @@ impl Client {
 
     fn unmap_surface(&mut self, surface: u32) -> Result<(), String> {
         self.clear_surface_bytes(surface);
-        self.runtime
+        let dropped = self
+            .runtime
             .lock()
             .map_err(|_| "runtime lock poisoned".to_string())?
             .unmap(SurfaceKey {
                 client: self.id,
                 object: surface,
-            })
+            })?;
+        self.refund_dropped(&dropped);
+        Ok(())
     }
 
     fn remove_surface(&mut self, surface: u32) -> Result<(), String> {
         self.clear_surface_bytes(surface);
-        self.runtime
+        let dropped = self
+            .runtime
             .lock()
             .map_err(|_| "runtime lock poisoned".to_string())?
             .remove(SurfaceKey {
                 client: self.id,
                 object: surface,
-            })
+            })?;
+        // Reached by a menu repainted after its window's role object went: the
+        // popup object outlives that, so its placement goes back into the
+        // scene and only this gives the bytes back.
+        self.refund_dropped(&dropped);
+        Ok(())
+    }
+
+    /// Give back the bytes of every menu that went down with a surface. The
+    /// scene names them, since its cascade is what decides how far a take-down
+    /// reaches; this ledger only has to agree with it.
+    ///
+    /// The client check is not ceremony, though nothing today can fail it: a
+    /// refund is spelled by OBJECT id, and object ids are per connection, so a
+    /// key from another client would give back the bytes of whichever surface
+    /// of this one happens to share its number.
+    ///
+    /// A take-down whose paint fails never reaches this, and does not have to:
+    /// the error ends the connection, so the ledger it would correct is the
+    /// departing `Client`'s own field.
+    fn refund_dropped(&mut self, dropped: &[SurfaceKey]) {
+        for key in dropped {
+            if key.client == self.id {
+                self.clear_surface_bytes(key.object);
+            }
+        }
     }
 
     fn send(&mut self, object: u32, opcode: u16, builder: wire::Builder) -> Result<(), String> {
@@ -1353,20 +1382,24 @@ impl Client {
     /// dismissing menus disconnected for buffers td is not holding.
     fn unmap_popup(&mut self, surface: u32) -> Result<(), String> {
         self.clear_surface_bytes(surface);
-        self.runtime
+        let dropped = self
+            .runtime
             .lock()
             .map_err(|_| "runtime lock poisoned".to_string())?
             .unmap_popup(SurfaceKey {
                 client: self.id,
                 object: surface,
-            })
+            })?;
+        self.refund_dropped(&dropped);
+        Ok(())
     }
 
     /// Break the parent edge of every popup that named this wl_surface. Only
     /// the surfaces that named it: a submenu's own edge points at the ORPHAN,
     /// which still exists, so it keeps that edge and never resolves to a rect
-    /// — the walk ends at a surface no layout has. It does keep its pixels,
-    /// which is the accounting gap DESIGN.md §3 records.
+    /// — the walk ends at a surface no layout has. Its pixels are not left
+    /// charged: this edits the object map alone, and the `remove_surface` that
+    /// follows cascades in the scene and refunds what it drops.
     fn orphan_popups_of(&mut self, surface: u32) {
         for object in self.objects.values_mut() {
             if let Object::XdgPopup { parent, .. } = object {
@@ -9308,6 +9341,212 @@ mod tests {
             None,
             "both edges are live at once, which is a cycle"
         );
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// The fixture's menu given a submenu and a sub-submenu, each mapped with
+    /// a buffer of its own. THREE levels below the window, because a cascade
+    /// that walked only one would still take a two-level tree down whole and
+    /// so could not be told from one that walks them all.
+    fn menu_tree(client: &mut Client, peer: &mut UnixStream, pool_path: &PathBuf) {
+        for (surface, xdg_surface, popup, parent, buffer) in
+            [(20u32, 21u32, 22u32, 13u32, 27u32), (40, 41, 42, 21, 47)]
+        {
+            client
+                .insert(surface, Object::Surface(SurfaceState::default()))
+                .unwrap();
+            let mut shell = wire::Builder::new();
+            shell.u32(xdg_surface);
+            shell.u32(surface);
+            client
+                .dispatch(request(12, 2, shell).unwrap(), &mut VecDeque::new())
+                .unwrap();
+            let mut hanging = wire::Builder::new();
+            hanging.u32(popup);
+            hanging.u32(parent);
+            hanging.u32(30);
+            client
+                .dispatch(
+                    request(xdg_surface, 2, hanging).unwrap(),
+                    &mut VecDeque::new(),
+                )
+                .unwrap();
+            map_popup_surface(client, peer, surface, xdg_surface, buffer, pool_path);
+        }
+        assert_eq!(
+            client.mapped_bytes.keys().copied().collect::<Vec<u32>>(),
+            vec![6, 20, 40],
+            "the menu tree is not charged the way this test needs it"
+        );
+    }
+
+    /// A menu's pixels are charged to the client that sent them, and a window
+    /// going down takes its whole menu tree with it. The scene discards those
+    /// pixels; this ledger has to hear about it, or a client that opens and
+    /// closes menus is charged for every one it ever opened and is eventually
+    /// disconnected for buffers td threw away.
+    ///
+    /// The refund follows the CASCADE rather than a walk of this ledger's own.
+    /// What went down is whatever the scene's walk reached, and a walk made
+    /// here afterwards would read the edges that walk has already removed.
+    #[test]
+    fn a_window_hiding_refunds_the_menus_that_went_with_it() {
+        let (mut client, mut peer, _runtime, framebuffer_path, pool_path) =
+            mapped_popup("popup-refund-hide");
+        menu_tree(&mut client, &mut peer, &pool_path);
+
+        // A bufferless surface still takes this path, and what is under test
+        // is the menus the window drags down rather than its own pixels.
+        let mut detach = wire::Builder::new();
+        detach.u32(0);
+        detach.i32(0);
+        detach.i32(0);
+        client
+            .dispatch(request(5, 1, detach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        commit(&mut client).unwrap();
+        assert!(
+            client.mapped_bytes.is_empty(),
+            "a menu that went down with its window is still charged: {:?}",
+            client.mapped_bytes
+        );
+        assert_eq!(client.mapped_total, 0);
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// The same refund down the other take-down path. A menu closing takes its
+    /// own submenus rather than a window taking everything, and the two reach
+    /// the scene by different calls — so a refund on one of them is not a
+    /// refund on the other.
+    #[test]
+    fn a_menu_closing_refunds_the_submenus_that_went_with_it() {
+        let (mut client, mut peer, _runtime, framebuffer_path, pool_path) =
+            mapped_popup("popup-refund-close");
+        menu_tree(&mut client, &mut peer, &pool_path);
+
+        let mut detach = wire::Builder::new();
+        detach.u32(0);
+        detach.i32(0);
+        detach.i32(0);
+        client
+            .dispatch(request(6, 1, detach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(
+            client.mapped_bytes.is_empty(),
+            "a submenu that went down with its menu is still charged: {:?}",
+            client.mapped_bytes
+        );
+        assert_eq!(client.mapped_total, 0);
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// The third take-down path, which looked unreachable and is not. A menu
+    /// does not have to be CREATED after its window's role object goes — it
+    /// only has to be repainted. Its popup object, its xdg_surface and its
+    /// configure tracker all outlive the toplevel, so a second buffer attaches
+    /// with no fresh acknowledgement and the placement goes back into the
+    /// scene naming a parent that is no longer a window. The destroy then
+    /// reaches `remove_surface` with a live tree under it.
+    ///
+    /// `get_popup` refusing a parent with no role object is what made this
+    /// look impossible, and all it rules out is a NEW menu.
+    #[test]
+    fn a_menu_repainted_after_its_window_went_is_refunded_by_the_destroy() {
+        let (mut client, _peer, _runtime, framebuffer_path, pool_path) =
+            mapped_popup("popup-recommit");
+        assert_eq!(
+            client.mapped_bytes.get(&6).copied(),
+            Some(4),
+            "the menu is not charged to begin with"
+        );
+
+        // The toplevel goes. This unmaps the window and cascades the menu
+        // away, refunding it down the `unmap_surface` path.
+        client
+            .dispatch(
+                request(10, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(
+            client.mapped_bytes.is_empty(),
+            "the toplevel's own take-down left the menu charged: {:?}",
+            client.mapped_bytes
+        );
+
+        // The menu's own objects are all still alive, so the client may
+        // simply REPAINT it — no new popup is created, which is the step the
+        // unreachability argument assumed was needed.
+        client
+            .insert(
+                27,
+                Object::Buffer(Buffer {
+                    serial: 27,
+                    file: Arc::new(File::open(&pool_path).unwrap()),
+                    offset: 0,
+                    width: 1,
+                    height: 1,
+                    stride: 4,
+                    format: SHM_XRGB8888,
+                }),
+            )
+            .unwrap();
+        let mut attach = wire::Builder::new();
+        attach.u32(27);
+        attach.i32(0);
+        attach.i32(0);
+        client
+            .dispatch(request(6, 1, attach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        // The step the whole test turns on. Without this charge the assertion
+        // below would pass on a menu that was never re-entered in the scene,
+        // and the test would stop covering `remove_surface` with nothing to
+        // say so.
+        assert_eq!(
+            client.mapped_bytes.get(&6).copied(),
+            Some(4),
+            "the repaint did not put the menu back"
+        );
+
+        // The xdg_surface may go now: its role object was destroyed above.
+        client
+            .dispatch(
+                request(9, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+
+        // And the wl_surface, whose role is retired rather than Xdg(_).
+        client
+            .dispatch(
+                request(5, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(
+            client.mapped_bytes.is_empty(),
+            "remove_surface reached a live popup tree and did not refund it: {:?}",
+            client.mapped_bytes
+        );
+        assert_eq!(client.mapped_total, 0);
 
         let _ = fs::remove_file(&framebuffer_path);
         let _ = fs::remove_file(&pool_path);
