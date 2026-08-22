@@ -478,6 +478,25 @@ and `ready` compares the model in `<tool>/<model>` to refuse it.
 Commit the increment first, then review `git show HEAD` — that is the
 unit being judged, and it hands the reviewer the message along with the
 diff — then `git commit --amend` to add your summary and the record.
+
+### Review cycle limit
+
+Schedule at most TWO complete review cycles for one commit. A cycle is
+all required reviewers examining the same exact commit: the acting
+agent's review subagent and both required cross-model slots (including
+an approved waiver or substitute). The first cycle reviews the initial
+implementation. Fix or explicitly dismiss every finding, amend the
+commit, and use the second cycle as the final scheduled acceptance pass.
+
+If the second cycle finds a release blocker, disposition it but STOP
+before starting another review, declaring the commit ready, or pushing
+it. Ask the user whether to authorize a third exact-commit cycle. Never
+start that cycle automatically, silently ship a known blocker, or split
+the changed commit among ad-hoc reviewers to evade the limit. A reviewer
+may clarify its existing report without consuming a cycle only while the
+reviewed commit remains unchanged; any review of amended code is another
+cycle.
+
 Run every cross-model reviewer at a strong model + high reasoning
 effort. The reviewers do NOT write the record: the acting agent reads
 all three, acts on the findings — fixing each real one or dismissing it
