@@ -3962,6 +3962,111 @@ mod tests {
         );
     }
 
+    /// `!` negates a PIPELINE, and ash takes at most one of them, at the head.
+    /// Its `pipeline()` reads the token with an `if` rather than a loop
+    /// (ash.c:11957), so a second one -- or one opening a stage that is not the
+    /// head -- falls into `parse_command`, where a `!` cannot start a command.
+    /// This shell consumed any number and toggled, so `! ! true` ran and
+    /// `true | ! false` looked for a command named `!`.
+    #[test]
+    fn a_pipeline_takes_one_bang_and_only_at_its_head() {
+        // One is fine wherever the grammar allows a pipeline.
+        for (src, want) in [
+            ("! true; echo $?", "1\n"),
+            ("! false; echo $?", "0\n"),
+            // Builtins only: the in-process harness has no PATH, and the
+            // `!` covers the whole pipeline, so its LAST stage is what flips.
+            ("! : | :; echo $?", "1\n"),
+            ("! true && ! false; echo $?", "1\n"),
+            ("true && ! false; echo $?", "0\n"),
+            ("if ! true; then echo N; else echo Y; fi", "Y\n"),
+            ("while ! true; do :; done; echo done", "done\n"),
+            // `! false` is TRUE, so this one ends; `until ! true` never would.
+            ("until ! false; do echo BODY; done; echo ok", "ok\n"),
+            ("for i in a; do ! true; done; echo $?", "1\n"),
+            ("case x in x) ! true;; esac; echo $?", "1\n"),
+            ("f() { ! true; }; f; echo $?", "1\n"),
+        ] {
+            assert_eq!(run(src), (0, want.to_string(), String::new()), "{src:?}");
+        }
+        // A SECOND one is a syntax error, in every construct whose body or
+        // condition is a list -- and inside BOTH substitution bodies, which is
+        // where this parts company with the closers above: a closer ends ash's
+        // `list(2)` body and is never looked at, while a `!` reaches
+        // `parse_command` there too. A stage that is not the head is the same
+        // refusal, since only the head is ash's `pipeline()`.
+        for src in [
+            "! ! true",
+            "! ! ! true",
+            "true; ! ! true",
+            "if ! ! true; then :; fi",
+            "while ! ! true; do :; done",
+            "until ! ! true; do :; done",
+            "for i in a; do ! ! true; done",
+            "case x in x) ! ! true;; esac",
+            "f() { ! ! true; }",
+            "{ ! ! true; }",
+            "( ! ! true )",
+            "echo $(! ! true)",
+            "echo `! ! true`",
+            "true | ! false",
+            "! true | ! false",
+        ] {
+            let (status, out, err) = run(src);
+            assert_eq!((status, out.as_str()), (2, ""), "{src:?}: {err}");
+            assert!(
+                err.trim_end().ends_with("syntax error: unexpected \"!\""),
+                "{src:?}: {err}"
+            );
+        }
+        // A `!` with no command after it is refused too, but by whatever
+        // follows it rather than by the rule above: it consumed the token and
+        // the next one has to open a command. At the end of the input that is
+        // end-of-file, and a trailing newline is a token in its own right --
+        // the same two spellings every other unclosed construct has.
+        for (src, want) in [
+            ("! ; echo AFTER", "\";\""),
+            ("!", "end of file"),
+            ("! ", "end of file"),
+            ("!\n", "newline"),
+        ] {
+            let (status, out, err) = run(src);
+            assert_eq!((status, out.as_str()), (2, ""), "{src:?}: {err}");
+            assert!(
+                err.trim_end().ends_with(&format!("syntax error: unexpected {want}")),
+                "{src:?}: {err}"
+            );
+        }
+        // The word after a `!` is a COMMAND word, so an alias resolves there --
+        // and an alias may itself BE a `!`, which is how one reaches a stage
+        // the parser never saw a `!` in. Both count toward the one.
+        for (src, want) in [
+            ("alias t=true\n! t; echo $?", "1\n"),
+            ("alias n='! '\nn true; echo $?", "1\n"),
+            ("alias p='true |'\n! p :; echo $?", "1\n"),
+        ] {
+            assert_eq!(run(src), (0, want.to_string(), String::new()), "{src:?}");
+        }
+        for src in ["alias n='! '\n! n true", "alias nn='! ! '\nnn true"] {
+            let (status, out, err) = run(src);
+            assert_eq!((status, out.as_str()), (2, ""), "{src:?}: {err}");
+            assert!(
+                err.trim_end().ends_with("syntax error: unexpected \"!\""),
+                "{src:?}: {err}"
+            );
+        }
+        // Only the RESERVED word is refused. Quoted, escaped or expanded it is
+        // an ordinary command name, and in argument position it is a word.
+        for src in ["\"!\" true", "\\! true", "x=!; $x true"] {
+            assert_eq!(run(src).0, 127, "{src:?} must look for a command");
+        }
+        assert_eq!(run("echo ! ; echo a!b").1, "!\na!b\n");
+        // `[[ ]]` has its own `!` and takes as many as it likes, which is a
+        // different path and stays that way.
+        assert_eq!(run("[[ ! -f /nonexistent ]]; echo $?").1, "0\n");
+        assert_eq!(run("[[ ! ! -f /nonexistent ]]; echo $?").1, "1\n");
+    }
+
     /// A `${...}` body this shell does not serve fails when the word is
     /// EXPANDED, not when the list is parsed -- ash reports `bad substitution`
     /// from its expander. So one in a branch never taken never reports, which

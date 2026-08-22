@@ -770,16 +770,18 @@ impl Units {
     }
 
     fn parse_pipeline(&mut self) -> Syn<Pipeline> {
-        let mut bang = false;
         // Every command in the grammar is reached through here, so this is the one
         // place a command word's alias check has to be made.
-        loop {
-            self.check_alias(Chk::Command)?;
-            if self.peek_reserved() != Some("!") {
-                break;
-            }
+        //
+        // ONE `!`, because ash's `pipeline()` reads it with an `if` and not a
+        // loop (ash.c:11957). A second reaches a command position, which
+        // `parse_command_inner` refuses -- the word after the `!` is a command
+        // word, which is why the alias check runs on both sides of it.
+        self.check_alias(Chk::Command)?;
+        let bang = self.peek_reserved() == Some("!");
+        if bang {
             self.bump();
-            bang = !bang;
+            self.check_alias(Chk::Command)?;
         }
         let mut cmds = vec![self.staged()?];
         while self.peek_op() == Some(Op::Pipe) {
@@ -844,6 +846,12 @@ impl Units {
         // everywhere except the one position the grammar claims it.
         if self.peek_reserved() == Some("[[") {
             return self.parse_cond();
+        }
+        // A second `!`, or one opening a stage that is not the head. Ungated
+        // unlike the closers below: `TNOT` carries no `tokendlist` bit
+        // (ash.c:8657), so it does not end a backtick body the way they do.
+        if self.peek_reserved() == Some("!") {
+            return Err("syntax error: unexpected \"!\"".into());
         }
         // Before the function-definition test, or `fi() { … }` defines one where
         // ash refuses it. The text is ash's spelling exactly.
