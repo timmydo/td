@@ -4814,7 +4814,7 @@ A's kernel commit is the only true blocking edge, and it is small.
 |---|---|
 | `builder/src/affected.rs`, `Cargo.toml` | **serialize** until V.0 lands — they are the same landing anyway |
 | `recipes/src/recipes/system-x86-64.rs` | do not touch during development; one serialized wiring landing per component at the end |
-| `UNSAFE.md` + the roster table in `AGENTS.md` | one at a time, in roster order (#9 A, #10 B, #11 C), each appending its own section. The table row is the conflict; the body is not |
+| the roster in `UNSAFE.md` | one at a time, in roster order (#9 A, #10 B, #11 C), each appending its own section. The roster entry is the conflict; the body is not |
 | `recipes/src/ladder.rs` | append only |
 | `recipes/src/source_pins.rs` | D only, per seed. Alphabetical keys *spread* insertions rather than preventing collisions — mitigation, not a mechanism |
 | this document | **each agent amends its own section**, and only from rung 0 onward. While it is being written it is single-owned, which is what lets one increment change a conclusion and its premise together |
