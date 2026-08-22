@@ -909,14 +909,15 @@ impl ScriptParser<'_> {
                 Some(c) => out.push(c),
             }
         }
+        // GNU's `read_text` ends the buffer with a NEWLINE before any escape is
+        // decoded (compile.c:877), so a trailing `\c` takes that terminator as
+        // its operand and leaves `0x0A ^ 0x40`, a `J`, with nothing after it.
+        // WHICH command shows that is the writers' asymmetry: `a` dumps the
+        // buffer verbatim where `i`/`c` drop its last byte -- see `text_body`.
+        out.push(b'\n');
         if undecoded {
             return Ok(Some(out));
         }
-        // No terminator here: the writer supplies one, and WHICH one is not the
-        // same for all three. `i`/`c` end their text with the record separator,
-        // so under -z it is a NUL; `a` ends its with a literal newline whatever
-        // the separator is. GNU's asymmetry, recorded in spec/README, and the
-        // reason parsing does not append either.
         Ok(Some(normalize_buffer(&out)?))
     }
 
@@ -1426,6 +1427,15 @@ fn normalize_buffer(raw: &[u8]) -> Result<Vec<u8>, String> {
         }
     }
     Ok(out)
+}
+
+/// An `a`/`i`/`c` text WITHOUT the terminating newline the parser gave it. `i`
+/// and `c` write `text_length - 1` bytes and end with the record separator
+/// instead (execute.c:1444), which is what hides the `J` a trailing `\c` leaves
+/// there and what makes their terminator a NUL under `-z` where `a` keeps a
+/// newline.
+fn text_body(text: &[u8]) -> &[u8] {
+    text.split_last().map_or(&[], |(_, body)| body)
 }
 
 /// Read up to `max_digits` of a `\d`/`\o`/`\x` escape's operand, advancing `i`.
@@ -2368,14 +2378,6 @@ impl<'a> Sink<'a> {
     fn queued(&mut self, bytes: &[u8]) -> Result<(), Vec<u8>> {
         self.pay(Chan::Main)?;
         self.put(bytes)
-    }
-
-    /// Queued `a`/`r` text. GNU terminates it with a NEWLINE even under `-z`
-    /// (the append queue dumps the text as parsed), where `i`/`c` follow the
-    /// record separator.
-    fn write_text(&mut self, bytes: &[u8]) -> Result<(), Vec<u8>> {
-        self.queued(bytes)?;
-        self.put(b"\n")
     }
 
     /// Write one line; an unterminated one owes its separator to the next write on
@@ -4634,8 +4636,10 @@ impl Sed {
                 // direction. A text-less `i`/`c` is the OPPOSITE case and not
                 // a positional one: they pay when they have text, and GNU's
                 // `output_line` returns before paying when they have none.
-                Append::Text(Some(text)) => sink.write_text(&text)?,
-                Append::Text(None) => sink.queued(&[])?,
+                // The text carries its own terminating newline, so the queue
+                // writes it VERBATIM as `dump_append_queue` does: nothing
+                // follows the `J` a trailing `\c` makes of that newline.
+                Append::Text(text) => sink.queued(text.as_deref().unwrap_or(&[]))?,
                 // A missing file is not an error for `r`/`R`, as in GNU sed — but
                 // GNU pays the owed separator BEFORE it finds out, so `printf x |
                 // sed 'r /nonexistent'` still ends with one. Writing the empty
@@ -4751,12 +4755,11 @@ impl Sed {
                 }
                 Some(Kind::Append(text)) => self.appends.push(Append::Text(text.clone())),
                 Some(Kind::Insert(text)) => {
-                    if let Some(text) = text.clone() {
-                        sink.write_line(&text, true)?;
+                    if let Some(text) = text {
+                        sink.write_line(text_body(text), true)?;
                     }
                 }
                 Some(Kind::Change(text)) => {
-                    let text = text.clone();
                     // Over a range, `c` prints once, at the range's last line.
                     let ends = self
                         .ranges
@@ -4764,7 +4767,7 @@ impl Sed {
                         .is_none_or(|r| !matches!(r, RangeState::Active(_)));
                     // A `c` with no text still deletes; it just writes no line.
                     if let (true, Some(text)) = (ends, text) {
-                        sink.write_line(&text, true)?;
+                        sink.write_line(text_body(text), true)?;
                     }
                     self.pattern.clear();
                     return Ok(Flow::Deleted);

@@ -1513,16 +1513,30 @@ td-txt-authored case files
     where GNU dies rather than asking one question later.
 
   - A `\c` with nothing to control eats an `a` text's own TERMINATOR: GNU
-    accumulates the text WITH its trailing newline and decodes that whole buffer,
-    so `a\<newline>\c` appends `J` -- the newline upper-cased and XORed with 0x40
-    -- and no newline after it. td-txt's buffer ends where the newline begins, the
-    separator being appended by the writer, so there is nothing there to consume.
-    One xfail case, `a` only: `i` and `c` substitute the separator for the text's
-    last byte and so agree whatever it ends with. Matching it means the text
-    carrying its own terminator, which puts back in play the `-z` asymmetry td-txt
-    matches today (`i foo` ends in a NUL where `a foo` ends in a newline). The
-    neighbouring shapes are NOT gaps: a text ending in an unpaired backslash is
-    emitted raw, and a continuation collapses only across an `-e` boundary.
+    accumulates the text WITH its trailing newline and decodes that whole
+    buffer, so `a\<newline>\c` appends `J` -- the newline upper-cased and XORed
+    with 0x40 -- and no newline after it. CLOSED, by giving the text that
+    terminator here too: `parse_text` ends the buffer with a newline before
+    `normalize_buffer` sees it, where GNU's `read_text` puts it
+    (compile.c:877).
+
+    What made this look larger than it is was the `-z` asymmetry it seemed to
+    put back in play (`i foo` ends in a NUL where `a foo` ends in a newline),
+    and the answer is that the asymmetry belongs to the WRITERS rather than to
+    the parser. All three commands compile identically -- `sed --debug` prints
+    `a\J` and `i\J` alike -- and `a` dumps the buffer verbatim from the append
+    queue where `i`/`c` write `text_length - 1` bytes and supply the record
+    separator themselves (execute.c:1444). So `a` keeps a literal newline
+    under `-z` because the newline is IN the text, `i`/`c` end with the NUL
+    because they put the separator where the text's last byte was, and that
+    same rule is why only `a` ever shows the `J`.
+
+    The neighbouring shapes were never gaps and are untouched. A text ending
+    in an unpaired backslash is emitted RAW because GNU returns from
+    `read_text` on that path without normalizing at all -- it adds the newline
+    and returns (compile.c:870), which is what td-txt's `undecoded` arm
+    models, so the terminator joins that buffer too and nothing else about it
+    changes. A continuation still collapses only across an `-e` boundary.
 
   - A backreference to a group under a repetition whose BODY can match empty,
     which POSIX leaves undefined and where GNU's answers do not follow a rule.

@@ -6385,6 +6385,17 @@ f2
 ## stderr-contains: recursive escaping after \c not allowed
 ## status: 1
 
+# --- GNU's `read_text' ends a text buffer with a NEWLINE before any escape is
+# --- decoded (compile.c:877), so that terminator is part of what a trailing
+# --- `\c' can reach: it takes the newline as its operand and leaves 0x0A ^ 0x40
+# --- -- a `J' -- with nothing after it. All three commands COMPILE alike (`sed
+# --- --debug' prints `a\J' and `i\J' the same); they diverge in the WRITER.
+# --- `a' dumps the buffer verbatim from the append queue, so the J shows and
+# --- the record after it runs straight on; `i' and `c' write text_length - 1
+# --- bytes and supply the record separator themselves (execute.c:1444), so the
+# --- J is exactly the byte they drop. Which is also why an `a' text ends with a
+# --- literal newline under -z where `i' ends with the NUL.
+
 #### \c at the end of a text controls the text's own terminator
 ## argv: sed "a\\\n\\c"
 ## stdin-json: "X\n"
@@ -6392,17 +6403,87 @@ f2
 ## stderr-json: ""
 ## status: 0
 
-#### which i shows the same way
+#### so the record after it runs straight on
+## argv: sed "a\\\n\\c"
+## stdin-json: "X\nY\n"
+## stdout-json: "X\nJY\nJ"
+## stderr-json: ""
+## status: 0
+
+#### the text's own bytes come first, the J standing where its newline was
+## argv: sed "a\\\nAB\\c"
+## stdin-json: "X\n"
+## stdout-json: "X\nABJ"
+## stderr-json: ""
+## status: 0
+
+#### the one-liner form reaches that terminator the same way
+## argv: sed 'a A\c'
+## stdin-json: "X\n"
+## stdout-json: "X\nAJ"
+## stderr-json: ""
+## status: 0
+
+#### the queue writes each text verbatim, so a second a runs into the J
+## argv: sed -e "a\\" -e "\\c" -e "a\\" -e "B"
+## stdin-json: "X\n"
+## stdout-json: "X\nJB\n"
+## stderr-json: ""
+## status: 0
+
+#### which i does NOT show, dropping its text's last byte
 ## argv: sed "i\\\nA\\c"
 ## stdin-json: "X\n"
 ## stdout-json: "A\nX\n"
 ## stderr-json: ""
 ## status: 0
 
-#### and c the same way as a
+#### so an i whose whole text is that J writes an empty line
+## argv: sed "i\\\n\\c"
+## stdin-json: "X\n"
+## stdout-json: "\nX\n"
+## stderr-json: ""
+## status: 0
+
+#### and c drops it too, being the writer i is
 ## argv: sed "c\\\nA\\c"
 ## stdin-json: "X\n"
 ## stdout-json: "A\n"
+## stderr-json: ""
+## status: 0
+
+#### an escape that is not last leaves the terminator alone
+## argv: sed "a\\\nA\\cB"
+## stdin-json: "X\n"
+## stdout-json: "X\nA\u0002\n"
+## stderr-json: ""
+## status: 0
+
+#### nor does a trailing \c\\, which controls the backslash instead
+## argv: sed "a\\\nA\\c\\\\"
+## stdin-json: "X\n"
+## stdout-json: "X\nA\u001c\n"
+## stderr-json: ""
+## status: 0
+
+#### under -z an a text still ends with a literal NEWLINE
+## argv: sed -z "a\\\nA"
+## stdin-json: "X\u0000"
+## stdout-json: "X\u0000A\n"
+## stderr-json: ""
+## status: 0
+
+#### where i under -z ends its text with the NUL
+## argv: sed -z "i\\\nA"
+## stdin-json: "X\u0000"
+## stdout-json: "A\u0000X\u0000"
+## stderr-json: ""
+## status: 0
+
+#### and -z leaves the J where it was, the terminator not being the separator
+## argv: sed -z "a\\\nA\\c"
+## stdin-json: "X\u0000"
+## stdout-json: "X\u0000AJ"
 ## stderr-json: ""
 ## status: 0
 
