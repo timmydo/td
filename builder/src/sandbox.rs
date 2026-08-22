@@ -20,9 +20,10 @@
 //!     real store paths while writes land in the scratch directory (the rootless
 //!     rung's mechanics) and the bound inputs stay protected by their host-root
 //!     ownership;
-//!   - build dir: a fresh tmpfs /tmp with /tmp/guix-build-<drvname>-0 (0700,
-//!     <drvname> keeps the .drv suffix), cwd there. Mesboot steps are materialized
-//!     there and consumed before recipe execution;
+//!   - build dir: private disk-backed scratch bind-mounted at `/tmp`, with
+//!     `/tmp/guix-build-<drvname>-0` (0700, <drvname> keeps the .drv suffix) as
+//!     cwd. Mesboot steps are materialized there and consumed before recipe
+//!     execution;
 //!   - env: cleared, then PATH/HOME/NIX_STORE/NIX_BUILD_CORES, the drv's
 //!     env, then NIX_BUILD_TOP/TMPDIR/TEMPDIR/TMP/TEMP/PWD — build.cc's exact
 //!     set and override order (the TMPDIR group wins over drv env). The trusted
@@ -32,14 +33,14 @@
 #![allow(unsafe_code)] // confined raw-syscall / low-level layer (UNSAFE.md)
 
 use std::collections::BTreeSet;
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{Command, ExitCode, ExitStatus};
 
 use crate::drv::Derivation;
 use crate::sys;
@@ -64,6 +65,18 @@ fn trusted_recipe_builder(builder: &str) -> bool {
     builder == format!("{}/bin/td-builder", crate::store::builder_identity_path())
 }
 
+fn forward_trusted_check_policy(
+    command: &mut Command,
+    builder: &str,
+    inherited: Option<&OsStr>,
+) {
+    if trusted_recipe_builder(builder) {
+        if let Some(value) = inherited {
+            command.env(crate::check_memory::JOB_BUDGET_ENV, value);
+        }
+    }
+}
+
 /// Replace the trusted mesboot runner's hashed `TD_STEPS` data with the
 /// sandbox-local file path that `run_mesboot` consumes.
 fn configure_builder_env(
@@ -73,6 +86,15 @@ fn configure_builder_env(
     env: &[(String, String)],
     mesboot_steps_file: &Path,
 ) -> io::Result<Option<String>> {
+    if env
+        .iter()
+        .any(|(key, _)| key == crate::check_memory::JOB_BUDGET_ENV)
+    {
+        return Err(err(format!(
+            "derivation environment may not set reserved policy key {}",
+            crate::check_memory::JOB_BUDGET_ENV
+        )));
+    }
     let mesboot = args.len() == 1
         && args.first().is_some_and(|arg| arg == "mesboot-build")
         && builder.ends_with("/bin/td-builder");
@@ -337,64 +359,349 @@ pub fn store_path_name(path: &str) -> io::Result<&str> {
     store_path_name_in(&store_prefix(), path)
 }
 
-/// Per-build leaf-cgroup names are unique within this process via a counter
-/// alongside the pid (the build daemon realizes drvs serially in one process).
-static CGROUP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Parse `TD_BUILD_MEM_MAX` into a per-build byte cap. Accepts a bare integer
-/// (bytes) or an integer with a `K`/`M`/`G` suffix (1024-based, case-insensitive,
-/// optional space). An absent, empty, zero, or unparseable value yields None —
-/// the cap is **OFF by default**, so the loop can never go spuriously red. A cap
-/// is reproducibility-safe like `nice`: a build that exceeds it FAILS, it never
-/// produces different bytes.
-fn parse_mem_max(raw: Option<String>) -> Option<u64> {
-    let s = raw?;
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    let (num, mult) = match s.chars().last().map(|c| c.to_ascii_uppercase()) {
-        Some('K') => (&s[..s.len() - 1], 1024_u64),
-        Some('M') => (&s[..s.len() - 1], 1024 * 1024),
-        Some('G') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
-        _ => (s, 1),
-    };
-    let bytes = num.trim().parse::<u64>().ok()?.checked_mul(mult)?;
-    (bytes != 0).then_some(bytes)
-}
-
-/// Best-effort true-RSS cap. When the operator delegates a writable cgroup2 dir
-/// via `TD_BUILD_CGROUP`, create a per-build leaf cgroup with `memory.max = cap`
-/// and return it; the build child joins it before unsharing and the parent
-/// removes it afterward. td uses a DELEGATED cgroup the way a kubelet hands a
-/// container its own — it does not try to conjure one inside the read-only,
-/// rootless loop sandbox, where this returns None and the `setrlimit` backstop
-/// alone applies. Any failure (no delegation, RO cgroupfs, EBUSY, missing
-/// controller) warns and degrades to that backstop.
-fn setup_build_cgroup(cap: u64) -> Option<PathBuf> {
-    let base = std::env::var("TD_BUILD_CGROUP").ok().filter(|s| !s.is_empty())?;
-    let base = PathBuf::from(base);
-    if !base.is_dir() {
-        sys::warn(b"td-builder: TD_BUILD_CGROUP is not a directory; memory cap uses the rlimit backstop\n");
-        return None;
-    }
-    // The memory controller must be delegated to children for the leaf's
-    // memory.max to bind; harmless if already enabled (an empty delegated base).
-    let _ = fs::write(base.join("cgroup.subtree_control"), "+memory");
-    let seq = CGROUP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let leaf = base.join(format!("td-build-{}-{}", std::process::id(), seq));
-    if let Err(e) = fs::create_dir(&leaf) {
-        if e.kind() != io::ErrorKind::AlreadyExists {
-            sys::warn(b"td-builder: could not create build cgroup; memory cap uses the rlimit backstop\n");
-            return None;
+fn mountinfo_path(field: &str) -> Option<PathBuf> {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0usize;
+    while at < bytes.len() {
+        if bytes.get(at) == Some(&b'\\') {
+            let digits = bytes.get(at.saturating_add(1)..at.saturating_add(4))?;
+            if digits.len() != 3 || !digits.iter().all(|byte| matches!(byte, b'0'..=b'7')) {
+                return None;
+            }
+            let first = *digits.first()?;
+            let second = *digits.get(1)?;
+            let third = *digits.get(2)?;
+            let value = u16::from(first - b'0') * 64
+                + u16::from(second - b'0') * 8
+                + u16::from(third - b'0');
+            let value = u8::try_from(value).ok()?;
+            if value == 0 {
+                return None;
+            }
+            out.push(value);
+            at = at.saturating_add(4);
+        } else {
+            out.push(*bytes.get(at)?);
+            at = at.saturating_add(1);
         }
     }
-    if fs::write(leaf.join("memory.max"), cap.to_string()).is_err() {
-        sys::warn(b"td-builder: could not set cgroup memory.max; memory cap uses the rlimit backstop\n");
-        let _ = fs::remove_dir(&leaf);
-        return None;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(out)))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MountBacking {
+    fs_type: String,
+    overlay_upper: Option<PathBuf>,
+}
+
+fn mount_backing_from(mountinfo: &str, path: &Path) -> Option<MountBacking> {
+    let mut best: Option<(usize, MountBacking)> = None;
+    for line in mountinfo.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let Some(split) = fields.iter().position(|field| *field == "-") else {
+            continue;
+        };
+        let Some(mount) = fields.get(4).and_then(|field| mountinfo_path(field)) else {
+            continue;
+        };
+        let Some(fs_type) = fields.get(split.saturating_add(1)) else {
+            continue;
+        };
+        let overlay_upper = if *fs_type == "overlay" {
+            fields
+                .get(split.saturating_add(3))
+                .and_then(|options| {
+                    options
+                        .split(',')
+                        .find_map(|option| option.strip_prefix("upperdir="))
+                })
+                .and_then(mountinfo_path)
+        } else {
+            None
+        };
+        if !path.starts_with(&mount) {
+            continue;
+        }
+        let depth = mount.components().count();
+        if best.as_ref().is_none_or(|(old, _)| depth >= *old) {
+            best = Some((
+                depth,
+                MountBacking {
+                    fs_type: (*fs_type).to_string(),
+                    overlay_upper,
+                },
+            ));
+        }
     }
-    Some(leaf)
+    best.map(|(_, backing)| backing)
+}
+
+fn memory_backed_fs(fs_type: &str) -> bool {
+    matches!(
+        fs_type,
+        "tmpfs" | "ramfs" | "hugetlbfs" | "devtmpfs"
+    )
+}
+
+fn require_disk_backed_from(
+    mountinfo: &str,
+    path: &Path,
+    depth: usize,
+    allow_hidden_overlay_upper: bool,
+) -> io::Result<()> {
+    if depth > 8 {
+        return Err(err(format!(
+            "cannot resolve overlay backing filesystem for build scratch {}",
+            path.display()
+        )));
+    }
+    let backing = mount_backing_from(mountinfo, path).ok_or_else(|| {
+        err(format!(
+            "cannot identify the filesystem backing build scratch {}",
+            path.display()
+        ))
+    })?;
+    if memory_backed_fs(&backing.fs_type) {
+        return Err(err(format!(
+            "build scratch {} is on memory-backed {}; choose disk-backed scratch",
+            path.display(),
+            backing.fs_type
+        )));
+    }
+    if backing.fs_type == "overlay" {
+        let upper = backing.overlay_upper.ok_or_else(|| {
+            err(format!(
+                "cannot prove that overlay scratch {} has a disk-backed writable layer",
+                path.display()
+            ))
+        })?;
+        if !upper.is_absolute() || upper == path {
+            return Err(err(format!(
+                "cannot prove that overlay scratch {} has a distinct disk-backed writable layer",
+                path.display()
+            )));
+        }
+        // A detached sandbox and an ordinary rootless container can expose an
+        // overlay bind while hiding the host's upperdir pathname behind their
+        // own root. Reject a visible memory-backed upper, but do not reject an
+        // otherwise usable disk overlay merely because that host path cannot
+        // be resolved in this namespace. This is cooperative OOM avoidance,
+        // not an authenticated storage boundary.
+        if upper.exists() || !allow_hidden_overlay_upper {
+            require_disk_backed_from(
+                mountinfo,
+                &upper,
+                depth.saturating_add(1),
+                allow_hidden_overlay_upper,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn require_disk_backed(path: &Path) -> io::Result<()> {
+    let canonical = fs::canonicalize(path)?;
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    require_disk_backed_from(&mountinfo, &canonical, 0, true)
+}
+
+struct ScratchCleanup {
+    path: PathBuf,
+    _lease: fs::File,
+}
+
+fn make_dir_accessible(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o700 != 0o700 {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700))?;
+    }
+    Ok(())
+}
+
+/// Delete a recipe-controlled directory without recursion and without retaining
+/// one pathname per sibling or depth. Each pass removes files until it finds a
+/// child directory, descends using one mutable PathBuf, then rescans the parent
+/// after the child is gone. That trades some directory scans for a fixed memory
+/// footprint and cannot overflow a daemon worker's call stack.
+fn remove_directory_tree(path: &Path) -> io::Result<()> {
+    let root = path.to_path_buf();
+    let mut current = root.clone();
+    loop {
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if current == root {
+                    return Ok(());
+                }
+                if !current.pop() {
+                    return Err(err("scratch cleanup lost its root".to_string()));
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        // A child swapped from a directory to a symlink or file is removed,
+        // never followed outside the scratch tree.
+        if !metadata.is_dir() {
+            fs::remove_file(&current)?;
+            if current == root {
+                return Ok(());
+            }
+            if !current.pop() {
+                return Err(err("scratch cleanup lost its root".to_string()));
+            }
+            continue;
+        }
+        make_dir_accessible(&current)?;
+
+        let mut descended = false;
+        for entry in fs::read_dir(&current)? {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            let child = entry.path();
+            let child_metadata = match fs::symlink_metadata(&child) {
+                Ok(metadata) => metadata,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            if child_metadata.is_dir() {
+                current = child;
+                descended = true;
+                break;
+            }
+            match fs::remove_file(&child) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                // A concurrent replacement became a directory; rescan it on
+                // the next pass rather than treating the race as admission.
+                Err(e) if e.kind() == io::ErrorKind::IsADirectory => {
+                    current = child;
+                    descended = true;
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if descended {
+            continue;
+        }
+        match fs::remove_dir(&current) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => continue,
+            Err(e) => return Err(e),
+        }
+        if current == root {
+            return Ok(());
+        }
+        if !current.pop() {
+            return Err(err("scratch cleanup lost its root".to_string()));
+        }
+    }
+}
+
+pub(crate) fn remove_scratch_tree(path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if metadata.is_dir() {
+        remove_directory_tree(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+impl Drop for ScratchCleanup {
+    fn drop(&mut self) {
+        let _ = remove_scratch_tree(&self.path);
+    }
+}
+
+/// Reclaim disk-backed build trees whose builder no longer holds the sibling
+/// lease. The walk follows only the daemon scratch layout and never descends
+/// into output `newstore` trees. A missing lease is preserved for compatibility
+/// with an older concurrently running builder; only scratch created by this
+/// version is eligible for automatic crash recovery.
+pub(crate) fn sweep_abandoned_build_temps(root: &Path) -> io::Result<()> {
+    struct Frame {
+        depth: usize,
+        entries: fs::ReadDir,
+    }
+
+    fn reclaim_one(dir: &Path) -> io::Result<()> {
+        let build_tmp = dir.join("build-tmp");
+        if fs::symlink_metadata(&build_tmp)
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false)
+        {
+            let lease_path = dir.join(".build-tmp.lock");
+            if let Ok(lease) = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lease_path)
+            {
+                // Crash recovery is best-effort and must never become global
+                // daemon admission. A pathological tree may remain on disk,
+                // but it cannot poison unrelated future requests.
+                if lease.try_lock().is_ok() {
+                    let _ = remove_scratch_tree(&build_tmp);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    reclaim_one(root)?;
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+    // The daemon layout is at most two levels below `root`. Retain only those
+    // three live iterators, so both memory and file-descriptor use stay constant
+    // with directory width while every entry is eventually visited.
+    let mut stack = vec![Frame { depth: 0, entries }];
+    while let Some(frame) = stack.last_mut() {
+        let Some(entry) = frame.entries.next() else {
+            stack.pop();
+            continue;
+        };
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let name = entry.file_name();
+        if matches!(name.to_str(), Some("newstore" | "buildroot" | "build-tmp")) {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let depth = frame.depth.saturating_add(1);
+        let path = entry.path();
+        reclaim_one(&path)?;
+        if depth < 2 {
+            if let Ok(entries) = fs::read_dir(&path) {
+                stack.push(Frame { depth, entries });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Cap `cmd`'s child — and everything it forks/execs — at `bytes` of data
@@ -425,13 +732,10 @@ pub fn cap_child_data_rlimit(cmd: &mut Command, bytes: u64) {
 /// otherwise leaves its gate reparented to init, where it keeps running with
 /// nobody waiting on it; eight such test binaries once spun for three days.
 ///
-/// This reaches the DIRECT child only: the flag is cleared across fork(2), so a
-/// body's own descendants do not inherit it. While the runner LIVES they are
-/// still covered, by the watchdog's process-GROUP kill (gates.rs). When the
-/// runner is KILLED they are not: the watchdog dies with it, and a cgroup does
-/// not kill its members when the runner exits either. So this narrows the
-/// orphan window to a gate's grandchildren rather than closing it — closing it
-/// needs a PID namespace or a cgroup.kill, neither of which is here.
+/// This reaches the DIRECT child only: the flag is cleared across fork(2).
+/// Check-host and gate commands therefore pair it with `contain_pid_namespace`;
+/// killing namespace PID 1 makes the kernel reap the entire descendant tree.
+/// Other sandbox call sites use their own PID-1 parent-liveness handshake.
 pub fn die_with_parent(cmd: &mut Command) {
     // Captured HERE, in the parent, rather than read once the fork has happened:
     // a getppid taken in the child cannot tell "my parent" from "the reaper that
@@ -453,6 +757,100 @@ pub fn die_with_parent(cmd: &mut Command) {
             }
             Ok(())
         });
+    }
+}
+
+/// Make `cmd` PID 1 of a fresh rootless PID namespace while preserving the
+/// caller-visible child and exit status.
+///
+/// The `Command` child first creates the namespaces, then forks once. Its
+/// child becomes PID 1 and execs the requested program; the outer half only
+/// waits and mirrors the status. Linux tears down every other namespace member
+/// when PID 1 exits, including double-forked descendants that changed process
+/// group or session. This turns a check-host or gate permit into a real process
+/// lifetime boundary without a privileged cgroup.
+pub fn contain_pid_namespace(cmd: &mut Command) -> io::Result<()> {
+    let host_uid = sys::getuid();
+    let host_gid = sys::getgid();
+    let root = CString::new("/").map_err(io::Error::other)?;
+    let proc_path = CString::new("/proc").map_err(io::Error::other)?;
+    let proc_type = CString::new("proc").map_err(io::Error::other)?;
+    unsafe {
+        cmd.pre_exec(move || {
+            sys::unshare(sys::CLONE_NEWUSER | sys::CLONE_NEWNS | sys::CLONE_NEWPID)
+                .map_err(|e| {
+                    sys::warn(b"td-builder check: FAILED creating the PID lifetime namespace\n");
+                    e
+                })?;
+            map_userns_id(host_uid, host_gid, host_uid, host_gid).map_err(|e| {
+                sys::warn(b"td-builder check: FAILED mapping the PID namespace identity\n");
+                e
+            })?;
+            sys::mount(None, &root, None, sys::MS_REC | sys::MS_PRIVATE, None).map_err(|e| {
+                sys::warn(b"td-builder check: FAILED privatizing PID namespace mounts\n");
+                e
+            })?;
+            let (live_r, live_w) = sys::pipe_liveness()?;
+            let pid = sys::fork()?;
+            if pid != 0 {
+                let _ = sys::close(live_r);
+                let status = sys::waitpid(pid)?;
+                let code = if status & 0x7f == 0 {
+                    (status >> 8) & 0xff
+                } else {
+                    128 + (status & 0x7f)
+                };
+                sys::exit_group(code);
+            }
+            sys::set_pdeathsig(sys::SIGKILL)?;
+            pid1_confirm_parent(live_r, live_w)?;
+            sys::mount(
+                Some(&proc_type),
+                &proc_path,
+                Some(&proc_type),
+                0,
+                None,
+            )
+            .map_err(|e| {
+                sys::warn(b"td-builder check: FAILED mounting the PID namespace procfs\n");
+                e
+            })
+        });
+    }
+    Ok(())
+}
+
+/// Executed only by the hidden `check-pidns-run` wrapper (or its unit-test
+/// surrogate). Keeping the namespace setup in a process that has already
+/// exec'd is important: its caller can start RSS/deadline monitoring as soon as
+/// this wrapper exists, while the wrapper waits for namespace PID 1 below.
+pub fn pid_namespace_status(args: &[String]) -> io::Result<ExitStatus> {
+    let program = args
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "PID namespace has no command"))?;
+    let mut command = Command::new(program);
+    command.args(args.get(1..).unwrap_or_default());
+    die_with_parent(&mut command);
+    contain_pid_namespace(&mut command)?;
+    command.status()
+}
+
+pub fn pid_namespace_cli(args: &[String]) -> ExitCode {
+    match pid_namespace_status(args) {
+        Ok(status) => {
+            use std::os::unix::process::ExitStatusExt as _;
+            let code = status.code().unwrap_or_else(|| {
+                status
+                    .signal()
+                    .map(|signal| 128i32.saturating_add(signal))
+                    .unwrap_or(i32::from(u8::MAX))
+            });
+            ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX))
+        }
+        Err(e) => {
+            eprintln!("td-builder: cannot run check PID namespace: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -755,6 +1153,8 @@ pub fn build(
             drv.platform
         )));
     }
+    fs::create_dir_all(scratch)?;
+    require_disk_backed(scratch)?;
 
     // The active store dir (default /td/store; overridden by TD_STORE_DIR). Every
     // closure path the build SEES is under this prefix, the new root mounts its store
@@ -827,6 +1227,26 @@ pub fn build(
     let store_dir_c = cstr(&store_dir);
     let tmp_dir = newroot.join("tmp");
     let tmp_dir_c = cstr(&tmp_dir);
+    let build_tmp = scratch.join("build-tmp");
+    let build_tmp_lease_path = scratch.join(".build-tmp.lock");
+    let build_tmp_lease = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&build_tmp_lease_path)?;
+    build_tmp_lease.lock()?;
+    remove_scratch_tree(&build_tmp)?;
+    fs::create_dir_all(&build_tmp)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&build_tmp, fs::Permissions::from_mode(0o1777))?;
+    }
+    let build_tmp_cleanup = ScratchCleanup {
+        path: build_tmp.clone(),
+        _lease: build_tmp_lease,
+    };
+    let build_tmp_c = cstr(&build_tmp);
     let dev_dir = newroot.join("dev");
     let dev_dir_c = cstr(&dev_dir);
     let proc_dir = newroot.join("proc");
@@ -873,6 +1293,8 @@ pub fn build(
     let mesboot_steps_file =
         PathBuf::from(&build_dir).join(crate::build::MESBOOT_STEPS_FILE);
 
+    let inherited_job_budget = crate::check_memory::request_job_budget()
+        .map(|bytes| std::ffi::OsString::from(bytes.to_string()));
     let mut cmd = Command::new(&drv.builder);
     cmd.args(&drv.args);
     cmd.env_clear();
@@ -881,7 +1303,10 @@ pub fn build(
     cmd.env("PATH", "/path-not-set");
     cmd.env("HOME", "/homeless-shelter");
     cmd.env("NIX_STORE", &store_dir_str);
-    cmd.env("NIX_BUILD_CORES", "1");
+    cmd.env(
+        "NIX_BUILD_CORES",
+        crate::check_memory::build_jobs().to_string(),
+    );
     let mesboot_steps = configure_builder_env(
         &mut cmd,
         &drv.builder,
@@ -889,17 +1314,14 @@ pub fn build(
         &drv.env,
         &mesboot_steps_file,
     )?;
+    forward_trusted_check_policy(
+        &mut cmd,
+        &drv.builder,
+        inherited_job_budget.as_deref(),
+    );
     for k in ["NIX_BUILD_TOP", "TMPDIR", "TEMPDIR", "TMP", "TEMP", "PWD"] {
         cmd.env(k, &build_dir);
     }
-
-    // Per-build resource caps (opt-in via TD_BUILD_MEM_MAX; OFF by default).
-    // The cgroup leaf — when an operator delegates one via TD_BUILD_CGROUP — is
-    // a true RSS cap; the setrlimit(RLIMIT_DATA) backstop applied in pre_exec
-    // works everywhere (rootless, CI). Both are inherited onto the PID-1 builder.
-    let mem_cap = parse_mem_max(std::env::var("TD_BUILD_MEM_MAX").ok());
-    let cgroup_leaf = mem_cap.and_then(setup_build_cgroup);
-    let cgroup_procs = cgroup_leaf.as_ref().map(|d| d.join("cgroup.procs"));
 
     // Captured in the PARENT: a `getppid` taken in the CHILD cannot tell "my
     // parent" from "the reaper that already adopted me", so both reads agree
@@ -918,24 +1340,6 @@ pub fn build(
                 // exit here as "exec succeeded", so the caller would take an
                 // orphan-avoidance bail for a build that ran.
                 return Err(io::Error::from_raw_os_error(ESRCH));
-            }
-            // Per-build memory caps, applied BEFORE the unshare (host cgroupfs is
-            // still writable as the invoking user) and BEFORE the fork (so the
-            // PID-1 builder and its whole tree inherit them). Best-effort: a cap
-            // can only make a build FAIL, so a setup hiccup warns and continues
-            // rather than killing the build — never silently weakens isolation.
-            if let Some(cap) = mem_cap {
-                // True RSS cap: join the delegated leaf cgroup (memory.max set in
-                // the parent). cgroup membership survives the unshare+fork below.
-                if let Some(procs) = &cgroup_procs {
-                    if fs::write(procs, format!("{}\n", std::process::id())).is_err() {
-                        sys::warn(b"td-builder: could not join build cgroup; rlimit backstop only\n");
-                    }
-                }
-                // Portable backstop (rootless, CI): cap the data segment.
-                if sys::set_rlimit(sys::RLIMIT_DATA, cap, cap).is_err() {
-                    sys::warn(b"td-builder: could not set RLIMIT_DATA build memory cap\n");
-                }
             }
             // New USER + PID + mount + net + IPC + UTS namespaces. NEWPID rides in
             // the SAME unshare as NEWUSER so the new PID namespace is owned by the
@@ -1020,8 +1424,15 @@ pub fn build(
                 fs::create_dir_all(&extra_store_dirs[i])?;
                 sys::mount(Some(&newstore_c), dst, None, sys::MS_BIND | sys::MS_REC, None)?;
             }
-            // Writable build tmpfs.
-            sys::mount(Some(&tmpfs_c), &tmp_dir_c, Some(&tmpfs_c), 0, None)?;
+            // Keep large source and object trees on private disk-backed scratch,
+            // rather than charging them as tmpfs memory.
+            sys::mount(
+                Some(&build_tmp_c),
+                &tmp_dir_c,
+                None,
+                sys::MS_BIND | sys::MS_REC,
+                None,
+            )?;
             // /dev rbind'd whole (preserves working device binds; see note above).
             sys::mount(Some(&dev_src_c), &dev_dir_c, None, sys::MS_BIND | sys::MS_REC, None)?;
             // A FRESH procfs reflecting the build's OWN pid namespace (we are PID 1),
@@ -1035,7 +1446,7 @@ pub fn build(
             std::env::set_current_dir("/")?;
             sys::umount2(&oldroot_abs_c, sys::MNT_DETACH)?;
             let _ = fs::remove_dir("/oldroot");
-            // The build dir lives on the fresh /tmp tmpfs.
+            // The build dir lives on the private disk-backed /tmp bind.
             fs::DirBuilder::new().mode(0o700).create(&build_dir_owned)?;
             write_mesboot_steps_file(&mesboot_steps_file, mesboot_steps.as_deref())?;
             std::env::set_current_dir(&build_dir_owned)?;
@@ -1044,11 +1455,7 @@ pub fn build(
     }
 
     let status = cmd.status();
-    // The build tree has exited, so the leaf cgroup is empty — tear it down
-    // (best-effort) whether the build passed or failed, before any early return.
-    if let Some(leaf) = &cgroup_leaf {
-        let _ = fs::remove_dir(leaf);
-    }
+    drop(build_tmp_cleanup);
     let status = status.map_err(|e| err(format!("spawning builder {}: {e}", drv.builder)))?;
     if !status.success() {
         return Err(err(format!(
@@ -1093,9 +1500,8 @@ pub struct Bind {
     /// When `readonly`, tolerate a FAILED read-only remount by DETACHING the bind
     /// (fail closed — no host-owned subtree left writable in the sandbox) instead
     /// of erroring. Set ONLY for defense-in-depth ro binds the kernel may forbid
-    /// remounting in a child user namespace — e.g. `/sys/fs/cgroup` (cgroup2,
-    /// owned by the host userns: a child userns lacks CAP_SYS_ADMIN over it, so
-    /// MS_REMOUNT|MS_RDONLY → EPERM on some kernels, e.g. GitHub's azure runner).
+    /// remounting in a child user namespace because the mount is owned by the
+    /// host user namespace.
     /// NEVER for binds whose read-only is load-bearing (the store): those still
     /// error on a failed remount.
     pub ro_optional: bool,
@@ -1423,24 +1829,15 @@ pub fn host_shell(
                         sys::MS_REMOUNT | sys::MS_BIND | sys::MS_REC | sys::MS_RDONLY,
                         None,
                     );
-                    // A child userns cannot remount-ro a mount owned by the host
-                    // userns (e.g. /sys/fs/cgroup → EPERM on the azure runner). For
-                    // ro_optional binds, that failure is tolerated (fail closed
-                    // instead of failing the whole sandbox) rather than fatal. For
-                    // every other ro bind (the store) the read-only is load-bearing
-                    // — a failed remount is fatal.
+                    // A child userns cannot always remount read-only a mount
+                    // owned by the host userns. For ro_optional binds that
+                    // failure detaches the bind; every load-bearing read-only
+                    // bind (notably the store) remains fatal.
                     if let Err(e) = ro {
                         if spec.ro_optional {
-                            // Can't make it read-only (a child userns cannot
-                            // remount-ro a mount owned by the host userns, e.g.
-                            // cgroup2 on the azure runner). Rather than leave the
-                            // host subtree WRITABLE inside the "hermetic" sandbox,
-                            // DETACH it — fail closed, nothing host-owned exposed.
-                            // The only ro_optional bind is /sys/fs/cgroup (gate-run's
-                            // per-gate memory-limit delegation, issue #328, reads the
-                            // hierarchy structure); where the ro-remount succeeds
-                            // (most local/dev hosts) it stays bound, so the leftover
-                            // empty dir here is harmless.
+                            // Rather than leave the host subtree writable inside
+                            // the hermetic sandbox, detach it. The leftover empty
+                            // mountpoint is harmless.
                             sys::warn(b"td-builder host-sandbox: ro-remount not permitted for an ro_optional bind; detached (fail-closed, no host exposure)\n");
                             let _ = sys::umount2(&spec.target, sys::MNT_DETACH);
                         } else {
@@ -1802,6 +2199,41 @@ mod tests {
             key == std::ffi::OsStr::new("TD_STEPS")
                 && value == Some(std::ffi::OsStr::new(&large))
         }));
+        let mut policy_collision = Command::new(&builder);
+        policy_collision.env_clear();
+        let collision = vec![(
+            crate::check_memory::JOB_BUDGET_ENV.to_string(),
+            u64::MAX.to_string(),
+        )];
+        let error = configure_builder_env(
+            &mut policy_collision,
+            &builder,
+            &["autotools-build".to_string()],
+            &collision,
+            steps_file,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("reserved policy key"), "{error}");
+
+        let inherited = std::ffi::OsStr::new("4294967296");
+        let mut trusted = Command::new(&builder);
+        trusted.env_clear();
+        forward_trusted_check_policy(&mut trusted, &builder, Some(inherited));
+        assert!(trusted.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new(crate::check_memory::JOB_BUDGET_ENV)
+                && value == Some(inherited)
+        }));
+        let mut untrusted = Command::new("/td/store/other/bin/td-builder");
+        untrusted.env_clear();
+        forward_trusted_check_policy(
+            &mut untrusted,
+            "/td/store/other/bin/td-builder",
+            Some(inherited),
+        );
+        assert!(untrusted.get_envs().all(|(key, _)| {
+            key != std::ffi::OsStr::new(crate::check_memory::JOB_BUDGET_ENV)
+        }));
+
         let mut bootstrap_application = Command::new(&builder);
         bootstrap_application.env_clear();
         let error = configure_builder_env(
@@ -2332,21 +2764,136 @@ mod tests {
     }
 
     #[test]
-    fn parse_mem_max_handles_suffixes_and_off_by_default() {
-        // OFF by default — the whole point of the safe default (no spurious loop reds).
-        assert_eq!(parse_mem_max(None), None, "unset -> no cap");
-        assert_eq!(parse_mem_max(Some("".into())), None, "empty -> no cap");
-        assert_eq!(parse_mem_max(Some("   ".into())), None, "blank -> no cap");
-        assert_eq!(parse_mem_max(Some("garbage".into())), None, "garbage -> no cap");
-        assert_eq!(parse_mem_max(Some("0".into())), None, "0 -> no cap (opt out)");
-        // Bare bytes and 1024-based suffixes (case-insensitive, optional space).
-        assert_eq!(parse_mem_max(Some("4096".into())), Some(4096));
-        assert_eq!(parse_mem_max(Some(" 512K ".into())), Some(512 * 1024));
-        assert_eq!(parse_mem_max(Some("2m".into())), Some(2 * 1024 * 1024));
-        assert_eq!(parse_mem_max(Some("8G".into())), Some(8 * 1024 * 1024 * 1024));
-        assert_eq!(parse_mem_max(Some("4 G".into())), Some(4 * 1024 * 1024 * 1024));
-        // Overflow on the multiply degrades to "no cap" rather than a wrap.
-        assert_eq!(parse_mem_max(Some("999999999999G".into())), None);
+    fn mountinfo_selects_the_deepest_backing_mount_and_decodes_paths() {
+        let info = "malformed row that must not hide later mounts\n\
+                    1 0 8:1 / / rw - ext4 /dev/root rw\n\
+                    2 1 0:2 / /work rw - tmpfs tmpfs rw\n\
+                    3 1 8:2 / /work/disk\\040cache rw - xfs /dev/sdb rw\n\
+                    4 1 0:3 / /work rw - overlay overlay rw,lowerdir=/lower,upperdir=/memory/upper,workdir=/memory/work\n\
+                    5 1 0:4 / /memory rw - tmpfs tmpfs rw\n";
+        let overlay = mount_backing_from(info, Path::new("/work/tree")).unwrap();
+        assert_eq!(
+            overlay,
+            MountBacking {
+                fs_type: "overlay".to_string(),
+                overlay_upper: Some(PathBuf::from("/memory/upper")),
+            }
+        );
+        assert_eq!(
+            mount_backing_from(info, Path::new("/work/disk cache/build"))
+                .map(|backing| backing.fs_type),
+            Some("xfs".to_string()),
+        );
+        assert!(require_disk_backed_from(info, Path::new("/work/tree"), 0, false).is_err());
+        assert!(
+            require_disk_backed_from(info, Path::new("/work/disk cache/build"), 0, false).is_ok()
+        );
+        assert!(memory_backed_fs("tmpfs"));
+        assert!(!memory_backed_fs("xfs"));
+    }
+
+    #[test]
+    fn hidden_overlay_upper_is_usable_in_a_detached_sandbox() {
+        let hidden = format!("/td-hidden-overlay-upper-{}", std::process::id());
+        assert!(!Path::new(&hidden).exists());
+        let info = format!(
+            "1 0 0:1 / / rw - tmpfs tmpfs rw\n\
+             2 1 0:2 / /tmp rw - overlay overlay rw,lowerdir=/lower,upperdir={hidden},workdir=/work\n"
+        );
+
+        assert!(require_disk_backed_from(&info, Path::new("/tmp/logs"), 0, true).is_ok());
+        assert!(require_disk_backed_from(&info, Path::new("/tmp/logs"), 0, false).is_err());
+    }
+
+    #[test]
+    fn scratch_cleanup_recovers_read_only_build_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "td-readonly-scratch-{}",
+            std::process::id()
+        ));
+        let nested = root.join("readonly/nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("artifact"), b"bytes").unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(root.join("readonly"), fs::Permissions::from_mode(0o500)).unwrap();
+        remove_scratch_tree(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn build_scratch_sweep_reclaims_only_unleased_trees() {
+        // Nest this test fixture below the production walk's depth bound. A
+        // daemon-request exercised concurrently by another test may sweep its
+        // own broad scratch root; that must not make this lock-lifetime test
+        // race an unrelated sweeper.
+        let fixture_root = std::env::temp_dir()
+            .join(format!("td-build-scratch-sweep-{}", std::process::id()));
+        let fixture = fixture_root.join("fixture/a");
+        let root = fixture.join("root");
+        let _ = fs::remove_dir_all(&fixture_root);
+        let stale = root.join("stale");
+        let active = root.join("active");
+        for dir in [&stale, &active] {
+            fs::create_dir_all(dir.join("build-tmp/objects")).unwrap();
+            fs::write(dir.join("build-tmp/objects/file"), b"large tree").unwrap();
+            fs::File::create(dir.join(".build-tmp.lock")).unwrap();
+        }
+        let active_lease = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(active.join(".build-tmp.lock"))
+            .unwrap();
+        active_lease.lock().unwrap();
+
+        sweep_abandoned_build_temps(&root).unwrap();
+
+        assert!(!stale.join("build-tmp").exists());
+        assert!(active.join("build-tmp").exists());
+        drop(active_lease);
+        sweep_abandoned_build_temps(&root).unwrap();
+        assert!(!active.join("build-tmp").exists());
+        let _ = fs::remove_dir_all(fixture_root);
+    }
+
+    #[test]
+    fn overdeep_scratch_cannot_poison_unrelated_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "td-build-scratch-depth-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let poison = root.join("poison");
+        let mut deep = poison.join("build-tmp");
+        let mut created = Vec::new();
+        for _ in 0..(128 + 2) {
+            deep = deep.join("d");
+            created.push(deep.clone());
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("artifact"), b"bytes").unwrap();
+        fs::File::create(poison.join(".build-tmp.lock")).unwrap();
+        if let Some(blocked) = created.last() {
+            fs::set_permissions(blocked, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let healthy = root.join("healthy");
+        fs::create_dir_all(healthy.join("build-tmp")).unwrap();
+        fs::File::create(healthy.join(".build-tmp.lock")).unwrap();
+        let opaque = root.join("opaque");
+        fs::create_dir_all(opaque.join("nested/build-tmp")).unwrap();
+        fs::set_permissions(&opaque, fs::Permissions::from_mode(0o000)).unwrap();
+
+        sweep_abandoned_build_temps(&root).unwrap();
+
+        assert!(!healthy.join("build-tmp").exists());
+        assert!(!poison.join("build-tmp").exists());
+        for dir in created.iter().rev() {
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        }
+        let _ = fs::set_permissions(&opaque, fs::Permissions::from_mode(0o700));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

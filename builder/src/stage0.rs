@@ -655,6 +655,10 @@ pub(crate) fn bootstrap_stage0(
         .env("PATH", &bootpath)
         .env("HOME", &work)
         .env("CARGO_HOME", work.join("cargo"))
+        .env(
+            "CARGO_BUILD_JOBS",
+            crate::check_memory::build_jobs().to_string(),
+        )
         // CARGO_ENCODED_RUSTFLAGS (highest precedence) — NOT a per-target
         // CARGO_TARGET_<musl>_RUSTFLAGS: a guix cargo is a wrapper that re-injects
         // `RUSTFLAGS="… -C linker=<gcc> -rpath …"` at RUNTIME (after our env_clear),

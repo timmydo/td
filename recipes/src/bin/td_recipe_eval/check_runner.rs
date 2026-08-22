@@ -14,6 +14,13 @@ use td_recipe::{
 };
 
 pub(crate) const TD_STORE_DIR: &str = "/td/store";
+const JOB_BUDGET_ENV: &str = "TD_CHECK_JOB_BUDGET_BYTES";
+
+fn forward_inherited_check_policy(command: &mut Command) {
+    if let Some(value) = env::var_os(JOB_BUDGET_ENV) {
+        command.env(JOB_BUDGET_ENV, value);
+    }
+}
 
 /// Opt-in warm-run profiling (TD_TIMING=1): time a harness phase and print
 /// `[timing] <label> <ms>ms` on drop. Diagnostic only; the timer is a no-op
@@ -2298,6 +2305,7 @@ impl RecipeCheckRunner {
             // rust recipe's committed Cargo.lock and its warm `.td-build-cache/crate-vendor`
             // tree under this root (re #547). Absent ⇒ no committed-lock vendoring.
             .env("TD_AUTO_REPO_ROOT", root_s);
+        forward_inherited_check_policy(&mut cmd);
         // The derived blessed-seed-db lookup keys on the REAL daemon dir; the
         // ladder HOME override above would otherwise re-point it at a dir
         // where nothing was blessed (re #469 round-8).
@@ -2846,6 +2854,7 @@ impl RecipeCheckRunner {
             .env("TD_BUILDER_PATH", &self.builder_path)
             .env("TD_BUILDER_STORE", &self.builder_store)
             .env("TD_BUILDER_DB", &self.builder_db);
+        forward_inherited_check_policy(&mut cmd);
         cmd
     }
 
@@ -2860,6 +2869,7 @@ impl RecipeCheckRunner {
             .env("TD_BUILDER_PATH", &self.builder_path)
             .env("TD_BUILDER_STORE", &self.builder_store)
             .env("TD_BUILDER_DB", &self.builder_db);
+        forward_inherited_check_policy(&mut cmd);
         if let Some(daemon_dir) = &self.daemon_dir {
             cmd.env("TD_DAEMON_DIR", daemon_dir);
         }

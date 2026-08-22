@@ -500,11 +500,9 @@ pub(crate) fn run_cmd_phase(
 /// child's recorded exit status decides pass/fail once it has exited.
 ///
 /// Process-group note: the new group makes the trip kill atomic (configure's
-/// transient children included) and is invisible to the post-#328 cgroup
-/// memory enforcement (descendants inherit the gate cgroup regardless of
-/// pgroup). The gate runner's FALLBACK pgroup-RSS sampler, used only where no
-/// delegated cgroup exists, does lose sight of phase children for a build run
-/// in-gate — the per-process RLIMIT_DATA cap still binds each of them.
+/// transient children included). The gate runner's aggregate RSS sampler walks
+/// descendants across this group boundary; the per-process RLIMIT_DATA cap remains a
+/// local backstop for each compiler.
 fn run_cmd(
     prog: &str,
     args: &[&str],
@@ -1544,6 +1542,10 @@ pub fn run_rust() -> Result<(), String> {
         ("CARGO_HOME".into(), cargo_home.clone()),
         ("SOURCE_DATE_EPOCH".into(), "1".into()),
         ("RUSTFLAGS".into(), rustflags),
+        (
+            "CARGO_BUILD_JOBS".into(),
+            crate::check_memory::build_jobs().to_string(),
+        ),
     ];
     if let Some(gpp) = gpp {
         envs.push(("CXX".into(), gpp));
@@ -3360,10 +3362,7 @@ pub fn run_mesboot() -> Result<(), String> {
     let ctx = StepCtx {
         src: format!("{root}/src"),
         tools: format!("{root}/tools"),
-        jobs: std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .to_string(),
+        jobs: crate::check_memory::build_jobs().to_string(),
         out: out.clone(),
         root,
         inputs,

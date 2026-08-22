@@ -3,8 +3,8 @@
 //!
 //! A gate whose `GateDef.script` is EMPTY is "native": the gate runner
 //! (`gates.rs::run_gate`) execs `<current_exe> gate-body <name>` in the exact
-//! same memory-limited wrapper (the pre_exec setrlimit(RLIMIT_DATA), the
-//! per-gate cgroup, its own process group, TD_GATE_SPECS env) it uses for
+//! same memory-limited wrapper (the pre_exec setrlimit(RLIMIT_DATA), its own
+//! process group, and TD_GATE_SPECS env) it uses for
 //! shell gates. `current_exe` is the stage0 td-builder in the loop (the
 //! prelude execs `<stage0> … gate-run`), so a native body gets `tb` = its own
 //! binary for free — no `load_stage0` shell dance for the td-builder under test.
@@ -54,14 +54,8 @@ const NATIVE: &[&str] = &[
 
 use crate::check_loop::UNPROVISIONED_TAG;
 
-/// `td-builder gate-body <name>` — run one native gate body. Self-moves into
-/// the per-gate cgroup first (the bash bodies' `echo $$ > $TD_GATE_CG` line),
-/// then dispatches. Prints the gate's PASS/FAIL narration itself.
+/// `td-builder gate-body <name>` — run one native gate body.
 pub fn cli(name: &str) -> ExitCode {
-    if let Err(e) = enter_cgroup_if_requested() {
-        eprintln!("gate-run: cannot enter the gate cgroup: {e}");
-        return ExitCode::from(97);
-    }
     let root = match std::env::current_dir() {
         Ok(r) => r,
         Err(e) => {
@@ -103,17 +97,6 @@ pub fn cli(name: &str) -> ExitCode {
             }
         }
     }
-}
-
-/// The self-move into the gate cgroup, mirroring the bash prelude the runner
-/// prepends. No-op when TD_GATE_CG is unset (watchdog/unpooled mode).
-fn enter_cgroup_if_requested() -> Result<(), String> {
-    let Some(procs) = std::env::var_os("TD_GATE_CG") else {
-        return Ok(());
-    };
-    let pid = std::process::id();
-    std::fs::write(&procs, format!("{pid}\n"))
-        .map_err(|e| format!("write {}: {e}", Path::new(&procs).display()))
 }
 
 // --- shared helpers ---------------------------------------------------------
@@ -1863,10 +1846,11 @@ enum CheckOutcome {
     HostGap,
 }
 
-/// One finished check: its verdict plus everything it wrote, held so the whole
-/// block can be printed at once rather than interleaved with its peers'.
+/// One finished check: its verdict plus a bounded output tail, held so the
+/// whole block can be printed at once rather than interleaved with its peers'.
 ///
-/// Both streams are CAPTURED now, where stderr was teed and stdout inherited.
+/// Bounded tails from both streams are captured, where stderr was teed and
+/// stdout inherited.
 /// That tee existed so a single check's progress kept streaming; with checks
 /// running concurrently, streaming is what makes the log unreadable — four
 /// builds' lines arrive interleaved with nothing saying which is which. What
@@ -1876,6 +1860,59 @@ enum CheckOutcome {
 struct FinishedCheck {
     outcome: CheckOutcome,
     output: Vec<u8>,
+    output_truncated: bool,
+}
+
+const RECIPE_CHECK_OUTPUT_BYTES: usize = 1024 * 1024;
+
+struct CapturedCheckOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+    saw_sentinel: bool,
+}
+
+fn capture_check_output(
+    mut reader: impl std::io::Read,
+    sentinel: Option<&[u8]>,
+    limit: usize,
+) -> CapturedCheckOutput {
+    let mut tail = std::collections::VecDeque::with_capacity(limit);
+    let mut chunk = [0u8; 8192];
+    let mut scan_tail = Vec::new();
+    let mut truncated = false;
+    let mut saw_sentinel = false;
+    loop {
+        let count = match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => count,
+        };
+        let bytes = chunk.get(..count).unwrap_or(&[]);
+        if let Some(needle) = sentinel.filter(|needle| !needle.is_empty()) {
+            let mut scan = Vec::with_capacity(scan_tail.len().saturating_add(bytes.len()));
+            scan.extend_from_slice(&scan_tail);
+            scan.extend_from_slice(bytes);
+            if scan.windows(needle.len()).any(|window| window == needle) {
+                saw_sentinel = true;
+            }
+            let keep = needle.len().saturating_sub(1).min(scan.len());
+            scan_tail.clear();
+            scan_tail.extend_from_slice(scan.get(scan.len().saturating_sub(keep)..).unwrap_or(&[]));
+        }
+        let overflow = tail.len().saturating_add(bytes.len()).saturating_sub(limit);
+        if overflow > 0 {
+            truncated = true;
+            for _ in 0..overflow.min(tail.len()) {
+                let _ = tail.pop_front();
+            }
+        }
+        let keep_from = bytes.len().saturating_sub(limit);
+        tail.extend(bytes.get(keep_from..).unwrap_or(&[]));
+    }
+    CapturedCheckOutput {
+        bytes: tail.into_iter().collect(),
+        truncated,
+        saw_sentinel,
+    }
 }
 
 /// Print one check's block: banner, its captured output verbatim, verdict. The
@@ -1888,6 +1925,11 @@ fn report_finished_check(spec: &str, index: usize, done: Result<&FinishedCheck, 
     let _ = std::io::stdout().flush();
     match done {
         Ok(done) => {
+            if done.output_truncated {
+                let _ = std::io::stderr().write_all(
+                    b"[td-builder: earlier recipe-check output truncated at the memory-safe tail limit]\n",
+                );
+            }
             let _ = std::io::stderr().write_all(&done.output);
             let _ = std::io::stderr().flush();
             match done.outcome {
@@ -1910,93 +1952,24 @@ fn report_finished_check(spec: &str, index: usize, done: Result<&FinishedCheck, 
     let _ = std::io::stdout().flush();
 }
 
-/// How many recipe checks run at once. `TD_CHECK_RECIPE_JOBS` overrides; the
-/// default is deliberately MODEST rather than `nproc`.
-///
-/// The `TD_CHECK_` prefix is load-bearing, not cosmetic. `td-builder check` runs
-/// the gates inside `host-sandbox`, which `env_clear`s and re-adds by PREFIX —
-/// `TD_CHECK_`/`TD_SUBST_`/`TD_DAEMON_` (main.rs) — so a knob named anything else
-/// is dropped at that boundary and this gate silently runs at its default however
-/// it was invoked. Named `TD_RECIPE_CHECK_JOBS` it did exactly that, and it is a
-/// nasty shape of bug: it works from a bare `gate-run`, which does not cross the
-/// sandbox, and does nothing under `td-builder check`.
-///
-/// Each check is a full recipe build, so width multiplies peak memory, and the
-/// gate's own critical path is one long check (the Rust toolchain) that no width
-/// shortens — past about four, wall-clock is bounded by that check rather than by
-/// the queue, and the extra concurrency buys memory pressure instead of time. The
-/// machine-wide slot pool's admission is the backstop under that, not this number.
-/// Never more than the work itself, so a two-check run does not claim four.
+/// Each check is a full recipe build. Allocate a conservative 4 GiB share to
+/// each worker from the host-issued grant held by the enclosing gate.
 fn recipe_check_width(work: usize) -> usize {
-    recipe_check_width_from(
-        std::env::var("TD_CHECK_RECIPE_JOBS").ok(),
-        std::env::var("TD_CHECK_GATE_TREE_MEM_MIB").ok(),
-        work,
-    )
+    recipe_check_width_for_budget(crate::check_memory::request_job_budget(), work)
 }
 
 /// Roughly what one recipe check's process tree may peak at. Only used to derive
 /// a width from the gate's memory budget — deliberately generous, since being
 /// wrong low costs concurrency and being wrong high costs the whole gate.
-const RECIPE_CHECK_PEAK_MIB: u64 = 4096;
+const RECIPE_CHECK_PEAK_BYTES: u64 = 4 * crate::check_memory::GIB;
 
-/// gate-run's own default for `TD_CHECK_GATE_TREE_MEM_MIB` (gates.rs). Mirrored so
-/// the width cap below applies to the DEFAULT configuration and not only when an
-/// operator has set the variable; a drift between the two costs concurrency or
-/// gets the group killed, so they are pinned together by a test.
-const GATE_TREE_MEM_MIB_DEFAULT: u64 = 16384;
-
-/// The width policy itself, taking the raw settings rather than reading them.
-///
-/// Split out because the env-reading form cannot be unit-tested: `TD_CHECK_*`
-/// reaches EVERY gate, `cargo-test` included, so a test that asserted the default
-/// would fail for anyone who set the knob — the gate suite breaking because of
-/// how the suite was invoked.
-///
-/// The memory budget is an input because these checks all run in the GATE's
-/// process group, against one `TD_CHECK_GATE_TREE_MEM_MIB` (16 GiB by default)
-/// that does not scale with width: four concurrent builds summing past it get the
-/// whole group SIGKILLed, or — under a delegated cgroup — one check OOM-killed,
-/// which surfaces as a red recipe check that is really an out-of-memory. Width is
-/// therefore capped by what the budget can hold, which is also where the default
-/// 4 comes from rather than being a taste: 16 GiB over a generous 4 GiB a check.
-/// A budget of 0 disables the guard, so it caps nothing here either.
-fn recipe_check_width_from(raw: Option<String>, mem_budget_mib: Option<String>, work: usize) -> usize {
-    let requested = match raw.as_deref().map(str::trim) {
-        None | Some("") => 4,
-        Some(v) => match v.parse::<usize>() {
-            Ok(n) if n >= 1 => n,
-            // Loud, not silent: every other gate-run knob warns rather than
-            // defaulting quietly, and this whole change came out of a knob that
-            // did nothing without saying so.
-            _ => {
-                eprintln!(
-                    "recipe-checks: TD_CHECK_RECIPE_JOBS={v:?} is not a positive integer — \
-                     using the default width 4"
-                );
-                4
-            }
-        },
-    };
-    // An ABSENT budget is gate-run's own default, not "unbounded": the guard is on
-    // whether or not anyone set the variable, so assuming no cap here would leave
-    // the default configuration — the one nearly every run uses — the only one
-    // this cap does not apply to.
-    let budget = match mem_budget_mib.as_deref().map(str::trim) {
-        None | Some("") => Some(GATE_TREE_MEM_MIB_DEFAULT),
-        Some(v) => match v.parse::<u64>() {
-            Ok(0) => None,               // explicitly disabled, as gate-run reads it
-            Ok(mib) => Some(mib),
-            Err(_) => Some(GATE_TREE_MEM_MIB_DEFAULT),
-        },
-    };
-    let by_memory = match budget {
-        None => usize::MAX,
-        Some(mib) => usize::try_from(mib / RECIPE_CHECK_PEAK_MIB)
-            .unwrap_or(usize::MAX)
-            .max(1),
-    };
-    requested.min(by_memory).min(work.max(1))
+fn recipe_check_width_for_budget(budget: Option<u64>, work: usize) -> usize {
+    let width = budget
+        .map(|bytes| bytes / RECIPE_CHECK_PEAK_BYTES)
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(1)
+        .max(1);
+    width.min(work.max(1))
 }
 
 /// Run the work list `width`-at-a-time, returning one result per item IN ORDER.
@@ -2017,38 +1990,26 @@ fn run_recipe_checks_concurrently(
     // Serializes the REPORTING, not the work: a block is printed whole while this
     // is held, so four builds' output cannot interleave line by line.
     let pen = std::sync::Mutex::new(());
+    let worker_budget = crate::check_memory::request_job_budget()
+        .unwrap_or(RECIPE_CHECK_PEAK_BYTES)
+        / u64::try_from(width).unwrap_or(1).max(1);
 
     std::thread::scope(|scope| {
-        for worker in 0..width {
+        for _worker in 0..width {
             let (pen, next, slots) = (&pen, &next, &slots);
             scope.spawn(move || loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some((spec, index)) = work.get(i) else {
                     return;
                 };
-                // A slot for each concurrent check, so inner width contends with
-                // every other gate on the box under the same memory admission —
-                // EXCEPT the first worker, which runs under the slot the gate
-                // itself already holds.
-                //
-                // That exception is what keeps a saturated pool from wedging. A
-                // gate blocks in this scope until its workers finish, so if every
-                // slot were held by such a gate and every worker needed a NEW
-                // one, nothing could release and none could finish. Worker 0
-                // never waits, so a gate keeps making progress WHILE WORKER 0
-                // STILL HAS WORK — which is the guarantee, and it is weaker than
-                // "no deadlock": once the cursor is exhausted worker 0 returns,
-                // and a pool saturated by enough such gates could still stall the
-                // stragglers. It also means width 1 takes no inner slot at all,
-                // so the sequential baseline is byte-identical to the behaviour
-                // before this commit. Nothing is admitted that was not admitted
-                // then, when all the inner builds ran under that one slot anyway.
-                let run = || run_recipe_check(eval, spec, *index, eval_s, stage0_base);
-                let done = if worker == 0 {
-                    run()
-                } else {
-                    crate::gates::with_gate_slot(run)
-                };
+                let done = run_recipe_check(
+                    eval,
+                    spec,
+                    *index,
+                    eval_s,
+                    stage0_base,
+                    worker_budget,
+                );
                 // Printed HERE, as each check lands, rather than after the whole
                 // set: a gate that shows nothing for ten minutes is one nobody can
                 // tell from a hung one, and the run this replaced streamed. The
@@ -2120,8 +2081,9 @@ fn run_recipe_check(
     index: usize,
     eval_s: &str,
     stage0_base: &str,
+    job_budget_bytes: u64,
 ) -> Result<FinishedCheck, String> {
-    use std::io::{BufRead, BufReader};
+    use std::io::BufReader;
     let index_s = index.to_string();
     let mut command = Command::new(eval);
     command
@@ -2132,15 +2094,22 @@ fn run_recipe_check(
         .env("TD_RECIPE_CHECK_SPEC", spec)
         .env("TD_RECIPE_CHECK_INDEX", &index_s)
         .env("TD_STAGE0_BASE", stage0_base)
+        .env(
+            crate::check_memory::JOB_BUDGET_ENV,
+            job_budget_bytes.to_string(),
+        )
+        .env(
+            "CARGO_BUILD_JOBS",
+            crate::check_memory::jobs_for_budget(job_budget_bytes, crate::gates::nproc())
+                .to_string(),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = crate::spawn::past_a_busy_program(|| command.spawn())
         .map_err(|e| format!("FAIL: cannot spawn td-recipe-eval check-run {spec}: {e}"))?;
-    let mut saw_sentinel = false;
-    // CAPTURED, not forwarded: checks run concurrently, so writing straight to the
-    // shared streams would interleave four builds' output line by line and leave no
-    // block attributable to the check that produced it. The reporting loop prints
-    // this verbatim under the check's own banner.
+    // CAPTURED as bounded tails, not forwarded: checks run concurrently, so
+    // writing straight to the shared streams would interleave builds' output
+    // line by line and leave no block attributable to its check.
     //
     // BOTH streams. A check prints its `STEP`/`PASS` progress on stdout, which was
     // inherited here — so it went straight to the gate's stdout, past the print
@@ -2158,44 +2127,31 @@ fn run_recipe_check(
         std::thread::Builder::new()
             .name("recipe-check-stdout".to_string())
             .spawn(move || {
-                let mut buf = Vec::new();
-                let _ = std::io::Read::read_to_end(&mut BufReader::new(out), &mut buf);
-                buf
+                capture_check_output(out, None, RECIPE_CHECK_OUTPUT_BYTES)
             })
             .ok()
     });
-    let mut output = Vec::new();
-    if let Some(err) = child.stderr.take() {
-        // BYTES, not lines: `BufRead::lines` errors on invalid UTF-8, and a
-        // compiler that emits one stray byte would then fail a check that was
-        // passing. Keeping raw also preserves the child's output verbatim.
-        let mut reader = BufReader::new(err);
-        let mut buf = Vec::new();
-        let sentinel = crate::check_loop::UNPROVISIONED_SENTINEL.as_bytes();
-        loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf) {
-                Ok(0) => break,
-                Ok(_) => {}
-                // A broken pipe mid-check must not fail a check that is
-                // otherwise fine; the exit status below is the verdict.
-                Err(_) => break,
-            }
-            if buf.windows(sentinel.len()).any(|w| w == sentinel) {
-                saw_sentinel = true;
-            }
-            output.extend_from_slice(&buf);
-        }
-    }
+    let mut stderr = child.stderr.take().map_or(
+        CapturedCheckOutput {
+            bytes: Vec::new(),
+            truncated: false,
+            saw_sentinel: false,
+        },
+        |err| {
+            capture_check_output(
+                BufReader::new(err),
+                Some(crate::check_loop::UNPROVISIONED_SENTINEL.as_bytes()),
+                RECIPE_CHECK_OUTPUT_BYTES,
+            )
+        },
+    );
     // Joined BEFORE the wait, so the child is never reaped with its stdout pipe
-    // still filling. A reader thread that panicked loses that check's stdout and
-    // nothing else — the verdict is the exit status below. The two streams are
-    // therefore concatenated rather than interleaved in time order: within one
-    // check the `STEP`/`PASS` progress lines arrive as a block after the build's
-    // stderr, where they used to arrive live among it.
+    // still filling. The two bounded tails are concatenated rather than
+    // interleaved in time order.
     if let Some(handle) = stdout_reader {
-        if let Ok(mut out) = handle.join() {
-            output.append(&mut out);
+        if let Ok(mut stdout) = handle.join() {
+            stderr.bytes.append(&mut stdout.bytes);
+            stderr.truncated |= stdout.truncated;
         }
     }
     let status = child
@@ -2203,12 +2159,16 @@ fn run_recipe_check(
         .map_err(|e| format!("FAIL: wait check-run {spec}: {e}"))?;
     let outcome = if status.success() {
         CheckOutcome::Passed
-    } else if td_engine::exit::host_gap_from_parts(status.code(), saw_sentinel) {
+    } else if td_engine::exit::host_gap_from_parts(status.code(), stderr.saw_sentinel) {
         CheckOutcome::HostGap
     } else {
         CheckOutcome::Failed
     };
-    Ok(FinishedCheck { outcome, output })
+    Ok(FinishedCheck {
+        outcome,
+        output: stderr.bytes,
+        output_truncated: stderr.truncated,
+    })
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -3802,70 +3762,36 @@ mod tests {
         assert_eq!(cook_cmdline(Vec::new()), None);
     }
 
-    // Width never exceeds the work: a two-check run must not claim four slots from
-    // the machine-wide pool and make three other agents' gates wait on grants it
-    // has no use for. And it is never zero, which would run nothing at all and
-    // report a vacuous green.
-    //
-    // Driven through the pure form, never the env-reading one: this gate's own
-    // knob is forwarded to every gate including `cargo-test`, so a test that read
-    // the ambient value would fail whenever someone set it.
     #[test]
     fn recipe_check_width_is_bounded_by_the_work_and_never_zero() {
-        // Memory guard explicitly OFF ("0"): this test is about the knob and the
-        // work list, and the budget's own cap has a test of its own.
-        let w = |raw: Option<&str>, work: usize| {
-            recipe_check_width_from(raw.map(str::to_string), Some("0".to_string()), work)
-        };
-        // Default width, clamped down by a short work list.
-        assert_eq!(w(None, 1), 1);
-        assert_eq!(w(None, 2), 2);
-        // ...and capped at the default once the work exceeds it.
-        assert_eq!(w(None, 26), 4);
-        assert_eq!(w(None, 1000), 4);
-        // An empty list still yields a runnable width rather than a pool of none.
-        assert_eq!(w(None, 0), 1);
-        // The knob is honoured, including the sequential case the measurements use.
-        assert_eq!(w(Some("1"), 26), 1);
-        assert_eq!(w(Some("8"), 26), 8);
-        assert_eq!(w(Some(" 3 "), 26), 3);
-        // Garbage and zero fall back to the default rather than running nothing.
-        assert_eq!(w(Some("0"), 26), 4);
-        assert_eq!(w(Some("weasel"), 26), 4);
-        assert_eq!(w(Some(""), 26), 4);
+        assert_eq!(recipe_check_width_for_budget(Some(16 * crate::check_memory::GIB), 1), 1);
+        assert_eq!(recipe_check_width_for_budget(Some(16 * crate::check_memory::GIB), 2), 2);
+        assert_eq!(recipe_check_width_for_budget(Some(16 * crate::check_memory::GIB), 26), 4);
+        assert_eq!(recipe_check_width_for_budget(None, 26), 1);
+        assert_eq!(recipe_check_width_for_budget(Some(1), 0), 1);
     }
 
-    // Width is also capped by the gate's PROCESS-GROUP memory budget, which does
-    // not scale with it: these checks share one `TD_CHECK_GATE_TREE_MEM_MIB`, so
-    // four builds summing past it get the whole group killed, or one OOM-killed
-    // and reported as a red check. The default 4 IS that arithmetic (16 GiB over
-    // 4 GiB a check) rather than a taste.
     #[test]
     fn recipe_check_width_is_capped_by_the_gates_memory_budget() {
-        let w = |raw: Option<&str>, mem: Option<&str>, work: usize| {
-            recipe_check_width_from(raw.map(str::to_string), mem.map(str::to_string), work)
-        };
-        // The default budget yields the default width.
-        assert_eq!(w(None, Some("16384"), 26), 4);
-        // A smaller budget lowers it, even when more is asked for.
-        assert_eq!(w(Some("8"), Some("8192"), 26), 2);
-        assert_eq!(w(Some("8"), Some("4096"), 26), 1);
-        // Never to zero: a budget under one check's peak still runs them, one at
-        // a time, because refusing to run the gate would be worse than the risk.
-        assert_eq!(w(Some("8"), Some("512"), 26), 1);
-        // 0 disables the guard, so it caps nothing here either.
-        assert_eq!(w(Some("8"), Some("0"), 26), 8);
-        // ABSENT means gate-run's default, not "unbounded" — otherwise the cap
-        // would miss the configuration nearly every run uses.
-        assert_eq!(w(Some("8"), None, 26), 4);
-        assert_eq!(w(Some("8"), Some("weasel"), 26), 4);
-        // And that mirrored default must not drift from the one gate-run reads.
-        assert_eq!(GATE_TREE_MEM_MIB_DEFAULT, 16384);
-        assert_eq!(
-            w(None, None, 26),
-            w(None, Some(&GATE_TREE_MEM_MIB_DEFAULT.to_string()), 26),
-            "an absent budget must behave exactly as the default spelled out"
+        assert_eq!(recipe_check_width_for_budget(Some(8 * crate::check_memory::GIB), 26), 2);
+        assert_eq!(recipe_check_width_for_budget(Some(4 * crate::check_memory::GIB), 26), 1);
+        assert_eq!(recipe_check_width_for_budget(Some(512 * 1024 * 1024), 26), 1);
+    }
+
+    #[test]
+    fn recipe_check_output_keeps_a_bounded_tail_and_finds_split_sentinels() {
+        let mut input = vec![b'x'; 8190];
+        input.extend_from_slice(crate::check_loop::UNPROVISIONED_SENTINEL.as_bytes());
+        input.extend_from_slice(&vec![b'y'; 64]);
+        let captured = capture_check_output(
+            input.as_slice(),
+            Some(crate::check_loop::UNPROVISIONED_SENTINEL.as_bytes()),
+            128,
         );
+        assert!(captured.truncated);
+        assert!(captured.saw_sentinel);
+        assert_eq!(captured.bytes.len(), 128);
+        assert!(captured.bytes.ends_with(&vec![b'y'; 64]));
     }
 
     // The pool's contract, which the verdict rests on: every work item yields
@@ -3998,7 +3924,11 @@ mod tests {
             std::fs::set_permissions(&p, perm).unwrap();
             p
         };
-        let run = |p: &Path| run_recipe_check(p, "spec", 1, "e", "s").unwrap().outcome;
+        let run = |p: &Path| {
+            run_recipe_check(p, "spec", 1, "e", "s", RECIPE_CHECK_PEAK_BYTES)
+                .unwrap()
+                .outcome
+        };
 
         assert!(matches!(run(&write("ok", "exit 0")), CheckOutcome::Passed));
         assert!(matches!(

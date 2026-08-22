@@ -9,15 +9,10 @@
 //! make's actual value (file-dependency tracking) was never used — and make could
 //! not give the loop the two scheduling properties it wants:
 //!
-//!   • MACHINE-WIDE concurrency: N agents' concurrent checks share ONE slot pool
-//!     (exclusively-flocked slot files, default `~/.td/build-daemon/slots` — a
-//!     path host-sandbox already binds into every check sandbox). flock dies with
-//!     the holder, so a SIGKILLed gate can never leak a slot. Every run can
-//!     therefore use `-j$(nproc)` without N runs multiplying to N×nproc: the pool
-//!     (TD_CHECK_SLOTS, default 8×nproc — a runaway BRAKE, not a schedule; memory admission +
-//!     the per-gate rlimit backstop are the safety limits, #319) caps the box, `-j` only the local
-//!     width. This replaces the retired AGENTS.md "two checks, -j2, stagger by
-//!     hand" guidance — scheduling is the runner's job now, not the agents'.
+//!   • PER-USER concurrency: concurrent checks share one lazy rootless host and
+//!     its memory-token pool. Token flocks die with their holder, so a killed
+//!     gate cannot leak capacity. Local `-j` may lower, but never raise, the
+//!     memory-derived width.
 //!   • DATA-DRIVEN order: ready heavy gates start longest-first from the previous
 //!     run's wall-clock table (.td-build-cache/gate-timing/latest.txt), so LPT
 //!     packing no longer lives in hand-renumbered <NNN> filename prefixes (the
@@ -613,139 +608,32 @@ fn gate_timeout_budget(
 }
 
 // ---------------------------------------------------------------------------
-// The machine-wide slot pool.
+// The per-user memory-token pool.
 
-/// The cross-agent concurrency cap: N slot files, each held by an exclusive
-/// flock for the duration of one running gate. Every concurrent `gate-run` (any
-/// worktree, any agent) contends on the same files, so the box-wide running-gate
-/// count never exceeds the pool size no matter how many checks run at once.
-struct SlotPool {
-    dir: Option<PathBuf>,
-    n: usize,
-    /// Memory-admission reserve (GiB): a free slot is only taken while
-    /// MemAvailable stays above this, EXCEPT when no other slot is held (the
-    /// daemon's `admit` no-deadlock rule, mirrored — if nothing else runs, the
-    /// pressure isn't ours and blocking the whole loop forever is worse; the
-    /// per-gate rlimit backstop contains the runaway). `<= 0` disables.
-    min_free_gib: f64,
-    /// Memory-PRESSURE admission ceiling (PSI `some avg10`, %): unlike
-    /// MemAvailable — which LAGS allocation — pressure leads OOM and catches
-    /// reclaim-thrash, so it is the primary "go up until a memory limit"
-    /// signal (human direction re #319). `<= 0` disables.
-    psi_limit: f64,
-    /// Grant pacing (ms): at most one slot grant per interval box-wide, so a
-    /// herd of ready gates cannot all pass the memory checks in the window
-    /// BEFORE any of them has allocated (the lag the pace exists to damp).
-    pace_ms: u64,
-}
-
-/// PSI memory `some avg10` from /proc/pressure/memory (None: no PSI).
-fn mem_psi_some_avg10() -> Option<f64> {
-    parse_psi_some_avg10(&std::fs::read_to_string("/proc/pressure/memory").ok()?)
-}
-
-fn parse_psi_some_avg10(text: &str) -> Option<f64> {
-    let line = text.lines().find(|l| l.starts_with("some "))?;
-    let field = line.split_whitespace().find_map(|w| w.strip_prefix("avg10="))?;
-    field.parse().ok()
-}
+/// Every hosted check, gate, and persistent-daemon build contends on the same
+/// rootless token files created by the user's lazy check host.
+struct SlotPool;
 
 enum Grant {
-    /// No pool configured — the local `-j` width is the only cap.
-    NoPool,
-    /// A held slot; dropping the file releases the flock.
-    Held(std::fs::File),
+    /// A held memory grant; dropping it releases every token flock.
+    Held(crate::check_memory::MemoryPermit),
+    /// Direct `gate-run` use outside `td-builder check`: serialized and small.
+    Standalone,
     /// The run failed while waiting — do not start the gate.
     Aborted,
 }
 
 impl SlotPool {
-    /// The pace gate: one grant per pace_ms box-wide. Serialized by a flock'd
-    /// pace file whose contents are the last grant's ns timestamp; a busy lock
-    /// means another runner is granting RIGHT NOW — defer (that IS the pace).
-    fn pace_grant(&self, dir: &Path) -> bool {
-        if self.pace_ms == 0 {
-            return true;
-        }
-        let p = dir.join("grant.pace");
-        let Ok(f) = std::fs::OpenOptions::new().create(true).read(true).write(true).open(&p)
-        else {
-            return true; // pacing is damping, never a correctness gate
-        };
-        use std::os::fd::AsRawFd;
-        if !matches!(crate::sys::flock_try_exclusive(f.as_raw_fd()), Ok(true)) {
-            return false;
-        }
-        let last: u128 = std::fs::read_to_string(&p)
-            .ok()
-            .and_then(|t| t.trim().parse().ok())
-            .unwrap_or(0);
-        let now = now_ns();
-        if now.saturating_sub(last) < u128::from(self.pace_ms) * 1_000_000 {
-            return false;
-        }
-        let _ = std::fs::write(&p, now.to_string());
-        true
-    }
-
     fn acquire(&self, aborted: &dyn Fn() -> bool) -> Grant {
-        let Some(dir) = &self.dir else { return Grant::NoPool };
-        // Loop-invariant: compute the slot paths once, not per 200ms poll.
-        let paths: Vec<PathBuf> = (0..self.n).map(|i| dir.join(format!("slot-{i}"))).collect();
-        loop {
-            // One sweep: take the first free slot, and COUNT the held ones —
-            // the memory admission below needs to know whether anything else
-            // is running box-wide.
-            let mut opened_any = false;
-            let mut held = 0usize;
-            let mut got: Option<std::fs::File> = None;
-            for p in &paths {
-                let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(p)
-                else {
-                    continue;
-                };
-                opened_any = true;
-                use std::os::fd::AsRawFd;
-                match crate::sys::flock_try_exclusive(f.as_raw_fd()) {
-                    Ok(true) if got.is_none() => got = Some(f),
-                    Ok(true) => {} // free; dropping f releases the probe flock
-                    Ok(false) => held += 1,
-                    Err(_) => {}
-                }
+        if std::env::var_os(crate::check_memory::HOST_CHILD_ENV).is_none() {
+            return Grant::Standalone;
+        }
+        match crate::check_memory::gate_permit(aborted) {
+            Ok(permit) => Grant::Held(permit),
+            Err(e) => {
+                eprintln!("gate-run: cannot acquire hosted memory grant: {e}");
+                Grant::Aborted
             }
-            if !opened_any {
-                // Every slot file is unopenable (permissions, ENOSPC, read-only
-                // mount): spinning forever would hang the whole check silently.
-                // Degrade to unpooled — same posture as slot_pool_from_env's
-                // cannot-create fallback — and say so.
-                eprintln!(
-                    "gate-run: cannot open any slot file under {} — running WITHOUT the \
-                     machine-wide slot pool (local -j is the only cap)",
-                    dir.display()
-                );
-                return Grant::NoPool;
-            }
-            if let Some(f) = got {
-                // Memory admission (the over-provisioned pool's OOM guard, issue
-                // #319): with CPU slots > cores, free memory — not slot count —
-                // is the binding safety limit. Defer the grant while
-                // MemAvailable is below the reserve, unless nothing else holds a
-                // slot (the daemon admit()'s no-deadlock rule).
-                let mem_ok = self.min_free_gib <= 0.0
-                    || crate::build_daemon::mem_available_gib()
-                        .map(|g| g >= self.min_free_gib)
-                        .unwrap_or(true);
-                let psi_ok = self.psi_limit <= 0.0
-                    || mem_psi_some_avg10().map(|p| p < self.psi_limit).unwrap_or(true);
-                if held == 0 || (mem_ok && psi_ok && self.pace_grant(dir)) {
-                    return Grant::Held(f);
-                }
-                drop(f); // give the slot back while memory is tight or the pace gate defers
-            }
-            if aborted() {
-                return Grant::Aborted;
-            }
-            std::thread::sleep(Duration::from_millis(200));
         }
     }
 }
@@ -754,75 +642,8 @@ pub(crate) fn nproc() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
-/// Hold one machine-wide slot for the duration of `f`.
-///
-/// For a gate that runs several heavy builds CONCURRENTLY inside itself
-/// (`recipe-checks`): without this its inner builds would all run under the one
-/// slot the gate holds, and the pool's memory admission — the binding safety
-/// limit, since the pool is deliberately over-provisioned — would never see
-/// them. Taking a slot each puts them under the same admission and PSI ceiling
-/// every other gate contends on, so inner width throttles itself under memory
-/// pressure instead of racing the box to an OOM.
-///
-/// Never aborts: the caller has already decided to run this work, so a pool
-/// that cannot be opened degrades to unpooled exactly as `gate-run` does.
-pub(crate) fn with_gate_slot<T>(f: impl FnOnce() -> T) -> T {
-    let pool = slot_pool_from_env();
-    let _grant = pool.acquire(&|| false);
-    f()
-}
-
-/// Build the slot pool from the environment. TD_CHECK_SLOTS sizes it (default
-/// 2×nproc — deliberately OVER-PROVISIONED, issue #319: most heavy gates are
-/// single-threaded or daemon/IO-blocked for long stretches, so slot=gate at
-/// nproc left cores idle; memory admission + the per-gate rlimit backstop are
-/// the safety limits instead. 0 disables). TD_CHECK_SLOTS_DIR overrides the
-/// shared directory (default ~/.td/build-daemon/slots — bound into every check
-/// sandbox at the same absolute path, so concurrent sandboxed checks really do
-/// contend). TD_MIN_FREE_GIB (default 4, the build daemon's knob) sets the
-/// memory-admission reserve.
 fn slot_pool_from_env() -> SlotPool {
-    let n = match std::env::var("TD_CHECK_SLOTS") {
-        Ok(v) => v.trim().parse::<usize>().unwrap_or_else(|_| 8 * nproc()),
-        Err(_) => 8 * nproc(),
-    };
-    let min_free_gib = std::env::var("TD_MIN_FREE_GIB")
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .unwrap_or(4.0);
-    let psi_limit = std::env::var("TD_CHECK_MEM_PSI")
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .unwrap_or(10.0);
-    let pace_ms = std::env::var("TD_CHECK_GRANT_PACE_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(250);
-    if n == 0 {
-        return SlotPool { dir: None, n: 0, min_free_gib, psi_limit, pace_ms };
-    }
-    let dir = match std::env::var("TD_CHECK_SLOTS_DIR") {
-        Ok(d) if !d.is_empty() => PathBuf::from(d),
-        _ => match std::env::var("HOME") {
-            Ok(h) => Path::new(&h).join(".td/build-daemon/slots"),
-            Err(_) => {
-                eprintln!(
-                    "gate-run: no HOME and no TD_CHECK_SLOTS_DIR — running WITHOUT the \
-                     machine-wide slot pool (local -j is the only cap)"
-                );
-                return SlotPool { dir: None, n: 0, min_free_gib, psi_limit, pace_ms };
-            }
-        },
-    };
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!(
-            "gate-run: cannot create slot dir {}: {e} — running WITHOUT the machine-wide \
-             slot pool (local -j is the only cap)",
-            dir.display()
-        );
-        return SlotPool { dir: None, n: 0, min_free_gib, psi_limit, pace_ms };
-    }
-    SlotPool { dir: Some(dir), n, min_free_gib, psi_limit, pace_ms }
+    SlotPool
 }
 
 // ---------------------------------------------------------------------------
@@ -852,54 +673,78 @@ fn timing_event(log: Option<&Path>, gate: &str, kind: &str) {
 /// setrlimit(RLIMIT_DATA) when a per-process memory cap is configured),
 /// stdout+stderr appended in order to LOG_PATH (the per-gate output buffer).
 /// Returns success.
-/// Sum the resident bytes of every process in PGID's process group
-/// (/proc/*/stat field 5 == pgid; RSS from /proc/*/statm resident pages).
-fn pgroup_rss_bytes(pgid: u32) -> u64 {
+/// Snapshot every current descendant of `root`, including descendants that
+/// created their own process group. RSS is read from `/proc/PID/statm`.
+fn process_tree_snapshot(root: u32) -> Vec<(u32, u64)> {
     const PAGE: u64 = 4096; // platform pinned x86_64-linux
-    let Ok(entries) = std::fs::read_dir("/proc") else { return 0 };
-    let mut total = 0u64;
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
     for e in entries.flatten() {
         let name = e.file_name();
-        let Some(pid) = name.to_str().filter(|n| n.bytes().all(|b| b.is_ascii_digit())) else {
+        let Some(pid_text) = name
+            .to_str()
+            .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        else {
             continue;
         };
-        let Some((_state, grp)) = proc_state_and_pgrp(pid) else { continue };
-        if grp != pgid {
+        let Some(pid) = pid_text.parse::<u32>().ok() else {
             continue;
-        }
-        let Ok(statm) = std::fs::read_to_string(format!("/proc/{pid}/statm")) else { continue };
-        if let Some(resident) = statm.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok())
-        {
-            total = total.saturating_add(resident.saturating_mul(PAGE));
-        }
+        };
+        let Some((_state, parent, _group)) = proc_state_parent_pgrp(pid_text) else {
+            continue;
+        };
+        let rss = std::fs::read_to_string(format!("/proc/{pid}/statm"))
+            .ok()
+            .and_then(|statm| {
+                statm
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .unwrap_or(0)
+            .saturating_mul(PAGE);
+        rows.push((pid, parent, rss));
     }
-    total
-}
-
-/// LIVE members of process group `pgid`, and of `cg` where a cgroup layer
-/// answers. Zombies are excluded — the gate's own leader is one by the time the
-/// sweep runs, held unreaped on purpose, and a process that has already exited
-/// is not something left running.
-///
-/// The cgroup half is the only way to see a descendant that called `setsid(2)`:
-/// it has left the gate's process group, so the group walk is blind to it by
-/// construction and the group kill cannot reach it either.
-fn live_survivors(pgid: u32, cg: Option<&Path>) -> Vec<u32> {
-    let mut out = pgroup_live_pids(pgid);
-    if let Some(cg) = cg {
-        for pid in cgroup_live_pids(cg) {
-            if !out.contains(&pid) {
-                out.push(pid);
+    let mut tree = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        for (pid, ppid, rss) in &rows {
+            if (*pid == root || *ppid == parent) && !tree.iter().any(|(seen, _)| seen == pid) {
+                tree.push((*pid, *rss));
+                frontier.push(*pid);
             }
         }
     }
-    out
+    tree
 }
 
-/// Pids rather than formatted lines, so the COUNT is the group's and does not
-/// depend on whether an argv could be read: a survivor whose `/proc` cmdline is
-/// empty — caught between `fork` and `execve` — is still a survivor.
-fn pgroup_live_pids(pgid: u32) -> Vec<u32> {
+fn process_tree_rss_bytes(root: u32) -> u64 {
+    process_tree_snapshot(root)
+        .into_iter()
+        .fold(0u64, |total, (_, rss)| total.saturating_add(rss))
+}
+
+fn kill_process_tree(root: u32) {
+    let mut pids: Vec<u32> = process_tree_snapshot(root)
+        .into_iter()
+        .map(|(pid, _)| pid)
+        .filter(|pid| *pid != root)
+        .collect();
+    pids.sort_unstable_by(|a, b| b.cmp(a));
+    let _ = crate::sys::kill_process_group(root, crate::sys::SIGKILL);
+    let _ = crate::sys::kill_pid(i64::from(root), crate::sys::SIGKILL);
+    for pid in pids {
+        let _ = crate::sys::kill_pid(i64::from(pid), crate::sys::SIGKILL);
+    }
+}
+
+/// LIVE members of process group `pgid`. Zombies are excluded: the gate's
+/// namespace supervisor is held unreaped while teardown owns its process-group
+/// id. The nested PID namespace is the stronger boundary: when its PID 1 exits,
+/// the kernel removes even descendants that escaped this group.
+fn live_survivors(pgid: u32) -> Vec<u32> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else { return out };
     for e in entries.flatten() {
@@ -907,8 +752,8 @@ fn pgroup_live_pids(pgid: u32) -> Vec<u32> {
         let Some(pid) = name.to_str().filter(|n| n.bytes().all(|b| b.is_ascii_digit())) else {
             continue;
         };
-        let Some((state, grp)) = proc_state_and_pgrp(pid) else { continue };
-        if grp != pgid || state == 'Z' {
+        let Some((state, _parent, group)) = proc_state_parent_pgrp(pid) else { continue };
+        if group != pgid || state == 'Z' {
             continue;
         }
         if let Ok(n) = pid.parse() {
@@ -918,35 +763,16 @@ fn pgroup_live_pids(pgid: u32) -> Vec<u32> {
     out
 }
 
-/// LIVE members of cgroup `cg`, read from its `cgroup.procs`. Empty where no
-/// cgroup layer answers. A member is still listed there while it is a zombie,
-/// so the state filter is the group walk's rather than implied.
-fn cgroup_live_pids(cg: &Path) -> Vec<u32> {
-    let Ok(text) = std::fs::read_to_string(cg.join("cgroup.procs")) else { return Vec::new() };
-    // Parsed BEFORE it is used to build a path. cgroupfs writes this file, but
-    // on a hybrid v1/v2 host /sys/fs/cgroup is plain tmpfs and the gate body
-    // owns it — it is handed the path in TD_GATE_CG — so nothing it can put
-    // there becomes part of a `/proc` lookup.
-    text.lines().filter_map(|l| l.trim().parse().ok()).filter(|p| pid_is_live(*p)).collect()
-}
-
-/// A process's `state` and `pgrp` from `/proc/<pid>/stat`, the one parse both
-/// the RSS sampler and the sweep read those fields through. They are fields 3
-/// and 5, taken after the LAST ')' because comm is field 2 and may contain both
-/// spaces and parentheses — counting from the left mis-parses `sh -c 'x) y'`.
-fn proc_state_and_pgrp(pid: &str) -> Option<(char, u32)> {
+/// A process's state, parent, and process group from `/proc/<pid>/stat`, the one
+/// parse both the RSS sampler and sweep use. They are fields 3 through 5, taken
+/// after the LAST ')' because comm is field 2 and may contain both spaces and
+/// parentheses — counting from the left mis-parses `sh -c 'x) y'`.
+fn proc_state_parent_pgrp(pid: &str) -> Option<(char, u32, u32)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let mut it = stat.rsplit_once(')')?.1.split_whitespace();
     let state = it.next()?.chars().next()?;
-    let _ppid = it.next()?;
-    Some((state, it.next()?.parse().ok()?))
-}
-
-/// Whether one pid is a process that has not exited. A zombie is not: it holds
-/// a `/proc` entry and a pid, but it is done, and the drain must stop for it or
-/// it would wait out its whole window on every gate.
-fn pid_is_live(pid: u32) -> bool {
-    proc_state_and_pgrp(&pid.to_string()).is_some_and(|(state, _)| state != 'Z')
+    let parent = it.next()?.parse().ok()?;
+    Some((state, parent, it.next()?.parse().ok()?))
 }
 
 /// How much of one survivor's argv reaches the log. argv can be ARG_MAX long
@@ -1051,82 +877,6 @@ fn hex_nibble(n: u8) -> char {
     char::from(if n < 10 { b'0' + n } else { b'a' + n - 10 })
 }
 
-/// Create the gate's child cgroup with the tree budget; returns its dir.
-///
-/// `create_dir`, never `create_dir_all` or a plain join: an EXISTING cgroup must
-/// never be adopted. The runner's own leaf is `run_dir/host` and `host` is a
-/// legal gate name, so a gate called that is refused here by EEXIST alone. That
-/// was untidiness while the only consequence was a stray `memory.max`; it is
-/// load-bearing now that the deadline kill writes `cgroup.kill` into whatever
-/// this returns, which for `host` would be the cgroup holding the runner.
-fn cgroup_enter(run_dir: &Path, gate: &str, budget_mib: u64) -> Option<PathBuf> {
-    let cg = run_dir.join(gate);
-    std::fs::create_dir(&cg).ok()?;
-    let bytes = budget_mib.saturating_mul(1024 * 1024);
-    if std::fs::write(cg.join("memory.max"), bytes.to_string()).is_err() {
-        let _ = std::fs::remove_dir(&cg);
-        return None;
-    }
-    // Throttle-before-kill: reclaim pressure starts at 90% of the cap.
-    let _ = std::fs::write(cg.join("memory.high"), (bytes / 10 * 9).to_string());
-    // Swap must be bounded too: memory.swap.max defaults to `max`, so on a
-    // swap-enabled host the kernel would page the gate out instead of
-    // OOM-killing — the budget silently unenforced and the host thrashed
-    // (review finding). Absent file = kernel without swap accounting: swap
-    // can't be charged there either way.
-    let swap = cg.join("memory.swap.max");
-    if swap.is_file() && std::fs::write(&swap, "0").is_err() {
-        let _ = std::fs::remove_dir(&cg);
-        return None;
-    }
-    Some(cg)
-}
-
-/// SIGKILL every member of `cg` at once, whatever process group each is in.
-/// True iff the kernel took the write.
-///
-/// This is what `kill(-pgid, …)` cannot do: a descendant that called `setsid(2)`
-/// — or merely `setpgid` — has left the gate's process group and is invisible to
-/// a group kill, while nothing it can do to its own process group moves it out
-/// of the cgroup. (Writing another cgroup's `cgroup.procs` would, and a gate
-/// body is handed one in `TD_GATE_CG`; gates are td's own code, so that is a
-/// bound on the claim rather than a threat.) cgroup v2 only (Linux 5.14+); an
-/// older kernel has no such file, which is why the caller still issues the group
-/// kill rather than choosing between them.
-///
-/// Opened rather than written, so "never CREATES the file" is a property of the
-/// syscall instead of the stat before it: `fs::write` is `O_CREAT|O_TRUNC`, and
-/// while cgroupfs refuses a create, `cgroup_enter` only ever made a DIRECTORY —
-/// on a hybrid v1/v2 host /sys/fs/cgroup is plain tmpfs where the create
-/// succeeds, leaving a stray file and reporting a kill with no kernel behind it.
-/// `is_file()` stays in front of the open for a second reason: it refuses a
-/// FIFO, and opening one of those for writing BLOCKS until a reader appears —
-/// the one shape that could hang the watchdog.
-fn cgroup_kill(cg: &Path) -> bool {
-    use std::io::Write;
-    let f = cg.join("cgroup.kill");
-    if !f.is_file() {
-        return false;
-    }
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&f)
-        .and_then(|mut h| h.write_all(b"1"))
-        .is_ok()
-}
-
-/// oom_kill count from the cgroup's memory.events (0 when unreadable).
-fn cgroup_oom_kills(cg: &Path) -> u64 {
-    std::fs::read_to_string(cg.join("memory.events"))
-        .ok()
-        .and_then(|t| {
-            t.lines()
-                .find_map(|l| l.strip_prefix("oom_kill "))
-                .and_then(|v| v.trim().parse().ok())
-        })
-        .unwrap_or(0)
-}
-
 /// How one gate ended. `Unprovisioned` (the body exited EXIT_UNPROVISIONED, 69)
 /// is a runner-setup gap — no toolchain reachable in this jail — tolerated like a
 /// non-blocking failure but reported as a skip, NOT a red. Any other nonzero exit
@@ -1146,10 +896,57 @@ enum Outcome {
 fn log_has_unprovisioned_sentinel(log_path: &Path, upto: u64) -> bool {
     use std::io::Read;
     let needle = crate::check_loop::UNPROVISIONED_SENTINEL.as_bytes();
-    let mut bytes = Vec::new();
-    match std::fs::File::open(log_path).and_then(|f| f.take(upto).read_to_end(&mut bytes)) {
-        Ok(_) => bytes.windows(needle.len()).any(|w| w == needle),
-        Err(_) => false,
+    if needle.is_empty() {
+        return true;
+    }
+    // KMP keeps the sentinel check constant-memory even when a failing gate
+    // emitted a multi-gigabyte log before exit 69. The bounded file handle is
+    // read only through the body-length snapshot, excluding survivor-sweep
+    // diagnostics appended afterwards.
+    let mut prefix = vec![0usize; needle.len()];
+    let mut matched = 0usize;
+    for index in 1..needle.len() {
+        while matched > 0 && needle.get(index) != needle.get(matched) {
+            matched = prefix
+                .get(matched.saturating_sub(1))
+                .copied()
+                .unwrap_or(0);
+        }
+        if needle.get(index) == needle.get(matched) {
+            matched = matched.saturating_add(1);
+        }
+        if let Some(slot) = prefix.get_mut(index) {
+            *slot = matched;
+        }
+    }
+    let Ok(file) = std::fs::File::open(log_path) else {
+        return false;
+    };
+    let mut reader = file.take(upto);
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let count = match reader.read(&mut buf) {
+            Ok(0) => return false,
+            Ok(count) => count,
+            Err(_) => return false,
+        };
+        let Some(bytes) = buf.get(..count) else {
+            return false;
+        };
+        for byte in bytes {
+            while matched > 0 && Some(byte) != needle.get(matched) {
+                matched = prefix
+                    .get(matched.saturating_sub(1))
+                    .copied()
+                    .unwrap_or(0);
+            }
+            if Some(byte) == needle.get(matched) {
+                matched = matched.saturating_add(1);
+            }
+            if matched == needle.len() {
+                return true;
+            }
+        }
     }
 }
 
@@ -1162,7 +959,8 @@ fn run_gate(
     mem_mib: u64,
     tree_mem_mib: u64,
     timeout_secs: u64,
-    cgroup_dir: Option<&Path>,
+    job_budget_bytes: u64,
+    grant_held: bool,
 ) -> Outcome {
     let mut logf = match std::fs::File::create(log_path) {
         Ok(f) => f,
@@ -1172,36 +970,10 @@ fn run_gate(
         }
     };
     timing_event(timing, &g.name, "START");
-    // Cgroup mode (primary when delegated): the BODY self-moves into the gate's
-    // cgroup before anything else runs — written by the child itself, so there
-    // is no parent-side move race with early forks.
-    //
-    // A cgroup is made only for a MEMORY budget, so the deadline kill's
-    // cgroup.kill arm is off under TD_CHECK_GATE_TREE_MEM_MIB=0 and a setsid
-    // escapee survives a timeout there as it always did. Provisioning one for
-    // containment alone is a policy change rather than an oversight: the body's
-    // enter prelude exits 97 when the move fails, so a cgroup made where none
-    // was before turns a partially-delegated host's passing gates red.
-    let gate_cg = match (cgroup_dir, tree_mem_mib) {
-        (Some(run_dir), b) if b > 0 => cgroup_enter(run_dir, &g.name, b),
-        _ => None,
-    };
     // A native (typed-Rust) gate carries an empty body: run it as `<current_exe>
-    // gate-body <name>` instead of `sh -c <script>` (#318 axis 3). Same
-    // wrapper (rlimit/cgroup/pgroup/env); the native body self-moves into the
-    // gate cgroup itself (gate_bodies::cli), so the shell cgroup prelude — which
-    // is shell-only — is skipped for it.
+    // gate-body <name>` instead of `sh -c <script>` (#318 axis 3).
     let native = g.body.trim().is_empty();
-    // The enter path travels via env, NEVER interpolated into the shell text:
-    // an env-derived run dir containing a quote would otherwise escape the
-    // quoting and execute as code (review finding).
-    let body = match &gate_cg {
-        Some(_) if !native => format!(
-            "echo $$ > \"$TD_GATE_CG\" || {{ echo 'gate-run: cannot enter the gate cgroup' >&2; exit 97; }}\n{}",
-            g.body
-        ),
-        _ => g.body.clone(),
-    };
+    let body = g.body.clone();
     let self_exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -1210,35 +982,95 @@ fn run_gate(
             return Outcome::Failed;
         }
     };
+    let gate_request_lock = if grant_held {
+        match crate::check_memory::create_gate_request_lock() {
+            Ok(path) => Some(path),
+            Err(e) => {
+                let _ = writeln!(
+                    logf,
+                    "gate-run: FAIL: gate {}: cannot create daemon-request lease: {e}",
+                    g.name
+                );
+                timing_event(timing, &g.name, "END");
+                return Outcome::Failed;
+            }
+        }
+    } else {
+        None
+    };
     let outcome = (|| {
         let (out, err) = match (logf.try_clone(), logf.try_clone()) {
             (Ok(o), Ok(e)) => (o, e),
             _ => return Outcome::Failed,
         };
-        // The inner program is `sh -c <body>` (shell gate) or `<self> gate-body
-        // <name>` (native gate). When mem_mib > 0, a pre_exec
-        // setrlimit(RLIMIT_DATA) caps the child and everything it forks/execs —
-        // td's own prlimit(1) replacement (the unsafe lives in sandbox.rs), so
-        // the memory backstop needs no host binary inside the loop sandbox.
-        let mut cmd = if native {
-            let mut c = std::process::Command::new(&self_exe);
-            c.arg("gate-body").arg(&g.name);
-            c
+        // Each body runs behind an already-exec'd namespace supervisor. Linux
+        // tears down every remaining member when namespace PID 1 exits,
+        // including double forks that called setsid, so a gate permit is a
+        // process-lifetime boundary without a privileged cgroup.
+        let (body_program, body_args): (String, Vec<String>) = if native {
+            (
+                self_exe.display().to_string(),
+                vec!["gate-body".to_string(), g.name.clone()],
+            )
         } else {
-            let mut c = std::process::Command::new("sh");
-            c.arg("-c").arg(&body);
-            c
+            ("sh".to_string(), vec!["-c".to_string(), body])
         };
+        #[cfg(not(test))]
+        let mut cmd = {
+            let mut command = std::process::Command::new(&self_exe);
+            command
+                .arg("check-pidns-run")
+                .arg(&body_program)
+                .args(&body_args);
+            command
+        };
+        // A unit-test binary is a libtest harness rather than td-builder's main,
+        // so re-exec its one hidden helper test and pass the real body through
+        // private environment fields. Production always uses the verb above.
+        #[cfg(test)]
+        let mut cmd = {
+            let mut command = std::process::Command::new(&self_exe);
+            command
+                .args([
+                    "--exact",
+                    "gates::tests::pid_namespace_exec_helper",
+                    "--quiet",
+                    "--test-threads=1",
+                ])
+                .env("TD_TEST_PIDNS_PROGRAM", &body_program)
+                .env("TD_TEST_PIDNS_ARG_COUNT", body_args.len().to_string());
+            for (index, arg) in body_args.iter().enumerate() {
+                command.env(format!("TD_TEST_PIDNS_ARG_{index}"), arg);
+            }
+            command
+        };
+        // A pre_exec setrlimit(RLIMIT_DATA) caps the wrapper and everything it
+        // forks/execs — td's own prlimit(1) replacement, so the memory backstop
+        // needs no host binary inside the loop sandbox.
         if mem_mib > 0 {
             crate::sandbox::cap_child_data_rlimit(&mut cmd, mem_mib.saturating_mul(1024 * 1024));
         }
         cmd.current_dir(root)
             .env("TD_GATE_GOALS", goal_words)
             .env("TD_BUILDER_SELF", &self_exe)
+            .env(
+                crate::check_memory::JOB_BUDGET_ENV,
+                job_budget_bytes.to_string(),
+            )
+            .env(
+                "CARGO_BUILD_JOBS",
+                crate::check_memory::jobs_for_budget(job_budget_bytes, nproc()).to_string(),
+            )
             .stdout(std::process::Stdio::from(out))
             .stderr(std::process::Stdio::from(err));
-        if let Some(cg) = &gate_cg {
-            cmd.env("TD_GATE_CG", cg.join("cgroup.procs"));
+        if grant_held {
+            cmd.env(crate::check_memory::GATE_GRANT_HELD_ENV, "1");
+            if let Some(path) = &gate_request_lock {
+                cmd.env(crate::check_memory::GATE_REQUEST_LOCK_ENV, path);
+            }
+        } else {
+            cmd.env_remove(crate::check_memory::GATE_GRANT_HELD_ENV);
+            cmd.env_remove(crate::check_memory::GATE_REQUEST_LOCK_ENV);
         }
         if !g.specs.is_empty() {
             cmd.env("TD_GATE_SPECS", g.specs.join(" "));
@@ -1246,7 +1078,8 @@ fn run_gate(
         for (k, v) in &g.extra_env {
             cmd.env(k, v);
         }
-        // Own process group: the tree watchdog kills by pgid, and a gate's
+        // Own process group: the tree watchdog kills the ordinary tree by pgid
+        // plus a descendant snapshot for nested process groups, and a gate's
         // children must never share the runner's group.
         {
             use std::os::unix::process::CommandExt;
@@ -1282,11 +1115,7 @@ fn run_gate(
         let stop = std::sync::atomic::AtomicBool::new(false);
         let breached = std::sync::atomic::AtomicBool::new(false);
         let timed_out = std::sync::atomic::AtomicBool::new(false);
-        // RSS is sampled from /proc only on the undelegated host — under a
-        // delegated cgroup the kernel enforces memory.max instead. The CLOCK is
-        // watched either way: a cgroup bounds how much a gate may allocate, not
-        // how long it may spin.
-        let watch_rss = tree_mem_mib > 0 && gate_cg.is_none();
+        let watch_rss = tree_mem_mib > 0;
         let status = std::thread::scope(|ws| {
             let watchdog = (watch_rss || timeout_secs > 0).then(|| {
                 ws.spawn(|| {
@@ -1310,20 +1139,17 @@ fn run_gate(
                     // so nothing is added at all.
                     let mut tick: u32 = 0;
                     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        if watch_rss && tick % 5 == 0 && pgroup_rss_bytes(pgid) > budget {
+                        if watch_rss
+                            && tick.is_multiple_of(5)
+                            && process_tree_rss_bytes(pgid) > budget
+                        {
                             breached.store(true, std::sync::atomic::Ordering::Relaxed);
-                            let _ = crate::sys::kill_process_group(pgid, crate::sys::SIGKILL);
+                            kill_process_tree(pgid);
                             return;
                         }
-                        // The GROUP, not the child: a hang is usually in a
-                        // grandchild (a test binary under cargo under sh), which
-                        // shares the pgid the spawn gave the gate. Where a
-                        // cgroup is delegated the SUBTREE is killed as well, and
-                        // that one reaches a descendant which left the group
-                        // with setsid(2) — the escape the group kill has always
-                        // had. Both, not either: cgroup.kill is Linux 5.14+, and
-                        // an older kernel silently has no such file.
-                        //
+                        // The TREE, not only the child: a hang is usually in a
+                        // grandchild (a test binary under cargo under sh), and
+                        // compiler phases may have created another group.
                         // `stop` is re-read immediately before the kill, which
                         // narrows the window where a gate exiting on its deadline
                         // is signalled anyway; what makes a kill that still slips
@@ -1338,17 +1164,7 @@ fn run_gate(
                             && !stop.load(std::sync::atomic::Ordering::Relaxed)
                         {
                             timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
-                            // The group kill FIRST: it is one syscall and it is
-                            // the teardown that works on every kernel, so it
-                            // does not queue behind a stat, an open and a write
-                            // whose kernel side takes cgroup_mutex. The cgroup
-                            // kill then catches whatever left the group. Its
-                            // result is discarded on purpose — the group kill
-                            // above is the fallback for every way it answers no.
-                            let _ = crate::sys::kill_process_group(pgid, crate::sys::SIGKILL);
-                            if let Some(cg) = gate_cg.as_deref() {
-                                let _ = cgroup_kill(cg);
-                            }
+                            kill_process_tree(pgid);
                             return;
                         }
                         tick = tick.wrapping_add(1);
@@ -1404,8 +1220,7 @@ fn run_gate(
         // member — the leader's own zombie being one. So this is the last
         // instant it is provably ours rather than one the kernel may have
         // reissued. On the fallback arm the wait already reaped, so the group is
-        // not signalled there; the cgroup, which names members rather than a
-        // reusable number, still is.
+        // not signalled there.
         //
         // The LISTING happens on BOTH ARMS OF THE WAIT — that axis, not the
         // watchdog's, which suppresses it below. It costs the one /proc walk the
@@ -1429,7 +1244,7 @@ fn run_gate(
         // safe direction on this one is a genuine toolchain gap reported as a
         // red rather than a real regression tolerated as a skip.
         let body_log_len = std::fs::metadata(log_path).map(|m| m.len()).unwrap_or(0);
-        let survivors = live_survivors(pgid, gate_cg.as_deref());
+        let survivors = live_survivors(pgid);
         // On the deadline and RSS arms the watchdog has ALREADY SIGKILLed this
         // group, so what the walk just found is the gate's own children partway
         // through dying — still R or S, cmdline already unreadable — rather than
@@ -1472,17 +1287,11 @@ fn run_gate(
                 let _ = writeln!(logf, "gate-run:   left behind: … and {more} more");
             }
         }
-        // The group kill is the arm's to withhold; the CGROUP kill is not. The
-        // reuse argument is about the pgid, and `cgroup.procs` names this gate's
-        // own members whatever the leader's reap did to that number — so the
-        // fallback arm still gets the half that is unambiguous.
         let killed_group = status.is_none();
         if killed_group {
-            // Group first for the deadline path's reason: one syscall, and the
-            // one that works with no cgroup at all.
+            // One process-group signal reaches the ordinary descendant tree.
             let _ = crate::sys::kill_process_group(pgid, crate::sys::SIGKILL);
         }
-        let killed_cg = gate_cg.as_deref().is_some_and(cgroup_kill);
         // kill(2) QUEUES a signal, it does not deliver one, so without this the
         // runner returns and starts the next gate while a survivor still holds a
         // lock, a port or a core — the failure this exists to prevent, arriving
@@ -1494,28 +1303,24 @@ fn run_gate(
         // Retaining is the cheaper shape and the wrong one: a survivor that
         // forked between the walk and the kill is in the group and dies with it,
         // but it was never on that list, so the drain would return while it was
-        // still alive — and a subtree cgroup's members are not in `cgroup.procs`
-        // at all, though `cgroup.kill` reaches them. Re-walking also makes this
+        // still alive. Re-walking also makes this
         // MEMBERSHIP rather than bare existence, so a reissued pid cannot be
         // mistaken for a survivor and waited on. The walk is /proc-wide, and
         // paying for it fifty times a second is why the loop is entered only
         // when the pre-kill walk found something — a gate that has already
         // misbehaved.
         let mut remaining = survivors.len();
-        if (killed_group || killed_cg) && remaining > 0 {
+        if killed_group && remaining > 0 {
             let mut ticks = 0;
             while remaining > 0 && ticks < DRAIN_TICKS {
                 std::thread::sleep(DRAIN_TICK);
                 ticks += 1;
-                remaining = live_survivors(pgid, gate_cg.as_deref()).len();
+                remaining = live_survivors(pgid).len();
             }
             if remaining > 0 {
                 // Reported rather than waited out: nothing bounds an
                 // uninterruptible sleep, and a gate that hangs the runner is
-                // worse than one that leaks. A pre-5.14 kernel reaches this too
-                // — a setsid escapee is listed by cgroup.procs, unreachable by
-                // the group kill, and cgroup.kill does not exist to catch it —
-                // so the line names the outcome and leaves the cause open.
+                // worse than one that leaks.
                 //
                 // NOT suppressed on the watchdog's arms, unlike the listing
                 // above: that one names processes expected to be dying anyway,
@@ -1534,30 +1339,11 @@ fn run_gate(
             Some(st) => st,
             None => child.wait(),
         };
-        if let Some(cg) = &gate_cg {
-            if cgroup_oom_kills(cg) > 0 {
-                breached.store(true, std::sync::atomic::Ordering::Relaxed);
-                let _ = writeln!(
-                    logf,
-                    "gate-run: FAIL: gate {} — the kernel OOM-killed inside its cgroup \
-                     ({tree_mem_mib} MiB memory.max, TD_CHECK_GATE_TREE_MEM_MIB)",
-                    g.name
-                );
-            }
-            // The group is dead or done; empty cgroups rmdir immediately, a
-            // straggler zombie can delay it a moment.
-            for _ in 0..10 {
-                if std::fs::remove_dir(cg).is_ok() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        }
-        if breached.load(std::sync::atomic::Ordering::Relaxed) && gate_cg.is_none() {
+        if breached.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = writeln!(
                 logf,
                 "gate-run: FAIL: gate {} — process-tree RSS exceeded the {tree_mem_mib} MiB \
-                 budget (TD_CHECK_GATE_TREE_MEM_MIB); the whole process group was killed",
+                 hosted grant; the whole descendant tree was killed",
                 g.name
             );
         }
@@ -1579,7 +1365,7 @@ fn run_gate(
                 "gate-run: FAIL: gate {} — exceeded its {timeout_secs}s wall-clock budget \
                  (the larger of TD_CHECK_GATE_TIMEOUT and TD_CHECK_GATE_TIMEOUT_FACTOR x this \
                  gate's last measured span, capped by TD_CHECK_GATE_TIMEOUT_MAX); the whole \
-                 process group was killed",
+                 descendant tree was killed",
                 g.name
             );
         }
@@ -1634,6 +1420,9 @@ fn run_gate(
             }
         }
     })();
+    if let Some(path) = gate_request_lock {
+        let _ = std::fs::remove_file(path);
+    }
     timing_event(timing, &g.name, "END");
     outcome
 }
@@ -1643,10 +1432,13 @@ fn run_gate(
 /// logs routinely carry non-UTF-8 (compiler/tar output), and read_to_string
 /// would silently drop the WHOLE log — the one thing a red gate must not lose.
 fn print_gate_output(name: &str, log_path: &Path, outcome: Outcome, non_blocking: bool, secs: f64) {
-    let body = std::fs::read(log_path).unwrap_or_default();
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    let _ = lock.write_all(&body);
+    // Keep target-synchronized output without allocating the entire, attacker-
+    // or compiler-controlled gate log in the runner after the gate exits.
+    if let Ok(mut body) = std::fs::File::open(log_path) {
+        let _ = std::io::copy(&mut body, &mut lock);
+    }
     let verdict = match outcome {
         Outcome::Passed => "PASS",
         Outcome::Unprovisioned => {
@@ -1713,6 +1505,7 @@ struct RunCfg {
     timing_log: Option<PathBuf>,
     /// Where per-gate output buffers live.
     log_dir: PathBuf,
+    remove_logs: bool,
     /// The working-tree content key (TD_CHECK_TREE, computed host-side by
     /// `td-builder check` from git HEAD + dirty diff + untracked contents).
     /// When present, every PASS is journaled under it; None disables journaling.
@@ -1729,20 +1522,12 @@ struct RunCfg {
     /// TD_CHECK_GATE_TIMEOUT_MAX: the ceiling on the scaled term, which bounds
     /// the ratchet a timed-out gate's own recorded span would otherwise start.
     gate_timeout_max_secs: u64,
-    /// The delegated per-run cgroup dir (TD_CHECK_CGROUP, issue #328). When
-    /// present, each gate runs in its own child cgroup with memory.max set to
-    /// the tree budget (kernel-enforced, escape-proof — a setsid() child stays
-    /// in its cgroup) and the sampling watchdog below is NOT used. None =
-    /// undelegated host = watchdog fallback.
-    cgroup_dir: Option<PathBuf>,
     /// AGGREGATE tree budget per gate, in MiB (0 = off): a watchdog samples the
-    /// gate's process group's summed RSS and SIGKILLs the whole group on breach
-    /// — the layer the per-process rlimit below cannot provide (N children each
-    /// under the per-process cap can collectively exceed the box; human review
-    /// re #319). KNOWN GAP, and only for the UNDELEGATED host this sampler runs
-    /// on: a setsid() escapee leaves the process group and so the sampler's
-    /// sight. Where a subtree IS delegated the kernel charges the whole cgroup,
-    /// escapee included, and the deadline kill reaches it through cgroup.kill.
+    /// gate's descendant-tree RSS and SIGKILLs the captured tree on breach —
+    /// the layer the per-process rlimit below cannot provide (N children each
+    /// under the per-process cap can collectively exceed the box). The host's
+    /// admission reserve remains the final backstop for a process that fully
+    /// daemonizes and is reparented between samples.
     gate_tree_mem_mib: u64,
     /// Per-PROCESS RLIMIT_DATA cap for gate bodies, in MiB (0 = off). Applied
     /// via a pre_exec setrlimit in the spawned body (sys::set_rlimit — no host
@@ -1763,19 +1548,26 @@ struct RunCfg {
     explicit_goals: HashSet<usize>,
 }
 
-/// True when a node contends on the machine-wide pool: everything except the
-/// sub-5s serial cheap gates, build-recipes, and the BUILD_GATES behind it —
-/// those two classes submit to the shared build daemon, whose own global budget
-/// (TD_BUILD_JOBS) is their real limiter; holding a box-wide slot while blocked
-/// on the daemon would double-count the box and starve the CPU-heavy gates.
+/// True when a node takes a per-user memory grant. Only sub-five-second cheap
+/// gates bypass the pool. A daemon request launched by a granted gate reuses
+/// this grant, so build gates remain accounted without double-counting.
 fn takes_slot(g: &Gate) -> bool {
-    g.name != BUILD_RECIPES
-        && !g.pools.contains(&Pool::Cheap)
-        && !g.deps.iter().any(|d| d == BUILD_RECIPES)
+    !g.pools.contains(&Pool::Cheap)
 }
 
 fn lock_sched<'a>(m: &'a Mutex<Sched>) -> std::sync::MutexGuard<'a, Sched> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn prepare_gate_log_dir(path: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(path)
+        .map_err(|e| format!("gate-run: cannot create {}: {e}", path.display()))?;
+    crate::sandbox::require_disk_backed(path).map_err(|e| {
+        format!(
+            "gate-run: log directory {} is not proven disk-backed: {e}",
+            path.display()
+        )
+    })
 }
 
 /// Run the selected nodes. Returns Ok(true) if everything passed.
@@ -1788,8 +1580,7 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
         eprintln!("gate-run: no gates selected for the given goals — nothing to run");
         return Ok(true);
     }
-    std::fs::create_dir_all(&cfg.log_dir)
-        .map_err(|e| format!("gate-run: cannot create {}: {e}", cfg.log_dir.display()))?;
+    prepare_gate_log_dir(&cfg.log_dir)?;
 
     // Priority: build-recipes first (it unblocks every BUILD_GATE), then measured
     // duration descending (LPT), unknown-duration gates ahead of known ones (a new
@@ -1905,11 +1696,11 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                     }
                 };
                 let Some(g) = set.gates.get(gi) else { return };
-                let mut _slot_hold: Option<std::fs::File> = None;
+                let mut slot_hold: Option<crate::check_memory::MemoryPermit> = None;
                 if takes_slot(g) {
                     match cfg.pool.acquire(&|| lock_sched(&sched).fail) {
-                        Grant::Held(f) => _slot_hold = Some(f),
-                        Grant::NoPool => {}
+                        Grant::Held(permit) => slot_hold = Some(permit),
+                        Grant::Standalone => {}
                         Grant::Aborted => {
                             let mut s = lock_sched(&sched);
                             s.st.insert(gi, St::Pending);
@@ -1921,6 +1712,11 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                 }
                 let log_path = cfg.log_dir.join(format!("{}.log", g.name));
                 let started = std::time::Instant::now();
+                let job_budget_bytes = slot_hold
+                    .as_ref()
+                    .map(crate::check_memory::MemoryPermit::bytes)
+                    .or_else(crate::check_memory::request_job_budget)
+                    .unwrap_or(crate::check_memory::TOKEN_BYTES);
                 let outcome = run_gate(
                     g,
                     &cfg.root,
@@ -1935,7 +1731,8 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                         cfg.gate_timeout_max_secs,
                         durations.get(&g.name).copied(),
                     ),
-                    cfg.cgroup_dir.as_deref(),
+                    job_budget_bytes,
+                    slot_hold.is_some(),
                 );
                 print_gate_output(
                     &g.name,
@@ -1944,6 +1741,13 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                     g.non_blocking,
                     started.elapsed().as_secs_f64(),
                 );
+                // The whole check's /tmp is a private disk bind, not tmpfs,
+                // and each finished log is discarded immediately after its
+                // target-synchronized stream. This bounds both RAM and normal-
+                // exit disk retention when several chatty gates run together.
+                if cfg.remove_logs {
+                    let _ = std::fs::remove_file(&log_path);
+                }
                 // Only a real PASS is journaled: an Unprovisioned skip must re-run
                 // on a provisioned host, so it is never recorded green for --resume.
                 if outcome == Outcome::Passed {
@@ -2079,10 +1883,12 @@ fn long_gate_names(set: &GateSet) -> Vec<String> {
 }
 
 pub fn cli(args: &[String]) -> ExitCode {
-    let mut jobs: usize = match std::env::var("TD_CHECK_JOBS") {
-        Ok(v) => v.trim().parse().unwrap_or_else(|_| nproc()),
-        Err(_) => nproc(),
+    let host_jobs = if std::env::var_os(crate::check_memory::HOST_CHILD_ENV).is_some() {
+        crate::check_memory::hosted_gate_capacity()
+    } else {
+        1
     };
+    let mut jobs = host_jobs;
     let mut goals: Vec<String> = Vec::new();
     let mut resume = false;
     let mut it = args.iter();
@@ -2093,16 +1899,16 @@ pub fn cli(args: &[String]) -> ExitCode {
                 return ExitCode::from(2);
             };
             match v.trim().parse::<usize>() {
-                Ok(n) => jobs = n,
-                Err(_) => {
+                Ok(n) if n > 0 => jobs = n.min(host_jobs),
+                _ => {
                     eprintln!("gate-run: bad {a} value `{v}`");
                     return ExitCode::from(2);
                 }
             }
         } else if let Some(n) = a.strip_prefix("-j") {
             match n.trim().parse::<usize>() {
-                Ok(v) => jobs = v,
-                Err(_) => {
+                Ok(v) if v > 0 => jobs = v.min(host_jobs),
+                _ => {
                     eprintln!("gate-run: bad -j value `{n}`");
                     return ExitCode::from(2);
                 }
@@ -2203,13 +2009,12 @@ pub fn cli(args: &[String]) -> ExitCode {
     } else {
         Some(root.join(format!(".td-build-cache/gate-timing/run-{}.log", now_ns())))
     };
-    // TD_CHECK_GATE_MEM_MIB: per-process gate memory cap (default 8192; 0 off).
-    // Enforced natively (a pre_exec setrlimit on each gate body), so it is
-    // ALWAYS available — no PATH probe, no host util-linux.
-    let gate_mem_mib: u64 = std::env::var("TD_CHECK_GATE_MEM_MIB")
+    let gate_budget_mib = std::env::var(crate::check_memory::GATE_TOKENS_ENV)
         .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(8192);
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1)
+        .saturating_mul(crate::check_memory::TOKEN_BYTES / (1024 * 1024));
+    let gate_mem_mib = gate_budget_mib.min(4096);
     let tree_key = std::env::var("TD_CHECK_TREE").ok().filter(|k| !k.is_empty());
     if resume && tree_key.is_none() {
         eprintln!(
@@ -2217,13 +2022,7 @@ pub fn cli(args: &[String]) -> ExitCode {
         );
         resume = false;
     }
-    // TD_CHECK_GATE_TREE_MEM_MIB: aggregate per-gate process-tree budget
-    // (default 16 GiB; 0 off). Enforced by the runner itself via /proc — no
-    // prlimit, no cgroups needed.
-    let gate_tree_mem_mib: u64 = std::env::var("TD_CHECK_GATE_TREE_MEM_MIB")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(16384);
+    let gate_tree_mem_mib = gate_budget_mib;
     // TD_CHECK_GATE_TIMEOUT: the per-gate wall-clock floor (timeout(1) suffixes
     // s/m/h/d accepted; 0 disables). Four hours is far above every gate this
     // table has ever measured — the longest is under half an hour — because the
@@ -2278,6 +2077,7 @@ pub fn cli(args: &[String]) -> ExitCode {
         pool: slot_pool_from_env(),
         timing_log,
         log_dir: std::env::temp_dir().join(format!("td-gate-run-{}", std::process::id())),
+        remove_logs: true,
         tree_key,
         resume,
         gate_mem_mib,
@@ -2287,11 +2087,6 @@ pub fn cli(args: &[String]) -> ExitCode {
         gate_timeout_max_secs,
         goal_words: goals.join(" "),
         explicit_goals: explicit_goal_indices(&set, &goals),
-        cgroup_dir: std::env::var("TD_CHECK_CGROUP")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .filter(|p| p.is_dir()),
     };
     match run_selected(&set, &selected, &cfg) {
         Ok(true) => {
@@ -2314,6 +2109,65 @@ pub fn cli(args: &[String]) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unprovisioned_sentinel_search_is_bounded_and_crosses_read_chunks() {
+        let d = tmpdir("sentinel-stream");
+        let path = d.join("gate.log");
+        let needle = crate::check_loop::UNPROVISIONED_SENTINEL.as_bytes();
+        let prefix_len = (64usize * 1024).saturating_sub(needle.len() / 2);
+        let mut contents = vec![b'x'; prefix_len];
+        contents.extend_from_slice(needle);
+        contents.extend_from_slice(b" ignored survivor diagnostics");
+        std::fs::write(&path, &contents).unwrap();
+
+        let through_needle = prefix_len.saturating_add(needle.len()) as u64;
+        assert!(log_has_unprovisioned_sentinel(&path, through_needle));
+        assert!(!log_has_unprovisioned_sentinel(
+            &path,
+            through_needle.saturating_sub(1)
+        ));
+    }
+
+    /// Re-exec target for `run_gate` under libtest. The production binary has
+    /// the hidden `check-pidns-run` verb; a unit-test executable has libtest's
+    /// generated main instead, so this one exact test supplies the same wrapper
+    /// without weakening what the tests exercise.
+    #[test]
+    fn pid_namespace_exec_helper() {
+        let Ok(program) = std::env::var("TD_TEST_PIDNS_PROGRAM") else {
+            return;
+        };
+        let count = std::env::var("TD_TEST_PIDNS_ARG_COUNT")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut argv = vec![program];
+        for index in 0..count {
+            match std::env::var(format!("TD_TEST_PIDNS_ARG_{index}")) {
+                Ok(arg) => argv.push(arg),
+                Err(e) => {
+                    eprintln!("missing PID namespace test argument {index}: {e}");
+                    std::process::exit(125);
+                }
+            }
+        }
+        let status = match crate::sandbox::pid_namespace_status(&argv) {
+            Ok(status) => status,
+            Err(e) => {
+                eprintln!("PID namespace test wrapper failed: {e}");
+                std::process::exit(125);
+            }
+        };
+        use std::os::unix::process::ExitStatusExt as _;
+        let code = status.code().unwrap_or_else(|| {
+            status
+                .signal()
+                .map(|signal| 128i32.saturating_add(signal))
+                .unwrap_or(125)
+        });
+        std::process::exit(code);
+    }
 
     /// Every compiled gate_def that resolves the evaluator must propagate that
     /// step's exit status. It exits 69 with the unprovisioned sentinel when no
@@ -2417,6 +2271,11 @@ mod tests {
         // The derived graph holds: the synthetic build-recipes prelude node is present.
         let br = set.gates.iter().find(|g| g.name == BUILD_RECIPES).unwrap();
         assert!(br.extra_env.iter().any(|(k, _)| k == "TD_BUILD_SPECS"));
+        assert!(takes_slot(br), "build-recipes performs compiler work and needs a grant");
+        for (_, def) in defs().into_iter().filter(|(_, def)| def.build_gate) {
+            let gate = set.gates.iter().find(|gate| gate.name == def.name).unwrap();
+            assert!(takes_slot(gate), "build gate {} bypassed memory admission", def.name);
+        }
         // Every bash body is non-empty plain bash (no make-isms survived
         // conversion). A NATIVE (typed-Rust) gate (#318 axis 3) legitimately has
         // an empty body — it runs via `td-builder gate-body <name>` — so it is
@@ -2551,17 +2410,14 @@ mod tests {
         GateSet { gates, index, build_specs: Vec::new() }
     }
 
-    fn cfg(dir: &Path, jobs: usize, slots: Option<(PathBuf, usize)>) -> RunCfg {
-        let (sdir, n) = match slots {
-            Some((d, n)) => (Some(d), n),
-            None => (None, 0),
-        };
+    fn cfg(dir: &Path, jobs: usize, _slots: Option<(PathBuf, usize)>) -> RunCfg {
         RunCfg {
             root: dir.to_path_buf(),
             jobs,
-            pool: SlotPool { dir: sdir, n, min_free_gib: 0.0, psi_limit: 0.0, pace_ms: 0 },
+            pool: SlotPool,
             timing_log: None,
             log_dir: dir.join("logs"),
+            remove_logs: false,
             tree_key: None,
             resume: false,
             gate_mem_mib: 0,
@@ -2573,7 +2429,6 @@ mod tests {
             gate_timeout_max_secs: DEFAULT_GATE_TIMEOUT_MAX_SECS,
             goal_words: String::new(),
             explicit_goals: HashSet::new(),
-            cgroup_dir: None,
         }
     }
 
@@ -2582,6 +2437,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn gate_logs_reject_a_memory_backed_tmp_directory() {
+        let shm = Path::new("/dev/shm");
+        if !shm.is_dir() {
+            return;
+        }
+        let dir = shm.join(format!("td-gate-log-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let error = prepare_gate_log_dir(&dir).unwrap_err();
+
+        assert!(error.contains("not proven disk-backed"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2841,43 +2711,6 @@ mod tests {
     }
 
     #[test]
-    fn memory_admission_defers_while_another_slot_is_held() {
-        use std::os::fd::AsRawFd;
-        let d = tmpdir("mem");
-        let slots = d.join("slots");
-        std::fs::create_dir_all(&slots).unwrap();
-        // Simulate "someone else is running": hold slot-0 ourselves.
-        let holder = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(slots.join("slot-0"))
-            .unwrap();
-        assert!(crate::sys::flock_try_exclusive(holder.as_raw_fd()).unwrap());
-        // An impossibly-high reserve: with a held slot present, the free slot
-        // must NOT be granted (deferred), so the aborted() escape is taken.
-        let pool = SlotPool { dir: Some(slots.clone()), n: 2, min_free_gib: 1e9, psi_limit: 0.0, pace_ms: 0 };
-        assert!(matches!(pool.acquire(&|| true), Grant::Aborted));
-        // Same reserve, but nothing else held: the no-deadlock rule admits.
-        // Poll briefly: another test thread's Command::spawn may have forked
-        // while `holder` was open — the child inherits the flock'd fd until
-        // its exec's CLOEXEC closes it, keeping the lock alive a few ms past
-        // drop(). Production tolerates the same window as one poll cycle.
-        drop(holder);
-        let mut admitted = false;
-        for _ in 0..40 {
-            if matches!(pool.acquire(&|| true), Grant::Held(_)) {
-                admitted = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(admitted, "no-deadlock rule must admit once the inherited fd clears");
-        // Reserve disabled: always admits.
-        let pool = SlotPool { dir: Some(slots), n: 2, min_free_gib: 0.0, psi_limit: 0.0, pace_ms: 0 };
-        assert!(matches!(pool.acquire(&|| true), Grant::Held(_)));
-    }
-
-    #[test]
     fn gate_mem_backstop_contains_a_runaway_allocator() {
         // Native pre_exec setrlimit — no host prlimit needed, so no host guard.
         let d = tmpdir("rlimit");
@@ -2916,233 +2749,41 @@ mod tests {
     }
 
     #[test]
-    fn cgroup_mode_enforces_the_tree_budget_when_delegated() {
-        // Runs ONLY where a writable delegated cgroup subtree exists (systemd
-        // user session, or the documented root-side /sys/fs/cgroup/td setup);
-        // everywhere else the watchdog fallback tests carry the budget
-        // property. The check_loop probe is replicated inline.
-        let probe = |c: &Path| -> bool {
-            // Must be cgroup2fs, not merely a writable directory (mirrors
-            // check_loop::cgroup_delegated_root's guard): on a hybrid v1/v2
-            // host, /sys/fs/cgroup itself is plain tmpfs, so a directory
-            // create there succeeds with zero kernel enforcement and this
-            // test would go on to assert a memory cap that was never real.
-            if !c.join("cgroup.controllers").is_file() {
-                return false;
-            }
-            let p = c.join(format!("td-probe-{}", std::process::id()));
-            std::fs::create_dir(&p).map(|_| { let _ = std::fs::remove_dir(&p); true }).unwrap_or(false)
-        };
-        let root = [PathBuf::from("/sys/fs/cgroup/td")]
-            .into_iter()
-            .chain(
-                std::fs::read_to_string("/proc/self/cgroup")
-                    .ok()
-                    .and_then(|t| t.lines().find_map(|l| l.strip_prefix("0::").map(|p| PathBuf::from(format!("/sys/fs/cgroup{}", p.trim()))))),
-            )
-            .find(|c| probe(c));
-        let Some(root) = root else { return };
-        let _ = std::fs::write(root.join("cgroup.subtree_control"), "+memory");
-        let run = root.join(format!("td-test-{}", std::process::id()));
-        std::fs::create_dir(&run).unwrap();
-        if std::fs::write(run.join("cgroup.subtree_control"), "+memory").is_err() {
-            let _ = std::fs::remove_dir(&run);
-            return; // memory controller not delegatable here
-        }
-        let d = tmpdir("cg");
-        let hog = r#"x=$(head -c 134217728 /dev/zero | tr '\0' a); sleep 1; echo ${#x}"#;
-        let set = synth(&d, &[("cghog", Pool::Heavy, hog, &[])]);
-        let sel = expand_goals(&set, &["cghog".to_string()]).unwrap();
-        // FIRST HOP: self-move into a host leaf so the gate bodies' own moves
-        // are within-delegation (mirrors cgroup_run_dir; without it the enter
-        // write is EPERM and the red half would be red for the WRONG reason —
-        // which is exactly how the first live run of this test caught the
-        // common-ancestor rule).
-        let host = run.join("host");
-        std::fs::create_dir(&host).unwrap();
-        if std::fs::write(host.join("cgroup.procs"), std::process::id().to_string()).is_err() {
-            let _ = std::fs::remove_dir(&host);
-            let _ = std::fs::remove_dir(&run);
-            return; // delegation without the first-hop grant — see check_loop
-        }
-        let mut c = cfg(&d, 2, None);
-        c.cgroup_dir = Some(run.clone());
-        c.gate_tree_mem_mib = 32; // 128 MiB allocation vs a 32 MiB cgroup cap
-        assert!(!run_selected(&set, &sel, &c).unwrap(), "cgroup memory.max must red the hog");
-        // The RIGHT red: the kernel OOM inside the cgroup, named in the log —
-        // never the enter-failure exit 97 (that once masked an EPERM as red).
-        let log = std::fs::read_to_string(d.join("logs/cghog.log")).unwrap_or_default();
-        assert!(log.contains("OOM-killed inside its cgroup"), "red must be the cgroup OOM, got: {log}");
-        let mut c2 = cfg(&d, 2, None);
-        c2.cgroup_dir = Some(run.clone());
-        c2.gate_tree_mem_mib = 1024;
-        assert!(run_selected(&set, &sel, &c2).unwrap(), "roomy cgroup cap must pass");
-        let _ = std::fs::remove_dir(&host);
-        let _ = std::fs::remove_dir(&run);
-    }
+    fn process_tree_snapshot_crosses_a_child_process_group() {
+        use std::os::unix::process::CommandExt as _;
 
-    #[test]
-    fn a_cgroup_kill_that_cannot_be_written_reports_it() {
-        // The caller issues the group kill BECAUSE this can fail: a kernel
-        // before 5.14 has no cgroup.kill, and a false here is what makes that a
-        // fallback rather than a teardown the watchdog silently stops doing. An
-        // ordinary directory stands in — and it is not a contrived one, being
-        // exactly what a hybrid v1/v2 host's plain-tmpfs /sys/fs/cgroup gives.
-        let d = tmpdir("cgkill");
-        assert!(!cgroup_kill(&d), "a directory with no cgroup.kill must report false");
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg("sleep 5").process_group(0);
+        let mut child = command.spawn().unwrap();
+        let child_pid = child.id();
+        std::thread::sleep(Duration::from_millis(20));
+        let found = process_tree_snapshot(std::process::id())
+            .iter()
+            .any(|(pid, _)| *pid == child_pid);
+        let _ = crate::sys::kill_process_group(child_pid, crate::sys::SIGKILL);
+        let _ = child.wait();
         assert!(
-            !d.join("cgroup.kill").exists(),
-            "and must not CREATE one — a stray regular file would take the write and \
-             report a kill with no kernel behind it"
+            found,
+            "a compiler phase in its own process group remains in the gate RSS tree"
         );
-        assert!(!cgroup_kill(&d.join("absent")), "a missing directory must report false too");
     }
 
     #[test]
-    fn cgroup_kill_reaches_a_process_group_escapee() {
-        // The property the group kill cannot have: a descendant in a process
-        // group of its own is invisible to kill(-pgid) and still inside the
-        // cgroup. Runs ONLY where a writable delegated subtree exists; the
-        // probe is the one cgroup_mode_enforces_the_tree_budget_when_delegated
-        // uses.
-        let probe = |c: &Path| -> bool {
-            if !c.join("cgroup.controllers").is_file() {
-                return false;
-            }
-            let p = c.join(format!("td-killprobe-{}", std::process::id()));
-            std::fs::create_dir(&p).map(|_| { let _ = std::fs::remove_dir(&p); true }).unwrap_or(false)
-        };
-        let root = [PathBuf::from("/sys/fs/cgroup/td")]
-            .into_iter()
-            .chain(
-                std::fs::read_to_string("/proc/self/cgroup")
-                    .ok()
-                    .and_then(|t| t.lines().find_map(|l| l.strip_prefix("0::").map(|p| PathBuf::from(format!("/sys/fs/cgroup{}", p.trim()))))),
-            )
-            .find(|c| probe(c));
-        let Some(root) = root else { return };
-        let cg = root.join(format!("td-test-kill-{}", std::process::id()));
-        if std::fs::create_dir(&cg).is_err() {
-            return;
-        }
-        // Never this process's own cgroup: the escapee is moved into a child
-        // made for it, so the kill below cannot reach the test harness.
-        use std::os::unix::process::CommandExt;
-        let mut cmd = std::process::Command::new("sleep");
-        cmd.arg("30")
-            .process_group(0) // its OWN group — the escape being modelled
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let Ok(mut child) = cmd.spawn() else {
-            let _ = std::fs::remove_dir(&cg);
-            return;
-        };
-        let pid = child.id();
-        if std::fs::write(cg.join("cgroup.procs"), pid.to_string()).is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = std::fs::remove_dir(&cg);
-            return; // no common-ancestor grant for the cgroup.procs move
-        }
-        // A delegated v2 subtree does NOT imply cgroup.kill: delegation predates
-        // it and the interface is 5.14+. Asserting through it on such a kernel
-        // would red for the kernel's age, which is the one thing the production
-        // fallback exists to tolerate.
-        if !cg.join("cgroup.kill").is_file() {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = std::fs::remove_dir(&cg);
-            return;
-        }
-        // THE CONTROL: the escapee really is out of reach of a group kill.
-        // Established by reading the kernel's own answer — /proc's pgrp field —
-        // rather than by signalling, because the only group this test could
-        // legitimately signal is its OWN, and killing that kills the harness.
-        let pgrp_of = |p: u32| -> Option<String> {
-            let stat = std::fs::read_to_string(format!("/proc/{p}/stat")).ok()?;
-            // state, ppid, pgrp — counted from after the last ')', a comm being
-            // able to contain both spaces and parentheses.
-            let (_, rest) = stat.rsplit_once(')')?;
-            rest.split_whitespace().nth(2).map(str::to_string)
-        };
-        let escapee_pgrp = pgrp_of(pid);
-        let our_pgrp = pgrp_of(std::process::id());
-        // Alive AT THE MOMENT OF THE KILL, or the whole test is vacuous: a
-        // `sleep` that was missing or exited at once is a zombie, whose /proc
-        // still reads, whose pgrp is still its own, and whose `try_wait` returns
-        // Some on the first poll — green, having proved nothing about
-        // cgroup.kill. (A cgroup.procs write naming a dying task can succeed
-        // while migrating nothing, so the move above does not establish this.)
-        let alive_before = child.try_wait().ok().flatten().is_none();
-        let wrote = cgroup_kill(&cg);
-        // SIGKILL is not instant; poll rather than assume.
-        let mut gone = false;
-        for _ in 0..100 {
-            if child.try_wait().ok().flatten().is_some() {
-                gone = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        // Everything is OBSERVED first and asserted after, so that a failing
-        // assertion cannot unwind past the cleanup and leave a live sleeper and
-        // a cgroup directory behind in /sys/fs/cgroup.
-        if !gone {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        // Retried as the runner's own teardown is: a straggler zombie makes the
-        // rmdir fail, and a leaf left in /sys/fs/cgroup is permanent.
-        for _ in 0..10 {
-            if std::fs::remove_dir(&cg).is_ok() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        assert!(alive_before, "the escapee must be alive at the kill, or this proves nothing");
-        assert!(escapee_pgrp.is_some(), "the escapee must still be alive to be a control");
-        assert_ne!(
-            escapee_pgrp, our_pgrp,
-            "the escapee must be in its OWN process group — otherwise a group kill \
-             would reach it and this proves nothing about cgroup.kill"
+    fn gate_pid_namespace_reaps_a_detached_background_process() {
+        let d = tmpdir("pidns-reap");
+        let escaped = d.join("escaped");
+        let body = format!(
+            "setsid sh -c 'sleep 1; touch {}' >/dev/null 2>&1 &",
+            escaped.display()
         );
-        assert!(wrote, "cgroup.kill must take the write in a delegated subtree");
-        assert!(gone, "cgroup.kill must reach a member that left the process group");
-    }
-
-    #[test]
-    fn psi_parser_reads_some_avg10() {
-        let sample = "some avg10=3.25 avg60=1.00 avg300=0.10 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
-        assert_eq!(parse_psi_some_avg10(sample), Some(3.25));
-        assert_eq!(parse_psi_some_avg10("garbage"), None);
-    }
-
-    #[test]
-    fn pace_gate_defers_within_the_interval_and_admits_after() {
-        let d = tmpdir("pace");
-        let pool =
-            SlotPool { dir: Some(d.clone()), n: 1, min_free_gib: 0.0, psi_limit: 0.0, pace_ms: 200 };
-        assert!(pool.pace_grant(&d), "first grant is free");
-        assert!(!pool.pace_grant(&d), "second grant inside the interval defers");
-        std::thread::sleep(Duration::from_millis(220));
-        assert!(pool.pace_grant(&d), "grant admits after the interval");
-    }
-
-    #[test]
-    fn slot_pool_bounds_cross_gate_concurrency() {
-        let d = tmpdir("slots");
-        // Two heavy gates with no ordering between them; a 1-slot pool must
-        // serialize them. Each gate asserts the other is not mid-flight.
-        let probe = "test ! -e {D}/busy && touch {D}/busy && sleep 0.3 && rm {D}/busy";
-        let set = synth(
-            &d,
-            &[("h1", Pool::Heavy, probe, &[]), ("h2", Pool::Heavy, probe, &[])],
+        let set = synth(&d, &[("detach", Pool::Heavy, &body, &[])]);
+        let sel = expand_goals(&set, &["detach".to_string()]).unwrap();
+        assert!(run_selected(&set, &sel, &cfg(&d, 1, None)).unwrap());
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(
+            !escaped.exists(),
+            "a setsid descendant survived after its gate released the permit"
         );
-        let sel = expand_goals(&set, &["check".to_string()]).unwrap();
-        let slots = d.join("slots");
-        std::fs::create_dir_all(&slots).unwrap();
-        assert!(run_selected(&set, &sel, &cfg(&d, 4, Some((slots, 1)))).unwrap());
     }
 
     #[test]
@@ -3298,66 +2939,24 @@ mod tests {
         );
     }
 
-    /// A body that exits while something it started keeps running: the survivor
-    /// must be dead when the gate returns, and named in the log. Before this the
-    /// gate PASSED and the sleeper spun on, reparented to init.
+    /// A body that exits while many things it started keep running: every one
+    /// must be dead before the gate returns. Before the PID-namespace boundary
+    /// the gate passed and the sleepers spun on, reparented to init.
     #[test]
     fn a_gate_does_not_leave_its_descendants_running() {
         let d = tmpdir("sweep");
-        // Prints each pid, then exits at once leaving them behind. Stdio is
-        // redirected or the sleepers hold the log handle open.
-        //
-        // SIXTY rather than one, which is what makes this a test of the DRAIN
-        // and not only of the kill: kill(2) queues a signal rather than
-        // delivering one, and with a single sleeper the runner won that race
-        // every time — with sixty it never does.
-        let body = r#"i=0; while [ $i -lt 60 ]; do sleep 30 </dev/null >/dev/null 2>&1 & echo "SLEEPER $!"; i=$((i+1)); done"#;
+        // Each child would leave a delayed marker if it outlived the body. Sixty
+        // makes this exercise namespace teardown under a fork burst rather than
+        // merely the one-child happy path.
+        let body = r#"i=0; while [ $i -lt 60 ]; do sh -c 'sleep 1; echo escaped >> {D}/escaped' </dev/null >/dev/null 2>&1 & i=$((i+1)); done"#;
         let set = synth(&d, &[("leaky", Pool::Cheap, body, &[])]);
         let sel = expand_goals(&set, &["check-fast".to_string()]).unwrap();
         let c = cfg(&d, 1, None);
         assert!(run_selected(&set, &sel, &c).unwrap(), "the body exits 0, so the gate passes");
-        let log = std::fs::read_to_string(d.join("logs/leaky.log")).unwrap();
-        let pids: Vec<u32> = log
-            .lines()
-            .filter_map(|l| l.strip_prefix("SLEEPER "))
-            .filter_map(|v| v.trim().parse().ok())
-            .collect();
-        assert_eq!(pids.len(), 60, "the body must report every pid it backgrounded");
-        // A zombie keeps its /proc entry, so the pathname alone would read a
-        // killed sleeper as alive; the state field is the honest answer. They
-        // are grandchildren, so nothing here can reap them.
-        let alive = |p: u32| -> bool {
-            let Ok(stat) = std::fs::read_to_string(format!("/proc/{p}/stat")) else {
-                return false;
-            };
-            match stat.rsplit_once(')') {
-                Some((_, rest)) => !matches!(rest.split_whitespace().next(), Some("Z") | None),
-                None => false,
-            }
-        };
-        // Asserted with NO polling: a wait here is exactly the window in which
-        // the runner would have started the next gate.
-        //
-        // Deliberately NOT killed on failure: they are grandchildren, so init
-        // may already have reaped one and the kernel reissued its pid — a
-        // cleanup kill would then land on an unrelated process. `sleep 30` ends
-        // on its own, so a failure leaks nothing that does not expire.
-        let live: Vec<u32> = pids.iter().copied().filter(|p| alive(*p)).collect();
+        std::thread::sleep(Duration::from_millis(1200));
         assert!(
-            live.is_empty(),
-            "the sweep must kill every descendant the body left running; {} of {} alive: {live:?}",
-            live.len(),
-            pids.len()
-        );
-        // The COUNT is the shell's business — some interpose a subshell for a
-        // redirected background command — so what is pinned is that it named
-        // them, and that past CMDLINE_LINES_MAX it says how many it did not.
-        assert!(
-            log.contains("process(es) running")
-                && log.contains("left behind: ")
-                && log.contains(": sleep 30")
-                && log.contains("… and "),
-            "and must name what it killed, and account for the rest; got:\n{log}"
+            !d.join("escaped").exists(),
+            "a descendant survived after the gate returned and wrote its delayed marker"
         );
     }
 
@@ -3415,10 +3014,10 @@ mod tests {
     }
 
     /// A survivor's argv is text a gate chose and the unprovisioned sentinel is
-    /// printable, so escaping cannot stop one spelling it. What stops it is the
-    /// ORDER — the sentinel is read before the sweep writes — and this is the
-    /// assertion of that: a bare `exit 69` stays a real failure even when a
-    /// process the body left behind is named after the token.
+    /// printable, so escaping cannot stop one spelling it. Namespace teardown
+    /// now removes the process before any survivor listing is possible; a bare
+    /// `exit 69` must stay a real failure and the detached argv must not be
+    /// copied into the body-output portion of the log.
     #[test]
     fn a_survivors_argv_cannot_forge_the_unprovisioned_sentinel() {
         let d = tmpdir("forge69");
@@ -3436,67 +3035,9 @@ mod tests {
         );
         let log = std::fs::read_to_string(d.join("logs/forger.log")).unwrap();
         assert!(
-            log.contains(crate::check_loop::UNPROVISIONED_SENTINEL),
-            "and the token must really have reached the log, or this proves nothing; got:\n{log}"
+            !log.contains(crate::check_loop::UNPROVISIONED_SENTINEL),
+            "a detached argv must not forge the body-output sentinel; got:\n{log}"
         );
-    }
-
-    /// The sweep's cgroup arm, without a delegated subtree: `cgroup.procs` is
-    /// an ordinary file to read, so the UNION and the dedup — the parts this
-    /// crate wrote — are testable anywhere. What needs a real delegation is the
-    /// KILL, and `cgroup_kill_reaches_a_process_group_escapee` covers that
-    /// wherever one exists.
-    #[test]
-    fn live_survivors_unions_a_cgroup_member_that_left_the_process_group() {
-        use std::os::unix::process::CommandExt;
-        let null = || std::process::Stdio::null();
-        let d = tmpdir("cgunion");
-        // A live process in a group of its own: the setsid escapee's shape.
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .stdin(null())
-            .stdout(null())
-            .stderr(null())
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let escapee = child.id();
-        // And an unreaped one, which cgroup.procs lists exactly as it lists a
-        // live member — the reason cgroup_live_pids checks the state itself
-        // rather than inheriting the group walk's filter.
-        let mut dead = std::process::Command::new("true")
-            .stdin(null())
-            .stdout(null())
-            .stderr(null())
-            .spawn()
-            .unwrap();
-        let zombie = dead.id();
-        let mut is_zombie = false;
-        for _ in 0..200 {
-            if proc_state_and_pgrp(&zombie.to_string()).is_some_and(|(s, _)| s == 'Z') {
-                is_zombie = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(is_zombie, "the exited child must be an unreaped zombie (pid {zombie})");
-        let mine = std::process::id();
-        let (_, pgid) = proc_state_and_pgrp("self").unwrap();
-        std::fs::write(d.join("cgroup.procs"), format!("{escapee}\n{mine}\n{zombie}\n")).unwrap();
-        let group_only = live_survivors(pgid, None);
-        assert!(!group_only.contains(&escapee), "the group walk cannot see an escapee");
-        assert!(group_only.contains(&mine), "but it does see this process");
-        let both = live_survivors(pgid, Some(&d));
-        assert!(both.contains(&escapee), "and the cgroup arm must add it; got {both:?}");
-        assert!(!both.contains(&zombie), "but never a zombie member; got {both:?}");
-        assert_eq!(
-            both.iter().filter(|p| **p == mine).count(),
-            1,
-            "a member in BOTH is named once, or the count double-counts it; got {both:?}"
-        );
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = dead.wait();
     }
 
     /// A pid whose cmdline cannot be read — it vanished between the walk and
@@ -3506,80 +3047,6 @@ mod tests {
     fn a_pid_with_no_readable_cmdline_answers_none() {
         // pid 0 is never a process, so this is that shape without racing one.
         assert_eq!(live_cmdline(0), None);
-        assert!(!pid_is_live(0), "and it is not something the drain waits out");
-    }
-
-    /// The deadline kill issues a cgroup kill AFTER the group kill wherever a
-    /// cgroup is configured. This is the arm where that layer answers nothing —
-    /// a plain directory, which is both what a pre-5.14 kernel's cgroup looks
-    /// like to `cgroup_kill` and what a hybrid v1/v2 host's tmpfs
-    /// /sys/fs/cgroup really is. The group kill must still be the whole
-    /// teardown, and it runs everywhere, unlike the delegated tests.
-    #[test]
-    fn a_timeout_still_kills_where_the_cgroup_layer_answers_nothing() {
-        let d = tmpdir("timeout-nocg");
-        let set = synth(&d, &[("hang", Pool::Cheap, "sleep 30", &[])]);
-        let sel = expand_goals(&set, &["check-fast".to_string()]).unwrap();
-        let mut c = cfg(&d, 1, None);
-        c.gate_timeout_secs = 1;
-        // cgroup_enter only creates a directory and writes memory.max, both of
-        // which succeed on tmpfs — so this really does drive the `Some(cg)` arm
-        // rather than skipping it the way a None would.
-        let fake_cg = d.join("cg");
-        std::fs::create_dir(&fake_cg).unwrap();
-        c.cgroup_dir = Some(fake_cg.clone());
-        c.gate_tree_mem_mib = 64;
-        let started = std::time::Instant::now();
-        assert!(!run_selected(&set, &sel, &c).unwrap());
-        assert!(
-            started.elapsed() < Duration::from_secs(60),
-            "the group kill must still end the gate when cgroup.kill is absent"
-        );
-        let log = std::fs::read_to_string(d.join("logs/hang.log")).unwrap();
-        assert!(log.contains("wall-clock budget"), "must still be reported as the clock; got:\n{log}");
-        // Pins the arm rather than assuming it: without this every assertion
-        // here also passes with gate_cg == None, which is not what is claimed.
-        assert!(
-            fake_cg.join("hang").join("memory.max").is_file(),
-            "cgroup_enter must have returned Some — otherwise this is the None arm"
-        );
-        assert!(
-            !fake_cg.join("hang").join("cgroup.kill").exists(),
-            "and no stray cgroup.kill may be left behind by the attempt"
-        );
-    }
-
-    /// Pins the WIRING, which the two tests above do not: both stay green if the
-    /// `cgroup_kill` call in the watchdog is deleted outright, since one exercises
-    /// the helper directly and the other passes through the group-kill fallback.
-    /// Here the gate BODY creates a `cgroup.kill` in its own cgroup — the one
-    /// place a test can put a file inside a directory `cgroup_enter` makes — so
-    /// the deadline kill finds a writable interface and its `1` is observable
-    /// afterwards. Everything is tmpfs; no kernel is involved and it runs
-    /// everywhere.
-    #[test]
-    fn a_timeout_asks_the_cgroup_layer_to_kill_when_one_is_there() {
-        let d = tmpdir("timeout-cg");
-        // $TD_GATE_CG is <cg>/cgroup.procs, so its dirname is the gate's cgroup.
-        let body = r#"d=$(dirname "$TD_GATE_CG"); : > "$d/cgroup.kill"; sleep 30"#;
-        let set = synth(&d, &[("hang", Pool::Cheap, body, &[])]);
-        let sel = expand_goals(&set, &["check-fast".to_string()]).unwrap();
-        let mut c = cfg(&d, 1, None);
-        c.gate_timeout_secs = 1;
-        let fake_cg = d.join("cg");
-        std::fs::create_dir(&fake_cg).unwrap();
-        c.cgroup_dir = Some(fake_cg.clone());
-        c.gate_tree_mem_mib = 64;
-        assert!(!run_selected(&set, &sel, &c).unwrap());
-        // The dir survives the run's rmdir attempts precisely because it is not
-        // empty, which is what leaves the evidence readable.
-        let killfile = fake_cg.join("hang").join("cgroup.kill");
-        assert!(killfile.is_file(), "the body must have made the interface; got no file");
-        assert_eq!(
-            std::fs::read_to_string(&killfile).unwrap_or_default(),
-            "1",
-            "the deadline kill must WRITE the cgroup layer, not only the process group"
-        );
     }
 
     /// The other half, and the one that matters for false positives: with no

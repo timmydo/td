@@ -21,7 +21,9 @@ mod bootstrap;
 mod build;
 mod build_daemon;
 mod bzip2;
+mod check_host;
 mod check_loop;
+mod check_memory;
 mod drv;
 mod elf;
 mod erofs;
@@ -966,6 +968,136 @@ fn pid_is_alive(pid: u32) -> bool {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(_) => true,
     }
+}
+
+struct HostSandboxScratch {
+    run: PathBuf,
+    tmp: PathBuf,
+    namespace: PathBuf,
+    _live: std::fs::File,
+}
+
+impl Drop for HostSandboxScratch {
+    fn drop(&mut self) {
+        let _ = sandbox::remove_scratch_tree(&self.run);
+    }
+}
+
+fn make_host_scratch_run_accessible(run: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(metadata) = std::fs::symlink_metadata(run) else {
+        return;
+    };
+    if !metadata.is_dir() {
+        return;
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o700 != 0o700 {
+        let _ = std::fs::set_permissions(run, std::fs::Permissions::from_mode(mode | 0o700));
+    }
+}
+
+/// Remove check-sandbox scratch whose owner no longer holds its live flock.
+/// The parent coordination lock brackets both this sweep and publication of a
+/// newly locked run, so a concurrent creator can never be mistaken for a
+/// crash. Ambiguous lock/open errors preserve the tree rather than racing it.
+fn sweep_host_sandbox_scratch(parent: &Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let abandoned = entries.flatten().filter(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("run-"))
+            && entry.file_type().is_ok_and(|kind| kind.is_dir())
+    });
+    for entry in abandoned.take(4096) {
+        let run = entry.path();
+        make_host_scratch_run_accessible(&run);
+        let live_path = run.join(".live");
+        let stale = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&live_path)
+        {
+            Ok(file) => file.try_lock().is_ok(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        };
+        if stale {
+            let _ = sandbox::remove_scratch_tree(&run);
+        }
+    }
+}
+
+/// Allocate the private disk tree mounted at `/tmp` for one complete hosted
+/// check. It lives beside the worktree cache rather than under the host's
+/// possibly-tmpfs `/tmp`, and a live flock makes crash recovery safe across
+/// concurrent PID namespaces whose numeric PIDs may overlap.
+fn host_sandbox_scratch(worktree: &Path) -> Result<HostSandboxScratch, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let parent = worktree.join(".td-build-cache/check-scratch");
+    std::fs::create_dir_all(&parent)
+        .map_err(|e| format!("create check scratch {}: {e}", parent.display()))?;
+    sandbox::require_disk_backed(&parent)
+        .map_err(|e| format!("check scratch {}: {e}", parent.display()))?;
+    let coordination_path = parent.join(".coord.lock");
+    let coordination = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&coordination_path)
+        .map_err(|e| format!("open check scratch lock {}: {e}", coordination_path.display()))?;
+    coordination
+        .lock()
+        .map_err(|e| format!("lock check scratch {}: {e}", coordination_path.display()))?;
+    sweep_host_sandbox_scratch(&parent);
+
+    for _ in 0..128 {
+        let nonce = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let run = parent.join(format!("run-{}-{nonce}", std::process::id()));
+        match std::fs::create_dir(&run) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("create check scratch {}: {e}", run.display())),
+        }
+        let live_path = run.join(".live");
+        let live = match std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&live_path)
+        {
+            Ok(file) => file,
+            Err(e) => {
+                let _ = sandbox::remove_scratch_tree(&run);
+                return Err(format!("create check scratch lease {}: {e}", live_path.display()));
+            }
+        };
+        if let Err(e) = live.lock() {
+            let _ = sandbox::remove_scratch_tree(&run);
+            return Err(format!("lock check scratch lease {}: {e}", live_path.display()));
+        }
+        let tmp = run.join("tmp");
+        let namespace = run.join("namespace");
+        if let Err(e) = std::fs::create_dir(&tmp).and_then(|()| std::fs::create_dir(&namespace)) {
+            let _ = sandbox::remove_scratch_tree(&run);
+            return Err(format!("initialize check scratch {}: {e}", run.display()));
+        }
+        drop(coordination);
+        return Ok(HostSandboxScratch {
+            run,
+            tmp,
+            namespace,
+            _live: live,
+        });
+    }
+    Err(format!(
+        "cannot allocate a unique check scratch under {}",
+        parent.display()
+    ))
 }
 
 /// Sweep crash-orphaned commit temporaries (`.commit-tmp.<pid>.<base>`) under DIR whose
@@ -2845,39 +2977,109 @@ struct BuilderOverride {
     db: String,
 }
 
-/// The machine-wide concurrent-build budget for the build daemon: `TD_BUILD_JOBS` if set,
-/// else `min(nproc*3/4, MemAvailableGiB / 2)` clamped to ≥1. This is the ONE cap that all
-/// agents' submissions to the single shared daemon share, so it must bound the whole box
-/// (leaving ~1/4 of cores + memory headroom for interactive work and the not-yet-daemon-
-/// managed heavy gates) — never a per-check slice, which N agents would multiply.
+/// Compiler-process concurrency inside the persistent daemon. Memory admission
+/// is shared with gates by the per-user host's token pool.
 fn daemon_budget() -> usize {
-    if let Ok(v) = std::env::var("TD_BUILD_JOBS") {
-        if let Ok(n) = v.trim().parse::<usize>() {
-            if n >= 1 {
-                return n;
+    if std::env::var_os("TD_DAEMON_TEST_SLEEP_MS").is_some() {
+        if let Ok(value) = std::env::var("TD_DAEMON_TEST_BUDGET") {
+            if let Ok(budget) = value.parse::<usize>() {
+                return budget.max(1);
             }
         }
     }
-    let nproc = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let cpu_cap = (nproc * 3 / 4).max(1);
-    match mem_available_gib() {
-        Some(g) => cpu_cap.min(((g / 2.0) as usize).max(1)),
-        None => cpu_cap,
-    }
+    crate::check_memory::hosted_gate_capacity()
 }
 
-/// MemAvailable from /proc/meminfo, in GiB (None if unreadable).
-fn mem_available_gib() -> Option<f64> {
-    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            let kb: f64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
-            return Some(kb / 1024.0 / 1024.0);
+/// Recognize the synthetic no-build request used by the daemon semaphore gate.
+/// It exists only on an explicitly test-configured daemon, so the gate can fill
+/// the daemon worker pool without borrowing more memory grants or accidentally
+/// turning the probe into a real derivation build.
+fn daemon_budget_probe(req: &str, enabled: bool) -> Result<Option<String>, String> {
+    let Some(raw) = req.strip_prefix("PROBE ") else {
+        return Ok(None);
+    };
+    if !enabled {
+        return Err("daemon budget probe requires TD_DAEMON_TEST_SLEEP_MS".to_string());
+    }
+    let id = raw
+        .parse::<u32>()
+        .ok()
+        .filter(|id| *id > 0 && *id <= 1_000_000)
+        .ok_or_else(|| "daemon budget probe has an invalid id".to_string())?;
+    Ok(Some(format!("probe {id}")))
+}
+
+const DAEMON_STDOUT_TAIL_BYTES: usize = 64 * 1024;
+const MAX_DERIVATION_BYTES: u64 = 16 * 1024 * 1024;
+
+fn read_daemon_stdout_tail(
+    mut reader: impl std::io::Read,
+) -> Result<(Vec<u8>, bool), String> {
+    let mut tail = std::collections::VecDeque::with_capacity(DAEMON_STDOUT_TAIL_BYTES);
+    let mut chunk = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        let count = reader
+            .read(&mut chunk)
+            .map_err(|e| format!("read daemon child stdout: {e}"))?;
+        if count == 0 {
+            break;
+        }
+        let bytes = chunk
+            .get(..count)
+            .ok_or_else(|| "daemon stdout read escaped its fixed buffer".to_string())?;
+        let overflow = tail
+            .len()
+            .saturating_add(bytes.len())
+            .saturating_sub(DAEMON_STDOUT_TAIL_BYTES);
+        if overflow > 0 {
+            truncated = true;
+            for _ in 0..overflow.min(tail.len()) {
+                let _ = tail.pop_front();
+            }
+        }
+        let keep_from = bytes.len().saturating_sub(DAEMON_STDOUT_TAIL_BYTES);
+        tail.extend(bytes.get(keep_from..).unwrap_or(&[]));
+    }
+    Ok((tail.into_iter().collect(), truncated))
+}
+
+fn daemon_ok_line(tail: &[u8], truncated: bool) -> Option<String> {
+    let safe = if truncated {
+        let start = tail.iter().position(|byte| *byte == b'\n')?.saturating_add(1);
+        tail.get(start..)?
+    } else {
+        tail
+    };
+    let text = String::from_utf8_lossy(safe);
+    text.lines()
+        .rev()
+        .find(|line| line.starts_with("OK "))
+        .map(str::to_string)
+}
+
+type DaemonKeyMap = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>,
+    >,
+>;
+
+struct DaemonKeyUse {
+    map: DaemonKeyMap,
+    key: String,
+    lock: std::sync::Arc<std::sync::Mutex<()>>,
+}
+
+impl Drop for DaemonKeyUse {
+    fn drop(&mut self) {
+        let mut map = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if std::sync::Arc::strong_count(&self.lock) == 2 {
+            map.remove(&self.key);
         }
     }
-    None
 }
 
 /// LINEAGE-verify a builder override before it can carry `ControlPlaneBuilder`
@@ -2943,7 +3145,17 @@ fn builder_override_from_env() -> Result<Option<BuilderOverride>, String> {
 /// The content-addressed first-output basename of `drv` — the STABLE per-drv scratch/dedup
 /// key (the same drv always keys the same dir, so a valid prior realization is a cache hit).
 fn drv_scratch_key(drv: &str) -> Result<String, String> {
-    let content = std::fs::read(drv).map_err(|e| format!("read {drv}: {e}"))?;
+    use std::io::Read;
+    let file = std::fs::File::open(drv).map_err(|e| format!("open {drv}: {e}"))?;
+    let mut content = Vec::new();
+    file.take(MAX_DERIVATION_BYTES.saturating_add(1))
+        .read_to_end(&mut content)
+        .map_err(|e| format!("read {drv}: {e}"))?;
+    if u64::try_from(content.len()).unwrap_or(u64::MAX) > MAX_DERIVATION_BYTES {
+        return Err(format!(
+            "{drv}: derivation exceeds the {MAX_DERIVATION_BYTES}-byte daemon limit"
+        ));
+    }
     let parsed = drv::parse(&content).map_err(|e| format!("parse drv {drv}: {e}"))?;
     let first = parsed
         .outputs
@@ -7490,6 +7702,9 @@ fn main() -> ExitCode {
         Some("flock") => return applet_exit("flock", run_flock_applet(&args)),
         _ => {}
     }
+    if check_host::should_forward(args.get(1..).unwrap_or(&[])) {
+        return check_host::forward(args.get(1..).unwrap_or(&[]));
+    }
     // Builds run nicer than the loop's other work so a shared desktop stays smooth.
     // Scope to the build-executing subcommands; their spawned compilers inherit it.
     if matches!(args.get(1).map(String::as_str), Some("build" | "realize" | "autotools-build")) {
@@ -7505,6 +7720,11 @@ fn main() -> ExitCode {
         // map the branch diff to a right-sized check set + the waive/escalate
         // decision. Run from the repo root. See builder/src/affected.rs.
         Some("affected-checks") => affected::main(&args[2..]),
+        Some("check-host-serve") => check_host::serve_cli(args.get(2..).unwrap_or(&[])),
+        Some("check-host-stop") if args.len() == 2 => check_host::stop_cli(),
+        // Internal process-lifetime boundary. It is intentionally absent from
+        // user-facing help; check-host and gate-run construct it themselves.
+        Some("check-pidns-run") => sandbox::pid_namespace_cli(args.get(2..).unwrap_or(&[])),
         // ready — the gate an agent runs before pushing a rolling branch: the
         // bounded checks over the committed diff plus the per-commit review
         // record AGENTS.md requires. See builder/src/ready.rs.
@@ -7512,8 +7732,8 @@ fn main() -> ExitCode {
         // gate-run — td's OWN gate runner: the loop scheduler that replaced `make`
         // on the spine. The gates are compiled in (src/gate_defs/*.rs registry);
         // runs the requested tier/gates with cheap-serial + heavy-parallel
-        // ordering, a MACHINE-WIDE flock slot pool (TD_CHECK_SLOTS, shared across
-        // every concurrent check on the box), and data-driven longest-first heavy
+        // ordering, the per-user host's shared memory-token pool, and
+        // data-driven longest-first heavy
         // order. Run from the repo root, inside the loop sandbox (`td-builder
         // check` execs it there). See builder/src/gates.rs.
         Some("gate-run") => gates::cli(args.get(2..).unwrap_or(&[])),
@@ -7668,6 +7888,26 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             },
         },
+        // Test-only raw client for daemon-budget. Unlike `daemon-request`, it
+        // deliberately does not enter the rootless host or acquire another
+        // memory grant: the only request it can spell is the daemon's
+        // explicitly enabled, no-build PROBE grammar below.
+        Some("daemon-budget-probe") if args.len() == 4 => {
+            let request = format!("PROBE {}", args[3]);
+            match daemon_budget_probe(&request, true)
+                .and_then(|_| build_daemon::request(&args[2], &request, None))
+            {
+                Ok(response) if response.starts_with("OK probe ") => ExitCode::SUCCESS,
+                Ok(response) => {
+                    eprintln!("td-builder: daemon-budget-probe: {response}");
+                    ExitCode::FAILURE
+                }
+                Err(e) => {
+                    eprintln!("td-builder: daemon-budget-probe: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // bootstrap-recipe <name> | --list — run a structured source-bootstrap rung
         // (the tests/bootstrap-*.sh drivers as typed Rust data; see bootstrap.rs).
         Some("bootstrap-recipe") => bootstrap::cli(&args),
@@ -9474,9 +9714,33 @@ fn main() -> ExitCode {
             // so the drv builds once (the 2nd cache-hits) and two builds never race the same
             // content-addressed scratch — the guix-daemon "a valid path is built once"
             // property, preserved across concurrency and across agents (one shared daemon).
-            let keymap: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>> =
-                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-            let handle = move |req: &str| -> Result<String, String> {
+            let keymap: DaemonKeyMap = std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            ));
+            let handle = move |
+                req: &str,
+                cancelled: &std::sync::atomic::AtomicBool,
+            | -> Result<String, String> {
+                let (request_budget, req) = match req.strip_prefix("BUDGET ") {
+                    Some(rest) => {
+                        let (raw, request) = rest
+                            .split_once(' ')
+                            .ok_or_else(|| "BUDGET request is missing its build".to_string())?;
+                        let bytes = raw
+                            .parse::<u64>()
+                            .ok()
+                            .filter(|bytes| *bytes > 0 && *bytes <= crate::check_memory::MAX_WORK_BYTES)
+                            .ok_or_else(|| "BUDGET request has an invalid byte grant".to_string())?;
+                        (Some(bytes), request)
+                    }
+                    None => (None, req),
+                };
+                if let Some(response) = daemon_budget_probe(
+                    req,
+                    std::env::var_os("TD_DAEMON_TEST_SLEEP_MS").is_some(),
+                )? {
+                    return Ok(response);
+                }
                 // Request grammar: "<drv> [SEED-DIR BP BS BD]" (build) or "CHECK <drv> [SEED-DIR
                 // BP BS BD]" (reproducibility). The optional trailing fields are the SEED store
                 // DIR (content-scanned for the input closure — #267 retired the /var/guix/db read)
@@ -9511,13 +9775,30 @@ fn main() -> ExitCode {
                     }
                 };
                 let key = drv_scratch_key(drv)?;
-                let keylock = {
-                    let mut m = keymap.lock().unwrap();
-                    m.entry(key)
+                let key_use = {
+                    let mut map = keymap
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let lock = map
+                        .entry(key.clone())
                         .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
-                        .clone()
+                        .clone();
+                    DaemonKeyUse {
+                        map: keymap.clone(),
+                        key,
+                        lock,
+                    }
                 };
-                let _kg = keylock.lock().unwrap();
+                let _kg = key_use
+                    .lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err("daemon requester disconnected before its build started".to_string());
+                }
+                crate::sandbox::sweep_abandoned_build_temps(Path::new(&scratch)).map_err(|e| {
+                    format!("sweep abandoned daemon build scratch {}: {e}", scratch)
+                })?;
                 // Each build runs in its OWN child td-builder process (Command = the safe
                 // fork+exec): an in-process fork on a daemon thread is unsound (sandbox::build
                 // mutates the process CWD + forks with heavy pre-exec work). The child's stderr
@@ -9534,26 +9815,78 @@ fn main() -> ExitCode {
                 for (k, v) in &override_env {
                     cmd.env(k, v);
                 }
-                let out = crate::spawn::past_a_busy_program(|| cmd.output())
+                if let Some(bytes) = request_budget {
+                    cmd.env(crate::check_memory::JOB_BUDGET_ENV, bytes.to_string());
+                    cmd.env(
+                        "CARGO_BUILD_JOBS",
+                        crate::check_memory::jobs_for_budget(bytes, crate::gates::nproc())
+                            .to_string(),
+                    );
+                }
+                cmd.stdout(std::process::Stdio::piped()).process_group(0);
+                // The request worker waits below, but the persistent daemon
+                // itself can still be killed. Arm the child against that
+                // parent-thread death before spawning so its requester cannot
+                // observe EOF, release the memory grant, and leave an
+                // unattributed build running.
+                crate::sandbox::die_with_parent(&mut cmd);
+                let mut child = crate::spawn::past_a_busy_program(|| cmd.spawn())
                     .map_err(|e| format!("spawn {sub} for {drv}: {e}"))?;
-                if !out.status.success() {
+                let stdout = child.stdout.take().ok_or_else(|| {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    format!("capture bounded stdout from {sub} for {drv}")
+                })?;
+                let reader = std::thread::Builder::new()
+                    .name("td-build-daemon-stdout".to_string())
+                    .stack_size(512 * 1024)
+                    .spawn(move || read_daemon_stdout_tail(stdout))
+                    .map_err(|e| {
+                        let _ = crate::sys::kill_process_group(
+                            child.id(),
+                            crate::sys::SIGKILL,
+                        );
+                        let _ = child.wait();
+                        format!("spawn bounded stdout reader for {sub} for {drv}: {e}")
+                    })?;
+                let status = loop {
+                    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = crate::sys::kill_process_group(
+                            child.id(),
+                            crate::sys::SIGKILL,
+                        );
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = reader.join();
+                        return Err(format!(
+                            "daemon requester disconnected; cancelled {sub} for {drv}"
+                        ));
+                    }
+                    match child.try_wait() {
+                        Ok(Some(status)) => break status,
+                        Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                        Err(e) => {
+                            let _ = crate::sys::kill_process_group(
+                                child.id(),
+                                crate::sys::SIGKILL,
+                            );
+                            let _ = child.wait();
+                            let _ = reader.join();
+                            return Err(format!("wait for {sub} for {drv}: {e}"));
+                        }
+                    }
+                };
+                let (tail, truncated) = reader
+                    .join()
+                    .map_err(|_| format!("bounded stdout reader panicked for {sub} for {drv}"))??;
+                if !status.success() {
                     return Err(format!("{sub} failed for {drv} (see daemon log)"));
                 }
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                stdout
-                    .lines()
-                    .find_map(|l| l.strip_prefix("OK "))
-                    .map(str::to_string)
+                daemon_ok_line(&tail, truncated)
+                    .and_then(|line| line.strip_prefix("OK ").map(str::to_string))
                     .ok_or_else(|| format!("{sub}: no OK line for {drv}"))
             };
-            // Reserve free memory before admitting a build — the global OOM guard on this
-            // swapless host, shared by every daemon via /proc/meminfo (bounds machine-wide
-            // memory even when per-binary daemons fragment the concurrency budget).
-            let min_free_gib = std::env::var("TD_MIN_FREE_GIB")
-                .ok()
-                .and_then(|v| v.trim().parse::<f64>().ok())
-                .unwrap_or(4.0);
-            match build_daemon::serve(&socket, budget, min_free_gib, handle) {
+            match build_daemon::serve(&socket, budget, handle) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("td-builder: daemon: {e}");
@@ -9600,7 +9933,37 @@ fn main() -> ExitCode {
         //   daemon-request SOCKET REQUEST
         Some("daemon-request") if args.len() == 4 => {
             let (socket, drv) = (&args[2], &args[3]);
-            match build_daemon::request(socket, drv) {
+            let held_by_gate = std::env::var_os(crate::check_memory::GATE_GRANT_HELD_ENV)
+                .is_some();
+            let _gate_request = if held_by_gate && drv != "SHUTDOWN" {
+                match crate::check_memory::lock_gate_request() {
+                    Ok(lock) => Some(lock),
+                    Err(e) => {
+                        eprintln!(
+                            "td-builder: daemon-request: cannot borrow the gate memory grant: {e}"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                None
+            };
+            let permit = if drv == "SHUTDOWN" || held_by_gate {
+                None
+            } else {
+                match crate::check_memory::build_permit(&|| false) {
+                    Ok(permit) => Some(permit),
+                    Err(e) => {
+                        eprintln!("td-builder: daemon-request: memory admission failed: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            };
+            let request_budget = permit
+                .as_ref()
+                .map(crate::check_memory::MemoryPermit::bytes)
+                .or_else(crate::check_memory::request_job_budget);
+            match build_daemon::request(socket, drv, request_budget) {
                 Ok(resp) => {
                     println!("{resp}");
                     if resp.starts_with("OK ") {
@@ -9934,7 +10297,7 @@ fn main() -> ExitCode {
         // container (pivot into a fresh root exposing only the selected store,
         // synthetic /proc and /dev, and its own loopback-only netns), toward
         // replacing `guix shell -C`. With
-        // `--expose-cwd` it adds the FULL loop env (worktree + cgroups,
+        // `--expose-cwd` it adds the full loop env (worktree + host tokens,
         // caller PATH + TD_SUBST_*/TD_DAEMON_* preserved, chdir into the
         // cwd) so a real rung runs as under `guix shell -C`.
         //
@@ -10028,49 +10391,44 @@ fn main() -> ExitCode {
                         }
                     }
                 }
-                let mut tmpfs = vec!["/tmp".to_string()];
+                let mut tmpfs = Vec::new();
                 let mut path_env = String::new();
                 let mut workdir = String::new();
                 let mut extra_env: Vec<(String, String)> = Vec::new();
+                let mut check_scratch: Option<HostSandboxScratch> = None;
                 if expose_cwd {
                     let cwd = std::env::current_dir()
                         .map_err(|e| e.to_string())?
                         .to_string_lossy()
                         .into_owned();
-                    // Worktree (rw, like guix shell -C's shared cwd) and the host
-                    // cgroup hierarchy (ro — gate-run's per-gate memory-limit
-                    // delegation, issue #328, needs to READ the hierarchy structure;
-                    // only its own delegated subtree, bound separately below, is
-                    // writable). HOME is a dir on the writable root tmpfs (created by
-                    // these binds), so no HOME tmpfs.
+                    // Worktree (rw, like guix shell -C's shared cwd). HOME is a
+                    // dir on the writable root tmpfs, so no HOME tmpfs.
                     binds.push(sandbox::Bind { src: cwd.clone(), dest: None, readonly: false, ro_optional: false });
-                    if Path::new("/sys/fs/cgroup").is_dir() {
-                        // ro is defense-in-depth (least-privilege default: expose the
-                        // hierarchy read-only unless a specific subtree needs writes).
-                        // A child userns can't remount-ro the host-owned cgroup2 on
-                        // some kernels (EPERM, e.g. the azure CI runner); there the
-                        // bind is DETACHED (fail-closed), never left writable — see
-                        // Bind::ro_optional.
-                        binds.push(sandbox::Bind {
-                            src: "/sys/fs/cgroup".to_string(),
-                            dest: None,
-                            readonly: true,
-                            ro_optional: true,
-                        });
-                        // The delegated per-run cgroup dir (issue #328): bound
-                        // RW OVER the ro hierarchy so gate-run (inside) can
-                        // create per-gate child cgroups + set memory.max. Only
-                        // when `td-builder check` probed a delegation; the rest
-                        // of the hierarchy stays ro.
-                        if let Ok(cg) = std::env::var("TD_CHECK_CGROUP") {
-                            if !cg.is_empty() && Path::new(&cg).is_dir() {
-                                binds.push(sandbox::Bind {
-                                    src: cg,
-                                    dest: None,
-                                    readonly: false,
-                                    ro_optional: false,
-                                });
-                            }
+                    let allocated = host_sandbox_scratch(Path::new(&cwd))?;
+                    binds.push(sandbox::Bind {
+                        src: allocated.tmp.to_string_lossy().into_owned(),
+                        dest: Some("/tmp".to_string()),
+                        readonly: false,
+                        ro_optional: false,
+                    });
+                    check_scratch = Some(allocated);
+                    let mut sandbox_host_runtime = None;
+                    if let Ok(runtime) = std::env::var(crate::check_memory::HOST_RUNTIME_ENV) {
+                        if !runtime.is_empty() && Path::new(&runtime).is_dir() {
+                            // The sandboxed gate runner and daemon clients lock
+                            // the same per-user token files as the host. Always
+                            // give it a synthetic /run path: the rootless host
+                            // falls back to /dev/shm when /run/user/UID is
+                            // absent, while host_shell deliberately replaces
+                            // /dev with a private minimal tree.
+                            let inside = "/run/td-builder-check-host".to_string();
+                            binds.push(sandbox::Bind {
+                                src: runtime,
+                                dest: Some(inside.clone()),
+                                readonly: false,
+                                ro_optional: false,
+                            });
+                            sandbox_host_runtime = Some(inside);
                         }
                     }
                     // The persistent signed substitute store (~/.td/subst) —
@@ -10088,9 +10446,15 @@ fn main() -> ExitCode {
                     // output back, so it must be visible at the SAME absolute path in every
                     // check sandbox — RW (connect to the socket; read the store). Bound only
                     // when present; a cold machine without a running daemon simply lacks it.
-                    let bdd = format!("{home}/.td/build-daemon");
-                    if Path::new(&bdd).is_dir() {
-                        binds.push(sandbox::Bind { src: bdd, dest: None, readonly: false, ro_optional: false });
+                    if let Ok(bdd) = crate::check_loop::daemon_runtime_dir() {
+                        if bdd.is_dir() {
+                            binds.push(sandbox::Bind {
+                                src: bdd.to_string_lossy().into_owned(),
+                                dest: None,
+                                readonly: false,
+                                ro_optional: false,
+                            });
+                        }
                     }
                     // The shared warmed-source cache (~/.td/sources, populated HOST-SIDE by
                     // `td-feed warm sources` before this sandbox starts) — READ-ONLY: the
@@ -10110,22 +10474,54 @@ fn main() -> ExitCode {
                         // substitute resolver knobs (TD_SUBST_BIN/STORE/PUBKEY) the toolchain gates
                         // read to FETCH the lock-keyed closure instead of building from seed;
                         // TD_DAEMON_* = the shared build daemon's socket (TD_DAEMON_SOCKET) the
-                        // corpus build submits to. TD_CHECK_* = the runner's own knobs
-                        // (slots/jobs/disable).
-                        if k.starts_with("TD_CHECK_")
+                        // corpus build submits to. TD_CHECK_* includes the
+                        // host-owned memory-token policy and gate controls.
+                        if (k.starts_with("TD_CHECK_")
                             || k.starts_with("TD_SUBST_")
-                            || k.starts_with("TD_DAEMON_")
+                            || k.starts_with("TD_DAEMON_"))
+                            && k != crate::check_memory::HOST_RUNTIME_ENV
+                            && k != crate::check_memory::TOKEN_DIR_ENV
                         {
                             extra_env.push((k, v));
                         }
                     }
+                    if let Some(runtime) = sandbox_host_runtime {
+                        let token_name = std::env::var_os(crate::check_memory::TOKEN_DIR_ENV)
+                            .and_then(|path| {
+                                PathBuf::from(path).file_name().map(|name| name.to_os_string())
+                            })
+                            .ok_or_else(|| {
+                                format!(
+                                    "hosted check is missing a valid {}",
+                                    crate::check_memory::TOKEN_DIR_ENV
+                                )
+                            })?;
+                        let token_dir = Path::new(&runtime)
+                            .join(token_name)
+                            .to_string_lossy()
+                            .into_owned();
+                        extra_env.push((
+                            crate::check_memory::HOST_RUNTIME_ENV.to_string(),
+                            runtime,
+                        ));
+                        extra_env.push((
+                            crate::check_memory::TOKEN_DIR_ENV.to_string(),
+                            token_dir,
+                        ));
+                    }
                 } else {
+                    tmpfs.push("/tmp".to_string());
                     tmpfs.push(home.clone());
                 }
-                let scratch = std::env::temp_dir()
-                    .join(format!("td-host-sandbox-{}-{}", sys::getuid(), std::process::id()));
-                let _ = std::fs::remove_dir_all(&scratch);
-                std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+                let scratch = match &check_scratch {
+                    Some(allocated) => allocated.namespace.clone(),
+                    None => std::env::temp_dir()
+                        .join(format!("td-host-sandbox-{}-{}", sys::getuid(), std::process::id())),
+                };
+                if check_scratch.is_none() {
+                    let _ = std::fs::remove_dir_all(&scratch);
+                    std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+                }
                 let result = sandbox::host_shell(
                     &cmd, &cmd_args, &binds, &tmpfs, &path_env, &home, &workdir, &extra_env,
                     &ro_dirs, &scratch,
@@ -10134,7 +10530,9 @@ fn main() -> ExitCode {
                 // Remove the scratch tree (the sandbox's mounts lived in the
                 // child's now-gone mount namespace, so only an empty dir remains
                 // here). Previously leaked one dir per run.
-                let _ = std::fs::remove_dir_all(&scratch);
+                if check_scratch.is_none() {
+                    let _ = std::fs::remove_dir_all(&scratch);
+                }
                 result
             };
             match run() {
@@ -10302,7 +10700,7 @@ fn main() -> ExitCode {
         },
         _ => {
             eprintln!("usage: td-builder            # print the S1 sentinel");
-            eprintln!("       td-builder check [GOAL...]             # the loop: host prelude + sandboxed gate ladder");
+            eprintln!("       td-builder check [GOAL...]             # lazy per-user memory host + sandboxed gate ladder");
             eprintln!("       td-builder gate-run [-j N] [GOAL...]   # the in-sandbox gate scheduler (src/gate_defs/)");
             eprintln!("       td-builder check-rung HARNESS [ARG...] # dev: run a harness inside the loop sandbox");
             eprintln!("       td-builder text <op> ...               # typed text assertions/extraction for loop scripts");
@@ -10355,6 +10753,110 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn daemon_budget_probe_is_test_only_and_cannot_name_a_build() {
+        assert_eq!(
+            daemon_budget_probe("PROBE 7", true).unwrap(),
+            Some("probe 7".to_string())
+        );
+        assert!(daemon_budget_probe("PROBE 7", false).is_err());
+        assert!(daemon_budget_probe("PROBE ../../real.drv", true).is_err());
+        assert_eq!(daemon_budget_probe("/td/store/real.drv", true).unwrap(), None);
+    }
+
+    #[test]
+    fn check_scratch_sweep_preserves_a_live_run_and_reclaims_a_crash() {
+        let parent = std::env::temp_dir().join(format!(
+            "td-check-scratch-sweep-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&parent);
+        let stale = parent.join("run-1-0");
+        let active = parent.join("run-2-0");
+        for run in [&stale, &active] {
+            std::fs::create_dir_all(run.join("tmp/tree")).unwrap();
+            std::fs::File::create(run.join(".live")).unwrap();
+        }
+        let active_lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(active.join(".live"))
+            .unwrap();
+        active_lease.lock().unwrap();
+
+        sweep_host_sandbox_scratch(&parent);
+
+        assert!(!stale.exists());
+        assert!(active.exists());
+        drop(active_lease);
+        sweep_host_sandbox_scratch(&parent);
+        assert!(!active.exists());
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn check_scratch_cleanup_reclaims_mode_000_trees() {
+        let parent = std::env::temp_dir().join(format!(
+            "td-check-scratch-mode-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&parent);
+        let run = parent.join("run-1-0");
+        let nested = run.join("tmp/closed");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("artifact"), b"large tree").unwrap();
+        std::fs::File::create(run.join(".live")).unwrap();
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        sweep_host_sandbox_scratch(&parent);
+
+        assert!(!run.exists());
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn daemon_stdout_keeps_only_a_bounded_complete_tail() {
+        let mut output = vec![b'x'; DAEMON_STDOUT_TAIL_BYTES.saturating_mul(3)];
+        output.extend_from_slice(b"\nOK /td/store/result /scratch/result\n");
+        let (tail, truncated) = read_daemon_stdout_tail(output.as_slice()).unwrap();
+        assert!(truncated);
+        assert!(tail.len() <= DAEMON_STDOUT_TAIL_BYTES);
+        assert_eq!(
+            daemon_ok_line(&tail, truncated).as_deref(),
+            Some("OK /td/store/result /scratch/result")
+        );
+
+        let mut partial = vec![b'x'; DAEMON_STDOUT_TAIL_BYTES.saturating_add(32)];
+        partial.extend_from_slice(b"OK forged-without-boundary");
+        let (tail, truncated) = read_daemon_stdout_tail(partial.as_slice()).unwrap();
+        assert!(truncated);
+        assert!(daemon_ok_line(&tail, truncated).is_none());
+    }
+
+    #[test]
+    fn daemon_dedup_keys_leave_when_the_last_request_finishes() {
+        let map: DaemonKeyMap = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        ));
+        let lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+        map.lock().unwrap().insert("key".to_string(), lock.clone());
+        let first = DaemonKeyUse {
+            map: map.clone(),
+            key: "key".to_string(),
+            lock: lock.clone(),
+        };
+        let second = DaemonKeyUse {
+            map: map.clone(),
+            key: "key".to_string(),
+            lock,
+        };
+        drop(first);
+        assert_eq!(map.lock().unwrap().len(), 1);
+        drop(second);
+        assert!(map.lock().unwrap().is_empty());
+    }
 
     /// The daemon CHECK verb reuses the build already realized as ONE of the two
     /// independent reproducibility builds — but ONLY when every output tree is actually

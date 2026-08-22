@@ -330,7 +330,7 @@ pub fn getgid() -> u32 {
     unsafe { syscall5(SYS_GETGID, 0, 0, 0, 0, 0) as u32 }
 }
 
-/// flock(2) LOCK_EX|LOCK_NB — the gate runner's machine-wide slot pool (gates.rs).
+/// flock(2) LOCK_EX|LOCK_NB — shared per-user scheduler tokens.
 /// A slot is an exclusively-flocked file; the kernel releases the lock when the
 /// holding process exits (even on SIGKILL), so a crashed gate can never leak a slot
 /// — the property that makes the cross-agent pool safe without a reaper.
@@ -339,9 +339,9 @@ const LOCK_EX: usize = 2;
 const LOCK_NB: usize = 4;
 const EWOULDBLOCK: i32 = 11;
 
-/// kill(2) to a whole PROCESS GROUP (negative pid) — the gate-tree memory
-/// watchdog's enforcement (gates.rs): SIGKILL the gate's process group when its
-/// aggregate RSS crosses the tree budget.
+/// kill(2) to a whole PROCESS GROUP (negative pid). Gate containment combines
+/// this atomic ordinary-tree kill with a `/proc` descendant snapshot so phases
+/// that created another process group are covered too.
 const SYS_KILL: usize = 62;
 
 pub fn kill_process_group(pgid: u32, sig: usize) -> io::Result<()> {

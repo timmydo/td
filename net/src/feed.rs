@@ -22,11 +22,26 @@
 //                      Also asserts both gates are load-bearing: a wrong pinned hash reds
 //                      warm, a corrupted store byte reds serve (sidecar mismatch).
 use sha2::{Digest, Sha256};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const SERVE_WORKERS: usize = 8;
+const SERVE_WORKER_STACK_BYTES: usize = 512 * 1024;
+const MAX_REQUEST_LINE_BYTES: usize = 16 * 1024;
+const MAX_REQUEST_HEAD_BYTES: usize = 64 * 1024;
+const REQUEST_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const RESPONSE_DEADLINE: Duration = Duration::from_secs(30 * 60);
+const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
+const FEED_NO_DAEMON_ENV: &str = "TD_FEED_NO_DAEMON";
 
 /// One mirror artifact: served at `path`, fetched from `url`, content sha256 `sha256`.
 struct Entry {
@@ -45,6 +60,237 @@ struct SourcePin {
 
 fn hex_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn reader_sha256_before(
+    reader: &mut impl Read,
+    max_bytes: u64,
+    guard: Option<&ResponseGuard<'_>>,
+) -> io::Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        if let Some(guard) = guard {
+            guard.check()?;
+        }
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+        if total > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("feed hash input exceeds its {max_bytes}-byte limit"),
+            ));
+        }
+        let chunk = buf.get(..n).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "hash read exceeded its buffer")
+        })?;
+        hasher.update(chunk);
+    }
+    if let Some(guard) = guard {
+        guard.check()?;
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn file_sha256(path: &Path) -> io::Result<String> {
+    file_sha256_before(path, MAX_ARTIFACT_BYTES, None)
+}
+
+fn file_sha256_before(
+    path: &Path,
+    max_bytes: u64,
+    guard: Option<&ResponseGuard<'_>>,
+) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    if file.metadata()?.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("feed hash input exceeds its {max_bytes}-byte limit"),
+        ));
+    }
+    reader_sha256_before(&mut file, max_bytes, guard)
+}
+
+fn decode_mount_field(value: &str) -> PathBuf {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes.get(index) == Some(&b'\\') {
+            let a = bytes.get(index.saturating_add(1)).copied();
+            let b = bytes.get(index.saturating_add(2)).copied();
+            let c = bytes.get(index.saturating_add(3)).copied();
+            if let (Some(a), Some(b), Some(c)) = (a, b, c) {
+                if (b'0'..=b'7').contains(&a)
+                    && (b'0'..=b'7').contains(&b)
+                    && (b'0'..=b'7').contains(&c)
+                {
+                    decoded.push((a - b'0') * 64 + (b - b'0') * 8 + (c - b'0'));
+                    index = index.saturating_add(4);
+                    continue;
+                }
+            }
+        }
+        if let Some(byte) = bytes.get(index) {
+            decoded.push(*byte);
+        }
+        index = index.saturating_add(1);
+    }
+    PathBuf::from(std::ffi::OsString::from_vec(decoded))
+}
+
+fn mount_is_memory_backed(path: &Path, mountinfo: &str, depth: usize) -> io::Result<bool> {
+    if depth > 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "overlay backing mount recursion exceeds its limit",
+        ));
+    }
+    let mut chosen: Option<(usize, &str, &str)> = None;
+    for line in mountinfo.lines() {
+        let Some((left, right)) = line.split_once(" - ") else {
+            continue;
+        };
+        let Some(encoded_mount) = left.split_whitespace().nth(4) else {
+            continue;
+        };
+        let mount = decode_mount_field(encoded_mount);
+        if !path.starts_with(&mount) {
+            continue;
+        }
+        let mut fields = right.split_whitespace();
+        let Some(fs_type) = fields.next() else {
+            continue;
+        };
+        let _source = fields.next();
+        let Some(super_options) = fields.next() else {
+            continue;
+        };
+        let width = mount.as_os_str().as_bytes().len();
+        if chosen.is_none_or(|(best, _, _)| width > best) {
+            chosen = Some((width, fs_type, super_options));
+        }
+    }
+    let Some((_, fs_type, super_options)) = chosen else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("no mount accounting for {}", path.display()),
+        ));
+    };
+    if matches!(fs_type, "tmpfs" | "ramfs" | "hugetlbfs" | "devtmpfs") {
+        return Ok(true);
+    }
+    if fs_type != "overlay" {
+        return Ok(false);
+    }
+    let upper = super_options
+        .split(',')
+        .find_map(|option| option.strip_prefix("upperdir="))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("overlay mount for {} has no upperdir", path.display()),
+            )
+        })?;
+    mount_is_memory_backed(
+        &decode_mount_field(upper),
+        mountinfo,
+        depth.saturating_add(1),
+    )
+}
+
+fn require_disk_backed(path: &Path) -> io::Result<()> {
+    let canonical = std::fs::canonicalize(path)?;
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")?;
+    if mount_is_memory_backed(&canonical, &mountinfo, 0)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "feed scratch {} is memory-backed; choose a disk-backed TD_FEED_DIR",
+                canonical.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Copy and hash one warmed artifact into an already-unlinked disk file, then
+/// serve that exact descriptor. Hashing a mutable path and rewinding it left a
+/// race where a same-inode writer could change the bytes between those steps;
+/// the snapshot preserves constant memory without weakening integrity. Hashing
+/// during the copy avoids another full read before serving.
+#[cfg(test)]
+fn snapshot_for_serve(path: &Path) -> io::Result<(File, String)> {
+    let guard = ResponseGuard::without_client(Instant::now() + RESPONSE_DEADLINE);
+    snapshot_for_serve_before(path, &guard)
+}
+
+fn snapshot_for_serve_before(path: &Path, guard: &ResponseGuard<'_>) -> io::Result<(File, String)> {
+    static NEXT_SNAPSHOT: AtomicU64 = AtomicU64::new(0);
+    guard.check()?;
+    let mut source = File::open(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "feed path has no parent"))?;
+    require_disk_backed(parent)?;
+    for _ in 0..128 {
+        guard.check()?;
+        let nonce = NEXT_SNAPSHOT.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!(
+            ".td-feed-serve-{}-{nonce}.tmp",
+            std::process::id()
+        ));
+        let opened = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp);
+        let mut snapshot = match opened {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        if let Err(e) = std::fs::remove_file(&tmp) {
+            drop(snapshot);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        let mut hasher = Sha256::new();
+        let mut total = 0u64;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            guard.check()?;
+            let n = source.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            total = total.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+            if total > MAX_ARTIFACT_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "feed snapshot exceeds its 16 GiB byte limit",
+                ));
+            }
+            let chunk = buf.get(..n).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "snapshot read exceeded its buffer")
+            })?;
+            hasher.update(chunk);
+            snapshot.write_all(chunk)?;
+            guard.check()?;
+        }
+        guard.check()?;
+        snapshot.rewind()?;
+        return Ok((snapshot, format!("{:x}", hasher.finalize())));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique feed snapshot",
+    ))
 }
 
 /// Parse an index: `<path> <url> <sha256>` per line; `#` comments and blanks ignored.
@@ -91,6 +337,34 @@ fn sidecar_path(dst: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+fn read_digest_sidecar(path: &Path) -> io::Result<String> {
+    const DIGEST_BYTES: usize = 64;
+
+    let file = File::open(path)?;
+    let mut bytes = Vec::with_capacity(DIGEST_BYTES.saturating_add(1));
+    file.take(u64::try_from(DIGEST_BYTES.saturating_add(2)).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)?;
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    if bytes.len() != DIGEST_BYTES
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "feed digest sidecar is not one lowercase SHA-256 digest",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "feed digest sidecar is not UTF-8",
+        )
+    })
+}
+
 /// Write `bytes` to `dst` atomically (pid-unique temp + rename), so a concurrent serve /
 /// another warming agent never sees a partial file.
 fn write_atomic(dst: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -108,17 +382,190 @@ fn try_get(url: &str) -> Result<Vec<u8>, String> {
     crate::http::get_body(url)
 }
 
+fn try_get_before(url: &str, guard: &ResponseGuard<'_>) -> Result<Vec<u8>, String> {
+    guard.check().map_err(|e| e.to_string())?;
+    let body = crate::http::get_body_before(url, guard.deadline)?;
+    guard.check().map_err(|e| e.to_string())?;
+    Ok(body)
+}
+
+struct RemoveFileOnDrop {
+    path: PathBuf,
+    _directory_lock: File,
+    _reservation: File,
+}
+
+struct RemoveDirOnDrop(PathBuf);
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl Drop for RemoveFileOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn sweep_download_temps(parent: &Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let abandoned = entries.flatten().filter(|entry| {
+        let name = entry.file_name();
+        let bytes = name.as_bytes();
+        bytes.starts_with(b".td-feed-download-") && bytes.ends_with(b".tmp")
+    });
+    for entry in abandoned.take(4096) {
+        let _ = std::fs::remove_file(entry.path());
+    }
+}
+
+fn sweep_kernel_header_temps(parent: &Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let abandoned = entries.flatten().filter(|entry| {
+        let name = entry.file_name();
+        let bytes = name.as_bytes();
+        bytes.starts_with(b".td-feed-kh-work-")
+            || (bytes.starts_with(b".td-feed-kh-output-") && bytes.ends_with(b".tmp"))
+    });
+    for entry in abandoned.take(4096) {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            let _ = std::fs::remove_dir_all(path);
+        } else {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Download and verify a pinned artifact through a constant-memory path, then
+/// atomically publish it. The 16 GiB wire ceiling matches the decoded archive
+/// and tar-payload ceilings: it is a disk-demand backstop as well as protection
+/// against an endless HTTP body.
+fn download_verified(url: &str, dst: &Path, want: &str) -> Result<(), String> {
+    download_verified_before(url, dst, want, None)
+}
+
+fn download_verified_before(
+    url: &str,
+    dst: &Path,
+    want: &str,
+    guard: Option<&ResponseGuard<'_>>,
+) -> Result<(), String> {
+    static NEXT_DOWNLOAD: AtomicU64 = AtomicU64::new(0);
+    let parent = dst
+        .parent()
+        .ok_or_else(|| format!("download destination {} has no parent", dst.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    require_disk_backed(parent).map_err(|e| e.to_string())?;
+    // Serializing downloads within one destination directory lowers demand
+    // and makes crash cleanup race-free. SIGKILL releases this lock, so the
+    // next download can remove every abandoned named partial before starting.
+    let lock_path = parent.join(".td-feed-download.lock");
+    let directory_lock = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)
+        .map_err(|e| format!("open {}: {e}", lock_path.display()))?;
+    if let Some(guard) = guard {
+        loop {
+            guard.check().map_err(|e| e.to_string())?;
+            match directory_lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    std::thread::sleep(
+                        response_remaining(guard.deadline)
+                            .map_err(|e| e.to_string())?
+                            .min(Duration::from_millis(20)),
+                    );
+                }
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(format!("lock {}: {e}", lock_path.display()))
+                }
+            }
+        }
+    } else {
+        directory_lock
+            .lock()
+            .map_err(|e| format!("lock {}: {e}", lock_path.display()))?;
+    }
+    sweep_download_temps(parent);
+    let existing = file_sha256_before(dst, MAX_ARTIFACT_BYTES, guard);
+    if let Some(guard) = guard {
+        guard
+            .check()
+            .map_err(|e| format!("hash {}: {e}", dst.display()))?;
+    }
+    if existing.ok().as_deref() == Some(want) {
+        return Ok(());
+    }
+    let (path, reservation) = loop {
+        let nonce = NEXT_DOWNLOAD.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".td-feed-download-{}-{nonce}.tmp",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("reserve {}: {e}", candidate.display())),
+        }
+    };
+    let tmp = RemoveFileOnDrop {
+        path,
+        _directory_lock: directory_lock,
+        _reservation: reservation,
+    };
+    (|| {
+        if let Some(guard) = guard {
+            guard.check().map_err(|e| e.to_string())?;
+            crate::http::get_to_file_before(
+                url,
+                &tmp.path,
+                MAX_ARTIFACT_BYTES,
+                guard.deadline,
+            )?;
+            guard.check().map_err(|e| e.to_string())?;
+        } else {
+            crate::http::get_to_file(url, &tmp.path, MAX_ARTIFACT_BYTES)?;
+        }
+        let got = file_sha256_before(&tmp.path, MAX_ARTIFACT_BYTES, guard)
+            .map_err(|e| format!("hash {}: {e}", tmp.path.display()))?;
+        if got != want {
+            return Err(format!(
+                "sha256 mismatch for {url}\n  want {want}\n  got  {got}"
+            ));
+        }
+        std::fs::rename(&tmp.path, dst)
+            .map_err(|e| format!("publish {}: {e}", dst.display()))?;
+        Ok(())
+    })()
+}
+
 /// Warm one entry into `store` (+ its sidecar); Ok(true) if fetched, Ok(false) if already
 /// warm + verified. Never egresses for an entry already present + matching.
 fn warm_one(e: &Entry, store: &Path) -> Result<bool, String> {
     let dst =
         store_path(store, &e.path).ok_or_else(|| format!("unsafe index path {:?}", e.path))?;
     let side = sidecar_path(&dst);
-    if let Ok(have) = std::fs::read(&dst) {
-        if hex_sha256(&have) == e.sha256 {
+    if let Ok(have) = file_sha256(&dst) {
+        if have == e.sha256 {
             // File is warm; make sure the integrity sidecar is present + correct.
-            let ok = std::fs::read_to_string(&side)
-                .map(|s| s.trim() == e.sha256)
+            let ok = read_digest_sidecar(&side)
+                .map(|digest| digest == e.sha256)
                 .unwrap_or(false);
             if !ok {
                 write_atomic(&side, format!("{}\n", e.sha256).as_bytes())?;
@@ -126,20 +573,8 @@ fn warm_one(e: &Entry, store: &Path) -> Result<bool, String> {
             return Ok(false);
         }
     }
-    let body = try_get(&e.url)?;
-    let got = hex_sha256(&body);
-    if got != e.sha256 {
-        return Err(format!(
-            "sha256 mismatch for {}\n  want {}\n  got  {}",
-            e.url, e.sha256, got
-        ));
-    }
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| format!("mkdir {}: {err}", parent.display()))?;
-    }
-    write_atomic(&dst, &body)?;
-    write_atomic(&side, format!("{got}\n").as_bytes())?;
+    download_verified(&e.url, &dst, &e.sha256)?;
+    write_atomic(&side, format!("{}\n", e.sha256).as_bytes())?;
     Ok(true)
 }
 
@@ -158,79 +593,314 @@ fn warm(index: &[Entry], store: &Path) -> Result<(usize, usize), String> {
 }
 
 /// Write an HTTP/1.1 response with `Connection: close`.
+struct ResponseGuard<'a> {
+    deadline: Instant,
+    client: Option<&'a TcpStream>,
+}
+
+impl<'a> ResponseGuard<'a> {
+    fn client(deadline: Instant, client: &'a TcpStream) -> Self {
+        Self {
+            deadline,
+            client: Some(client),
+        }
+    }
+
+    #[cfg(test)]
+    fn without_client(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            client: None,
+        }
+    }
+
+    fn check(&self) -> io::Result<()> {
+        let _ = response_remaining(self.deadline)?;
+        if let Some(client) = self.client {
+            if client_disconnected(client)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "feed client disconnected before response was ready",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn response_remaining(deadline: Instant) -> io::Result<Duration> {
+    deadline.checked_duration_since(Instant::now()).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::TimedOut, "feed response deadline expired")
+    })
+}
+
+fn client_disconnected(conn: &TcpStream) -> io::Result<bool> {
+    conn.set_nonblocking(true)?;
+    let mut probe = [0u8; 1];
+    let result = loop {
+        match conn.peek(&mut probe) {
+            Ok(0) => break Ok(true),
+            Ok(_) => break Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break Ok(false),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::NotConnected
+                        | io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                break Ok(true);
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    let restore = conn.set_nonblocking(false);
+    match (result, restore) {
+        (Ok(disconnected), Ok(())) => Ok(disconnected),
+        (Ok(_), Err(e)) | (Err(e), _) => Err(e),
+    }
+}
+
+fn write_before(conn: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let remaining = response_remaining(deadline)?;
+        conn.set_write_timeout(Some(remaining.min(REQUEST_IO_TIMEOUT)))?;
+        let count = conn.write(bytes)?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "feed response made no progress",
+            ));
+        }
+        bytes = bytes.get(count..).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "feed response write exceeded its buffer")
+        })?;
+    }
+    Ok(())
+}
+
+fn flush_before(conn: &mut TcpStream, deadline: Instant) -> io::Result<()> {
+    let remaining = response_remaining(deadline)?;
+    conn.set_write_timeout(Some(remaining.min(REQUEST_IO_TIMEOUT)))?;
+    conn.flush()
+}
+
 fn respond(conn: &mut TcpStream, code: u16, reason: &str, body: &[u8]) -> io::Result<()> {
+    let deadline = Instant::now() + RESPONSE_DEADLINE;
+    respond_before(conn, code, reason, body, deadline)
+}
+
+fn respond_before(
+    conn: &mut TcpStream,
+    code: u16,
+    reason: &str,
+    body: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
     let head = format!(
         "HTTP/1.1 {code} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    conn.write_all(head.as_bytes())?;
-    conn.write_all(body)?;
-    conn.flush()
+    write_before(conn, head.as_bytes(), deadline)?;
+    write_before(conn, body, deadline)?;
+    flush_before(conn, deadline)
+}
+
+fn respond_file_before(
+    conn: &mut TcpStream,
+    file: &mut File,
+    len: u64,
+    deadline: Instant,
+) -> io::Result<()> {
+    let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n");
+    write_before(conn, head.as_bytes(), deadline)?;
+    let mut remaining = len;
+    let mut buf = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let width = usize::try_from(remaining.min(buf.len() as u64)).unwrap_or(buf.len());
+        let chunk = buf.get_mut(..width).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "feed response read exceeded its buffer")
+        })?;
+        let count = file.read(chunk)?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "feed artifact ended while it was served",
+            ));
+        }
+        let bytes = chunk.get(..count).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "feed response read exceeded its buffer")
+        })?;
+        write_before(conn, bytes, deadline)?;
+        remaining = remaining.saturating_sub(u64::try_from(count).unwrap_or(u64::MAX));
+    }
+    flush_before(conn, deadline)
+}
+
+fn read_request_head(conn: &mut TcpStream) -> io::Result<Vec<u8>> {
+    let deadline = Instant::now() + REQUEST_IO_TIMEOUT;
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "feed request head deadline expired",
+                )
+            })?;
+        conn.set_read_timeout(Some(remaining))?;
+        let n = conn.read(&mut chunk)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "feed request ended before its header",
+            ));
+        }
+        let Some(bytes) = chunk.get(..n) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "feed request read exceeded its buffer",
+            ));
+        };
+        if head.len().saturating_add(bytes.len()) > MAX_REQUEST_HEAD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "feed request head exceeds its byte limit",
+            ));
+        }
+        head.extend_from_slice(bytes);
+        if head.windows(4).any(|window| window == b"\r\n\r\n")
+            || head.windows(2).any(|window| window == b"\n\n")
+        {
+            return Ok(head);
+        }
+    }
 }
 
 /// Handle one request: route `GET /<path>`, verify the file against its sidecar, stream.
 fn handle_conn(mut conn: TcpStream, store: &Path) -> io::Result<()> {
-    let mut reader = BufReader::new(conn.try_clone()?);
-    let mut req_line = String::new();
-    reader.read_line(&mut req_line)?;
-    // Drain the rest of the request head so the client can write fully.
-    loop {
-        let mut h = String::new();
-        let n = reader.read_line(&mut h)?;
-        if n == 0 || h == "\r\n" || h == "\n" {
-            break;
-        }
+    conn.set_write_timeout(Some(REQUEST_IO_TIMEOUT))?;
+    let head = read_request_head(&mut conn)?;
+    let response_deadline = Instant::now() + RESPONSE_DEADLINE;
+    let line_end = head
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing request line"))?;
+    if line_end > MAX_REQUEST_LINE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "feed request line exceeds its byte limit",
+        ));
     }
+    let req_line = std::str::from_utf8(head.get(..line_end).unwrap_or_default())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 request line"))?;
     let mut parts = req_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
     if method != "GET" {
-        return respond(
+        return respond_before(
             &mut conn,
             405,
             "Method Not Allowed",
             b"method not allowed\n",
+            response_deadline,
         );
     }
     let path = target.trim_start_matches('/');
     // The integrity sidecars are internal — never serve them.
     if path.ends_with(".sha256") {
-        return respond(&mut conn, 404, "Not Found", b"not served\n");
+        return respond_before(
+            &mut conn,
+            404,
+            "Not Found",
+            b"not served\n",
+            response_deadline,
+        );
     }
     let full = match store_path(store, path) {
         Some(p) => p,
-        None => return respond(&mut conn, 400, "Bad Request", b"bad path\n"),
+        None => {
+            return respond_before(
+                &mut conn,
+                400,
+                "Bad Request",
+                b"bad path\n",
+                response_deadline,
+            )
+        }
     };
-    let bytes = match std::fs::read(&full) {
-        Ok(b) => b,
-        Err(_) => return respond(&mut conn, 404, "Not Found", b"not warmed\n"),
+    let snapshot = {
+        let guard = ResponseGuard::client(response_deadline, &conn);
+        snapshot_for_serve_before(&full, &guard)
     };
-    let want = match std::fs::read_to_string(sidecar_path(&full)) {
-        Ok(s) => s.trim().to_string(),
+    let (mut file, got) = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return respond_before(
+                &mut conn,
+                404,
+                "Not Found",
+                b"not warmed\n",
+                response_deadline,
+            )
+        }
+        Err(e) => return Err(e),
+    };
+    ResponseGuard::client(response_deadline, &conn).check()?;
+    let want = match read_digest_sidecar(&sidecar_path(&full)) {
+        Ok(digest) => digest,
         // No sidecar ⇒ the artifact was not placed by `warm`; refuse to serve unverified.
-        Err(_) => return respond(&mut conn, 500, "No Integrity Sidecar", b"no sidecar\n"),
+        Err(_) => {
+            return respond_before(
+                &mut conn,
+                500,
+                "No Integrity Sidecar",
+                b"no sidecar\n",
+                response_deadline,
+            )
+        }
     };
-    if hex_sha256(&bytes) != want {
+    ResponseGuard::client(response_deadline, &conn).check()?;
+    if got != want {
         // verify-on-serve: the store drifted from the warmed hash — refuse to serve.
-        return respond(
+        return respond_before(
             &mut conn,
             500,
             "Integrity Failure",
             b"store sha256 mismatch\n",
+            response_deadline,
         );
     }
-    respond(&mut conn, 200, "OK", &bytes)
+    let len = file.metadata()?.len();
+    respond_file_before(&mut conn, &mut file, len, response_deadline)
 }
 
-/// Run the mirror server forever on `listener` (one thread per connection).
-fn serve_loop(listener: TcpListener, store: Arc<PathBuf>) {
+fn serve_worker(listener: TcpListener, store: Arc<PathBuf>) {
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
-        let store = Arc::clone(&store);
-        std::thread::spawn(move || {
-            let _ = handle_conn(conn, &store);
-        });
+        let _ = handle_conn(conn, &store);
     }
+}
+
+/// Run the mirror server forever with a fixed worker count. Kernel socket
+/// backlog supplies bounded backpressure without allocating a thread per peer.
+fn serve_loop(listener: TcpListener, store: Arc<PathBuf>) {
+    for worker in 1..SERVE_WORKERS {
+        let Ok(worker_listener) = listener.try_clone() else {
+            break;
+        };
+        let worker_store = Arc::clone(&store);
+        let _ = std::thread::Builder::new()
+            .name(format!("td-feed-{worker}"))
+            .stack_size(SERVE_WORKER_STACK_BYTES)
+            .spawn(move || serve_worker(worker_listener, worker_store));
+    }
+    serve_worker(listener, store);
 }
 
 fn die(msg: String) -> ! {
@@ -368,15 +1038,22 @@ fn crates_base() -> String {
 
 /// The sparse-registry index path for a crate name (lowercased): `1/{n}`, `2/{n}`,
 /// `3/{c}/{n}`, else `{n[0:2]}/{n[2:4]}/{n}`.
-fn index_path(name: &str) -> String {
+fn index_path(name: &str) -> Option<String> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
     let n = name.to_lowercase();
-    match n.len() {
-        0 => n,
+    Some(match n.len() {
         1 => format!("1/{n}"),
         2 => format!("2/{n}"),
-        3 => format!("3/{}/{n}", &n[0..1]),
-        _ => format!("{}/{}/{n}", &n[0..2], &n[2..4]),
-    }
+        3 => format!("3/{}/{n}", n.get(0..1)?),
+        _ => format!("{}/{}/{n}", n.get(0..2)?, n.get(2..4)?),
+    })
 }
 
 /// Extract the sha256 `cksum` for `version` from a sparse-index document (newline JSON).
@@ -394,15 +1071,34 @@ fn cksum_for(index_text: &str, version: &str) -> Option<String> {
 }
 
 /// Serve (cache-or-proxy) a sparse-index document from index.crates.io.
-fn serve_index(store: &Path, idxpath: &str) -> Result<Vec<u8>, String> {
+fn serve_index_before(
+    store: &Path,
+    idxpath: &str,
+    guard: &ResponseGuard<'_>,
+) -> Result<Vec<u8>, String> {
+    guard.check().map_err(|e| e.to_string())?;
     let cache = store_path(&store.join("index"), idxpath).ok_or("unsafe index path")?;
-    if let Ok(b) = std::fs::read(&cache) {
-        return Ok(b);
+    if let Ok(metadata) = std::fs::metadata(&cache) {
+        if metadata.len() > MAX_INDEX_BYTES {
+            return Err(format!(
+                "cached sparse index {} exceeds its {MAX_INDEX_BYTES}-byte limit",
+                cache.display()
+            ));
+        }
+        if let Ok(bytes) = std::fs::read(&cache) {
+            return Ok(bytes);
+        }
     }
-    let body = try_get(&format!("{}/{idxpath}", index_base()))?;
+    let body = try_get_before(&format!("{}/{idxpath}", index_base()), guard)?;
+    if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_INDEX_BYTES {
+        return Err(format!(
+            "sparse index {idxpath} exceeds its {MAX_INDEX_BYTES}-byte limit"
+        ));
+    }
     if let Some(p) = cache.parent() {
         std::fs::create_dir_all(p).map_err(|e| format!("mkdir {}: {e}", p.display()))?;
     }
+    guard.check().map_err(|e| e.to_string())?;
     write_atomic(&cache, &body)?;
     Ok(body)
 }
@@ -412,39 +1108,97 @@ fn serve_index(store: &Path, idxpath: &str) -> Result<Vec<u8>, String> {
 /// hit is re-verified against the index cksum on every serve, and a corrupted/stale entry
 /// is discarded and refetched. So the sha256==index-cksum guarantee holds for cached hits,
 /// not just fresh downloads (the integrity the `warm crate`/`warm crate-local` path relies on).
-fn serve_crate(store: &Path, cr: &str, ver: &str) -> Result<Vec<u8>, String> {
+fn serve_crate_before(
+    store: &Path,
+    cr: &str,
+    ver: &str,
+    guard: &ResponseGuard<'_>,
+) -> Result<(File, u64), String> {
+    guard.check().map_err(|e| e.to_string())?;
+    let idxpath = index_path(cr).ok_or_else(|| format!("bad download crate name {cr:?}"))?;
+    if ver.is_empty()
+        || ver.len() > 128
+        || !ver.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_')
+        })
+    {
+        return Err(format!("bad download version {ver:?}"));
+    }
     let cache = store_path(&store.join("crates"), &format!("{cr}-{ver}.crate"))
         .ok_or("unsafe crate name")?;
-    let idx = serve_index(store, &index_path(cr))?;
+    guard.check().map_err(|e| e.to_string())?;
+    let idx = serve_index_before(store, &idxpath, guard)?;
+    guard.check().map_err(|e| e.to_string())?;
     let cksum = cksum_for(&String::from_utf8_lossy(&idx), ver)
         .ok_or_else(|| format!("no cksum for {cr} {ver} in the index"))?;
-    if let Ok(b) = std::fs::read(&cache) {
-        if hex_sha256(&b) == cksum {
-            return Ok(b);
+    if cache.is_file() {
+        match snapshot_for_serve_before(&cache, guard) {
+            Ok((file, got)) => {
+                if got == cksum {
+                    let len = file
+                        .metadata()
+                        .map_err(|e| format!("stat {}: {e}", cache.display()))?
+                        .len();
+                    return Ok((file, len));
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::BrokenPipe | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(e.to_string());
+            }
+            Err(_) => {}
         }
         // Corrupted/stale cache entry — drop it and refetch rather than serve bad bytes.
         let _ = std::fs::remove_file(&cache);
     }
     let url = format!("{}/crates/{cr}/{cr}-{ver}.crate", crates_base());
-    let body = try_get(&url)?;
-    if hex_sha256(&body) != cksum {
+    if let Some(p) = cache.parent() {
+        std::fs::create_dir_all(p).map_err(|e| format!("mkdir {}: {e}", p.display()))?;
+    }
+    guard.check().map_err(|e| e.to_string())?;
+    download_verified_before(&url, &cache, &cksum, Some(guard))?;
+    guard.check().map_err(|e| e.to_string())?;
+    let (file, got) = snapshot_for_serve_before(&cache, guard)
+        .map_err(|e| format!("snapshot {}: {e}", cache.display()))?;
+    if got != cksum {
         return Err(format!(
             "sha256 mismatch for {cr} {ver}: index cksum {cksum}"
         ));
     }
-    if let Some(p) = cache.parent() {
-        std::fs::create_dir_all(p).map_err(|e| format!("mkdir {}: {e}", p.display()))?;
-    }
-    write_atomic(&cache, &body)?;
-    Ok(body)
+    let len = file
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", cache.display()))?
+        .len();
+    Ok((file, len))
+}
+
+enum CargoBody {
+    Bytes(Vec<u8>),
+    File(File, u64),
 }
 
 /// Route one cargo sparse-registry request. `base` is HOST:PORT for the config URLs.
-fn cargo_route(store: &Path, base: &str, path: &str) -> Result<Vec<u8>, String> {
+#[cfg(test)]
+fn cargo_route(store: &Path, base: &str, path: &str) -> Result<CargoBody, String> {
+    let guard = ResponseGuard::without_client(Instant::now() + RESPONSE_DEADLINE);
+    cargo_route_before(store, base, path, &guard)
+}
+
+fn cargo_route_before(
+    store: &Path,
+    base: &str,
+    path: &str,
+    guard: &ResponseGuard<'_>,
+) -> Result<CargoBody, String> {
+    guard.check().map_err(|e| e.to_string())?;
     if path == "/config.json" {
-        return Ok(
+        return Ok(CargoBody::Bytes(
             format!("{{\"dl\":\"http://{base}/dl\",\"api\":\"http://{base}\"}}").into_bytes(),
-        );
+        ));
     }
     // The download endpoint is `/dl/<crate>/<version>/download`. A crate whose name starts with
     // "dl" has a sparse-index path that ALSO starts with `dl/` (e.g. `dlv-list` -> `dl/v-/dlv-list`),
@@ -459,37 +1213,52 @@ fn cargo_route(store: &Path, base: &str, path: &str) -> Result<Vec<u8>, String> 
             && !parts[0].is_empty()
             && !parts[1].is_empty()
         {
-            return serve_crate(store, parts[0], parts[1]);
+            let (file, len) = serve_crate_before(store, parts[0], parts[1], guard)?;
+            return Ok(CargoBody::File(file, len));
         }
     }
-    serve_index(store, path.trim_start_matches('/'))
+    guard.check().map_err(|e| e.to_string())?;
+    serve_index_before(store, path.trim_start_matches('/'), guard).map(CargoBody::Bytes)
 }
 
 /// Handle one cargo request: parse `GET /<path>`, route, stream.
 fn handle_cargo_conn(mut conn: TcpStream, store: &Path, base: &str) -> io::Result<()> {
-    let mut reader = BufReader::new(conn.try_clone()?);
-    let mut req_line = String::new();
-    reader.read_line(&mut req_line)?;
-    loop {
-        let mut h = String::new();
-        let n = reader.read_line(&mut h)?;
-        if n == 0 || h == "\r\n" || h == "\n" {
-            break;
-        }
+    conn.set_write_timeout(Some(REQUEST_IO_TIMEOUT))?;
+    let head = read_request_head(&mut conn)?;
+    let response_deadline = Instant::now() + RESPONSE_DEADLINE;
+    let line_end = head
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing request line"))?;
+    if line_end > MAX_REQUEST_LINE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cargo-proxy request line exceeds its byte limit",
+        ));
     }
+    let req_line = std::str::from_utf8(head.get(..line_end).unwrap_or_default())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 request line"))?;
     let mut parts = req_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
     if method != "GET" {
-        return respond(
+        return respond_before(
             &mut conn,
             405,
             "Method Not Allowed",
             b"method not allowed\n",
+            response_deadline,
         );
     }
-    match cargo_route(store, base, target) {
-        Ok(bytes) => respond(&mut conn, 200, "OK", &bytes),
+    let route = {
+        let guard = ResponseGuard::client(response_deadline, &conn);
+        cargo_route_before(store, base, target, &guard)
+    };
+    match route {
+        Ok(CargoBody::Bytes(bytes)) => respond_before(&mut conn, 200, "OK", &bytes, response_deadline),
+        Ok(CargoBody::File(mut file, len)) => {
+            respond_file_before(&mut conn, &mut file, len, response_deadline)
+        }
         Err(e) => {
             eprintln!("td-feed cargo-proxy: {target}: {e}");
             let code = if e.starts_with("no cksum") || e.starts_with("bad download") {
@@ -497,20 +1266,34 @@ fn handle_cargo_conn(mut conn: TcpStream, store: &Path, base: &str) -> io::Resul
             } else {
                 502
             };
-            respond(&mut conn, code, "Error", e.as_bytes())
+            respond_before(&mut conn, code, "Error", e.as_bytes(), response_deadline)
         }
     }
 }
 
-/// Run the cargo-proxy forever on `listener` (one thread per connection).
-fn cargo_proxy_loop(listener: TcpListener, store: Arc<PathBuf>, base: String) {
+fn cargo_proxy_worker(listener: TcpListener, store: Arc<PathBuf>, base: Arc<String>) {
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
-        let (store, base) = (Arc::clone(&store), base.clone());
-        std::thread::spawn(move || {
-            let _ = handle_cargo_conn(conn, &store, &base);
-        });
+        let _ = handle_cargo_conn(conn, &store, &base);
     }
+}
+
+/// Run the cargo-proxy with a fixed worker count. The listen backlog supplies
+/// backpressure without allocating one default-stack thread per slow peer.
+fn cargo_proxy_loop(listener: TcpListener, store: Arc<PathBuf>, base: String) {
+    let base = Arc::new(base);
+    for worker in 1..SERVE_WORKERS {
+        let Ok(worker_listener) = listener.try_clone() else {
+            break;
+        };
+        let worker_store = Arc::clone(&store);
+        let worker_base = Arc::clone(&base);
+        let _ = std::thread::Builder::new()
+            .name(format!("td-cargo-proxy-{worker}"))
+            .stack_size(SERVE_WORKER_STACK_BYTES)
+            .spawn(move || cargo_proxy_worker(worker_listener, worker_store, worker_base));
+    }
+    cargo_proxy_worker(listener, store, base);
 }
 
 /// Hermetic loopback selftest of the cargo-proxy: a mock index/static.crates.io on 127.0.0.1
@@ -933,14 +1716,10 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
     //    that isn't there). The /dl GET sidesteps resolution; deps come later from the source's
     //    OWN lock (step 3).
     let dlurl = format!("http://{addr}/dl/{krate}/{ver}/download");
-    let body = match try_get(&dlurl) {
-        Ok(b) if !b.is_empty() => b,
-        _ => {
-            eprintln!("td-feed warm crate: source fetch failed for {krate}-{ver} (GET {dlurl})");
-            return;
-        }
-    };
-    if std::fs::create_dir_all(&work).is_err() || std::fs::write(&srccrate, &body).is_err() {
+    if std::fs::create_dir_all(&work).is_err()
+        || crate::http::get_to_file(&dlurl, &srccrate, MAX_ARTIFACT_BYTES).is_err()
+        || std::fs::metadata(&srccrate).map(|m| m.len() == 0).unwrap_or(true)
+    {
         eprintln!("td-feed warm crate: could not stage the source crate for {krate}-{ver}");
         return;
     }
@@ -1251,18 +2030,37 @@ fn sources_dir() -> PathBuf {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum FeedDaemonPolicy {
+    Explicit(String),
+    Disabled,
+    Ensure,
+}
+
+fn feed_daemon_policy(explicit: Option<String>, no_daemon: bool) -> FeedDaemonPolicy {
+    match explicit.filter(|value| !value.is_empty()) {
+        Some(base) => FeedDaemonPolicy::Explicit(base),
+        None if no_daemon => FeedDaemonPolicy::Disabled,
+        None => FeedDaemonPolicy::Ensure,
+    }
+}
+
 /// The shared feed `(addr, store)` — the ONE cross-worktree single-egress path.
-/// This does NOT depend on the caller's env: if TD_FEED_BASE is exported (the loop
-/// prelude runs `td-feed ensure-serve` and exports it) use it directly; otherwise
-/// ensure/discover the shared daemon ourselves on the default store, so an ad-hoc
-/// or background `td-feed warm sources` still egresses each pin ONCE for the whole
-/// host instead of dropping to a per-worktree direct GET. None only if we could
-/// neither reach an exported feed nor bring the shared daemon up.
+/// An explicit TD_FEED_BASE always wins. Otherwise ordinary callers lazily
+/// ensure the shared daemon, while a rootless check-host request sets
+/// TD_FEED_NO_DAEMON because any daemon it starts would be trapped in that
+/// request's private PID namespace. Such checks use the direct, verified,
+/// streaming path rather than publishing a short-lived shared endpoint.
 fn shared_feed() -> Option<(String, PathBuf)> {
     let dir = feed_dir();
     let store = dir.join("store");
-    if let Some(base) = std::env::var("TD_FEED_BASE").ok().filter(|s| !s.is_empty()) {
-        return Some((strip_scheme(&base), store));
+    match feed_daemon_policy(
+        std::env::var("TD_FEED_BASE").ok(),
+        std::env::var_os(FEED_NO_DAEMON_ENV).is_some(),
+    ) {
+        FeedDaemonPolicy::Explicit(base) => return Some((strip_scheme(&base), store)),
+        FeedDaemonPolicy::Disabled => return None,
+        FeedDaemonPolicy::Ensure => {}
     }
     match ensure_serve_daemon(&dir) {
         Ok(addr) => Some((addr, store)),
@@ -1302,8 +2100,8 @@ fn warm_sources(root: &Path) -> Result<(), String> {
 
     for pin in &pins {
         let out = dest.join(&pin.file);
-        if let Ok(b) = std::fs::read(&out) {
-            if hex_sha256(&b) == pin.sha256 {
+        if let Ok(have) = file_sha256(&out) {
+            if have == pin.sha256 {
                 continue; // already warm + verified
             }
         }
@@ -1320,19 +2118,13 @@ fn warm_sources(root: &Path) -> Result<(), String> {
                 sha256: pin.sha256.clone(),
             };
             let _ = warm_one(&e, store);
-            if let Ok(b) = try_get(&format!("http://{addr}/{path}")) {
-                if hex_sha256(&b) == pin.sha256 && write_atomic(&out, &b).is_ok() {
-                    via = Some(format!("the shared feed (http://{addr})"));
-                }
+            if download_verified(&format!("http://{addr}/{path}"), &out, &pin.sha256).is_ok() {
+                via = Some(format!("the shared feed (http://{addr})"));
             }
         }
         // Fallback: a direct GET (feed unavailable, or a cold-feed miss).
-        if via.is_none() {
-            if let Ok(b) = try_get(&pin.url) {
-                if hex_sha256(&b) == pin.sha256 && write_atomic(&out, &b).is_ok() {
-                    via = Some("a direct fetch".to_string());
-                }
-            }
+        if via.is_none() && download_verified(&pin.url, &out, &pin.sha256).is_ok() {
+            via = Some("a direct fetch".to_string());
         }
         match via {
             Some(v) => eprintln!(">> td-feed warm sources: warmed {} via {v} (sha256 verified)", out.display()),
@@ -1519,6 +2311,7 @@ fn warm_kernel_headers(root: &Path, arch: &str) {
 }
 
 fn warm_kernel_headers_from_pins(arch: &str, pins: &[SourcePin]) {
+    static NEXT_KERNEL_HEADERS: AtomicU64 = AtomicU64::new(0);
     let Some(pin) = pins.iter().find(|pin| pin.key == "linux-source") else {
         return;
     };
@@ -1532,8 +2325,49 @@ fn warm_kernel_headers_from_pins(arch: &str, pins: &[SourcePin]) {
     let cache = sources_dir();
     let src = cache.join(file);
     let out = cache.join(format!("linux-headers-{ver}-{arch}.tar"));
+    if let Err(e) = std::fs::create_dir_all(&cache) {
+        eprintln!(
+            ">> td-feed warm kernel-headers ({arch}): cannot create {} ({e}) — skipping",
+            cache.display()
+        );
+        return;
+    }
+    if let Err(e) = require_disk_backed(&cache) {
+        eprintln!(
+            ">> td-feed warm kernel-headers ({arch}): shared scratch is not disk-backed ({e}) — skipping"
+        );
+        return;
+    }
+    // One shared lock covers output publication and crash recovery for both
+    // architectures. A killed hosted check releases it; the next warm then
+    // removes every named partial before extracting another large Linux tree.
+    let lock_path = cache.join(".td-feed-kernel-headers.lock");
+    let lock = match OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)
+    {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!(
+                ">> td-feed warm kernel-headers ({arch}): cannot open {} ({e}) — skipping",
+                lock_path.display()
+            );
+            return;
+        }
+    };
+    if let Err(e) = lock.lock() {
+        eprintln!(
+            ">> td-feed warm kernel-headers ({arch}): cannot lock {} ({e}) — skipping",
+            lock_path.display()
+        );
+        return;
+    }
+    sweep_kernel_header_temps(&cache);
     if out.exists() {
-        return; // already produced
+        return;
     }
     if !src.is_file() {
         eprintln!(">> td-feed warm kernel-headers ({arch}): linux source not warm ({}) — skipping (PREP best-effort)", src.display());
@@ -1543,18 +2377,17 @@ fn warm_kernel_headers_from_pins(arch: &str, pins: &[SourcePin]) {
         eprintln!(">> td-feed warm kernel-headers ({arch}): need host make+gcc+xz to produce headers — skipping (best-effort)");
         return;
     }
-
-    let work = std::env::temp_dir().join(format!("td-feed-kh-{arch}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
-    if std::fs::create_dir_all(&work).is_err() {
+    let nonce = NEXT_KERNEL_HEADERS.fetch_add(1, Ordering::Relaxed);
+    let work = cache.join(format!(
+        ".td-feed-kh-work-{arch}-{}-{nonce}",
+        std::process::id()
+    ));
+    if std::fs::create_dir(&work).is_err() {
         return;
     }
-    let cleanup = || {
-        let _ = std::fs::remove_dir_all(&work);
-    };
+    let cleanup = RemoveDirOnDrop(work.clone());
     if !extract_xz_tar(&src, &work) {
         eprintln!(">> td-feed warm kernel-headers ({arch}): could not extract {file} — skipping");
-        cleanup();
         return;
     }
     let hdr = work.join("hdr");
@@ -1566,14 +2399,12 @@ fn warm_kernel_headers_from_pins(arch: &str, pins: &[SourcePin]) {
             .arg("headers_install"),
     ) {
         eprintln!(">> td-feed warm kernel-headers ({arch}): headers_install failed — skipping");
-        cleanup();
         return;
     }
     let code = linux_version_code(&ver);
     let vdir = hdr.join("include/linux");
     let _ = std::fs::create_dir_all(&vdir);
     if std::fs::write(vdir.join("version.h"), version_h(code)).is_err() {
-        cleanup();
         return;
     }
     // Drop Kbuild byproducts before packing — they embed the PID-bearing build
@@ -1581,7 +2412,6 @@ fn warm_kernel_headers_from_pins(arch: &str, pins: &[SourcePin]) {
     // every run and every host (re #469). Only the sanitized headers survive.
     if let Err(e) = strip_kbuild_byproducts(&hdr.join("include")) {
         eprintln!(">> td-feed warm kernel-headers ({arch}): could not strip Kbuild byproducts ({e}) — skipping");
-        cleanup();
         return;
     }
     // Force fixed 0755/0644 modes so the seed digest is umask-independent — the tar
@@ -1589,15 +2419,33 @@ fn warm_kernel_headers_from_pins(arch: &str, pins: &[SourcePin]) {
     // inherits from the ambient umask (re #469).
     if let Err(e) = normalize_header_modes(&hdr.join("include")) {
         eprintln!(">> td-feed warm kernel-headers ({arch}): could not normalize header modes ({e}) — skipping");
-        cleanup();
         return;
     }
     // PID-unique temp: the shared cache may be warmed by concurrent worktrees, and a fixed
     // `.tmp` would let two of them write the same inode before the atomic rename below.
     let tmp = cache.join(format!(
-        "linux-headers-{ver}-{arch}.tar.{}.tmp",
+        ".td-feed-kh-output-{ver}-{arch}-{}-{nonce}.tmp",
         std::process::id()
     ));
+    let tmp_cleanup = RemoveFileOnDrop {
+        path: tmp.clone(),
+        _directory_lock: lock,
+        _reservation: match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+        {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!(
+                    ">> td-feed warm kernel-headers ({arch}): cannot reserve {} ({e}) — skipping",
+                    tmp.display()
+                );
+                return;
+            }
+        },
+    };
     // NORMALIZED, UNCOMPRESSED packing (KERNEL_HEADERS_TAR_FLAGS): sorted names,
     // zeroed mtimes, no ownership, GNU format — plus the fixed 0755/0644 modes forced
     // above (tar records mode bits but these flags do not normalize them). Together the
@@ -1618,10 +2466,10 @@ fn warm_kernel_headers_from_pins(arch: &str, pins: &[SourcePin]) {
     if ok && std::fs::rename(&tmp, &out).is_ok() {
         eprintln!(">> td-feed warm kernel-headers ({arch}): produced {} (LINUX_VERSION_CODE={code}) from the pinned {file}", out.display());
     } else {
-        let _ = std::fs::remove_file(&tmp);
         eprintln!(">> td-feed warm kernel-headers ({arch}): could not pack the headers tarball — skipping");
     }
-    cleanup();
+    drop(tmp_cleanup);
+    drop(cleanup);
 }
 
 /// Hermetic OFFLINE selftest of the warm orchestration's pure + in-process legs (the parts
@@ -1809,6 +2657,11 @@ fn feed_addr_reachable(addr: &str) -> bool {
 /// address instead of exiting so `warm sources` can bring the shared feed up itself
 /// when TD_FEED_BASE is not exported — keeping single-egress self-sufficient.
 fn ensure_serve() -> ! {
+    if std::env::var_os(FEED_NO_DAEMON_ENV).is_some() {
+        die(format!(
+            "ensure-serve: implicit persistent feed disabled by {FEED_NO_DAEMON_ENV} for this hosted check"
+        ));
+    }
     match ensure_serve_daemon(&feed_dir()) {
         Ok(addr) => {
             println!("{addr}");
@@ -2009,7 +2862,14 @@ pub fn run(a: &[String]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{detach_from_workspace, ensure_serve_daemon, parse_serve_addr, resolve_feed_dir};
+    use super::{
+        cargo_route, detach_from_workspace, download_verified, ensure_serve_daemon,
+        feed_daemon_policy, file_sha256_before, index_path, mount_is_memory_backed, parse_serve_addr,
+        read_digest_sidecar, resolve_feed_dir, snapshot_for_serve, snapshot_for_serve_before,
+        sweep_download_temps, sweep_kernel_header_temps, write_before,
+        FeedDaemonPolicy, ResponseGuard, RESPONSE_DEADLINE,
+    };
+    use std::io::Read;
     use std::path::PathBuf;
 
     /// A per-invocation-unique temp dir under $TMPDIR. `cargo test` runs tests
@@ -2022,6 +2882,220 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("td-feed-{tag}-{}-{n}", std::process::id()))
+    }
+
+    #[test]
+    fn serve_snapshot_is_stable_after_the_store_file_changes() {
+        let dir = unique_tmp_dir("serve-snapshot");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("artifact");
+        std::fs::write(&path, b"verified bytes").unwrap();
+        let (mut snapshot, digest) = snapshot_for_serve(&path).unwrap();
+        std::fs::write(&path, b"changed bytes").unwrap();
+        let mut got = Vec::new();
+        snapshot.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"verified bytes");
+        assert_eq!(digest, super::hex_sha256(b"verified bytes"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn serve_snapshot_obeys_response_deadline_before_copying() {
+        let dir = unique_tmp_dir("serve-snapshot-deadline");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("artifact");
+        std::fs::write(&path, b"verified bytes").unwrap();
+        let expired = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+        let guard = ResponseGuard::without_client(expired);
+
+        let error = snapshot_for_serve_before(&path, &guard).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn serve_snapshot_stops_when_client_disconnects_before_response_ready() {
+        let dir = unique_tmp_dir("serve-snapshot-disconnect");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("artifact");
+        let bytes: Vec<u8> = (0u32..(128 * 1024)).map(|n| (n % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(client);
+        let guard = ResponseGuard::client(
+            std::time::Instant::now() + RESPONSE_DEADLINE,
+            &server,
+        );
+
+        let error = snapshot_for_serve_before(&path, &guard).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        drop(server);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn digest_sidecars_are_fixed_size_and_strictly_formatted() {
+        let dir = unique_tmp_dir("digest-sidecar-bound");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("artifact.sha256");
+        let digest = "a".repeat(64);
+        std::fs::write(&path, format!("{digest}\n")).unwrap();
+        assert_eq!(read_digest_sidecar(&path).unwrap(), digest);
+
+        std::fs::write(&path, vec![b'a'; 1024 * 1024]).unwrap();
+        assert!(read_digest_sidecar(&path).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn guarded_hashing_obeys_the_response_deadline() {
+        let dir = unique_tmp_dir("guarded-hash-deadline");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("artifact");
+        std::fs::write(&path, vec![b'x'; 128 * 1024]).unwrap();
+        let expired = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+        let guard = ResponseGuard::without_client(expired);
+
+        let error = file_sha256_before(&path, 16 * 1024 * 1024, Some(&guard)).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn artifact_hashing_rejects_oversized_existing_files_before_reading() {
+        let dir = unique_tmp_dir("oversized-existing-hash");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("artifact");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(super::MAX_ARTIFACT_BYTES + 1).unwrap();
+
+        let error = super::file_sha256(&path).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn feed_scratch_rejects_tmpfs_and_overlay_on_tmpfs() {
+        let mounts = "30 1 0:1 / / rw - btrfs /dev/disk rw\n\
+                      31 30 0:2 / /dev/shm rw - tmpfs tmpfs rw\n\
+                      32 30 0:3 / /overlay rw - overlay overlay rw,lowerdir=/lower,upperdir=/dev/shm/up,workdir=/dev/shm/work\n\
+                      33 30 0:4 / /huge rw - hugetlbfs hugetlbfs rw\n\
+                      34 30 0:5 / /devices rw - devtmpfs devtmpfs rw\n";
+        assert!(!mount_is_memory_backed(std::path::Path::new("/home/u"), mounts, 0).unwrap());
+        assert!(
+            mount_is_memory_backed(std::path::Path::new("/dev/shm/cache"), mounts, 0).unwrap()
+        );
+        assert!(
+            mount_is_memory_backed(std::path::Path::new("/overlay/cache"), mounts, 0).unwrap()
+        );
+        assert!(mount_is_memory_backed(std::path::Path::new("/huge/cache"), mounts, 0).unwrap());
+        assert!(
+            mount_is_memory_backed(std::path::Path::new("/devices/cache"), mounts, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn abandoned_download_partials_are_swept() {
+        let dir = unique_tmp_dir("download-sweep");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join(".td-feed-download-1-2.tmp");
+        let unrelated = dir.join("keep.tmp");
+        std::fs::write(&stale, b"partial").unwrap();
+        std::fs::write(&unrelated, b"keep").unwrap();
+        sweep_download_temps(&dir);
+        assert!(!stale.exists());
+        assert!(unrelated.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn abandoned_kernel_header_trees_and_outputs_are_swept() {
+        let dir = unique_tmp_dir("kernel-header-sweep");
+        let stale_tree = dir.join(".td-feed-kh-work-i386-1-0");
+        let stale_output = dir.join(".td-feed-kh-output-1-i386-1-0.tmp");
+        let unrelated = dir.join("linux-source.tar.xz");
+        std::fs::create_dir_all(&stale_tree).unwrap();
+        std::fs::write(stale_tree.join("partial"), b"partial").unwrap();
+        std::fs::write(&stale_output, b"partial").unwrap();
+        std::fs::write(&unrelated, b"keep").unwrap();
+
+        sweep_kernel_header_temps(&dir);
+
+        assert!(!stale_tree.exists());
+        assert!(!stale_output.exists());
+        assert!(unrelated.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cargo_registry_paths_reject_non_ascii_without_panicking() {
+        assert_eq!(index_path("a"), Some("1/a".to_string()));
+        assert_eq!(index_path("AB"), Some("2/ab".to_string()));
+        assert_eq!(index_path("abc"), Some("3/a/abc".to_string()));
+        assert_eq!(index_path("serde_json"), Some("se/rd/serde_json".to_string()));
+        assert_eq!(index_path("aéx"), None);
+
+        let dir = unique_tmp_dir("cargo-route-input");
+        let error = cargo_route(&dir, "127.0.0.1:1", "/dl/aéx/1/download")
+            .err()
+            .unwrap();
+        assert!(error.starts_with("bad download crate name"), "{error}");
+    }
+
+    #[test]
+    fn response_writes_obey_an_absolute_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let expired = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let error = write_before(&mut server, b"body", expired).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        drop(client);
+    }
+
+    #[test]
+    fn a_waiting_download_reuses_the_file_published_ahead_of_it() {
+        let dir = unique_tmp_dir("download-dedup");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("artifact");
+        std::fs::write(&out, b"published bytes").unwrap();
+        let want = super::hex_sha256(b"published bytes");
+
+        download_verified("http://127.0.0.1:0/must-not-connect", &out, &want).unwrap();
+
+        assert_eq!(std::fs::read(&out).unwrap(), b"published bytes");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hosted_checks_never_create_an_implicit_feed_daemon() {
+        assert_eq!(
+            feed_daemon_policy(None, true),
+            FeedDaemonPolicy::Disabled
+        );
+        assert_eq!(
+            feed_daemon_policy(Some("http://127.0.0.1:9".to_string()), true),
+            FeedDaemonPolicy::Explicit("http://127.0.0.1:9".to_string()),
+            "an explicitly supplied external feed remains usable"
+        );
+        assert_eq!(feed_daemon_policy(None, false), FeedDaemonPolicy::Ensure);
     }
 
     // Detaching must be idempotent (a warm re-runs over an already-extracted tree)

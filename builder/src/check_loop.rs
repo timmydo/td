@@ -13,8 +13,7 @@
 //!      CLOSED (exit `EXIT_UNPROVISIONED`) while the bootstrap graph still
 //!      declares scaffolding the chain has not built (re #469),
 //!   4. the warm prelude (subst store, source/crate warms),
-//!   5. the machine-wide slot dir, and
-//!   6. the sandboxed gate run: TB host-sandbox --expose-cwd --no-daemon
+//!   5. the sandboxed gate run: TB host-sandbox --expose-cwd --no-daemon
 //!      --store-item-at SRC DEST… -- TB gate-run. The sandbox mounts NO store
 //!      directory: only the loop's declared inputs — the td-built userland at
 //!      /td/store — each bound read-only, the drv build jail's input-only model.
@@ -331,6 +330,7 @@ fn provision_userland(root: &Path) -> Result<LoopUserland, CheckError> {
         cmd.arg(stem);
     }
     cmd.current_dir(root);
+    arm_check_child(&mut cmd);
     // This same process cargo-built `eval` moments ago; see `crate::spawn`.
     let out = crate::spawn::past_a_busy_program(|| cmd.output())
         .map_err(|e| fatal(&format!("could not run {eval} build-run: {e}")))?;
@@ -519,9 +519,11 @@ fn resolve_recipe_eval_bin(root: &Path) -> Result<String, CheckError> {
         }
     }
     if find_in_path("cargo").is_some() {
-        let status = Command::new("cargo")
-            .args(["build", "--release", "--quiet"])
-            .current_dir(root.join("recipes"))
+        let mut cmd = Command::new("cargo");
+        cmd.args(["build", "--release", "--quiet"])
+            .current_dir(root.join("recipes"));
+        arm_check_child(&mut cmd);
+        let status = cmd
             .status()
             .map_err(|e| CheckError::Fatal(fatal(&format!("spawn cargo build (recipes): {e}"))))?;
         if !status.success() {
@@ -681,6 +683,13 @@ fn wait_with_deadline(child: &mut std::process::Child, deadline: Option<Instant>
     }
 }
 
+fn arm_check_child(cmd: &mut Command) {
+    // Every child spawned before the final gate sandbox must die when this
+    // hosted runner dies. PR_SET_PDEATHSIG is reset across fork, so arming only
+    // the runner in check_host is not enough for provisioning and warm tools.
+    crate::sandbox::die_with_parent(cmd);
+}
+
 fn spawn_argv(
     argv: &[String],
     root: &Path,
@@ -692,6 +701,7 @@ fn spawn_argv(
     for (k, v) in envs {
         cmd.env(k, v);
     }
+    arm_check_child(&mut cmd);
     cmd.spawn().ok()
 }
 
@@ -713,6 +723,7 @@ fn warm_capture(argv: &[String], root: &Path, envs: &[(String, String)]) -> Stri
     for (k, v) in envs {
         cmd.env(k, v);
     }
+    arm_check_child(&mut cmd);
     cmd.output()
         .ok()
         .filter(|o| o.status.success())
@@ -724,141 +735,6 @@ fn s(v: &str) -> String {
     v.to_string()
 }
 
-/// A writable cgroup-v2 subtree delegated to this uid, or None (issue #328).
-/// Probe order: TD_CGROUP_ROOT (explicit) → /sys/fs/cgroup/td (the documented
-/// Guix System/Shepherd delegation: one root-side
-///   mkdir /sys/fs/cgroup/td
-///   echo +memory > /sys/fs/cgroup/cgroup.subtree_control
-///   chown -R <loop-user> /sys/fs/cgroup/td
-/// ) → the process's OWN cgroup dir (systemd hosts: user@.service subtrees are
-/// Delegate=yes, so /proc/self/cgroup names a dir we own). Writability is
-/// proven by actually creating a child (the only test that matters).
-fn cgroup_delegated_root() -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(v) = std::env::var("TD_CGROUP_ROOT") {
-        // `off` forces the NON-cgroup path on a delegated machine — keeps the
-        // watchdog fallback testable where cgroup mode would otherwise win
-        // (human direction 2026-07-03).
-        if matches!(v.as_str(), "off" | "none" | "0") {
-            eprintln!("td-builder check: cgroup mode disabled (TD_CGROUP_ROOT={v}) — using the watchdog fallback");
-            return None;
-        }
-        if !v.is_empty() {
-            candidates.push(PathBuf::from(v));
-        }
-    }
-    candidates.push(PathBuf::from("/sys/fs/cgroup/td"));
-    if let Ok(selfcg) = std::fs::read_to_string("/proc/self/cgroup") {
-        if let Some(path) = selfcg.lines().find_map(|l| l.strip_prefix("0::")) {
-            candidates.push(PathBuf::from(format!("/sys/fs/cgroup{}", path.trim())));
-        }
-    }
-    for c in candidates {
-        // Must be cgroup2fs, not merely a writable directory: on a plain dir
-        // every 'cgroup file' write would create ordinary files and appear to
-        // succeed — cgroup mode would engage with ZERO kernel enforcement
-        // while also disabling the watchdog (review finding).
-        if !c.join("cgroup.controllers").is_file() {
-            continue;
-        }
-        let probe = c.join(format!("td-probe-{}", std::process::id()));
-        if std::fs::create_dir(&probe).is_ok() {
-            let _ = std::fs::remove_dir(&probe);
-            return Some(c);
-        }
-    }
-    None
-}
-
-/// Prepare the per-run cgroup parent under the delegated root: enable the
-/// memory controller for its children and return the run dir. Best-effort —
-/// any failure means "no cgroup mode this run" (the watchdog fallback holds).
-fn cgroup_run_dir(root: &Path) -> Option<PathBuf> {
-    // Sweep DEAD runs' leftovers: a run dir can't remove itself (the check
-    // process sits in its own host leaf until exit), so each run reaps its
-    // predecessors — empty leaves + parents whose pid is gone rmdir cleanly;
-    // a LIVE concurrent run's dirs are populated and refuse, which is the
-    // correct discrimination.
-    if let Ok(entries) = std::fs::read_dir(root) {
-        for e in entries.flatten() {
-            let p = e.path();
-            let name = e.file_name();
-            let Some(n) = name.to_str() else { continue };
-            if !(n.starts_with("run-") || n.starts_with("td-test-")) || !p.is_dir() {
-                continue;
-            }
-            // LIVENESS, not emptiness: a live concurrent run's just-created
-            // leaf is momentarily empty (between cgroup_enter and the body's
-            // self-move) and rmdir would spuriously red its gate with exit 97
-            // (review finding). Only dirs whose owning pid is GONE are reaped.
-            let alive = n
-                .rsplit_once('-')
-                .and_then(|(_, pid)| pid.parse::<u32>().ok())
-                .map(|pid| Path::new(&format!("/proc/{pid}")).exists())
-                .unwrap_or(true);
-            if alive {
-                continue;
-            }
-            if let Ok(children) = std::fs::read_dir(&p) {
-                for c in children.flatten() {
-                    if c.path().is_dir() {
-                        let _ = std::fs::remove_dir(c.path());
-                    }
-                }
-            }
-            let _ = std::fs::remove_dir(&p);
-        }
-    }
-    let run = root.join(format!("run-{}", std::process::id()));
-    std::fs::create_dir(&run).ok()?;
-    // THE FIRST HOP: migrating a process needs write access to the COMMON
-    // ANCESTOR's cgroup.procs, and this process starts OUTSIDE the delegated
-    // subtree — so self-move ONCE here (into a host leaf; the run dir itself
-    // must stay process-free, it has child controllers). Every descendant
-    // (sandbox → gate-run → gates) then inherits, and the gates' own moves
-    // (host leaf → gate leaf) share the user-owned run dir as ancestor —
-    // always permitted. If THIS write is EPERM, the delegation lacks the
-    // first-hop grant — group-writable root cgroup.procs (chgrp+g+w for the
-    // loop user's group), or a PAM session hook placing sessions inside the
-    // subtree as systemd's PID1 does — fall back loudly.
-    // ORDER MATTERS (review finding): the self-move must precede enabling
-    // controllers — the no-internal-process rule EBUSYes a subtree_control
-    // write while the cgroup has member processes, so the own-cgroup
-    // (systemd scope) candidate only works if we vacate it FIRST.
-    let host_leaf = run.join("host");
-    if std::fs::create_dir(&host_leaf).is_err()
-        || std::fs::write(
-            host_leaf.join("cgroup.procs"),
-            std::process::id().to_string(),
-        )
-        .is_err()
-    {
-        let _ = std::fs::remove_dir(&host_leaf);
-        let _ = std::fs::remove_dir(&run);
-        eprintln!(
-            "td-builder check: delegated cgroup subtree found but the FIRST HOP into it \
-             is denied (common-ancestor cgroup.procs) — grant it once, e.g.  \
-             sudo sh -c 'chgrp <loop-group> /sys/fs/cgroup/cgroup.procs && chmod g+w \
-             /sys/fs/cgroup/cgroup.procs'  (cgroupfs perms reset at boot: persist it \
-             in the system config; issue #328)"
-        );
-        return None;
-    }
-    // Controllers, after vacating: root (may only now be empty in the scope
-    // case), then the run dir (its processes live in leaves, never in itself).
-    let _ = std::fs::write(root.join("cgroup.subtree_control"), "+memory");
-    if std::fs::write(run.join("cgroup.subtree_control"), "+memory").is_err() {
-        // Leave the dirs for the next run's sweep — this process now SITS in
-        // run/host and cannot rmdir it.
-        eprintln!(
-            "td-builder check: delegated cgroup subtree found but the memory controller \
-             could not be enabled for it — falling back to the watchdog"
-        );
-        return None;
-    }
-    Some(run)
-}
-
 /// The working-tree content key for the verdict journal (issue #320): sha256
 /// over git HEAD + the full dirty diff + every untracked file's bytes — ANY
 /// tree change yields a new key, so a --resume skip can never survive an edit
@@ -866,11 +742,10 @@ fn cgroup_run_dir(root: &Path) -> Option<PathBuf> {
 /// git is unavailable (resume then refuses to run).
 fn tree_key(root: &Path) -> Option<String> {
     let git = |args: &[&str]| -> Option<Vec<u8>> {
-        let out = Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .output()
-            .ok()?;
+        let mut cmd = Command::new("git");
+        cmd.args(args).current_dir(root);
+        arm_check_child(&mut cmd);
+        let out = cmd.output().ok()?;
         if !out.status.success() {
             return None;
         }
@@ -1097,7 +972,8 @@ fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option<Instant>) 
     let ambient_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{rustpath}:{ccpath}:{ambient_path}");
 
-    let child = Command::new(&cargo)
+    let mut command = Command::new(&cargo);
+    command
         .args(["build", "--release", "--quiet", "--target", musl])
         .current_dir(root.join(dir))
         .env("PATH", &new_path)
@@ -1122,8 +998,9 @@ fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option<Instant>) 
         .env(&ar_target_us, &ar)
         .env(&host_linker_var, &cc)
         .env("CARGO_ENCODED_RUSTFLAGS", &encoded_rustflags)
-        .stdin(Stdio::null())
-        .spawn();
+        .stdin(Stdio::null());
+    arm_check_child(&mut command);
+    let child = command.spawn();
     let mut child = match child {
         Ok(c) => c,
         Err(e) => {
@@ -1306,30 +1183,28 @@ fn warm_crate_closure(root: &Path, lock_rel: &str, name: &str) {
             break;
         }
         let url = format!("https://static.crates.io/crates/{crate_name}/{nv}.crate");
-        // Pid-suffixed tmp: concurrent preludes (normal on this box) each
-        // write their own, so one warm's rename never publishes bytes another
-        // warm is still writing.
-        let tmp = dest.join(format!("{nv}.crate.{}.tmp", std::process::id()));
-        // td-fetch verifies the pin itself; its one success line STREAMS to
+        // td-fetch serializes this destination, rechecks it after admission,
+        // streams into its own crash-swept partial, verifies the pin, and only
+        // then atomically publishes `out`. Concurrent preludes therefore share
+        // one fetch without leaving PID-named caller temporaries after SIGKILL.
+        // Its one success line STREAMS to
         // our stderr (the shell's `>&2` — a dup'd fd, never a pipe, so a
         // chatty child cannot deadlock the warm), and a fetch outliving the
         // budget is killed rather than left to stall the prelude.
         let mut cmd = Command::new(&tdf);
-        cmd.args(["fetch", &url, &sum]).arg(&tmp).current_dir(root);
+        cmd.args(["fetch", &url, &sum]).arg(&out).current_dir(root);
         {
             use std::os::fd::AsFd as _;
             if let Ok(err_fd) = std::io::stderr().as_fd().try_clone_to_owned() {
                 cmd.stdout(Stdio::from(err_fd));
             }
         }
+        arm_check_child(&mut cmd);
         let fetched = match cmd.spawn() {
             Ok(mut child) => wait_with_deadline(&mut child, deadline),
             Err(_) => false,
         };
-        if fetched && crate::sha256::sha256_file(&tmp).ok().as_deref() == Some(sum.as_str()) {
-            let _ = std::fs::rename(&tmp, &out);
-        } else {
-            let _ = std::fs::remove_file(&tmp);
+        if !fetched || crate::sha256::sha256_file(&out).ok().as_deref() != Some(sum.as_str()) {
             eprintln!("td-builder check: warm {name} crates: could not td-fetch/verify {nv}");
         }
     }
@@ -1349,7 +1224,7 @@ fn warm_crate_closure(root: &Path, lock_rel: &str, name: &str) {
 
 /// The heavy-tier warm prelude: source-bootstrap tarballs + rust crate closures
 /// (td-feed), all BEST-EFFORT (the gates enforce presence), fanned out in
-/// batches of TD_WARM_JOBS exactly as the shell prelude did.
+/// batches sized from the hosted request's memory grant.
 /// The td-tool crate-closure warm (td-fetch): host-side network PREP that
 /// populates the offline vendor set `.td-build-cache/crate-vendor/{name}`
 /// BEFORE the chain that consumes it is provisioned. This MUST run ahead of
@@ -1487,9 +1362,11 @@ fn heavy_warms(root: &Path) {
     };
     let tdfeed = tdfeed.display().to_string();
 
-    // `td-feed warm sources` (serial-first), routed through the ONE shared
-    // td-feed serve daemon when `td-feed ensure-serve` can start/reuse it
-    // (native since #318 axis 2 — was tools/feed-ensure.sh).
+    // `td-feed warm sources` (serial-first). Ordinary invocations start/reuse
+    // the shared feed daemon. The rootless check host sets
+    // TD_FEED_NO_DAEMON: a daemon created inside the check PID namespace could
+    // not persist safely, so ensure-serve fails fast and warm sources uses its
+    // verified, constant-memory direct-fetch fallback.
     let mut src_envs = vec![(s("TD_ROOT"), root.display().to_string())];
     // `warm sources` resolves the recipe-owned pins by BUILDING td-recipe-eval through
     // tests/recipe-eval-tool.sh, which hard-requires TD_BUILDER_SELF; without it the
@@ -1510,12 +1387,9 @@ fn heavy_warms(root: &Path) {
         );
     }
 
-    // Corpus crate warms: independent, fanned out in batches of TD_WARM_JOBS.
-    let warm_jobs: usize = std::env::var("TD_WARM_JOBS")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .filter(|n| *n >= 1)
-        .unwrap_or(4);
+    // Corpus crate warms are independent, but compiler memory is the limiting
+    // resource on the hosts this scheduler protects.
+    let warm_jobs = crate::check_memory::build_jobs().min(4);
     let specs: [&[&str]; 10] = [
         &["warm", "crate", "ripgrep", "14.1.1"],
         &["warm", "crate", "sd", "1.0.0"],
@@ -1578,6 +1452,13 @@ pub(crate) fn daemon_runtime_dir() -> Result<PathBuf, String> {
 }
 
 pub fn cli(args: &[String]) -> ExitCode {
+    if matches!(args, [flag] if matches!(flag.as_str(), "-h" | "--help")) {
+        println!("usage: td-builder check [-j N] [--resume] [GOAL...]");
+        println!(
+            "Runs through a lazy per-user memory host shared by concurrent worktrees; no sudo or setup step is required."
+        );
+        return ExitCode::SUCCESS;
+    }
     match run(args) {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(e @ CheckError::Unprovisioned(_)) => {
@@ -1692,20 +1573,12 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     })?;
 
     let mut child_envs: Vec<(String, String)> = vec![(s("PATH"), toolchain)];
-    // The runner's knobs must cross the sandbox boundary (host-sandbox preserves
-    // the TD_CHECK_ prefix): without this, `TD_CHECK_SLOTS=… td-builder check`
-    // would be silently dead and gate-run would always default to nproc.
     // TD_CHECK_DISABLE forwards the gate-disable list (gate names / `pool:<name>`
     // tokens) so `TD_CHECK_DISABLE=… td-builder check` reaches the in-sandbox runner.
     // Every build uses the one shared warm ladder (re #469) — there is no
     // cold-cache toggle to forward; `td-recipe-eval clear-store` is the only way
     // to force a cold climb.
-    for k in [
-        "TD_CHECK_SLOTS",
-        "TD_CHECK_SLOTS_DIR",
-        "TD_CHECK_JOBS",
-        "TD_CHECK_DISABLE",
-    ] {
+    for k in ["TD_CHECK_DISABLE"] {
         if let Ok(v) = std::env::var(k) {
             child_envs.push((k.to_string(), v));
         }
@@ -1734,48 +1607,11 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
         heavy_warms(&root);
     }
 
-    // Per-gate cgroup memory limits (issue #328): when the host delegates a
-    // writable cgroup-v2 subtree, gate-run gives every gate a child cgroup
-    // with memory.max/high — the escape-proof successor to the RSS watchdog
-    // (which stays the fallback everywhere else).
-    let cgroup_run = cgroup_delegated_root().and_then(|r| cgroup_run_dir(&r));
-    match &cgroup_run {
-        Some(dir) => {
-            child_envs.push((s("TD_CHECK_CGROUP"), dir.display().to_string()));
-        }
-        // (The off-knob and first-hop branches already said their piece.)
-        None if !matches!(
-            std::env::var("TD_CGROUP_ROOT").ok().as_deref(),
-            Some("off") | Some("none") | Some("0")
-        ) =>
-        {
-            eprintln!(
-                "td-builder check: no delegated cgroup subtree — per-gate tree memory \
-                 budgets fall back to the sampling watchdog (delegation setup: issue #328)"
-            )
-        }
-        None => {}
-    }
+    let host_jobs = crate::check_memory::hosted_gate_capacity();
+    let jobs = jobs_flag.map_or(host_jobs, |requested| requested.min(host_jobs));
 
-    // The machine-wide slot dir must exist HOST-SIDE so host-sandbox binds
-    // ~/.td/build-daemon (same absolute path inside) — that bind is what makes
-    // the gate runner's slot pool machine-wide. The shared ladder lives under the
-    // same bind (created lazily by the first build), so it too is reachable at the
-    // same absolute path, RW, from every check sandbox.
-    if let Ok(home) = std::env::var("HOME") {
-        let _ = std::fs::create_dir_all(Path::new(&home).join(".td/build-daemon/slots"));
-    }
-
-    let jobs = jobs_flag.unwrap_or_else(|| {
-        std::env::var("TD_CHECK_JOBS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|n| *n >= 1)
-            .unwrap_or_else(crate::gates::nproc)
-    });
-
-    // nice/ionice the whole loop so it yields to interactive work; the slot pool
-    // and daemon budget bound how MUCH runs, nice bounds its priority.
+    // nice/ionice the whole loop so it yields to interactive work; the host's
+    // memory tokens bound how much runs, while nice bounds its priority.
     let tdnice = std::env::var("TD_NICE").unwrap_or_else(|_| "10".to_string());
     let mut argv: Vec<String> = Vec::new();
     if let Some(nice) = find_in_path("nice") {
@@ -1811,24 +1647,10 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     for (k, v) in &child_envs {
         cmd.env(k, v);
     }
+    crate::sandbox::die_with_parent(&mut cmd);
     let st = cmd
         .status()
         .map_err(|e| fatal(&format!("could not start the loop sandbox: {e}")))?;
-    // Best-effort cgroup cleanup: gate leaves are removed by gate-run; the
-    // per-run parent goes here (empty by now; a leftover only wastes a dir).
-    if let Some(dir) = &cgroup_run {
-        // NOTE: this process still SITS in dir/host, so that rmdir fails and
-        // the run dir lingers until the process exits — harmless (empty dirs),
-        // and the next run uses a fresh pid-keyed dir. Gate leaves go now.
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for e in entries.flatten() {
-                if e.path().is_dir() {
-                    let _ = std::fs::remove_dir(e.path());
-                }
-            }
-        }
-        let _ = std::fs::remove_dir(dir);
-    }
     let _ = std::io::stdout().flush();
     Ok(st.code().unwrap_or(1))
 }
