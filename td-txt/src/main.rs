@@ -49,9 +49,6 @@ const _: () = assert!(
 /// list, through `--list`, against the names it packs.
 const APPLETS: &[(&str, Applet)] = &[("grep", grep::main), ("sed", sed::main)];
 
-/// A plain loop rather than an iterator search: this file is embedded verbatim
-/// into the recipe, and the ladder guard scans step content for host-tool names
-/// that the search combinator happens to share.
 /// BYTES rather than `&str`: argv[0] and the applet argument need not be UTF-8,
 /// and converting one to ask this question is what left the refusal below naming
 /// an applet the caller never passed.

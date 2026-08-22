@@ -51,11 +51,11 @@ use crate::types::{Recipe, Step};
 //
 // Every source below is written out with a WriteFile, which the ladder
 // `no_bootstrap_step_invokes_host_find_or_xargs` guard scans as a command
-// surface. So the embedded `.rs` must not contain the literal host-tool tokens
-// that guard rejects (use plain loops over the search combinator that shares a
-// name with one) — they would trip the host-tool-tier guard even though rustc
-// never interprets the file as a shell script. Same constraint td-sh/td-kexec/
-// td-netd/td-util document.
+// surface. A `.rs` body is read only INSIDE its string literals, so an
+// identifier like `Iterator::find` is free; what must not appear is a bare
+// `find`/`xargs` in a LITERAL, which reads exactly as a command name would.
+// That guard's roster exempts named reviewed bodies from even that, and none
+// of td-init's is on it.
 const MAIN_RS: &str = include_str!("../../../td-init/src/main.rs");
 
 // (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.

@@ -27,9 +27,12 @@ use crate::types::{Recipe, Step};
 // it in {src}. Keep MODULES in sync with `main.rs`'s `mod` lines.
 //
 // Every source below is written out with a WriteFile, which the ladder
-// `no_bootstrap_step_invokes_host_find_or_xargs` guard scans as a command surface,
-// so the embedded `.rs` must not contain those literal host-tool tokens. Same
-// constraint td-util/td-sh/td-init document.
+// `no_bootstrap_step_invokes_host_find_or_xargs` guard scans as a command
+// surface. A `.rs` body is read only INSIDE its string literals, so an
+// identifier like `Iterator::find` is free; what must not appear is a bare
+// `find`/`xargs` in a LITERAL, which reads exactly as a command name would.
+// That guard's roster exempts named reviewed bodies from even that, and none
+// of td-firstboot's is on it.
 pub(crate) const MAIN_RS: &str = include_str!("../../../td-firstboot/src/main.rs");
 
 // (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.

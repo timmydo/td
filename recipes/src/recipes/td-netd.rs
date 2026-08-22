@@ -29,9 +29,10 @@ use crate::types::{Recipe, Step};
 //
 // The embedded source is written out with a WriteFile below, which the ladder
 // `no_bootstrap_step_invokes_host_find_or_xargs` guard scans as a command surface.
-// So the .rs must not contain the literal tokens `find`/`xargs` (it uses plain loops
-// instead of `Iterator::find`) — they would trip the host-tool-tier guard even though
-// rustc never interprets the file as a shell script.
+// A `.rs` body is read only INSIDE its string literals, so `Iterator::find` as an
+// identifier is free; what must not appear is a bare `find`/`xargs` in a LITERAL,
+// which reads exactly as a command name would. That guard's roster exempts named
+// reviewed bodies from even that, and none of td-netd's is on it.
 const MAIN_RS: &str = include_str!("../../../td-netd/src/main.rs");
 
 pub fn recipe() -> Recipe {

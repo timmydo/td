@@ -241,10 +241,6 @@ impl ScriptParser<'_> {
     /// flag exists. Parts are in increasing `end` order, so the first whose end
     /// is past `pos` is the one holding it -- and the separator newline AT an end
     /// belongs to the part after, which is where the next command starts.
-    /// A loop rather than the iterator search that reads better: this module is
-    /// embedded verbatim by `recipes/src/recipes/td-txt.rs`, and the ladder's
-    /// host-tool guard tokenises what it writes, so that method's NAME alone
-    /// reds the gate.
     fn mode(&self) -> Mode {
         let mut mode = self.fallback;
         for p in &self.parts {
@@ -3070,9 +3066,6 @@ fn locus_at(parts: &[Part], src: &[u8], spot: Spot) -> Option<Vec<u8>> {
         Spot::Read(pos) => (pos, false),
         Spot::Saved(pos) => (pos, true),
     };
-    // `position` rather than the iterator method whose NAME is also a retired
-    // host tool's: this file is embedded verbatim in td-txt's recipe, and the
-    // ladder guard scans that text for the bare token (recipes/src/ladder.rs).
     let idx = parts.iter().position(|p| pos <= p.end)?;
     let part = parts.get(idx)?;
     let start = match idx.checked_sub(1) {

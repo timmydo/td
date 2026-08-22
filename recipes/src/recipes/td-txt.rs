@@ -33,10 +33,13 @@ use crate::types::{Recipe, Step};
 //
 // Every source below is written out with a WriteFile, which the ladder
 // `no_bootstrap_step_invokes_host_find_or_xargs` guard scans as a command surface.
-// So the embedded `.rs` must not contain the literal tokens `find`/`xargs` (use a
-// plain loop / `iter().position` over `Iterator::find`/`str::find`) — they would
-// trip the host-tool-tier guard even though rustc never interprets the file as a
-// shell script. Same constraint td-sh/td-kexec/td-netd document.
+// A `.rs` body is read only INSIDE its string literals, so `Iterator::find` as an
+// identifier is free; a bare `find`/`xargs` in a LITERAL is not. `sed.rs` alone is
+// on that guard's roster, for the one case nothing can be spelled around — GNU's
+// `can't find label' diagnostic, which must match byte for byte. Another module
+// needing such a literal is a REVIEWED roster entry there, not an edit here, and
+// naming `Command` in any of them reds that guard's tripwire test. Keep the
+// premise true. td-sh and td-netd document the constraint as it stands for them.
 const MAIN_RS: &str = include_str!("../../../td-txt/src/main.rs");
 
 // (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.

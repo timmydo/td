@@ -938,7 +938,8 @@ mod tests {
     /// a comment reads exactly as a quoted `Command::new("find")` does. That
     /// remains true of every SCRIPT body, which is what this is applied to now
     /// — a `.rs` body goes through `rust_source_invokes`, which can tell the
-    /// two apart because Rust has string literals to look inside.
+    /// two apart because Rust has string literals to look inside, and a body
+    /// on `RUST_NOT_A_COMMAND_SURFACE` through neither.
     fn invokes(s: &str, cmd: &str) -> bool {
         s.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
             .any(|t| t == cmd)
@@ -1166,13 +1167,129 @@ mod tests {
             .any(|literal| invokes_in(literal, cmd))
     }
 
-    fn step_invokes(step: &Step, text: &str, cmd: &str) -> bool {
+    /// A `.rs` body rustc compiles. NON-EXECUTABLE, because `exec` is a file
+    /// MODE rather than a promise about the reader: a `.rs` written executable
+    /// is a script something interprets, and the literal-only scan below would
+    /// read its commands as prose.
+    fn is_rust_module(step: &Step) -> bool {
+        rust_module_path(step).is_some()
+    }
+
+    /// The same question as `is_rust_module`, answering with the path — which
+    /// is what every caller that has to match the enum a second time wanted.
+    fn rust_module_path(step: &Step) -> Option<&str> {
         match step {
-            Step::WriteFile { path, .. } if path.ends_with(".rs") => {
-                rust_source_invokes(text, cmd)
+            Step::WriteFile { path, exec, .. } if path.ends_with(".rs") && !exec => {
+                Some(path.as_str())
             }
-            _ => invokes(text, cmd),
+            _ => None,
         }
+    }
+
+    fn step_invokes(step: &Step, text: &str, cmd: &str) -> bool {
+        if is_rust_module(step) {
+            rust_source_invokes(text, cmd)
+        } else {
+            invokes(text, cmd)
+        }
+    }
+
+    /// The recipes whose Rust modules are not a command surface at all.
+    ///
+    /// `rust_source_invokes` above frees the identifier and the comment, which
+    /// is most of the problem and leaves one case it cannot reach: a
+    /// DIAGNOSTIC. td-txt is scored byte for byte against GNU, and GNU sed
+    /// refuses an unresolvable jump with `can't find label for jump to \`X'`
+    /// — so matching it puts the bare word in a string literal, which is
+    /// exactly where a command name would be. No scan can tell those apart,
+    /// because they are the same thing to a scanner: text in a literal.
+    ///
+    /// So this is a REVIEWED LIST and not an inference. The inference was
+    /// written first and deleted, against ten known ways to satisfy "this
+    /// crate cannot spawn" and still compile one — `global_asm!`,
+    /// `extern "C"`, `include!` from a non-`.rs` body, `Unpack`,
+    /// `SubstituteText` rewriting a source after it was read, `Symlink`,
+    /// `--cap-lints`, `--force-warn`, a `@response` file, and a multi-line
+    /// `#[doc]` holding a line that looks like the crate's lint attribute.
+    /// Every one WIDENED the exemption silently. Proving it from recipe text
+    /// means proving a property of a compilation this cannot see; a name a
+    /// human edits is the same protection without the surface.
+    ///
+    /// Per FILE and not per recipe, which is the difference between an entry
+    /// a human can check and one that grows on its own: a reviewer opens
+    /// `sed.rs` and confirms its `find` tokens are messages, where a
+    /// crate-wide entry would go on covering modules added to td-txt long
+    /// after anyone read it. Silent widening is the failure this whole design
+    /// is about, so the roster must not have it either.
+    ///
+    /// ONE entry, because one that exempts nothing is speculation rather than
+    /// a decision: td-seatd is equally spawn-free and was rostered at first,
+    /// but nothing it writes holds either word. Adding one is a reviewed
+    /// decision, and what to check first is
+    /// `the_rostered_recipes_still_cannot_spawn` below: no `Command` in what
+    /// the recipe writes, a crate root that forbids `unsafe_code`, and no
+    /// `.rs` handed to anything but rustc. That test is a TRIPWIRE and not a
+    /// gate — it cannot exempt anything, only complain — which is why it is
+    /// safe for it to be approximate where a gate would not be.
+    const RUST_NOT_A_COMMAND_SURFACE: [(&str, &str); 1] = [("td-txt", "{src}/sed.rs")];
+
+    /// Whether this step writes a rostered `.rs` body of `stem`.
+    ///
+    /// The WHOLE path the recipe spells, not the basename: a basename would
+    /// exempt a second `sed.rs` written anywhere else in the same recipe, and
+    /// an entry that covers a body nobody reviewed is the silent widening this
+    /// roster exists to avoid. A path that moves fails CLOSED — the entry stops
+    /// matching, and the guard asks for a fresh look.
+    fn rostered(stem: &str, step: &Step) -> bool {
+        let Some(path) = rust_module_path(step) else {
+            return false;
+        };
+        RUST_NOT_A_COMMAND_SURFACE
+            .iter()
+            .any(|(recipe, body)| *recipe == stem && *body == path)
+    }
+
+    /// The guard's scan over ONE recipe: the first `find`/`xargs` invocation in
+    /// a command surface, or `None` for a clean recipe. Extracted so the
+    /// synthetic tests that pin the exemption run the SAME skip the catalog
+    /// walk does — a list asserted on its own stays green with this skip wired
+    /// backwards.
+    fn host_tool_invocation(stem: &str, recipe: &Recipe) -> Option<(&'static str, String)> {
+        let steps = recipe.steps.as_ref()?;
+        for step in steps {
+            // The exemption frees the ROSTERED bodies and only those: another
+            // `.rs` in the same recipe, Run argv, a baked Makefile, ToolFarm
+            // links and a SubstituteText's `to` all keep the full scan, since
+            // a shell reads those whatever the Rust beside them can do.
+            if rostered(stem, step) {
+                continue;
+            }
+            for text in command_texts(step) {
+                for cmd in ["find", "xargs"] {
+                    if !step_invokes(step, text, cmd) {
+                        continue;
+                    }
+                    // A rung may expose one only through a ToolFarm link to an
+                    // explicitly declared td-built BusyBox input.
+                    let declared_busybox_tool = recipe
+                        .native_inputs
+                        .as_ref()
+                        .is_some_and(|inputs| inputs.iter().any(|i| i == "busybox-x86-64"))
+                        && matches!(
+                            step,
+                            Step::ToolFarm { links }
+                                if links.iter().any(|(name, target)| {
+                                    name == cmd
+                                        && target == "{in:busybox-x86-64}/bin/busybox"
+                                })
+                        );
+                    if !declared_busybox_tool {
+                        return Some((cmd, text.to_string()));
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Every catalog-authored text of a step that becomes a command or an
@@ -1712,35 +1829,307 @@ mod tests {
     #[test]
     fn no_bootstrap_step_invokes_host_find_or_xargs() {
         for (stem, recipe) in catalog::all() {
-            let Some(steps) = &recipe.steps else {
-                continue;
+            if let Some((cmd, text)) = host_tool_invocation(stem, &recipe) {
+                panic!(
+                    "recipe `{stem}' invokes `{cmd}' in `{text}' — \
+                     GNU findutils was retired from the tool tier; a rung \
+                     must expose this command through a ToolFarm link to \
+                     its declared td-built busybox-x86-64 input"
+                );
+            }
+        }
+    }
+
+    /// The ROSTER, exercised through the guard's own scan.
+    ///
+    /// The body here is what the literal scan cannot help with: a diagnostic
+    /// td-txt must emit byte for byte because GNU sed does, spelled in a
+    /// string literal because that is where a message lives — and where a
+    /// command name would live too.
+    ///
+    /// Driven through `host_tool_invocation` rather than by inspecting the
+    /// roster, because a list is not a guard: a skip wired backwards leaves
+    /// every assertion about the list green.
+    #[test]
+    fn a_rust_module_in_a_rostered_recipe_is_not_a_command_surface() {
+        let rs = |path: &str, content: &str| Step::WriteFile {
+            path: path.into(),
+            content: content.into(),
+            exec: false,
+        };
+        const SED: &str =
+            "fn refuse() -> Error {\n    Error::new(\"can't find label for jump to `\")\n}\n";
+        let diagnostic = rs("{src}/sed.rs", SED);
+        let found = Some(("find", SED.into()));
+        let recipe = Recipe::gnu("td-txt", "1").steps(vec![diagnostic.clone()]);
+
+        // Rostered: the word is a message, not a program.
+        assert_eq!(host_tool_invocation("td-txt", &recipe), None);
+
+        // Not rostered: the literal scan catches the same body, which is the
+        // whole reason the roster has to exist. This is the assertion that
+        // matters most here.
+        assert_eq!(host_tool_invocation("td-sh", &recipe), found);
+        assert_eq!(host_tool_invocation("gcc-mesboot", &recipe), found);
+
+        // Per FILE: another `.rs` in the SAME rostered recipe keeps the full
+        // literal scan, so the entry covers the body a human read and not
+        // whatever td-txt grows next. `grep.rs` is a real td-txt module, so
+        // rostering it later reds this leg — which is the look being asked
+        // for, not a false alarm.
+        let sibling = Recipe::gnu("td-txt", "1").steps(vec![rs("{src}/grep.rs", SED)]);
+        assert_eq!(host_tool_invocation("td-txt", &sibling), found);
+
+        // ...and by the WHOLE path: a second `sed.rs` written elsewhere in the
+        // same recipe is a body nobody reviewed, so a basename match would be
+        // the silent widening the roster exists to avoid.
+        let elsewhere = Recipe::gnu("td-txt", "1").steps(vec![rs("{src}/vendor/sed.rs", SED)]);
+        assert_eq!(host_tool_invocation("td-txt", &elsewhere), found);
+
+        // The ROSTERED path written EXECUTABLE, which is the only shape that
+        // proves the `exec` bit revokes the exemption: any other name would be
+        // scanned for its name's sake and the leg would assert nothing.
+        let script = Recipe::gnu("td-txt", "1").steps(vec![Step::WriteFile {
+            path: "{src}/sed.rs".into(),
+            content: "#!/bin/sh\nfind . -delete\n".into(),
+            exec: true,
+        }]);
+        assert_eq!(
+            host_tool_invocation("td-txt", &script),
+            Some(("find", "#!/bin/sh\nfind . -delete\n".into()))
+        );
+
+        // The exemption frees `.rs` bodies and NOTHING else: inside the SAME
+        // rostered recipe every other command surface keeps the full catch.
+        // Each leg pins the reported TEXT, or it would pass on the wrong step
+        // being blamed.
+        let baked = Recipe::gnu("td-txt", "1").steps(vec![
+            diagnostic.clone(),
+            Step::WriteFile {
+                path: "Makefile".into(),
+                content: "clean:\n\tfind . -delete\n".into(),
+                exec: false,
+            },
+        ]);
+        assert_eq!(
+            host_tool_invocation("td-txt", &baked),
+            Some(("find", "clean:\n\tfind . -delete\n".into()))
+        );
+
+        let ran = Recipe::gnu("td-txt", "1").steps(vec![
+            diagnostic.clone(),
+            Step::Run {
+                argv: vec!["find".into(), ".".into()],
+                env: Vec::new(),
+                dir: String::new(),
+            },
+        ]);
+        assert_eq!(host_tool_invocation("td-txt", &ran), Some(("find", "find".into())));
+
+        let farm = Recipe::gnu("td-txt", "1").steps(vec![
+            diagnostic.clone(),
+            Step::ToolFarm {
+                links: vec![("find".into(), "{root}/tools/find".into())],
+            },
+        ]);
+        assert_eq!(host_tool_invocation("td-txt", &farm), Some(("find", "find".into())));
+
+        let edited = Recipe::gnu("td-txt", "1").steps(vec![
+            diagnostic,
+            Step::SubstituteText {
+                file: "configure".into(),
+                edits: vec![crate::types::TextEdit::new("rm -f x", "xargs rm -f", 1)],
+            },
+        ]);
+        assert_eq!(
+            host_tool_invocation("td-txt", &edited),
+            Some(("xargs", "xargs rm -f".into()))
+        );
+    }
+
+    /// Every rostered entry names a `.rs` that recipe actually writes.
+    ///
+    /// A typo in either half fails CLOSED — it exempts nothing — but the body
+    /// it was meant to name goes back under the scan, and the way that
+    /// surfaces is a `find` in shipped source reddening the guard with no hint
+    /// that the roster is why.
+    ///
+    /// Each tuple is checked against the steps ITSELF rather than through
+    /// `rostered`, which searches the whole roster: once two entries share a
+    /// recipe, a misspelt one would ride on the other's match. EXACTLY one, so
+    /// a recipe writing a path twice cannot leave an entry covering a body
+    /// that is not the reviewed one.
+    #[test]
+    fn every_rostered_entry_names_a_body_the_recipe_writes() {
+        for (stem, body) in RUST_NOT_A_COMMAND_SURFACE {
+            let recipe = catalog::all()
+                .into_iter()
+                .find(|(name, _)| *name == stem)
+                .map(|(_, recipe)| recipe);
+            let Some(recipe) = recipe else {
+                panic!("rostered recipe `{stem}' is not in the catalog");
             };
-            for step in steps {
-                for text in command_texts(step) {
-                    for cmd in ["find", "xargs"] {
-                        let declared_busybox_tool =
-                            recipe.native_inputs.as_ref().is_some_and(|inputs| {
-                                inputs.iter().any(|input| input == "busybox-x86-64")
-                            }) && matches!(
-                                step,
-                                Step::ToolFarm { links }
-                                    if links.iter().any(|(name, target)| {
-                                        name == cmd
-                                            && target
-                                                == "{in:busybox-x86-64}/bin/busybox"
-                                    })
-                            );
-                        assert!(
-                            !step_invokes(step, text, cmd) || declared_busybox_tool,
-                            "recipe `{stem}' invokes `{cmd}' in `{text}' — \
-                             GNU findutils was retired from the tool tier; a rung \
-                             must expose this command through a ToolFarm link to \
-                             its declared td-built busybox-x86-64 input"
-                        );
+            let written = recipe.steps.as_ref().map_or(0, |steps| {
+                steps
+                    .iter()
+                    .filter(|step| rust_module_path(step) == Some(body))
+                    .count()
+            });
+            assert_eq!(
+                written, 1,
+                "rostered `{stem}'/`{body}' must name exactly one `.rs' that \
+                 recipe writes, or the entry covers nothing or too much"
+            );
+        }
+    }
+
+    /// Why a rostered recipe looks able to start a process, or `None`.
+    ///
+    /// Split out from the test below so the CHECK can be exercised in both
+    /// directions. Asserted only against the catalog it would answer `None`
+    /// for everything and stay green if it were deleted — the trap the first
+    /// version of these tests fell into.
+    ///
+    /// Approximate in BOTH directions, which is why it is a tripwire and not
+    /// a gate. It over-complains: a bare `Command` token also matches a
+    /// comment, a string or an `enum Command` in any body the recipe writes;
+    /// the `forbid` must open and close on one line AND be the first
+    /// substantive one, so an inner attribute above it reds; and only
+    /// `main.rs` counts as a crate root, so a rostered recipe growing a
+    /// `lib.rs` reds `writes no crate root`. Those cost a human a second look.
+    ///
+    /// It also UNDER-detects, and that half must not be read as a guarantee:
+    /// this is the deleted inference's reading, so every one of the ten
+    /// evasions listed on `RUST_NOT_A_COMMAND_SURFACE` defeats it too —
+    /// `extern "C"` reaching libc, a `concat!`-spelled name, `include!`,
+    /// `--cap-lints`, and Rust arriving by `Unpack`/`CopyTree`, which is not a
+    /// `WriteFile` body at all and so has nothing for either this or the scan
+    /// to read. The interpreter leg is bounded the same way: it looks for an
+    /// argv element ENDING in `.rs`, so `sh -c 'sh {src}/x.rs; echo done'`
+    /// passes it. What makes that acceptable here is only that it decides
+    /// nothing — as a gate the same reading would have exempted a recipe.
+    fn spawn_tripwire(recipe: &Recipe) -> Option<String> {
+        let steps = recipe.steps.as_ref()?;
+        let mut roots = 0usize;
+        for step in steps {
+            if let Step::Run { argv, .. } = step {
+                let rustc = argv
+                    .first()
+                    .is_some_and(|arg| arg.rsplit('/').next() == Some("rustc"));
+                if !rustc {
+                    if let Some(arg) = argv.iter().find(|arg| arg.ends_with(".rs")) {
+                        return Some(format!("`{arg}' is handed to a program that is not rustc"));
                     }
                 }
             }
+            let Step::WriteFile { path, content, .. } = step else {
+                continue;
+            };
+            if invokes(content, "Command") {
+                return Some(format!("`{path}' names `Command'"));
+            }
+            if !is_rust_module(step) || path.rsplit('/').next() != Some("main.rs") {
+                continue;
+            }
+            roots += 1;
+            // The first substantive line, so a mention in a comment or a
+            // string cannot stand in for the attribute — and the lint has to
+            // be an item INSIDE the parens, or `#![forbid(dead_code)] //
+            // unsafe_code` reads as the real thing.
+            let opens_with_forbid = content
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !line.starts_with("//"))
+                .and_then(|line| line.strip_prefix("#![forbid("))
+                .and_then(|rest| rest.split_once(')'))
+                .is_some_and(|(lints, _)| {
+                    lints.split(',').any(|lint| lint.trim() == "unsafe_code")
+                });
+            if !opens_with_forbid {
+                return Some(format!("crate root `{path}' does not forbid unsafe"));
+            }
         }
+        (roots == 0).then(|| "writes no crate root".to_string())
+    }
+
+    /// A TRIPWIRE, deliberately not a gate: the rostered recipes still cannot
+    /// start a process.
+    ///
+    /// The gate is the roster, because inferring this from recipe text was
+    /// tried and could not be made sound — see `RUST_NOT_A_COMMAND_SURFACE`.
+    /// The same reading is safe HERE because it decides nothing: at worst it
+    /// complains about a recipe that is fine, where as a gate it would have
+    /// exempted one that is not. What it buys is that td-txt growing a
+    /// `Command` reds a test naming the reason, instead of quietly making a
+    /// `find` in its source meaningful again.
+    #[test]
+    fn the_rostered_recipes_still_cannot_spawn() {
+        for (stem, recipe) in catalog::all() {
+            if !RUST_NOT_A_COMMAND_SURFACE.iter().any(|(name, _)| *name == stem) {
+                continue;
+            }
+            if let Some(why) = spawn_tripwire(&recipe) {
+                panic!(
+                    "rostered recipe `{stem}': {why} — its `.rs' bodies are \
+                     exempt from the find/xargs scan and must not be able to \
+                     spawn"
+                );
+            }
+        }
+
+        // ...and the check FIRES, which asserting it over the catalog alone
+        // could never show.
+        let rs = |path: &str, content: &str| Step::WriteFile {
+            path: path.into(),
+            content: content.into(),
+            exec: false,
+        };
+        const ROOT: &str = "#![forbid(unsafe_code)]\nfn main() {}\n";
+        for (steps, want) in [
+            (
+                vec![rs("{src}/main.rs", ROOT), rs("{src}/go.rs", "Command::new(x)")],
+                "names `Command'",
+            ),
+            (
+                vec![rs("{src}/main.rs", "#![deny(unsafe_code)]\nfn main() {}\n")],
+                "does not forbid unsafe",
+            ),
+            (
+                vec![rs("{src}/main.rs", "//! docs\n/*\n#![forbid(unsafe_code)]\n*/\n")],
+                "does not forbid unsafe",
+            ),
+            (
+                vec![rs(
+                    "{src}/main.rs",
+                    "#![forbid(dead_code)] // unsafe_code\nfn main() {}\n",
+                )],
+                "does not forbid unsafe",
+            ),
+            (vec![rs("{src}/go.rs", "fn go() {}")], "writes no crate root"),
+            (
+                vec![
+                    rs("{src}/main.rs", ROOT),
+                    Step::Run {
+                        argv: vec!["sh".into(), "{src}/probe.rs".into()],
+                        env: Vec::new(),
+                        dir: String::new(),
+                    },
+                ],
+                "is handed to a program that is not rustc",
+            ),
+        ] {
+            let recipe = Recipe::gnu("probe", "1").steps(steps);
+            let why = spawn_tripwire(&recipe).unwrap_or_default();
+            assert!(why.contains(want), "expected `{want}', got `{why}'");
+        }
+
+        // ...and does NOT fire on a forbid naming more than one lint, which
+        // reading the parens too strictly would break.
+        let many = Recipe::gnu("probe", "1").steps(vec![rs(
+            "{src}/main.rs",
+            "#![forbid(unsafe_code, dead_code)]\nfn main() {}\n",
+        )]);
+        assert_eq!(spawn_tripwire(&many), None);
     }
 
     /// The `.rs` rule above is narrow in the direction that matters: a staged
