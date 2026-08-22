@@ -732,6 +732,63 @@ mod confinement {
         assert_eq!(code_only(source("builtin.rs")).matches(raw).count(), 1);
     }
 
+    /// Which readings of the function TABLE may skip `Shell::func`. That
+    /// accessor carries ash's rule that a name containing `/` is not a
+    /// function lookup (`find_command`, ash.c:13801), so a CALL decision made
+    /// against `funcs` directly would run `a/b() { ... }; a/b` where ash runs
+    /// a path. Three readings legitimately bypass it -- `unset -f`,
+    /// completion, and a subshell's copy -- because each takes the TABLE
+    /// rather than resolving a word.
+    ///
+    /// Counted by the ACCESS and over SQUEEZED text, which is what makes this
+    /// a guard rather than a spelling test. The first version counted
+    /// `funcs.get(` in `code_only` text and a review defeated it in one line:
+    /// `sh.funcs` and `.get(w)` on separate lines is one construct to the
+    /// compiler and two strings to a scan, and `get_mut`, `entry`, `values`
+    /// or a `let t = &sh.funcs` binding each answer a lookup without writing
+    /// `get(` at all. Every one of those writes the field access, so a sixth
+    /// is a deliberate change here.
+    ///
+    /// What it does NOT see is a bypass that adds no access: a pattern
+    /// binding the field by name (`let Shell { funcs, .. }`, a `match` arm,
+    /// a parameter), or a split of this accessor into a rule-checking
+    /// wrapper over a private one holding the pinned text. Measured, all
+    /// three reach only the frame decision, and the CALL site stays caught
+    /// by behaviour whatever it is spelled as. Making `funcs` private to
+    /// this module is what would close the class; the exact-equality counts
+    /// mean a stray block comment can only red this, never green it.
+    ///
+    /// Needed because one of the four call sites -- the local-var frame
+    /// decision -- answers the same either way: a `/` name is not a special
+    /// builtin, so both spellings frame it, and no behaviour catches that one
+    /// going back.
+    #[test]
+    fn only_the_accessor_resolves_a_word_to_a_function() {
+        let access = concat!(".", "funcs");
+        let uses = |name: &str| squeeze(&code_only(source(name))).matches(access).count();
+        for (module, n) in [("exec.rs", 2), ("builtin.rs", 1), ("complete.rs", 1), ("process.rs", 1)]
+        {
+            assert_eq!(uses(module), n, "{module} must make {n} `{access}` access(es)");
+        }
+        let total: usize = SOURCES.iter().map(|(n, _)| uses(n)).sum();
+        assert_eq!(total, 5, "a new `{access}` reader must be declared here");
+        // ... and each of the five is the reading it is meant to be. Only the
+        // accessor's own read resolves a WORD; the other four are the table.
+        for (module, needle) in [
+            ("exec.rs", concat!("self.", "funcs.get(name)")),
+            ("exec.rs", concat!("sh.", "funcs.insert(")),
+            ("builtin.rs", concat!("sh.", "funcs.remove(")),
+            ("complete.rs", concat!("sh.", "funcs.keys()")),
+            ("process.rs", concat!("sh.", "funcs.clone()")),
+        ] {
+            assert_eq!(
+                squeeze(&code_only(source(module))).matches(needle).count(),
+                1,
+                "{module} must make its `{needle}` reading exactly once"
+            );
+        }
+    }
+
     /// A module missing from SOURCES is a module none of the scans below can
     /// see, so an unsafe block there would be invisible to all of them.
     #[test]

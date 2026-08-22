@@ -663,6 +663,21 @@ impl Shell {
         };
     }
 
+    /// The function a command WORD names, which is not every function in the
+    /// table. ash's `find_command` (ash.c:13788) returns `CMDNORMAL` for a name
+    /// containing `/` at 13801-13815 -- "don't use PATH or hash table" -- and
+    /// its `cmdlookup`, the call that finds a `CMDFUNCTION`, is at 13825, below
+    /// that return. So `a/b() { ... }` defines something `a/b` cannot call.
+    ///
+    /// One accessor because `unset -f` and completion read the same table and
+    /// must NOT apply this -- ash serves both from `cmdtable`.
+    pub fn func(&self, name: &str) -> Option<&Func> {
+        if name.contains('/') {
+            return None;
+        }
+        self.funcs.get(name)
+    }
+
     pub fn get_var(&self, name: &str) -> Option<String> {
         self.vars.get(name).and_then(|v| v.value.clone())
     }
@@ -1709,7 +1724,7 @@ fn run_simple(
     let framed = argv.first().is_some_and(|w| {
         // Resolved the way `dispatch_simple` resolves it below: a function shadowing
         // a special builtin's NAME is still a function, and ash gives it a frame.
-        sh.funcs.contains_key(w) || !builtin::is_ash_special_word(w)
+        sh.func(w).is_some() || !builtin::is_ash_special_word(w)
     });
     if framed {
         sh.localvar_depth = sh.localvar_depth.saturating_add(1);
@@ -1739,7 +1754,7 @@ fn dispatch_simple(
 ) -> R<()> {
     // A function call runs in the current shell with the assignments applied for
     // its duration and the words as its positional parameters.
-    if let Some(func) = argv.first().and_then(|name| sh.funcs.get(name)).cloned() {
+    if let Some(func) = argv.first().and_then(|name| sh.func(name)).cloned() {
         return call_function(sh, &func, argv, assigns, redirs);
     }
 
@@ -2295,6 +2310,80 @@ mod tests {
         crate::process::run_capturing(src)
     }
 
+    /// A `/` name is DEFINED and never looked up, which is not the same as
+    /// not being defined. ash files it in `cmdtable` like any other name and
+    /// refuses it at the LOOKUP: `find_command` (ash.c:13788) returns
+    /// `CMDNORMAL` for a name containing one at 13801-13815 -- "don't use PATH
+    /// or hash table" -- and the `cmdlookup` that finds a `CMDFUNCTION` is at
+    /// 13825, below that return.
+    ///
+    /// Every verb below agreed with ash while the rule sat at the DEFINITION
+    /// instead, which is why this test exists at all: the one reading that
+    /// tells the two placements apart is the one that enumerates the table.
+    #[test]
+    fn a_slash_name_is_defined_but_never_looked_up() {
+        // `type` below stats the name against the SHELL's cwd, which
+        // `new_for_test` seeds from the process's -- so say why a red is one.
+        assert!(!std::path::Path::new("a/b").exists(), "an `a/b` in the cwd reds this");
+        // Defining one is silent, and naming it afterwards reaches PATH rather
+        // than the definition -- this harness has none, so 127.
+        assert_eq!(run("a/b() { echo B; }"), (0, String::new(), String::new()));
+        assert_eq!(run("a/b() { echo B; }; a/b").0, 127);
+        // `type` reports it on STDOUT and `command -v` says nothing at all,
+        // both 127, both measured against ash.
+        assert_eq!(
+            run("a/b() { echo B; }; type a/b"),
+            (127, "a/b: not found\n".to_string(), String::new())
+        );
+        assert_eq!(
+            run("a/b() { echo B; }; command -v a/b"),
+            (127, String::new(), String::new())
+        );
+        // `command` follows its operand to the same lookup, so a `/` name is
+        // not a function there either.
+        assert_eq!(run("a/b() { echo B; }; command a/b").0, 127);
+        // The `function` spelling files the same name and is refused by the
+        // same lookup.
+        assert_eq!(run("function a/b { echo B; }; echo after").1, "after\n");
+        assert_eq!(run("function a/b { echo B; }; a/b").0, 127);
+        // A name with no `/` is untouched by any of it.
+        assert_eq!(run("ab() { echo B; }; ab").1, "B\n");
+        assert_eq!(run("ab() { echo B; }; type ab").1, "ab is a function\n");
+    }
+
+    /// The reading that tells DEFINITION from LOOKUP. ash's completion walks
+    /// `cmdtable` for `CMDFUNCTION` entries (`ash_command_name`), so a `/`
+    /// name it can never CALL is still a name it OFFERS -- measured under a
+    /// pty against busybox ash 1.37.0, which answers `a/b  alias  azz` where
+    /// this shell answered `alias  azz`. `unset -f` removes from the same
+    /// table, so the offer goes with it.
+    #[test]
+    fn completion_offers_a_slash_name_it_cannot_call() {
+        let offered = |src: &str, prefix: &str| {
+            let src = src.to_string();
+            let prefix = prefix.to_string();
+            crate::process::on_shell_stack(move || {
+                let mut sh = super::Shell::new_for_test();
+                let status = super::run_program(&mut sh, &src);
+                (status, crate::complete::commands(&sh, &prefix))
+            })
+            .map(|(status, names)| (status, names.contains(&"a/b".to_string())))
+        };
+        // BOTH spellings file the name, and each has its own line to lose it
+        // on -- so both are asked, or restoring one filter goes unnoticed.
+        for defs in ["a/b() { echo B; }\nazz() { echo Z; }\n", "function a/b { echo B; }\n"] {
+            assert_eq!(offered(defs, "a").ok(), Some((0, true)), "{defs:?} must be offered");
+            // Removed from the table, so no longer offered -- ash agrees.
+            assert_eq!(
+                offered(&format!("{defs}unset -f a/b\n"), "a").ok(),
+                Some((0, false)),
+                "`unset -f` must take {defs:?} back out"
+            );
+        }
+        // Still not callable, which is the whole asymmetry this pins.
+        assert_eq!(run("a/b() { echo B; }; a/b").0, 127);
+    }
+
     /// A function NAME is any single word, not a POSIX name. ash tests the
     /// SHAPE of the command -- one word, no assignment prefix, no redirection
     /// (ash.c:12165) -- and its own name check is commented out beside a note
@@ -2334,16 +2423,12 @@ mod tests {
             let src = format!("{name}() {{ echo B; }}; {name}");
             assert_eq!(run(&src), (0, "B\n".to_string(), String::new()), "{src:?}");
         }
-        // Quoted, expanded, or carrying a `/`: ash defines these and none can
-        // be called back, which is what a `None` name means here. The lookup
-        // then misses, and this harness has no PATH, so it is 127.
+        // Quoted or expanded: ash files these under the word's own text, which
+        // no later word can spell, and that is what a `None` name means here.
+        // The lookup then misses, and this harness has no PATH, so it is 127.
         for src in ["\"f\"() { echo B; }; f", "'f'() { echo B; }; f", "x=f; $x() { echo B; }; f"] {
             assert_eq!(run(src).0, 127, "{src:?} must define nothing callable");
         }
-        // The `/` one is not even looked up, so defining it alone is silent and
-        // naming it afterwards reaches PATH rather than the definition.
-        assert_eq!(run("a/b() { echo B; }"), (0, String::new(), String::new()));
-        assert_eq!(run("a/b() { echo B; }; a/b").0, 127);
         // A reserved word that only CLOSES a construct is still refused before
         // the definition test, or `fi() { ... }` would define one.
         for src in ["fi() { echo B; }", "done() { echo B; }", "then() { echo B; }"] {

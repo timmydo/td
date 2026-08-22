@@ -1056,12 +1056,12 @@ impl Units {
     }
 
     fn parse_func_def(&mut self) -> Syn<Cmd> {
-        // `plain` is None for a quoted or expanded name and a `/` makes one
-        // unreachable as a lookup; ash defines both and neither can be called,
-        // which is what `func_body`'s `None` says. The `function` spelling has
-        // taken the name this way all along.
+        // `plain` is None for a quoted or expanded name, which ash files under
+        // the word's own text -- control bytes and all -- so no later word can
+        // spell it. That is what `func_body`'s `None` says. A `/` name IS
+        // stored: ash defines it and the LOOKUP is what refuses it.
         let name = match self.peek() {
-            Some(Tok::Word(w)) => w.plain().filter(|n| !n.contains('/')).map(str::to_string),
+            Some(Tok::Word(w)) => w.plain().map(str::to_string),
             _ => return Err("syntax error: expected a function name".into()),
         };
         self.bump();
@@ -1133,9 +1133,6 @@ impl Units {
             self.bump();
             return Err(self.unexpected(None));
         }
-        // A command word with a `/` in it is never a function LOOKUP, so a
-        // definition under one is as unreachable as an unspellable name.
-        let name = name.filter(|n| !n.contains('/'));
         self.bump();
         // CHKNL|CHKKWD (ash.c:12133): newlines are skipped and an alias does
         // NOT fire. The `()` spelling rejoins the ordinary path below, where

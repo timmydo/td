@@ -3652,7 +3652,7 @@ fn describe_one(sh: &Shell, name: &str, verbose: bool, path: Option<&str>) -> (S
         }
         text.push_str(" is an alias for ");
         text.push_str(value);
-    } else if sh.funcs.contains_key(name) {
+    } else if sh.func(name).is_some() {
         text.push_str(if verbose { " is a function" } else { name });
     } else if lookup(name).is_some() {
         if verbose {

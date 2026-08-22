@@ -171,7 +171,7 @@ pub fn expand_command_words(sh: &mut Shell, words: &[Word]) -> R<Vec<String>> {
         // reaches the builtin past a function of that name -- while a function named
         // `command` is not the builtin and stops the walk before it starts.
         while let Some(name) = argv.get(head) {
-            if !nofunc && sh.funcs.contains_key(name.as_str()) {
+            if !nofunc && sh.func(name.as_str()).is_some() {
                 break;
             }
             if name != "command" {

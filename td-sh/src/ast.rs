@@ -242,9 +242,11 @@ pub enum Cmd {
     /// own, kept because it is not the body's: dash reports `$LINENO` inside a
     /// function RELATIVE to it (`funcline`, eval.c:996).
     FuncDef {
-        /// `None` for a definition nothing can ever name -- a quoted or
-        /// expanded one, or one carrying a `/`. Parsed and not registered,
-        /// which is ash's own unreachable definition observably.
+        /// `None` for a definition nothing can ever name -- a quoted or an
+        /// expanded one, which ash files under the word's own text. Parsed
+        /// and not registered, which is ash's own unreachable definition
+        /// observably. A `/` name is NOT one of these: it is registered, and
+        /// `Shell::func` is what refuses it at the lookup.
         name: Option<String>,
         /// A `Stage` and not a bare `Cmd` because the body is a command node
         /// too, and a compound's OWN line is what its header expands under:
