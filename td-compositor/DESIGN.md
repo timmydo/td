@@ -1018,15 +1018,21 @@ and what it cost was that client's own ceiling.
 Of the three take-downs that refund, the one at `wl_surface.destroy` looks
 unreachable and is not. `get_popup` refuses a parent xdg_surface with no role
 object, so no NEW menu can be hung off a window whose toplevel has gone — but
-an existing menu does not have to be created, only REPAINTED. Its popup object,
-its xdg_surface and its configure tracker all outlive the toplevel, so a second
-buffer attaches with no fresh acknowledgement and the placement goes back into
-the scene naming a parent that is no longer a window. The destroy then reaches
-`remove_surface` with a live tree under it, and its refund is the only thing
-that gives those bytes back. This paragraph claimed the opposite until review
-built the sequence; the correction is recorded rather than quietly swapped,
-because a wrong unreachability claim is the kind that gets a live refund
-deleted later as dead code.
+an existing menu does not have to be created, only REPAINTED. Its popup object
+and its xdg_surface both outlive the toplevel, so the client may map it again
+and the placement goes back into the scene naming a parent that is no longer a
+window. The destroy then reaches `remove_surface` with a live tree under it,
+and its refund is the only thing that gives those bytes back. This paragraph
+claimed the opposite until review built the sequence; the correction is
+recorded rather than quietly swapped, because a wrong unreachability claim is
+the kind that gets a live refund deleted later as dead code.
+
+What has changed since is the COST of that repaint and not its reachability.
+The tracker outlived the toplevel too, so the second buffer used to attach
+with no fresh acknowledgement; a dismissal unmaps now, so the same client has
+to perform the whole initial commit again. It reaches the same refund by a
+longer road, which is why the paragraph above is a correction rather than a
+deletion.
 
 With that, a popup CYCLE is unbuildable — and the argument is written out
 because review has had to correct it THREE times, so the conclusion is worth
@@ -1103,20 +1109,82 @@ breadth-first, so a parent's index is the lower one whatever order the
 placements happened in, and whatever the client did. That td does not enforce
 the mapping rule is a gap of its own, recorded here rather than relied on.
 
+Signalling is only HALF of a dismissal, and the protocol puts both halves in
+one sentence: "a popup_done event will be sent out, and at the same time the
+surface will be unmapped". So a popup td tells is also unmapped — its
+configure tracker is reset, and a newly-unmapped surface "must perform the
+initial commit again before attaching a buffer". Without that the event is
+ADVICE. A client that misses `popup_done` and repaints on its next frame gets
+its menu straight back, which is exactly the client a dismissal is written
+for; with it, the repaint is `unconfigured_buffer` and the client is
+disconnected. That is the harsher answer and the one the protocol names.
+
+The two halves are ONE call rather than an event sent here and a state change
+made there, because a caller reaching for only one of them would leave a
+client told its menu was gone by a compositor still willing to show it — and
+which half you got would depend on which helper was nearest.
+
+Saying `unconfigured_buffer` on the WIRE took a fix of its own, and the gap
+predates the dismissal that made it matter: the pre-configure attach returned
+a plain error, so it went out as the generic implementation code against the
+wl_surface whose commit raised it. A code is read against the INTERFACE of the
+object it arrives on, and 3 on a wl_surface is `invalid_offset` — which is
+about the x and y of `wl_surface.attach`, so a client would have been told it
+passed a bad offset in a request that carries none. (`invalid_size` is 2 and
+a different error; naming it here was this paragraph's own slip.) The
+refusal now names the xdg_surface and carries the xdg_surface's own code, the
+same override the decoration errors take and for the same reason.
+
+BOTH refusals, because the protocol gives them one code between them. td
+checks twice — a buffer attached before the configure was sent, and one
+attached before it was acknowledged — and "the client must acknowledge it and
+is then allowed to attach a buffer" makes the second an unconfigured surface
+exactly as the first is. Fixing one and leaving the other would have made the
+code a property of which check happened to fire. Both reach every
+pre-configure attach and not only a repainted menu, so this is a conformance
+fix riding along rather than the point of the landing.
+
+Re-mapping exposes a gap worth naming rather than leaving to be found, and
+the honest form of it is broader than the case that surfaced it: what should
+td answer a re-map's initial commit with AT ALL? Two halves, and neither is
+fixed here.
+
+Where the parent is GONE, td sends a configure anyway, inviting a buffer it
+will then decline to place. The decline is correct and refunds the bytes, but
+the invitation should not have been issued, and the open question is WHICH
+error to raise instead — the popup is no longer placeable and the protocol
+has no code for that.
+
+Where the parent is LIVE the re-map is legal, and the problem is the popup
+half of the answer: td re-sends `xdg_popup.configure` on the same popup
+object, which "for version 2 or older ... is only ever sent once for the
+initial configuration", and td advertises `xdg_wm_base` version 1. Only the
+`xdg_surface.configure` should be re-sent. This is NOT introduced by the
+dismissal — a client's own null attach already unmapped the tracker and
+already reached it — but the dismissal is a second route to it, so it is
+recorded here rather than left where nothing names it. Both halves are one
+landing, because both are about what a popup's re-map is answered with.
+
 The surface NAMED gets nothing: its client took it down and is not owed an
 event saying so. One take-down is not a cascade at all and is signalled
 separately — a popup still unmapped when its window went was never in the
 scene to be cascaded over, so when its client finally commits the buffer it
 was preparing, td declines the menu and says so there. That is the only moment
 such a popup can ever be told, and without it a client waits on a menu td
-discarded in silence. What remains is
-that td dismisses nothing of its OWN volition, which is the grab bullet above
-rather than this one. A workspace switch is not a dismissal either and
-correctly sends nothing — a menu on a workspace that is not showing is
-RETAINED rather than taken down, so it is still the client's and reappears on
-return, which is a different thing from the client being told it closed. A
-window hidden in a stacked container is the same case for the same reason: the
-placement stops being visible and the menu is not dropped.
+discarded in silence. It is the same call, so that popup is unmapped as a
+cascade's are, and a client that simply re-attaches on a timer is refused
+instead of being refunded round after round. Not one that repeats the whole
+mapping dance, though: that is legal every time, and td refunds and tells it
+every time — bounded, because a round retires nothing the acknowledgement in
+it does not clear, but unbounded in rounds. The dismissal makes the cheap loop
+illegal, not the expensive one. What remains is that td dismisses nothing of
+its OWN volition, which is the grab bullet above rather than this one. A
+workspace switch is not a dismissal either and correctly sends nothing — a
+menu on a workspace that is not showing is RETAINED rather than taken down, so
+it is still the client's and reappears on return, which is a different thing
+from the client being told it closed. A window hidden in a stacked container
+is the same case for the same reason: the placement stops being visible and
+the menu is not dropped.
 **Reposition** is version 3 and out of reach at the `xdg_wm_base` version td
 advertises. td also refuses a NULL parent,
 which the protocol permits only so that another protocol may supply one before

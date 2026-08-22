@@ -45,6 +45,7 @@ const WL_DISPLAY_ERROR_IMPLEMENTATION: u32 = 3;
 /// message beside it, which spells the same thing out.
 const XDG_SURFACE_ERROR_NOT_CONSTRUCTED: u32 = 1;
 const XDG_SURFACE_ERROR_ALREADY_CONSTRUCTED: u32 = 2;
+const XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER: u32 = 3;
 const XDG_SURFACE_ERROR_INVALID_SIZE: u32 = 5;
 /// `invalid_input` is the positioner's own error and is raised ON the
 /// positioner, since that is the object the client got wrong. The five
@@ -1220,21 +1221,25 @@ impl Client {
             if key.client != self.id {
                 continue;
             }
-            if let Some(popup) = self.popup_object_of(key.object) {
-                self.send(popup, XDG_POPUP_POPUP_DONE, wire::Builder::new())?;
-            }
+            self.dismiss_popup(key.object)?;
         }
         Ok(())
     }
 
-    /// The `xdg_popup` standing for a wl_surface, if one does — walked
-    /// FORWARDS along the two edges the surface already keeps, which is the
-    /// same pair `commit_surface` follows to reach this object. Asking the
+    /// What dismissing a wl_surface's popup needs: the `xdg_popup` to tell,
+    /// and the configure tracker that has to be reset. Both come off ONE walk
+    /// because a dismissal needs both — telling a client its menu is gone
+    /// while leaving the surface able to take a buffer is half a dismissal,
+    /// and which half you get would depend on which helper a caller reached
+    /// for.
+    ///
+    /// Walked FORWARDS along the two edges the surface already keeps, which is
+    /// the pair `commit_surface` follows to reach the same object. Asking the
     /// surface which role object is current answers with the current one; a
     /// scan for any popup that happens to name the surface answers with
-    /// whichever the object map yields first, and the two are the same only
-    /// while nothing has been replaced.
-    fn popup_object_of(&self, surface: u32) -> Option<u32> {
+    /// whichever the object map yields first, and the two agree only while
+    /// nothing has been replaced.
+    fn popup_dismissal_of(&self, surface: u32) -> Option<(u32, Arc<Mutex<ConfigureTracker>>)> {
         let Some(Object::Surface(state)) = self.objects.get(&surface) else {
             return None;
         };
@@ -1244,10 +1249,36 @@ impl Client {
         match self.objects.get(&role) {
             Some(Object::XdgSurface {
                 role_object: Some(RoleObject::Popup(popup)),
+                configure,
                 ..
-            }) => Some(*popup),
+            }) => Some((*popup, Arc::clone(configure))),
             _ => None,
         }
+    }
+
+    /// Take one popup down as the PROTOCOL means it: the surface unmapped and
+    /// the client told, which xdg-shell describes as one act rather than two.
+    ///
+    /// The reset goes first. If the send then fails the connection is ending
+    /// anyway, and a surface left unmapped-and-untold is the safe half to be
+    /// holding; the reverse would leave a client told its menu was dismissed
+    /// by a compositor still willing to show it.
+    ///
+    /// The RESET can fail too — a poisoned lock, or a tracker at its retired
+    /// ceiling — and then this popup gets neither half and the cascade above
+    /// stops, leaving the ancestors behind it in the walk untold as well.
+    /// That is not an argument for the other order, which fails the same way
+    /// with the halves swapped; it is why neither order makes the pair
+    /// atomic, and both failures end the connection.
+    fn dismiss_popup(&mut self, surface: u32) -> Result<(), String> {
+        let Some((popup, configure)) = self.popup_dismissal_of(surface) else {
+            return Ok(());
+        };
+        configure
+            .lock()
+            .map_err(|_| "XDG configure tracker lock poisoned".to_string())?
+            .unmap()?;
+        self.send(popup, XDG_POPUP_POPUP_DONE, wire::Builder::new())
     }
 
     fn send(&mut self, object: u32, opcode: u16, builder: wire::Builder) -> Result<(), String> {
@@ -1957,9 +1988,13 @@ impl Client {
                 .initial_sent();
             if !initial_sent {
                 if attaching_buffer {
-                    return Err(format!(
-                        "xdg_surface {role} attached a buffer before its initial configure"
-                    ));
+                    return self.fail_protocol_on(
+                        role,
+                        XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER,
+                        &format!(
+                            "xdg_surface {role} attached a buffer before its initial configure"
+                        ),
+                    );
                 }
                 match role_object {
                     RoleObject::Toplevel(toplevel) => send_initial_configure(
@@ -1991,9 +2026,11 @@ impl Client {
                     .map_err(|_| "XDG configure tracker lock poisoned".to_string())?
                     .can_attach()
             {
-                return Err(format!(
-                    "xdg_surface {role} attached a buffer before acknowledging configure"
-                ));
+                return self.fail_protocol_on(
+                    role,
+                    XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER,
+                    &format!("xdg_surface {role} attached a buffer before acknowledging configure"),
+                );
             }
             if let RoleObject::Popup(popup_object) = role_object {
                 let Some(Object::XdgPopup { parent, rect, .. }) =
@@ -2134,32 +2171,26 @@ impl Client {
                     // dismissal no cascade can reach — a popup still unmapped
                     // when its window went was never in the scene to be
                     // cascaded over, so this commit of a buffer is the only
-                    // moment td can ever decide against it. What it FIRES on
-                    // is wider: a popup that was mapped, was dismissed by the
-                    // cascade, and is repainted anyway hits it too and hears
-                    // `popup_done` a second time. That is redundant rather
-                    // than ill-formed — the event carries no argument and no
-                    // serial — and it is only reachable by a client that
-                    // ignored the first one.
+                    // moment td can ever decide against it. What it FIRES
+                    // on is wider: a popup that was mapped, dismissed by
+                    // the cascade, and repainted anyway hits it too and
+                    // hears `popup_done` a second time. Redundant rather
+                    // than ill-formed — the event carries no argument and
+                    // no serial — and reaching it now takes a client that
+                    // both ignored the first one AND performed the whole
+                    // mapping dance again, since that dismissal unmapped
+                    // the surface.
                     (PendingBuffer::Buffer { object, buffer, .. }, None) => {
-                        // The configure tracker is left MAPPED, unlike the
-                        // detach above. Unmapping it clears `initial_sent`, and
-                        // a buffer on a surface without one is a protocol
-                        // error — so a client repainting its abandoned menu a
-                        // second time would be disconnected for it. Clearing
-                        // the bytes leaves `was_mapped` false from here on, so
-                        // a later detach does not reset it either — and what
-                        // makes that unreadable is not that the surface is
-                        // finished (destroy this popup and build another on the
-                        // same xdg_surface and it maps) but that destroying the
-                        // popup replaces the tracker.
+                        // The tracker is reset by the dismissal below,
+                        // and this commit is the only one that can do it:
+                        // clearing the bytes leaves `was_mapped` false
+                        // from here on, so the detach path's own reset
+                        // would never fire for this surface afterwards.
                         self.unmap_popup(id)?;
                         // AFTER the submenus `unmap_popup` just dismissed,
                         // which hang above this one: the protocol's order is
                         // topmost first whichever call the popups came from.
-                        if let Some(popup) = self.popup_object_of(id) {
-                            self.send(popup, XDG_POPUP_POPUP_DONE, wire::Builder::new())?;
-                        }
+                        self.dismiss_popup(id)?;
                         if matches!(
                             self.objects.get(&object),
                             Some(Object::Buffer(current)) if current.serial == buffer.serial
@@ -9116,6 +9147,13 @@ mod tests {
 
         // The menu recommits its buffer, which is what a repaint is. It is
         // placed NOWHERE rather than onto the window that now holds id 5.
+        //
+        // The window's take-down dismissed the menu, so the repaint starts
+        // from an UNMAPPED surface and has to be configured again before it
+        // may attach. td answers that commit even though the parent is gone,
+        // which is a gap of its own; what this test is about is where the
+        // buffer then lands.
+        reconfigure_popup(&mut client, &mut peer, 6, 13);
         drain_messages(&mut peer);
         let mut attach = wire::Builder::new();
         attach.u32(7);
@@ -9153,7 +9191,10 @@ mod tests {
 
         // Again, because once is not the interesting case: a client that has
         // not noticed its window is gone repaints on a timer, and an orphan
-        // that could only be taken down once would fail on the second.
+        // that could only be taken down once would fail on the second. Each
+        // round is a whole one — the take-down unmapped the surface, so the
+        // repaint after it starts from the initial commit, as the first did.
+        reconfigure_popup(&mut client, &mut peer, 6, 13);
         let mut again = wire::Builder::new();
         again.u32(7);
         again.i32(0);
@@ -9181,6 +9222,7 @@ mod tests {
         client
             .dispatch(request(13, 3, measured).unwrap(), &mut VecDeque::new())
             .unwrap();
+        reconfigure_popup(&mut client, &mut peer, 6, 13);
         let mut once_more = wire::Builder::new();
         once_more.u32(7);
         once_more.i32(0);
@@ -9520,17 +9562,21 @@ mod tests {
 
     /// The third take-down path, which looked unreachable and is not. A menu
     /// does not have to be CREATED after its window's role object goes — it
-    /// only has to be repainted. Its popup object, its xdg_surface and its
-    /// configure tracker all outlive the toplevel, so a second buffer attaches
-    /// with no fresh acknowledgement and the placement goes back into the
-    /// scene naming a parent that is no longer a window. The destroy then
-    /// reaches `remove_surface` with a live tree under it.
+    /// only has to be painted again. Its popup object and its xdg_surface
+    /// outlive the toplevel, so the client can map it back and the placement
+    /// goes into the scene naming a parent that is no longer a window. The
+    /// destroy then reaches `remove_surface` with a live tree under it.
+    ///
+    /// Mapping it BACK, not attaching to it: the take-down dismissed the menu
+    /// and a dismissal unmaps, so the repaint owes the initial commit again.
+    /// That is a longer road to the same refund, and it is the whole of what
+    /// changed here — the reachability this test was written for did not.
     ///
     /// `get_popup` refusing a parent with no role object is what made this
     /// look impossible, and all it rules out is a NEW menu.
     #[test]
     fn a_menu_repainted_after_its_window_went_is_refunded_by_the_destroy() {
-        let (mut client, _peer, _runtime, framebuffer_path, pool_path) =
+        let (mut client, mut peer, _runtime, framebuffer_path, pool_path) =
             mapped_popup("popup-recommit");
         assert_eq!(
             client.mapped_bytes.get(&6).copied(),
@@ -9553,8 +9599,12 @@ mod tests {
         );
 
         // The menu's own objects are all still alive, so the client may
-        // simply REPAINT it — no new popup is created, which is the step the
-        // unreachability argument assumed was needed.
+        // paint it AGAIN — no new popup is created, which is the step the
+        // unreachability argument assumed was needed. What it does need is
+        // the initial commit again, because the take-down above unmapped the
+        // surface; a bare attach here is `unconfigured_buffer` now, and
+        // `a_dismissed_menu_may_not_simply_paint_again` is that half.
+        reconfigure_popup(&mut client, &mut peer, 6, 13);
         client
             .insert(
                 27,
@@ -9613,6 +9663,268 @@ mod tests {
             client.mapped_bytes
         );
         assert_eq!(client.mapped_total, 0);
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// A menu td dismissed is UNMAPPED, not merely undrawn.
+    ///
+    /// The protocol makes those one act — "a popup_done event will be sent
+    /// out, and at the same time the surface will be unmapped" — and the
+    /// unmapping is the half a client cannot ignore: a newly-unmapped surface
+    /// "must perform the initial commit again before attaching a buffer".
+    /// Without it the event is ADVICE. A client that misses `popup_done` and
+    /// repaints on its next frame gets its menu back, so the dismissal means
+    /// nothing to exactly the clients it was written for.
+    #[test]
+    fn a_dismissed_menu_may_not_simply_paint_again() {
+        let (mut client, mut peer, _runtime, framebuffer_path, pool_path) =
+            mapped_popup("popup-dismissed-repaint");
+        menu_tree(&mut client, &mut peer, &pool_path);
+
+        client
+            .dispatch(
+                request(10, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(dismissals(&client, &mut peer), vec![42, 22, 14]);
+
+        // EVERY level, not just the topmost: the reset rides the cascade, so
+        // a submenu two deep is as unmapped as the menu it hangs off. A reset
+        // applied to the topmost alone would leave the rest of a tree
+        // repaintable and pass a one-level fixture. (Not "the surface the
+        // take-down named" — that is the TOPLEVEL, which is never a dismissal
+        // target at all.)
+        //
+        // A real client dies on the first of these, so the loop is asking one
+        // question of three surfaces rather than replaying a session. What it
+        // reads is per-surface state, which the failed dispatch leaves intact.
+        for (surface, xdg_surface, buffer) in [(6u32, 13u32, 7u32), (20, 21, 27), (40, 41, 47)] {
+            let mut attach = wire::Builder::new();
+            attach.u32(buffer);
+            attach.i32(0);
+            attach.i32(0);
+            client
+                .dispatch(request(surface, 1, attach).unwrap(), &mut VecDeque::new())
+                .unwrap();
+            let refused = client
+                .dispatch(
+                    request(surface, 6, wire::Builder::new()).unwrap(),
+                    &mut VecDeque::new(),
+                )
+                .unwrap_err();
+            assert_eq!(
+                refused,
+                format!("xdg_surface {xdg_surface} attached a buffer before its initial configure"),
+                "a dismissed menu painted itself back"
+            );
+            // On the XDG_SURFACE and with the xdg_surface's own code. Wayland
+            // reads an error code against the INTERFACE of the object it
+            // arrives on, so 3 reported against the wl_surface whose commit
+            // raised it is `wl_surface.invalid_offset` — a different fault,
+            // and one about an argument the client did not pass.
+            assert_eq!(
+                client.protocol_error_code,
+                XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER
+            );
+            assert_eq!(client.protocol_error_object, Some(xdg_surface));
+        }
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// The other dismissal td sends is the same act. A popup td declines to
+    /// place is told and unmapped together, exactly as a cascade's are, so a
+    /// client that keeps repainting is refused instead of refunded forever.
+    ///
+    /// It is the same helper, and this test is what makes that a checked
+    /// property: the arm could have kept the send it grew and skipped the
+    /// reset, which is the shape "tell the client" has when it is written as
+    /// an event rather than as a state change.
+    #[test]
+    fn an_orphaned_menu_told_it_was_dismissed_is_unmapped_too() {
+        let (mut client, mut peer, _runtime, framebuffer_path, pool_path) =
+            mapped_popup("popup-orphan-unmap");
+        // The whole parent tree, so the popup's parent edge is broken and its
+        // repaint reaches the orphan arm rather than being placed again.
+        destroy_the_parent_window(&mut client);
+        assert_eq!(dismissals(&client, &mut peer), vec![14]);
+
+        // The cascade unmapped it, so the repaint is a whole mapping again.
+        reconfigure_popup(&mut client, &mut peer, 6, 13);
+        let mut attach = wire::Builder::new();
+        attach.u32(7);
+        attach.i32(0);
+        attach.i32(0);
+        client
+            .dispatch(request(6, 1, attach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            dismissals(&client, &mut peer),
+            vec![14],
+            "the orphan arm did not tell the client again"
+        );
+
+        // And that telling unmapped it too, so the NEXT repaint is refused
+        // rather than being refunded and told a third time.
+        let mut again = wire::Builder::new();
+        again.u32(7);
+        again.i32(0);
+        again.i32(0);
+        client
+            .dispatch(request(6, 1, again).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert_eq!(
+            client
+                .dispatch(
+                    request(6, 6, wire::Builder::new()).unwrap(),
+                    &mut VecDeque::new(),
+                )
+                .unwrap_err(),
+            "xdg_surface 13 attached a buffer before its initial configure",
+            "an orphan told it was dismissed was still mapped"
+        );
+        assert_eq!(
+            client.protocol_error_code,
+            XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER
+        );
+        assert_eq!(client.protocol_error_object, Some(13));
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// Half a re-dance is not a re-dance. A dismissed menu that asks for its
+    /// configure and attaches without ACKNOWLEDGING it is refused as well,
+    /// which is the protocol's "the client must acknowledge it and is then
+    /// allowed to attach a buffer".
+    ///
+    /// The two refusals are different checks — one reads `initial_sent`, the
+    /// other `can_attach` — and they carry the same code because the protocol
+    /// gives them one: both are "attaching a buffer to an unconfigured
+    /// surface". This is the arm a client reaches by ignoring `popup_done`
+    /// and re-mapping from a half-remembered handshake, so it is the same
+    /// story as the test above rather than a neighbouring one.
+    #[test]
+    fn a_dismissed_menu_that_skips_the_acknowledgement_is_refused_too() {
+        let (mut client, mut peer, _runtime, framebuffer_path, pool_path) =
+            mapped_popup("popup-dismissed-unacked");
+        client
+            .dispatch(
+                request(10, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(dismissals(&client, &mut peer), vec![14]);
+
+        // The bufferless commit alone: the configure comes back and is left
+        // unacknowledged.
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(
+            drain_messages(&mut peer)
+                .iter()
+                .any(|message| (message.object, message.opcode) == (13, 0)),
+            "the re-map was not answered with a configure"
+        );
+
+        let mut attach = wire::Builder::new();
+        attach.u32(7);
+        attach.i32(0);
+        attach.i32(0);
+        client
+            .dispatch(request(6, 1, attach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert_eq!(
+            client
+                .dispatch(
+                    request(6, 6, wire::Builder::new()).unwrap(),
+                    &mut VecDeque::new(),
+                )
+                .unwrap_err(),
+            "xdg_surface 13 attached a buffer before acknowledging configure"
+        );
+        assert_eq!(
+            client.protocol_error_code,
+            XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER
+        );
+        assert_eq!(client.protocol_error_object, Some(13));
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// A client that keeps re-mapping a menu td keeps dismissing is bounded.
+    ///
+    /// Unmapping is what a dismissal does now, and `ConfigureTracker::unmap`
+    /// RETIRES the configures outstanding at the time rather than dropping
+    /// them — it has to, since an ack for one may still be in flight. That
+    /// makes a loop a client can drive: re-map, be dismissed, re-map. Nothing
+    /// caps the rounds, so what must hold is that a round is a CLOSED cycle,
+    /// and `unmap` refuses once retired and outstanding together pass 32.
+    ///
+    /// What this catches is residue that survives the ack, which is a
+    /// CONJUNCTION rather than either half — established by mutation, because
+    /// the reasoning goes wrong in both directions on its own. Retiring an
+    /// extra serial per round is absorbed, since acking the initial configure
+    /// clears the retired list; and dropping that clear leaks nothing, since
+    /// a round that acked everything retires nothing. Only both together grow
+    /// the list, and no other test in the suite notices.
+    ///
+    /// Thirty-four rounds against a ceiling of 32, which is one round of
+    /// margin rather than the threshold: measured under the conjunction
+    /// above, 32 rounds still passes and 33 catches it.
+    ///
+    /// Each round asserts twice over without a SECOND message read. The drain
+    /// inside `reconfigure_popup` is the round's only one and costs a 50ms
+    /// timeout, so this test sets the suite's wall-clock floor either way and
+    /// a per-round dismissal check would double what it costs; both
+    /// assertions ride a read already being made. `reconfigure_popup` unwraps
+    /// on FINDING a configure, so a round whose predecessor failed to unmap
+    /// dies there; and the commit must succeed, so a round that accumulated
+    /// residue dies on `unmap`'s refusal. The dismissal itself is asserted
+    /// once at the end, which is the last round's.
+    #[test]
+    fn a_menu_re_mapped_and_re_dismissed_forever_retires_nothing() {
+        let (mut client, mut peer, _runtime, framebuffer_path, pool_path) =
+            mapped_popup("popup-dismiss-loop");
+        destroy_the_parent_window(&mut client);
+        assert_eq!(dismissals(&client, &mut peer), vec![14]);
+
+        for round in 0..34 {
+            reconfigure_popup(&mut client, &mut peer, 6, 13);
+            let mut attach = wire::Builder::new();
+            attach.u32(7);
+            attach.i32(0);
+            attach.i32(0);
+            client
+                .dispatch(request(6, 1, attach).unwrap(), &mut VecDeque::new())
+                .unwrap();
+            client
+                .dispatch(
+                    request(6, 6, wire::Builder::new()).unwrap(),
+                    &mut VecDeque::new(),
+                )
+                .unwrap_or_else(|error| panic!("round {round} refused: {error}"));
+        }
+        assert_eq!(
+            dismissals(&client, &mut peer),
+            vec![14],
+            "the last round did not dismiss"
+        );
 
         let _ = fs::remove_file(&framebuffer_path);
         let _ = fs::remove_file(&pool_path);
@@ -9924,14 +10236,13 @@ mod tests {
         let _ = fs::remove_file(&pool_path);
     }
 
-    /// Take a popup surface through the whole map: the bufferless commit that
-    /// asks for a configure, the acknowledgement, and the buffer.
+    /// Take a popup surface through the whole map: `reconfigure_popup`'s
+    /// bufferless commit and acknowledgement, then the buffer.
     ///
-    /// Wants a FRESH configure tracker — an already-configured surface is sent
-    /// no initial pair, and the serial scan below then matches nothing. Both
-    /// callers have one because `xdg_popup.destroy` replaces the tracker. The
-    /// LAST configure is the one taken, which is unambiguous only because the
-    /// drain empties the socket first.
+    /// Wants a FRESH configure tracker, for the reason `reconfigure_popup`
+    /// gives. Callers have one either because the surface is new, because
+    /// `xdg_popup.destroy` replaced the tracker, or because a dismissal reset
+    /// it.
     fn map_popup_surface(
         client: &mut Client,
         peer: &mut UnixStream,
@@ -9940,25 +10251,7 @@ mod tests {
         buffer: u32,
         pool_path: &PathBuf,
     ) {
-        client
-            .dispatch(
-                request(surface, 6, wire::Builder::new()).unwrap(),
-                &mut VecDeque::new(),
-            )
-            .unwrap();
-        let serial = drain_messages(peer)
-            .iter()
-            .rev()
-            .find_map(|message| {
-                ((message.object, message.opcode) == (xdg_surface, 0))
-                    .then(|| wire::Cursor::new(&message.payload).u32().unwrap())
-            })
-            .unwrap();
-        let mut ack = wire::Builder::new();
-        ack.u32(serial);
-        client
-            .dispatch(request(xdg_surface, 4, ack).unwrap(), &mut VecDeque::new())
-            .unwrap();
+        reconfigure_popup(client, peer, surface, xdg_surface);
         client
             .insert(
                 buffer,
@@ -9985,6 +10278,43 @@ mod tests {
                 request(surface, 6, wire::Builder::new()).unwrap(),
                 &mut VecDeque::new(),
             )
+            .unwrap();
+    }
+
+    /// The dance a DISMISSED popup has to repeat before it may attach a
+    /// buffer again: a bufferless commit, and an ack of the configure that
+    /// answers it. `map_popup_surface` is this plus the buffer, and calls it;
+    /// this one stands alone because a test whose subject is the repaint
+    /// keeps its own attach.
+    ///
+    /// Wants a FRESH configure tracker — an already-configured surface is
+    /// sent no initial pair, and the scan below then matches nothing and
+    /// unwraps. The LAST configure is the one taken, which is unambiguous
+    /// only because the drain empties the socket first.
+    fn reconfigure_popup(
+        client: &mut Client,
+        peer: &mut UnixStream,
+        surface: u32,
+        xdg_surface: u32,
+    ) {
+        client
+            .dispatch(
+                request(surface, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        let serial = drain_messages(peer)
+            .iter()
+            .rev()
+            .find_map(|message| {
+                ((message.object, message.opcode) == (xdg_surface, 0))
+                    .then(|| wire::Cursor::new(&message.payload).u32().unwrap())
+            })
+            .unwrap();
+        let mut ack = wire::Builder::new();
+        ack.u32(serial);
+        client
+            .dispatch(request(xdg_surface, 4, ack).unwrap(), &mut VecDeque::new())
             .unwrap();
     }
 
@@ -10176,6 +10506,7 @@ mod tests {
         assert_eq!(XDG_WM_BASE_ERROR_INVALID_POSITIONER, 5);
         assert_eq!(XDG_SURFACE_ERROR_NOT_CONSTRUCTED, 1);
         assert_eq!(XDG_SURFACE_ERROR_ALREADY_CONSTRUCTED, 2);
+        assert_eq!(XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER, 3);
         assert_eq!(XDG_SURFACE_ERROR_INVALID_SIZE, 5);
         assert_eq!(XDG_POSITIONER_ERROR_INVALID_INPUT, 0);
         assert_eq!(XDG_POPUP_CONFIGURE, 0);
