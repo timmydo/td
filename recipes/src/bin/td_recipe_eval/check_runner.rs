@@ -6074,7 +6074,24 @@ chmod 755 '{}'
             .unwrap();
         assert!(contender.try_lock().is_err(), "commit lock is exclusive while held");
         drop(held);
-        assert!(contender.try_lock().is_ok(), "released once the holder drops");
+        // Not instantly: a sibling test's `Command::spawn` forks a child that
+        // holds a duplicate of this descriptor until it execs, and an flock
+        // lives on the open file description, so a lock this thread dropped can
+        // still read as held. Attempt, THEN check the clock, so a thread
+        // preempted past the deadline still gets its last try.
+        const WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+        const POLL: std::time::Duration = std::time::Duration::from_millis(10);
+        let deadline = std::time::Instant::now() + WAIT;
+        let released = loop {
+            if contender.try_lock().is_ok() {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(POLL);
+        };
+        assert!(released, "released once the holder drops");
         let _ = fs::remove_dir_all(&lw);
     }
 
@@ -6110,10 +6127,13 @@ chmod 755 '{}'
         );
         drop(wiper);
         // BLOCKING, as every production caller is. A `try_lock_shared` here fails
-        // intermittently with WouldBlock while `/proc/locks` shows the inode already
-        // free: releasing on close is not ordered against a lock request on another
-        // descriptor. The claim is that a build is admitted, not how fast — so this
-        // waits, and a regression that never admits hangs rather than passing.
+        // intermittently with WouldBlock, and the reason is not that releasing on
+        // close is unordered against a lock request on another descriptor: it is
+        // that a sibling test's `Command::spawn` forks a child holding a duplicate
+        // of this descriptor until it execs, and an flock lives on the open file
+        // description, so the release does not take effect until that child execs.
+        // The claim is that a build is admitted, not how fast — so this waits, and
+        // a regression that never admits hangs rather than passing.
         drop(build);
         drop(lock_ladder(&lock, LadderLock::Shared).unwrap());
 

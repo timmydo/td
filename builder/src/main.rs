@@ -974,11 +974,16 @@ struct HostSandboxScratch {
     run: PathBuf,
     tmp: PathBuf,
     namespace: PathBuf,
-    _live: std::fs::File,
+    live: Option<std::fs::File>,
 }
 
 impl Drop for HostSandboxScratch {
     fn drop(&mut self) {
+        // `.live` lives INSIDE the tree, and a custom Drop runs before the
+        // fields it owns, so closing it first is what keeps an unlinked-but-open
+        // file from defeating the final rmdir where a filesystem renames it
+        // aside instead. Same rule `sandbox::reclaim_leased_tree` follows.
+        self.live = None;
         let _ = sandbox::remove_scratch_tree(&self.run);
     }
 }
@@ -1001,35 +1006,66 @@ fn make_host_scratch_run_accessible(run: &Path) {
 /// Remove check-sandbox scratch whose owner no longer holds its live flock.
 /// The parent coordination lock brackets both this sweep and publication of a
 /// newly locked run, so a concurrent creator can never be mistaken for a
-/// crash. Ambiguous lock/open errors preserve the tree rather than racing it.
-fn sweep_host_sandbox_scratch(parent: &Path) {
-    let Ok(entries) = std::fs::read_dir(parent) else {
-        return;
+/// crash. Ambiguous lock/open errors preserve the tree rather than racing it,
+/// and the report names the tree and the reason rather than dropping both.
+fn sweep_host_sandbox_scratch(parent: &Path) -> sandbox::ScratchSweep {
+    let mut report = sandbox::ScratchSweep::default();
+    // A parent, entry or type this sweep cannot read may hide a whole crashed
+    // run, so it is named rather than dropped.
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(e) => {
+            report.note_unreachable(parent, e);
+            return report;
+        }
     };
-    let abandoned = entries.flatten().filter(|entry| {
-        entry
+    let mut swept = 0usize;
+    let mut errors = 0usize;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                report.note_unreachable(parent, e);
+                errors = errors.saturating_add(1);
+                if errors > sandbox::READDIR_ERROR_LIMIT {
+                    report.truncated = true;
+                    break;
+                }
+                continue;
+            }
+        };
+        // A name that is not ours is not this sweep's business — including a
+        // non-UTF-8 one, which no run of ours can have. What wears the name and
+        // is not a directory IS its business, and `reclaim_leased_tree` is the
+        // one place that decides so, rather than a type check hoisted to here
+        // that would drop it in silence.
+        if !entry
             .file_name()
             .to_str()
             .is_some_and(|name| name.starts_with("run-"))
-            && entry.file_type().is_ok_and(|kind| kind.is_dir())
-    });
-    for entry in abandoned.take(4096) {
+        {
+            continue;
+        }
+        if swept >= 4096 {
+            // A 4097th RUN is one this sweep never looked at, so the report
+            // must not read as a clean one. Anything else past the bound is
+            // not a run and was not skipped.
+            report.truncated = true;
+            break;
+        }
+        swept = swept.saturating_add(1);
         let run = entry.path();
         make_host_scratch_run_accessible(&run);
-        let live_path = run.join(".live");
-        let stale = match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&live_path)
-        {
-            Ok(file) => file.try_lock().is_ok(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-            Err(_) => false,
-        };
-        if stale {
-            let _ = sandbox::remove_scratch_tree(&run);
-        }
+        // A run with no `.live` at all crashed before it published one, so
+        // here a missing lease is the crash rather than an older builder.
+        let outcome = sandbox::reclaim_leased_tree(
+            &run.join(".live"),
+            &run,
+            sandbox::MissingLease::Reclaim,
+        );
+        report.record(&run, outcome);
     }
+    report
 }
 
 /// Allocate the private disk tree mounted at `/tmp` for one complete hosted
@@ -1053,7 +1089,15 @@ fn host_sandbox_scratch(worktree: &Path) -> Result<HostSandboxScratch, String> {
     coordination
         .lock()
         .map_err(|e| format!("lock check scratch {}: {e}", coordination_path.display()))?;
-    sweep_host_sandbox_scratch(&parent);
+    let swept = sweep_host_sandbox_scratch(&parent);
+    if swept.incomplete() {
+        // Best-effort by design — the next run sweeps again — but no longer
+        // silent: a tree that resists removal now names itself and its errno.
+        eprintln!(
+            "td-builder: incomplete check scratch sweep in {}: {swept:?}",
+            parent.display()
+        );
+    }
 
     for _ in 0..128 {
         let nonce = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1091,7 +1135,7 @@ fn host_sandbox_scratch(worktree: &Path) -> Result<HostSandboxScratch, String> {
             run,
             tmp,
             namespace,
-            _live: live,
+            live: Some(live),
         });
     }
     Err(format!(
@@ -9796,9 +9840,16 @@ fn main() -> ExitCode {
                 if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                     return Err("daemon requester disconnected before its build started".to_string());
                 }
-                crate::sandbox::sweep_abandoned_build_temps(Path::new(&scratch)).map_err(|e| {
-                    format!("sweep abandoned daemon build scratch {}: {e}", scratch)
-                })?;
+                let swept = crate::sandbox::sweep_abandoned_build_temps(Path::new(&scratch));
+                if swept.incomplete() {
+                    // A tree this sweep could not reclaim is left for the next
+                    // one rather than failing this request — but the reason is
+                    // reported, since a `build-tmp` still on disk cannot say
+                    // whether a builder holds its lease or removal failed.
+                    eprintln!(
+                        "td-builder: incomplete build scratch sweep in {scratch}: {swept:?}"
+                    );
+                }
                 // Each build runs in its OWN child td-builder process (Command = the safe
                 // fork+exec): an in-process fork on a daemon thread is unsound (sandbox::build
                 // mutates the process CWD + forks with heavy pre-exec work). The child's stderr
@@ -10785,13 +10836,36 @@ mod tests {
             .unwrap();
         active_lease.lock().unwrap();
 
-        sweep_host_sandbox_scratch(&parent);
+        // Each wait settles on the ONE thing the fork window can perturb — a
+        // lease that should be free reading as held — so a sweep that fails or
+        // half-finishes is judged on its own report rather than retried until a
+        // later one tidies up after it. One run is legitimately live here.
+        let report = sandbox::retry_briefly(
+            || sweep_host_sandbox_scratch(&parent),
+            |report| report.leased == 1,
+        );
+        assert!(
+            !stale.exists(),
+            "crashed run not reclaimed by one sweep: {report:?}"
+        );
+        assert!(
+            active.exists(),
+            "live run reclaimed under its holder: {report:?}"
+        );
+        assert_eq!(report.reclaimed, 1, "one sweep did it: {report:?}");
+        assert_eq!(report.failed, 0, "{report:?}");
 
-        assert!(!stale.exists());
-        assert!(active.exists());
         drop(active_lease);
-        sweep_host_sandbox_scratch(&parent);
-        assert!(!active.exists());
+        let report = sandbox::retry_briefly(
+            || sweep_host_sandbox_scratch(&parent),
+            |report| report.leased == 0,
+        );
+        assert!(
+            !active.exists(),
+            "finished run not reclaimed by one sweep: {report:?}"
+        );
+        assert_eq!(report.reclaimed, 1, "one sweep did it: {report:?}");
+        assert_eq!(report.failed, 0, "{report:?}");
         let _ = std::fs::remove_dir_all(parent);
     }
 
@@ -10810,9 +10884,11 @@ mod tests {
         std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o000)).unwrap();
         std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        sweep_host_sandbox_scratch(&parent);
+        // Nothing ever locks this run's `.live`, so there is no lease to wait
+        // on: a tree still here is a removal that failed, and says so.
+        let report = sweep_host_sandbox_scratch(&parent);
 
-        assert!(!run.exists());
+        assert!(!run.exists(), "mode-000 tree not reclaimed: {report:?}");
         let _ = std::fs::remove_dir_all(parent);
     }
 
@@ -13878,7 +13954,10 @@ daemon build START (2/2 active)
             .unwrap();
         assert!(contender.try_lock().is_err(), "commit lock held exclusively while in use");
         drop(held);
-        assert!(contender.try_lock().is_ok(), "commit lock acquirable again once released");
+        // Not instantly: a sibling test's spawn can hold a fork-duplicated
+        // copy of this descriptor until it execs.
+        let released = sandbox::retry_briefly(|| contender.try_lock().is_ok(), |ok| *ok);
+        assert!(released, "commit lock acquirable again once released");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

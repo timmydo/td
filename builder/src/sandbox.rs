@@ -550,7 +550,17 @@ fn remove_directory_tree(path: &Path) -> io::Result<()> {
         // A child swapped from a directory to a symlink or file is removed,
         // never followed outside the scratch tree.
         if !metadata.is_dir() {
-            fs::remove_file(&current)?;
+            // A concurrent remover of the same tree is ordinary — two sweeps,
+            // or a sweep and an owner's Drop, race by design — so a child that
+            // is already gone is removed, not an error. Every other arm of this
+            // walk tolerates that; these three did not, and a NotFound reaching
+            // a caller becomes a `Failed` that means the opposite of what it
+            // says.
+            match fs::remove_file(&current) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
             if current == root {
                 return Ok(());
             }
@@ -559,10 +569,20 @@ fn remove_directory_tree(path: &Path) -> io::Result<()> {
             }
             continue;
         }
-        make_dir_accessible(&current)?;
+        match make_dir_accessible(&current) {
+            Ok(()) => {}
+            // Re-enter at the top, where the vanished path pops to its parent.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        }
 
         let mut descended = false;
-        for entry in fs::read_dir(&current)? {
+        let children = match fs::read_dir(&current) {
+            Ok(children) => children,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        for entry in children {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
@@ -629,49 +649,211 @@ impl Drop for ScratchCleanup {
     }
 }
 
+/// What one sweep decided about one scratch tree. A tree still on disk cannot
+/// say WHY it survived, so a held lease, a lease that could not be read, and a
+/// removal that failed are separate arms rather than one silent skip.
+#[derive(Debug)]
+pub(crate) enum ScratchReclaim {
+    /// No tree there to reclaim.
+    Absent,
+    /// No lease beside the tree.
+    NoLease,
+    /// The lease is held.
+    Leased,
+    /// The lease could not be opened or probed, so its owner is unknown.
+    Unreadable(io::Error),
+    Reclaimed,
+    /// The lease was free and the removal still failed.
+    Failed(io::Error),
+}
+
+/// Whether a tree with no lease beside it is a crash to reclaim or an older
+/// concurrent builder's to preserve.
+#[derive(Clone, Copy)]
+pub(crate) enum MissingLease {
+    Preserve,
+    Reclaim,
+}
+
+/// Probe `lease` and reclaim `tree` when nothing holds it.
+///
+/// A held lease is NOT proof of a live owner. `Command`'s fork duplicates every
+/// open descriptor into the child until it execs, and an flock lives on the
+/// open file DESCRIPTION rather than on a process — so any concurrent request
+/// spawning its build child briefly holds a copy of every lease this process
+/// has open, including ones already dropped. That defers a reclaim to the next
+/// sweep, which is why reclaiming is best-effort and why no caller may read
+/// `Leased` as an error. The duplicate only ever ADDS a holder, so the
+/// direction that would matter — a live tree reclaimed under its owner — is not
+/// reachable this way.
+pub(crate) fn reclaim_leased_tree(
+    lease_path: &Path,
+    tree: &Path,
+    missing: MissingLease,
+) -> ScratchReclaim {
+    match fs::symlink_metadata(tree) {
+        Ok(metadata) if metadata.is_dir() => {}
+        // Only a path that is NOT THERE is absent. A file or a symlink wearing
+        // the name of a build tree is a corrupt layout that this never removes
+        // — it is not a tree, so nothing here knows what it is — and a stat
+        // that failed for any reason but absence is the same kind of unknown.
+        // Both are named rather than folded into "nothing to do".
+        Ok(_) => return ScratchReclaim::Unreadable(io::ErrorKind::NotADirectory.into()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return ScratchReclaim::Absent,
+        Err(e) => return ScratchReclaim::Unreadable(e),
+    }
+    let lease = match fs::OpenOptions::new().read(true).write(true).open(lease_path) {
+        Ok(lease) => match lease.try_lock() {
+            Ok(()) => Some(lease),
+            Err(fs::TryLockError::WouldBlock) => return ScratchReclaim::Leased,
+            Err(fs::TryLockError::Error(e)) => return ScratchReclaim::Unreadable(e),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => match missing {
+            MissingLease::Preserve => return ScratchReclaim::NoLease,
+            MissingLease::Reclaim => None,
+        },
+        Err(e) => return ScratchReclaim::Unreadable(e),
+    };
+    // The lease is HELD across the removal, so nothing can claim the name and
+    // recreate the tree under a walk already inside it. A lease that lives IN
+    // the tree is the exception: it goes with the tree, so holding it protects
+    // nothing, and an unlinked-but-open file defeats the final rmdir on a
+    // filesystem that renames it aside instead (NFS). The caller shaped that
+    // way brackets its whole sweep with the parent coordination lock, so it
+    // has no claimer to race.
+    if lease_path.starts_with(tree) {
+        drop(lease);
+    }
+    match remove_scratch_tree(tree) {
+        Ok(()) => ScratchReclaim::Reclaimed,
+        // The tree being gone IS the goal, however it got there. The walk
+        // tolerates a vanished path itself; this keeps `Failed` meaning a
+        // removal that failed even if a fourth site ever leaks a NotFound.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => ScratchReclaim::Reclaimed,
+        Err(e) => ScratchReclaim::Failed(e),
+    }
+}
+
+/// One sweep's bounded result: counters, plus the FIRST path it could not
+/// reclaim or could not read, and why. A caller can name what it left behind
+/// without retaining one pathname per directory swept.
+#[derive(Debug, Default)]
+pub(crate) struct ScratchSweep {
+    pub(crate) reclaimed: usize,
+    pub(crate) leased: usize,
+    pub(crate) no_lease: usize,
+    pub(crate) unreadable: usize,
+    pub(crate) failed: usize,
+    /// A sweep that stopped at its own bound has not looked at everything, so
+    /// it cannot report a clean one.
+    pub(crate) truncated: bool,
+    /// The first tree whose REMOVAL failed, and the first path the sweep could
+    /// not read, kept in separate slots: sharing one would let whichever
+    /// directory order happened to yield first hide the other's errno, which is
+    /// the silence this report exists to end.
+    pub(crate) first_failure: Option<(PathBuf, io::Error)>,
+    pub(crate) first_unreadable: Option<(PathBuf, io::Error)>,
+}
+
+impl ScratchSweep {
+    pub(crate) fn record(&mut self, tree: &Path, outcome: ScratchReclaim) {
+        match outcome {
+            ScratchReclaim::Absent => {}
+            ScratchReclaim::NoLease => self.no_lease = self.no_lease.saturating_add(1),
+            ScratchReclaim::Leased => self.leased = self.leased.saturating_add(1),
+            ScratchReclaim::Reclaimed => self.reclaimed = self.reclaimed.saturating_add(1),
+            ScratchReclaim::Unreadable(e) => {
+                self.unreadable = self.unreadable.saturating_add(1);
+                if self.first_unreadable.is_none() {
+                    self.first_unreadable = Some((tree.to_path_buf(), e));
+                }
+            }
+            ScratchReclaim::Failed(e) => {
+                self.failed = self.failed.saturating_add(1);
+                if self.first_failure.is_none() {
+                    self.first_failure = Some((tree.to_path_buf(), e));
+                }
+            }
+        }
+    }
+
+    /// Record a directory the walk could not read. One that vanished mid-walk
+    /// is ordinary — scratch really does go away under a concurrent sweep —
+    /// and anything else may hide a whole crashed tree, so it is named rather
+    /// than dropped.
+    pub(crate) fn note_unreachable(&mut self, dir: &Path, e: io::Error) {
+        if e.kind() != io::ErrorKind::NotFound {
+            self.record(dir, ScratchReclaim::Unreadable(e));
+        }
+    }
+
+    /// Whether the sweep could not do — or could not tell — something, or did
+    /// not get to the end of its work. A held lease is ordinary; these are
+    /// worth a log line.
+    pub(crate) fn incomplete(&self) -> bool {
+        self.failed > 0 || self.unreadable > 0 || self.truncated
+    }
+}
+
+/// How many iteration errors one directory may report before a sweep gives up
+/// on it. `ReadDir::next` yields `Some(Err(..))` for as long as `readdir(3)`
+/// keeps failing, so a device erroring under the walk would otherwise spin with
+/// nothing advancing.
+pub(crate) const READDIR_ERROR_LIMIT: usize = 64;
+
 /// Reclaim disk-backed build trees whose builder no longer holds the sibling
 /// lease. The walk follows only the daemon scratch layout and never descends
 /// into output `newstore` trees. A missing lease is preserved for compatibility
 /// with an older concurrently running builder; only scratch created by this
 /// version is eligible for automatic crash recovery.
-pub(crate) fn sweep_abandoned_build_temps(root: &Path) -> io::Result<()> {
+///
+/// Crash recovery is best-effort and must never become global daemon
+/// admission: a pathological tree may remain on disk, but it cannot poison
+/// unrelated future requests. Nothing here is an error to a caller, then —
+/// the report is how one says what it left behind rather than discarding the
+/// reason.
+pub(crate) fn sweep_abandoned_build_temps(root: &Path) -> ScratchSweep {
     struct Frame {
         depth: usize,
+        errors: usize,
+        /// The directory being enumerated. A `ReadDir` error names no path, and
+        /// a directory the walk cannot finish reading may hide a whole tree —
+        /// so the report needs to say which one. Two frames live at most, so
+        /// this stays constant with directory width.
+        dir: PathBuf,
         entries: fs::ReadDir,
     }
 
-    fn reclaim_one(dir: &Path) -> io::Result<()> {
+    fn reclaim_one(dir: &Path, report: &mut ScratchSweep) {
         let build_tmp = dir.join("build-tmp");
-        if fs::symlink_metadata(&build_tmp)
-            .map(|metadata| metadata.is_dir())
-            .unwrap_or(false)
-        {
-            let lease_path = dir.join(".build-tmp.lock");
-            if let Ok(lease) = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&lease_path)
-            {
-                // Crash recovery is best-effort and must never become global
-                // daemon admission. A pathological tree may remain on disk,
-                // but it cannot poison unrelated future requests.
-                if lease.try_lock().is_ok() {
-                    let _ = remove_scratch_tree(&build_tmp);
-                }
-            }
-        }
-        Ok(())
+        let outcome = reclaim_leased_tree(
+            &dir.join(".build-tmp.lock"),
+            &build_tmp,
+            MissingLease::Preserve,
+        );
+        report.record(&build_tmp, outcome);
     }
 
-    reclaim_one(root)?;
+    let mut report = ScratchSweep::default();
+    reclaim_one(root, &mut report);
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(_) => return Ok(()),
+        Err(e) => {
+            report.note_unreachable(root, e);
+            return report;
+        }
     };
-    // The daemon layout is at most two levels below `root`. Retain only those
-    // three live iterators, so both memory and file-descriptor use stay constant
-    // with directory width while every entry is eventually visited.
-    let mut stack = vec![Frame { depth: 0, entries }];
+    // The daemon layout is at most two levels below `root`, so at most two
+    // iterators are live at once — the root's and one child's; a depth-2 entry
+    // is reclaimed without being descended into. Both memory and
+    // file-descriptor use therefore stay constant with directory width while
+    // every entry is eventually visited.
+    let mut stack = vec![Frame {
+        depth: 0,
+        errors: 0,
+        dir: root.to_path_buf(),
+        entries,
+    }];
     while let Some(frame) = stack.last_mut() {
         let Some(entry) = frame.entries.next() else {
             stack.pop();
@@ -679,7 +861,15 @@ pub(crate) fn sweep_abandoned_build_temps(root: &Path) -> io::Result<()> {
         };
         let entry = match entry {
             Ok(entry) => entry,
-            Err(_) => continue,
+            Err(e) => {
+                report.note_unreachable(&frame.dir, e);
+                frame.errors = frame.errors.saturating_add(1);
+                if frame.errors > READDIR_ERROR_LIMIT {
+                    report.truncated = true;
+                    stack.pop();
+                }
+                continue;
+            }
         };
         let name = entry.file_name();
         if matches!(name.to_str(), Some("newstore" | "buildroot" | "build-tmp")) {
@@ -687,21 +877,68 @@ pub(crate) fn sweep_abandoned_build_temps(root: &Path) -> io::Result<()> {
         }
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
-            Err(_) => continue,
+            Err(e) => {
+                report.note_unreachable(&entry.path(), e);
+                continue;
+            }
         };
         if !file_type.is_dir() {
             continue;
         }
         let depth = frame.depth.saturating_add(1);
         let path = entry.path();
-        reclaim_one(&path)?;
+        reclaim_one(&path, &mut report);
         if depth < 2 {
-            if let Ok(entries) = fs::read_dir(&path) {
-                stack.push(Frame { depth, entries });
+            match fs::read_dir(&path) {
+                Ok(entries) => stack.push(Frame {
+                    depth,
+                    errors: 0,
+                    dir: path,
+                    entries,
+                }),
+                Err(e) => report.note_unreachable(&path, e),
             }
         }
     }
-    Ok(())
+    report
+}
+
+/// How long a test waits out the fork-duplicated lease `reclaim_leased_tree`
+/// describes, and how often it re-probes. Orders of magnitude above the window
+/// itself, which is one `fork`-to-`exec`.
+#[cfg(test)]
+pub(crate) const LEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(test)]
+pub(crate) const LEASE_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Retry `attempt` until `settled` accepts its RESULT or the deadline passes,
+/// returning the last one for the assertion that follows. Settling on the
+/// result rather than on the world is what keeps this a wait for the lease and
+/// not for the work: a regression still fails, at the deadline rather than at
+/// once.
+#[cfg(test)]
+pub(crate) fn retry_briefly<R>(
+    mut attempt: impl FnMut() -> R,
+    mut settled: impl FnMut(&R) -> bool,
+) -> R {
+    let deadline = std::time::Instant::now() + LEASE_WAIT;
+    let mut first = None;
+    loop {
+        let result = attempt();
+        if settled(&result) {
+            return result;
+        }
+        if std::time::Instant::now() >= deadline {
+            // The FIRST attempt is the evidence: every later one ran against a
+            // world an earlier one had already changed, so a regression that
+            // does its damage immediately reports an empty last attempt.
+            return first.unwrap_or(result);
+        }
+        if first.is_none() {
+            first = Some(result);
+        }
+        std::thread::sleep(LEASE_POLL);
+    }
 }
 
 /// Cap `cmd`'s child — and everything it forks/execs — at `bytes` of data
@@ -2846,14 +3083,70 @@ mod tests {
             .unwrap();
         active_lease.lock().unwrap();
 
-        sweep_abandoned_build_temps(&root).unwrap();
+        // Each wait settles on the ONE thing the fork window can perturb: a
+        // lease that should be free reading as held. Every other outcome is
+        // terminal, so a sweep that fails or half-finishes is judged on its own
+        // report rather than retried until a later sweep tidies up after it —
+        // production sweeps once per request and would never get that chance.
+        // Here one lease is legitimately held, so `leased == 1` is the answer
+        // and `2` is the duplicate.
+        let report = retry_briefly(
+            || sweep_abandoned_build_temps(&root),
+            |report| report.leased == 1,
+        );
+        assert!(
+            !stale.join("build-tmp").exists(),
+            "unleased build tree not reclaimed by one sweep: {report:?}"
+        );
+        assert!(
+            active.join("build-tmp").exists(),
+            "leased build tree reclaimed under its holder: {report:?}"
+        );
+        assert_eq!(report.reclaimed, 1, "one sweep did it: {report:?}");
+        assert_eq!(report.failed, 0, "{report:?}");
 
-        assert!(!stale.join("build-tmp").exists());
-        assert!(active.join("build-tmp").exists());
         drop(active_lease);
-        sweep_abandoned_build_temps(&root).unwrap();
-        assert!(!active.join("build-tmp").exists());
+        let report = retry_briefly(
+            || sweep_abandoned_build_temps(&root),
+            |report| report.leased == 0,
+        );
+        assert!(
+            !active.join("build-tmp").exists(),
+            "released build tree not reclaimed by one sweep: {report:?}"
+        );
+        assert_eq!(report.reclaimed, 1, "one sweep did it: {report:?}");
+        assert_eq!(report.failed, 0, "{report:?}");
         let _ = fs::remove_dir_all(fixture_root);
+    }
+
+    #[test]
+    fn scratch_sweep_names_a_layout_it_cannot_reclaim() {
+        // A FILE wearing a build tree's name is not a tree, so the sweep does
+        // not remove it — but a corrupt layout left in silence is the thing
+        // this report exists to prevent, so it is counted and named.
+        let root = std::env::temp_dir().join(format!(
+            "td-build-scratch-foreign-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let odd = root.join("odd");
+        fs::create_dir_all(&odd).unwrap();
+        fs::write(odd.join("build-tmp"), b"not a tree").unwrap();
+        // No lease file: the layout is refused before one would be opened.
+
+        let report = sweep_abandoned_build_temps(&root);
+
+        assert!(odd.join("build-tmp").is_file(), "{report:?}");
+        assert_eq!(report.reclaimed, 0, "{report:?}");
+        assert_eq!(report.unreadable, 1, "{report:?}");
+        assert!(report.incomplete(), "{report:?}");
+        assert_eq!(
+            report.first_unreadable.as_ref().map(|(path, _)| path.clone()),
+            Some(odd.join("build-tmp")),
+            "the report names the path it could not reclaim: {report:?}"
+        );
+        assert!(report.first_failure.is_none(), "nothing was removed: {report:?}");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2885,10 +3178,27 @@ mod tests {
         fs::create_dir_all(opaque.join("nested/build-tmp")).unwrap();
         fs::set_permissions(&opaque, fs::Permissions::from_mode(0o000)).unwrap();
 
-        sweep_abandoned_build_temps(&root).unwrap();
+        let report = sweep_abandoned_build_temps(&root);
 
-        assert!(!healthy.join("build-tmp").exists());
-        assert!(!poison.join("build-tmp").exists());
+        assert!(
+            !healthy.join("build-tmp").exists(),
+            "an unreachable tree must not block an unrelated reclaim: {report:?}"
+        );
+        assert!(!poison.join("build-tmp").exists(), "{report:?}");
+        // `opaque` denies the stat of its own `build-tmp`, and a directory the
+        // sweep cannot even look into is the case the report exists for: it is
+        // counted and named, never folded into "nothing there". Root ignores
+        // the mode bits, so the claim is only made where the denial is real.
+        let denied = matches!(
+            fs::symlink_metadata(opaque.join("build-tmp")),
+            Err(ref e) if e.kind() == io::ErrorKind::PermissionDenied
+        );
+        if denied {
+            assert!(
+                report.unreadable > 0 && report.first_unreadable.is_some(),
+                "an unreadable scratch is reported, not silently skipped: {report:?}"
+            );
+        }
         for dir in created.iter().rev() {
             let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
         }
