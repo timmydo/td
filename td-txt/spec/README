@@ -478,9 +478,27 @@ td-txt-authored case files
   and unlike one passes `fail = false`, so a source that does not exist yet is not
   an error and is instead DEAD FOR THE RUN: its `fp` stays null, and
   `rewind_read_files` skips a null `fp`, so even `-s` cannot revive it. td-txt
-  opens `R` when it runs, which agrees everywhere the source exists at compile
-  time and diverges where a `w` in the same script creates it afterwards. See the
-  `R`-open-time entry among the gaps.
+  opens it there too, which puts BOTH file lists in the compile and makes SCRIPT
+  ORDER the whole of the answer -- `-e 'R f' -e 'w f'` reads nothing all run,
+  where the same pair the other way round reads everything the `w` writes.
+
+  What is opened is a HANDLE and not a copy, which is the half that a "the
+  compile reads the file" reading would get wrong: a source that DOES exist at
+  compile survives the later `w` truncating it, and goes on serving what that
+  `w` flushes into the file it is already holding open. The three special names
+  are the one kind of source the compile does not open at all -- `get_openfile`
+  serves them from a static entry `ck_fopen` never sees -- so `R /dev/stdout` is
+  still refused by the READ, and an `R` that never runs still never refuses.
+
+  Two consequences are worth naming because neither is visible in the corpus. A
+  source that will not open is spent for the RUN -- `fp == NULL` in GNU, a spent
+  source here -- and `-s` cannot revive it, `rewind_read_files` skipping a null
+  `fp`. That was already so, the failed open having been cached before this too;
+  what MOVED is when the one attempt is made. And an `R` whose source BLOCKS --
+  a fifo with no writer --
+  now blocks the COMPILE, so `sed -e 'R fifo' -e ZZZ` hangs instead of reporting
+  the bad command. That is GNU's behaviour, measured, and it is the price of the
+  rule rather than an oversight.
 
   Position in the script is therefore what orders that failure against everything
   else, and it is the whole of the rule. A script error LATER loses to it and an
@@ -1278,18 +1296,34 @@ td-txt-authored case files
     run, which changes what every mode flag applies to and so is its own increment,
     not a corner of this one.
 
-  - `R /dev/stdout` and `R /dev/stderr` HANG when the named stream is a pipe, where
-    GNU is `read error on stdout: Bad file descriptor` and exit 4; with that stream
-    on a regular file td-txt exits 0 and GNU still exits 4. A hang rather than a
-    wrong answer, so it is recorded here even though no case can carry it -- the
-    corpus would only see its 10s timeout. Pre-existing and a different axis (`r`
-    and, HERE, `R` open when they RUN, which is why the `w` work above does not
-    touch it -- GNU opens `R` at compile instead, which is its own entry below and
-    is what would move WHEN this hangs rather than whether); a reviewer's
-    cross-product found it here. The NUL-truncation landing WIDENS what
-    reaches it without changing it: `R /dev/stdout\0X` used to be a name nothing
-    could open, so it passed through, and it now truncates to the name above and
-    hangs with it. Every spelling that truncates to one of these two is this entry.
+  - `R /dev/stdout` and `R /dev/stderr` HANG when the named stream is a pipe --
+    RECORDED BUT NOT REPRODUCING, so read the rest of this entry as history
+    rather than as current behaviour. As written: GNU is `read error on stdout:
+    Bad file descriptor` and exit 4 where td-txt hangs, and with that stream on a
+    regular file td-txt exits 0 and GNU still exits 4. A hang rather than a wrong
+    answer, so it was recorded here even though no case can carry it -- the
+    corpus would only see its 10s timeout. The sweep below reproduced none of it
+    on either build, so until it is reproduced the claim above -- the
+    NUL-truncation one included -- stands unverified. Pre-existing and a
+    different axis than the `w` work above; a reviewer's cross-product found it
+    here. The NUL-truncation landing WIDENS what reaches it without changing it:
+    `R /dev/stdout\0X` used to be a name nothing could open, so it passed
+    through, and it now truncates to the name above and hangs with it. Every
+    spelling that truncates to one of these two is this entry.
+
+    Two things measured while `R`'s open moved to compile time, neither of them a
+    fix, and between them the reason the claim above is marked unverified. The
+    entry below predicted that the move would change WHEN this hangs rather than
+    whether; it changes neither, because a special name is exactly
+    the kind of source the compile does NOT open, and under `POSIXLY_CORRECT`,
+    where the name IS opened for real, the open succeeds at once and it is the
+    read that blocks. And the sweep that established that -- both names, stdout a
+    pipe, a regular file and `/dev/null`, with and without `POSIXLY_CORRECT`, 12
+    arrangements against GNU, the parent binary and this one -- found all three
+    AGREEING in every one of them, with no hang anywhere. So the divergence this
+    entry opens with did not reproduce, on either build. That is not a claim it
+    was never there; it is a note that it needs re-establishing before it can be
+    closed, which is its own increment and not this one's.
 
   - An `r` of the file a `w` in the SAME run is writing, CLOSED -- by doing the
     thing this entry said was worse than the divergence. GNU's `w` output is
@@ -1326,25 +1360,66 @@ td-txt-authored case files
     `-s` restarts it besides. `sed -s -n -e 'R wf' -e 'w wf' f1 f2` was nothing
     in GNU and `a` here; it is nothing in both now. It was never `R` reading
     wrongly, so buffering `w` closed it without `R` being touched. What that
-    shape still diverges on past the buffer is `R`'s OPEN TIME, which is the
-    entry below and a different cause with the same face.
+    shape diverged on past the buffer was `R`'s OPEN TIME -- a different cause
+    with the same face, which is the entry below and is closed too.
 
-  - An `R` SOURCE IS OPENED AT COMPILE TIME in GNU and when it RUNS here, which
-    only a script that CREATES its own source can see. GNU compiles `R` the way
-    it compiles `w` -- `get_openfile (&file_read, read_mode, false)`,
-    compile.c:1217 -- and the `false` is the whole entry: unlike a `w` target,
-    a source that will not open is not an error, so `R` of a file that does not
-    exist YET leaves a null `fp` and is dead for the rest of the run.
-    `rewind_read_files` (compile.c:1641) skips a null `fp`, so not even `-s`
-    revives it. td-txt opens when it runs, so a `w` that creates the file
-    afterwards brings the source to life. `sed -s -u -e 'R wf' -e 'w wf' h h2`
-    over `1\n2\n` and `3\n4\n` is `1 2 3 4` in GNU and `1 2 3 1 4 2` here.
-    Compile the `w` FIRST and both agree (`1 1 2 2 3 1 4 2`), because then the
-    file exists when `R` opens -- which is the passing case beside the xfail.
-    PRE-EXISTING: the build before the `w` buffer answers identically. Found by
-    this landing's sweep rather than by the buffer, and left open because
-    changing when `R` opens moves the `R /dev/stdout` hang above from run time
-    to compile time, which is its own increment.
+  - An `R` SOURCE IS OPENED AT COMPILE TIME, CLOSED -- td-txt opens it there too
+    now, so both of sed's file lists are the compile's and SCRIPT ORDER is the
+    whole of the answer. GNU compiles `R` the way it compiles `w` --
+    `get_openfile (&file_read, read_mode, false)`, compile.c:1217 -- and the
+    `false` is the entry: unlike a `w` target, a source that will not open is not
+    an error, so `R` of a file that does not exist YET leaves a null `fp` and is
+    dead for the rest of the run. `rewind_read_files` (compile.c:1641) skips a
+    null `fp`, so not even `-s` revives it. `sed -s -u -e 'R wf' -e 'w wf' h h2`
+    over `1\n2\n` and `3\n4\n` was `1 2 3 4` in GNU and `1 2 3 1 4 2` here; it is
+    `1 2 3 4` in both. Compile the `w` FIRST and it is `1 1 2 2 3 1 4 2` in both,
+    which it already was and is the case that stops the fix being "R is always
+    dead".
+
+    The open is a HANDLE and not a copy of the bytes, and that half needs its own
+    case or a compile that SLURPED would pass: `-e 'R pre' -e 'w pre'` over an
+    EXISTING `pre` reads `1 2 3 1 4 2`, the `w` having truncated the very inode
+    the source is holding open and the source going on to serve what the `w`
+    flushes into it. Four more cases pin that the rule is about the compile and
+    not about `-e` counting -- the same pair inside one `-f` script, a `W`, an
+    `s///w` flag, and `-e 'R wf' -e 'w wf' -e 'R wf'`, where the SECOND `R` is
+    deduped against the first at compile and so stays dead even though the `w`
+    between them has created the file. That last one is the case the dedup needs:
+    without it the second `R` opens for real and the pair goes live, which is a
+    mutant the other three all survive.
+
+    Two consequences, neither of them corpus-shaped. A source that will not open
+    is spent for the run and `-s` cannot revive it -- unchanged, since the failed
+    open was cached before this as well; what moved is WHEN the one attempt is
+    made. And an `R` whose source BLOCKS now blocks the COMPILE: over a fifo
+    with no writer, `sed -e 'R fifo' -e ZZZ` reported the bad command before and
+    hangs now, which is what GNU does -- measured, 124 from a 3s timeout for GNU
+    and for this build, exit 1 for the parent. That is the price of the rule, and
+    it is the one place this landing makes td-txt worse at reporting a script
+    error. Script order decides that WITHIN the compile and no further: a later
+    `-f` whose READ fails still beats the open here and does not in GNU, which is
+    the compile-per-part entry above and is bounded to exactly that case --
+    `-e 'R fifo' -f /nonexistent` hangs in GNU and is `couldn't open file
+    /nonexistent` here, while the same pair with a READABLE `-f` hangs in both
+    and an earlier script error stops both. None of this moves the
+    `R /dev/stdout` hang above, which the entry there now records.
+
+    Opening at compile also means a script can exhaust the DESCRIPTOR TABLE
+    before the run starts, and GNU is exhausted by it in the same way: with 100
+    distinct `R` sources under `ulimit -n 64`, `sed -n -e '<100 R lines>' -e p
+    in` is `can't read in: Too many open files` and exit 2 in GNU and here
+    alike, where the parent -- opening on first use, so the operand was already
+    open -- printed 60 lines and exited 0. Two notes on that. The stdout
+    descriptor is now taken BEFORE the compile, because otherwise the sources
+    take the last one and the failure is a `write error` on a stdout that never
+    opened, which is worse than GNU rather than equal to it; the RESULT is
+    carried to where it was checked before, so a script error still beats it.
+    And the `-f` form still differs by exactly ONE descriptor -- GNU prints 61
+    lines there and this refuses -- because GNU holds the script's own
+    descriptor open across the compile and frees it afterwards, where td-txt
+    reads a `-f` script whole before compiling anything. That is the
+    compile-per-part difference already recorded above, seen from the resource
+    side, and not a separate gap.
 
   - An `r` SOURCE read whole, CLOSED, and it was a MEMORY divergence rather than
     a behavioural one. `r` dumps the entire file by definition, so neither

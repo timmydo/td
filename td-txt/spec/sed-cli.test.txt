@@ -3617,7 +3617,9 @@ sed: couldn't open file /nosuchdir/out: No such file or directory
 ## status: 4
 
 #### an R that never runs never reads, so nothing is refused
-# The read happens when the command RUNS, not when the script is compiled.
+# The three special names are the one kind of source the COMPILE does not open:
+# GNU serves them from a static entry `ck_fopen' never sees, so the refusal can
+# only come from the read, and a command that never runs never makes one.
 ## argv: sed -n -e '5R /dev/stdout' -e p IN
 ## file-json IN: "LINE\n"
 ## stdin-json: ""
@@ -3837,13 +3839,20 @@ sed: couldn't open file /nosuchdir/out: No such file or directory
 ## stderr-json: ""
 ## status: 0
 
-# WHEN an `R' source is opened is GNU's compile rather than its run, which only a
-# script that CREATES its own source can tell apart. `get_openfile (&file_read,
+# An `R' source is opened by the COMPILE and not by the run, which only a script
+# that creates its own source can tell apart. `get_openfile (&file_read,
 # read_mode, false)' (compile.c:1217) passes `false', so unlike a `w' target a
 # source that will not open is no error -- it leaves a null `fp' and is dead for
 # the run, and `rewind_read_files' skips a null `fp' so `-s' cannot revive it.
-# td-txt opens when it runs. `-u' is here only to make the `w' visible one line at
-# a time rather than at 4096; the divergence is the open, not the buffer.
+# SCRIPT ORDER is therefore what decides, since a `w' target is opened by the
+# compile too: the pair reads nothing one way round and everything the other.
+# `-u' is here only to make the `w' visible one line at a time rather than at
+# 4096; what these pin is the open, not the buffer.
+#
+# The open is a HANDLE and not a copy of the bytes, which is what the third case
+# separates: a source that exists at compile survives the later `w' truncating
+# it, and goes on reading whatever that `w' flushes into the file it is already
+# holding open.
 
 #### an R compiled before the w that creates its source is dead for the run in GNU
 ## argv: sed -s -u -e 'R wf' -e 'w wf' h h2
@@ -3862,6 +3871,58 @@ sed: couldn't open file /nosuchdir/out: No such file or directory
 ## file-after-json wf: "1\n2\n3\n4\n"
 ## stdin-json: ""
 ## stdout-json: "1\n1\n2\n2\n3\n1\n4\n2\n"
+## stderr-json: ""
+## status: 0
+
+#### an R whose source EXISTS at compile is live, even when a later w truncates it
+## argv: sed -s -u -e 'R pre' -e 'w pre' h h2
+## file-json h: "1\n2\n"
+## file-json h2: "3\n4\n"
+## file-json pre: "seed\n"
+## stdin-json: ""
+## stdout-json: "1\n2\n3\n1\n4\n2\n"
+## file-after-json pre: "1\n2\n3\n4\n"
+## stderr-json: ""
+## status: 0
+
+#### the same ordering inside one -f script, so it is the compile and not the -e count
+## argv: sed -s -u -f sc.sed h h2
+## file-json h: "1\n2\n"
+## file-json h2: "3\n4\n"
+## file-json sc.sed: "R wf\nw wf\n"
+## stdin-json: ""
+## stdout-json: "1\n2\n3\n4\n"
+## file-after-json wf: "1\n2\n3\n4\n"
+## stderr-json: ""
+## status: 0
+
+#### a W creates the source just as a w does, and just as late
+## argv: sed -s -u -e 'R wf' -e 'W wf' h h2
+## file-json h: "1\n2\n"
+## file-json h2: "3\n4\n"
+## stdin-json: ""
+## stdout-json: "1\n2\n3\n4\n"
+## file-after-json wf: "1\n2\n3\n4\n"
+## stderr-json: ""
+## status: 0
+
+#### so does an s///w flag, which opens while the s is still being parsed
+## argv: sed -s -u -e 'R wf' -e 's/^/X/w wf' h h2
+## file-json h: "1\n2\n"
+## file-json h2: "3\n4\n"
+## stdin-json: ""
+## stdout-json: "X1\nX2\nX3\nX4\n"
+## file-after-json wf: "X1\nX2\nX3\nX4\n"
+## stderr-json: ""
+## status: 0
+
+#### a second R on the same name is deduped at COMPILE, so the w between them revives nothing
+## argv: sed -s -u -e 'R wf' -e 'w wf' -e 'R wf' h h2
+## file-json h: "1\n2\n"
+## file-json h2: "3\n4\n"
+## stdin-json: ""
+## stdout-json: "1\n2\n3\n4\n"
+## file-after-json wf: "1\n2\n3\n4\n"
 ## stderr-json: ""
 ## status: 0
 

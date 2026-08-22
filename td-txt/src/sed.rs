@@ -34,9 +34,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::regex::{Captures, Options, Regex};
-use crate::util::{
-    errmsg, number, posixly_correct, print_line, records, Input, Out, Records, VERSION,
-};
+use crate::util::{errmsg, number, posixly_correct, print_line, Input, Out, Records, VERSION};
 
 const USAGE: &str =
     "usage: sed [-nrEszu] [-i[SUFFIX]] [-l N] [-e SCRIPT] [-f FILE] [SCRIPT] [FILE]...";
@@ -165,7 +163,6 @@ struct Cmd {
     kind: Kind,
 }
 
-#[derive(Debug, Default)]
 struct Script {
     cmds: Vec<Cmd>,
     /// A `v` was compiled, which is GNU's `posixicity = POSIXLY_EXTENDED`
@@ -180,6 +177,9 @@ struct Script {
     /// that names it, so compiling a script is what creates and truncates them.
     /// Keyed by filename because GNU keeps one output per name, not per command.
     wfiles: BTreeMap<FileTarget, WFile>,
+    /// The `R` sources, ALREADY OPEN, for the same reason and by the same call:
+    /// `get_openfile` serves both lists.
+    rfiles: BTreeMap<FileTarget, RFile>,
 }
 
 /// GNU's tri-state. `Closed` is not `Inactive`: a range whose start address is a
@@ -230,6 +230,7 @@ struct ScriptParser<'a> {
     parts: Vec<Part>,
     regexes: Vec<Regex>,
     wfiles: BTreeMap<FileTarget, WFile>,
+    rfiles: BTreeMap<FileTarget, RFile>,
 }
 
 impl ScriptParser<'_> {
@@ -1003,6 +1004,28 @@ impl ScriptParser<'_> {
         Ok(())
     }
 
+    /// `R`'s source, opened where `w`'s target is: `get_openfile` serves both
+    /// lists (compile.c:423), so compiling the command is what opens the file and
+    /// SCRIPT ORDER decides what is there to open. That is the whole of the
+    /// difference from opening on first use -- `-e 'R f' -e 'w f'` finds no `f`
+    /// and is dead for the run, where the same pair the other way round reads
+    /// what the `w` writes.
+    ///
+    /// Unlike `w`'s, this open may FAIL and say nothing (`fail=false`), which is
+    /// what makes `R` over a missing file silent; `open_source` already answers a
+    /// failed open with a spent source, so there is no error to return here.
+    /// The three special names are not opened at all -- GNU serves them from a
+    /// static entry that never reaches `ck_fopen` -- so they keep the run-time
+    /// path, which is also where their refusal has to happen.
+    fn open_rfile(&mut self, target: &FileTarget) {
+        if target.special.is_some() || self.rfiles.contains_key(target) {
+            return;
+        }
+        let separator = separator_for(self.inv.null_data);
+        let opened = open_source(&target.path, separator);
+        self.rfiles.insert(target.clone(), opened);
+    }
+
     /// Returns `Fatal` because the `w` FLAG opens its target here, mid-command:
     /// GNU reaches that flag before it compiles the pattern, so an unopenable
     /// target beats a bad regex or a bad backreference in the same `s`.
@@ -1529,6 +1552,7 @@ fn parse_script(
         parts,
         regexes: Vec::new(),
         wfiles: BTreeMap::new(),
+        rfiles: BTreeMap::new(),
     };
     // Parsed by a function of its own so the parser SURVIVES its own failure:
     // `?` returns from THERE, leaving `p.pos` readable here. That position is the
@@ -1703,7 +1727,11 @@ fn parse_commands(p: &mut ScriptParser) -> Result<Script, Fatal> {
                     b'r' => Kind::ReadFile(name),
                     // `r` is never aliased -- GNU reads its operand with a bare
                     // `read_filename` -- so only `R` resolves against the table.
-                    _ => Kind::ReadLine(FileTarget::resolve(&name, p.extended())),
+                    _ => {
+                        let target = FileTarget::resolve(&name, p.extended());
+                        p.open_rfile(&target);
+                        Kind::ReadLine(target)
+                    }
                 }
             }
             b'w' | b'W' => {
@@ -1784,6 +1812,7 @@ fn parse_commands(p: &mut ScriptParser) -> Result<Script, Fatal> {
         regexes: std::mem::take(&mut p.regexes),
         labels,
         wfiles: std::mem::take(&mut p.wfiles),
+        rfiles: std::mem::take(&mut p.rfiles),
     })
 }
 
@@ -3626,6 +3655,14 @@ fn compile_and_run(
     files: Vec<Vec<u8>>,
     separator: u8,
 ) -> Result<i32, Fatal> {
+    // The stdout dup is taken BEFORE the script compiles, because compiling one
+    // now OPENS FILES: a script with more `R` sources than the descriptor table
+    // has room for would otherwise leave none for this, where GNU -- whose stdout
+    // needs no descriptor of its own -- goes on printing. The RESULT is carried
+    // rather than unwrapped here so the ordering is untouched: a script error
+    // still beats a write error, which is what a bad script with stdout CLOSED
+    // reports.
+    let opened_out = Out::new();
     let mut script = compile_script(source, parts, mode, inv)?;
     let seed = seed_ranges(&script.cmds);
     // GNU's `posixicity` at the moment the run starts: the option loop's FINAL
@@ -3633,13 +3670,15 @@ fn compile_and_run(
     // the last `-e` never reaches one and still governs the run.
     let script_extended = mode.extended_with_v(script.v_promoted);
     let wfiles = std::mem::take(&mut script.wfiles);
+    let rfiles = std::mem::take(&mut script.rfiles);
     // BEFORE `sed`, which is what makes the `w`-before-sink order structural: a
     // local drops in reverse declaration order, so `sed`'s targets flush and then
     // this does. The explicit flushes below are for their ERROR, which a drop
     // cannot report; ordering no longer depends on anyone remembering them, and
     // an exit nobody enumerated -- a `?` from anywhere in here -- comes out right
     // anyway.
-    let mut out = Out::new().map_err(|e| Fatal::runtime(format!("write error: {}", errmsg(&e))))?;
+    let mut out =
+        opened_out.map_err(|e| Fatal::runtime(format!("write error: {}", errmsg(&e))))?;
     if conf.unbuffered {
         out.unbuffer();
     }
@@ -3663,7 +3702,7 @@ fn compile_and_run(
         last_regex: None,
         recompiled: std::collections::BTreeSet::new(),
         wfiles,
-        rfiles: BTreeMap::new(),
+        rfiles,
     };
 
     // `-i` rewrites its OPERANDS, so with none there is nothing to edit and
@@ -3879,11 +3918,6 @@ struct RFile {
 /// endless file has to hand a line to every cycle rather than never returning.
 enum RSource {
     Stream(Records<std::fs::File>),
-    /// The standard-input special, still read WHOLE. It is the one source that
-    /// shares its descriptor with the operand reader, and two readers giving back
-    /// their own over-read cannot both be right about a RELATIVE seek; see
-    /// spec/README.
-    Whole { lines: Vec<Line>, pos: usize },
     /// Opened and spent, or never opened at all -- `R` over a missing file is
     /// silent, and is cached this way so the name is opened at most once.
     Spent,
@@ -3901,13 +3935,6 @@ impl RFile {
                 }
                 Ok(false) => Ok(None),
                 Err(e) => Err(read_error(name, &e)),
-            },
-            RSource::Whole { lines, pos } => match lines.get(*pos) {
-                Some(line) => {
-                    *pos += 1;
-                    Ok(Some(Line { text: line.text.clone(), terminated: line.terminated }))
-                }
-                None => Ok(None),
             },
             RSource::Spent => Ok(None),
         }
@@ -3927,11 +3954,6 @@ impl RFile {
                 {
                     true => rec.restart(),
                     false => rec.forget_eof(),
-                }
-            }
-            RSource::Whole { pos, .. } => {
-                if self.rewindable {
-                    *pos = 0;
                 }
             }
             RSource::Spent => {}
@@ -4216,32 +4238,16 @@ fn read_error(name: &[u8], e: &std::io::Error) -> Vec<u8> {
     crate::util::name_in("read error on ", name, &format!(": {}", errmsg(e)))
 }
 
-/// `R`'s source, which unlike `r`'s is resolved through the table above: GNU
-/// compiles `R` with `get_openfile` and `r` with a bare `read_filename`, so only
-/// `R` gets the aliasing. The non-extended arm is reached through
-/// `POSIXLY_CORRECT` and not through `--posix`, which withdraws `R` itself — so
-/// under the variable this opens the NAME again, hang and all, exactly as GNU
-/// does there.
-fn open_r_source(target: &FileTarget, separator: u8) -> Result<RFile, Vec<u8>> {
-    let Some(s) = target.special else {
-        return Ok(open_source(&target.path, separator));
-    };
-    let Special::In = s else {
-        return Err(read_error(target.name(), &ebadf()));
-    };
-    // The descriptor we were GIVEN, rather than the name opened a second time.
-    // Where standard input is a fifo whose writer has gone, fd 0 is at end of file
-    // while a fresh open of the name waits for a writer that never comes.
-    let mut data = Vec::new();
-    match std::io::stdin().lock().read_to_end(&mut data) {
-        // Never rewindable: GNU does not `rewind` a special stream under `-s`,
-        // however seekable the descriptor behind it happens to be.
-        Ok(_) => Ok(RFile {
-            src: RSource::Whole { lines: to_lines(&data, separator), pos: 0 },
-            rewindable: false,
-        }),
-        Err(e) => Err(read_error(s.name().as_bytes(), &e)),
-    }
+/// The refusal an `R` from `/dev/stdout` or `/dev/stderr` earns, and `refuse_write`
+/// the other way round. GNU serves all three special names from a STATIC entry
+/// that `get_openfile` never hands to `ck_fopen` (compile.c:398), so unlike a
+/// named source there is nothing for the COMPILE to open -- and two of the three
+/// are streams the process may only write to, which the C library answers with
+/// `EBADF` when one is read. `/dev/stdin` is the third and never reaches here: it
+/// is the run's own reader, held by the stream so an operand naming it and an `R`
+/// share one position.
+fn refuse_read(s: Special) -> Vec<u8> {
+    read_error(s.name().as_bytes(), &ebadf())
 }
 
 /// Open a file named by `R`, to be read a BLOCK at a time. Unlike an operand or
@@ -4362,13 +4368,6 @@ fn version_is_newer(want: &[u8]) -> bool {
         (b'1'..=b'9', b'1'..=b'9') => longer_run(),
         _ => x > y,
     }
-}
-
-fn to_lines(data: &[u8], separator: u8) -> Vec<Line> {
-    records(data, separator)
-        .into_iter()
-        .map(|(text, terminated)| Line { text: text.to_vec(), terminated })
-        .collect()
 }
 
 /// Return what a `q` over-read from standard input, at the ONE point on each path
@@ -4595,14 +4594,17 @@ impl Sed {
         let line = if matches!(target.special, Some(Special::In)) {
             stream.stdin_record()?
         } else {
-            let entry = match self.rfiles.get_mut(target) {
-                Some(e) => e,
-                None => {
-                    let opened = open_r_source(target, separator)?;
-                    self.rfiles.entry(target.clone()).or_insert(opened)
+            match (self.rfiles.get_mut(target), target.special) {
+                (Some(entry), _) => entry.next(target.name())?,
+                // The parser opened every NAMED source, so what is left here is a
+                // special one: the two write-only streams, which have nothing to
+                // open and refuse the read. A named miss would be a command whose
+                // name never reached `open_rfile`, not a filesystem failure.
+                (None, Some(s)) => return Err(refuse_read(s)),
+                (None, None) => {
+                    return Err(crate::util::name_in("no input was opened for ", &target.path, ""))
                 }
-            };
-            entry.next(target.name())?
+            }
         };
         let Some(line) = line else {
             return Ok(());
@@ -5189,6 +5191,7 @@ mod tests {
         let seed = seed_ranges(&script.cmds);
         let script_extended = mode.extended_with_v(script.v_promoted);
         let wfiles = std::mem::take(&mut script.wfiles);
+        let rfiles = std::mem::take(&mut script.rfiles);
         let mut sed = Sed {
             script,
             ranges: seed,
@@ -5207,10 +5210,10 @@ mod tests {
             replaced: false,
             quit: None,
             last_regex: None,
-        recompiled: std::collections::BTreeSet::new(),
+            recompiled: std::collections::BTreeSet::new(),
             wfiles,
-            rfiles: BTreeMap::new(),
-            };
+            rfiles,
+        };
         let mut stream = stream_over(input.as_bytes(), sep);
         let mut sink = Sink::buffer(sep);
         sed.run_stream(&mut stream, &mut sink).unwrap();
