@@ -40,6 +40,7 @@ mod builtin;
 mod complete;
 mod exec;
 mod expand;
+mod funcs;
 mod jobs;
 mod lexer;
 mod line;
@@ -598,8 +599,10 @@ fn read_complete(
 /// writing two handler words and no others, issuing three ioctl requests and no
 /// others, asking about one descriptor and one event, and named by three
 /// modules and no others.
-/// Every needle is built with `concat!` so this module's own text does not
-/// count itself.
+/// Needles that can reach this module's own text are built with `concat!` so
+/// the module does not count itself, with two exceptions: the ioctl-request
+/// needle asserts ABSENCE, where a self-match could only red, and the
+/// declaration pin is a plain literal that scans `funcs.rs` alone.
 #[cfg(test)]
 mod confinement {
     /// Every file the recipe compiles. `covers_every_module` keeps it honest.
@@ -611,6 +614,7 @@ mod confinement {
         ("complete.rs", include_str!("complete.rs")),
         ("exec.rs", include_str!("exec.rs")),
         ("expand.rs", include_str!("expand.rs")),
+        ("funcs.rs", include_str!("funcs.rs")),
         ("jobs.rs", include_str!("jobs.rs")),
         ("lexer.rs", include_str!("lexer.rs")),
         ("line.rs", include_str!("line.rs")),
@@ -732,59 +736,41 @@ mod confinement {
         assert_eq!(code_only(source("builtin.rs")).matches(raw).count(), 1);
     }
 
-    /// Which readings of the function TABLE may skip `Shell::func`. That
-    /// accessor carries ash's rule that a name containing `/` is not a
-    /// function lookup (`find_command`, ash.c:13801), so a CALL decision made
-    /// against `funcs` directly would run `a/b() { ... }; a/b` where ash runs
-    /// a path. Three readings legitimately bypass it -- `unset -f`,
-    /// completion, and a subshell's copy -- because each takes the TABLE
-    /// rather than resolving a word.
+    /// What privacy cannot state about itself, in two parts. Both guard the
+    /// accidental edit, and neither is sound against an author working
+    /// around it. The compiler guards the `&Func` path against every other
+    /// module; nothing guards it inside `funcs.rs`. The commit message
+    /// measures all three gaps: the in-module one, the forwarder, and a
+    /// decoy comment against the declaration pin.
     ///
-    /// Counted by the ACCESS and over SQUEEZED text, which is what makes this
-    /// a guard rather than a spelling test. The first version counted
-    /// `funcs.get(` in `code_only` text and a review defeated it in one line:
-    /// `sh.funcs` and `.get(w)` on separate lines is one construct to the
-    /// compiler and two strings to a scan, and `get_mut`, `entry`, `values`
-    /// or a `let t = &sh.funcs` binding each answer a lookup without writing
-    /// `get(` at all. Every one of those writes the field access, so a sixth
-    /// is a deliberate change here.
+    /// The map's DECLARATION. Any visibility on it puts every module back in
+    /// a position to answer a lookup without the `/` rule, and this is one
+    /// crate, so `pub(crate)` is `pub` by another name. Pinned as the whole
+    /// squeezed declaration with its braces, so no modifier fits in any
+    /// spelling or on any line -- but this is an exact count over text that
+    /// keeps block comments, so a decoy comment buys the match back.
     ///
-    /// What it does NOT see is a bypass that adds no access: a pattern
-    /// binding the field by name (`let Shell { funcs, .. }`, a `match` arm,
-    /// a parameter), or a split of this accessor into a rule-checking
-    /// wrapper over a private one holding the pinned text. Measured, all
-    /// three reach only the frame decision, and the CALL site stays caught
-    /// by behaviour whatever it is spelled as. Making `funcs` private to
-    /// this module is what would close the class; the exact-equality counts
-    /// mean a stray block comment can only red this, never green it.
-    ///
-    /// Needed because one of the four call sites -- the local-var frame
-    /// decision -- answers the same either way: a `/` name is not a special
-    /// builtin, so both spellings frame it, and no behaviour catches that one
-    /// going back.
+    /// The modules that NAME the enumeration. `defined_names().any(|n| n == w)`
+    /// answers a word question, and privacy cannot tell asking from listing.
+    /// Pinned on the IDENTIFIER rather than on a call shape, because every
+    /// form of call -- method, qualified, function item, through a binding --
+    /// writes the name. That is the modules that write it, not reach: a
+    /// forwarder in `complete.rs` carries it anywhere.
     #[test]
-    fn only_the_accessor_resolves_a_word_to_a_function() {
-        let access = concat!(".", "funcs");
-        let uses = |name: &str| squeeze(&code_only(source(name))).matches(access).count();
-        for (module, n) in [("exec.rs", 2), ("builtin.rs", 1), ("complete.rs", 1), ("process.rs", 1)]
-        {
-            assert_eq!(uses(module), n, "{module} must make {n} `{access}` access(es)");
-        }
-        let total: usize = SOURCES.iter().map(|(n, _)| uses(n)).sum();
-        assert_eq!(total, 5, "a new `{access}` reader must be declared here");
-        // ... and each of the five is the reading it is meant to be. Only the
-        // accessor's own read resolves a WORD; the other four are the table.
-        for (module, needle) in [
-            ("exec.rs", concat!("self.", "funcs.get(name)")),
-            ("exec.rs", concat!("sh.", "funcs.insert(")),
-            ("builtin.rs", concat!("sh.", "funcs.remove(")),
-            ("complete.rs", concat!("sh.", "funcs.keys()")),
-            ("process.rs", concat!("sh.", "funcs.clone()")),
-        ] {
+    fn the_map_carries_no_visibility_and_only_completion_enumerates() {
+        let decl = "structFuncs{table:HashMap<String,Func>,}";
+        assert_eq!(
+            squeeze(&code_only(source("funcs.rs"))).matches(decl).count(),
+            1,
+            "the map must be the one field of `Funcs` and carry no visibility"
+        );
+        let enumerate = concat!("defined_", "names");
+        for (module, _) in SOURCES.iter().filter(|(n, _)| *n != "funcs.rs") {
+            let want = usize::from(*module == "complete.rs");
             assert_eq!(
-                squeeze(&code_only(source(module))).matches(needle).count(),
-                1,
-                "{module} must make its `{needle}` reading exactly once"
+                squeeze(&code_only(source(module))).matches(enumerate).count(),
+                want,
+                "{module}: completion names the enumeration once, every other module never"
             );
         }
     }

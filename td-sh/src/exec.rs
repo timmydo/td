@@ -158,7 +158,7 @@ impl Opts {
 
 pub struct Shell {
     pub vars: HashMap<String, Var>,
-    pub funcs: HashMap<String, Func>,
+    pub funcs: crate::funcs::Funcs,
     pub params: Vec<String>, // positional parameters $1..
     pub arg0: String,        // $0
     /// What `$LINENO` reads: the input line of the command being run, already
@@ -436,7 +436,7 @@ impl Shell {
         }
         let mut sh = Shell {
             vars,
-            funcs: HashMap::new(),
+            funcs: crate::funcs::Funcs::default(),
             params: Vec::new(),
             arg0: "td-sh".to_string(),
             lineno: 1,
@@ -561,7 +561,7 @@ impl Shell {
     pub fn new_for_test() -> Self {
         let mut sh = Shell {
             vars: HashMap::new(),
-            funcs: HashMap::new(),
+            funcs: crate::funcs::Funcs::default(),
             params: Vec::new(),
             // Seeded rather than left lazy, so a unit test that reads `$RANDOM`
             // is deterministic instead of taking the pid and the clock.
@@ -661,21 +661,6 @@ impl Shell {
             0 => line,
             f => line - i64::from(f) + 1,
         };
-    }
-
-    /// The function a command WORD names, which is not every function in the
-    /// table. ash's `find_command` (ash.c:13788) returns `CMDNORMAL` for a name
-    /// containing `/` at 13801-13815 -- "don't use PATH or hash table" -- and
-    /// its `cmdlookup`, the call that finds a `CMDFUNCTION`, is at 13825, below
-    /// that return. So `a/b() { ... }` defines something `a/b` cannot call.
-    ///
-    /// One accessor because `unset -f` and completion read the same table and
-    /// must NOT apply this -- ash serves both from `cmdtable`.
-    pub fn func(&self, name: &str) -> Option<&Func> {
-        if name.contains('/') {
-            return None;
-        }
-        self.funcs.get(name)
     }
 
     pub fn get_var(&self, name: &str) -> Option<String> {
@@ -1305,7 +1290,7 @@ fn run_command_inner(sh: &mut Shell, cmd: &Cmd) -> R<()> {
         } => with_redirs(sh, redirs, |sh| run_case(sh, word, items)),
         Cmd::FuncDef { name, body, line } => {
             if let Some(name) = name {
-                sh.funcs.insert(
+                sh.funcs.define(
                     name.clone(),
                     Func {
                         line: *line,
@@ -1724,7 +1709,7 @@ fn run_simple(
     let framed = argv.first().is_some_and(|w| {
         // Resolved the way `dispatch_simple` resolves it below: a function shadowing
         // a special builtin's NAME is still a function, and ash gives it a frame.
-        sh.func(w).is_some() || !builtin::is_ash_special_word(w)
+        sh.funcs.get(w).is_some() || !builtin::is_ash_special_word(w)
     });
     if framed {
         sh.localvar_depth = sh.localvar_depth.saturating_add(1);
@@ -1754,7 +1739,7 @@ fn dispatch_simple(
 ) -> R<()> {
     // A function call runs in the current shell with the assignments applied for
     // its duration and the words as its positional parameters.
-    if let Some(func) = argv.first().and_then(|name| sh.func(name)).cloned() {
+    if let Some(func) = argv.first().and_then(|name| sh.funcs.get(name)).cloned() {
         return call_function(sh, &func, argv, assigns, redirs);
     }
 
@@ -2354,7 +2339,7 @@ mod tests {
     /// The reading that tells DEFINITION from LOOKUP. ash's completion walks
     /// `cmdtable` for `CMDFUNCTION` entries (`ash_command_name`), so a `/`
     /// name it can never CALL is still a name it OFFERS -- measured under a
-    /// pty against busybox ash 1.37.0, which answers `a/b  alias  azz` where
+    /// pty against busybox ash 1.37.0, which answers `a/b    alias  azz` where
     /// this shell answered `alias  azz`. `unset -f` removes from the same
     /// table, so the offer goes with it.
     #[test]

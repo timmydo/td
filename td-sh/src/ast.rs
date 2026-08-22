@@ -246,7 +246,7 @@ pub enum Cmd {
         /// expanded one, which ash files under the word's own text. Parsed
         /// and not registered, which is ash's own unreachable definition
         /// observably. A `/` name is NOT one of these: it is registered, and
-        /// `Shell::func` is what refuses it at the lookup.
+        /// `Funcs::get` is what refuses it at the lookup.
         name: Option<String>,
         /// A `Stage` and not a bare `Cmd` because the body is a command node
         /// too, and a compound's OWN line is what its header expands under:

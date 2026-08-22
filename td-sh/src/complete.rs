@@ -408,7 +408,7 @@ pub fn commands(sh: &crate::exec::Shell, prefix: &str) -> Vec<String> {
             out.push((*n).to_string());
         }
     }
-    for n in sh.funcs.keys().chain(sh.aliases.keys()) {
+    for n in sh.funcs.defined_names().chain(sh.aliases.keys()) {
         if n.starts_with(prefix) {
             out.push(n.clone());
         }
