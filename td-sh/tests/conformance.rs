@@ -1107,6 +1107,144 @@ fn a_body_this_shell_cannot_serve_is_silent_under_dash_n()
     Ok(())
 }
 
+/// `-n` evaluates NOTHING, and a `!` is evaluation. ash tests `nflag` at the
+/// top of `evaltree`, ABOVE both the `case NNOT` that negates and the `case
+/// NPIPE` that forks the stages, so under `-n` a pipeline's status is never
+/// touched. This shell tested it one level down, in the walker for a single
+/// COMMAND, so the `!` above it still ran -- over a status nothing had
+/// produced. `sh -n -c '! true'` exited 1, which is a syntax check reporting
+/// failure for a script whose syntax is fine.
+#[test]
+fn dash_n_evaluates_nothing_including_a_negation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let check = |args: &[&str]| -> Result<(Option<i32>, String, String), Box<dyn std::error::Error>> {
+        let out = std::process::Command::new(&shell).args(args).output()?;
+        Ok((
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ))
+    };
+    // A valid script checks clean whatever it would have RETURNED, and prints
+    // nothing whatever it would have PRINTED. The `!` rows are the bug; the
+    // rest are the neighbours that must not move with them.
+    for code in [
+        "! true",
+        "! false",
+        "true",
+        "false",
+        "! echo hi",
+        "! : | :",
+        "! true && ! false",
+        "true && ! false",
+        "echo hi; ! true",
+        "! true; echo hi",
+        "if ! true; then :; fi",
+        "while ! true; do :; done",
+        "until ! false; do :; done",
+        "for i in a; do ! true; done",
+        "case x in x) ! true;; esac",
+        "f() { ! true; }; f",
+        "! cat | cat | cat",
+    ] {
+        assert_eq!(check(&["-n", "-c", code])?, (Some(0), String::new(), String::new()), "{code:?}");
+    }
+    // WHERE the guard sits is load-bearing, and this is what says so. Guarding
+    // the `!` alone answers every row above identically, because each stage's
+    // own walker returns early -- but the pipeline machinery has already run
+    // by then, and it takes two real descriptors per junction. So the stage
+    // count is taken from THIS host's soft limit rather than written down: a
+    // pipeline with more junctions than the process may hold descriptors
+    // reports `cannot create pipe` and exits 1 under a guard placed lower,
+    // where ash and this one check it and answer 0. The cap is what keeps a
+    // host with a huge limit from building an enormous list; there the row
+    // still asserts the right answer, it just stops reddening that mutation.
+    let soft = std::fs::read_to_string("/proc/self/limits")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .filter(|l| l.starts_with("Max open files"))
+                .filter_map(|l| l.split_whitespace().nth(3))
+                .filter_map(|n| n.parse::<usize>().ok())
+                .next()
+        })
+        .unwrap_or(1024);
+    let stages = (soft / 2 + 8).clamp(64, 4096);
+    let long = vec![":"; stages].join(" | ");
+    assert_eq!(
+        check(&["-n", "-c", &long])?,
+        (Some(0), String::new(), String::new()),
+        "{stages} stages, soft limit {soft}"
+    );
+    // What says the machinery never STARTED, rather than merely never filled
+    // the descriptor table: `run_command` no longer guards, so a guard below
+    // this point does not just build pipes -- the stages run. A stage that
+    // would leave a trace therefore separates them, and depends on no limit.
+    let dir = std::env::temp_dir().join(format!("td-sh-noexec-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    for (code, what) in [
+        (format!(": > {}/stage | :", dir.display()), "stage"),
+        (format!(": > {}/plain", dir.display()), "plain"),
+        (format!(": > {}/job &", dir.display()), "job"),
+    ] {
+        assert_eq!(check(&["-n", "-c", &code])?, (Some(0), String::new(), String::new()), "{what}");
+        assert!(!dir.join(what).exists(), "`-n` ran a redirection: {what}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    // A BACKGROUND job is the other thing built before its list is walked, and
+    // the guard for it is a second site: `run_list` creates the job -- a thread
+    // of its own -- and only the thread then reaches the walker that would have
+    // returned early. So `-n` used to start one per `&` in a file it was only
+    // checking. ash's `nflag` test is above `case NBACKGND` too.
+    for code in [": &", "! : &", ": & : & : &", ": | : &", "{ ! : ; } &"] {
+        assert_eq!(check(&["-n", "-c", code])?, (Some(0), String::new(), String::new()), "{code:?}");
+    }
+    // At a scale where starting one per `&` is visible: silent and 0, where
+    // starting them reported `cannot start job` once per job under a
+    // constrained address space and exited 1.
+    let many = vec![": &"; 10000].join("\n");
+    assert_eq!(check(&["-n", "-c", &many])?, (Some(0), String::new(), String::new()));
+    assert_eq!(check(&["-c", &format!("set -n\n{many}")])?, (Some(0), String::new(), String::new()));
+    // How `-n` was reached is not the question -- `set -n` mid-script is the
+    // same flag, and the commands BEFORE it really did run. These are the
+    // shapes that actually REACHED the negation, since a compound entered
+    // before `-n` came on is walked, unlike one the mode was already on for.
+    for code in [
+        "set -n; ! true",
+        "if true; then set -n; ! true; fi",
+        "case x in x) set -n; ! true;; esac",
+        "{ set -n; ! true; }",
+        "( set -n; ! true )",
+        "eval \"set -n; ! true\"",
+        "f() { set -n; ! true; }; f",
+    ] {
+        assert_eq!(check(&["-c", code])?, (Some(0), String::new(), String::new()), "{code:?}");
+    }
+    let (status, out, err) = check(&["-c", "echo a; set -n; ! true"])?;
+    assert_eq!((status, out.as_str(), err.as_str()), (Some(0), "a\n", ""));
+    // `errexit` is below the same test in `evaltree`, so `-n` must not exit on
+    // a status left by whatever ran last -- doing so swallowed the syntax error
+    // the mode exists to report. The `!` is what turns `-n` on while `errexit`
+    // is armed, and `:` is the command whose skipped status used to trip it.
+    let (status, out, err) = check(&["-c", "set -e\n! set -n\n:\nfi"])?;
+    assert_eq!((status, out.as_str()), (Some(2), ""), "{err}");
+    assert!(err.contains("syntax error: unexpected \"fi\""), "{err}");
+    // Without the syntax error the shell still ends on that status, as ash does.
+    assert_eq!(check(&["-c", "set -e\n! set -n\n:\necho no"])?, (Some(1), String::new(), String::new()));
+    // What `-n` is FOR still works: the units are parsed, so a syntax error is
+    // still reported and still carries its status.
+    for code in ["! ! true", "! true | ! false", "fi", "if true"] {
+        let (status, out, err) = check(&["-n", "-c", code])?;
+        assert_eq!((status, out.as_str()), (Some(2), ""), "{code:?}: {err}");
+        assert!(err.contains("syntax error"), "{code:?}: {err}");
+    }
+    let (status, _, err) = check(&["-c", "set -n; ! ! true"])?;
+    assert_eq!(status, Some(2), "{err}");
+    assert!(err.contains("syntax error: unexpected \"!\""), "{err}");
+    Ok(())
+}
+
 /// The script OPERAND is opened before the shell exists, so its failure is the
 /// one diagnostic the in-process harness cannot reach -- and it was still
 /// printing `io::Error`'s Display after every other site had stopped. ash words

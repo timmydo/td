@@ -1086,8 +1086,9 @@ pub fn run_subshell(sh: &mut Shell, body: &List, redirs: &[Redir]) -> R<()> {
 /// and a diagnostic that met a broken stderr must still end the shell.
 pub fn run_background_operand(sh: &mut Shell, and_or: &AndOr) -> R<()> {
     // Applying a redirection IS running — an output target would be created or
-    // truncated — so `-n` takes the ordinary route rather than a second copy of
-    // the policy that lives in `run_command`.
+    // truncated — so `-n` takes the ordinary route rather than deciding here.
+    // `run_list` guards the one caller, so this is this function's own entry
+    // condition rather than a live path.
     if sh.opts.noexec {
         return exec::run_and_or(sh, and_or);
     }

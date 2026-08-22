@@ -1028,7 +1028,7 @@ pub fn run_source(sh: &mut Shell, src: &str) -> R<()> {
                 return Err(Sig::Abort(2));
             }
             // Still PARSED under `-n`, which is the point of the mode: the syntax
-            // errors are reported. `run_command` is what declines to run it.
+            // errors are reported. `run_operand` is what declines to run it.
             Some(Ok(list)) => run_list(sh, &list)?,
         }
     }
@@ -1038,6 +1038,13 @@ pub fn run_source(sh: &mut Shell, src: &str) -> R<()> {
 pub fn run_list(sh: &mut Shell, list: &List) -> R<()> {
     for (and_or, sep) in &list.items {
         if *sep == Sep::Bg {
+            // `-n` starts no job either: ash's `nflag` test is above the whole
+            // of `evaltree`'s switch, `case NBACKGND` included. It is asked
+            // HERE because the job is created before its list is walked, so
+            // the guard further in never sees it.
+            if sh.opts.noexec {
+                continue;
+            }
             // An ISOLATED subshell, so the job's variable/cwd/option changes
             // cannot leak back, running on a THREAD of its own -- `jobs.rs` has
             // why it is a thread and what that costs.
@@ -1109,6 +1116,20 @@ pub(crate) fn run_and_or(sh: &mut Shell, and_or: &AndOr) -> R<()> {
 /// then subject to `errexit` only where its node is one ash tests: see
 /// `checks_errexit`.
 fn run_operand(sh: &mut Shell, pipe: &Pipeline, is_last: bool) -> R<()> {
+    // `-n` stops at the next COMMAND, which is ash's `nflag` test at the top of
+    // `evaltree` -- above the `case NNOT` that negates, the `case NPIPE` that
+    // forks the stages, and the `checkexit` that tests `errexit`. All three are
+    // below this line, which is why the test is here and not deeper: the status
+    // a `!` would invert is one nothing produced, the pipes a fork needs are
+    // two descriptors per junction, and the `errexit` would exit on a status
+    // left by whatever ran last. `set +n` can never turn it back off, and
+    // `eval` and a trap action are suppressed too, since both reach here the
+    // same way. `$?` is left alone, as at `evaltree`'s `out:`. Neither dash nor
+    // ash exempts an interactive shell (POSIX 2.5.1 does), so neither does
+    // td-sh.
+    if sh.opts.noexec {
+        return Ok(());
+    }
     let exempt = !is_last || pipe.bang;
     if exempt {
         sh.errexit_suppressed += 1;
@@ -1197,15 +1218,6 @@ fn run_pipeline(sh: &mut Shell, pipe: &Pipeline) -> R<()> {
 /// call, `eval`/`.`, and command-substitution body re-enters here, so one guard
 /// covers them all (and their compositions) against a native stack overflow.
 pub fn run_command(sh: &mut Shell, cmd: &Cmd) -> R<()> {
-    // dash's and busybox ash's `nflag`, which both test at the top of evaltree --
-    // this walker's counterpart -- so `-n` stops at the next COMMAND, not merely
-    // at the next parsed unit. That is why `set +n` can never turn it back off,
-    // and why `eval` and a trap action are suppressed too: they reach evaltree
-    // the same way. Neither shell exempts an interactive shell (POSIX 2.5.1 does),
-    // so neither does td-sh. `$?` is left alone, as at evaltree's `out:`.
-    if sh.opts.noexec {
-        return Ok(());
-    }
     if sh.run_depth >= MAX_RUN_DEPTH {
         return Err(sh.fatal("maximum recursion depth exceeded", 2));
     }
@@ -1216,10 +1228,10 @@ pub fn run_command(sh: &mut Shell, cmd: &Cmd) -> R<()> {
     // thing at the two ends of a script: the LAST command's own diagnostic
     // would otherwise never be looked at, and `set -x; sleep .3; :` with a
     // broken stderr would report 0 where bash reports 141. It is also what
-    // makes `set -n` safe to leave above — the flag is seen by the post-check
-    // of the very command that set it, so it can never be left pending for a
-    // `noexec` early return to step over forever. The command's own error wins,
-    // being the more specific answer.
+    // makes `-n` safe to guard in `run_operand`: the `set -n` that arms the
+    // mode runs through HERE, so its own post-check still happens and nothing
+    // is left pending for that guard to step over. The command's own error
+    // wins, being the more specific answer.
     result?;
     epipe_pending(sh)
 }
@@ -2281,6 +2293,28 @@ pub fn note_epipe(sh: &Shell, r: std::io::Result<()>) -> std::io::Result<()> {
 mod tests {
     fn run(src: &str) -> (i32, String, String) {
         crate::process::run_capturing(src)
+    }
+
+    /// `-n` starts no background job, and no OUTPUT can show it: a job that
+    /// DID start under `-n` skips its own operand and prints nothing either,
+    /// so status and output are identical either way. Starting one RECORDS it
+    /// though, so `$!` is what the assertion has to be about.
+    #[test]
+    fn dash_n_records_no_background_job() {
+        let under = |noexec: bool| {
+            crate::process::on_shell_stack(move || {
+                let mut sh = super::Shell::new_for_test();
+                sh.opts.noexec = noexec;
+                let status = super::run_program(&mut sh, ": &\n: &\n: &\n");
+                (status, sh.last_bg)
+            })
+            .unwrap()
+        };
+        assert_eq!(under(true), (0, None), "`-n` recorded a background job");
+        // Not vacuous: the same script does record one when it runs.
+        let (status, last) = under(false);
+        assert_eq!(status, 0);
+        assert!(last.is_some(), "a job that runs must be recorded");
     }
 
     /// The two rules a `trim()` would break. An EMPTY field is a value, not a
