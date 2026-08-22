@@ -1,4 +1,7 @@
-use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH, TD_JAIL_TRANSITION_MARKER};
+use crate::ladder::{
+    post_bootstrap_path, POST_BOOTSTRAP_SH, TD_JAIL_FIXTURE_BOOT_MARKER,
+    TD_JAIL_TRANSITION_MARKER,
+};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 pub fn recipe() -> Recipe {
@@ -39,7 +42,7 @@ pub fn recipe() -> Recipe {
                      o=$(TD_JAIL_TEST_LEAK_FD=1 '{bin}' --probe-transition 2>&1) || {{ exec 9<&-; echo \"td-jail namespace transition probe failed: $o\" >&2; exit 1; }}; \
                      exec 9<&-; \
                      [ \"$o\" = '{TD_JAIL_TRANSITION_MARKER} pid=1' ] || {{ echo \"td-jail transition returned the wrong proof: $o\" >&2; exit 1; }}; \
-                     '{bin}' >/dev/null 2>&1 && {{ echo 'td-jail launched without a complete confinement path' >&2; exit 1; }}; :"
+                     '{bin}' >/dev/null 2>&1 && {{ echo 'td-jail accepted a bare internal invocation' >&2; exit 1; }}; :"
                 ),
             ],
         )
@@ -67,7 +70,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
         content: format!(
-            "PASS: td-jail is a static ELF64 x86-64 executable; the build-host policy permits the complete namespace transition, stage 1 closes inherited descriptors and installs an exact CAP_SYS_ADMIN exec bridge with an empty bounding set, stage 2 enters a read-back immutable tmpfs root with fresh proc/dev/devpts/shm/tmp/var-tmp and no old root, clears every capability, sets and reads back no-new-privileges, installs and reads back the compiled seccomp filter, and reaps filtered descendants as PID 1; the td-GCC-built non-shipped probe is capable of checking real filter errno and kill behavior while application launch remains disabled; the host smoke leg may skip behavior under an inherited filter, and system-x86-64's QEMU oracle always supplies the authoritative target-kernel proof through {TD_JAIL_TRANSITION_MARKER}\n"
+            "PASS: td-jail is a static ELF64 x86-64 executable; the build-host policy permits the complete namespace transition, stage 1 closes inherited descriptors, brings up and reads back isolated loopback, and installs an exact CAP_SYS_ADMIN exec bridge with an empty bounding set; stage 2 enters a read-back immutable tmpfs root with fresh proc/dev/devpts/shm/tmp/var-tmp and no old root, clears every capability, sets and reads back no-new-privileges, installs and reads back the compiled seccomp filter, and reaps filtered descendants as PID 1; the td-GCC-built non-shipped probe checks real filter errno and kill behavior, and a bare td-jail invocation cannot enter its internal interface; the host smoke leg may skip behavior under an inherited filter, while system-x86-64's QEMU oracle supplies the authoritative target-kernel transition through {TD_JAIL_TRANSITION_MARKER} and the installed-application launch proof, including a bounded loopback datagram, through {TD_JAIL_FIXTURE_BOOT_MARKER}\n"
         ),
         exec: false,
     });
@@ -85,7 +88,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-jail-test: build-plan --auto builds the static target td-jail and a non-shipped td-GCC seccomp probe, smoke-tests namespace/mount/capability transition, installs and reads back no-new-privileges plus the compiled filter, attempts real errno/kill behavior only when the host has no inherited seccomp filter, verifies filtered PID-1 orphan reaping, and keeps application launch disabled; the system QEMU oracle always proves the target kernel"
+echo ">> recipe-check td-jail-test: build-plan --auto builds the static target td-jail and a non-shipped td-GCC seccomp probe, smoke-tests namespace/mount/capability transition, installs and reads back no-new-privileges plus the compiled filter, attempts real errno/kill behavior only when the host has no inherited seccomp filter, verifies filtered PID-1 orphan reaping, and refuses bare internal invocation; the system QEMU oracle proves installed launch on the target kernel"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-jail-test 1
 "#,

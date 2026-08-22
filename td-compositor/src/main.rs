@@ -48,7 +48,8 @@ const MAX_HELD_KEYS: usize = 256;
 
 fn usage() -> String {
     "usage: td-compositor run --framebuffer PATH --input DIR --socket PATH \
-     --launcher-client PATH --terminal-client PATH | td-compositor probe SOCKET | td-compositor terminfo PATH | \
+     --launcher-client PATH [--launcher-application NAME --launcher-runtime PATH] \
+     --terminal-client PATH | td-compositor probe SOCKET | td-compositor terminfo PATH | \
      td-compositor selftest"
         .into()
 }
@@ -65,9 +66,9 @@ fn term_usage() -> String {
         .into()
 }
 
-/// Which program this binary was invoked as. Three names, one artifact: the
-/// terminal ships as a symlink beside the compositor rather than as a second
-/// build of the same modules.
+/// Which program this binary was invoked as. Three installed names share one
+/// artifact; the fixture keeps the compositor basename, so its authenticated
+/// identity and exact `/app` entry jointly select the demo personality.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Personality {
     Compositor,
@@ -76,8 +77,14 @@ enum Personality {
 }
 
 impl Personality {
-    fn of(executable: &str) -> Personality {
-        match Path::new(executable).file_name().and_then(|name| name.to_str()) {
+    fn of(executable: &str, jail_fixture: bool) -> Personality {
+        if jail_fixture && executable == client::JAIL_FIXTURE_ENTRY {
+            return Personality::Demo;
+        }
+        let name = Path::new(executable)
+            .file_name()
+            .and_then(|name| name.to_str());
+        match name {
             Some("td-ui-demo") => Personality::Demo,
             Some("td-term") => Personality::Term,
             _ => Personality::Compositor,
@@ -140,6 +147,8 @@ struct RunOptions {
     input: PathBuf,
     socket: PathBuf,
     launcher_client: PathBuf,
+    launcher_application: Option<String>,
+    launcher_runtime: Option<PathBuf>,
     terminal_client: PathBuf,
 }
 
@@ -148,6 +157,8 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
     let mut input = None;
     let mut socket = None;
     let mut launcher_client = None;
+    let mut launcher_application = None;
+    let mut launcher_runtime = None;
     let mut terminal_client = None;
     let mut index = 0;
     while index < args.len() {
@@ -164,14 +175,27 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             "--launcher-client" if launcher_client.is_none() => {
                 launcher_client = Some(PathBuf::from(value))
             }
+            "--launcher-application" if launcher_application.is_none() => {
+                launcher_application = Some(value.clone())
+            }
+            "--launcher-runtime" if launcher_runtime.is_none() => {
+                launcher_runtime = Some(PathBuf::from(value))
+            }
             "--terminal-client" if terminal_client.is_none() => {
                 terminal_client = Some(PathBuf::from(value))
             }
             "--framebuffer" | "--input" | "--socket" | "--launcher-client"
-            | "--terminal-client" => return Err(format!("duplicate flag '{flag}'")),
+            | "--launcher-application" | "--launcher-runtime" | "--terminal-client" => {
+                return Err(format!("duplicate flag '{flag}'"));
+            }
             _ => return Err(format!("unrecognised argument '{flag}'")),
         }
         index += 2;
+    }
+    if launcher_application.is_some() != launcher_runtime.is_some() {
+        return Err(
+            "--launcher-application and --launcher-runtime must be supplied together".into(),
+        );
     }
     Ok(RunOptions {
         framebuffer: framebuffer.ok_or_else(|| "--framebuffer is required".to_string())?,
@@ -179,6 +203,8 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
         socket: socket.ok_or_else(|| "--socket is required".to_string())?,
         launcher_client: launcher_client
             .ok_or_else(|| "--launcher-client is required".to_string())?,
+        launcher_application,
+        launcher_runtime,
         // Required rather than defaulted: the compositor cannot know the store
         // path the terminal landed at, and a launcher entry that spawns nothing
         // is worse than one that never appeared.
@@ -190,7 +216,9 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
 fn run_compositor(options: RunOptions) -> Result<(), String> {
     let framebuffer = Framebuffer::open(&options.framebuffer)?;
     let geometry = (framebuffer.width, framebuffer.height, framebuffer.stride);
-    let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+    let mut runtime = Runtime::new(framebuffer);
+    runtime.set_launcher_application(options.launcher_application.is_some());
+    let runtime = Arc::new(Mutex::new(runtime));
     runtime
         .lock()
         .map_err(|_| "runtime lock poisoned".to_string())?
@@ -202,6 +230,9 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
             socket: options.socket.clone(),
             client: options.launcher_client,
             terminal: options.terminal_client,
+            application: options.launcher_application.zip(options.launcher_runtime).map(
+                |(name, runtime)| launcher::ApplicationLaunch { name, runtime },
+            ),
         },
     )?;
     // Reported, never fatal: a compositor without a clock is worth more
@@ -341,24 +372,24 @@ fn parse_client_run(args: &[String]) -> Result<client::Options, String> {
     })
 }
 
-fn run_client(args: &[String]) -> Result<(), String> {
+fn run_client(args: &[String]) -> Result<(), client::ClientRunFailure> {
     let command = args.first().ok_or_else(client_usage)?;
     match command.as_str() {
         "run" => client::run(&parse_client_run(args.get(1..).ok_or_else(client_usage)?)?),
         "probe" => {
             let socket = args.get(1).ok_or_else(client_usage)?;
             if args.get(2).is_some() {
-                return Err(client_usage());
+                return Err(client_usage().into());
             }
-            client::probe(Path::new(socket))
+            client::probe(Path::new(socket)).map_err(Into::into)
         }
         "selftest" => {
             if args.get(1).is_some() {
-                return Err(client_usage());
+                return Err(client_usage().into());
             }
-            client::selftest()
+            client::selftest().map_err(Into::into)
         }
-        _ => Err(client_usage()),
+        _ => Err(client_usage().into()),
     }
 }
 
@@ -366,10 +397,18 @@ fn main() {
     let mut argv = env::args();
     let executable = argv.next().unwrap_or_default();
     let args: Vec<String> = argv.collect();
-    let personality = Personality::of(&executable);
+    let jail_fixture =
+        env::var_os("FLATPAK_ID").as_deref() == Some(client::JAIL_FIXTURE_ID.as_ref());
+    let personality = Personality::of(&executable, jail_fixture);
     let result = match personality {
         Personality::Compositor => run(&args),
-        Personality::Demo => run_client(&args),
+        Personality::Demo => match run_client(&args) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                eprintln!("{}: {}", personality.program(), error.message());
+                process::exit(error.exit_code());
+            }
+        },
         Personality::Term => run_term(&args),
     };
     if let Err(error) = result {
@@ -384,24 +423,29 @@ mod tests {
 
     #[test]
     fn the_three_names_pick_the_three_programs() {
-        // Whatever path the symlink is reached by, only the file name decides.
-        assert!(Personality::of("/bin/td-term") == Personality::Term);
-        assert!(Personality::of("td-term") == Personality::Term);
-        assert!(Personality::of("/td/store/x-td-compositor/bin/td-term") == Personality::Term);
-        assert!(Personality::of("/bin/td-ui-demo") == Personality::Demo);
-        assert!(Personality::of("/bin/td-compositor") == Personality::Compositor);
+        // Installed symlinks select by basename; only the exact fixture entry
+        // also uses its authenticated application identity.
+        assert!(Personality::of("/bin/td-term", false) == Personality::Term);
+        assert!(Personality::of("td-term", false) == Personality::Term);
+        assert!(Personality::of("/td/store/x-td-compositor/bin/td-term", false) == Personality::Term);
+        assert!(Personality::of("/bin/td-ui-demo", false) == Personality::Demo);
+        assert!(Personality::of("/bin/td-compositor", false) == Personality::Compositor);
+        assert!(Personality::of(client::JAIL_FIXTURE_ENTRY, true) == Personality::Demo);
+        assert!(Personality::of("/bin/td-compositor", true) == Personality::Compositor);
+        assert!(Personality::of("/bin/td-term", true) == Personality::Term);
+        assert!(Personality::of("/bin/td-ui-demo", true) == Personality::Demo);
         // An unknown name is the compositor, as it was before td-term existed.
-        assert!(Personality::of("/bin/something-else") == Personality::Compositor);
-        assert!(Personality::of("") == Personality::Compositor);
+        assert!(Personality::of("/bin/something-else", false) == Personality::Compositor);
+        assert!(Personality::of("", false) == Personality::Compositor);
         // A name that merely CONTAINS one is not that one.
-        assert!(Personality::of("/bin/td-terminal") == Personality::Compositor);
-        assert!(Personality::of("/bin/td-term/") == Personality::Term);
+        assert!(Personality::of("/bin/td-terminal", false) == Personality::Compositor);
+        assert!(Personality::of("/bin/td-term/", false) == Personality::Term);
         for personality in [
             Personality::Compositor,
             Personality::Demo,
             Personality::Term,
         ] {
-            assert_eq!(Personality::of(personality.program()), personality);
+            assert_eq!(Personality::of(personality.program(), false), personality);
         }
     }
 
@@ -426,8 +470,12 @@ mod tests {
     fn launcher_command_round_trips_through_the_client_parser() {
         let launch = launcher::LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
-            client: PathBuf::from("/bin/td-ui-demo"),
+            client: PathBuf::from("/bin/td-jail-fixture"),
             terminal: PathBuf::from("/bin/td-term"),
+            application: Some(launcher::ApplicationLaunch {
+                name: "td-jail-fixture".into(),
+                runtime: PathBuf::from("/run/user/1000/td-app"),
+            }),
         };
         let (program, arguments, ready_socket) =
             launcher::launch_command(&launch, launcher::LaunchRequest::UiDemo, 7).unwrap();
@@ -439,10 +487,13 @@ mod tests {
         assert_eq!(arguments.first().map(String::as_str), Some("run"));
         let parsed = parse_client_run(arguments.get(1..).unwrap()).unwrap();
         assert_eq!(parsed.socket, launch.socket);
-        assert_eq!(parsed.ready_socket, ready_socket);
         assert_eq!(
             parsed.ready_socket.parent(),
-            Some(Path::new("/run/user/1000"))
+            Some(Path::new("/run/user/1000/td-app"))
+        );
+        assert_eq!(
+            ready_socket.parent(),
+            Some(Path::new("/run/user/1000/td-app/td-jail-fixture"))
         );
         let ready_name = parsed.ready_socket.file_name().unwrap().to_string_lossy();
         assert!(ready_name.starts_with("td-launcher-"));
@@ -986,7 +1037,11 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             "--socket".into(),
             "/run/user/1000/wayland-0".into(),
             "--launcher-client".into(),
-            "/bin/td-ui-demo".into(),
+            "/bin/td-jail-fixture".into(),
+            "--launcher-application".into(),
+            "td-jail-fixture".into(),
+            "--launcher-runtime".into(),
+            "/run/user/1000/td-app".into(),
             "--terminal-client".into(),
             "/bin/td-term".into(),
         ])
@@ -994,7 +1049,12 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         assert_eq!(options.framebuffer, std::path::PathBuf::from("/dev/fb0"));
         assert_eq!(
             options.launcher_client,
-            std::path::PathBuf::from("/bin/td-ui-demo")
+            std::path::PathBuf::from("/bin/td-jail-fixture")
+        );
+        assert_eq!(options.launcher_application.as_deref(), Some("td-jail-fixture"));
+        assert_eq!(
+            options.launcher_runtime,
+            Some(std::path::PathBuf::from("/run/user/1000/td-app"))
         );
         assert_eq!(
             options.terminal_client,
@@ -1012,6 +1072,21 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             "/run/user/1000/wayland-0".into(),
             "--launcher-client".into(),
             "/bin/td-ui-demo".into(),
+        ])
+        .is_err());
+        assert!(super::parse_run(&[
+            "--framebuffer".into(),
+            "/dev/fb0".into(),
+            "--input".into(),
+            "/dev/input".into(),
+            "--socket".into(),
+            "/run/user/1000/wayland-0".into(),
+            "--launcher-client".into(),
+            "/bin/td-jail-fixture".into(),
+            "--launcher-application".into(),
+            "td-jail-fixture".into(),
+            "--terminal-client".into(),
+            "/bin/td-term".into(),
         ])
         .is_err());
         assert!(super::parse_run(&[

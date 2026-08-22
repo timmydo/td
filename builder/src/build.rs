@@ -3034,7 +3034,7 @@ fn compile_application_tables_in(
     let mut registry_entries = Vec::with_capacity(packages.len());
     let mut launcher_entries = Vec::with_capacity(packages.len());
     for ((expected_name, package), expected_runtime) in names.iter().zip(packages).zip(runtimes) {
-        td_engine::application::validate_application_name(expected_name)
+        td_engine::application::validate_application_identity(expected_name)
             .map_err(|error| format!("compileApplicationTables: selected name: {error}"))?;
         let Some(basename) = package.strip_prefix(&prefix) else {
             return Err(format!(
@@ -4326,6 +4326,18 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("selected=\"catalog-stem\""), "{error}");
+
+        let error = compile_application_tables_in(
+            &["td-jail".into()],
+            &[package.to_string_lossy().into_owned()],
+            &["/td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-empty-runtime-1".into()],
+            &payloads,
+            &directory.join("reserved-name/registry.tsv"),
+            &directory.join("reserved-name/launcher.tsv"),
+            &store.to_string_lossy(),
+        )
+        .unwrap_err();
+        assert!(error.contains("reserved by td-jail"), "{error}");
 
         let noncanonical_registry = directory.join("noncanonical/registry.tsv");
         let noncanonical_table = directory.join("noncanonical/launcher.tsv");

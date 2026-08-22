@@ -14,6 +14,26 @@
 
 use crate::types::{Step, TextEdit};
 
+pub const TD_APPLICATION_PACKAGE_ROOT: &str = "/td/store";
+pub const TD_APPLICATION_STATE_ROOT: &str = ".td/app";
+pub const TD_APPLICATION_RUNTIME_ROOT: &str = "td-app";
+pub const TD_APPLICATION_CONFIG_PATH: &str = "/etc/td-app.conf";
+pub const TD_APPLICATION_REGISTRY: &str = "/etc/td-applications.tsv";
+pub const TD_APPLICATION_LAUNCHER_TABLE: &str = "/etc/td-launcher.tsv";
+pub const TD_JAIL_FIXTURE_NAME: &str = "td-jail-fixture";
+pub const TD_JAIL_FIXTURE_ENTRY: &str = "/app/bin/td-compositor";
+pub const TD_JAIL_FIXTURE_ALIAS: &str = "org.td.JailFixture";
+pub const TD_JAIL_FIXTURE_DISPLAY_NAME: &str = "Jail Fixture";
+pub const TD_JAIL_FIXTURE_SEARCH_TERMS: &[&str] =
+    &["jail", "fixture", "sandbox", "wayland"];
+pub const TD_APPLICATION_CONFIG_TEXT: &str = concat!(
+    "format=1\n",
+    "package-root=/td/store\n",
+    "state-root=.td/app\n",
+    "registry=/etc/td-applications.tsv\n",
+    "launcher-table=/etc/td-launcher.tsv\n",
+);
+
 /// The td-built bootstrap shell (catalog stem). `bash-mesboot` is bash 2.05b
 /// built from source with no host tools (baked Makefiles + engine-native
 /// patches + `oyacc`), so every rung declares it as a RecipeOutput edge.
@@ -252,6 +272,7 @@ pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 /// It does not change what the guest does: the wait token derived from it is clamped
 /// in the generated scripts, so the retry budgets are the same at either value.
 pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 480;
+pub const QEMU_GUEST_WAIT_MARGIN_SECS: u64 = 30;
 
 /// Printed after the running system installs and activates a verified candidate
 /// deployment through td-boot's fsync + atomic-rename transaction.
@@ -448,6 +469,10 @@ pub const TD_JAIL_TRANSITION_MARKER: &str = "TD-JAIL-TRANSITION-OK";
 /// Emitted only by the QEMU fixture after its non-shipped td-GCC probe installs
 /// td-jail's exported filter and observes the compiled errno and kill actions.
 pub const TD_JAIL_SECCOMP_PROBE_MARKER: &str = "TD-JAIL-SECCOMP-PROBE-OK";
+
+/// Emitted by the trusted fixture-evidence unit only after its unprivileged
+/// probe accepts the fixture's post-frame readiness socket.
+pub const TD_JAIL_FIXTURE_BOOT_MARKER: &str = "TD-JAIL-FIXTURE-BOOT-READY";
 
 /// Kernel-cmdline token the headless `qemu-boot-system` oracle appends so the greeter
 /// waits for the root-owned health/update transaction and then exits. `tty-session`
@@ -854,6 +879,20 @@ mod tests {
     use crate::catalog;
     use crate::types::{Recipe, Step};
     use std::collections::HashSet;
+
+    #[test]
+    fn application_config_text_is_built_from_the_contract_constants() {
+        assert_eq!(
+            super::TD_APPLICATION_CONFIG_TEXT,
+            format!(
+                "format=1\npackage-root={}\nstate-root={}\nregistry={}\nlauncher-table={}\n",
+                super::TD_APPLICATION_PACKAGE_ROOT,
+                super::TD_APPLICATION_STATE_ROOT,
+                super::TD_APPLICATION_REGISTRY,
+                super::TD_APPLICATION_LAUNCHER_TABLE,
+            )
+        );
+    }
 
     const POST_BOOTSTRAP_BOUNDARY_OUTPUTS: [&str; 5] = [
         "rust-toolchain",

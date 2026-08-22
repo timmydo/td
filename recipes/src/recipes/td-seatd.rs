@@ -96,5 +96,9 @@ mod tests {
             )
         }));
         assert!(MAIN_RS.contains("#![forbid(unsafe_code)]"));
+        assert!(MAIN_RS.contains(
+            "fs::set_permissions(path, Permissions::from_mode(0o700))"
+        ));
+        assert!(MAIN_RS.contains("verify_owner_mode(path, account, 0o700)"));
     }
 }

@@ -1,6 +1,6 @@
 //! Canonical application launcher metadata and the two image tables derived from it.
 
-use crate::application::validate_application_name;
+use crate::application::{validate_application_identity, RESERVED_APPLICATION_NAMES};
 use crate::json::Json;
 use std::collections::BTreeSet;
 
@@ -11,6 +11,7 @@ pub const MAX_LAUNCHER_EXPORT_BYTES: usize = 4096;
 pub const MAX_APPLICATION_TABLE_BYTES: usize = 1024 * 1024;
 pub const MAX_APPLICATIONS: usize = 256;
 pub const MAX_PACKAGE_PATH_BYTES: usize = 4096;
+pub const RESERVED_LAUNCHER_NAMES: &[&str] = RESERVED_APPLICATION_NAMES;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LauncherDeclaration {
@@ -114,7 +115,7 @@ pub struct LauncherExport {
 
 impl LauncherExport {
     pub fn new(name: &str, display_name: &str, search_terms: &[String]) -> Result<Self, String> {
-        validate_application_name(name)?;
+        validate_application_identity(name)?;
         validate_display_name(display_name)?;
         validate_search_terms(search_terms.iter().map(String::as_str))?;
         let export = Self {
@@ -250,7 +251,7 @@ impl ApplicationRegistry {
             ));
         }
         for (name, path) in &entries {
-            validate_application_name(name)?;
+            validate_application_identity(name)?;
             validate_package_path(path)?;
         }
         entries.sort_by(|left, right| left.0.cmp(&right.0));
@@ -511,6 +512,20 @@ mod tests {
                 ApplicationRegistry::parse(text).is_err(),
                 "accepted {text:?}"
             );
+        }
+    }
+
+    #[test]
+    fn launcher_names_cannot_select_td_jail_internal_modes() {
+        for name in RESERVED_LAUNCHER_NAMES {
+            assert!(LauncherDeclaration::new("Reserved", &[])
+                .unwrap()
+                .bind(name)
+                .is_err());
+            assert!(ApplicationRegistry::new(vec![
+                ((*name).to_string(), "/td/store/package".into()),
+            ])
+            .is_err());
         }
     }
 

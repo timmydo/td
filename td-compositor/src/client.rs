@@ -14,7 +14,9 @@ use crate::scene::SHM_XRGB8888;
 use crate::ui::{KeyboardUpdate, PointerUpdate, UiKeyState, UiModel, UiModifiers};
 use crate::{socket, sys, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
 use std::collections::BTreeSet;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+use std::net::{Ipv4Addr, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -23,6 +25,37 @@ use std::time::{Duration, Instant};
 const DEFAULT_WIDTH: usize = 512;
 const DEFAULT_HEIGHT: usize = 320;
 const PRESENT_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const JAIL_FIXTURE_ID: &str = "org.td.JailFixture";
+pub(crate) const JAIL_FIXTURE_ENTRY: &str = "/app/bin/td-compositor";
+pub(crate) const JAIL_FIXTURE_UID: u32 = 1000;
+const JAIL_FIXTURE_STATUS_EXIT_CODE: i32 = 70;
+const JAIL_FIXTURE_BOUNDARY_EXIT_CODE: i32 = 71;
+const JAIL_FIXTURE_MOUNTS_EXIT_CODE: i32 = 72;
+const JAIL_FIXTURE_LOOPBACK_EXIT_CODE: i32 = 73;
+
+pub(crate) struct ClientRunFailure {
+    message: String,
+    exit_code: i32,
+}
+
+impl ClientRunFailure {
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub(crate) fn exit_code(&self) -> i32 {
+        self.exit_code
+    }
+}
+
+impl From<String> for ClientRunFailure {
+    fn from(message: String) -> ClientRunFailure {
+        ClientRunFailure {
+            message,
+            exit_code: 1,
+        }
+    }
+}
 
 pub struct Options {
     pub socket: PathBuf,
@@ -710,7 +743,158 @@ fn announce(out: &mut impl Write, width: usize, height: usize) -> Result<(), Str
         .map_err(|e| format!("flush UI client ready marker: {e}"))
 }
 
-pub fn run(options: &Options) -> Result<(), String> {
+fn verify_jail_status() -> Result<(), String> {
+    let status = fs::read_to_string("/proc/self/status")
+        .map_err(|e| format!("read jailed /proc/self/status: {e}"))?;
+    for (key, expected) in [
+        ("NoNewPrivs:", "1"),
+        ("Seccomp:", "2"),
+        ("CapInh:", "0000000000000000"),
+        ("CapPrm:", "0000000000000000"),
+        ("CapEff:", "0000000000000000"),
+        ("CapBnd:", "0000000000000000"),
+        ("CapAmb:", "0000000000000000"),
+    ] {
+        let actual = status
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .map(str::trim);
+        if actual != Some(expected) {
+            return Err(format!(
+                "jailed /proc/self/status {key} is {actual:?}, expected {expected:?}"
+            ));
+        }
+    }
+    let uid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|fields| fields.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u32>().ok());
+    if uid != Some(JAIL_FIXTURE_UID) {
+        return Err(format!(
+            "jailed /proc/self/status effective uid is {uid:?}, expected {JAIL_FIXTURE_UID}"
+        ));
+    }
+    Ok(())
+}
+
+fn verify_jail_boundary() -> Result<(), String> {
+    match fs::File::open("/proc/1/fd/1") {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(error) => {
+            return Err(format!(
+                "jailed PID 1 output boundary failed for unexpected reason: {error}"
+            ));
+        }
+        Ok(_) => return Err("jailed application can reopen PID 1 output".into()),
+    }
+    for path in ["/td/store", "/etc", "/dev/fb0", "/dev/input"] {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("inspect confined path {path}: {error}")),
+            Ok(_) => return Err(format!("host path {path} is visible inside the jail")),
+        }
+    }
+    Ok(())
+}
+
+fn verify_jail_mounts() -> Result<(), String> {
+    let entry = fs::symlink_metadata(JAIL_FIXTURE_ENTRY)
+        .map_err(|e| format!("inspect jailed application entry: {e}"))?;
+    if !entry.file_type().is_file() {
+        return Err("jailed application entry is not a regular file".into());
+    }
+    if !fs::symlink_metadata("/usr")
+        .map_err(|e| format!("inspect jailed runtime: {e}"))?
+        .file_type()
+        .is_dir()
+    {
+        return Err("jailed runtime is not a directory".into());
+    }
+    let mut probe_bytes = [0_u8; 8];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut random| random.read_exact(&mut probe_bytes))
+        .map_err(|e| format!("read jailed write-probe randomness: {e}"))?;
+    let probe_tag = u64::from_le_bytes(probe_bytes);
+    for immutable_root in ["/app", "/usr"] {
+        let path = format!("{immutable_root}/.td-jail-write-probe-{probe_tag:016x}");
+        if fs::symlink_metadata(&path).is_ok() {
+            return Err(format!("immutable probe path {path} already exists"));
+        }
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::ReadOnlyFilesystem => {}
+            Err(error) => {
+                return Err(format!(
+                    "immutable jail tree refused {path} for {error}, not read-only-filesystem"
+                ));
+            }
+            Ok(_) => {
+                let _ = fs::remove_file(&path);
+                return Err(format!("immutable jail tree accepted a write at {path}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_jail_loopback() -> Result<(), String> {
+    let loopback = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .map_err(|e| format!("bind jailed loopback oracle: {e}"))?;
+    let address = loopback
+        .local_addr()
+        .map_err(|e| format!("read jailed loopback address: {e}"))?;
+    loopback
+        .connect(address)
+        .map_err(|e| format!("connect jailed loopback oracle: {e}"))?;
+    loopback
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .and_then(|()| loopback.set_write_timeout(Some(Duration::from_secs(5))))
+        .map_err(|e| format!("bound jailed loopback oracle: {e}"))?;
+    let expected = b"td-jail-loopback-v1";
+    let sent = loopback
+        .send(expected)
+        .map_err(|e| format!("send jailed loopback oracle: {e}"))?;
+    if sent != expected.len() {
+        return Err(format!(
+            "jailed loopback oracle sent {sent} bytes, expected {}",
+            expected.len()
+        ));
+    }
+    let mut received = [0_u8; 32];
+    let count = loopback
+        .recv(&mut received)
+        .map_err(|e| format!("receive jailed loopback oracle: {e}"))?;
+    if received.get(..count) != Some(expected.as_slice()) {
+        return Err("jailed loopback oracle changed its datagram".into());
+    }
+    Ok(())
+}
+
+fn verify_jail_fixture() -> Result<(), ClientRunFailure> {
+    verify_jail_status().map_err(|message| ClientRunFailure {
+        message,
+        exit_code: JAIL_FIXTURE_STATUS_EXIT_CODE,
+    })?;
+    verify_jail_boundary().map_err(|message| ClientRunFailure {
+        message,
+        exit_code: JAIL_FIXTURE_BOUNDARY_EXIT_CODE,
+    })?;
+    verify_jail_mounts().map_err(|message| ClientRunFailure {
+        message,
+        exit_code: JAIL_FIXTURE_MOUNTS_EXIT_CODE,
+    })?;
+    verify_jail_loopback().map_err(|message| ClientRunFailure {
+        message,
+        exit_code: JAIL_FIXTURE_LOOPBACK_EXIT_CODE,
+    })?;
+    Ok(())
+}
+
+pub fn run(options: &Options) -> Result<(), ClientRunFailure> {
+    let jail_fixture = std::env::var_os("FLATPAK_ID").as_deref() == Some(JAIL_FIXTURE_ID.as_ref());
+    if jail_fixture {
+        verify_jail_fixture()?;
+    }
     let runtime_directory = options
         .socket
         .parent()
@@ -727,9 +911,9 @@ pub fn run(options: &Options) -> Result<(), String> {
 
     let _ready = socket::publish(&options.ready_socket, "ui-demo-ready", Vec::new())?;
     // `writeln!` rather than `println!`, which PANICS on a write failure -- the
-    // crate forbids that on any path, and the launcher spawns this binary with
-    // its stdout wherever the compositor's went. `lock()` for `announce`'s
-    // reason there.
+    // crate forbids that on any path. Direct launch inherits compositor stdout;
+    // the jailed fixture uses /dev/null and proves readiness through its socket
+    // and the root-owned evidence unit. `lock()` for `announce`'s reason there.
     announce(&mut std::io::stdout().lock(), size.width, size.height)?;
 
     loop {
@@ -914,6 +1098,14 @@ mod tests {
     use crate::conn::{DISPLAY, MAX_PENDING_FDS};
     use crate::keyboard::XKB_KEYMAP;
     use std::os::fd::IntoRawFd;
+
+    #[test]
+    fn jail_fixture_failures_have_phase_specific_exit_codes() {
+        assert_eq!(JAIL_FIXTURE_STATUS_EXIT_CODE, 70);
+        assert_eq!(JAIL_FIXTURE_BOUNDARY_EXIT_CODE, 71);
+        assert_eq!(JAIL_FIXTURE_MOUNTS_EXIT_CODE, 72);
+        assert_eq!(JAIL_FIXTURE_LOOPBACK_EXIT_CODE, 73);
+    }
 
     fn test_connection(stream: UnixStream) -> Connection {
         Connection::over(stream, None, FIRST_DYNAMIC_ID)

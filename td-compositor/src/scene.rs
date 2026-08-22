@@ -813,6 +813,10 @@ impl Scene {
         }
     }
 
+    pub(crate) fn set_launcher_application(&mut self, application: bool) {
+        self.launcher.set_application(application);
+    }
+
     /// A client named what its pointer should look like: which surface to
     /// point WITH and where on it the pointer falls, or `None` for a null
     /// surface, which asks for no cursor at all.

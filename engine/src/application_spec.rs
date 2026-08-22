@@ -5,7 +5,7 @@
 //! only this closed, canonical format rather than interpreting package bytes.
 
 use crate::application::{
-    validate_application_name, validate_entry, validate_environment_name,
+    validate_application_identity, validate_entry, validate_environment_name,
     validate_environment_value, ApplicationManifest,
 };
 use crate::permissions::PermissionPolicy;
@@ -13,10 +13,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_APPLICATION_SPEC_BYTES: usize = 48 * 1024;
 const MAX_RUNTIME_PATH_BYTES: usize = 4096;
-const MAX_SPEC_ENVIRONMENT_ENTRIES: usize = 256;
+pub const MAX_SPEC_ENVIRONMENT_ENTRIES: usize = 256;
+pub const APPLICATION_UID: u32 = 1000;
 
 const BASE_ENVIRONMENT: &[(&str, &str)] = &[
-    ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
     ("GDK_BACKEND", "wayland"),
     ("GTK_A11Y", "none"),
     ("HOME", "/home/td"),
@@ -31,7 +31,6 @@ const BASE_ENVIRONMENT: &[(&str, &str)] = &[
     ("XDG_CURRENT_DESKTOP", "td"),
     ("XDG_DATA_DIRS", "/app/share:/usr/share"),
     ("XDG_DATA_HOME", "/home/td/.local/share"),
-    ("XDG_RUNTIME_DIR", "/run/user/1000"),
     ("XDG_SESSION_DESKTOP", "td"),
     ("XDG_SESSION_TYPE", "wayland"),
     ("XDG_STATE_HOME", "/home/td/.local/state"),
@@ -61,6 +60,12 @@ impl ApplicationSpec {
             .iter()
             .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
             .collect();
+        let runtime_directory = format!("/run/user/{APPLICATION_UID}");
+        environment.insert(
+            "DBUS_SESSION_BUS_ADDRESS".into(),
+            format!("unix:path={runtime_directory}/bus"),
+        );
+        environment.insert("XDG_RUNTIME_DIR".into(), runtime_directory);
         environment.insert(
             "FLATPAK_ID".into(),
             manifest.alias().unwrap_or(manifest.name()).to_string(),
@@ -257,7 +262,7 @@ impl ApplicationSpec {
     }
 
     fn validate(&self) -> Result<(), String> {
-        validate_application_name(&self.name)?;
+        validate_application_identity(&self.name)?;
         validate_runtime_path(&self.runtime)?;
         validate_entry(&self.entry)?;
         if self.environment.len() > MAX_SPEC_ENVIRONMENT_ENTRIES {
@@ -375,6 +380,14 @@ mod tests {
         let environment: BTreeMap<&str, &str> = spec.environment().collect();
         assert_eq!(environment.get("PATH"), Some(&"/app/bin:/usr/bin"));
         assert_eq!(environment.get("FLATPAK_ID"), Some(&"org.td.ripgrep"));
+        assert_eq!(
+            environment.get("DBUS_SESSION_BUS_ADDRESS"),
+            Some(&format!("unix:path=/run/user/{APPLICATION_UID}/bus").as_str())
+        );
+        assert_eq!(
+            environment.get("XDG_RUNTIME_DIR"),
+            Some(&format!("/run/user/{APPLICATION_UID}").as_str())
+        );
         assert!(!spec.to_keyfile().contains("provenance="));
         assert_eq!(ApplicationSpec::parse(&spec.to_keyfile()).unwrap(), spec);
     }

@@ -219,9 +219,31 @@ pub fn recipe() -> Recipe {
 mod tests {
     use super::*;
     use crate::ladder::{
-        TD_POINTER_ABSOLUTE_MARKER, TD_TERM_RUNTIME_MARKER, TD_UI_CLIENT_RUNTIME_MARKER,
-        TD_WAYLAND_RUNTIME_MARKER,
+        TD_JAIL_FIXTURE_ALIAS, TD_JAIL_FIXTURE_ENTRY, TD_POINTER_ABSOLUTE_MARKER,
+        TD_TERM_RUNTIME_MARKER, TD_UI_CLIENT_RUNTIME_MARKER, TD_WAYLAND_RUNTIME_MARKER,
     };
+
+    #[test]
+    fn embedded_rust_does_not_contain_live_recipe_templates() {
+        for (name, source) in
+            std::iter::once(("main", MAIN_RS)).chain(MODULES.iter().copied())
+        {
+            for template in [
+                "{root}",
+                "{src}",
+                "{out}",
+                "{tools}",
+                "{jobs}",
+                "{in:",
+                "{payload:",
+            ] {
+                assert!(
+                    !source.contains(template),
+                    "{name}.rs contains recipe template {template}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn recipe_writes_every_declared_module() {
@@ -231,6 +253,69 @@ mod tests {
         written.sort_unstable();
         assert_eq!(declared, written);
         assert!(MAIN_RS.contains("#![deny(unsafe_code)]"));
+        let client = MODULES
+            .iter()
+            .find_map(|(name, source)| (*name == "client").then_some(*source))
+            .expect("client source");
+        assert!(client.contains(&format!(
+            "pub(crate) const JAIL_FIXTURE_ID: &str = \"{TD_JAIL_FIXTURE_ALIAS}\";"
+        )));
+        assert!(client.contains(&format!(
+            "pub(crate) const JAIL_FIXTURE_ENTRY: &str = \"{TD_JAIL_FIXTURE_ENTRY}\";"
+        )));
+        assert!(client.contains(&format!(
+            "pub(crate) const JAIL_FIXTURE_UID: u32 = {};",
+            td_engine::application_spec::APPLICATION_UID
+        )));
+        for row in [
+            "const JAIL_FIXTURE_STATUS_EXIT_CODE: i32 = 70;",
+            "const JAIL_FIXTURE_BOUNDARY_EXIT_CODE: i32 = 71;",
+            "const JAIL_FIXTURE_MOUNTS_EXIT_CODE: i32 = 72;",
+            "const JAIL_FIXTURE_LOOPBACK_EXIT_CODE: i32 = 73;",
+        ] {
+            assert!(client.contains(row), "fixture source lacks {row}");
+        }
+        assert!(client.contains("fs::File::open(\"/proc/1/fd/1\")"));
+        assert!(MAIN_RS.contains("executable == client::JAIL_FIXTURE_ENTRY"));
+        assert!(MAIN_RS.contains("Some(client::JAIL_FIXTURE_ID.as_ref())"));
+        assert!(MAIN_RS.contains("process::exit(error.exit_code())"));
+        let launcher = MODULES
+            .iter()
+            .find_map(|(name, source)| (*name == "launcher").then_some(*source))
+            .expect("launcher source");
+        assert!(launcher.contains(&format!(
+            "const MAX_APPLICATION_NAME_BYTES: usize = {};",
+            td_engine::application::MAX_APPLICATION_NAME_BYTES
+        )));
+        assert!(launcher.contains(&format!(
+            "const RESERVED_APPLICATION_NAMES: &[&str] = &{:?};",
+            td_engine::application::RESERVED_APPLICATION_NAMES
+        )));
+        assert!(launcher.contains(&format!(
+            "const APPLICATION_RUNTIME_ROOT_NAME: &str = {:?};",
+            crate::ladder::TD_APPLICATION_RUNTIME_ROOT
+        )));
+        assert!(launcher.contains(&format!(
+            "const JAIL_FIXTURE_APPLICATION_NAME: &str = {:?};",
+            crate::ladder::TD_JAIL_FIXTURE_NAME
+        )));
+        for fragment in [
+            "application.name.starts_with('-')",
+            "application.name == \".\"",
+            "application.name.contains(\"..\")",
+            "byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')",
+        ] {
+            assert!(launcher.contains(fragment));
+        }
+        assert!(launcher.contains(&format!(
+            "label: {:?}",
+            crate::ladder::TD_JAIL_FIXTURE_DISPLAY_NAME.to_ascii_uppercase()
+        )));
+        assert!(launcher.contains(&format!(
+            "search: {:?}",
+            crate::ladder::TD_JAIL_FIXTURE_SEARCH_TERMS.join(" ")
+        )));
+        assert!(launcher.contains("(LaunchRequest::UiDemo, Some(application))"));
         let server = MODULES
             .iter()
             .find_map(|(name, source)| (*name == "server").then_some(*source))

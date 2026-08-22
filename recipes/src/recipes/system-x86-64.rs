@@ -8,9 +8,9 @@ use crate::ladder::{
     SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
     SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
-    TD_INIT_RUNTIME_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER, TD_JAIL_TRANSITION_MARKER,
-    TD_LOGIN_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_TXT_RUNTIME_MARKER,
-    TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
+    TD_INIT_RUNTIME_MARKER, TD_JAIL_FIXTURE_BOOT_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
+    TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER,
+    TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -25,6 +25,7 @@ const BOOT_SUCCESS_RETRY_MAX_SECS: u8 = 10;
 /// — see BOOTSUCCESS below. Named rather than spelled twice because the td-svc
 /// backstop and the host's own ceiling are both derived from it, and a figure that
 /// drifted between them would leave one of the two killing a healthy boot.
+#[cfg(test)]
 const BOOT_SUCCESS_ITERATION_BUDGET_SECS: u32 = 45;
 const BOOT_FAIL_PARK_WAIT_SECS: u8 = 30;
 const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
@@ -129,11 +130,39 @@ struct SystemDef {
     applications: &'static [ShippedApplication],
 }
 
-const APPLICATION_PACKAGE_ROOT: &str = "/td/store";
-const APPLICATION_STATE_ROOT: &str = ".td/app";
-const APPLICATION_REGISTRY: &str = "/etc/td-applications.tsv";
-const APPLICATION_LAUNCHER_TABLE: &str = "/etc/td-launcher.tsv";
-const APPLICATION_CONFIG: &str = "/etc/td-app.conf";
+const APPLICATION_REGISTRY: &str = crate::ladder::TD_APPLICATION_REGISTRY;
+const APPLICATION_LAUNCHER_TABLE: &str =
+    crate::ladder::TD_APPLICATION_LAUNCHER_TABLE;
+const APPLICATION_CONFIG: &str = crate::ladder::TD_APPLICATION_CONFIG_PATH;
+const APPLICATION_RUNTIME_ROOT: &str = crate::ladder::TD_APPLICATION_RUNTIME_ROOT;
+const APPLICATION_FIXTURE_NAME: &str = crate::ladder::TD_JAIL_FIXTURE_NAME;
+const APPLICATION_FIXTURE_EVIDENCE_PATH: &str = "/run/td-jail-fixture-evidence-ok";
+const APPLICATION_FIXTURE_EVIDENCE_TMP_PATH: &str =
+    "/run/.td-jail-fixture-evidence.tmp";
+const APPLICATION_FIXTURE_EVIDENCE: &str = "td-jail-fixture-evidence-v1";
+const APPLICATION_FIXTURE_COMPLETION_PATH: &str =
+    "/run/td-jail-fixture-evidence-complete";
+const APPLICATION_FIXTURE_COMPLETION_TMP_PATH: &str =
+    "/run/.td-jail-fixture-evidence-complete.tmp";
+const APPLICATION_FIXTURE_COMPLETION: &str = "td-jail-fixture-evidence-complete-v1";
+const APPLICATION_FIXTURE_READY_TIMEOUT_SECS: u16 = 90;
+const APPLICATION_FIXTURE_READY_ATTEMPTS: u16 = 2;
+const APPLICATION_FIXTURE_RETRY_MARGIN_SECS: u16 = 60;
+// The evidence unit polls itself so its deadline is not widened by td-svc's
+// exponential restart backoff. Autotest allows two cold starts plus margin.
+const APPLICATION_FIXTURE_EVIDENCE_WAIT_ITERATIONS: u16 =
+    APPLICATION_FIXTURE_READY_TIMEOUT_SECS * APPLICATION_FIXTURE_READY_ATTEMPTS
+        + APPLICATION_FIXTURE_RETRY_MARGIN_SECS;
+// The greeter may observe deployment health before the fixture's first ready
+// timeout starts the evidence unit, so its own allowance includes that offset.
+const APPLICATION_FIXTURE_GREETER_WAIT_ITERATIONS: u16 =
+    APPLICATION_FIXTURE_READY_TIMEOUT_SECS + APPLICATION_FIXTURE_EVIDENCE_WAIT_ITERATIONS;
+
+const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[ShippedApplication {
+    name: APPLICATION_FIXTURE_NAME,
+    package: APPLICATION_FIXTURE_NAME,
+    runtime: "empty-runtime",
+}];
 
 /// Account names are embedded UNQUOTED in generated root shell — `/bin/su -s /bin/sh
 /// <name> -c …` in rootcheck and every health leg, and `/bin/login -f <name>` in
@@ -208,13 +237,11 @@ const SYSTEM: SystemDef = SystemDef {
             passwordless: true,
         },
     ],
-    // Rung 10 proves td-jail's zero-capability PID-1 transition, but ordinary launch
-    // remains disabled until the confinement boundary is complete.
-    applications: &[],
+    applications: SHIPPED_APPLICATIONS,
 };
 
 const UI_USER: &str = "tester";
-const UI_UID: u32 = 1000;
+const UI_UID: u32 = td_engine::application_spec::APPLICATION_UID;
 const UI_GID: u32 = 1000;
 // ────────────────────────────────────────────────────────────────────────────────
 
@@ -783,7 +810,7 @@ fn td_svc_conf_etc_name() -> &'static str {
 /// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
 /// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
 /// regression this catches: the boot comes up missing a service and says nothing.
-const TD_SVC_UNITS: [&str; 11] = [
+const TD_SVC_UNITS: [&str; 13] = [
     "hostname",
     "td-firstboot",
     "rootcheck",
@@ -791,6 +818,8 @@ const TD_SVC_UNITS: [&str; 11] = [
     "netup",
     "wayland",
     "terminal",
+    "jail-fixture",
+    "jail-fixture-evidence",
     "bootsuccess",
     "bootfail",
     "sshd",
@@ -925,7 +954,7 @@ fn build_td_svc_conf() -> String {
          # credentials, and the compositor opens only those fixed paths.\n\
          [wayland]\n\
          type=daemon\n\
-         exec=/bin/su -s /bin/sh {ui_user} -c '/bin/td-compositor run --framebuffer /dev/fb0 --input /dev/input --socket /run/user/{ui_uid}/wayland-0 --launcher-client /bin/td-ui-demo --terminal-client /bin/td-term'\n\
+         exec=/bin/su -s /bin/sh {ui_user} -c '/bin/td-compositor run --framebuffer /dev/fb0 --input /dev/input --socket /run/user/{ui_uid}/wayland-0 --launcher-client /bin/{fixture_name} --launcher-application {fixture_name} --launcher-runtime /run/user/{ui_uid}/{application_runtime_root} --terminal-client /bin/td-term'\n\
          after=seat\n\
          requires=seat\n\
          ready=/bin/su -s /bin/sh {ui_user} -c '/bin/td-compositor probe /run/user/{ui_uid}/wayland-0'\n\
@@ -946,6 +975,31 @@ fn build_td_svc_conf() -> String {
          ready=/bin/su -s /bin/sh {ui_user} -c '/bin/td-term probe /run/user/{ui_uid}/td-term-ready'\n\
          ready-timeout=30\n\
          restart=always\n\
+         \n\
+         # The first packaged application is also QEMU boot evidence. td-login passes\n\
+         # a literal argv, td-jail resolves argv[0] through the immutable image\n\
+         # registry, and the client publishes readiness only after jailed pixels land.\n\
+         # The trusted evidence unit below accepts that readiness before it emits.\n\
+         [jail-fixture]\n\
+         type=daemon\n\
+         exec=/bin/td-login exec-as {ui_user} -- /bin/{fixture_name} run --socket /run/user/{ui_uid}/wayland-0 --ready-socket /run/user/{ui_uid}/{application_runtime_root}/ready\n\
+         after=wayland\n\
+         requires=wayland\n\
+         ready=/bin/td-login exec-as {ui_user} -- /bin/td-ui-demo probe /run/user/{ui_uid}/{application_runtime_root}/{fixture_name}/ready\n\
+         ready-timeout={fixture_ready_timeout}\n\
+         restart=always\n\
+         \n\
+         # This fixture is test evidence, not deployment health. The exact\n\
+         # host-side probe must succeed before trusted unit code prints the\n\
+         # marker QEMU requires, but mutable user state cannot block bootsuccess.\n\
+         # A failed cold start is covered by this unit's bounded one-second probe\n\
+         # loop, not td-svc's exponential restart backoff. No unit consumes its\n\
+         # spawn-ready state; the marker after atomic publication is the authority.\n\
+         [jail-fixture-evidence]\n\
+         type=daemon\n\
+         exec=/bin/sh -c 'n=0; while [ \"$n\" -lt {fixture_evidence_wait} ]; do if /bin/td-login exec-as {ui_user} -- /bin/td-ui-demo probe /run/user/{ui_uid}/{application_runtime_root}/{fixture_name}/ready >/dev/null 2>&1; then /bin/rm -f {fixture_evidence_tmp_path} {fixture_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {fixture_evidence} > {fixture_evidence_tmp_path} && /bin/td-util chmod 0644 {fixture_evidence_tmp_path} && /bin/mv {fixture_evidence_tmp_path} {fixture_evidence_path} && /bin/echo {fixture_marker} && /bin/td-util printf \"%s\\n\" {fixture_completion} > {fixture_completion_tmp_path} && /bin/td-util chmod 0644 {fixture_completion_tmp_path} && /bin/mv {fixture_completion_tmp_path} {fixture_completion_path} && exit 0; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'\n\
+         after=jail-fixture\n\
+         restart=never\n\
          \n\
          [bootsuccess]\n\
          type=oneshot\n\
@@ -999,6 +1053,17 @@ fn build_td_svc_conf() -> String {
         ui_user = UI_USER,
         ui_uid = UI_UID,
         ui_gid = UI_GID,
+        fixture_name = APPLICATION_FIXTURE_NAME,
+        fixture_marker = TD_JAIL_FIXTURE_BOOT_MARKER,
+        fixture_evidence = APPLICATION_FIXTURE_EVIDENCE,
+        fixture_evidence_path = APPLICATION_FIXTURE_EVIDENCE_PATH,
+        fixture_evidence_tmp_path = APPLICATION_FIXTURE_EVIDENCE_TMP_PATH,
+        fixture_completion = APPLICATION_FIXTURE_COMPLETION,
+        fixture_completion_path = APPLICATION_FIXTURE_COMPLETION_PATH,
+        fixture_completion_tmp_path = APPLICATION_FIXTURE_COMPLETION_TMP_PATH,
+        fixture_ready_timeout = APPLICATION_FIXTURE_READY_TIMEOUT_SECS,
+        fixture_evidence_wait = APPLICATION_FIXTURE_EVIDENCE_WAIT_ITERATIONS,
+        application_runtime_root = APPLICATION_RUNTIME_ROOT,
         host_key = SSHD_HOST_KEY,
         authorized_keys = SSHD_AUTHORIZED_KEYS,
     )
@@ -1078,8 +1143,18 @@ fn build_deployment_init(sys: &SystemDef) -> String {
          /bin/td-util ln -s /run /sysroot/var/run\n\
          /bin/td-util chown 0:0 /sysroot/var /sysroot/var/log /sysroot/var/home /sysroot/var/root\n\
          /bin/td-util chmod 0755 /sysroot/var /sysroot/var/log /sysroot/var/home\n\
-         /bin/td-util chmod 0700 /sysroot/var/root\n\
-         if /bin/td-util test -e /sysroot/var/lib/td-test/td-jail-seccomp-probe; then\n\
+         /bin/td-util chmod 0700 /sysroot/var/root\n",
+    );
+    for user in sys.users {
+        if user.home != "/root" {
+            init.push_str(&format!(
+                "/bin/td-util chmod 0700 /sysroot/var{}\n",
+                user.home
+            ));
+        }
+    }
+    init.push_str(
+        "if /bin/td-util test -e /sysroot/var/lib/td-test/td-jail-seccomp-probe; then\n\
          /bin/td-util test -f /sysroot/var/lib/td-test/td-jail-seccomp-probe\n\
          /bin/td-util chown 0:0 /sysroot/var/lib /sysroot/var/lib/td-test \
          /sysroot/var/lib/td-test/td-jail-seccomp-probe\n\
@@ -1906,7 +1981,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
         sys.autologin,
         sys.autologin,
         sys.autologin,
-        hostname = sys.hostname
+        hostname = sys.hostname,
     )
 }
 
@@ -1998,12 +2073,23 @@ fn build_profile(sys: &SystemDef) -> String {
          case \"$token\" in {BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}*) \
          wait=${{token#{BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}}};; esac; done; \
          case \"$wait\" in ''|*[!0-9]*|0) wait=1;; esac; \
-         n=0; while [ \"$n\" -lt \"$wait\" ]; do \
+         n=0; fixture_wait=0; while [ \"$n\" -lt \"$wait\" ]; do \
          status=$(/bin/td-util cat /run/td-boot-success-ok 2>/dev/null); \
-         [ \"$status\" = td-boot-success-v1 ] && break; \
+         fixture=$(/bin/td-util cat {fixture_evidence_path} 2>/dev/null); \
+         fixture_complete=$(/bin/td-util cat {fixture_completion_path} 2>/dev/null); \
+         [ \"$status\" = td-boot-success-v1 ] && [ \"$fixture\" = {fixture_evidence} ] && \
+         [ \"$fixture_complete\" = {fixture_completion} ] && break; \
+         if [ \"$status\" = td-boot-success-v1 ]; then \
+         fixture_wait=$((fixture_wait+1)); \
+         [ \"$fixture_wait\" -ge {fixture_greeter_wait} ] && break; fi; \
          [ \"$status\" = td-boot-failure-v1 ] && break; \
          n=$((n+1)); /bin/td-util sleep 1; done; \
-         exit 0; fi\n"
+         exit 0; fi\n",
+        fixture_evidence = APPLICATION_FIXTURE_EVIDENCE,
+        fixture_evidence_path = APPLICATION_FIXTURE_EVIDENCE_PATH,
+        fixture_completion = APPLICATION_FIXTURE_COMPLETION,
+        fixture_completion_path = APPLICATION_FIXTURE_COMPLETION_PATH,
+        fixture_greeter_wait = APPLICATION_FIXTURE_GREETER_WAIT_ITERATIONS,
     ));
     s
 }
@@ -2213,10 +2299,7 @@ fn build_mutable_state() -> String {
 }
 
 fn build_application_config() -> String {
-    format!(
-        "format=1\npackage-root={APPLICATION_PACKAGE_ROOT}\nstate-root={APPLICATION_STATE_ROOT}\n\
-         registry={APPLICATION_REGISTRY}\nlauncher-table={APPLICATION_LAUNCHER_TABLE}\n"
-    )
+    crate::ladder::TD_APPLICATION_CONFIG_TEXT.to_string()
 }
 
 fn application_etc_name(path: &'static str) -> &'static str {
@@ -2224,6 +2307,13 @@ fn application_etc_name(path: &'static str) -> &'static str {
         Some(name) => name,
         None => path,
     }
+}
+
+fn application_names(sys: &SystemDef) -> Vec<&'static str> {
+    sys.applications
+        .iter()
+        .map(|application| application.name)
+        .collect()
 }
 
 fn application_payload_inputs(sys: &SystemDef) -> Vec<&'static str> {
@@ -2587,8 +2677,8 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         target: "{in:td-compositor}/bin/td-ui-demo".into(),
         link: "{root}/real-root/bin/td-ui-demo".into(),
     });
-    // The terminal: what the boot starts, and what the launcher opens. The
-    // demo keeps its own /bin name below because the launcher spawns it.
+    // The demo name remains for the unprivileged readiness probes above. The
+    // terminal is what the boot starts and what the launcher opens.
     steps.push(Step::Symlink {
         target: "{in:td-compositor}/bin/td-term".into(),
         link: "{root}/real-root/bin/td-term".into(),
@@ -2856,6 +2946,9 @@ fn shape_check() -> String {
      uidemo=\"{root}/real-root{in:td-compositor}/bin/td-ui-demo\"; { [ -f \"$uidemo\" ] && [ -x \"$uidemo\" ]; } || { echo 'root tree: td-ui-demo is not packed and executable' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-term\" 2>/dev/null)\" = \"{in:td-compositor}/bin/td-term\" ] || { echo 'root tree: /bin/td-term is not a symlink to the staged terminal' >&2; exit 1; }; \
      tdterm=\"{root}/real-root{in:td-compositor}/bin/td-term\"; { [ -f \"$tdterm\" ] && [ -x \"$tdterm\" ]; } || { echo 'root tree: td-term is not packed/executable at real-root{in:td-compositor}/bin/td-term - the /bin/td-term symlink would dangle' >&2; exit 1; }; \
+     for a in @APPLICATIONS@; do \
+         [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = /bin/td-jail ] || { echo \"root tree: /bin/$a is not an application launcher pointing to /bin/td-jail - another packed /bin provider replaced it\" >&2; exit 1; }; \
+     done; \
      [ -f \"{root}/real-root{in:td-compositor}/share/terminfo/t/td-term\" ] || { echo 'root tree: the td-term terminfo entry is not packed, so /etc/terminfo resolves to a tree without it' >&2; exit 1; }; \
      tdsplan=$(\"$tds\" check -f \"$root@TD_SVC_CONF@\" 2>&1) || { echo 'td-svc check REJECTED the unit table this image ships - the boot would run a table the supervisor only partly understood. Its diagnostics:' >&2; printf '%s\\n' \"$tdsplan\" >&2; exit 1; }; \
      for u in @TD_SVC_UNITS@; do \
@@ -2866,14 +2959,14 @@ fn shape_check() -> String {
      : 'the plan identical. the_declared_edges_are_exactly_these pins the edge set on'; \
      : 'the host; this pins that td-svc itself still resolves them this way.'; \
      svcpos() { printf '%s\\n' \"$tdsplan\" | grep -n -E \"^[0-9]+\\. $1\\$\" | cut -d: -f1; }; \
-     hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); st=$(svcpos seat); nu=$(svcpos netup); wl=$(svcpos wayland); tm=$(svcpos terminal); bs=$(svcpos bootsuccess); sd=$(svcpos sshd); gr=$(svcpos greeter); \
+     hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); st=$(svcpos seat); nu=$(svcpos netup); wl=$(svcpos wayland); tm=$(svcpos terminal); jf=$(svcpos jail-fixture); je=$(svcpos jail-fixture-evidence); bs=$(svcpos bootsuccess); sd=$(svcpos sshd); gr=$(svcpos greeter); \
      [ \"$hn\" -lt \"$fb\" ] || { echo 'td-svc would not serialize hostname before td-firstboot - init ran every sysinit line to completion before the next, and td-svc starts settled units in the same pass' >&2; exit 1; }; \
      [ \"$fb\" -lt \"$rc\" ] || { echo 'td-svc would start rootcheck before td-firstboot - rootcheck asserts the identity td-firstboot mints is readable' >&2; exit 1; }; \
      [ \"$rc\" -lt \"$nu\" ] || { echo 'td-svc would start netup before rootcheck - networking must follow the read-only-root self-check' >&2; exit 1; }; \
      [ \"$nu\" -lt \"$sd\" ] || { echo 'td-svc would start sshd before netup - sshd binds loopback, which netup brings up' >&2; exit 1; }; \
      [ \"$fb\" -lt \"$sd\" ] || { echo 'td-svc would start sshd before td-firstboot - sshd is fail-closed on the host key td-firstboot mints, so it would refuse to start on every boot' >&2; exit 1; }; \
      [ \"$nu\" -lt \"$gr\" ] || { echo 'td-svc would start the greeter before netup' >&2; exit 1; }; \
-     [ \"$rc\" -lt \"$st\" ] && [ \"$st\" -lt \"$wl\" ] && [ \"$wl\" -lt \"$tm\" ] && [ \"$tm\" -lt \"$bs\" ] || { echo 'td-svc would not serialize rootcheck -> seat -> wayland -> terminal -> bootsuccess' >&2; exit 1; }; \
+     [ \"$rc\" -lt \"$st\" ] && [ \"$st\" -lt \"$wl\" ] && [ \"$wl\" -lt \"$tm\" ] && [ \"$wl\" -lt \"$jf\" ] && [ \"$jf\" -lt \"$je\" ] && [ \"$tm\" -lt \"$bs\" ] || { echo 'td-svc would not serialize rootcheck -> seat -> wayland -> terminal+jailed fixture evidence and independent bootsuccess' >&2; exit 1; }; \
      mkdir -p '{root}/pivot-probe' && cp \"$tdi\" '{root}/pivot-probe/init' || { echo 'root tree: could not build the switch_root probe NEWROOT' >&2; exit 1; }; \
      tdipiv=$(\"$tdi\" switch_root '{root}/pivot-probe' /init 2>&1) && { echo 'td-init switch_root ACCEPTED a NEWROOT that is not a mount point - the last refusal standing between a bad pivot and a panicked kernel is gone' >&2; exit 1; }; \
      case \"$tdipiv\" in *'not a mount point'*) : ;; *) echo \"td-init switch_root refused a non-mount NEWROOT for the WRONG reason, so the mount-point guard is untested: $tdipiv\" >&2; exit 1;; esac; \
@@ -2931,6 +3024,7 @@ fn shape_check() -> String {
         .replace("@TD_SH_APPLETS@", &TD_SH_APPLETS.join(" "))
         .replace("@TD_INIT_APPLETS@", &td_init_applets().join(" "))
         .replace("@TD_LOGIN_APPLETS@", &TD_LOGIN_APPLETS.join(" "))
+        .replace("@APPLICATIONS@", &application_names(&SYSTEM).join(" "))
         .replace("@TD_SVC_UNITS@", &TD_SVC_UNITS.join(" "))
         .replace("@TD_SVC_CONF@", TD_SVC_CONF)
         .replace("@TD_SVC_CONF_NAME@", td_svc_conf_etc_name())
@@ -3165,7 +3259,7 @@ pub fn recipe() -> Recipe {
         //   how every unprivileged health leg runs. See td-login/THREAT-MODEL.md.
         // td-svc: the static service supervisor that starts every real-root job.
         // td-jail: the static application boundary; its target-kernel transition probe
-        //   runs at boot even while ordinary application launch remains disabled.
+        //   and the selected fixture launch both run on every boot.
         // td-seatd/td-compositor: the static single-user UI substrate and demo client,
         // copied directly.
         .native_inputs(&[
@@ -3351,8 +3445,21 @@ mod tests {
         );
     }
 
-    /// The boot's first graphical client is the TERMINAL, and the marker the
-    /// QEMU oracle waits for is the one THAT client prints.
+    #[test]
+    fn generated_service_comments_begin_at_column_zero() {
+        let services = build_td_svc_conf();
+        for line in services
+            .lines()
+            .filter(|line| line.trim_start().starts_with('#'))
+        {
+            assert!(
+                line.starts_with('#'),
+                "generated service comment carries indentation: {line:?}"
+            );
+        }
+    }
+
+    /// The terminal is deployment health; the packaged application is separate evidence.
     ///
     /// The two live in different files — the unit table here, the oracle in
     /// `td-recipe-eval` — and nothing but this ties them. Point the unit back
@@ -3385,23 +3492,154 @@ mod tests {
             Some("terminal")
         );
         assert!(unit_after("bootsuccess").contains(&"terminal".to_string()));
+        assert!(!unit_after("bootsuccess").contains(&"jail-fixture".to_string()));
         // Which marker the ORACLE selects cannot be seen from this crate's
         // lib — it is a `const` in the `td-recipe-eval` bin — so the pin for
         // that lives beside it, in `qemu_boot.rs`'s own tests.
-        // And nothing STARTS the demo any more. Stated as the property rather
-        // than as one spelling of it: the demo's name may appear in a unit
-        // ONLY as the launcher client the compositor spawns on request, which
-        // is not a service. Anchoring on `-c '` instead would let a unit using
-        // double quotes, or no `su` wrapper, walk straight past.
+        let fixture = unit_key("jail-fixture", "exec").unwrap_or_default();
+        assert!(fixture.contains(&format!(
+            "/bin/td-login exec-as tester -- /bin/{APPLICATION_FIXTURE_NAME} run "
+        )));
+        assert_eq!(
+            unit_key("jail-fixture", "requires").as_deref(),
+            Some("wayland")
+        );
+        let fixture_ready = unit_key("jail-fixture", "ready").unwrap_or_default();
+        let published = fixture
+            .split("--ready-socket ")
+            .nth(1)
+            .unwrap_or_default()
+            .split(['\'', ' '])
+            .next()
+            .unwrap_or_default();
+        let dialled = fixture_ready
+            .split("probe ")
+            .nth(1)
+            .unwrap_or_default()
+            .split(['\'', ' '])
+            .next()
+            .unwrap_or_default();
+        assert_eq!(
+            published,
+            format!("/run/user/1000/{APPLICATION_RUNTIME_ROOT}/ready")
+        );
+        assert_eq!(
+            dialled,
+            format!(
+                "/run/user/1000/{APPLICATION_RUNTIME_ROOT}/{APPLICATION_FIXTURE_NAME}/ready"
+            )
+        );
+        assert_eq!(
+            unit_key("jail-fixture", "ready-timeout"),
+            Some(APPLICATION_FIXTURE_READY_TIMEOUT_SECS.to_string())
+        );
+        assert_eq!(
+            APPLICATION_FIXTURE_EVIDENCE_WAIT_ITERATIONS,
+            APPLICATION_FIXTURE_READY_TIMEOUT_SECS * APPLICATION_FIXTURE_READY_ATTEMPTS
+                + APPLICATION_FIXTURE_RETRY_MARGIN_SECS
+        );
+        assert_eq!(
+            APPLICATION_FIXTURE_GREETER_WAIT_ITERATIONS,
+            APPLICATION_FIXTURE_READY_TIMEOUT_SECS
+                + APPLICATION_FIXTURE_EVIDENCE_WAIT_ITERATIONS
+        );
+        assert!(
+            u64::from(APPLICATION_FIXTURE_GREETER_WAIT_ITERATIONS)
+                <= crate::ladder::DEFAULT_BOOT_TIMEOUT_SECS
+                    .saturating_sub(crate::ladder::QEMU_GUEST_WAIT_MARGIN_SECS)
+                    .saturating_sub(u64::from(BOOT_SUCCESS_ITERATION_BUDGET_SECS)),
+            "the default guest wait must preserve the complete fixture evidence window"
+        );
+        let evidence = unit_key("jail-fixture-evidence", "exec").unwrap_or_default();
+        assert!(evidence.starts_with(&format!(
+            "/bin/sh -c 'n=0; while [ \"$n\" -lt {APPLICATION_FIXTURE_EVIDENCE_WAIT_ITERATIONS} ]; do if /bin/td-login exec-as tester -- /bin/td-ui-demo probe /run/user/1000/{APPLICATION_RUNTIME_ROOT}/{APPLICATION_FIXTURE_NAME}/ready >/dev/null 2>&1; then "
+        )));
+        assert!(evidence.contains(&format!(
+            "/bin/rm -f {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} {APPLICATION_FIXTURE_COMPLETION_TMP_PATH}"
+        )));
+        let evidence_write = evidence
+            .find(&format!(
+                "{APPLICATION_FIXTURE_EVIDENCE} > {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH}"
+            ))
+            .expect("fixture evidence temporary write missing");
+        let evidence_chmod = evidence
+            .find(&format!(
+                "/bin/td-util chmod 0644 {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH}"
+            ))
+            .expect("fixture evidence chmod missing");
+        let evidence_marker = evidence
+            .find(&format!("/bin/echo {TD_JAIL_FIXTURE_BOOT_MARKER}"))
+            .expect("fixture evidence marker missing");
+        let evidence_publish = evidence
+            .find(&format!(
+                "/bin/mv {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} {APPLICATION_FIXTURE_EVIDENCE_PATH}"
+            ))
+            .expect("fixture evidence publication missing");
+        let completion_write = evidence
+            .find(&format!(
+                "{APPLICATION_FIXTURE_COMPLETION} > {APPLICATION_FIXTURE_COMPLETION_TMP_PATH}"
+            ))
+            .expect("fixture completion temporary write missing");
+        let completion_chmod = evidence
+            .find(&format!(
+                "/bin/td-util chmod 0644 {APPLICATION_FIXTURE_COMPLETION_TMP_PATH}"
+            ))
+            .expect("fixture completion chmod missing");
+        let completion_publish = evidence
+            .find(&format!(
+                "/bin/mv {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} {APPLICATION_FIXTURE_COMPLETION_PATH}"
+            ))
+            .expect("fixture completion publication missing");
+        assert!(
+            evidence_write < evidence_chmod
+                && evidence_chmod < evidence_publish
+                && evidence_publish < evidence_marker
+                && evidence_marker < completion_write
+                && completion_write < completion_chmod
+                && completion_chmod < completion_publish,
+            "evidence, marker and completion must have one exact order"
+        );
+        assert!(evidence.ends_with(&format!(
+            "&& /bin/mv {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} {APPLICATION_FIXTURE_COMPLETION_PATH} && exit 0; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'"
+        )));
+        assert_eq!(
+            unit_key("jail-fixture-evidence", "type").as_deref(),
+            Some("daemon")
+        );
+        assert_eq!(
+            unit_key("jail-fixture-evidence", "restart").as_deref(),
+            Some("never")
+        );
+        assert!(
+            unit_after("jail-fixture-evidence").contains(&"jail-fixture".to_string())
+        );
+        assert!(unit_key("jail-fixture-evidence", "requires").is_none());
+
+        // td-ui-demo appears in service definitions only as the exact host-side
+        // readiness probe for the jailed fixture.
         for (unit, keys) in parse_td_svc_conf() {
             for (key, value) in keys {
-                for occurrence in value.match_indices("/bin/td-ui-demo") {
-                    let (at, _) = occurrence;
-                    let before = value.get(..at).unwrap_or_default();
+                for (at, _) in value.match_indices("/bin/td-ui-demo") {
+                    let after = value
+                        .get(at + "/bin/td-ui-demo".len()..)
+                        .unwrap_or_default();
+                    let expected_ready = format!(
+                        " probe /run/user/1000/{APPLICATION_RUNTIME_ROOT}/{APPLICATION_FIXTURE_NAME}/ready"
+                    );
+                    let readiness =
+                        unit == "jail-fixture" && key == "ready" && after == expected_ready;
+                    let expected_evidence = format!(
+                        " probe /run/user/1000/{APPLICATION_RUNTIME_ROOT}/{APPLICATION_FIXTURE_NAME}/ready >/dev/null 2>&1; then /bin/rm -f {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} && /bin/td-util printf \"%s\\n\" {APPLICATION_FIXTURE_EVIDENCE} > {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} && /bin/td-util chmod 0644 {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} && /bin/mv {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} {APPLICATION_FIXTURE_EVIDENCE_PATH} && /bin/echo {TD_JAIL_FIXTURE_BOOT_MARKER} && /bin/td-util printf \"%s\\n\" {APPLICATION_FIXTURE_COMPLETION} > {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} && /bin/td-util chmod 0644 {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} && /bin/mv {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} {APPLICATION_FIXTURE_COMPLETION_PATH} && exit 0; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'"
+                    );
+                    let evidence = unit == "jail-fixture-evidence"
+                        && key == "exec"
+                        && value.starts_with(&format!(
+                            "/bin/sh -c 'n=0; while [ \"$n\" -lt {APPLICATION_FIXTURE_EVIDENCE_WAIT_ITERATIONS} ]; do if /bin/td-login exec-as tester -- /bin/td-ui-demo"
+                        ))
+                        && after == expected_evidence;
                     assert!(
-                        before.ends_with("--launcher-client "),
-                        "unit [{unit}] {key}= names the demo somewhere other than \
-                         as the launcher client: {value}"
+                        readiness || evidence,
+                        "unit [{unit}] {key}= gives td-ui-demo an unreviewed role: {value}"
                     );
                 }
             }
@@ -3462,19 +3700,22 @@ mod tests {
                 "{flag} passes {path}, which is not a /bin name"
             );
             let link = format!("{{root}}/real-root{path}");
-            assert!(
-                steps.iter().any(|step| matches!(
-                    step,
-                    Step::Symlink { link: at, target } if at == &link
-                        && target == &format!("{{in:td-compositor}}/bin/{program}")
-                )),
-                "{flag} passes {path}, but nothing stages it"
-            );
+            let expected_target = match *flag {
+                "--launcher-client" => "/bin/td-jail",
+                "--terminal-client" => "{in:td-compositor}/bin/td-term",
+                _ => "",
+            };
+            assert!(steps.iter().any(|step| matches!(
+                step,
+                Step::Symlink { link: at, target }
+                    if at == &link && target == expected_target
+            )), "{flag} passes {path}, but nothing stages it through {expected_target}");
         }
         // Order-independent, because two flags on one command line have none:
         // what is pinned is which program each NAMES.
+        let launcher_path = format!("/bin/{APPLICATION_FIXTURE_NAME}");
         for expected in [
-            ("--launcher-client", "/bin/td-ui-demo"),
+            ("--launcher-client", launcher_path.as_str()),
             ("--terminal-client", "/bin/td-term"),
         ] {
             assert!(
@@ -3488,15 +3729,18 @@ mod tests {
 
     #[test]
     fn wayland_service_supplies_both_explicit_client_paths() {
+        let expected = format!(
+            "/bin/su -s /bin/sh tester -c '/bin/td-compositor run \
+             --framebuffer /dev/fb0 --input /dev/input \
+             --socket /run/user/1000/wayland-0 \
+             --launcher-client /bin/{APPLICATION_FIXTURE_NAME} \
+             --launcher-application {APPLICATION_FIXTURE_NAME} \
+             --launcher-runtime /run/user/1000/{APPLICATION_RUNTIME_ROOT} \
+             --terminal-client /bin/td-term'"
+        );
         assert_eq!(
             unit_key("wayland", "exec").as_deref(),
-            Some(
-                "/bin/su -s /bin/sh tester -c '/bin/td-compositor run \
-                 --framebuffer /dev/fb0 --input /dev/input \
-                 --socket /run/user/1000/wayland-0 \
-                 --launcher-client /bin/td-ui-demo \
-                 --terminal-client /bin/td-term'"
-            )
+            Some(expected.as_str())
         );
     }
 
@@ -3681,6 +3925,8 @@ mod tests {
             ("netup", vec!["rootcheck"]),
             ("wayland", vec!["seat"]),
             ("terminal", vec!["wayland"]),
+            ("jail-fixture", vec!["wayland"]),
+            ("jail-fixture-evidence", vec!["jail-fixture"]),
             (
                 "bootsuccess",
                 sysinit
@@ -3750,8 +3996,8 @@ mod tests {
         assert_eq!(
             unit_key("bootsuccess", "requires").as_deref(),
             Some("terminal"),
-            "deployment health must be skipped when the graphical client failed; \
-             after= alone settles on either success or failure"
+            "deployment health must be skipped when the terminal failed, while the \
+             mutable-state fixture remains independent QEMU evidence"
         );
     }
 
@@ -3800,6 +4046,16 @@ mod tests {
             Some("always"),
             "the graphical client is supervised and restartable"
         );
+        assert_eq!(
+            unit_key("jail-fixture", "requires").as_deref(),
+            Some("wayland"),
+            "the packaged fixture must not start without its compositor"
+        );
+        assert_eq!(
+            unit_key("jail-fixture", "restart").as_deref(),
+            Some("always"),
+            "the packaged fixture is supervised and restartable"
+        );
     }
 
     #[test]
@@ -3818,10 +4074,18 @@ mod tests {
             "the image needs one runtime-closure step"
         );
         let (roots, dest) = closures.first().expect("one runtime closure");
+        let expected_roots = vec![
+            "{in:uutils}".to_string(),
+            "{in:ripgrep}".to_string(),
+            "{in:fd}".to_string(),
+            "{in:sshd}".to_string(),
+            "{payload:empty-runtime}".to_string(),
+            format!("{{payload:{APPLICATION_FIXTURE_NAME}}}"),
+        ];
         assert_eq!(
             roots.as_slice(),
-            ["{in:uutils}", "{in:ripgrep}", "{in:fd}", "{in:sshd}"],
-            "the dynamically linked shipped programs are the explicit runtime roots"
+            expected_roots.as_slice(),
+            "the shipped programs and application packages are explicit runtime roots"
         );
         assert_eq!(dest.as_str(), "{root}/real-root");
         assert!(
@@ -3953,6 +4217,13 @@ mod tests {
              td-seatd, XDG_RUNTIME_DIR, and WAYLAND_DISPLAY all bind tester 1000:1000; \
              make those generated before changing the graphical account"
         );
+        assert_eq!(
+            unit_key("seat", "exec"),
+            Some(format!(
+                "/bin/td-seatd assign --uid {UI_UID} --gid {UI_GID}"
+            )),
+            "the seat service must create the application runtime for the compiled identity"
+        );
         // td-login refuses `login -f` for a LOCKED account — stricter than busybox, whose
         // `-f` skips the account database entirely (td-login/THREAT-MODEL.md section 3). So a
         // `passwordless: false` auto-login user is an image that boots to a getty respawn
@@ -4020,7 +4291,8 @@ mod tests {
         );
         for application in SYSTEM.applications {
             assert!(
-                td_engine::application::validate_application_name(application.name).is_ok(),
+                td_engine::application::validate_application_identity(application.name)
+                    .is_ok(),
                 "shipped application name {:?} is not a valid launcher key",
                 application.name
             );
@@ -4232,13 +4504,6 @@ mod tests {
     /// is not which static binary serves them but that uutils never does.
     /// Every /bin farm, name-tagged. ONE table: two tests consume it, and an eighth
     /// farm added to only one of them would leave the other silently narrower.
-    fn application_names(sys: &SystemDef) -> Vec<&'static str> {
-        sys.applications
-            .iter()
-            .map(|application| application.name)
-            .collect()
-    }
-
     fn bin_farms<'a>(
         td_init: &'a [&'static str],
         applications: &'a [&'static str],
@@ -4314,14 +4579,18 @@ mod tests {
                     && link == "{root}/real-root/bin/fixture"
         )));
 
-        assert!(
-            SYSTEM.applications.is_empty(),
-            "no application may be selected before td-jail confinement is complete"
+        assert_eq!(SYSTEM.applications.len(), 1);
+        assert_eq!(
+            SYSTEM.applications.first().map(|app| app.name),
+            Some(APPLICATION_FIXTURE_NAME)
         );
         let system_recipe = recipe();
-        assert!(
-            system_recipe.payload_inputs.is_none(),
-            "the empty application selection must not create a nominal payload channel"
+        assert_eq!(
+            system_recipe.payload_inputs,
+            Some(vec![
+                "empty-runtime".into(),
+                APPLICATION_FIXTURE_NAME.into()
+            ])
         );
     }
 
@@ -4940,6 +5209,14 @@ mod tests {
             applications: COLLIDING,
         };
         assert_eq!(application_name_collisions(&fixture), vec!["rg", "td-netd"]);
+        let shape = shape_check();
+        assert!(shape.contains(&format!(
+            "for a in {}; do",
+            application_names(&SYSTEM).join(" ")
+        )));
+        assert!(shape.contains(
+            "[ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = /bin/td-jail ]"
+        ));
     }
 
     /// The mirror of the busybox-multiplexer ban, for the form this commit actually
@@ -5788,6 +6065,12 @@ mod tests {
                 init.contains(&path),
                 "stage-1 init must create state directory {path} before switch_root"
             );
+            if user.home != "/root" {
+                assert!(
+                    init.contains(&format!("chmod 0700 {path}")),
+                    "stage-1 init must make application home {path} private"
+                );
+            }
         }
         assert!(
             init.contains("umask 077") && init.contains("mkdir -p /sysroot/var/root"),
@@ -5935,6 +6218,7 @@ mod tests {
             "the write marker must require a fresh path and a successful sync"
         );
         let bootsuccess = build_bootsuccess(&SYSTEM);
+        let services = build_td_svc_conf();
         let bootfail = build_bootfail();
         let profile = build_profile(&SYSTEM);
         assert!(
@@ -5981,6 +6265,28 @@ mod tests {
                 && bootsuccess.contains("while [ \"$n\" -lt \"$wait\" ]")
                 && profile.contains("/run/td-boot-success-ok"),
             "the root-owned target must probe unprivileged runtime health, retry, and acknowledge the exact deployment"
+        );
+        assert!(
+            services.contains(&format!(
+                "/bin/td-ui-demo probe /run/user/{UI_UID}/{APPLICATION_RUNTIME_ROOT}/{APPLICATION_FIXTURE_NAME}/ready >/dev/null 2>&1"
+            )) && services.contains(&format!(
+                "{APPLICATION_FIXTURE_EVIDENCE} > {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH}"
+            )) && services.contains(&format!(
+                "/bin/echo {TD_JAIL_FIXTURE_BOOT_MARKER}"
+            )) && services.contains(&format!(
+                "/bin/mv {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} {APPLICATION_FIXTURE_EVIDENCE_PATH}"
+            )) && services.contains(&format!(
+                "{APPLICATION_FIXTURE_COMPLETION} > {APPLICATION_FIXTURE_COMPLETION_TMP_PATH}"
+            )) && services.contains(&format!(
+                "/bin/mv {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} {APPLICATION_FIXTURE_COMPLETION_PATH}"
+            )) && !bootsuccess.contains(TD_JAIL_FIXTURE_BOOT_MARKER)
+                && profile.contains(&format!(
+                    "fixture_complete=$(/bin/td-util cat {APPLICATION_FIXTURE_COMPLETION_PATH} 2>/dev/null)"
+                ))
+                && profile.contains(&format!(
+                    "[ \"$status\" = td-boot-success-v1 ] && [ \"$fixture\" = {APPLICATION_FIXTURE_EVIDENCE} ] && [ \"$fixture_complete\" = {APPLICATION_FIXTURE_COMPLETION} ] && break"
+                )),
+            "fixture evidence must be exact without controlling deployment health"
         );
         assert!(
             bootsuccess.find("/bin/cat /etc/os-release").unwrap()
@@ -6286,6 +6592,10 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         assert!(
             profile.contains(AUTOTEST_CMDLINE_TOKEN)
                 && profile.contains("set -f; wait=0")
+                && profile.contains("fixture_wait=0")
+                && profile.contains(&format!(
+                    "[ \"$fixture_wait\" -ge {APPLICATION_FIXTURE_GREETER_WAIT_ITERATIONS} ] && break"
+                ))
                 && profile.contains("exit"),
             "profile must exit on the autotest cmdline token so the headless boot powers off"
         );
@@ -7162,6 +7472,29 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
                 && !bootsuccess.contains("unexpected output: $p"),
             "a failing target probe must not reflect a success marker into console evidence"
         );
+        assert!(
+            !bootsuccess.contains(TD_JAIL_FIXTURE_BOOT_MARKER),
+            "mutable application state must not control deployment boot success"
+        );
+        let services = build_td_svc_conf();
+        let evidence_probe = services
+            .find(&format!(
+                "/bin/td-ui-demo probe /run/user/1000/{APPLICATION_RUNTIME_ROOT}/{APPLICATION_FIXTURE_NAME}/ready >/dev/null 2>&1"
+            ))
+            .expect("jailed fixture evidence probe missing");
+        let fixture = services
+            .find(&format!("/bin/echo {TD_JAIL_FIXTURE_BOOT_MARKER}"))
+            .expect("jailed fixture evidence marker missing");
+        let evidence_publish = services
+            .find(&format!(
+                "/bin/mv {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} {APPLICATION_FIXTURE_EVIDENCE_PATH}"
+            ))
+            .expect("jailed fixture evidence publication missing");
+        let completion_publish = services
+            .find(&format!(
+                "/bin/mv {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} {APPLICATION_FIXTURE_COMPLETION_PATH}"
+            ))
+            .expect("jailed fixture completion publication missing");
         let success = bootsuccess
             .find(&format!("echo {SYSTEM_BOOT_SUCCESS_MARKER}"))
             .expect("boot success marker missing");
@@ -7170,9 +7503,12 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
                 && probe < seccomp
                 && seccomp < gate
                 && gate < seccomp_gate
-                && seccomp_gate < success,
+                && seccomp_gate < success
+                && evidence_probe < evidence_publish
+                && evidence_publish < fixture
+                && fixture < completion_publish,
             "target transition must close a leaked descriptor, run the optional target filter \
-             oracle, and gate boot success"
+             oracle, gate boot success, and keep fixture evidence independent"
         );
     }
 
@@ -7620,11 +7956,9 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
              absent TD-LOGIN-RUN-OK names the credential switch rather than some component \
              upstream of it"
         );
-        // `exec-as` is otherwise never run on the image: no unit uses it yet and no other
-        // probe names it, so without this leg it would ship with only `parse` and
-        // `session_for` covered. Its ROOT placement is already pinned by the whole-leg
-        // assertion above — which spells the text either side of it — so nothing here
-        // repeats that.
+        // The fixture uses `exec-as`, while this independent health leg verifies
+        // its credential readback. Its ROOT placement is already pinned by the
+        // whole-leg assertion above, so nothing here repeats that.
         let exec_as = td_login_exec_as_probe(&SYSTEM);
         assert!(
             exec_as.contains("/bin/td-login exec-as tester -- /bin/td-login verify-credentials"),

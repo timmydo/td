@@ -1,10 +1,15 @@
-use crate::{seccomp, sys};
-use std::collections::BTreeSet;
+use crate::{
+    authority::{self, LaunchPlan},
+    seccomp, sys,
+};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::IntoRawFd;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -12,6 +17,10 @@ use std::time::{Duration, Instant};
 pub const PROBE_ARG: &str = "--probe-transition";
 const FILTER_ARG: &str = "--internal-write-seccomp-filter";
 const STAGE2_ARG: &str = "--internal-stage-2";
+const STAGE2_PROBE_ARG: &str = "--probe";
+const STAGE2_LAUNCH_ARG: &str = "--launch";
+const STAGE2_ENVIRONMENT_ARG: &str = "--environment";
+const STAGE2_ARGUMENTS_ARG: &str = "--arguments";
 const REAPER_CHILD_ARG: &str = "--internal-reaper-child";
 const REAPER_ORPHAN_ARG: &str = "--internal-reaper-orphan";
 pub const TRANSITION_MARKER: &str = "TD-JAIL-TRANSITION-OK";
@@ -30,6 +39,7 @@ const REAPER_PROBE_PATH: &str = "/tmp/td-jail-reaper-probe";
 const REAPER_TIMEOUT: Duration = Duration::from_secs(2);
 const REAPER_POLL: Duration = Duration::from_millis(5);
 const STAGE2_OUTPUT_LIMIT: usize = 4096;
+const WRITE_PROBE_PREFIX: &str = ".td-jail-write-probe-";
 
 const DEVICE_NODES: &[(&str, u64, u64)] = &[
     ("null", 1, 3),
@@ -101,9 +111,20 @@ pub enum Mode {
     Stage2 {
         token: [u8; TOKEN_LEN],
         identity: Identity,
+        action: Stage2Action,
     },
     ReaperChild,
     ReaperOrphan,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum Stage2Action {
+    Probe,
+    Launch {
+        entry: String,
+        environment: Vec<(OsString, OsString)>,
+        arguments: Vec<OsString>,
+    },
 }
 
 pub fn parse_mode<I>(mut args: I) -> io::Result<Mode>
@@ -127,12 +148,11 @@ where
         let encoded = args.next().ok_or_else(usage_error)?;
         let uid = parse_id(args.next(), "uid")?;
         let gid = parse_id(args.next(), "gid")?;
-        if args.next().is_some() {
-            return Err(usage_error());
-        }
+        let action = parse_stage2_action(&mut args, uid)?;
         return Ok(Mode::Stage2 {
             token: decode_token(&encoded)?,
             identity: Identity { uid, gid },
+            action,
         });
     }
     if mode == REAPER_CHILD_ARG {
@@ -146,6 +166,50 @@ where
             return Err(usage_error());
         }
         return Ok(Mode::ReaperOrphan);
+    }
+    Err(usage_error())
+}
+
+fn parse_stage2_action<I>(args: &mut I, uid: u32) -> io::Result<Stage2Action>
+where
+    I: Iterator<Item = OsString>,
+{
+    let action = args.next().ok_or_else(usage_error)?;
+    if action == STAGE2_PROBE_ARG {
+        if args.next().is_some() {
+            return Err(usage_error());
+        }
+        return Ok(Stage2Action::Probe);
+    }
+    if action == STAGE2_LAUNCH_ARG {
+        let entry = args
+            .next()
+            .ok_or_else(usage_error)?
+            .into_string()
+            .map_err(|_| usage_error())?;
+        authority::validate_entry(&entry)?;
+        if args.next().as_deref() != Some(STAGE2_ENVIRONMENT_ARG.as_ref()) {
+            return Err(usage_error());
+        }
+        let count = parse_count(args.next(), "environment count")?;
+        if count > authority::MAX_ENVIRONMENT_ENTRIES {
+            return Err(usage_error());
+        }
+        let mut environment = Vec::with_capacity(count);
+        for _ in 0..count {
+            let key = args.next().ok_or_else(usage_error)?;
+            let value = args.next().ok_or_else(usage_error)?;
+            environment.push((key, value));
+        }
+        authority::validate_environment_list(&environment, uid)?;
+        if args.next().as_deref() != Some(STAGE2_ARGUMENTS_ARG.as_ref()) {
+            return Err(usage_error());
+        }
+        return Ok(Stage2Action::Launch {
+            entry,
+            environment,
+            arguments: authority::collect_arguments(args)?,
+        });
     }
     Err(usage_error())
 }
@@ -169,10 +233,56 @@ fn parse_id(value: Option<OsString>, name: &str) -> io::Result<u32> {
         })
 }
 
+fn stage2_launch_arguments(
+    token: &[u8; TOKEN_LEN],
+    identity: Identity,
+    entry: &str,
+    environment: &[(OsString, OsString)],
+    arguments: &[OsString],
+) -> Vec<OsString> {
+    let mut stage2 = Vec::with_capacity(
+        9usize
+            .saturating_add(environment.len().saturating_mul(2))
+            .saturating_add(arguments.len()),
+    );
+    stage2.extend([
+        OsString::from(STAGE2_ARG),
+        OsString::from(encode_token(token)),
+        OsString::from(identity.uid.to_string()),
+        OsString::from(identity.gid.to_string()),
+        OsString::from(STAGE2_LAUNCH_ARG),
+        OsString::from(entry),
+        OsString::from(STAGE2_ENVIRONMENT_ARG),
+        OsString::from(environment.len().to_string()),
+    ]);
+    stage2.extend(
+        environment
+            .iter()
+            .flat_map(|(key, value)| [key.clone(), value.clone()]),
+    );
+    stage2.push(OsString::from(STAGE2_ARGUMENTS_ARG));
+    stage2.extend(arguments.iter().cloned());
+    stage2
+}
+
+fn parse_count(value: Option<OsString>, name: &str) -> io::Result<usize> {
+    value
+        .ok_or_else(usage_error)?
+        .to_str()
+        .ok_or_else(usage_error)?
+        .parse()
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid stage-2 {name}: {e}"),
+            )
+        })
+}
+
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "application launch is disabled until td-jail confinement is complete; only --probe-transition is available",
+        "bare td-jail accepts only --probe-transition; installed applications are selected by argv[0]",
     )
 }
 
@@ -411,8 +521,11 @@ fn require_only_stdio_descriptors() -> io::Result<()> {
 }
 
 fn create_dir(path: &str, mode: u32) -> io::Result<()> {
-    fs::create_dir(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+    fs::create_dir(path)
+        .map_err(|error| io::Error::new(error.kind(), format!("create {path}: {error}")))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|error| {
+        io::Error::new(error.kind(), format!("set mode {mode:#o} on {path}: {error}"))
+    })
 }
 
 fn mount_tmpfs(path: &str, flags: usize, data: &str) -> io::Result<()> {
@@ -424,11 +537,35 @@ fn mount_tmpfs(path: &str, flags: usize, data: &str) -> io::Result<()> {
 }
 
 fn mount_bind_read_only(source: &str, target: &str) -> io::Result<()> {
+    mount_bind(Path::new(source), target)?;
+    remount_read_only(target, sys::MS_BIND | sys::MS_NOSUID | sys::MS_NOEXEC)
+}
+
+fn mount_application_tree(source: &Path, target: &str) -> io::Result<()> {
+    mount_bind(source, target)?;
+    remount_read_only(target, sys::MS_BIND | sys::MS_NOSUID | sys::MS_NODEV)
+}
+
+fn mount_private_bind(source: &Path, target: &str, read_only: bool) -> io::Result<()> {
+    mount_bind(source, target)?;
+    let target_c = cstring(target)?;
+    let mut flags =
+        sys::MS_REMOUNT | sys::MS_BIND | sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC;
+    if read_only {
+        flags |= sys::MS_RDONLY;
+    }
+    sys::mount(None, &target_c, None, flags, None)
+        .map_err(|e| io::Error::other(format!("remount {target} as a private bind: {e}")))
+}
+
+fn mount_bind(source: &Path, target: &str) -> io::Result<()> {
+    let source = source.to_str().ok_or_else(|| {
+        io::Error::other(format!("mount source is not UTF-8: {}", source.display()))
+    })?;
     let source_c = cstring(source)?;
     let target_c = cstring(target)?;
     sys::mount(Some(&source_c), &target_c, None, sys::MS_BIND, None)
-        .map_err(|e| io::Error::other(format!("bind {source} at {target}: {e}")))?;
-    remount_read_only(target, sys::MS_BIND | sys::MS_NOSUID | sys::MS_NOEXEC)
+        .map_err(|e| io::Error::other(format!("bind {source} at {target}: {e}")))
 }
 
 fn remount_read_only(path: &str, flags: usize) -> io::Result<()> {
@@ -443,7 +580,11 @@ fn remount_read_only(path: &str, flags: usize) -> io::Result<()> {
     .map_err(|e| io::Error::other(format!("remount {path} read-only: {e}")))
 }
 
-fn prepare_mount_plan(identity: Identity, executable: &Path) -> io::Result<()> {
+fn prepare_mount_plan(
+    identity: Identity,
+    executable: &Path,
+    application: Option<&LaunchPlan>,
+) -> io::Result<()> {
     let root = cstring("/")?;
     sys::mount(None, &root, None, sys::MS_REC | sys::MS_PRIVATE, None)
         .map_err(|e| io::Error::other(format!("make mount tree private: {e}")))?;
@@ -466,6 +607,17 @@ fn prepare_mount_plan(identity: Identity, executable: &Path) -> io::Result<()> {
         create_dir(&path, mode)?;
     }
     create_dir(&format!("{NEW_ROOT}/var/tmp"), 0o1777)?;
+
+    if application.is_some() {
+        for (path, mode) in [
+            (format!("{NEW_ROOT}/app"), 0o555),
+            (format!("{NEW_ROOT}/usr"), 0o555),
+            (format!("{NEW_ROOT}/run"), 0o755),
+            (format!("{NEW_ROOT}/home"), 0o755),
+        ] {
+            create_dir(&path, mode)?;
+        }
+    }
 
     let dev = format!("{NEW_ROOT}/dev");
     mount_tmpfs(&dev, sys::MS_NOSUID | sys::MS_NOEXEC, "mode=0755")?;
@@ -508,37 +660,101 @@ fn prepare_mount_plan(identity: Identity, executable: &Path) -> io::Result<()> {
 
     mount_tmpfs(
         &format!("{NEW_ROOT}/tmp"),
-        sys::MS_NOSUID | sys::MS_NODEV,
-        "mode=1777",
+        sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC,
+        "mode=1777,size=268435456",
     )?;
     mount_tmpfs(
         &format!("{NEW_ROOT}/var/tmp"),
-        sys::MS_NOSUID | sys::MS_NODEV,
-        "mode=1777",
+        sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC,
+        "mode=1777,size=268435456",
     )?;
-    install_reaper_probe(executable)?;
+    if let Some(application) = application {
+        let run = format!("{NEW_ROOT}/run");
+        mount_tmpfs(
+            &run,
+            sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC,
+            "mode=0755,size=67108864",
+        )?;
+        create_dir(&format!("{run}/user"), 0o755)?;
+        let runtime = format!("{run}/user/{}", identity.uid);
+        create_dir(&runtime, 0o700)?;
+        let application_runtime = format!("{runtime}/{}", crate::authority::RUNTIME_ROOT_NAME);
+        create_dir(&application_runtime, 0o700)?;
+        let wayland = format!("{runtime}/wayland-0");
+        let listener = UnixListener::bind(&wayland)
+            .map_err(|e| io::Error::other(format!("create Wayland bind target: {e}")))?;
+        drop(listener);
+
+        create_dir(&format!("{NEW_ROOT}/home/td"), 0o700)?;
+        mount_application_tree(&application.package_files, &format!("{NEW_ROOT}/app"))?;
+        mount_application_tree(&application.runtime_files, &format!("{NEW_ROOT}/usr"))?;
+        mount_private_bind(
+            &application.state.home,
+            &format!("{NEW_ROOT}/home/td"),
+            false,
+        )?;
+        for (source, target) in [
+            (&application.state.config, ".config"),
+            (&application.state.cache, ".cache"),
+            (&application.state.data, ".local/share"),
+            (&application.state.local_state, ".local/state"),
+        ] {
+            mount_private_bind(source, &format!("{NEW_ROOT}/home/td/{target}"), false)?;
+        }
+        mount_private_bind(&application.state.runtime, &application_runtime, false)?;
+        mount_private_bind(&application.wayland_socket, &wayland, true)?;
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+        for (source, target) in [
+            (application.package_files.as_path(), format!("{NEW_ROOT}/app")),
+            (application.runtime_files.as_path(), format!("{NEW_ROOT}/usr")),
+            (application.state.home.as_path(), format!("{NEW_ROOT}/home/td")),
+            (
+                application.state.config.as_path(),
+                format!("{NEW_ROOT}/home/td/.config"),
+            ),
+            (
+                application.state.cache.as_path(),
+                format!("{NEW_ROOT}/home/td/.cache"),
+            ),
+            (
+                application.state.data.as_path(),
+                format!("{NEW_ROOT}/home/td/.local/share"),
+            ),
+            (
+                application.state.local_state.as_path(),
+                format!("{NEW_ROOT}/home/td/.local/state"),
+            ),
+            (application.state.runtime.as_path(), application_runtime),
+            (application.wayland_socket.as_path(), wayland),
+        ] {
+            require_bind_source(&mountinfo, source, Path::new(&target))?;
+        }
+    }
+    if application.is_none() {
+        mount_reaper_probe(executable)?;
+    }
     remount_read_only(&dev, sys::MS_NOSUID | sys::MS_NOEXEC)
 }
 
-fn install_reaper_probe(executable: &Path) -> io::Result<()> {
+fn mount_reaper_probe(executable: &Path) -> io::Result<()> {
     let target = format!("{NEW_ROOT}{REAPER_PROBE_PATH}");
     if fs::symlink_metadata(&target).is_ok() {
         return Err(io::Error::other("fresh reaper-probe path already exists"));
     }
-    let expected_len = fs::metadata(executable)?.len();
-    let copied = fs::copy(executable, &target)?;
-    fs::set_permissions(&target, fs::Permissions::from_mode(0o500))?;
+    drop(OpenOptions::new().write(true).create_new(true).open(&target)?);
+    mount_bind(executable, &target)?;
+    remount_read_only(
+        &target,
+        sys::MS_BIND | sys::MS_NOSUID | sys::MS_NODEV,
+    )?;
     let metadata = fs::metadata(&target)?;
-    if copied != expected_len
-        || metadata.len() != expected_len
-        || !metadata.file_type().is_file()
-        || metadata.mode() & 0o7777 != 0o500
-    {
+    if !metadata.file_type().is_file() || metadata.mode() & 0o111 == 0 {
         return Err(io::Error::other(
-            "reaper-probe copy does not match the current executable",
+            "reaper-probe mount is not an executable regular file",
         ));
     }
-    Ok(())
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    require_bind_source(&mountinfo, executable, Path::new(&target))
 }
 
 fn last_capability() -> io::Result<u32> {
@@ -929,19 +1145,231 @@ fn require_mount_super_option(mountinfo: &str, target: &str, required: &str) -> 
     )))
 }
 
-fn require_writable_tmp(path: &str) -> io::Result<()> {
-    let probe = format!("{path}/td-jail-write-probe");
-    fs::write(&probe, b"ok")?;
-    fs::remove_file(probe)
+#[derive(Debug, Eq, PartialEq)]
+struct MountIdentity {
+    device: String,
+    root: PathBuf,
 }
 
-fn require_mount_plan() -> io::Result<()> {
+#[derive(Clone, Debug)]
+struct MountRow {
+    id: u64,
+    parent: u64,
+    device: String,
+    root: PathBuf,
+    mountpoint: PathBuf,
+}
+
+fn root_mount_row(rows: &[MountRow]) -> Option<MountRow> {
+    for row in rows.iter().rev() {
+        if row.mountpoint == Path::new("/") {
+            return Some(row.clone());
+        }
+    }
+    None
+}
+
+fn child_mount_row(rows: &[MountRow], parent: u64) -> Option<MountRow> {
+    for row in rows.iter().rev() {
+        if row.parent == parent {
+            return Some(row.clone());
+        }
+    }
+    None
+}
+
+fn decode_mountinfo_path(field: &str) -> io::Result<PathBuf> {
+    let mut decoded = Vec::with_capacity(field.len());
+    let mut bytes = field.as_bytes().iter().copied();
+    while let Some(byte) = bytes.next() {
+        if byte != b'\\' {
+            decoded.push(byte);
+            continue;
+        }
+        let escape = [bytes.next(), bytes.next(), bytes.next()];
+        let value = match escape {
+            [Some(b'0'), Some(b'4'), Some(b'0')] => b' ',
+            [Some(b'0'), Some(b'1'), Some(b'1')] => b'\t',
+            [Some(b'0'), Some(b'1'), Some(b'2')] => b'\n',
+            [Some(b'1'), Some(b'3'), Some(b'4')] => b'\\',
+            _ => {
+                return Err(io::Error::other(
+                    "mountinfo contains an invalid path escape",
+                ));
+            }
+        };
+        decoded.push(value);
+    }
+    Ok(PathBuf::from(OsString::from_vec(decoded)))
+}
+
+fn mount_identity_for_path(mountinfo: &str, path: &Path) -> io::Result<MountIdentity> {
+    let mut rows = BTreeMap::<usize, Vec<MountRow>>::new();
+    let mut mount_ids = BTreeSet::new();
+    for line in mountinfo.lines() {
+        let left = line
+            .split_once(" - ")
+            .ok_or_else(|| io::Error::other("mountinfo row has no separator"))?
+            .0;
+        let mut fields = left.split_whitespace();
+        let id = fields
+            .next()
+            .ok_or_else(|| io::Error::other("mountinfo row has no mount ID"))?
+            .parse::<u64>()
+            .map_err(|error| io::Error::other(format!("invalid mount ID: {error}")))?;
+        let parent = fields
+            .next()
+            .ok_or_else(|| io::Error::other("mountinfo row has no parent ID"))?
+            .parse::<u64>()
+            .map_err(|error| io::Error::other(format!("invalid mount parent ID: {error}")))?;
+        if !mount_ids.insert(id) {
+            return Err(io::Error::other(format!(
+                "mountinfo repeats mount ID {id}"
+            )));
+        }
+        let device = fields
+            .next()
+            .ok_or_else(|| io::Error::other("mountinfo row has no device"))?;
+        let root = fields
+            .next()
+            .ok_or_else(|| io::Error::other("mountinfo row has no root"))?;
+        let mountpoint = fields
+            .next()
+            .ok_or_else(|| io::Error::other("mountinfo row has no mount point"))?;
+        let root = decode_mountinfo_path(root)?;
+        let mountpoint = decode_mountinfo_path(mountpoint)?;
+        if path.strip_prefix(&mountpoint).is_err() {
+            continue;
+        }
+        let depth = mountpoint.components().count();
+        rows.entry(depth).or_default().push(MountRow {
+            id,
+            parent,
+            device: device.to_string(),
+            root,
+            mountpoint,
+        });
+    }
+    let mut selected: Option<MountRow> = None;
+    let mut selected_ids = BTreeSet::new();
+    for rows_at_depth in rows.into_values() {
+        if selected.is_none() {
+            selected = root_mount_row(&rows_at_depth);
+            if let Some(row) = &selected {
+                selected_ids.insert(row.id);
+            }
+        }
+        while let Some(parent) = selected.as_ref().map(|row| row.id) {
+            let Some(next) = child_mount_row(&rows_at_depth, parent) else {
+                break;
+            };
+            if !selected_ids.insert(next.id) {
+                return Err(io::Error::other("mountinfo parent tree contains a cycle"));
+            }
+            selected = Some(next);
+        }
+    }
+    let selected = selected
+        .ok_or_else(|| io::Error::other(format!("mountinfo does not cover {}", path.display())))?;
+    let relative = path.strip_prefix(&selected.mountpoint).map_err(|error| {
+        io::Error::other(format!(
+            "selected mount {} does not cover {}: {error}",
+            selected.mountpoint.display(),
+            path.display()
+        ))
+    })?;
+    let mut root = selected.root;
+    if !relative.as_os_str().is_empty() {
+        root.push(relative);
+    }
+    Ok(MountIdentity {
+        device: selected.device,
+        root,
+    })
+}
+
+fn require_bind_source(mountinfo: &str, source: &Path, target: &Path) -> io::Result<()> {
+    let source_identity = mount_identity_for_path(mountinfo, source)?;
+    let target_identity = mount_identity_for_path(mountinfo, target)?;
+    if source_identity != target_identity {
+        return Err(io::Error::other(format!(
+            "{} binds {target_identity:?}, expected source {} as {source_identity:?}",
+            target.display(),
+            source.display()
+        )));
+    }
+    Ok(())
+}
+
+fn writable_probe_path(path: &str, token: &[u8; TOKEN_LEN]) -> PathBuf {
+    Path::new(path).join(format!("{WRITE_PROBE_PREFIX}{}", encode_token(token)))
+}
+
+fn require_writable_directory(path: &str, token: &[u8; TOKEN_LEN]) -> io::Result<()> {
+    let probe = writable_probe_path(path, token);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("create writable probe {}: {error}", probe.display()),
+            )
+        })?;
+    match fs::remove_file(&probe) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("unlink writable probe {}: {error}", probe.display()),
+            ));
+        }
+    }
+    file.write_all(b"ok").map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("write writable probe {}: {error}", probe.display()),
+        )
+    })
+}
+
+fn require_read_only_mount(path: &str, token: &[u8; TOKEN_LEN]) -> io::Result<()> {
+    let probe = writable_probe_path(path, token);
+    match OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Err(error) if error.kind() == io::ErrorKind::ReadOnlyFilesystem => Ok(()),
+        Err(error) => Err(io::Error::other(format!(
+            "immutable jail tree refused {} for {error}, not read-only-filesystem",
+            probe.display()
+        ))),
+        Ok(file) => {
+            drop(file);
+            let _ = fs::remove_file(&probe);
+            Err(io::Error::other(format!(
+                "immutable jail tree accepted a write at {}",
+                probe.display()
+            )))
+        }
+    }
+}
+
+fn require_mount_plan(
+    application: bool,
+    token: &[u8; TOKEN_LEN],
+    identity: Identity,
+) -> io::Result<()> {
     if fs::symlink_metadata(OLD_ROOT).is_ok() || fs::symlink_metadata("/etc").is_ok() {
         return Err(io::Error::other(
             "detached host root remains reachable in the fresh root",
         ));
     }
-    require_names("/", &["dev", "proc", "tmp", "var"])?;
+    let root_names = if application {
+        &["app", "dev", "home", "proc", "run", "tmp", "usr", "var"][..]
+    } else {
+        &["dev", "proc", "tmp", "var"][..]
+    };
+    require_names("/", root_names)?;
     require_names("/var", &["tmp"])?;
     require_mode("/", 0o755)?;
     require_mode("/dev", 0o755)?;
@@ -992,10 +1420,11 @@ fn require_mount_plan() -> io::Result<()> {
             &mountinfo,
             path,
             Some("tmpfs"),
-            &["rw", "nosuid", "nodev"],
+            &["rw", "nosuid", "nodev", "noexec"],
             &["ro"],
         )?;
-        require_writable_tmp(path)?;
+        require_mount_super_option(&mountinfo, path, "size=262144k")?;
+        require_writable_directory(path, token)?;
     }
     require_mount(
         &mountinfo,
@@ -1019,6 +1448,88 @@ fn require_mount_plan() -> io::Result<()> {
             None,
             &["ro", "nosuid", "noexec"],
             &["rw", "nodev"],
+        )?;
+    }
+
+    if application {
+        require_names("/home", &["td"])?;
+        require_names("/run", &["user"])?;
+        let runtime = format!("/run/user/{}", identity.uid);
+        require_mode(&runtime, 0o700)?;
+        require_names("/run/user", &[&identity.uid.to_string()])?;
+        require_names(
+            &runtime,
+            &[crate::authority::RUNTIME_ROOT_NAME, "wayland-0"],
+        )?;
+        for path in ["/app", "/usr"] {
+            require_mount(
+                &mountinfo,
+                path,
+                None,
+                &["ro", "nosuid", "nodev"],
+                &["rw", "noexec"],
+            )?;
+        }
+        require_mount(
+            &mountinfo,
+            "/run",
+            Some("tmpfs"),
+            &["rw", "nosuid", "nodev", "noexec"],
+            &["ro"],
+        )?;
+        require_mount(
+            &mountinfo,
+            "/home/td",
+            None,
+            &["rw", "nosuid", "nodev", "noexec"],
+            &["ro"],
+        )?;
+        for path in [
+            "/home/td/.config",
+            "/home/td/.cache",
+            "/home/td/.local/share",
+            "/home/td/.local/state",
+        ] {
+            require_mount(
+                &mountinfo,
+                path,
+                None,
+                &["rw", "nosuid", "nodev", "noexec"],
+                &["ro"],
+            )?;
+            require_writable_directory(path, token)?;
+        }
+        require_mount(
+            &mountinfo,
+            &format!("{runtime}/wayland-0"),
+            None,
+            &["ro", "nosuid", "nodev", "noexec"],
+            &["rw"],
+        )?;
+        let application_runtime = format!("{runtime}/{}", crate::authority::RUNTIME_ROOT_NAME);
+        require_mode(&application_runtime, 0o700)?;
+        require_mode("/home/td", 0o700)?;
+        require_mount(
+            &mountinfo,
+            &application_runtime,
+            None,
+            &["rw", "nosuid", "nodev", "noexec"],
+            &["ro"],
+        )?;
+        require_mount_super_option(&mountinfo, "/run", "size=65536k")?;
+        require_writable_directory(&application_runtime, token)?;
+        require_writable_directory("/home/td", token)?;
+        for path in ["/app", "/usr"] {
+            require_read_only_mount(path, token)?;
+        }
+    } else {
+        require_names("/tmp", &["td-jail-reaper-probe"])?;
+        require_mount(
+            &mountinfo,
+            REAPER_PROBE_PATH,
+            None,
+            &["ro", "nosuid", "nodev"],
+            &["rw", "noexec"],
         )?;
     }
 
@@ -1162,7 +1673,7 @@ fn probe_pid1_reaper() -> io::Result<()> {
             "PID 1 reaped {reaped:?}, expected {expected:?}"
         )));
     }
-    fs::remove_file(REAPER_PROBE_PATH)
+    Ok(())
 }
 
 pub fn probe_transition() -> io::Result<()> {
@@ -1180,12 +1691,14 @@ pub fn probe_transition() -> io::Result<()> {
     sys::unshare_namespaces(true)?;
     install_identity_maps(identity)?;
     NamespaceSnapshot::read()?.require_all_changed(&before)?;
+    sys::bring_up_loopback()
+        .map_err(|e| io::Error::other(format!("bring up isolated loopback: {e}")))?;
     let test_leak = install_test_leak_if_requested()?;
     close_inherited_descriptors()?;
     if let Some(descriptor) = test_leak {
         require_descriptor_closed(descriptor)?;
     }
-    prepare_mount_plan(identity, &executable)?;
+    prepare_mount_plan(identity, &executable, None)?;
     prepare_capability_bridge()?;
 
     let (proof_reader, mut proof_writer) = io::pipe()?;
@@ -1196,6 +1709,7 @@ pub fn probe_transition() -> io::Result<()> {
         .arg(encode_token(&token))
         .arg(identity.uid.to_string())
         .arg(identity.gid.to_string())
+        .arg(STAGE2_PROBE_ARG)
         .stdin(Stdio::from(proof_reader))
         .stdout(Stdio::from(stage2_writer))
         .stderr(Stdio::from(stage2_error_writer))
@@ -1247,7 +1761,11 @@ pub fn probe_transition() -> io::Result<()> {
     writeln!(io::stdout(), "{TRANSITION_MARKER} pid=1")
 }
 
-pub fn run_stage2(expected: [u8; TOKEN_LEN], expected_identity: Identity) -> io::Result<()> {
+pub fn run_stage2(
+    expected: [u8; TOKEN_LEN],
+    expected_identity: Identity,
+    action: Stage2Action,
+) -> io::Result<()> {
     if std::process::id() != 1 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -1264,6 +1782,8 @@ pub fn run_stage2(expected: [u8; TOKEN_LEN], expected_identity: Identity) -> io:
             "internal stage-2 proof does not match",
         ));
     }
+    drop(stdin);
+    sys::set_parent_death_signal()?;
     require_only_stdio_descriptors()?;
 
     let status = fs::read_to_string("/proc/self/status")?;
@@ -1281,11 +1801,218 @@ pub fn run_stage2(expected: [u8; TOKEN_LEN], expected_identity: Identity) -> io:
     require_single_map("/proc/self/gid_map", identity.gid)?;
     require_stage2_capabilities()?;
     enter_mount_plan()?;
-    require_mount_plan()?;
+    let mount_probe_token = random_token()?;
+    require_mount_plan(
+        matches!(action, Stage2Action::Launch { .. }),
+        &mount_probe_token,
+        identity,
+    )?;
     clear_and_require_empty_capabilities()?;
     install_standard_seccomp_filter()?;
-    probe_pid1_reaper()?;
-    writeln!(io::stdout(), "{STAGE2_MARKER} pid=1")
+    match action {
+        Stage2Action::Probe => {
+            probe_pid1_reaper()?;
+            writeln!(io::stdout(), "{STAGE2_MARKER} pid=1")
+        }
+        Stage2Action::Launch {
+            entry,
+            environment,
+            arguments,
+        } => {
+            sys::set_dumpable(false)?;
+            if sys::dumpable()? {
+                return Err(io::Error::other("PID 1 remained dumpable"));
+            }
+            start_stage1_liveness_watcher()?;
+            run_application(&entry, &environment, &arguments)
+        }
+    }
+}
+
+fn start_stage1_liveness_watcher() -> io::Result<()> {
+    let watcher = std::thread::Builder::new()
+        .name("td-jail-stage1-liveness".to_string())
+        .spawn(|| {
+            wait_for_stage1_end(&mut io::stdin());
+            std::process::exit(125);
+        })?;
+    drop(watcher);
+    Ok(())
+}
+
+fn wait_for_stage1_end(reader: &mut impl Read) {
+    let mut unexpected = [0_u8; 1];
+    loop {
+        match reader.read(&mut unexpected) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            _ => return,
+        }
+    }
+}
+
+fn run_application(
+    entry: &str,
+    environment: &[(OsString, OsString)],
+    arguments: &[OsString],
+) -> io::Result<()> {
+    let null_input = fs::File::open("/dev/null")?;
+    let null_output = OpenOptions::new().write(true).open("/dev/null")?;
+    let null_error = OpenOptions::new().write(true).open("/dev/null")?;
+    let mut command = Command::new(entry);
+    command
+        .args(arguments)
+        .env_clear()
+        .envs(environment.iter().map(|(key, value)| (key, value)))
+        .stdin(Stdio::from(null_input))
+        .stdout(Stdio::from(null_output))
+        .stderr(Stdio::from(null_error));
+    let child = command.spawn();
+    drop(command);
+    let child = child
+        .map_err(|e| io::Error::other(format!("launch application entry {entry}: {e}")))?;
+    let application_pid = i32::try_from(child.id())
+        .map_err(|e| io::Error::other(format!("application PID is invalid: {e}")))?;
+    drop(child);
+
+    let mut application_status = None;
+    loop {
+        match sys::wait_any(false)? {
+            sys::Reaped::Child { pid, status } => {
+                if pid == application_pid && application_status.is_none() {
+                    application_status = Some(status);
+                }
+            }
+            sys::Reaped::NotYet => continue,
+            sys::Reaped::NoChildren => break,
+        }
+    }
+    match application_status {
+        Some(0) => Ok(()),
+        Some(status) => Err(io::Error::other(format!(
+            "application entry returned raw status {status:#x}"
+        ))),
+        None => Err(io::Error::other(
+            "application entry disappeared without a wait status",
+        )),
+    }
+}
+
+pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
+    let identity = current_identity()?;
+    if identity.uid == 0 || identity.gid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "td-jail requires the nonzero application identity",
+        ));
+    }
+    let before = NamespaceSnapshot::read()?;
+    let token = random_token()?;
+    let executable = std::env::current_exe()?;
+
+    sys::unshare_namespaces(true)?;
+    install_identity_maps(identity)?;
+    NamespaceSnapshot::read()?.require_all_changed(&before)?;
+    sys::bring_up_loopback()
+        .map_err(|e| io::Error::other(format!("bring up isolated loopback: {e}")))?;
+    close_inherited_descriptors()?;
+    prepare_mount_plan(identity, &executable, Some(&application))?;
+    prepare_capability_bridge()?;
+
+    let (proof_reader, mut proof_writer) = io::pipe()?;
+    let (mut stage2_error, stage2_error_writer) = io::pipe()?;
+    let stage2_arguments = stage2_launch_arguments(
+        &token,
+        identity,
+        &application.entry,
+        &application.environment,
+        &application.arguments,
+    );
+    let mut command = Command::new(executable);
+    command
+        .args(&stage2_arguments)
+        .env_clear()
+        .stdin(Stdio::from(proof_reader))
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stage2_error_writer));
+    let mut child = command.spawn()?;
+    drop(command);
+
+    if let Err(error) = require_child_pid_namespace_changed(&before, child.id()) {
+        let _ = child.kill();
+        let status = child.wait();
+        drop(proof_writer);
+        let diagnostic = match read_launch_diagnostic(&mut stage2_error) {
+            Ok(response) if response.trim().is_empty() => String::new(),
+            Ok(response) => format!("; diagnostic: {}", response.trim()),
+            Err(read_error) => format!("; diagnostic unavailable: {read_error}"),
+        };
+        let status = match status {
+            Ok(status) => status.to_string(),
+            Err(wait_error) => format!("wait failed: {wait_error}"),
+        };
+        return Err(io::Error::other(format!(
+            "verify launch-stage PID namespace: {error}; stage 2 {status}{diagnostic}"
+        )));
+    }
+    if let Err(error) = proof_writer.write_all(&token) {
+        let _ = child.kill();
+        let status = child.wait();
+        drop(proof_writer);
+        let diagnostic = match read_launch_diagnostic(&mut stage2_error) {
+            Ok(response) if response.trim().is_empty() => String::new(),
+            Ok(response) => format!("; diagnostic: {}", response.trim()),
+            Err(read_error) => format!("; diagnostic unavailable: {read_error}"),
+        };
+        let status = match status {
+            Ok(status) => status.to_string(),
+            Err(wait_error) => format!("wait failed: {wait_error}"),
+        };
+        return Err(io::Error::other(format!(
+            "write launch-stage proof: {error}; stage 2 {status}{diagnostic}"
+        )));
+    }
+    let response = match read_launch_diagnostic(&mut stage2_error) {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let status = child.wait()?;
+    drop(proof_writer);
+    if !status.success() {
+        let detail = response.trim();
+        if !detail.is_empty() {
+            return Err(io::Error::other(format!(
+                "application jail exited unsuccessfully: {status}: {detail}"
+            )));
+        }
+        return Err(io::Error::other(format!(
+            "application jail exited unsuccessfully: {status}"
+        )));
+    }
+    if !response.is_empty() {
+        return Err(io::Error::other(format!(
+            "successful application jail returned a diagnostic: {:?}",
+            response.trim()
+        )));
+    }
+    Ok(())
+}
+
+fn read_launch_diagnostic(reader: &mut impl Read) -> io::Result<String> {
+    let mut response = Vec::new();
+    reader
+        .take((STAGE2_OUTPUT_LIMIT + 1) as u64)
+        .read_to_end(&mut response)?;
+    if response.len() > STAGE2_OUTPUT_LIMIT {
+        return Err(io::Error::other(
+            "launch-stage diagnostic exceeded 4096 bytes",
+        ));
+    }
+    String::from_utf8(response)
+        .map_err(|e| io::Error::other(format!("launch-stage diagnostic is not UTF-8: {e}")))
 }
 
 pub fn write_standard_filter() -> io::Result<()> {
@@ -1294,9 +2021,32 @@ pub fn write_standard_filter() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::indexing_slicing, clippy::unwrap_used)]
+    #![allow(
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::unwrap_used
+    )]
 
     use super::*;
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_directory() -> io::Result<PathBuf> {
+        loop {
+            let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "td-jail-write-probe-test-{}-{sequence}",
+                std::process::id()
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(path),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
 
     fn args(values: &[&str]) -> std::vec::IntoIter<OsString> {
         values
@@ -1336,9 +2086,215 @@ mod tests {
         assert_eq!(decode_token(&OsString::from(&encoded)).unwrap(), token);
         assert!(decode_token(&OsString::from("00")).is_err());
         assert!(decode_token(&OsString::from("G0".repeat(TOKEN_LEN))).is_err());
-        assert!(parse_mode(args(&[STAGE2_ARG, &encoded, "1000", "1000"])).is_ok());
+        assert!(parse_mode(args(&[
+            STAGE2_ARG,
+            &encoded,
+            "1000",
+            "1000",
+            STAGE2_PROBE_ARG,
+        ]))
+        .is_ok());
+        assert!(matches!(
+            parse_mode(args(&[
+                STAGE2_ARG,
+                &encoded,
+                "1000",
+                "1000",
+                STAGE2_LAUNCH_ARG,
+                "/app/bin/app",
+                STAGE2_ENVIRONMENT_ARG,
+                "5",
+                "FLATPAK_ID",
+                "org.td.App",
+                "GLIBC_TUNABLES",
+                "glibc.malloc.perturb=1",
+                "HOME",
+                "/home/td",
+                "WAYLAND_DISPLAY",
+                "wayland-0",
+                "XDG_RUNTIME_DIR",
+                "/run/user/1000",
+                STAGE2_ARGUMENTS_ARG,
+                "--flag",
+            ]))
+            .unwrap(),
+            Mode::Stage2 {
+                action: Stage2Action::Launch { entry, environment, arguments },
+                ..
+            } if entry == "/app/bin/app"
+                && environment.first() == Some(&(
+                    OsString::from("FLATPAK_ID"),
+                    OsString::from("org.td.App"),
+                ))
+                && arguments == [OsString::from("--flag")]
+        ));
         assert!(parse_mode(args(&[STAGE2_ARG, &encoded])).is_err());
         assert!(parse_mode(args(&[STAGE2_ARG, &encoded, "1000", "1000", "extra"])).is_err());
+        assert!(parse_mode(args(&[
+            STAGE2_ARG,
+            &encoded,
+            "1000",
+            "1000",
+            STAGE2_LAUNCH_ARG,
+            "/usr/bin/app",
+            STAGE2_ENVIRONMENT_ARG,
+            "0",
+            STAGE2_ARGUMENTS_ARG,
+        ]))
+        .is_err());
+        assert!(parse_mode(args(&[
+            STAGE2_ARG,
+            &encoded,
+            "1000",
+            "1000",
+            STAGE2_LAUNCH_ARG,
+            "/app/bin/app",
+            STAGE2_ENVIRONMENT_ARG,
+            "3",
+            "WAYLAND_DISPLAY",
+            "wayland-0",
+            "HOME",
+            "/home/td",
+            "XDG_RUNTIME_DIR",
+            "/run/user/1000",
+            STAGE2_ARGUMENTS_ARG,
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn stage2_launch_emitter_round_trips_through_the_parser() {
+        let token = [7_u8; TOKEN_LEN];
+        let identity = Identity {
+            uid: 1000,
+            gid: 1000,
+        };
+        let environment = vec![
+            (OsString::from("FLATPAK_ID"), OsString::from("org.td.App")),
+            (OsString::from("HOME"), OsString::from("/home/td")),
+            (
+                OsString::from("WAYLAND_DISPLAY"),
+                OsString::from("wayland-0"),
+            ),
+            (
+                OsString::from("XDG_RUNTIME_DIR"),
+                OsString::from("/run/user/1000"),
+            ),
+        ];
+        let arguments = vec![OsString::from("--flag")];
+        let emitted = stage2_launch_arguments(
+            &token,
+            identity,
+            "/app/bin/app",
+            &environment,
+            &arguments,
+        );
+        assert_eq!(
+            parse_mode(emitted.into_iter()).unwrap(),
+            Mode::Stage2 {
+                token,
+                identity,
+                action: Stage2Action::Launch {
+                    entry: "/app/bin/app".into(),
+                    environment,
+                    arguments,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn writable_probe_never_replaces_an_existing_path() {
+        let directory = temporary_directory().unwrap();
+        let directory_text = directory.to_str().unwrap();
+        let token = [9_u8; TOKEN_LEN];
+        let probe = writable_probe_path(directory_text, &token);
+        require_writable_directory(directory_text, &token).unwrap();
+        assert!(fs::read_dir(&directory).unwrap().next().is_none());
+
+        fs::write(&probe, b"application-owned").unwrap();
+        let error = require_writable_directory(directory_text, &token).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&probe).unwrap(), b"application-owned");
+        fs::remove_file(&probe).unwrap();
+
+        let target = directory.join("application-target");
+        fs::write(&target, b"symlink-target").unwrap();
+        symlink(&target, &probe).unwrap();
+        let error = require_writable_directory(directory_text, &token).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(fs::symlink_metadata(&probe)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), b"symlink-target");
+
+        fs::remove_file(&probe).unwrap();
+        fs::remove_file(&target).unwrap();
+        fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn dropping_a_spawned_launch_command_releases_its_diagnostic_writer() {
+        let (mut reader, writer) = io::pipe().unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--list")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(writer));
+        let mut child = command.spawn().unwrap();
+        drop(command);
+        assert!(child.wait().unwrap().success());
+        let mut response = Vec::new();
+        reader.read_to_end(&mut response).unwrap();
+        assert!(response.is_empty());
+    }
+
+    #[test]
+    fn launch_diagnostics_are_bounded_utf8() {
+        let mut valid = &b"stage failed\n"[..];
+        assert_eq!(read_launch_diagnostic(&mut valid).unwrap(), "stage failed\n");
+
+        let mut invalid = &[0xff_u8][..];
+        assert!(read_launch_diagnostic(&mut invalid).is_err());
+
+        let oversized = vec![b'x'; STAGE2_OUTPUT_LIMIT + 1];
+        let mut oversized = oversized.as_slice();
+        assert!(read_launch_diagnostic(&mut oversized).is_err());
+    }
+
+    #[test]
+    fn writable_probe_preserves_interrupted_launch_residue() {
+        let directory = temporary_directory().unwrap();
+        let directory_text = directory.to_str().unwrap();
+        let stale = writable_probe_path(directory_text, &[8_u8; TOKEN_LEN]);
+        fs::write(&stale, b"ok").unwrap();
+
+        require_writable_directory(directory_text, &[9_u8; TOKEN_LEN]).unwrap();
+        assert_eq!(fs::read(&stale).unwrap(), b"ok");
+        fs::remove_file(&stale).unwrap();
+        fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn writable_probe_ignores_application_owned_reserved_lookalikes() {
+        let directory = temporary_directory().unwrap();
+        let directory_text = directory.to_str().unwrap();
+        let regular = writable_probe_path(directory_text, &[7_u8; TOKEN_LEN]);
+        let reserved_directory = writable_probe_path(directory_text, &[8_u8; TOKEN_LEN]);
+        fs::write(&regular, b"application-owned").unwrap();
+        fs::create_dir(&reserved_directory).unwrap();
+
+        require_writable_directory(directory_text, &[9_u8; TOKEN_LEN]).unwrap();
+        assert_eq!(fs::read(&regular).unwrap(), b"application-owned");
+        assert!(fs::symlink_metadata(&reserved_directory)
+            .unwrap()
+            .file_type()
+            .is_dir());
+
+        fs::remove_file(&regular).unwrap();
+        fs::remove_dir(&reserved_directory).unwrap();
+        fs::remove_dir(&directory).unwrap();
     }
 
     #[test]
@@ -1361,6 +2317,72 @@ mod tests {
         let mut changed = token;
         changed[TOKEN_LEN - 1] = 8;
         assert!(!tokens_equal(&token, &changed));
+    }
+
+    #[test]
+    fn liveness_watcher_retries_an_interrupted_read() {
+        struct InterruptedThenEof {
+            reads: usize,
+        }
+
+        impl Read for InterruptedThenEof {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                if self.reads == 1 {
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
+                }
+                Ok(0)
+            }
+        }
+
+        let mut reader = InterruptedThenEof { reads: 0 };
+        wait_for_stage1_end(&mut reader);
+        assert_eq!(reader.reads, 2);
+    }
+
+    #[test]
+    fn stage1_liveness_watcher_helper() {
+        if std::env::var_os("TD_JAIL_TEST_STAGE1_LIVENESS").is_none() {
+            return;
+        }
+        start_stage1_liveness_watcher().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    fn stage1_pipe_eof_terminates_the_supervisor() {
+        let executable = std::env::current_exe().unwrap();
+        let mut child = Command::new(executable)
+            .args([
+                "--exact",
+                "transition::tests::stage1_liveness_watcher_helper",
+                "--nocapture",
+            ])
+            .env("TD_JAIL_TEST_STAGE1_LIVENESS", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let writer = child.stdin.take().unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        drop(writer);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert_eq!(status.code(), Some(125));
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("stage-1 EOF did not terminate the supervisor");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
@@ -1395,5 +2417,69 @@ mod tests {
         assert!(require_mount(mountinfo, "/missing", Some("tmpfs"), &[], &[]).is_err());
         assert!(require_mount_super_option(mountinfo, "/tmp", "size=524288k").is_ok());
         assert!(require_mount_super_option(mountinfo, "/tmp", "size=1k").is_err());
+
+        let binds = "1 0 0:1 / / rw - ext4 root rw\n\
+                     2 1 0:2 / /run/user/1000 rw - tmpfs run rw\n\
+                     3 1 0:2 /td-app/fixture /tmp/td-jail-root/run/user/1000/td-app rw - tmpfs run rw\n";
+        assert!(require_bind_source(
+            binds,
+            Path::new("/run/user/1000/td-app/fixture"),
+            Path::new("/tmp/td-jail-root/run/user/1000/td-app"),
+        )
+        .is_ok());
+        assert!(require_bind_source(
+            &binds.replace("/td-app/fixture", "/td-app/other"),
+            Path::new("/run/user/1000/td-app/fixture"),
+            Path::new("/tmp/td-jail-root/run/user/1000/td-app"),
+        )
+        .is_err());
+
+        let canonical_home = "1 0 0:1 / / rw - erofs root rw\n\
+                              2 1 0:2 / /var rw - btrfs var rw\n\
+                              3 1 0:2 /home/tester/state /tmp/td-jail-root/home/td rw - btrfs var rw\n";
+        assert!(require_bind_source(
+            canonical_home,
+            Path::new("/var/home/tester/state"),
+            Path::new("/tmp/td-jail-root/home/td"),
+        )
+        .is_ok());
+        assert!(require_bind_source(
+            canonical_home,
+            Path::new("/home/tester/state"),
+            Path::new("/tmp/td-jail-root/home/td"),
+        )
+        .is_err());
+
+        let escaped = "1 0 0:1 / / rw - tmpfs root rw\n\
+                       2 1 0:3 /path\\040with\\134slash /source\\040dir rw - tmpfs tmpfs rw\n\
+                       3 1 0:3 /path\\040with\\134slash /target rw - tmpfs tmpfs rw\n";
+        assert!(require_bind_source(
+            escaped,
+            Path::new("/source dir"),
+            Path::new("/target"),
+        )
+        .is_ok());
+        assert!(decode_mountinfo_path("/bad\\777").is_err());
+
+        let shadowed = "1 0 0:1 / / rw - tmpfs root rw\n\
+                        2 1 8:1 /hidden /a/b rw - ext4 hidden rw\n\
+                        3 1 0:3 / /a rw - tmpfs visible rw\n";
+        assert_eq!(
+            mount_identity_for_path(shadowed, Path::new("/a/b/file")).unwrap(),
+            MountIdentity {
+                device: "0:3".into(),
+                root: PathBuf::from("/b/file"),
+            }
+        );
+        let visible_child = format!(
+            "{shadowed}4 3 0:4 /child /a/b rw - tmpfs child rw\n"
+        );
+        assert_eq!(
+            mount_identity_for_path(&visible_child, Path::new("/a/b/file")).unwrap(),
+            MountIdentity {
+                device: "0:4".into(),
+                root: PathBuf::from("/child/file"),
+            }
+        );
     }
 }

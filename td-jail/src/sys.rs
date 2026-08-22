@@ -2,11 +2,14 @@
 
 use std::ffi::CStr;
 use std::io;
+use std::net::{Ipv4Addr, UdpSocket};
+use std::os::fd::AsRawFd;
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
 compile_error!("td-jail is x86_64-linux only (raw syscall ABI)");
 
 const SYS_CLOSE: usize = 3;
+const SYS_IOCTL: usize = 16;
 const SYS_WAIT4: usize = 61;
 const SYS_CAPGET: usize = 125;
 const SYS_CAPSET: usize = 126;
@@ -40,6 +43,9 @@ pub const CAP_SETPCAP: u32 = 8;
 pub const CAP_SYS_ADMIN: u32 = 21;
 
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+const PR_SET_PDEATHSIG: usize = 1;
+const PR_GET_DUMPABLE: usize = 3;
+const PR_SET_DUMPABLE: usize = 4;
 const PR_CAPBSET_READ: usize = 23;
 const PR_CAPBSET_DROP: usize = 24;
 const PR_SET_NO_NEW_PRIVS: usize = 38;
@@ -55,6 +61,9 @@ const EINTR: i32 = 4;
 const ECHILD: i32 = 10;
 const SECCOMP_SET_MODE_FILTER: usize = 1;
 pub(crate) const SECCOMP_MAX_FILTER_INSNS: usize = 4096;
+const SIOCGIFFLAGS: usize = 0x8913;
+const SIOCSIFFLAGS: usize = 0x8914;
+const IFF_UP: i16 = 0x1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CapabilitySets {
@@ -103,6 +112,13 @@ struct CapabilityData {
 struct CapabilityDataPair {
     low: CapabilityData,
     high: CapabilityData,
+}
+
+#[repr(C, align(8))]
+struct IfreqFlags {
+    name: [u8; 16],
+    flags: i16,
+    padding: [u8; 22],
 }
 
 impl CapabilityDataPair {
@@ -206,6 +222,58 @@ pub fn unshare_namespaces(isolate_network: bool) -> io::Result<()> {
         true => ISOLATED_NETWORK_FLAGS,
     };
     check(syscall5(SYS_UNSHARE, flags, 0, 0, 0, 0))
+}
+
+fn loopback_request() -> IfreqFlags {
+    let mut name = [0_u8; 16];
+    name[0] = b'l';
+    name[1] = b'o';
+    IfreqFlags {
+        name,
+        flags: 0,
+        padding: [0; 22],
+    }
+}
+
+fn read_interface_flags(fd: u32, value: &mut IfreqFlags) -> io::Result<()> {
+    check(syscall5(
+        SYS_IOCTL,
+        fd as usize,
+        SIOCGIFFLAGS,
+        std::ptr::from_mut(value) as usize,
+        0,
+        0,
+    ))
+}
+
+fn write_interface_flags(fd: u32, value: &mut IfreqFlags) -> io::Result<()> {
+    check(syscall5(
+        SYS_IOCTL,
+        fd as usize,
+        SIOCSIFFLAGS,
+        std::ptr::from_mut(value) as usize,
+        0,
+        0,
+    ))
+}
+
+pub fn bring_up_loopback() -> io::Result<()> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+    let fd = u32::try_from(socket.as_raw_fd())
+        .map_err(|_| io::Error::other("loopback ioctl socket has a negative descriptor"))?;
+    let mut request = loopback_request();
+    read_interface_flags(fd, &mut request)?;
+    request.flags |= IFF_UP;
+    write_interface_flags(fd, &mut request)?;
+
+    let mut readback = loopback_request();
+    read_interface_flags(fd, &mut readback)?;
+    if readback.flags & IFF_UP == 0 {
+        return Err(io::Error::other(
+            "loopback interface did not read back as up",
+        ));
+    }
+    Ok(())
 }
 
 pub fn mount(
@@ -358,6 +426,29 @@ pub fn no_new_privileges() -> io::Result<bool> {
     )
 }
 
+pub fn set_parent_death_signal() -> io::Result<()> {
+    const SIGKILL: usize = 9;
+    check(syscall5(SYS_PRCTL, PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0))
+}
+
+pub fn set_dumpable(dumpable: bool) -> io::Result<()> {
+    check(syscall5(
+        SYS_PRCTL,
+        PR_SET_DUMPABLE,
+        usize::from(dumpable),
+        0,
+        0,
+        0,
+    ))
+}
+
+pub fn dumpable() -> io::Result<bool> {
+    strict_bool(
+        syscall5(SYS_PRCTL, PR_GET_DUMPABLE, 0, 0, 0, 0),
+        "dumpable readback",
+    )
+}
+
 pub fn install_seccomp_filter(instructions: &[SockFilter]) -> io::Result<()> {
     if instructions.len() > SECCOMP_MAX_FILTER_INSNS {
         return Err(io::Error::new(
@@ -433,6 +524,9 @@ mod tests {
         assert_eq!(LINUX_CAPABILITY_VERSION_3, 0x2008_0522);
         assert_eq!(CAP_SETPCAP, 8);
         assert_eq!(CAP_SYS_ADMIN, 21);
+        assert_eq!(PR_SET_PDEATHSIG, 1);
+        assert_eq!(PR_GET_DUMPABLE, 3);
+        assert_eq!(PR_SET_DUMPABLE, 4);
         assert_eq!(PR_CAPBSET_READ, 23);
         assert_eq!(PR_CAPBSET_DROP, 24);
         assert_eq!(PR_SET_NO_NEW_PRIVS, 38);
@@ -446,10 +540,25 @@ mod tests {
         assert_eq!(std::mem::size_of::<CapabilityDataPair>(), 24);
         assert_eq!(std::mem::size_of::<SockFilter>(), 8);
         assert_eq!(std::mem::size_of::<SockFprog>(), 16);
+        assert_eq!(std::mem::size_of::<IfreqFlags>(), 40);
+        assert_eq!(std::mem::align_of::<IfreqFlags>(), 8);
         assert_eq!(SECCOMP_SET_MODE_FILTER, 1);
         assert_eq!(SECCOMP_MAX_FILTER_INSNS, 4096);
+        assert_eq!(SYS_IOCTL, 16);
+        assert_eq!(SIOCGIFFLAGS, 0x8913);
+        assert_eq!(SIOCSIFFLAGS, 0x8914);
+        assert_eq!(IFF_UP, 1);
         assert_eq!(PID_ANY, usize::MAX);
         assert_eq!(WNOHANG, 1);
+    }
+
+    #[test]
+    fn loopback_ioctl_request_is_exact() {
+        let request = loopback_request();
+        assert_eq!(request.name.get(..3), Some(b"lo\0".as_slice()));
+        assert!(request.name.get(3..).unwrap().iter().all(|byte| *byte == 0));
+        assert_eq!(request.flags, 0);
+        assert!(request.padding.iter().all(|byte| *byte == 0));
     }
 
     #[test]

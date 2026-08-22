@@ -46,7 +46,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `ioctl(2)` |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
-| 9 | `td-jail` | `close(2)`, `wait4(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `seccomp(2)` with one value-pinned operation |
+| 9 | `td-jail` | `close(2)`, `ioctl(2)` with two value-pinned requests, `wait4(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `seccomp(2)` with one value-pinned operation |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering: it is host-side, and no
@@ -974,16 +974,21 @@ virtual fd table that stands in for `dup2` — is reachable through safe
 
 ## 9. `td-jail` — the application sandbox
 
-The fourth `td-jail` increment carries exactly TEN syscalls on x86-64
-through one `syscall5` body: `unshare(2)`, `close(2)`, `wait4(2)`,
-`mount(2)`, `umount2(2)`, `pivot_root(2)`, `capset(2)`, `capget(2)`, and
-`prctl(2)`, plus `seccomp(2)` with exactly one operation:
+The landed `td-jail` surface carries exactly ELEVEN syscalls on x86-64
+through one `syscall5` body: `unshare(2)`, `close(2)`, `ioctl(2)`,
+`wait4(2)`, `mount(2)`, `umount2(2)`, `pivot_root(2)`, `capset(2)`,
+`capget(2)`, and `prctl(2)`, plus `seccomp(2)` with exactly one operation:
 `SECCOMP_SET_MODE_FILTER`=1 and flags zero.
 The unshare wrapper accepts only the two compiled namespace sets the
 application design permits:
 `CLONE_NEWUSER|CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWUTS`, with
 `CLONE_NEWNET` either absent for a declared shared network or present for
 an isolated one. There is no caller-provided flags word.
+The ioctl wrapper accepts no caller-provided request or interface. It uses
+only `SIOCGIFFLAGS`=0x8913 and `SIOCSIFFLAGS`=0x8914 over a pinned 40-byte
+`ifreq` naming `lo`, preserves the kernel-returned flags while adding `IFF_UP`,
+and reads `IFF_UP` back. A safe `std` UDP socket is only the ioctl carrier and
+is dropped before inherited descriptors are swept.
 
 Stage 1 is single-threaded when it issues the call, writes `setgroups`
 deny before the identity gid map, reads both maps back, and checks that
@@ -1005,7 +1010,10 @@ makes the tree private, replaces its scratch `/tmp` with a fresh tmpfs,
 builds another tmpfs as the root, binds only null/zero/full/random/urandom
 as individually read-only mounts into a fresh nosuid/noexec `/dev`, mounts
 fresh devpts and `/dev/shm`, mounts fresh `/tmp` and `/var/tmp`, and
-remounts `/dev` read-only. Stage 2 mounts a
+remounts `/dev` read-only. Probe mode overlays the current executable as one
+read-only, nosuid, nodev, executable file bind inside the otherwise-noexec
+`/tmp`, and source-identity checks that bind before detaching the old root;
+application mode never creates it. Stage 2 mounts a
 fresh procfs for the PID namespace it inhabits while the old procfs is
 still visible (the kernel's `mount_too_revealing` rule requires that),
 pivots, changes directory to `/`, detaches the old root, removes its
@@ -1013,13 +1021,24 @@ mount point, and remounts the new root read-only. It reads mountinfo back,
 requires only PID 1 in procfs, checks the exact root and device entries,
 device numbers, modes and every device-bind flag, and proves the base
 root, `/dev`, and device binds are read-only while procfs, devpts,
-bounded `/dev/shm`, `/tmp`, and `/var/tmp` carry their compiled writable
-flags. Read-only bind metadata does not prevent the compiled character
-devices from performing their device operations; the probe writes to
-`/dev/null` after the remounts.
+bounded `/dev/shm`, `/tmp`, and `/var/tmp` carry their compiled writable,
+no-exec flags and size ceilings. The application action additionally reads
+back its bounded private `/run`. Read-only bind metadata does not prevent the
+compiled character devices from performing their device operations; the probe writes
+to `/dev/null` after the remounts. The mountinfo `ro` row is the evidence that
+the bind remount itself succeeded; the `EROFS` write probes separately prove
+there is no writable route at `/app` or `/usr`, even when their source
+superblock is already read-only. Writable probes use an unpredictable
+create-new path and unlink it before writing through the open descriptor, so
+ordinary completion and every failure after unlink leave no state litter. They
+do not sweep prefix-matching residue because an application may own such a
+lookalike. Interruption in the single create/unlink syscall window can leave the
+empty probe name behind; a same-uid process can also rename that name during the
+window, but it already has direct authority over the application state tree.
 
 `capset(2)` and `capget(2)` use capability ABI v3 and a compiled
-two-word structure. `prctl(2)` has exactly FIVE operations:
+two-word structure. `prctl(2)` has exactly EIGHT operations:
+`PR_SET_PDEATHSIG`=1, `PR_GET_DUMPABLE`=3, `PR_SET_DUMPABLE`=4,
 `PR_CAPBSET_DROP`=24, `PR_CAPBSET_READ`=23,
 `PR_SET_NO_NEW_PRIVS`=38, `PR_GET_NO_NEW_PRIVS`=39, and
 `PR_CAP_AMBIENT`=47;
@@ -1032,7 +1051,13 @@ creates stage 2;
 before releasing it, stage 1 verifies `/proc/<child>/ns/pid` differs
 from its own original PID namespace. Stage 2 refuses unless its
 namespace PID is 1 and a fresh 32-byte proof arrives on the stdin
-descriptor stage 1 explicitly installed. Before mounting it requires
+descriptor stage 1 explicitly installed. Stage 2 installs a `SIGKILL`
+parent-death signal before mounting. On the application-launch path, after the
+filter readback, a watcher retries an interrupted read and treats proof-pipe
+EOF, unexpected data, or any other read error as fatal, closing the
+set-before-check race without relying on a parent PID invisible in the new
+namespace. Before
+mounting it requires
 effective, permitted, inheritable and ambient to equal exactly
 `CAP_SYS_ADMIN`, the bounding set to be empty, and the syscall and
 `/proc/self/status` readbacks to agree. After the mount readback, stage 2
@@ -1042,6 +1067,9 @@ requires all five capability rows to be zero.
 After capability removal, stage 2 validates the compiled constant cBPF
 program, sets and reads back no-new-privileges, installs that exact program,
 and requires `/proc/self/status` to report `NoNewPrivs: 1` and `Seccomp: 2`.
+It remains single-threaded through this flags-zero installation. Only after the
+readback does it create the liveness watcher, which therefore inherits the
+filter; the embedded-source test pins that ordering.
 The filter's instruction count is derived from its array, and a safe validator
 refuses unknown opcodes, offsets, actions, out-of-range jumps, wrong lengths,
 more than the kernel's 4096 instructions, and programs without a final return
@@ -1063,21 +1091,69 @@ an exact marker line. Reaper descendants require the installed restriction
 and filter readbacks too.
 
 `wait4(2)` is pinned to pid -1, a null rusage pointer, and either zero or
-`WNOHANG`. The transition probe copies the static td-jail into its fresh
-`/tmp`, launches a zero-capability child that creates a grandchild and
+`WNOHANG`. Through that single-file bind, the transition probe launches a
+zero-capability child that creates a grandchild and
 exits without waiting, then requires PID 1 to reap both the direct child
 and the reparented orphan with successful raw statuses under one bounded
 deadline. Only after `ECHILD` makes the report pipe nonblocking does it
-read the orphan PID, verify the exact collected set, and remove the copy.
-This is an internal confinement oracle, not application launch; ordinary
-entry remains a refusal until its authority path lands.
+read the orphan PID and verify the exact collected set; namespace exit removes
+the probe-only mount.
+The same transition now has one closed application action. A `/bin` symlink
+selects a name by argv[0]; safe Rust reads the immutable image configuration,
+sorted registry and canonical builder-owned spec, then accepts only the
+builder-authenticated spec with exactly the Wayland socket grant. The runtime
+parser closes the spec grammar and socket policy; the image compiler selects
+the fixture's empty runtime. Stage 1 binds authenticated package/runtime
+trees read-only, the exact compositor
+socket read-only, application-owned persistent state read-write, and one
+application-owned volatile runtime directory read-write. Package and runtime
+binds are builder-authenticated. State sources are canonicalized and checked
+for the application uid, private mode, source device and subtree root before
+stage 2 can enter them, so the shipped `/home -> /var/home` alias and
+mountinfo's escaped path fields resolve to the same identity the kernel
+records. This is not isolation from an unsandboxed same-uid process, which can
+replace its own state path during launch; that process already has direct
+authority over all application state. The
+volatile runtime bind carries the fixture's readiness socket across the
+otherwise-private `/run`; safe Rust on the host probes the per-application
+end before trusted QEMU evidence. Stage 2
+performs the same mount/capability/filter readbacks before spawning the entry
+and reaps the namespace to `ECHILD`; the transition probe separately exercises
+the bound orphan-reaper fixture. No caller supplies a mount, filter, namespace
+or raw syscall argument. The application entry, environment and argv cross the
+authenticated stage boundary as inert argv data and are grammar-revalidated
+there; binding them to the authenticated spec remains stage 1's job. Stage 2
+itself execs with an empty environment; only the final ordinary application
+child receives the compiled environment after the capability and filter
+readbacks. Stage 2's argv includes the one-use proof token, entry, environment
+and application arguments. Before launch it becomes non-dumpable, so procfs
+denies the unprivileged child PID 1's `fd`, `exe`, and `environ` entries but
+continues to expose `/proc/1/cmdline`. None of the stage-2 argv values may be a
+secret; the child's own arguments and environment are likewise
+application-visible. The child cannot
+reopen PID 1's executable or proof descriptor, no td-jail binary exists in its
+mount plan, and the installed filter refuses the namespace transition. In
+launch mode, stage 2 receives the
+proof pipe on stdin, null
+stdout and one bounded diagnostic pipe on stderr. It sets and reads back PID 1
+as non-dumpable, pre-opens the application's null stdin/stdout/stderr, and
+then spawns it. PID 1 retains the proof reader for its filtered liveness
+watcher and the diagnostic writer through the application's final status.
+Spawn and post-spawn failures therefore still reach stage 1, while procfs
+denies the same-UID application access to PID 1's descriptors. A separate
+trusted unit probes the post-frame readiness socket before emitting the QEMU
+marker; it is not deployment-success authority. The application inherits no
+descriptor through which it can emit the marker, flood the console, or alter
+terminal state. The readiness socket is same-UID evidence rather than an
+authenticated peer: another uid-1000 process can satisfy the probe, so this is
+an image-test oracle, not hostile-payload attestation.
 
-Deliberately NOT in this surface yet are the other three calls in
-`APPLICATIONS.md`'s target-state draft: `kill`, `prlimit64`, and `ioctl`.
+Deliberately NOT in this surface yet are the other two calls in
+`APPLICATIONS.md`'s target-state draft: `kill` and `prlimit64`.
 Each arrives only with the rung that uses and tests it; the
 roadmap is not advance authorization for dormant wrappers.
 There is likewise no `fork`, `pre_exec`, `clone`, `setns`, or caller-
-supplied namespace, mount set, or BPF program. An eleventh syscall, a sixth
+supplied namespace, mount set, or BPF program. A twelfth syscall, a ninth
 prctl operation, a second seccomp operation or nonzero seccomp flag, a fourth
 ambient sub-operation, or a third unshare flag set
 is an amendment here.

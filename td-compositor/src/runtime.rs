@@ -221,6 +221,10 @@ impl Runtime {
         }
     }
 
+    pub(crate) fn set_launcher_application(&mut self, application: bool) {
+        self.scene.set_launcher_application(application);
+    }
+
     pub fn width(&self) -> usize {
         self.framebuffer.width
     }

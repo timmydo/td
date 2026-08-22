@@ -9,14 +9,15 @@
 use crate::json::Json;
 use std::collections::BTreeMap;
 
-const MAX_APPLICATION_NAME_BYTES: usize = 32;
+pub const MAX_APPLICATION_NAME_BYTES: usize = 32;
+pub const RESERVED_APPLICATION_NAMES: &[&str] = &["td-jail", "td-jail-reaper-probe"];
 pub const MAX_MANIFEST_BYTES: usize = 16 * 1024;
 const MAX_VERSION_BYTES: usize = 128;
 const MAX_ALIAS_BYTES: usize = 255;
-const MAX_ENTRY_BYTES: usize = 4096;
+pub const MAX_ENTRY_BYTES: usize = 4096;
 const MAX_ENVIRONMENT_ENTRIES: usize = 128;
-const MAX_ENVIRONMENT_NAME_BYTES: usize = 128;
-const MAX_ENVIRONMENT_VALUE_BYTES: usize = 4096;
+pub const MAX_ENVIRONMENT_NAME_BYTES: usize = 128;
+pub const MAX_ENVIRONMENT_VALUE_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApplicationProvenance {
@@ -197,7 +198,7 @@ impl ApplicationManifest {
         entry: &str,
         provenance: ApplicationProvenance,
     ) -> Result<ApplicationManifest, String> {
-        validate_application_name(name)?;
+        validate_application_identity(name)?;
         validate_version(version)?;
         validate_application_name(runtime).map_err(|reason| format!("runtime: {reason}"))?;
         validate_entry(entry)?;
@@ -318,6 +319,17 @@ pub fn validate_application_name(name: &str) -> Result<(), String> {
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     {
         return Err("application name must use only ASCII letters, digits, `.`, `_` or `-'".into());
+    }
+    Ok(())
+}
+
+/// Validate an application identity rather than a runtime package name.
+pub fn validate_application_identity(name: &str) -> Result<(), String> {
+    validate_application_name(name)?;
+    if RESERVED_APPLICATION_NAMES.contains(&name) {
+        return Err(format!(
+            "application name {name:?} is reserved by td-jail"
+        ));
     }
     Ok(())
 }
@@ -566,7 +578,7 @@ fn apply_declaration(
 ) -> Result<(), String> {
     match key {
         "name" => {
-            validate_application_name(value).map_err(|reason| at_line(line, &reason))?;
+            validate_application_identity(value).map_err(|reason| at_line(line, &reason))?;
             set_once(&mut fields.name, key, value, line)
         }
         "version" => {
@@ -793,6 +805,17 @@ mod tests {
             let got = validate_application_name(invalid).unwrap_err();
             assert!(got.contains(reason), "{invalid:?}: {got}");
         }
+    }
+
+    #[test]
+    fn application_identities_cannot_select_td_jail_internal_modes() {
+        for name in RESERVED_APPLICATION_NAMES {
+            assert!(validate_application_name(name).is_ok());
+            assert!(validate_application_identity(name).is_err());
+            let text = VALID.replacen("name=firefox\n", &format!("name={name}\n"), 1);
+            assert!(parse_manifest(&text).is_err());
+        }
+        assert!(validate_application_identity("ordinary-app").is_ok());
     }
 
     #[test]

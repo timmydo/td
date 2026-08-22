@@ -713,9 +713,8 @@ immutable files:
 Each table admits at most 256 applications and 1 MiB. Keeping the path out of
 the presentation table gives each reader only its own input and closes the
 previous design gap where a three-column row gave `td-jail` no way to locate a
-content-addressed package. Both tables are presently empty because no
-application is selected before the jail exists. Activation will always be the
-literal argv `/bin/<name>`.
+content-addressed package. The image now selects the first jailed fixture into
+both tables. Activation is always the literal argv `/bin/<name>`.
 
 An image selection names the authenticated application identity plus its
 package catalog key and runtime catalog key. The latter two are data inputs.
@@ -761,9 +760,9 @@ have to serve. The deployment bundle is the only delivery td has
   release ships the kernel and userland and spends a reboot;
 - rolling an application back rolls the system back with it, which can
   undo an unrelated security fix;
-- the boot-attempt counter does **not** cover applications — boot success
-  is recorded when the system comes up, before any application runs — so
-  a broken application is not automatically rolled back;
+- the boot-attempt counter does **not** cover application execution: the
+  confined fixture is independent QEMU evidence, so broken application code
+  or mutable application state cannot roll back the whole deployment;
 - every account on the machine gets the same set of applications, and
   two accounts can no longer disagree about a browser version;
 - the image carries every packaged application and runtime.
@@ -988,11 +987,11 @@ the per-user repository in.
 The package and application-state roots remain configuration, not paths baked
 into this context-free parser. The rung-6 spec preserves these typed grants;
 rung 9's immutable-base mount plan accepts no caller paths. The launch-time
-extension at rung 12 resolves `~/`, XDG names and absolute sources against the
-current configuration, then refuses every alias or overlap with those roots
-before file-type checks, mount-target separation and deny-wins merging within
-the policy and against immutable defaults. The format does not pretend a
-lexical parser performed those filesystem operations.
+extension scheduled at rung 12b resolves `~/`, XDG names and absolute sources
+against the current configuration, then refuses every alias or overlap with
+those roots before file-type checks, mount-target separation and deny-wins
+merging within the policy and against immutable defaults. The format does not
+pretend a lexical parser performed those filesystem operations.
 
 Session-bus keys are exact well-known names, never unique names or wildcards,
 and their values are the ordered capabilities `see`, `talk` and `own`.
@@ -1835,9 +1834,64 @@ ambient, then drops and reads back the complete bounding set while
 state and empty bounding set, mounts the fresh procfs for its own PID
 namespace while the old procfs is still visible, pivots into the prepared
 root, then drops every remaining capability before policy finalization.
-Every bind is read-only unless
-marked **rw**, and a failed read-only remount on a load-bearing bind is
-fatal, never degraded:
+The landed rung-12 application path is the closed static/empty-runtime
+subset of this target table. It implements `/app`, `/usr`, fresh `/proc`,
+the minimal `/dev`, tmpfs `/run`, the exact Wayland socket and the five
+persistent state directories, and a read-back-up loopback interface in the
+otherwise-empty network namespace. It deliberately leaves `/etc`, `/sys`, the
+bus, `/var/lib`, `/var/cache`, `.flatpak-info`, extension mounts, network
+sharing and authored filesystem/resource grants absent; a spec requesting
+any policy beyond
+exactly `sockets=wayland` is refused. Later rungs fill those named rows
+without making their absence a degraded launch mode. The compiled application
+environment crosses the internal exec only as bounded, canonical argv data:
+stage 2 starts empty and applies those entries only to the final child after
+its capability and seccomp readbacks. The internal argv also carries the
+one-use stage proof token. Before spawning the application, PID 1 becomes
+non-dumpable, which denies the unprivileged child access to PID 1's
+`fd`, `exe`, and `environ` procfs entries. Linux leaves `/proc/1/cmdline`
+readable, so the stage-2 argv must never contain a secret.
+The entry arguments and environment are applied to the child and remain
+application-visible, so their values must never be treated as secrets. The app
+cannot reopen PID 1's executable or proof descriptor, has no td-jail binary in
+its namespace, and cannot create the required namespaces after the filter. In
+launch mode, stage 2 receives its
+proof pipe on stdin, null stdout and one bounded diagnostic pipe on stderr.
+After its readbacks it makes PID 1 non-dumpable and verifies that state, opens
+the application's null descriptors, and spawns it. PID 1 retains the proof
+reader and bounded diagnostic writer: a filtered watcher treats proof EOF as
+stage-1 death and terminates the namespace, while the diagnostic remains live
+through the application's final status. PID 1 is non-dumpable before the child
+exists, so the same-UID application cannot reopen either descriptor through
+procfs. A separate trusted evidence unit probes post-frame readiness,
+atomically publishes the root-owned evidence file, emits
+`TD-JAIL-FIXTURE-BOOT-READY`, then atomically publishes a distinct completion
+record that releases the autotest greeter. Its own bounded one-second probe
+loop covers the second fixture cold-start attempt without inheriting td-svc's
+exponential restart backoff. The greeter's separate allowance also includes
+the first fixture ready timeout that can elapse before the evidence unit starts.
+Deployment success does not depend on the fixture or its mutable state. Once
+deployment health has finished, missing evidence or completion releases the
+greeter when that complete bounded allowance expires, so
+QEMU reports the missing marker instead of waiting for the full boot ceiling.
+The fixture keeps its stdout and stderr on `/dev/null`, so it cannot forge the
+console marker. Confinement failures instead use phase-specific exits 70--73
+for status/capability, procfs/host-boundary, mount, and loopback verification;
+PID 1 reports the raw application status through td-jail's bounded diagnostic.
+The fixture is deliberately both autostarted and present in the launcher, so a
+button press may create a second instance over the same state roots. This rung's
+client writes no persistent state; a stateful application must declare and
+enforce its single-instance or multi-profile policy before using both paths.
+
+Probe mode alone overlays one read-only executable bind at
+`/tmp/td-jail-reaper-probe` after mounting `/tmp` noexec. It is the current
+trusted `td-jail` inode, source-identity checked before the old root is detached,
+and exists only long enough to prove that PID 1 reaps a direct child and its
+orphan. Application mode never creates that mount, so its entire `/tmp` remains
+noexec.
+
+Every bind is read-only unless marked **rw**, and a failed read-only remount
+on a load-bearing bind is fatal, never degraded:
 
 ```
  0  CLOSE every inherited descriptor above 2, and REPLACE 0/1/2 with
@@ -1892,8 +1946,9 @@ fatal, never degraded:
         `devices=dri` is PARSED and REFUSED with a named diagnostic from
         the first landing, so honouring it later (binding renderD128 only,
         never card0) is a policy-table flip, not a parser change (§M)
-11  /tmp, /var/tmp   tmpfs rw 1777;  /var/lib, /var/cache  empty tmpfs
-12  /run   tmpfs;  /run/user/1000 mode 0700
+11  /tmp, /var/tmp   tmpfs rw 1777, noexec, 256 MiB ceiling each;
+        /var/lib, /var/cache  empty tmpfs
+12  /run   tmpfs, 64 MiB ceiling;  /run/user/1000 mode 0700
         wayland-0 <- bind, when sockets=wayland
         bus       <- bind, ALWAYS (the broker is the policy, not the mount)
 13  /.flatpak-info  <- ro bind of a file on a jail-created tmpfs, written
@@ -2266,7 +2321,7 @@ and policy rungs land with callers and tests.
 The quoted block is the completed target, not the current roster; it
 intentionally retains the future thirteen-call count and `jail.rs`
 caller. Only the unquoted, implemented roster in `UNSAFE.md` authorizes
-today's ten calls and `transition.rs` caller.
+today's eleven calls and `transition.rs` caller.
 
 > ## 9. `td-jail` — the application sandbox
 >
@@ -2277,11 +2332,12 @@ today's ten calls and `transition.rs` caller.
 > `pivot_root(2)` for the validated mount plan, `capset(2)` with
 > `capget(2)` for the one-capability exec bridge, capability drop and
 > their readbacks, `prctl(2)` with
-> SIX value-pinned operations (`PR_SET_NO_NEW_PRIVS`=38,
+> EIGHT value-pinned operations (`PR_SET_NO_NEW_PRIVS`=38,
 > `PR_GET_NO_NEW_PRIVS`=39, `PR_SET_PDEATHSIG`=1, `PR_CAPBSET_DROP`=24,
 > `PR_CAPBSET_READ`=23 — the readback mount-plan step 16 requires,
 > which an earlier draft mandated in the plan while forbidding it in the
-> roster — and `PR_CAP_AMBIENT`=47 with its own three pinned
+> roster — `PR_SET_DUMPABLE`=4, `PR_GET_DUMPABLE`=3, and
+> `PR_CAP_AMBIENT`=47 with its own three pinned
 > sub-operations, `PR_CAP_AMBIENT_RAISE`,
 > `PR_CAP_AMBIENT_CLEAR_ALL`, and `PR_CAP_AMBIENT_IS_SET`.
 > That last one is a correction: a draft left 47 out on the grounds that
@@ -3371,27 +3427,50 @@ packaged selftest, boot oracle — with **network never in the gate**.
    nested-mount-namespace attribution, FileChooser flows through the pure
    dialog model, refusal of a file outside grants, screenshot pixel and
    PNG hashes, inhibitor acquire/readback/release/crash-cleanup.
-6. **The offline QEMU oracle — the centrepiece.** The image test builds a
-   **fixture package by recipe**: a small td-built static Rust binary
-   with a generated manifest and an empty runtime — which is also the
-   cheapest proof that the jail needs nothing td-owned from a runtime.
+6. **The offline QEMU oracle — the centrepiece.** Its first slice has
+   **LANDED**. The image builds a **fixture package by recipe** from the
+   static `td-compositor` artifact's small fixture personality
+   with a generated manifest and an empty runtime — the cheapest proof at the
+   recipe/runtime-dependency level that the jail needs nothing td-owned from a
+   runtime. The fixture package deliberately carries a second copy of the
+   compositor artifact, so this is not an image-size optimization.
    Because the package is a recipe output like any other, this needs no
    fixture repository and no install-time network — and since §B.1 the
    fixture is *in the image the test boots*, so the boot runs
    `/bin/<fixture>` directly with no install step at all. The guest
-   inside the jail
-   asserts its `/proc` says `NoNewPrivs`/`Seccomp`, asserts `mount(2)`
-   fails `EPERM`, connects `wayland-0`, maps a toplevel and commits a
-   frame, calls `Settings.ReadAll` through the bus and reads its
+   currently asserts its `/proc` says `NoNewPrivs`/`Seccomp` and all five
+   capability sets are zero, that
+   `/app` and `/usr` reject writes, and that the host store, `/etc`,
+   framebuffer and input nodes are absent; it completes a bounded datagram
+   round-trip over the isolated loopback, connects the one granted
+   `wayland-0`, maps a toplevel, commits a frame, then publishes readiness in
+   its private volatile runtime bind. `td-svc` probes the host-side
+   per-application end of that bind for the fixture service; an independent
+   trusted evidence unit repeats the probe in its own bounded one-second loop,
+   publishes the evidence file, emits `TD-JAIL-FIXTURE-BOOT-READY`, then
+   publishes a completion record that lets the autotest greeter exit. QEMU
+   requires that marker on every system boot.
+   That unit is not a dependency of `bootsuccess`, so user-owned state cannot
+   decrement the deployment attempt counter. The application has no terminal
+   or console descriptor
+   with which to forge that evidence or alter terminal state. The earlier
+   plan's direct in-guest
+   `mount(2) == EPERM` subprobe remains deferred: this slice directly reads
+   back all five empty capability sets and the standard-filter interpreter
+   pins `EPERM` for the complete mount syscall roster, but a target-side
+   syscall attempt needs a separately reviewed safe probe surface. The later
+   broker/portal slice calls
+   `Settings.ReadAll` through
+   the bus and reads its
    **direct reply** — `ReadAll` is a synchronous method returning
    `a{sa{sv}}`, NOT a Request-producing call, so an oracle that waited
    for a `Request.Response` would hang forever on a portal that was
    working perfectly; an earlier draft said exactly that, and it is the
    kind of error that presents as "the portal is broken" —
-   then prints one marker the oracle latches after
-   `TD-BUSD-READY` and `TD-PORTAL-READY`. That single marker is jail +
-   seccomp + broker + policy + portal + compositor, end to end, offline,
-   on the shipped kernel. The first *foreign*-toolkit oracle uses a
+   and extends the end-to-end proof after `TD-BUSD-READY` and
+   `TD-PORTAL-READY`. Today the exact fixture marker is jail + seccomp +
+   immutable package/runtime + state + socket grant + compositor,
+   offline, on the shipped kernel. The first *foreign*-toolkit oracle uses a
    pinned small GTK application — not Firefox.
 7. **Recipe tests**: every new crate — `td-jail`, `td-busd`, `td-audio` —
    stays a one-package dependency-free crate and joins BOTH
@@ -3534,8 +3613,10 @@ Each row is one landing or a small family, leaving the tree green.
 | 9 | **mount transition — LANDED**: inherited-FD closure, a private compiled tmpfs root with individually read-only allowlisted device binds and immutable metadata, fresh devpts/shm/tmp/var-tmp, capability-v3 set/get readbacks, an exact ambient/inheritable `CAP_SYS_ADMIN` exec bridge, an empty/read-back bounding set, stage-2 procfs for its own PID namespace, pivot + old-root detach, mountinfo/device/mode/writability readbacks, and host plus target-kernel probes; application launch still refuses | none |
 | 10 | **capability drop/readback + PID-1 reaper — LANDED**: ambient is explicitly cleared before effective/permitted/inheritable become empty, all five sets are read back zero, and a copied static internal helper leaves a zero-capability grandchild for PID 1's bounded `wait4(-1)` oracle; ordinary application launch still refuses | none |
 | 11 | **const BPF assembler, standard filter, interpreter tests, build-host and target probes — LANDED**: stage 2 sets and reads back no-new-privileges, validates and installs the constant policy, requires `Seccomp: 2`, and its filtered PID-1 descendants inherit the same restriction; the non-shipped td-GCC probe is injected only into the disposable QEMU volume | none |
-| 12 | **fixture package shipped in the image and launched by `/bin/<fixture>`** | **first jailed pixels on the QEMU screen** |
+| 12 | **fixture package shipped in the image and launched by `/bin/<fixture>` — LANDED**: the static `td-compositor` artifact's fixture personality is copied through an ordinary declared input into a generated application package with an empty payload-only runtime and exactly `sockets=wayland`; the image selects it into the immutable registry and `/bin` farm, its supervised boot unit and the compositor launcher both enter through `/bin/td-jail-fixture`, and td-jail accepts only the canonical index/spec subset this rung implements. Stage 1 canonicalizes, mounts and source-identity-checks immutable `/app` and `/usr`, the exact compositor socket, bounded private tmpfs trees, the five persistent state directories, and one private volatile runtime directory; stage 2 verifies the mount plan, clears capabilities, installs seccomp, holds a parent-death pipe, replaces application stdio with null descriptors, launches and reaps. The client publishes readiness through that volatile bind only after confinement readback and a presented frame; a separate readiness-gated evidence unit emits the exact QEMU marker without making mutable application state deployment-success authority | **first jailed pixels on the QEMU screen** |
 | 12a | the same fixture under `--host`, asserting the degradation report (§X.5) | host mode works, and says what it could not enforce |
+| 12b | realize the typed filesystem grants: canonical source resolution, alias/overlap refusal, separate bind targets and deny-wins merging | a jailed app can open only an explicitly granted host path |
+| 12c | realize the typed memory/task policy with hard enforcement and readback; `cpu-max` remains refused until the kernel bandwidth controller lands | application resource limits are effective rather than metadata |
 | 13 | `td-busd` codec, auth, surface #10 | none |
 | 14 | names, routing, match rules, descriptor passing | none |
 | 15 | per-app policy, lineage identity, in-jail activation | none |
@@ -4924,7 +5005,7 @@ the work that is deferred:**
 | applied by | `td-boot publish` + reboot | `td-boot publish` + **reboot** | a pointer flip, no reboot |
 | verified by | signed manifest, ed25519 | the same signed manifest | a content hash against the recipe graph |
 | rollback | `previous` selector, attempt counter | `previous` — so an application rollback is a **system** rollback, and can undo an unrelated security fix | repoint; state in `$HOME` untouched |
-| covered by the attempt counter | yes | **almost never, and not quite never** — the `bootsuccess` unit is `after` the compositor and terminal and `requires` the terminal, so it records after the graphical session is ready and before any application is launched. The exception is §A's launcher table: the compositor reads a package-generated `td-launcher.tsv` at startup, so a malformed one can keep readiness from being reached and drive the counter down. A rollback for a bad application is therefore possible by that one path and by no other | n/a |
+| covered by the attempt counter | yes | **not application execution** — `bootsuccess` requires the terminal but not the confined fixture. The fixture has a separate readiness-gated evidence unit for QEMU, so broken application code or mutable per-app state cannot drive the counter down. §A's immutable launcher table is emitted but not yet consumed; the current fixture card is compiled into the compositor | n/a |
 | frequency | td's cadence | td's cadence | upstream's, which for a browser is far higher |
 
 A browser is the fastest-moving thing on the machine and it now moves at
@@ -5101,7 +5182,7 @@ It **decouples §A–§C from §E–§F**: packages, identity, the permission
 model and `td-jail` can be built and exercised against a host session
 while the portal and Wayland-gap work is still in flight. Under §I first
 foreign pixels wait on rungs 16–22; under host mode a window is reachable
-at **rung 12** — not rung 8, since rung 8 is a jail skeleton and §X.4's
+at **rung 12a** — not rung 8, since rung 8 is a jail skeleton and §X.4's
 probe-and-refuse rule means nothing runs before the filter exists at 11.
 
 **§D is not on the near side of that line.** Anything portal-mediated

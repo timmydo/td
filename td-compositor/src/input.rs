@@ -2800,7 +2800,7 @@ mod tests {
                 Bound::Command(Command::ToggleFullscreen) => "TOGGLE FULLSCREEN",
                 Bound::Command(Command::ToggleGrouped) => "GROUP A COLUMN",
                 Bound::Launch(LaunchRequest::Terminal) => "NEW TERMINAL",
-                Bound::Launch(LaunchRequest::UiDemo) => "NEW INPUT MONITOR",
+                Bound::Launch(LaunchRequest::UiDemo) => "OPEN UI CLIENT",
                 Bound::Launcher(_) => "OPEN LAUNCHER",
                 Bound::Help(_) => "THIS HELP",
             }
@@ -3986,6 +3986,7 @@ mod tests {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
             client: PathBuf::from("/bin/td-ui-demo"),
             terminal: PathBuf::from("/bin/td-term"),
+            application: None,
         })
         .unwrap();
         let target = Mutex::new(LiveInputTarget {
@@ -4033,6 +4034,7 @@ mod tests {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
             client: PathBuf::from("/bin/td-ui-demo"),
             terminal: PathBuf::from("/bin/td-term"),
+            application: None,
         })
         .unwrap();
         let target = Mutex::new(LiveInputTarget {

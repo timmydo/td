@@ -106,6 +106,7 @@ const TD_LOGIN_RUNTIME_MARKER: &str = td_recipe::ladder::TD_LOGIN_RUNTIME_MARKER
 const TD_SANDBOX_KERNEL_MARKER: &str = td_recipe::ladder::TD_SANDBOX_KERNEL_MARKER;
 const TD_JAIL_TRANSITION_MARKER: &str = td_recipe::ladder::TD_JAIL_TRANSITION_MARKER;
 const TD_JAIL_SECCOMP_PROBE_MARKER: &str = td_recipe::ladder::TD_JAIL_SECCOMP_PROBE_MARKER;
+const TD_JAIL_FIXTURE_BOOT_MARKER: &str = td_recipe::ladder::TD_JAIL_FIXTURE_BOOT_MARKER;
 const TD_JAIL_SECCOMP_PROBE_PATH: &str = "@var/lib/td-test/td-jail-seccomp-probe";
 
 /// Printed after the unprivileged software compositor paints and listens.
@@ -180,7 +181,7 @@ const KEXEC_STAGE2_MARKER: &str = td_recipe::ladder::KEXEC_STAGE2_MARKER;
 /// Default wall-clock ceiling — declared in `ladder` rather than here so the guest
 /// side can assert it outlasts the loop it is waiting for; see there.
 const DEFAULT_BOOT_TIMEOUT_SECS: u64 = td_recipe::ladder::DEFAULT_BOOT_TIMEOUT_SECS;
-const GUEST_WAIT_MARGIN_SECS: u64 = 30;
+const GUEST_WAIT_MARGIN_SECS: u64 = td_recipe::ladder::QEMU_GUEST_WAIT_MARGIN_SECS;
 const POLL: Duration = Duration::from_millis(200);
 
 /// Cap on retained console/diagnostic bytes. The console is scanned incrementally
@@ -250,6 +251,7 @@ struct ConsoleEvidence {
     td_sandbox_kernel: bool,
     td_jail_transition: bool,
     td_jail_seccomp: bool,
+    td_jail_fixture: bool,
     td_wayland_runtime: bool,
     td_pointer_absolute: bool,
     td_term_runtime: bool,
@@ -849,6 +851,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          ({TD_POINTER_ABSOLUTE_MARKER}), \
          presented the td-native wl_shm TERMINAL and received its first frame callback \
          ({TD_TERM_RUNTIME_MARKER}), \
+         launched the installed fixture through td-jail and presented its confined frame \
+         ({TD_JAIL_FIXTURE_BOOT_MARKER}), \
          and unmounted state \
          before exit ({SYSTEM_SHUTDOWN_MARKER})",
         td_boot_protocol::DEFAULT_BOOT_ATTEMPTS,
@@ -1312,6 +1316,17 @@ fn validate_system_boot(
         return Err(format!(
             "the {ordinal} boot did not emit the deployment-success marker \
              {SYSTEM_BOOT_SUCCESS_MARKER:?}. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_jail_fixture {
+        return Err(format!(
+            "the compositor and terminal became ready, but the packaged jail fixture marker \
+             ({TD_JAIL_FIXTURE_BOOT_MARKER:?}) was absent — argv[0] registry resolution, \
+             canonical spec parsing, the immutable /app and /usr binds, persistent state, the \
+             private runtime directory, the exact Wayland socket grant, zero capabilities, \
+             no-new-privileges/seccomp readback, or the jailed frame presentation failed. \
+             Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -3078,7 +3093,8 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_LOGIN_RUNTIME_MARKER.len(),
         TD_SANDBOX_KERNEL_MARKER.len(),
         TD_JAIL_TRANSITION_MARKER.len(),
-        TD_JAIL_SECCOMP_PROBE_MARKER.len() + 2,
+        exact_line_window(TD_JAIL_SECCOMP_PROBE_MARKER),
+        exact_line_window(TD_JAIL_FIXTURE_BOOT_MARKER),
         TD_WAYLAND_RUNTIME_MARKER.len(),
         TD_POINTER_ABSOLUTE_MARKER.len(),
         TD_TERM_RUNTIME_MARKER.len(),
@@ -3096,6 +3112,10 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
     ]
     .into_iter()
     .fold(0, usize::max)
+}
+
+fn exact_line_window(marker: &str) -> usize {
+    marker.len().saturating_add(3)
 }
 
 fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[u8]) {
@@ -3226,6 +3246,11 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         &mut evidence.td_jail_seccomp,
         buf,
         TD_JAIL_SECCOMP_PROBE_MARKER.as_bytes(),
+    );
+    latch_line_marker(
+        &mut evidence.td_jail_fixture,
+        buf,
+        TD_JAIL_FIXTURE_BOOT_MARKER.as_bytes(),
     );
     latch_marker(
         &mut evidence.td_wayland_runtime,
@@ -4099,13 +4124,9 @@ mod tests {
     /// this: its result is dominated by the id-bearing markers (marker + space + 64-char
     /// hex), so a "no marker exceeds the max" assertion cannot fail and would only look like
     /// a guard. The rescan window is covered behaviourally instead, by the split tests below.
-    /// The oracle's first-client evidence must be the TERMINAL's marker.
-    ///
-    /// Rebinding the alias to the demo's is a boot that runs to its timeout:
-    /// nothing has started the demo since the cutover, so its line never
-    /// appears and the failure names a marker rather than a cause. The
-    /// equality is not a tautology — the alias names one of several ladder
-    /// constants, and which one is exactly what can go wrong.
+    /// The terminal remains the first-client marker; the jailed demo's stdout
+    /// is `/dev/null`. Rebinding this alias makes a boot run to its timeout
+    /// with no cause on the console.
     #[test]
     fn the_first_client_evidence_is_the_terminals_marker() {
         assert_eq!(
@@ -4119,7 +4140,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 38] {
+    fn all_console_markers() -> [&'static str; 39] {
         [
             MARKER,
             EROFS_MARKER,
@@ -4156,6 +4177,7 @@ mod tests {
             TD_SANDBOX_KERNEL_MARKER,
             TD_JAIL_TRANSITION_MARKER,
             TD_JAIL_SECCOMP_PROBE_MARKER,
+            TD_JAIL_FIXTURE_BOOT_MARKER,
             TD_WAYLAND_RUNTIME_MARKER,
             TD_POINTER_ABSOLUTE_MARKER,
             TD_TERM_RUNTIME_MARKER,
@@ -4242,6 +4264,23 @@ mod tests {
     }
 
     #[test]
+    fn jail_fixture_evidence_requires_an_exact_console_line() {
+        let mut evidence = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut evidence,
+            format!("\ntd-ui: {TD_JAIL_FIXTURE_BOOT_MARKER} failed\n").as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_jail_fixture);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_JAIL_FIXTURE_BOOT_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_jail_fixture);
+    }
+
+    #[test]
     fn exact_seccomp_marker_line_survives_a_read_boundary() {
         const CHUNK: usize = 8192;
         let seq = AtomicU64::new(2500);
@@ -4267,6 +4306,43 @@ mod tests {
         )
         .unwrap();
         assert!(evidence.td_jail_seccomp);
+    }
+
+    #[test]
+    fn exact_jail_fixture_boot_marker_line_survives_a_read_boundary() {
+        const CHUNK: usize = 8192;
+        let seq = AtomicU64::new(2600);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        let path = dir.join("console.log");
+        let start = CHUNK - (TD_JAIL_FIXTURE_BOOT_MARKER.len() - 1);
+        let mut bytes = vec![b'x'; start];
+        *bytes.last_mut().unwrap() = b'\n';
+        bytes.extend_from_slice(TD_JAIL_FIXTURE_BOOT_MARKER.as_bytes());
+        bytes.push(b'\n');
+        fs::write(&path, bytes).unwrap();
+
+        let mut file = None;
+        let mut buffer = Vec::new();
+        let mut evidence = ConsoleEvidence::default();
+        drain_console_to_eof(
+            &path,
+            &mut file,
+            &mut buffer,
+            b"target-never-appears",
+            &mut evidence,
+        )
+        .unwrap();
+        assert!(evidence.td_jail_fixture);
+    }
+
+    #[test]
+    fn exact_line_overlap_includes_prefix_and_crlf() {
+        assert_eq!(exact_line_window("marker"), "\nmarker\r\n".len());
+        assert_eq!(
+            exact_line_window(TD_JAIL_FIXTURE_BOOT_MARKER),
+            TD_JAIL_FIXTURE_BOOT_MARKER.len() + 3
+        );
     }
 
     #[test]
@@ -4344,6 +4420,7 @@ mod tests {
             TD_TXT_RUNTIME_MARKER,
             TD_JAIL_TRANSITION_MARKER,
             TD_JAIL_SECCOMP_PROBE_MARKER,
+            TD_JAIL_FIXTURE_BOOT_MARKER,
             SYSTEM_PERSIST_WRITE_MARKER,
             SYSTEM_PERSIST_READ_MARKER,
             SYSTEM_BOOT_SUCCESS_MARKER,
@@ -4398,6 +4475,7 @@ mod tests {
         assert!(evidence.td_txt_runtime);
         assert!(evidence.td_jail_transition);
         assert!(evidence.td_jail_seccomp);
+        assert!(evidence.td_jail_fixture);
         assert!(evidence.persist_write);
         assert!(evidence.persist_read);
         assert!(evidence.boot_success);
