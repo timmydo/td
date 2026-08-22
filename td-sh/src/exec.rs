@@ -2295,6 +2295,65 @@ mod tests {
         crate::process::run_capturing(src)
     }
 
+    /// A function NAME is any single word, not a POSIX name. ash tests the
+    /// SHAPE of the command -- one word, no assignment prefix, no redirection
+    /// (ash.c:12165) -- and its own name check is commented out beside a note
+    /// that bash allows `123` and `..`. This shell required `is_name`, so
+    /// `py-repr() { ... }` was `syntax error: unexpected "("` where ash defines
+    /// it; the `function` spelling had taken any word all along.
+    #[test]
+    fn a_function_name_is_any_word_that_is_not_an_assignment() {
+        // Punctuation, a leading digit, and nothing but dots: all callable.
+        for name in ["py-repr", "a.b", "a+b", "a:b", "a@b", "a,b", "9lives", "..", "_ok"] {
+            let src = format!("{name}() {{ echo B; }}; {name}");
+            assert_eq!(run(&src), (0, "B\n".to_string(), String::new()), "{src:?}");
+        }
+        // An assignment prefix leaves ash's `do_func` without the one argument
+        // it tests for, so the `(` is a syntax error rather than a name.
+        for src in ["a=b() { echo B; }", "a=1 f() { echo B; }"] {
+            let (status, out, err) = run(src);
+            assert_eq!((status, out.as_str()), (2, ""), "{src:?}: {err}");
+            assert!(err.contains("unexpected \"(\""), "{src:?}: {err}");
+        }
+        // A name that is not one WORD is not a definition either, and neither
+        // is one reached after a REDIRECTION -- ash's third condition, which
+        // holds here because this test is asked before either is taken.
+        for src in [
+            "a b() { echo B; }",
+            "> x f() { echo B; }",
+            "< x py-repr() { echo B; }",
+            "2> x f() { echo B; }",
+            "py-repr 2> x() { echo B; }",
+            "a< b() { echo B; }",
+        ] {
+            assert_eq!(run(src).0, 2, "{src:?}");
+        }
+        // The assignment test is `as_assignment`, so the boundary is what ash's
+        // `isassignment` calls one: these are NOT assignments and so are names.
+        for name in ["1=b", "a-b=c", ".=b", "=b", "a+=b"] {
+            let src = format!("{name}() {{ echo B; }}; {name}");
+            assert_eq!(run(&src), (0, "B\n".to_string(), String::new()), "{src:?}");
+        }
+        // Quoted, expanded, or carrying a `/`: ash defines these and none can
+        // be called back, which is what a `None` name means here. The lookup
+        // then misses, and this harness has no PATH, so it is 127.
+        for src in ["\"f\"() { echo B; }; f", "'f'() { echo B; }; f", "x=f; $x() { echo B; }; f"] {
+            assert_eq!(run(src).0, 127, "{src:?} must define nothing callable");
+        }
+        // The `/` one is not even looked up, so defining it alone is silent and
+        // naming it afterwards reaches PATH rather than the definition.
+        assert_eq!(run("a/b() { echo B; }"), (0, String::new(), String::new()));
+        assert_eq!(run("a/b() { echo B; }; a/b").0, 127);
+        // A reserved word that only CLOSES a construct is still refused before
+        // the definition test, or `fi() { ... }` would define one.
+        for src in ["fi() { echo B; }", "done() { echo B; }", "then() { echo B; }"] {
+            assert_eq!(run(src).0, 2, "{src:?}");
+        }
+        // Both spellings agree, which is the point: the `function` one always
+        // took any word, and its doc said so of the bare one too.
+        assert_eq!(run("function py-repr { echo B; }; py-repr").1, "B\n");
+    }
+
     /// `-n` starts no background job, and no OUTPUT can show it: a job that
     /// DID start under `-n` skips its own operand and prints nothing either,
     /// so status and output are identical either way. Starting one RECORDS it
@@ -4320,9 +4379,8 @@ mod tests {
             // rejoins the ordinary path; without it ash reads that token with
             // no CHKALIAS at all.
             ("alias B='{ echo BODY; }'\nfunction f() B\nf", "BODY\n"),
-            // The NAME is any word here, where the bare spelling needs a
-            // `is_name` one -- both of these define under ash and neither is
-            // a name.
+            // The NAME is any word, as it is for the bare spelling: neither
+            // of these is a POSIX name and ash defines both.
             ("function 1f { echo x; }; 1f", "x\n"),
             ("function f-g { echo x; }; f-g", "x\n"),
             // ... and `function` is a keyword only where a command starts.

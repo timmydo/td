@@ -1040,19 +1040,28 @@ impl Units {
         }
     }
 
+    /// ash tests the SHAPE and not the spelling: one word, no assignment
+    /// prefix, no redirection (ash.c:12165), with its own name check commented
+    /// out beside a note that bash allows `123` and `..`. Two of the three are
+    /// this POSITION -- a word with `(` next, reached before an assignment or a
+    /// redirection has been taken -- so the assignment is the one left to ask.
     fn at_func_def(&mut self) -> bool {
         let Some(Tok::Word(w)) = self.peek() else {
             return false;
         };
-        if !w.plain().is_some_and(is_name) {
+        if as_assignment(w).is_some() {
             return false;
         }
         matches!(self.tok_at(self.pos + 1), Some(Tok::Op(Op::LParen)))
     }
 
     fn parse_func_def(&mut self) -> Syn<Cmd> {
+        // `plain` is None for a quoted or expanded name and a `/` makes one
+        // unreachable as a lookup; ash defines both and neither can be called,
+        // which is what `func_body`'s `None` says. The `function` spelling has
+        // taken the name this way all along.
         let name = match self.peek() {
-            Some(Tok::Word(w)) => w.plain().unwrap_or_default().to_string(),
+            Some(Tok::Word(w)) => w.plain().filter(|n| !n.contains('/')).map(str::to_string),
             _ => return Err("syntax error: expected a function name".into()),
         };
         self.bump();
@@ -1067,7 +1076,7 @@ impl Units {
         // The body is a command position like any other, so an alias may supply it:
         // `alias B='{ echo yes; }'` then `f()` / `B`.
         self.open_command()?;
-        self.func_body(Some(name), line)
+        self.func_body(name, line)
     }
 
     /// The body both spellings share, its position already opened by the

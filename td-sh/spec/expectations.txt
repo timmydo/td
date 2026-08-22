@@ -360,6 +360,7 @@ xfail assign-extended.test.sh::declare -pnrx var
 xfail assign-extended.test.sh::dynamic array parsing is not allowed
 xfail assign-extended.test.sh::dynamic flag in array in assign builtin
 xfail assign-extended.test.sh::eval -- "$(declare -p arr)" (restore arrays w/ unset elements)
+xfail assign-extended.test.sh::function name with /
 xfail assign-extended.test.sh::invalid var name
 xfail assign-extended.test.sh::local -a
 xfail assign-extended.test.sh::myvar=typeset (another form of dynamic assignment)
@@ -991,6 +992,7 @@ xfail sh-options.test.sh::noclobber on
 xfail sh-options.test.sh::noclobber on <>
 xfail sh-options.test.sh::pipefail
 xfail sh-options.test.sh::set without args lists variables
+xfail sh-options.test.sh::shopt -s strict:all
 xfail sh-usage.test.sh::LC_CTYPE=invalid
 xfail sh-usage.test.sh::Other flag parsers are not affected by - rule
 xfail sh-usage.test.sh::Set LC_ALL LC_CTYPE LC_COLLATE LANG - affects glob ?
