@@ -1134,6 +1134,14 @@ impl Scene {
         self.popups.get(&key).map(|placed| placed.placement)
     }
 
+    /// The popups bottom-first, which is placement order. Exposed so a test
+    /// can assert that this and the parent chain DISAGREE, since every claim
+    /// about dismissal order rests on their being different things.
+    #[cfg(test)]
+    pub(crate) fn popup_stack(&self) -> Vec<SurfaceKey> {
+        self.popups_stacked()
+    }
+
     /// The pixels alone, byte-accounted, without saying what they are FOR.
     /// Answers whether the surface is one td had not seen before.
     fn store_surface(&mut self, key: SurfaceKey, surface: Surface) -> Result<bool, String> {
@@ -1324,8 +1332,10 @@ impl Scene {
         self.popups.remove(&key);
         // Every popup this surface was the PARENT of goes too, and their
         // submenus with them. A menu whose window has gone is a rectangle
-        // floating over whatever tile the layout gives that space to next, and
-        // the client that owns it has been told nothing.
+        // floating over whatever tile the layout gives that space to next.
+        // Who they were is the caller's to act on — it is what tells their
+        // clients they were dismissed — which is why they are returned rather
+        // than merely dropped.
         let dropped = self.drop_popups_of(key);
         self.titles.remove(&key);
         self.layout.forget(key);

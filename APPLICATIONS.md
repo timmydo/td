@@ -3130,9 +3130,10 @@ What is deliberately still absent is the part that makes a menu *behave*:
 constraint adjustment is recorded and not acted on, so a popup near a screen
 edge runs past it instead of sliding or flipping; `xdg_popup.grab` is accepted
 without td dismissing anything, so a click outside a menu does not close it —
-the client must notice and destroy it; and nothing ever sends
-`xdg_popup.popup_done`, so a menu td stops drawing because its window was
-stacked away is still open as far as its client knows. All are named in
+the client must notice and destroy it. What td DOES signal now is its own
+dismissal: every popup a take-down cascades over is sent
+`xdg_popup.popup_done`, deepest first, so a menu whose window went is no longer
+open as far as its client knows. The two gaps that remain are named in
 `td-compositor/DESIGN.md` §3. Several conformance gaps beside them are closed:
 `xdg_wm_base`'s error codes are raised on the shell object rather than on the
 xdg_surface the request arrived at, that shell object may not be destroyed
@@ -3160,7 +3161,7 @@ by them, and records why a tile ignores them and what an offset cannot reach.
 | `wl_subcompositor` | absent | **B** | 2,500–4,000 |
 | `wl_data_device_manager` v3, selection | absent | **B** | 4,000–6,000 (DnD later, +~900) |
 | `xdg_positioner` + `get_popup` | **landed** | — | ~900 — spent. Rules recorded and copied at `get_popup`; anchor, gravity and offset resolved on independent axes; the popup floats over its parent, above the tiles and below td's own bar, hit-tested first (though never over the bar), placed by its window geometry, required to abut its parent, stacked by td's own order, and relative to the parent so a submenu hangs off the menu that opened it. A null parent is refused (td implements no protocol that could supply one later) and a zero-area anchor rectangle is accepted as a point |
-| popup grabs + dismissal | absent | **U** | 1,200–2,000 — `grab` is accepted and does nothing, so a click outside a menu does not close it; `popup_done` is never sent, so a menu td stops drawing stays open to its client |
+| popup grabs + dismissal | **part** | **U** | 1,200–2,000, ~150 spent — `popup_done` is now sent for every popup a take-down cascades over, deepest first, which is the order the protocol makes a client destroy nested popups in; a menu whose window went is no longer left open to its client. `grab` still records nothing, so a click outside a menu does not close it, and that is the rest of the row |
 | popup protocol conformance (error object, permanent role, `not_the_topmost_popup`, `defunct_surfaces`, `already_constructed`) | **landed** | — | ~350 — spent. `xdg_wm_base`'s errors name the shell object rather than the xdg_surface they arrived at, and it outlives the surfaces it made so that id stays meaningful; a surface's role kind outlives its role object, so a former menu cannot come back as a tiled window; and a menu may not be destroyed before the submenu hanging off it |
 | shell edges across id reuse | **landed** | — | ~600 — spent. Neither shell edge keeps a number the client has back: a popup's parent edge is broken when the surface it names is destroyed, and a wl_surface's role edge is retired when its xdg_surface is. So a reissued id cannot re-parent a menu onto an unrelated window, commit a surface through a stranger's role object, close a popup cycle, or answer a `not_the_topmost_popup` scan for a submenu that does not exist. Per surface rather than a sweep, so one window closing leaves other windows' menus alone. The byte accounting it left open is the row below |
 | popup byte accounting across a cascade | **landed** | — | ~120 — spent. A take-down reports the menus it dropped and the client's ledger gives back exactly those, rather than a second walk of the parent edges — which by then reads the edges that walk removed. An application that opens and closes menus is no longer charged for buffers td discarded, and so no longer approaches its own ceiling for holding nothing. All three refunds are reachable, including the one at `wl_surface.destroy`, which looked dead: `get_popup` refuses a parent with no role object, so no new menu can hang off a window whose toplevel has gone — but an existing one only has to be REPAINTED, since its popup object outlives the toplevel and puts the placement back in the scene |

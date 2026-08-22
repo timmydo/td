@@ -58,6 +58,7 @@ const XDG_WM_BASE_ERROR_NOT_THE_TOPMOST_POPUP: u32 = 2;
 const XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT: u32 = 3;
 const XDG_WM_BASE_ERROR_INVALID_POSITIONER: u32 = 5;
 const XDG_POPUP_CONFIGURE: u16 = 0;
+const XDG_POPUP_POPUP_DONE: u16 = 1;
 const WL_SEAT_ERROR_MISSING_CAPABILITY: u32 = 0;
 const WL_POINTER_ERROR_ROLE: u32 = 0;
 /// `wl_pointer.axis_source`'s `wheel`. The other three sources — finger,
@@ -1161,7 +1162,7 @@ impl Client {
                 client: self.id,
                 object: surface,
             })?;
-        self.refund_dropped(&dropped);
+        self.release_dropped(&dropped)?;
         Ok(())
     }
 
@@ -1178,27 +1179,74 @@ impl Client {
         // Reached by a menu repainted after its window's role object went: the
         // popup object outlives that, so its placement goes back into the
         // scene and only this gives the bytes back.
-        self.refund_dropped(&dropped);
+        self.release_dropped(&dropped)?;
         Ok(())
     }
 
-    /// Give back the bytes of every menu that went down with a surface. The
-    /// scene names them, since its cascade is what decides how far a take-down
-    /// reaches; this ledger only has to agree with it.
+    /// Everything owed to the menus a take-down cascaded over: their bytes
+    /// back, and their clients TOLD. One call rather than two beside each
+    /// other at three sites, because they are one event seen twice — a
+    /// take-down that refunded and forgot to dismiss is the shape of bug the
+    /// refund itself was.
     ///
-    /// The client check is not ceremony, though nothing today can fail it: a
-    /// refund is spelled by OBJECT id, and object ids are per connection, so a
-    /// key from another client would give back the bytes of whichever surface
-    /// of this one happens to share its number.
+    /// The scene names them, since its cascade is what decides how far a
+    /// take-down reaches; this side only has to agree with it.
+    ///
+    /// The client check is not ceremony, though nothing today can fail it:
+    /// both halves are spelled by OBJECT id, and object ids are per
+    /// connection, so a key from another client would refund — and send an
+    /// event to — whichever object of this one happens to share its number.
     ///
     /// A take-down whose paint fails never reaches this, and does not have to:
     /// the error ends the connection, so the ledger it would correct is the
-    /// departing `Client`'s own field.
-    fn refund_dropped(&mut self, dropped: &[SurfaceKey]) {
+    /// departing `Client`'s own field and the events would go to a socket
+    /// being shut down.
+    fn release_dropped(&mut self, dropped: &[SurfaceKey]) -> Result<(), String> {
         for key in dropped {
             if key.client == self.id {
                 self.clear_surface_bytes(key.object);
             }
+        }
+        // BACKWARDS, which is the whole of the ordering requirement: the
+        // protocol dismisses nested popups in the order it makes a client
+        // destroy them, topmost first, and the cascade is breadth-first from
+        // the surface that went — so a parent is always at a lower index than
+        // its submenus and reversing puts every child ahead of its parent.
+        //
+        // The refund above is a SEPARATE loop that has already run to
+        // completion, which is what stops a send failing part way down here
+        // from costing a client bytes. Its own direction is immaterial.
+        for key in dropped.iter().rev() {
+            if key.client != self.id {
+                continue;
+            }
+            if let Some(popup) = self.popup_object_of(key.object) {
+                self.send(popup, XDG_POPUP_POPUP_DONE, wire::Builder::new())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The `xdg_popup` standing for a wl_surface, if one does — walked
+    /// FORWARDS along the two edges the surface already keeps, which is the
+    /// same pair `commit_surface` follows to reach this object. Asking the
+    /// surface which role object is current answers with the current one; a
+    /// scan for any popup that happens to name the surface answers with
+    /// whichever the object map yields first, and the two are the same only
+    /// while nothing has been replaced.
+    fn popup_object_of(&self, surface: u32) -> Option<u32> {
+        let Some(Object::Surface(state)) = self.objects.get(&surface) else {
+            return None;
+        };
+        let Some(SurfaceRole::Xdg(role)) = state.role else {
+            return None;
+        };
+        match self.objects.get(&role) {
+            Some(Object::XdgSurface {
+                role_object: Some(RoleObject::Popup(popup)),
+                ..
+            }) => Some(*popup),
+            _ => None,
         }
     }
 
@@ -1390,7 +1438,7 @@ impl Client {
                 client: self.id,
                 object: surface,
             })?;
-        self.refund_dropped(&dropped);
+        self.release_dropped(&dropped)?;
         Ok(())
     }
 
@@ -2081,9 +2129,18 @@ impl Client {
                     // this. Taken DOWN rather than left as it was: the menu is
                     // no longer on screen and its pixels are no longer the
                     // client's to be charged for. Not an error either — the
-                    // client broke nothing by closing a window with a menu up,
-                    // and the protocol gives td no way to say the menu is
-                    // defunct, since `popup_done` is that and td sends none.
+                    // client broke nothing by closing a window with a menu up.
+                    // It IS told, though. What this arm is FOR is the one
+                    // dismissal no cascade can reach — a popup still unmapped
+                    // when its window went was never in the scene to be
+                    // cascaded over, so this commit of a buffer is the only
+                    // moment td can ever decide against it. What it FIRES on
+                    // is wider: a popup that was mapped, was dismissed by the
+                    // cascade, and is repainted anyway hits it too and hears
+                    // `popup_done` a second time. That is redundant rather
+                    // than ill-formed — the event carries no argument and no
+                    // serial — and it is only reachable by a client that
+                    // ignored the first one.
                     (PendingBuffer::Buffer { object, buffer, .. }, None) => {
                         // The configure tracker is left MAPPED, unlike the
                         // detach above. Unmapping it clears `initial_sent`, and
@@ -2097,6 +2154,12 @@ impl Client {
                         // same xdg_surface and it maps) but that destroying the
                         // popup replaces the tracker.
                         self.unmap_popup(id)?;
+                        // AFTER the submenus `unmap_popup` just dismissed,
+                        // which hang above this one: the protocol's order is
+                        // topmost first whichever call the popups came from.
+                        if let Some(popup) = self.popup_object_of(id) {
+                            self.send(popup, XDG_POPUP_POPUP_DONE, wire::Builder::new())?;
+                        }
                         if matches!(
                             self.objects.get(&object),
                             Some(Object::Buffer(current)) if current.serial == buffer.serial
@@ -3206,9 +3269,12 @@ impl Client {
                     *configure = Arc::new(Mutex::new(ConfigureTracker::new()));
                     Ok(())
                 }
-                // grab. Accepted and not yet acted on: td dismisses no popup of
-                // its own, so a grab it recorded would be a promise about
-                // keyboard and pointer routing that nothing here keeps.
+                // grab. Accepted and not yet acted on: td dismisses no popup
+                // of its own VOLITION — it signals the dismissals its own
+                // take-downs cause, but nothing here closes a menu because a
+                // click landed outside it — so a grab it recorded would be a
+                // promise about keyboard and pointer routing that nothing
+                // keeps.
                 1 => {
                     args.u32()?;
                     args.u32()?;
@@ -9547,6 +9613,312 @@ mod tests {
             client.mapped_bytes
         );
         assert_eq!(client.mapped_total, 0);
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// Every popup td took down of its own accord, in the order it said so.
+    ///
+    /// Which objects are popups is asked of the CLIENT rather than listed
+    /// here: a roster written down goes stale the moment a fixture grows a
+    /// menu, and it goes stale silently — the missing event simply never
+    /// appears and the assertion still passes.
+    fn dismissals(client: &Client, peer: &mut UnixStream) -> Vec<u32> {
+        drain_messages(peer)
+            .iter()
+            .filter(|message| {
+                message.opcode == XDG_POPUP_POPUP_DONE
+                    && matches!(
+                        client.objects.get(&message.object),
+                        Some(Object::XdgPopup { .. })
+                    )
+            })
+            .map(|message| message.object)
+            .collect()
+    }
+
+    /// A menu td stops drawing is still open as far as its client knows, until
+    /// it is told. `popup_done` is the telling, and the protocol asks for it in
+    /// the same order it makes a client destroy nested popups — topmost first
+    /// — so a client that obeys by destroying each one as it hears never has
+    /// to destroy a menu with a submenu still hanging off it, which is the
+    /// `not_the_topmost_popup` error td already raises.
+    #[test]
+    fn a_window_going_tells_its_menus_they_were_dismissed_topmost_first() {
+        let (mut client, mut peer, _runtime, framebuffer_path, pool_path) =
+            mapped_popup("popup-dismiss-window");
+        menu_tree(&mut client, &mut peer, &pool_path);
+        assert!(
+            dismissals(&client, &mut peer).is_empty(),
+            "a menu was dismissed before anything took it down"
+        );
+
+        let mut detach = wire::Builder::new();
+        detach.u32(0);
+        detach.i32(0);
+        detach.i32(0);
+        client
+            .dispatch(request(5, 1, detach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        commit(&mut client).unwrap();
+
+        // 42 hangs off 22 hangs off 14, so this is the chain deepest first.
+        // The cascade itself is breadth-first from the window, which is the
+        // opposite order — a parent always reaches the list before its
+        // submenus — so getting this right is a reversal and not an accident
+        // of how the popups happen to be numbered.
+        assert_eq!(
+            dismissals(&client, &mut peer),
+            vec![42, 22, 14],
+            "the menu tree was not dismissed topmost first"
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// A client that closes its OWN menu is not told td dismissed it: the
+    /// event means the compositor took the decision, and here the client did.
+    /// Its submenus are the other case — nothing asked for those to go, so
+    /// they are td's dismissal and hear about it.
+    ///
+    /// The menu is closed by a null attach rather than by destroying its
+    /// `xdg_popup`, and that is forced rather than chosen: `xdg_popup.destroy`
+    /// refuses with `not_the_topmost_popup` while a submenu hangs off it, so
+    /// the destroy path can never reach a take-down with a cascade under it.
+    #[test]
+    fn closing_a_menu_dismisses_its_submenus_but_not_the_menu_itself() {
+        let (mut client, mut peer, _runtime, framebuffer_path, pool_path) =
+            mapped_popup("popup-dismiss-menu");
+        menu_tree(&mut client, &mut peer, &pool_path);
+        let _ = dismissals(&client, &mut peer);
+
+        let mut detach = wire::Builder::new();
+        detach.u32(0);
+        detach.i32(0);
+        detach.i32(0);
+        client
+            .dispatch(request(6, 1, detach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            dismissals(&client, &mut peer),
+            vec![42, 22],
+            "the client's own menu was dismissed back at it, or its submenus were not"
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// The one dismissal a cascade cannot reach. A popup still unmapped when
+    /// its window goes is in no cascade — there is nothing of it on screen to
+    /// take down — so it is never dismissed by one. Its client then commits
+    /// the buffer it was preparing, and td decides against the menu right
+    /// there, which is the only moment it can ever be told.
+    ///
+    /// Left untold, the client waits on a menu td silently discarded: it gets
+    /// its buffer back and no configure, no pixels, and no reason.
+    #[test]
+    fn a_menu_orphaned_before_its_first_buffer_is_still_told() {
+        let (mut client, mut peer, _runtime, framebuffer_path, pool_path) =
+            mapped_popup("popup-dismiss-orphan");
+
+        // A second menu on the same window, created and never mapped.
+        client
+            .insert(60, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        let mut shell = wire::Builder::new();
+        shell.u32(61);
+        shell.u32(60);
+        client
+            .dispatch(request(12, 2, shell).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut hanging = wire::Builder::new();
+        hanging.u32(62);
+        hanging.u32(9);
+        hanging.u32(30);
+        client
+            .dispatch(request(61, 2, hanging).unwrap(), &mut VecDeque::new())
+            .unwrap();
+
+        // As far through the map as a client gets before it has pixels: the
+        // bufferless commit that asks for a configure, and the acknowledgement.
+        // The BUFFER is what is withheld, and withholding it is what keeps this
+        // popup out of the scene and so out of any cascade.
+        client
+            .dispatch(
+                request(60, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        let serial = drain_messages(&mut peer)
+            .iter()
+            .rev()
+            .find_map(|message| {
+                ((message.object, message.opcode) == (61, 0))
+                    .then(|| wire::Cursor::new(&message.payload).u32().unwrap())
+            })
+            .unwrap();
+        let mut ack = wire::Builder::new();
+        ack.u32(serial);
+        client
+            .dispatch(request(61, 4, ack).unwrap(), &mut VecDeque::new())
+            .unwrap();
+
+        // The window goes, all the way to its wl_surface, which is what breaks
+        // the parent edges.
+        for (object, opcode) in [(10u32, 0u16), (9, 0), (5, 0)] {
+            client
+                .dispatch(
+                    request(object, opcode, wire::Builder::new()).unwrap(),
+                    &mut VecDeque::new(),
+                )
+                .unwrap();
+        }
+        // The cascade dismissed the MAPPED menu and could not have reached
+        // 62, which had no pixels to take down. Asserted rather than drained,
+        // because it is the half this test's name turns on.
+        assert_eq!(
+            dismissals(&client, &mut peer),
+            vec![14],
+            "the cascade did not do what this test assumes it did"
+        );
+
+        // The client finishes what it started: a buffer for a menu that now
+        // has nowhere to go.
+        client
+            .insert(
+                63,
+                Object::Buffer(Buffer {
+                    serial: 63,
+                    file: Arc::new(File::open(&pool_path).unwrap()),
+                    offset: 0,
+                    width: 1,
+                    height: 1,
+                    stride: 4,
+                    format: SHM_XRGB8888,
+                }),
+            )
+            .unwrap();
+        let mut attach = wire::Builder::new();
+        attach.u32(63);
+        attach.i32(0);
+        attach.i32(0);
+        client
+            .dispatch(request(60, 1, attach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(60, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            dismissals(&client, &mut peer),
+            vec![62],
+            "a menu td decided against was not told it was dismissed"
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// The dismissal order follows the TREE, not the order the popups were
+    /// placed in — and the two really can disagree, which is why this is a
+    /// test rather than a remark.
+    ///
+    /// The protocol FORBIDS what this fixture does — "the parent of an
+    /// xdg_popup must be mapped before the xdg_popup itself" — and td does not
+    /// police it, which a compositor need not: `get_popup` checks only that
+    /// the parent xdg_surface holds a role object. So a client that ignores
+    /// the rule can commit a sub-submenu before the submenu it hangs off, and
+    /// the scene's stacking order then runs the opposite way to the chain:
+    /// here 40 is placed before its own parent 20 and carries the LOWER order.
+    ///
+    /// That the sequence is non-conformant is the point rather than a flaw in
+    /// the fixture. Reversing the cascade is a property of the tree and holds
+    /// whatever the client does; a stacking sort holds only while clients obey
+    /// a rule nothing checks, so one misbehaving client could extract from it
+    /// the very destroy order td refuses.
+    ///
+    /// Sorting the dismissal by that order — which reads as the obvious way to
+    /// get "topmost first" — would put 20 ahead of 40, a parent ahead of its
+    /// child, and a client obeying it would destroy a menu with a submenu
+    /// still hanging off it. That is `not_the_topmost_popup`, which td itself
+    /// raises. Reversing the cascade cannot make that mistake: the cascade is
+    /// breadth-first, so a parent's index is always the lower one whatever
+    /// order the placements happened in.
+    #[test]
+    fn a_submenu_placed_before_its_menu_is_still_dismissed_first() {
+        let (mut client, mut peer, runtime, framebuffer_path, pool_path) =
+            mapped_popup("popup-dismiss-order");
+
+        // Both role objects first, so neither map below is blocked on the
+        // other existing.
+        for (surface, xdg_surface, popup, parent) in
+            [(20u32, 21u32, 22u32, 13u32), (40, 41, 42, 21)]
+        {
+            client
+                .insert(surface, Object::Surface(SurfaceState::default()))
+                .unwrap();
+            let mut shell = wire::Builder::new();
+            shell.u32(xdg_surface);
+            shell.u32(surface);
+            client
+                .dispatch(request(12, 2, shell).unwrap(), &mut VecDeque::new())
+                .unwrap();
+            let mut hanging = wire::Builder::new();
+            hanging.u32(popup);
+            hanging.u32(parent);
+            hanging.u32(30);
+            client
+                .dispatch(
+                    request(xdg_surface, 2, hanging).unwrap(),
+                    &mut VecDeque::new(),
+                )
+                .unwrap();
+        }
+
+        // The DEEPER one first. This is the whole fixture: it gives 40 a lower
+        // stacking order than the 20 it hangs off.
+        map_popup_surface(&mut client, &mut peer, 40, 41, 27, &pool_path);
+        map_popup_surface(&mut client, &mut peer, 20, 21, 47, &pool_path);
+        let _ = dismissals(&client, &mut peer);
+
+        // The inversion this test exists for, asserted rather than assumed:
+        // bottom-first, 40 sits below the 20 it hangs off. Without it the
+        // fixture would prove nothing, because a reversal and an order sort
+        // agree whenever the placements happen to run with the chain.
+        let key = |object| SurfaceKey { client: 88, object };
+        assert_eq!(
+            runtime.lock().unwrap().popup_stack(),
+            vec![key(6), key(40), key(20)],
+            "the submenu was not placed below its own menu"
+        );
+
+        let mut detach = wire::Builder::new();
+        detach.u32(0);
+        detach.i32(0);
+        detach.i32(0);
+        client
+            .dispatch(request(5, 1, detach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        commit(&mut client).unwrap();
+
+        assert_eq!(
+            dismissals(&client, &mut peer),
+            vec![42, 22, 14],
+            "the dismissal followed the placements rather than the chain"
+        );
 
         let _ = fs::remove_file(&framebuffer_path);
         let _ = fs::remove_file(&pool_path);

@@ -368,6 +368,11 @@ impl Runtime {
         self.scene.popup_placement(key)
     }
 
+    #[cfg(test)]
+    pub fn popup_stack(&self) -> Vec<SurfaceKey> {
+        self.scene.popup_stack()
+    }
+
     /// A popup taken down — by a null attach, by its role object going away, or
     /// by the surface being destroyed. Settles for the reason above: the
     /// pointer may have been over it.

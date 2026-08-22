@@ -1078,17 +1078,47 @@ renderer's depth bound stays. Six rules across two modules is exactly the kind
 of conjunction that has now been corrected three times, and what it costs to be
 wrong is a compositor that never paints again.
 
-Four parts are deliberately NOT here yet, and each is a landing of its own.
+Three parts are incomplete and a fourth has landed, and each is a landing of
+its own.
 **Constraint adjustment** is recorded and not acted on: every bit of it is
 permission for td to move a popup that does not fit, so a menu near an edge
 extends past it rather than sliding or flipping. **Grabs** are accepted and not
 acted on — `xdg_popup.grab` records nothing, td dismisses no popup of its own,
 and a client that expects a click outside to close its menu must notice and
-destroy it. **Dismissal is never SIGNALLED**: nothing sends
-`xdg_popup.popup_done`, so when td stops drawing a menu because its window was
-stacked away or its workspace switched, the client still believes the menu is
-open and it reappears on return. **Reposition** is version 3 and out of reach
-at the `xdg_wm_base` version td advertises. td also refuses a NULL parent,
+destroy it. **Dismissal is signalled where td dismisses, and
+nowhere else.** Every popup a take-down cascades over is sent
+`xdg_popup.popup_done`, deepest first — the order the protocol makes a client
+destroy nested popups in, so a client that destroys each one as it hears never
+arrives at td's own `not_the_topmost_popup`. That order follows the CHAIN and
+not the stacking, and the two really can disagree. The protocol requires a
+popup's parent to be mapped before the popup itself; td does not police that,
+as `get_popup` checks only for a role object, so a client that ignores the
+rule can place a sub-submenu before the submenu it hangs off and leave a child
+BELOW its own parent in the stack.
+Sorting the dismissal by stacking order — which reads as the obvious way to
+spell "topmost first" — would then put a parent ahead of its child and hand a
+client the very destroy order td refuses — and it is exactly a client already
+ignoring the protocol that would get it. Reversing the cascade cannot: it is
+breadth-first, so a parent's index is the lower one whatever order the
+placements happened in, and whatever the client did. That td does not enforce
+the mapping rule is a gap of its own, recorded here rather than relied on.
+
+The surface NAMED gets nothing: its client took it down and is not owed an
+event saying so. One take-down is not a cascade at all and is signalled
+separately — a popup still unmapped when its window went was never in the
+scene to be cascaded over, so when its client finally commits the buffer it
+was preparing, td declines the menu and says so there. That is the only moment
+such a popup can ever be told, and without it a client waits on a menu td
+discarded in silence. What remains is
+that td dismisses nothing of its OWN volition, which is the grab bullet above
+rather than this one. A workspace switch is not a dismissal either and
+correctly sends nothing — a menu on a workspace that is not showing is
+RETAINED rather than taken down, so it is still the client's and reappears on
+return, which is a different thing from the client being told it closed. A
+window hidden in a stacked container is the same case for the same reason: the
+placement stops being visible and the menu is not dropped.
+**Reposition** is version 3 and out of reach at the `xdg_wm_base` version td
+advertises. td also refuses a NULL parent,
 which the protocol permits only so that another protocol may supply one before
 the first commit: td implements no such protocol, so a popup that arrived that
 way could never be placed at all. A zero-area anchor rectangle IS accepted,
