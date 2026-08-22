@@ -58,6 +58,12 @@ const XDG_WM_BASE_ERROR_DEFUNCT_SURFACES: u32 = 1;
 const XDG_WM_BASE_ERROR_NOT_THE_TOPMOST_POPUP: u32 = 2;
 const XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT: u32 = 3;
 const XDG_WM_BASE_ERROR_INVALID_POSITIONER: u32 = 5;
+/// The `xdg_wm_base` td advertises, and the only one it binds. Named rather
+/// than spelled `1` at both sites because `XdgPopup::configure_sent` turns on
+/// it: version 3 makes a popup's configure repeatable and would make sending
+/// it once WRONG, so a bump has to be read against that.
+const XDG_WM_BASE_VERSION: u32 = 1;
+const XDG_SURFACE_CONFIGURE: u16 = 0;
 const XDG_POPUP_CONFIGURE: u16 = 0;
 const XDG_POPUP_POPUP_DONE: u16 = 1;
 const WL_SEAT_ERROR_MISSING_CAPABILITY: u32 = 0;
@@ -296,6 +302,17 @@ enum Object {
         /// Where the rules put it, resolved once at `get_popup` and copied here
         /// for the reason above.
         rect: PositionerRect,
+        /// Whether this popup OBJECT has been sent its `xdg_popup.configure`.
+        /// Per object rather than per mapping, which is the scope the protocol
+        /// uses: "for version 2 or older, the configure event for an xdg_popup
+        /// is only ever sent once for the initial configuration", and td
+        /// advertises `xdg_wm_base` version 1. A surface that unmaps and maps
+        /// again is answered with the `xdg_surface` half alone.
+        ///
+        /// Never cleared. `xdg_popup.destroy` takes the object with it, so the
+        /// next popup starts false — which is what makes "once per object" the
+        /// property rather than "once per xdg_surface".
+        configure_sent: bool,
     },
     XdgToplevel {
         xdg_surface: u32,
@@ -476,7 +493,7 @@ fn send_configure(
 
     let mut surface = wire::Builder::new();
     surface.u32(configure.serial);
-    let surface = surface.message(registration.xdg_surface, 0)?;
+    let surface = surface.message(registration.xdg_surface, XDG_SURFACE_CONFIGURE)?;
 
     let mut outbound = outbound
         .lock()
@@ -499,37 +516,50 @@ fn send_initial_configure(
     sent
 }
 
-/// A popup's initial configure: where it was placed and how big, then the
-/// xdg_surface serial that makes the pair one atomic configuration. The
-/// rectangle rather than a size alone is what distinguishes this from a
-/// toplevel's — a popup is placed by its client's own rules, and the client is
-/// told the answer it will be drawn at.
+/// Answer a popup's initial commit: optionally where it was placed and how
+/// big, then the xdg_surface serial. The rectangle rather than a size alone
+/// is what distinguishes this from a toplevel's — a popup is placed by its
+/// client's own rules, and the client is told the answer it will be drawn at.
+///
+/// `placement` is `Some` only the FIRST time for a given popup object; see
+/// `XdgPopup::configure_sent`. So the two are a PAIR on the first map and the
+/// xdg_surface event alone on a re-map, which the protocol allows for: "a
+/// configure sequence is a set of one or more events", with the role event
+/// extending it only where applicable. The serial is the half that is never
+/// optional, since it is what the client must acknowledge before attaching.
 fn send_popup_configure(
     outbound: &Arc<Mutex<Outbound>>,
     xdg_surface: u32,
     popup: u32,
-    rect: PositionerRect,
+    placement: Option<PositionerRect>,
     tracker: &Arc<Mutex<ConfigureTracker>>,
 ) -> Result<(), String> {
     let configure = tracker
         .lock()
         .map_err(|_| "XDG configure tracker lock poisoned".to_string())?
         .initial(next_serial())?;
-    let mut placed = wire::Builder::new();
-    placed.i32(rect.x);
-    placed.i32(rect.y);
-    placed.i32(rect.width);
-    placed.i32(rect.height);
-    let placed = placed.message(popup, XDG_POPUP_CONFIGURE)?;
+    let placed = match placement {
+        Some(rect) => {
+            let mut placed = wire::Builder::new();
+            placed.i32(rect.x);
+            placed.i32(rect.y);
+            placed.i32(rect.width);
+            placed.i32(rect.height);
+            Some(placed.message(popup, XDG_POPUP_CONFIGURE)?)
+        }
+        None => None,
+    };
 
     let mut surface = wire::Builder::new();
     surface.u32(configure.serial);
-    let surface = surface.message(xdg_surface, 0)?;
+    let surface = surface.message(xdg_surface, XDG_SURFACE_CONFIGURE)?;
 
     let mut outbound = outbound
         .lock()
         .map_err(|_| "Wayland outbound lock poisoned".to_string())?;
-    outbound.send(&placed)?;
+    if let Some(placed) = placed {
+        outbound.send(&placed)?;
+    }
     outbound.send(&surface)
 }
 
@@ -1691,7 +1721,12 @@ impl Client {
         self.global(registry, GLOBAL_COMPOSITOR, "wl_compositor", 4)?;
         self.global(registry, GLOBAL_SHM, "wl_shm", 1)?;
         self.global(registry, GLOBAL_OUTPUT, "wl_output", 4)?;
-        self.global(registry, GLOBAL_XDG_WM_BASE, "xdg_wm_base", 1)?;
+        self.global(
+            registry,
+            GLOBAL_XDG_WM_BASE,
+            "xdg_wm_base",
+            XDG_WM_BASE_VERSION,
+        )?;
         self.global(registry, GLOBAL_DECORATION, "zxdg_decoration_manager_v1", 1)?;
         self.global(registry, GLOBAL_SEAT, "wl_seat", SEAT_VERSION)
     }
@@ -1720,7 +1755,7 @@ impl Client {
                 self.insert(id, Object::Output { version })?;
                 self.send_output(id, version)
             }
-            (GLOBAL_XDG_WM_BASE, "xdg_wm_base") if version == 1 => {
+            (GLOBAL_XDG_WM_BASE, "xdg_wm_base") if version == XDG_WM_BASE_VERSION => {
                 self.insert(id, Object::XdgWmBase)
             }
             (GLOBAL_DECORATION, "zxdg_decoration_manager_v1") if version == 1 => {
@@ -2005,19 +2040,36 @@ impl Client {
                             tracker: Arc::clone(&configure),
                         },
                     )?,
-                    // A popup is told WHERE as well as how big, and is not
-                    // registered for layout updates: it is in no arrangement,
-                    // so the publisher that answers "what tile do you have
-                    // now" has nothing to say about one.
+                    // A popup is told WHERE as well as how big — on its
+                    // first map; see `configure_sent` — and is not registered
+                    // for layout updates: it is in no arrangement, so the
+                    // publisher that answers "what tile do you have now" has
+                    // nothing to say about one.
                     RoleObject::Popup(popup_object) => {
-                        let Some(Object::XdgPopup { rect, .. }) =
-                            self.objects.get(&popup_object).cloned()
+                        let Some(Object::XdgPopup {
+                            rect,
+                            configure_sent,
+                            ..
+                        }) = self.objects.get_mut(&popup_object)
                         else {
                             return Err(format!(
                                 "xdg_surface {role} names a missing xdg_popup {popup_object}"
                             ));
                         };
-                        send_popup_configure(&self.outbound, role, popup_object, rect, &configure)?;
+                        // A RE-MAP gets the xdg_surface half alone; see
+                        // `configure_sent`. Held mutably across the send so
+                        // the flag is set from the same lookup that read it —
+                        // `outbound` is a disjoint field, so the borrow costs
+                        // nothing.
+                        let placement = (!*configure_sent).then_some(*rect);
+                        send_popup_configure(
+                            &self.outbound,
+                            role,
+                            popup_object,
+                            placement,
+                            &configure,
+                        )?;
+                        *configure_sent = true;
                     }
                 }
             } else if attaching_buffer
@@ -3110,6 +3162,7 @@ impl Client {
                             xdg_surface: message.object,
                             parent: Some(parent_surface),
                             rect,
+                            configure_sent: false,
                         },
                     )?;
                     self.objects.insert(
@@ -9837,7 +9890,7 @@ mod tests {
         assert!(
             drain_messages(&mut peer)
                 .iter()
-                .any(|message| (message.object, message.opcode) == (13, 0)),
+                .any(|message| (message.object, message.opcode) == (13, XDG_SURFACE_CONFIGURE)),
             "the re-map was not answered with a configure"
         );
 
@@ -9862,6 +9915,215 @@ mod tests {
             XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER
         );
         assert_eq!(client.protocol_error_object, Some(13));
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// A popup's own configure is sent ONCE per popup object, so a menu that
+    /// maps again is not placed again.
+    ///
+    /// "For version 2 or older, the configure event for an xdg_popup is only
+    /// ever sent once for the initial configuration", and td advertises
+    /// `xdg_wm_base` version 1 — repeated role configures start at version 3,
+    /// with `set_reactive` and `reposition`, neither of which td has. The
+    /// `xdg_surface.configure` IS re-sent, because that carries the serial the
+    /// client has to acknowledge before it may attach again; dropping both
+    /// would leave a re-map with nothing to ack and no way back on screen.
+    ///
+    /// What the client loses is a fresh position, and on version 1 that is not
+    /// td's to give: the placement was resolved at `get_popup` and there is no
+    /// event on this version that may revise it.
+    ///
+    /// The parent EDGE survives here — only the toplevel role object is
+    /// destroyed, and `orphan_popups_of` breaks the edge on `wl_surface`
+    /// destruction — so this is a placeable popup, not the unplaceable case
+    /// DESIGN.md §3 leaves open.
+    #[test]
+    fn a_re_mapped_menu_is_not_placed_a_second_time() {
+        let (mut client, mut peer, _runtime, framebuffer_path, pool_path) =
+            mapped_popup("popup-remap-once");
+        // The mapping in the fixture has already spent this popup's one
+        // configure, which is what makes the re-map below the second.
+        drain_messages(&mut peer);
+
+        client
+            .dispatch(
+                request(10, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(dismissals(&client, &mut peer), vec![14]);
+
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        let answered = drain_messages(&mut peer);
+        assert!(
+            answered
+                .iter()
+                .any(|message| (message.object, message.opcode) == (13, XDG_SURFACE_CONFIGURE)),
+            "the re-map was given no serial to acknowledge: {:?}",
+            answered
+                .iter()
+                .map(|message| (message.object, message.opcode))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !answered
+                .iter()
+                .any(|message| (message.object, message.opcode) == (14, XDG_POPUP_CONFIGURE)),
+            "the popup was placed a second time"
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// A NEW popup object is placed, which is the other side of "once per
+    /// object" and the half that says why the flag lives where it does.
+    ///
+    /// `xdg_popup.destroy` then `get_popup` on the same xdg_surface is the
+    /// legal way to reopen a menu, and a toolkit reaching for a different
+    /// positioner is the ordinary reason. Scope the flag to the XDG_SURFACE
+    /// instead — where the configure tracker already lives, so it is the
+    /// tidying refactor someone will reach for — and the second popup is
+    /// never told where it is: the client gets a serial and no placement,
+    /// and draws its menu at the previous one's coordinates.
+    ///
+    /// A DIFFERENT size is asked for so the placement is distinguishable
+    /// from the first popup's, and the payload is read rather than the
+    /// event merely counted: an event carrying the old rect would satisfy
+    /// a presence check while being exactly the bug.
+    #[test]
+    fn a_recreated_popup_object_is_placed_again() {
+        let (mut client, mut peer, _runtime, framebuffer_path, pool_path) =
+            mapped_popup("popup-recreate");
+        drain_messages(&mut peer);
+
+        // The popup OBJECT goes; its xdg_surface stays and may take another.
+        client
+            .dispatch(
+                request(14, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        drain_messages(&mut peer);
+
+        let mut size = wire::Builder::new();
+        size.i32(50);
+        size.i32(25);
+        client
+            .dispatch(request(30, 1, size).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        get_popup(&mut client, 15, 9, 30).unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+
+        let answered = drain_messages(&mut peer);
+        let placed: Vec<&Vec<u8>> = answered
+            .iter()
+            .filter(|message| (message.object, message.opcode) == (15, XDG_POPUP_CONFIGURE))
+            .map(|message| &message.payload)
+            .collect();
+        assert_eq!(
+            placed.len(),
+            1,
+            "a recreated popup was placed {} times, not once: {:?}",
+            placed.len(),
+            answered
+                .iter()
+                .map(|message| (message.object, message.opcode))
+                .collect::<Vec<_>>()
+        );
+        let mut payload = wire::Cursor::new(placed.first().unwrap());
+        let (_x, _y) = (payload.i32().unwrap(), payload.i32().unwrap());
+        assert_eq!(
+            (payload.i32().unwrap(), payload.i32().unwrap()),
+            (50, 25),
+            "the recreated popup was told the first one's size"
+        );
+        assert!(
+            answered
+                .iter()
+                .any(|message| (message.object, message.opcode) == (13, XDG_SURFACE_CONFIGURE)),
+            "the recreated popup was given no serial to acknowledge: {:?}",
+            answered
+                .iter()
+                .map(|message| (message.object, message.opcode))
+                .collect::<Vec<_>>()
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// The same, by the route that does not involve td at all: a client
+    /// unmaps its own menu with a null buffer and maps it again.
+    ///
+    /// This one is why the flag lives on the POPUP OBJECT rather than beside
+    /// the dismissal. The client's own unmap resets the same tracker and has
+    /// done since before td dismissed anything, so a fix hung off dismissal
+    /// would have left the older route sending a second configure — and it is
+    /// the route a toolkit reaches by ordinary means, since it needs no
+    /// ignored `popup_done`. The parent is untouched here, so this popup is
+    /// placeable, as the one in
+    /// `a_re_mapped_menu_is_not_placed_a_second_time` is.
+    #[test]
+    fn a_menu_its_client_unmapped_is_not_placed_a_second_time() {
+        let (mut client, mut peer, _runtime, framebuffer_path, pool_path) =
+            mapped_popup("popup-selfremap-once");
+        drain_messages(&mut peer);
+
+        // A null buffer is how a client unmaps a surface of its own accord.
+        let mut detach = wire::Builder::new();
+        detach.u32(0);
+        detach.i32(0);
+        detach.i32(0);
+        client
+            .dispatch(request(6, 1, detach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(
+            dismissals(&client, &mut peer).is_empty(),
+            "a client's own unmap is not a dismissal and is owed no event"
+        );
+
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        let answered = drain_messages(&mut peer);
+        assert!(
+            answered
+                .iter()
+                .any(|message| (message.object, message.opcode) == (13, XDG_SURFACE_CONFIGURE)),
+            "the re-map was given no serial to acknowledge: {:?}",
+            answered
+                .iter()
+                .map(|message| (message.object, message.opcode))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !answered
+                .iter()
+                .any(|message| (message.object, message.opcode) == (14, XDG_POPUP_CONFIGURE)),
+            "the popup was placed a second time"
+        );
 
         let _ = fs::remove_file(&framebuffer_path);
         let _ = fs::remove_file(&pool_path);
@@ -10307,7 +10569,7 @@ mod tests {
             .iter()
             .rev()
             .find_map(|message| {
-                ((message.object, message.opcode) == (xdg_surface, 0))
+                ((message.object, message.opcode) == (xdg_surface, XDG_SURFACE_CONFIGURE))
                     .then(|| wire::Cursor::new(&message.payload).u32().unwrap())
             })
             .unwrap();
@@ -10509,7 +10771,9 @@ mod tests {
         assert_eq!(XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER, 3);
         assert_eq!(XDG_SURFACE_ERROR_INVALID_SIZE, 5);
         assert_eq!(XDG_POSITIONER_ERROR_INVALID_INPUT, 0);
+        assert_eq!(XDG_SURFACE_CONFIGURE, 0);
         assert_eq!(XDG_POPUP_CONFIGURE, 0);
+        assert_eq!(XDG_WM_BASE_VERSION, 1);
     }
 
     /// The popup direction of `already_constructed`. Deleting the check is not

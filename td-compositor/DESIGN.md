@@ -888,7 +888,9 @@ application opening its first menu died. They are implemented: a positioner
 records the rules — size, anchor rectangle, anchor, gravity, constraint
 adjustment and offset — and `get_popup` derives a rectangle from them, which is
 what the client is told in `xdg_popup.configure`, before the
-`xdg_surface.configure` that makes the pair one configuration.
+`xdg_surface.configure` that makes the pair one configuration. A PAIR on the
+popup object's first map only — §3's re-map paragraph is the qualification,
+and on a re-map the xdg_surface event goes alone.
 
 The rules are COPIED at `get_popup`, as the protocol requires, so the client may
 reuse or destroy the positioner immediately and nothing already placed moves.
@@ -1144,26 +1146,34 @@ code a property of which check happened to fire. Both reach every
 pre-configure attach and not only a repainted menu, so this is a conformance
 fix riding along rather than the point of the landing.
 
-Re-mapping exposes a gap worth naming rather than leaving to be found, and
-the honest form of it is broader than the case that surfaced it: what should
-td answer a re-map's initial commit with AT ALL? Two halves, and neither is
-fixed here.
+Re-mapping raises one question in two halves — what should td answer a
+re-map's initial commit WITH? — and one half is answered.
 
-Where the parent is GONE, td sends a configure anyway, inviting a buffer it
-will then decline to place. The decline is correct and refunds the bytes, but
-the invitation should not have been issued, and the open question is WHICH
-error to raise instead — the popup is no longer placeable and the protocol
-has no code for that.
+Where the parent is LIVE the re-map is legal, and what it gets is the
+`xdg_surface.configure` ALONE. The popup's own configure is sent once per
+popup OBJECT, because "for version 2 or older, the configure event for an
+xdg_popup is only ever sent once for the initial configuration" and td
+advertises `xdg_wm_base` version 1; repeated role configures begin at version
+3 with `set_reactive` and `reposition`, neither of which td has. The
+xdg_surface half is still owed, since it carries the serial the client must
+acknowledge before attaching — drop both and a re-map has nothing to ack and
+no way back on screen.
 
-Where the parent is LIVE the re-map is legal, and the problem is the popup
-half of the answer: td re-sends `xdg_popup.configure` on the same popup
-object, which "for version 2 or older ... is only ever sent once for the
-initial configuration", and td advertises `xdg_wm_base` version 1. Only the
-`xdg_surface.configure` should be re-sent. This is NOT introduced by the
-dismissal — a client's own null attach already unmapped the tracker and
-already reached it — but the dismissal is a second route to it, so it is
-recorded here rather than left where nothing names it. Both halves are one
-landing, because both are about what a popup's re-map is answered with.
+What the client gives up is a fresh POSITION, and on version 1 that is not
+td's to give: the placement was resolved at `get_popup` and this version has
+no event that may revise it. The flag sits on the popup object rather than
+beside the dismissal deliberately. A client's own null attach unmaps the same
+tracker and has done since before td dismissed anything, so a fix hung off
+dismissal would have left the older route — the one a toolkit reaches without
+ignoring any event — still placing a popup twice.
+
+Where the parent is GONE the other half is open: td sends a configure anyway,
+inviting a buffer it will then decline to place. The decline is correct and
+refunds the bytes, but the invitation should not have been issued, and the
+question is what to send instead. `popup_done` reads as the answer — the
+popup can never be placed, so dismissing it says exactly that and needs no
+error code the protocol does not have — but it is a behaviour change owed its
+own tests rather than a rider here.
 
 The surface NAMED gets nothing: its client took it down and is not owed an
 event saying so. One take-down is not a cascade at all and is signalled
