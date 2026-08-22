@@ -1400,7 +1400,76 @@ c
 ## END
 ## stdout-json: ""
 ## status: 4
-## stderr-contains: sed:
+## stderr-json: "sed: can't find label for jump to `nowhere'\n"
+
+# --- WHICH unresolvable jump is named is the LAST one in the script, not
+# --- the first. GNU PREPENDS each jump to a list as it compiles it and
+# --- resolves from that list's head (compile.c:1611), so the walk runs
+# --- backwards; it skips a jump that resolves and skips the EMPTY label,
+# --- which is a jump to the end of the script rather than to a label.
+
+#### and the one it names is the LAST unresolvable jump, not the first
+## argv: sed 'ba;bb;bc'
+## stdin-json: "x\n"
+## stdout-json: ""
+## stderr-json: "sed: can't find label for jump to `c'\n"
+## status: 4
+
+#### which the reversed script shows from the other side
+## argv: sed 'bc;bb;ba'
+## stdin-json: "x\n"
+## stdout-json: ""
+## stderr-json: "sed: can't find label for jump to `a'\n"
+## status: 4
+
+#### a jump that RESOLVES is passed over on the way
+## argv: sed 'ba;:a;bb'
+## stdin-json: "x\n"
+## stdout-json: ""
+## stderr-json: "sed: can't find label for jump to `b'\n"
+## status: 4
+
+#### and so is the empty label, which names no label to find
+## argv: sed 'bq;b'
+## stdin-json: "x\n"
+## stdout-json: ""
+## stderr-json: "sed: can't find label for jump to `q'\n"
+## status: 4
+
+#### a t is a jump the walk sees, so it names the t and not the b
+## argv: sed 'bq;tz'
+## stdin-json: "x\n"
+## stdout-json: ""
+## stderr-json: "sed: can't find label for jump to `z'\n"
+## status: 4
+
+#### and a T the same way
+## argv: sed 'bq;Tw'
+## stdin-json: "x\n"
+## stdout-json: ""
+## stderr-json: "sed: can't find label for jump to `w'\n"
+## status: 4
+
+#### a block does not change which one is named
+## argv: sed '{ba};bb'
+## stdin-json: "x\n"
+## stdout-json: ""
+## stderr-json: "sed: can't find label for jump to `b'\n"
+## status: 4
+
+#### nor does the -e boundary, the parts being one script
+## argv: sed -e 'ba' -e 'bb'
+## stdin-json: "x\n"
+## stdout-json: ""
+## stderr-json: "sed: can't find label for jump to `b'\n"
+## status: 4
+
+#### and the name is written RAW, a byte above 0x7f included
+## argv: sed "b no\xffsuch"
+## stdin-json: "x\n"
+## stdout-json: ""
+## stderr-json: "sed: can't find label for jump to `no\xffsuch'\n"
+## status: 4
 
 #### no script at all is a usage error
 ## argv: sed
@@ -4334,7 +4403,7 @@ sed: couldn't open file /nosuchdir/out: No such file or directory
 ## stdin-json: "x\n"
 ## stdout-json: ""
 ## file-after-json out: ""
-## stderr-contains: label
+## stderr-json: "sed: can't find label for jump to `nope'\n"
 ## status: 4
 
 #### an unopenable w is reported before an operand that cannot be read
@@ -5554,7 +5623,7 @@ f$
 ## stdin-json: "a\n"
 ## stdout-json: ""
 ## status: 4
-## stderr-contains: label
+## stderr-json: "sed: can't find label for jump to `p'\n"
 
 # --- ``\` ``/`\'` under M are indistinguishable from `^`/`$` in an ADDRESS, and
 # --- move to the record separator with them. In a SUBSTITUTION only a SEGMENT

@@ -1824,21 +1824,34 @@ fn parse_commands(p: &mut ScriptParser) -> Result<Script, Fatal> {
 
 /// Turn every branch's label name into a command index. Done after the whole
 /// script is parsed because a branch may jump forward.
+///
+/// BACKWARDS, which only the DIAGNOSTIC sees: GNU prepends each jump to a list
+/// as it compiles one and resolves from that list's head (compile.c:1611), so
+/// the jump it names is the LAST unresolvable one in the script, not the first.
 fn resolve_labels(cmds: &mut [Cmd], labels: &BTreeMap<Vec<u8>, usize>) -> Result<(), Vec<u8>> {
-    for cmd in cmds.iter_mut() {
-        let name = match &cmd.kind {
+    for cmd in cmds.iter_mut().rev() {
+        let target = match &cmd.kind {
             Kind::Branch(Target::Name(n))
             | Kind::BranchIfSub(Target::Name(n))
-            | Kind::BranchIfNoSub(Target::Name(n)) => n.clone(),
-            _ => continue,
-        };
-        let target = if name.is_empty() {
-            None
-        } else {
-            match labels.get(&name) {
-                Some(t) => Some(*t),
-                None => return Err(crate::util::name_in("can't operate on label `", &name, "'")),
+            | Kind::BranchIfNoSub(Target::Name(n)) => {
+                // An empty label is a jump to the end of the script, not a name
+                // to look up: GNU passes it over with `if (*go->name)`.
+                if n.is_empty() {
+                    None
+                } else {
+                    match labels.get(n) {
+                        Some(t) => Some(*t),
+                        None => {
+                            return Err(crate::util::name_in(
+                                "can't find label for jump to `",
+                                n,
+                                "'",
+                            ))
+                        }
+                    }
+                }
             }
+            _ => continue,
         };
         cmd.kind = match &cmd.kind {
             Kind::Branch(_) => Kind::Branch(Target::At(target)),

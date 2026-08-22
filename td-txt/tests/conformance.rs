@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 2573;
+const CORPUS_FLOOR: usize = 2582;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -1073,33 +1073,19 @@ fn a_diagnostic_names_a_file_in_raw_bytes() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-/// Two more sites the same landing touched, held to td-txt's OWN bytes rather
-/// than to GNU's: each diverges from GNU somewhere the corpus cannot compare
-/// (spec/README), so GNU is not the whole oracle here and the name and the
-/// shape are what is under test. Without these the label splice and the
-/// hand-rolled possibilities join -- which replaced a `join(" ")` that could
-/// not carry bytes -- are defended by nothing.
+/// Two sites the raw-name landing touched, held to td-txt's OWN bytes rather
+/// than to GNU's: each diverges from GNU somewhere the corpus cannot compare,
+/// so GNU is not the whole oracle here and the name and the shape are what is
+/// under test. The ambiguity line's divergence is spec/README's; the scratch
+/// file's NAME is nobody's contract, as the comment below it says. Without
+/// these the hand-rolled possibilities join -- which replaced a `join(" ")`
+/// that could not carry bytes -- is defended by nothing.
 #[test]
 fn a_diverging_diagnostic_still_names_in_raw_bytes() -> Result<(), Box<dyn std::error::Error>> {
     use std::os::unix::ffi::OsStrExt;
 
     let dir = TempDir::new("rawname-diverge")?;
     std::fs::write(dir.0.join("IN"), b"a\n")?;
-
-    // A branch to a label nothing defines. GNU words this `can't find label for
-    // jump to', but writes the NAME the same way -- raw.
-    let out = std::process::Command::new(bin())
-        .arg("sed")
-        .arg(std::ffi::OsStr::from_bytes(b"b no\xffsuch"))
-        .arg("IN")
-        .current_dir(&dir.0)
-        .output()?;
-    assert_eq!(
-        out.stderr,
-        b"sed: can't operate on label `no\xffsuch'\n".to_vec(),
-        "the unresolved label was not named raw"
-    );
-    assert_eq!(out.status.code(), Some(4));
 
     // The ambiguity list. GNU names itself by argv[0] and td-txt by the applet,
     // so the LINE still diverges; everything after that prefix does not, which

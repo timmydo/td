@@ -2787,14 +2787,18 @@ td-txt-authored case files
     expand it empty -- which was what my own probe showed, the probe having
     reused a group-LESS regex and so never reaching the case that matters.
 
-  - `sed -e '1a\<newline>foo' -e 'bar'` is `can't find label for jump to `ar''
-    in GNU and `can't operate on label `ar'` here -- the same refusal, worded
-    differently. Both modes, predates the branch. It is also a different
-    LABEL once a script leaves SEVERAL unresolved: GNU names the last and
-    td-txt the first, so `ba;bb;bc` is `c' there and `a' here, and reversing
-    the script reverses both answers. Recorded by a review of the
-    reader-truncation landing, whose sweeps kept surfacing this pair -- the
-    wording had been the only half written down.
+  - An unresolvable label's DIAGNOSTIC, which diverged in both halves: the
+    WORDING (`can't find label for jump to `ar'' in GNU against `can't operate
+    on label `ar'` here) and WHICH label a script with several unresolved ones
+    names. CLOSED, both. The wording is now GNU's byte for byte, raw name
+    included, and the walk that picks the label runs BACKWARDS: GNU prepends
+    each jump to a list as it compiles one and resolves from that list's head
+    (compile.c:1611), so `ba;bb;bc` names `c' and the reversed script names
+    `a'. Two jumps are skipped on the way and both are pinned as cases -- one
+    that RESOLVES, and the EMPTY label, which `if (*go->name)` passes over
+    because it jumps to the end of the script rather than to a label.
+    Predated the branch, and was found by a fuzz over malformed scripts after
+    a review of the reader-truncation landing had recorded the wording half.
 
   - Two divergences a sweep of every command letter x {bare, addressed,
     ranged} x {flag, no flag} turned up, none of them about `--posix` and both
