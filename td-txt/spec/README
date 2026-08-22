@@ -134,7 +134,12 @@ td-txt-authored case files
       run `grep [-E] <flags> -e PAT file` under both binaries with LC_ALL=C, and
       compare status + stdout + stderr;
     - BUCKET the divergences before reading them. Raw counts are dominated by
-      noise: a deliberate refusal (`-b`) and GNU's own `warning:` notices. The
+      noise: a deliberate refusal (`-b`) and GNU's own `warning:` notices --
+      though the STRAY-BACKSLASH one is modelled now and is no longer on that
+      list, so bucketing every `warning:` away would hide a real divergence in
+      it. What remains unmodelled is the at-start-of-expression family
+      (`* ? + {...}`), which shares the same gate and would be a small
+      increment on top of it. The
       quantifier-on-a-zero-width-assertion corner (`\<*`, `\b?`) used to belong on
       that list -- excluding it took one run from ~450 divergences to 3 -- and no
       longer does: it is modelled now, in all four dialects, and what remains is
@@ -1578,6 +1583,19 @@ td-txt-authored case files
     matchers -- it has no reason to prefer either -- but it has to model the
     CHOICE, since this byte is observable through it. The count is taken after
     GNU drops duplicate patterns (grep.c:182-201), so `-e ab -e ab` is one.
+
+    "No reason to prefer either" was too strong, and a review of the
+    stray-backslash lint found the second observable: a set GNU converts to
+    fixed strings is never REGEX-PARSED, so a pattern that is not a valid
+    regex still works. `printf '\\\n' | grep -e a -e '\'` prints the
+    backslash and exits 0 under GNU -- `try_fgrep_pattern`'s escape switch is
+    guarded by `if (1 < len)`, so a lone trailing backslash is copied as a
+    literal -- where td-txt compiles it and refuses with `Trailing backslash`
+    at exit 2. STILL open. It is one pattern short of the `-o -w` entry below
+    in what it wants: the matcher CHOICE is modelled, and what is missing is
+    letting that choice pick a different COMPILE. The lint is gated on the
+    same choice and is correct, since GNU's silence there follows from the
+    same never-parsing.
 
   - `-o` with `-w` over a pattern LIST, which is STILL open and now xfailed.
     GNU joins the list with newlines and compiles it as ONE regex when nothing

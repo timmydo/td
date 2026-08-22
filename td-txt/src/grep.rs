@@ -219,14 +219,7 @@ impl Grep {
     /// GNU short-circuits all three — even `-c` prints no count line.
     /// `-L` reports the ABSENCE of a match, so it is handled separately.
     fn settled(&self) -> bool {
-        self.conf.max_count == Some(0)
-            || (self.pats.is_empty() && !self.conf.invert)
-            // `-x`/`-w` narrow an empty pattern to empty/word-bounded lines, so
-            // it no longer selects everything and nothing can be concluded.
-            || (self.only_empty
-                && self.conf.invert
-                && !self.conf.whole_line
-                && !self.conf.word)
+        settled(&self.conf, self.pats.is_empty(), self.only_empty)
     }
 }
 
@@ -275,7 +268,8 @@ struct Grep {
     /// Only `settled` reads this; matching compiles an empty pattern like any other.
     only_empty: bool,
     /// Whether GNU would run its REGEX matcher for this pattern set — see
-    /// `gnu_runs_regex_matcher`. Only the `-w -x` span reads it.
+    /// `gnu_runs_regex_matcher`. Only the `-w -x` span reads this FIELD; the
+    /// stray-backslash lint reads the same answer before the struct exists.
     regex_matcher: bool,
 }
 
@@ -285,17 +279,68 @@ struct Grep {
 /// run whose patterns are all literal switches AWAY from it because `-F` is.
 ///
 /// td-txt has no reason to care which is faster and does not switch. It cares
-/// because the two matchers disagree about ONE observable: a `-w -x` span runs past
-/// the record separator in `EGexecute` (dfasearch.c:512-519) and not in `Fexecute`
-/// (kwsearch.c:152-156). So `grep -w -x -o -e ab` prints the extra byte and
-/// `-e ab -e cd` prints it for neither line.
+/// because the two matchers disagree about two observables. A `-w -x` span runs
+/// past the record separator in `EGexecute` (dfasearch.c:512-519) and not in
+/// `Fexecute` (kwsearch.c:152-156), so `grep -w -x -o -e ab` prints the extra
+/// byte and `-e ab -e cd` prints it for neither line. And only the regex matcher
+/// LEXES a pattern, so only it can lint one: the stray-backslash warning is
+/// silent for a set that switched away, however strayful the patterns.
 fn gnu_runs_regex_matcher(conf: &Conf, pats: &[&Vec<u8>]) -> bool {
     match conf.syntax == Syntax::Fixed {
         // `-F` -> `-G` for a single word-matching pattern in a unibyte locale.
-        // `separator_in_span` is the only caller and asks only under `-w`.
+        // `separator_in_span` asks this only under `-w`, where the switch is
+        // real; the stray lint is a SECOND caller and asks always, so this arm
+        // answers `true` for a plain `grep -F -e '\d'` too. Harmless only
+        // because `-F` compiles to `Patterns::Fixed`, which holds no `Regex`
+        // and so no stray -- the lint's `if let` is what actually stops it, not
+        // this answer.
         true => pats.len() == 1,
         // `-E`/`-G` -> `-F` when two or more patterns are all literal.
         false => pats.len() <= 1 || !all_literal(conf.syntax == Syntax::Extended, pats),
+    }
+}
+
+/// GNU stats stdout and compares it with `/dev/null` (grep.c:2877-2889),
+/// because output nothing can read makes `-l`/`-L`/`-c` moot. A `File` for
+/// descriptor 1 would need `from_raw_fd`, which this crate forbids, so the
+/// descriptor is named through `/proc/self/fd/1` and `metadata` follows the
+/// link to the same device. A pipe or a socket stats fine there and simply is
+/// not that device; no procfs at all answers no, which is what GNU does when
+/// its own `fstat` fails.
+fn stdout_is_dev_null() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(out), Ok(null)) =
+        (std::fs::metadata("/proc/self/fd/1"), std::fs::metadata("/dev/null"))
+    else {
+        return false;
+    };
+    out.dev() == null.dev() && out.ino() == null.ino()
+}
+
+/// GNU fails without reading input where matching provably cannot succeed
+/// (grep.c:2909-2914). Two readers, which is why it is a free function: the
+/// read-skip below, and the stray lint -- because that `return` is ABOVE the
+/// compile, so a run that takes it never lexes a pattern and never lints.
+/// `grep -m0 -e '\d'` is silent for that reason where `grep -m0 -L -e '\d'`
+/// still lints: `-L` reports the ABSENCE of a match, so the short cut excludes
+/// it (`list_files != LISTFILES_NONMATCHING`) and both readers say so.
+fn settled(conf: &Conf, no_patterns: bool, only_empty: bool) -> bool {
+    conf.max_count == Some(0)
+        || (no_patterns && !conf.invert)
+        // `-x`/`-w` narrow an empty pattern to empty/word-bounded lines, so
+        // it no longer selects everything and nothing can be concluded.
+        || (only_empty && conf.invert && !conf.whole_line && !conf.word)
+}
+
+/// GNU's `dfawarn` text for a stray backslash (dfa.c:1565-1576). The order of the
+/// three arms is GNU's and is what makes TAB "unprintable" rather than white
+/// space: `iswprint` is asked first, and in the C locale every control byte and
+/// everything above `~` fails it, so the white-space arm only ever names 0x20.
+fn stray_note(b: u8) -> String {
+    match b {
+        b' ' => "warning: stray \\ before white space".to_string(),
+        0x21..=0x7e => format!("warning: stray \\ before {}", char::from(b)),
+        _ => "warning: stray \\ before unprintable character".to_string(),
     }
 }
 
@@ -975,7 +1020,20 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
     let mut operands = operands.into_iter();
     if !pattern_seen {
         match operands.next() {
-            Some(p) => push_expr(&mut patterns, &p),
+            // A POSITIONAL pattern operand beginning `\-` loses that backslash
+            // (grep.c:2852-2862), and the strip exists for this lint alone:
+            // `grep '\-x'` is how a script writes a pattern that would
+            // otherwise be read as options, so warning about it would punish
+            // the workaround. `-e` and `-f` need no such spelling and keep the
+            // backslash. Outside `-F` matching never saw the difference, since
+            // both spellings match `-x`, which is why the gap surfaced only
+            // once there was a lint; under `-F` the strip WOULD change what
+            // matches (`\-x` is then the literal text), and that is what the
+            // `Syntax::Fixed` guard is for rather than the lint.
+            Some(p) => {
+                let skip = conf.syntax != Syntax::Fixed && p.starts_with(b"\\-");
+                push_expr(&mut patterns, p.get(usize::from(skip)..).unwrap_or_default());
+            }
             None => {
                 eprintln!("{USAGE}");
                 return 2;
@@ -984,6 +1042,25 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
     }
     files.extend(operands);
 
+    // `-x`/`-w` narrow an empty pattern, so `only_empty` is asked of the raw
+    // list; nothing here needs the compile that follows.
+    let only_empty = !patterns.is_empty() && patterns.iter().all(Vec::is_empty);
+    // GNU takes this short cut ABOVE the compile (grep.c:2909-2914), so a run
+    // that takes it neither lints a pattern nor REPORTS ONE AS BROKEN:
+    // `grep -m0 -e '[:alpha:]'` exits 1 in silence where the same pattern
+    // without `-m0` is an error. Asking after compiling would have been a
+    // second answer to a question GNU answers once, and got that case wrong.
+    // `-L` is that short cut's one exception, and `-q` or a stdout that IS
+    // `/dev/null` takes the exception away: GNU clears `list_files` for either
+    // (grep.c:2894-2896) BEFORE testing it, since neither can show a file name.
+    // Only the EXCEPTION is computed here, not GNU's whole line -- the same
+    // line also sets `done_on_match`, which `-l` already has, so clearing the
+    // flags outright would make `grep -l` on an endless pipe read forever.
+    let names_a_file = conf.files_without && !conf.quiet && !stdout_is_dev_null();
+    if settled(&conf, patterns.is_empty(), only_empty) && !names_a_file {
+        return 1;
+    }
+
     let pats = match compile(&conf, &patterns) {
         Ok(p) => p,
         Err(msg) => {
@@ -991,7 +1068,32 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
             return 2;
         }
     };
-    let only_empty = !patterns.is_empty() && patterns.iter().all(Vec::is_empty);
+
+    // The stray-backslash lint lives in `dfaparse`, so a set that switched to
+    // the fixed-string matcher is never lexed and never lints -- not even for a
+    // pattern that lints on its own: `grep -e '\d'` lints and
+    // `grep -e '\d' -e '\y'` does not. Emitted HERE, where GNU compiles,
+    // rather than beside the matching that follows: the compile precedes
+    // operand expansion, so `grep -r -e '\d' missing` lints before the walk
+    // reports the missing path.
+    let regex_matcher = gnu_runs_regex_matcher(&conf, &deduped(&patterns));
+    if regex_matcher {
+        if let Patterns::Regex(res) = &pats {
+            // GNU lexes the patterns JOINED, so the first confusing bracket
+            // ends the lex for the whole SET and not just for its own pattern:
+            // `-e '\d' -e 'a[:alpha:]'` lints, `-e 'a[:alpha:]' -e '\d'` does
+            // not. The refusal is that same lex dying, so it follows here.
+            for re in res {
+                for stray in &re.strays {
+                    err(&stray_note(*stray));
+                }
+                if re.class_syntax {
+                    err(crate::regex::CLASS_SYNTAX);
+                    return 2;
+                }
+            }
+        }
+    }
 
     // `-R` flips the device DEFAULT (grep.c:3007): following symlinks is a claim
     // that what a link points AT should be read, and the default's whole content
@@ -1066,7 +1168,6 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
     // GNU decides the name from the OPERANDS, not from how many files the walk
     // turned them into.
     let show_name = conf.with_filename.unwrap_or(files.len() > 1 || descended);
-    let regex_matcher = gnu_runs_regex_matcher(&conf, &deduped(&patterns));
     let grep = Grep { conf, pats, only_empty, regex_matcher };
     // Fallible because the sink DUPLICATES descriptor 1; grep's own error status.
     let mut out = match Out::new() {
@@ -1079,10 +1180,6 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
     let mut any_match = false;
     let mut printed_groups = false;
 
-    // Nothing to look for and no `-v` to invert it: GNU never OPENS the
-    // operands, so a nonexistent one is not an error either. `-L` is the
-    // exception — it must still report the file, so it still stats it.
-    let settled = grep.settled() && !grep.conf.files_without;
     // Asked ONCE, of the pattern, as GNU asks it before it opens anything: may
     // an empty record be selected? Where it cannot, dropping a read that holds
     // only empty records changes no answer. A pattern that fails to answer is
@@ -1096,12 +1193,6 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
             true => b"(standard input)",
             false => path,
         };
-        // Nothing to look for: GNU never OPENS these, and `search_file`'s own
-        // settled branch would print nothing for a case that got this far
-        // (`-L` clears `settled` here precisely so its name still gets said).
-        if settled {
-            continue;
-        }
         // The default reads a device named as an operand and skips the same one
         // found underfoot, so the policy is asked about THIS name's provenance;
         // where it says skip, provenance decides again which side of the open
@@ -1714,9 +1805,19 @@ fn compile(conf: &Conf, lines: &[Vec<u8>]) -> Result<Patterns, String> {
         // the `dfaerror` arm and `[:alpha:]` without its outer bracket is an
         // error whatever the environment says. sed sets that bit nowhere, which
         // is why the same lint is `dfawarn` there and the variable can discard
-        // it. Wiring the variable in here is the obvious wrong fix, so two
-        // grep-cli cases pin this `false` against it.
-        confusing_bracket_ok: false,
+        // it. Wiring the variable in HERE would still be the wrong fix, and is
+        // not what this `true` does: grep still refuses, from `main`, on the
+        // same patterns and with the same message. It MOVED because it and the
+        // stray lint come from one `dfaparse` and the lint can precede it
+        // (`\d[:alpha:]` warns, then errors) -- which a refusal raised during
+        // compile cannot express. sed's `PendingLint` is the same shape. The
+        // move also puts it AFTER the per-pattern compile, where GNU has it:
+        // `regcomp` runs first (dfasearch.c:265-278), so a LATER pattern's
+        // `\(` now outranks an earlier one's bracket as it does under GNU.
+        // It is gated on `regex_matcher` and `Patterns::Regex` rather than on
+        // nothing, and that gate cannot swallow a refusal: `all_literal`
+        // refuses `[`, which a confusing bracket must contain.
+        confusing_bracket_ok: true,
         // grep matches with its own dfa, which satisfies a mid-branch `$`. It falls
         // back to glibc for `-o` and for any pattern with a backreference, where GNU
         // then disagrees with itself; td-txt keeps the dfa reading throughout.

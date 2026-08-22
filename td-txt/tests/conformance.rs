@@ -1139,6 +1139,40 @@ fn a_diverging_diagnostic_still_names_in_raw_bytes() -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// A stdout that IS `/dev/null` takes `-L`'s exemption from the `-m0` short cut
+/// away (grep.c:2894-2896): GNU clears `list_files` for it exactly as for `-q`,
+/// since neither can show a file name, and only then tests whether the short cut
+/// applies. The corpus cannot ask for this — it captures stdout through a pipe,
+/// and the whole condition is what stdout IS — so the two runs differ only in
+/// that. Measured against GNU grep 3.11 under `LC_ALL=C`.
+#[test]
+fn a_dev_null_stdout_takes_the_l_exemption_away() -> Result<(), Box<dyn std::error::Error>> {
+    let run = |null: bool| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let out = std::process::Command::new(bin())
+            .args(["grep", "-L", "-m0", "-e", r"\d"])
+            .stdin(std::process::Stdio::null())
+            .stdout(match null {
+                true => std::process::Stdio::null(),
+                false => std::process::Stdio::piped(),
+            })
+            .stderr(std::process::Stdio::piped())
+            .env("LC_ALL", "C")
+            .output()?;
+        Ok(out.stderr)
+    };
+    // Down a pipe `-L` still names a file, so the short cut does not apply and
+    // the pattern is lexed and linted.
+    assert_eq!(
+        String::from_utf8_lossy(&run(false)?),
+        "grep: warning: stray \\ before d\n",
+        "-L -m0 down a pipe should lint",
+    );
+    // Into `/dev/null` it names nothing, so the short cut applies and nothing is
+    // compiled at all.
+    assert_eq!(String::from_utf8_lossy(&run(true)?), "", "-L -m0 into /dev/null should be silent");
+    Ok(())
+}
+
 /// grep STREAMS: it reports a match without waiting for end of input. The
 /// corpus cannot ask for this — a case supplies stdin as bytes and the harness
 /// closes it, and "did not wait" is exactly a question about a stream that has

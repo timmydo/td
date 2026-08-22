@@ -313,6 +313,11 @@ pub struct Regex {
     pub class_syntax: bool,
     /// See `Options::no_sub`.
     pub no_sub: bool,
+    /// The bytes GNU would name in `warning: stray \ before X`, in pattern
+    /// order. Exposed rather than raised: whether a stray is REPORTED depends
+    /// on the whole pattern SET, which only the caller knows. See
+    /// `grep::gnu_runs_regex_matcher`.
+    pub strays: Vec<u8>,
     root: Node,
     ngroups: usize,
     icase: bool,
@@ -407,6 +412,10 @@ struct Parser<'a> {
     pos: usize,
     opts: Options,
     ngroups: usize,
+    /// The byte after each backslash GNU would lint as a stray, in pattern
+    /// order. COLLECTED rather than printed because this parser is shared and
+    /// only grep warns: sed reaches the same escapes silently.
+    strays: Vec<u8>,
     /// Groups whose `)` has not been reached. A backreference may not name one:
     /// GNU refuses `\(\1\)` as an invalid back reference, where naming a group
     /// that HAS closed is fine from anywhere later in the pattern.
@@ -1044,6 +1053,29 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `\B` where the escape leaves `B` a plain literal, recording it as a
+    /// stray unless the byte is one GNU's lexer gives a case of its own. Only
+    /// the arms that PRODUCE a literal call this: an escape handled above --
+    /// `\b`, `\<`, a backreference -- is an operator and never a stray.
+    fn stray(&mut self, b: u8) -> Node {
+        // The metacharacters an escape merely makes literal. GNU reaches
+        // `normal_char` for each through its own `case`, and reaching
+        // `stray_backslash` instead is what MAKES an escape a stray
+        // (dfa.c:1558-1580).
+        const QUIET: &[u8] = b"$*.[\\]^|}";
+        // Operators in an ERE, so escaping one is how a literal is written;
+        // in a BRE the escape makes them the OPERATOR, which is the reverse.
+        const QUIET_ERE: &[u8] = b"()+?{";
+        let quiet = QUIET.contains(&b) || (self.opts.ere && QUIET_ERE.contains(&b));
+        // A confusing bracket EXITS GNU's lexer (dfa.c:1143-1148), so nothing past
+        // one is ever lexed and nothing past one can lint: `\d[:alpha:]\y`
+        // names `d` and never `y`.
+        if !quiet && !self.class_syntax {
+            self.strays.push(b);
+        }
+        self.literal(b)
+    }
+
     fn literal(&self, b: u8) -> Node {
         if self.opts.icase && b.is_ascii_alphabetic() {
             let mut set = ByteSet::empty();
@@ -1083,7 +1115,10 @@ impl<'a> Parser<'a> {
             // the character, so `grep '\{2\}'` matches the text `{2}`.
             b'{' if !self.opts.ere => match self.opts.strict_repeats {
                 true => Err(Error::new("Invalid preceding regular expression")),
-                false => Ok(self.literal(b'{')),
+                // Reached only with nothing to repeat -- an interval is
+                // consumed as a repeat before this -- which is exactly when
+                // GNU's `laststart` sends `\{` to the stray lint.
+                false => Ok(self.stray(b'{')),
             },
             // An interval consumes its own `\}`, so one reaching here closes nothing
             // and GNU reads it as the character: `s/a\}/-/` matches `a}`.
@@ -1133,7 +1168,7 @@ impl<'a> Parser<'a> {
             b'>' => Ok(Node::WordEdge(false)),
             b'`' => Ok(Node::BufStart),
             b'\'' => Ok(Node::BufEnd),
-            _ => Ok(self.literal(b)),
+            _ => Ok(self.stray(b)),
         }
     }
 
@@ -1385,6 +1420,7 @@ impl Regex {
                 class_syntax: false,
                 paren_debt: 0,
                 eaten: None,
+                strays: Vec::new(),
             };
         let root = p.parse_alt(0)?;
         if p.pos < pattern.len() {
@@ -1403,6 +1439,7 @@ impl Regex {
         Ok(Self {
             class_syntax: p.class_syntax,
             no_sub: opts.no_sub,
+            strays: p.strays,
             root,
             ngroups: p.ngroups,
             icase: opts.icase,
@@ -2255,6 +2292,84 @@ mod tests {
     /// has its own test.
     fn m(sep: u8) -> Option<Anchor> {
         Some(Anchor { sep, newline_anchor: sep == b'\n' })
+    }
+
+    /// The escapes GNU lints as strays, over every byte, in both dialects.
+    /// GOLDEN, measured against GNU grep 3.11 under `LC_ALL=C` by compiling
+    /// `\\X` as a single pattern -- single because the lint is gated on the
+    /// pattern SET (see `grep::gnu_runs_regex_matcher`) and two patterns can
+    /// silence it. A table rather than a rule because the quiet set is not
+    /// derivable from anything td-txt knows: it is exactly the bytes GNU's
+    /// lexer gives a `case` of its own.
+    #[test]
+    fn the_stray_escapes_are_gnus() {
+        // Escaping one of these means "the literal character", so the
+        // backslash is consumed rather than linted.
+        const BRE_QUIET: &[u8] = b"$'*.<>BSW[\\]^`bsw|}";
+        // An ERE reads its own operators as literal when escaped; a BRE reads
+        // the same escapes as the OPERATORS, so it lints them instead.
+        const ERE_EXTRA_QUIET: &[u8] = b"()+?{";
+        // A backreference, and a BRE's unmatched group.
+        const BRE_ERR: &[u8] = b"()123456789";
+        const ERE_ERR: &[u8] = b"123456789";
+        let ere_quiet = [BRE_QUIET, ERE_EXTRA_QUIET].concat();
+        for &ere in &[false, true] {
+            let (quiet, err): (&[u8], &[u8]) = match ere {
+                false => (BRE_QUIET, BRE_ERR),
+                true => (&ere_quiet, ERE_ERR),
+            };
+            for b in 1..=255u8 {
+                // `\<newline>` never reaches this parser: grep splits the
+                // pattern list on newlines first, so the backslash always ends
+                // up last in a pattern of its own and is `Trailing backslash`.
+                // grep-cli pins that; there is nothing here to have an opinion on.
+                if b == b'\n' {
+                    continue;
+                }
+                let pat = [b'\\', b];
+                let opts = Options { ere, ..Options::default() };
+                let got = Regex::compile(&pat, opts);
+                if err.contains(&b) {
+                    assert!(got.is_err(), "ere={ere} 0x{b:02x} should not compile");
+                    continue;
+                }
+                let re = match got {
+                    Ok(re) => re,
+                    Err(e) => panic!("ere={ere} 0x{b:02x} did not compile: {}", e.msg),
+                };
+                let want: Vec<u8> = if quiet.contains(&b) { vec![] } else { vec![b] };
+                assert_eq!(re.strays, want, "ere={ere} byte 0x{b:02x}");
+            }
+        }
+    }
+
+    /// The three repeat operators a BRE spells with a backslash lint only where
+    /// there is nothing to repeat -- GNU's `laststart`, which is the same
+    /// condition `strict_repeats` models. An ERE escapes them to mean the
+    /// literal, so it never lints them at all.
+    #[test]
+    fn a_bre_repeat_lints_only_with_nothing_to_repeat() {
+        for pat in ["\\?", "\\+", "\\{2\\}"] {
+            assert!(!bre(pat).strays.is_empty(), "bare {pat} should lint");
+        }
+        for pat in ["a\\?", "a\\+", "a\\{2\\}", "a\\?\\?"] {
+            assert_eq!(bre(pat).strays, Vec::<u8>::new(), "{pat} should be quiet");
+        }
+        // The first has nothing to repeat and becomes a literal `{`; the second
+        // then HAS something, so one lint and not two.
+        assert_eq!(bre("\\{2\\}\\{3\\}").strays, vec![b'{']);
+        assert_eq!(bre("\\?\\?").strays, vec![b'?']);
+        for pat in ["\\?", "a\\?", "\\{", "a\\{2\\}"] {
+            assert_eq!(ere(pat).strays, Vec::<u8>::new(), "ERE {pat} should be quiet");
+        }
+    }
+
+    /// Strays are reported in PATTERN ORDER, since GNU emits each as the lexer
+    /// reaches it.
+    #[test]
+    fn strays_keep_their_order() {
+        assert_eq!(bre("a\\db\\yc").strays, vec![b'd', b'y']);
+        assert_eq!(ere("\\y\\d").strays, vec![b'y', b'd']);
     }
 
     fn bre(pat: &str) -> Regex {

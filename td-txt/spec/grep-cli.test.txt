@@ -7107,3 +7107,444 @@ gamma
 ## stdin-json: "alpha\u0000beta\u0000"
 ## stdout-json: "6:beta\u0000"
 ## status: 0
+
+# --- the stray-backslash lint (dfa.c:1558-1580). Whether it FIRES is a
+# property of the pattern SET, not of the pattern: a set that switches to
+# the fixed-string matcher is never lexed and so never lints.
+
+#### a lone stray backslash is linted and the pattern still compiles
+## argv: grep -e '\d'
+## stdin:
+apple
+delta
+-x
+a-b
+## END
+## stdout:
+delta
+## END
+## stderr:
+grep: warning: stray \ before d
+## END
+## status: 0
+
+#### the lint names the byte, and a space is named as white space
+## argv: grep -e '\ '
+## stdin:
+apple
+delta
+-x
+a-b
+## END
+## stdout-json: ""
+## stderr:
+grep: warning: stray \ before white space
+## END
+## status: 1
+
+#### a control byte is unprintable rather than named
+## argv: grep -e '\	'
+## stdin:
+apple
+delta
+-x
+a-b
+## END
+## stdout-json: ""
+## stderr:
+grep: warning: stray \ before unprintable character
+## END
+## status: 1
+
+#### two literal patterns switch to the fixed matcher, which never lints
+## argv: grep -e '\d' -e '\y'
+## stdin:
+apple
+delta
+-x
+a-b
+## END
+## stdout:
+delta
+## END
+## stderr-json: ""
+## status: 0
+
+#### a second pattern that blocks that switch brings the lint back
+## argv: grep -e '\d' -e a.
+## stdin:
+apple
+delta
+-x
+a-b
+## END
+## stdout:
+apple
+delta
+a-b
+## END
+## stderr:
+grep: warning: stray \ before d
+## END
+## status: 0
+
+#### duplicate patterns are one pattern, so the lint fires once
+## argv: grep -e '\d' -e '\d'
+## stdin:
+apple
+delta
+-x
+a-b
+## END
+## stdout:
+delta
+## END
+## stderr:
+grep: warning: stray \ before d
+## END
+## status: 0
+
+#### -F never lints, having no pattern lexer to lint with
+## argv: grep -F -e '\d'
+## stdin:
+apple
+delta
+-x
+a-b
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### a BRE repeat with nothing to repeat is a stray
+## argv: grep -e '\?'
+## stdin:
+apple
+delta
+-x
+a-b
+## END
+## stdout-json: ""
+## stderr:
+grep: warning: stray \ before ?
+## END
+## status: 1
+
+#### the same repeat with something to repeat is not
+## argv: grep -e 'a\?'
+## stdin:
+apple
+delta
+-x
+a-b
+## END
+## stdout:
+apple
+delta
+-x
+a-b
+## END
+## stderr-json: ""
+## status: 0
+
+#### an ERE escapes its own operators to mean the literal, and is quiet
+## argv: grep -E -e '\?'
+## stdin:
+apple
+delta
+-x
+a-b
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### a positional operand may write \- to avoid an option, and is not linted
+## argv: grep '\-x'
+## stdin:
+apple
+delta
+-x
+a-b
+## END
+## stdout:
+-x
+## END
+## stderr-json: ""
+## status: 0
+
+#### -e needs no such spelling, so it keeps the backslash and is linted
+## argv: grep -e '\-x'
+## stdin:
+apple
+delta
+-x
+a-b
+## END
+## stdout:
+-x
+## END
+## stderr:
+grep: warning: stray \ before -
+## END
+## status: 0
+
+#### the strip takes only the leading one
+## argv: grep '\-a\-'
+## stdin:
+apple
+delta
+-x
+a-b
+## END
+## stdout-json: ""
+## stderr:
+grep: warning: stray \ before -
+## END
+## status: 1
+
+#### the lint does not touch the exit status, not even under -q
+## argv: grep -q -e '\d'
+## stdin:
+apple
+delta
+-x
+a-b
+## END
+## stdout-json: ""
+## stderr:
+grep: warning: stray \ before d
+## END
+## status: 0
+
+#### a backslash last in a pattern is an error rather than a stray
+## argv: grep -e 'a\'
+## stdin:
+apple
+delta
+-x
+a-b
+## END
+## stdout-json: ""
+## stderr:
+grep: Trailing backslash
+## END
+## status: 2
+
+#### -m 0 fails before the pattern is compiled, so nothing is linted
+## argv: grep -m0 -e '\d'
+## stdin:
+apple
+delta
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### -L is the exception to that short cut, and still lints
+## argv: grep -m0 -L -e '\d'
+## stdin:
+apple
+delta
+## END
+## stdout:
+(standard input)
+## END
+## stderr:
+grep: warning: stray \ before d
+## END
+## status: 1
+
+#### the lint precedes the walk's diagnostics, as the compile precedes the walk
+## argv: grep -r -e '\d' nosuchpath
+## stdout-json: ""
+## stderr:
+grep: warning: stray \ before d
+grep: nosuchpath: No such file or directory
+## END
+## status: 2
+
+#### -F does not strip a leading backslash-dash, so the pattern stays literal
+## argv: grep -F '\-x'
+## stdin:
+\-x
+-x
+delta
+yak
+## END
+## stdout:
+\-x
+## END
+## stderr-json: ""
+## status: 0
+
+#### without -F the same operand is stripped and matches the bare text too
+## argv: grep '\-x'
+## stdin:
+\-x
+-x
+delta
+yak
+## END
+## stdout:
+\-x
+-x
+## END
+## stderr-json: ""
+## status: 0
+
+#### two patterns that keep the regex matcher lint in pattern order
+## argv: grep -e '\d' -e '\y.'
+## stdin:
+\-x
+-x
+delta
+yak
+## END
+## stdout:
+delta
+yak
+## END
+## stderr:
+grep: warning: stray \ before d
+grep: warning: stray \ before y
+## END
+## status: 0
+
+#### and the other order, so the order is pinned rather than the pair
+## argv: grep -e '\y' -e '\d.'
+## stdin:
+\-x
+-x
+delta
+yak
+## END
+## stdout:
+delta
+yak
+## END
+## stderr:
+grep: warning: stray \ before y
+grep: warning: stray \ before d
+## END
+## status: 0
+
+#### a lint reached before a confusing bracket precedes the refusal it dies on
+## argv: grep -e '\d[:alpha:]'
+## stdin:
+apple
+delta
+## END
+## stdout-json: ""
+## stderr:
+grep: warning: stray \ before d
+grep: character class syntax is [[:space:]], not [:space:]
+## END
+## status: 2
+
+#### nothing past that bracket is lexed, so nothing past it lints
+## argv: grep -e '\d[:alpha:]\y'
+## stdin:
+apple
+delta
+## END
+## stdout-json: ""
+## stderr:
+grep: warning: stray \ before d
+grep: character class syntax is [[:space:]], not [:space:]
+## END
+## status: 2
+
+#### a bracket before the stray leaves no lint at all
+## argv: grep -e '[:alpha:]\d'
+## stdin:
+apple
+delta
+## END
+## stdout-json: ""
+## stderr:
+grep: character class syntax is [[:space:]], not [:space:]
+## END
+## status: 2
+
+#### the lex is over the JOINED patterns, so an earlier one's stray still lints
+## argv: grep -e '\d' -e 'a[:alpha:]'
+## stdin:
+apple
+delta
+## END
+## stdout-json: ""
+## stderr:
+grep: warning: stray \ before d
+grep: character class syntax is [[:space:]], not [:space:]
+## END
+## status: 2
+
+#### and a later one's does not
+## argv: grep -e 'a[:alpha:]' -e '\d'
+## stdin:
+apple
+delta
+## END
+## stdout-json: ""
+## stderr:
+grep: character class syntax is [[:space:]], not [:space:]
+## END
+## status: 2
+
+#### -m 0 is decided above the compile, so a broken pattern is not even reported
+## argv: grep -m0 -e '[:alpha:]'
+## stdin:
+apple
+delta
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### -q takes -L's exemption away, so -q -L -m0 takes the short cut and is silent
+## argv: grep -q -L -m0 -e '\d'
+## stdin:
+apple
+delta
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### a stray before a glibc-stage error is not linted, since regcomp runs first
+## argv: grep -e '\d\('
+## stdin:
+apple
+delta
+## END
+## stdout-json: ""
+## stderr:
+grep: Unmatched ( or \(
+## END
+## status: 2
+
+#### nor before any other of them, which is what tells them from the bracket
+## argv: grep -e '\d\1'
+## stdin:
+apple
+delta
+## END
+## stdout-json: ""
+## stderr:
+grep: Invalid back reference
+## END
+## status: 2
+
+#### and a later pattern's glibc error outranks an earlier one's bracket
+## argv: grep -e 'a[:alpha:]' -e 'b\('
+## stdin:
+apple
+delta
+## END
+## stdout-json: ""
+## stderr:
+grep: Unmatched ( or \(
+## END
+## status: 2
+
