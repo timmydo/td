@@ -1249,6 +1249,47 @@ mod tests {
             .any(|(recipe, body)| *recipe == stem && *body == path)
     }
 
+    /// The retired tools, named once: the farm branch and the text branch each
+    /// scan for them, and a third added to one alone would be invisible on the
+    /// other with every test still green.
+    const HOST_TOOLS: [&str; 2] = ["find", "xargs"];
+
+    /// A ToolFarm judged link by link, which the flattened text list cannot do.
+    ///
+    /// A name is excused only by ITS OWN target being the declared busybox,
+    /// and only while it is a bare filename — `tools.join(name)` puts anything
+    /// else outside the farm. A target is never excused at all: it is what the
+    /// link resolves TO. Flattening loses both of those, since it keeps
+    /// neither the pairing nor which side a string came from.
+    ///
+    /// `invokes` rather than `step_invokes`: a farm is never a `.rs` body, so
+    /// the literal-only reading cannot apply to one and the two agree here.
+    ///
+    /// A later link SHADOWS an earlier one of the same name, but a bad link is
+    /// reported even where a good one follows it: the farm is the recipe's
+    /// declaration of what it wants, and fail-closed is the right direction
+    /// for a duplicate nobody meant to write.
+    fn farm_invocation(recipe: &Recipe, links: &[(String, String)]) -> Option<(&'static str, String)> {
+        let declared = recipe
+            .native_inputs
+            .as_ref()
+            .is_some_and(|inputs| inputs.iter().any(|i| i == "busybox-x86-64"));
+        for (name, target) in links {
+            let excused = declared
+                && !name.contains('/')
+                && target == "{in:busybox-x86-64}/bin/busybox";
+            for cmd in HOST_TOOLS {
+                if invokes(name, cmd) && !excused {
+                    return Some((cmd, name.clone()));
+                }
+                if invokes(target, cmd) {
+                    return Some((cmd, target.clone()));
+                }
+            }
+        }
+        None
+    }
+
     /// The guard's scan over ONE recipe: the first `find`/`xargs` invocation in
     /// a command surface, or `None` for a clean recipe. Extracted so the
     /// synthetic tests that pin the exemption run the SAME skip the catalog
@@ -1264,28 +1305,20 @@ mod tests {
             if rostered(stem, step) {
                 continue;
             }
+            if let Step::ToolFarm { links } = step {
+                if let Some(hit) = farm_invocation(recipe, links) {
+                    return Some(hit);
+                }
+                continue;
+            }
             for text in command_texts(step) {
-                for cmd in ["find", "xargs"] {
+                for cmd in HOST_TOOLS {
                     if !step_invokes(step, text, cmd) {
                         continue;
                     }
-                    // A rung may expose one only through a ToolFarm link to an
-                    // explicitly declared td-built BusyBox input.
-                    let declared_busybox_tool = recipe
-                        .native_inputs
-                        .as_ref()
-                        .is_some_and(|inputs| inputs.iter().any(|i| i == "busybox-x86-64"))
-                        && matches!(
-                            step,
-                            Step::ToolFarm { links }
-                                if links.iter().any(|(name, target)| {
-                                    name == cmd
-                                        && target == "{in:busybox-x86-64}/bin/busybox"
-                                })
-                        );
-                    if !declared_busybox_tool {
-                        return Some((cmd, text.to_string()));
-                    }
+                    // The one exemption lives in `farm_invocation` above, which
+                    // this loop no longer sees a ToolFarm for.
+                    return Some((cmd, text.to_string()));
                 }
             }
         }
@@ -1299,7 +1332,11 @@ mod tests {
     /// edits (the host-free `patch`/`sed` stand-in). Engine-native steps that
     /// carry only paths (Unpack/CopyTree/Symlink/PatchShebangs/…) cannot invoke a
     /// tool, so they contribute nothing. Shared by the catalog-walk guard and its
-    /// coverage test so both exercise exactly the same extraction.
+    /// coverage test so both exercise exactly the same extraction — EXCEPT a
+    /// ToolFarm, which the guard now reads through `farm_invocation` instead,
+    /// because a link's two halves mean different things and flattening them
+    /// into one list loses that. The arm stays because this is a general
+    /// extractor and a farm's strings really are catalog-authored text.
     ///
     /// Only a SubstituteText's `to` is a command surface: `from` is the text being
     /// REMOVED from a source file, so a `find`/`xargs` there is being deleted, not
@@ -1838,6 +1875,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The busybox exemption excuses a LINK NAME, never a target beside it.
+    ///
+    /// `command_texts` flattens a ToolFarm to every string in it, names and
+    /// targets alike, and the answer used to be step-wide: one declared
+    /// `find` link then excused a second link pointing at a host path in the
+    /// same step, which is the one shape this exemption must not cover.
+    #[test]
+    fn a_busybox_farm_excuses_its_own_link_and_not_a_host_path_beside_it() {
+        const BB: &str = "{in:busybox-x86-64}/bin/busybox";
+        let farm = |links: Vec<(String, String)>| {
+            Recipe::gnu("probe", "1")
+                .native_inputs(&["busybox-x86-64"])
+                .steps(vec![Step::ToolFarm { links }])
+        };
+
+        // The declared links themselves stay exempt, which is what a rung needs.
+        let ok = farm(vec![("find".into(), BB.into()), ("date".into(), BB.into())]);
+        assert_eq!(host_tool_invocation("probe", &ok), None);
+
+        // A host path beside one does NOT ride on that exemption.
+        let mixed = farm(vec![
+            ("find".into(), BB.into()),
+            ("scan".into(), "/usr/bin/find".into()),
+        ]);
+        assert_eq!(
+            host_tool_invocation("probe", &mixed),
+            Some(("find", "/usr/bin/find".into()))
+        );
+
+        // A link NAMED for the tool but pointing elsewhere is not a busybox
+        // link, so naming it right does not excuse it.
+        let liar = farm(vec![("find".into(), "{root}/tools/find".into())]);
+        assert_eq!(host_tool_invocation("probe", &liar), Some(("find", "find".into())));
+
+        // ...and the exemption is not narrowed to the bare tool name: a link
+        // whose name merely tokenises to it is still a declared busybox link.
+        let hyphen = farm(vec![("find-files".into(), BB.into())]);
+        assert_eq!(host_tool_invocation("probe", &hyphen), None);
+
+        // Without the declared input there is no exemption at all — and the
+        // recipe declares ANOTHER native input, so this pins the input's
+        // identity rather than merely that the field is populated.
+        let undeclared = Recipe::gnu("probe", "1")
+            .native_inputs(&["gcc-x86-64-native"])
+            .steps(vec![Step::ToolFarm {
+                links: vec![("find".into(), BB.into())],
+            }]);
+        assert_eq!(
+            host_tool_invocation("probe", &undeclared),
+            Some(("find", "find".into()))
+        );
+
+        // A DUPLICATE name is judged on its own target. The farm applies its
+        // links in order and each replaces the last, so this second one is
+        // what `{tools}/find` actually becomes.
+        let shadowed = farm(vec![
+            ("find".into(), BB.into()),
+            ("find".into(), "{in:other}/bin/search".into()),
+        ]);
+        assert_eq!(host_tool_invocation("probe", &shadowed), Some(("find", "find".into())));
+
+        // A TARGET spelled as a sibling's link name is still a target.
+        let alias = farm(vec![("find".into(), BB.into()), ("scan".into(), "find".into())]);
+        assert_eq!(host_tool_invocation("probe", &alias), Some(("find", "find".into())));
+
+        // `xargs` as well as `find`, because this branch carries its own copy
+        // of the tool list: dropping one from it would leave every leg above
+        // green, the catalog naming only legitimate `xargs` links.
+        let both = farm(vec![
+            ("xargs".into(), BB.into()),
+            ("scan".into(), "/usr/bin/xargs".into()),
+        ]);
+        assert_eq!(
+            host_tool_invocation("probe", &both),
+            Some(("xargs", "/usr/bin/xargs".into()))
+        );
+
+        // A name is a BARE filename, not merely a non-absolute one: `sub/find`
+        // lands at `{tools}/sub/find` and so is harmless, but refusing it is
+        // the fail-closed direction and pins the rule as written.
+        let nested = farm(vec![("sub/find".into(), BB.into())]);
+        assert_eq!(host_tool_invocation("probe", &nested), Some(("find", "sub/find".into())));
+
+        // A name is excused only while it is a bare filename. ALONE in the
+        // farm, so nothing else can catch it: `tools.join("/usr/bin/find")`
+        // discards the farm directory outright, so this link is not a tool
+        // named `find` inside it whatever it points at.
+        let escaped = farm(vec![("/usr/bin/find".into(), BB.into())]);
+        assert_eq!(
+            host_tool_invocation("probe", &escaped),
+            Some(("find", "/usr/bin/find".into()))
+        );
     }
 
     /// The ROSTER, exercised through the guard's own scan.
