@@ -911,11 +911,6 @@ xfail print-source-code.test.sh::typeset -f prints function source code
 xfail print-source-code.test.sh::typeset -f prints function source code - nested functions
 xfail print-source-code.test.sh::typeset -f with function keyword (ksh style)
 xfail process-sub.test.sh::$(<file) idiom with process sub
-xfail process-sub.test.sh::Non-linear pipeline with >()
-xfail process-sub.test.sh::Process sub from external process to stdin
-xfail process-sub.test.sh::Process sub from shell to stdin
-xfail process-sub.test.sh::Process sub input
-xfail process-sub.test.sh::process sub in background &
 xfail process-sub.test.sh::process subs and pipelines together
 xfail process-sub.test.sh::shopt -s process_sub_fail
 xfail process-sub.test.sh::status code is available

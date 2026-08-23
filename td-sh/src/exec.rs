@@ -215,6 +215,21 @@ pub struct Shell {
     /// `fds` go first closes the parent's copies; a job that still needs one
     /// holds its own `Arc` of the same `File`, so nothing a job is using shuts.
     pub jobs: crate::jobs::Jobs,
+    /// The process substitutions this shell has open, oldest first. Each holds
+    /// this shell's end of one pipe and the thread running the body on the
+    /// other end of it.
+    ///
+    /// Declared AFTER both, and for the reason that puts `fds` before `jobs`:
+    /// dropping an entry closes this shell's end and then WAITS for the body,
+    /// and a body reaches EOF only once every copy of the other end is gone.
+    /// A copy can be in either of them -- `exec 3> >(cat)` leaves one in `fds`,
+    /// and a job handed the path can open its own -- so both let go first.
+    pub procsubs: crate::process::ProcSubs,
+    /// The sequence number the next process substitution will take. A command
+    /// records this before it expands anything and ends everything at or above
+    /// it afterwards; `process::close_procsubs` says why a POSITION in
+    /// `procsubs` cannot serve.
+    pub procsub_seq: u64,
     /// ash's `localvar_stack` depth. `local` is an error at zero and nowhere else,
     /// so this is the whole of "am I somewhere a `local` may be declared".
     pub localvar_depth: u32,
@@ -462,6 +477,8 @@ impl Shell {
             interactive: false,
             concurrent: false,
             jobs: crate::jobs::Jobs::new(),
+            procsubs: crate::process::ProcSubs::default(),
+            procsub_seq: 0,
             in_ps4: false,
             getopts_optind: 1,
             getopts_off: -1,
@@ -590,6 +607,8 @@ impl Shell {
             interactive: false,
             concurrent: false,
             jobs: crate::jobs::Jobs::new(),
+            procsubs: crate::process::ProcSubs::default(),
+            procsub_seq: 0,
             in_ps4: false,
             getopts_optind: 1,
             getopts_off: -1,
@@ -1252,7 +1271,36 @@ pub(crate) fn epipe_pending(sh: &Shell) -> R<()> {
     Ok(())
 }
 
+/// Every command is the lifetime of the process substitutions its own words
+/// opened.
+///
+/// ash puts that descriptor on the redirection frame `evalcommand` pops, and
+/// `evalcommand` is the SIMPLE command -- so in ash a `for` list's or a
+/// redirected group's outlives the command and is only closed when some
+/// enclosing frame pops, which at the top level is never. Measured: 50
+/// iterations of `{ echo x; } > >(cat >/dev/null)` leave ash holding 50
+/// descriptors it will not get back.
+///
+/// This shell draws the line around EVERY command instead, and the reason is
+/// that its entries cost more than ash's. Each is two descriptors and a thread
+/// with an 8 MiB stack where ash has one descriptor and a process, so the same
+/// loop cost four descriptors an iteration here, and `[[ -r <(true) ]]` -- a
+/// shape ash does not have at all, so there is nothing to match -- cost one.
+/// Unbounded is unbounded either way; this bounds it.
+///
+/// What that costs is one measured agreement with ash:
+/// `for f in <(echo a); do :; done; cat $f` prints `a` there and reports a
+/// missing file here. It is a word used after the command that made it, which
+/// is a script bug in every shell and already answers differently here for the
+/// separate reason `process::dev_fd_path` gives.
 fn run_command_inner(sh: &mut Shell, cmd: &Cmd) -> R<()> {
+    let mark = sh.procsub_seq;
+    let outcome = run_command_dispatch(sh, cmd);
+    process::close_procsubs(sh, mark);
+    outcome
+}
+
+fn run_command_dispatch(sh: &mut Shell, cmd: &Cmd) -> R<()> {
     match cmd {
         Cmd::Simple {
             assigns,

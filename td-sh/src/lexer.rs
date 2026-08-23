@@ -1095,7 +1095,13 @@ impl Lexer {
                 return Ok(Tok::Word(word?));
             }
             self.regex_next = false;
-            if matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')') {
+            // `<(` and `>(` are the one place a redirection operator's own
+            // character opens a WORD instead. ash decides it in the word
+            // scanner, which is why the whole token is one (ash.c:12676); this
+            // shell decides it here, before the operator scan, and the word
+            // scanner below re-asks for the ones that start mid-word.
+            if matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')') && self.at_procsub().is_none()
+            {
                 let op = self.scan_op()?;
                 match op {
                     // `&&`, `||` and `(` are the conditional's own connectives
@@ -1398,6 +1404,30 @@ impl Lexer {
         self.read_heredoc_bodies()
     }
 
+    /// `<(`/`>(` at the cursor, and which direction it is. `Some(true)` is
+    /// `>(`.
+    ///
+    /// The lookahead deliberately does NOT step over a `\<newline>` fold, where
+    /// every other two-character lookahead in this lexer does: ash reads this
+    /// one with `pgetc` rather than `pgetc_eatbnl` (ash.c:12677), so
+    /// `echo <\<newline>(true)` is a redirection whose target opens with `(` --
+    /// measured as `syntax error: unexpected "("`, where bash folds and
+    /// substitutes.
+    ///
+    /// `in_braces` is ash's `varnest`, which guards the same test there:
+    /// `${v:-<(true)}` is the literal text in ash, not a substitution, and
+    /// `${#<(true)}` is `bad substitution` -- both measured.
+    fn at_procsub(&self) -> Option<bool> {
+        if self.in_braces {
+            return None;
+        }
+        let c = self.sc.peek()?;
+        if !matches!(c, '<' | '>') || self.sc.peek_at(1) != Some('(') {
+            return None;
+        }
+        Some(c == '>')
+    }
+
     /// Scan one word. With `stop_at_delims`, blanks and operator characters end
     /// it (normal tokenizing); without, the whole remaining input is the word.
     fn scan_word(&mut self, stop_at_delims: bool) -> Syn<Word> {
@@ -1437,6 +1467,20 @@ impl Lexer {
                 }
                 // A newline ends the word even mid-group, so an unbalanced `(`
                 // reports an unmatched paren rather than swallowing the script.
+            }
+            // BEFORE the delimiter test, which `<` and `>` would otherwise
+            // end the word at, and after the regex block, which keeps them
+            // literal inside a `=~` group. ash reads it at exactly this point:
+            // the word-terminating branch, asking whether the terminator is
+            // followed by `(` before it lets the word end.
+            if let Some(write) = self.at_procsub() {
+                self.sc.bump();
+                self.sc.bump();
+                // After the `(`, so this is the line the BODY opens on.
+                let line = self.sc.line;
+                let code = self.scan_paren_body()?;
+                buf.push_seg(Seg::ProcSub { code, write, line });
+                continue;
             }
             if stop_at_delims && is_word_end(c) {
                 ran_out = false;
@@ -2659,6 +2703,66 @@ mod tests {
     fn empty_quotes_are_a_real_field() -> Syn<()> {
         let ws = words("echo ''")?;
         assert!(matches!(nth(&ws, 1)?.0.as_slice(), [Seg::Quoted(s)] if s.is_empty()));
+        Ok(())
+    }
+
+    /// `<(` is the one place a redirection operator's own character opens a
+    /// WORD instead, so the boundary is the lexer's to draw and every case here
+    /// is measured against ash.
+    #[test]
+    fn a_process_substitution_is_a_word_where_the_bare_character_is_an_operator() -> Syn<()> {
+        // The token STARTS with it, where `<` alone would have been a redirection.
+        let ws = words("echo <(true)")?;
+        assert_eq!(ws.len(), 2);
+        assert!(matches!(nth(&ws, 1)?.0.as_slice(),
+            [Seg::ProcSub { code, write: false, .. }] if code == "true"));
+        // `>(` is the other direction and otherwise the same word.
+        assert!(matches!(words("echo >(true)")?.get(1).map(|w| w.0.as_slice()),
+            Some([Seg::ProcSub { write: true, .. }])));
+        // Mid-word, which is where ash reads it -- its word scanner asks whether
+        // the character that would END the word is followed by `(`. Measured:
+        // `echo x<(true)y` prints `x/dev/fd/64y`, one field.
+        let ws = words("echo x<(true)y")?;
+        assert_eq!(ws.len(), 2);
+        assert!(matches!(nth(&ws, 1)?.0.as_slice(),
+            [Seg::Lit(a), Seg::ProcSub { .. }, Seg::Lit(b)] if a == "x" && b == "y"));
+        // Two of them in one word, which is the whole reason it is a SEGMENT.
+        assert_eq!(nth(&words("echo <(a)<(b)")?, 1)?.0.len(), 2);
+        // The body is balanced by the same scan `$(` uses, so a nested one is
+        // the inner body's and an unclosed one is an error rather than a word
+        // that quietly ends early.
+        assert!(matches!(nth(&words("echo <(cat <(x))")?, 1)?.0.as_slice(),
+            [Seg::ProcSub { code, .. }] if code == "cat <(x)"));
+        assert!(words("echo <(true").is_err());
+        Ok(())
+    }
+
+    /// Every way of writing something that is NOT one, all measured against ash.
+    #[test]
+    fn a_process_substitution_needs_a_bare_paren_at_the_very_next_character() -> Syn<()> {
+        let op_at = |src: &str, i: usize| -> Syn<Op> {
+            match tokenize(src, 1)?.toks.get(i).map(|p| &p.tok) {
+                Some(Tok::Op(op)) => Ok(*op),
+                other => Err(format!("token {i} is {other:?}").into()),
+            }
+        };
+        // Quoted: ash's double-quote syntax class makes `<` an ordinary word
+        // character, so there is no quoted spelling of one.
+        assert!(matches!(nth(&words("echo \"<(true)\"")?, 1)?.0.as_slice(),
+            [Seg::Quoted(s)] if s == "<(true)"));
+        // Escaped: `\<` is a quoted `<`, and the `(` after it is then an
+        // operator -- ash answers `syntax error: unexpected "("`.
+        assert_eq!(op_at("echo \\<(true)", 2)?, Op::LParen);
+        // A blank between them is a redirection and a subshell.
+        assert_eq!(op_at("echo < (true)", 1)?, Op::Less);
+        // A `\<newline>` fold between them is NOT eaten, where every other
+        // two-character lookahead in this lexer does eat one: ash reads this
+        // lookahead with `pgetc`, not `pgetc_eatbnl`. Measured -- ash answers
+        // `syntax error: unexpected "("` where bash folds and substitutes.
+        assert_eq!(op_at("echo <\\\n(true)", 1)?, Op::Less);
+        // `>>` is read as the append operator before either half can pair with
+        // the paren, so `echo hi >>(cat)` is a syntax error in ash too.
+        assert_eq!(op_at("echo hi >>(cat)", 2)?, Op::DGreat);
         Ok(())
     }
 

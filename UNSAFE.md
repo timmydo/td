@@ -976,8 +976,30 @@ SIGALRM and so needs the handler this surface deliberately cannot
 install.
 
 Every other primitive td-sh needs — pipes, process spawn, `exec`, the
-virtual fd table that stands in for `dup2` — is reachable through safe
-`std`, which is what keeps that surface at four.
+virtual fd table that stands in for `dup2`, and process substitution —
+is reachable through safe `std`, which is what keeps that surface at
+four.
+
+Process substitution is the one of those that had to be argued rather
+than observed, so the argument is written down here. `<(cmd)` expands to
+a PATH an arbitrary program opens for itself, and in ash that path is
+`/dev/fd/64`: a descriptor the shell duplicated with `F_DUPFD` and the
+exec'd command INHERITED. Every descriptor safe `std` opens is
+close-on-exec — `io::pipe`, `File::open`, and `try_clone_to_owned`,
+which is `F_DUPFD_CLOEXEC` — and nothing in safe `std` clears that flag,
+so the inheriting spelling needs `fcntl(2)` as a FIFTH syscall. It was
+built that way, with `F_SETFD` pinned by value and its argument pinned
+to zero, and then removed — not for taste. The flag belongs to the
+DESCRIPTOR and the descriptor table belongs to the PROCESS, while this
+shell's subshells are threads, so clearing it hands the end to every
+`execve` the shell makes next, the body's own included, where a forking
+shell's body cannot see a descriptor its table predates. Two hangs came
+of it, both measured: `seq 3 > >(tac)` gave `tac` a copy of the write
+end of its own input, and `head -n 1 <(seq 100000)` gave `seq` a copy of
+the read end of its own output. td-sh names the descriptor by PID
+instead — `/proc/<pid>/fd/N`, which the command OPENS rather than
+inherits. That needs no flag, leaks no descriptor into any child, reads
+the same in both directions, and costs only the text of the word.
 
 ## 9. `td-jail` — the application sandbox
 

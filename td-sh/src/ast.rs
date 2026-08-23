@@ -106,6 +106,20 @@ pub enum Seg {
     /// `$((...))` — the inner text is itself a word (it may contain `$x`), so it
     /// is expanded first and then evaluated as an arithmetic expression.
     Arith { expr: Word, quoted: bool },
+    /// `<(...)` / `>(...)` — the raw source. Expanding the word runs it
+    /// CONCURRENTLY behind a pipe and leaves the path of this shell's end of
+    /// that pipe in its place (`process::dev_fd_path`). `write` is the `>(`
+    /// direction, whose command READS what the outer one writes.
+    ///
+    /// No `quoted` field, unlike `Cmd`: ash reads `<(` in its word scanner and
+    /// only outside quotes and outside `${...}` (ash.c:12676), so there is no
+    /// quoted spelling of one -- `"<(true)"` and `${v:-<(true)}` are both the
+    /// literal text, measured.
+    ProcSub {
+        code: String,
+        write: bool,
+        line: u32,
+    },
     /// A `${...}` whose body this shell does not serve, as its source text: ash
     /// raises `bad substitution` from its expander, so this fails there too.
     /// Not a `Param` -- `expand_param` would look the name up first.

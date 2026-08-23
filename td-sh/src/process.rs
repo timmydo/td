@@ -20,14 +20,19 @@
 //! real `fork`, so `exec 3>f; cmd >&3` works (3 is remapped onto a standard
 //! descriptor for the child) while `exec 3>f; cmd` cannot let `cmd` see fd 3.
 //! A `Fd::Closed` likewise reaches the child as `/dev/null` rather than closed.
+//! Process substitution is the one thing that needs a child to reach a higher
+//! descriptor, and it goes around that rule rather than through it: the word it
+//! expands to names the descriptor by PID (`dev_fd_path`), so the command opens
+//! it rather than inheriting it.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Read, Write};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use crate::ast::{AndOr, Cmd, List, Redir, RedirKind, Sep, Stage, Word};
 use crate::exec::{
@@ -1541,6 +1546,12 @@ impl Drop for Subshell {
         // ignoring it, and restoring first both breaks that and races the
         // save/restore a job's own spawn does under `GUARD`.
         self.shell.fds.release();
+        // Between the two for the same reason they are in this order: a JOB can
+        // be blocked for EOF on an end this shell is holding -- it need only
+        // have opened the path -- and waiting for that job first would wait for
+        // a reader only this shell can release. The joins still come last, when
+        // the `procsubs` field itself drops.
+        self.shell.procsubs.release_all();
         self.shell.jobs.wait_all();
         // A clone that never set a mask has none to put back, and putting one
         // back anyway is how a stage came to undo a sibling's. `drop` runs
@@ -1632,6 +1643,11 @@ pub fn fork_shell(sh: &Shell) -> Subshell {
         concurrent: sh.concurrent,
         // Fresh, never cloned: see the field's note.
         jobs: crate::jobs::Jobs::new(),
+        // NOT carried into the clone, exactly as `jobs` is not: the end an
+        // entry holds belongs to the shell that opened it, and a clone that
+        // dropped one would close a descriptor its parent is still naming.
+        procsubs: ProcSubs::default(),
+        procsub_seq: 0,
         // Inherited: a `$(...)` inside $PS4 runs in one of these, and it must
         // still know it is inside PS4 or the guard buys nothing.
         in_ps4: sh.in_ps4,
@@ -1708,6 +1724,267 @@ fn read_capture(sh: &mut Shell, buf: &Arc<Mutex<Vec<u8>>>) -> R<String> {
         .map(|v| v.clone())
         .map_err(|_| sh.fatal("command substitution: poisoned capture buffer", 1))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// One live process substitution: this shell's own end of the pipe between it
+/// and the body, and the thread running that body.
+///
+/// The end stays OPEN across the command whose word names it, and closes the
+/// moment that command is done -- the same point ash pops its own.
+///
+/// What a word naming it does AFTERWARDS is not this shell's to promise, and
+/// `dev_fd_path` is where that is written down: the descriptor number goes
+/// straight back into circulation, so a stale word names whatever this shell
+/// has opened since. It does not reliably fail. Measured in review:
+/// `f=<(echo A); exec 3< secret; cat $f` prints the secret file.
+pub struct ProcSub {
+    /// Which command opened this one, as a number that only ever grows. A
+    /// POSITION in the list served until entries could be reaped out of the
+    /// middle: removing one shifts every later entry down, and a mark taken as
+    /// a length then names the wrong place. A sequence number is not a place.
+    seq: u64,
+    /// Behind an `Option` because closing the end and waiting for the body are
+    /// two events, not one: the end goes at the end of the COMMAND that named
+    /// it, and the wait is owed at the end of the shell ENVIRONMENT.
+    ours: Option<File>,
+    job: Option<JoinHandle<i32>>,
+}
+
+impl ProcSub {
+    /// Let go of this shell's end: the body can reach EOF or EPIPE from here,
+    /// and the path stops resolving.
+    fn release(&mut self) {
+        self.ours = None;
+    }
+
+    /// Whether this shell has already let its end go, so nothing can name the
+    /// descriptor any more and only the body is still owed anything.
+    fn spent(&self) -> bool {
+        self.ours.is_none()
+    }
+
+    /// Whether the body has already ended, so joining it cannot block.
+    fn ended(&self) -> bool {
+        self.job.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+}
+
+/// Every process substitution one shell has open, oldest first.
+///
+/// A type of its own for one reason, and it is the reason `close_procsubs`
+/// releases every end before it waits for any body: a body's shell is a CLONE
+/// of this shell's descriptor table, so it can be holding a copy of a SIBLING's
+/// end. `exec 3> >(cat)` puts a write end of the first body's pipe at
+/// descriptor 3, and the `for f in >(cat)` after it hands the second body a
+/// table with that descriptor still in it -- so waiting for the FIRST body
+/// while the second's end was still open waited for an EOF only the second
+/// could release. Measured as a hang, at teardown, which is the one place a
+/// bare `Vec` would have done the joins one entry at a time.
+#[derive(Default)]
+pub struct ProcSubs(Vec<ProcSub>);
+
+impl ProcSubs {
+    /// How many are still live. The shell itself never asks -- which is why
+    /// this is `cfg(test)` rather than merely unused -- but the test that pins
+    /// reaping has no other way to see that the list is not growing.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// How many still HOLD their end, so a word can still name them. The
+    /// difference from `len` is the entries this shell has finished with and
+    /// has not yet been able to join.
+    #[cfg(test)]
+    pub fn live(&self) -> usize {
+        self.0.iter().filter(|ps| !ps.spent()).count()
+    }
+}
+
+impl ProcSubs {
+    /// Let go of every end without waiting for anything. The release and the
+    /// wait are separable, and one caller needs them apart: a shell environment
+    /// ending has to let go BEFORE it joins its background jobs, because a job
+    /// that opened one of these paths is a reader this shell is holding open.
+    /// Found in review as a hang, `for f in >(cat); do cat $f & done`.
+    pub(crate) fn release_all(&mut self) {
+        for ps in &mut self.0 {
+            ps.release();
+        }
+    }
+}
+
+impl Drop for ProcSubs {
+    fn drop(&mut self) {
+        // Phase one. Phase two is the `Vec`'s own drop, which runs after this
+        // and joins each body -- by which time no end this shell holds can be
+        // the one a body is waiting on.
+        self.release_all();
+    }
+}
+
+impl Drop for ProcSub {
+    fn drop(&mut self) {
+        self.release();
+        // JOINED, where ash leaves the child it forked running. A thread has no
+        // parent to be reparented to, so a body abandoned at process exit takes
+        // output with it that ash's orphan would still have written -- and one
+        // shape needs it here rather than at exit: `x=$( { echo a; } > >(cat) )`
+        // is `[a]` in ash, whose substitution reads the capture pipe until the
+        // BODY closes its inherited end too (measured, sleep included). This is
+        // the same trade `&` already makes; `Subshell::drop` waits its jobs.
+        if let Some(job) = self.job.take() {
+            let _ = job.join();
+        }
+    }
+}
+
+/// `<(cmd)` / `>(cmd)`: start `cmd` concurrently and answer the path naming the
+/// end of the pipe that the command being expanded reads from or writes to.
+///
+/// `write` is the `>(` direction: the body READS what the outer command writes,
+/// so the body gets descriptor 0 and this shell keeps the write end.
+pub fn open_procsub(sh: &mut Shell, code: &str, write: bool, line: u32) -> R<String> {
+    let list = match crate::parser::parse_subst_body(code, &sh.aliases, line) {
+        Ok(l) => l,
+        Err(e) => return Err(sh.fatal(&e.msg, 2)),
+    };
+    // ash makes neither pipe nor child for an empty body: `evalbackcmd` leaves
+    // `result->fd` at -1 and the word becomes the path of a descriptor that
+    // cannot exist. `echo <( )` prints `/dev/fd/-1` and `cat <( )` fails with
+    // ENOENT -- both measured, and both are what formatting -1 like any other
+    // number gives.
+    if list.items.is_empty() {
+        return Ok(dev_fd_path(-1));
+    }
+    let (r, w) = match std::io::pipe() {
+        Ok(ends) => ends,
+        Err(e) => {
+            let why = exec::strerror(&e);
+            return Err(sh.fatal(&format!("cannot create pipe: {why}"), 1));
+        }
+    };
+    let (ours, theirs, theirs_at) = if write {
+        (File::from(OwnedFd::from(w)), File::from(OwnedFd::from(r)), 0)
+    } else {
+        (File::from(OwnedFd::from(r)), File::from(OwnedFd::from(w)), 1)
+    };
+    let raw = ours.as_raw_fd();
+    let mut child = fork_shell(sh);
+    // A body is `concurrent` for `jobs::spawn`'s reason: the interrupt guard and
+    // the process's signal dispositions are one cell shared with whatever else
+    // is running, and neither is a body's to take.
+    child.concurrent = true;
+    child.fds.set(theirs_at, Fd::File(Arc::new(theirs)));
+    // `Builder`, not `thread::spawn`, which PANICS when the OS cannot make a
+    // thread -- and how many substitutions a command names is whatever the
+    // operator wrote. What the refusal is then REPORTED as is the pipe failure
+    // above and not `run_pipeline`'s per-stage 126: a substitution that never
+    // started leaves a word with nothing to name, so the expansion has no
+    // answer to give and this ends the command like any other fatal expansion
+    // error.
+    let started = std::thread::Builder::new()
+        .stack_size(SHELL_THREAD_STACK)
+        .spawn(move || {
+            let mut child = child;
+            let status = match exec::run_list(&mut child, &list) {
+                Ok(()) => child.status,
+                // `Return` sits with them for `jobs::spawn`'s reason: a body IS
+                // the end of a shell environment, so a `return` inside one has
+                // nowhere left to return to and its operand is the status.
+                Err(Sig::Exit(code) | Sig::Abort(code) | Sig::Return(code)) => code,
+                // Not re-raised: there is no caller left on this thread, and the
+                // body took no interrupt guard, so the signal that ended it
+                // reached the whole process anyway.
+                Err(Sig::Interrupt(code)) => code,
+                Err(_) => child.status,
+            };
+            exec::run_exit_trap(&mut child, status)
+        });
+    let job = match started {
+        Ok(job) => job,
+        Err(e) => return Err(sh.fatal(&format!("cannot create thread: {e}"), 1)),
+    };
+    let seq = sh.procsub_seq;
+    sh.procsub_seq = seq.saturating_add(1);
+    sh.procsubs.0.push(ProcSub {
+        seq,
+        ours: Some(ours),
+        job: Some(job),
+    });
+    Ok(dev_fd_path(raw))
+}
+
+/// The path that names descriptor `fd` OF THIS PROCESS.
+///
+/// ash writes `/dev/fd/64`, and `/dev/fd` is a symlink to `/proc/self/fd`, so
+/// its word resolves only in a process that INHERITED the descriptor -- which
+/// ash's children do, `F_DUPFD` leaving close-on-exec clear (ash.c:6640). Every
+/// descriptor `std` opens has that flag SET, and safe `std` cannot clear it.
+///
+/// Clearing it was built and measured and is worse than naming the process. The
+/// flag lives on the descriptor, the descriptor table belongs to the PROCESS,
+/// and this shell's subshells are THREADS -- so clearing it hands the end to
+/// every `execve` the shell makes next, the body's own included, where a forking
+/// shell's body cannot see a descriptor its table predates. Two hangs came of
+/// it, both measured: `seq 3 > >(tac)` gave `tac` a copy of the write end of its
+/// own input and it waited for an EOF only it could send, and
+/// `head -n 1 <(seq 100000)` gave `seq` a copy of the read end of its own output
+/// and it blocked on a full pipe with itself as the only reader.
+///
+/// Naming the process needs no flag, leaks no descriptor into any child, and
+/// reads the same in both directions -- so `tee >(wc -c)` is served, which
+/// clearing the flag could not have served without the same race. It costs the
+/// TEXT of the word: `/proc/1234/fd/5` where ash writes `/dev/fd/64`. Nothing in
+/// the corpus reads it, and what it names is the same pipe.
+///
+/// `-1` is the empty body's, and formats like any other number into a path that
+/// cannot open -- which is ash's answer to `<( )` as well.
+fn dev_fd_path(fd: std::os::fd::RawFd) -> String {
+    format!("/proc/{}/fd/{fd}", std::process::id())
+}
+
+/// End every process substitution this shell opened at or after `mark`: close
+/// this shell's end of each, then reap whatever is finished with.
+///
+/// The closes all happen before any reaping, but what makes THIS function safe
+/// is the `ended()` guard below and not the order: a join it reaches cannot
+/// block on anything, sibling-held or not. The order is `ProcSubs::drop`'s
+/// requirement, where the join is unguarded, and the two are written alike so
+/// that reading one teaches the other. Review found the reason misattributed
+/// here.
+///
+/// The reaping sweeps the WHOLE list and not just what this command opened, and
+/// that is not tidiness. A body has almost never finished by the time the
+/// command that opened it has: the outer command sees EOF the instant the body
+/// lets its end go, which is the last thing that thread does, so a check here
+/// loses that race nearly every time. Reaping above `mark` alone therefore left
+/// every entry behind, and `while true; do cat <(echo x); done` accumulated one
+/// unjoined thread -- an 8 MiB stack apiece -- per iteration, without bound.
+/// Both reviewers found it; one measured 200 iterations at 9.7 GB of address
+/// space.
+///
+/// SPENT and ended, never merely ended: an entry still holding its end can be
+/// named by a word this shell has already expanded, and a `for` list's outlives
+/// every command in the body by design. That pair is also what keeps `mark`
+/// meaningful --
+/// an entry below a live mark is one no completed frame has released, so it is
+/// never spent, so the sweep never moves it.
+///
+/// What is NOT joined here is a body that has not ended. That is owed to the
+/// end of the shell environment, where `fds` has first let go of every copy of
+/// the descriptor a body might still be waiting on: `exec 3> >(cat)` keeps a
+/// writer on fd 3 long after the `exec` itself is over, and joining there
+/// deadlocked (measured) where ash, which waits for nothing, prints `hi`.
+pub fn close_procsubs(sh: &mut Shell, mark: u64) {
+    for ps in &mut sh.procsubs.0 {
+        if ps.seq >= mark {
+            ps.release();
+        }
+    }
+    // `retain` DROPS what it removes, and dropping joins -- which is why only an
+    // entry that has already ended may be dropped here.
+    sh.procsubs.0.retain(|ps| !(ps.spent() && ps.ended()));
 }
 
 /// `exec command …`: replace this shell process with `command`.
@@ -2259,6 +2536,15 @@ mod thread_state {
 mod tests {
     use super::{exec, OpenKind, EEXIST, ENOENT, ENOTDIR};
 
+    /// Captured output as SORTED lines. Two threads writing one capture buffer
+    /// have no order between them, so a test about what was written must not
+    /// be a test about when.
+    fn sorted_lines(out: &str) -> Vec<&str> {
+        let mut lines: Vec<&str> = out.lines().collect();
+        lines.sort_unstable();
+        lines
+    }
+
     /// Neither errno is arbitrary: ENOENT is the missing name and ENOTDIR the
     /// name under a non-directory, and ash answers both with one word because
     /// to a script they are the same mistake.
@@ -2383,5 +2669,227 @@ mod tests {
             super::open_error("./x", OpenKind::Read, &denied),
             "can't open ./x: Permission denied"
         );
+    }
+
+    /// A process substitution is a real pipe with the body on the far end, and
+    /// the word is the path of THIS process's descriptor for it.
+    #[test]
+    fn a_process_substitution_is_a_path_naming_this_processs_descriptor() {
+        let run = crate::process::run_capturing;
+        // Read direction: the body writes, the command that named it reads. The
+        // redirection here is opened by the shell itself, so this needs no
+        // external command.
+        assert_eq!(run("read line < <(echo hello); echo \"[$line]\""), (0, "[hello]\n".into(), String::new()));
+        // Write direction: the body READS what the command writes to it.
+        assert_eq!(
+            run("{ echo one; echo two; } > >(while read x; do echo \"[$x]\"; done)").1,
+            "[one]\n[two]\n"
+        );
+        // The word is the path, and the path names this process -- `/dev/fd/N`
+        // is `/proc/self/fd/N`, and `self` in the command being expanded is that
+        // command rather than this shell. See `dev_fd_path`.
+        let (_, out, _) = run("echo <(true)");
+        let mine = format!("/proc/{}/fd/", std::process::id());
+        assert!(out.starts_with(&mine), "{out} does not name pid {}", std::process::id());
+        // An EMPTY body gets no pipe and no thread, and a path that cannot open.
+        // ash prints `/dev/fd/-1` for `<( )` and fails ENOENT on reading it.
+        assert!(run("echo <( )").1.trim_end().ends_with("/fd/-1"), "{:?}", run("echo <( )").1);
+        assert_ne!(run("read line < <( )").0, 0);
+    }
+
+    /// The body runs CONCURRENTLY behind a real pipe, so an unbounded one is
+    /// bounded by the kernel buffer rather than by memory -- the property a
+    /// capture-into-a-`Vec` implementation cannot have. An infinite body is the
+    /// test that tells them apart: this answers, and a synchronous one never
+    /// would.
+    #[test]
+    fn an_unbounded_body_is_bounded_by_the_pipe_and_ended_by_the_close() {
+        let run = crate::process::run_capturing;
+        assert_eq!(run("read line < <(while true; do echo x; done); echo \"[$line]\"").1, "[x]\n");
+        // And for one that outlives the command that named it, so its own
+        // `drop` is what ends it: the end has to GO before the wait, or the
+        // wait is for a body this shell is itself blocking. Nothing here ever
+        // opens the path -- the body is blocked on a full pipe from the start.
+        assert_eq!(run("for f in <(while true; do echo x; done); do echo ok; done").1, "ok\n");
+    }
+
+    /// The descriptor lives exactly as long as the COMMAND whose word named it,
+    /// which is where ash pops it too -- onto and off the same redirection frame
+    /// `evalcommand` pops.
+    #[test]
+    fn the_descriptor_ends_with_the_command_that_named_it() {
+        let run = crate::process::run_capturing;
+        // An assignment is that command, so its descriptor is gone before the
+        // next one runs. Asserted on the LIST and not on what reading the dead
+        // path then does: the descriptor NUMBER is handed straight back out --
+        // to another test's pipe, this suite running its tests on concurrent
+        // threads of one process -- so what a stale word names afterwards is not
+        // this shell's to promise. Against the binary, where nothing else is
+        // opening descriptors, ash and this shell both refuse it; the reuse is a
+        // divergence of its own that `dev_fd_path` carries.
+        //
+        // The body here never ends, so the entry cannot be reaped and what is
+        // left to see is exactly whether the end was released.
+        let live = super::on_shell_stack(|| {
+            let mut sh = crate::exec::Shell::new_for_test();
+            sh.fds.set(1, super::Fd::Null);
+            let _ = crate::exec::run_program(&mut sh, "f=<(while true; do echo x; done); :");
+            let live = sh.procsubs.live();
+            drop(sh);
+            live
+        })
+        .expect("could not start the shell thread");
+        assert_eq!(live, 0, "the assignment's descriptor outlived the assignment");
+        // A `for` list's descriptor belongs to the `for`, so it outlives every
+        // command in the body. TWO of them, so the second iteration proves that
+        // closing at the end of the body's command closed only what that
+        // command opened.
+        assert_eq!(
+            run("for f in <(echo a) <(echo b); do read line < $f; echo \"[$line]\"; done").1,
+            "[a]\n[b]\n"
+        );
+        // A clone carries NO entry of its parent's, which is what makes a
+        // subshell safe here: one that dropped an entry would close a
+        // descriptor its parent is still naming. The `for` list's is still live
+        // across the subshell below, and the read after it proves it.
+        assert_eq!(
+            run("for f in <(echo a); do ( echo sub ); read line < $f; echo \"[$line]\"; done").1,
+            "sub\n[a]\n"
+        );
+        // A command substitution reads the body's bytes too: ash answers `[a]`
+        // for this, because its capture ends when the BODY closes its inherited
+        // end and not when the substitution's own command does.
+        assert_eq!(
+            run("x=$( { echo a; } > >(while read y; do echo \"[$y]\"; done) ); echo \"($x)\"").1,
+            "([a])\n"
+        );
+        // A descriptor the SHELL keeps outlives the command that opened it, so
+        // the body cannot be waited for there: `exec 3>` still has a writer on
+        // fd 3 when the `exec` is over, and joining at the end of that command
+        // deadlocked (measured).
+        //
+        // The two lines are compared as a SET. `read x` returns on data, not on
+        // EOF, so the body writes `[hi]` the moment `echo hi >&3` lands and the
+        // two threads race for the capture buffer -- pinning one order failed
+        // 24 runs in 300, which review measured and this test had.
+        assert_eq!(
+            sorted_lines(&run(
+                "exec 3> >(while read x; do echo \"[$x]\"; done); echo hi >&3; exec 3>&-; echo done"
+            ).1),
+            ["[hi]", "done"]
+        );
+    }
+
+    /// Every end is released BEFORE any body is waited for, at teardown as much
+    /// as at the end of a command.
+    ///
+    /// A body's shell is a CLONE of this one's descriptor table, so `exec 3>`
+    /// puts a writer on the FIRST body's pipe into the table the SECOND body
+    /// inherits. Waiting for the first while the second's end was still open
+    /// waited for an EOF only the second could send -- measured as a hang, at
+    /// teardown, where a bare `Vec` did the joins one entry at a time. Found in
+    /// review, with an external `cat` on both ends; this is the same shape with
+    /// nothing but builtins, and ash answers it identically.
+    #[test]
+    fn teardown_releases_every_end_before_it_waits_for_any_body() {
+        let src = concat!(
+            "exec 3> >(while read x; do echo \"A:$x\"; done)\n",
+            "for f in >(while read y; do echo \"B:$y\"; done); do :; done\n",
+            "echo hi >&3\n",
+            "exec 3>&-\n",
+            "echo done\n",
+        );
+        // A SET, for the reason the `exec 3>` case above gives: the body writes
+        // as soon as its `read` has data, not when the shell is finished.
+        assert_eq!(sorted_lines(&crate::process::run_capturing(src).1), ["A:hi", "done"]);
+    }
+
+    /// A loop that opens one per iteration must not accumulate them. Each entry
+    /// left behind is an unjoined thread with an 8 MiB stack, and the reaping
+    /// that was supposed to prevent it ran only over what the command itself
+    /// opened -- which is exactly the entry whose body has NOT finished yet,
+    /// the outer command having seen EOF the instant the body let its end go.
+    /// Both reviewers found it; one measured 200 iterations at 9.7 GB.
+    ///
+    /// This is the one property the shell has no output for, so it reads the
+    /// list directly rather than through `run_capturing`.
+    #[test]
+    fn a_loop_of_substitutions_does_not_accumulate_entries() {
+        let (kept, out) = super::on_shell_stack(|| {
+            let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut sh = crate::exec::Shell::new_for_test();
+            sh.fds.set(1, super::Fd::WriteBuf(out.clone()));
+            let _ = crate::exec::run_program(
+                &mut sh,
+                // The body writes its line and then KEEPS GOING, so `read`
+                // returns while it is still running and the entry cannot be
+                // reaped by its own command. That is the case the sweep exists
+                // for: a body that ends promptly is usually collected at its own
+                // close and never tests anything.
+                concat!(
+                    "i=0; while [ $i -lt 200 ]; do i=$((i+1)); ",
+                    "read line < <(echo $i; j=0; while [ $j -lt 300 ]; do j=$((j+1)); done); ",
+                    "done; echo \"[$line]\"",
+                ),
+            );
+            let kept = sh.procsubs.len();
+            drop(sh);
+            let text = out.lock().map(|v| String::from_utf8_lossy(&v).into_owned());
+            (kept, text.unwrap_or_default())
+        })
+        .expect("could not start the shell thread");
+        assert_eq!(out, "[200]\n");
+        // A handful at most. Two hundred is what is left if nothing below the
+        // mark is ever swept -- and with THIS body, which outlives the command
+        // that opened it, nearly every entry needs that sweep. The bound is
+        // loose enough for a loaded machine and far below what a per-command
+        // sweep alone leaves.
+        assert!(kept <= 20, "{kept} entries left after 200 substitutions");
+    }
+
+    /// The same for a command that is not a SIMPLE one. ash bounds a
+    /// substitution's life by the frame `evalcommand` pushes, which only a
+    /// simple command has, so a `[[ ]]` operand -- a shape ash does not have at
+    /// all -- had nothing to end it: measured at one descriptor an iteration,
+    /// without bound, before every command took a mark of its own.
+    #[test]
+    fn a_loop_of_substitutions_outside_a_simple_command_does_not_accumulate() {
+        let kept = super::on_shell_stack(|| {
+            let mut sh = crate::exec::Shell::new_for_test();
+            sh.fds.set(1, super::Fd::Null);
+            let _ = crate::exec::run_program(
+                &mut sh,
+                "i=0; while [ $i -lt 200 ]; do i=$((i+1)); [[ -n <(true) ]]; done",
+            );
+            let kept = sh.procsubs.len();
+            drop(sh);
+            kept
+        })
+        .expect("could not start the shell thread");
+        assert!(kept <= 40, "{kept} entries left after 200 conditional substitutions");
+    }
+
+    /// Where ash reads no substitution, so neither does this: the two guards are
+    /// the syntax class of a quoted `<` and `varnest`, and both are measured.
+    #[test]
+    fn quotes_and_a_brace_expansion_keep_the_text_literal() {
+        let run = crate::process::run_capturing;
+        assert_eq!(run("echo \"<(true)\"").1, "<(true)\n");
+        assert_eq!(run("unset v; echo ${v:-<(true)}").1, "<(true)\n");
+        assert_eq!(run("v=1; echo ${v:+<(true)}").1, "<(true)\n");
+        // And the shape that is not even a word there: ash raises `bad
+        // substitution` from its expander for `${#<(true)}`, status 2.
+        let (st, _, err) = run("echo ${#<(true)}");
+        assert_eq!(st, 2);
+        assert!(err.contains("bad substitution"), "{err:?}");
+    }
+
+    /// The path is EXPANDED text and not a literal, so it is field-split like a
+    /// command substitution's bytes. ash splits its own on `IFS=/` too; the
+    /// COUNT is five here and four there because this path carries one more
+    /// `/`, which is the whole of the difference.
+    #[test]
+    fn the_path_is_split_like_any_other_expansion() {
+        assert_eq!(crate::process::run_capturing("IFS=/; set -- <(true); echo $#").1, "5\n");
     }
 }

@@ -280,6 +280,24 @@ fn expand_raw(sh: &mut Shell, w: &Word, force_quoted: bool, splitting: bool) -> 
                 let out = command_subst(sh, code, *line)?;
                 push_expanded(&mut cur.chars, &out, q);
             }
+            // The path is `expanded`, like a command substitution's bytes and
+            // unlike a literal, so it is field-split and globbed rather than
+            // taken whole: ash splits `<(true)` on `IFS=/` too (measured; the
+            // COUNT differs there only because its path has fewer `/`).
+            // `quoted` can only come from the CALLER -- there is no quoted
+            // spelling of a process substitution, see `Seg::ProcSub` -- and no
+            // caller reaches here with it set today: the only words built with
+            // `force_quoted` come from `word_from_str_at`, which scans under
+            // `in_braces`, where `at_procsub` refuses. Kept because the rule is
+            // about the SEGMENT and not about who happens to call it. Review
+            // found it unreachable.
+            Seg::ProcSub { code, write, line } => {
+                if force_quoted {
+                    cur.had_quotes = true;
+                }
+                let path = crate::process::open_procsub(sh, code, *write, *line)?;
+                push_expanded(&mut cur.chars, &path, force_quoted);
+            }
             Seg::Arith { expr, quoted } => {
                 let q = *quoted || force_quoted;
                 if q {
