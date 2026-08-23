@@ -1632,13 +1632,71 @@ td-txt-authored case files
     no end is not a behaviour to reproduce, and this is the answer GNU is
     computing.
 
-  - A missing OPTION-ARGUMENT prints no usage line after the diagnostic for
-    `-m`/`-A`/`-B`/`-C`, where `-e`, `-f`, an unknown short option and every
-    long-option error all print one and GNU prints one for all of them. So
-    `grep -m` is one line here and three in GNU. Pre-existing, and td-txt is
-    inconsistent with itself rather than only with GNU. Invisible to the
-    sweeps, whose classifier strips each side's usage pointer before
-    comparing.
+  - CLOSED: a missing OPTION-ARGUMENT printed no usage line after the
+    diagnostic for `-m`/`-A`/`-B`/`-C`, the four short options taking a COUNT,
+    where the other four that take an argument (`-e`, `-f`, `-d`, `-D`), an
+    unknown short option, an unrecognized long one and every long option MISSING
+    its argument all printed one. (A long option given a BAD VALUE prints none,
+    in either program: `--max-count=a` is one line in both.) The sharpest form
+    of it was that td-txt disagreed with ITSELF between the two spellings of one
+    option -- `grep -m` was one line and `grep --max-count` two -- which is why
+    the goldens pin the short form against its own long form rather than against
+    GNU, and why the four peers it is measured against are now pinned EXACTLY
+    too: a regression stripping the line from THEM would re-open the same gap
+    from the other side. What does NOT change is the usage WORDING: GNU follows
+    the diagnostic with a two-line pointer (`Usage: grep [OPTION]... PATTERNS
+    [FILE]...` and `Try 'grep --help' …`) where td-txt prints its own single
+    line. So all EIGHT argument-taking short options are two lines here against
+    GNU's three, as are the unknown-option paths; the no-pattern path is one
+    against two, having no diagnostic above the usage. That divergence is
+    recorded in its own right below and is untouched. It was invisible to the
+    sweeps, whose classifier strips each side's usage pointer before comparing
+    -- which is what let an inconsistency this plain survive them.
+
+  - CLOSED for grep: a stderr WRITE FAILURE used to ABORT it. The usage line
+    and the argmatch candidate list went out through `eprintln!`, which panics
+    when the write fails, so every path printing one died at SIGABRT/134 on
+    an OPEN-but-failing stderr -- while the `grep: ` diagnostic beside it was
+    already safe, `errb` swallowing the error on purpose. That pairing is what
+    made it worth fixing here rather than later: adding the usage line to
+    `-m`/`-A`/`-B`/`-C` would otherwise have taken those four FROM 2 TO 134
+    under `2>/dev/full`, a regression bought with the fix above. All 17 grep
+    sites now write through `note`, so the four stay at 2 and EVERY other path
+    that prints one returns its ordinary status instead of aborting -- 18 of
+    22 sampled paths were 134 in the parent and none is now.
+    `a_failing_stderr_does_not_abort_grep` pins that over sixteen of the
+    seventeen sites; the seventeenth is an unreachable `LongErr::Unknown` arm.
+
+    Only an OPEN-but-failing stderr ever reached that panic. A CLOSED one did
+    not: Rust's runtime opens `/dev/null` over any closed standard descriptor
+    before `main`, so `grep -e 2>&-` was status 2 all along. That is the
+    same sanitising the closed-STDIN entry below turns on -- it is recorded
+    there for descriptor 0, and its mechanism sentence covers all three.
+
+    What is left is the price of swallowing, and NO rule about it has survived
+    being written down here -- two were tried and both were refuted by a later
+    measurement, so this records measurements and stops. GNU tracks the failed
+    write and reports it through the status it uses for FAILURE; td-txt swallows
+    and keeps whatever status it had. That status of GNU's is not constant: it
+    is 2 ordinarily and 0 under `-q`, so the difference has no single direction
+    and cannot be stated as one. FOUR pairs measured, td-txt first: 1/2 `grep -d
+    bogus`, in every spelling reaching it (`-dbogus`, `--directories=bogus`,
+    `--dir=bogus`, the ambiguous `-d re`); 0/2 three times, each a SUCCESS path
+    through an `errb` that is no usage site -- `grep hello BINARY >out` on the
+    `binary file matches` line (stdout must be a FILE: GNU reads a `/dev/null`
+    stdout as `-q` and never writes it), `grep 'a\ b' f` on the stray-backslash
+    warning, and `grep -R hello tree` over a symlink loop. Adding `-q` to any of
+    those three makes it 0/0, GNU's failure status being 0 there; 2/0 `grep -q
+    zzz BINARY nosuchfile`; and 1/0 `grep -qR zzz tree` over that same loop.
+    Expect more: this is a list, not a characterisation. Only the FIRST pair is
+    new here -- that path aborted at 134 before, so `note` is what gives it a
+    status to keep -- and the other three predate the landing untouched.
+
+    Not crate-wide: this closes GREP. `sed.rs` still has 10 `eprintln!` sites
+    and `main.rs` 4, and sed aborts identically -- `sed --nosuchopt
+    2>/dev/full` is 134 against GNU sed's 1. Those are their own landing;
+    naming the count here is what keeps that from being discovered a third
+    time.
 
   - `POSIXLY_CORRECT` selects a POSIX MODE in GNU sed, on top of the option
     order it decides, and that mode is now SERVED but for one pre-existing

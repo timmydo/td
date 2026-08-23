@@ -716,6 +716,26 @@ fn errb(msg: &[u8]) {
     let _ = std::io::stderr().write_all(&out);
 }
 
+/// A stderr line that is NOT a `grep: ` diagnostic -- the usage line and the
+/// argmatch candidate list. Written the way `errb` writes: a failed stderr is
+/// SWALLOWED. The `eprintln!` these replaced PANICKED when the write failed, so
+/// `grep -e 2>/dev/full` aborted at 134 where GNU exits with its ordinary
+/// status; the diagnostic above it was already safe, which is what made the
+/// pair inconsistent.
+fn note(line: &str) {
+    use std::io::Write;
+    // Sized for the newline up front: `to_vec` would allocate at exactly the
+    // length and reallocate the whole of `USAGE` to push one byte.
+    let mut out = Vec::with_capacity(line.len() + 1);
+    out.extend_from_slice(line.as_bytes());
+    out.push(b'\n');
+    let _ = std::io::stderr().write_all(&out);
+}
+
+fn usage() {
+    note(USAGE);
+}
+
 /// Applet entry point. `args[0]` is the invoked name.
 pub fn main(args: &[Vec<u8>]) -> i32 {
     let mut conf = Conf::default();
@@ -753,12 +773,12 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                 Ok(pair) => pair,
                 Err(msg) if msg.is_empty() => {
                     errb(&name_in("unrecognized option '", arg, "'"));
-                    eprintln!("{USAGE}");
+                    usage();
                     return 2;
                 }
                 Err(msg) => {
                     errb(&msg);
-                    eprintln!("{USAGE}");
+                    usage();
                     return 2;
                 }
             };
@@ -769,7 +789,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
             let value = match (arity, inline) {
                 (Arg::None, Some(_)) => {
                     errb(&name_in("option '--", name, "' doesn't allow an argument"));
-                    eprintln!("{USAGE}");
+                    usage();
                     return 2;
                 }
                 (Arg::None, None) => None,
@@ -782,7 +802,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                     }
                     None => {
                         errb(&name_in("option '--", name, "' requires an argument"));
-                        eprintln!("{USAGE}");
+                        usage();
                         return 2;
                     }
                 },
@@ -810,7 +830,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                 // `resolve_long` already rejected an unknown name.
                 Err(LongErr::Unknown) => {
                     errb(&name_in("unrecognized option '", arg, "'"));
-                    eprintln!("{USAGE}");
+                    usage();
                     return 2;
                 }
                 Err(LongErr::Message(m)) => {
@@ -911,7 +931,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                 b'd' => {
                     let Some(v) = value_of(&mut j, &mut i) else {
                         errb(&byte_in("option requires an argument -- '", opt, "'"));
-                        eprintln!("{USAGE}");
+                        usage();
                         return 2;
                     };
                     let Some(action) = dirs_arg(&v) else { return 1 };
@@ -920,7 +940,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                 b'D' => {
                     let Some(v) = value_of(&mut j, &mut i) else {
                         errb(&byte_in("option requires an argument -- '", opt, "'"));
-                        eprintln!("{USAGE}");
+                        usage();
                         return 2;
                     };
                     let Some(action) = devices_arg(&v) else {
@@ -943,7 +963,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                     }
                     None => {
                         err("option requires an argument -- 'e'");
-                        eprintln!("{USAGE}");
+                        usage();
                         return 2;
                     }
                 },
@@ -960,13 +980,14 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                     },
                     None => {
                         err("option requires an argument -- 'f'");
-                        eprintln!("{USAGE}");
+                        usage();
                         return 2;
                     }
                 },
                 b'm' => {
                     let Some(v) = value_of(&mut j, &mut i) else {
                         errb(&byte_in("option requires an argument -- '", opt, "'"));
+                        usage();
                         return 2;
                     };
                     let Some(limit) = parse_max_count(&v) else {
@@ -979,6 +1000,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                 b'A' | b'B' | b'C' => {
                     let Some(v) = value_of(&mut j, &mut i) else {
                         errb(&byte_in("option requires an argument -- '", opt, "'"));
+                        usage();
                         return 2;
                     };
                     let Some(n) = parse_count(&v) else {
@@ -989,7 +1011,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                 }
                 _ => {
                     errb(&byte_in("invalid option -- '", opt, "'"));
-                    eprintln!("{USAGE}");
+                    usage();
                     return 2;
                 }
             }
@@ -1035,7 +1057,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                 push_expr(&mut patterns, p.get(usize::from(skip)..).unwrap_or_default());
             }
             None => {
-                eprintln!("{USAGE}");
+                usage();
                 return 2;
             }
         }
@@ -1535,11 +1557,11 @@ fn complain_dirs(value: &[u8], ambiguous: bool) -> Option<Dirs> {
     crate::util::quote_arg(value, &mut msg);
     msg.extend_from_slice(b" for '--directories'");
     errb(&msg);
-    eprintln!("Valid arguments are:");
-    for name in ["read", "recurse", "skip"] {
-        eprintln!("  - '{name}'");
+    note("Valid arguments are:");
+    for line in ["  - 'read'", "  - 'recurse'", "  - 'skip'"] {
+        note(line);
     }
-    eprintln!("{USAGE}");
+    usage();
     None
 }
 
@@ -1633,7 +1655,7 @@ fn parse_long(
         | b"label"
         | b"line-buffered" => {
             errb(&name_in("unsupported option '--", name, "'"));
-            eprintln!("{USAGE}");
+            usage();
             return Err(LongErr::Handled);
         }
         b"regexp" => {

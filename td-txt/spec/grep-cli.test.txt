@@ -1993,6 +1993,76 @@ b
 ## status: 2
 ## stderr-contains: requires an argument
 
+# GNU prints a usage POINTER after every getopt failure. td-txt printed one for
+# `-e`, `-f`, `-d`, `-D`, an unknown short option and every long option, and NOT
+# for the four short options that take a COUNT -- so it disagreed with ITSELF
+# between the two spellings of one option. These pin the short form against its
+# own long form.
+# EXACT stderr, not a substring: the property is that a second line follows, and
+# `stderr-contains` on the diagnostic passes just as well when none does. The
+# usage WORDING is still td-txt's own single line against GNU's two, which is a
+# divergence recorded in ../spec/README and unaffected by this.
+
+#### a missing -m argument prints the usage line, as -e and -f do
+## argv: grep -m
+## stdout-json: ""
+## stderr-json: "grep: option requires an argument -- 'm'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## status: 2
+
+#### a missing -A argument prints the usage line, as -e and -f do
+## argv: grep -A
+## stdout-json: ""
+## stderr-json: "grep: option requires an argument -- 'A'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## status: 2
+
+#### a missing -B argument prints the usage line, as -e and -f do
+## argv: grep -B
+## stdout-json: ""
+## stderr-json: "grep: option requires an argument -- 'B'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## status: 2
+
+#### a missing -C argument prints the usage line, as -e and -f do
+## argv: grep -C
+## stdout-json: ""
+## stderr-json: "grep: option requires an argument -- 'C'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## status: 2
+
+#### and its own long spelling agrees, which is the pair that had diverged
+## argv: grep --max-count
+## stdout-json: ""
+## stderr-json: "grep: option '--max-count' requires an argument\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## status: 2
+
+# The four options this shape is measured AGAINST were themselves pinned only
+# by a substring, or not at all -- so a regression stripping the usage line from
+# THEM would re-open the same self-inconsistency from the other side with the
+# gate green. That is the argument the block above makes, applied to the block
+# above's own reference.
+
+#### the -e peer holds that shape too, pinned exactly so it cannot drift out of it
+## argv: grep -e
+## stdout-json: ""
+## stderr-json: "grep: option requires an argument -- 'e'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## status: 2
+
+#### the -f peer holds that shape too, pinned exactly so it cannot drift out of it
+## argv: grep -f
+## stdout-json: ""
+## stderr-json: "grep: option requires an argument -- 'f'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## status: 2
+
+#### the -d peer holds that shape too, pinned exactly so it cannot drift out of it
+## argv: grep -d
+## stdout-json: ""
+## stderr-json: "grep: option requires an argument -- 'd'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## status: 2
+
+#### the -D peer holds that shape too, pinned exactly so it cannot drift out of it
+## argv: grep -D
+## stdout-json: ""
+## stderr-json: "grep: option requires an argument -- 'D'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## status: 2
+
 #### -m rejects a non-number with its own wording
 ## argv: grep -m a f1
 ## file f1:

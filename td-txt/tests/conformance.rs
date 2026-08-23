@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 2582;
+const CORPUS_FLOOR: usize = 2623;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -3315,5 +3315,72 @@ fn a_joined_record_keeps_the_offset_it_began_at()
         .env("LC_ALL", "C")
         .output()?;
     assert_eq!(String::from_utf8_lossy(&out.stdout), "98304:bar\0");
+    Ok(())
+}
+
+/// A failing stderr must not KILL grep. The usage line and the argmatch
+/// candidate list used to go out through `eprintln!`, which panics when the
+/// write fails, so every path that printed one aborted at 134 -- where the
+/// `grep: ` diagnostic beside it was already safe, `errb` swallowing the error
+/// on purpose. `/dev/full` accepts an open and fails every write, which is the
+/// cheapest way to reach that. A CLOSED stderr does NOT: Rust's runtime opens
+/// `/dev/null` over any closed standard descriptor before `main`, so `2>&-`
+/// writes succeed and never reached the panic.
+///
+/// A source-level check would only pin the spelling; this pins the behaviour,
+/// and it is the corpus harness that cannot reach it, capturing stderr through
+/// a pipe that never fails.
+#[test]
+fn a_failing_stderr_does_not_abort_grep() -> Result<(), Box<dyn std::error::Error>> {
+    // status, not just "not 134": a signal death has no code at all, so
+    // `code()` returning None is the failure this is really watching for.
+    // Aimed at SITES, not options: all 17 funnel through `note`, so one case
+    // would prove the helper works, and a re-introduced `eprintln!` at any
+    // other site would still pass. Sixteen of the seventeen are reached here
+    // -- `-A`/`-B`/`-C` share one arm and `-d bogus` reaches three sites at
+    // once, so the counts do not line up one to one. The seventeenth is the
+    // `LongErr::Unknown` arm, which `resolve_long` makes unreachable.
+    let cases: &[(&[&str], i32)] = &[
+        // The four this landing added the usage line to.
+        (&["grep", "-m"], 2),
+        (&["grep", "-A"], 2),
+        (&["grep", "-B"], 2),
+        (&["grep", "-C"], 2),
+        // The four that already printed one.
+        (&["grep", "-e"], 2),
+        (&["grep", "-f"], 2),
+        (&["grep", "-d"], 2),
+        (&["grep", "-D"], 2),
+        // An unknown short option, an unrecognized long one, and no pattern
+        // at all -- three distinct sites.
+        (&["grep", "-Y"], 2),
+        (&["grep", "--nosuchopt"], 2),
+        (&["grep"], 2),
+        // The long-option arms: missing argument, AMBIGUOUS prefix, a value
+        // given to an option that takes none, and an unsupported name.
+        (&["grep", "--max-count"], 2),
+        (&["grep", "--i"], 2),
+        (&["grep", "--count=3"], 2),
+        (&["grep", "--label"], 2),
+        // The argmatch list, whose own lines panicked separately from the
+        // usage line under them. Status 1, not 2 -- which is also the one
+        // path GNU answers differently here (see spec/README).
+        (&["grep", "-d", "bogus"], 1),
+    ];
+    for (argv, want) in cases {
+        let full = std::fs::OpenOptions::new().write(true).open("/dev/full")?;
+        let out = std::process::Command::new(bin())
+            .args(*argv)
+            .stderr(full)
+            .env("LC_ALL", "C")
+            .output()?;
+        assert_eq!(
+            out.status.code(),
+            Some(*want),
+            "{argv:?} with stderr on /dev/full: expected exit {want}, got {:?} \
+             (None means it died on a signal, which is the abort this pins)",
+            out.status
+        );
+    }
     Ok(())
 }
