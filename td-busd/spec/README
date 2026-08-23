@@ -1,9 +1,14 @@
-td-busd interop corpus — recorded D-Bus conversations
-=====================================================
+td-busd interop corpus
+======================
 
-Bytes that a real D-Bus client and the reference `dbus-daemon` actually
-exchanged, replayed against this crate by ../src/recorded.rs. Recorded by
-../examples/dbus-capture.rs.
+Two bodies of evidence about a D-Bus implementation this crate has to agree
+with, and neither is this crate's own reading of the specification:
+
+  *.conversation   bytes a real client and the reference `dbus-daemon`
+                   actually exchanged, replayed by ../src/recorded.rs and
+                   recorded by ../examples/dbus-capture.rs
+  auth/            dbus's OWN auth-script suite, vendored from its source
+                   tree, replayed by ../src/authscript.rs
 
 
 Why this exists beside the hand-laid corpus
@@ -27,8 +32,39 @@ neither replaces the other:
 What a recording does NOT carry is upstream's INTENT. It is one session
 between one client and one daemon version; where it and the specification
 disagree, the specification wins and the recording is evidence about a
-particular implementation. (Vendoring dbus's own `test/data/auth/*.auth-script`
-suite would add the intent half. It is not here yet — see "Not yet done".)
+particular implementation.
+
+`auth/` is the third kind and the one that carries intent: dbus's own tests for
+its own server, stating what the reference implementation is REQUIRED to
+answer — including to peers no client would ever be. They are the only fixtures
+here that neither this author nor a running daemon produced.
+
+  hand-laid   what SHOULD happen, as the author read §D
+  recorded    what DOES happen, between real programs
+  auth/       what upstream REQUIRES, in upstream's own words
+
+The third kind paid for itself on arrival. The hand-laid corpus asserted that
+`AUTH EXTERNAL willy` is answered `REJECTED`; `invalid-hex-encoding.auth-script`
+says `ERROR`, and upstream is right, and so is the specification: an argument that
+cannot be READ claims no identity, so no identity was refused, and ERROR is
+what the ERROR Command section reserves for a peer that "did not understand the
+arguments to the command", after which the sender "must continue as if the
+command causing the ERROR had never been received".
+
+The specification is not of one mind, and the honest version says so: its
+server state table calls REJECTED the answer when "the client failed to
+authenticate or there was an ERROR IN RESP", which reads the other way. dbus
+settles its own tension in code and in this fixture — `process_data` decodes
+before the mechanism is ever consulted — and interoperating means answering
+what the reference implementation answers.
+
+So it is a conformance difference and not a better outcome for the client:
+libdbus answers this ERROR with CANCEL and disconnects on anything but
+REJECTED, and answers `REJECTED EXTERNAL` by finding it has no mechanism left
+to try and disconnecting too. Either way the connection ends.
+
+The misreading wrote the code and the fixture alike, which is exactly the
+failure the hand-laid corpus cannot detect on its own.
 
 
 Format
@@ -100,9 +136,141 @@ member='NameOwnerChanged'"
     covers:  the empty `AUTH EXTERNAL` + `DATA` spelling, and the entire
              handshake pipelined into one write
 
-These are recordings of protocol traffic, not copied dbus source: no file here
-is derived from dbus's own source tree. The traffic was produced by running the
-programs above, which are packaged by Guix at the store path named.
+These are recordings of protocol traffic, not copied dbus source: no file at
+the top level is derived from dbus's own source tree. The traffic was produced
+by running the programs above, which are packaged by Guix at the store path
+named.
+
+
+Provenance — auth/
+------------------
+
+  Upstream:   dbus 1.16.2
+  Source:     https://dbus.freedesktop.org/releases/dbus/dbus-1.16.2.tar.xz
+  SHA-256:    0ba2a1a4b16afe7bceb2c07e9ce99a8c2c3508e5dec290dbb643384bd6beb7e2
+  Path:       dbus-1.16.2/test/data/auth/  (copied byte-for-byte)
+  Semantics:  dbus-1.16.2/test/internals/dbus-auth-script.c, which is the
+              driver that defines every directive below
+  License:    AFL-2.1 OR GPL-2.0-or-later, at the recipient's choice. The
+              scripts carry no per-file SPDX marker, and `.reuse/dep5` — which
+              exists, with one stanza, for `subprojects/*.wrap` — has no entry
+              covering them,
+              so they take the project default stated in dbus's COPYING; the
+              driver that gives them meaning carries that identifier
+              explicitly. Vendored as test DATA, as `td-txt/spec` vendors GNU
+              grep's and GNU sed's.
+
+  How the URL and the hash were tied together. The file these 15 were copied
+  out of arrived named `dbus_1.16.2.orig.tar.xz`, which is Debian's name for a
+  source package's upstream tarball rather than upstream's own. The two are the
+  same bytes, and that is checked rather than assumed: this host's store holds
+  Guix's `builtin:download` fixed-output derivation for that release,
+
+    /gnu/store/qk85ia65s49kkh7i0pr4gwx0n8vyd8zb-dbus-1.16.2.tar.xz.drv
+
+  whose `url` is the Source line above and whose `sha256` is the SHA-256 above,
+  character for character. So the pin is upstream's URL and upstream's hash,
+  and the tarball on hand is that release under another name.
+
+  Selection rule: every `*.auth-script` in that directory whose side marker
+  line is `SERVER`. That is 15 of the 19 files. The other 4 are `CLIENT`
+  scripts — they drive the peer half of the handshake, and td-busd has no
+  client role. The rule is mechanical, so re-running it against the pinned
+  tarball reproduces this directory exactly; `every_committed_script_parses_as_
+  a_server_script` refuses a CLIENT script that arrived here by hand.
+
+  Per file, so that "pristine" is checkable and not merely asserted. A count
+  says how many files are here, not which one each is; `sha256sum -c` against
+  these says both. The replay requires the 15 to be distinct from each other,
+  which catches a substitution, and these catch an edit.
+
+    9d12c68986274cf0ac6d55c905939be6bda96e48d264fdc5ec09c44419a7764f  anonymous-server-successful.auth-script
+    f71f482849c7aaacc27261801b150437e222b5a7b0593d9e2af24287f66b583c  cancel.auth-script
+    9c57c239408d198e2ab73b9073069c5083927c123bc4e70b93fefc04395ff0c9  cookie-sha1-username.auth-script
+    bc571e9463b1c68a2648ddc7bca5397b33d3a91227860504eee677df6a492416  cookie-sha1.auth-script
+    bbddfc64227a76d2af51d3dce5796aeec48825fe447613a96b72436cf88aa961  external-auto.auth-script
+    9f31fcddd62bd0caae804f16037b444c9e742d10a62d41c43a2e27c577cf0fe5  external-failed.auth-script
+    68b8d2311d3ed2d521f868654c1744f5137aae2df01ec4c0f4d0c511ea14d3a4  external-root.auth-script
+    c33dbe7eca0a96b7367af5a7f1498bcc82eec91d2953f8e76acfcb2b70afa5fe  external-silly.auth-script
+    f9bd6e51ca74695572ef98d6a656bfcb41161d54bfeed57cd47e5c4aec5456c8  external-successful.auth-script
+    2338a45a1a2cc1b1a0d82dadb53d7949183109c3751ab7fba6136d96ffec9758  external-username.auth-script
+    074d78ea9dd98215470188bb211d215e05694617a501a3814649274ff6c3e8e8  extra-bytes.auth-script
+    e2af3c07a29aa8b7e781191acc303bc6524ad4e4af1b72e7048587cb7e023f60  fail-after-n-attempts.auth-script
+    0633217f36b9050f61241139c79bd37f72faea7bddafe95a4d57b6a150ac96f3  invalid-command.auth-script
+    a1ed54e7a4b1c3bfca11ff55f5bb80c3cd8ecbbee49d23e803d1f2d9ececb5bf  invalid-hex-encoding.auth-script
+    34a27f59f54f99589742819251a8597fc264176415d95efb93cf834e25c8af01  mechanisms.auth-script
+
+  Files are PRISTINE. Nothing is edited to make it pass, and nothing is edited
+  to make it run: where td answers differently, the difference is recorded in
+  `DEVIATIONS` in ../src/authscript.rs with its reason, and the script is still
+  replayed and still required to fail.
+
+  An exemption is not a hole. Each one pins the SUBSTRING its failure must
+  contain, so a divergence that starts failing for some other reason — a parse
+  bug, a disconnect, the right refusal at the wrong step — reds as loudly as
+  one that starts passing. Both were measured: with only "it still fails"
+  required, a broker that began accepting ANONYMOUS replayed clean, because
+  `anonymous-server-successful` then fails one step later than it used to and
+  one failure looked like any other.
+
+  Of the 15: 10 pass and 5 are recorded deviations — two DBUS_COOKIE_SHA1 and
+  one ANONYMOUS, mechanisms §D refuses by name, and two that open with
+  `NO_CREDENTIALS`, which this crate has no identity for. On the only transport
+  it serves SO_PEERCRED always answers; a peer it could not answer for has to
+  be refused before a handshake exists, which is the transport's job and not
+  built yet (UNSAFE.md surface #10).
+
+  All five are REPLAYED. An earlier draft skipped the last two by name and
+  checked their excuse against the fact that the script still said
+  NO_CREDENTIALS — a property of the file, which never changes, so teaching the
+  crate the very thing the excuse is about would have left them skipped
+  forever. The refusal to model an absent credential is now itself the recorded
+  failure, and stops being one the day it stops being true.
+
+
+  The one thing the scripts assume that this crate does not
+  ---------------------------------------------------------
+
+  No script sends the connection's leading NUL. Upstream's `DBusAuth` never
+  sees it: the transport takes the credentials byte off the stream first, and
+  hands the auth object a stream that starts at the first command. This crate
+  puts that byte inside the handshake instead — it is the one place a peer's
+  very first write is checked — so the replay supplies it once, ahead of the
+  first `SEND`. It is in the replay and not in the data, and
+  `../src/authscript.rs` says so where it happens.
+
+  The other one is the peer. Upstream's NO_/ROOT_/SILLY_CREDENTIALS set the
+  socket credential a claim is checked against; td wants each script replayed
+  against a peer whose claim and credential are DIFFERENT numbers, or a broker
+  recording whatever the peer claimed would pass all fifteen. Both are had by
+  replaying every script TWICE and requiring the same verdict: once faithfully,
+  where the kernel says exactly what the script says, and once through a
+  mapping onto a sentinel credential no script names. The faithful run is why
+  ROOT_CREDENTIALS still means a peer the kernel calls root rather than a
+  literal in an otherwise ordinary script.
+
+
+  The one line read differently from upstream's own driver
+  ---------------------------------------------------------
+
+  `AUTHENTICATED_WITH_UNUSED_BYTES` is not a `DBusAuthState`. It appears in one
+  script and nowhere else in dbus, and `auth_state_from_string` resolves it by
+  PREFIX match against `AUTHENTICATED` — so upstream's driver reads
+  extra-bytes' two `EXPECT_STATE` lines as the same state, and the distinction
+  its author plainly meant to draw is not enforced by the thing that runs it.
+
+  Read here at face value instead: the first line requires bytes to be left
+  over and the second requires none. Strictly stronger, and the reason the
+  `consumed` contract has a state check as well as an `EXPECT_UNUSED`. The cost
+  is that a future script using the spelling loosely would red where upstream
+  passes — a failure that needs reading rather than believing, which is the
+  right way round.
+
+  It is the only directive read DIFFERENTLY, which is not the same as the only
+  one upstream handles and this does not. `WAITING_FOR_MEMORY`,
+  `HAVE_BYTES_TO_SEND`, `ALLOWED_MECHS` and `WIN_ONLY` are refused rather than
+  interpreted. No committed script reaches them, and one that did would fail
+  loudly rather than quietly become a shorter script that passes.
 
 
 Descriptor passing
@@ -170,10 +338,11 @@ this directory and compares it against that list, so an unlisted file reds.
 Not yet done
 ------------
 
-  * dbus's own `test/data/auth/*.auth-script` suite, which would carry
-    upstream's intent rather than one session's behaviour. The dbus source
-    tarball is not realized in this machine's store, only its derivation, so
-    the file list could not be confirmed from here.
+  * The auth scripts cover the HANDSHAKE alone. dbus's `test/data/` also
+    carries message-level fixtures — `invalid-messages/*.message-raw` among
+    them — which belong beside `corpus.rs`'s decoder cases. Not vendored here:
+    that is a second selection rule, with its own reading of a second driver,
+    and it is a separate landing rather than a wider one.
   * A recording is replayed by DIRECTION, not by interleaving: swapping a
     client and a daemon frame in a file would not be noticed. Causal order is
     guaranteed by the recorder instead, which logs a frame before forwarding

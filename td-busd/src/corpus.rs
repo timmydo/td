@@ -852,8 +852,6 @@ pub const AUTH_REJECTIONS: &[(&str, &[u8])] = &[
     ("ANONYMOUS", b"\x00AUTH ANONYMOUS\r\n"),
     ("DBUS_COOKIE_SHA1", b"\x00AUTH DBUS_COOKIE_SHA1 6162\r\n"),
     ("a bare AUTH", b"\x00AUTH\r\n"),
-    ("an identity that is not hex", b"\x00AUTH EXTERNAL zzzz\r\n"),
-    ("an identity of odd length", b"\x00AUTH EXTERNAL 313\r\n"),
     ("an identity that is not numeric", b"\x00AUTH EXTERNAL 6162\r\n"),
     // "+1000": numeric to `parse`, and a second text for one uid.
     ("an identity carrying a sign", b"\x00AUTH EXTERNAL 2b31303030\r\n"),
@@ -880,9 +878,37 @@ const AUTHED: &[u8] = b"\x00AUTH EXTERNAL 31303030\r\n";
 const FROM_AUTH: &[u8] = b"AUTH EXTERNAL 31303030\r\nBEGIN\r\n";
 
 pub const AUTH_ERRORS: &[AuthErrorCase] = &[
-    // The case with a real consequence: REJECTED here would tell a client to
-    // tear down an attempt that succeeded, and libdbus would answer it by
-    // trying the next mechanism.
+    // Unreadable hex, which is NOT an identity that failed to resolve: the
+    // ones below decode to something and are refused for what it says, and
+    // these decode to nothing at all. The specification's ERROR is for a peer
+    // that "did not understand the arguments to the command", and both
+    // spellings of the argument reach the same decoder, so both are here.
+    AuthErrorCase {
+        name: "an identity that is not hex",
+        prefix: b"\x00",
+        command: b"AUTH EXTERNAL zzzz\r\n",
+        finish: FROM_AUTH,
+    },
+    AuthErrorCase {
+        name: "an identity of odd length",
+        prefix: b"\x00",
+        command: b"AUTH EXTERNAL 313\r\n",
+        finish: FROM_AUTH,
+    },
+    AuthErrorCase {
+        name: "unreadable hex inside the DATA exchange",
+        prefix: b"\x00AUTH EXTERNAL\r\n",
+        command: b"DATA zz\r\n",
+        finish: b"DATA\r\nBEGIN\r\n",
+    },
+    // The case with a real consequence: REJECTED here would tell a peer its
+    // authentication failed after it had succeeded. An earlier version of this
+    // comment said libdbus would answer by trying the next mechanism, which it
+    // cannot — past OK it is waiting for AGREE_UNIX_FD, and that state has no
+    // REJECTED arm at all, so it answers ERROR "Unknown command". The point
+    // stands without the embroidery: the specification's ERROR is what a
+    // command out of its phase gets, and REJECTED would be a lie about an
+    // attempt that succeeded.
     AuthErrorCase {
         name: "AUTH from a peer that has already authenticated",
         prefix: AUTHED,

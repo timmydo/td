@@ -390,7 +390,7 @@ impl<'a> Handshake<'a> {
             // `BEGIN junk` lands: neither takes an argument, and one that
             // carries one is not the command it resembles. This is the server's
             // ERROR, which is not the client's above.
-            _ => Ok(b"ERROR\r\n".to_vec()),
+            _ => Ok(error()),
         }
     }
 
@@ -427,8 +427,32 @@ impl<'a> Handshake<'a> {
 
     /// Decode a hex-encoded identity and check that it resolves.
     fn settle(&mut self, hex: &[u8]) -> Vec<u8> {
+        // Unreadable hex is a syntax error one layer ABOVE the mechanism: no
+        // identity was claimed, so none was refused. The specification's ERROR
+        // Command puts it exactly here — ERROR is for a peer that "did not
+        // know a command, does not accept the given command in the current
+        // context, or DID NOT UNDERSTAND THE ARGUMENTS to the command", and
+        // the sender then "must continue as if the command causing the ERROR
+        // had never been received", which is why the phase does not move.
+        // dbus reaches the same answer through one `process_data`, shared by
+        // the AUTH initial response and DATA, and pins it in
+        // `spec/auth/invalid-hex-encoding.auth-script`.
+        //
+        // The specification is not of one mind here, and it is worth saying
+        // so: its server state table calls REJECTED the answer when "the
+        // client failed to authenticate or there was an ERROR IN RESP", which
+        // reads the other way. dbus resolves its own tension in code and in
+        // this fixture, decoding before the mechanism is consulted, and
+        // interoperating means answering what the reference implementation
+        // answers.
+        //
+        // The reason is therefore conformance and not a better outcome for the
+        // client: libdbus answers this ERROR with CANCEL and then disconnects
+        // on anything but REJECTED, and answers `REJECTED EXTERNAL` by finding
+        // it has no mechanism left to try and disconnecting too. Both
+        // spellings end the connection.
         let Some(decoded) = unhex(hex) else {
-            return self.reject_identity();
+            return error();
         };
         // The decoded bytes are the identity as TEXT — "1000", not 1000 — and
         // §D refuses a non-numeric one. What this rejects that `parse` would
@@ -486,6 +510,11 @@ impl<'a> Handshake<'a> {
 /// The mechanisms this broker serves, which is the one §D names.
 fn rejected() -> Vec<u8> {
     b"REJECTED EXTERNAL\r\n".to_vec()
+}
+
+/// The server's `ERROR`: this command was not understood, and nothing moved.
+fn error() -> Vec<u8> {
+    b"ERROR\r\n".to_vec()
 }
 
 /// Split off the first space-delimited word, returning it and the remainder
@@ -671,12 +700,12 @@ mod tests {
         }
     }
 
-    /// An identity that is not hex, not even-length, not text, or not numeric.
+    /// An identity that decodes but names nobody this peer may claim. The
+    /// argument was READ here; what it said is what fails, so the mechanism
+    /// answers for it.
     #[test]
     fn a_malformed_identity_is_refused() {
         for identity in [
-            "zz",         // not hex
-            "313",        // odd length
             "6162",       // "ab" — decodes, but is not numeric
             "2d31",       // "-1"
             // "+1000" — the one `parse::<u32>` would ACCEPT, which is why the
@@ -695,6 +724,45 @@ mod tests {
             );
             assert_eq!(shake.uid(), None);
         }
+    }
+
+    /// An argument that is not hex at all, which is the other half of the
+    /// case above and lands in the other class. Nothing was claimed, so
+    /// nothing was refused: the peer is told the command was unreadable and
+    /// left where it was, free to restate it — where `REJECTED` would send it
+    /// looking for a mechanism this broker does not serve. Pinned by
+    /// upstream's `invalid-hex-encoding.auth-script`.
+    #[test]
+    fn an_unreadable_argument_is_a_command_error() {
+        for argument in ["willy", "zz", "313", "3q"] {
+            let mut shake = handshake();
+            let line = format!("\0AUTH EXTERNAL {argument}\r\n");
+            assert_eq!(
+                feed(&mut shake, line.as_bytes()),
+                "ERROR\r\n",
+                "argument {argument} was not an ERROR"
+            );
+            assert_eq!(shake.uid(), None);
+            // A retry still authenticates. In THIS phase that is equally true
+            // of a refusal — `reject_identity` unwinds to the same place — so
+            // what pins the difference is the DATA case below, where an ERROR
+            // stays in the exchange and a REJECTED would leave it.
+            assert_eq!(
+                feed(&mut shake, b"AUTH EXTERNAL 31303030\r\n"),
+                format!("OK {GUID}\r\n"),
+                "argument {argument} moved the phase"
+            );
+        }
+    }
+
+    /// The same decoder, reached by the other spelling.
+    #[test]
+    fn an_unreadable_data_argument_is_a_command_error() {
+        let mut shake = handshake();
+        assert_eq!(feed(&mut shake, b"\0AUTH EXTERNAL\r\n"), "DATA\r\n");
+        assert_eq!(feed(&mut shake, b"DATA zz\r\n"), "ERROR\r\n");
+        assert_eq!(shake.uid(), None);
+        assert_eq!(feed(&mut shake, b"DATA\r\n"), format!("OK {GUID}\r\n"));
     }
 
     /// Unknown commands get ERROR and leave the state alone, so the handshake

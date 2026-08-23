@@ -1035,13 +1035,14 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // host tests decode, decoded by the target build. Host cargo holds the Rust
     // rules and the no-unsafe confinement test.
     //
-    // spec/ holds recorded-conversation DATA and examples/ the recorder that
-    // writes it. Both are host-side interop tooling — src/recorded.rs replays
-    // them under cfg(test), so the recipe never stages them — and both already
-    // match `td-busd/*`, since `glob_match` is fnmatch WITHOUT FNM_PATHNAME and
-    // its star crosses `/`. They are named in the assertions below rather than
-    // here: an added alternative would change no decision while implying the
-    // star stops at a separator.
+    // spec/ holds interop DATA — recorded conversations, and upstream's own
+    // auth scripts a directory deeper — and examples/ the recorder that writes
+    // the former. All are host-side: src/recorded.rs and src/authscript.rs
+    // replay them under cfg(test), so the recipe never stages them. All already
+    // match `td-busd/*`, at either depth, since `glob_match` is fnmatch WITHOUT
+    // FNM_PATHNAME and its star crosses `/`. They are named in the assertions
+    // below rather than here: an added alternative would change no decision
+    // while implying the star stops at a separator.
     //
     // The recipe-checks selection below is wider than these two paths need,
     // since the recipe never sees them. That over-selection predates this and
@@ -1980,6 +1981,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // `td-busd/*` already matches both, so these passed before the corpus
     // existed and would notice only a future narrowing of the matcher.
     assert_preflight!("td-busd/spec/libdbus-listnames.conversation", "cargo-test");
+    assert_preflight!("td-busd/spec/auth/external-successful.auth-script", "cargo-test");
     assert_preflight!("td-busd/examples/dbus-capture.rs", "cargo-test");
     assert_target!("td-busd/Cargo.lock", "check");
     assert_target!("td-busd/Cargo.lock", "recipe-checks");

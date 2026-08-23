@@ -2493,9 +2493,17 @@ uid can authenticate a uid-1000 client (§L revisits what that buys).
 Empty
 `AUTH EXTERNAL` may enter the `DATA` exchange (sd-bus's spelling). A
 client that skips `NEGOTIATE_UNIX_FD` is refused any message carrying a
-descriptor, per spec. Refused: `ANONYMOUS`, `DBUS_COOKIE_SHA1`,
-non-numeric identities, a second `BEGIN`, lines over 4 KiB, more than 16
-auth commands. Unknown commands get `ERROR` without changing state.
+descriptor, per spec. `REJECTED`: `ANONYMOUS`, `DBUS_COOKIE_SHA1`, and an
+identity that decodes and is not this peer's — non-numeric, signed, or
+another uid. The connection ends on: a second `BEGIN`, a `BEGIN` before
+the handshake completes or carrying an argument, lines over 4 KiB, more
+than 16 auth commands. Unknown commands get `ERROR` without changing
+state, and so does a command whose ARGUMENT cannot be read — an
+unreadable hex identity claims nobody, so nothing is refused, and the
+specification reserves `ERROR` for a peer that "did not understand the
+arguments to the command" and requires the sender to "continue as if the
+command causing the `ERROR` had never been received". `REJECTED` there
+would end an attempt no one made.
 
 ### Messages
 
