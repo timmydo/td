@@ -1,3 +1,4 @@
+use crate::ladder::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 
 // td-sh — target-built static POSIX /bin/sh (busybox-`sh` replacement).
@@ -150,10 +151,10 @@ pub fn recipe() -> Recipe {
     steps.push(Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
     steps.push(Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
     steps.push(
-        Step::run(
+        target_rustc(
             "{src}",
+            rustc,
             &[
-                rustc,
                 "--edition",
                 "2021",
                 "-C",
@@ -165,11 +166,10 @@ pub fn recipe() -> Recipe {
                 "-C",
                 "relocation-model=static",
                 // Mirror the crate's [profile.release] (cargo never sees this
-                // direct rustc build): abort — not unwind — on panic, and strip.
+                // direct rustc build): abort — not unwind — on panic. The
+                // shared target policy deliberately preserves symbols.
                 "-C",
                 "panic=abort",
-                "-C",
-                "strip=symbols",
                 &linker,
                 "-L",
                 glib,
@@ -178,8 +178,6 @@ pub fn recipe() -> Recipe {
                 // The synthesized libgcc_eh.a lives here (see above).
                 "-Clink-arg=-L{root}/eh",
                 "-Clink-arg=-static-libgcc",
-                "--remap-path-prefix",
-                "{src}=/td-build",
                 "-o",
                 "{out}/bin/td-sh",
                 "{src}/main.rs",
@@ -194,6 +192,7 @@ pub fn recipe() -> Recipe {
     });
     // Fail closed on any interpreter/needed/rpath: the shipped shell must be a
     // self-contained static ELF with an empty runtime closure (boot-critical sh).
+    steps.push(split_target_debug("{out}"));
     steps.push(Step::assert_static(&["{out}/bin/td-sh"]));
 
     Recipe::mesboot("td-sh", "0.1")

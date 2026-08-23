@@ -77,7 +77,13 @@ pub fn recipe() -> Recipe {
              -idirafter \"{{root}}/kh\" -B\"{nbin}/\" -B\"{xglibc}/lib\" \
              -L\"{xglibc}/lib\" -static-libgcc \
              -Wl,--dynamic-linker=\"{xglibc}/lib/ld-linux-x86-64.so.2\" \
-             -Wl,--enable-new-dtags -Wl,-rpath -Wl,\"{xglibc}/lib\" \"$@\"\n"
+             -Wl,--enable-new-dtags -Wl,-rpath -Wl,\"{xglibc}/lib\" \"$@\" \
+             -fno-omit-frame-pointer -g1 \
+             -ffile-prefix-map=\"{{root}}\"=/td-build-root \
+             -ffile-prefix-map=\"{{src}}\"=/td-build \
+             -ffile-prefix-map=\"{{src}}/vendor\"=/td-cargo/vendor \
+             -ffile-prefix-map=\"{{root}}/cargo-home\"=/td-cargo \
+             -Wl,--build-id=sha1\n"
         ),
         exec: true,
     });
@@ -88,7 +94,13 @@ pub fn recipe() -> Recipe {
              -idirafter \"{{root}}/kh\" -B\"{nbin}/\" -B\"{xglibc}/lib\" \
              -L\"{xglibc}/lib\" -static-libgcc -static-libstdc++ \
              -Wl,--dynamic-linker=\"{xglibc}/lib/ld-linux-x86-64.so.2\" \
-             -Wl,--enable-new-dtags -Wl,-rpath -Wl,\"{xglibc}/lib\" \"$@\"\n"
+             -Wl,--enable-new-dtags -Wl,-rpath -Wl,\"{xglibc}/lib\" \"$@\" \
+             -fno-omit-frame-pointer -g1 \
+             -ffile-prefix-map=\"{{root}}\"=/td-build-root \
+             -ffile-prefix-map=\"{{src}}\"=/td-build \
+             -ffile-prefix-map=\"{{src}}/vendor\"=/td-cargo/vendor \
+             -ffile-prefix-map=\"{{root}}/cargo-home\"=/td-cargo \
+             -Wl,--build-id=sha1\n"
         ),
         exec: true,
     });
@@ -240,12 +252,15 @@ channel = "stable"
 optimize = true
 debug = false
 debug-assertions = false
-debuginfo-level = 0
-debuginfo-level-std = 0
-debuginfo-level-tools = 0
+debuginfo-level = 1
+debuginfo-level-rustc = 1
+debuginfo-level-std = 1
+debuginfo-level-tools = 1
 incremental = false
 rpath = true
-remap-debuginfo = true
+remap-debuginfo = false
+frame-pointers = true
+strip = false
 download-rustc = false
 codegen-backends = ["llvm"]
 lld = false
@@ -309,6 +324,15 @@ jemalloc = false
         .env("CARGO_NET_OFFLINE", "true")
         .env("TMPDIR", "{root}/tmp")
         .env("SOURCE_DATE_EPOCH", "1")
+        // Upstream's remap-debuginfo scheme deliberately emits /rustc/<hash>.
+        // td owns stable source/build namespaces shared with every other
+        // target recipe. Bootstrap appends this environment after its generated
+        // flags for every non-stage0 artifact, including final std and tools;
+        // stage0 and stage1 are not installed.
+        .env(
+            "RUSTFLAGS_NOT_BOOTSTRAP",
+            "--remap-path-prefix={root}=/td-build-root --remap-path-prefix={src}=/td-build --remap-path-prefix={src}/vendor=/td-cargo/vendor --remap-path-prefix={root}/cargo-home=/td-cargo -Cstrip=none",
+        )
         // python-mesboot is an i686 bootstrap tool dynamically linked to this
         // declared libc. x86_64 products carry their own td RUNPATH and ignore
         // the wrong-class candidates while inheriting this build-only setting.
@@ -395,6 +419,16 @@ jemalloc = false
         )
         .env("PATH", &path),
     );
+    steps.push(Step::split_debug_tree(
+        "{out}",
+        &format!("{nbin}/objcopy"),
+    ));
+    steps.push(Step::assert_debug_size(
+        "{out}",
+        "{out}/share/td/debug-size",
+        "rust-toolchain",
+        td_engine::target_profile::TOOLCHAIN_DEBUG_CEILING_BYTES,
+    ));
 
     Recipe::mesboot("rust-toolchain", "1.96.0")
         .source_input("rust-source")

@@ -3,7 +3,7 @@ use crate::ladder::{
     gcc_install_headers_without_tar, libtool_extract_without_find, mesboot0_inputs, mesboot0_path,
     unpack_into, unpack_keep_top, SH,
 };
-use crate::types::{Recipe, Step};
+use crate::types::{Recipe, Step, TextEdit};
 
 // Host-free build tools: mesboot0 + make-mesboot; flex/bison/m4 dead (gcc-14-source). re #469.
 pub fn recipe() -> Recipe {
@@ -20,6 +20,23 @@ pub fn recipe() -> Recipe {
     for t in ["gmp63", "mpfr421", "mpc131"] {
         steps.extend(unpack_keep_top(t, "{src}"));
     }
+    // GCC's generated xgcc bypasses the configure compiler wrappers when it
+    // builds the target libgcc runtime. Upstream appends plain `-g` to the
+    // caller's CFLAGS and appends `-g0` for crtbegin/crtend, so CFLAGS_FOR_TARGET
+    // cannot enforce the global bounded-line-table policy by itself. Pin both
+    // upstream sites to -g1 before configure; exact replacement counts make an
+    // upstream layout change fail rather than silently reopening the gap.
+    steps.push(Step::substitute_text(
+        "{src}/libgcc/Makefile.in",
+        vec![
+            TextEdit::new("LIBGCC2_DEBUG_CFLAGS = -g", "LIBGCC2_DEBUG_CFLAGS = -g1", 1),
+            TextEdit::new(
+                "$(MULTILIB_CFLAGS) -g0 \\",
+                "$(MULTILIB_CFLAGS) -g1 \\",
+                1,
+            ),
+        ],
+    ));
     steps.push(Step::Symlink {
         target: "gmp-6.3.0".into(),
         link: "{src}/gmp".into(),
@@ -62,8 +79,15 @@ pub fn recipe() -> Recipe {
         path: "{root}/wb/gcc".into(),
         content: format!(
             "#!{SH}\n\
-             for a in \"$@\"; do case \"$a\" in -shared) exec \"{ngcc}\" -idirafter {{root}}/sysroot/include -B{{root}}/sysroot/lib \"$@\";; esac; done\n\
-             exec \"{ngcc}\" -static -idirafter {{root}}/sysroot/include -B{{root}}/sysroot/lib \"$@\"\n"
+             for a in \"$@\"; do case \"$a\" in -shared) exec \"{ngcc}\" \
+             -idirafter {{root}}/sysroot/include -B{{root}}/sysroot/lib \"$@\" \
+             -fno-omit-frame-pointer -g1 -ffile-prefix-map={{root}}=/td-build-root \
+             -ffile-prefix-map={{src}}=/td-build \
+             -Wl,--build-id=sha1;; esac; done\n\
+             exec \"{ngcc}\" -static -idirafter {{root}}/sysroot/include \
+             -B{{root}}/sysroot/lib \"$@\" -fno-omit-frame-pointer -g1 \
+             -ffile-prefix-map={{root}}=/td-build-root \
+             -ffile-prefix-map={{src}}=/td-build -Wl,--build-id=sha1\n"
         ),
         exec: true,
     });
@@ -71,8 +95,15 @@ pub fn recipe() -> Recipe {
         path: "{root}/wb/g++".into(),
         content: format!(
             "#!{SH}\n\
-             for a in \"$@\"; do case \"$a\" in -shared) exec \"{ngpp}\" -idirafter {{root}}/sysroot/include -B{{root}}/sysroot/lib \"$@\";; esac; done\n\
-             exec \"{ngpp}\" -static -idirafter {{root}}/sysroot/include -B{{root}}/sysroot/lib \"$@\"\n"
+             for a in \"$@\"; do case \"$a\" in -shared) exec \"{ngpp}\" \
+             -idirafter {{root}}/sysroot/include -B{{root}}/sysroot/lib \"$@\" \
+             -fno-omit-frame-pointer -g1 -ffile-prefix-map={{root}}=/td-build-root \
+             -ffile-prefix-map={{src}}=/td-build \
+             -Wl,--build-id=sha1;; esac; done\n\
+             exec \"{ngpp}\" -static -idirafter {{root}}/sysroot/include \
+             -B{{root}}/sysroot/lib \"$@\" -fno-omit-frame-pointer -g1 \
+             -ffile-prefix-map={{root}}=/td-build-root \
+             -ffile-prefix-map={{src}}=/td-build -Wl,--build-id=sha1\n"
         ),
         exec: true,
     });
@@ -158,8 +189,8 @@ pub fn recipe() -> Recipe {
                 "LDFLAGS_FOR_TARGET=-static",
                 // rustc links this gcc's static libstdc++.a/libgcc.a into its SHARED
                 // librustc_driver.so, so target libs (C and C++) must be built PIC.
-                "CFLAGS_FOR_TARGET=-g -O2 -fPIC",
-                "CXXFLAGS_FOR_TARGET=-g -O2 -fPIC",
+                "CFLAGS_FOR_TARGET=-g1 -O2 -fPIC -fno-omit-frame-pointer -ffile-prefix-map={root}=/td-build-root -ffile-prefix-map={src}=/td-build",
+                "CXXFLAGS_FOR_TARGET=-g1 -O2 -fPIC -fno-omit-frame-pointer -ffile-prefix-map={root}=/td-build-root -ffile-prefix-map={src}=/td-build",
             ],
         )
         .env("PATH", &path)
@@ -218,6 +249,10 @@ pub fn recipe() -> Recipe {
         ],
         exec: false,
     });
+    steps.push(Step::split_debug_tree(
+        "{out}/stage/td/store/gcc-14.3.0-x86_64-self",
+        "{in:binutils-x86-64-self}/bin/objcopy",
+    ));
 
     Recipe::mesboot("gcc-x86-64-self", "14.3.0")
         .source_input("gcc-14-source")
@@ -236,4 +271,59 @@ pub fn recipe() -> Recipe {
             "linux-headers-x86-64",
         ]))
         .steps(steps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recipe;
+    use crate::types::Step;
+
+    #[test]
+    fn static_mode_precedes_package_arguments_but_profile_policy_overrides_them() {
+        let steps = recipe().steps.expect("gcc-x86-64-self steps");
+        for path in ["{root}/wb/gcc", "{root}/wb/g++"] {
+            let wrapper = steps
+                .iter()
+                .find_map(|step| match step {
+                    Step::WriteFile {
+                        path: written,
+                        content,
+                        ..
+                    } if written == path => Some(content),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing compiler wrapper {path}"));
+            let static_mode = wrapper.find("-static").expect("static mode");
+            let package_args = wrapper.rfind("\"$@\"").expect("package argv");
+            let profile_policy = wrapper
+                .rfind("-fno-omit-frame-pointer")
+                .expect("profile policy");
+            assert!(static_mode < package_args && package_args < profile_policy);
+        }
+    }
+
+    #[test]
+    fn generated_target_runtime_makefiles_keep_bounded_line_tables() {
+        let steps = recipe().steps.expect("gcc-x86-64-self steps");
+        let edits = steps
+            .iter()
+            .find_map(|step| match step {
+                Step::SubstituteText { file, edits } if file == "{src}/libgcc/Makefile.in" => {
+                    Some(edits)
+                }
+                _ => None,
+            })
+            .expect("libgcc profile-policy edit");
+        assert_eq!(edits.len(), 2);
+        assert!(edits.iter().any(|edit| {
+            edit.from == "LIBGCC2_DEBUG_CFLAGS = -g"
+                && edit.to == "LIBGCC2_DEBUG_CFLAGS = -g1"
+                && edit.expect == 1
+        }));
+        assert!(edits.iter().any(|edit| {
+            edit.from == "$(MULTILIB_CFLAGS) -g0 \\"
+                && edit.to == "$(MULTILIB_CFLAGS) -g1 \\"
+                && edit.expect == 1
+        }));
+    }
 }

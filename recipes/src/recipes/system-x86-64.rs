@@ -68,7 +68,7 @@ const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
 // userland — into a first-class deployment bundle:
 //
 //   boot/{selector-initramfs.cpio,manifest}
-//   deployment/{bzImage,initramfs.cpio,root.erofs,manifest}
+//   deployment/{bzImage,initramfs.cpio,root.erofs,debug-size,manifest}
 //
 // The direct-boot selector initramfs carries td-sh (the shell), td-init (for
 // the mount pair), td-boot, td-util and td-kexec; it has no branch that can
@@ -3099,7 +3099,7 @@ fn shape_check() -> String {
      [ \"$dsz\" -ge 4096 ] || { echo \"root.erofs: implausibly small ($dsz bytes)\" >&2; exit 1; }; \
      set -- $(od -An -tx1 -j 1024 -N 4 \"$disk\"); \
      [ \"$1$2$3$4\" = e2e1f5e0 ] || { echo 'root.erofs: missing EROFS superblock magic at byte 1024' >&2; exit 1; }; \
-     [ \"$(wc -l < \"$manifest\")\" -eq 4 ] || { echo 'manifest: expected header plus exactly three payload entries' >&2; exit 1; }; \
+     [ \"$(wc -l < \"$manifest\")\" -eq 4 ] || { echo 'manifest: expected header plus exactly three boot payload entries' >&2; exit 1; }; \
      [ \"$(head -n 1 \"$manifest\")\" = td-deployment-v1 ] || { echo 'manifest: unsupported or missing td-deployment-v1 header' >&2; exit 1; }; \
      for a in bzImage initramfs.cpio root.erofs; do \
          grep -q -E \"^[0-9a-f]{64}  $a$\" \"$manifest\" || { echo \"manifest: missing strict SHA-256 entry for $a\" >&2; exit 1; }; \
@@ -3289,6 +3289,12 @@ pub fn recipe() -> Recipe {
             "{out}/boot/selector-initramfs.cpio".into(),
         )],
     });
+    steps.push(Step::assert_debug_size(
+        "{root}/real-root",
+        "{out}/deployment/debug-size",
+        "deployment",
+        td_engine::target_profile::DEPLOYMENT_DEBUG_CEILING_BYTES,
+    ));
     steps.push(Step::PackErofs {
         root: "{root}/real-root".into(),
         output: "{out}/deployment/root.erofs".into(),
@@ -3312,6 +3318,7 @@ pub fn recipe() -> Recipe {
             "{out}/deployment/initramfs.cpio".into(),
             "{out}/deployment/root.erofs".into(),
             "{out}/deployment/manifest".into(),
+            "{out}/deployment/debug-size".into(),
             "{out}/boot/selector-initramfs.cpio".into(),
             "{out}/boot/manifest".into(),
         ],

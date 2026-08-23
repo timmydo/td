@@ -790,13 +790,13 @@ have to serve. The deployment bundle is the only delivery td has
   two accounts can no longer disagree about a browser version;
 - the image carries every packaged application and runtime.
 
-**Three size constants in the tree say this does not fit yet, and each
-is a landing this decision owes**:
+**Three size constants bound this today, and large applications still owe a
+reviewed capacity landing**:
 
-| constant | today | why it blocks |
+| constant | today | capacity consequence |
 |---|---|---|
-| `td-boot/src/protocol.rs`'s `MIN_VOLUME_BYTES` | 2 GiB | its own comment is *"two deployments plus the attempt bookkeeping, with room for the update that installs the third before retiring the first"* — so a deployment is retained **three times transiently**, not twice, and `td-install` enforces the constant. A Firefox-plus-runtime deployment will not fit at 3×, and the failure surfaces mid-publish |
-| the QEMU oracle's `PERSISTENT_VOLUME_BYTES` / headroom | 1 GiB / 256 MiB, `copies = 3` | caps a whole deployment at roughly 256 MiB for the boot oracle, which hard-errors above it. §H's fixture fits; a real GTK application is doubtful and Firefox is impossible — and §H's proof *is* an oracle run, so this blocks the design's own acceptance criterion |
+| `td-boot/src/protocol.rs`'s `MIN_VOLUME_BYTES` | 5 GiB | three deployment-sized copies are transiently live during publish. The profiling policy budgets one GiB of debug companions in each copy, one GiB for all three copies' non-debug payloads, and one GiB for Btrfs metadata plus `@var`. `td-install` enforces this as an admission floor, not a promise that every deployment fits; a larger update can still fail with `ENOSPC` while staging, before selectors change |
+| the QEMU oracle's `PERSISTENT_VOLUME_BYTES` / headroom | 5 GiB / 1 GiB, `copies = 3` | permits four GiB of aggregate fixture payload across the three transactional copies. Three ceiling-sized debug trees consume three GiB of that, leaving one GiB total for their boot payloads (roughly 341 MiB per deployment). §H's small fixture fits, but a large browser can still exceed the oracle and therefore still needs an explicit capacity landing |
 | `ESP_BYTES` | 512 MiB | **not** a problem — the ESP carries kernel and initramfs only. Named here because a reader would otherwise assume it is the partition that grows |
 
 The disk cost is therefore **2× the browser permanently and 3× across an

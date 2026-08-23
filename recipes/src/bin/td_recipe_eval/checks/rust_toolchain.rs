@@ -71,6 +71,22 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let smoke = format!(
         "set -eu\n\
          test ! -e /gnu/store\n\
+         bb='{busybox_path}'\n\
+         readelf='{binutils_path}/readelf'\n\
+         test -f '{rust_path}/share/td/debug-size'\n\
+         \"$bb\" grep -F -x 'scope=rust-toolchain' '{rust_path}/share/td/debug-size' >/dev/null\n\
+         marker='{rust_path}/lib/debug/.td-assembly-exception'\n\
+         test -f \"$marker\"\n\
+         \"$bb\" grep -F -x 'exception.2.source=rust-toolchain' \"$marker\" >/dev/null\n\
+         for name in rustc rustdoc cargo; do\n\
+           runtime='{rust_path}/bin/'\"$name\"\n\
+           debug='{rust_path}/lib/debug/bin/'\"$name\"'.debug'\n\
+           test -f \"$debug\"\n\
+           test \"$(\"$readelf\" -n \"$runtime\" | \"$bb\" grep 'Build ID:')\" = \"$(\"$readelf\" -n \"$debug\" | \"$bb\" grep 'Build ID:')\"\n\
+           if \"$readelf\" -S \"$runtime\" | \"$bb\" grep -F '.symtab' >/dev/null; then exit 89; fi\n\
+           \"$readelf\" -S \"$debug\" | \"$bb\" grep -F '.symtab' >/dev/null\n\
+           \"$readelf\" -S \"$debug\" | \"$bb\" grep -F '.debug_line' >/dev/null\n\
+         done\n\
          printf '%s\\n' 'fn main() {{ println!(\"42\"); }}' >/tmp/td-rust-smoke.rs\n\
          '{rust_path}/bin/rustc' --edition=2021 /tmp/td-rust-smoke.rs \
            -C linker={gcc_path}/bin/gcc \
@@ -220,6 +236,18 @@ fn prove_td_shell_userland(
          \"$readelf\" -l \"$fd\" | grep -F '{interp}' >/dev/null\n\
          \"$readelf\" -l \"$uutils\" | grep -F '{interp}' >/dev/null\n\
          for binary in \"$rg\" \"$fd\" \"$uutils\"; do\n\
+           package=${{binary%/bin/*}}\n\
+           name=${{binary##*/}}\n\
+           debug=\"$package/lib/debug/bin/$name.debug\"\n\
+           test -f \"$debug\"\n\
+           test \"$(\"$readelf\" -n \"$binary\" | grep 'Build ID:')\" = \"$(\"$readelf\" -n \"$debug\" | grep 'Build ID:')\"\n\
+           if \"$readelf\" -S \"$binary\" | grep -F '.symtab' >/dev/null; then exit 88; fi\n\
+           \"$readelf\" -S \"$debug\" | grep -F '.symtab' >/dev/null\n\
+           \"$readelf\" -S \"$debug\" | grep -F '.debug_line' >/dev/null\n\
+           marker=\"$package/lib/debug/.td-assembly-exception\"\n\
+           grep -F -x 'exception.0.source=glibc-x86-64' \"$marker\" >/dev/null\n\
+           grep -F -x 'exception.1.source=gcc-x86-64-self' \"$marker\" >/dev/null\n\
+           grep -F -x 'exception.2.source=rust-toolchain' \"$marker\" >/dev/null\n\
            if grep -a -F /gnu/store \"$binary\" >/dev/null; then exit 93; fi\n\
            if grep -a -F '{stage0_base}' \"$binary\" >/dev/null; then exit 94; fi\n\
          done\n\

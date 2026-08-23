@@ -28,9 +28,11 @@ use crate::types::{Recipe, Step, TextEdit};
 // ignore it.
 pub fn recipe() -> Recipe {
     let xgccbin = "{in:gcc-x86-64-stage1}/stage/td/store/gcc-14.3.0-x86_64/bin";
+    let xgcc = format!("{xgccbin}/x86_64-pc-linux-gnu-gcc");
     let path = format!("{xgccbin}:{{in:binutils-x86-64}}/bin:{}", mesboot0_path());
     let stage = "{out}/stage/td/store/glibc-2.41-x86_64";
     let lp = "{in:glibc-mesboot-shared}/lib";
+    let cflags = "-O2 -g1 -fno-omit-frame-pointer -ffile-prefix-map={root}=/td-build-root -ffile-prefix-map={src}=/td-build";
     let mut steps = unpack_into("glibc-x86-64-source", "{src}");
     steps.extend(glibc241_host_free_fixups());
     steps.extend(unpack_keep_top("linux-headers-x86-64", "{root}/kh"));
@@ -49,6 +51,18 @@ pub fn recipe() -> Recipe {
         path: "{root}/wb/build-cc".into(),
         content: format!(
             "#!{SH}\nexec \"{{in:gcc-14}}/stage/td/store/gcc-14.3.0/bin/gcc\" -static -idirafter {{in:glibc-mesboot}}/include -B{{in:glibc-mesboot}}/lib \"$@\"\n"
+        ),
+        exec: true,
+    });
+    // Configure and make append package flags after CC. Keep the platform
+    // policy at the wrapper tail so glibc's own `-g` cannot turn the bounded
+    // line tables back into full DWARF or re-enable frame omission.
+    steps.push(Step::WriteFile {
+        path: "{root}/wb/target-cc".into(),
+        content: format!(
+            "#!{SH}\nexec \"{xgcc}\" \"$@\" -fno-omit-frame-pointer -g1 \
+             -ffile-prefix-map={{root}}=/td-build-root \
+             -ffile-prefix-map={{src}}=/td-build -Wl,--build-id=sha1\n"
         ),
         exec: true,
     });
@@ -107,10 +121,11 @@ pub fn recipe() -> Recipe {
         .env("PATH", &path)
         .env("CONFIG_SHELL", SH)
         .env("SHELL", SH)
-        .env("CC", "x86_64-pc-linux-gnu-gcc")
+        .env("CC", "{root}/wb/target-cc")
         .env("BUILD_CC", "{root}/wb/build-cc")
         .env("AR", "x86_64-pc-linux-gnu-ar")
         .env("RANLIB", "x86_64-pc-linux-gnu-ranlib")
+        .env("CFLAGS", cflags)
         .env("LD_LIBRARY_PATH", lp),
     );
     steps.push(
@@ -174,6 +189,10 @@ pub fn recipe() -> Recipe {
         ],
         exec: false,
     });
+    steps.push(Step::split_debug_tree(
+        stage,
+        "{in:binutils-x86-64}/bin/x86_64-pc-linux-gnu-objcopy",
+    ));
     Recipe::mesboot("glibc-x86-64", "2.41")
         .source_input("glibc-241-source")
         .native_inputs(&[

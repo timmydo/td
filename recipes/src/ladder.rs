@@ -150,6 +150,44 @@ pub fn link_bins(rung: BinutilsRung) -> Step {
 /// output, not a host bash.
 pub const SH: &str = "{in:bash-mesboot}/bin/bash";
 
+/// One target-only direct-rustc invocation. The shared arguments follow every
+/// recipe's functional arguments so a local `-C` option cannot quietly override
+/// the target-wide frame/debug/build-ID policy.
+pub fn target_rustc(dir: &str, rustc: &str, args: &[&str]) -> Step {
+    target_rustc_at_roots(dir, rustc, args, "{root}", "{src}")
+}
+
+/// Direct rustc with explicit ephemeral roots. This exists for the bounded
+/// two-root reproducibility oracle; shipped recipes otherwise use
+/// `target_rustc`, whose roots are the standard build templates.
+pub fn target_rustc_at_roots(
+    dir: &str,
+    rustc: &str,
+    args: &[&str],
+    build_root: &str,
+    source_root: &str,
+) -> Step {
+    let mut argv =
+        Vec::with_capacity(1 + td_engine::target_profile::DIRECT_RUSTC_ARGS.len() + args.len());
+    argv.push(rustc.to_string());
+    argv.extend(args.iter().map(|arg| (*arg).to_string()));
+    argv.extend(
+        td_engine::target_profile::direct_rustc_args(build_root, source_root),
+    );
+    Step::Run {
+        argv,
+        env: Vec::new(),
+        dir: dir.into(),
+    }
+}
+
+/// Split every installed runtime ELF in a direct td recipe with the final
+/// source-built binutils. Keeping this adjacent to `target_rustc` makes the
+/// compile and post-link halves of the global policy one reusable path.
+pub fn split_target_debug(root: &str) -> Step {
+    Step::split_debug_tree(root, "{in:binutils-x86-64-self}/bin/objcopy")
+}
+
 /// The shell and userland beyond the native self-hosting tool boundary. BusyBox
 /// is a reviewed boundary output and must be a declared `native_input` of every
 /// recipe using these paths.

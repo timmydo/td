@@ -27,7 +27,7 @@ mod td_boot_fixture;
 // out of the last LBA, because it is the copy the `last_usable`/backup
 // arithmetic can put in the wrong place while every primary-table check passes.
 const ESP_AT: u64 = 1024 * 1024;
-const DISK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const DISK_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 const SECTOR: u64 = 512;
 // The volume follows the ESP, and lands exactly there because the ESP's size is
 // a whole number of 1 MiB alignments — so this is the same number `plan()`

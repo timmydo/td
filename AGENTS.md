@@ -150,9 +150,11 @@ the kernel, firmware, marked foreign payloads, hand-written assembly, and the
 exact coverage and reproducibility rules are specified in
 `td-profiler/DESIGN.md`; profiler output reports every boundary explicitly.
 
-This is a target contract whose enforcement lands in the first
-`td-profiler/DESIGN.md` implementation increment; until that increment is in
-the base, it describes the intended state rather than the current artifacts.
+The first `td-profiler/DESIGN.md` implementation increment enforces the
+producer side in compiler flags, per-output runtime/debug pair checks, size
+ceilings, and reproducibility oracles. The image-integration increment owns
+the whole-deployment coverage walk; until that increment is present, this
+paragraph is a target contract rather than a whole-image completeness claim.
 
 # Principles
 

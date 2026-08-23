@@ -207,9 +207,14 @@ const DRAIN_BUDGET: usize = 4 * 1024 * 1024;
 /// their sum crosses this ceiling the boot is aborted (qemu killed) and reported as
 /// flooded — generous enough that a normal boot's few KiB of printk never trips it.
 const MAX_CONSOLE_BYTES: u64 = 64 * 1024 * 1024;
-const PERSISTENT_VOLUME_BYTES: u64 = 1024 * 1024 * 1024;
-// Reserve fixture space for Btrfs metadata and the writable @var subvolume.
-const PERSISTENT_VOLUME_HEADROOM: u64 = 256 * 1024 * 1024;
+const PERSISTENT_DEPLOYMENT_COPIES: u64 = 3;
+// Reserve one GiB for the non-debug payloads across every retained deployment,
+// then another for Btrfs metadata and the writable @var subvolume. The image is
+// sparse, so this bounds the logical fixture without allocating five GiB on the
+// host for an ordinary small deployment.
+const PERSISTENT_NON_DEBUG_BYTES: u64 = 1024 * 1024 * 1024;
+const PERSISTENT_VOLUME_HEADROOM: u64 = 1024 * 1024 * 1024;
+const PERSISTENT_VOLUME_BYTES: u64 = td_boot_protocol::MIN_VOLUME_BYTES;
 // A 64 MiB console needs 17 passes including EOF; allow seven EINTR retries.
 const FINAL_DRAIN_PASSES: usize = 24;
 
@@ -1873,13 +1878,12 @@ fn valid_manifest_digest(digest: &str) -> bool {
 /// Hashing again at consumption catches stale, truncated, or tampered staging
 /// before qemu sees any artifact.
 pub(crate) fn verify_deployment(deployment: &Path) -> Result<(PathBuf, PathBuf, PathBuf), String> {
-    // This byte-sorted order is part of the v1 wire format: the producer sorts
-    // labels before writing, and the strict consumer rejects non-canonical order.
     const CANONICAL_NAMES: [&str; 3] = ["bzImage", "initramfs.cpio", "root.erofs"];
     let manifest_path = deployment.join("manifest");
     let digests = parse_host_manifest(&manifest_path, "deployment", &CANONICAL_NAMES)?;
-
     let mut paths = Vec::with_capacity(CANONICAL_NAMES.len());
+    // Positional pairing is safe only because parse_host_manifest has already
+    // required each label at this exact canonical position.
     for (name, digest) in CANONICAL_NAMES.into_iter().zip(digests) {
         let path = deployment.join(name);
         if !path.is_file() {
@@ -4122,6 +4126,14 @@ mod tests {
 
     #[test]
     fn persistent_fixture_capacity_accounts_for_the_injected_probe() {
+        assert_eq!(
+            PERSISTENT_VOLUME_BYTES,
+            td_engine::target_profile::DEPLOYMENT_DEBUG_CEILING_BYTES
+                * PERSISTENT_DEPLOYMENT_COPIES
+                + PERSISTENT_NON_DEBUG_BYTES
+                + PERSISTENT_VOLUME_HEADROOM,
+            "transactional fixtures must fit three ceiling-sized debug trees plus non-debug payloads"
+        );
         let seq = AtomicU64::new(2400);
         let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
         let _guard = Scratch { dir: dir.clone() };

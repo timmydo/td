@@ -124,6 +124,28 @@ pub enum Step {
         from: String,
         dest: String,
     },
+    /// Create and verify deterministic debug companions for every ET_EXEC and
+    /// ET_DYN below `root`. `objcopy` is an explicitly declared target tool;
+    /// the engine walks the tree and validates GNU build IDs, symbols and line
+    /// tables without depending on a shell or host ELF utility.
+    SplitDebugTree {
+        root: String,
+        objcopy: String,
+    },
+    /// Count hard-link-deduplicated files below every `lib/debug` in `root`,
+    /// refuse the compiled ceiling, and write a stable machine-readable report.
+    AssertDebugSize {
+        root: String,
+        report: String,
+        scope: String,
+        ceiling: u64,
+    },
+    /// Refuse unless two regular files are byte-identical. Used by bounded
+    /// reproducibility oracles without adding a shell or comparison utility.
+    CompareFiles {
+        left: String,
+        right: String,
+    },
     /// Stage the transitive ELF-loader and symlink store closure of explicit
     /// roots under `dest`. Script interpreters and data-only `dlopen` paths are
     /// outside this step's graph. Every reachable store item must be a declared
@@ -282,6 +304,27 @@ impl Step {
     pub fn assert_static(paths: &[&str]) -> Step {
         Step::AssertStatic { paths: vs(paths) }
     }
+    /// Apply the target debug-companion policy to an installed package tree.
+    pub fn split_debug_tree(root: &str, objcopy: &str) -> Step {
+        Step::SplitDebugTree {
+            root: root.into(),
+            objcopy: objcopy.into(),
+        }
+    }
+    pub fn assert_debug_size(root: &str, report: &str, scope: &str, ceiling: u64) -> Step {
+        Step::AssertDebugSize {
+            root: root.into(),
+            report: report.into(),
+            scope: scope.into(),
+            ceiling,
+        }
+    }
+    pub fn compare_files(left: &str, right: &str) -> Step {
+        Step::CompareFiles {
+            left: left.into(),
+            right: right.into(),
+        }
+    }
     pub fn validate_static_application(declaration: &ApplicationDeclaration) -> Step {
         Step::ValidateStaticApplication {
             entry: declaration.entry().to_string(),
@@ -354,6 +397,34 @@ impl Step {
                 Json::Obj(vec![
                     ("from".into(), Json::Str(from.clone())),
                     ("dest".into(), Json::Str(dest.clone())),
+                ]),
+            )]),
+            Step::SplitDebugTree { root, objcopy } => Json::Obj(vec![(
+                "splitDebugTree".into(),
+                Json::Obj(vec![
+                    ("root".into(), Json::Str(root.clone())),
+                    ("objcopy".into(), Json::Str(objcopy.clone())),
+                ]),
+            )]),
+            Step::AssertDebugSize {
+                root,
+                report,
+                scope,
+                ceiling,
+            } => Json::Obj(vec![(
+                "assertDebugSize".into(),
+                Json::Obj(vec![
+                    ("root".into(), Json::Str(root.clone())),
+                    ("report".into(), Json::Str(report.clone())),
+                    ("scope".into(), Json::Str(scope.clone())),
+                    ("ceiling".into(), Json::Num(ceiling.to_string())),
+                ]),
+            )]),
+            Step::CompareFiles { left, right } => Json::Obj(vec![(
+                "compareFiles".into(),
+                Json::Obj(vec![
+                    ("left".into(), Json::Str(left.clone())),
+                    ("right".into(), Json::Str(right.clone())),
                 ]),
             )]),
             Step::StageRuntimeClosure { roots, dest } => Json::Obj(vec![(
@@ -1574,6 +1645,25 @@ mod tests {
         assert_eq!(
             manifest.to_json().to_canonical(),
             r#"{"sha256Manifest":{"entries":[["bzImage","{out}/deployment/bzImage"],["initramfs.cpio","{out}/deployment/initramfs.cpio"]],"output":"{out}/deployment/manifest"}}"#
+        );
+    }
+
+    #[test]
+    fn split_debug_tree_emits_the_engine_dispatch_shape() {
+        let split = Step::split_debug_tree("{out}", "{in:binutils}/bin/objcopy");
+        assert_eq!(
+            split.to_json().to_canonical(),
+            r#"{"splitDebugTree":{"objcopy":"{in:binutils}/bin/objcopy","root":"{out}"}}"#
+        );
+        let size = Step::assert_debug_size("{out}", "{out}/debug-size", "toolchain", 4096);
+        assert_eq!(
+            size.to_json().to_canonical(),
+            r#"{"assertDebugSize":{"ceiling":4096,"report":"{out}/debug-size","root":"{out}","scope":"toolchain"}}"#
+        );
+        let compare = Step::compare_files("{root}/one", "{root}/two");
+        assert_eq!(
+            compare.to_json().to_canonical(),
+            r#"{"compareFiles":{"left":"{root}/one","right":"{root}/two"}}"#
         );
     }
 }

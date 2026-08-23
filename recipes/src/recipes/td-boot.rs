@@ -1,3 +1,4 @@
+use crate::ladder::{split_target_debug, target_rustc_at_roots};
 use crate::types::{Recipe, Step};
 
 // Target-built static deployment verifier and kexec boot shim. The shipped
@@ -30,6 +31,12 @@ pub fn recipe() -> Recipe {
     let mut steps = vec![
         Step::MkDir {
             path: "{out}/bin".into(),
+        },
+        Step::MkDir {
+            path: "{root}/profile-repro-a/bin".into(),
+        },
+        Step::MkDir {
+            path: "{root}/profile-repro-b/bin".into(),
         },
         Step::MkDir {
             path: "{src}/td-boot/src".into(),
@@ -71,17 +78,30 @@ pub fn recipe() -> Recipe {
             path: "{root}/eh".into(),
         },
     ];
+    for dest in [
+        "{root}/profile-repro-a/source",
+        "{root}/profile-repro-b/source",
+    ] {
+        steps.push(Step::CopyTree {
+            from: "{src}".into(),
+            dest: dest.into(),
+        });
+    }
     // The self toolchain folds the unwinder into libgcc.a; rustc's static link
     // still requests the conventional libgcc_eh.a name.
     steps.push(
         Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
     );
     steps.push(Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
-    steps.push(
-        Step::run(
-            "{src}/td-boot/src",
+    let compile = |root: &str| {
+        let source = format!("{root}/source");
+        let directory = format!("{source}/td-boot/src");
+        let output = format!("{root}/bin/td-boot");
+        let main = format!("{source}/td-boot/src/main.rs");
+        target_rustc_at_roots(
+            &directory,
+            rustc,
             &[
-                rustc,
                 "--edition",
                 "2021",
                 "-C",
@@ -94,8 +114,6 @@ pub fn recipe() -> Recipe {
                 "relocation-model=static",
                 "-C",
                 "panic=abort",
-                "-C",
-                "strip=symbols",
                 &linker,
                 "-L",
                 glib,
@@ -103,20 +121,44 @@ pub fn recipe() -> Recipe {
                 &bin_b,
                 "-Clink-arg=-L{root}/eh",
                 "-Clink-arg=-static-libgcc",
-                "--remap-path-prefix",
-                "{src}=/td-build",
                 "-o",
-                "{out}/bin/td-boot",
-                "{src}/td-boot/src/main.rs",
+                &output,
+                &main,
             ],
+            root,
+            &source,
         )
         .env("PATH", &path)
-        .env("SOURCE_DATE_EPOCH", "1"),
-    );
+        .env("SOURCE_DATE_EPOCH", "1")
+    };
+    // One small representative direct-rustc program is copied below two
+    // different source and build roots, then built independently. Their
+    // canonical remaps, deterministic build ID, runtime strip, and companion
+    // transform must all converge byte for byte.
+    steps.push(compile("{root}/profile-repro-a"));
+    steps.push(compile("{root}/profile-repro-b"));
+    steps.push(Step::compare_files(
+        "{root}/profile-repro-a/bin/td-boot",
+        "{root}/profile-repro-b/bin/td-boot",
+    ));
+    steps.push(Step::CopyFiles {
+        files: vec!["{root}/profile-repro-a/bin/td-boot".into()],
+        dest: "{out}/bin".into(),
+    });
     steps.push(Step::Require {
         paths: vec!["{out}/bin/td-boot".into()],
         exec: true,
     });
+    steps.push(split_target_debug("{out}"));
+    steps.push(split_target_debug("{root}/profile-repro-b"));
+    steps.push(Step::compare_files(
+        "{out}/bin/td-boot",
+        "{root}/profile-repro-b/bin/td-boot",
+    ));
+    steps.push(Step::compare_files(
+        "{out}/lib/debug/bin/td-boot.debug",
+        "{root}/profile-repro-b/lib/debug/bin/td-boot.debug",
+    ));
     steps.push(Step::assert_static(&["{out}/bin/td-boot"]));
 
     Recipe::mesboot("td-boot", "0.1")

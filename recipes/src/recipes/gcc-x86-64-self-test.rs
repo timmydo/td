@@ -77,6 +77,26 @@ pub fn recipe() -> Recipe {
                 "{root}/test",
                 &["{root}/test/assert-tool", "elf64-x86_64", SGPP],
             ),
+            // These objects are compiled by GCC's generated xgcc rather than
+            // the configure compiler wrapper. Their realized section tables
+            // prove the libgcc Makefile edit kept the target-runtime path on
+            // the same line-table policy.
+            Step::run(
+                "{root}/test",
+                &[
+                    "{root}/test/assert-tool",
+                    "debug-line",
+                    "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/lib/gcc/x86_64-pc-linux-gnu/14.3.0/crtbegin.o",
+                ],
+            ),
+            Step::run(
+                "{root}/test",
+                &[
+                    "{root}/test/assert-tool",
+                    "debug-line",
+                    "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/lib/gcc/x86_64-pc-linux-gnu/14.3.0/crtend.o",
+                ],
+            ),
             Step::run(
                 "{root}/test",
                 &[
@@ -545,6 +565,99 @@ static int elf64_x86_64(const char *path) {
         && hdr[4] == 2 && machine == 62;
 }
 
+static unsigned int little16(const unsigned char *p) {
+    return (unsigned int)p[0] | ((unsigned int)p[1] << 8);
+}
+
+static unsigned int little32(const unsigned char *p) {
+    return little16(p) | (little16(p + 2) << 16);
+}
+
+static unsigned long long little64(const unsigned char *p) {
+    return (unsigned long long)little32(p)
+        | ((unsigned long long)little32(p + 4) << 32);
+}
+
+static int read_at(int fd, unsigned long long offset, unsigned char *buf,
+                   unsigned long len) {
+    unsigned long done = 0;
+    if (offset > 0x7fffffffffffffffULL
+        || lseek(fd, (long)offset, SEEK_SET) < 0) {
+        return -1;
+    }
+    while (done < len) {
+        long n = (long)read(fd, buf + done, len - done);
+        if (n <= 0) {
+            return -1;
+        }
+        done += (unsigned long)n;
+    }
+    return 0;
+}
+
+static int elf_has_section(const char *path, const char *wanted) {
+    unsigned char header[64];
+    unsigned char section[64];
+    unsigned char candidate[32];
+    unsigned long wanted_len = (unsigned long)strlen(wanted) + 1;
+    unsigned long long shoff;
+    unsigned long long names_offset;
+    unsigned long long names_size;
+    unsigned int shentsize;
+    unsigned int shnum;
+    unsigned int shstrndx;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0 || wanted_len > sizeof(candidate)) {
+        return -1;
+    }
+    if (read_at(fd, 0, header, sizeof(header)) != 0
+        || memcmp(header, "\177ELF", 4) != 0 || header[4] != 2
+        || header[5] != 1) {
+        close(fd);
+        return -1;
+    }
+    shoff = little64(header + 0x28);
+    shentsize = little16(header + 0x3a);
+    shnum = little16(header + 0x3c);
+    shstrndx = little16(header + 0x3e);
+    if (shoff == 0 || shentsize < sizeof(section) || shnum == 0
+        || shstrndx >= shnum) {
+        close(fd);
+        return -1;
+    }
+    if (read_at(fd, shoff + (unsigned long long)shstrndx * shentsize,
+                section, sizeof(section)) != 0) {
+        close(fd);
+        return -1;
+    }
+    names_offset = little64(section + 0x18);
+    names_size = little64(section + 0x20);
+    for (unsigned int i = 0; i < shnum; ++i) {
+        unsigned int name_offset;
+        if (read_at(fd, shoff + (unsigned long long)i * shentsize,
+                    section, sizeof(section)) != 0) {
+            close(fd);
+            return -1;
+        }
+        name_offset = little32(section);
+        if ((unsigned long long)name_offset + wanted_len > names_size) {
+            continue;
+        }
+        if (read_at(fd, names_offset + name_offset, candidate, wanted_len) != 0) {
+            close(fd);
+            return -1;
+        }
+        if (memcmp(candidate, wanted, wanted_len) == 0) {
+            int useful = little32(section + 4) == 1
+                && little64(section + 0x20) > 0;
+            close(fd);
+            return useful;
+        }
+    }
+    close(fd);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     int r;
     if (argc == 3 && strcmp(argv[1], "elf64-x86_64") == 0) {
@@ -556,6 +669,13 @@ int main(int argc, char **argv) {
             return 66;
         }
         return r == 0 ? 0 : 67;
+    }
+    if (argc == 3 && strcmp(argv[1], "debug-line") == 0) {
+        r = elf_has_section(argv[2], ".debug_line");
+        if (r < 0) {
+            return 71;
+        }
+        return r == 1 ? 0 : 72;
     }
     if (argc == 4 && strcmp(argv[1], "same-file") == 0) {
         r = same_file(argv[2], argv[3]);

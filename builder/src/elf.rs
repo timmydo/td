@@ -26,6 +26,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 // ELF identification (class-independent).
@@ -53,6 +54,16 @@ const DT_NEEDED: u64 = 1; // .dynstr offset of a required shared-object name
 const DT_STRTAB: u64 = 5; // vaddr of the .dynstr string table
 const DT_RPATH: u64 = 15; // legacy run-path (string offset into .dynstr)
 const DT_RUNPATH: u64 = 29; // run-path, takes precedence over DT_RPATH at load time
+const SHT_PROGBITS: u32 = 1;
+const SHT_SYMTAB: u32 = 2;
+const SHT_STRTAB: u32 = 3;
+const SHT_NOTE: u32 = 7;
+const SHT_NOBITS: u32 = 8;
+const NT_GNU_BUILD_ID: u32 = 3;
+const SHF_ALLOC: u64 = 2;
+const SHF_COMPRESSED: u64 = 0x800;
+const MAX_SECTION_NAME_TABLE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SECTION_HEADER_BYTES: usize = 4096;
 
 fn u16le(b: &[u8], off: usize) -> Result<u16, String> {
     let end = off
@@ -287,6 +298,589 @@ impl<'a> Elf<'a> {
         }
         Ok(None)
     }
+}
+
+fn align4_u64(value: u64) -> Result<u64, String> {
+    value
+        .checked_add(3)
+        .map(|rounded| rounded & !3)
+        .ok_or_else(|| "ELF note alignment overflow".to_string())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FileSection {
+    name_offset: usize,
+    kind: u32,
+    flags: u64,
+    offset: u64,
+    size: u64,
+    link: usize,
+    entry_size: u64,
+}
+
+/// Bounded-memory view of the section metadata needed by the profile gate.
+/// Large runtime and companion files are never copied into one allocation.
+struct FileElf {
+    file: std::fs::File,
+    length: u64,
+    is64: bool,
+    names: Vec<u8>,
+    sections: Vec<FileSection>,
+}
+
+impl FileElf {
+    fn open(path: &Path) -> Result<Self, String> {
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let length = file
+            .metadata()
+            .map_err(|e| format!("stat {}: {e}", path.display()))?
+            .len();
+        let header_len = usize::try_from(length.min(64))
+            .map_err(|_| format!("{}: ELF header length does not fit usize", path.display()))?;
+        let mut header = vec![0u8; header_len];
+        file.read_exact(&mut header)
+            .map_err(|e| format!("read ELF header {}: {e}", path.display()))?;
+        let parsed = Elf::parse(&header).map_err(|e| format!("{}: {e}", path.display()))?;
+        let is64 = parsed.is64;
+        let (
+            shoff_field,
+            ents_field,
+            num_field,
+            str_field,
+            min_ents,
+            flags_field,
+            off_field,
+            size_field,
+            link_field,
+            entry_size_field,
+        ) = if is64 {
+            (
+                0x28, 0x3a, 0x3c, 0x3e, 64usize, 0x08, 0x18, 0x20, 0x28, 0x38,
+            )
+        } else {
+            (
+                0x20, 0x2e, 0x30, 0x32, 40usize, 0x08, 0x10, 0x14, 0x18, 0x24,
+            )
+        };
+        let shoff = parsed.word(shoff_field)?;
+        let shentsize = u16le(&header, ents_field)? as usize;
+        let shnum = u16le(&header, num_field)? as usize;
+        let shstrndx = u16le(&header, str_field)? as usize;
+        if shoff == 0 || shnum == 0 {
+            return Err(format!("{}: ELF has no section-header table", path.display()));
+        }
+        if !(min_ents..=MAX_SECTION_HEADER_BYTES).contains(&shentsize) {
+            return Err(format!(
+                "{}: implausible e_shentsize {shentsize}",
+                path.display()
+            ));
+        }
+        if shstrndx == 0xffff {
+            return Err(format!(
+                "{}: ELF extended section-name index is unsupported",
+                path.display()
+            ));
+        }
+        if shstrndx >= shnum {
+            return Err(format!(
+                "{}: ELF e_shstrndx {shstrndx} is outside {shnum} sections",
+                path.display()
+            ));
+        }
+        let table_bytes = u64::try_from(shentsize)
+            .ok()
+            .and_then(|width| width.checked_mul(shnum as u64))
+            .ok_or_else(|| format!("{}: ELF section-header table overflows", path.display()))?;
+        let table_end = shoff
+            .checked_add(table_bytes)
+            .ok_or_else(|| format!("{}: ELF section-header table overflows", path.display()))?;
+        if table_end > length {
+            return Err(format!(
+                "{}: ELF section-header table runs past end of file",
+                path.display()
+            ));
+        }
+
+        let read_header = |file: &mut std::fs::File, index: usize| -> Result<Vec<u8>, String> {
+            let offset = (index as u64)
+                .checked_mul(shentsize as u64)
+                .and_then(|delta| shoff.checked_add(delta))
+                .ok_or_else(|| format!("{}: ELF section-header {index} overflows", path.display()))?;
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|e| format!("seek {} section {index}: {e}", path.display()))?;
+            let mut bytes = vec![0u8; shentsize];
+            file.read_exact(&mut bytes)
+                .map_err(|e| format!("read {} section {index}: {e}", path.display()))?;
+            Ok(bytes)
+        };
+        let range = |section: &[u8], file_backed: bool| -> Result<(u64, u64), String> {
+            let offset = if is64 {
+                u64le(section, off_field)?
+            } else {
+                u32le(section, off_field)? as u64
+            };
+            let size = if is64 {
+                u64le(section, size_field)?
+            } else {
+                u32le(section, size_field)? as u64
+            };
+            if file_backed {
+                let end = offset
+                    .checked_add(size)
+                    .ok_or("ELF section range overflow")?;
+                if end > length {
+                    return Err("ELF section runs past end of file".into());
+                }
+            }
+            Ok((offset, size))
+        };
+
+        let names_header = read_header(&mut file, shstrndx)?;
+        let names_kind = u32le(&names_header, 4)?;
+        let (names_offset, names_size) = range(&names_header, names_kind != SHT_NOBITS)?;
+        if names_size > MAX_SECTION_NAME_TABLE_BYTES {
+            return Err(format!(
+                "{}: ELF section-name table is {names_size} bytes (limit {MAX_SECTION_NAME_TABLE_BYTES})",
+                path.display()
+            ));
+        }
+        let mut names = vec![0u8; names_size as usize];
+        file.seek(SeekFrom::Start(names_offset))
+            .map_err(|e| format!("seek ELF section names {}: {e}", path.display()))?;
+        file.read_exact(&mut names)
+            .map_err(|e| format!("read ELF section names {}: {e}", path.display()))?;
+
+        let mut sections = Vec::with_capacity(shnum);
+        for index in 0..shnum {
+            let section = read_header(&mut file, index)?;
+            let name_offset = u32le(&section, 0)? as usize;
+            let kind = u32le(&section, 4)?;
+            let flags = if is64 {
+                u64le(&section, flags_field)?
+            } else {
+                u32le(&section, flags_field)? as u64
+            };
+            let raw_name = names
+                .get(name_offset..)
+                .ok_or("ELF section name offset is outside .shstrtab")?;
+            raw_name
+                .iter()
+                .position(|byte| *byte == 0)
+                .ok_or("ELF section name is not NUL-terminated")?;
+            let (offset, size) = range(&section, kind != SHT_NOBITS)?;
+            let link = u32le(&section, link_field)? as usize;
+            let entry_size = if is64 {
+                u64le(&section, entry_size_field)?
+            } else {
+                u32le(&section, entry_size_field)? as u64
+            };
+            sections.push(FileSection {
+                name_offset,
+                kind,
+                flags,
+                offset,
+                size,
+                link,
+                entry_size,
+            });
+        }
+        Ok(Self {
+            file,
+            length,
+            is64,
+            names,
+            sections,
+        })
+    }
+
+    fn section_name<'a>(&'a self, section: &FileSection) -> Result<&'a [u8], String> {
+        let tail = self
+            .names
+            .get(section.name_offset..)
+            .ok_or("ELF section name offset is outside .shstrtab")?;
+        let end = tail
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or("ELF section name is not NUL-terminated")?;
+        tail.get(..end)
+            .ok_or_else(|| "ELF section name range overflow".to_string())
+    }
+
+    fn validate_symbol_table(&self, section: FileSection) -> Result<(), String> {
+        let expected_entry_size = if self.is64 { 24 } else { 16 };
+        if section.entry_size != expected_entry_size
+            || section.size < expected_entry_size * 2
+            || section.size % expected_entry_size != 0
+        {
+            return Err(format!(
+                ".symtab has size {} and entry size {}, expected at least two {}-byte entries",
+                section.size, section.entry_size, expected_entry_size
+            ));
+        }
+        if self.sections.get(section.link).map(|linked| linked.kind) != Some(SHT_STRTAB) {
+            return Err(".symtab does not link to a string table".into());
+        }
+        Ok(())
+    }
+
+    fn read_fixed<const N: usize>(&mut self, offset: u64, what: &str) -> Result<[u8; N], String> {
+        let end = offset
+            .checked_add(N as u64)
+            .ok_or_else(|| format!("{what} offset overflows"))?;
+        if end > self.length {
+            return Err(format!("{what} runs past end of file"));
+        }
+        self.file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("seek {what}: {e}"))?;
+        let mut bytes = [0u8; N];
+        self.file
+            .read_exact(&mut bytes)
+            .map_err(|e| format!("read {what}: {e}"))?;
+        Ok(bytes)
+    }
+
+    fn validate_debug_line(&mut self, section: FileSection) -> Result<(), String> {
+        let section_end = section
+            .offset
+            .checked_add(section.size)
+            .ok_or(".debug_line range overflows")?;
+        if section.size == 0 {
+            return Err(".debug_line is empty".into());
+        }
+        let mut cursor = section.offset;
+        let mut units = 0usize;
+        let mut program_units = 0usize;
+        while cursor < section_end {
+            let initial = self.read_fixed::<4>(cursor, ".debug_line unit length")?;
+            let initial_length = u32le(&initial, 0)?;
+            cursor = cursor
+                .checked_add(4)
+                .ok_or(".debug_line cursor overflows")?;
+            let (unit_length, dwarf64) = if initial_length == u32::MAX {
+                let extended = self.read_fixed::<8>(cursor, ".debug_line 64-bit unit length")?;
+                cursor = cursor
+                    .checked_add(8)
+                    .ok_or(".debug_line cursor overflows")?;
+                (u64le(&extended, 0)?, true)
+            } else if initial_length >= 0xfffffff0 {
+                return Err(".debug_line uses a reserved initial length".into());
+            } else {
+                (initial_length as u64, false)
+            };
+            if unit_length == 0 {
+                return Err(".debug_line contains an empty unit".into());
+            }
+            let unit_end = cursor
+                .checked_add(unit_length)
+                .ok_or(".debug_line unit range overflows")?;
+            if unit_end > section_end {
+                return Err(".debug_line unit runs past its section".into());
+            }
+            if cursor.checked_add(2).is_none_or(|end| end > unit_end) {
+                return Err(".debug_line unit ends before its version".into());
+            }
+            let version_bytes = self.read_fixed::<2>(cursor, ".debug_line version")?;
+            let version = u16le(&version_bytes, 0)?;
+            if !(2..=5).contains(&version) {
+                return Err(format!(".debug_line has unsupported DWARF version {version}"));
+            }
+            cursor = cursor
+                .checked_add(2)
+                .ok_or(".debug_line cursor overflows")?;
+            if version == 5 {
+                if cursor.checked_add(2).is_none_or(|end| end > unit_end) {
+                    return Err(".debug_line version 5 unit ends before its address sizes".into());
+                }
+                let sizes = self.read_fixed::<2>(cursor, ".debug_line address sizes")?;
+                let address_size = sizes
+                    .first()
+                    .copied()
+                    .ok_or(".debug_line address size is absent")?;
+                if !(1..=8).contains(&address_size) {
+                    return Err(format!(
+                        ".debug_line has invalid address size {address_size}"
+                    ));
+                }
+                cursor = cursor
+                    .checked_add(2)
+                    .ok_or(".debug_line cursor overflows")?;
+            }
+            let header_width = if dwarf64 { 8u64 } else { 4u64 };
+            if cursor
+                .checked_add(header_width)
+                .is_none_or(|end| end > unit_end)
+            {
+                return Err(".debug_line unit ends before its header length".into());
+            }
+            let (header_length, width) = if dwarf64 {
+                let bytes = self.read_fixed::<8>(cursor, ".debug_line header length")?;
+                (u64le(&bytes, 0)?, 8u64)
+            } else {
+                let bytes = self.read_fixed::<4>(cursor, ".debug_line header length")?;
+                (u32le(&bytes, 0)? as u64, 4u64)
+            };
+            cursor = cursor
+                .checked_add(width)
+                .ok_or(".debug_line cursor overflows")?;
+            let program_start = cursor
+                .checked_add(header_length)
+                .ok_or(".debug_line header range overflows")?;
+            if header_length < 6 || program_start > unit_end {
+                return Err(".debug_line has no complete header".into());
+            }
+            let prologue = self.read_fixed::<6>(cursor, ".debug_line prologue")?;
+            let prologue_byte = |index| {
+                prologue
+                    .get(index)
+                    .copied()
+                    .ok_or(".debug_line prologue byte is absent")
+            };
+            let (minimum_instruction_length, maximum_operations, line_range, opcode_base) =
+                if version <= 3 {
+                    (prologue_byte(0)?, 1, prologue_byte(3)?, prologue_byte(4)?)
+                } else {
+                    (
+                        prologue_byte(0)?,
+                        prologue_byte(1)?,
+                        prologue_byte(4)?,
+                        prologue_byte(5)?,
+                    )
+                };
+            if minimum_instruction_length == 0
+                || maximum_operations == 0
+                || line_range == 0
+                || opcode_base == 0
+            {
+                return Err(".debug_line prologue has an invalid zero field".into());
+            }
+            let fixed_prologue = if version <= 3 { 5u64 } else { 6u64 };
+            let table_terminators = if version == 5 { 4u64 } else { 2u64 };
+            let minimum_header_length = fixed_prologue
+                .checked_add((opcode_base - 1) as u64)
+                .and_then(|length| length.checked_add(table_terminators))
+                .ok_or(".debug_line minimum header length overflows")?;
+            if header_length < minimum_header_length {
+                return Err(format!(
+                    ".debug_line header is {header_length} bytes, below its {minimum_header_length}-byte structural minimum"
+                ));
+            }
+            if program_start < unit_end {
+                program_units = program_units
+                    .checked_add(1)
+                    .ok_or(".debug_line program-unit count overflows")?;
+            }
+            cursor = unit_end;
+            units = units
+                .checked_add(1)
+                .ok_or(".debug_line unit count overflows")?;
+        }
+        if units == 0 {
+            return Err(".debug_line contains no units".into());
+        }
+        if program_units == 0 {
+            return Err(".debug_line contains no line program".into());
+        }
+        Ok(())
+    }
+
+    fn build_ids(&mut self) -> Result<Vec<[u8; 20]>, String> {
+        let mut ids = Vec::new();
+        for section in self.sections.iter().filter(|section| section.kind == SHT_NOTE) {
+            let end = section
+                .offset
+                .checked_add(section.size)
+                .ok_or("ELF note section range overflow")?;
+            let mut cursor = section.offset;
+            while cursor < end {
+                let header_end = cursor
+                    .checked_add(12)
+                    .ok_or("ELF note header offset overflow")?;
+                if header_end > end {
+                    return Err("ELF note section ends in a partial note header".into());
+                }
+                self.file
+                    .seek(SeekFrom::Start(cursor))
+                    .map_err(|e| format!("seek ELF note: {e}"))?;
+                let mut header = [0u8; 12];
+                self.file
+                    .read_exact(&mut header)
+                    .map_err(|e| format!("read ELF note: {e}"))?;
+                let namesz = u32le(&header, 0)? as u64;
+                let descsz = u32le(&header, 4)? as u64;
+                let note_type = u32le(&header, 8)?;
+                let name_start = header_end;
+                let name_end = name_start
+                    .checked_add(namesz)
+                    .ok_or("ELF note name range overflow")?;
+                let desc_start = align4_u64(name_end)?;
+                let desc_end = desc_start
+                    .checked_add(descsz)
+                    .ok_or("ELF note descriptor range overflow")?;
+                let next = align4_u64(desc_end)?;
+                if next > end || next > self.length {
+                    return Err("ELF note runs past its section".into());
+                }
+                let mut name = [0u8; 4];
+                if namesz == name.len() as u64 {
+                    self.file
+                        .seek(SeekFrom::Start(name_start))
+                        .map_err(|e| format!("seek ELF note name: {e}"))?;
+                    self.file
+                        .read_exact(&mut name)
+                        .map_err(|e| format!("read ELF note name: {e}"))?;
+                }
+                if note_type == NT_GNU_BUILD_ID && namesz == 4 && name == *b"GNU\0" {
+                    if descsz != 20 {
+                        return Err(format!(
+                            "GNU build ID is {descsz} bytes, expected SHA-1's 20"
+                        ));
+                    }
+                    let mut id = [0u8; 20];
+                    self.file
+                        .seek(SeekFrom::Start(desc_start))
+                        .map_err(|e| format!("seek GNU build ID: {e}"))?;
+                    self.file
+                        .read_exact(&mut id)
+                        .map_err(|e| format!("read GNU build ID: {e}"))?;
+                    ids.push(id);
+                }
+                cursor = next;
+            }
+        }
+        Ok(ids)
+    }
+}
+
+/// Whether `path` is an installed runtime ELF (ET_EXEC or ET_DYN). Non-ELF
+/// files return false; a file carrying ELF magic but a truncated/unsupported
+/// header is an error so the package walk cannot silently skip corrupt output.
+pub fn is_runtime_elf(path: &Path) -> Result<bool, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let mut header = Vec::with_capacity(18);
+    let mut prefix = std::io::Read::take(&mut file, 18);
+    std::io::Read::read_to_end(&mut prefix, &mut header)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    if header.len() < EI_MAG.len() || header.get(..EI_MAG.len()) != Some(EI_MAG) {
+        return Ok(false);
+    }
+    if header.len() < 18 {
+        return Err(format!("{}: truncated ELF header", path.display()));
+    }
+    let class = header
+        .get(EI_CLASS)
+        .copied()
+        .ok_or_else(|| format!("{}: missing ELF class", path.display()))?;
+    match class {
+        1 | 2 => {}
+        class => return Err(format!("{}: unsupported ELF class {class}", path.display())),
+    }
+    if header.get(EI_DATA).copied() != Some(1) {
+        return Err(format!("{}: unsupported ELF byte order", path.display()));
+    }
+    Ok(matches!(u16le(&header, 0x10)?, ET_EXEC | ET_DYN))
+}
+
+/// Read the one deterministic GNU SHA-1 build ID. Missing, duplicate, or
+/// non-SHA-1 notes are rejected rather than turning object identity into a
+/// best-effort property.
+pub fn read_build_id(path: &Path) -> Result<Vec<u8>, String> {
+    let mut elf = FileElf::open(path)?;
+    one_build_id(path, &mut elf)
+}
+
+fn one_build_id(path: &Path, elf: &mut FileElf) -> Result<Vec<u8>, String> {
+    let ids = elf.build_ids()?;
+    if ids.len() != 1 {
+        return Err(format!(
+            "{}: expected exactly one GNU build ID, found {}",
+            path.display(),
+            ids.len()
+        ));
+    }
+    Ok(ids
+        .into_iter()
+        .next()
+        .ok_or("GNU build ID vanished after count check")?
+        .to_vec())
+}
+
+/// Verify the runtime/debug pair identity and the companion's minimum useful
+/// contents. The runtime retains only allocated/runtime metadata and dynamic
+/// symbols; the full ordinary symbol table lives in the companion.
+pub fn assert_debug_pair(runtime: &Path, debug: &Path) -> Result<(), String> {
+    if !is_runtime_elf(runtime)? {
+        return Err(format!("{}: debug-pair runtime is not ET_EXEC/ET_DYN", runtime.display()));
+    }
+    let mut runtime_elf = FileElf::open(runtime)?;
+    let runtime_id = one_build_id(runtime, &mut runtime_elf)?;
+    let mut debug_elf = FileElf::open(debug)?;
+    let debug_id = one_build_id(debug, &mut debug_elf)?;
+    if runtime_id != debug_id {
+        return Err(format!(
+            "{} and {} carry different GNU build IDs",
+            runtime.display(),
+            debug.display()
+        ));
+    }
+    for section in &runtime_elf.sections {
+        let name = runtime_elf.section_name(section)?;
+        if section.kind == SHT_SYMTAB {
+            return Err(format!(
+                "{}: stripped runtime still carries an ordinary symbol table",
+                runtime.display()
+            ));
+        }
+        if section.flags & SHF_ALLOC == 0
+            && (name.starts_with(b".debug_") || name.starts_with(b".zdebug_"))
+        {
+            return Err(format!(
+                "{}: stripped runtime still carries debug section {}",
+                runtime.display(),
+                String::from_utf8_lossy(name)
+            ));
+        }
+    }
+    let mut has_symbols = false;
+    let mut has_lines = false;
+    for index in 0..debug_elf.sections.len() {
+        let section = debug_elf
+            .sections
+            .get(index)
+            .copied()
+            .ok_or("debug section index vanished during validation")?;
+        let name = debug_elf.section_name(&section)?;
+        let is_symbols = section.kind == SHT_SYMTAB && name == b".symtab";
+        let is_lines = section.kind == SHT_PROGBITS && name == b".debug_line";
+        let is_compressed_lines = name == b".zdebug_line"
+            || (name == b".debug_line" && section.flags & SHF_COMPRESSED != 0);
+        if is_compressed_lines {
+            return Err(format!(
+                "{}: compressed {} is outside the deterministic companion policy",
+                debug.display(),
+                String::from_utf8_lossy(name)
+            ));
+        }
+        if is_symbols {
+            debug_elf.validate_symbol_table(section)?;
+            has_symbols = true;
+        }
+        if is_lines {
+            debug_elf
+                .validate_debug_line(section)
+                .map_err(|error| format!("{}: {error}", debug.display()))?;
+            has_lines = true;
+        }
+    }
+    if !has_symbols || !has_lines {
+        return Err(format!(
+            "{}: debug companion requires .symtab and .debug_line (symbols={has_symbols}, lines={has_lines})",
+            debug.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Locate the PT_INTERP program header and return `(file_offset, filesz)` of its
@@ -1072,6 +1666,157 @@ mod tests {
         b
     }
 
+    fn synth_profiled_elf(
+        build_ids: &[[u8; 20]],
+        with_lines: bool,
+        with_symbols: bool,
+    ) -> Vec<u8> {
+        let names = b"\0.shstrtab\0.note.gnu.build-id\0.symtab\0.debug_line\0.strtab\0.text\0.bss\0.debug_gdb_scripts\0";
+        let name_offset = |name: &[u8]| {
+            names
+                .windows(name.len())
+                .position(|candidate| candidate == name)
+                .unwrap()
+        };
+        let mut note = Vec::new();
+        for build_id in build_ids {
+            note.extend_from_slice(&4u32.to_le_bytes());
+            note.extend_from_slice(&20u32.to_le_bytes());
+            note.extend_from_slice(&NT_GNU_BUILD_ID.to_le_bytes());
+            note.extend_from_slice(b"GNU\0");
+            note.extend_from_slice(build_id);
+        }
+        let mut line_unit = Vec::new();
+        line_unit.extend_from_slice(&17u32.to_le_bytes());
+        line_unit.extend_from_slice(&4u16.to_le_bytes());
+        line_unit.extend_from_slice(&8u32.to_le_bytes());
+        line_unit.extend_from_slice(&[1, 1, 1, 0xfb, 14, 1, 0, 0]);
+        line_unit.extend_from_slice(&[0, 1, 1]);
+        let mut lines = line_unit.clone();
+        lines.extend_from_slice(&line_unit);
+        let symbol_names = b"\0td_symbol\0";
+
+        let ehdr = 64usize;
+        let names_off = ehdr;
+        let note_off = (names_off + names.len() + 3) & !3;
+        let symtab_off = note_off + note.len();
+        let symtab_size = 48usize;
+        let lines_off = symtab_off + symtab_size;
+        let strtab_off = lines_off + lines.len();
+        let allocated_debug_off = strtab_off + symbol_names.len();
+        let shoff = (allocated_debug_off + 1 + 7) & !7;
+        let shentsize = 64usize;
+        let shnum = 8usize;
+        let mut bytes = vec![0u8; shoff + shentsize * shnum];
+        bytes[0..4].copy_from_slice(EI_MAG);
+        bytes[EI_CLASS] = 2;
+        bytes[EI_DATA] = 1;
+        bytes[6] = 1;
+        bytes[0x10..0x12].copy_from_slice(&ET_EXEC.to_le_bytes());
+        bytes[0x28..0x30].copy_from_slice(&(shoff as u64).to_le_bytes());
+        bytes[0x3a..0x3c].copy_from_slice(&(shentsize as u16).to_le_bytes());
+        bytes[0x3c..0x3e].copy_from_slice(&(shnum as u16).to_le_bytes());
+        bytes[0x3e..0x40].copy_from_slice(&1u16.to_le_bytes());
+        bytes[names_off..names_off + names.len()].copy_from_slice(names);
+        bytes[note_off..note_off + note.len()].copy_from_slice(&note);
+        bytes[symtab_off + 24..symtab_off + 28].copy_from_slice(&1u32.to_le_bytes());
+        bytes[lines_off..lines_off + lines.len()].copy_from_slice(&lines);
+        bytes[strtab_off..strtab_off + symbol_names.len()].copy_from_slice(symbol_names);
+        let nobits_off = bytes.len() + 4096;
+
+        let mut section = |index: usize,
+                           name: &[u8],
+                           kind: u32,
+                           flags: u64,
+                           off: usize,
+                           size: usize,
+                           link: u32,
+                           entry_size: u64| {
+            let header = shoff + index * shentsize;
+            bytes[header..header + 4].copy_from_slice(&(name_offset(name) as u32).to_le_bytes());
+            bytes[header + 4..header + 8].copy_from_slice(&kind.to_le_bytes());
+            bytes[header + 8..header + 16].copy_from_slice(&flags.to_le_bytes());
+            bytes[header + 0x18..header + 0x20].copy_from_slice(&(off as u64).to_le_bytes());
+            bytes[header + 0x20..header + 0x28].copy_from_slice(&(size as u64).to_le_bytes());
+            bytes[header + 0x28..header + 0x2c].copy_from_slice(&link.to_le_bytes());
+            bytes[header + 0x38..header + 0x40].copy_from_slice(&entry_size.to_le_bytes());
+        };
+        section(1, b".shstrtab", SHT_STRTAB, 0, names_off, names.len(), 0, 0);
+        section(
+            2,
+            b".note.gnu.build-id",
+            SHT_NOTE,
+            0,
+            note_off,
+            note.len(),
+            0,
+            0,
+        );
+        let symbol_name: &[u8] = if with_symbols { b".symtab" } else { b".text" };
+        section(
+            3,
+            symbol_name,
+            if with_symbols { SHT_SYMTAB } else { SHT_PROGBITS },
+            0,
+            symtab_off,
+            symtab_size,
+            5,
+            24,
+        );
+        let line_name: &[u8] = if with_lines { b".debug_line" } else { b".text" };
+        section(
+            4,
+            line_name,
+            SHT_PROGBITS,
+            0,
+            lines_off,
+            lines.len(),
+            0,
+            0,
+        );
+        section(
+            5,
+            b".strtab",
+            SHT_STRTAB,
+            0,
+            strtab_off,
+            symbol_names.len(),
+            0,
+            0,
+        );
+        // Debug companions produced by GNU objcopy commonly retain allocated
+        // sections as SHT_NOBITS entries whose logical range is not file-backed.
+        section(6, b".bss", SHT_NOBITS, SHF_ALLOC, nobits_off, 8192, 0, 0);
+        // rustc's allocated debugger-registration payload is deliberately
+        // retained by `objcopy --strip-all`; only non-allocated debug
+        // sections belong exclusively in the companion.
+        section(
+            7,
+            b".debug_gdb_scripts",
+            SHT_PROGBITS,
+            SHF_ALLOC,
+            allocated_debug_off,
+            1,
+            0,
+            0,
+        );
+        bytes
+    }
+
+    fn profile_section_u64(bytes: &mut [u8], section: usize, field: usize, value: u64) {
+        let shoff = u64le(bytes, 0x28).unwrap() as usize;
+        let start = shoff + section * 64 + field;
+        bytes
+            .get_mut(start..start + 8)
+            .unwrap()
+            .copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn profile_section_offset(bytes: &[u8], section: usize) -> usize {
+        let shoff = u64le(bytes, 0x28).unwrap() as usize;
+        u64le(bytes, shoff + section * 64 + 0x18).unwrap() as usize
+    }
+
     #[test]
     fn reads_interp() {
         let dir = std::env::temp_dir().join(format!("elf-test-r-{}", std::process::id()));
@@ -1079,6 +1824,103 @@ mod tests {
         let f = dir.join("a");
         std::fs::write(&f, synth_elf("/lib64/ld-linux-x86-64.so.2")).unwrap();
         assert_eq!(read_interp(&f).unwrap().as_deref(), Some("/lib64/ld-linux-x86-64.so.2"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn profiled_elf_requires_one_sha1_id_symbols_and_lines() {
+        let dir = std::env::temp_dir().join(format!("elf-test-profile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runtime = dir.join("runtime");
+        let debug = dir.join("debug");
+        let id = [0x5au8; 20];
+        std::fs::write(&runtime, synth_profiled_elf(&[id], false, false)).unwrap();
+        std::fs::write(&debug, synth_profiled_elf(&[id], true, true)).unwrap();
+        assert!(is_runtime_elf(&runtime).unwrap());
+        assert_eq!(read_build_id(&runtime).unwrap(), id);
+        assert_debug_pair(&runtime, &debug).unwrap();
+
+        std::fs::write(&runtime, synth_profiled_elf(&[id], false, true)).unwrap();
+        let err = assert_debug_pair(&runtime, &debug).unwrap_err();
+        assert!(err.contains("ordinary symbol table"), "unexpected error: {err}");
+        std::fs::write(&runtime, synth_profiled_elf(&[id], false, false)).unwrap();
+
+        std::fs::write(&debug, synth_profiled_elf(&[[0xa5; 20]], true, true)).unwrap();
+        let err = assert_debug_pair(&runtime, &debug).unwrap_err();
+        assert!(
+            err.contains("different GNU build IDs"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::write(&debug, synth_profiled_elf(&[], true, true)).unwrap();
+        let err = read_build_id(&debug).unwrap_err();
+        assert!(err.contains("found 0"), "unexpected error: {err}");
+
+        std::fs::write(&debug, synth_profiled_elf(&[id, id], true, true)).unwrap();
+        let err = read_build_id(&debug).unwrap_err();
+        assert!(err.contains("found 2"), "unexpected error: {err}");
+
+        std::fs::write(&runtime, synth_profiled_elf(&[id], true, false)).unwrap();
+        std::fs::write(&debug, synth_profiled_elf(&[id], true, true)).unwrap();
+        let err = assert_debug_pair(&runtime, &debug).unwrap_err();
+        assert!(
+            err.contains("still carries debug section"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::write(&runtime, synth_profiled_elf(&[id], false, false)).unwrap();
+        let mut malformed = synth_profiled_elf(&[id], true, true);
+        profile_section_u64(&mut malformed, 3, 0x20, 0);
+        std::fs::write(&debug, &malformed).unwrap();
+        let err = assert_debug_pair(&runtime, &debug).unwrap_err();
+        assert!(err.contains(".symtab has size 0"), "unexpected error: {err}");
+
+        let mut malformed = synth_profiled_elf(&[id], true, true);
+        profile_section_u64(&mut malformed, 3, 0x38, 1);
+        std::fs::write(&debug, &malformed).unwrap();
+        let err = assert_debug_pair(&runtime, &debug).unwrap_err();
+        assert!(err.contains("entry size 1"), "unexpected error: {err}");
+
+        let mut malformed = synth_profiled_elf(&[id], true, true);
+        profile_section_u64(&mut malformed, 4, 0x08, SHF_COMPRESSED);
+        std::fs::write(&debug, &malformed).unwrap();
+        let err = assert_debug_pair(&runtime, &debug).unwrap_err();
+        assert!(
+            err.contains("compressed .debug_line"),
+            "unexpected error: {err}"
+        );
+
+        let mut mixed = synth_profiled_elf(&[id], true, true);
+        let lines = profile_section_offset(&mixed, 4);
+        mixed
+            .get_mut(lines + 6..lines + 10)
+            .unwrap()
+            .copy_from_slice(&11u32.to_le_bytes());
+        std::fs::write(&debug, &mixed).unwrap();
+        assert_debug_pair(&runtime, &debug).unwrap();
+        mixed
+            .get_mut(lines + 27..lines + 31)
+            .unwrap()
+            .copy_from_slice(&11u32.to_le_bytes());
+        std::fs::write(&debug, &mixed).unwrap();
+        let err = assert_debug_pair(&runtime, &debug).unwrap_err();
+        assert!(
+            err.contains("contains no line program"),
+            "unexpected error: {err}"
+        );
+
+        let mut malformed = synth_profiled_elf(&[id], true, true);
+        let lines = profile_section_offset(&malformed, 4);
+        malformed
+            .get_mut(lines + 4..lines + 6)
+            .unwrap()
+            .copy_from_slice(&1u16.to_le_bytes());
+        std::fs::write(&debug, &malformed).unwrap();
+        let err = assert_debug_pair(&runtime, &debug).unwrap_err();
+        assert!(
+            err.contains("unsupported DWARF version 1"),
+            "unexpected error: {err}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -40,7 +40,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1402,6 +1402,8 @@ pub fn run_rust() -> Result<(), String> {
     let src = env::var("TD_SRC").map_err(|_| "TD_SRC not set".to_string())?;
     let inputs = env::var("TD_INPUTS").unwrap_or_default();
     let bins_spec = env::var("TD_RUST_BINS").map_err(|_| "TD_RUST_BINS not set".to_string())?;
+    let recipe_name =
+        env::var("TD_RECIPE_NAME").map_err(|_| "TD_RECIPE_NAME not set".to_string())?;
     let bins: Vec<&str> = bins_spec.split_whitespace().collect();
     if bins.is_empty() {
         return Err("TD_RUST_BINS is empty (no binaries to install)".into());
@@ -1433,6 +1435,10 @@ pub fn run_rust() -> Result<(), String> {
     let path = path.join(":");
     let cargo = find_in_path(&path, "cargo").ok_or("cargo not found in TD_INPUTS")?;
     find_in_path(&path, "rustc").ok_or("rustc not found in TD_INPUTS")?;
+    let objcopy = env::var("TD_RUST_OBJCOPY").map_err(|_| {
+        "TD_RUST_OBJCOPY not set (exact declared target objcopy is required)".to_string()
+    })?;
+    require_executable_file(&objcopy, "target objcopy")?;
     let cp = find_in_path(&path, "cp").ok_or("cp not found in TD_INPUTS")?;
     let chmod = find_in_path(&path, "chmod").ok_or("chmod not found in TD_INPUTS")?;
     let gcc = env::var("TD_RUST_STORE_CC")
@@ -1479,12 +1485,17 @@ pub fn run_rust() -> Result<(), String> {
     let build_abs = build_abs.to_str().ok_or("non-utf8 build path")?.to_string();
     let cargo_home = cwd.join("td-cargo-home");
     let cargo_home = cargo_home.to_str().ok_or("non-utf8 cargo-home")?.to_string();
+    let vendor_dir = cwd.join("td-rust-vendor");
+    let vendor_abs = vendor_dir
+        .to_str()
+        .ok_or("non-utf8 vendor path")?
+        .to_string();
     // Reproducibility: remap the (varying) build dir + CARGO_HOME so file!()/debug
     // paths don't leak into the binary; link via gcc (ld-wrapper) so the output
     // gets a RUNPATH to the toolchain libs.
-    let mut rustflags = format!(
-        "--remap-path-prefix={build_abs}=/td-build --remap-path-prefix={cargo_home}=/td-cargo -Clinker={gcc}"
-    );
+    let mut rustflags =
+        td_engine::target_profile::cargo_rustflags(&build_abs, &cargo_home, &vendor_abs, &gcc);
+    let cflags = td_engine::target_profile::cargo_cflags(&build_abs, &cargo_home, &vendor_abs);
     // Native /td/store toolchain (#258): the native gcc is a PLAIN gcc, NOT guix's ld-wrapper, so it
     // injects no interp/RUNPATH. When TD_RUST_STORE_INTERP is set the caller is linking against the
     // native /td/store toolchain — bake them explicitly (the #255 rustc-compile recipe): the dynamic
@@ -1521,11 +1532,11 @@ pub fn run_rust() -> Result<(), String> {
     // "compiler bug". Such probes honor LDFLAGS on their link, so mirror the same /td/store
     // dynamic-linker + RUNPATH the rustc link gets above. The `cc` crate never reads LDFLAGS
     // for its object compiles, so this only reaches build scripts that link a runnable exe.
-    // Unset TD_RUST_STORE_INTERP ⇒ LDFLAGS stays unset (guix + self-host paths unchanged).
-    let mut ldflags = String::new();
+    // Unset TD_RUST_STORE_INTERP leaves only the deterministic build-ID policy.
+    let mut ldflags = String::from("-Wl,--build-id=sha1");
     if let Ok(interp) = env::var("TD_RUST_STORE_INTERP") {
         if !interp.is_empty() {
-            ldflags.push_str(&format!("-Wl,--dynamic-linker,{interp}"));
+            ldflags.push_str(&format!(" -Wl,--dynamic-linker,{interp}"));
             for rp in env::var("TD_RUST_STORE_RPATH").unwrap_or_default().split(':').filter(|s| !s.is_empty()) {
                 ldflags.push_str(&format!(" -Wl,-rpath,{rp}"));
             }
@@ -1538,6 +1549,8 @@ pub fn run_rust() -> Result<(), String> {
         ("C_INCLUDE_PATH".into(), cinc.join(":")),
         ("CPLUS_INCLUDE_PATH".into(), cinc.join(":")),
         ("CC".into(), gcc.clone()),
+        ("CFLAGS".into(), cflags.clone()),
+        ("CXXFLAGS".into(), cflags),
         ("HOME".into(), "/homeless-shelter".into()),
         ("CARGO_HOME".into(), cargo_home.clone()),
         ("SOURCE_DATE_EPOCH".into(), "1".into()),
@@ -1550,9 +1563,7 @@ pub fn run_rust() -> Result<(), String> {
     if let Some(gpp) = gpp {
         envs.push(("CXX".into(), gpp));
     }
-    if !ldflags.is_empty() {
-        envs.push(("LDFLAGS".into(), ldflags));
-    }
+    envs.push(("LDFLAGS".into(), ldflags));
 
     // vendored deps: if TD_VENDOR_CRATES is set, assemble a cargo `vendored-sources`
     // directory from each `.crate` (untar -> `<name>-<version>/`, plus a minimal
@@ -1567,9 +1578,7 @@ pub fn run_rust() -> Result<(), String> {
     )?;
     if !crate_files.is_empty() {
         let tar = find_in_path(&path, "tar").ok_or("tar not found in TD_INPUTS (vendor)")?;
-        let vendor_dir = cwd.join("td-rust-vendor");
         fs::create_dir_all(&vendor_dir).map_err(|e| format!("mkdir vendor: {e}"))?;
-        let vendor_abs = vendor_dir.to_str().ok_or("non-utf8 vendor path")?.to_string();
         for (c, nv) in &crate_files {
             // a cargo `.crate` tarball unpacks to exactly the single `<name>-<version>/` dir.
             run_cmd(&tar, &["xf", c.as_str(), "-C", &vendor_abs], ".", &path_env, &WATCH_PHASE)?;
@@ -1622,6 +1631,7 @@ pub fn run_rust() -> Result<(), String> {
         }
         run_cmd(&cp, &["-p", &from, &format!("{bindir}/{b}")], ".", &path_env, &WATCH_PHASE)?;
     }
+    split_debug_tree(Path::new(&out), Path::new(&objcopy), &recipe_name)?;
     Ok(())
 }
 
@@ -2664,6 +2674,9 @@ fn scan_runtime_store_refs(
         let metadata = fs::symlink_metadata(&path)
             .map_err(|e| format!("stageRuntimeClosure: stat {}: {e}", path.display()))?;
         if metadata.file_type().is_dir() {
+            if is_debug_companion_dir(&path) {
+                continue;
+            }
             let entries = fs::read_dir(&path)
                 .map_err(|e| format!("stageRuntimeClosure: read dir {}: {e}", path.display()))?;
             for entry in entries {
@@ -2724,6 +2737,15 @@ fn scan_runtime_store_refs(
         }
     }
     Ok(absolute_refs)
+}
+
+fn is_debug_companion_dir(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("debug")
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            == Some("lib")
 }
 
 fn scan_runtime_fragment(
@@ -3314,6 +3336,335 @@ fn refuse_aliased_payloads(
     Ok(())
 }
 
+fn collect_runtime_elfs(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let mut entries = fs::read_dir(dir)
+        .map_err(|e| format!("read debug-tree directory {}: {e}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read debug-tree directory {}: {e}", dir.display()))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|e| format!("stat debug-tree entry {}: {e}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            collect_runtime_elfs(&path, out)?;
+        } else if metadata.is_file() && crate::elf::is_runtime_elf(&path)? {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn collect_debug_bytes(
+    dir: &Path,
+    inside_debug: bool,
+    seen: &mut std::collections::HashSet<(u64, u64)>,
+    total: &mut u64,
+) -> Result<(), String> {
+    let mut entries = fs::read_dir(dir)
+        .map_err(|e| format!("read debug-size directory {}: {e}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read debug-size directory {}: {e}", dir.display()))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|e| format!("stat debug-size entry {}: {e}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            let enters_debug = path.file_name() == Some(OsStr::new("debug"))
+                && path.parent().and_then(Path::file_name) == Some(OsStr::new("lib"));
+            collect_debug_bytes(&path, inside_debug || enters_debug, seen, total)?;
+        } else if inside_debug
+            && metadata.is_file()
+            && seen.insert((metadata.dev(), metadata.ino()))
+        {
+            *total = total
+                .checked_add(metadata.len())
+                .ok_or_else(|| format!("debug-size byte total overflow below {}", dir.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn assert_debug_size(root: &Path, report: &Path, scope: &str, ceiling: u64) -> Result<(), String> {
+    if !root.is_dir() {
+        return Err(format!(
+            "debug-size root is not a directory: {}",
+            root.display()
+        ));
+    }
+    if scope.is_empty()
+        || !scope
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(format!("debug-size scope is not a lowercase label: {scope:?}"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut bytes = 0u64;
+    collect_debug_bytes(root, false, &mut seen, &mut bytes)?;
+    if bytes == 0 {
+        return Err(format!(
+            "debug-size scope {scope} found no companion bytes below {}",
+            root.display()
+        ));
+    }
+    if bytes > ceiling {
+        return Err(format!(
+            "debug-size scope {scope} uses {bytes} bytes, exceeding compiled ceiling {ceiling}"
+        ));
+    }
+    if let Some(parent) = report
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("mkdir debug-size report {}: {e}", parent.display()))?;
+    }
+    let content = format!(
+        "format=1\nscope={scope}\ndebug_bytes={bytes}\nceiling_bytes={ceiling}\n"
+    );
+    fs::write(report, content)
+        .map_err(|e| format!("write debug-size report {}: {e}", report.display()))?;
+    fs::set_permissions(report, fs::Permissions::from_mode(0o644))
+        .map_err(|e| format!("chmod debug-size report {}: {e}", report.display()))?;
+    eprintln!("debug-size: scope={scope} bytes={bytes} ceiling={ceiling}");
+    Ok(())
+}
+
+fn compare_files(left: &Path, right: &Path) -> Result<(), String> {
+    let left_meta = fs::metadata(left)
+        .map_err(|e| format!("compare stat {}: {e}", left.display()))?;
+    let right_meta = fs::metadata(right)
+        .map_err(|e| format!("compare stat {}: {e}", right.display()))?;
+    if !left_meta.is_file() || !right_meta.is_file() {
+        return Err(format!(
+            "compare requires two regular files: {} {}",
+            left.display(),
+            right.display()
+        ));
+    }
+    if left_meta.len() != right_meta.len() {
+        return Err(format!(
+            "files differ in length: {}={} {}={}",
+            left.display(),
+            left_meta.len(),
+            right.display(),
+            right_meta.len()
+        ));
+    }
+    let mut left_file = fs::File::open(left)
+        .map_err(|e| format!("compare open {}: {e}", left.display()))?;
+    let mut right_file = fs::File::open(right)
+        .map_err(|e| format!("compare open {}: {e}", right.display()))?;
+    let mut left_buf = vec![0u8; 64 * 1024];
+    let mut right_buf = vec![0u8; 64 * 1024];
+    let mut offset = 0u64;
+    while offset < left_meta.len() {
+        let width = usize::try_from((left_meta.len() - offset).min(left_buf.len() as u64))
+            .map_err(|_| "compare chunk width does not fit usize")?;
+        left_file
+            .read_exact(
+                left_buf
+                    .get_mut(..width)
+                    .ok_or("compare left chunk width exceeds buffer")?,
+            )
+            .map_err(|e| format!("compare read {}: {e}", left.display()))?;
+        right_file
+            .read_exact(
+                right_buf
+                    .get_mut(..width)
+                    .ok_or("compare right chunk width exceeds buffer")?,
+            )
+            .map_err(|e| format!("compare read {}: {e}", right.display()))?;
+        let left_chunk = left_buf
+            .get(..width)
+            .ok_or("compare left chunk width exceeds buffer")?;
+        let right_chunk = right_buf
+            .get(..width)
+            .ok_or("compare right chunk width exceeds buffer")?;
+        if left_chunk != right_chunk {
+            let within = left_chunk
+                .iter()
+                .zip(right_chunk)
+                .position(|(a, b)| a != b)
+                .ok_or("compare mismatch had no differing byte")?;
+            return Err(format!(
+                "files differ at byte {}: {} {}",
+                offset + within as u64,
+                left.display(),
+                right.display()
+            ));
+        }
+        offset += width as u64;
+    }
+    Ok(())
+}
+
+/// Split every installed executable/shared object below `root`, then verify
+/// the runtime and companion as one build-ID-addressed pair. The walker and
+/// validation are engine-native; only the declared target `objcopy` executes.
+fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<(), String> {
+    if !root.is_dir() {
+        return Err(format!(
+            "debug-tree root is not a directory: {}",
+            root.display()
+        ));
+    }
+    require_executable_file(
+        objcopy
+            .to_str()
+            .ok_or_else(|| format!("non-UTF-8 objcopy path: {}", objcopy.display()))?,
+        "target objcopy",
+    )?;
+    let debug_root = root.join("lib/debug");
+    if debug_root.exists() {
+        return Err(format!(
+            "debug companion root already exists before split: {}",
+            debug_root.display()
+        ));
+    }
+    let mut runtimes = Vec::new();
+    collect_runtime_elfs(root, &mut runtimes)?;
+    runtimes.sort();
+    if runtimes.is_empty() {
+        return Err(format!(
+            "debug-tree root contains no ET_EXEC/ET_DYN: {}",
+            root.display()
+        ));
+    }
+    let objcopy = objcopy
+        .to_str()
+        .ok_or_else(|| format!("non-UTF-8 objcopy path: {}", objcopy.display()))?;
+    let cwd = root
+        .to_str()
+        .ok_or_else(|| format!("non-UTF-8 debug-tree root: {}", root.display()))?;
+    // Create every companion before stripping any runtime. Installed packages
+    // may expose one ELF through several hard links (glibc getconf does); a
+    // later in-place objcopy of one name must not become the source for another
+    // name's companion.
+    let mut companion_by_inode: std::collections::HashMap<(u64, u64), (PathBuf, PathBuf)> =
+        std::collections::HashMap::new();
+    let mut pairs = Vec::with_capacity(runtimes.len());
+    for runtime in &runtimes {
+        // Validate the linked identity before changing bytes. A missing or
+        // duplicate note therefore cannot leave an apparently paired output.
+        crate::elf::read_build_id(runtime)?;
+        let metadata = fs::metadata(runtime)
+            .map_err(|e| format!("stat installed ELF {}: {e}", runtime.display()))?;
+        let inode = (metadata.dev(), metadata.ino());
+        let relative = runtime.strip_prefix(root).map_err(|_| {
+            format!(
+                "runtime {} escaped debug-tree root {}",
+                runtime.display(),
+                root.display()
+            )
+        })?;
+        let relative_text = relative
+            .to_str()
+            .ok_or_else(|| format!("non-UTF-8 installed ELF path: {}", relative.display()))?;
+        let debug = debug_root.join(format!("{relative_text}.debug"));
+        let parent = debug
+            .parent()
+            .ok_or_else(|| format!("debug companion has no parent: {}", debug.display()))?;
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("mkdir debug companion parent {}: {e}", parent.display()))?;
+        let runtime_text = runtime
+            .to_str()
+            .ok_or_else(|| format!("non-UTF-8 installed ELF path: {}", runtime.display()))?;
+        let debug_text = debug
+            .to_str()
+            .ok_or_else(|| format!("non-UTF-8 debug companion path: {}", debug.display()))?;
+        let canonical_runtime = if let Some((first_debug, first_runtime)) =
+            companion_by_inode.get(&inode)
+        {
+            fs::hard_link(first_debug, &debug).map_err(|e| {
+                format!(
+                    "hard-link debug companion {} from {}: {e}",
+                    debug.display(),
+                    first_debug.display()
+                )
+            })?;
+            first_runtime.clone()
+        } else {
+            run_cmd(
+                objcopy,
+                &["--only-keep-debug", runtime_text, debug_text],
+                cwd,
+                &[],
+                &WATCH_PHASE,
+            )?;
+            fs::set_permissions(&debug, fs::Permissions::from_mode(0o644))
+                .map_err(|e| format!("chmod debug companion {}: {e}", debug.display()))?;
+            companion_by_inode.insert(inode, (debug.clone(), runtime.clone()));
+            runtime.clone()
+        };
+        pairs.push((runtime.clone(), debug, canonical_runtime, inode));
+    }
+    let mut stripped_inodes = std::collections::HashSet::new();
+    for (_, _, canonical_runtime, original_inode) in &pairs {
+        if !stripped_inodes.insert(*original_inode) {
+            continue;
+        }
+        let runtime_text = canonical_runtime
+            .to_str()
+            .ok_or_else(|| {
+                format!(
+                    "non-UTF-8 installed ELF path: {}",
+                    canonical_runtime.display()
+                )
+            })?;
+        run_cmd(
+            objcopy,
+            &["--strip-all", runtime_text],
+            cwd,
+            &[],
+            &WATCH_PHASE,
+        )?;
+    }
+    // GNU objcopy currently preserves a multiply-linked inode, but enforce the
+    // installed relation rather than depending on that implementation detail.
+    // If objcopy replaced the canonical name, every alias is reconnected to the
+    // stripped bytes before pair validation.
+    for (runtime, _, canonical_runtime, _) in &pairs {
+        if runtime == canonical_runtime {
+            continue;
+        }
+        fs::remove_file(runtime)
+            .map_err(|e| format!("remove pre-strip hard-link alias {}: {e}", runtime.display()))?;
+        fs::hard_link(canonical_runtime, runtime).map_err(|e| {
+            format!(
+                "restore runtime hard link {} from {}: {e}",
+                runtime.display(),
+                canonical_runtime.display()
+            )
+        })?;
+    }
+    for (runtime, debug, _, _) in &pairs {
+        crate::elf::assert_debug_pair(runtime, debug)?;
+    }
+    let exceptions = td_engine::target_profile::output_assembly_exceptions(recipe_name);
+    if !exceptions.is_empty() {
+        let marker = debug_root.join(".td-assembly-exception");
+        let mut content = format!("format=1\noutput={recipe_name}\n");
+        for (index, (source, reason)) in exceptions.iter().enumerate() {
+            content.push_str(&format!("exception.{index}.source={source}\n"));
+            content.push_str(&format!("exception.{index}.reason={reason}\n"));
+        }
+        fs::write(&marker, content)
+            .map_err(|e| format!("write assembly-exception marker {}: {e}", marker.display()))?;
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o644))
+            .map_err(|e| format!("chmod assembly-exception marker {}: {e}", marker.display()))?;
+    }
+    Ok(())
+}
+
 /// mesboot-build — td's bootstrap-RUNG build "system" (#378 slices 2+3; sibling
 /// of `run`/`run_rust`/`run_cmake`/`run_stage0`). Executes the recipe's typed
 /// steps (materialized from the drv's `TD_STEPS` data; see recipes/src/types.rs
@@ -3326,6 +3677,8 @@ fn refuse_aliased_payloads(
 /// oracle guards it).
 pub fn run_mesboot() -> Result<(), String> {
     let out = env::var("out").map_err(|_| "out not set".to_string())?;
+    let recipe_name =
+        env::var("TD_RECIPE_NAME").map_err(|_| "TD_RECIPE_NAME not set".to_string())?;
     let steps_file = env::var_os(MESBOOT_STEPS_FILE_ENV)
         .ok_or_else(|| format!("{MESBOOT_STEPS_FILE_ENV} not set"))?;
     let steps_path = Path::new(&steps_file);
@@ -3482,6 +3835,26 @@ pub fn run_mesboot() -> Result<(), String> {
             let from = ctx.expand_data(&field(o, "from")?).map_err(err)?;
             let dest = ctx.expand(&field(o, "dest")?).map_err(err)?;
             copy_tree_writable(Path::new(&from), Path::new(&dest)).map_err(err)?;
+        } else if let Some(o) = step.get("splitDebugTree") {
+            let root = ctx.expand(&field(o, "root")?).map_err(err)?;
+            let objcopy = ctx.expand(&field(o, "objcopy")?).map_err(err)?;
+            split_debug_tree(Path::new(&root), Path::new(&objcopy), &recipe_name).map_err(err)?;
+        } else if let Some(o) = step.get("assertDebugSize") {
+            let root = ctx.expand(&field(o, "root")?).map_err(err)?;
+            let report = ctx.expand(&field(o, "report")?).map_err(err)?;
+            let scope = field(o, "scope")?;
+            let ceiling = match o.get("ceiling") {
+                Some(Json::Num(number)) => number
+                    .parse::<u64>()
+                    .map_err(|e| err(format!("assertDebugSize.ceiling: {e}")))?,
+                _ => return Err(err("assertDebugSize.ceiling: missing/non-number".into())),
+            };
+            assert_debug_size(Path::new(&root), Path::new(&report), &scope, ceiling)
+                .map_err(err)?;
+        } else if let Some(o) = step.get("compareFiles") {
+            let left = ctx.expand(&field(o, "left")?).map_err(err)?;
+            let right = ctx.expand(&field(o, "right")?).map_err(err)?;
+            compare_files(Path::new(&left), Path::new(&right)).map_err(err)?;
         } else if let Some(o) = step.get("stageRuntimeClosure") {
             let roots = ctx
                 .expand_data_all(&string_array(o, "roots").map_err(err)?)
@@ -3632,6 +4005,53 @@ pub fn run_mesboot() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_closure_walk_skips_only_debug_companion_directories() {
+        assert!(is_debug_companion_dir(Path::new("/out/lib/debug")));
+        assert!(is_debug_companion_dir(Path::new(
+            "/out/stage/td/store/pkg/lib/debug"
+        )));
+        assert!(!is_debug_companion_dir(Path::new("/out/debug")));
+        assert!(!is_debug_companion_dir(Path::new("/out/lib/debugger")));
+    }
+
+    #[test]
+    fn debug_size_deduplicates_hard_links_and_enforces_the_external_ceiling() {
+        let base = std::env::temp_dir().join(format!("td-debug-size-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let debug = base.join("root/pkg/lib/debug/bin");
+        fs::create_dir_all(&debug).unwrap();
+        fs::write(debug.join("one.debug"), b"1234").unwrap();
+        fs::hard_link(debug.join("one.debug"), debug.join("two.debug")).unwrap();
+        fs::write(base.join("root/not-debug"), b"not counted").unwrap();
+        let report = base.join("report");
+
+        assert_debug_size(&base.join("root"), &report, "fixture", 4).unwrap();
+        assert_eq!(
+            fs::read_to_string(&report).unwrap(),
+            "format=1\nscope=fixture\ndebug_bytes=4\nceiling_bytes=4\n"
+        );
+        let error = assert_debug_size(&base.join("root"), &report, "fixture", 3).unwrap_err();
+        assert!(error.contains("exceeding compiled ceiling 3"), "{error}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn compare_files_streams_equal_bytes_and_names_the_first_difference() {
+        let base = std::env::temp_dir().join(format!("td-compare-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let left = base.join("left");
+        let right = base.join("right");
+        fs::write(&left, b"same").unwrap();
+        fs::write(&right, b"same").unwrap();
+        compare_files(&left, &right).unwrap();
+        fs::write(&right, b"samp").unwrap();
+        let error = compare_files(&left, &right).unwrap_err();
+        assert!(error.contains("differ at byte 3"), "{error}");
+        let _ = fs::remove_dir_all(&base);
+    }
 
     fn compact_mesboot_dispatch() -> String {
         let source = include_str!("build.rs");

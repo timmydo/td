@@ -1,3 +1,4 @@
+use crate::ladder::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 
 const MAIN_RS: &str = include_str!("../../../td-seatd/src/main.rs");
@@ -30,10 +31,10 @@ pub fn recipe() -> Recipe {
         },
         Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
         Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
-        Step::run(
+        target_rustc(
             "{src}",
+            rustc,
             &[
-                rustc,
                 "--edition",
                 "2021",
                 "-C",
@@ -46,8 +47,6 @@ pub fn recipe() -> Recipe {
                 "relocation-model=static",
                 "-C",
                 "panic=abort",
-                "-C",
-                "strip=symbols",
                 &linker,
                 "-L",
                 glib,
@@ -55,8 +54,6 @@ pub fn recipe() -> Recipe {
                 &bin_b,
                 "-Clink-arg=-L{root}/eh",
                 "-Clink-arg=-static-libgcc",
-                "--remap-path-prefix",
-                "{src}=/td-build",
                 "-o",
                 "{out}/bin/td-seatd",
                 "{src}/main.rs",
@@ -68,6 +65,7 @@ pub fn recipe() -> Recipe {
             paths: vec!["{out}/bin/td-seatd".into()],
             exec: true,
         },
+        split_target_debug("{out}"),
         Step::assert_static(&["{out}/bin/td-seatd"]),
     ];
 

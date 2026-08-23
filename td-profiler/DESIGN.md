@@ -42,21 +42,24 @@ panic strategy remain independent choices. Bootstrap seeds, build-only
 intermediates which cannot execute in the shipped system, the kernel and
 firmware are separate contracts. Marked foreign application payloads cannot
 acquire frame pointers after the fact; §7 defines their explicit fallback.
-The first implementation increment in §8 changes this policy from a target
-into a checked current claim.
+Implementation increment 1 makes this a checked current claim.
 
 The compiler policy applies to compiler-generated code. Hand-written assembly
 which changes the frame chain must either preserve the architecture's frame
 pointer convention or appear in a reviewed exception roster. An exception is
 a named coverage boundary, not permission to certify the containing object as
-fully unwindable.
+fully unwindable. Every split output records the conservative transitive union
+of applicable roster entries at `lib/debug/.td-assembly-exception`; this
+includes glibc startup and libgcc in downstream static executables, plus the
+Rust runtime and package-specific assembly where applicable. Offline analysis
+therefore does not need the recipe checkout to discover a boundary.
 
 Rust compilation emits line-table debug information and ordinary symbols.
 Every varying build path is remapped before it reaches either artifact. The
-canonical roots are `/td-build` for package source and `/td-cargo` for Cargo's
-working state; vendor source is mapped below `/td-cargo/vendor`. Timestamps,
-archive ordering, and other build identity inputs remain pinned by the normal
-recipe reproducibility contract.
+canonical roots are `/td-build` for package source, `/td-build-root` for other
+build scratch, and `/td-cargo` for Cargo's working state; vendor source is
+mapped below `/td-cargo/vendor`. Timestamps, archive ordering, and other build
+identity inputs remain pinned by the normal recipe reproducibility contract.
 
 A recipe links each user-mode ELF with a deterministic GNU build ID, using the
 linker's SHA-1 build-id form. This is a pair check over linked bytes, not object
@@ -77,18 +80,41 @@ garbage collection, deployment selection, and rollback cannot separate code
 from its symbols. Debug files are not separate downloads and require no
 td-operated server.
 
+Stripping removes the full ordinary symbol table and non-allocated debug
+payload from the runtime after both have been copied to the companion. Dynamic
+symbols and allocated sections remain available to the loader. An allocated
+section is part of the runtime mapping even when its name begins `.debug_`;
+rustc's `.debug_gdb_scripts` registration section is the known example and
+remains in both files. Pair validation distinguishes it by `SHF_ALLOC` rather
+than by a name allowlist.
+
 Companions carry ordinary symbols plus line tables, not full variable and type
 debugging information. The image recipe records their total bytes and enforces
-a literal compiled ceiling kept outside the measuring code. Its initial value
-comes from a reviewed closure measurement with explicit headroom; changing it
-is reviewed with the image-size change. This keeps the always-available data
-useful for function and source-line attribution without turning every
-deployment into a full debugger SDK.
+a literal compiled ceiling kept outside the measuring code. The source-built
+toolchain and shipped deployment have independent ceilings: four GiB for the
+LLVM/rustc-dominated toolchain and one GiB for the image, which deliberately
+excludes that build-only toolchain. Changing either is reviewed with the
+corresponding size report. This keeps the always-available data useful for
+function and source-line attribution without turning every deployment into a
+full debugger SDK.
+
+The deployment bundle records `deployment/debug-size` beside `root.erofs`.
+It remains a derived build report rather than a boot payload: the exact
+three-payload `td-deployment-v1` manifest stays readable by selectors already
+installed before profiling, while the manifest's `root.erofs` digest binds the
+debug companions whose size the report measures. The source-built Rust
+toolchain records its separately dominated subtotal at `share/td/debug-size`
+in that output. Both reports are stable `key=value` files and enforce their
+scope's compiled ceiling before their containing outputs can be committed.
 
 Debug information is expected to change output hashes. Reproducibility means
 that the same declared inputs produce the same runtime and debug bytes; it
 does not mean that enabling observability preserves an older store path. The
-double-build check remains the oracle.
+double-build check remains the oracle. Increment 1 copies the same `td-boot`
+source below two different source and build roots, canonicalizes each with the
+shared direct-rustc policy, and performs two independent links and companion
+transforms. It compares both the installed runtime and companion byte for byte;
+the normal closure checks remain the wider reproducibility backstop.
 
 ## 3. Collection boundary
 
@@ -328,8 +354,9 @@ design:
    to every shipped source-built user-mode build path. Tests pin flags, path
    remaps, GNU build IDs, companion layout and pair verification, assembly
    exceptions, and double-build identity. A literal debug-size ceiling is
-   reviewed outside the measuring code; image checks report the toolchain share
-   separately because rustc, LLVM, and std dominate it.
+   reviewed outside the measuring code. The shipped image and the separately
+   retained source-built toolchain each report against their own ceiling, so
+   rustc and LLVM growth cannot silently relax the deployment budget.
 2. Add the dependency-free `td-profiler` collector and offline report command.
    Amend `UNSAFE.md`, confine the syscall roster, and register the standalone
    lock and affected checks. Unit tests cover CPU-set parsing, perf record

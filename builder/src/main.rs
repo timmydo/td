@@ -5601,6 +5601,7 @@ fn assemble_recipe_drv(
                     "recipe: buildSystem \"mesboot\" supports no configureFlags/phases — rungs declare typed `steps'".into(),
                 );
             }
+            push_drv_env(&mut spec, "TD_RECIPE_NAME", name)?;
             push_drv_env(&mut spec, "TD_STEPS", &steps.to_json_string())?;
             let map = input_map_json(&entries, &payloads)?;
             // The refusals in `payload_names` partition NAMES; the sandbox keys its
@@ -5641,6 +5642,7 @@ fn assemble_recipe_drv(
         // rust: the cargo phase runner installs the named binaries (TD_RUST_BINS) and,
         // if any vendored deps were locked, resolves them offline (TD_VENDOR_CRATES).
         "rust" => {
+            push_drv_env(&mut spec, "TD_RECIPE_NAME", name)?;
             let bins: Vec<&str> = alist
                 .get("bins")
                 .and_then(json::Json::as_arr)
@@ -5650,6 +5652,20 @@ fn assemble_recipe_drv(
                 return Err("recipe: buildSystem \"rust\" requires a non-empty `bins'".into());
             }
             push_drv_env(&mut spec, "TD_RUST_BINS", &bins.join(" "))?;
+            let objcopy_root = entries
+                .iter()
+                .find(|entry| entry.name == "binutils-x86-64-self")
+                .map(|entry| entry.path.as_str())
+                .ok_or_else(|| {
+                    format!(
+                        "recipe: rust target `{name}' must declare binutils-x86-64-self for debug splitting"
+                    )
+                })?;
+            push_drv_env(
+                &mut spec,
+                "TD_RUST_OBJCOPY",
+                &format!("{objcopy_root}/bin/objcopy"),
+            )?;
             if !vendor.is_empty() {
                 push_drv_env(&mut spec, "TD_VENDOR_CRATES", &vendor.join(":"))?;
             }
@@ -14951,6 +14967,7 @@ daemon build START (2/2 active)
             &lock,
             "ripgrep-source /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ripgrep-14.1.1.tar.gz source\n\
              /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-gcc-14.3.0-x86_64-native /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-gcc-14.3.0-x86_64-native\n\
+             binutils-x86-64-self /td/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-binutils-x86-64-self td-recipe-output\n\
              /td/store/cccccccccccccccccccccccccccccccc-rust-1.96.0-x86_64-store-native /td/store/cccccccccccccccccccccccccccccccc-rust-1.96.0-x86_64-store-native\n",
         )
         .unwrap();
@@ -14986,6 +15003,12 @@ daemon build START (2/2 active)
         assert_eq!(env_of(&drv, "TD_RUST_STORE_CC").as_deref(), Some(cc), "cc forwarded");
         assert_eq!(env_of(&drv, "TD_RUST_STORE_CXX").as_deref(), Some(cxx), "cxx forwarded");
         assert_eq!(env_of(&drv, "TD_RUST_STORE_INCLUDE").as_deref(), Some(include), "include forwarded");
+        assert_eq!(
+            env_of(&drv, "TD_RUST_OBJCOPY").as_deref(),
+            Some("/td/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-binutils-x86-64-self/bin/objcopy"),
+            "debug splitting binds the exact named tool input"
+        );
+        assert_eq!(env_of(&drv, "TD_RECIPE_NAME").as_deref(), Some("ripgrep"));
 
         // WITHOUT the vars (default): none are emitted.
         let (_p, _f, drv0, _s) = assemble_recipe_drv(recipe, lockp, &dir, None).unwrap();

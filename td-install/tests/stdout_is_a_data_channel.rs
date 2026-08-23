@@ -17,9 +17,9 @@ use std::process::Command;
 type Res<T> = Result<T, Box<dyn Error>>;
 
 const BIN: &str = env!("CARGO_BIN_EXE_td-install");
-/// The ESP plus the smallest volume `plan` accepts, and no bigger: this is a
-/// sparse file, but the copy reads every byte of the volume.
-const DISK: u64 = 4 * 1024 * 1024 * 1024;
+/// The ESP plus the smallest volume `plan` accepts, with bounded alignment
+/// headroom. This is sparse, but the copy reads every byte of the volume.
+const DISK: u64 = 6 * 1024 * 1024 * 1024;
 
 fn scratch_dir(tag: &str) -> Res<PathBuf> {
     let dir = std::env::temp_dir().join(format!("td-install-it-{tag}-{}", std::process::id()));

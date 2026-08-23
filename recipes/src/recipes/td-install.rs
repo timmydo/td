@@ -1,3 +1,4 @@
+use crate::ladder::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 
 // Target-built static disk installer. The shipped source reuses the engine's
@@ -84,10 +85,10 @@ pub fn recipe() -> Recipe {
     );
     steps.push(Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
     steps.push(
-        Step::run(
+        target_rustc(
             "{src}/td-install/src",
+            rustc,
             &[
-                rustc,
                 "--edition",
                 "2021",
                 "-C",
@@ -100,8 +101,6 @@ pub fn recipe() -> Recipe {
                 "relocation-model=static",
                 "-C",
                 "panic=abort",
-                "-C",
-                "strip=symbols",
                 &linker,
                 "-L",
                 glib,
@@ -109,8 +108,6 @@ pub fn recipe() -> Recipe {
                 &bin_b,
                 "-Clink-arg=-L{root}/eh",
                 "-Clink-arg=-static-libgcc",
-                "--remap-path-prefix",
-                "{src}=/td-build",
                 "-o",
                 "{out}/bin/td-install",
                 "{src}/td-install/src/main.rs",
@@ -123,6 +120,7 @@ pub fn recipe() -> Recipe {
         paths: vec!["{out}/bin/td-install".into()],
         exec: true,
     });
+    steps.push(split_target_debug("{out}"));
     steps.push(Step::assert_static(&["{out}/bin/td-install"]));
 
     Recipe::mesboot("td-install", "0.1")

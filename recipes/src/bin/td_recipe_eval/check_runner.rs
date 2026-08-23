@@ -3114,6 +3114,23 @@ fn visit_step_templates(
             visit("copyTree.from", from, true)?;
             visit("copyTree.dest", dest, false)?;
         }
+        Step::SplitDebugTree { root, objcopy } => {
+            visit("splitDebugTree.root", root, false)?;
+            visit("splitDebugTree.objcopy", objcopy, false)?;
+        }
+        Step::AssertDebugSize {
+            root,
+            report,
+            scope: _,
+            ceiling: _,
+        } => {
+            visit("assertDebugSize.root", root, false)?;
+            visit("assertDebugSize.report", report, false)?;
+        }
+        Step::CompareFiles { left, right } => {
+            visit("compareFiles.left", left, false)?;
+            visit("compareFiles.right", right, false)?;
+        }
         Step::StageRuntimeClosure { roots, dest } => {
             for root in roots {
                 visit("stageRuntimeClosure.roots", root, true)?;
@@ -4536,6 +4553,12 @@ mod tests {
             ("copyFiles.files", Step::CopyFiles { files: vec![bad(BAD)], dest: "{root}".into() }),
             ("copyFiles.dest", Step::CopyFiles { files: vec!["{src}/x".into()], dest: bad(BAD) }),
             ("copyTree.dest", Step::CopyTree { from: "{src}".into(), dest: bad(BAD) }),
+            ("splitDebugTree.root", Step::SplitDebugTree { root: bad(BAD), objcopy: "{in:binutils}/bin/objcopy".into() }),
+            ("splitDebugTree.objcopy", Step::SplitDebugTree { root: "{out}".into(), objcopy: bad(BAD) }),
+            ("assertDebugSize.root", Step::AssertDebugSize { root: bad(BAD), report: "{out}/debug-size".into(), scope: "fixture".into(), ceiling: 1 }),
+            ("assertDebugSize.report", Step::AssertDebugSize { root: "{out}".into(), report: bad(BAD), scope: "fixture".into(), ceiling: 1 }),
+            ("compareFiles.left", Step::CompareFiles { left: bad(BAD), right: "{out}/two".into() }),
+            ("compareFiles.right", Step::CompareFiles { left: "{out}/one".into(), right: bad(BAD) }),
             ("stageRuntimeClosure.dest", Step::StageRuntimeClosure { roots: vec!["{in:glibc}".into()], dest: bad(BAD) }),
             ("compileApplicationTables.registry", Step::CompileApplicationTables { names: vec!["firefox".into()], packages: vec!["{payload:firefox}".into()], runtimes: vec!["{payload:runtime}".into()], registry: bad(BAD), launcher: "{out}/launcher.tsv".into() }),
             ("compileApplicationTables.launcher", Step::CompileApplicationTables { names: vec!["firefox".into()], packages: vec!["{payload:firefox}".into()], runtimes: vec!["{payload:runtime}".into()], registry: "{out}/registry.tsv".into(), launcher: bad(BAD) }),
@@ -4555,7 +4578,7 @@ mod tests {
             ("substituteText.file", Step::SubstituteText { file: bad(BAD), edits: Vec::new() }),
             ("assertStatic.paths", Step::AssertStatic { paths: vec![bad(BAD)] }),
         ];
-        assert_eq!(cases.len(), 31, "every expanded, non-data field is listed");
+        assert_eq!(cases.len(), 37, "every expanded, non-data field is listed");
         let mut expected: HashSet<(&'static str, bool)> =
             cases.iter().map(|(field, _)| (*field, false)).collect();
         assert_eq!(expected.len(), cases.len(), "field labels must be distinct");

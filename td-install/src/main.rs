@@ -302,7 +302,8 @@ fn plan(sector_size: u64, disk_bytes: u64) -> Result<Plan, String> {
     if volume_bytes < protocol::MIN_VOLUME_BYTES {
         return Err(format!(
             "the td volume would be {volume_bytes} bytes and needs at \
-             least {} — a disk this size cannot hold two deployments",
+             least {} — a disk this size cannot retain two deployments while \
+             publishing an update",
             protocol::MIN_VOLUME_BYTES
         ));
     }
@@ -1401,9 +1402,9 @@ mod tests {
 
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * MIB;
-    /// Big enough for the ESP plus the smallest volume td-install accepts, and
-    /// no bigger: these are sparse files, but every byte a test READS is real.
-    const DISK: u64 = 4 * GIB;
+    /// Big enough for the ESP plus the smallest volume td-install accepts.
+    /// These are sparse files, but every byte a test READS is real.
+    const DISK: u64 = 6 * GIB;
 
     struct Scratch {
         path: PathBuf,
@@ -4268,7 +4269,7 @@ mod tests {
     }
 
     #[test]
-    fn a_disk_too_small_for_two_deployments_is_refused_by_name() {
+    fn a_disk_too_small_for_retention_and_an_update_is_refused_by_name() {
         let error = plan(512, protocol::ESP_BYTES + 64 * MIB).unwrap_err();
         assert!(error.contains("td volume"), "{error}");
         // Smaller than the ESP itself: the volume never starts.

@@ -21,8 +21,14 @@ pub fn recipe() -> Recipe {
         path: "{root}/wb/cc".into(),
         content: format!(
             "#!{SH}\n\
-             for a in \"$@\"; do case \"$a\" in -shared) exec \"{ngcc}\" -B{xglibc}/lib \"$@\";; esac; done\n\
-             exec \"{ngcc}\" -static -B{xglibc}/lib \"$@\"\n"
+             for a in \"$@\"; do case \"$a\" in -shared) exec \"{ngcc}\" \
+             -B{xglibc}/lib \"$@\" -fno-omit-frame-pointer -g1 \
+             -ffile-prefix-map={{root}}=/td-build-root \
+             -ffile-prefix-map={{src}}=/td-build \
+             -Wl,--build-id=sha1;; esac; done\n\
+             exec \"{ngcc}\" -static -B{xglibc}/lib \"$@\" -fno-omit-frame-pointer -g1 \
+             -ffile-prefix-map={{root}}=/td-build-root \
+             -ffile-prefix-map={{src}}=/td-build -Wl,--build-id=sha1\n"
         ),
         exec: true,
     });
@@ -100,6 +106,18 @@ pub fn recipe() -> Recipe {
         ],
         exec: true,
     });
+    // An objcopy process cannot atomically rewrite the executable backing its
+    // own current mapping (ETXTBSY). Stage the just-built target tool outside
+    // the output before walking it; this is still the same declared recipe
+    // artifact, not a host or earlier-toolchain substitute.
+    steps.push(Step::CopyFiles {
+        files: vec!["{out}/bin/objcopy".into()],
+        dest: "{root}/profile-tools".into(),
+    });
+    steps.push(Step::split_debug_tree(
+        "{out}",
+        "{root}/profile-tools/objcopy",
+    ));
 
     Recipe::mesboot("binutils-x86-64-self", "2.44")
         .source_input("binutils-244-source")
@@ -153,5 +171,23 @@ mod tests {
                  install-time ldemul.c recompile can find stdio.h"
             );
         }
+    }
+
+    #[test]
+    fn static_mode_precedes_package_arguments_but_profile_policy_overrides_them() {
+        let steps = recipe().steps.expect("binutils-x86-64-self steps");
+        let wrapper = steps
+            .iter()
+            .find_map(|step| match step {
+                Step::WriteFile { path, content, .. } if path == "{root}/wb/cc" => Some(content),
+                _ => None,
+            })
+            .expect("compiler wrapper");
+        let static_mode = wrapper.find("-static").expect("static mode");
+        let package_args = wrapper.rfind("\"$@\"").expect("package argv");
+        let profile_policy = wrapper
+            .rfind("-fno-omit-frame-pointer")
+            .expect("profile policy");
+        assert!(static_mode < package_args && package_args < profile_policy);
     }
 }
