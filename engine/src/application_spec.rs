@@ -16,6 +16,32 @@ const MAX_RUNTIME_PATH_BYTES: usize = 4096;
 pub const MAX_SPEC_ENVIRONMENT_ENTRIES: usize = 256;
 pub const APPLICATION_UID: u32 = 1000;
 
+/// Variables `td-jail` holds a spec to EXACTLY, and which a manifest may
+/// therefore not set.
+///
+/// Without this the loop below would let a manifest overwrite one after the
+/// compiler had inserted it, producing a spec that compiles here and is refused
+/// at launch — a package that builds and cannot start, diagnosed at the far end
+/// from the thing that caused it. Refusing at compile time puts the diagnostic
+/// where the packager can act on it, and is what lets the two sides be
+/// described as agreeing by construction rather than by coincidence.
+///
+/// This is the same rule as the `LD_*` refusal below for a different reason,
+/// and `TD_*` is refused a layer down by the name grammar.
+///
+/// "Pins" is not all one thing: `authority.rs` holds four of these to an exact
+/// VALUE and requires `FLATPAK_ID` to be present and non-empty, its value being
+/// per-application. Both are refusals a manifest cannot talk its way past, which
+/// is what puts them on one list; adding a name to either check there means
+/// adding it here.
+const PINNED_ENVIRONMENT: &[&str] = &[
+    "DBUS_SESSION_BUS_ADDRESS",
+    "FLATPAK_ID",
+    "HOME",
+    "WAYLAND_DISPLAY",
+    "XDG_RUNTIME_DIR",
+];
+
 const BASE_ENVIRONMENT: &[(&str, &str)] = &[
     ("GDK_BACKEND", "wayland"),
     ("GTK_A11Y", "none"),
@@ -74,6 +100,11 @@ impl ApplicationSpec {
             if name.starts_with("LD_") {
                 return Err(format!(
                     "application environment {name:?} controls the dynamic loader and is not allowed in a jail spec"
+                ));
+            }
+            if PINNED_ENVIRONMENT.contains(&name) {
+                return Err(format!(
+                    "application environment {name:?} is fixed by the jail contract and cannot be set by a manifest"
                 ));
             }
             environment.insert(name.to_string(), value.to_string());
@@ -438,6 +469,38 @@ mod tests {
             )
             .unwrap_err();
             assert!(error.contains("dynamic loader"), "{name}: {error}");
+        }
+    }
+
+    /// A manifest may not set what the jail pins.
+    ///
+    /// The failure this prevents is not a security one — td-jail refuses the
+    /// spec either way — it is a package that compiles and then cannot start,
+    /// reported by the sandbox at launch rather than by the compiler that had
+    /// the manifest in its hands.
+    #[test]
+    fn package_overrides_of_jail_pinned_variables_are_refused_at_compilation() {
+        for name in [
+            "DBUS_SESSION_BUS_ADDRESS",
+            "FLATPAK_ID",
+            "HOME",
+            "WAYLAND_DISPLAY",
+            "XDG_RUNTIME_DIR",
+        ] {
+            let declaration = ApplicationDeclaration::new("empty-runtime", "/app/bin/rg")
+                .unwrap()
+                .with_environment(name, "/app/value")
+                .unwrap();
+            let manifest = declaration
+                .manifest("ripgrep-seed", "15.2.0", ApplicationProvenance::Foreign)
+                .unwrap();
+            let error = ApplicationSpec::compile(
+                &manifest,
+                "/td/store/0123456789abcdfghijklmnpqrsvwxyz-empty-runtime-1",
+                PermissionPolicy::new(),
+            )
+            .unwrap_err();
+            assert!(error.contains("fixed by the jail contract"), "{name}: {error}");
         }
     }
 

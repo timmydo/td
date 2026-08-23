@@ -18,6 +18,24 @@ use crate::types::{Recipe, Step};
 use crate::td_boot_protocol;
 
 const BOOT_SUCCESS_RETRY_SECS: u8 = 3;
+/// How many /etc/bootsuccess sweeps the bus marker may be missing for before
+/// the script stops waiting for it.
+///
+/// The bus leg does not set `healthy=0` — see APPLICATIONS.md §D on why an
+/// application must not be able to reach the rollback decision — and that
+/// removed something nobody was thinking about: `healthy=0` was also what kept
+/// the loop ITERATING. Every other leg still votes, so a sweep in which only
+/// the bus failed now runs straight to `td-boot success` and `exit 0`, the
+/// marker never prints, and the image oracle reds on a transient — a broker
+/// that `restart=always` happened to be restarting during the first sweep.
+///
+/// So the marker gets a bounded grace of its own, on the SUCCESS gate rather
+/// than on `healthy`: while the bus leg has failed fewer than this many times
+/// the script keeps sweeping, and after that it proceeds regardless. It is a
+/// retry, not a veto — the distinction is the whole point, and it is why the
+/// counter can only delay `td-boot success` by a fixed number of seconds
+/// instead of withholding it.
+const BUS_MARKER_GRACE_SWEEPS: u8 = 2;
 const BOOT_SUCCESS_RETRY_MAX_SECS: u8 = 10;
 /// What ONE iteration of the boot-success loop may cost on a slow TCG guest: eight
 /// `su` probe blocks, four `td-boot update` passes and a `rollback`. Exactly ONE of
@@ -1026,7 +1044,7 @@ fn build_td_svc_conf() -> String {
          [jail-fixture]\n\
          type=daemon\n\
          exec=/bin/td-login exec-as {ui_user} -- /bin/{fixture_name} run --socket /run/user/{ui_uid}/wayland-0 --ready-socket /run/user/{ui_uid}/{application_runtime_root}/ready\n\
-         after=wayland\n\
+         after=busd,wayland\n\
          requires=wayland\n\
          ready=/bin/td-login exec-as {ui_user} -- /bin/td-ui-demo probe /run/user/{ui_uid}/{application_runtime_root}/{fixture_name}/ready\n\
          ready-timeout={fixture_ready_timeout}\n\
@@ -1883,7 +1901,9 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          case \"$wait\" in ''|*[!0-9]*|0) wait={BOOT_SUCCESS_RETRY_SECS};; esac\n\
          [ \"$wait\" -gt {BOOT_SUCCESS_RETRY_MAX_SECS} ] && wait={BOOT_SUCCESS_RETRY_MAX_SECS}\n\
          n=0\n\
-         mu=0; mrf=0; ms=0; mtu=0; mti=0; mtl=0; mtt=0; mtb=0\n\
+         bg={BUS_MARKER_GRACE_SWEEPS}\n\
+         [ \"$bg\" -ge \"$wait\" ] && bg=$((wait-1))\n\
+         mu=0; mrf=0; ms=0; mtu=0; mti=0; mtl=0; mtt=0; mtb=0; btb=0\n\
          msk=0; mtj=0; mts=1\n\
          if /bin/su -s /bin/sh {} -c \
          '{sandbox_kernel_probes}[ \"$k\" = 1 ]'; then \
@@ -1967,11 +1987,13 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          {{ echo \"td-busd: the session bus did not answer on /run/user/{UI_UID}/bus: \
          $b\"; \
          exit 1; }}'; then \
-         [ \"$mtb\" = 1 ] || {{ echo {TD_BUSD_RUNTIME_MARKER}; mtb=1; }}; else healthy=0; fi; \
+         [ \"$mtb\" = 1 ] || {{ echo {TD_BUSD_RUNTIME_MARKER}; mtb=1; }}; \
+         else btb=$((btb+1)); fi; \
          [ \"$msk\" = 1 ] || healthy=0; \
          [ \"$mtj\" = 1 ] || healthy=0; \
          [ \"$mts\" = 1 ] || healthy=0; \
          if [ \"$healthy\" = 1 ] \
+         && {{ [ \"$mtb\" = 1 ] || [ \"$btb\" -ge \"$bg\" ]; }} \
          && /bin/td-boot success /dev/vda /run/td-update \"$deployment\" >/run/td-success-id; then \
          if /bin/grep -q -F '{DEPLOY_INSTALL_CMDLINE_TOKEN}' /proc/cmdline; then \
          if /bin/td-boot {update} /dev/vda /run/td-update /run/td-volume \
@@ -3542,7 +3564,12 @@ mod tests {
         assert!(ready.contains("/bin/td-term probe "), "{ready}");
         // The SAME socket in both, which containing the right program does not
         // give: a probe dialling a path the client never publishes burns the
-        // 30s ready-timeout, restarts forever, and never reaches bootsuccess.
+        // 30s ready-timeout and then settles as FAILED with td-term still
+        // running — `restart=` is evaluated on EXIT, so `restart=always` does
+        // not retry a unit that failed its probe — and `bootsuccess` requires
+        // this unit, so the boot never reaches its success gate. An earlier
+        // version of this comment said "restarts forever", which is what a
+        // daemon that DIES does.
         let published = exec.split("--ready-socket ").nth(1).unwrap_or_default();
         let published = published.split(['\'', ' ']).next().unwrap_or_default();
         let dialled = ready.split("probe ").nth(1).unwrap_or_default();
@@ -3995,7 +4022,7 @@ mod tests {
             ("busd", vec!["seat"]),
             ("wayland", vec!["seat"]),
             ("terminal", vec!["wayland"]),
-            ("jail-fixture", vec!["wayland"]),
+            ("jail-fixture", vec!["busd", "wayland"]),
             ("jail-fixture-evidence", vec!["jail-fixture"]),
             (
                 "bootsuccess",
@@ -4018,6 +4045,42 @@ mod tests {
         }
     }
 
+    /// The image ships exactly ONE application, and that is a precondition of
+    /// the bus mount rather than a fact about the roadmap.
+    ///
+    /// td-jail binds `/run/user/1000/bus` into every jail unconditionally,
+    /// because APPLICATIONS.md §C's mount plan, step 12, says the broker is the
+    /// policy. The broker is not that yet: no well-known names, no match rules,
+    /// no per-caller filter, and an admission quota keyed on `SO_PEERCRED.pid`
+    /// that a PID namespace with no pids cap lets one application fork past.
+    /// Every consequence of that is a problem between PEERS.
+    ///
+    /// Which is NOT what this counts, and the gap is stated here rather than
+    /// left for a reader to assume away. A package count does not bound peers:
+    /// `td-portal` will speak D-Bus and is not a `ShippedApplication`, and this
+    /// one package already has two launch routes — its unit and the
+    /// compositor's launcher menu — with no single-instance lock between them.
+    /// What actually makes the exposures unreachable today is that nothing
+    /// inside a jail opens the bus at all, and that is not assertable here.
+    ///
+    /// So this is a tripwire on the likeliest next step, put where adding the
+    /// entry breaks the build rather than promised in prose a future change
+    /// would not have to read. APPLICATIONS.md §D carries the rest of the
+    /// sentence, including what the tripwire does not cover.
+    #[test]
+    fn the_image_ships_one_application_until_the_broker_is_a_boundary() {
+        assert_eq!(
+            SHIPPED_APPLICATIONS.len(),
+            1,
+            "a second application would share a session bus that cannot yet \
+             tell its callers apart: td-jail binds the bus into every jail \
+             unconditionally on the grounds that the broker is the policy, and \
+             td-busd has no per-caller filter and no per-instance admission \
+             key. See APPLICATIONS.md §D, 'the broker is not that component \
+             yet', for what must land with the second entry"
+        );
+    }
+
     /// The session bus is a unit, runs as the UI user, and binds where the seat
     /// assignment put the runtime directory.
     ///
@@ -4026,8 +4089,17 @@ mod tests {
     /// whatever the boot path happened to export. The `ready=` line is `td-busd
     /// probe`, which completes the `EXTERNAL` handshake under the uid the kernel
     /// reports for it — so a broker that bound the path and cannot serve it never
-    /// reaches ready, and td-svc restarts it rather than leaving /etc/bootsuccess
-    /// probing a socket with nothing behind it.
+    /// reaches ready, and td-svc marks the unit FAILED and says so on the console
+    /// rather than leaving /etc/bootsuccess to probe a socket with nothing behind
+    /// it.
+    ///
+    /// It does not RESTART it, and an earlier version of this comment said it
+    /// did. A readiness probe that never succeeds changes the unit's phase and
+    /// leaves the process running, while `restart=` is evaluated when a process
+    /// EXITS. So `restart=always` below covers a broker that dies, which is the
+    /// common case, and not one that is up and not serving; nothing re-probes a
+    /// unit once it has failed that way. APPLICATIONS.md §D says the same thing,
+    /// and this comment contradicting it is what made the error findable.
     #[test]
     fn the_session_bus_runs_unprivileged_where_the_seat_put_its_runtime_dir() {
         assert_eq!(
@@ -4159,10 +4231,39 @@ mod tests {
             Some("always"),
             "the graphical client is supervised and restartable"
         );
+        // ORDERED after the bus, and STRICT only on the compositor, and the
+        // asymmetry is the point. td-jail RESOLVES /run/user/1000/bus before
+        // it unshares and fails the launch if it is not a socket owned by the
+        // login user, so the fixture needs that socket to EXIST — `busd` and
+        // `wayland` are siblings, each requiring only `seat`, so without an
+        // ordering edge td-svc may release the fixture the moment the
+        // compositor is ready, onto a bus that has not bound.
+        //
+        // What the fixture does NOT need is a working broker: it opens no
+        // D-Bus connection. A draft made the edge `requires=busd` anyway, on
+        // the grounds that a FAILED broker settles for ordering too. The
+        // grounds are right and the remedy was wrong. td-svc sets
+        // `phase = Failed` with `retry_at` on a `restart=always` daemon that
+        // is merely in its restart BACKOFF, `requires_failed` reads that phase
+        // and cannot tell it from a permanent failure, and the dependent is
+        // then set `Failed` with `retry_at = None`. So one busd crash inside
+        // the boot window would permanently kill the application tier of a
+        // machine whose broker recovers a second later.
+        //
+        // Ordering alone recovers instead. A socket file outlives the process
+        // that bound it, so the settled-but-crashed case still leaves the path
+        // there; and in the case where the broker never bound at all, the
+        // fixture's own `restart=always` retries it until the broker's does,
+        // which is self-healing where the strict edge was terminal. The
+        // diagnostic that made the strict edge tempting is no longer the
+        // argument for it either: `session_socket` labels its errors, so a
+        // fixture dying on an absent bus now says "session bus
+        // /run/user/1000/bus" rather than a bare ENOENT.
         assert_eq!(
             unit_key("jail-fixture", "requires").as_deref(),
             Some("wayland"),
-            "the packaged fixture must not start without its compositor"
+            "the packaged fixture must not start without its compositor — and \
+             must not be made strictly dependent on a broker it never opens"
         );
         assert_eq!(
             unit_key("jail-fixture", "restart").as_deref(),
@@ -6364,18 +6465,42 @@ mod tests {
                     "/bin/td-busd probe /run/user/{UI_UID}/bus"
                 ))
                 && bootsuccess.contains(TD_BUSD_RUNTIME_MARKER)
-                // The GATE, and the whole leg, not merely that the command and
-                // the marker both appear somewhere in the script. Moving the
-                // `echo` out of the `then` branch, or dropping `healthy=0`
-                // from the `else`, leaves both `contains` above matching while
-                // the oracle greens a boot with a dead bus — which is the one
-                // thing this leg exists to prevent. Every farm beside it is
-                // pinned leg-whole for the same reason; see the td-login
-                // assertion and its comment further down.
+                // The GATE, and the whole leg, not merely that the command
+                // and the marker both appear somewhere in the script. Moving
+                // the `echo` out of the `then` branch leaves both `contains`
+                // above matching while the marker prints for a bus that never
+                // answered. Every farm beside it is pinned leg-whole for the
+                // same reason; see the td-login assertion further down.
+                //
+                // What this leg's `else` holds is NOT `healthy=0`, and an
+                // earlier version of this comment named dropping that as the
+                // mutation to catch — while the commit it was written for
+                // dropped it deliberately. It counts instead: `btb` is what
+                // gives the marker its bounded grace on the success gate, and
+                // a leg whose `else` disappeared would take the retry with it
+                // and turn a restarting broker into a red image.
                 && bootsuccess.contains(&format!(
                     "[ \"$mtb\" = 1 ] || {{ echo {TD_BUSD_RUNTIME_MARKER}; mtb=1; }}; \
-                     else healthy=0; fi"
+                     else btb=$((btb+1)); fi"
                 ))
+                && bootsuccess.contains(
+                    "&& { [ \"$mtb\" = 1 ] || [ \"$btb\" -ge \"$bg\" ]; } \
+                     && /bin/td-boot success"
+                )
+                // And the two lines that make that gate a RETRY. The
+                // initialiser, because an unset `bg` makes the comparison
+                // `[ 1 -ge "" ]` and the gate an error rather than a wait; and
+                // the CLAMP, which is the whole safety argument. `wait` comes
+                // off the kernel command line and may legitimately be 1, and
+                // with an unclamped grace of 2 a single failed probe could
+                // never reach the threshold — `td-boot success` would never be
+                // called, the loop would end in `fail`, and the rollback lever
+                // this landing removed would be back by another route. Neither
+                // line has a test of its own anywhere else, and both were
+                // silently removable before this assertion.
+                && bootsuccess.contains(&format!("bg={BUS_MARKER_GRACE_SWEEPS}"))
+                && bootsuccess
+                    .contains("[ \"$bg\" -ge \"$wait\" ] && bg=$((wait-1))")
                 // And the probe's own words reach the console. The oracle's
                 // failure text asks the reader to tell a refused bind from a
                 // refused uid from a bus that accepted and said nothing, and

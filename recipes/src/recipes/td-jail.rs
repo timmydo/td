@@ -381,6 +381,41 @@ mod tests {
         .to_keyfile();
         target_authority::test_parse_spec(&spec)
             .expect("td-jail must consume the exact spec emitted by the compiler");
+        // The two halves of the session bus are held to ONE value, by running
+        // the jail's own contract over the spec the engine compiled. A draft
+        // searched the emitted text for a literal built from an ENGINE constant
+        // — which pins the engine against itself and notices nothing if td-jail
+        // starts expecting a different path. `test_parse_spec` cannot do it
+        // either: it is the grammar, and never consults the required-value
+        // table. `validate_environment_list` is what a launch runs, so it is
+        // what this runs.
+        target_authority::test_validate_spec_environment(
+            &spec,
+            td_engine::application_spec::APPLICATION_UID,
+        )
+        .expect("td-jail's environment contract must accept the spec the engine compiles");
+        // And it has teeth: the same spec with the bus somewhere else is
+        // refused. Without this, a contract that had stopped checking the value
+        // would pass the assertion above just as happily.
+        let elsewhere = spec.replace(
+            &format!(
+                "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{}/bus",
+                td_engine::application_spec::APPLICATION_UID
+            ),
+            &format!(
+                "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{}/elsewhere",
+                td_engine::application_spec::APPLICATION_UID
+            ),
+        );
+        assert_ne!(elsewhere, spec, "the compiled spec must name the bus at all");
+        assert!(
+            target_authority::test_validate_spec_environment(
+                &elsewhere,
+                td_engine::application_spec::APPLICATION_UID,
+            )
+            .is_err(),
+            "td-jail accepted a spec naming a bus it does not bind"
+        );
         let package = "/td/store/0123456789abcdefghijklmnopqrstuv-td-jail-fixture-0.1";
         let registry = ApplicationRegistry::new(vec![(
             crate::ladder::TD_JAIL_FIXTURE_NAME.to_string(),

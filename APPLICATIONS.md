@@ -1859,14 +1859,26 @@ namespace while the old procfs is still visible, pivots into the prepared
 root, then drops every remaining capability before policy finalization.
 The landed rung-12 application path is the closed static/empty-runtime
 subset of this target table. It implements `/app`, `/usr`, fresh `/proc`,
-the minimal `/dev`, tmpfs `/run`, the exact Wayland socket and the five
-persistent state directories, and a read-back-up loopback interface in the
-otherwise-empty network namespace. It deliberately leaves `/etc`, `/sys`, the
-bus, `/var/lib`, `/var/cache`, `.flatpak-info`, extension mounts, network
-sharing and authored filesystem/resource grants absent; a spec requesting
-any policy beyond
+the minimal `/dev`, tmpfs `/run`, the exact Wayland socket, the session
+bus socket of step 12 and the five persistent state directories, and a
+read-back-up loopback interface in the otherwise-empty network namespace.
+It deliberately leaves `/etc`, `/sys`, `/var/lib`, `/var/cache`,
+`.flatpak-info`, extension mounts, network sharing and authored
+filesystem/resource grants absent; a spec requesting any policy beyond
 exactly `sockets=wayland` is refused. Later rungs fill those named rows
-without making their absence a degraded launch mode. The compiled application
+without making their absence a degraded launch mode.
+
+The bus is bound unconditionally and is deliberately not a `sockets=`
+permission, which is what step 12 has said since it was written. It is
+also the one landed row whose enclosing claim — that the broker is the
+policy — is a target rather than a description of what runs: today's
+td-busd routes directed calls and enforces admission quotas, and has no
+per-caller policy at all. Its PRESENCE is a launch precondition as well:
+`plan_launch` resolves the socket before the jail unshares, so a missing
+or non-socket `/run/user/1000/bus` fails the launch of every application,
+including one that never opens D-Bus. §D records what all of that costs.
+
+The compiled application
 environment crosses the internal exec only as bounded, canonical argv data:
 stage 2 starts empty and applies those entries only to the final child after
 its capability and seccomp readbacks. The internal argv also carries the
@@ -3307,20 +3319,70 @@ the boot GREEN, and a deployment marked successful is the thing that is
 hard to walk back.
 
 So the bus now stands beside uutils, ripgrep+fd, sshd, td-util, td-txt,
-td-init and td-login: a deployment is not healthy without it. That is a
-real decision and not a formality, because `healthy` gates
-`td-boot success`, which is what clears the attempt budget — so a broker
-that cannot come up will, after the attempt budget is spent, roll the
-machine back to `previous`. Rolling back for a bus that nothing on the
-image talks to yet looks disproportionate, and the argument for it is
-`sshd`, which is in the same farm on the same terms and which nothing on
-the image talks to either: both are shipped system services whose
-absence means the deployment is not what it claims to be, and rolling
-back to a deployment that HAS them is the fail-safe direction. The
-precedent that points the other way — the jailed fixture, which prints
-its evidence from a separate unit precisely so it cannot block
-`bootsuccess` — is about MUTABLE USER STATE, which is a different thing
-from immutable shipped infrastructure.
+td-init and td-login in that farm — but its leg REPORTS and does not
+VOTE. It prints the marker when the probe answers and never sets
+`healthy=0` when it does not, and the difference is the whole argument of
+this paragraph.
+
+The first landing gave it the vote, on the `sshd` precedent: both are
+shipped system services whose absence means the deployment is not what it
+claims to be, and rolling back to a deployment that HAS them is the
+fail-safe direction. Landing the jail's side of the bus on top of that
+showed why this leg is not sshd's. `healthy` gates `td-boot success`,
+which is what clears the attempt budget, so a leg with a vote is a lever
+that rolls the machine back to `previous` — and unlike sshd's, an
+application can pull this one. The broker admits 64 connections and 16
+per peer PID, a jail is a PID namespace with no pids cap, and the farm's
+probe is one more client asking for a slot. Sixteen connections from each
+of four forks inside a single jailed application fill the table; the
+broker then accepts the probe's connection and closes it, the leg fails,
+and with a vote it would spend the attempt budget and roll the system
+back. An unprivileged confined process reaching the deployment's rollback
+decision is a worse outcome than a bus that is down.
+
+What is kept is the half with no such lever. The image oracle still
+REQUIRES `TD-BUSD-RUN-OK` on the console, so a build whose bus does not
+come up fails at the gate — where there is no attacker, and where the
+failure is a broken image rather than a running machine someone else can
+push over. What brings the vote back is a per-INSTANCE admission key, not
+the per-caller policy filter: filling the table is an admission problem,
+and a filter on what a peer may SEND does not stop one opening
+sixty-four sockets and saying nothing. Until then the marker is evidence
+and not a verdict.
+
+That the disclosure half of this landing is not live yet and the
+starvation half is, is not an inconsistency — it is the reason the two
+halves are treated differently. Filling the connection table takes
+`connect(2)` sixty-four times and nothing else: no D-Bus library, no
+message, not even a handshake, so any jailed process can do it the day
+this lands. Every disclosure above needs a second peer, which does not
+exist yet.
+
+The residual is named rather than left implied: a broker that passes in
+QEMU and fails only on a particular machine now leaves that deployment
+marked SUCCESSFUL. Nothing recovers it either, because the failure mode
+is a readiness probe that never succeeds, which sets the phase and leaves
+the process running where `restart=` cannot see it. Applications on such
+a machine do not start either, since `plan_launch` resolves the bus
+socket before it unshares — but they retry rather than being skipped, so
+a broker that comes back brings them with it. The console carries both
+td-svc's `readiness probe did not succeed in time` and the broker's own
+`cannot listen on …`. That is a diagnosable machine
+and not a self-healing one, which is the trade accepted here: nothing on
+the image needs the bus yet, and the alternative was leaving an
+application able to roll the system back. Two things would change it — a
+per-instance admission key restoring the vote safely, and a td-svc that
+treats a never-ready daemon as a restartable failure. The second is a
+td-svc change and belongs to `td-svc/DESIGN.md`, not here.
+
+The marker itself keeps a bounded retry that does not depend on the vote.
+`healthy=0` was what kept `/etc/bootsuccess`'s loop sweeping, so removing
+it from this leg would have left the marker one attempt and reddened the
+image on a broker `restart=always` happened to be restarting. The leg
+counts its failures instead, and the loop's success gate waits for the
+marker while that count is under `BUS_MARKER_GRACE_SWEEPS` — a delay of a
+fixed few seconds, never a withheld `td-boot success`, which is exactly
+the difference between a retry and a veto.
 
 The probe is also the eighth `su` block in that farm and the only one
 with a bounded wait of its own, which is why the guest's per-iteration
@@ -3348,6 +3410,118 @@ can exercise — which user the unit runs as, which directory exists at
 the moment it binds, and whether the socket the unit names is the socket
 a client finds — and landing those before the portal rests on them is
 cheaper than diagnosing them underneath it.
+
+### What is landed of the bus inside the jail
+
+**The socket is bound in, always.** §C's mount plan, step 12, has said
+`bus <- bind, ALWAYS (the broker is the policy, not the mount)` since it
+was written; the jail now does it. `/run/user/1000/bus` is bound
+read-only into the jail's own `/run/user/1000` exactly the way
+`wayland-0` is: a socket inode made by binding a listener and dropping
+it, a private bind over that inode, then a `require_bind_source` at
+preparation time and a `require_mount` the confined process checks
+against its own `/proc/self/mountinfo` after `pivot_root`. The runtime
+directory's name roster becomes exactly `td-app`, `bus` and `wayland-0`,
+so a fourth entry there is a refusal rather than a surprise.
+
+Read-only costs the app nothing, and it is worth writing down exactly
+what it buys, because a draft of this paragraph named the wrong thing.
+`connect(2)` is unaffected: read-only here is a vfsmount flag enforced by
+`mnt_want_write()` on the write paths, not by `inode_permission`, and
+`SCM_RIGHTS` is socket-layer and sees no mount flags at all. It does NOT
+stop the app replacing the socket — unlink is governed by the parent
+directory, which is the jail's own writable tmpfs; what refuses it is
+that the path is a mountpoint (`EBUSY`) and the app has no
+`CAP_SYS_ADMIN` to unmount it. What `MS_RDONLY` actually buys is `chmod`
+and `chown`, which do take a write reference. The app owns that inode —
+uid 1000, mode 0600, and the jail maps `1000 1000 1` — so without the
+flag it could `chmod 0000` the HOST's real bus socket through its own
+bind and deny `connect(2)` to the compositor, the portal and the
+`/etc/bootsuccess` probe.
+
+**`DBUS_SESSION_BUS_ADDRESS` was already compiled and never checked.**
+The engine has put `unix:path=/run/user/1000/bus` into every application
+spec since the tier existed, and td-jail's environment contract — which
+already held `HOME`, `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` to exact
+values — did not mention it. A spec could therefore name a bus the jail
+does not mount, and nothing would say so until an application failed to
+reach one. It is now the fourth entry in that contract and it is checked
+by VALUE, not by presence: an address that is well formed and points
+somewhere else is refused, because the address is not advice about where
+a bus might be. It is the name of the one socket this jail binds.
+
+Both halves are now held to one value by something that can notice them
+drifting apart. The engine REFUSES a manifest that sets any variable the
+jail pins, so a package cannot compile a spec whose only symptom is a
+launch failure reported by the sandbox at the far end from the manifest
+that caused it. And the td-jail recipe runs `validate_environment_list` —
+the contract a real launch runs — over the text the engine compiles, with
+a negative case that moves the bus one path over. A draft searched the
+emitted text for a literal built from an ENGINE constant, which pins the
+engine against itself and would say nothing if td-jail started expecting
+a different path.
+
+**There is no `sockets=` permission for the bus**, and step 12 gives the
+reason in five words: the broker is the policy. A per-app switch would be
+a second place to say no, in the component with no policy language, about
+a question belonging to the component that will have one. What an app may
+DO on the bus is the broker's business; that it HAS one is not a question
+the mount namespace should answer differently per app.
+
+**The broker is not that component yet, and this is the exposure.** A
+draft of this section wrote that a per-app switch would duplicate "a
+boundary td-busd already draws per connection". It draws no such
+boundary, as the rung-14 section above says plainly: no well-known names,
+no match rules, no per-caller filter. Any peer may list every unique name
+on the bus, read any peer's uid and pid out of `GetConnectionCredentials`
+and send a directed call to any of them. The broker also keeps no
+call/reply pairing, so a peer may aim a `METHOD_RETURN` at another peer
+carrying the serial that peer's pending call is waiting on, and libdbus
+and GDBus will both match it. And the admission quota is keyed on
+`SO_PEERCRED.pid` while a jail is a PID namespace with no pids cap, so
+one application can fork its way to the whole table.
+
+Two more belong on that list. Descriptors do not cross between peers
+yet — the broker refuses to route a descriptor-bearing message with
+`NotSupported` and drops what it claimed, which is rung 14's remaining
+work — but a peer can still ATTACH them, and they are charged against the
+BUS's queued-descriptor budget rather than the sender's. So a jailed peer
+can hold that whole allowance against everyone else: the same family as
+the connection table, through a different door, and the read-only bind
+does not reach it because `SCM_RIGHTS` is socket-layer. And
+`GetConnectionCredentials` reports the pid `SO_PEERCRED` gave the broker,
+which is a pid in the INIT namespace, so a jailed caller reads host
+pids — its own included — through a channel its PID namespace otherwise
+closes.
+
+Every one of those is a problem between PEERS. What makes them
+unreachable today is that nothing inside a jail opens the bus: the
+fixture does not, and there is no second application. Half of that can be
+machine-checked and is — the system recipe asserts
+`SHIPPED_APPLICATIONS.len() == 1`, and a second entry breaks the build
+with a diagnostic naming what has to land with it.
+
+Be exact about what that tripwire does NOT cover, because a gate believed
+to cover more than it does is worse than no gate. It counts
+APPLICATIONS; the exposures are about PEERS.
+
+- **`td-portal` will not trip it.** It is the next thing that will speak
+  D-Bus and it is not a `ShippedApplication`. On the day it lands a
+  jailed application can enumerate its unique name, read its uid and pid,
+  call it directly and aim a forged reply serial at a call it is waiting
+  on — with the count still one and the build still green.
+- **One application is already two peers.** Nothing takes a
+  single-instance lock, and the image has two launch routes for the
+  fixture: the `jail-fixture` unit and the compositor's launcher menu.
+
+So the honest statement is that the bus is bound into a jail whose
+occupant does not use it, ahead of the policy that will make using it
+safe, and the count is a tripwire on the likeliest next step rather than
+a proof. Before ANYTHING in a jail opens the bus — the portal
+included — the broker needs its per-caller filter and a per-INSTANCE
+admission key, since per-pid is the wrong key once a caller can fork.
+That is the sentence to check against, and this paragraph is amended in
+the landing that makes it false.
 
 ---
 

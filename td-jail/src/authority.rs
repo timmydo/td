@@ -39,6 +39,7 @@ pub(crate) struct LaunchPlan {
     pub(crate) runtime_files: PathBuf,
     pub(crate) state: StatePlan,
     pub(crate) wayland_socket: PathBuf,
+    pub(crate) bus_socket: PathBuf,
     pub(crate) entry: String,
     pub(crate) environment: Vec<(OsString, OsString)>,
     pub(crate) arguments: Vec<OsString>,
@@ -139,10 +140,20 @@ where
         .map(|(key, value)| (OsString::from(key), OsString::from(value)))
         .collect::<Vec<_>>();
     validate_environment_list(&environment, identity.0)?;
-    let wayland_socket = PathBuf::from(format!("/run/user/{}/wayland-0", identity.0));
-    require_wayland_socket(&wayland_socket, identity.0)?;
-    let wayland_socket = fs::canonicalize(&wayland_socket)?;
-    require_wayland_socket(&wayland_socket, identity.0)?;
+    let wayland_socket = session_socket("wayland-0", "Wayland authority", identity.0)?;
+    // Unconditional, like the mount it feeds: APPLICATIONS.md §C's mount plan,
+    // step 12, binds the bus ALWAYS, because the BROKER is the policy. A jail
+    // that omitted it when a manifest asked for no bus would put that decision
+    // in the component with no policy language and take it away from the one
+    // that will have it.
+    //
+    // Today's broker does NOT have it: no per-caller filter, no match rules, an
+    // admission quota keyed on a pid a jailed caller can fork past. So the
+    // isolation this mount declines to enforce is not being enforced anywhere,
+    // and what bounds that is the image shipping ONE application — asserted in
+    // the system recipe, not promised here. APPLICATIONS.md §D carries what has
+    // to land before a second one does.
+    let bus_socket = session_socket("bus", "session bus", identity.0)?;
     let state = prepare_state(name, identity)?;
 
     Ok(LaunchPlan {
@@ -150,6 +161,7 @@ where
         runtime_files,
         state,
         wayland_socket,
+        bus_socket,
         entry: spec.entry,
         environment,
         arguments,
@@ -222,6 +234,14 @@ pub(crate) fn validate_environment_list(
     }
 
     for (key, expected) in [
+        // The engine has compiled this into every spec since the application
+        // tier existed; nothing enforced it, so a spec could name a bus this
+        // jail does not mount, or mount one the app is told nothing about.
+        // Both halves are now the same fact checked in one place.
+        (
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path=/run/user/{uid}/bus"),
+        ),
         ("HOME", "/home/td".to_string()),
         ("WAYLAND_DISPLAY", "wayland-0".to_string()),
         ("XDG_RUNTIME_DIR", format!("/run/user/{uid}")),
@@ -518,11 +538,55 @@ fn canonical_child_directory(parent: &Path, name: &str, label: &str) -> io::Resu
     Ok(canonical)
 }
 
-fn require_wayland_socket(path: &Path, uid: u32) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
+/// One uid-owned socket under the login user's runtime directory, resolved.
+///
+/// Checked before and after `canonicalize`, and it is worth being exact about
+/// what each check does and does not buy, because a draft of this comment
+/// claimed more than either delivers.
+///
+/// The FIRST check is the one that closes a case. `symlink_metadata` does not
+/// follow the final component, so a `bus` that is a symlink to somebody else's
+/// socket is seen as a link, is not a socket, and is refused here. Drop this
+/// check and `canonicalize` resolves the link, the post-check sees a perfectly
+/// good uid-owned socket at the far end, and the jail binds it.
+///
+/// The SECOND check closes no case of its own. Once the first has run there is
+/// no symlink left for it to catch, and its test — type and owner — cannot tell
+/// the right socket from any other socket the same uid owns. All it does is
+/// narrow the window between the `symlink_metadata` lookup and `canonicalize`.
+/// It is kept because narrowing that window is free and because the canonical
+/// path is what gets bound, so verifying the name actually used costs nothing;
+/// it is NOT a second boundary and a draft of this comment described it as one.
+///
+/// Neither closes a time-of-check-to-time-of-use gap. A process running as this
+/// same uid that can write the runtime directory can swap the socket after both
+/// checks and before the `mount`. What holds the bind to its source afterwards
+/// is `require_bind_source`, which compares mount IDENTITIES out of
+/// `/proc/self/mountinfo` once the bind exists rather than pathnames before it.
+/// The residual is bounded by who can write `/run/user/<uid>`, which is 0700
+/// and owned by the login user — the principal the session belongs to.
+fn session_socket(name: &str, what: &str, uid: u32) -> io::Result<PathBuf> {
+    let path = PathBuf::from(format!("/run/user/{uid}/{name}"));
+    require_session_socket(&path, uid, what)?;
+    // Labelled rather than propagated bare. The likeliest failure on this path
+    // is now "the broker has not bound yet", and `main` prints `td-jail: {e}` —
+    // so a bare `ENOENT` would reach an operator as `No such file or directory`
+    // with no path and no noun, ambiguous between two sockets since there are
+    // two. `require_regular` and `require_directory` in this file already say
+    // which thing they were looking at; this is that habit applied here.
+    let path = fs::canonicalize(&path).map_err(|error| {
+        invalid(format!("{what} {}: {error}", path.display()))
+    })?;
+    require_session_socket(&path, uid, what)?;
+    Ok(path)
+}
+
+fn require_session_socket(path: &Path, uid: u32, what: &str) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| invalid(format!("{what} {}: {error}", path.display())))?;
     if !metadata.file_type().is_socket() || metadata.uid() != uid {
         return Err(invalid(format!(
-            "Wayland authority {} is not a socket owned by uid {uid}",
+            "{what} {} is not a socket owned by uid {uid}",
             path.display()
         )));
     }
@@ -725,6 +789,24 @@ pub(crate) fn test_registry_entry(text: &str, selected: &str) -> io::Result<Opti
     registry_entry(text, selected)
 }
 
+/// The environment CONTRACT over a spec's own text, for the recipe check that
+/// holds the engine and this crate to one value.
+///
+/// `test_parse_spec` is the grammar and nothing else, so a check built on it
+/// alone passes while the two sides drift apart in value. This runs the same
+/// `validate_environment_list` a launch runs, which is the only thing that can
+/// notice.
+#[cfg(test)]
+pub(crate) fn test_validate_spec_environment(text: &str, uid: u32) -> io::Result<()> {
+    let spec = parse_spec(text)?;
+    let environment = spec
+        .environment
+        .iter()
+        .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+        .collect::<Vec<_>>();
+    validate_environment_list(&environment, uid)
+}
+
 #[cfg(test)]
 pub(crate) fn test_limits() -> [usize; 8] {
     [
@@ -853,12 +935,12 @@ mod tests {
 
     #[test]
     fn spec_parser_accepts_only_the_closed_canonical_subset() {
-        let text = "format=1\nname=fixture\nruntime=/td/store/0123456789abcdefghijklmnopqrstuv-empty-runtime-1\nentry=/app/bin/fixture\n\n[Environment]\nHOME=/home/td\nWAYLAND_DISPLAY=wayland-0\nXDG_RUNTIME_DIR=/run/user/1000\n\n[Context]\nsockets=wayland\n";
+        let text = "format=1\nname=fixture\nruntime=/td/store/0123456789abcdefghijklmnopqrstuv-empty-runtime-1\nentry=/app/bin/fixture\n\n[Environment]\nDBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus\nHOME=/home/td\nWAYLAND_DISPLAY=wayland-0\nXDG_RUNTIME_DIR=/run/user/1000\n\n[Context]\nsockets=wayland\n";
         assert!(test_parse_spec(text).is_ok());
         let spec = parse_spec(text).unwrap();
         assert_eq!(spec.name, "fixture");
         assert_eq!(spec.entry, "/app/bin/fixture");
-        assert_eq!(spec.environment.len(), 3);
+        assert_eq!(spec.environment.len(), 4);
 
         for invalid in [
             text.replace(
@@ -899,6 +981,10 @@ mod tests {
     fn required_environment_is_exact_for_the_effective_uid() {
         let environment = [
             (
+                OsString::from("DBUS_SESSION_BUS_ADDRESS"),
+                OsString::from("unix:path=/run/user/1000/bus"),
+            ),
+            (
                 OsString::from("FLATPAK_ID"),
                 OsString::from("org.td.Fixture"),
             ),
@@ -913,8 +999,55 @@ mod tests {
             ),
         ];
         assert!(validate_environment_list(&environment, 1000).is_ok());
+        // A DIFFERENT uid fails on every uid-derived value at once, the bus
+        // address among them: an app told to reach /run/user/1000/bus while
+        // running as 1001 would find a socket it cannot use, or somebody
+        // else's.
         assert!(validate_environment_list(&environment, 1001).is_err());
-        assert!(validate_environment_list(&environment[1..], 1000).is_err());
+        // Each required name is required ON ITS OWN. A draft sliced the front
+        // of the array instead, which drops one name and then two, so the
+        // second assertion passed for the first one's reason and no name after
+        // `FLATPAK_ID` was ever exercised alone.
+        for dropped in [
+            "DBUS_SESSION_BUS_ADDRESS",
+            "FLATPAK_ID",
+            "HOME",
+            "WAYLAND_DISPLAY",
+            "XDG_RUNTIME_DIR",
+        ] {
+            let without = environment
+                .iter()
+                .filter(|(key, _)| key != dropped)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(without.len(), environment.len() - 1, "{dropped} was not there");
+            assert!(
+                validate_environment_list(&without, 1000).is_err(),
+                "a spec missing {dropped} was accepted"
+            );
+        }
+
+        // A bus address that is well formed and points somewhere ELSE is the
+        // case the uid check cannot see: same uid, different socket. It is
+        // refused because the address is not advice — td-jail binds one socket
+        // into the jail at one path, and a spec naming another either sends the
+        // app to a socket the mount namespace has no bind for, or names a bus
+        // outside the runtime directory that the app has no business reaching.
+        // The value is checked, not merely the key's presence.
+        let elsewhere = environment
+            .iter()
+            .map(|(key, value)| {
+                if key == "DBUS_SESSION_BUS_ADDRESS" {
+                    (key.clone(), OsString::from("unix:path=/tmp/bus"))
+                } else {
+                    (key.clone(), value.clone())
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            validate_environment_list(&elsewhere, 1000).is_err(),
+            "a spec may not point the app at a bus this jail does not mount"
+        );
 
         let unsorted = [
             (
@@ -924,5 +1057,39 @@ mod tests {
             (OsString::from("HOME"), OsString::from("/home/td")),
         ];
         assert!(validate_environment_list(&unsorted, 1000).is_err());
+    }
+
+    /// The shim the td-jail recipe check reaches across the crate boundary
+    /// with, exercised on THIS side too.
+    ///
+    /// Not because that check would miss a broken shim. A draft of this comment
+    /// said it could not tell a working shim from one that answers `Ok` to
+    /// everything, and that is false: the negative case beside it — the same
+    /// spec with the bus moved one path over — fails an always-`Ok` shim.
+    ///
+    /// What the recipe check cannot do is exercise the contract against a spec
+    /// the ENGINE does not compile. The uid it is evaluated against is the
+    /// shim's own argument and no compiled spec varies it, so the uid case
+    /// below exists only here; and the wiring — text through `parse_spec` into
+    /// `validate_environment_list` — is pinned on the side that owns both.
+    #[test]
+    fn the_spec_environment_shim_runs_the_contract_it_names() {
+        let text = "format=1\nname=fixture\nruntime=/td/store/0123456789abcdefghijklmnopqrstuv-empty-runtime-1\nentry=/app/bin/fixture\n\n[Environment]\nDBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus\nFLATPAK_ID=org.td.Fixture\nHOME=/home/td\nWAYLAND_DISPLAY=wayland-0\nXDG_RUNTIME_DIR=/run/user/1000\n\n[Context]\nsockets=wayland\n";
+        assert!(
+            test_validate_spec_environment(text, 1000).is_ok(),
+            "a complete spec must be accepted"
+        );
+        assert!(
+            test_validate_spec_environment(text, 1001).is_err(),
+            "the shim must evaluate the contract against the uid it is given"
+        );
+        assert!(
+            test_validate_spec_environment(
+                &text.replace("/run/user/1000/bus", "/run/user/1000/elsewhere"),
+                1000,
+            )
+            .is_err(),
+            "the shim must reach the VALUE check and not stop at the grammar"
+        );
     }
 }

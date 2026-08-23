@@ -726,6 +726,18 @@ fn prepare_mount_plan(
         let listener = UnixListener::bind(&wayland)
             .map_err(|e| io::Error::other(format!("create Wayland bind target: {e}")))?;
         drop(listener);
+        // A bind target must exist, and the kernel's graft check only refuses
+        // mounting a directory over a non-directory and the reverse — a regular
+        // file would do. A socket is used because it says what the path IS to
+        // anyone reading the jail's runtime directory, and because the roster
+        // check below is an exact set that a stray empty file would satisfy
+        // just as well while meaning nothing. Binding a listener and dropping
+        // it is simply how one makes a socket inode; it never accepts, and what
+        // survives the drop is the inode.
+        let bus = format!("{runtime}/bus");
+        let listener = UnixListener::bind(&bus)
+            .map_err(|e| io::Error::other(format!("create session bus bind target: {e}")))?;
+        drop(listener);
 
         create_dir(&format!("{NEW_ROOT}/home/td"), 0o700)?;
         mount_application_tree(&application.package_files, &format!("{NEW_ROOT}/app"))?;
@@ -745,6 +757,26 @@ fn prepare_mount_plan(
         }
         mount_private_bind(&application.state.runtime, &application_runtime, false)?;
         mount_private_bind(&application.wayland_socket, &wayland, true)?;
+        // Read-only like the Wayland socket. It does not cost the app anything:
+        // `unix_find_other` asks for `MAY_WRITE` on the path, but `sb_permission`
+        // returns `EROFS` only for regular files, directories and symlinks on a
+        // read-only SUPERBLOCK, and `MNT_READONLY` is a vfsmount flag that
+        // `inode_permission` never consults — it is enforced by
+        // `mnt_want_write()` on the write paths. So `connect(2)` works, and
+        // `SCM_RIGHTS` is socket-layer and untouched by mount flags.
+        //
+        // What it BUYS is `chmod`/`chown`, which do call `mnt_want_write()`. The
+        // app owns this inode — uid 1000, mode 0600, and the jail maps
+        // `1000 1000 1` — so without `MS_RDONLY` it could `chmod 0000` the
+        // socket through its own bind and change the HOST's real bus socket,
+        // denying `connect(2)` to the compositor, the portal and
+        // `/etc/bootsuccess`'s probe. A draft of this comment said instead that
+        // read-only stops the app replacing the socket: it does not, and nothing
+        // here needs it to. Unlink is governed by the parent directory — the
+        // jail's own rw tmpfs — and is refused because the path is a mountpoint
+        // (`is_local_mountpoint` -> `EBUSY`) and the app has no `CAP_SYS_ADMIN`
+        // to unmount it.
+        mount_private_bind(&application.bus_socket, &bus, true)?;
         let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
         for (source, target) in [
             (application.package_files.as_path(), format!("{NEW_ROOT}/app")),
@@ -768,6 +800,7 @@ fn prepare_mount_plan(
             ),
             (application.state.runtime.as_path(), application_runtime),
             (application.wayland_socket.as_path(), wayland),
+            (application.bus_socket.as_path(), bus),
         ] {
             require_bind_source(&mountinfo, source, Path::new(&target))?;
         }
@@ -1501,7 +1534,7 @@ fn require_mount_plan(
         require_names("/run/user", &[&identity.uid.to_string()])?;
         require_names(
             &runtime,
-            &[crate::authority::RUNTIME_ROOT_NAME, "wayland-0"],
+            &[crate::authority::RUNTIME_ROOT_NAME, "bus", "wayland-0"],
         )?;
         for path in ["/app", "/usr"] {
             require_mount(
@@ -1544,6 +1577,13 @@ fn require_mount_plan(
         require_mount(
             &mountinfo,
             &format!("{runtime}/wayland-0"),
+            None,
+            &["ro", "nosuid", "nodev", "noexec"],
+            &["rw"],
+        )?;
+        require_mount(
+            &mountinfo,
+            &format!("{runtime}/bus"),
             None,
             &["ro", "nosuid", "nodev", "noexec"],
             &["rw"],
@@ -2404,7 +2444,9 @@ mod tests {
                 STAGE2_LAUNCH_ARG,
                 "/app/bin/app",
                 STAGE2_ENVIRONMENT_ARG,
-                "5",
+                "6",
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/run/user/1000/bus",
                 "FLATPAK_ID",
                 "org.td.App",
                 "GLIBC_TUNABLES",
@@ -2424,8 +2466,8 @@ mod tests {
                 ..
             } if entry == "/app/bin/app"
                 && environment.first() == Some(&(
-                    OsString::from("FLATPAK_ID"),
-                    OsString::from("org.td.App"),
+                    OsString::from("DBUS_SESSION_BUS_ADDRESS"),
+                    OsString::from("unix:path=/run/user/1000/bus"),
                 ))
                 && arguments == [OsString::from("--flag")]
         ));
@@ -2451,7 +2493,9 @@ mod tests {
             STAGE2_LAUNCH_ARG,
             "/app/bin/app",
             STAGE2_ENVIRONMENT_ARG,
-            "3",
+            "4",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "unix:path=/run/user/1000/bus",
             "WAYLAND_DISPLAY",
             "wayland-0",
             "HOME",
@@ -2471,6 +2515,10 @@ mod tests {
             gid: 1000,
         };
         let environment = vec![
+            (
+                OsString::from("DBUS_SESSION_BUS_ADDRESS"),
+                OsString::from("unix:path=/run/user/1000/bus"),
+            ),
             (OsString::from("FLATPAK_ID"), OsString::from("org.td.App")),
             (OsString::from("HOME"), OsString::from("/home/td")),
             (
