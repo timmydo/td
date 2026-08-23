@@ -153,16 +153,15 @@ list is exhaustive: never re-run on a judgment that the changes were large.
 - touches a file no reviewer in the cycle saw;
 - amends `UNSAFE.md` or a surface it governs: a new syscall, a new
   value-pinned request, or a second scoped `#[allow]`;
-- adds a crate, a dependency, or a `[[package]]` entry;
-- changes what a check asserts rather than making an existing assertion pass;
-- follows a confirmation pass that reported a release blocker.
+- adds a crate, a dependency, or a `[[package]]` entry.
 
-Stop — before another review, before declaring the commit ready, and before
-pushing — when a release blocker survives a panel re-run, when successive
-confirmation passes keep reporting new work instead of converging, or when a
-trigger fires again after a re-run. Ask the user whether to authorize more.
-Never ship a known blocker or split the changed commit among ad-hoc reviewers
-to evade the loop.
+Findings from a confirmation pass are dispositioned the same way as panel
+findings: amend, then confirm again. A release blocker does not itself trigger
+another full panel; only an amendment matching the exhaustive list above does.
+After such a panel re-run, return to confirmation passes unless a later
+amendment independently matches the list. Continue until a confirmation pass
+accepts the exact code, and never ship a known blocker or split the changed
+commit among ad-hoc reviewers to evade the loop.
 
 A reviewer may clarify an existing report without consuming anything while the
 reviewed commit is unchanged.
