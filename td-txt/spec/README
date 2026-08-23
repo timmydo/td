@@ -1002,22 +1002,27 @@ td-txt-authored case files
     whether sed's reader shares the flag, which GNU sed does not set -- a
     question about a different program, so it is its own landing.
 
-    What is NOT reproduced is the ambiguity POSSIBILITY ORDER, which `--devices`
-    makes reachable in more cells without causing it. GNU lists the candidates in
-    its own `long_options` order (`--devices` `--directories`
-    `--dereference-recursive`) and td-txt's table is alphabetical, so `--d=skip`
-    names the same three in a different sequence. It already diverged for `--d`
-    before this option existed, and `--de` is the one ambiguity `--devices` newly
-    creates, having resolved uniquely to `--dereference-recursive` before.
+    What was NOT reproduced, UNTIL THE REORDER BELOW, was the ambiguity
+    POSSIBILITY ORDER, which `--devices` made reachable in more cells without
+    causing it. GNU lists the candidates in its own `long_options` order
+    (`--devices` `--directories` `--dereference-recursive`) and td-txt's table
+    WAS alphabetical, so `--d=skip` named the same three in a different
+    sequence. It had already diverged for `--d` before this option existed, and
+    `--de` was the one ambiguity `--devices` newly created, having resolved
+    uniquely to `--dereference-recursive` before.
 
-    Matching it means reordering the whole table, and the size of that is worth
-    recording so the landing is not guessed at: exactly FOUR prefixes print a
-    different list, `--d` and `--de` in one cluster and `--f`/`--fi` in the
-    other. Every other ambiguous prefix names candidates the two orderings agree
-    on, and an EXACT name is never an ambiguity at all, so the rest of the table
-    is untouched either way. What it costs is that td-txt's table stops being
-    alphabetical -- GNU groups its own by purpose, which is why the orders differ
-    -- and that is the trade to weigh, not the message count.
+    SUPERSEDED: the reorder landed, and the table is GNU's `long_options[]`
+    order now -- see the entry below that records it taking those six divergent
+    SPELLINGS to ZERO. The sizing is kept because it was right, and is the shape
+    to expect next time: exactly FOUR NON-EMPTY prefixes printed a different
+    list, `--d` and `--de` in one cluster and `--f`/`--fi` in the other. The
+    EMPTY prefix is a fifth listing and is counted separately below, `--=` being
+    the whole table read out in order and so divergent whenever anything is.
+    Every other ambiguous prefix named candidates the two orderings agree on,
+    and an EXACT name was never an ambiguity at all, so the rest of the table
+    was untouched either way. What it COST is that td-txt's table stopped being
+    alphabetical -- GNU groups its own by purpose, which is why the orders
+    differed -- and that was the trade, taken deliberately.
 
   Following what the walk finds is the usual way a directory becomes reachable
   from inside itself, but NOT the only one -- a bind mount does it with no
@@ -1225,8 +1230,9 @@ td-txt-authored case files
   special-file table, and whose case PASSES. So the paragraph has now been
   caught out a THIRD time, by its own example rather than by a new one, and
   the count above is deliberately a count of what the CORPUS asserts rather
-  than a claim about the flag. What remains under it is `-u`, which is a gap
-  of its own (below) and not a `--posix` rule at all.
+  than a claim about the flag. This entry once named `-u` as what
+  remained under it; `-u` is CLOSED on both halves (below), and was never a
+  `--posix` rule in the first place.
 
   - `--posix`: its REGEX half is implemented, and it splits in two along a
     line that is GNU's rather than this reimplementation's. The flag's OWN
@@ -1280,26 +1286,30 @@ td-txt-authored case files
     `--posix` given after it.
 
   - WHEN a script part is compiled relative to the OPTIONS around it. GNU compiles
-    each `-e` and `-f` as it scans the command line, so a flag that follows one is
-    not in effect for it and a failure inside one outranks anything a later option
-    hits. td-txt collects the parts and compiles once, after every option is known.
-    Invisible until `w` targets started opening at compile time, and now not:
-    `sed -n -e 'w out' --sandbox` writes the file and exits 0 in GNU because sandbox
-    mode was not set when that `-e` compiled, where td-txt refuses it; `-e 'w
-    /nodir/o' --badopt` is GNU's exit 4 and td-txt's exit 1; and `-e 'w out' -f
-    /nosuch` creates `out` in GNU before failing on the script file. The same rule
-    scopes `-E`, which is why `sed -e 's/a+/X/p' -E` does not apply the flag to that
-    expression. Two sharper witnesses than any of those: `-e 'w /nodir/o' -f
-    /nosuch` is exit 4 in BOTH, naming a different file in each, which is the
-    status-identical message-divergent pair this corpus normally pins; and where a
-    `w` target names the `-f` SCRIPT, `sed -n -e 'w s.sed' -f s.sed` truncates the
-    script before reading it, so GNU runs an empty program and prints nothing while
+    each `-e` and `-f` as it scans the command line, so a flag that follows one
+    is not in effect for it and a failure inside one outranks anything a later
+    option hits. The FLAG half of that is CLOSED: each part carries the flags it
+    was SCANNED with, which the positional-flag entry below records and
+    `586e7151` landed. So `-e 'w out' --sandbox` writes the file and exits 0
+    here as it does in GNU, and `sed -e 's/a+/X/p' -E` reads that part as a BRE
+    in both. What is LEFT is WHEN the compile happens: td-txt records each
+    part's flags during the scan but still compiles them all once, after it. The
+    side effects and failures GNU produces mid-scan therefore happen later here,
+    or not at all -- `-e 'w /nodir/o' --badopt` is GNU's exit 4 and td-txt's
+    exit 1, and `-e 'w out' -f /nosuch` creates `out` in GNU before failing on
+    the script file where td-txt exits 4 having created nothing. Two sharper
+    witnesses than either: `-e 'w /nodir/o' -f /nosuch` is exit 4 in BOTH,
+    naming a different file in each, which is the status-identical
+    message-divergent pair this corpus normally pins; and where a `w` target
+    names the `-f` SCRIPT, `sed -n -e 'w s.sed' -f s.sed` truncates the script
+    before reading it, so GNU runs an empty program and prints nothing while
     td-txt reads the `p` and prints -- the axis reaches STDOUT, not just files,
-    which the other witnesses make it easy to assume otherwise. Two xfail cases,
-    that one and the `--sandbox` one. Pre-existing -- the parent commit's binary
-    answers identically -- and closing it means compiling per part rather than per
-    run, which changes what every mode flag applies to and so is its own increment,
-    not a corner of this one.
+    which the other witnesses make it easy to assume otherwise. ONE xfail case
+    now, and it is this one (the `--sandbox` case that used to sit beside it
+    passes, per the flag half above). It is pre-existing -- the parent commit's
+    binary answers identically -- and closing it means compiling per part rather
+    than per run, which changes what every mode flag applies to and so is its
+    own increment, not a corner of this one.
 
   - `R /dev/stdout` and `R /dev/stderr` HANG when the named stream is a pipe --
     RECORDED BUT NOT REPRODUCING, so read the rest of this entry as history
@@ -1835,24 +1845,28 @@ td-txt-authored case files
     withdrawing `v` itself. Found while sweeping for the address-modifier
     landing and outside it.
 
-  - An `R` SOURCE read whole -- the NAMED half now closed, the standard-input
-    half not. A named source is read a BLOCK at a time (`open_source`, the same
-    4 KiB `Records` the operands take), so it is held open across cycles and
-    gives one line per invocation as GNU's `ck_getdelim` does. What that closes
-    is measured: `sed -n -e 'R /dev/urandom' -e p A` returns, where reading to
-    EOF never did; a 600 MB source runs under a 700 MB address-space limit,
-    where the whole read died `read error on BIG: out of memory` at exit 4; and
-    a fifo whose writer is still open no longer waits for it. `-s` rewinds by
-    seeking the handle to 0 and RESTARTING the reader, since a reader that kept
-    its buffer would hand back records from before the seek.
+  - An `R` SOURCE read whole -- CLOSED now on both halves, the named one and
+    standard input. A named source is read a BLOCK at a time (`open_source`, the
+    same 4 KiB `Records` the operands take), so it is held open across cycles
+    and gives one line per invocation as GNU's `ck_getdelim` does. What that
+    closes is measured: `sed -n -e 'R /dev/urandom' -e p A` returns, where
+    reading to EOF never did; a 600 MB source runs under a 700 MB address-space
+    limit, where the whole read died `read error on BIG: out of memory` at exit
+    4; and a fifo whose writer is still open no longer waits for it. `-s`
+    rewinds by seeking the handle to 0 and RESTARTING the reader, since a reader
+    that kept its buffer would hand back records from before the seek.
 
-    WHEN a source is opened is a second axis, unchanged by this and recorded
-    here because this entry is now the place for it: GNU opens every `R` source
-    at COMPILE time, td-txt at the command's first execution. So `sed -n -e
-    '999R F' -e p f1` over a fifo nobody writes hangs before GNU reads a line of
-    input and returns at once here, and a source that exists at startup but is
-    removed before the first `R` still yields its lines in GNU and none here.
-    Pre-existing in both builds either side of this landing.
+    WHEN a source is opened was a second axis and is CLOSED -- td-txt opens an
+    ordinary NAMED `R` source at COMPILE time too (the `/dev/std*` sources are
+    their own case, below), which the entry above records and
+    `5911d857` landed. The two shapes this paragraph used to cite as divergent
+    now answer as GNU does, and naming the outcome is the point of citing them:
+    `sed -n -e '999R F' -e p f1` over a fifo nobody writes BLOCKS in both, where
+    td-txt returned at once; and a source that exists at startup but is removed
+    before the first `R` still yields its lines in both, where td-txt yielded
+    none. It read as a live divergence here for some time after it had
+    stopped being one, which is the failure mode this ledger keeps having --
+    an entry closed in one place and left standing in another.
 
     `R /dev/stdin` was what was left, and it is CLOSED: it is the one source
     that could not simply take a reader of its own. It is the INPUT's own
@@ -3147,11 +3161,15 @@ td-txt-authored case files
     and not a second divergence -- the offset arithmetic is shared, and only
     GNU's count of the bytes it discarded is declined.
 
-    Implementing it also retires a substitution in td's own ladder: glibc's build
-    wants `grep -ob U`, which the recipes replaced with an awk program because
-    this option was refused. `grep -ob U` now matches GNU byte for byte, so that
-    replacement can go -- in its own landing, since it touches recipes rather
-    than this crate.
+    A follow-up this entry once claimed is NOT available, and the reason is
+    kept so it is not proposed a second time. glibc's build wants `grep -ob U`
+    and the recipes replaced it with an awk program -- but not because td-txt
+    refused the option. `recipes/src/ladder.rs` gives the real reason: the grep
+    on that rung's PATH is `grep-mesboot0` 2.4, which PREDATES `-o`. td-txt
+    cannot be that grep at any price, its own `native_inputs` naming
+    `glibc-x86-64` and `rust-toolchain` -- so it is built long after the rung
+    that would have to use it. Retiring the awk program is a dependency cycle,
+    not a landing.
 
   - A SPARSE file is binary to GNU before any NUL has been read, and td-txt
     does not follow. This is the SECOND door to the verdict above: GNU asks
@@ -3174,15 +3192,20 @@ td-txt-authored case files
     there is silent and costs the reader every match in the file, so the
     divergence is recorded rather than guessed at.
 
-  - The `-v` short cut above under `-r`, which GNU takes before it expands
-    operands and td-txt takes after: `grep -rcv -e '' /nosuchdir` is exit 1 and
-    silent in GNU, exit 2 with `No such file or directory` here, and the same
-    holds for the `-m 0` and empty-list clauses (`grep -rcm0 a /nosuchdir`,
-    `grep -rc -f /dev/null /nosuchdir`). `Grep::settled` is consulted after
-    `walk` has already reported. Pre-existing, and the part of this axis the
-    landing that closed it did NOT close. `-R`'s cycle WARNING joins the same
-    entry: `grep -Rlm0 a t` says nothing in GNU, which never traverses, and warns
-    here, which traverses first and consults the short cut after.
+  - CLOSED: the `-v` short cut above under `-r`, which GNU takes before it
+    expands operands and td-txt used to take after. The free `settled` predicate
+    is consulted BEFORE the walk now (`grep.rs`; `Grep::settled` is the method
+    wrapping it, and still runs per file inside `search_file`) -- a side effect
+    of hoisting it so the stray-backslash lint could be gated at the same point
+    -- so the three shapes this entry was written for answer as GNU does. `grep
+    -rcv -e '' /nosuchdir`, `grep -rcm0 a /nosuchdir` and `grep -rc -f /dev/null
+    /nosuchdir` are exit 1 and silent, where each was exit 2 with `No such file
+    or directory`. `-R`'s cycle WARNING went with them: `grep -Rlm0 a t` over a
+    directory loop says nothing now, GNU never traversing and td-txt no longer
+    traversing either -- while `grep -Rl a t` still warns, which is what makes
+    that silence the short cut firing rather than the warning having gone
+    missing. Closed by a landing not aimed at it, and recorded here rather than
+    left for the next sweep to re-derive.
 
   - A `^$` whose `$` is followed by MORE pattern, which grep's dfa answers as
     though that `$` were not there: `grep -c '^$|$'` selects a line `|` and
@@ -3219,13 +3242,17 @@ td-txt-authored case files
     the byte eaten is a `[`, no reading fits the answers. Measured exhaustively
     over the 55,980 bracket bodies of length 2-6 spellable in `[ ] : . = a`, the
     rule makes 16,967 shapes agree with GNU that did not, and 52 disagree that
-    did; 8 are wrong either way. Every one of the 52 puts a `[` at the position
+    did; 8 are wrong either way. Every one of the 52 put a `[` at the position
     the closer test eats, in any of the three kinds -- `[[..[]]`, `[[::[]]` and
-    `[[==[]]` are `Unmatched [` in GNU and `unterminated` here -- so it is a
+    `[[==[]]` were `Unmatched [` in GNU and `unterminated` here -- so it was a
     family, not the collating-element corner an earlier draft of this entry
-    claimed. Four xfail cases: those three, plus `[[...][.[.]]` for the reverse
-    direction, where GNU is `unterminated` and td-txt compiles. Three readings
-    were tried and each is contradicted by one of four probes: abandon the
+    claimed. NO xfail case now, and none of those readings is a live
+    divergence: the four this entry was written for -- those three, plus
+    `[[...][.[.]]` for the reverse direction, where GNU was `unterminated` and
+    td-txt compiled -- all carry GNU's goldens and pass, the three named above
+    answering `Unmatched [, [^, [:, [., or [=` byte for byte. What survives
+    here is the measurement and the refuted readings. Three readings were
+    tried and each is contradicted by one of four probes: abandon the
     sub-expression on a consumed `[` (`[[..[a]]` refutes it), open a nested one
     (`[[...][.a.]]` refutes it), and treat `[` as ordinary content (`[[..[]]`
     refutes it). Recorded rather than guessed at, because a fourth reading fitted
@@ -3288,16 +3315,18 @@ td-txt-authored case files
     uncovered is a RULE, and it reaches every pattern that contains one.
 
   - The group a grep ERE drop left unclosed, once a BACKREFERENCE names it. Grep
-    answers backreference patterns from glibc rather than its own dfa -- the split
-    recorded below -- and glibc keeps the eaten `)` INSIDE the group where td-txt
-    closes the group before it. So `(*))\1` counts 2 lines of `)`/`))`/`)))`/`a`
-    in grep and 5 here, and `({2}*)\1` selects nothing in grep and 7 here. The
-    message differs on the same axis: a group that never closed is `Invalid back
-    reference` to grep, because the group was still open when `\1` was read,
-    against `Unmatched ( or \(` here -- `(a\b*)\1` and `({)\1`, where the STATUS
-    agrees at 2 and main wrongly compiled both. Four xfail cases. Not reachable
-    without a backreference: `-c` cannot tell the two boundaries apart, since
-    `(a\b*))` is `a` then `)` either way.
+    answers backreference patterns from glibc rather than its own dfa -- the
+    split recorded below -- and glibc keeps the eaten `)` INSIDE the group where
+    td-txt closes the group before it. So `(*))\1` counts 2 lines of
+    `)`/`))`/`)))`/`a` in grep and 5 here, and `({2}*)\1` selects nothing in
+    grep and 7 here. The message differs on the same axis: a group that never
+    closed is `Invalid back reference` to grep, because the group was still open
+    when `\1` was read, against `Unmatched ( or \(` here -- `(a\b*)\1` and
+    `({)\1`, where the STATUS agrees at 2 and main wrongly compiled both. TWO
+    xfail cases -- the two consequences named above; `({2}*)\1` and `({)\1`
+    carry no case of their own. Not reachable without a backreference: `-c`
+    cannot tell the two boundaries apart, since `(a\b*))` is `a` then `)` either
+    way.
 
   - WHAT FOLLOWS a sed BRE assertion-plus-operator, where the parse rule above is
     uniform and glibc's MATCHER is not. `s|x\b\?|<&>|` selects the `x?` in `x?y`
@@ -3313,41 +3342,43 @@ td-txt-authored case files
     in the sed-BRE grid, the other three dialects being 0 of 2400 each.
 
   - A BACKREFERENCE anywhere in a grep pattern, which switches the whole of it to
-    glibc's reading -- that is, to sed's. It reaches the mid-branch `$` above, so
-    `grep -c '\(x\)\1$|*'` answers 0 where `grep -c 'x$|*'` selects the line, and
-    so does `-o`, which runs glibc for the same pattern `-c` gives the dfa. td-txt
-    keeps the dfa reading for grep throughout, that being the one `-c` pins, and
-    a pattern LIST is where that costs most. Swept over duplicate-bearing lists
-    and sixteen flag sets, every divergence left is a list GNU hands to glibc:
-    under `-o`, or because some pattern in it carries a BACKREFERENCE, which
-    switches the whole list and so is not confined to `-o` at all --
-    `grep -c -e 'x$|' -e '\(x\)\1$|'` selects five lines of seven where td-txt
-    selects one, and dropping the `\1` makes both agree. The counts depend on
-    which alphabet is swept, so they are not quoted here; the shape does not,
-    each being a list the naive literal reading this rule replaced happened to
-    agree with glibc about. It reaches the brace rule above too:
+    glibc's reading -- that is, to sed's. It reaches the mid-branch `$` above,
+    so `grep -c '\(x\)\1$|*'` answers 0 where `grep -c 'x$|*'` selects the line,
+    and so does `-o`, which runs glibc for the same pattern `-c` gives the dfa.
+    td-txt keeps the dfa reading for grep throughout, that being the one `-c`
+    pins, and a pattern LIST is where that costs most. Swept over
+    duplicate-bearing lists and sixteen flag sets, every divergence left is a
+    list GNU hands to glibc: under `-o`, or because some pattern in it carries a
+    BACKREFERENCE, which switches the whole list and so is not confined to `-o`
+    at all -- `grep -c -e 'x$|' -e '\(x\)\1$|'` selects five lines of seven
+    where td-txt selects one, and dropping the `\1` makes both agree. The counts
+    depend on which alphabet is swept, so they are not quoted here; the shape
+    does not, each being a list the naive literal reading this rule replaced
+    happened to agree with glibc about. It reaches the brace rule above too:
     `(a)\1|^{}` selects one line of `aa`/`{}`/`{}a` in grep and three here,
     though `(a)\1|{}` -- the same alternation with the anchor dropped -- agrees
-    at three, so it is the anchored brace glibc reads differently. One xfail with
-    that control beside it. `grep '\(.\)\1*\b*'` selects exactly
-    what `sed 's|\(.\)\1*\b*|[&]|'` marks, while the same pattern WITHOUT the
-    `\1` selects every line, the repeat reading modelled above. The minimal
-    witness is `grep '\(a\)\1\b*'` on `aa`, which GNU does not select and
-    td-txt does; it holds in the ERE too. This is grep choosing between its own
-    dfa.c and glibc per PATTERN, and the same split shows up per INVOCATION:
-    `grep -o` uses glibc where `-c` and `-q` use the dfa, so GNU itself answers
-    `-c '\b*a'` and `-o '\b*a'` differently on `xab` -- the corpus pins `-c`,
-    and td-txt, having one engine, cannot satisfy both. The brace rule above
-    lands on the dfa side too, so this split now covers that whole family --
-    grep counts the lines of `^{}` and its own `-o` selects nothing in them.
-    Seven cases carry the goldens, two of them a DROPPED INTERVAL, where the disagreement is with
+    at three, so it is the anchored brace glibc reads differently. One xfail
+    with that control beside it. `grep '\(.\)\1*\b*'` selects exactly what `sed
+    's|\(.\)\1*\b*|[&]|'` marks, while the same pattern WITHOUT the `\1` selects
+    every line, the repeat reading modelled above. The minimal witness is `grep
+    '\(a\)\1\b*'` on `aa`, which GNU does not select and td-txt does; it holds
+    in the ERE too. This is grep choosing between its own dfa.c and glibc per
+    PATTERN, and the same split shows up per INVOCATION: `grep -o` uses glibc
+    where `-c` and `-q` use the dfa, so GNU itself answers `-c '\b*a'` and `-o
+    '\b*a'` differently on `xab` -- the corpus pins `-c`, and td-txt, having one
+    engine, cannot satisfy both. The brace rule above lands on the dfa side too,
+    so this split now covers that whole family -- grep counts the lines of `^{}`
+    and its own `-o` selects nothing in them. FOUR xfails carry GNU's `-o`
+    goldens for this half, two of them a DROPPED INTERVAL, and each has a
+    passing `-c` control beside it. On the interval the disagreement is with
     itself and plain: on `2a`/`{2}a`/`a`, GNU counts all three lines for `{2}a`
     and its `-o` finds one occurrence in the file. A reviewer read this as
     something the group rule had newly exposed, since `({2}*)a` compiles only
-    since that rule landed; the no-paren control is why it is filed here
-    instead -- `{2}a` answers identically on main, so what the rule changed is
-    which patterns reach the split, not the split. The landing's own METHOD warning applies to its own model here: a
-    corner probed through one frame confirms whatever that frame implies.
+    since that rule landed; the no-paren control is why it is filed here instead
+    -- `{2}a` answers identically on main, so what the rule changed is which
+    patterns reach the split, not the split. The landing's own METHOD warning
+    applies to its own model here: a corner probed through one frame confirms
+    whatever that frame implies.
 
     This gap is where an earlier draft of this landing went wrong, and the shape
     of the mistake is worth keeping. Every probe of the corner used a follower of
@@ -3421,9 +3452,62 @@ Overlay
                          --example gen_expectations -- \
                          td-txt/target/release/td-txt td-txt/spec > td-txt/spec/expectations.txt
 
-                     It is EMPTY today: td-txt passes every case in this corpus.
-                     That is a statement about the corpus as much as about
-                     td-txt — growing the corpus is how the next gap gets found.
+                     It is NOT empty: 22 xfail entries and no skips,
+                     against 2592 of a 2614-case corpus passing -- 99.16%.
+                     This line read "EMPTY today" long after it stopped being
+                     true, which is why the count now sits beside the claim.
+
+                     Those 22 split SIX ways, counted from the manifest and
+                     not summarised: this line was first written off a
+                     summary and got two families wrong.
+
+                     THIRTEEN are td-txt keeping grep's own dfa where GNU
+                     read the pattern with glibc. Two INDEPENDENT things
+                     hand GNU to glibc: `-o`, which asks for spans, and a
+                     BACKREFERENCE anywhere in the pattern list, which
+                     switches the whole list whatever the flags are. They
+                     differ in whether GNU is consistent with ITSELF, and
+                     the split is FOUR and NINE. Under `-o` alone `-c` and
+                     `-q` keep the dfa, so GNU answers one input two ways
+                     and no single engine can match both. With a
+                     backreference BOTH go to glibc -- measured, `-c` and
+                     `-o` agreeing on every one of those nine -- so GNU is
+                     self-consistent there and td-txt alone dissents.
+                     THREE are the dead mid-branch `$`, agreeing with the
+                     count in that entry above. TWO are what follows a BRE
+                     assertion plus an operator. ONE is a REFUSAL
+                     rather than a divergence: `-w` over sliding greedy
+                     repeats exceeds the matcher's step budget, and td-txt
+                     answers `too complex` instead of proving absence. None
+                     of those NINETEEN is scheduled, though not all for one
+                     reason: SEVENTEEN are declined on their own terms, and
+                     the TWO BRE-assertion cases are unsolved rather than
+                     declined -- no property that survives probing has been
+                     found, so there is nothing yet to decline or serve.
+
+                     The other THREE are DEFERRED increments rather than
+                     refusals, each sized in an entry above: TWO are `-o -w`
+                     over a pattern LIST and ONE is per-part compilation of
+                     `-e`/`-f`. Two criteria for separating that pair from
+                     the engine THIRTEEN have been tried here and both were
+                     refuted by the manifest: not the presence of a
+                     backreference (four of the thirteen carry none), and
+                     not whether GNU contradicts itself (nine of them it
+                     does not, per the paragraph above). What survives is
+                     WHAT diverges. The thirteen are GNU's engine CHOICE
+                     for the pattern, which td-txt cannot follow having
+                     one engine. The pair is not about engines at all: GNU
+                     compiles an `-e` list as ONE regex and td-txt runs
+                     `-w`'s retry loop per PATTERN, which the entry above
+                     records in full.
+
+                     Both figures are AS OF THIS LANDING. Nothing reds when
+                     they go stale -- which is how the line above came to
+                     read "EMPTY" long after it was not -- so they are a
+                     dated reading rather than a live count.
+
+                     The corpus is what bounds all of this, and growing it is
+                     how the next gap gets found.
                      The usage-derived block above is one such growth, and it
                      found four (see the landing commit): `sed -i` with no file
                      operand, `-i` following symlinks and sharing hard links,

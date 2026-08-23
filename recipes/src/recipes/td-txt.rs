@@ -8,12 +8,19 @@ use crate::types::{Recipe, Step};
 // ONE source of truth and cannot drift; the path escapes the
 // `recipes/src/recipes/*.rs` catalog glob, so it is not itself a recipe module.
 //
-// STATUS: the multicall passes its whole conformance corpus — the vendored GNU
-// grep regex suites, the GNU sed testsuite triples, and td-txt's own option-surface
-// cases (see td-txt/tests/conformance.rs). td-txt is NOT yet referenced by
-// system-x86-64: the image's `/bin/grep` and `/bin/sed` stay busybox until the
-// corpus covers enough of the surface the image's own scripts use. Only then are
-// those two symlinks flipped, the same staging td-sh follows for `/bin/sh`.
+// STATUS: shipped. `system-x86-64` points `/bin/grep` and `/bin/sed` at this
+// multicall through `TD_TXT_APPLETS` (the symlink farm is built there), and no
+// busybox serves either any more. That is enforced, not merely true: the image
+// build REFUSES a packed `/bin/busybox` or a staged busybox package outright,
+// so the multiplexer cannot come back by drift.
+//
+// The conformance corpus is the vendored GNU grep regex suites, the GNU sed
+// testsuite triples, and td-txt's own option-surface cases; all three are
+// driven by td-txt/tests/conformance.rs. It is NOT a clean sweep, and the
+// phrasing here matters because this comment was wrong once:
+// td-txt/spec/expectations.txt carries the cases td-txt still answers
+// differently, generated rather than curated, and a listed case that starts
+// passing reds the gate until the entry is promoted.
 //
 // Why mesboot-style (rustc invoked directly) rather than `Recipe::rust`, and why
 // static: identical to td-sh/td-util. `grep` and `sed` are reached from scripts
