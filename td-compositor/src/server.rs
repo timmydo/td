@@ -68,6 +68,11 @@ const WL_BUFFER_RELEASE: u16 = 0;
 const WL_CALLBACK_DONE: u16 = 0;
 const XDG_POPUP_CONFIGURE: u16 = 0;
 const XDG_POPUP_POPUP_DONE: u16 = 1;
+/// How far `grab_parent` walks before it gives up. The scene bounds its own
+/// popup walk at the same depth and for the same reason.
+const MAX_POPUP_CHAIN: usize = 32;
+/// `xdg_popup`'s only error: "tried to grab after being mapped".
+const XDG_POPUP_ERROR_INVALID_GRAB: u32 = 0;
 const WL_SEAT_ERROR_MISSING_CAPABILITY: u32 = 0;
 const WL_POINTER_ERROR_ROLE: u32 = 0;
 /// `wl_pointer.axis_source`'s `wheel`. The other three sources — finger,
@@ -176,6 +181,24 @@ enum PendingBuffer {
 enum RoleObject {
     Toplevel(u32),
     Popup(u32),
+}
+
+/// Whether a grab may hang off a surface, which is a question about the whole
+/// CHAIN above it rather than about one node.
+///
+/// The protocol's rule reads one level — "an xdg_toplevel surface or another
+/// xdg_popup with an explicit grab" — but it is inductive: the popup being
+/// nested under is itself only grabbing while the thing IT hangs off can still
+/// hold one. Checking a single level lets a menu whose window has gone keep
+/// handing out grabs to submenus opened under it afterwards.
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+enum GrabParent {
+    /// A toplevel, reached directly or through grabbing popups.
+    Holdable,
+    /// A popup in the chain took no explicit grab. The protocol's one error.
+    NotGrabbed,
+    /// Nothing up there can hold a grab: dismissed, unplaceable, or gone.
+    Gone,
 }
 
 /// WHICH role an xdg_surface was given, without the object that carried it.
@@ -315,6 +338,40 @@ enum Object {
         /// next popup starts false — which is what makes "once per object" the
         /// property rather than "once per xdg_surface".
         configure_sent: bool,
+        /// Whether this popup asked for an explicit grab and got one.
+        ///
+        /// Recorded because the protocol reads the CHAIN through it: a
+        /// grabbing popup may only hang off a toplevel or off another
+        /// grabbing popup, so the answer for one popup is a precondition for
+        /// the next. What the flag does not yet buy is the grab's behaviour —
+        /// nothing routes a click outside the menu to it — so it is a record
+        /// of what the client asked for and what td let it ask.
+        grabbed: bool,
+        /// Whether td has told this popup it is over.
+        ///
+        /// Separate from `grabbed` because a dismissed grabbing popup is
+        /// neither of the two answers a chain check wants: it held a grab, so
+        /// "did not grab" is the wrong refusal, and it cannot hold one now,
+        /// so accepting is wrong too. The protocol gives that case its own
+        /// outcome — a child grabbing under it "will be immediately
+        /// dismissed" — which needs the state to be three-valued.
+        ///
+        /// CLEARED when td configures the popup again, which is not
+        /// `configure_sent`'s rule and deliberately so. That one records a
+        /// fact about the object's life, which the protocol scopes that way;
+        /// this one is read as "can it hold a grab NOW", and a menu td has
+        /// just agreed to place again can.
+        dismissed: bool,
+        /// Whether this popup has EVER had pixels up.
+        ///
+        /// `invalid_grab` is "tried to grab after being mapped", which is a
+        /// fact about the popup's life rather than its state now: the byte
+        /// ledger is cleared on unmap, so a popup that mapped, took itself
+        /// down with a null attach, and then grabbed would slip past a check
+        /// on that. A real menu does not: a toolkit destroys the popup and
+        /// makes another rather than re-mapping one, and a fresh object
+        /// starts false.
+        mapped_once: bool,
     },
     XdgToplevel {
         xdg_surface: u32,
@@ -1258,6 +1315,67 @@ impl Client {
         Ok(())
     }
 
+    /// Whether a grab may hang off this surface: the chain walked up to a
+    /// toplevel, or to the first thing that cannot hold one.
+    ///
+    /// Each step goes FORWARDS along the two edges the surface keeps, for
+    /// `popup_dismissal_of`'s reason — asking the surface which role object
+    /// is current answers with the current one, where a scan for whatever
+    /// names it answers with whichever the map yields first.
+    ///
+    /// A popup that grabbed still fails the walk once it is DISMISSED or its
+    /// own parent edge is broken, and both matter: a client may open a
+    /// submenu under a menu whose window went, and neither the menu's grab
+    /// nor its role object goes away when that happens.
+    ///
+    /// BOUNDED rather than trusted to end, for the reason the renderer's walk
+    /// is: the edge rules should make a cycle impossible, but that is an
+    /// argument across modules and what it protects here is a compositor that
+    /// stops answering. Running out says `Gone`, which dismisses a menu that
+    /// should not have existed.
+    fn grab_parent(&self, surface: u32) -> GrabParent {
+        let mut at = surface;
+        for _ in 0..MAX_POPUP_CHAIN {
+            let Some(Object::Surface(state)) = self.objects.get(&at) else {
+                return GrabParent::Gone;
+            };
+            let Some(SurfaceRole::Xdg(role)) = state.role else {
+                return GrabParent::Gone;
+            };
+            let Some(Object::XdgSurface {
+                role_object: Some(role_object),
+                ..
+            }) = self.objects.get(&role)
+            else {
+                return GrabParent::Gone;
+            };
+            let popup = match role_object {
+                RoleObject::Toplevel(_) => return GrabParent::Holdable,
+                RoleObject::Popup(popup) => popup,
+            };
+            let Some(Object::XdgPopup {
+                grabbed,
+                dismissed,
+                parent,
+                ..
+            }) = self.objects.get(popup)
+            else {
+                return GrabParent::Gone;
+            };
+            if !*grabbed {
+                return GrabParent::NotGrabbed;
+            }
+            if *dismissed {
+                return GrabParent::Gone;
+            }
+            let Some(next) = *parent else {
+                return GrabParent::Gone;
+            };
+            at = next;
+        }
+        GrabParent::Gone
+    }
+
     /// What dismissing a wl_surface's popup needs: the `xdg_popup` to tell,
     /// and the configure tracker that has to be reset. Both come off ONE walk
     /// because a dismissal needs both — telling a client its menu is gone
@@ -1310,6 +1428,12 @@ impl Client {
             .lock()
             .map_err(|_| "XDG configure tracker lock poisoned".to_string())?
             .unmap()?;
+        // Marked before the send, which is the reset's ordering and for the
+        // reset's reason: a failed send ends the connection, and a popup
+        // recorded as dismissed but untold is the safe half to be holding.
+        if let Some(Object::XdgPopup { dismissed, .. }) = self.objects.get_mut(&popup) {
+            *dismissed = true;
+        }
         self.send(popup, XDG_POPUP_POPUP_DONE, wire::Builder::new())
     }
 
@@ -2002,6 +2126,9 @@ impl Client {
         // buffer path below to float it over its parent rather than tile it.
         let mut popup: Option<PopupPlacement> = None;
         let mut is_popup = false;
+        // Which xdg_popup this surface's role object is, for the facts the
+        // OBJECT keeps rather than the surface: see `mapped_once`.
+        let mut popup_object_id: Option<u32> = None;
         if let Some(SurfaceRole::Xdg(role)) = state.role {
             let xdg = self
                 .objects
@@ -2071,6 +2198,7 @@ impl Client {
                             let Some(Object::XdgPopup {
                                 rect,
                                 configure_sent,
+                                dismissed,
                                 ..
                             }) = self.objects.get_mut(&popup_object)
                             else {
@@ -2083,6 +2211,13 @@ impl Client {
                             // so the flag is set from the same lookup that
                             // read it — `outbound` is a disjoint field, so the
                             // borrow costs nothing.
+                            // Inviting it back ends the dismissal. The
+                            // flag answers "can this hold a grab now", and a
+                            // menu td has just agreed to place can — leaving
+                            // it set would have a submenu opened under a
+                            // re-mapped menu turned away for a take-down that
+                            // is over.
+                            *dismissed = false;
                             let placement = (!*configure_sent).then_some(*rect);
                             send_popup_configure(
                                 &self.outbound,
@@ -2122,6 +2257,7 @@ impl Client {
                 // arm and join the arrangement — a menu given a share of the
                 // screen, a title band and a drag handle.
                 is_popup = true;
+                popup_object_id = Some(popup_object);
                 popup = parent.map(|parent| PopupPlacement {
                     parent: SurfaceKey {
                         client: self.id,
@@ -2290,6 +2426,14 @@ impl Client {
                             )?;
                         self.mapped_bytes.insert(id, surface_bytes);
                         self.mapped_total = next;
+                        // Pixels are up, which is what `invalid_grab` dates
+                        // from. Recorded on the popup OBJECT rather than read
+                        // back off the byte ledger, which an unmap clears.
+                        if let Some(Object::XdgPopup { mapped_once, .. }) =
+                            popup_object_id.and_then(|popup| self.objects.get_mut(&popup))
+                        {
+                            *mapped_once = true;
+                        }
                         if matches!(
                             self.objects.get(&object),
                             Some(Object::Buffer(current)) if current.serial == buffer.serial
@@ -3182,6 +3326,9 @@ impl Client {
                             parent: Some(parent_surface),
                             rect,
                             configure_sent: false,
+                            grabbed: false,
+                            dismissed: false,
+                            mapped_once: false,
                         },
                     )?;
                     self.objects.insert(
@@ -3372,16 +3519,101 @@ impl Client {
                     *configure = Arc::new(Mutex::new(ConfigureTracker::new()));
                     Ok(())
                 }
-                // grab. Accepted and not yet acted on: td dismisses no popup
-                // of its own VOLITION — it signals the dismissals its own
-                // take-downs cause, but nothing here closes a menu because a
-                // click landed outside it — so a grab it recorded would be a
-                // promise about keyboard and pointer routing that nothing
-                // keeps.
+                // grab. RECORDED and checked, not yet acted on: nothing here
+                // closes a menu because a click landed outside it, so what
+                // this buys is the chain the protocol reads through the flag
+                // and the answers a client can already earn.
                 1 => {
-                    args.u32()?;
-                    args.u32()?;
-                    args.finish()
+                    let seat = args.u32()?;
+                    // The serial is read and not checked. It should name
+                    // an input event, and td keeps no ledger of the INPUT
+                    // serials it has issued — `next_serial` mints and
+                    // forgets, where the configure serials the tracker holds
+                    // are a different set. Refusing what cannot be verified
+                    // would reject every honest client, so it is dropped and
+                    // the gap recorded in DESIGN.md §3.
+                    let _serial = args.u32()?;
+                    args.finish()?;
+                    if !matches!(self.objects.get(&seat), Some(Object::Seat { .. })) {
+                        return Err(format!(
+                            "xdg_popup {} grabbed with {seat}, which is no wl_seat",
+                            message.object
+                        ));
+                    }
+                    let Some(Object::XdgSurface {
+                        surface, wm_base, ..
+                    }) = self.objects.get(&xdg_surface).cloned()
+                    else {
+                        return Err(format!(
+                            "xdg_popup {} lost xdg_surface {xdg_surface}",
+                            message.object
+                        ));
+                    };
+                    // "Tried to grab after being mapped" is the whole of
+                    // `invalid_grab`, and it is a fact about the popup's LIFE
+                    // rather than its state now — see `mapped_once`. Not the
+                    // configure being answered, though: a toolkit asks for
+                    // the grab on the press that opens the menu, long before
+                    // it has painted one.
+                    let Some(Object::XdgPopup {
+                        parent,
+                        mapped_once,
+                        ..
+                    }) = self.objects.get(&message.object)
+                    else {
+                        return Err(format!("xdg_popup {} is not a popup", message.object));
+                    };
+                    let (parent, mapped_once) = (*parent, *mapped_once);
+                    if mapped_once {
+                        return self.fail_protocol_on(
+                            message.object,
+                            XDG_POPUP_ERROR_INVALID_GRAB,
+                            &format!("xdg_popup {} grabbed after being mapped", message.object),
+                        );
+                    }
+                    // A grabbing popup hangs off a toplevel or off another
+                    // GRABBING popup. Only ONE of the ways to fail that is an
+                    // error: the protocol names one for a popup parent that
+                    // took no grab, and answers every other unholdable parent
+                    // with a dismissal — "if the parent is a grabbing popup
+                    // which has already been dismissed, this popup will be
+                    // immediately dismissed", and "if the compositor denies
+                    // the grab, the popup will be immediately dismissed".
+                    // Ending the connection where the protocol says to close
+                    // a menu would be td being stricter than the thing it
+                    // implements.
+                    match parent.map_or(GrabParent::Gone, |parent| self.grab_parent(parent)) {
+                        GrabParent::Holdable => {}
+                        // Took no grab, so it cannot be nested under. This is
+                        // the one the protocol raises an error for, and the
+                        // code is `xdg_wm_base`'s rather than the popup's,
+                        // which has none for it — so it goes to the shell
+                        // object, as td's other wm_base errors do.
+                        GrabParent::NotGrabbed => {
+                            return self.fail_protocol_on(
+                                wm_base,
+                                XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT,
+                                &format!(
+                                    "xdg_popup {} grabbed on a popup that took no grab",
+                                    message.object
+                                ),
+                            );
+                        }
+                        // Nothing up there can hold it, so the answer is this
+                        // popup's own dismissal rather than the client's
+                        // connection.
+                        GrabParent::Gone => {
+                            self.unmap_popup(surface)?;
+                            return self.dismiss_popup(surface);
+                        }
+                    }
+                    let Some(Object::XdgPopup { grabbed, .. }) =
+                        self.objects.get_mut(&message.object)
+                    else {
+                        return Err(format!("xdg_popup {} is not a popup", message.object));
+                    };
+                    *grabbed = true;
+                    Ok(())
                 }
                 _ => Err(format!("unsupported xdg_popup request {}", message.opcode)),
             },
@@ -10646,6 +10878,604 @@ mod tests {
         let _ = fs::remove_file(&pool_path);
     }
 
+    /// A menu on a window, not yet mapped, with a seat to grab from.
+    fn grabbable_popup(stem: &str) -> (Client, UnixStream, Arc<Mutex<Runtime>>, PathBuf) {
+        let (mut client, peer, runtime, framebuffer_path) = popup_fixture(stem);
+        adopt_role(&mut client);
+        commit(&mut client).unwrap();
+        menu_rules(&mut client);
+        get_popup(&mut client, 14, 9, 30).unwrap();
+        client.insert(70, Object::Seat { version: 3 }).unwrap();
+        (client, peer, runtime, framebuffer_path)
+    }
+
+    fn grab(client: &mut Client, popup: u32, seat: u32) -> Result<(), String> {
+        let mut request_body = wire::Builder::new();
+        request_body.u32(seat);
+        request_body.u32(1);
+        client.dispatch(
+            request(popup, 1, request_body).unwrap(),
+            &mut VecDeque::new(),
+        )
+    }
+
+    /// A submenu on the menu, sharing its positioner, unmapped.
+    fn submenu_object(client: &mut Client) {
+        client
+            .insert(20, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        let mut shell = wire::Builder::new();
+        shell.u32(21);
+        shell.u32(20);
+        client
+            .dispatch(request(12, 2, shell).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut hanging = wire::Builder::new();
+        hanging.u32(22);
+        hanging.u32(13);
+        hanging.u32(30);
+        client
+            .dispatch(request(21, 2, hanging).unwrap(), &mut VecDeque::new())
+            .unwrap();
+    }
+
+    /// `invalid_grab` is the whole of what `xdg_popup` can refuse, and it is
+    /// exactly "tried to grab after being mapped".
+    ///
+    /// Before the pixels the grab is legal, which is the case a real menu is:
+    /// a toolkit asks for the grab on the button press that opens the menu,
+    /// long before it has painted one.
+    #[test]
+    fn a_menu_may_grab_before_it_is_mapped_and_not_after() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            grabbable_popup("popup-grab-timing");
+        grab(&mut client, 14, 70).unwrap();
+        assert!(
+            matches!(
+                client.objects.get(&14),
+                Some(Object::XdgPopup { grabbed: true, .. })
+            ),
+            "the grab was not recorded"
+        );
+
+        // Mapped, and then a second grab, which is the one the protocol names.
+        let pool_path = std::env::temp_dir().join(format!(
+            "td-wayland-popup-grab-timing-{}-{}.pool",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&pool_path, [0x21u8, 0x43, 0x65, 0]).unwrap();
+        map_popup_surface(&mut client, &mut peer, 6, 13, 7, &pool_path);
+        assert_eq!(client.mapped_bytes.get(&6).copied(), Some(4));
+
+        assert_eq!(
+            grab(&mut client, 14, 70).unwrap_err(),
+            "xdg_popup 14 grabbed after being mapped"
+        );
+        assert_eq!(client.protocol_error_code, XDG_POPUP_ERROR_INVALID_GRAB);
+        // The popup's OWN error, so raised on the popup rather than the shell.
+        assert_eq!(client.protocol_error_object, Some(14));
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// A popup that mapped, took itself down, and then grabs is still
+    /// grabbing AFTER BEING MAPPED, which is what `invalid_grab` names.
+    ///
+    /// The byte ledger cannot answer this: an unmap clears it, so a check on
+    /// what is mapped NOW lets the sequence through. The popup object keeps
+    /// the fact instead. No real menu is refused by the difference — a
+    /// toolkit destroys the popup and makes another rather than re-mapping
+    /// one, and a fresh object has never been mapped.
+    #[test]
+    fn a_menu_that_unmapped_itself_may_still_not_grab() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            grabbable_popup("popup-grab-remap");
+        let pool_path = std::env::temp_dir().join(format!(
+            "td-wayland-popup-grab-remap-{}-{}.pool",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&pool_path, [0x21u8, 0x43, 0x65, 0]).unwrap();
+        map_popup_surface(&mut client, &mut peer, 6, 13, 7, &pool_path);
+
+        // The client's own null attach, which clears the byte ledger.
+        let mut detach = wire::Builder::new();
+        detach.u32(0);
+        detach.i32(0);
+        detach.i32(0);
+        client
+            .dispatch(request(6, 1, detach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            client.mapped_bytes.get(&6),
+            None,
+            "the fixture stayed mapped"
+        );
+
+        assert_eq!(
+            grab(&mut client, 14, 70).unwrap_err(),
+            "xdg_popup 14 grabbed after being mapped"
+        );
+        assert_eq!(client.protocol_error_code, XDG_POPUP_ERROR_INVALID_GRAB);
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// "The parent of a grabbing popup must either be an xdg_toplevel surface
+    /// or another xdg_popup with an explicit grab", and the second half is
+    /// what makes the chain a chain: a submenu may grab only under a menu
+    /// that grabbed.
+    ///
+    /// The refusal carries `xdg_wm_base`'s `invalid_popup_parent`, because
+    /// `xdg_popup` has no code for it — `invalid_grab` is its only one, and
+    /// it means something else. So it is raised on the shell object, as td's
+    /// other wm_base errors are.
+    #[test]
+    fn a_submenu_may_only_grab_under_a_menu_that_grabbed() {
+        let (mut client, _peer, _runtime, framebuffer_path) = grabbable_popup("popup-grab-chain");
+        submenu_object(&mut client);
+
+        // The menu has NOT grabbed, so the submenu may not.
+        assert_eq!(
+            grab(&mut client, 22, 70).unwrap_err(),
+            "xdg_popup 22 grabbed on a popup that took no grab"
+        );
+        assert_eq!(
+            client.protocol_error_code,
+            XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT
+        );
+        assert_eq!(client.protocol_error_object, Some(12));
+        assert!(
+            matches!(
+                client.objects.get(&22),
+                Some(Object::XdgPopup { grabbed: false, .. })
+            ),
+            "a refused grab was recorded anyway"
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// The same chain, walked the other way: once the menu holds a grab, the
+    /// submenu hanging off it may take one too, and becomes the topmost.
+    #[test]
+    fn a_submenu_may_grab_under_a_menu_that_did() {
+        let (mut client, _peer, _runtime, framebuffer_path) = grabbable_popup("popup-grab-nested");
+        submenu_object(&mut client);
+
+        grab(&mut client, 14, 70).unwrap();
+        grab(&mut client, 22, 70).unwrap();
+        assert!(
+            matches!(
+                client.objects.get(&22),
+                Some(Object::XdgPopup { grabbed: true, .. })
+            ),
+            "a submenu under a grabbing menu was not allowed to grab"
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// A grab names the seat the user acted on. td advertises one and checks
+    /// that the id is that object rather than any number the client had —
+    /// a plain error, since the protocol gives no code for an argument of the
+    /// wrong INTERFACE and the connection is over either way.
+    #[test]
+    fn a_grab_that_names_no_seat_is_refused() {
+        let (mut client, _peer, _runtime, framebuffer_path) = grabbable_popup("popup-grab-seat");
+        assert_eq!(
+            grab(&mut client, 14, 30).unwrap_err(),
+            "xdg_popup 14 grabbed with 30, which is no wl_seat"
+        );
+        assert!(
+            matches!(
+                client.objects.get(&14),
+                Some(Object::XdgPopup { grabbed: false, .. })
+            ),
+            "a grab naming a positioner was recorded"
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// A menu whose window has gone is DISMISSED when it grabs, not refused.
+    ///
+    /// Nothing is left to hold the grab, which is the same fact that has such
+    /// a popup dismissed at its initial commit rather than configured. The
+    /// answer is the same too: the protocol says a compositor that denies a
+    /// grab dismisses the popup, and reserves its one error for a parent that
+    /// took no grab. Ending the connection here would be td being stricter
+    /// than the thing it implements — and a client that destroyed its own
+    /// window and had a grab already queued would lose everything rather than
+    /// one menu.
+    #[test]
+    fn a_menu_whose_window_went_is_dismissed_when_it_grabs() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            grabbable_popup("popup-grab-orphan");
+        destroy_the_parent_window(&mut client);
+        drain_messages(&mut peer);
+
+        grab(&mut client, 14, 70).unwrap();
+        assert_eq!(dismissals(&client, &mut peer), vec![14]);
+        assert!(
+            matches!(
+                client.objects.get(&14),
+                Some(Object::XdgPopup { grabbed: false, .. })
+            ),
+            "a grab that could not be held was recorded anyway"
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// A parent whose ROLE OBJECT has gone, with its surface and xdg_surface
+    /// still there, reaches the same answer by the other road.
+    ///
+    /// This is the one that exercises `grab_parent`. The test above never
+    /// reaches it: destroying the window's wl_surface nulls the popup's own
+    /// parent FIELD, so the walk short-circuits before the helper is called.
+    /// Destroying the xdg_toplevel alone leaves the edge pointing at a live
+    /// surface whose xdg_surface carries no role object, which only the
+    /// helper can see.
+    #[test]
+    fn a_menu_whose_window_lost_its_role_is_dismissed_when_it_grabs() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            grabbable_popup("popup-grab-roleless");
+        // The toplevel alone. Its xdg_surface 9 and wl_surface 5 stay, so the
+        // popup's parent edge still names a surface that exists.
+        client
+            .dispatch(
+                request(10, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                client.objects.get(&14),
+                Some(Object::XdgPopup {
+                    parent: Some(5),
+                    ..
+                })
+            ),
+            "the fixture broke the parent edge, which is the other test"
+        );
+        drain_messages(&mut peer);
+
+        grab(&mut client, 14, 70).unwrap();
+        assert_eq!(dismissals(&client, &mut peer), vec![14]);
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// A menu that was dismissed and MAPPED BACK holds a grab again.
+    ///
+    /// The mirror of
+    /// `a_grab_under_a_dismissed_submenu_is_dismissed_though_the_chain_is_whole`
+    /// — same fixture, same self-take-down, opposite outcome — and the reason
+    /// `dismissed` is cleared rather than kept for the object's life. td supports painting a
+    /// dismissed popup back — that is what the whole mapping dance after a
+    /// take-down is for — and a submenu opened under a menu that is up again
+    /// must not be turned away for a dismissal that is over.
+    #[test]
+    fn a_grab_under_a_re_mapped_submenu_is_granted_again() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            grabbable_popup("popup-grab-remapped-parent");
+        let pool_path = std::env::temp_dir().join(format!(
+            "td-wayland-popup-grab-remapped-{}-{}.pool",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&pool_path, [0x21u8, 0x43, 0x65, 0]).unwrap();
+
+        grab(&mut client, 14, 70).unwrap();
+        map_popup_surface(&mut client, &mut peer, 6, 13, 7, &pool_path);
+        submenu_object(&mut client);
+        grab(&mut client, 22, 70).unwrap();
+        map_popup_surface(&mut client, &mut peer, 20, 21, 27, &pool_path);
+
+        client
+            .insert(40, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        let mut shell = wire::Builder::new();
+        shell.u32(41);
+        shell.u32(40);
+        client
+            .dispatch(request(12, 2, shell).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut hanging = wire::Builder::new();
+        hanging.u32(42);
+        hanging.u32(21);
+        hanging.u32(30);
+        client
+            .dispatch(request(41, 2, hanging).unwrap(), &mut VecDeque::new())
+            .unwrap();
+
+        // The menu takes itself down, dismissing the submenu with it.
+        let mut detach = wire::Builder::new();
+        detach.u32(0);
+        detach.i32(0);
+        detach.i32(0);
+        client
+            .dispatch(request(6, 1, detach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(dismissals(&client, &mut peer), vec![22]);
+
+        // Both painted back, which is legal and which td supports. Fresh
+        // buffer ids: the first pair are still live objects.
+        map_popup_surface(&mut client, &mut peer, 6, 13, 8, &pool_path);
+        map_popup_surface(&mut client, &mut peer, 20, 21, 28, &pool_path);
+        assert!(
+            matches!(
+                client.objects.get(&22),
+                Some(Object::XdgPopup {
+                    dismissed: false,
+                    ..
+                })
+            ),
+            "a menu that is up again is still marked dismissed"
+        );
+        drain_messages(&mut peer);
+
+        grab(&mut client, 42, 70).unwrap();
+        assert_eq!(
+            dismissals(&client, &mut peer),
+            Vec::<u32>::new(),
+            "a grab under a menu that is up again was turned away"
+        );
+        assert!(
+            matches!(
+                client.objects.get(&42),
+                Some(Object::XdgPopup { grabbed: true, .. })
+            ),
+            "the grab was not recorded"
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// The walk RECURSES, and this is the test that says so.
+    ///
+    /// Other chain tests walk further, but every one of them reaches its
+    /// answer at the first grabbing popup. Here the menu is
+    /// orphaned but never dismissed — it was never mapped, so no cascade
+    /// reached it — and the submenu hanging off it is grabbing, undismissed,
+    /// and points at a surface that still exists. So the first step of the
+    /// walk finds nothing wrong; it is the SECOND, on the menu above it, that
+    /// finds the broken edge. A check that accepted at the first grabbing
+    /// popup would hand this grab out.
+    #[test]
+    fn a_grab_two_levels_under_a_gone_window_is_dismissed() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            grabbable_popup("popup-grab-two-deep");
+        grab(&mut client, 14, 70).unwrap();
+        submenu_object(&mut client);
+        grab(&mut client, 22, 70).unwrap();
+
+        // A sub-submenu on the submenu.
+        client
+            .insert(40, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        let mut shell = wire::Builder::new();
+        shell.u32(41);
+        shell.u32(40);
+        client
+            .dispatch(request(12, 2, shell).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut hanging = wire::Builder::new();
+        hanging.u32(42);
+        hanging.u32(21);
+        hanging.u32(30);
+        client
+            .dispatch(request(41, 2, hanging).unwrap(), &mut VecDeque::new())
+            .unwrap();
+
+        // The window goes. Nothing was mapped, so nothing is dismissed — the
+        // only thing that changes is the MENU's parent edge, two steps up
+        // from the popup about to grab.
+        destroy_the_parent_window(&mut client);
+        assert_eq!(
+            dismissals(&client, &mut peer),
+            Vec::<u32>::new(),
+            "the fixture dismissed something, which is the other test"
+        );
+        assert!(
+            matches!(
+                client.objects.get(&14),
+                Some(Object::XdgPopup { parent: None, .. })
+            ),
+            "the destroy left the menu's edge whole, which is what step two catches"
+        );
+        assert!(
+            matches!(
+                client.objects.get(&22),
+                Some(Object::XdgPopup {
+                    parent: Some(6),
+                    grabbed: true,
+                    dismissed: false,
+                    ..
+                })
+            ),
+            "the submenu is not the clean first step this test needs"
+        );
+
+        grab(&mut client, 42, 70).unwrap();
+        assert_eq!(dismissals(&client, &mut peer), vec![42]);
+        assert!(
+            matches!(
+                client.objects.get(&42),
+                Some(Object::XdgPopup { grabbed: false, .. })
+            ),
+            "a grab two levels under a gone window was granted"
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// The DISMISSED half of the chain rule, with the parent edge intact.
+    ///
+    /// The sibling test below reaches `Gone` by the other road — the parent's
+    /// edge is broken — so it would still pass if td ignored dismissal
+    /// entirely. This one cannot: the menu takes ITSELF down with a null
+    /// attach, which cascades over the submenu and dismisses it while leaving
+    /// every parent edge in the tree pointing at a live surface. A
+    /// sub-submenu grabbing under that dismissed submenu has a chain that
+    /// walks cleanly to the toplevel, and must still be turned away.
+    #[test]
+    fn a_grab_under_a_dismissed_submenu_is_dismissed_though_the_chain_is_whole() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            grabbable_popup("popup-grab-dismissed-mid");
+        let pool_path = std::env::temp_dir().join(format!(
+            "td-wayland-popup-grab-mid-{}-{}.pool",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&pool_path, [0x21u8, 0x43, 0x65, 0]).unwrap();
+
+        // Menu: grabs, then maps.
+        grab(&mut client, 14, 70).unwrap();
+        map_popup_surface(&mut client, &mut peer, 6, 13, 7, &pool_path);
+
+        // Submenu on the menu: grabs, then maps.
+        submenu_object(&mut client);
+        grab(&mut client, 22, 70).unwrap();
+        map_popup_surface(&mut client, &mut peer, 20, 21, 27, &pool_path);
+
+        // Sub-submenu on the submenu, uncommitted.
+        client
+            .insert(40, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        let mut shell = wire::Builder::new();
+        shell.u32(41);
+        shell.u32(40);
+        client
+            .dispatch(request(12, 2, shell).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut hanging = wire::Builder::new();
+        hanging.u32(42);
+        hanging.u32(21);
+        hanging.u32(30);
+        client
+            .dispatch(request(41, 2, hanging).unwrap(), &mut VecDeque::new())
+            .unwrap();
+
+        // The MENU takes itself down. That cascades over the submenu, which
+        // is dismissed — and no edge is broken, because no surface died.
+        let mut detach = wire::Builder::new();
+        detach.u32(0);
+        detach.i32(0);
+        detach.i32(0);
+        client
+            .dispatch(request(6, 1, detach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            dismissals(&client, &mut peer),
+            vec![22],
+            "the cascade did not dismiss the submenu"
+        );
+        assert!(
+            matches!(
+                client.objects.get(&22),
+                Some(Object::XdgPopup {
+                    parent: Some(6),
+                    grabbed: true,
+                    ..
+                })
+            ),
+            "the fixture broke the edge or the grab, which is the other road"
+        );
+        assert!(
+            matches!(
+                client.objects.get(&14),
+                Some(Object::XdgPopup {
+                    parent: Some(5),
+                    ..
+                })
+            ),
+            "the menu's own edge went, so the walk would stop short of it"
+        );
+
+        // The chain above 42 is whole all the way to the toplevel. It is the
+        // DISMISSAL of 22 that has to turn this grab away.
+        grab(&mut client, 42, 70).unwrap();
+        assert_eq!(dismissals(&client, &mut peer), vec![42]);
+        assert!(
+            matches!(
+                client.objects.get(&42),
+                Some(Object::XdgPopup { grabbed: false, .. })
+            ),
+            "a grab under a dismissed submenu was granted"
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// A submenu under a menu that GRABBED and was then dismissed is
+    /// dismissed itself: "if the parent is a grabbing popup which has already
+    /// been dismissed, this popup will be immediately dismissed".
+    ///
+    /// The state has to be three-valued for this. A dismissed grabbing popup
+    /// is neither answer a two-valued flag can give — it did grab, so "took
+    /// no grab" is the wrong refusal, and it cannot hold one now, so granting
+    /// is wrong too.
+    #[test]
+    fn a_submenu_under_a_dismissed_grab_is_dismissed_too() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            grabbable_popup("popup-grab-dismissed-parent");
+        submenu_object(&mut client);
+        grab(&mut client, 14, 70).unwrap();
+
+        // The window goes, which dismisses the menu. The submenu was never
+        // committed, so no cascade reaches it and its edge still names the
+        // menu's surface.
+        destroy_the_parent_window(&mut client);
+        drain_messages(&mut peer);
+        assert!(
+            matches!(
+                client.objects.get(&22),
+                Some(Object::XdgPopup {
+                    parent: Some(6),
+                    ..
+                })
+            ),
+            "the fixture did not leave the submenu hanging off the menu"
+        );
+
+        grab(&mut client, 22, 70).unwrap();
+        assert_eq!(dismissals(&client, &mut peer), vec![22]);
+        assert!(
+            matches!(
+                client.objects.get(&22),
+                Some(Object::XdgPopup { grabbed: false, .. })
+            ),
+            "a submenu under a dismissed grab was granted one"
+        );
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
     /// The dismissal order follows the TREE, not the order the popups were
     /// placed in — and the two really can disagree, which is why this is a
     /// test rather than a remark.
@@ -11011,8 +11841,12 @@ mod tests {
         assert_eq!(XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER, 3);
         assert_eq!(XDG_SURFACE_ERROR_INVALID_SIZE, 5);
         assert_eq!(XDG_POSITIONER_ERROR_INVALID_INPUT, 0);
+        assert_eq!(XDG_POPUP_ERROR_INVALID_GRAB, 0);
         assert_eq!(XDG_SURFACE_CONFIGURE, 0);
         assert_eq!(XDG_POPUP_CONFIGURE, 0);
+        assert_eq!(XDG_POPUP_POPUP_DONE, 1);
+        assert_eq!(WL_BUFFER_RELEASE, 0);
+        assert_eq!(WL_CALLBACK_DONE, 0);
         assert_eq!(XDG_WM_BASE_VERSION, 1);
     }
 

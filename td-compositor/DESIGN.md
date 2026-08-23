@@ -1089,27 +1089,95 @@ wrong is a compositor that never paints again.
 Three parts are incomplete and a fourth has landed, and each is a landing of
 its own. **Constraint adjustment** is recorded and not acted on: every bit of
 it is permission for td to move a popup that does not fit, so a menu near an
-edge extends past it rather than sliding or flipping. **Grabs** are accepted
-and not acted on — `xdg_popup.grab` records nothing, td dismisses no popup of
-its own, and a client that expects a click outside to close its menu must
-notice and destroy it. **Dismissal is signalled where td dismisses, and
-nowhere else.** Every popup a take-down cascades over is sent
-`xdg_popup.popup_done`, deepest first — the order the protocol makes a client
-destroy nested popups in, so a client that destroys each one as it hears does
-not arrive at td's own `not_the_topmost_popup` — for the popups a cascade
-reaches, which is the qualification recorded further down. That order follows
-the CHAIN and not the stacking, and the two really can disagree. The protocol
-requires a popup's parent to be mapped before the popup itself; td does not
-police that, as `get_popup` checks only for a role object, so a client that
-ignores the rule can place a sub-submenu before the submenu it hangs off and
-leave a child BELOW its own parent in the stack. Sorting the dismissal by
-stacking order — which reads as the obvious way to spell "topmost first" —
-would then put a parent ahead of its child and hand a client the very destroy
-order td refuses — and it is exactly a client already ignoring the protocol
-that would get it. Reversing the cascade cannot: it is breadth-first, so a
-parent's index is the lower one whatever order the placements happened in, and
-whatever the client did. That td does not enforce the mapping rule is a gap of
-its own, recorded here rather than relied on.
+edge extends past it rather than sliding or flipping. **Grabs** are recorded
+and checked, not acted on — nothing routes input through one, so a client that
+expects a click outside to close its menu must still notice and destroy it. td
+does dismiss a popup whose grab it will not hold, which is the protocol's own
+answer to a denied grab rather than td closing a menu on a user's behalf.
+**Dismissal is signalled where td dismisses, and nowhere else.** Every popup a
+take-down cascades over is sent `xdg_popup.popup_done`, deepest first — the
+order the protocol makes a client destroy nested popups in, so a client that
+destroys each one as it hears does not arrive at td's own
+`not_the_topmost_popup` — for the popups a cascade reaches, which is the
+qualification recorded further down. That order follows the CHAIN and not the
+stacking, and the two really can disagree. The protocol requires a popup's
+parent to be mapped before the popup itself; td does not police that, as
+`get_popup` checks only for a role object, so a client that ignores the rule
+can place a sub-submenu before the submenu it hangs off and leave a child
+BELOW its own parent in the stack. Sorting the dismissal by stacking order —
+which reads as the obvious way to spell "topmost first" — would then put a
+parent ahead of its child and hand a client the very destroy order td refuses
+— and it is exactly a client already ignoring the protocol that would get it.
+Reversing the cascade cannot: it is breadth-first, so a parent's index is the
+lower one whatever order the placements happened in, and whatever the client
+did. That td does not enforce the mapping rule is a gap of its own, recorded
+here rather than relied on.
+
+What a recorded grab buys, with nothing yet routing input to it, is the CHAIN
+and the answers a client can already earn. The protocol lets a grabbing popup
+hang off a toplevel or off another popup that grabbed, and nothing else, so
+one popup's answer is the next one's precondition — which is why the flag is
+kept rather than the request being dropped on the floor.
+
+The check is a WALK rather than a look at the parent. The rule reads one level
+but is inductive: a popup is only a grabbing parent while the thing IT hangs
+off can still hold a grab. Checking one level lets a menu whose window has
+gone keep handing grabs to submenus opened under it afterwards, since neither
+its own grab nor its role object goes away when its edge breaks. So the walk
+runs up to a toplevel, and any popup on the way that has been DISMISSED, or
+whose own edge is broken, ends it. It is bounded at the depth the renderer's
+popup walk uses and for the same reason: the edge rules should make a cycle
+impossible, but that is an argument across modules, and running out here says
+the grab cannot be held.
+
+Only ONE way to fail that walk is an error. The protocol names one for a popup
+parent that took no explicit grab, and answers every other unholdable parent
+with a dismissal — "if the parent is a grabbing popup which has already been
+dismissed, this popup will be immediately dismissed", and "if the compositor
+denies the grab, the popup will be immediately dismissed". td follows that
+split: `invalid_popup_parent` for the ungrabbed parent, carried on the shell
+object because `xdg_popup` has no code for it, and `popup_done` for a chain
+that is dismissed, orphaned, or gone. Ending a connection where the protocol
+says to close a menu would be td being stricter than the thing it implements,
+and it would cost a client that destroyed its own window with a grab already
+queued everything rather than one menu.
+
+`invalid_grab` is the popup's own and only error, and is exactly "tried to
+grab after being mapped". That is a fact about the popup's LIFE, not its state
+now: the byte ledger is cleared on unmap, so a popup that mapped, took itself
+down and then grabbed would slip past a check on what is mapped, and the
+object keeps the fact instead. It is not the configure being answered, though
+— a toolkit asks for the grab on the button press that opens the menu, long
+before it has painted, and dating the refusal from the acknowledgement would
+refuse every real menu. A fourth refusal is not the protocol's: the seat
+argument must name a `wl_seat`, and an id that names something else is a plain
+error, since xdg-shell gives no code for an argument of the wrong interface.
+
+The SERIAL is read and not checked. It should name the input event that
+justifies the grab, and td keeps no ledger of the INPUT-event serials it has
+issued: `next_serial` mints and forgets, where the configure serials
+`ConfigureTracker` holds are a different set for a different purpose.
+Refusing what cannot be verified would reject every honest client, so the
+argument is dropped and this is the gap — a client may quote any number.
+Closing it means recording issued input serials with the events that carried
+them and expiring them, which is worth doing when a grab does something, since
+until then there is no authority to forge.
+
+A dismissal is not permanent state. td supports painting a dismissed popup
+back — the whole mapping dance after a take-down is for that — so the flag
+that ends the walk is cleared when td configures the popup again. Keeping it
+for the object's life would turn away a submenu opened under a menu that is up
+again, for a take-down that is over.
+
+One thing the walk does NOT enforce is that the parent is the topmost grabbing
+popup. The protocol requires the parent to be "an xdg_toplevel surface or
+another xdg_popup with an explicit grab" and names no error for a second child
+opened under a menu whose submenu already holds the top, so refusing one would
+turn away a client the protocol permits. Review read the rule as demanding the
+active top; it is recorded here rather than acted on because td models grabs
+as a per-popup fact and not yet as one active stack, and nothing routes input
+through them, so a branch cannot yet send a click or a key to the wrong menu.
+The stack is owed when the routing lands.
 
 Signalling is only HALF of a dismissal, and the protocol puts both halves in
 one sentence: "a popup_done event will be sent out, and at the same time the
@@ -1249,22 +1317,22 @@ is still gone — so no buffer is ever invited, and the round costs a commit and
 an event rather than a paint. It is unbounded in rounds: a dismissal with no
 configure outstanding retires nothing, so the tracker's ceiling stays out of
 reach and leaving the loop is the client's to decide. The dismissal makes the
-cheap loop illegal, not the expensive one. What remains is that td dismisses
-nothing of its OWN volition, which is the grab bullet above rather than this
-one. A workspace switch is not a dismissal either and correctly sends nothing
-— a menu on a workspace that is not showing is RETAINED rather than taken
-down, so it is still the client's and reappears on return, which is a
-different thing from the client being told it closed. A window hidden in a
-stacked container is the same case for the same reason: the placement stops
-being visible and the menu is not dropped.
-**Reposition** is version 3 and out of reach at the `xdg_wm_base` version td
-advertises. td also refuses a NULL parent,
-which the protocol permits only so that another protocol may supply one before
-the first commit: td implements no such protocol, so a popup that arrived that
-way could never be placed at all. A zero-area anchor rectangle IS accepted,
-against the protocol's "non-zero anchor rectangle": it names a point perfectly
-well, and disconnecting a client over a rule with a defined answer is the worse
-reading.
+cheap loop illegal, not the expensive one. What remains is that td closes no
+menu because a user clicked elsewhere, which is the grab bullet above rather
+than this one — the dismissal it does make there is the protocol's answer to a
+grab td will not hold, not a take-down of its own choosing. A workspace switch
+is not a dismissal either and correctly sends nothing — a menu on a workspace
+that is not showing is RETAINED rather than taken down, so it is still the
+client's and reappears on return, which is a different thing from the client
+being told it closed. A window hidden in a stacked container is the same case
+for the same reason: the placement stops being visible and the menu is not
+dropped. **Reposition** is version 3 and out of reach at the `xdg_wm_base`
+version td advertises. td also refuses a NULL parent, which the protocol
+permits only so that another protocol may supply one before the first commit:
+td implements no such protocol, so a popup that arrived that way could never
+be placed at all. A zero-area anchor rectangle IS accepted, against the
+protocol's "non-zero anchor rectangle": it names a point perfectly well, and
+disconnecting a client over a rule with a defined answer is the worse reading.
 
 An error is posted against an OBJECT, so an error whose code belongs to another
 interface has to name that interface's object. Five codes are `xdg_wm_base`'s
