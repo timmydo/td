@@ -609,7 +609,7 @@ fn store_path(path: &Path) -> bool {
         && components.all(|component| matches!(component, Component::Normal(_)))
 }
 
-fn load_build_id(path: &Path) -> Result<Vec<u8>, String> {
+pub(crate) fn load_build_id(path: &Path) -> Result<Vec<u8>, String> {
     let mut file = File::open(path).map_err(|e| format!("open ELF: {e}"))?;
     let length = file.metadata().map_err(|e| format!("stat ELF: {e}"))?.len();
     let header = read_at(&mut file, 0, 64)?;
@@ -714,6 +714,22 @@ fn load_build_id(path: &Path) -> Result<Vec<u8>, String> {
     }
     ids.pop()
         .ok_or_else(|| "GNU build ID vanished after count check".into())
+}
+
+pub(crate) fn is_runtime_elf(path: &Path) -> Result<bool, String> {
+    let mut file = File::open(path).map_err(|e| format!("open ELF candidate: {e}"))?;
+    let mut header = [0u8; 64];
+    let read = file
+        .read(&mut header)
+        .map_err(|e| format!("read ELF candidate: {e}"))?;
+    if header.get(..4) != Some(b"\x7fELF") {
+        return Ok(false);
+    }
+    if read < header.len() {
+        return Err("ELF candidate has a truncated header".into());
+    }
+    require_elf64(&header)?;
+    Ok(matches!(le16(&header, 16)?, 2 | 3))
 }
 
 fn align4(value: u64) -> Result<u64, String> {

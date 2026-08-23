@@ -201,6 +201,12 @@ impl ReportWorker {
 }
 
 fn start_observation(config: &Config) -> Result<Observation, String> {
+    let paranoid = perf_event_paranoid()?;
+    if paranoid < 1 {
+        return Err(format!(
+            "kernel.perf_event_paranoid is {paranoid}, expected at least 1 so only the privileged opener can request system-wide events"
+        ));
+    }
     let symbolizer = match config.index.as_deref() {
         Some(index) => match assert_store_mount() {
             Ok(()) => Symbolizer::from_index(Some(index)),
@@ -1504,6 +1510,14 @@ fn online_cpus() -> Result<Vec<u32>, String> {
         ));
     }
     Ok(cpus)
+}
+
+fn perf_event_paranoid() -> Result<i32, String> {
+    let text = fs::read_to_string("/proc/sys/kernel/perf_event_paranoid")
+        .map_err(|e| format!("read kernel.perf_event_paranoid: {e}"))?;
+    text.trim()
+        .parse()
+        .map_err(|_| "kernel.perf_event_paranoid is not a canonical integer".into())
 }
 
 fn assert_store_mount() -> Result<(), String> {

@@ -517,6 +517,8 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_DRM_FBDEV_EMULATION[ =]/d; \
                   /^#? *CONFIG_DRM_CLIENT_DEFAULT_FBDEV[ =]/d; \
                   /^#? *CONFIG_SECURITY_DMESG_RESTRICT[ =]/d; \
+                  /^#? *CONFIG_PERF_EVENTS[ =]/d; \
+                  /^#? *CONFIG_HOTPLUG_CPU[ =]/d; \
                   /^#? *CONFIG_USER_NS[ =]/d; \
                   /^#? *CONFIG_PID_NS[ =]/d; \
                   /^#? *CONFIG_UTS_NS[ =]/d; \
@@ -595,6 +597,8 @@ pub fn recipe() -> Recipe {
                    'CONFIG_DRM_FBDEV_EMULATION=y' \
                    'CONFIG_DRM_CLIENT_DEFAULT_FBDEV=y' \
                    '# CONFIG_SECURITY_DMESG_RESTRICT is not set' \
+                   'CONFIG_PERF_EVENTS=y' \
+                   '# CONFIG_HOTPLUG_CPU is not set' \
                    'CONFIG_USER_NS=y' \
                    'CONFIG_PID_NS=y' \
                    'CONFIG_UTS_NS=y' \
@@ -669,6 +673,8 @@ pub fn recipe() -> Recipe {
                  if grep -q '^CONFIG_MODULES=y' .config; then echo 'MODULES on (would need module tooling)' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_DEBUG_INFO_BTF=y' .config; then echo 'BTF on (would need pahole)' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_SECURITY_DMESG_RESTRICT=y' .config; then echo 'SECURITY_DMESG_RESTRICT on — unprivileged /dev/kmsg reads become EPERM, so the shipped /bin/dmesg breaks for ordinary users' >&2; exit 1; fi; \
+                 grep -q '^CONFIG_PERF_EVENTS=y' .config || { echo 'PERF_EVENTS off — td-profiler cannot open its per-CPU software sampling events' >&2; exit 1; }; \
+                 if grep -q '^CONFIG_HOTPLUG_CPU=y' .config; then echo 'HOTPLUG_CPU on — td-profiler requires one fixed online-CPU roster for complete system-wide coverage' >&2; exit 1; fi; \
                  grep -q '^CONFIG_USER_NS=y' .config || { echo 'USER_NS off — unshare(CLONE_NEWUSER) returns EINVAL, so td-jail cannot build a sandbox at all' >&2; exit 1; }; \
                  grep -q '^CONFIG_PID_NS=y' .config || { echo 'PID_NS off — a jailed app would see (and could signal) every process on the machine' >&2; exit 1; }; \
                  grep -q '^CONFIG_UTS_NS=y' .config || { echo 'UTS_NS off — a jail could not present its own hostname' >&2; exit 1; }; \
@@ -922,4 +928,34 @@ pub fn recipe() -> Recipe {
     // operator or developer. Automated in-sandbox coverage is the shape checks
     // above (producer rung) and the linux-x86-64-test BuildOnly check, which
     // build the bzImage + initramfs and assert they are well-formed.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profiler_perf_events_are_builtin_and_cpu_hotplug_is_off() {
+        let command_text = recipe()
+            .steps
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|step| match step {
+                Step::Run { argv, .. } => Some(argv.join("\n")),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for required in [
+            "CONFIG_PERF_EVENTS=y",
+            "# CONFIG_HOTPLUG_CPU is not set",
+            "grep -q '^CONFIG_PERF_EVENTS=y' .config",
+            "grep -q '^CONFIG_HOTPLUG_CPU=y' .config",
+        ] {
+            assert!(
+                command_text.contains(required),
+                "kernel profiler contract omitted {required}"
+            );
+        }
+    }
 }

@@ -348,6 +348,7 @@ const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
     ("td-kexec/src", "recipes/src/recipes/td-kexec.rs"),
     ("td-login/src", "recipes/src/recipes/td-login.rs"),
     ("td-netd/src", "recipes/src/recipes/td-netd.rs"),
+    ("td-profiler/src", "recipes/src/recipes/td-profiler.rs"),
     ("td-seatd/src", "recipes/src/recipes/td-seatd.rs"),
     ("td-sh/src", "recipes/src/recipes/td-sh.rs"),
     ("td-svc/src", "recipes/src/recipes/td-svc.rs"),
@@ -976,6 +977,16 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // Unlike generic prose, the profiler design is its normative runtime and
+    // evidence contract. Route it before the docs waiver so an amendment runs
+    // both the host parser/boundedness tests and target image integration.
+    if p == "td-profiler/DESIGN.md" {
+        sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
+        return;
+    }
+
     if pattern_matches("*.md|DESIGN.md|CLAUDE.md|.gitignore", p) {
         return; // docs — no checks
     }
@@ -1057,14 +1068,17 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    // The collector is a standalone dependency-free crate. Increment two has
-    // no target recipe yet, so its exact tests, clippy lints, raw-format checks,
-    // and unsafe-confinement assertions live in the cargo preflight alone.
+    // The collector is a dependency-free crate embedded into its target-static
+    // recipe and packed into system-x86-64. Host cargo holds its parser,
+    // boundedness, and unsafe-confinement assertions; recipe-checks holds the
+    // source-built static link and image integration.
     if pattern_matches(
-        "td-profiler/*|td-profiler/src/*|td-profiler/Cargo.toml|td-profiler/Cargo.lock|td-profiler/DESIGN.md",
+        "td-profiler/*|td-profiler/src/*|td-profiler/Cargo.toml|td-profiler/Cargo.lock",
         p,
     ) {
         sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
         return;
     }
 
@@ -2000,8 +2014,11 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("td-profiler/src/perf.rs", "cargo-test");
     assert_preflight!("td-profiler/src/raw.rs", "cargo-test");
     assert_preflight!("td-profiler/Cargo.lock", "cargo-test");
-    assert_no_target!("td-profiler/src/main.rs", "check");
-    assert_no_target!("td-profiler/src/main.rs", "recipe-checks");
+    assert_preflight!("td-profiler/DESIGN.md", "cargo-test");
+    assert_target!("td-profiler/src/main.rs", "check");
+    assert_target!("td-profiler/src/main.rs", "recipe-checks");
+    assert_target!("td-profiler/DESIGN.md", "check");
+    assert_target!("td-profiler/DESIGN.md", "recipe-checks");
     // td-sh mirrors td-kexec: standalone std-only crate, main.rs include_str!'d into
     // its recipe, so host cargo preflight + the recipe-checks static-link proof.
     assert_target!("td-sh/src/main.rs", "check");
@@ -2523,7 +2540,7 @@ const DEPENDENCY_FREE_LOCKS: [(&str, usize); 18] = [
 /// binary are one text — which makes `recipes`, and therefore `cargo test
 /// --workspace`, a READER of those files. Checked against the tree rather than
 /// trusted, in `unembedded_crates_are_really_unembedded`.
-const UNEMBEDDED_CRATES: [&str; 2] = ["td-profiler", "td-review"];
+const UNEMBEDDED_CRATES: [&str; 1] = ["td-review"];
 
 /// Files under `builder/src` that are NOT the build engine, and so do not owe
 /// the from-source behavioural tier the rest of that directory does.

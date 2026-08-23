@@ -140,7 +140,9 @@ struct ShippedApplication {
     /// distinct from `package`, which is a catalog dependency key.
     name: &'static str,
     package: &'static str,
+    package_recipe: fn() -> Recipe,
     runtime: &'static str,
+    runtime_recipe: fn() -> Recipe,
 }
 
 /// The distro definition. EDIT THIS to tailor the system, then rebuild and
@@ -164,6 +166,16 @@ const APPLICATION_LAUNCHER_TABLE: &str =
     crate::ladder::TD_APPLICATION_LAUNCHER_TABLE;
 const APPLICATION_CONFIG: &str = crate::ladder::TD_APPLICATION_CONFIG_PATH;
 const APPLICATION_RUNTIME_ROOT: &str = crate::ladder::TD_APPLICATION_RUNTIME_ROOT;
+const PROFILER_OBJECT_INDEX: &str = "/etc/td-profiler-objects.tsv";
+const PROFILER_APPLICATION_ROOTS: &str = "/etc/td-profiler-application-roots.tsv";
+const PROFILER_CAPTURE_ROOT: &str = "/var/lib/td-profiler/captures";
+const PROFILER_USER: &str = "profiler";
+const PROFILER_UID: u32 = 997;
+const PROFILER_GID: u32 = 997;
+const PROFILER_READ_GID: u32 = 996;
+const PROFILER_CAPTURE_SECS: u16 = 60;
+const PROFILER_EVIDENCE_TIMEOUT_SECS: u16 = 180;
+const PROFILER_EVIDENCE_SERVICE_TIMEOUT_SECS: u16 = 195;
 const APPLICATION_FIXTURE_NAME: &str = crate::ladder::TD_JAIL_FIXTURE_NAME;
 const APPLICATION_FIXTURE_EVIDENCE_PATH: &str = "/run/td-jail-fixture-evidence-ok";
 const APPLICATION_FIXTURE_EVIDENCE_TMP_PATH: &str =
@@ -190,7 +202,9 @@ const APPLICATION_FIXTURE_GREETER_WAIT_ITERATIONS: u16 =
 const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[ShippedApplication {
     name: APPLICATION_FIXTURE_NAME,
     package: APPLICATION_FIXTURE_NAME,
+    package_recipe: super::td_jail_fixture::recipe,
     runtime: "empty-runtime",
+    runtime_recipe: super::empty_runtime::recipe,
 }];
 
 /// Account names are embedded UNQUOTED in generated root shell — `/bin/su -s /bin/sh
@@ -254,6 +268,16 @@ const SYSTEM: SystemDef = SystemDef {
             shell: "/bin/sh",
             groups: &[],
             passwordless: true,
+        },
+        User {
+            name: PROFILER_USER,
+            uid: PROFILER_UID,
+            gid: PROFILER_GID,
+            gecos: "System Profiler",
+            home: "/home/profiler",
+            shell: "/bin/sh",
+            groups: &[],
+            passwordless: false,
         },
         User {
             name: "tester",
@@ -761,6 +785,9 @@ fn build_group(sys: &SystemDef) -> String {
         .map(|u| u.name)
         .collect();
     s.push_str(&format!("wheel:x:10:{}\n", wheel.join(",")));
+    // Capture files use this members-capable group. No interactive account is
+    // enrolled by default; an analysis identity must be granted it explicitly.
+    s.push_str(&format!("profiler-read:x:{PROFILER_READ_GID}:\n"));
     s.push_str("tty:x:5:\n");
     s
 }
@@ -841,10 +868,12 @@ fn td_svc_conf_etc_name() -> &'static str {
 /// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
 /// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
 /// regression this catches: the boot comes up missing a service and says nothing.
-const TD_SVC_UNITS: [&str; 14] = [
+const TD_SVC_UNITS: [&str; 16] = [
     "hostname",
     "td-firstboot",
     "rootcheck",
+    "profiler",
+    "profiler-evidence",
     "seat",
     "netup",
     "busd",
@@ -979,6 +1008,29 @@ fn build_td_svc_conf() -> String {
          exec=/etc/rootcheck\n\
          after=td-firstboot\n\
          timeout={rootcheck}\n\
+         \n\
+         # Root opens the system-wide perf descriptors, then td-profiler drops all\n\
+         # credentials to the dedicated writer identity before collecting. Reports\n\
+         # remain local, bounded, and group-readable for an explicitly enrolled agent.\n\
+         [profiler]\n\
+         type=daemon\n\
+         exec=/bin/td-profiler collect --uid {profiler_uid} --gid {profiler_read_gid} --duration-secs {profiler_capture_secs} --deployment {{out}} --profiler-build {{in:td-profiler}}\n\
+         after=rootcheck\n\
+         requires=rootcheck\n\
+         restart=on-failure\n\
+         log=/var/log/svc/td-profiler.log\n\
+         console=yes\n\
+         \n\
+         # A trusted one-shot prints the shared boot marker only after one current-boot\n\
+         # capture has nonzero samples, complete reports, and no loss/corruption.\n\
+         [profiler-evidence]\n\
+         type=oneshot\n\
+         exec=/bin/td-profiler evidence {profiler_capture_root} --timeout-secs {profiler_evidence_timeout_secs} --uid {profiler_uid} --gid {profiler_read_gid}\n\
+         after=profiler\n\
+         requires=profiler\n\
+         timeout={profiler_evidence_service_timeout_secs}\n\
+         log=/var/log/svc/td-profiler-evidence.log\n\
+         console=yes\n\
          \n\
          # The one graphical user owns the fixed framebuffer and evdev seat.\n\
          [seat]\n\
@@ -1116,6 +1168,12 @@ fn build_td_svc_conf() -> String {
         ui_user = UI_USER,
         ui_uid = UI_UID,
         ui_gid = UI_GID,
+        profiler_uid = PROFILER_UID,
+        profiler_read_gid = PROFILER_READ_GID,
+        profiler_capture_secs = PROFILER_CAPTURE_SECS,
+        profiler_capture_root = PROFILER_CAPTURE_ROOT,
+        profiler_evidence_timeout_secs = PROFILER_EVIDENCE_TIMEOUT_SECS,
+        profiler_evidence_service_timeout_secs = PROFILER_EVIDENCE_SERVICE_TIMEOUT_SECS,
         fixture_name = APPLICATION_FIXTURE_NAME,
         fixture_marker = TD_JAIL_FIXTURE_BOOT_MARKER,
         fixture_evidence = APPLICATION_FIXTURE_EVIDENCE,
@@ -1184,6 +1242,8 @@ fn build_deployment_init(sys: &SystemDef) -> String {
      /bin/td-boot root-loop /volume \"$deployment\" /dev/loop0\n\
      /bin/mount -t erofs -o ro /dev/loop0 /sysroot\n\
      /bin/mount -t btrfs -o rw,nodev,nosuid,subvol=@var /dev/vda /sysroot/var\n\
+     /bin/td-util printf '%s\\n' 2 > /proc/sys/kernel/perf_event_paranoid\n\
+     /bin/td-util test \"$(/bin/td-util cat /proc/sys/kernel/perf_event_paranoid)\" = 2 || { echo 'td-init: kernel.perf_event_paranoid did not realize the pinned value 2' >&2; exit 1; }\n\
      /bin/umount /proc\n\
      /bin/umount /dev\n\
      /bin/umount /sys\n\
@@ -1222,16 +1282,21 @@ fn build_deployment_init(sys: &SystemDef) -> String {
             ));
         }
     }
-    init.push_str(
-        "if /bin/td-util test -e /sysroot/var/lib/td-test/td-jail-seccomp-probe; then\n\
+    init.push_str(&format!(
+        "/bin/td-util mkdir -p /sysroot/var/lib/td-profiler/captures\n\
+         /bin/td-util chown 0:0 /sysroot/var/lib /sysroot/var/lib/td-profiler\n\
+         /bin/td-util chmod 0755 /sysroot/var/lib /sysroot/var/lib/td-profiler\n\
+         /bin/td-util chown {PROFILER_UID}:{PROFILER_READ_GID} /sysroot/var/lib/td-profiler/captures\n\
+         /bin/td-util chmod 2750 /sysroot/var/lib/td-profiler/captures\n\
+         if /bin/td-util test -e /sysroot/var/lib/td-test/td-jail-seccomp-probe; then\n\
          /bin/td-util test -f /sysroot/var/lib/td-test/td-jail-seccomp-probe\n\
          /bin/td-util chown 0:0 /sysroot/var/lib /sysroot/var/lib/td-test \
          /sysroot/var/lib/td-test/td-jail-seccomp-probe\n\
          /bin/td-util chmod 0755 /sysroot/var/lib /sysroot/var/lib/td-test\n\
          /bin/td-util chmod 0555 /sysroot/var/lib/td-test/td-jail-seccomp-probe\n\
          fi\n\
-         exec /bin/switch_root /sysroot /init\n",
-    );
+         exec /bin/switch_root /sysroot /init\n"
+    ));
     init
 }
 
@@ -2407,6 +2472,33 @@ fn application_payload_inputs(sys: &SystemDef) -> Vec<&'static str> {
     inputs
 }
 
+fn profiler_application_roots(sys: &SystemDef) -> String {
+    let mut rows: Vec<_> = sys
+        .applications
+        .iter()
+        .map(|application| {
+            let package = (application.package_recipe)();
+            let runtime = (application.runtime_recipe)();
+            format!(
+                "{}\t{}-{}\t{}\t{}-{}\t{}\n",
+                application.name,
+                package.name,
+                package.version,
+                if package.is_foreign() { "foreign" } else { "source" },
+                runtime.name,
+                runtime.version,
+                if runtime.is_foreign() { "foreign" } else { "source" },
+            )
+        })
+        .collect();
+    rows.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    let mut table = String::from("td-profiler-application-roots-v1\n");
+    for row in rows {
+        table.push_str(&row);
+    }
+    table
+}
+
 /// The generated /etc files (config + the login-glue and boot-check scripts). `exec`
 /// marks the ones getty/init reference as executables. Shared by the real-root staging
 /// (written under `{root}/real-root/etc`) and the shape check (which asserts they landed).
@@ -2421,6 +2513,11 @@ fn etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
         (
             application_etc_name(APPLICATION_CONFIG),
             build_application_config(),
+            false,
+        ),
+        (
+            application_etc_name(PROFILER_APPLICATION_ROOTS),
+            profiler_application_roots(sys),
             false,
         ),
         ("inittab", build_inittab(), false),
@@ -2626,6 +2723,12 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     steps.push(Step::CopyTree {
         from: "{in:td-svc}".into(),
         dest: "{root}/real-root{in:td-svc}".into(),
+    });
+    // The static system-wide collector and offline reader. It opens perf while
+    // privileged, then runs and writes captures as the dedicated account.
+    steps.push(Step::CopyTree {
+        from: "{in:td-profiler}".into(),
+        dest: "{root}/real-root{in:td-profiler}".into(),
     });
     // td-jail is static so the running-kernel transition oracle does not depend
     // on the dynamic userland it helps confine.
@@ -2861,6 +2964,10 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         target: "{in:sshd}/bin/sshd".into(),
         link: "{root}/real-root/bin/sshd".into(),
     });
+    steps.push(Step::Symlink {
+        target: "{in:td-profiler}/bin/td-profiler".into(),
+        link: "{root}/real-root/bin/td-profiler".into(),
+    });
     // Generated /etc.
     for (name, content, exec) in etc_files(sys) {
         steps.push(Step::WriteFile {
@@ -2869,6 +2976,24 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
             exec,
         });
     }
+    // Compile the final deployment's object map only after all source-built
+    // closures and generated application tables exist. The registry names exact
+    // package roots; the indexer binds their builder-authenticated manifest/spec
+    // metadata to the catalog-derived package/runtime provenance table. Application
+    // manifest provenance describes containment and is deliberately not transferred
+    // to either root.
+    steps.push(Step::run(
+        "{root}",
+        &[
+            "{in:td-profiler}/bin/td-profiler",
+            "index",
+            "{root}/real-root",
+            "{root}/real-root/etc/td-profiler-objects.tsv",
+            "--exclude-registry",
+            "{root}/real-root/etc/td-applications.tsv",
+            "{root}/real-root/etc/td-profiler-application-roots.tsv",
+        ],
+    ));
     steps
 }
 
@@ -3030,6 +3155,10 @@ fn shape_check() -> String {
      tditab=$(\"$tdi\" init --dry-run -f \"$root/etc/inittab\" 2>&1) || { echo 'td-init init --dry-run REJECTED the inittab this image ships - PID 1 would come up having understood only part of its table. Its per-line diagnostics:' >&2; printf '%s\\n' \"$tditab\" >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-svc\" 2>/dev/null)\" = \"{in:td-svc}/bin/td-svc\" ] || { echo 'root tree: /bin/td-svc is not a symlink to the staged service supervisor - PID 1s only respawn line would exec nothing and the machine would have no userland at all' >&2; exit 1; }; \
      tds=\"{root}/real-root{in:td-svc}/bin/td-svc\"; { [ -f \"$tds\" ] && [ -x \"$tds\" ]; } || { echo 'root tree: the td-svc binary is not packed/executable at real-root{in:td-svc}/bin/td-svc - no identity, no network, no sshd and no console' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/td-profiler\" 2>/dev/null)\" = \"{in:td-profiler}/bin/td-profiler\" ] || { echo 'root tree: /bin/td-profiler is not a symlink to the staged collector' >&2; exit 1; }; \
+     tdp=\"{root}/real-root{in:td-profiler}/bin/td-profiler\"; { [ -f \"$tdp\" ] && [ -x \"$tdp\" ]; } || { echo 'root tree: td-profiler is not packed and executable' >&2; exit 1; }; \
+     pindex=\"$root@PROFILER_OBJECT_INDEX@\"; [ -s \"$pindex\" ] || { echo 'root tree: deployment profiler object index is absent or empty' >&2; exit 1; }; \
+     [ \"$(head -n 1 \"$pindex\")\" = td-profiler-objects-v1 ] || { echo 'root tree: deployment profiler object index has the wrong header' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-jail\" 2>/dev/null)\" = \"{in:td-jail}/bin/td-jail\" ] || { echo 'root tree: /bin/td-jail is not a symlink to the staged confinement boundary' >&2; exit 1; }; \
      tdj=\"{root}/real-root{in:td-jail}/bin/td-jail\"; { [ -f \"$tdj\" ] && [ -x \"$tdj\" ]; } || { echo 'root tree: td-jail is not packed and executable, so the running-kernel transition oracle cannot run' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-seatd\" 2>/dev/null)\" = \"{in:td-seatd}/bin/td-seatd\" ] || { echo 'root tree: /bin/td-seatd is not a symlink to the staged single-user seat assigner' >&2; exit 1; }; \
@@ -3055,9 +3184,10 @@ fn shape_check() -> String {
      : 'the plan identical. the_declared_edges_are_exactly_these pins the edge set on'; \
      : 'the host; this pins that td-svc itself still resolves them this way.'; \
      svcpos() { printf '%s\\n' \"$tdsplan\" | grep -n -E \"^[0-9]+\\. $1\\$\" | cut -d: -f1; }; \
-     hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); st=$(svcpos seat); nu=$(svcpos netup); wl=$(svcpos wayland); tm=$(svcpos terminal); jf=$(svcpos jail-fixture); je=$(svcpos jail-fixture-evidence); bs=$(svcpos bootsuccess); sd=$(svcpos sshd); gr=$(svcpos greeter); bd=$(svcpos busd); \
+     hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); pf=$(svcpos profiler); pe=$(svcpos profiler-evidence); st=$(svcpos seat); nu=$(svcpos netup); wl=$(svcpos wayland); tm=$(svcpos terminal); jf=$(svcpos jail-fixture); je=$(svcpos jail-fixture-evidence); bs=$(svcpos bootsuccess); sd=$(svcpos sshd); gr=$(svcpos greeter); bd=$(svcpos busd); \
      [ \"$hn\" -lt \"$fb\" ] || { echo 'td-svc would not serialize hostname before td-firstboot - init ran every sysinit line to completion before the next, and td-svc starts settled units in the same pass' >&2; exit 1; }; \
      [ \"$fb\" -lt \"$rc\" ] || { echo 'td-svc would start rootcheck before td-firstboot - rootcheck asserts the identity td-firstboot mints is readable' >&2; exit 1; }; \
+     [ \"$rc\" -lt \"$pf\" ] && [ \"$pf\" -lt \"$pe\" ] || { echo 'td-svc would not serialize rootcheck -> profiler -> profiler evidence' >&2; exit 1; }; \
      [ \"$rc\" -lt \"$nu\" ] || { echo 'td-svc would start netup before rootcheck - networking must follow the read-only-root self-check' >&2; exit 1; }; \
      [ \"$nu\" -lt \"$sd\" ] || { echo 'td-svc would start sshd before netup - sshd binds loopback, which netup brings up' >&2; exit 1; }; \
      [ \"$fb\" -lt \"$sd\" ] || { echo 'td-svc would start sshd before td-firstboot - sshd is fail-closed on the host key td-firstboot mints, so it would refuse to start on every boot' >&2; exit 1; }; \
@@ -3124,6 +3254,7 @@ fn shape_check() -> String {
         .replace("@APPLICATIONS@", &application_names(&SYSTEM).join(" "))
         .replace("@TD_SVC_UNITS@", &TD_SVC_UNITS.join(" "))
         .replace("@TD_SVC_CONF@", TD_SVC_CONF)
+        .replace("@PROFILER_OBJECT_INDEX@", PROFILER_OBJECT_INDEX)
         .replace("@TD_SVC_CONF_NAME@", td_svc_conf_etc_name())
         .replace(
             "@APPLICATION_CONFIG_NAME@",
@@ -3387,6 +3518,7 @@ pub fn recipe() -> Recipe {
             "td-firstboot",
             "td-login",
             "td-svc",
+            "td-profiler",
             "td-jail",
             "td-seatd",
             "td-compositor",
@@ -3472,6 +3604,110 @@ mod tests {
             seen.push(name);
         }
         false
+    }
+
+    #[test]
+    fn profiler_is_static_indexed_persistent_and_privilege_separated() {
+        let account = SYSTEM
+            .users
+            .iter()
+            .find(|user| user.name == PROFILER_USER)
+            .unwrap_or_else(|| unreachable!("no profiler account"));
+        assert_eq!(
+            (account.uid, account.gid, account.passwordless),
+            (PROFILER_UID, PROFILER_GID, false)
+        );
+        assert!(
+            build_group(&SYSTEM).contains(&format!(
+                "profiler-read:x:{PROFILER_READ_GID}:\n"
+            )),
+            "the reader group must exist without enrolling an interactive account"
+        );
+        assert!(build_shadow(&SYSTEM).contains("profiler:!:"));
+
+        let init = build_deployment_init(&SYSTEM);
+        for required in [
+            "/sysroot/var/lib/td-profiler/captures",
+            "chown 997:996 /sysroot/var/lib/td-profiler/captures",
+            "chmod 2750 /sysroot/var/lib/td-profiler/captures",
+            "printf '%s\\n' 2 > /proc/sys/kernel/perf_event_paranoid",
+            "cat /proc/sys/kernel/perf_event_paranoid)\" = 2",
+        ] {
+            assert!(init.contains(required), "missing persistent profiler setup: {required}");
+        }
+
+        assert_eq!(
+            unit_key("profiler", "after").as_deref(),
+            Some("rootcheck")
+        );
+        assert_eq!(
+            unit_key("profiler", "requires").as_deref(),
+            Some("rootcheck")
+        );
+        let collector = unit_key("profiler", "exec").unwrap_or_default();
+        for required in [
+            "/bin/td-profiler collect",
+            "--uid 997",
+            "--gid 996",
+            "--duration-secs 60",
+            "--deployment {out}",
+            "--profiler-build {in:td-profiler}",
+        ] {
+            assert!(collector.contains(required), "collector unit omitted {required}");
+        }
+        assert_eq!(unit_key("profiler", "restart").as_deref(), Some("on-failure"));
+        assert_eq!(
+            unit_key("profiler-evidence", "after").as_deref(),
+            Some("profiler")
+        );
+        assert!(
+            unit_key("profiler-evidence", "exec")
+                .unwrap_or_default()
+                .contains(PROFILER_CAPTURE_ROOT)
+        );
+        let evidence = unit_key("profiler-evidence", "exec").unwrap_or_default();
+        for required in ["--timeout-secs 180", "--uid 997", "--gid 996"] {
+            assert!(evidence.contains(required), "evidence unit omitted {required}");
+        }
+        assert_eq!(
+            unit_key("profiler-evidence", "log").as_deref(),
+            Some("/var/log/svc/td-profiler-evidence.log")
+        );
+
+        let steps = real_root_steps(&SYSTEM);
+        assert!(steps.iter().any(|step| matches!(
+            step,
+            Step::WriteFile { path, content, exec: false }
+                if path == "{root}/real-root/etc/td-profiler-application-roots.tsv"
+                    && content == "td-profiler-application-roots-v1\n\
+td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
+        )));
+        assert!(steps.iter().any(|step| matches!(
+            step,
+            Step::CopyTree { from, dest }
+                if from == "{in:td-profiler}"
+                    && dest == "{root}/real-root{in:td-profiler}"
+        )));
+        assert!(steps.iter().any(|step| matches!(
+            step,
+            Step::Run { argv, .. }
+                if argv == &[
+                    "{in:td-profiler}/bin/td-profiler",
+                    "index",
+                    "{root}/real-root",
+                    "{root}/real-root/etc/td-profiler-objects.tsv",
+                    "--exclude-registry",
+                    "{root}/real-root/etc/td-applications.tsv",
+                    "{root}/real-root/etc/td-profiler-application-roots.tsv",
+                ]
+        )));
+        assert!(
+            recipe()
+                .native_inputs
+                .as_deref()
+                .unwrap_or_default()
+                .contains(&"td-profiler".to_string())
+        );
     }
 
     /// PID 1 keeps ONLY what it must own. Everything else is a unit.
@@ -4564,6 +4800,16 @@ mod tests {
                 application.package, application.runtime,
                 "an application package and runtime must be distinct inputs"
             );
+            let package = (application.package_recipe)();
+            assert_eq!(
+                package.name, application.package,
+                "shipped application package provenance must come from its catalog recipe"
+            );
+            let runtime = (application.runtime_recipe)();
+            assert_eq!(
+                runtime.name, application.runtime,
+                "shipped application runtime provenance must come from its catalog recipe"
+            );
         }
     }
 
@@ -4774,7 +5020,9 @@ mod tests {
         const APPLICATIONS: &[ShippedApplication] = &[ShippedApplication {
             name: "fixture",
             package: "fixture-package",
+            package_recipe: super::super::td_jail_fixture::recipe,
             runtime: "fixture-runtime",
+            runtime_recipe: super::super::empty_runtime::recipe,
         }];
         let fixture = SystemDef {
             hostname: SYSTEM.hostname,
@@ -5425,12 +5673,16 @@ mod tests {
             ShippedApplication {
                 name: "rg",
                 package: "catalog-rg",
+                package_recipe: super::super::td_jail_fixture::recipe,
                 runtime: "runtime-rg",
+                runtime_recipe: super::super::empty_runtime::recipe,
             },
             ShippedApplication {
                 name: "td-netd",
                 package: "catalog-netd",
+                package_recipe: super::super::td_jail_fixture::recipe,
                 runtime: "runtime-netd",
+                runtime_recipe: super::super::empty_runtime::recipe,
             },
         ];
         let fixture = SystemDef {
@@ -7255,6 +7507,11 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
                     .collect(),
                 Step::MkDir { path } => vec![path],
                 Step::WriteFile { path, content, .. } => vec![path, content],
+                Step::Run { argv, env, dir } => argv
+                    .into_iter()
+                    .chain(env.into_iter().flat_map(|(key, value)| [key, value]))
+                    .chain(std::iter::once(dir))
+                    .collect(),
                 // Not a variant real_root_steps emits today. Failing beats
                 // skipping: an unmodelled variant is one this scan cannot see
                 // into, which is exactly how a repacked binary would get past.

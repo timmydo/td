@@ -119,6 +119,7 @@ mod tests {
             "td-kexec",
             "td-login",
             "td-netd",
+            "td-profiler",
             "td-seatd",
             "td-sh",
             "td-svc",

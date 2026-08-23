@@ -113,6 +113,7 @@ const TD_SANDBOX_KERNEL_MARKER: &str = td_recipe::ladder::TD_SANDBOX_KERNEL_MARK
 const TD_JAIL_TRANSITION_MARKER: &str = td_recipe::ladder::TD_JAIL_TRANSITION_MARKER;
 const TD_JAIL_SECCOMP_PROBE_MARKER: &str = td_recipe::ladder::TD_JAIL_SECCOMP_PROBE_MARKER;
 const TD_JAIL_FIXTURE_BOOT_MARKER: &str = td_recipe::ladder::TD_JAIL_FIXTURE_BOOT_MARKER;
+const TD_PROFILER_CAPTURE_MARKER: &str = td_recipe::td_profiler_contract::CAPTURE_MARKER;
 const TD_JAIL_SECCOMP_PROBE_PATH: &str = "@var/lib/td-test/td-jail-seccomp-probe";
 
 /// Printed after the unprivileged software compositor paints and listens.
@@ -264,6 +265,7 @@ struct ConsoleEvidence {
     td_jail_transition: bool,
     td_jail_seccomp: bool,
     td_jail_fixture: bool,
+    td_profiler_capture: bool,
     td_wayland_runtime: bool,
     td_pointer_absolute: bool,
     td_term_runtime: bool,
@@ -1317,6 +1319,16 @@ fn validate_system_boot(
              The Rust interpreter proves the program's bytes and the build-host run is only a \
              host-policy smoke test; this marker is the target-kernel behavior proof. Last \
              serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_profiler_capture {
+        return Err(format!(
+            "the userland health checks passed, but the continuous-profiler marker \
+             ({TD_PROFILER_CAPTURE_MARKER:?}) was absent — the root opener could not create \
+             per-CPU perf events, the dedicated profiler identity could not publish its \
+             bounded capture, or the current-boot capture contained no samples, indexed \
+             objects, or AI-readable reports. Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -3143,6 +3155,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_JAIL_TRANSITION_MARKER.len(),
         exact_line_window(TD_JAIL_SECCOMP_PROBE_MARKER),
         exact_line_window(TD_JAIL_FIXTURE_BOOT_MARKER),
+        TD_PROFILER_CAPTURE_MARKER.len(),
         TD_WAYLAND_RUNTIME_MARKER.len(),
         TD_POINTER_ABSOLUTE_MARKER.len(),
         TD_TERM_RUNTIME_MARKER.len(),
@@ -3304,6 +3317,11 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         &mut evidence.td_jail_fixture,
         buf,
         TD_JAIL_FIXTURE_BOOT_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.td_profiler_capture,
+        buf,
+        TD_PROFILER_CAPTURE_MARKER.as_bytes(),
     );
     latch_marker(
         &mut evidence.td_wayland_runtime,
@@ -4201,7 +4219,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 40] {
+    fn all_console_markers() -> [&'static str; 41] {
         [
             MARKER,
             EROFS_MARKER,
@@ -4240,6 +4258,7 @@ mod tests {
             TD_JAIL_TRANSITION_MARKER,
             TD_JAIL_SECCOMP_PROBE_MARKER,
             TD_JAIL_FIXTURE_BOOT_MARKER,
+            TD_PROFILER_CAPTURE_MARKER,
             TD_WAYLAND_RUNTIME_MARKER,
             TD_POINTER_ABSOLUTE_MARKER,
             TD_TERM_RUNTIME_MARKER,

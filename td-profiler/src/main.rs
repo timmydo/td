@@ -4,8 +4,11 @@
 #![deny(unsafe_code)]
 
 mod collector;
+mod contract;
 mod cpuset;
 mod event;
+mod evidence;
+mod index;
 mod json;
 mod perf;
 mod raw;
@@ -39,6 +42,8 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
     match command {
         "collect" => collector::run(parse_collect(arguments.get(1..).unwrap_or_default())?),
         "report" => report_command(arguments.get(1..).unwrap_or_default()),
+        "index" => index_command(arguments.get(1..).unwrap_or_default()),
+        "evidence" => evidence_command(arguments.get(1..).unwrap_or_default()),
         "probe" => probe(),
         "help" | "--help" | "-h" => {
             println!("{}", usage());
@@ -48,13 +53,67 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
     }
 }
 
+fn index_command(arguments: &[OsString]) -> Result<(), String> {
+    let root = arguments.first().ok_or_else(usage).map(PathBuf::from)?;
+    let output = arguments.get(1).ok_or_else(usage).map(PathBuf::from)?;
+    let exclusions = match arguments.get(2).and_then(|value| value.to_str()) {
+        None if arguments.len() == 2 => Vec::new(),
+        Some("--exclude-registry") if arguments.len() == 5 => index::registry_exclusions(
+            &root,
+            &PathBuf::from(
+                arguments
+                    .get(3)
+                    .ok_or("--exclude-registry requires a path")?,
+            ),
+            &PathBuf::from(
+                arguments
+                    .get(4)
+                    .ok_or("--exclude-registry requires an application-root policy")?,
+            ),
+        )?,
+        _ => return Err("index accepts only --exclude-registry REGISTRY APPLICATION_ROOTS".into()),
+    };
+    index::build(&root, &output, &exclusions)
+}
+
+fn evidence_command(arguments: &[OsString]) -> Result<(), String> {
+    let root = arguments.first().ok_or_else(usage).map(PathBuf::from)?;
+    let mut timeout = Duration::from_secs(30);
+    let mut uid = None;
+    let mut gid = None;
+    let mut at = 1usize;
+    while at < arguments.len() {
+        let option = arguments
+            .get(at)
+            .and_then(|value| value.to_str())
+            .ok_or("evidence option is not UTF-8")?;
+        at = at.saturating_add(1);
+        match option {
+            "--timeout-secs" => {
+                timeout = Duration::from_secs(number(take(arguments, &mut at, option)?, option)?);
+            }
+            "--uid" => uid = Some(number(take(arguments, &mut at, option)?, option)?),
+            "--gid" => gid = Some(number(take(arguments, &mut at, option)?, option)?),
+            other => return Err(format!("unknown evidence option {other}")),
+        }
+    }
+    evidence::wait(
+        &root,
+        timeout,
+        uid.ok_or("evidence requires --uid")?,
+        gid.ok_or("evidence requires --gid")?,
+    )
+}
+
 fn parse_collect(arguments: &[OsString]) -> Result<collector::Config, String> {
     let (current_uid, current_gid) = current_credentials()?;
     let mut config = collector::Config {
         root: PathBuf::from(collector::DEFAULT_ROOT),
         index: Some(PathBuf::from(collector::DEFAULT_INDEX)),
         deployment: "unknown".into(),
-        profiler_build: env!("CARGO_PKG_VERSION").into(),
+        // Direct target recipes invoke rustc without Cargo's package
+        // environment; host Cargo still supplies the same literal here.
+        profiler_build: option_env!("CARGO_PKG_VERSION").unwrap_or("0.1.0").into(),
         uid: current_uid,
         gid: current_gid,
         rate_hz: collector::DEFAULT_RATE_HZ,
@@ -186,7 +245,9 @@ fn usage() -> String {
      [--deployment ID] [--profiler-build PATH] [--uid N --gid N] [--rate-hz N] \
      [--duration-secs N|--duration-ms N] [--once]\n       td-profiler report ABSOLUTE-CAPTURE \
      [--object-index PATH|--no-object-index]  # maintenance writer; writes \
-     CAPTURE/regenerated\n       td-profiler probe"
+     ABSOLUTE-CAPTURE/regenerated\n       td-profiler index ROOT OUTPUT \
+     [--exclude-registry REGISTRY APPLICATION_ROOTS]\n       td-profiler evidence CAPTURE-ROOT \
+     [--timeout-secs N] --uid N --gid N\n       td-profiler probe"
         .into()
 }
 
