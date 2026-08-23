@@ -1087,29 +1087,29 @@ of conjunction that has now been corrected three times, and what it costs to be
 wrong is a compositor that never paints again.
 
 Three parts are incomplete and a fourth has landed, and each is a landing of
-its own.
-**Constraint adjustment** is recorded and not acted on: every bit of it is
-permission for td to move a popup that does not fit, so a menu near an edge
-extends past it rather than sliding or flipping. **Grabs** are accepted and not
-acted on — `xdg_popup.grab` records nothing, td dismisses no popup of its own,
-and a client that expects a click outside to close its menu must notice and
-destroy it. **Dismissal is signalled where td dismisses, and
+its own. **Constraint adjustment** is recorded and not acted on: every bit of
+it is permission for td to move a popup that does not fit, so a menu near an
+edge extends past it rather than sliding or flipping. **Grabs** are accepted
+and not acted on — `xdg_popup.grab` records nothing, td dismisses no popup of
+its own, and a client that expects a click outside to close its menu must
+notice and destroy it. **Dismissal is signalled where td dismisses, and
 nowhere else.** Every popup a take-down cascades over is sent
 `xdg_popup.popup_done`, deepest first — the order the protocol makes a client
-destroy nested popups in, so a client that destroys each one as it hears never
-arrives at td's own `not_the_topmost_popup`. That order follows the CHAIN and
-not the stacking, and the two really can disagree. The protocol requires a
-popup's parent to be mapped before the popup itself; td does not police that,
-as `get_popup` checks only for a role object, so a client that ignores the
-rule can place a sub-submenu before the submenu it hangs off and leave a child
-BELOW its own parent in the stack.
-Sorting the dismissal by stacking order — which reads as the obvious way to
-spell "topmost first" — would then put a parent ahead of its child and hand a
-client the very destroy order td refuses — and it is exactly a client already
-ignoring the protocol that would get it. Reversing the cascade cannot: it is
-breadth-first, so a parent's index is the lower one whatever order the
-placements happened in, and whatever the client did. That td does not enforce
-the mapping rule is a gap of its own, recorded here rather than relied on.
+destroy nested popups in, so a client that destroys each one as it hears does
+not arrive at td's own `not_the_topmost_popup` — for the popups a cascade
+reaches, which is the qualification recorded further down. That order follows
+the CHAIN and not the stacking, and the two really can disagree. The protocol
+requires a popup's parent to be mapped before the popup itself; td does not
+police that, as `get_popup` checks only for a role object, so a client that
+ignores the rule can place a sub-submenu before the submenu it hangs off and
+leave a child BELOW its own parent in the stack. Sorting the dismissal by
+stacking order — which reads as the obvious way to spell "topmost first" —
+would then put a parent ahead of its child and hand a client the very destroy
+order td refuses — and it is exactly a client already ignoring the protocol
+that would get it. Reversing the cascade cannot: it is breadth-first, so a
+parent's index is the lower one whatever order the placements happened in, and
+whatever the client did. That td does not enforce the mapping rule is a gap of
+its own, recorded here rather than relied on.
 
 Signalling is only HALF of a dismissal, and the protocol puts both halves in
 one sentence: "a popup_done event will be sent out, and at the same time the
@@ -1147,7 +1147,7 @@ pre-configure attach and not only a repainted menu, so this is a conformance
 fix riding along rather than the point of the landing.
 
 Re-mapping raises one question in two halves — what should td answer a
-re-map's initial commit WITH? — and one half is answered.
+re-map's initial commit WITH? — and both halves are answered below.
 
 Where the parent is LIVE the re-map is legal, and what it gets is the
 `xdg_surface.configure` ALONE. The popup's own configure is sent once per
@@ -1167,34 +1167,96 @@ tracker and has done since before td dismissed anything, so a fix hung off
 dismissal would have left the older route — the one a toolkit reaches without
 ignoring any event — still placing a popup twice.
 
-Where the parent is GONE the other half is open: td sends a configure anyway,
-inviting a buffer it will then decline to place. The decline is correct and
-refunds the bytes, but the invitation should not have been issued, and the
-question is what to send instead. `popup_done` reads as the answer — the
-popup can never be placed, so dismissing it says exactly that and needs no
-error code the protocol does not have — but it is a behaviour change owed its
-own tests rather than a rider here.
+Where the parent is GONE the answer is a DISMISSAL rather than a configure.
+Nothing can resolve a position for that popup again, so configuring it would
+ask the client to acknowledge a serial and paint a buffer the commit path is
+then obliged to refund — work solicited for an outcome td has already decided.
+`popup_done` is what td sends instead, at the first moment it knows: the
+protocol has no error code for "not placeable", and this is precisely what
+that event means. It goes out through the same take-down every dismissal
+uses, so the submenus the scene is holding come down first and their pixels
+are refunded — a menu is not left up over a parent td has just disowned.
+
+What that take-down reaches is the PLACED submenus, and the gap between that
+and the object graph is recorded rather than closed here. A submenu that
+exists as an `xdg_popup` but has committed no buffer is in no placement, so
+no cascade tells it — while `not_the_topmost_popup` is raised off the live
+parent edges, which do include it. A client told its menu is gone, doing what
+the protocol asks and destroying that popup, is then refused for a submenu it
+was never told about. This is not new and not this path's: the window-destroy
+cascade has the same hole and predates it, which is why the claim above about
+a client never arriving at td's own `not_the_topmost_popup` holds only for
+the placed subset. Closing it means walking the parent edges for dismissal
+rather than the scene, at every dismissal site at once, and that is its own
+landing.
+
+A client that ignores the event and attaches anyway meets
+`unconfigured_buffer`, but NOT because this dismissal unmapped anything.
+Reaching it took the surface being unconfigured already, which is the same
+condition the refusal tests; the tracker reset inside the dismissal has
+nothing left to clear here and no test can see it. The reset earns its place
+on the paths that reach it with a configure outstanding, and the pairing is
+what keeps a dismissal one act rather than two. What this path changes is
+only that the client was told.
+
+This DIVERGES from xdg_surface's own words, and the divergence is deliberate.
+That description is unconditional — a client "must perform an initial commit
+without any buffer attached" and the compositor "will reply with initial
+wl_surface state ... followed by an xdg_surface.configure event" — and here td
+replies with a dismissal and no configure. Sending the configure anyway would
+be conformant to the letter and dishonest: it promises a placement td has
+already resolved never to make. The risk raised against it is a toolkit that
+blocks in a roundtrip on the first popup configure and never wakes. The events
+share ONE queue, which is most of the answer: a client waiting out a roundtrip
+dispatches whatever arrives in it, and the dismissal is in it. Hanging takes a
+client that receives `popup_done`, does nothing with it, and keeps waiting —
+which is a client that hangs on any compositor that dismisses a popup it has
+not configured, and the spec permits that on a denied grab. The alternative,
+configuring and then dismissing at once, was weighed and declined: the
+configure would carry a placement measured against a parent that no longer
+exists, which is a worse thing to say than nothing. If a real toolkit is found
+to hang here, that alternative is the answer, and adopting it costs one send.
+
+The dismissal does NOT short-circuit the rest of the commit, and that is the
+part worth writing down: a client asks for a frame callback and commits in one
+breath, so the request is already in the buffer when td decides to turn the
+popup away. Returning early there would leave a `done` that never arrives —
+a client blocked in its own frame loop, which is a worse failure than the menu
+not opening and one with nothing on the wire to explain it.
+
+What this does NOT reach is the buffer commit of a popup that was configured
+and acknowledged while its parent was still alive and orphaned afterwards.
+That one is declined and refunded where it always was, because the invitation
+it is answering was legitimate when it was issued. It is also the only
+remaining way into that arm: a popup that got as far as being MAPPED has its
+tracker reset by the cascade, so its next attach meets one of the two
+pre-configure refusals above rather than the orphan check.
 
 The surface NAMED gets nothing: its client took it down and is not owed an
 event saying so. One take-down is not a cascade at all and is signalled
 separately — a popup still unmapped when its window went was never in the
-scene to be cascaded over, so when its client finally commits the buffer it
-was preparing, td declines the menu and says so there. That is the only moment
-such a popup can ever be told, and without it a client waits on a menu td
-discarded in silence. It is the same call, so that popup is unmapped as a
+scene to be cascaded over, so it is told at its own next step, whichever that
+turns out to be. A popup already configured and acknowledged is told when it
+commits the buffer it was preparing: td declines the menu and says so there.
+One that has not made its initial commit yet is told at that commit, which is
+earlier and asks it to paint nothing. Without either a client waits on a menu
+td discarded in silence. Both are the same call, so the popup is unmapped as a
 cascade's are, and a client that simply re-attaches on a timer is refused
 instead of being refunded round after round. Not one that repeats the whole
-mapping dance, though: that is legal every time, and td refunds and tells it
-every time — bounded, because a round retires nothing the acknowledgement in
-it does not clear, but unbounded in rounds. The dismissal makes the cheap loop
-illegal, not the expensive one. What remains is that td dismisses nothing of
-its OWN volition, which is the grab bullet above rather than this one. A
-workspace switch is not a dismissal either and correctly sends nothing — a
-menu on a workspace that is not showing is RETAINED rather than taken down, so
-it is still the client's and reappears on return, which is a different thing
-from the client being told it closed. A window hidden in a stacked container
-is the same case for the same reason: the placement stops being visible and
-the menu is not dropped.
+mapping dance, though: that is legal every time and answered every time. What
+it is answered WITH is the dismissal rather than a configure, since the parent
+is still gone — so no buffer is ever invited, and the round costs a commit and
+an event rather than a paint. It is unbounded in rounds: a dismissal with no
+configure outstanding retires nothing, so the tracker's ceiling stays out of
+reach and leaving the loop is the client's to decide. The dismissal makes the
+cheap loop illegal, not the expensive one. What remains is that td dismisses
+nothing of its OWN volition, which is the grab bullet above rather than this
+one. A workspace switch is not a dismissal either and correctly sends nothing
+— a menu on a workspace that is not showing is RETAINED rather than taken
+down, so it is still the client's and reappears on return, which is a
+different thing from the client being told it closed. A window hidden in a
+stacked container is the same case for the same reason: the placement stops
+being visible and the menu is not dropped.
 **Reposition** is version 3 and out of reach at the `xdg_wm_base` version td
 advertises. td also refuses a NULL parent,
 which the protocol permits only so that another protocol may supply one before

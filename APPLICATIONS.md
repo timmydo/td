@@ -3191,27 +3191,40 @@ dismissal: every popup a take-down cascades over is sent
 `xdg_popup.popup_done`, deepest first, so a menu whose window went is no
 longer open as far as its client knows — and is unmapped at the same time, as
 the protocol makes those one act, so a client that misses the event and
-repaints is refused rather than handed its menu back. The two gaps that remain
-are named in `td-compositor/DESIGN.md` §3. Several conformance gaps beside
-them are closed: `xdg_wm_base`'s error codes are raised on the shell object
-rather than on the xdg_surface the request arrived at, that shell object may
-not be destroyed before the surfaces it made, a second role object on one
-xdg_surface is `already_constructed`, a surface's role kind outlives the role
-object that carried it, and a menu may not be destroyed while a submenu hangs
-off it. A popup's parent edge is also broken rather than left holding a number
-when the surface it names is destroyed, so a reissued id cannot re-parent a
-menu onto a window that never opened it. The renderer's depth bound stays
-regardless: it is termination, where the rules above are only a reason to
-expect no cycle. `set_window_geometry` WAS the other of the two, parsed and
-discarded — a true no-op, so CSD margins tiled as dead borders and clicks
-landed offset, though the client survived. That row is closed: `ui: a window
-geometry is the part of a surface td tiles` honours it as a crop on both the
-paint and the hit test, with the two divergences it takes recorded in
-`td-compositor/DESIGN.md` §3. `wl_surface.attach`'s x and y were a second
-no-op of the same kind, parsed and dropped; `ui: an attach's offset is the
-cursor's to move` gives them the one role that has a use for them, the cursor
-whose hotspot the protocol decrements by them, and records why a tile ignores
-them and what an offset cannot reach.
+repaints is refused rather than handed its menu back. A menu that can never be
+placed is told sooner and by the same event: a popup whose parent is already
+gone when it makes its initial commit is dismissed AT that commit rather than
+configured, so td stops inviting a buffer it has already decided to decline,
+taking the submenus the scene is holding down first, as any cascade does.
+Answering an initial commit with a dismissal rather than a configure is a
+deliberate divergence from xdg_surface's unconditional wording, recorded with
+its reasoning in `td-compositor/DESIGN.md` §3. Where the parent is still
+there, a re-map gets its serial back but not a second placement, which
+`xdg_wm_base` version 1 has no event to revise. What remains of THIS row is
+grab-driven dismissal, the one named at the top of this paragraph; constraint
+solving has a row of its own further down. `td-compositor/DESIGN.md` §3 lists
+what is still open across all of them — constraint adjustment, grabs, and
+reposition, with the unenforced "parent must be mapped first" rule and the
+dismissal cascade's placement-versus-object-graph gap recorded beside them.
+Several conformance gaps beside them are closed: `xdg_wm_base`'s error codes
+are raised on the shell object rather than on the xdg_surface the request
+arrived at, that shell object may not be destroyed before the surfaces it
+made, a second role object on one xdg_surface is `already_constructed`, a
+surface's role kind outlives the role object that carried it, and a menu may
+not be destroyed while a submenu hangs off it. A popup's parent edge is also
+broken rather than left holding a number when the surface it names is
+destroyed, so a reissued id cannot re-parent a menu onto a window that never
+opened it. The renderer's depth bound stays regardless: it is termination,
+where the rules above are only a reason to expect no cycle.
+`set_window_geometry` WAS the other of the two, parsed and discarded — a true
+no-op, so CSD margins tiled as dead borders and clicks landed offset, though
+the client survived. That row is closed: `ui: a window geometry is the part of
+a surface td tiles` honours it as a crop on both the paint and the hit test,
+with the two divergences it takes recorded in `td-compositor/DESIGN.md` §3.
+`wl_surface.attach`'s x and y were a second no-op of the same kind, parsed and
+dropped; `ui: an attach's offset is the cursor's to move` gives them the one
+role that has a use for them, the cursor whose hotspot the protocol decrements
+by them, and records why a tile ignores them and what an offset cannot reach.
 
 | interface | td state | class | cost |
 |---|---|---|---|
@@ -3220,7 +3233,7 @@ them and what an offset cannot reach.
 | `wl_subcompositor` | absent | **B** | 2,500–4,000 |
 | `wl_data_device_manager` v3, selection | absent | **B** | 4,000–6,000 (DnD later, +~900) |
 | `xdg_positioner` + `get_popup` | **landed** | — | ~900 — spent. Rules recorded and copied at `get_popup`; anchor, gravity and offset resolved on independent axes; the popup floats over its parent, above the tiles and below td's own bar, hit-tested first (though never over the bar), placed by its window geometry, required to abut its parent, stacked by td's own order, and relative to the parent so a submenu hangs off the menu that opened it. A null parent is refused (td implements no protocol that could supply one later) and a zero-area anchor rectangle is accepted as a point |
-| popup grabs + dismissal | **part** | **U** | 1,200–2,000, ~210 spent — `popup_done` is now sent for every popup a take-down cascades over, deepest first, which is the order the protocol makes a client destroy nested popups in; a menu whose window went is no longer left open to its client. The surface is UNMAPPED with it, which the protocol makes the same act: the configure tracker is reset, so a client that ignores the event and repaints gets `unconfigured_buffer` instead of its menu back, and the dismissal is enforced rather than advised. `grab` still records nothing, so a click outside a menu does not close it, and that is the rest of the row |
+| popup grabs + dismissal | **part** | **U** | 1,200–2,000, ~450 spent — `popup_done` is now sent for every popup a take-down cascades over, deepest first, which is the order the protocol makes a client destroy nested popups in; a menu whose window went is no longer left open to its client. The surface is UNMAPPED with it, which the protocol makes the same act: the configure tracker is reset, so a client that ignores the event and repaints gets `unconfigured_buffer` instead of its menu back, and the dismissal is enforced rather than advised. A popup whose parent went before its own initial commit is dismissed AT that commit rather than configured and then refunded, taking the placed submenus down with it, deepest first, and one that maps again under a live parent gets the xdg_surface serial alone, since version 1 has no event that may revise a placement. `grab` still records nothing, so a click outside a menu does not close it, and that is the rest of the row |
 | popup protocol conformance (error object, permanent role, `not_the_topmost_popup`, `defunct_surfaces`, `already_constructed`) | **landed** | — | ~350 — spent. `xdg_wm_base`'s errors name the shell object rather than the xdg_surface they arrived at, and it outlives the surfaces it made so that id stays meaningful; a surface's role kind outlives its role object, so a former menu cannot come back as a tiled window; and a menu may not be destroyed before the submenu hanging off it |
 | shell edges across id reuse | **landed** | — | ~600 — spent. Neither shell edge keeps a number the client has back: a popup's parent edge is broken when the surface it names is destroyed, and a wl_surface's role edge is retired when its xdg_surface is. So a reissued id cannot re-parent a menu onto an unrelated window, commit a surface through a stranger's role object, close a popup cycle, or answer a `not_the_topmost_popup` scan for a submenu that does not exist. Per surface rather than a sweep, so one window closing leaves other windows' menus alone. The byte accounting it left open is the row below |
 | popup byte accounting across a cascade | **landed** | — | ~120 — spent. A take-down reports the menus it dropped and the client's ledger gives back exactly those, rather than a second walk of the parent edges — which by then reads the edges that walk removed. An application that opens and closes menus is no longer charged for buffers td discarded, and so no longer approaches its own ceiling for holding nothing. All three refunds are reachable, including the one at `wl_surface.destroy`, which looked dead: `get_popup` refuses a parent with no role object, so no new menu can hang off a window whose toplevel has gone — but an existing one only has to be REPAINTED, since its popup object outlives the toplevel and puts the placement back in the scene. Dismissal now unmaps, so that repaint is a whole mapping again rather than a bare attach; it reaches the same refund by a longer road |

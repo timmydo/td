@@ -377,14 +377,21 @@ impl Runtime {
         self.scene.popup_stack()
     }
 
-    /// A popup taken down — by a null attach, by its role object going away, or
-    /// by the surface being destroyed. Settles for the reason above: the
-    /// pointer may have been over it.
+    /// A popup taken down — by a null attach, by its role object going away,
+    /// by an orphan's buffer being declined, or by an unplaceable popup being
+    /// dismissed at its initial commit. Settles for the reason above: the
+    /// pointer may have been over it. A destroyed SURFACE goes through
+    /// `remove` instead.
     ///
     /// Returns the submenus that went with it, which a caller keeping its own
     /// account of these pixels has to give back.
     pub fn unmap_popup(&mut self, key: SurfaceKey) -> Result<Vec<SurfaceKey>, String> {
         let (drawn, dropped) = self.scene.unmap_popup(key);
+        // `drawn` alone, and the descendants need no second condition: a
+        // popup resolves its position by walking placements up to a visible
+        // TILE, so a chain that passes through a surface with no placement
+        // reaches no root and was never on screen. When this key was not
+        // drawn, nothing standing on it was either.
         if drawn {
             self.settle(false)?;
         }
