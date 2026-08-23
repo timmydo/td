@@ -12,11 +12,14 @@ In the control-plane engine the only `unsafe` is the raw-syscall layer
 (`builder/src/sys.rs` and its callers `nar.rs`/`sandbox.rs`), which carry
 `#![allow(unsafe_code)]` so `builder` can be `libc`-free. Every other
 engine crate (the shared `engine` lib and
-`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are NINE
+`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TEN
 target-side exceptions, each a standalone crate OUTSIDE the
 `builder`/`recipes`/`engine` workspace whose only `unsafe` is that same
 `syscall`-instruction layer under a scoped `#[allow]` (the crate itself
-`#![deny(unsafe_code)]`s).
+`#![deny(unsafe_code)]`s). NINE of the ten are exactly that and nothing
+more. The tenth, `td-busd`, carries a second scoped allow of a DIFFERENT
+shape — a descriptor adoption rather than an instruction — and §10 is
+where that difference is argued, because §6 turned the same allow down.
 
 Do not add `unsafe` anywhere else; a new `unsafe` surface is a reviewed
 amendment recorded HERE. A new syscall in an existing surface, a new
@@ -47,6 +50,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with two value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `seccomp(2)` with one value-pinned operation |
+| 10 | `td-busd` | `recvmsg(2)`, `sendmsg(2)`, `getsockopt(2)` with one value-pinned option; plus a SECOND scoped allow for descriptor adoption — see [§10](#10-td-busd--the-session-bus-broker) |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering: it is host-side, and no
@@ -1172,3 +1176,88 @@ supplied namespace, mount set, or BPF program. A thirteenth syscall, a ninth
 prctl operation, a second seccomp operation or nonzero seccomp flag, a fourth
 ambient sub-operation, or a third unshare flag set
 is an amendment here.
+
+## 10. `td-busd` — the session bus broker
+
+`td-busd` carries THREE syscalls through one `syscall5` body in
+`td-busd/src/sys.rs`: `recvmsg(2)` and `sendmsg(2)` for the SCM_RIGHTS
+descriptor passing D-Bus requires of a broker, and `getsockopt(2)` for
+exactly ONE value-pinned option, `SO_PEERCRED` at `SOL_SOCKET`. The body is
+`syscall5` rather than td-compositor's `syscall3` because `getsockopt`
+takes five arguments; the two message calls use three of the five and pass
+zero for the rest.
+
+`SO_PEERCRED` is read because the EXTERNAL mechanism in `auth.rs` has
+nothing else to check a client's asserted uid against, and the kernel's
+answer is the only account of it that the client cannot write. Stable Rust
+does not expose it: `UnixStream::peer_cred` is gated behind
+`peer_credentials_unix_socket` (rust#42839) and has been since 2017, so
+this is an unstable-API gap rather than a preference. The wrapper takes no
+caller-supplied level or option — there is no general `getsockopt` here,
+only `peer_credential` — and it checks the length the kernel writes back
+against `sizeof(struct ucred)` before believing the three words, because a
+short write would otherwise leave a zeroed uid that reads exactly like
+`root`.
+
+`MSG_CMSG_CLOEXEC` is requested on every receive so a forwarded descriptor
+cannot leak through a concurrent `exec`, and `MSG_NOSIGNAL` on every send
+so a peer that left mid-write is an `EPIPE` return rather than a signal.
+Rust's runtime already ignores SIGPIPE at start-up, so the second flag is
+belt-and-braces — but it makes the disposition a property of the call
+rather than of process-wide state, which is worth the zero it costs.
+
+### The second scoped allow
+
+This is the ONE surface with two `#[allow(unsafe_code)]` of different
+shapes: the `syscall` instruction, and `OwnedFd::from_raw_fd` for adopting
+a descriptor the kernel has already installed. §6 turned that same allow
+down and re-derived received descriptors through `/proc/self/fd/N`
+instead, so taking it here needs the reason §6's reason does not cover.
+
+It is this: the reopen trick works on what a compositor receives and not
+on what a broker receives. td-compositor receives wl_shm pool files and
+keymap memfds, and a file-backed descriptor reopens by that path
+faithfully. A broker forwards whatever an application chooses to send, and
+for a socket `open("/proc/self/fd/N")` fails with ENXIO — a socket inode
+has no open method — while an `eventfd` or other `anon_inode` fails with
+EACCES. Both are ordinary D-Bus payloads. A broker built on the reopen
+would therefore refuse to forward exactly the descriptors applications
+most want forwarded, and would do it with an errno that looks like a
+permissions bug. Reopening also produces a NEW open file description, so
+even where it succeeds the receiver gets independent offset and status
+flags rather than the shared description SCM_RIGHTS defines; for a pipe
+handed between two applications that is a semantic change, not a
+different route to the same place.
+
+The adoption appears ONCE, in one private function, and a confinement test
+pins that count. Its discipline is an ordering rule rather than a
+condition: EVERY descriptor a `recvmsg` returns is adopted into an
+`OwnedFd` BEFORE `MSG_CTRUNC` is examined, before the count is compared
+against the message's UNIX_FDS field, and before any parsing. The kernel
+installed those descriptors whether or not the message that carried them
+is one this broker will accept, so any check that returns early ahead of
+the adoption leaks a descriptor per malformed message — a remote fd-table
+exhaustion reachable by a client that only has to be malformed, not
+authenticated. Refusal happens after ownership, never instead of it.
+
+### Deliberately not here
+
+`close(2)` is NOT on this roster, and its absence is the point of taking
+the adoption: `OwnedFd` means `std` performs every close, so the crate
+needs no close of its own. §6 needs one precisely because it declined the
+adoption and must dispose of the raw number it reopened from — the two
+choices are a matched pair, and this surface pays for its second allow by
+giving back a syscall.
+
+There is no `poll(2)` or `epoll_*`. Stable `std` exposes neither, and
+readiness multiplexing would be a FOURTH rostered syscall bought for a
+scalability the session bus does not need; `td-busd` serves one connection
+per thread and blocks in `recvmsg`, which is the design decision recorded
+in `td-busd/src/transport.rs` rather than an oversight. There is no
+`socket(2)`, `bind(2)`, `listen(2)`, `accept(2)`, or `connect(2)` — safe
+`std` `UnixListener`/`UnixStream` do all of those, and the raw layer only
+ever borrows a descriptor `std` already owns. There is no `mmap`, no
+`fcntl`, and no credential-changing call of any kind: this broker reads a
+uid and never assumes one. A fourth syscall, a second socket option, or a
+third scoped allow is an amendment here and to `APPLICATIONS.md` §D in the
+same landing.

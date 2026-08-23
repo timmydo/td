@@ -8,6 +8,8 @@ const MODULES: &[(&str, &str)] = &[
     ("message", include_str!("../../../td-busd/src/message.rs")),
     ("name", include_str!("../../../td-busd/src/name.rs")),
     ("recorded", include_str!("../../../td-busd/src/recorded.rs")),
+    ("sys", include_str!("../../../td-busd/src/sys.rs")),
+    ("transport", include_str!("../../../td-busd/src/transport.rs")),
     ("wire", include_str!("../../../td-busd/src/wire.rs")),
 ];
 
@@ -136,22 +138,57 @@ mod tests {
         assert_eq!(declared, staged);
     }
 
-    /// The broker has no `UNSAFE.md` entry, and the shipped source is what that
-    /// claim is about — not the crate a host cargo happens to lint. Taking the
-    /// raw-syscall surface #10 needs will red this, which is the point: the
-    /// amendment is meant to be a landing rather than a diff nobody noticed.
+    /// `UNSAFE.md` §10, checked against the SHIPPED source — not the crate a
+    /// host cargo happens to lint. The crate has its own confinement tests;
+    /// this is the one that binds the roster to the bytes the recipe writes
+    /// into the store, which is what the roster is a claim about.
+    ///
+    /// Its predecessor asserted the crate carried NO surface, and taking one
+    /// redded it. That was the design: the amendment had to be a landing
+    /// rather than a diff nobody noticed, and it was.
     #[test]
-    fn the_shipped_source_forbids_the_unsafe_lint() {
-        assert!(MAIN_RS.contains("#![forbid(unsafe_code)]"));
+    fn the_shipped_source_confines_the_unsafe_lint_to_surface_ten() {
         let keyword = format!("un{}", "safe");
         let lint = format!("{keyword}_code");
+        assert!(MAIN_RS.contains(&format!("#![deny({lint})]")));
+        assert!(!MAIN_RS.contains(&format!("#![forbid({lint})]")));
         for (module, text) in std::iter::once(&("main", MAIN_RS)).chain(MODULES.iter()) {
             let bare = text
                 .matches(&keyword)
                 .count()
                 .saturating_sub(text.matches(&lint).count());
+            if *module == "sys" {
+                continue;
+            }
             assert_eq!(bare, 0, "{module} names the {keyword} keyword");
         }
+    }
+
+    /// The roster itself, by number, against the shipped bytes: two scoped
+    /// allows and three syscalls. `close(2)` is deliberately off it, because
+    /// the `OwnedFd` adoption means `std` performs every close.
+    #[test]
+    fn the_shipped_syscall_layer_is_the_rostered_surface() {
+        let lint = format!("un{}_code", "safe");
+        let sys = MODULES
+            .iter()
+            .find(|(name, _)| *name == "sys")
+            .map(|(_, text)| *text)
+            .unwrap_or_default();
+        assert_eq!(sys.matches(&format!("#[allow({lint})]")).count(), 2);
+        assert_eq!(sys.matches("const SYS_").count(), 3);
+        for (name, number) in [
+            ("SYS_SENDMSG", "46"),
+            ("SYS_RECVMSG", "47"),
+            ("SYS_GETSOCKOPT", "55"),
+        ] {
+            assert!(
+                sys.contains(&format!("const {name}: usize = {number};")),
+                "{name} is not pinned to {number}"
+            );
+        }
+        assert!(!sys.contains("SYS_CLOSE"));
+        assert_eq!(sys.matches("OwnedFd::from_raw_fd").count(), 1);
     }
 
     #[test]

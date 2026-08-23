@@ -13,6 +13,13 @@ pub fn recipe() -> Recipe {
         // rustc built for x86-64 with `panic=abort` and `opt-level=s`, where a
         // refusal this crate returns as an error and a refusal it reaches by
         // panicking are no longer the same observation.
+        //
+        // Since surface #10 the selftest also binds a socket, serves one peer
+        // on it and probes it, so this step exercises the three rostered
+        // syscalls on the target build rather than the codec alone. That
+        // matters here more than on the host: `SO_PEERCRED` and SCM_RIGHTS are
+        // the parts a sandbox can refuse, and a broker whose codec is perfect
+        // and whose socket will not bind is a broker this check used to pass.
         Step::run("{root}", &[bin, "selftest"]),
         Step::MkDir {
             path: "{out}".into(),
@@ -21,8 +28,9 @@ pub fn recipe() -> Recipe {
             path: "{out}/result".into(),
             content: "PASS: td-busd is a static target executable whose D-Bus selftest runs \
 there — every type round-tripped in both byte orders, the committed body and message streams \
-marshalled and decoded byte for byte, every committed malformed encoding refused, and every \
-committed auth transcript answered byte for byte\n"
+marshalled and decoded byte for byte, every committed malformed encoding refused, every \
+committed auth transcript answered byte for byte, and a bus bound on a real socket that \
+authenticated a peer by its kernel credential\n"
                 .into(),
             exec: false,
         },
@@ -37,7 +45,7 @@ committed auth transcript answered byte for byte\n"
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-busd-test: build the dependency-free target D-Bus broker, assert it is static, and run its codec and handshake selftest on the target build"
+echo ">> recipe-check td-busd-test: build the dependency-free target D-Bus broker, assert it is static, and run its codec, handshake and socket selftest on the target build"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-busd-test 1
 "#,

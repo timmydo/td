@@ -2793,23 +2793,46 @@ The reply is delivered when the service answers, or the pending call is
 errored on timeout — never dropped, because a caller waiting on a serial
 that will never be answered hangs rather than fails.
 
-### `UNSAFE.md` surface #10 (draft roster)
+### `UNSAFE.md` surface #10 (landed)
+
+The surface is landed and normative in `UNSAFE.md` §10. It is THREE
+syscalls, not the four this section drafted:
 
 ```
-| 10 | `td-busd` | `recvmsg(2)`, `sendmsg(2)`, `close(2)`, `getsockopt(2)` |
+| 10 | `td-busd` | `recvmsg(2)`, `sendmsg(2)`, `getsockopt(2)` |
 ```
+
+`close(2)` came off between draft and landing. The draft carried it from
+the hand-rolled descriptor owner the very next paragraph rejects; once the
+`OwnedFd` adoption is taken, `std` performs every close and the crate has
+no close of its own to make. Keeping the row as drafted would have
+rostered a syscall no line of code issues, which is the failure this file
+exists to prevent, pointed the other way.
 
 `getsockopt` accepts only `SOL_SOCKET`/`SO_PEERCRED` with a fixed
 `[i32; 3]` buffer whose length is pinned in the shipped build, since the
-kernel writes exactly `sizeof(struct ucred)` through the pointer.
-`recvmsg` pins `MSG_CMSG_CLOEXEC` and a control buffer sized for exactly
-64 descriptors. Sole callers are `transport.rs` and `auth.rs`.
+kernel writes exactly `sizeof(struct ucred)` through the pointer — and the
+landed wrapper compares the length the kernel writes BACK against that
+size before believing the words, because a short write leaves a zeroed uid
+that reads exactly like `root`. `recvmsg` pins `MSG_CMSG_CLOEXEC` and a
+control buffer sized for exactly 64 descriptors; `sendmsg` pins
+`MSG_NOSIGNAL`. The body is `syscall5`, since `getsockopt` takes five
+arguments.
+
+The sole caller is `transport.rs`. The draft named `auth.rs` too, and that
+turned out to be wrong: the handshake needs no syscall of its own, because
+the transport reads the bytes and hands them to a `settle()` that is pure.
+A confinement test pins the narrower list.
 
 **How a forwarded descriptor is owned.** td-compositor reopens received
 descriptors through `/proc/self/fd/N` rather than `from_raw_fd`, and that
 trick is *unavailable* to a broker — opening a `/proc/self/fd` entry
-naming a **socket** fails, and the compositor's descriptors are memfds
-and files. A forwarded descriptor here is freight: it is recounted
+naming a **socket** fails with `ENXIO`, and one naming an `anon_inode`
+such as an `eventfd` with `EACCES` (both measured, not assumed), while the
+compositor's descriptors are memfds and files, which reopen faithfully.
+Reopening also yields a NEW open file description, so even where it
+succeeds the receiver does not get the shared description `SCM_RIGHTS`
+defines. A forwarded descriptor here is freight: it is recounted
 against the message's `UNIX_FDS` field (mismatch disconnects the sender),
 forwarded by number, and closed.
 
@@ -2862,9 +2885,91 @@ it says nothing about whether index 7 exists when three arrived, and a
 parser that checks only the count will happily hand a caller the wrong
 descriptor from an adjacent message.
 
+**What enforces the 64-connection bound, and what it approximates.** The
+global half is exact. The per-instance half is not yet: mapping a peer to
+its jail instance needs the registry that `SO_PEERCRED.pid` is looked up
+in, and that lands with the integration rung. Until then the share is
+counted per PID, which is the finest identity the broker has before the
+registry exists. It is wrong only where one instance spans several
+processes — an instance then gets a share per process rather than one
+between them — and right about the case this section names, which is one
+app opening 64 sockets and locking everyone else off the bus. The number
+is a quarter of the ceiling. When the registry lands, the key changes from
+pid to instance and the bound stops being an approximation.
+
+**A second bound the list above does not state, and needs.** "64
+descriptors per message" is per message; a broker also has to bound what
+is queued and unclaimed. Per connection that is 64, since one legal
+message may carry that many — but 64 connections at 64 descriptors is
+4096, past a 1024 `RLIMIT_NOFILE`, so a per-connection cap alone produces
+exactly the `EMFILE` it was added to prevent. The queue is therefore
+charged against a BUS-wide budget of four messages' worth, which leaves
+the connection sockets, the listener and stdio their room.
+
+**Three bounds this landing does NOT have, named so they are not
+rediscovered.** A served connection has no idle or authentication timeout,
+so a peer that connects and never writes holds its slot until it leaves.
+That is bounded rather than open-ended — the per-peer share above means one
+app can hold only its own quarter, not the bus — but the slot is held
+indefinitely, and the bound that should replace "indefinitely" is a
+deadline on completing the handshake. Second, `inbox` and `frame` retain
+their high-water capacity per connection, so peers each sending one
+near-maximum message pin their size in memory charged to `td-busd` rather
+than to the app cgroup; the descriptor budget above is the pattern a byte
+budget would follow. Third, the socket is umask-wide between `bind` and the
+`chmod` that makes it 0600 — a window the 0700 parent covers, and one that
+`umask(2)` would close at the cost of a syscall this roster does not have.
+
+**The stale-socket check is narrowed, not atomic.** `bind` refuses a path
+whose socket still has a listener, which is what stops a second broker
+silently displacing a running one and stranding its peers. Two starts
+racing inside the window between that `connect` and the `unlink` can still
+both conclude "stale". Closing that needs arbitration this design has not
+specified — a lock file with stale recovery, or a syscall not on surface
+#10's roster — and `td-svc` supervises exactly one instance, so the
+remaining race is a misconfiguration rather than an expected path. Stated
+here rather than left for a reader to rediscover.
+
 Deliberately absent: `socket`/`bind`/`listen`/`accept` and byte I/O (all
 `std`), arbitrary socket options, `SCM_CREDENTIALS`, and any syscall a
-D-Bus *service* would need.
+D-Bus *service* would need. Also absent, and worth naming because a
+broker looks like it needs one: `poll(2)`/`epoll_*`. Stable `std` exposes
+no readiness API, so multiplexing would buy a FOURTH rostered syscall for
+a concurrency the session bus does not have; `td-busd` serves one
+connection per thread and blocks in `recvmsg`.
+
+What is landed of the above is the receive side: descriptors are adopted
+first, queued as freight, and claimed by the message whose `UNIX_FDS`
+says so, with a bound on how many may sit unclaimed. The `h`-index bounds
+check is landed too, in the codec: `wire.rs` refuses an index at or past
+the count `decode` was given, so a body value naming a descriptor that did
+not arrive is a decode failure rather than a lookup. An earlier draft of
+this paragraph said that check "lands with rung 14", which was simply
+false about live code — the inverse of the dead-branch mistake recorded
+below, and worth the same warning: a doc that reports a present check as
+missing costs the next reader either a redundant implementation or a
+wasted audit. What rung 14 adds is FORWARDING the descriptors that index
+names.
+
+**Which layer counts the descriptors, and one thing rung 14 must fix.**
+"Mismatch disconnects the sender" is enforced in `message.rs`, which takes
+the number that arrived and refuses any message whose `UNIX_FDS` is not
+EQUAL to it. The transport's own re-check of the same fact was therefore
+unreachable, and the red-check found it by reverting it and watching every
+test stay green — a dead branch shaped like a safety check, which is worse
+than no branch, because the next reader trusts it. It is gone; the message
+layer owns the count.
+
+The equality is right for one message and not yet right for two. The
+transport hands the decoder its WHOLE freight queue as "what arrived", so
+a peer that pipelines two descriptor-carrying messages into one write —
+legal, since `SCM_RIGHTS` boundaries have nothing to do with message
+boundaries — presents the first message with both messages' descriptors
+and is disconnected for a count it got right. Nothing reaches this today:
+descriptors go to peers, and until rung 14 there are no peers to name, so
+no client sends one to this broker. Rung 14 must make the decoder's count
+the message's DECLARED share of the queue rather than the queue's depth,
+and the test for it is two fd-carrying messages in a single `write`.
 
 ---
 
