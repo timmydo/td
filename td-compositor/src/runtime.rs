@@ -1,3 +1,4 @@
+use crate::configure::ConfigureTracker;
 use crate::framebuffer::Framebuffer;
 use crate::help::HelpAction;
 use crate::keyboard::{
@@ -13,7 +14,7 @@ use crate::scene::{
     BandPress, CursorRequest, Fraction, PopupPlacement, Scene, SharedInputRegion, Surface,
     SurfaceKey, WindowGeometry,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -76,7 +77,52 @@ pub enum KeyboardDelivery {
     Event(RoutedKeyboardEvent),
     Pointer(RoutedPointerFrame),
     DeleteId(u32),
+    /// One menu already taken down: tell its client. Named BOTH ways, and
+    /// both are needed. The wl_surface is what the registrations are keyed on
+    /// and what the scene places a popup by; the xdg_popup is what the event
+    /// is addressed to, and carrying it is what lets the seat thread prove the
+    /// surface still wears the menu this was about — an id is not an identity,
+    /// and a client may destroy one popup and get the next in a single buffer.
+    ///
+    /// Here rather than on the layout channel because this is the seat's
+    /// business: it answers a press, and it travels with the press's own
+    /// events so a client cannot see the two out of order.
+    PopupDone {
+        surface: u32,
+        popup: u32,
+    },
 }
+
+/// What taking one popup down needs, in a place more than one thread reaches.
+///
+/// A client's `objects` map belongs to its dispatch thread, and a dismissal now
+/// begins with a press the input path saw against a client that may be sending
+/// nothing. Keyed by wl_surface, which both ends already hold.
+pub struct PopupRegistration {
+    /// The xdg_popup object, which is what `popup_done` is addressed to.
+    pub popup: u32,
+    pub tracker: Arc<Mutex<ConfigureTracker>>,
+    /// Whether td has told this popup it is over.
+    ///
+    /// Separate from the shell's `grabbed` because a dismissed grabbing popup
+    /// is neither of the two answers a chain check wants: it held a grab, so
+    /// "did not grab" is the wrong refusal, and it cannot hold one now, so
+    /// accepting is wrong too. The protocol gives that case its own outcome — a
+    /// child grabbing under it "will be immediately dismissed" — which needs
+    /// the state to be three-valued.
+    ///
+    /// CLEARED when td configures the popup again, which is not
+    /// `configure_sent`'s rule and deliberately so. That one records a fact
+    /// about the object's life, which the protocol scopes that way; this one is
+    /// read as "can it hold a grab NOW", and a menu td has just agreed to place
+    /// again can.
+    ///
+    /// ONE copy, written by whichever thread takes the menu down and read by
+    /// the dispatch thread. Two would be two places to leave it stale.
+    pub dismissed: bool,
+}
+
+pub type PopupRegistrations = Arc<Mutex<BTreeMap<u32, PopupRegistration>>>;
 
 enum KeyboardChannel {
     Open(SyncSender<KeyboardDelivery>),
@@ -159,6 +205,18 @@ pub struct Runtime {
     framebuffer: Framebuffer,
     layout: Arc<BTreeMap<SurfaceKey, ViewLayout>>,
     subscribers: BTreeMap<u64, SyncSender<()>>,
+    /// Each connected client's popup registrations, by client.
+    ///
+    /// The compositor now takes menus down on its own initiative, and the two
+    /// halves of doing that must not be split across threads: the pixels leave
+    /// the scene here, and the record that says the menu is over has to leave
+    /// with them. Held so that both happen inside one call on one thread —
+    /// otherwise a client's commit lands in the gap and paints back a menu
+    /// nothing will take down again.
+    ///
+    /// A handle to the CLIENT's map rather than a copy of it, so the dispatch
+    /// thread reading `dismissed` and this writing it are the same bit.
+    popup_registrations: BTreeMap<u64, PopupRegistrations>,
     keyboard: KeyboardState,
     pointer: PointerState,
     keyboard_subscribers: BTreeMap<u64, KeyboardSender>,
@@ -213,6 +271,7 @@ impl Runtime {
             framebuffer,
             layout: Arc::new(BTreeMap::new()),
             subscribers: BTreeMap::new(),
+            popup_registrations: BTreeMap::new(),
             keyboard: KeyboardState::default(),
             pointer: PointerState::default(),
             keyboard_subscribers: BTreeMap::new(),
@@ -343,10 +402,51 @@ impl Runtime {
         input_region: Option<Option<SharedInputRegion>>,
         geometry: Option<WindowGeometry>,
     ) -> Result<(), String> {
+        // A menu td has already recorded as OVER does not come back, and this
+        // is the line that makes the dismissal enforced rather than advised.
+        // The client's commit and the dismissal are separated by nothing it
+        // can see: the shell reads its configure gate at the top of
+        // `commit_surface` and reaches here whole buffer copies later, so a
+        // commit that passed that gate legitimately can arrive after the press
+        // took the menu down. Refusing HERE closes it because both this and
+        // the dismissal run under the runtime lock, which is the only lock
+        // either shares — review found the guarantee resting on the gate
+        // instead, where the window is wide enough for an ordinary repaint.
+        //
+        // Refused rather than failed: the client committed before it could
+        // know, which is nobody's protocol error, and `popup_done` is already
+        // on its way. It comes back by DESTROYING the popup and asking again,
+        // which is what the event asked for. A poisoned registration lock
+        // refuses too, the same safe direction `Client::popup_dismissed`
+        // takes: no thread can be trusted to have finished a take-down.
+        let dismissed = self.popup_dismissed(key);
         let mut painted = false;
         if let Some(surface) = surface {
-            self.scene.commit_popup(key, surface, placement)?;
-            painted = true;
+            // The PIXELS are what a dismissal refuses, and only the pixels.
+            // The shell takes its pending geometry to get here, so returning
+            // early would drop that crop on the floor and the menu would map
+            // again with none — a toolkit's shadow drawn as menu, or the menu
+            // clipped. So GEOMETRY is still recorded below, and it shows
+            // nothing by itself: every road that records a dismissal unmaps
+            // first, `crop_shows` asks whether the key is mapped before it
+            // owes a paint, and a crop is only read with a buffer in hand.
+            // The input region below is a no-op after a real dismissal for
+            // the same reason — the unmap already dropped it, and the scene
+            // refuses a key it no longer holds — and is left to answer for
+            // itself rather than special-cased.
+            //
+            // One arm diverges and is worth naming: a POISONED registration
+            // lock refuses here without anything having unmapped the menu, so
+            // it is still on screen and BOTH land on it — the crop, which
+            // repaints the old pixels under a rectangle meant for the buffer
+            // just refused, and the input region, which can then hit-test
+            // against pixels that do not match it. That is a cosmetic
+            // mis-crop in a compositor that has already had a thread panic
+            // under it, and cheaper than dropping the crop for everyone.
+            if !dismissed {
+                self.scene.commit_popup(key, surface, placement)?;
+                painted = true;
+            }
         }
         let mut aimed = false;
         if let Some(input_region) = input_region {
@@ -807,6 +907,46 @@ impl Runtime {
         } else {
             buttons
         };
+        // A press outside the menus that hold the seat is the gesture that
+        // closes them, and it is the COMPOSITOR's press rather than a client's.
+        // Delivering it as well would close the menu AND click whatever the
+        // menu was covering, which is the one thing every toolkit relies on
+        // not happening.
+        //
+        // Only a PRESS asks the question: motion over another window must not
+        // close a menu, and a release is owed to whoever took the press.
+        // Dropped by the same road the overlay above drops one, and safe for
+        // the same reason — the model suppresses a release it matched no press
+        // to, so the half left behind reaches nobody.
+        let dismissed = if modal
+            || !buttons
+                .iter()
+                .any(|input| input.state == PointerButtonState::Pressed)
+        {
+            Vec::new()
+        } else {
+            self.scene
+                .grabs_dismissed_by_pointer(self.framebuffer.width, self.framebuffer.height)
+        };
+        // OWNER EVENTS. The protocol gives the grab-owning client its pointer
+        // events for all of its surfaces as normal, so the press is only td's
+        // to swallow when it belongs to somebody else — and that also settles
+        // the case of two independent chains, where a press inside one client's
+        // surviving menu must reach it even as another client's menu is closed
+        // by the same press.
+        let owned = hover.is_some_and(|target| self.scene.client_holds_grab(target.surface.client));
+        let mut kept_buttons = Vec::new();
+        let buttons = if dismissed.is_empty() || owned {
+            buttons
+        } else {
+            kept_buttons.extend(
+                buttons
+                    .iter()
+                    .copied()
+                    .filter(|input| input.state != PointerButtonState::Pressed),
+            );
+            &kept_buttons
+        };
         // A modal overlay drops the wheel outright, where it lets a RELEASE
         // through: a release is owed to a client already holding the button,
         // and a notch is owed to nobody — it is a whole gesture rather than
@@ -908,6 +1048,13 @@ impl Runtime {
             }
         }
         if let Err(error) = self.drag(modal, moved, alt_press, buttons) {
+            failures.push(error);
+        }
+        // LAST, and after the drag rather than before it: the press that
+        // closes a menu was taken out of `buttons` above, so nothing here
+        // picked a window up with it, and the grabs have to survive the hover
+        // gate above reading them.
+        if let Err(error) = self.dismiss_popups(&dismissed) {
             failures.push(error);
         }
         if failures.is_empty() {
@@ -1187,6 +1334,69 @@ impl Runtime {
         })
     }
 
+    /// Lend the runtime a client's popup registrations for the life of the
+    /// connection. Replacing an existing handle is not an error, though no
+    /// road reaches it: client ids are handed out by a counter that never
+    /// repeats, so a second lend under one id would be a bug elsewhere rather
+    /// than a reconnection.
+    pub fn register_popups(&mut self, id: u64, popups: PopupRegistrations) {
+        self.popup_registrations.insert(id, popups);
+    }
+
+    pub fn unregister_popups(&mut self, id: u64) {
+        self.popup_registrations.remove(&id);
+    }
+
+    /// Record that a menu is over, on the thread that decided it.
+    ///
+    /// Both acts, in `dismiss_popup`'s order and for its reasons: the configure
+    /// state machine is reset, so a client that ignores the event and repaints
+    /// earns `unconfigured_buffer` rather than its menu back, and the record is
+    /// set so a chain check turns away a grab nested under it.
+    ///
+    /// Answers the xdg_popup this surface wears, which the caller carries to
+    /// the client's seat thread — the event is addressed to that object, and by
+    /// the time it is written the surface may wear another.
+    ///
+    /// The tracker is locked with the registrations RELEASED, which is a lock
+    /// ordering requirement rather than a preference: `Client::dismiss_popup`
+    /// reaches for a tracker and then these, so holding these while reaching
+    /// for a tracker closes a cycle.
+    fn record_dismissal(&mut self, key: SurfaceKey) -> Option<u32> {
+        let registrations = self.popup_registrations.get(&key.client)?;
+        let (popup, tracker) = registrations
+            .lock()
+            .ok()?
+            .get(&key.object)
+            .map(|entry| (entry.popup, Arc::clone(&entry.tracker)))?;
+        if let Ok(mut tracker) = tracker.lock() {
+            let _ = tracker.unmap();
+        }
+        let registrations = self.popup_registrations.get(&key.client)?;
+        let mut registrations = registrations.lock().ok()?;
+        let entry = registrations.get_mut(&key.object)?;
+        if entry.popup != popup {
+            return None;
+        }
+        entry.dismissed = true;
+        Some(popup)
+    }
+
+    /// Whether td has recorded this menu as over. A surface with no
+    /// registration answers FALSE rather than true: a runtime driven with no
+    /// shell behind it has nothing recorded either way, and refusing there
+    /// would leave every popup in the runtime's own tests unpaintable.
+    fn popup_dismissed(&self, key: SurfaceKey) -> bool {
+        let Some(registrations) = self.popup_registrations.get(&key.client) else {
+            return false;
+        };
+        registrations.lock().map_or(true, |registrations| {
+            registrations
+                .get(&key.object)
+                .is_some_and(|entry| entry.dismissed)
+        })
+    }
+
     pub fn unsubscribe_keyboard(&mut self, id: u64) {
         if let Some(sender) = self.keyboard_subscribers.remove(&id) {
             sender.close();
@@ -1209,6 +1419,153 @@ impl Runtime {
                 "seat event queue overflowed before deleting object {object}"
             )),
         }
+    }
+
+    /// Ask a client's seat thread to take one menu down. Silent for a client
+    /// that has none subscribed: nobody is left to tell, which is not this
+    /// caller's failure.
+    ///
+    /// NOT gated on the seat being active, where `queue_keyboard_delete` is. A
+    /// client owns menus whether or not it ever asked for a `wl_keyboard`, and
+    /// an unheard `popup_done` leaves a menu its toolkit will never close.
+    ///
+    /// An OVERFLOWED queue is dropped rather than reported, which is
+    /// `publish_pointer`'s rule and must be. This runs on the shared input
+    /// thread: a report that fails takes the device reader down with it, and
+    /// the reader is not restarted. `queue_keyboard_delete` returns its
+    /// overflow as an error and can, because it runs on the one client's own
+    /// dispatch thread and ends that connection alone. Here the same shape
+    /// would let one client that has stopped reading its socket fill a bounded
+    /// queue and kill the mouse for the whole session — reachable by holding a
+    /// menu open and never reading, since nothing disconnects a client for
+    /// overflow. A menu left untold is that client's own menu.
+    fn queue_popup_done(&mut self, key: SurfaceKey, popup: u32) {
+        let Some(sender) = self.keyboard_subscribers.get(&key.client).cloned() else {
+            return;
+        };
+        let delivery = KeyboardDelivery::PopupDone {
+            surface: key.object,
+            popup,
+        };
+        if sender.try_send(delivery) == KeyboardQueueResult::Closed {
+            self.keyboard_subscribers.remove(&key.client);
+        }
+    }
+
+    /// Take a chain of grabbing menus down.
+    ///
+    /// The record and the PIXELS go here and now, so the menu leaves the
+    /// screen and the operator has the keyboard back with the click rather
+    /// than whenever each client's seat thread next runs. Only the TELLING is
+    /// that thread's, because naming the xdg_popup an event goes to needs the
+    /// client's own registrations; see `dismiss_from_seat`.
+    ///
+    /// A client may therefore see its menu gone before it hears why, and one
+    /// that maps it back in that window gets a menu holding no grab, refused
+    /// its next commit by the flag the event sets. `popup_done` is advice
+    /// until the client acts on it, which is the protocol's own shape.
+    ///
+    /// Every failure is collected rather than returned at the first, for
+    /// `pointer_report`'s reason: a chain half told is worse than a chain told
+    /// with one error reported, and the grabs are already gone by then.
+    fn dismiss_popups(&mut self, keys: &[SurfaceKey]) -> Result<(), String> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut failures = Vec::new();
+        let mut telling: Vec<SurfaceKey> = Vec::new();
+        for key in keys {
+            // Unkillable, and kept. `forget_popup` drops the grab of every
+            // mapping that ends and every key here came off `popups_stacked`,
+            // so one road or the other always covers this: the key's own unmap
+            // below, or — when a parent precedes its own child, which stacking
+            // order allows — the parent's cascade, since `drop_popups_of`
+            // forgets each child rather than merely removing it. Review read
+            // that second road as leaving the grab behind; it does not.
+            //
+            // It stays because this function's contract is that THESE grabs
+            // end, and an invariant holding only as a consequence of another
+            // module's unmap is one a later caller can break without ever
+            // touching this file.
+            self.scene.release_grab(*key);
+            // The CASCADE is the scene's answer rather than this caller's: a
+            // menu taken down takes its submenus with it, and those are owed
+            // the event just as much. Reversed because the scene answers a
+            // parent before the children standing on it, and the protocol
+            // destroys the children first.
+            match self.unmap_popup(*key) {
+                // The submenus standing on it, then IT — which is the split
+                // the dispatch thread's own take-down makes for the same
+                // reason. `unmap_popup` answers the cascade and not the popup
+                // named, so a caller that forwarded only its answer would take
+                // a menu off the screen and never tell the client whose menu
+                // it was.
+                Ok(dropped) => {
+                    telling.extend(dropped.into_iter().rev());
+                    telling.push(*key);
+                }
+                // Still told. The scene is mutated BEFORE the settle that
+                // failed, so this menu is already off the screen; the error is
+                // a paint that did not happen, and skipping the event on top
+                // of it would leave the client holding a menu nobody can see
+                // and no reason to destroy it.
+                //
+                // The CASCADE is unknown on this arm, and what that costs is
+                // uneven: a grabbing submenu is named by the chain in its own
+                // right and gets its turn below, while a non-grabbing one
+                // reaches this list only through `dropped` and so is not told
+                // at all. Recorded rather than fixed — reaching it would mean
+                // asking the scene a second question after a failure that says
+                // the scene is not answering — and unreachable by a client,
+                // since it takes a framebuffer that has stopped settling.
+                Err(error) => {
+                    failures.push(error);
+                    telling.push(*key);
+                }
+            }
+        }
+        // Unkillable for the same shape of reason: `unmap_popup` settles, and
+        // a settle answers focus — and a menu whose unmap does NOT settle was
+        // not drawn, which by `topmost_grab`'s bounds means it held no
+        // keyboard and no answer was owed. That argument crosses two modules
+        // and one of the bounds is a divergence td may revisit, so the answer
+        // is made here rather than inherited.
+        if let Err(error) = self.refresh_focus() {
+            failures.push(error);
+        }
+        // DEDUPED, keeping the first mention. The chain arrives in stacking
+        // order and td does not force that to agree with ancestry — a client
+        // may map a sub-submenu before the submenu it hangs off — so a parent
+        // can precede its own child here. Unmapping the parent then cascades
+        // over the child and names it, and the child's own turn names it
+        // again. Keeping the FIRST mention is what makes this right rather
+        // than merely quiet: the cascade puts a child ahead of its parent, so
+        // the surviving order is the one the protocol asks for even when the
+        // order this was handed is not.
+        let mut seen = BTreeSet::new();
+        for key in telling {
+            if !seen.insert(key) {
+                continue;
+            }
+            // RECORDED here, and the ordering within this call does not
+            // matter: a client re-maps a menu by committing, and every commit
+            // path takes the runtime lock this call is already holding, so no
+            // commit can land between the unmap above and this. What matters is
+            // that the record is made HERE at all rather than by the client's
+            // seat thread, which holds no such lock — review found td with it
+            // there, leaving a gap a commit could paint a menu back through.
+            //
+            // No registration means no client to tell — a scene driven without
+            // a shell, which the runtime's own tests are.
+            let Some(popup) = self.record_dismissal(key) else {
+                continue;
+            };
+            self.queue_popup_done(key, popup);
+        }
+        if failures.is_empty() {
+            return Ok(());
+        }
+        Err(failures.join("; "))
     }
 
     pub fn wake_layout(&mut self, id: u64) {
@@ -1406,6 +1763,34 @@ mod tests {
         }
     }
 
+    /// What a client lends the runtime, for a test that drives a dismissal
+    /// with no shell behind it. Without it the runtime has no way to address
+    /// the event and tells nobody, which is the right answer for a scene
+    /// driven bare and the wrong one for a test about being told.
+    ///
+    /// The xdg_popup object is the surface id plus an offset, so an assertion
+    /// that confuses the two fails rather than passing by coincidence.
+    fn lend_popups(runtime: &mut Runtime, client: u64, surfaces: &[u32]) -> PopupRegistrations {
+        let map: BTreeMap<u32, PopupRegistration> = surfaces
+            .iter()
+            .map(|surface| {
+                (
+                    *surface,
+                    PopupRegistration {
+                        popup: surface.saturating_add(POPUP_OBJECT_OFFSET),
+                        tracker: Arc::new(Mutex::new(ConfigureTracker::new())),
+                        dismissed: false,
+                    },
+                )
+            })
+            .collect();
+        let registrations: PopupRegistrations = Arc::new(Mutex::new(map));
+        runtime.register_popups(client, Arc::clone(&registrations));
+        registrations
+    }
+
+    const POPUP_OBJECT_OFFSET: u32 = 1_000;
+
     fn press(time: u32) -> PointerButtonInput {
         PointerButtonInput {
             time,
@@ -1435,6 +1820,9 @@ mod tests {
                 panic!("unexpected pointer frame for client {}", frame.client)
             }
             Ok(KeyboardDelivery::DeleteId(id)) => panic!("unexpected queued delete_id for {id}"),
+            Ok(KeyboardDelivery::PopupDone { surface, .. }) => {
+                panic!("unexpected menu dismissal for surface {surface}")
+            }
             Err(error) => panic!("no keyboard event was published: {error}"),
         }
     }
@@ -1447,6 +1835,9 @@ mod tests {
             }
             KeyboardDelivery::DeleteId(id) => {
                 panic!("unexpected queued delete_id for {id}");
+            }
+            KeyboardDelivery::PopupDone { surface, .. } => {
+                panic!("unexpected menu dismissal for surface {surface}");
             }
         }
     }
@@ -1465,6 +1856,9 @@ mod tests {
             }
             KeyboardDelivery::DeleteId(id) => {
                 panic!("unexpected queued delete_id for {id}");
+            }
+            KeyboardDelivery::PopupDone { surface, .. } => {
+                panic!("unexpected menu dismissal for surface {surface}");
             }
         }
     }
@@ -5024,6 +5418,671 @@ mod tests {
     /// the window underneath when it goes. Asserted through the EVENTS the
     /// client is sent rather than the snapshot alone: a focus the compositor
     /// believes in and never tells anyone about types into nothing.
+    /// A press with none of the menu under it closes it — and when the press
+    /// lands on the grab OWNER's own window it is still delivered, which the
+    /// protocol requires in as many words: "during a popup grab, the client
+    /// owning the grab will receive pointer and touch events for all their
+    /// surfaces as normal (similar to an `owner-events` grab in X11
+    /// parlance)". Review caught td swallowing it.
+    ///
+    /// The keyboard comes back on THIS call rather than when the client gets
+    /// round to destroying the popup, which is what makes the gesture feel
+    /// like one act.
+    #[test]
+    fn a_press_on_the_grab_owners_own_window_closes_the_menu_and_is_delivered() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-menu-press-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        // BOTH halves active. `subscribe_keyboard` leaves the pointer one off,
+        // and with it off no frame is published at all — which would make the
+        // "the press reached nobody" assertion below true of every press, and
+        // it was, until a mutation that delivered the press stayed green.
+        let subscription = runtime
+            .subscribe_input_with_activity(
+                1,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .unwrap();
+        let (events, stop) = subscription.split();
+        let window = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let menu = SurfaceKey {
+            client: 1,
+            object: 20,
+        };
+        runtime.commit(window, surface([1, 2, 3, 0])).unwrap();
+        let rect = runtime.layout_snapshot().get(&window).unwrap().rect;
+        let _registrations = lend_popups(&mut runtime, 1, &[menu.object]);
+
+        // A SMALL menu, so the tile it hangs off has somewhere outside it to
+        // press: the shared fixture's is the size of the window.
+        runtime.grab_popup(menu).unwrap();
+        runtime
+            .commit_popup(
+                menu,
+                Some(Surface {
+                    width: 10,
+                    height: 10,
+                    pixels: [7u8, 8, 9, 0].repeat(100),
+                    format: SHM_XRGB8888,
+                }),
+                PopupPlacement {
+                    parent: window,
+                    x: 5,
+                    y: 7,
+                    width: 10,
+                    height: 10,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(menu));
+
+        // Onto the tile and clear of the menu, with no button: the motion is
+        // what the press below must not be confused with.
+        let half = |value: usize| i32::try_from(value / 2).unwrap_or(0);
+        let (at_x, at_y) = (
+            i32::try_from(rect.x).unwrap() + half(rect.width),
+            i32::try_from(rect.y).unwrap() + half(rect.height),
+        );
+        runtime
+            .pointer_frame(10, at_x, at_y, &[], PointerScroll::default())
+            .unwrap();
+        while events.try_recv().is_ok() {}
+        assert_eq!(
+            runtime.keyboard_snapshot().focus,
+            Some(menu),
+            "motion alone closed the menu"
+        );
+        assert!(
+            runtime.popup_placement(menu).is_some(),
+            "motion unmapped it"
+        );
+
+        // The press. Nothing moves, so every delivery below is the press's.
+        runtime
+            .pointer_frame(11, 0, 0, &[press(11)], PointerScroll::default())
+            .unwrap();
+        assert!(
+            runtime.popup_placement(menu).is_none(),
+            "the menu is still on screen"
+        );
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(window));
+
+        let mut told = Vec::new();
+        let mut buttons = 0usize;
+        while let Ok(delivery) = events.try_recv() {
+            match delivery {
+                KeyboardDelivery::PopupDone { surface, .. } => told.push(surface),
+                KeyboardDelivery::Pointer(frame) => {
+                    buttons += frame
+                        .events
+                        .iter()
+                        .filter(|event| matches!(event, PointerEvent::Button { .. }))
+                        .count();
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(told, vec![menu.object], "the client was not told, or twice");
+        assert!(
+            buttons > 0,
+            "the owner was denied the press its own surfaces are owed"
+        );
+
+        stop.stop();
+        runtime.unsubscribe_keyboard(1);
+    }
+
+    /// A chain is told DEEPEST FIRST, which is the order the protocol makes a
+    /// client destroy nested popups in — telling a parent first hands a client
+    /// an order td's own `not_the_topmost_popup` would then refuse.
+    ///
+    /// Mapped CHILD FIRST on purpose. td does not force a client to map a
+    /// parent before the popup hanging off it, and the scene's order is
+    /// assigned at first map, so the chain can arrive parent-first. That is
+    /// the only arrangement where the cascade's own reversal does any work,
+    /// and it is also the one that names a popup twice — once from its
+    /// parent's cascade and once on its own turn — which the seen-set drops.
+    #[test]
+    fn a_chain_is_told_deepest_first_however_it_was_mapped() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-menu-chain-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let subscription = runtime
+            .subscribe_input_with_activity(
+                1,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .unwrap();
+        let (events, stop) = subscription.split();
+        let window = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let menu = SurfaceKey {
+            client: 1,
+            object: 20,
+        };
+        let submenu = SurfaceKey {
+            client: 1,
+            object: 21,
+        };
+        let stranger = SurfaceKey {
+            client: 2,
+            object: 30,
+        };
+        runtime.commit(window, surface([1, 2, 3, 0])).unwrap();
+        let small = || Surface {
+            width: 10,
+            height: 10,
+            pixels: [7u8, 8, 9, 0].repeat(100),
+            format: SHM_XRGB8888,
+        };
+        let at = |parent, x, y| PopupPlacement {
+            parent,
+            x,
+            y,
+            width: 10,
+            height: 10,
+        };
+        let _registrations = lend_popups(&mut runtime, 1, &[menu.object, submenu.object]);
+        runtime.grab_popup(menu).unwrap();
+        runtime.grab_popup(submenu).unwrap();
+        // The CHILD's placement is committed first, so the scene orders it
+        // below the menu it hangs off.
+        runtime
+            .commit_popup(submenu, Some(small()), at(menu, 10, 0), None, None)
+            .unwrap();
+        runtime
+            .commit_popup(menu, Some(small()), at(window, 5, 7), None, None)
+            .unwrap();
+
+        // A stranger's window, so the press is swallowed rather than owned,
+        // and the pointer parked over it well clear of either menu.
+        runtime.commit(stranger, surface([4, 5, 6, 0])).unwrap();
+        let rect = runtime.layout_snapshot().get(&stranger).unwrap().rect;
+        let half = |value: usize| i32::try_from(value / 2).unwrap_or(0);
+        runtime
+            .pointer_frame(
+                10,
+                i32::try_from(rect.x).unwrap() + half(rect.width),
+                i32::try_from(rect.y).unwrap() + half(rect.height),
+                &[],
+                PointerScroll::default(),
+            )
+            .unwrap();
+        while events.try_recv().is_ok() {}
+
+        runtime
+            .pointer_frame(11, 0, 0, &[press(11)], PointerScroll::default())
+            .unwrap();
+
+        let mut told = Vec::new();
+        while let Ok(delivery) = events.try_recv() {
+            if let KeyboardDelivery::PopupDone { surface, .. } = delivery {
+                told.push(surface);
+            }
+        }
+        assert_eq!(
+            told,
+            vec![submenu.object, menu.object],
+            "the chain was told in the wrong order, or a menu was told twice"
+        );
+
+        stop.stop();
+        runtime.unsubscribe_keyboard(1);
+    }
+
+    /// The commit ALREADY IN FLIGHT when the press landed does not paint the
+    /// menu back. A client reads its configure gate at the top of the shell's
+    /// commit and reaches the runtime whole buffer copies later, so an
+    /// ordinary repaint — the one a toolkit does on the motion just before the
+    /// click — can arrive after the dismissal has taken the menu down. Review
+    /// found td's guarantee resting on that gate, which is read too early to
+    /// give it.
+    ///
+    /// Driven through the runtime's own door rather than the shell's, because
+    /// the shell's gate would answer first and hide the question. This is the
+    /// backstop under it: whatever refused the commit upstairs, a menu td has
+    /// recorded as over is not placed again.
+    #[test]
+    fn a_commit_already_in_flight_does_not_paint_a_dismissed_menu_back() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-menu-inflight-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let window = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let menu = SurfaceKey {
+            client: 1,
+            object: 20,
+        };
+        let stranger = SurfaceKey {
+            client: 2,
+            object: 30,
+        };
+        let registrations = lend_popups(&mut runtime, 1, &[menu.object]);
+        runtime.commit(window, surface([1, 2, 3, 0])).unwrap();
+        runtime.grab_popup(menu).unwrap();
+        let placement = PopupPlacement {
+            parent: window,
+            x: 5,
+            y: 7,
+            width: 10,
+            height: 10,
+        };
+        let paint = || Surface {
+            width: 10,
+            height: 10,
+            pixels: [7u8, 8, 9, 0].repeat(100),
+            format: SHM_XRGB8888,
+        };
+        runtime
+            .commit_popup(menu, Some(paint()), placement, None, None)
+            .unwrap();
+        assert!(
+            runtime.popup_placement(menu).is_some(),
+            "the menu never went up, so this proves nothing"
+        );
+
+        runtime.commit(stranger, surface([4, 5, 6, 0])).unwrap();
+        let rect = runtime.layout_snapshot().get(&stranger).unwrap().rect;
+        let half = |value: usize| i32::try_from(value / 2).unwrap_or(0);
+        runtime
+            .pointer_frame(
+                10,
+                i32::try_from(rect.x).unwrap() + half(rect.width),
+                i32::try_from(rect.y).unwrap() + half(rect.height),
+                &[],
+                PointerScroll::default(),
+            )
+            .unwrap();
+        runtime
+            .pointer_frame(11, 0, 0, &[press(11)], PointerScroll::default())
+            .unwrap();
+        assert!(runtime.popup_placement(menu).is_none());
+
+        // The buffer the client sent before it heard, landing after — and
+        // carrying the crop that says which of its pixels are MENU and which
+        // are shadow. The shell takes that geometry to get here, so a refusal
+        // that dropped it would leave the client's next mapping uncropped:
+        // shadow drawn as menu, or the menu clipped at the far edge.
+        let geometry = WindowGeometry {
+            x: 1,
+            y: 1,
+            width: 8,
+            height: 8,
+        };
+        runtime
+            .commit_popup(menu, Some(paint()), placement, None, Some(geometry))
+            .expect("a commit that lost the race is not the client's error");
+        assert!(
+            runtime.popup_placement(menu).is_none(),
+            "the menu came back, and nothing can take it down again"
+        );
+        assert_eq!(
+            runtime.window_geometry(menu),
+            Some(geometry),
+            "the refusal swallowed the crop the client had already spent"
+        );
+
+        // Still recorded as over, so the answer does not depend on the paint
+        // having been the thing that cleared it.
+        assert!(
+            registrations
+                .lock()
+                .unwrap()
+                .get(&menu.object)
+                .is_some_and(|entry| entry.dismissed),
+            "the refused commit un-recorded the dismissal"
+        );
+    }
+
+    /// A client that stopped READING must not cost the session an input
+    /// device. `popup_done` is queued on the same bounded seat queue as every
+    /// other delivery, and review found td reporting a full one as an error
+    /// out of the press — which travels up through the device read loop and
+    /// ends the thread that reads that device, for everyone, because one
+    /// client opened a menu and went quiet.
+    ///
+    /// So the press SUCCEEDS over a full queue and the menu still goes down.
+    /// The event is dropped, which is the same answer every other delivery on
+    /// this queue gets: a client not reading has already lost its events.
+    #[test]
+    fn a_full_client_queue_costs_the_menu_its_event_and_nothing_else() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-menu-overflow-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let window = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let menu = SurfaceKey {
+            client: 1,
+            object: 20,
+        };
+        let stranger = SurfaceKey {
+            client: 2,
+            object: 30,
+        };
+        let registrations = lend_popups(&mut runtime, 1, &[menu.object]);
+        // HELD, never drained: dropping the receiver would close the queue,
+        // and a closed queue takes a different road than a full one.
+        let subscription = runtime
+            .subscribe_input_with_activity(
+                1,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .unwrap();
+        runtime.commit(window, surface([1, 2, 3, 0])).unwrap();
+        runtime.grab_popup(menu).unwrap();
+        runtime
+            .commit_popup(
+                menu,
+                Some(Surface {
+                    width: 10,
+                    height: 10,
+                    pixels: [7u8, 8, 9, 0].repeat(100),
+                    format: SHM_XRGB8888,
+                }),
+                PopupPlacement {
+                    parent: window,
+                    x: 5,
+                    y: 7,
+                    width: 10,
+                    height: 10,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        for time in 0..=MAX_PENDING_KEYBOARD_DELIVERIES {
+            runtime
+                .key(KeyInput {
+                    time: u32::try_from(time).unwrap(),
+                    key: 30,
+                    state: if time % 2 == 0 {
+                        KeyState::Pressed
+                    } else {
+                        KeyState::Released
+                    },
+                })
+                .unwrap();
+        }
+        // The test's own premise, asserted rather than assumed: without this
+        // the press below could pass over a queue with room in it and say
+        // nothing about overflow at all.
+        assert!(
+            runtime.queue_keyboard_delete(1, 7).is_err(),
+            "the queue has room, so this test would prove nothing"
+        );
+
+        runtime.commit(stranger, surface([4, 5, 6, 0])).unwrap();
+        let rect = runtime.layout_snapshot().get(&stranger).unwrap().rect;
+        let half = |value: usize| i32::try_from(value / 2).unwrap_or(0);
+        runtime
+            .pointer_frame(
+                10,
+                i32::try_from(rect.x).unwrap() + half(rect.width),
+                i32::try_from(rect.y).unwrap() + half(rect.height),
+                &[],
+                PointerScroll::default(),
+            )
+            .unwrap();
+        runtime
+            .pointer_frame(11, 0, 0, &[press(11)], PointerScroll::default())
+            .expect("a client that stopped reading failed the press");
+
+        assert!(
+            runtime.popup_placement(menu).is_none(),
+            "the menu survived a press it should not have"
+        );
+        assert!(
+            registrations
+                .lock()
+                .unwrap()
+                .get(&menu.object)
+                .is_some_and(|entry| entry.dismissed),
+            "the menu went down without being recorded"
+        );
+        drop(subscription);
+    }
+
+    /// The record and the PIXELS move together, and this is the test that says
+    /// so. A menu comes back by being committed again, so a dismissal that took
+    /// the pixels down here and left the record to another thread would leave a
+    /// gap: the client's own commit lands in it, paints the menu back, and
+    /// nothing takes it down a second time. Review found td doing exactly that.
+    ///
+    /// Asserted the moment the press RETURNS, before a single delivery is read,
+    /// because that is the whole claim — not that the record is eventually
+    /// made, but that no other thread can act between the two halves.
+    #[test]
+    fn a_dismissed_menu_is_recorded_before_the_press_returns() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-menu-record-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let window = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let menu = SurfaceKey {
+            client: 1,
+            object: 20,
+        };
+        let stranger = SurfaceKey {
+            client: 2,
+            object: 30,
+        };
+        let registrations = lend_popups(&mut runtime, 1, &[menu.object]);
+        runtime.commit(window, surface([1, 2, 3, 0])).unwrap();
+        runtime.grab_popup(menu).unwrap();
+        runtime
+            .commit_popup(
+                menu,
+                Some(Surface {
+                    width: 10,
+                    height: 10,
+                    pixels: [7u8, 8, 9, 0].repeat(100),
+                    format: SHM_XRGB8888,
+                }),
+                PopupPlacement {
+                    parent: window,
+                    x: 5,
+                    y: 7,
+                    width: 10,
+                    height: 10,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+
+        // A configured tracker, which is what a mapped menu has and what the
+        // reset has to undo: while it says configured, a commit paints back.
+        let tracker = registrations
+            .lock()
+            .unwrap()
+            .get(&menu.object)
+            .map(|entry| Arc::clone(&entry.tracker))
+            .unwrap();
+        tracker.lock().unwrap().initial(1).unwrap();
+        assert!(tracker.lock().unwrap().initial_sent());
+
+        runtime.commit(stranger, surface([4, 5, 6, 0])).unwrap();
+        let rect = runtime.layout_snapshot().get(&stranger).unwrap().rect;
+        let half = |value: usize| i32::try_from(value / 2).unwrap_or(0);
+        runtime
+            .pointer_frame(
+                10,
+                i32::try_from(rect.x).unwrap() + half(rect.width),
+                i32::try_from(rect.y).unwrap() + half(rect.height),
+                &[],
+                PointerScroll::default(),
+            )
+            .unwrap();
+        runtime
+            .pointer_frame(11, 0, 0, &[press(11)], PointerScroll::default())
+            .unwrap();
+
+        assert!(
+            runtime.popup_placement(menu).is_none(),
+            "the pixels are still on screen"
+        );
+        assert!(
+            registrations
+                .lock()
+                .unwrap()
+                .get(&menu.object)
+                .is_some_and(|entry| entry.dismissed),
+            "the pixels went and the record did not, which is the gap itself"
+        );
+        assert!(
+            !tracker.lock().unwrap().initial_sent(),
+            "the tracker still says configured, so a commit paints the menu back"
+        );
+    }
+
+    /// SOMEBODY ELSE's press is td's to take. The owner-events rule is about
+    /// the client that holds the grab; a press on another client's window
+    /// closes the menu and reaches nobody, because closing a menu must not
+    /// also click what the menu was covering.
+    #[test]
+    fn a_press_on_another_clients_window_closes_the_menu_and_is_swallowed() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-menu-press-other-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let owner = runtime
+            .subscribe_input_with_activity(
+                1,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .unwrap();
+        let (owner_events, owner_stop) = owner.split();
+        let other = runtime
+            .subscribe_input_with_activity(
+                2,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .unwrap();
+        let (other_events, other_stop) = other.split();
+        let window = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let menu = SurfaceKey {
+            client: 1,
+            object: 20,
+        };
+        let stranger = SurfaceKey {
+            client: 2,
+            object: 30,
+        };
+        runtime.commit(window, surface([1, 2, 3, 0])).unwrap();
+        runtime.grab_popup(menu).unwrap();
+        runtime
+            .commit_popup(
+                menu,
+                Some(Surface {
+                    width: 10,
+                    height: 10,
+                    pixels: [7u8, 8, 9, 0].repeat(100),
+                    format: SHM_XRGB8888,
+                }),
+                PopupPlacement {
+                    parent: window,
+                    x: 5,
+                    y: 7,
+                    width: 10,
+                    height: 10,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        runtime.commit(stranger, surface([4, 5, 6, 0])).unwrap();
+        let rect = runtime.layout_snapshot().get(&stranger).unwrap().rect;
+
+        let half = |value: usize| i32::try_from(value / 2).unwrap_or(0);
+        let (at_x, at_y) = (
+            i32::try_from(rect.x).unwrap() + half(rect.width),
+            i32::try_from(rect.y).unwrap() + half(rect.height),
+        );
+        runtime
+            .pointer_frame(10, at_x, at_y, &[], PointerScroll::default())
+            .unwrap();
+        while owner_events.try_recv().is_ok() {}
+        while other_events.try_recv().is_ok() {}
+
+        runtime
+            .pointer_frame(11, 0, 0, &[press(11)], PointerScroll::default())
+            .unwrap();
+        assert!(
+            runtime.popup_placement(menu).is_none(),
+            "a stranger's press left the menu up"
+        );
+
+        let mut buttons = 0usize;
+        while let Ok(delivery) = other_events.try_recv() {
+            if let KeyboardDelivery::Pointer(frame) = delivery {
+                buttons += frame
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event, PointerEvent::Button { .. }))
+                    .count();
+            }
+        }
+        assert_eq!(
+            buttons, 0,
+            "the press that closed the menu was clicked through as well"
+        );
+
+        owner_stop.stop();
+        other_stop.stop();
+        runtime.unsubscribe_keyboard(1);
+        runtime.unsubscribe_keyboard(2);
+    }
+
     #[test]
     fn a_grabbing_menu_takes_the_keyboard_and_gives_it_back() {
         let path = std::env::temp_dir().join(format!(
@@ -6836,7 +7895,9 @@ mod tests {
             .iter()
             .filter_map(|delivery| match delivery {
                 KeyboardDelivery::Event(event) => Some(event),
-                KeyboardDelivery::Pointer(_) | KeyboardDelivery::DeleteId(_) => None,
+                KeyboardDelivery::Pointer(_)
+                | KeyboardDelivery::DeleteId(_)
+                | KeyboardDelivery::PopupDone { .. } => None,
             })
             .collect();
         assert_eq!(retained.len(), MAX_PENDING_KEYBOARD_DELIVERIES);

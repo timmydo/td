@@ -1086,16 +1086,16 @@ renderer's depth bound stays. Six rules across two modules is exactly the kind
 of conjunction that has now been corrected three times, and what it costs to be
 wrong is a compositor that never paints again.
 
-Three parts are incomplete and a fourth has landed, and each is a landing of
-its own. **Constraint adjustment** is recorded and not acted on: every bit of
+Two parts are incomplete and two have landed, and each is a landing of its
+own. **Constraint adjustment** is recorded and not acted on: every bit of
 it is permission for td to move a popup that does not fit, so a menu near an
 edge extends past it rather than sliding or flipping. **Grabs** are recorded,
-checked, and half acted on: the topmost grabbing popup has the KEYBOARD,
-bounded as below, and nothing routes the pointer through a grab — so a client
-that expects a click outside to close its menu must still notice and destroy
-it. td does dismiss a popup whose grab it will not hold, which is the
-protocol's own answer to a denied grab rather than td closing a menu on a
-user's behalf.
+checked, and acted on: the topmost grabbing popup has the KEYBOARD, bounded as
+below, and a press with none of the grabbing menus under it CLOSES them — td
+takes the pixels down and sends `xdg_popup.popup_done`, rather than leaving a
+client to notice for itself. td also dismisses a popup whose grab it will not
+hold, which is the protocol's own answer to a denied grab rather than td
+closing a menu on a user's behalf.
 **Dismissal is signalled where td dismisses, and nowhere else.** Every popup a
 take-down cascades over is sent `xdg_popup.popup_done`, deepest first — the
 order the protocol makes a client destroy nested popups in, so a client that
@@ -1116,12 +1116,93 @@ did. That td does not enforce the mapping rule is a gap of its own, recorded
 here rather than relied on.
 
 What a recorded grab buys is the CHAIN, the answers a client can already
-earn, and the KEYBOARD. The protocol lets a grabbing popup hang off a toplevel
-or off another popup that grabbed, and nothing else, so one popup's answer is
-the next one's precondition — which is why the flag is kept rather than the
-request being dropped on the floor. What a grab does NOT yet buy is anything
-about the pointer: no click outside a menu closes it, and no click is withheld
-from the surface under it.
+earn, the KEYBOARD, and the PRESS. The protocol lets a grabbing popup hang off
+a toplevel or off another popup that grabbed, and nothing else, so one popup's
+answer is the next one's precondition — which is why the flag is kept rather
+than the request being dropped on the floor.
+
+A PRESS with none of the grabbing menus under it closes them. "Outside" is a
+question about the CHAIN and not about one rectangle: a grabbing menu survives
+a press on itself or on anything hanging off it, so pressing a submenu is not
+pressing outside the menu it hangs off — the alternative closes a menu as the
+pointer reaches the item that opened it. Everything else in the seat's set
+goes, deepest first, and a press on the bar, on a gap or on another window is
+outside all of them.
+
+The set asked here is the seat's UNFILTERED, where the keyboard's is bounded
+by being drawn and by hanging off the focused window. The two questions differ
+on purpose: those bounds say which menu the seat answers to, and this one says
+which menus the client believes are open. A menu off screen holds no keyboard
+and is still one a press ends, and leaving it recorded would leave a grab
+nothing could reach.
+
+The press itself is CONSUMED — filtered out before the pointer model sees it,
+by the road a modal overlay already uses. Delivering it as well would close the
+menu and click whatever the menu was covering, which is the one thing a toolkit
+relies on not happening; the cost is that dismissing takes its own click, which
+is what every other compositor does too. Only a press asks: motion must not
+close a menu, and a release is owed to whoever took the press. Dropping the
+press is safe because the model suppresses a release it matched no press to.
+
+The work is SPLIT across two threads and WHERE the split falls is the
+load-bearing part. Everything that decides a dismissal happens on the thread
+that read the press: the grab is released, the pixels leave the scene, focus is
+answered, the configure state machine is reset and the menu is recorded as
+over. Only writing the event is the client's own seat thread.
+
+The split has to fall there rather than one step earlier, and review found td
+with it in the wrong place. A menu comes back by being COMMITTED again, so a
+dismissal that dropped the pixels and left the record for the client's seat
+thread leaves a gap: the client's own commit lands in it, paints the menu back,
+and nothing takes it down a second time.
+
+What closes it is the RUNTIME LOCK rather than the order of two lines. Every
+commit path takes that lock to reach `commit_popup`, and the whole dismissal
+runs inside one hold of it, so no commit can land between the pixels going and
+the record being written. The seat thread holds no such lock, which is exactly
+why the record could not stay there. Within the call the order is free, and the
+cascade is recorded after the unmap because it is not known until then.
+
+The COMMIT ITSELF is refused by the runtime, and it has to be. The shell reads
+its configure gate at the top of `wl_surface.commit` and reaches the runtime
+whole buffer copies later, so a commit that passed that gate honestly can
+arrive after the press has taken the menu down — an ordinary repaint on the
+motion just before the click is enough. Review found td's enforcement resting
+on that gate, which is read too early to give it. So `commit_popup` refuses a
+key it has recorded as over, under the same lock the dismissal ran in. The
+client is not at fault and is not disconnected for it: it committed before it
+could know, and it gets the menu back by destroying the popup and asking
+again, which is what `popup_done` asked for.
+
+For the runtime to do that it needs the client's own popup registrations, so it
+holds a handle to each connected client's map. `dismissed` lives there and
+nowhere else — the deciding thread writes it, the dispatch thread reads it, and
+one copy cannot drift from a second. The dispatch thread is not an option for
+any of it: a client that is sending nothing never reaches it.
+
+Writing the event stays on the seat thread because ADDRESSING it needs those
+registrations, and the delivery carries the xdg_popup as well as the surface so
+that thread can prove the surface still wears the menu the press was about. An
+id is not an identity: a client may destroy one popup and get the next in a
+single buffer. The destroy path drops the registration BEFORE it retires the
+id, and the seat thread holds the OUTBOUND lock across the lookup — the same
+lock `wl_display.delete_id` goes out under — so while it holds, no id can be
+retired, and a registration still naming this popup proves none has been.
+
+Outbound before registrations, and never the other way. `Outbound::send` is a
+blocking write on the client's own socket, so a client that stops reading holds
+it for as long as it likes; the registrations are taken with the RUNTIME lock
+held, by the dismissal above. A seat thread that held the registrations inside
+that blocked write would park the input thread on them while it holds the
+runtime lock, and every other client's input, commits and repaints behind that
+— one quiet client stopping the compositor. Review built that interleaving out
+of td's first two fixes taken together. The registrations are a leaf: nothing
+is acquired while they are held.
+
+One consequence is recorded rather than fixed: the client's byte ceiling is not
+refunded until it DESTROYS the popup, because `mapped_bytes` is the dispatch
+thread's own. A client that never destroys keeps its own quota spent, which is
+its ceiling and nobody else's.
 
 The check is a WALK rather than a look at the parent. The rule reads one level
 but is inductive: a popup is only a grabbing parent while the thing IT hangs
@@ -1224,8 +1305,15 @@ window the operator is looking at unable to be typed into. Review argued the
 protocol's alternative: dismiss the whole grab chain on a workspace switch and
 send `popup_done`. That is the more faithful reading and td cannot take it
 here, because td retains popups across a switch as a matter of policy already
-and dismissing needs the path this landing does not build. It should be
-revisited when the pointer closes menus.
+and dismissing needs a path that landing did not build.
+
+That path EXISTS now: the press above dismisses a chain, and a workspace switch
+would use the same `dismiss_popups`. The blocker is gone and the divergence is
+not — it is held open deliberately, as one gesture per landing. A switch is a
+different question from a press about which menus it should end and whether a
+retained non-grabbing popup should go with them, and it is owed its own tests
+rather than a line folded into these. Recorded here so the next landing finds
+the argument rather than the excuse.
 
 The predicate is the drawn-ness one, in two halves. `popup_rect` resolves a
 chain to a visible tile with every link abutting; `on_screen` then asks whether

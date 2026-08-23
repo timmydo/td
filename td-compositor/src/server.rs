@@ -3,7 +3,10 @@ use crate::keyboard::{KeyboardEvent, KeyboardSnapshot, XKB_KEYMAP};
 use crate::layout::ViewLayout;
 use crate::pointer::{PointerEvent, PointerSnapshot, RoutedPointerFrame};
 use crate::positioner::{Anchor, Gravity, Positioner, Rect as PositionerRect};
-use crate::runtime::{KeyboardDelivery, KeyboardSubscriptionStop, Runtime, SubscriptionStop};
+use crate::runtime::{
+    KeyboardDelivery, KeyboardSubscriptionStop, PopupRegistration, PopupRegistrations, Runtime,
+    SubscriptionStop,
+};
 use crate::scene::{
     CursorRequest, InputRegion, PopupPlacement, SharedInputRegion, Surface, SurfaceKey,
     WindowGeometry, MAX_CURSOR_DIMENSION, MAX_INPUT_REGION_OPERATIONS, SHM_ARGB8888, SHM_XRGB8888,
@@ -343,25 +346,13 @@ enum Object {
         /// Recorded because the protocol reads the CHAIN through it: a
         /// grabbing popup may only hang off a toplevel or off another
         /// grabbing popup, so the answer for one popup is a precondition for
-        /// the next. What the flag does not yet buy is the grab's behaviour —
-        /// nothing routes a click outside the menu to it — so it is a record
-        /// of what the client asked for and what td let it ask.
+        /// the next.
+        ///
+        /// This flag answers ONLY that question. What the seat does with a
+        /// grab — which menu holds the keyboard, and which menus a press
+        /// outside closes — is answered from the scene's own set, since both
+        /// are questions about the whole desktop rather than about one popup.
         grabbed: bool,
-        /// Whether td has told this popup it is over.
-        ///
-        /// Separate from `grabbed` because a dismissed grabbing popup is
-        /// neither of the two answers a chain check wants: it held a grab, so
-        /// "did not grab" is the wrong refusal, and it cannot hold one now,
-        /// so accepting is wrong too. The protocol gives that case its own
-        /// outcome — a child grabbing under it "will be immediately
-        /// dismissed" — which needs the state to be three-valued.
-        ///
-        /// CLEARED when td configures the popup again, which is not
-        /// `configure_sent`'s rule and deliberately so. That one records a
-        /// fact about the object's life, which the protocol scopes that way;
-        /// this one is read as "can it hold a grab NOW", and a menu td has
-        /// just agreed to place again can.
-        dismissed: bool,
         /// Whether this popup has EVER had pixels up.
         ///
         /// `invalid_grab` is "tried to grab after being mapped", which is a
@@ -471,6 +462,7 @@ struct Client {
     configurations: Arc<Mutex<BTreeMap<SurfaceKey, ConfigureRegistration>>>,
     keyboards: Arc<Mutex<BTreeMap<u32, KeyboardRegistration>>>,
     pointers: Arc<Mutex<BTreeMap<u32, PointerRegistration>>>,
+    popups: PopupRegistrations,
     pointer_authority: PointerAuthority,
     keyboard_active: Arc<AtomicBool>,
     pointer_active: Arc<AtomicBool>,
@@ -1071,11 +1063,80 @@ fn send_reserved_delete_id(
     }
 }
 
+/// Tell a client one of its menus is over, on the SEAT's thread — the only
+/// thread a press the compositor saw can reach it from, since the dispatch
+/// thread may be blocked on a client that is sending nothing.
+///
+/// The WIRE and nothing else. The pixels left the scene and the dismissal was
+/// recorded when the runtime read the press, both in one call on one thread, so
+/// no commit can land between them and paint the menu back. What is left is the
+/// event, which cannot be sent there because addressing it needs this client's
+/// own registrations.
+///
+/// What no thread here can do is REFUND the client's byte ceiling:
+/// `mapped_bytes` is the dispatch thread's own field, and the refund arrives
+/// when the client destroys the menu it has just been told about. A client that
+/// never destroys keeps its own quota spent, which is its ceiling and nobody
+/// else's.
+///
+/// Silent for a surface with no popup registered, and for one that has since
+/// been given a different menu: the client destroyed the one this was about,
+/// which is the outcome the event asks for anyway.
+fn dismiss_from_seat(
+    surface: u32,
+    popup: u32,
+    popups: &PopupRegistrations,
+    outbound: &Arc<Mutex<Outbound>>,
+) -> Result<(), String> {
+    // OUTBOUND FIRST, then the registrations, and the order is the whole of
+    // the reasoning here.
+    //
+    // What has to hold is that `popup_done` precedes `wl_display.delete_id` on
+    // the wire, because an id is not an identity: the dispatch thread answers
+    // `xdg_popup.destroy` by dropping the registration and then retiring the
+    // id, after which the client may bind that number to something else, and an
+    // event aimed at a number read a moment ago would land on whatever now
+    // wears it. Taking `outbound` before the lookup gets that: `remove_object`
+    // sends `delete_id` through this same `outbound`, so while this hold lasts
+    // no id can be retired, and a registration still naming this popup proves
+    // none has been.
+    //
+    // Holding the REGISTRATIONS across the send would get it too, and that is
+    // what td did until review built the interleaving. `Outbound::send` is
+    // `write_all` on the client's socket with no timeout, so a client that
+    // stops reading blocks it forever — and `Runtime::record_dismissal` takes
+    // this same registration lock with the RUNTIME lock held. One client going
+    // quiet mid-dismissal would leave the seat thread holding the
+    // registrations inside a blocked write while the input thread waits for
+    // them holding the runtime lock, and every other client's input, commits
+    // and repaints wait behind that. The registrations must never be held
+    // across the write; `outbound` may be, since blocking on it is the
+    // client's own thread waiting on the client's own socket.
+    let message = wire::Builder::new().message(popup, XDG_POPUP_POPUP_DONE)?;
+    let mut outbound = outbound
+        .lock()
+        .map_err(|_| "Wayland outbound lock poisoned".to_string())?;
+    {
+        let registrations = popups
+            .lock()
+            .map_err(|_| "popup registration lock poisoned".to_string())?;
+        let Some(entry) = registrations.get(&surface) else {
+            return Ok(());
+        };
+        if entry.popup != popup {
+            return Ok(());
+        }
+    }
+    outbound.send(&message)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn seat_worker(
     receiver: Receiver<KeyboardDelivery>,
     stop: KeyboardSubscriptionStop,
     keyboards: Arc<Mutex<BTreeMap<u32, KeyboardRegistration>>>,
     pointers: Arc<Mutex<BTreeMap<u32, PointerRegistration>>>,
+    popups: PopupRegistrations,
     pointer_authority: PointerAuthority,
     pending_deletes: PendingDeletes,
     outbound: Arc<Mutex<Outbound>>,
@@ -1122,6 +1183,17 @@ fn seat_worker(
                 }
                 continue;
             }
+            KeyboardDelivery::PopupDone { surface, popup } => {
+                dismiss_from_seat(surface, popup, &popups, &outbound)?;
+                if outbound
+                    .lock()
+                    .map_err(|_| "Wayland outbound lock poisoned".to_string())?
+                    .disconnected
+                {
+                    return Ok(());
+                }
+                continue;
+            }
         };
         let Some(event) = event else {
             continue;
@@ -1157,6 +1229,7 @@ fn supervise_seat_worker(
     stop: KeyboardSubscriptionStop,
     keyboards: Arc<Mutex<BTreeMap<u32, KeyboardRegistration>>>,
     pointers: Arc<Mutex<BTreeMap<u32, PointerRegistration>>>,
+    popups: PopupRegistrations,
     pointer_authority: PointerAuthority,
     pending_deletes: PendingDeletes,
     outbound: Arc<Mutex<Outbound>>,
@@ -1166,6 +1239,7 @@ fn supervise_seat_worker(
         stop,
         keyboards,
         pointers,
+        popups,
         pointer_authority,
         pending_deletes,
         Arc::clone(&outbound),
@@ -1222,6 +1296,7 @@ impl Client {
             configurations: Arc::new(Mutex::new(BTreeMap::new())),
             keyboards: Arc::new(Mutex::new(BTreeMap::new())),
             pointers: Arc::new(Mutex::new(BTreeMap::new())),
+            popups: Arc::new(Mutex::new(BTreeMap::new())),
             pointer_authority: Arc::new(Mutex::new(None)),
             keyboard_active: Arc::new(AtomicBool::new(false)),
             pointer_active: Arc::new(AtomicBool::new(false)),
@@ -1354,10 +1429,7 @@ impl Client {
                 RoleObject::Popup(popup) => popup,
             };
             let Some(Object::XdgPopup {
-                grabbed,
-                dismissed,
-                parent,
-                ..
+                grabbed, parent, ..
             }) = self.objects.get(popup)
             else {
                 return GrabParent::Gone;
@@ -1365,7 +1437,7 @@ impl Client {
             if !*grabbed {
                 return GrabParent::NotGrabbed;
             }
-            if *dismissed {
+            if self.popup_dismissed(at) {
                 return GrabParent::Gone;
             }
             let Some(next) = *parent else {
@@ -1431,10 +1503,43 @@ impl Client {
         // Marked before the send, which is the reset's ordering and for the
         // reset's reason: a failed send ends the connection, and a popup
         // recorded as dismissed but untold is the safe half to be holding.
-        if let Some(Object::XdgPopup { dismissed, .. }) = self.objects.get_mut(&popup) {
-            *dismissed = true;
+        if let Some(registration) = self
+            .popups
+            .lock()
+            .map_err(|_| "popup registration lock poisoned".to_string())?
+            .get_mut(&surface)
+        {
+            registration.dismissed = true;
         }
         self.send(popup, XDG_POPUP_POPUP_DONE, wire::Builder::new())
+    }
+
+    /// Whether td has told the popup on this surface that it is over. A
+    /// surface with no popup on it answers false: nothing was told anything.
+    ///
+    /// A POISONED lock answers true, which is the safe direction rather than
+    /// the convenient one. The only caller refuses a nested grab under a
+    /// dismissed parent, and the read this replaced could not fail at all — so
+    /// answering "not dismissed" on a lock nobody can trust would accept a
+    /// grab the protocol says to turn away.
+    fn popup_dismissed(&self, surface: u32) -> bool {
+        self.popups.lock().map_or(true, |popups| {
+            popups.get(&surface).is_some_and(|entry| entry.dismissed)
+        })
+    }
+
+    /// Invite a dismissed popup back. Silent for a surface with no popup, as
+    /// the write it replaces was.
+    fn undismiss_popup(&mut self, surface: u32) -> Result<(), String> {
+        if let Some(registration) = self
+            .popups
+            .lock()
+            .map_err(|_| "popup registration lock poisoned".to_string())?
+            .get_mut(&surface)
+        {
+            registration.dismissed = false;
+        }
+        Ok(())
     }
 
     fn send(&mut self, object: u32, opcode: u16, builder: wire::Builder) -> Result<(), String> {
@@ -2207,10 +2312,18 @@ impl Client {
                             self.unmap_popup(id)?;
                             self.dismiss_popup(id)?;
                         } else {
+                            // Inviting it back ends the dismissal. The flag
+                            // answers "can this hold a grab now", and a menu td
+                            // has just agreed to place can — leaving it set
+                            // would have a submenu opened under a re-mapped
+                            // menu turned away for a take-down that is over.
+                            //
+                            // Before the borrow below rather than after the
+                            // send, so the lock is not held across it.
+                            self.undismiss_popup(id)?;
                             let Some(Object::XdgPopup {
                                 rect,
                                 configure_sent,
-                                dismissed,
                                 ..
                             }) = self.objects.get_mut(&popup_object)
                             else {
@@ -2223,13 +2336,6 @@ impl Client {
                             // so the flag is set from the same lookup that
                             // read it — `outbound` is a disjoint field, so the
                             // borrow costs nothing.
-                            // Inviting it back ends the dismissal. The
-                            // flag answers "can this hold a grab now", and a
-                            // menu td has just agreed to place can — leaving
-                            // it set would have a submenu opened under a
-                            // re-mapped menu turned away for a take-down that
-                            // is over.
-                            *dismissed = false;
                             let placement = (!*configure_sent).then_some(*rect);
                             send_popup_configure(
                                 &self.outbound,
@@ -3339,10 +3445,20 @@ impl Client {
                             rect,
                             configure_sent: false,
                             grabbed: false,
-                            dismissed: false,
                             mapped_once: false,
                         },
                     )?;
+                    self.popups
+                        .lock()
+                        .map_err(|_| "popup registration lock poisoned".to_string())?
+                        .insert(
+                            surface,
+                            PopupRegistration {
+                                popup: id,
+                                tracker: Arc::clone(&configure),
+                                dismissed: false,
+                            },
+                        );
                     self.objects.insert(
                         message.object,
                         Object::XdgSurface {
@@ -3507,6 +3623,17 @@ impl Client {
                             ),
                         );
                     }
+                    // FIRST, ahead of retiring the id. `remove_object`
+                    // sends `wl_display.delete_id` on this socket, after which
+                    // the client may bind the number to anything; the seat
+                    // thread aims `popup_done` by this registration and holds
+                    // `outbound` across the lookup, so dropping it here is what
+                    // makes its presence proof that the id is still this
+                    // popup's.
+                    self.popups
+                        .lock()
+                        .map_err(|_| "popup registration lock poisoned".to_string())?
+                        .remove(&surface);
                     self.remove_object(message.object)?;
                     // The seat's grab belongs to the OBJECT that took it, and
                     // the object is what just went: the wl_surface outlives
@@ -3539,12 +3666,12 @@ impl Client {
                     *configure = Arc::new(Mutex::new(ConfigureTracker::new()));
                     Ok(())
                 }
-                // grab. Recorded, checked, and ACTED ON in one respect: the
-                // menu that holds the seat's grab is the one the keyboard is
-                // pointed at. What is still not acted on is the pointer —
-                // nothing here closes a menu because a click landed outside
-                // it, and nothing withholds a click from the surface under
-                // it.
+                // grab. Recorded, checked, and ACTED ON: the menu that
+                // holds the seat's grab is the one the keyboard is pointed
+                // at, and a press with none of the grabbing menus under it
+                // closes them and is withheld from the surface beneath —
+                // except from this client's own surfaces, which the protocol
+                // gives it as normal for the length of its grab.
                 1 => {
                     let seat = args.u32()?;
                     // The serial is read and not checked. It should name
@@ -3872,11 +3999,18 @@ fn serve_client(
         .subscribe(id)?;
     let (receiver, stop) = subscription.split();
     let keyboard_subscription = match runtime.lock() {
-        Ok(mut runtime) => runtime.subscribe_input_with_activity(
-            id,
-            Arc::clone(&client.keyboard_active),
-            Arc::clone(&client.pointer_active),
-        ),
+        Ok(mut runtime) => {
+            // Lent for the life of the connection. A press the input path saw
+            // is what takes a menu down now, and the runtime records that on
+            // the thread that read the press — which needs this client's own
+            // registrations, since the dispatch thread may be blocked.
+            runtime.register_popups(id, Arc::clone(&client.popups));
+            runtime.subscribe_input_with_activity(
+                id,
+                Arc::clone(&client.keyboard_active),
+                Arc::clone(&client.pointer_active),
+            )
+        }
         Err(poisoned) => {
             stop.stop();
             poisoned.into_inner().unsubscribe(id);
@@ -3889,6 +4023,7 @@ fn serve_client(
             stop.stop();
             if let Ok(mut runtime) = runtime.lock() {
                 runtime.unsubscribe(id);
+                runtime.unregister_popups(id);
             }
             return Err(error);
         }
@@ -3924,6 +4059,7 @@ fn serve_client(
             if let Ok(mut runtime) = runtime.lock() {
                 runtime.unsubscribe(id);
                 runtime.unsubscribe_keyboard(id);
+                runtime.unregister_popups(id);
             }
             return Err(format!("spawn Wayland configure worker {id}: {error}"));
         }
@@ -3931,6 +4067,7 @@ fn serve_client(
     let worker_seat_stop = keyboard_stop.clone();
     let keyboards = Arc::clone(&client.keyboards);
     let pointers = Arc::clone(&client.pointers);
+    let seat_popups = Arc::clone(&client.popups);
     let pointer_authority = Arc::clone(&client.pointer_authority);
     let pending_deletes = Arc::clone(&client.pending_deletes);
     let outbound = Arc::clone(&client.outbound);
@@ -3944,6 +4081,7 @@ fn serve_client(
                 worker_seat_stop,
                 keyboards,
                 pointers,
+                seat_popups,
                 pointer_authority,
                 pending_deletes,
                 worker_outbound,
@@ -3959,6 +4097,7 @@ fn serve_client(
             if let Ok(mut runtime) = runtime.lock() {
                 runtime.unsubscribe(id);
                 runtime.unsubscribe_keyboard(id);
+                runtime.unregister_popups(id);
             }
             let _ = configure_thread.join();
             return Err(format!("spawn Wayland seat worker {id}: {error}"));
@@ -4010,6 +4149,7 @@ fn serve_client(
             let cleanup = runtime.remove_client(id);
             runtime.unsubscribe(id);
             runtime.unsubscribe_keyboard(id);
+            runtime.unregister_popups(id);
             cleanup
         }
         Err(_) => Err("runtime lock poisoned".to_string()),
@@ -4167,6 +4307,175 @@ mod tests {
         }
         assert_eq!(messages.len(), count);
         messages
+    }
+
+    /// The registrations are NOT held across the write, and one quiet client
+    /// therefore cannot stop the compositor. `Outbound::send` is `write_all` on
+    /// that client's socket with no timeout, so a client that stops reading
+    /// blocks the seat thread here for as long as it likes — and the runtime
+    /// takes this same registration lock with the RUNTIME lock held, to record
+    /// a dismissal on the thread that read the press. Holding the
+    /// registrations inside the blocked write would park the input thread on
+    /// them while it holds the runtime lock, and every other client's input,
+    /// commits and repaints behind that. Review built the interleaving; td had
+    /// it.
+    ///
+    /// A HELD `outbound` stands in for the blocked write, which is the same
+    /// thing from this function's side and needs no socket buffer filled to
+    /// arrange. The claim is then exactly testable: while the seat thread is
+    /// stuck at the write, the registrations are free for the taking.
+    #[test]
+    fn a_blocked_write_does_not_take_the_registrations_down_with_it() {
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let outbound = Arc::new(Mutex::new(Outbound {
+            stream: server,
+            disconnected: false,
+        }));
+        let popups: PopupRegistrations = Arc::new(Mutex::new(BTreeMap::from([(
+            6,
+            PopupRegistration {
+                popup: 14,
+                tracker: Arc::new(Mutex::new(ConfigureTracker::new())),
+                dismissed: true,
+            },
+        )])));
+
+        let held = outbound.lock().unwrap();
+        let (started, running) = std::sync::mpsc::channel();
+        let worker = {
+            let popups = Arc::clone(&popups);
+            let outbound = Arc::clone(&outbound);
+            thread::spawn(move || {
+                started.send(()).unwrap();
+                dismiss_from_seat(6, 14, &popups, &outbound)
+            })
+        };
+        running.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // Tried repeatedly rather than once: the worker has said it is running
+        // but need not have reached the write yet, and a single early attempt
+        // would pass without ever meeting the case. With the registrations
+        // held across the write this never succeeds; without, the first
+        // attempt does.
+        let mut free = false;
+        for _ in 0..200 {
+            if popups.try_lock().is_ok() {
+                free = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            free,
+            "the seat thread is holding the registrations inside a blocked write"
+        );
+
+        drop(held);
+        worker.join().unwrap().unwrap();
+        let seen: Vec<(u32, u16)> = drain_messages(&mut peer)
+            .iter()
+            .map(|message| (message.object, message.opcode))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![(14, XDG_POPUP_POPUP_DONE)],
+            "the menu was not told once the write could go through"
+        );
+    }
+
+    /// The seat thread's half of a dismissal the compositor started, which is
+    /// the WIRE and nothing else: the pixels went and the record was written
+    /// when the runtime read the press, both on that one thread. What is left
+    /// is addressing the event, which needs this client's registrations.
+    #[test]
+    fn a_menu_the_compositor_closed_is_told_on_the_seats_thread() {
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let outbound = Arc::new(Mutex::new(Outbound {
+            stream: server,
+            disconnected: false,
+        }));
+        let popups: PopupRegistrations = Arc::new(Mutex::new(BTreeMap::from([(
+            6,
+            PopupRegistration {
+                popup: 14,
+                tracker: Arc::new(Mutex::new(ConfigureTracker::new())),
+                dismissed: true,
+            },
+        )])));
+
+        dismiss_from_seat(6, 14, &popups, &outbound).unwrap();
+
+        let seen: Vec<(u32, u16)> = drain_messages(&mut peer)
+            .iter()
+            .map(|message| (message.object, message.opcode))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![(14, XDG_POPUP_POPUP_DONE)],
+            "the menu was not told, or was told something else"
+        );
+    }
+
+    /// A surface wearing a DIFFERENT menu by now is told nothing. A wl_surface
+    /// outlives the xdg_popup on it and may be given another, and a client can
+    /// destroy one and get the next in a single buffer without waiting to hear
+    /// anything — so the id this delivery was about is not proof of identity
+    /// on its own. Telling the replacement would close a menu the press never
+    /// touched.
+    ///
+    /// It is also what orders this event against `wl_display.delete_id`: the
+    /// destroy path drops the registration before it retires the id, so a
+    /// registration still naming this popup proves the number has not been
+    /// handed back.
+    #[test]
+    fn a_surface_wearing_another_menu_is_told_nothing() {
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let outbound = Arc::new(Mutex::new(Outbound {
+            stream: server,
+            disconnected: false,
+        }));
+        let popups: PopupRegistrations = Arc::new(Mutex::new(BTreeMap::from([(
+            6,
+            PopupRegistration {
+                popup: 15,
+                tracker: Arc::new(Mutex::new(ConfigureTracker::new())),
+                dismissed: false,
+            },
+        )])));
+
+        dismiss_from_seat(6, 14, &popups, &outbound).unwrap();
+
+        assert!(
+            drain_messages(&mut peer).is_empty(),
+            "the menu that replaced the dismissed one was told it was over"
+        );
+    }
+
+    /// A surface whose menu the client already destroyed is told NOTHING, and
+    /// silently. The press and this delivery are separated by a thread, so the
+    /// client tearing the menu down in between is ordinary rather than an
+    /// error — and it is the outcome the event was asking for anyway.
+    #[test]
+    fn a_menu_gone_before_the_seat_thread_reached_it_is_told_nothing() {
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let outbound = Arc::new(Mutex::new(Outbound {
+            stream: server,
+            disconnected: false,
+        }));
+        let popups: PopupRegistrations = Arc::new(Mutex::new(BTreeMap::new()));
+
+        dismiss_from_seat(6, 14, &popups, &outbound).unwrap();
+
+        assert!(
+            drain_messages(&mut peer).is_empty(),
+            "a menu that had already gone was sent an event"
+        );
     }
 
     /// Everything the compositor has sent and nothing more. `receive_messages`
@@ -4923,6 +5232,7 @@ mod tests {
                 worker_stop,
                 worker_keyboards,
                 Arc::new(Mutex::new(BTreeMap::new())),
+                Arc::new(Mutex::new(BTreeMap::new())),
                 Arc::new(Mutex::new(None)),
                 worker_pending_deletes,
                 worker_outbound,
@@ -5062,6 +5372,7 @@ mod tests {
                 worker_stop,
                 Arc::new(Mutex::new(BTreeMap::new())),
                 worker_pointers,
+                Arc::new(Mutex::new(BTreeMap::new())),
                 worker_authority,
                 worker_pending_deletes,
                 worker_outbound,
@@ -5271,6 +5582,7 @@ mod tests {
                 worker_stop,
                 worker_registrations,
                 Arc::new(Mutex::new(BTreeMap::new())),
+                Arc::new(Mutex::new(BTreeMap::new())),
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(BTreeMap::new())),
                 worker_outbound,
@@ -5423,6 +5735,7 @@ mod tests {
                 worker_stop,
                 Arc::new(Mutex::new(BTreeMap::new())),
                 worker_pointers,
+                Arc::new(Mutex::new(BTreeMap::new())),
                 worker_authority,
                 Arc::new(Mutex::new(BTreeMap::new())),
                 worker_outbound,
@@ -5822,6 +6135,7 @@ mod tests {
             stop,
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(Mutex::new(Outbound {
@@ -5889,6 +6203,7 @@ mod tests {
             stop,
             registrations,
             Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::clone(&outbound),
@@ -5922,6 +6237,7 @@ mod tests {
         assert!(seat_worker(
             receiver,
             stop,
+            Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(Mutex::new(None)),
@@ -11454,13 +11770,7 @@ mod tests {
         map_popup_surface(&mut client, &mut peer, 6, 13, 8, &pool_path);
         map_popup_surface(&mut client, &mut peer, 20, 21, 28, &pool_path);
         assert!(
-            matches!(
-                client.objects.get(&22),
-                Some(Object::XdgPopup {
-                    dismissed: false,
-                    ..
-                })
-            ),
+            !client.popup_dismissed(20),
             "a menu that is up again is still marked dismissed"
         );
         drain_messages(&mut peer);
@@ -11541,10 +11851,9 @@ mod tests {
                 Some(Object::XdgPopup {
                     parent: Some(6),
                     grabbed: true,
-                    dismissed: false,
                     ..
                 })
-            ),
+            ) && !client.popup_dismissed(20),
             "the submenu is not the clean first step this test needs"
         );
 

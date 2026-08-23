@@ -1163,6 +1163,72 @@ impl Scene {
         stack.pop()
     }
 
+    /// The grabbing popups a press where the pointer is would take down,
+    /// TOPMOST first — the order the protocol dismisses a chain in, and the
+    /// order `release_dropped` already sends in.
+    ///
+    /// A grabbing popup SURVIVES a press on itself or on anything hanging off
+    /// it, which is the whole of what "outside" means for a menu: pressing a
+    /// submenu is not pressing outside the menu it hangs off. Everything else
+    /// goes, and a press on nothing at all — the bar, a gap, another window —
+    /// is outside every one of them.
+    ///
+    /// The seat's set without the bounds `topmost_grab` puts on it, which is
+    /// the difference between holding the keyboard and being up. A menu off
+    /// screen, or hanging off a window that is not focused, holds no keyboard
+    /// and is still a menu its client believes is open; a press elsewhere is
+    /// still the gesture that ends it, and leaving it recorded would leave a
+    /// grab nothing can now reach.
+    ///
+    /// MAPPED popups only, though, because the walk is `popups_stacked`. A
+    /// grab recorded before its first buffer is not dismissed by a press, and
+    /// that is a gap rather than a definition: such a menu opens holding the
+    /// keyboard after the operator has already clicked away from it. The shell
+    /// refusing a grab after mapping bounds it to one commit, and closing it
+    /// needs a press to reach a menu with no rectangle to be outside of.
+    pub fn grabs_dismissed_by_pointer(&self, width: usize, height: usize) -> Vec<SurfaceKey> {
+        if self.grabs.is_empty() {
+            return Vec::new();
+        }
+        let placements = self.tiled_placements(width, height);
+        let hit = self.popup_target_from(&placements).map(|point| point.key);
+        let mut chain = self.popups_stacked();
+        chain.retain(|key| self.grabs.contains(key) && !self.shelters(*key, hit));
+        chain.reverse();
+        chain
+    }
+
+    /// Whether this client owns any recorded grab, which decides whether a
+    /// press is the compositor's to swallow. The protocol: "during a popup
+    /// grab, the client owning the grab will receive pointer and touch events
+    /// for all their surfaces as normal (similar to an `owner-events` grab in
+    /// X11 parlance)". So a press on ANY surface of the owning client is that
+    /// client's — its own window as much as its menu — and only a press
+    /// belonging to somebody else is one td may take.
+    pub fn client_holds_grab(&self, client: u64) -> bool {
+        self.grabs.iter().any(|key| key.client == client)
+    }
+
+    /// Whether a press on `hit` is a press INSIDE `key`: on that popup itself,
+    /// or on one descended from it. Bounded by the depth the placement walk is
+    /// bounded by, so a broken edge is a false rather than a loop.
+    fn shelters(&self, key: SurfaceKey, hit: Option<SurfaceKey>) -> bool {
+        let mut at = hit;
+        for _ in 0..=MAX_POPUP_DEPTH {
+            let Some(current) = at else {
+                return false;
+            };
+            if current == key {
+                return true;
+            }
+            at = self
+                .popups
+                .get(&current)
+                .map(|placed| placed.placement.parent);
+        }
+        false
+    }
+
     /// The grab alone, for the two ends a mapping does not have. The seat's
     /// record is dropped with a mapping that ENDS — see `forget_popup` — and
     /// these are the roads where no mapping is involved: the xdg_popup object
@@ -7094,6 +7160,122 @@ mod tests {
             .commit_popup(submenu, surface(SUBMENU, 40, 10), placed(menu, -40, 0, 40))
             .unwrap();
         assert_eq!(scene.topmost_grab(width, height), Some(submenu));
+    }
+
+    /// A chain of grabbing menus, and where the pointer is when a press
+    /// arrives. Returns the menu, the submenu standing on it, and the scene.
+    fn grabbing_chain() -> (Scene, usize, usize, Rect, SurfaceKey, SurfaceKey) {
+        let (mut scene, _frame, width, height, _stride, key, rect) = popup_output();
+        let menu = popup_key(20);
+        let submenu = popup_key(21);
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        scene
+            .commit_popup(submenu, surface(SUBMENU, 10, 10), placed(menu, 10, 0, 10))
+            .unwrap();
+        (scene, width, height, rect, menu, submenu)
+    }
+
+    /// A press with nothing of the chain under it takes ALL of it, deepest
+    /// first — the order the protocol destroys a chain in, so a client that
+    /// obeys what it hears never has to destroy a menu before the submenu
+    /// standing on it.
+    #[test]
+    fn a_press_outside_the_menus_takes_the_whole_chain_down() {
+        let (mut scene, width, height, rect, menu, submenu) = grabbing_chain();
+        assert!(scene.grab_popup(menu));
+        assert!(scene.grab_popup(submenu));
+
+        // On the WINDOW and clear of both menus, which is the ordinary way to
+        // close one: the operator goes back to what the menu was covering.
+        scene.move_pointer(
+            i32::try_from(rect.x + 100).unwrap(),
+            i32::try_from(rect.y + 50).unwrap(),
+            width,
+            height,
+        );
+        assert_eq!(
+            scene.grabs_dismissed_by_pointer(width, height),
+            vec![submenu, menu]
+        );
+    }
+
+    /// A press ON a grabbing menu keeps it and takes what stands on it, which
+    /// is a submenu closing as the pointer goes back to its parent. The menu
+    /// shelters ITSELF, so the press is not outside it.
+    #[test]
+    fn a_press_on_a_menu_takes_only_what_stands_on_it() {
+        let (mut scene, width, height, rect, menu, submenu) = grabbing_chain();
+        assert!(scene.grab_popup(menu));
+        assert!(scene.grab_popup(submenu));
+        scene.move_pointer(
+            i32::try_from(rect.x + 6).unwrap(),
+            i32::try_from(rect.y + 9).unwrap(),
+            width,
+            height,
+        );
+        assert_eq!(
+            scene.grabs_dismissed_by_pointer(width, height),
+            vec![submenu]
+        );
+    }
+
+    /// A press on a submenu is not a press outside the menu it hangs off, and
+    /// that is the whole of why "outside" is a question about the CHAIN rather
+    /// than about one rectangle. A menu whose own submenu took the press would
+    /// close as the pointer reached the item that opened it.
+    ///
+    /// The submenu here holds no grab of its own, which is the ordinary case:
+    /// a toolkit takes one grab for the menu and hangs the rest off it.
+    #[test]
+    fn a_press_on_a_submenu_leaves_the_menu_it_hangs_off_alone() {
+        let (mut scene, width, height, rect, menu, _submenu) = grabbing_chain();
+        assert!(scene.grab_popup(menu));
+        scene.move_pointer(
+            i32::try_from(rect.x + 16).unwrap(),
+            i32::try_from(rect.y + 9).unwrap(),
+            width,
+            height,
+        );
+        assert!(scene.grabs_dismissed_by_pointer(width, height).is_empty());
+    }
+
+    /// A menu holding no KEYBOARD is still a menu a press dismisses, and the
+    /// two questions are deliberately different. `topmost_grab` asks which
+    /// menu the seat answers to and bounds that hard; this asks which menus
+    /// the client believes are open, and every one of them ends on a press
+    /// elsewhere. Leaving one recorded would leave a grab nothing can reach.
+    #[test]
+    fn a_menu_the_seat_does_not_answer_to_is_still_dismissed() {
+        let (mut scene, width, height, rect, menu, _submenu) = grabbing_chain();
+        assert!(scene.grab_popup(menu));
+        let elsewhere = SurfaceKey {
+            client: 4,
+            object: 11,
+        };
+        // Mapping it FOCUSES it, which is what takes the seat off the menu.
+        scene.commit(elsewhere, surface(WINDOW, 40, 40)).unwrap();
+        assert_eq!(scene.focused(), Some(elsewhere));
+        assert_eq!(scene.topmost_grab(width, height), None, "it holds the seat");
+
+        // The pointer is over the window that took focus, which is outside the
+        // menu wherever that menu now is.
+        scene.move_pointer(
+            i32::try_from(rect.x + 100).unwrap(),
+            i32::try_from(rect.y + 50).unwrap(),
+            width,
+            height,
+        );
+        assert_eq!(scene.grabs_dismissed_by_pointer(width, height), vec![menu]);
+    }
+
+    /// No grab, nothing to dismiss — the shortcut that keeps every press on a
+    /// menuless desktop from walking the arrangement.
+    #[test]
+    fn a_press_with_no_menu_holding_a_grab_dismisses_nothing() {
+        let (scene, width, height, _rect, _menu, _submenu) = grabbing_chain();
+        assert!(scene.grabs_dismissed_by_pointer(width, height).is_empty());
     }
 
     /// A popup whose parent is not on screen is not drawn. The parent may be on
