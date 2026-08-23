@@ -3707,6 +3707,204 @@ td-txt-authored case files
     kernel's order, a divergence recorded elsewhere, so a case listing two
     siblings would pin that order instead of the filter.
 
+  The COLOUR OPTION -- `--color`/`--colour` -- is served, and like the filter
+  family above, every rule below was measured against GNU grep 3.11 rather than
+  read out of the manual. grep(1) gives the three answers, the nine spellings,
+  and the list of `GREP_COLORS` capabilities. What it does not give is what an
+  unrecognised WHEN does, how the capability string fails, when the legacy
+  variable is worth a warning, where the line colour opens and closes, or which
+  byte of a record is inside the escapes. Those were measured, and several are
+  surprising enough that reading the manual would have produced a wrong program
+  -- eight of them were wrong here until something other than reading said so.
+
+    WHEN is NINE spellings folded to THREE answers: always/yes/force,
+    never/no/none, auto/tty/if-tty. The match is whole and case-insensitive --
+    `ALWAYS` is `always`, and `alw` is not. A bare `--color` with no `=VALUE` is
+    `auto`, and because the argument is OPTIONAL the option never takes the next
+    argv element: `grep --color always f` searches for `always`.
+
+    An unrecognised WHEN is NOT an option error. GNU sets the same flag `--help`
+    sets, so the help text goes to STDOUT, the status is 0, and a real error the
+    same run would have raised is never reached -- `grep --color=nev a nosuchfile`
+    never opens the file and never diagnoses it. Every other bad option value in
+    grep is a diagnostic on stderr and exit 2, which is why this one is worth a
+    line here.
+
+    `auto` is resolved ONCE, and nothing downstream asks again: the destination
+    cannot change mid-run. A terminal is NECESSARY AND NOT SUFFICIENT -- GNU also
+    requires `TERM` to be set and to be something other than `dumb`. Set-but-
+    EMPTY counts as set and does paint, so the test is presence plus one exact
+    name, not a judgement about the value. The terminal half is
+    `std::io::IsTerminal`, which keeps the crate free of `unsafe`: td-txt is
+    `deny(unsafe_code)` and has no entry in UNSAFE.md, so an `isatty` through
+    libc would have been an amendment rather than a detail.
+
+    What CANNOT be pinned here is the true branch: the corpus captures output,
+    so every `auto` case in it resolves to off. `--color=always` carries the
+    painting, and `auto` is pinned only on the side a captured run can observe.
+    That gap is not decorative -- the `TERM` half of the rule was MISSING until a
+    reviewer probed `auto` in a real pty, and no case in this corpus could have
+    caught it. It is measurable how uncovered it is: reverting the `TERM` test
+    outright reddens NOTHING, where every other rule in this entry reddens two
+    or three cases when reverted. Anyone changing `auto` must test through a pty
+    by hand, because nothing here will tell them they broke it.
+
+    WHERE the colour environment is read is itself observable, and it sits
+    between two things. The settled short cut runs FIRST: `grep --color=always
+    -m0 a f` answers without reading input, and GNU has not looked at
+    `GREP_COLOR` by then, so a deprecated value goes unmentioned -- while
+    `-m0 -L`, that short cut's own exception, does reach it and warns. The
+    compile runs AFTER: a bad pattern is diagnosed second, so both messages
+    appear and in that order. Moving the read to either side breaks one of those
+    pairs, and the corpus holds all three.
+
+    Every painted element is the same five parts: `ESC[`, the capability, `m`,
+    then `ESC[K` to erase to the margin so a background colour reaches it; then
+    the text; then a bare `ESC[m` and the erase again. The `ne` capability drops
+    both erases. An EMPTY capability drops the whole wrapper instead of emitting
+    a bare `ESC[m` -- `fn=` prints the file name with no escape at all, which is
+    not the same thing as `fn=0`.
+
+    The defaults are `ms`=`mc`=`01;31`, `fn`=`35`, `ln`=`bn`=`32`, `se`=`36`,
+    and `sl`=`cx` EMPTY. `se` covers the `:` and `-` prefix separators and the
+    `--` between context groups; the COUNT `-c` prints is covered by nothing and
+    is never painted, and neither is the NUL `-Z` writes after a name -- that
+    NUL is data for whatever splits on it. `-o` paints the span and nothing
+    around it, since there is no line left for `sl` to apply to.
+
+    `mc` and `sl`/`cx` are only visible under the right option. A CONTEXT line
+    normally holds no match, so `mc` is reachable only under `-v`, where the
+    matching lines are the context ones. `rv` swaps `sl` and `cx`, and only when
+    `-v` is in effect; the MATCH colours never swap, being chosen by which list
+    the line came from.
+
+    A line is painted in SEGMENTS, not wrapped once. The line colour is reopened
+    before every stretch between matches and is not closed there; only the
+    trailing stretch closes it. So a record whose last byte ends a match leaves
+    its final line-colour run OPEN, and that is GNU's output rather than a defect
+    here. An EMPTY match colour skips the segment walk ALTOGETHER rather than
+    painting nothing per match, so `ms=` leaves the record one line-colour run
+    instead of one per stretch -- the same thing on a screen and a different byte
+    stream, which is why it is pinned. Two bytes sit in unobvious places: a CR
+    that ends the record is left OUT of the painted tail and written bare, so a
+    CRLF file gets no escape wrapped around the carriage return alone; and a
+    `-w -x` span is measured PAST the record separator, which puts that separator
+    INSIDE the match's escapes, under `-o` as well as on a whole line.
+
+    THREE divergences are pinned rather than fixed, all in ONE direction only:
+    the bytes and the exit status agree with GNU and just the escapes differ. td-txt's matcher has a step budget where GNU's has none, so a pattern
+    that exhausts it while locating spans to paint stops the walk and prints the
+    record unpainted where GNU paints it -- the alternative, taking `-o`'s route
+    and refusing, would lose a whole selected line to a decoration. And td-txt
+    locates spans per PATTERN where GNU matches the union of an alternation, so
+    `grep -w -e '..\?' -e '[a-z]\+'` over `a.b aa` colours a `b` GNU leaves
+    alone. And an ANCHORED pattern paints nothing where GNU paints an inner
+    match: GNU's painting pass looks for the pattern unanchored even under `-x`,
+    so on a context line `aaa` it paints the `aa` inside. That one is reachable
+    only where a line prints WITHOUT having been selected by the pattern -- the
+    trailing context `-m1 -A2` leaves once the count is spent, under `-v`. The
+    last two are the matcher's and predate this landing; `-o` already showed the
+    span gap, but whole-line output agreed until there were escapes to place.
+    All three are in divergence.test.txt, and none is visible without
+    `--color`.
+
+    `GREP_COLORS` fails in two different ways and the difference is the whole
+    reason the parser returns rather than skipping. A malformed VALUE -- anything
+    outside `[0-9;]`, a leading or trailing space included -- ABANDONS the rest
+    of the string while keeping every item already read, so `fn=33:ms=zz` still
+    recolours the file name and `ms=zz:fn=33` does not. An unknown NAME costs
+    nothing and parsing continues past it -- but a bare name is not always inert,
+    and the VALUE is judged BEFORE the name is looked at, so `ne=zz` and `bogus=zz` abort exactly as `ms=zz` does,
+    and `ne` is not set on the way past. An `=` with no NAME before it aborts as
+    well: GNU will not start a value it has no name for. An EMPTY ITEM is a
+    different thing and harmless, since `:::` carries no `=` at all. `ne` and
+    `rv` are then read by PRESENCE, so `ne=0` suppresses too. So is `mt`, which
+    is the one COLOUR capability with a value-less effect: GNU gives it a
+    function rather than a variable, and it re-points `mc` at whatever `ms` holds
+    when the item ends. `ms=32:mt` therefore recolours context matches, `mc=33:mt`
+    throws the explicit `mc` away, and either counts as ASSIGNING `mc` for the
+    warning below. Every other capability bare -- `sl`, `cx`, `se`, `bn`, `ln`,
+    `ms`, `mc`, `fn` -- does nothing, which is measured rather than assumed. `mt` sets `ms` and `mc` together, and the LAST
+    assignment wins, which makes `mt=X:ms=Y` and `ms=Y:mt=X` different.
+
+    `GREP_COLOR`, the superseded spelling of `mt`, is honoured and named in a
+    warning giving the modern form -- but only when that value is still IN
+    EFFECT. It must be non-empty and `[0-9;]`, or it sets nothing and says
+    nothing; and `GREP_COLORS` must not have assigned BOTH `ms` and `mc`, since
+    then the legacy value reached neither. Assigning one still warns, because
+    the other still carries it. The test is ASSIGNMENT, not agreement:
+    `mt=32:ms=01;36` writes the very string the legacy variable holds and still
+    silences the warning. An abort interacts with this by WHERE it falls, not by
+    aborting: `ms=zz` assigns nothing before stopping and so still warns, while
+    `mt=32:fn=zz` has already assigned both and stays silent. Saying an abort
+    "assigns nothing" is wrong, and was wrong in a draft of this entry -- what an
+    abort drops is the REST.
+
+    NINE defects in this landing survived every hand-written case that existed
+    when they were caught, and HOW each was caught is the part worth keeping --
+    three channels beyond the corpus itself, none subsuming the others.
+    Fifty-four cases were green -- every one of them matching GNU -- when a
+    randomised differential sweep found three: `GREP_COLOR=zz` and
+    `GREP_COLORS=mt=...` beside a legacy value, combinations nobody would think
+    to write, on the one axis where td-txt spoke where GNU stayed silent; plus
+    the empty-match-colour walk and the short-cut ordering. The sweep is 36,000
+    invocations over both variables, thirty-five option combinations, and a
+    fixture carrying CRLF, unterminated and empty records; 123,000 were run
+    across the landing as the axes grew, each new axis added by a finding the
+    previous ones could not reach.
+
+    The FOURTH came from neither, and is the more useful lesson. This entry
+    asserted that `rv` does not swap the match colours and that a context line is
+    painted only under `-v`; re-reading the entry before committing it and
+    MEASURING both -- rather than trusting the sentence that had just been
+    written -- showed the first true and the second half-wrong. A context line
+    that holds a match prints unpainted, which `-m` makes reachable: the trailing
+    context after the count is spent can match and still not be coloured. GNU
+    decides this STRUCTURALLY, where the line's list and `-v` disagree, and never
+    asks the bytes. Running the matcher over each printed line agrees everywhere
+    except there. No sweep axis reached it, because the sweep did not cross `-m`
+    with context until this was already known. Cases chosen by reading the
+    documentation cover what the reader thought of, the sweep covers what nobody
+    did, and checking one's own prose against the program covers the gap where a
+    plausible sentence is the only evidence.
+
+    The FIFTH came from a cross-model reviewer, and is the one both the sweep
+    and the self-check were built to miss. `GREP_COLORS` judges a VALUE before
+    it looks at the NAME, so `ne=zz` and `bogus=zz` abandon the rest exactly as
+    `ms=zz` does -- and `ne` is not set on the way past. td-txt read the two
+    booleans by presence FIRST and so never judged their values. Neither the
+    goldens nor the sweep could reach it: both drew boolean capabilities only
+    from `ne`, `rv`, `ne=0`, `rv=1`, every one of them well formed. The axis was
+    not thin, it was ABSENT, and a generator cannot cross an axis it does not
+    have. That is the argument for a reader who is not the author and not the
+    generator: the sweep answers "did I get the combinations right", and only a
+    reader asks "is there a combination I never wrote down".
+
+    FOUR MORE came from the two remaining reviewers, and one of them was the
+    worst defect in the landing. Colouring located its spans through the same
+    budgeted path `-o` uses, which REFUSES when the budget runs out -- so
+    `--color=always` could turn a search that had already selected the line into
+    exit 2 with no output, and under `-Hn` leave a half-written prefix behind.
+    Decoration was being allowed to destroy data. It now degrades instead: the
+    walk stops, the record prints unpainted, and bytes and status stay right.
+    Review also found that `auto` needs `TERM` as well as a terminal, that an
+    `=` with no name before it aborts the parse, and that a bare `mt` is NOT
+    inert -- that last one found by reading GNU's capability TABLE rather than
+    its behaviour, and noticing `mt` is declared with a function where every
+    other colour name has a variable. None of the four was reachable from the
+    corpus: one needs a pathological pattern, one needs a pty, one needs a
+    spelling no generator had been given, and one needs the upstream data
+    structure rather than any observation at all.
+
+    The pattern across the three is worth stating once. Every defect here was
+    found by a channel that could see something the others structurally could
+    not: the sweep crosses axes the author enumerated, the self-check reads
+    what the author asserted, and the reviewers reach what the author never
+    represented at all -- an axis absent from the generator, an environment the
+    harness cannot create, a cost model no fixture provokes, a shape visible
+    only in the upstream source. Adding cases to the corpus would have found
+    none of the last five.
+
   Goldens are C-locale. Under LC_ALL=C — the only locale td's image sets, and what
   every case here was captured under — GNU `grep -w '\.*'` selects `.a`; under a
   UTF-8 locale the same GNU binary selects nothing. Re-derive a `-w` golden without
@@ -3785,7 +3983,7 @@ Overlay
                          td-txt/target/release/td-txt td-txt/spec > td-txt/spec/expectations.txt
 
                      It is NOT empty: 22 xfail entries and no skips,
-                     against 2640 of a 2662-case corpus passing -- 99.17%.
+                     against 2717 of a 2739-case corpus passing -- 99.20%.
                      This line read "EMPTY today" long after it stopped being
                      true, which is why the count now sits beside the claim.
 

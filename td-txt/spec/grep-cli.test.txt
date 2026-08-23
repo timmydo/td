@@ -8148,3 +8148,784 @@ hit
 ## stderr-json: ""
 ## status: 0
 
+
+#### --color=always paints every match with ms, defaulting to bold red
+# Each painted element is the SGR run, then `ESC[K' to erase to the margin so
+# a background colour reaches it, then the text, then a bare `ESC[m' and the
+# erase again. `ms' is the capability for a match on a SELECTED line.
+## argv: grep --color=always beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "alpha \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K gamma\n\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 0
+
+#### and --color=never leaves the same run bare
+# The control the case above needs: same argv otherwise, so what differs is
+# the escapes and not which lines were selected.
+## argv: grep --color=never beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "alpha beta\nbeta gamma\nbeta beta beta\n"
+## stderr-json: ""
+## status: 0
+
+#### --color=auto to a PIPE is never, because the destination is not a terminal
+# The corpus runs applets with their output captured, so `auto' resolves the
+# same way it would in `grep ... | less': off. A terminal cannot be presented
+# here, so this pins only the half that a captured run can observe.
+## argv: grep --color=auto beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "alpha beta\nbeta gamma\nbeta beta beta\n"
+## stderr-json: ""
+## status: 0
+
+#### a bare --color is auto, not always
+# `--color' is grep's only OPTIONAL-argument option. Bare, it takes the same
+# branch `--color=auto' does.
+## argv: grep --color beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "alpha beta\nbeta gamma\nbeta beta beta\n"
+## stderr-json: ""
+## status: 0
+
+#### and it never eats the NEXT argv element, which is what Optional means
+# `Arg::Required' would make `always' the option's value and `f1' the pattern.
+# It is not: `always' is the PATTERN, f1 the file, and nothing matches it.
+## argv: grep --color always f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### --colour is the same option under its other spelling
+# One option to GNU -- same value, same arity -- and two names in the table.
+## argv: grep --colour=always beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "alpha \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K gamma\n\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 0
+
+#### and --col resolves rather than being ambiguous, because the two collapse
+# `--col' prefixes both spellings, which for any other pair would be an
+# ambiguity. glibc drops a later prefix match agreeing with the first on
+# option, flag and arity (getopt.c:230), and these agree on all three.
+## argv: grep --col=always beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "alpha \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K gamma\n\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 0
+
+#### --color=yes is a spelling of the same three answers
+# always/yes/force, never/no/none and auto/tty/if-tty are the whole
+# vocabulary; there is no fourth answer and no abbreviation.
+## argv: grep --color=yes beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "alpha \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K gamma\n\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 0
+
+#### --color=force is a spelling of the same three answers
+# always/yes/force, never/no/none and auto/tty/if-tty are the whole
+# vocabulary; there is no fourth answer and no abbreviation.
+## argv: grep --color=force beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "alpha \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K gamma\n\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 0
+
+#### --color=no is a spelling of the same three answers
+# always/yes/force, never/no/none and auto/tty/if-tty are the whole
+# vocabulary; there is no fourth answer and no abbreviation.
+## argv: grep --color=no beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "alpha beta\nbeta gamma\nbeta beta beta\n"
+## stderr-json: ""
+## status: 0
+
+#### --color=none is a spelling of the same three answers
+# always/yes/force, never/no/none and auto/tty/if-tty are the whole
+# vocabulary; there is no fourth answer and no abbreviation.
+## argv: grep --color=none beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "alpha beta\nbeta gamma\nbeta beta beta\n"
+## stderr-json: ""
+## status: 0
+
+#### --color=tty is a spelling of the same three answers
+# always/yes/force, never/no/none and auto/tty/if-tty are the whole
+# vocabulary; there is no fourth answer and no abbreviation.
+## argv: grep --color=tty beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "alpha beta\nbeta gamma\nbeta beta beta\n"
+## stderr-json: ""
+## status: 0
+
+#### --color=if-tty is a spelling of the same three answers
+# always/yes/force, never/no/none and auto/tty/if-tty are the whole
+# vocabulary; there is no fourth answer and no abbreviation.
+## argv: grep --color=if-tty beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "alpha beta\nbeta gamma\nbeta beta beta\n"
+## stderr-json: ""
+## status: 0
+
+#### WHEN is matched without regard to case
+# `c_strcasecmp', so `ALWAYS' is `always'. This is the only place in grep's
+# option handling where a VALUE is folded.
+## argv: grep --color=ALWAYS beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "alpha \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K gamma\n\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 0
+
+#### -n paints the line number with ln and the separator with se
+# The separator is its own element: `ln' covers the digits only.
+## argv: grep --color=always -n beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "\u001b[32m\u001b[K1\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[Kalpha \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n\u001b[32m\u001b[K2\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K gamma\n\u001b[32m\u001b[K4\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 0
+
+#### -b paints the byte offset with bn, and prints it AFTER the line number
+# `grep -bn' is `1:0:...', and the two are independent rather than one
+# implying the other.
+## argv: grep --color=always -bn beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "\u001b[32m\u001b[K1\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[32m\u001b[K0\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[Kalpha \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n\u001b[32m\u001b[K2\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[32m\u001b[K11\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K gamma\n\u001b[32m\u001b[K4\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[32m\u001b[K28\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 0
+
+#### -H paints the file name with fn
+## argv: grep --color=always -H beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "\u001b[35m\u001b[Kf1\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[Kalpha \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n\u001b[35m\u001b[Kf1\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K gamma\n\u001b[35m\u001b[Kf1\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 0
+
+#### -l paints the name it lists with the same fn
+# `-l' prints no separator, so this pins fn alone.
+## argv: grep --color=always -l beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "\u001b[35m\u001b[Kf1\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 0
+
+#### -L paints the name it lists too
+## argv: grep --color=always -L nope f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "\u001b[35m\u001b[Kf1\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 1
+
+#### -c paints the name and the separator but never the COUNT
+# The count is not a match, a name, a number of a line, or an offset, so no
+# capability covers it.
+## argv: grep --color=always -cH beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "\u001b[35m\u001b[Kf1\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K3\n"
+## stderr-json: ""
+## status: 0
+
+#### -o paints the span and nothing around it
+# There is no line left to colour under `-o', so `sl' has nothing to apply to.
+## argv: grep --color=always -o beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 0
+
+#### the -- that separates context groups is painted with se
+# Same capability as the `:'/`-' prefixes: it is a separator, not data.
+## argv: grep --color=always -C0 -n beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "\u001b[32m\u001b[K1\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[Kalpha \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n\u001b[32m\u001b[K2\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K gamma\n\u001b[36m\u001b[K--\u001b[m\u001b[K\n\u001b[32m\u001b[K4\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K \u001b[01;31m\u001b[Kbeta\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 0
+
+#### a context line takes the - separator, painted like the : one
+## argv: grep --color=always -C1 -n delta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "\u001b[32m\u001b[K2\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[Kbeta gamma\n\u001b[32m\u001b[K3\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kdelta\u001b[m\u001b[K\n\u001b[32m\u001b[K4\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[Kbeta beta beta\n"
+## stderr-json: ""
+## status: 0
+
+#### under -v the SELECTED lines have no match to paint
+# `-v' selects the lines that did NOT match, so `ms' never fires on them.
+## argv: grep --color=always -v beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "delta\n"
+## stderr-json: ""
+## status: 0
+
+#### but its CONTEXT lines do, which is the only place mc is ever seen
+# Under `-v' the matching lines are the context ones. `mc' is the match
+# colour for a context line and defaults to the same bold red as `ms', so
+# this case pins WHERE it applies rather than what it looks like.
+## argv: grep --color=always -v -C1 -n match h
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[32m\u001b[K2\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K here\n\u001b[32m\u001b[K3\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[Kq\n"
+## stderr-json: ""
+## status: 0
+
+#### and mc is what recolours it, leaving ms alone
+## argv: grep --color=always -v -C1 match h
+## env GREP_COLORS: mc=01;34
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[01;34m\u001b[Kmatch\u001b[m\u001b[K here\nq\n"
+## stderr-json: ""
+## status: 0
+
+#### GREP_COLORS recolours a match through ms
+## argv: grep --color=always match h
+## env GREP_COLORS: ms=01;32
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[01;32m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[01;32m\u001b[Kmatch\u001b[m\u001b[K here\n"
+## stderr-json: ""
+## status: 0
+
+#### mt sets the selected and context match colours together
+# One name for the pair, which is what the deprecated variable set.
+## argv: grep --color=always match h
+## env GREP_COLORS: mt=01;36
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[01;36m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[01;36m\u001b[Kmatch\u001b[m\u001b[K here\n"
+## stderr-json: ""
+## status: 0
+
+#### and the LAST assignment wins, so mt after ms overrides it
+## argv: grep --color=always match h
+## env GREP_COLORS: ms=01;32:mt=01;36
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[01;36m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[01;36m\u001b[Kmatch\u001b[m\u001b[K here\n"
+## stderr-json: ""
+## status: 0
+
+#### while ms after mt overrides only the selected half
+# The mirror of the case above. Ordering matters because the string is read
+# left to right and each item assigns, rather than being collected first.
+# Run under `-v -C1' so the CONTEXT line is present and `mc' is actually
+# observed still holding the `mt' value -- without it the case could not
+# tell `only the selected half' from `both'.
+## argv: grep --color=always -v -C1 match h
+## env GREP_COLORS: mt=01;36:ms=01;32
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[01;36m\u001b[Kmatch\u001b[m\u001b[K here\nq\n"
+## stderr-json: ""
+## status: 0
+#### sl paints the line UNDER the match, in segments rather than one wrapper
+# The line colour is reopened before each stretch between matches and is not
+# closed there; only the trailing stretch closes. A line ending in a match
+# therefore leaves its last line-colour run open, which is GNU's output.
+## argv: grep --color=always X m
+## env GREP_COLORS: sl=07
+## file-json m: "aXbXc\nXX\nabc\n"
+## stdout-json: "\u001b[07m\u001b[Ka\u001b[01;31m\u001b[KX\u001b[m\u001b[K\u001b[07m\u001b[Kb\u001b[01;31m\u001b[KX\u001b[m\u001b[K\u001b[07m\u001b[Kc\u001b[m\u001b[K\n\u001b[07m\u001b[K\u001b[01;31m\u001b[KX\u001b[m\u001b[K\u001b[07m\u001b[K\u001b[01;31m\u001b[KX\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 0
+
+#### and a line whose last byte ends a match writes no trailing stretch at all
+# `match' is the whole record, so there is nothing after the match to paint
+# and the tail is skipped -- leaving exactly one unclosed line-colour run.
+## argv: grep --color=always -x match h
+## env GREP_COLORS: sl=07
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[07m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 0
+
+#### cx paints a context line the way sl paints a selected one
+## argv: grep --color=always -C1 -x match h
+## env GREP_COLORS: sl=01;35:cx=02
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[01;35m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[02m\u001b[Kmatch here\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 0
+
+#### rv swaps those two, and only when -v is in effect
+# Under `-v' the selected line takes `cx' and the context line takes `sl'.
+# What this case shows is the LINE colours swapping and nothing more: `ms' and
+# `mc' are equal here, so it could not tell a match-colour swap from no swap.
+# That the match colours do NOT swap is pinned separately, by the case using
+# `rv:ms=31:mc=34' where the two differ.
+## argv: grep --color=always -v -C1 match h
+## env GREP_COLORS: rv:sl=01;35:cx=02
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[01;35m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K\u001b[01;35m\u001b[K here\u001b[m\u001b[K\n\u001b[02m\u001b[Kq\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 0
+
+#### and rv without -v changes nothing
+# The control for the swap: the same capabilities, the same fixture, and the
+# assignment the other way round.
+## argv: grep --color=always -C1 -x match h
+## env GREP_COLORS: rv:sl=01;35:cx=02
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[01;35m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[02m\u001b[Kmatch here\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 0
+
+#### ne drops the ESC[K that otherwise follows every escape
+# For a terminal that scrolls wrongly on the erase. It is read by PRESENCE.
+## argv: grep --color=always -Hn match h
+## env GREP_COLORS: ne
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[35mh\u001b[m\u001b[36m:\u001b[m\u001b[32m1\u001b[m\u001b[36m:\u001b[m\u001b[01;31mmatch\u001b[m\n\u001b[35mh\u001b[m\u001b[36m:\u001b[m\u001b[32m2\u001b[m\u001b[36m:\u001b[m\u001b[01;31mmatch\u001b[m here\n"
+## stderr-json: ""
+## status: 0
+
+#### and it is read by presence, so even ne=0 suppresses
+# The value is never looked at, which is why `ne=0' does not mean `off'.
+## argv: grep --color=always -Hn match h
+## env GREP_COLORS: ne=0
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[35mh\u001b[m\u001b[36m:\u001b[m\u001b[32m1\u001b[m\u001b[36m:\u001b[m\u001b[01;31mmatch\u001b[m\n\u001b[35mh\u001b[m\u001b[36m:\u001b[m\u001b[32m2\u001b[m\u001b[36m:\u001b[m\u001b[01;31mmatch\u001b[m here\n"
+## stderr-json: ""
+## status: 0
+
+#### an EMPTY capability drops the wrapper rather than emitting a bare escape
+# `fn=' is not `fn=0': the file name prints with no escape around it at all.
+## argv: grep --color=always -Hn match h
+## env GREP_COLORS: fn=
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "h\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[32m\u001b[K1\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K\nh\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[32m\u001b[K2\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K here\n"
+## stderr-json: ""
+## status: 0
+
+#### a malformed VALUE abandons the rest of the string
+# `zz' is not `[0-9;]', so parsing stops there and `fn' never reaches 33 --
+# it keeps the default 35.
+## argv: grep --color=always -Hn match h
+## env GREP_COLORS: ms=zz:fn=33
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[35m\u001b[Kh\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[32m\u001b[K1\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[35m\u001b[Kh\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[32m\u001b[K2\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K here\n"
+## stderr-json: ""
+## status: 0
+
+#### but everything BEFORE the malformed value is kept
+# The same two items the other way round. This pair is the whole reason the
+# parser returns rather than skipping: one ordering keeps fn, the other does
+# not, and only a rule about ABANDONING the rest explains both.
+## argv: grep --color=always -Hn match h
+## env GREP_COLORS: fn=33:ms=zz
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[33m\u001b[Kh\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[32m\u001b[K1\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[33m\u001b[Kh\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[32m\u001b[K2\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K here\n"
+## stderr-json: ""
+## status: 0
+
+#### an unknown NAME is skipped and parsing continues past it
+# Which is the opposite of a malformed value: `bogus' costs nothing and `ln'
+# still takes effect after it.
+## argv: grep --color=always -Hn match h
+## env GREP_COLORS: fn=33:bogus=9:ln=34
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[33m\u001b[Kh\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[34m\u001b[K1\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[33m\u001b[Kh\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[34m\u001b[K2\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K here\n"
+## stderr-json: ""
+## status: 0
+
+#### a LEADING space makes a value malformed
+# The charset is exactly `[0-9;]'; nothing is trimmed first.
+## argv: grep --color=always match h
+## env GREP_COLORS: ms= 31
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K here\n"
+## stderr-json: ""
+## status: 0
+
+#### and so does a TRAILING one, which is the half the pair needs
+# Written separately because one case cannot show both ends, and a comment
+# claiming both while testing one is how a gap hides. The BLOCK form is
+# required: the inline `## env NAME: value' spelling trims, so written inline
+# this case would silently run `ms=31' and pass while testing nothing.
+## argv: grep --color=always match h
+## env GREP_COLORS:
+ms=31 
+## END
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K here\n"
+## stderr-json: ""
+## status: 0
+#### a trailing semicolon does not, and reaches the terminal verbatim
+# `;' is in the charset, so `01;31;' is passed through as written rather than
+# being tidied.
+## argv: grep --color=always match h
+## env GREP_COLORS: ms=01;31;
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[01;31;m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[01;31;m\u001b[Kmatch\u001b[m\u001b[K here\n"
+## stderr-json: ""
+## status: 0
+
+#### a bare ms is inert, having no value to assign
+# NOT a general rule about value-less items, which was how a draft of this
+# comment put it: `ne', `rv' and `mt' all do something bare. What is true is
+# that the COLOUR capabilities other than `mt' are inert, and `ms' is one.
+## argv: grep --color=always match h
+## env GREP_COLORS: ms
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K here\n"
+## stderr-json: ""
+## status: 0
+
+#### and a string of nothing but separators leaves every default standing
+## argv: grep --color=always match h
+## env GREP_COLORS: :::
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K here\n"
+## stderr-json: ""
+## status: 0
+
+#### a CR that ends the record is left out of the painted tail
+# GNU measures the tail short of the carriage return and writes it bare, so a
+# CRLF file does not get an escape wrapped around the CR alone.
+## argv: grep --color=always match cr
+## env GREP_COLORS: sl=07
+## file-json cr: "match here\r\nplain\r\n"
+## stdout-json: "\u001b[07m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K\u001b[07m\u001b[K here\u001b[m\u001b[K\r\n"
+## stderr-json: ""
+## status: 0
+
+#### a -w -x span is measured PAST the record separator, and paints it
+# That byte is part of the match, so it sits INSIDE the match's escapes and
+# prints before the separator the line itself adds.
+## argv: grep --color=always -w -x match h
+## env GREP_COLORS: sl=07
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[07m\u001b[K\u001b[01;31m\u001b[Kmatch\n\u001b[m\u001b[K"
+## stderr-json: ""
+## status: 0
+
+#### and -o paints that same past-the-record byte inside the span
+# The `-o' half of the case above, which is where the blank line `grep -w -x
+# -o' leaves per match comes from.
+## argv: grep --color=always -o -w -x match h
+## env GREP_COLORS: sl=07
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[01;31m\u001b[Kmatch\n\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 0
+
+#### an EMPTY match is never painted, having no byte to carry the escape
+# `X*' matches non-emptily where there is an `X' and emptily everywhere else,
+# including on `abc', which prints with no escape at all. An empty match has
+# no byte to put between the escapes, so it gets none.
+## argv: grep --color=always X* m
+## file-json m: "aXbXc\nXX\nabc\n"
+## stdout-json: "a\u001b[01;31m\u001b[KX\u001b[m\u001b[Kb\u001b[01;31m\u001b[KX\u001b[m\u001b[Kc\n\u001b[01;31m\u001b[KXX\u001b[m\u001b[K\nabc\n"
+## stderr-json: ""
+## status: 0
+#### -Z's NUL is data and is never painted, though the name before it is
+# The NUL is what the consumer on the other end splits on; an escape around
+# it would be bytes that consumer never asked to parse.
+## argv: grep --color=always -Z -l beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "\u001b[35m\u001b[Kf1\u001b[m\u001b[K\u0000"
+## stderr-json: ""
+## status: 0
+
+#### GREP_COLOR is the superseded spelling of mt, and is diagnosed
+# Honoured, but named in a warning that gives the modern spelling, because a
+# caller still exporting it is carrying a setting the documented variable
+# would express differently.
+## argv: grep --color=always match h
+## env GREP_COLOR: 01;36
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[01;36m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[01;36m\u001b[Kmatch\u001b[m\u001b[K here\n"
+## stderr-json: "grep: warning: GREP_COLOR='01;36' is deprecated; use GREP_COLORS='mt=01;36'\n"
+## status: 0
+
+
+#### an unrecognised WHEN is not an option error but a request for HELP
+# Measured against GNU, which sets the same flag `--help' sets: the text goes
+# to STDOUT and the status is 0, where every other bad option value is a
+# diagnostic on stderr and exit 2. The text itself is td-txt's own usage --
+# the same substitution `--help' makes -- so only the SHAPE is GNU's here.
+## argv: grep --color=nev beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "usage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## stderr-json: ""
+## status: 0
+
+#### and an empty WHEN is unrecognised too, rather than meaning auto
+# `--color=' is not a bare `--color': the value is present and empty, and
+# empty is not one of the nine spellings.
+## argv: grep --color= beta f1
+## file-json f1: "alpha beta\nbeta gamma\ndelta\nbeta beta beta\n"
+## stdout-json: "usage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## stderr-json: ""
+## status: 0
+
+#### and that help outranks a real error the same run would have raised
+# The missing file is never opened, let alone diagnosed, because the flag is
+# answered once the option scan finishes and before any operand is looked at.
+## argv: grep --color=nev beta nosuchfile
+## stdout-json: "usage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## stderr-json: ""
+## status: 0
+
+
+#### a MALFORMED GREP_COLOR is silently nothing, warning included
+# The warning is for a value that would otherwise be honoured. `zz' is not
+# `[0-9;]', so it sets nothing -- and naming it would be advice about a
+# setting that is not in effect. This pairs with the case above: the same
+# variable, one value warned about and one not.
+## argv: grep --color=always match h
+## env GREP_COLOR: zz
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K here\n"
+## stderr-json: ""
+## status: 0
+
+#### and an EMPTY one is nothing too, by the same test
+# The block form is the only way to write an EMPTY value; inline, the trailing
+# space would open a block the case never closes.
+## argv: grep --color=always match h
+## env GREP_COLOR:
+## END
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K here\n"
+## stderr-json: ""
+## status: 0
+
+#### a lone semicolon IS a valid value, so it warns and is honoured
+# `;' is in the charset. The rule is the CHARSET, not whether the result
+# means anything to a terminal.
+## argv: grep --color=always match h
+## env GREP_COLOR: ;
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[;m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[;m\u001b[Kmatch\u001b[m\u001b[K here\n"
+## stderr-json: "grep: warning: GREP_COLOR=';' is deprecated; use GREP_COLORS='mt=;'\n"
+## status: 0
+
+#### an EMPTY match colour skips the match walk instead of painting nothing
+# `ms=' leaves the line one `sl' run rather than one per stretch between
+# matches: GNU runs its middle pass only where there IS a match colour to
+# apply. Painting an empty colour per match would give the same VISIBLE
+# result and a different byte stream, which is why this is pinned.
+## argv: grep --color=always -h . m
+## env GREP_COLORS: sl=02:ms=
+## file-json m: "aXbXc\nXX\nabc\n"
+## stdout-json: "\u001b[02m\u001b[KaXbXc\u001b[m\u001b[K\n\u001b[02m\u001b[KXX\u001b[m\u001b[K\n\u001b[02m\u001b[Kabc\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 0
+
+#### GREP_COLORS assigning BOTH match capabilities silences the legacy warning
+# The warning is about a setting still in effect. `mt' assigns `ms' and `mc'
+# together, so the legacy value reached nothing and there is nothing to warn
+# about.
+## argv: grep --color=always -C1 -v match h
+## env GREP_COLOR: 01;36
+## env GREP_COLORS: mt=32
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[32m\u001b[Kmatch\u001b[m\u001b[K here\nq\n"
+## stderr-json: ""
+## status: 0
+
+#### but assigning only ONE leaves the other holding it, and still warns
+# `ms=32' leaves `mc' carrying the legacy value, and a context line under
+# `-v' is where `mc' is seen. So the warning is not about whether the
+# variable was SET but about whether it still reaches something.
+## argv: grep --color=always -C1 -v match h
+## env GREP_COLOR: 01;36
+## env GREP_COLORS: ms=32
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[01;36m\u001b[Kmatch\u001b[m\u001b[K here\nq\n"
+## stderr-json: "grep: warning: GREP_COLOR='01;36' is deprecated; use GREP_COLORS='mt=01;36'\n"
+## status: 0
+
+#### and it is ASSIGNMENT that silences it, not the value agreeing
+# `mt=32' assigns both, and the later `ms=01;36' then writes the very string
+# the legacy variable holds. Still no warning: what was tested is that
+# GREP_COLORS assigned the capability, not what it assigned.
+## argv: grep --color=always -C1 -v match h
+## env GREP_COLOR: 01;36
+## env GREP_COLORS: mt=32:ms=01;36
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[32m\u001b[Kmatch\u001b[m\u001b[K here\nq\n"
+## stderr-json: ""
+## status: 0
+
+#### a GREP_COLORS whose parse ABORTS leaves the legacy value in place
+# `ms=zz' is malformed, so parsing stops before assigning anything -- which
+# means `ms' still carries the legacy value and the warning still fires. The
+# abort rule and the warning rule meet here.
+## argv: grep --color=always -C1 -v match h
+## env GREP_COLOR: 01;36
+## env GREP_COLORS: ms=zz
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[01;36m\u001b[Kmatch\u001b[m\u001b[K here\nq\n"
+## stderr-json: "grep: warning: GREP_COLOR='01;36' is deprecated; use GREP_COLORS='mt=01;36'\n"
+## status: 0
+
+#### the settled short cut runs BEFORE the colour environment is read
+# `-m0' answers without reading input or compiling, and GNU has not looked at
+# GREP_COLOR by then -- so a deprecated value goes unmentioned. This pins the
+# ORDER, which is the only thing that makes the pair below differ.
+## argv: grep --color=always -m 0 match h
+## env GREP_COLOR: 01;36
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### but -L, that short cut's exception, reaches it and warns
+# Same `-m0', same variable, and the warning appears because `-L' must still
+# report the file and so the run does not stop early.
+## argv: grep --color=always -m 0 -L match h
+## env GREP_COLOR: 01;36
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[35m\u001b[Kh\u001b[m\u001b[K\n"
+## stderr-json: "grep: warning: GREP_COLOR='01;36' is deprecated; use GREP_COLORS='mt=01;36'\n"
+## status: 1
+
+#### and a bad pattern is diagnosed AFTER the colour environment is read
+# The compile follows the colour init, so both diagnostics appear and in that
+# order. Placing the init after the compile would print them the other way
+# round, and placing it before the short cut would break the pair above.
+## argv: grep --color=always -e [ h
+## env GREP_COLOR: 01;36
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: ""
+## stderr-json: "grep: warning: GREP_COLOR='01;36' is deprecated; use GREP_COLORS='mt=01;36'\ngrep: Invalid regular expression\n"
+## status: 2
+
+#### whether a record is painted is STRUCTURAL, not asked of its bytes
+# `-m1' spends the count on the first line, and `-A2' then prints the trailing
+# context -- which here HOLDS a match and is still not painted. GNU paints
+# where the line's list and `-v' disagree, so a context line without `-v' is
+# never painted whatever it contains. Re-running the matcher over each printed
+# line instead gives the same answer everywhere but here.
+## argv: grep --color=always -m 1 -A 2 match f
+## env GREP_COLORS: ms=31:mc=34
+## file-json f: "match\nq\nmatch two\nmatch three\n"
+## stdout-json: "\u001b[31m\u001b[Kmatch\u001b[m\u001b[K\nq\nmatch two\n"
+## stderr-json: ""
+## status: 0
+
+#### and the LINE colour is unaffected by that, being about the list alone
+# The same run with `sl'/`cx' set: the unpainted context line still takes its
+# context line colour. What the rule above governs is the MATCH, not the line.
+## argv: grep --color=always -m 1 -A 2 match f
+## env GREP_COLORS: sl=07:cx=02
+## file-json f: "match\nq\nmatch two\nmatch three\n"
+## stdout-json: "\u001b[07m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[02m\u001b[Kq\u001b[m\u001b[K\n\u001b[02m\u001b[Kmatch two\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 0
+
+#### under -v that disagreement flips, so the matching context line IS painted
+# Same structural test, other way round: `-v' makes the context lines the
+# matching ones and they paint with `mc'.
+## argv: grep --color=always -v -C 1 match f
+## env GREP_COLORS: ms=31:mc=34
+## file-json f: "match\nq\nmatch two\nmatch three\n"
+## stdout-json: "\u001b[34m\u001b[Kmatch\u001b[m\u001b[K\nq\n\u001b[34m\u001b[Kmatch\u001b[m\u001b[K two\n"
+## stderr-json: ""
+## status: 0
+
+#### and rv does not swap the MATCH colours, only the line ones
+# Measured with `ms' and `mc' distinct, which the defaults cannot show since
+# they are equal: the context line's match stays `mc' under `rv'.
+## argv: grep --color=always -v -C 1 match f
+## env GREP_COLORS: rv:ms=31:mc=34
+## file-json f: "match\nq\nmatch two\nmatch three\n"
+## stdout-json: "\u001b[34m\u001b[Kmatch\u001b[m\u001b[K\nq\n\u001b[34m\u001b[Kmatch\u001b[m\u001b[K two\n"
+## stderr-json: ""
+## status: 0
+
+#### a value is judged BEFORE its name, so even ne=zz abandons the rest
+# `ne' is read by presence, but that reading happens AFTER the value is
+# checked -- so a malformed one aborts the parse and does not set `ne' on the
+# way past. Both halves show here: the erase is still emitted and `ms' never
+# reaches 31.
+## argv: grep --color=always match h
+## env GREP_COLORS: ne=zz:ms=31
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K here\n"
+## stderr-json: ""
+## status: 0
+
+#### and an UNKNOWN name with a malformed value aborts just the same
+# The check does not depend on the name being one td-txt knows. `bogus=9'
+# next door is skipped and parsing continues; `bogus=zz' stops it.
+## argv: grep --color=always match h
+## env GREP_COLORS: bogus=zz:ms=31
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K here\n"
+## stderr-json: ""
+## status: 0
+
+#### while an EMPTY value on a boolean is valid, and sets it
+# Empty is trivially within `[0-9;]', so `ne=' is not malformed -- it sets
+# `ne' exactly as a bare `ne' does.
+## argv: grep --color=always match h
+## env GREP_COLORS: ne=:ms=31
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[31mmatch\u001b[m\n\u001b[31mmatch\u001b[m here\n"
+## stderr-json: ""
+## status: 0
+
+#### and a bare unknown name, having no value to judge, is simply skipped
+# No `=' means nothing to validate, so parsing continues past it -- which is
+# what separates `zz' from `bogus=zz'. An unknown name is inert bare for the
+# duller reason that it is unknown, not because bare names are inert.
+## argv: grep --color=always match h
+## env GREP_COLORS: zz:ms=31
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[31m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[31m\u001b[Kmatch\u001b[m\u001b[K here\n"
+## stderr-json: ""
+## status: 0
+
+#### an = with no NAME before it abandons the rest
+# GNU will not start a value it has no name for, so `fn' never reaches 33.
+# This is not the same as an EMPTY ITEM: `:::' carries no `=' and simply
+# names nothing, which the case above shows continuing happily.
+## argv: grep --color=always -H match h
+## env GREP_COLORS: =0:fn=33
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[35m\u001b[Kh\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[35m\u001b[Kh\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K here\n"
+## stderr-json: ""
+## status: 0
+
+#### and that abort is what leaves the legacy variable still in effect
+# `mt=32' after it is never reached, so `ms' and `mc' still carry GREP_COLOR
+# and the deprecation warning fires. The empty-name rule and the warning rule
+# meet here the way the malformed-value rule and the warning rule do.
+## argv: grep --color=always match h
+## env GREP_COLORS: =0:mt=32
+## env GREP_COLOR: 31
+## file-json h: "match\nmatch here\nq\n"
+## stdout-json: "\u001b[31m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[31m\u001b[Kmatch\u001b[m\u001b[K here\n"
+## stderr-json: "grep: warning: GREP_COLOR='31' is deprecated; use GREP_COLORS='mt=31'\n"
+## status: 0
+
+#### a bare mt is the one colour capability that is NOT inert
+# GNU gives `mt' a function rather than a variable, and it fires when the item
+# ENDS -- with or without a value. It re-points `mc' at whatever `ms' holds at
+# that moment, so `ms=32:mt' recolours the context match too. Every other
+# colour name bare does nothing, which is why this one needs its own case.
+## argv: grep --color=always -v -C1 match f
+## env GREP_COLORS: ms=32:mt
+## file-json f: "match\nq\nmatch two\nmatch three\n"
+## stdout-json: "\u001b[32m\u001b[Kmatch\u001b[m\u001b[K\nq\n\u001b[32m\u001b[Kmatch\u001b[m\u001b[K two\n"
+## stderr-json: ""
+## status: 0
+
+#### and it throws an explicit mc away, because it ASSIGNS rather than defaults
+# `mc=33' then bare `mt': the `mt' overwrites `mc' with `ms', which here is
+# still the legacy value. Order decides, as everywhere else in this string.
+## argv: grep --color=always -v -C1 match f
+## env GREP_COLOR: 32
+## env GREP_COLORS: mc=33:mt
+## file-json f: "match\nq\nmatch two\nmatch three\n"
+## stdout-json: "\u001b[32m\u001b[Kmatch\u001b[m\u001b[K\nq\n\u001b[32m\u001b[Kmatch\u001b[m\u001b[K two\n"
+## stderr-json: "grep: warning: GREP_COLOR='32' is deprecated; use GREP_COLORS='mt=32'\n"
+## status: 0
+
+#### and that counts as assigning mc, so it can silence the legacy warning
+# The bare `mt' marks `mc' assigned exactly as `mt=X' would. With `ms' already
+# assigned, both halves are covered and the deprecation warning goes quiet --
+# a value-less item changing what is said on stderr.
+## argv: grep --color=always match f
+## env GREP_COLOR: 32
+## env GREP_COLORS: ms=33:mt
+## file-json f: "match\nq\nmatch two\nmatch three\n"
+## stdout-json: "\u001b[33m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[33m\u001b[Kmatch\u001b[m\u001b[K two\n\u001b[33m\u001b[Kmatch\u001b[m\u001b[K three\n"
+## stderr-json: ""
+## status: 0

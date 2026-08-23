@@ -229,70 +229,6 @@ a
 ## status: 2
 ## stderr-contains: invalid option -- 'X'
 
-#### grep refuses --color, which GNU SERVES
-# GNU colours the matched text with SGR escapes. Emitting them would mean a
-# second output path and a terminal check; not emitting them while accepting
-# the option would make `grep --color=always' silently produce uncoloured
-# output, which is the failure a caller cannot see. So it is refused.
-## argv: grep --color hit f1
-## file f1:
-hit
-## END
-## stdout-json: ""
-## status: 2
-## stderr-json: "grep: unsupported option '--color'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
-
-#### and --colour, the other spelling, which names ITSELF in the diagnostic
-# Not a duplicate: the two are one option to GNU (same `val', same arity) but
-# two names in the table, and the refusal reports the name that RESOLVED.
-## argv: grep --colour hit f1
-## file f1:
-hit
-## END
-## stdout-json: ""
-## status: 2
-## stderr-json: "grep: unsupported option '--colour'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
-
-#### --col is NOT ambiguous, because the two spellings collapse
-# The whole point of the SYNONYMS entry. `--col' prefixes both `--color' and
-# `--colour', which for any other pair would be an ambiguity; glibc drops a
-# later prefix match that agrees with the FIRST on option, flag and arity
-# (getopt.c:230), and these agree on all three. Without the entry td-txt
-# reports `--col' ambiguous where GNU searches -- so this case pins the
-# collapse, and the name it resolves to is the FIRST spelling, `--color'.
-## argv: grep --col hit f1
-## file f1:
-hit
-## END
-## stdout-json: ""
-## status: 2
-## stderr-json: "grep: unsupported option '--color'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
-
-#### --color= takes its value, which is what makes the arity Optional not None
-# `--color' is grep's ONLY `optional_argument'. Declared `Arg::None' this
-# would be `option '--color' doesn't allow an argument' before the refusal is
-# ever reached, so the case pins the arity from one side.
-## argv: grep --color=always hit f1
-## file f1:
-hit
-## END
-## stdout-json: ""
-## status: 2
-## stderr-json: "grep: unsupported option '--color'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
-
-#### and bare --color does not demand one, which pins it from the other
-# Declared `Arg::Required' this would be `option '--color' requires an
-# argument'. Optional also means the option never eats the NEXT argv element,
-# which is not observable here -- td-txt refuses either way -- but is
-# observable in GNU: `grep --color always f' searches for `always'.
-## argv: grep --color
-## stdin:
-hit
-## END
-## stdout-json: ""
-## status: 2
-## stderr-json: "grep: unsupported option '--color'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
-
 #### grep refuses --label, which names STANDARD INPUT in every prefixed line
 # Only standard input: measured, `grep --label=X -H a f1' prints `f1:a' and
 # leaves the operand's own name alone, while the same command reading `-'
@@ -1700,3 +1636,53 @@ a.c
 ## stdout-json: ""
 ## stderr-json: ""
 ## status: 1
+
+#### colouring DEGRADES rather than failing when the matcher runs out of budget
+# td-txt's matcher has a step budget; GNU's does not. A pattern that exhausts
+# it while LOCATING spans for `--color' would, taking the same route `-o'
+# takes, refuse the whole run -- and a search that had already selected this
+# line would exit 2 with no output at all. That trade is wrong for a
+# decoration, so the walk stops and the record prints unpainted instead.
+# GNU paints it. Bytes and STATUS agree; only the escapes differ, which is
+# the one direction this divergence is allowed to run. `-o' keeps the refusal,
+# because there the span IS the output rather than a highlight on it.
+## argv: grep --color=always -w -e key -e '[^:]*.*a\(ab\)*a*' f
+## file-json f: "key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val \n"
+## stdout-json: "key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val \n"
+## stderr-json: ""
+## status: 0
+
+
+#### and a multi-pattern span differs from GNU's union, which colour now shows
+# td-txt locates spans per PATTERN and takes the best; GNU matches the union
+# of the alternation. On `a.b aa' with `-w' GNU colours `a' and `aa' only,
+# while td-txt also colours `b'. The gap is the matcher's and predates this
+# landing -- `-o' already showed it -- but whole-line output agreed until
+# there were escapes to place, so it is recorded again here at the point it
+# became visible. Selection, count and status are unaffected: the same run
+# without `--color' matches GNU byte for byte.
+## argv: grep --color=always -w -e '..\?' -e '[a-z]\+' f
+## env GREP_COLORS: ms=31:sl=07
+## file-json f: "a.b aa\n"
+## stdout-json: "\u001b[07m\u001b[K\u001b[31m\u001b[Ka\u001b[m\u001b[K\u001b[07m\u001b[K.\u001b[31m\u001b[Kb\u001b[m\u001b[K\u001b[07m\u001b[K \u001b[31m\u001b[Kaa\u001b[m\u001b[K\n"
+## stderr-json: ""
+## status: 0
+
+
+#### and an anchored pattern paints nothing where GNU paints an inner match
+# The third of the same family, and the same one direction: bytes and status
+# agree, only escapes differ. GNU's painting pass looks for the pattern
+# UNANCHORED even under `-x', so on a context line `aaa' it paints the `aa'
+# inside; td-txt asks its span search the anchored question and is told there
+# is no match, so it paints none. Reachable only where a line prints WITHOUT
+# having been selected by the pattern -- here the trailing context `-m1 -A2'
+# leaves after the count is spent, under `-v'. Without `--color' the two agree
+# byte for byte, which is why this surfaced only once there were escapes to
+# place.
+## argv: grep --color=always -m1 -A2 -v -x aa gx
+## env GREP_COLORS: ms=31:mc=34
+## file-json gx: "aaa\nbbb\naaa\nccc\naaa\n"
+## stdout-json: "aaa\nbbb\naaa\n"
+## stderr-json: ""
+## status: 0
+

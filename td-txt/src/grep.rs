@@ -12,9 +12,7 @@
 //!
 //! * a second regex engine — `-P`/`--perl-regexp`, and `-X`, whose argument
 //!   reaches the same one (`-X perl` IS `-P`);
-//! * output this one does not produce — `--color`/`--colour`, whose escapes
-//!   would need a second output path and a terminal test, and
-//!   `-T`/`--initial-tab`;
+//! * output this one does not produce — `-T`/`--initial-tab`;
 //! * one value of an option that IS served — `-I`, which is
 //!   `--binary-files=without-match`, the other two values being the default
 //!   and `-a`'s;
@@ -23,7 +21,10 @@
 //!
 //! `--include`, `--exclude`, `--exclude-from` and `--exclude-dir` were on that
 //! list and are served now; `Globs` below carries the selection model and
-//! `walk`'s `prune` carries the one that decides descent.
+//! `walk`'s `prune` carries the one that decides descent. So is
+//! `--color`/`--colour`, whose escapes `Colors` below carries — the second
+//! output path that entry once priced, and a terminal test that `auto` asks
+//! once rather than per line.
 //!
 //! Each is DIAGNOSED and never a silent no-op: `invalid option` for the short
 //! spellings, `unrecognized option` for the long ones — getopt's own split and
@@ -38,14 +39,16 @@
 //! Remove ONE row and only `--binary` changes what RUNS: it resolves to
 //! `--binary-files` and takes the next argv as its value, so `grep --binary
 //! text a` searches and exits 0 where the refusal ran nothing. Drop any other
-//! row named above and every prefix that reached it still ends in an error:
-//! a prefix that was ambiguous stays ambiguous, and one that used to resolve
-//! to the row either lands on a SIBLING — `--colo` finds `--colour` once
-//! `--color` is gone — or reports `unrecognized` against the argument where
-//! it said `unsupported` against the option. That is re-measured row by row
-//! against the table as it stands, not inherited: the filter family has since
-//! moved from this roster to being served, and a counterfactual about a table
-//! does not survive the table changing.
+//! row still named above and every prefix that reached it ends in an error
+//! either way: a prefix that was ambiguous stays ambiguous, and one that used
+//! to resolve to the row reports `unrecognized` against the argument where it
+//! said `unsupported` against the option. That is re-measured row by row
+//! against the table as it stands, not inherited: the filter family and then
+//! the colour pair have moved off this roster to being served, and a
+//! counterfactual about a table does not survive the table changing. The
+//! SIBLING landing that clause used to name went with them — `--colo` still
+//! finds `--colour` once `--color` is gone, but both rows are served now, so
+//! the roster above no longer holds two names close enough to show it.
 //!
 //! Those four filter names still pay the older debt even though they are in
 //! the table to be SERVED now: they are what keeps `--e`, `--ex` and `--exc`
@@ -293,6 +296,227 @@ struct Selection {
     dirs: Globs,
 }
 
+/// What `--color` paints with, under the names `GREP_COLORS` gives them. An
+/// empty capability means the element prints with NO escape around it at all,
+/// which is not the same as an escape carrying no attributes -- `fn=` drops the
+/// wrapper rather than emitting a bare `ESC[m`.
+struct Colors {
+    /// A match on a SELECTED line, and one on a CONTEXT line. Distinct because
+    /// `-v` puts the matching lines in the context, which is the only place a
+    /// context match exists to paint.
+    ms: Vec<u8>,
+    mc: Vec<u8>,
+    /// The whole selected/context line under the match. Empty by default, so
+    /// the common case emits nothing for them.
+    sl: Vec<u8>,
+    cx: Vec<u8>,
+    fname: Vec<u8>,
+    ln: Vec<u8>,
+    bn: Vec<u8>,
+    se: Vec<u8>,
+    /// Suppress the `ESC[K` that otherwise follows every escape. Presence
+    /// alone sets it: GNU never reads the value, so `ne=0` suppresses too.
+    ne: bool,
+    /// Swap `sl` and `cx`, and only when `-v` is in effect.
+    rv: bool,
+}
+
+impl Default for Colors {
+    fn default() -> Self {
+        Self {
+            ms: b"01;31".to_vec(),
+            mc: b"01;31".to_vec(),
+            sl: Vec::new(),
+            cx: Vec::new(),
+            fname: b"35".to_vec(),
+            ln: b"32".to_vec(),
+            bn: b"32".to_vec(),
+            se: b"36".to_vec(),
+            ne: false,
+            rv: false,
+        }
+    }
+}
+
+impl Colors {
+    /// Open an SGR run. `ESC[K` erases to end of line so a background colour
+    /// reaches the margin; `ne` is how a terminal that scrolls wrongly on it
+    /// asks for it to be left out.
+    fn start(&self, out: &mut Out, cap: &[u8]) -> std::io::Result<()> {
+        if cap.is_empty() {
+            return Ok(());
+        }
+        out.write(b"\x1b[")?;
+        out.write(cap)?;
+        out.write(b"m")?;
+        if !self.ne {
+            out.write(b"\x1b[K")?;
+        }
+        Ok(())
+    }
+
+    fn end(&self, out: &mut Out, cap: &[u8]) -> std::io::Result<()> {
+        if cap.is_empty() {
+            return Ok(());
+        }
+        out.write(b"\x1b[m")?;
+        if !self.ne {
+            out.write(b"\x1b[K")?;
+        }
+        Ok(())
+    }
+
+    fn wrap(&self, out: &mut Out, cap: &[u8], text: &[u8]) -> std::io::Result<()> {
+        self.start(out, cap)?;
+        out.write(text)?;
+        self.end(out, cap)
+    }
+}
+
+/// A capability VALUE is `[0-9;]` and nothing else -- not even a surrounding
+/// space, which is why `ms= 31` is malformed rather than trimmed.
+fn sgr_value(v: &[u8]) -> bool {
+    v.iter().all(|b| b.is_ascii_digit() || *b == b';')
+}
+
+/// `GREP_COLORS`, whose two failure modes differ and both matter: an unknown
+/// NAME is skipped and parsing continues, but a malformed VALUE abandons the
+/// rest of the string while keeping every item already read. So `fn=33:ms=zz`
+/// still recolours the file name and `ms=zz:fn=33` does not.
+/// Which match capabilities `GREP_COLORS` ASSIGNED, which decides whether the
+/// legacy variable is still in effect. Assignment, not value: `mt=32:ms=01;36`
+/// leaves `ms` holding the legacy string and still counts as overridden.
+#[derive(Default)]
+struct Assigned {
+    ms: bool,
+    mc: bool,
+}
+
+fn parse_grep_colors(spec: &[u8], c: &mut Colors, set: &mut Assigned) {
+    for item in spec.split(|b| *b == b':') {
+        let (name, value) = match item.iter().position(|b| *b == b'=') {
+            Some(eq) => (item.get(..eq).unwrap_or_default(), item.get(eq + 1..)),
+            None => (item, None),
+        };
+        // An `=` with nothing before it abandons the rest: GNU refuses to start a
+        // value it has no name for. An EMPTY ITEM is different and harmless --
+        // `:::` carries no `=` and simply names nothing.
+        if value.is_some() && name.is_empty() {
+            return;
+        }
+        // A value present is judged BEFORE the name is looked at, so a malformed
+        // one abandons the rest whatever it was written against -- `ne=zz` and
+        // `bogus=zz` abort exactly as `ms=zz` does, and `ne` is not set on the
+        // way past.
+        if let Some(v) = value {
+            if !sgr_value(v) {
+                return;
+            }
+        }
+        // The booleans are then read by PRESENCE rather than by value, which is
+        // why `ne=0` suppresses and why a bare `ne` needs no `=` at all.
+        match name {
+            b"ne" => {
+                c.ne = true;
+                continue;
+            }
+            b"rv" => {
+                c.rv = true;
+                continue;
+            }
+            // `mt` is the one COLOUR capability that does something without a
+            // value: GNU gives it a function re-pointing `mc` at whatever `ms`
+            // holds at that moment, and that counts as ASSIGNING `mc` for the
+            // legacy warning. So `ms=32:mt` recolours context matches too, and
+            // `mc=33:mt` throws the explicit `mc` away again.
+            b"mt" if value.is_none() => {
+                c.mc = c.ms.clone();
+                set.mc = set.ms;
+                continue;
+            }
+            _ => {}
+        }
+        // Every other capability is inert without a value -- measured, not
+        // assumed: bare `sl`, `cx`, `se`, `bn`, `ln`, `ms`, `mc` and `fn` all do
+        // nothing at all.
+        let Some(value) = value else { continue };
+        let v = value.to_vec();
+        match name {
+            b"mt" => {
+                c.ms = v.clone();
+                c.mc = v;
+                set.ms = true;
+                set.mc = true;
+            }
+            b"ms" => {
+                c.ms = v;
+                set.ms = true;
+            }
+            b"mc" => {
+                c.mc = v;
+                set.mc = true;
+            }
+            b"sl" => c.sl = v,
+            b"cx" => c.cx = v,
+            b"fn" => c.fname = v,
+            b"ln" => c.ln = v,
+            b"bn" => c.bn = v,
+            b"se" => c.se = v,
+            _ => {}
+        }
+    }
+}
+
+/// Whether `auto` paints. A terminal is necessary and not sufficient: GNU also
+/// wants `TERM` to be SET and to be something other than `dumb`. Set-but-EMPTY
+/// counts as set and does paint, so this is presence and one exact name, not a
+/// judgement about the value.
+fn auto_colors() -> bool {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return false;
+    }
+    match std::env::var_os("TERM") {
+        Some(t) => t != *"dumb",
+        None => false,
+    }
+}
+
+/// The colours a run paints with, or `None` when it does not paint. `GREP_COLOR`
+/// is the superseded spelling of `mt` and is diagnosed rather than silently
+/// honoured, because a caller still exporting it is carrying a setting the
+/// documented variable would express differently.
+fn colors_from_env() -> Colors {
+    let mut c = Colors::default();
+    // Only a value that would be HONOURED counts: an empty or malformed one
+    // sets nothing, and naming it would be advice about a setting not in effect.
+    let legacy = std::env::var_os("GREP_COLOR")
+        .map(|v| std::os::unix::ffi::OsStrExt::as_bytes(v.as_os_str()).to_vec())
+        .filter(|b| !b.is_empty() && sgr_value(b));
+    if let Some(v) = &legacy {
+        c.ms = v.clone();
+        c.mc = v.clone();
+    }
+    let mut set = Assigned::default();
+    if let Some(v) = std::env::var_os("GREP_COLORS") {
+        let spec = std::os::unix::ffi::OsStrExt::as_bytes(v.as_os_str()).to_vec();
+        parse_grep_colors(&spec, &mut c, &mut set);
+    }
+    // The warning is about a setting still IN EFFECT, so a `GREP_COLORS` that
+    // assigned both match capabilities silences it -- the legacy value reached
+    // nothing. Assigning only one leaves the other holding it, and still warns.
+    if let Some(v) = &legacy {
+        if !(set.ms && set.mc) {
+            let mut msg = b"warning: GREP_COLOR='".to_vec();
+            msg.extend_from_slice(v);
+            msg.extend_from_slice(b"' is deprecated; use GREP_COLORS='mt=");
+            msg.extend_from_slice(v);
+            msg.extend_from_slice(b"'");
+            errb(&msg);
+        }
+    }
+    c
+}
+
 struct Conf {
     syntax: Syntax,
     icase: bool,
@@ -333,6 +557,13 @@ struct Conf {
     text: bool,
     /// `--include`/`--exclude`/`--exclude-from`/`--exclude-dir`.
     selection: Selection,
+    /// `--color`'s WHEN as GIVEN, resolved into `colors` once the scan is over
+    /// -- the same shape as `after`/`before`/`both`, which are also kept as
+    /// asked for and settled afterwards.
+    color_when: Option<ColorWhen>,
+    /// `--color`, already resolved: `auto` has been decided against the
+    /// terminal by the time a search runs, so nothing downstream asks again.
+    colors: Option<Colors>,
 }
 
 impl Default for Conf {
@@ -363,6 +594,8 @@ impl Default for Conf {
             null_data: false,
             text: false,
             selection: Selection::default(),
+            color_when: None,
+            colors: None,
         }
     }
 }
@@ -987,6 +1220,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                 &mut patterns,
                 &mut pattern_seen,
                 &mut syntax_chosen,
+                &mut show_help,
             ) {
                 Ok(()) => continue,
                 // `resolve_long` already rejected an unknown name.
@@ -1244,6 +1478,19 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
     if settled(&conf, patterns.is_empty(), only_empty) && !names_a_file {
         return 1;
     }
+
+    // `auto` is decided ONCE, and never asked again: the question is about the
+    // DESTINATION, which a search cannot change. Placed HERE, between the
+    // settled short cut and the compile, because that is where GNU reads the
+    // colour environment: `grep --color=always -e '[' f` warns about a
+    // deprecated GREP_COLOR and THEN reports the bad pattern, while
+    // `grep --color=always -v '' f` -- which the short cut answers -- warns
+    // about nothing at all. `-m0 -L`, the short cut's own exception, warns.
+    conf.colors = match conf.color_when {
+        Some(ColorWhen::Always) => Some(colors_from_env()),
+        Some(ColorWhen::Auto) if auto_colors() => Some(colors_from_env()),
+        _ => None,
+    };
 
     let pats = match compile(&conf, &patterns) {
         Ok(p) => p,
@@ -1710,6 +1957,27 @@ fn argmatch<T: Copy>(value: &[u8], names: &[(&[u8], T)]) -> Result<T, NoMatch> {
 /// Returned rather than reported, unlike `dirs_arg`: both callers say the same
 /// thing and differ only in how they leave, which is the shape `dirs_arg` cannot
 /// use because its message is built from the value.
+/// `--color=WHEN`. Kept as the three ANSWERS rather than the nine spellings,
+/// since `auto` is the only one that still has a question to ask.
+#[derive(Clone, Copy, PartialEq)]
+enum ColorWhen {
+    Never,
+    Always,
+    Auto,
+}
+
+/// WHEN is matched WHOLE and case-insensitively -- there is no abbreviation
+/// here, so `--color=alw` is not `always`. Three spellings answer each way.
+fn color_when(value: &[u8]) -> Option<ColorWhen> {
+    let v = value.to_ascii_lowercase();
+    match v.as_slice() {
+        b"always" | b"yes" | b"force" => Some(ColorWhen::Always),
+        b"never" | b"no" | b"none" => Some(ColorWhen::Never),
+        b"auto" | b"tty" | b"if-tty" => Some(ColorWhen::Auto),
+        _ => None,
+    }
+}
+
 fn devices_arg(value: &[u8]) -> Option<Devices> {
     match value {
         b"read" => Some(Devices::Read),
@@ -1772,6 +2040,7 @@ fn parse_long(
     patterns: &mut Vec<Vec<u8>>,
     pattern_seen: &mut bool,
     syntax_chosen: &mut Option<Syntax>,
+    show_help: &mut bool,
 ) -> Result<(), LongErr> {
     let need = |value: Option<&[u8]>| -> Result<Vec<u8>, LongErr> {
         value
@@ -1840,11 +2109,22 @@ fn parse_long(
         // at all differs and is the module doc's. The usage block goes with it
         // because this is an OPTION error, where the value errors above are
         // GNU's `die()` and print none.
+        b"color" | b"colour" => {
+            // An OPTIONAL argument, so `value` is the `=VALUE` form or nothing;
+            // a bare `--color` is `auto`. An unrecognised WHEN is not an option
+            // error at all: GNU sets the same flag `--help` sets, so the caller
+            // gets the help text on STDOUT and exit 0.
+            match value {
+                None => conf.color_when = Some(ColorWhen::Auto),
+                Some(v) => match color_when(v) {
+                    Some(w) => conf.color_when = Some(w),
+                    None => *show_help = true,
+                },
+            }
+        }
         b"binary"
         | b"initial-tab"
         | b"perl-regexp"
-        | b"color"
-        | b"colour"
         | b"group-separator"
         | b"no-group-separator"
         | b"no-ignore-case"
@@ -2133,24 +2413,47 @@ fn prefix(
     at: At,
     sep: u8,
 ) -> std::io::Result<()> {
+    let c = grep.conf.colors.as_ref();
+    // The separator is painted, the `-Z` NUL is not: that NUL is DATA for the
+    // consumer on the other end of the pipe, and an escape around it would be
+    // bytes that consumer never asked to parse.
+    fn written_sep(out: &mut Out, c: Option<&Colors>, sep: u8) -> std::io::Result<()> {
+        match c {
+            Some(c) => c.wrap(out, &c.se, &[sep]),
+            None => out.write(&[sep]),
+        }
+    }
     if show_name {
-        out.write(path)?;
+        match c {
+            Some(c) => c.wrap(out, &c.fname, path)?,
+            None => out.write(path)?,
+        }
         // -Z replaces only the byte after the NAME; a following line number
         // still carries the ordinary separator.
-        out.write(&[if grep.conf.null_name { 0 } else { sep }])?;
+        if grep.conf.null_name {
+            out.write(&[0])?;
+        } else {
+            written_sep(out, c, sep)?;
+        }
     }
     if grep.conf.line_number {
         if let Some(n) = at.no {
-            out.write(&number(n))?;
-            out.write(&[sep])?;
+            match c {
+                Some(c) => c.wrap(out, &c.ln, &number(n))?,
+                None => out.write(&number(n))?,
+            }
+            written_sep(out, c, sep)?;
         }
     }
     // AFTER the line number: `grep -bn` prints `2:6:beta`, not the other way
     // round, and the two are independent rather than one implying the other.
     if grep.conf.byte_offset {
         if let Some(n) = at.byte {
-            out.write(&number(n))?;
-            out.write(&[sep])?;
+            match c {
+                Some(c) => c.wrap(out, &c.bn, &number(n))?,
+                None => out.write(&number(n))?,
+            }
+            written_sep(out, c, sep)?;
         }
     }
     Ok(())
@@ -2191,15 +2494,135 @@ fn write_spans(
                 .map(|b| b.saturating_add(u64::try_from(s).unwrap_or(u64::MAX))),
         };
         io(prefix(out, grep, display, show_name, span, sep))?;
-        io(out.write(line.get(s..e.min(line.len())).unwrap_or_default()))?;
+        let text = line.get(s..e.min(line.len())).unwrap_or_default();
         // A span reaching PAST the line is `-w -x`: GNU measured it past the record
         // separator, so that byte is part of the match and prints before the one
-        // `-o` adds itself. Hence the blank line `grep -w -x -o` leaves per match.
-        if e > line.len() {
-            io(out.write(&[data_sep]))?;
+        // `-o` adds itself. Hence the blank line `grep -w -x -o` leaves per match --
+        // and, painted, that byte sits INSIDE the match's escapes.
+        let past = e > line.len();
+        // `-o` prints no line colour: there is no line left to colour, only the
+        // span, so `sl`/`cx` have nothing to apply to.
+        match grep.conf.colors.as_ref() {
+            Some(c) => {
+                let cap = if sep == b':' { &c.ms } else { &c.mc };
+                io(c.start(out, cap))?;
+                io(out.write(text))?;
+                if past {
+                    io(out.write(&[data_sep]))?;
+                }
+                io(c.end(out, cap))?;
+            }
+            None => {
+                io(out.write(text))?;
+                if past {
+                    io(out.write(&[data_sep]))?;
+                }
+            }
         }
         io(out.write(&[data_sep]))?;
         scan = e;
+    }
+    Ok(())
+}
+
+/// The record itself, painted. GNU colours a line by SEGMENT rather than
+/// wrapping the whole record: the line colour is reopened before each stretch
+/// between matches and never closed there, and the trailing stretch is written
+/// only when it has bytes. So a line whose last byte ends a match leaves its
+/// final line-colour run open, which is GNU's output and not an oversight here.
+fn write_body(
+    grep: &Grep,
+    out: &mut Out,
+    line: &[u8],
+    selected: bool,
+    // The RECORD separator, and whether this record gets one. Owned here rather
+    // than by the caller because a `-w -x` span can measure past it, which puts
+    // that byte inside the match's escapes instead of after them.
+    sep: u8,
+    term: bool,
+) -> Result<(), String> {
+    let io = |r: std::io::Result<()>| -> Result<(), String> {
+        r.map_err(|e| format!("write error: {}", errmsg(&e)))
+    };
+    let Some(c) = grep.conf.colors.as_ref() else {
+        io(out.write(line))?;
+        if term {
+            io(out.write(&[sep]))?;
+        }
+        return Ok(());
+    };
+    // `rv` swaps the two LINE colours, and only under `-v`. The MATCH colour is
+    // chosen by which list the line came from and never swaps: under `-v` the
+    // matching lines are the context ones, which is the only place `mc` exists
+    // to be seen at all.
+    let swapped = c.rv && grep.conf.invert;
+    let line_color = if selected != swapped { &c.sl } else { &c.cx };
+    let match_color = if selected { &c.ms } else { &c.mc };
+    let mut scan = 0usize;
+    let mut cur = 0usize;
+    let mut consumed = false;
+    // WHETHER a record is painted at all is structural, not a question asked of
+    // its bytes: GNU paints where the line's list and `-v` disagree. So an
+    // ordinary context line is never painted even when it DOES hold a match --
+    // which `-m` makes reachable, since the trailing context after the count is
+    // spent may match and still print unpainted. An EMPTY match colour skips
+    // the walk for the other reason, that there is no colour to apply.
+    let paints = (selected != grep.conf.invert) && !match_color.is_empty();
+    if paints {
+        // Painting is DECORATION. A pattern the matcher cannot finish exploring
+        // within its budget must not turn a search that already SELECTED this
+        // line into a failed run -- GNU prints the line and exits 0, and losing
+        // the output to a refusal is the worse answer by far. So the `Err` ends
+        // the walk instead of propagating: the bytes and the status stay right,
+        // and what is given up is the highlighting the walk had not reached.
+        while let Ok(found) = grep.match_at(line, scan, OnBudget::Fail, Want::Span) {
+            let Some((s, e)) = found else { break };
+            // An empty match is never painted -- it has no byte to carry the
+            // escape -- but it still has to advance the scan or this would not end.
+            if e == s {
+                scan = s.saturating_add(1);
+                if scan > line.len() {
+                    break;
+                }
+                continue;
+            }
+            // A `-w -x` span is measured PAST the record separator, and GNU paints
+            // that byte with the match rather than leaving it outside the escapes.
+            let past = e > line.len();
+            let stop = e.min(line.len());
+            let Some(pre) = line.get(cur..s) else { break };
+            io(c.start(out, line_color))?;
+            io(out.write(pre))?;
+            io(c.start(out, match_color))?;
+            io(out.write(line.get(s..stop).unwrap_or_default()))?;
+            if past && term {
+                io(out.write(&[sep]))?;
+                consumed = true;
+            }
+            io(c.end(out, match_color))?;
+            cur = stop;
+            scan = e;
+        }
+    }
+    let mut tail = line.get(cur..).unwrap_or_default();
+    // A CR that ends the record is not part of the painted tail: GNU measures
+    // the tail short of it and writes it bare, so a CRLF file does not get an
+    // escape wrapped around the carriage return alone.
+    let cr: &[u8] = match tail.strip_suffix(b"\r") {
+        Some(rest) => {
+            tail = rest;
+            b"\r"
+        }
+        None => b"",
+    };
+    if !tail.is_empty() {
+        io(c.start(out, line_color))?;
+        io(out.write(tail))?;
+        io(c.end(out, line_color))?;
+    }
+    io(out.write(cr))?;
+    if term && !consumed {
+        io(out.write(&[sep]))?;
     }
     Ok(())
 }
@@ -2318,7 +2741,10 @@ fn search_file(
             *read_failed = true;
         }
         if grep.conf.files_without && !grep.conf.quiet {
-            io(out.write(display))?;
+            match grep.conf.colors.as_ref() {
+                Some(c) => io(c.wrap(out, &c.fname, display))?,
+                None => io(out.write(display))?,
+            }
             io(out.write(&[if grep.conf.null_name { 0 } else { b'\n' }]))?;
         }
         return Ok(false);
@@ -2413,7 +2839,13 @@ fn search_file(
                         upto => first_ctx > upto.saturating_add(1),
                     };
                     if gap {
-                        io(out.write(b"--\n"))?;
+                        match grep.conf.colors.as_ref() {
+                            Some(c) => {
+                                io(c.wrap(out, &c.se, b"--"))?;
+                                io(out.write(b"\n"))?;
+                            }
+                            None => io(out.write(b"--\n"))?,
+                        }
                     }
                     *printed_before = true;
                     let ctx_start = first_ctx.max(covered.saturating_add(1));
@@ -2431,13 +2863,10 @@ fn search_file(
                         }
                         let w = At { no: Some(*no), byte: Some(*ctx_at) };
                         io(prefix(out, grep, display, show_name, w, b'-'))?;
-                        io(out.write(ctx))?;
                         // Only the LAST record can lack a separator, so this is
                         // the same test the whole-file form spelled as "or there
                         // is a line after it".
-                        if *ctx_term {
-                            io(out.write(&[sep]))?;
-                        }
+                        write_body(grep, out, ctx, false, sep, *ctx_term)?;
                     }
                 }
                 if grep.conf.only {
@@ -2448,10 +2877,9 @@ fn search_file(
                 } else {
                     let w = At { no: Some(lineno), byte: Some(at) };
                     io(prefix(out, grep, display, show_name, w, b':'))?;
-                    io(out.write(line))?;
                     // GNU terminates every line it prints, including a final
                     // input line that carried no newline of its own.
-                    io(out.write(&[sep]))?;
+                    write_body(grep, out, line, true, sep, true)?;
                 }
                 covered = lineno;
                 pending_after = grep.conf.after_lines();
@@ -2474,8 +2902,7 @@ fn search_file(
             } else {
                 let w = At { no: Some(lineno), byte: Some(at) };
                 io(prefix(out, grep, display, show_name, w, b'-'))?;
-                io(out.write(line))?;
-                io(out.write(&[sep]))?;
+                write_body(grep, out, line, false, sep, true)?;
             }
             covered = lineno;
             pending_after -= 1;
@@ -2504,7 +2931,10 @@ fn search_file(
         io(out.write(b"\n"))?;
     }
     if (grep.conf.files_with && any) || (grep.conf.files_without && !any) {
-        io(out.write(display))?;
+        match grep.conf.colors.as_ref() {
+            Some(c) => io(c.wrap(out, &c.fname, display))?,
+            None => io(out.write(display))?,
+        }
         io(out.write(&[if grep.conf.null_name { 0 } else { b'\n' }]))?;
     }
     Ok(any)
