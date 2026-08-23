@@ -6,12 +6,20 @@
 //! socket they happen on. `run` binds the session bus and serves it; `probe` is
 //! what `APPLICATIONS.md` §A's `ready=` line calls to decide the bus is up.
 //!
-//! Names, routing and match rules are rung 14. A method call that arrives now
-//! is framed, decoded against the descriptors that came with it, and ANSWERED
-//! with an error saying so — never dropped, because a caller waiting on a
-//! serial that will never be answered hangs rather than fails. A signal, a
-//! reply, or a call marked `NO_REPLY_EXPECTED` is consumed silently, because
-//! nothing is waiting on it and the specification reserves replies for calls.
+//! Rung 14's first half is here: a connection says `Hello`, earns a `:1.N`,
+//! and is addressable by it. A call naming a connection that exists is RELAYED
+//! to it with the broker's own `SENDER` stamped on; one addressed to the bus is
+//! answered by the bus — `Hello`, `Ping`, `GetId`, the name lookups and the
+//! credential lookups; one naming a name nobody owns comes back
+//! `NameHasNoOwner`. Well-known names and match rules are the second half, so
+//! `RequestName` and `AddMatch` are `UnknownMethod` until then and nothing on
+//! this bus broadcasts.
+//!
+//! What no call gets is silence. A caller waiting on a serial that will never
+//! be answered hangs rather than fails, so a call this broker cannot serve is
+//! ANSWERED with an error saying so rather than dropped. A signal, a reply, or
+//! a call marked `NO_REPLY_EXPECTED` is consumed without one, because nothing
+//! is waiting on it and the specification reserves replies for calls.
 
 mod auth;
 mod authscript;
@@ -19,6 +27,7 @@ mod corpus;
 mod message;
 mod name;
 mod recorded;
+mod registry;
 mod sys;
 mod transport;
 mod wire;
@@ -72,6 +81,7 @@ fn run(socket: &Path) -> Result<String, String> {
     // function's frame, so it is an `Arc` rather than a borrow. Same for the
     // guid text, which each thread re-validates into a `Guid` of its own.
     let quota = Arc::new(transport::Quota::new());
+    let bus = Arc::new(registry::Bus::new());
     let guid_text = Arc::new(text);
     // Consecutive failed accepts. Reset by any success, so a busy bus that
     // sheds the occasional peer never approaches the ceiling.
@@ -147,12 +157,13 @@ fn run(socket: &Path) -> Result<String, String> {
             }
         };
         let text = Arc::clone(&guid_text);
+        let directory = Arc::clone(&bus);
         let spawned = thread::Builder::new().spawn(move || {
             // `admitted` is moved in, so this peer's place in the quota is
             // given back when this thread ends, however it ends.
             let _admitted = admitted;
             match auth::Guid::new(text.as_str()) {
-                Ok(guid) => serve_one(stream, guid, &_admitted),
+                Ok(guid) => serve_one(stream, guid, &_admitted, &directory),
                 Err(error) => eprintln!("td-busd: bad guid: {error:?}"),
             }
         });
@@ -172,8 +183,9 @@ fn serve_one(
     stream: std::os::unix::net::UnixStream,
     guid: auth::Guid<'_>,
     admitted: &transport::Admitted,
+    bus: &registry::Bus,
 ) {
-    match transport::Connection::accept(stream, guid, admitted.quota()) {
+    match transport::Connection::accept(stream, guid, admitted.quota(), bus) {
         Ok(mut connection) => {
             let peer = connection.credential();
             let ended = connection.serve();
@@ -243,6 +255,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("message", include_str!("message.rs")),
     ("name", include_str!("name.rs")),
     ("recorded", include_str!("recorded.rs")),
+    ("registry", include_str!("registry.rs")),
     ("wire", include_str!("wire.rs")),
 ];
 

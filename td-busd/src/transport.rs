@@ -18,10 +18,19 @@ use std::os::fd::{OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::auth::{Guid, Handshake, PeerIdentity, GUID_LEN};
 use crate::message;
+use crate::registry::{Bus, Outbox, Overflow, Rejected};
 use crate::sys::{self, PeerCredential};
+use crate::wire::{WireError, Writer};
+
+/// The bus's own name, path and interface. A message addressed here is for the
+/// broker itself; anything else is for another peer.
+pub const BUS_NAME: &str = "org.freedesktop.DBus";
+pub const BUS_PATH: &str = "/org/freedesktop/DBus";
+pub const PEER_INTERFACE: &str = "org.freedesktop.DBus.Peer";
 
 /// The largest frame `message::frame_len` can return, and so the most this
 /// will ever hold for one message.
@@ -85,6 +94,12 @@ const READ_CHUNK: usize = 8192;
 /// is what calls it. A supervision check that can hang is one that reports
 /// nothing rather than failure, which is the shape of mistake `guid_text`
 /// above already records.
+/// How long a connection that is ending waits for what it has already
+/// queued to reach the socket. Bounded: a peer that is alive and not reading
+/// would otherwise hold the reader thread for as long as it liked, which is a
+/// denial of service dressed as politeness.
+const FAREWELL: std::time::Duration = std::time::Duration::from_secs(2);
+
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long the selftest's one-peer listener waits to be probed before giving
@@ -333,10 +348,22 @@ pub fn guid_text() -> io::Result<String> {
 pub struct Connection<'a> {
     stream: UnixStream,
     shake: Handshake<'a>,
+    /// The GUID this bus advertised, kept for `GetId`: a client that asks must
+    /// be told the same one the handshake agreed, not a fresh one.
+    guid: &'a str,
     credential: PeerCredential,
     /// The bus's budget, which this connection's queued descriptors are
     /// charged against and returned to.
     quota: &'a Quota,
+    /// The directory this connection is routed through.
+    bus: &'a Bus,
+    /// Where this connection's outgoing frames go. Written by a thread of its
+    /// own, so a peer that will not read cannot stall whoever sent to it.
+    outbox: Arc<Outbox>,
+    /// This connection's unique name, once it has said `Hello`. §D: anything
+    /// before `Hello` disconnects, so `None` here is a peer that has not
+    /// earned the right to send anything else.
+    unique: Option<String>,
     /// The serial of the NEXT message this side sends. The specification
     /// requires a sender's serials to be unique per connection, and a broker
     /// that answered every call with serial 1 would be telling a client that
@@ -375,6 +402,12 @@ pub enum Ended {
 
 impl Drop for Connection<'_> {
     fn drop(&mut self) {
+        // Off the directory before anything else: a name that outlived its
+        // connection would route a message to a socket nobody is reading.
+        if let Some(unique) = self.unique.take() {
+            self.bus.leave(&unique);
+        }
+        self.outbox.close();
         // Whatever is still queued was charged and is about to be closed by
         // `OwnedFd`. Without this the bus's budget only ever falls, and a
         // broker that has served enough connections refuses descriptors it has
@@ -387,13 +420,27 @@ impl<'a> Connection<'a> {
     /// Take a peer the listener accepted. The credential is read HERE, once, at
     /// accept, and is what the handshake admits by — never anything the peer
     /// says about itself.
-    pub fn accept(stream: UnixStream, guid: Guid<'a>, quota: &'a Quota) -> io::Result<Self> {
+    pub fn accept(
+        stream: UnixStream,
+        guid: Guid<'a>,
+        quota: &'a Quota,
+        bus: &'a Bus,
+    ) -> io::Result<Self> {
         let credential = sys::peer_credential(&stream)?;
+        let guid_text = guid.as_str();
+        // The writer's half of the socket. Cloned here rather than later
+        // because a connection without an outbox has no way to be answered,
+        // and the failure to make one belongs at accept where it can be seen.
+        let outbox = bus.outbox_for(stream.try_clone()?);
         Ok(Connection {
             stream,
             shake: Handshake::new(PeerIdentity::unmapped(credential.uid), guid),
+            guid: guid_text,
             credential,
             quota,
+            bus,
+            outbox,
+            unique: None,
             next_serial: 1,
             chunk: vec![0u8; READ_CHUNK],
             inbox: Vec::new(),
@@ -411,14 +458,56 @@ impl<'a> Connection<'a> {
     }
 
     /// Serve this peer until it leaves or breaks the protocol.
+    ///
+    /// Two threads: this one reads, and the writer below drains the outbox.
+    /// EVERY outgoing byte goes through that one writer, the handshake's OK
+    /// line included. Writing the handshake here and routed messages there
+    /// would be two writers on one socket, and nothing but the order things
+    /// happen to occur in would stop them interleaving halfway through a
+    /// frame — a bug that would appear only once a peer was busy.
     pub fn serve(&mut self) -> Ended {
-        loop {
+        let writing = Arc::clone(&self.outbox);
+        let writer = std::thread::Builder::new().spawn(move || {
+            while let Some(frame) = writing.take() {
+                let size = frame.len();
+                let outcome = write_frame(writing.stream(), &frame, &[]);
+                // Dropped BEFORE the bytes are given back, so the moment the
+                // budget says this connection is holding nothing is a moment
+                // at which it really is.
+                drop(frame);
+                writing.finished(size);
+                if let Err(why) = outcome {
+                    // The peer is unreachable. Closing is what tells everyone
+                    // queuing to it to stop, and what wakes the reader.
+                    eprintln!("td-busd: {why}");
+                    writing.close();
+                    return;
+                }
+            }
+        });
+        let writer = match writer {
+            Ok(handle) => handle,
+            Err(error) => return Ended::Failed(format!("cannot spawn a writer: {error}")),
+        };
+        let ended = loop {
             match self.pump() {
                 Ok(true) => {}
-                Ok(false) => return Ended::PeerLeft,
-                Err(ended) => return ended,
+                Ok(false) => break Ended::PeerLeft,
+                Err(ended) => break ended,
             }
-        }
+        };
+        // Seal, then flush, then close. The last thing a connection is told
+        // is usually WHY it is ending, and closing on the spot throws that
+        // away: a peer that makes a bad call and then a fatal one would get a
+        // bare EOF rather than the error reply the broker had already written
+        // for it. The flush is bounded because the peer may be alive and
+        // simply not reading, in which case the writer is blocked in `sendmsg`
+        // and would never finish on its own.
+        self.outbox.seal();
+        self.outbox.flush_within(FAREWELL);
+        self.outbox.close();
+        let _ = writer.join();
+        ended
     }
 
     /// One read, and everything that read makes possible. `Ok(false)` means the
@@ -519,7 +608,7 @@ impl<'a> Connection<'a> {
             .feed(&self.inbox)
             .map_err(|error| Ended::Refused(format!("authentication: {error:?}")))?;
         if !fed.reply.is_empty() {
-            self.write_all(&fed.reply, &[])?;
+            self.queue_own(fed.reply)?;
         }
         // `consumed` stops at BEGIN, so whatever a client pipelined behind it
         // stays in the inbox and is framed below rather than swallowed here.
@@ -569,12 +658,56 @@ impl<'a> Connection<'a> {
         // because the next reader trusts it.
         let wanted = usize::try_from(message.fields.unix_fds.unwrap_or(0)).unwrap_or(0);
         // Claimed descriptors leave the queue with the message that named them.
-        // Dropping them here is what this increment does with freight it cannot
-        // yet route; rung 14 forwards them instead, and the queue discipline is
-        // the same either way.
+        // Forwarding them is the descriptor half of rung 14; this increment
+        // routes bytes, and a message carrying descriptors is refused rather
+        // than delivered without them — silently dropping an `h` a recipient
+        // will index is worse than saying no.
         let claimed: Vec<OwnedFd> = self.freight.drain(..wanted.min(self.freight.len())).collect();
         self.quota.release_fds(claimed.len());
         drop(claimed);
+
+        // A message type this version does not know is IGNORED, which the
+        // specification requires and which has to be decided HERE rather than
+        // in the relay. A draft refused it in `restamp`, so the disposition
+        // depended on whether the destination happened to exist: the same
+        // message was silently dropped when addressed to a name nobody owned
+        // and disconnected the sender when addressed to a live peer. One rule,
+        // one place, before anything looks at where it was going.
+        //
+        // Below the Hello gate, so an unknown type from a nameless connection
+        // still disconnects: §D's rule is that ANYTHING before `Hello` does.
+        //
+        // §D: `Hello` first, and anything before it disconnects. The rule is
+        // the specification's and it is load-bearing here rather than
+        // ceremonial — a peer with no unique name has no SENDER to stamp on
+        // what it sends, so routing it would mean delivering a message whose
+        // origin the recipient cannot check.
+        //
+        // A `Hello` with no DESTINATION counts. Real clients set one and the
+        // specification says to, but there is nothing else a connection with
+        // no name could be addressing: the broker is the only peer it can
+        // reach. Requiring the field made the `None` alternative in the match
+        // below unreachable — a dead arm shaped like a live case, which is the
+        // same fault as the dead branch this file removed above — and it turned
+        // a lenient case into a disconnect whose reason read "Hello before
+        // Hello". The INTERFACE is not checked for the same reason.
+        let is_hello = message.kind == message::MessageType::MethodCall
+            && message.fields.member == Some("Hello")
+            && matches!(message.fields.destination, None | Some(BUS_NAME))
+            && matches!(message.fields.interface, None | Some(BUS_NAME))
+            && on_the_bus_object(&message);
+        if self.unique.is_none() && !is_hello {
+            // The reason is spelled out rather than reported as "Hello before
+            // Hello", which is what a peer got when it sent a `Hello` this
+            // broker did not recognise AS one.
+            let what = match message.fields.member {
+                Some("Hello") => "a Hello that is not org.freedesktop.DBus.Hello \
+                                  at /org/freedesktop/DBus",
+                Some(member) => member,
+                None => "a message",
+            };
+            return Err(Ended::Refused(format!("{what} before Hello")));
+        }
 
         // What may be answered at all. Replying to a signal, a method return
         // or an error is itself a protocol violation — the specification
@@ -587,67 +720,739 @@ impl<'a> Connection<'a> {
         // reading of "never leave a caller waiting" and the wrong one: a
         // caller that is not waiting cannot be left waiting, and an error
         // addressed to a signal is a message its sender has no serial for.
-        if message.kind != message::MessageType::MethodCall
-            || message.flags & message::FLAG_NO_REPLY_EXPECTED != 0
-        {
+        let wants_reply = message.kind == message::MessageType::MethodCall
+            && message.flags & message::FLAG_NO_REPLY_EXPECTED == 0;
+
+        // Stated once, here, rather than left to emerge from three places
+        // that each happen to drop it: `wants_reply` is false for any type
+        // that is not a method call, so the bus path and both routing paths
+        // would all fall through to `Ok(())` on their own. That makes this
+        // early return invisible to behaviour — the red-check records it as
+        // uncoverable for exactly that reason — and keeping it is still right.
+        // A rule that holds because three unrelated branches agree is a rule
+        // that stops holding when one of them changes. It also keeps a peer
+        // from writing one relay-failure line to the journal per message.
+        if matches!(message.kind, message::MessageType::Unknown(_)) {
             return Ok(());
         }
 
-        let serial = message.serial;
-        let mine = self.next_serial;
-        // Wrapping, skipping zero: a serial is a u32 and zero is not legal.
-        // No connection will reach this, but a counter that silently becomes
-        // an illegal value is worse than one that says what it does.
-        self.next_serial = self.next_serial.checked_add(1).unwrap_or(1);
-        let reply = message::Builder::error(
-            message.endian,
-            "org.freedesktop.DBus.Error.NotSupported",
-            serial,
-        )
-        .serial(mine)
-        .body("s", |writer| {
-            writer.string(
-                "td-busd serves the handshake and the wire format; names, \
-                 routing and match rules land with rung 14",
-            )
-        })
-        .map_err(|error| Ended::Failed(format!("reply body: {error}")))?
-        .encode()
-        .map_err(|error| Ended::Failed(format!("reply: {error}")))?;
-        self.write_all(&reply, &[])
+        // Addressed to the broker, or to a peer?
+        match message.fields.destination {
+            Some(BUS_NAME) | None if is_hello => self.say_hello(&message, wants_reply),
+            Some(BUS_NAME) => self.bus_method(&message, wants_reply),
+            Some(destination) => self.route(&message, destination, wants_reply, wanted),
+            // No DESTINATION and not `Hello`. A SIGNAL without one is a
+            // broadcast, which needs the match rules that land next, so it is
+            // accepted and goes nowhere rather than being refused — a signal
+            // has no reply to be missing, and erroring one would be answering
+            // a message that was addressed to nobody. A method CALL without
+            // one is the opposite case and gets the opposite treatment: the
+            // caller is waiting on a serial, and until match rules land there
+            // is no route that could ever produce the reply, so it is told
+            // rather than left to time out.
+            None if wants_reply => self.refuse(
+                &message,
+                "org.freedesktop.DBus.Error.NotSupported",
+                "a method call must name a destination on this bus; \
+                 undirected delivery lands with match rules",
+            ),
+            None => Ok(()),
+        }
     }
 
-    /// Write a whole frame, attaching descriptors to the FIRST write only: a
-    /// partial `sendmsg` that re-attached them would deliver each one twice.
-    fn write_all(&mut self, bytes: &[u8], fds: &[RawFd]) -> Result<(), Ended> {
-        if bytes.is_empty() {
-            // The loop below is `while sent < bytes.len()`, so an empty frame
-            // returns `Ok(())` without one `sendmsg` — and any descriptors
-            // handed with it are dropped having gone nowhere. No caller does
-            // this today; the guard is here so that none can start.
-            return Err(Ended::Failed(format!(
-                "refusing to write an empty frame carrying {} descriptors",
-                fds.len()
-            )));
+    /// `Hello`: the connection earns its unique name and is told what it is.
+    ///
+    /// `wants_reply` is honoured here as everywhere else. A `Hello` carrying
+    /// `NO_REPLY_EXPECTED` is a strange thing for a client to send, but it is
+    /// the one bus method that changes state, so it still earns the name and
+    /// simply is not answered — a draft answered it regardless, which made
+    /// this the single method that ignored the flag.
+    fn say_hello(
+        &mut self,
+        message: &message::Message<'_>,
+        wants_reply: bool,
+    ) -> Result<(), Ended> {
+        if self.unique.is_some() {
+            // The specification says a second `Hello` is an error, and §D says
+            // the connection ends. A peer that asks twice has lost track of
+            // its own identity, which is not a state to keep serving.
+            return Err(Ended::Refused("Hello twice".into()));
         }
-        let mut sent = 0usize;
-        let mut attach = fds;
-        while sent < bytes.len() {
-            let rest = bytes.get(sent..).unwrap_or(&[]);
-            match sys::send(&self.stream, rest, attach) {
-                Ok(0) => return Err(Ended::Failed("write made no progress".into())),
-                Ok(count) => {
-                    sent = sent.saturating_add(count);
-                    attach = &[];
+        let unique = self
+            .bus
+            .reserve()
+            .map_err(|why| Ended::Failed(format!("cannot name a peer: {why}")))?;
+        // Recorded before anything that can fail, so `Drop` leaves the bus
+        // under this name whatever happens next. A draft set it only after the
+        // reply encoded, which leaked the directory entry on any failure in
+        // between — and once `publish` moved below the reply, it would have
+        // been a name reserved and never released.
+        self.unique = Some(unique.clone());
+        if wants_reply {
+            let reply = message::Builder::method_return(message.endian, message.serial)
+                .sender(BUS_NAME)
+                .destination(&unique)
+                .serial(self.take_serial())
+                .body("s", |writer| writer.string(&unique))
+                .map_err(|error| Ended::Failed(format!("Hello body: {error}")))?
+                .encode()
+                .map_err(|error| Ended::Failed(format!("Hello reply: {error}")))?;
+            self.queue_own(reply)?;
+        }
+        // Routable only now: the reply is already ahead of anything another
+        // peer can aim at this name.
+        self.bus
+            .publish(&unique, &self.outbox, self.credential.uid, self.credential.pid)
+            .map_err(|why| Ended::Failed(format!("cannot name a peer: {why}")))
+    }
+
+    /// The bus's own interface: what a peer may ask the broker itself.
+    ///
+    /// Everything here is answered from the directory, and none of it reaches
+    /// another peer. §D's rule for the rest is `UnknownMethod` rather than
+    /// silence — a client that calls a method this bus does not have should
+    /// find out now, not on a reply that never comes. `RequestName`,
+    /// `AddMatch` and their neighbours land with match rules; until then they
+    /// are honestly absent rather than quietly accepted, because a client told
+    /// its match rule was installed and then never signalled is worse off than
+    /// one told there is no such method.
+    fn bus_method(
+        &mut self,
+        message: &message::Message<'_>,
+        wants_reply: bool,
+    ) -> Result<(), Ended> {
+        let member = message.fields.member.unwrap_or("");
+        let interface = message.fields.interface;
+        // INTERFACE is optional in a method call, so a message that omits it is
+        // taken at its member. One that names a DIFFERENT interface is not: a
+        // `Ping` sent to the bus on some application's interface is that
+        // application's method, and answering it here would be the broker
+        // impersonating a peer.
+        let on = |name: &str| interface.is_none() || interface == Some(name);
+        // `org.freedesktop.DBus`'s methods live on ONE object. `Peer` does
+        // not — the specification puts it on every object a connection
+        // exposes — so `Ping` is answered wherever it is addressed and the
+        // rest is answered only at the broker's own path. Without this, a
+        // call to `/org/example/Thing` addressed to the bus name would be
+        // answered by the broker as though it were that object.
+        let here = on_the_bus_object(message);
+        // A peer that is not waiting gets no answer, but the work above still
+        // has to happen for the ones that change state. None of these do.
+        if !wants_reply {
+            return Ok(());
+        }
+        match member {
+            "Ping" if on(PEER_INTERFACE) => {
+                if !self.takes(message, "")? {
+                    return Ok(());
                 }
-                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                    return Err(Ended::Failed("peer closed while being written to".into()))
+                self.answer(message, "", |_| Ok(()))
+            }
+            "GetId" if here && on(BUS_NAME) => {
+                if !self.takes(message, "")? {
+                    return Ok(());
                 }
-                Err(error) => return Err(Ended::Failed(format!("write: {error}"))),
+                let guid = self.guid.to_string();
+                self.answer(message, "s", move |writer| writer.string(&guid))
+            }
+            "ListNames" if here && on(BUS_NAME) => {
+                if !self.takes(message, "")? {
+                    return Ok(());
+                }
+                let mut names = vec![BUS_NAME.to_string()];
+                names.extend(self.bus.names());
+                self.answer(message, "as", move |writer| {
+                    writer.array("s", |inner| {
+                        for name in &names {
+                            inner.string(name)?;
+                        }
+                        Ok(())
+                    })
+                })
+            }
+            // td has no service activation: nothing on this bus starts because
+            // it was called. An empty list is the true answer, and it is the
+            // one that lets a client get on with its life.
+            "ListActivatableNames" if here && on(BUS_NAME) => {
+                if !self.takes(message, "")? {
+                    return Ok(());
+                }
+                self.answer(message, "as", |writer| writer.array("s", |_| Ok(())))
+            }
+            "NameHasOwner" if here && on(BUS_NAME) => {
+                let Some(asked) = self.bus_name_argument(message)? else {
+                    return Ok(());
+                };
+                let held = asked == BUS_NAME || self.bus.route(&asked).is_some();
+                self.answer(message, "b", move |writer| {
+                    writer.bool(held);
+                    Ok(())
+                })
+            }
+            "GetNameOwner" if here && on(BUS_NAME) => {
+                let Some(asked) = self.bus_name_argument(message)? else {
+                    return Ok(());
+                };
+                // The bus owns its own name, and says so: a client that asks
+                // who `org.freedesktop.DBus` is should not be told nobody.
+                if asked == BUS_NAME || self.bus.route(&asked).is_some() {
+                    self.answer(message, "s", move |writer| writer.string(&asked))
+                } else {
+                    self.refuse(
+                        message,
+                        "org.freedesktop.DBus.Error.NameHasNoOwner",
+                        "no such connection on this bus",
+                    )
+                }
+            }
+            // What the kernel says about whoever is behind a name. td's
+            // confinement story rests on this being the broker's answer rather
+            // than the peer's: an application that asks who called it is asking
+            // `SO_PEERCRED`, taken once at accept and not re-derived from
+            // anything the caller sent.
+            "GetConnectionUnixUser" if here && on(BUS_NAME) => {
+                let Some(asked) = self.bus_name_argument(message)? else {
+                    return Ok(());
+                };
+                match self.credentials_for(&asked) {
+                    // A uid of 0 is root, not "unknown", so this needs no
+                    // guard where the pid below does.
+                    Some((uid, _)) => self.answer(message, "u", move |writer| {
+                        writer.uint32(uid);
+                        Ok(())
+                    }),
+                    None => self.no_such_owner(message),
+                }
+            }
+            "GetConnectionUnixProcessID" if here && on(BUS_NAME) => {
+                let Some(asked) = self.bus_name_argument(message)? else {
+                    return Ok(());
+                };
+                match self.credentials_for(&asked) {
+                    None => self.no_such_owner(message),
+                    Some((_, pid)) => match usable_pid(pid) {
+                        Some(pid) => self.answer(message, "u", move |writer| {
+                            writer.uint32(pid);
+                            Ok(())
+                        }),
+                        // The name IS here; its pid is not knowable. A draft
+                        // answered `NameHasNoOwner`, which `ListNames` and
+                        // `GetNameOwner` contradict one call later. The
+                        // specification has an error for exactly this case.
+                        None => self.refuse(
+                            message,
+                            "org.freedesktop.DBus.Error.UnixProcessIdUnknown",
+                            "the kernel did not report a pid for that connection",
+                        ),
+                    },
+                }
+            }
+            "GetConnectionCredentials" if here && on(BUS_NAME) => {
+                let Some(asked) = self.bus_name_argument(message)? else {
+                    return Ok(());
+                };
+                // As many credentials as are known, which is what the
+                // `a{sv}` shape is for. Two drafts got this wrong in opposite
+                // directions: the first reported `ProcessID: 0` for a peer
+                // whose pid was not knowable, and the second refused the whole
+                // call and threw away a uid the kernel HAD reported. An entry
+                // that is absent says "not known"; a zero says "pid zero".
+                match self.credentials_for(&asked) {
+                    Some((uid, pid)) => {
+                        let pid = usable_pid(pid);
+                        self.answer(message, "a{sv}", move |writer| {
+                            writer.array("{sv}", |array| {
+                                array.dict_entry(|entry| {
+                                    entry.string("UnixUserID")?;
+                                    entry.variant("u", |value| {
+                                        value.uint32(uid);
+                                        Ok(())
+                                    })
+                                })?;
+                                if let Some(pid) = pid {
+                                    array.dict_entry(|entry| {
+                                        entry.string("ProcessID")?;
+                                        entry.variant("u", |value| {
+                                            value.uint32(pid);
+                                            Ok(())
+                                        })
+                                    })?;
+                                }
+                                Ok(())
+                            })
+                        })
+                    }
+                    None => self.no_such_owner(message),
+                }
+            }
+            _ => self.refuse(
+                message,
+                "org.freedesktop.DBus.Error.UnknownMethod",
+                "td-busd serves Hello, the name and credential lookups and \
+                 directed routing; the rest of org.freedesktop.DBus lands with \
+                 match rules",
+            ),
+        }
+    }
+
+    /// The kernel's word on whoever owns `name`, or `None` for a name that is
+    /// not here. The broker's own name is answered from this process, which is
+    /// the truthful answer: `org.freedesktop.DBus` IS td-busd.
+    fn credentials_for(&self, name: &str) -> Option<(u32, i32)> {
+        if name == BUS_NAME {
+            // The bus is this process. Reading `/proc/self` rather than calling
+            // `getuid` keeps the roster at three syscalls, for the reason
+            // `main`'s `current_uid` gives.
+            let entry = fs::metadata("/proc/self").ok()?;
+            let uid = std::os::unix::fs::MetadataExt::uid(&entry);
+            let pid = fs::read_link("/proc/self").ok()?;
+            let pid = pid.file_name()?.to_str()?.parse().ok()?;
+            return Some((uid, pid));
+        }
+        self.bus.credentials(name)
+    }
+
+    /// The one refusal every name lookup shares.
+    fn no_such_owner(&mut self, message: &message::Message<'_>) -> Result<(), Ended> {
+        self.refuse(
+            message,
+            "org.freedesktop.DBus.Error.NameHasNoOwner",
+            "no such connection on this bus",
+        )
+    }
+
+    /// This connection's unique name.
+    ///
+    /// Every path that builds an outgoing message runs after `dispatch`'s
+    /// `Hello` gate, so the name is always there. Saying so in the signature
+    /// rather than writing `unwrap_or_default` is the difference between an
+    /// impossible case that fails loudly and a silent fallback shaped like a
+    /// default: an empty SENDER is not a legal bus name, so the "default"
+    /// would have produced a message the codec then refused, one layer away
+    /// from where the mistake was.
+    fn named(&self) -> Result<&str, Ended> {
+        self.unique
+            .as_deref()
+            .ok_or_else(|| Ended::Failed("a reply was built before Hello".into()))
+    }
+
+    /// Check a call's arguments against the signature the method takes, and
+    /// answer `InvalidArgs` if they disagree.
+    ///
+    /// The SIGNATURE is the whole check, not the first argument's type. A
+    /// draft read `args()[0]` and ignored everything else, so `GetNameOwner`
+    /// with a spare argument, or `Ping` with a body, ran as though it had been
+    /// called correctly. Comparing signatures rejects both, and rejects a
+    /// wrongly typed argument as a side effect rather than as a special case.
+    ///
+    /// `Hello` is not checked here and cannot be: an error reply has to be
+    /// ADDRESSED, and a connection that has not yet said `Hello` has no name
+    /// to address it to. Its arguments are ignored, which is what every other
+    /// implementation does with them.
+    fn takes(
+        &mut self,
+        message: &message::Message<'_>,
+        signature: &str,
+    ) -> Result<bool, Ended> {
+        if message.fields.signature.unwrap_or("") == signature {
+            return Ok(true);
+        }
+        let wanted = if signature.is_empty() {
+            "no arguments".to_string()
+        } else {
+            format!("arguments of signature '{signature}'")
+        };
+        self.refuse(
+            message,
+            "org.freedesktop.DBus.Error.InvalidArgs",
+            &format!("this method takes {wanted}"),
+        )?;
+        Ok(false)
+    }
+
+    /// The one bus name a name lookup was called with, or an `InvalidArgs`
+    /// reply for the caller.
+    ///
+    /// A missing, wrongly typed, or syntactically invalid argument is a
+    /// MALFORMED CALL, not a broken connection: the specification has an error
+    /// name for exactly this, and a draft disconnected instead — which its own
+    /// comment said it did not do. It is also not a lookup of the empty
+    /// string, which would be answered truthfully and uselessly with "nobody
+    /// owns that".
+    fn bus_name_argument(
+        &mut self,
+        message: &message::Message<'_>,
+    ) -> Result<Option<String>, Ended> {
+        if !self.takes(message, "s")? {
+            return Ok(None);
+        }
+        let asked = message.args().first().and_then(crate::wire::Value::as_str);
+        match asked {
+            // Validated rather than looked up: a string that is not a bus name
+            // cannot be owned by anyone, so answering "nobody owns it" is true
+            // and unhelpful — it reads as a fact about the bus rather than
+            // about the question.
+            Some(text) if crate::name::valid_bus_name(text) => Ok(Some(text.to_string())),
+            _ => {
+                self.refuse(
+                    message,
+                    "org.freedesktop.DBus.Error.InvalidArgs",
+                    "that is not a bus name",
+                )?;
+                Ok(None)
             }
         }
-        Ok(())
     }
+
+    /// A method return to whoever sent `message`, with a body this bus writes.
+    fn answer<F>(
+        &mut self,
+        message: &message::Message<'_>,
+        signature: &str,
+        fill: F,
+    ) -> Result<(), Ended>
+    where
+        F: FnOnce(&mut Writer) -> Result<(), WireError>,
+    {
+        // Cloned so the builder borrows a local: `destination` holds a
+        // reference for as long as the builder lives, and `take_serial` needs
+        // `&mut self` in the middle of it.
+        let mine = self.named()?.to_string();
+        let serial = self.take_serial();
+        let mut builder = message::Builder::method_return(message.endian, message.serial)
+            .sender(BUS_NAME)
+            .destination(&mine)
+            .serial(serial);
+        if !signature.is_empty() {
+            builder = builder
+                .body(signature, fill)
+                .map_err(|error| Ended::Failed(format!("reply body: {error}")))?;
+        }
+        let reply = builder
+            .encode()
+            .map_err(|error| Ended::Failed(format!("reply: {error}")))?;
+        self.queue_own(reply)
+    }
+
+    /// Deliver to another peer, with this connection's name stamped on it.
+    fn route(
+        &mut self,
+        message: &message::Message<'_>,
+        destination: &str,
+        wants_reply: bool,
+        descriptors: usize,
+    ) -> Result<(), Ended> {
+        // A message carrying descriptors is not forwarded yet, and saying so
+        // is the point: delivering it WITHOUT them would hand the recipient a
+        // body whose `h` values index nothing.
+        if descriptors > 0 {
+            return if wants_reply {
+                self.refuse(
+                    message,
+                    "org.freedesktop.DBus.Error.NotSupported",
+                    "descriptor passing between peers lands with the rest of rung 14",
+                )
+            } else {
+                Ok(())
+            };
+        }
+        let Some(outbox) = self.bus.route(destination) else {
+            // §D's one consistent story: a name with no owner is absent, and
+            // the caller is told so rather than left waiting.
+            return if wants_reply {
+                self.refuse(
+                    message,
+                    "org.freedesktop.DBus.Error.NameHasNoOwner",
+                    "no such connection on this bus",
+                )
+            } else {
+                Ok(())
+            };
+        };
+        let sender = self.named()?.to_string();
+        // Re-encoding can FAIL on a message the broker itself accepted, and
+        // the sender must be told rather than torn down for it. The broker
+        // adds a SENDER field, and the cap on an incoming header-fields array
+        // is the same number as the cap on an outgoing one — object paths have
+        // no length bound of their own — so a legal message whose fields are
+        // within a couple of dozen bytes of the ceiling cannot be relayed. A
+        // draft propagated that as `Ended::Failed`, which disconnected the
+        // sender with NO reply at all and logged it as a BROKER fault. Peer
+        // input must not produce a broker fault.
+        // Rebuilt rather than relayed: the SENDER field is the broker's word
+        // about who sent this, and §D refuses a client-supplied one. The BODY
+        // is copied byte for byte — a broker has no business re-marshalling a
+        // payload it does not read.
+        let forwarded = match self.restamp(message, &sender) {
+            Ok(forwarded) => forwarded,
+            Err(why) => {
+                eprintln!("td-busd: cannot relay from {sender}: {why}");
+                return if wants_reply {
+                    self.refuse(
+                        message,
+                        "org.freedesktop.DBus.Error.LimitsExceeded",
+                        &format!("this message cannot be relayed: {why}"),
+                    )
+                } else {
+                    Ok(())
+                };
+            }
+        };
+        match self.deliver(&outbox, forwarded) {
+            Ok(()) => Ok(()),
+            // The recipient's queue is full, and the SENDER is told. The
+            // recipient is NOT disconnected: it did not choose when this
+            // fired. See `registry::MAX_OUTGOING_BYTES` — two maximum messages
+            // back to back exceed the ceiling by construction, so a draft that
+            // disconnected here let any peer evict any other with two frames.
+            // A peer that genuinely never reads is removed by the BUS ceiling's
+            // remedy instead, which picks the largest consumer.
+            Err(Overflow::Connection { bytes, frames }) => {
+                if wants_reply {
+                    self.refuse(
+                        message,
+                        "org.freedesktop.DBus.Error.LimitsExceeded",
+                        &format!(
+                            "the recipient is {bytes} bytes behind in {frames} frames"
+                        ),
+                    )
+                } else {
+                    Ok(())
+                }
+            }
+            Err(Overflow::Bus(_)) => {
+                if wants_reply {
+                    self.refuse(
+                        message,
+                        "org.freedesktop.DBus.Error.LimitsExceeded",
+                        "the bus is over its queue ceiling",
+                    )
+                } else {
+                    Ok(())
+                }
+            }
+            Err(Overflow::Closed) => {
+                if wants_reply {
+                    self.refuse(
+                        message,
+                        "org.freedesktop.DBus.Error.NameHasNoOwner",
+                        "that connection has gone",
+                    )
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// The same message with the broker's SENDER on it and nothing else
+    /// changed.
+    fn restamp(
+        &self,
+        message: &message::Message<'_>,
+        sender: &str,
+    ) -> Result<Vec<u8>, String> {
+        // Every field taken here is one `message.rs` already refused the
+        // message for lacking, so none of these can be absent. A draft wrote
+        // `unwrap_or` at each of them, which reads as a default and is not
+        // one: `path.unwrap_or(BUS_PATH)` would have relabelled a peer's call
+        // as addressed to the BROKER's own object. An impossible case gets a
+        // loud error, not a plausible substitute.
+        let missing = || "a relayed message lost a mandatory field".to_string();
+        let mut builder = match message.kind {
+            message::MessageType::MethodCall => {
+                let (Some(path), Some(member)) = (message.fields.path, message.fields.member)
+                else {
+                    return Err(missing());
+                };
+                message::Builder::method_call(message.endian, path, message.fields.interface, member)
+            }
+            message::MessageType::Signal => {
+                let (Some(path), Some(interface), Some(member)) = (
+                    message.fields.path,
+                    message.fields.interface,
+                    message.fields.member,
+                ) else {
+                    return Err(missing());
+                };
+                message::Builder::signal(message.endian, path, interface, member)
+            }
+            message::MessageType::MethodReturn => {
+                let Some(reply_serial) = message.fields.reply_serial else {
+                    return Err(missing());
+                };
+                message::Builder::method_return(message.endian, reply_serial)
+            }
+            message::MessageType::Error => {
+                let (Some(name), Some(reply_serial)) =
+                    (message.fields.error_name, message.fields.reply_serial)
+                else {
+                    return Err(missing());
+                };
+                message::Builder::error(message.endian, name, reply_serial)
+            }
+            message::MessageType::Unknown(_) => {
+                // Unreachable: `dispatch` ignores an unknown type before it
+                // looks at the destination. Named rather than silent, because a
+                // silent fallback here would forward it as something else.
+                return Err("an unknown message type reached the relay".into());
+            }
+        };
+        builder = builder.sender(sender).serial(message.serial).flags(message.flags);
+        if let Some(destination) = message.fields.destination {
+            builder = builder.destination(destination);
+        }
+        let body = message.body_bytes().to_vec();
+        if !body.is_empty() || message.fields.signature.is_some() {
+            builder = builder
+                .body_raw(message.fields.signature.unwrap_or(""), body)
+                .map_err(|error| format!("relay body: {error}"))?;
+        }
+        builder.encode().map_err(|error| format!("relay: {error}"))
+    }
+
+    /// An error reply to the peer that sent this, queued like any other.
+    fn refuse(
+        &mut self,
+        message: &message::Message<'_>,
+        name: &str,
+        why: &str,
+    ) -> Result<(), Ended> {
+        let mine = self.named()?.to_string();
+        let serial = self.take_serial();
+        let reply = message::Builder::error(message.endian, name, message.serial)
+            .serial(serial)
+            .sender(BUS_NAME)
+            .destination(&mine)
+            .body("s", |writer| writer.string(why))
+            .map_err(|error| Ended::Failed(format!("refusal body: {error}")))?
+            .encode()
+            .map_err(|error| Ended::Failed(format!("refusal: {error}")))?;
+        self.queue_own(reply)
+    }
+
+    /// Append a frame to an outbox, applying §D's remedy if the BUS is full.
+    ///
+    /// The remedy belongs wherever the condition is seen, not only on the
+    /// routing path. A draft ran it only in `route` and turned a bus overflow
+    /// into `Ended::Failed` everywhere else, which made the ceiling a weapon
+    /// rather than a bound: four peers that stop reading fill the budget, and
+    /// the next INNOCENT peer to call `GetId` — or the next connection to
+    /// reach its `Hello` reply, or even its `OK` line — is the one
+    /// disconnected, while the four sit there untouched.
+    ///
+    /// One retry. If the bus is still over its ceiling after its largest
+    /// consumer has gone, the answer really is that the bus is full.
+    fn deliver(&self, outbox: &Arc<Outbox>, frame: Vec<u8>) -> Result<(), Overflow> {
+        let rejected = match outbox.push(frame) {
+            Ok(()) => return Ok(()),
+            Err(rejected) => rejected,
+        };
+        let Rejected {
+            why: Overflow::Bus(bytes),
+            frame,
+        } = rejected
+        else {
+            return Err(rejected.why);
+        };
+        // §D: a broker-level condition, logged apart from an ordinary refusal
+        // because reaching it means a policy elsewhere is wrong.
+        let relieved = self.bus.relieve_largest();
+        eprintln!(
+            "td-busd: the bus is {bytes} bytes behind; disconnected {}",
+            relieved.as_deref().unwrap_or("nobody")
+        );
+        outbox.push(frame).map_err(|again| again.why)
+    }
+
+    /// Queue a frame this broker generated for its own peer.
+    fn queue_own(&mut self, frame: Vec<u8>) -> Result<(), Ended> {
+        match self.deliver(&Arc::clone(&self.outbox), frame) {
+            Ok(()) => Ok(()),
+            Err(Overflow::Closed) => Err(Ended::PeerLeft),
+            Err(Overflow::Connection { bytes, frames }) => Err(Ended::Refused(format!(
+                "{bytes} bytes in {frames} frames queued and unread"
+            ))),
+            Err(Overflow::Bus(bytes)) => {
+                Err(Ended::Failed(format!("the bus is {bytes} bytes behind")))
+            }
+        }
+    }
+
+    /// This connection's next outgoing serial. Unique per connection, as the
+    /// specification requires, and never zero.
+    fn take_serial(&mut self) -> u32 {
+        let mine = self.next_serial;
+        self.next_serial = self.next_serial.checked_add(1).unwrap_or(1);
+        mine
+    }
+
+}
+
+/// Is this message addressed to the broker's own object?
+///
+/// PATH is mandatory on a method call, so an absent one is a message the codec
+/// has already refused; it is spelled out rather than defaulted for the reason
+/// `restamp` gives.
+fn on_the_bus_object(message: &message::Message<'_>) -> bool {
+    message.fields.path == Some(BUS_PATH)
+}
+
+/// A pid this broker is willing to report, or `None` for one it cannot.
+///
+/// `SO_PEERCRED` answers 0 for a peer whose pid does not exist in the reader's
+/// namespace, and 0 is not a process. Reporting it would hand a caller a
+/// number that looks like an answer and names nothing, and `/proc/0` is a
+/// lookup that fails much later and somewhere else. `None` means "not
+/// knowable" and NOT "no such connection" — the two are different answers and
+/// a draft gave the second for the first.
+fn usable_pid(pid: i32) -> Option<u32> {
+    if pid <= 0 {
+        return None;
+    }
+    u32::try_from(pid).ok()
+}
+
+/// Write a whole frame, attaching descriptors to the FIRST write only: a
+/// partial `sendmsg` that re-attached them would deliver each one twice.
+///
+/// Free rather than a method on `Connection` because the writer thread outlives
+/// every borrow of one: the reader owns the `Connection`, the writer owns only
+/// an `Arc<Outbox>` and the socket it hands over.
+fn write_frame(stream: &UnixStream, bytes: &[u8], fds: &[RawFd]) -> Result<(), String> {
+    if bytes.is_empty() {
+        // The loop below is `while sent < bytes.len()`, so an empty frame
+        // returns `Ok(())` without one `sendmsg` — and any descriptors handed
+        // with it are dropped having gone nowhere. No caller does this today;
+        // the guard is here so that none can start.
+        return Err(format!(
+            "refusing to write an empty frame carrying {} descriptors",
+            fds.len()
+        ));
+    }
+    let mut sent = 0usize;
+    let mut attach = fds;
+    while sent < bytes.len() {
+        let rest = bytes.get(sent..).unwrap_or(&[]);
+        match sys::send(stream, rest, attach) {
+            Ok(0) => return Err("write made no progress".into()),
+            Ok(count) => {
+                sent = sent.saturating_add(count);
+                attach = &[];
+            }
+            // No `Interrupted` arm: `sys::send` retries `EINTR` itself, so
+            // it never surfaces one. A draft added it here by symmetry with
+            // the READ path, where it is live — a dead branch shaped like a
+            // safety check, which `dispatch`'s own comment two hundred lines
+            // above warns against, and which the red-check could not catch
+            // because reverting it changes nothing.
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                return Err("peer closed while being written to".into())
+            }
+            Err(error) => return Err(format!("write: {error}")),
+        }
+    }
+    Ok(())
 }
 
 /// Connect to a running bus and complete the client half of `EXTERNAL`. This is
@@ -790,7 +1595,9 @@ fn loopback_at(path: &Path, uid: u32) -> Result<String, String> {
                     // non-blocking flag on Linux, so the connection below is
                     // an ordinary blocking one.
                     Ok((stream, _)) => {
-                        if let Ok(mut connection) = Connection::accept(stream, guid, &quota) {
+                        let bus = Bus::new();
+                        let accepted = Connection::accept(stream, guid, &quota, &bus);
+                        if let Ok(mut connection) = accepted {
                             let _ = connection.serve();
                         }
                         break;
@@ -879,7 +1686,8 @@ mod tests {
         thread::spawn(move || {
             let guid = Guid::new(GUID).expect("guid");
             let quota = Quota::new();
-            let mut connection = Connection::accept(server, guid, &quota).expect("accept");
+            let bus = Bus::new();
+            let mut connection = Connection::accept(server, guid, &quota, &bus).expect("accept");
             let ended = connection.serve();
             let _ = tell.send(Outcome {
                 ended,
@@ -888,6 +1696,1308 @@ mod tests {
             });
         });
         (client, hear)
+    }
+
+    /// A bus with several served connections on it, and the client end of
+    /// each.
+    ///
+    /// ONE `Bus` behind all of them, which is the whole point: routing is a
+    /// property of the directory, and a harness that gave each connection its
+    /// own directory would prove only that a message goes nowhere.
+    fn bus_of(peers: usize) -> (Arc<Bus>, Vec<UnixStream>) {
+        let mut clients = Vec::new();
+        let mut servers = Vec::new();
+        for _ in 0..peers {
+            let (client, server) = UnixStream::pair().expect("socketpair");
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                .expect("client read timeout");
+            clients.push(client);
+            servers.push(server);
+        }
+        // Handed back so a test can reach the directory the connections share
+        // — filling the bus's budget, say, which no client can do cheaply.
+        let bus = Arc::new(Bus::new());
+        let serving = Arc::clone(&bus);
+        thread::spawn(move || {
+            let quota = Quota::new();
+            let bus = serving;
+            thread::scope(|scope| {
+                for server in servers {
+                    let quota = &quota;
+                    let bus = &*bus;
+                    let spawned = thread::Builder::new().spawn_scoped(scope, move || {
+                        let guid = Guid::new(GUID).expect("guid");
+                        if let Ok(mut connection) = Connection::accept(server, guid, quota, bus) {
+                            let _ = connection.serve();
+                        }
+                    });
+                    spawned.expect("spawn a connection thread");
+                }
+            });
+        });
+        (bus, clients)
+    }
+
+    /// One client's side of a connection: writes what a peer writes, and hands
+    /// back whole frames.
+    struct Peer {
+        stream: UnixStream,
+        held: Vec<u8>,
+        /// How many handshake lines are still to be stepped over. One for the
+        /// `OK`, two when `AGREE_UNIX_FD` follows it.
+        lines: usize,
+    }
+
+    impl Peer {
+        /// Authenticate, BEGIN and say `Hello`, all in one write, and return
+        /// the unique name the bus handed out.
+        fn arrive(stream: UnixStream) -> (Self, String) {
+            Self::arriving(stream, false)
+        }
+
+        /// The same, having negotiated descriptor passing.
+        fn arrive_with_fds(stream: UnixStream) -> (Self, String) {
+            Self::arriving(stream, true)
+        }
+
+        fn arriving(stream: UnixStream, descriptors: bool) -> (Self, String) {
+            let mut peer = Peer {
+                stream,
+                held: Vec::new(),
+                lines: if descriptors { 2 } else { 1 },
+            };
+            let negotiate = if descriptors { "NEGOTIATE_UNIX_FD\r\n" } else { "" };
+            let mut opening =
+                format!("\0AUTH EXTERNAL {}\r\n{negotiate}BEGIN\r\n", uid_hex()).into_bytes();
+            opening.extend_from_slice(&bus_call("Hello", 1));
+            peer.send(&opening);
+            let frame = peer.frame();
+            let (reply, _) = message::decode(&frame, 0).expect("decode Hello's reply");
+            assert_eq!(
+                reply.kind,
+                message::MessageType::MethodReturn,
+                "Hello was not answered with a name"
+            );
+            let name = reply
+                .args()
+                .first()
+                .and_then(crate::wire::Value::as_str)
+                .expect("Hello answers with a name")
+                .to_string();
+            (peer, name)
+        }
+
+        fn send(&mut self, bytes: &[u8]) {
+            self.stream.write_all(bytes).expect("write");
+        }
+
+        /// Send a frame with a descriptor attached, the way a client that
+        /// negotiated `UNIX_FD` does.
+        fn send_with_fd(&mut self, frame: &[u8], fd: RawFd) {
+            let sent = sys::send(&self.stream, frame, &[fd]).expect("sendmsg");
+            assert_eq!(sent, frame.len(), "the test wrote only part of a frame");
+        }
+
+        /// The next whole frame, reading until there is one. The handshake's
+        /// lines are stepped over on the way past.
+        fn frame(&mut self) -> Vec<u8> {
+            let mut chunk = [0u8; 1024];
+            loop {
+                while self.lines > 0 {
+                    match self.held.windows(2).position(|pair| pair == b"\r\n") {
+                        Some(at) => {
+                            self.held.drain(..at + 2);
+                            self.lines -= 1;
+                        }
+                        None => break,
+                    }
+                }
+                if self.lines == 0 {
+                    if let Ok(Some(length)) = message::frame_len(&self.held) {
+                        if self.held.len() >= length {
+                            return self.held.drain(..length).collect();
+                        }
+                    }
+                }
+                let read = self.stream.read(&mut chunk).expect("read");
+                assert_ne!(read, 0, "the bus closed without answering");
+                self.held.extend_from_slice(&chunk[..read]);
+            }
+        }
+
+        /// Nothing more arrives. The wait is short because the assertion is
+        /// that nothing comes, and a long one would only make the suite slow
+        /// at proving it.
+        fn expect_silence(&mut self) {
+            assert!(self.held.is_empty(), "a frame was already waiting");
+            self.stream
+                .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+                .expect("read timeout");
+            let mut chunk = [0u8; 64];
+            match self.stream.read(&mut chunk) {
+                Ok(0) => {}
+                Ok(read) => panic!("{read} unexpected bytes: {:?}", &chunk[..read]),
+                Err(error) => assert!(
+                    matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ),
+                    "read failed for the wrong reason: {error}"
+                ),
+            }
+        }
+
+        /// The connection is gone: the far end has hung up.
+        fn expect_disconnect(&mut self) {
+            self.stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                .expect("read timeout");
+            let mut chunk = [0u8; 256];
+            loop {
+                match self.stream.read(&mut chunk) {
+                    Ok(0) => return,
+                    // Bytes already in flight when the bus decided are not a
+                    // failure — the disconnect is what is being asserted.
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionReset => return,
+                    Err(error) => panic!("read failed: {error}"),
+                }
+            }
+        }
+    }
+
+    /// A method call addressed to the broker itself.
+    fn bus_call(member: &str, serial: u32) -> Vec<u8> {
+        message::Builder::method_call(crate::wire::Endian::Little, BUS_PATH, Some(BUS_NAME), member)
+            .destination(BUS_NAME)
+            .serial(serial)
+            .encode()
+            .expect("encode a bus call")
+    }
+
+    /// A method call addressed to another peer, carrying a string so the test
+    /// can tell a forwarded body from a rebuilt one.
+    fn peer_call(destination: &str, serial: u32, text: &str) -> Vec<u8> {
+        message::Builder::method_call(
+            crate::wire::Endian::Little,
+            "/org/example/Thing",
+            Some("org.example.Thing"),
+            "Do",
+        )
+        .destination(destination)
+        .serial(serial)
+        .body("s", |writer| writer.string(text))
+        .expect("body")
+        .encode()
+        .expect("encode a peer call")
+    }
+
+    /// A directed message reaches the connection its DESTINATION names, and
+    /// arrives with the broker's word about who sent it.
+    #[test]
+    fn a_message_reaches_the_peer_it_names() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+        assert_ne!(name_one, name_two, "two connections shared a name");
+
+        one.send(&peer_call(&name_two, 7, "over here"));
+        let frame = two.frame();
+        let (got, _) = message::decode(&frame, 0).expect("decode what arrived");
+        assert_eq!(got.kind, message::MessageType::MethodCall);
+        assert_eq!(got.fields.member, Some("Do"));
+        assert_eq!(got.fields.path, Some("/org/example/Thing"));
+        assert_eq!(got.fields.interface, Some("org.example.Thing"));
+        assert_eq!(got.fields.destination, Some(name_two.as_str()));
+        // The serial is the SENDER's, unchanged: it is what the sender will
+        // match a reply against.
+        assert_eq!(got.serial, 7);
+        assert_eq!(
+            got.fields.sender,
+            Some(name_one.as_str()),
+            "the broker did not stamp the sender"
+        );
+        assert_eq!(
+            got.args().first().and_then(crate::wire::Value::as_str),
+            Some("over here"),
+            "the body did not survive the relay"
+        );
+        // The sender is told nothing: a delivered call is answered by the
+        // peer that received it, not by the broker.
+        one.expect_silence();
+    }
+
+    /// A client cannot forge who a message came from. §D refuses a
+    /// client-supplied SENDER outright rather than overwriting it, because a
+    /// client that sets one is either broken or lying and neither should be
+    /// quietly corrected.
+    #[test]
+    fn a_client_may_not_supply_its_own_sender() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        let forged = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            "/org/example/Thing",
+            Some("org.example.Thing"),
+            "Do",
+        )
+        .destination(&name_two)
+        .sender(":1.99")
+        .serial(7)
+        .encode()
+        .expect("encode");
+        one.send(&forged);
+        one.expect_disconnect();
+        // And nothing reached the peer it was addressed to.
+        two.expect_silence();
+    }
+
+    /// A call to a name nobody owns is REFUSED rather than dropped. A caller
+    /// left waiting on a serial hangs; a caller told `NameHasNoOwner` fails.
+    #[test]
+    fn a_call_to_a_name_nobody_owns_is_refused() {
+        let (_bus, mut clients) = bus_of(1);
+        let only = clients.pop().expect("one client");
+        let (mut peer, _) = Peer::arrive(only);
+
+        peer.send(&peer_call(":1.404", 5, "anyone there"));
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode the refusal");
+        assert_eq!(reply.kind, message::MessageType::Error);
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.NameHasNoOwner")
+        );
+        assert_eq!(reply.fields.reply_serial, Some(5));
+        assert_eq!(reply.fields.sender, Some(BUS_NAME));
+    }
+
+    /// The same call with NO_REPLY_EXPECTED gets no error either: a sender
+    /// that is not waiting must not be sent a message it has no serial for.
+    #[test]
+    fn an_undeliverable_message_that_wants_no_reply_is_silently_dropped() {
+        let (_bus, mut clients) = bus_of(1);
+        let only = clients.pop().expect("one client");
+        let (mut peer, _) = Peer::arrive(only);
+
+        let quiet = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            "/org/example/Thing",
+            Some("org.example.Thing"),
+            "Do",
+        )
+        .destination(":1.404")
+        .flags(message::FLAG_NO_REPLY_EXPECTED)
+        .serial(5)
+        .encode()
+        .expect("encode");
+        peer.send(&quiet);
+        peer.expect_silence();
+    }
+
+    /// Anything before `Hello` ends the connection. A peer with no unique name
+    /// has no SENDER to be stamped with, so routing it would mean delivering a
+    /// message whose origin the recipient cannot check.
+    #[test]
+    fn nothing_may_be_sent_before_hello() {
+        let (mut client, hear) = serving();
+        let mut opening =
+            format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+        opening.extend_from_slice(&bus_call("ListNames", 1));
+        client.write_all(&opening).expect("write");
+        match ended(&hear).ended {
+            Ended::Refused(why) => assert!(why.contains("before Hello"), "{why}"),
+            other => panic!("a call before Hello gave {other:?}"),
+        }
+    }
+
+    /// A SECOND `Hello` ends it too. A peer that asks twice has lost track of
+    /// its own identity, which is not a state to keep serving.
+    #[test]
+    fn a_second_hello_ends_the_connection() {
+        let (client, hear) = serving();
+        let (mut peer, _) = Peer::arrive(client);
+        peer.send(&bus_call("Hello", 2));
+        match ended(&hear).ended {
+            Ended::Refused(why) => assert!(why.contains("Hello twice"), "{why}"),
+            other => panic!("a second Hello gave {other:?}"),
+        }
+    }
+
+    /// The bus answers for itself: who is here, who owns a name, and what this
+    /// bus is called. `busctl list` is these three and little else.
+    #[test]
+    fn the_bus_answers_for_its_own_names() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (_two, name_two) = Peer::arrive(second);
+
+        one.send(&bus_call("ListNames", 2));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode ListNames");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
+        let listed: Vec<String> = reply
+            .args()
+            .first()
+            .and_then(crate::wire::Value::as_seq)
+            .expect("an array came back")
+            .values(64)
+            .expect("read the array")
+            .iter()
+            .filter_map(crate::wire::Value::as_str)
+            .map(str::to_string)
+            .collect();
+        assert!(listed.contains(&BUS_NAME.to_string()), "{listed:?}");
+        assert!(listed.contains(&name_one), "{listed:?}");
+        assert!(listed.contains(&name_two), "{listed:?}");
+
+        // A name that is here.
+        one.send(&name_query("GetNameOwner", &name_two, 3));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode GetNameOwner");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
+        assert_eq!(
+            reply.args().first().and_then(crate::wire::Value::as_str),
+            Some(name_two.as_str())
+        );
+
+        // And one that is not.
+        one.send(&name_query("GetNameOwner", ":1.404", 4));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode the refusal");
+        assert_eq!(reply.kind, message::MessageType::Error);
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.NameHasNoOwner")
+        );
+
+        // `GetId` answers with the GUID the handshake agreed, not a fresh one.
+        one.send(&bus_call("GetId", 5));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode GetId");
+        assert_eq!(
+            reply.args().first().and_then(crate::wire::Value::as_str),
+            Some(GUID),
+            "GetId answered with a different GUID than the handshake"
+        );
+    }
+
+    /// The broker answers who is behind a name from the KERNEL, not from
+    /// anything the caller said. td's confinement story rests on this: an
+    /// application asking who called it is asking `SO_PEERCRED`, taken once at
+    /// accept, and a peer cannot describe itself into a different answer.
+    #[test]
+    fn the_bus_reports_the_kernels_word_on_who_owns_a_name() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (_two, name_two) = Peer::arrive(second);
+
+        one.send(&name_query("GetConnectionUnixUser", &name_two, 2));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode the uid");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
+        assert_eq!(
+            reply.args().first().and_then(crate::wire::Value::as_u32),
+            Some(this_uid())
+        );
+
+        // Both peers are this test process, so the pid is known exactly.
+        one.send(&name_query("GetConnectionUnixProcessID", &name_two, 3));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode the pid");
+        assert_eq!(
+            reply.args().first().and_then(crate::wire::Value::as_u32),
+            Some(std::process::id())
+        );
+
+        // The dictionary form carries the same two numbers.
+        one.send(&name_query("GetConnectionCredentials", &name_two, 4));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode the credentials");
+        assert_eq!(reply.fields.signature, Some("a{sv}"));
+        let mut found = Vec::new();
+        let entries = reply
+            .args()
+            .first()
+            .and_then(crate::wire::Value::as_seq)
+            .expect("a dictionary came back")
+            .values(16)
+            .expect("read the dictionary");
+        for entry in &entries {
+            let pair = entry
+                .as_seq()
+                .expect("a dict entry")
+                .values(2)
+                .expect("read the entry");
+            let key = pair.first().and_then(crate::wire::Value::as_str);
+            let value = pair
+                .get(1)
+                .and_then(crate::wire::Value::as_seq)
+                .and_then(|variant| variant.values(1).ok())
+                .and_then(|held| held.first().and_then(crate::wire::Value::as_u32));
+            if let (Some(key), Some(value)) = (key, value) {
+                found.push((key.to_string(), value));
+            }
+        }
+        assert!(
+            found.contains(&("UnixUserID".to_string(), this_uid())),
+            "{found:?}"
+        );
+        assert!(
+            found.contains(&("ProcessID".to_string(), std::process::id())),
+            "{found:?}"
+        );
+
+        // A name nobody owns has no credentials, and says so rather than
+        // answering with a zero that reads like root and pid 0. All THREE
+        // lookups: a draft covered only the first, and the red-check found
+        // that the other two could each be made to answer zero with every
+        // test still green.
+        for (which, member) in [
+            "GetConnectionUnixUser",
+            "GetConnectionUnixProcessID",
+            "GetConnectionCredentials",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let serial = 5u32.saturating_add(u32::try_from(which).unwrap_or(0));
+            one.send(&name_query(member, ":1.404", serial));
+            let frame = one.frame();
+            let (reply, _) = message::decode(&frame, 0).expect("decode the refusal");
+            assert_eq!(reply.kind, message::MessageType::Error, "{member} answered");
+            assert_eq!(
+                reply.fields.error_name,
+                Some("org.freedesktop.DBus.Error.NameHasNoOwner"),
+                "{member} refused for the wrong reason"
+            );
+            assert_eq!(reply.fields.reply_serial, Some(serial));
+        }
+    }
+
+    /// A message with no DESTINATION splits by type. A signal is a broadcast,
+    /// which needs the match rules that have not landed, and is accepted and
+    /// goes nowhere — it has no reply to be missing. A method CALL is the
+    /// opposite: its sender is waiting on a serial no route can currently
+    /// answer, so it is told rather than left to time out.
+    #[test]
+    fn an_undirected_message_is_dropped_or_refused_by_type() {
+        let (_bus, mut clients) = bus_of(1);
+        let only = clients.pop().expect("one client");
+        let (mut peer, _) = Peer::arrive(only);
+
+        let broadcast = message::Builder::signal(
+            crate::wire::Endian::Little,
+            "/org/example/Thing",
+            "org.example.Thing",
+            "Happened",
+        )
+        .serial(2)
+        .encode()
+        .expect("encode the signal");
+        peer.send(&broadcast);
+        peer.expect_silence();
+
+        let undirected = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            "/org/example/Thing",
+            Some("org.example.Thing"),
+            "Do",
+        )
+        .serial(3)
+        .encode()
+        .expect("encode the call");
+        peer.send(&undirected);
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode the refusal");
+        assert_eq!(reply.kind, message::MessageType::Error);
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.NotSupported")
+        );
+        assert_eq!(reply.fields.reply_serial, Some(3));
+    }
+
+    /// A bus method this version does not have is `UnknownMethod`, not
+    /// silence. `RequestName` and `AddMatch` land with match rules; a client
+    /// told its match rule was installed and then never signalled is worse off
+    /// than one told there is no such method.
+    #[test]
+    fn a_bus_method_this_version_lacks_is_an_error_rather_than_silence() {
+        let (_bus, mut clients) = bus_of(1);
+        let only = clients.pop().expect("one client");
+        let (mut peer, _) = Peer::arrive(only);
+
+        peer.send(&bus_call("AddMatch", 2));
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode the refusal");
+        assert_eq!(reply.kind, message::MessageType::Error);
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.UnknownMethod")
+        );
+        assert_eq!(reply.fields.reply_serial, Some(2));
+    }
+
+    /// A message carrying descriptors to a PEER is refused, not stripped.
+    /// Delivering it without them would hand the recipient a body whose `h`
+    /// values index nothing — a corruption the recipient cannot detect,
+    /// because the message it receives is well formed and simply wrong.
+    #[test]
+    fn a_message_carrying_descriptors_to_a_peer_is_refused_rather_than_stripped() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, _) = Peer::arrive_with_fds(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        let spare = fs::File::open("/dev/null").expect("/dev/null");
+        let carrying = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            "/org/example/Thing",
+            Some("org.example.Thing"),
+            "Take",
+        )
+        .destination(&name_two)
+        .serial(7)
+        .unix_fds(1)
+        .body("h", |writer| {
+            writer.unix_fd(0);
+            Ok(())
+        })
+        .expect("body")
+        .encode()
+        .expect("encode");
+        one.send_with_fd(&carrying, spare.as_raw_fd());
+
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode the refusal");
+        assert_eq!(reply.kind, message::MessageType::Error);
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.NotSupported")
+        );
+        assert_eq!(reply.fields.reply_serial, Some(7));
+        // And nothing at all reached the peer it was addressed to.
+        two.expect_silence();
+    }
+
+    /// A name leaves the bus with its connection. A unique name that outlived
+    /// the socket behind it would send a message to nobody, and the directory
+    /// would grow for the life of the broker.
+    #[test]
+    fn a_name_leaves_the_bus_with_its_connection() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (two, name_two) = Peer::arrive(second);
+
+        // While it is here, it is findable.
+        one.send(&name_query("GetNameOwner", &name_two, 2));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
+
+        drop(two);
+
+        // The bus notices asynchronously: the reading thread has to come back
+        // from `recvmsg` before it can leave the directory. So this polls to a
+        // DEADLINE rather than sleeping a guessed interval — a fixed sleep is
+        // either flaky or slow, and usually both.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut serial = 3u32;
+        loop {
+            one.send(&name_query("GetNameOwner", &name_two, serial));
+            let frame = one.frame();
+            let (reply, _) = message::decode(&frame, 0).expect("decode");
+            if reply.kind == message::MessageType::Error {
+                assert_eq!(
+                    reply.fields.error_name,
+                    Some("org.freedesktop.DBus.Error.NameHasNoOwner")
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{name_two} is still on the bus after its connection ended"
+            );
+            serial = serial.saturating_add(1);
+        }
+
+        // And a message to it is refused rather than queued for a socket
+        // nobody is reading.
+        one.send(&peer_call(&name_two, 99, "anyone"));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(reply.kind, message::MessageType::Error);
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.NameHasNoOwner")
+        );
+    }
+
+    /// A name lookup with no name to look up is a malformed CALL, answered
+    /// with `InvalidArgs`. It is not a question about the empty string, which
+    /// would be answered truthfully and uselessly with "nobody owns that", and
+    /// it is not a broken connection: the specification has an error name for
+    /// exactly this, and a draft disconnected instead — which its own comment
+    /// said it did not do.
+    #[test]
+    fn a_name_lookup_without_a_name_is_refused_rather_than_answered() {
+        let (_bus, mut clients) = bus_of(1);
+        let only = clients.pop().expect("one client");
+        let (mut peer, _) = Peer::arrive(only);
+
+        peer.send(&bus_call("GetNameOwner", 2));
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode the refusal");
+        assert_eq!(reply.kind, message::MessageType::Error);
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.InvalidArgs")
+        );
+        assert_eq!(reply.fields.reply_serial, Some(2));
+
+        // And the connection is still usable afterwards, which is the whole
+        // difference between a bad call and a bad peer.
+        peer.send(&bus_call("GetId", 3));
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
+        assert_eq!(reply.fields.reply_serial, Some(3));
+    }
+
+    /// A member the broker knows, on an interface that is not the broker's, is
+    /// not the broker's method. Answering it would be td-busd impersonating a
+    /// peer — and `Ping` is the one every implementation puts on every
+    /// connection, so it is the one this is most likely to get wrong.
+    #[test]
+    fn a_known_member_on_a_foreign_interface_is_not_the_brokers() {
+        let (_bus, mut clients) = bus_of(1);
+        let only = clients.pop().expect("one client");
+        let (mut peer, _) = Peer::arrive(only);
+
+        let call = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            BUS_PATH,
+            Some("org.example.Thing"),
+            "Ping",
+        )
+        .destination(BUS_NAME)
+        .serial(2)
+        .encode()
+        .expect("encode");
+        peer.send(&call);
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(reply.kind, message::MessageType::Error);
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.UnknownMethod")
+        );
+    }
+
+    /// `Hello` with no DESTINATION is still `Hello`. There is nothing else a
+    /// connection with no name could be addressing, and the alternative — the
+    /// `None` arm of the destination match being unreachable — is a dead case
+    /// dressed as a live one.
+    #[test]
+    fn hello_without_a_destination_is_still_hello() {
+        let (mut client, _hear) = serving();
+        let bare = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            BUS_PATH,
+            Some(BUS_NAME),
+            "Hello",
+        )
+        .serial(1)
+        .encode()
+        .expect("encode");
+        let mut opening = format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+        opening.extend_from_slice(&bare);
+        client.write_all(&opening).expect("write");
+
+        let mut peer = Peer {
+            stream: client,
+            held: Vec::new(),
+            lines: 1,
+        };
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
+        assert_eq!(
+            reply.args().first().and_then(crate::wire::Value::as_str),
+            Some(":1.1")
+        );
+    }
+
+    /// A full BUS does not disconnect whoever calls next. §D's remedy is that
+    /// the largest consumer goes; a draft ran it only on the routing path and
+    /// turned a bus overflow into `Ended::Failed` everywhere else, which made
+    /// the ceiling a weapon aimed at every peer except the ones responsible.
+    #[test]
+    fn a_full_bus_relieves_its_largest_consumer_rather_than_the_caller() {
+        let (bus, mut clients) = bus_of(1);
+        let only = clients.pop().expect("one client");
+        let (mut peer, _) = Peer::arrive(only);
+
+        // Four hoarders fill the whole budget between them. They are not real
+        // connections — they do not need to be. What is being tested is what
+        // happens to the peer that calls NEXT.
+        let mut kept = Vec::new();
+        for which in 0..4i32 {
+            let (client, server) = UnixStream::pair().expect("socketpair");
+            kept.push(client);
+            let outbox = bus.outbox_for(server);
+            bus.join(&outbox, 1000, 9100 + which).expect("join");
+            outbox
+                .push(vec![0u8; crate::registry::MAX_OUTGOING_BYTES])
+                .expect("push");
+        }
+        assert_eq!(bus.queued_bytes(), crate::registry::MAX_OUTGOING_BYTES_TOTAL);
+
+        // An ordinary call from an innocent peer. It is answered.
+        peer.send(&bus_call("GetId", 2));
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(
+            reply.kind,
+            message::MessageType::MethodReturn,
+            "a full bus disconnected the peer that asked rather than the one holding it"
+        );
+        assert_eq!(reply.fields.reply_serial, Some(2));
+        // And the budget really did come down, so a hoarder went.
+        assert!(
+            bus.queued_bytes() < crate::registry::MAX_OUTGOING_BYTES_TOTAL,
+            "nothing was relieved"
+        );
+    }
+
+    /// What is already queued survives the connection ending. The last thing a
+    /// peer is told is usually WHY it is ending, and a draft threw it away:
+    /// `close` cleared the queue on every exit path, so a peer that made a bad
+    /// call and then a fatal one got a bare EOF instead of the reply the
+    /// broker had already written for it.
+    #[test]
+    fn the_reply_before_a_fatal_error_still_reaches_the_peer() {
+        let (client, hear) = serving();
+        let (mut peer, _) = Peer::arrive(client);
+
+        // Both in ONE write, so the reader dispatches the call and then hits
+        // the fatal frame without ever going back to the socket in between.
+        let mut together = bus_call("GetId", 2);
+        together.extend_from_slice(&[0u8; 16]);
+        peer.send(&together);
+
+        // The connection is ENDED first, and only then is anything read. A
+        // draft read first, which let the test pass whenever the writer
+        // happened to be scheduled before the teardown — it detected the
+        // regression sometimes, which for a race is the same as not at all.
+        // Waiting means the reply has to have survived seal-flush-close, not
+        // merely raced it.
+        match ended(&hear).ended {
+            Ended::Refused(_) => {}
+            other => panic!("a malformed frame gave {other:?}"),
+        }
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode the answer");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
+        assert_eq!(reply.fields.reply_serial, Some(2));
+    }
+
+    /// A message type this version does not know is IGNORED, and the same way
+    /// whoever it was addressed to. A draft refused it inside the relay, so
+    /// the disposition depended on whether the destination happened to exist:
+    /// silently dropped for a name nobody owned, a disconnect for a live peer.
+    #[test]
+    fn an_unknown_message_type_is_ignored_wherever_it_is_addressed() {
+        let (bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+        let _ = &bus;
+
+        // The SAME message to a live peer and to a name nobody owns. Both
+        // must be ignored; the draft disconnected for the first and dropped
+        // the second, so the disposition turned on a third party.
+        for (which, destination) in [name_two.as_str(), ":1.404"].into_iter().enumerate() {
+            let serial = 2u32.saturating_add(u32::try_from(which).unwrap_or(0));
+            let mut frame = peer_call(destination, serial, "unknown to you");
+            // Type 9 is not a type this version knows. The header's type byte
+            // is at offset 1, and nothing else about the frame changes.
+            if let Some(kind) = frame.get_mut(1) {
+                *kind = 9;
+            }
+            one.send(&frame);
+        }
+        // Nothing comes back, and the connection is still alive: an ordinary
+        // call after them is answered.
+        one.send(&bus_call("GetId", 9));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
+        assert_eq!(
+            reply.fields.reply_serial,
+            Some(9),
+            "an unknown type was answered rather than ignored"
+        );
+        two.expect_silence();
+    }
+
+    /// `Hello` honours `NO_REPLY_EXPECTED` like every other method. It still
+    /// earns the name — it is the one bus method that changes state — but a
+    /// draft answered it regardless, which made it the single method that
+    /// ignored the flag.
+    #[test]
+    fn a_hello_that_wants_no_reply_still_earns_a_name() {
+        let (bus, mut clients) = bus_of(1);
+        let mut client = clients.pop().expect("one client");
+        let quiet = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            BUS_PATH,
+            Some(BUS_NAME),
+            "Hello",
+        )
+        .destination(BUS_NAME)
+        .flags(message::FLAG_NO_REPLY_EXPECTED)
+        .serial(1)
+        .encode()
+        .expect("encode");
+        let mut opening = format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+        opening.extend_from_slice(&quiet);
+        client.write_all(&opening).expect("write");
+
+        let mut peer = Peer {
+            stream: client,
+            held: Vec::new(),
+            lines: 1,
+        };
+        // No Hello reply — but the name exists, which the directory can say.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !bus.names().iter().any(|name| name == ":1.1") {
+            assert!(deadline > std::time::Instant::now(), "no name was assigned");
+            std::thread::yield_now();
+        }
+        // And the connection is usable, which proves it got past the gate.
+        peer.send(&bus_call("GetId", 2));
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(reply.fields.reply_serial, Some(2), "the Hello was answered");
+    }
+
+    /// The bus's own methods live on ONE object; `Peer` lives on every object.
+    /// Without the distinction, a call to some application's path addressed to
+    /// the bus name would be answered by the broker as though it were that
+    /// application's object.
+    #[test]
+    fn the_brokers_methods_are_at_the_brokers_path_and_ping_is_everywhere() {
+        let (_bus, mut clients) = bus_of(1);
+        let only = clients.pop().expect("one client");
+        let (mut peer, _) = Peer::arrive(only);
+
+        let elsewhere = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            "/org/example/Thing",
+            Some(BUS_NAME),
+            "ListNames",
+        )
+        .destination(BUS_NAME)
+        .serial(2)
+        .encode()
+        .expect("encode");
+        peer.send(&elsewhere);
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(reply.kind, message::MessageType::Error);
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.UnknownMethod")
+        );
+
+        // `Peer.Ping` is answered wherever it is sent.
+        let ping = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            "/org/example/Thing",
+            Some(PEER_INTERFACE),
+            "Ping",
+        )
+        .destination(BUS_NAME)
+        .serial(3)
+        .encode()
+        .expect("encode");
+        peer.send(&ping);
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
+        assert_eq!(reply.fields.reply_serial, Some(3));
+    }
+
+    /// `Hello` is held to the same rule as the rest of the broker's
+    /// interface: the broker's name, at the broker's object. One sent to
+    /// another path is not this broker's `Hello`, and a connection that sends
+    /// it has still not said `Hello` — so it is disconnected, and told why in
+    /// those words rather than the "Hello before Hello" a draft reported.
+    #[test]
+    fn a_hello_at_another_object_is_not_hello() {
+        let (mut client, hear) = serving();
+        let elsewhere = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            "/org/example/Thing",
+            Some(BUS_NAME),
+            "Hello",
+        )
+        .destination(BUS_NAME)
+        .serial(1)
+        .encode()
+        .expect("encode");
+        let mut opening = format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+        opening.extend_from_slice(&elsewhere);
+        client.write_all(&opening).expect("write");
+        match ended(&hear).ended {
+            Ended::Refused(why) => {
+                assert!(why.contains("before Hello"), "{why}");
+                assert!(
+                    why.contains("/org/freedesktop/DBus"),
+                    "the reason does not say what was wrong with it: {why}"
+                );
+            }
+            other => panic!("a Hello at another object gave {other:?}"),
+        }
+    }
+
+    /// A pid of zero is not a process. `SO_PEERCRED` answers 0 for a peer
+    /// whose pid does not exist in the reader's namespace, and reporting it
+    /// would hand a caller a number that looks like an answer and names
+    /// nothing — worse than "no such name", because `/proc/0` fails much later
+    /// and somewhere else.
+    ///
+    /// Pinned on the function rather than through a connection: a test cannot
+    /// make a live peer have an unmappable pid, and the rule is worth having
+    /// anyway.
+    #[test]
+    fn a_pid_that_names_nothing_is_not_reported() {
+        assert_eq!(usable_pid(42), Some(42));
+        assert_eq!(usable_pid(0), None, "pid 0 is not a process");
+        assert_eq!(usable_pid(-1), None, "a negative pid is not one");
+    }
+
+    /// A message the broker cannot RE-ENCODE is refused, and the sender stays.
+    ///
+    /// The broker adds a SENDER field, and the cap on an incoming header-field
+    /// array is the same number as the cap on an outgoing one — object paths
+    /// have no length bound of their own — so a legal message whose fields sit
+    /// within a couple of dozen bytes of the ceiling cannot be relayed. A
+    /// draft propagated that as a broker FAULT: the sender was torn down with
+    /// no reply at all, for a message this broker had itself accepted.
+    #[test]
+    fn a_message_that_cannot_be_re_encoded_is_refused_not_fatal() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        // The longest object path this codec will accept in a message with
+        // these fields — found by asking it, so the test tracks the constant
+        // rather than restating it.
+        let mut brimful = None;
+        for len in (65_000..65_500).rev() {
+            let path = format!("/{}", "a".repeat(len));
+            let built = message::Builder::method_call(
+                crate::wire::Endian::Little,
+                &path,
+                Some("org.example.Thing"),
+                "Do",
+            )
+            .destination(&name_two)
+            .serial(7)
+            .encode();
+            if let Ok(frame) = built {
+                brimful = Some(frame);
+                break;
+            }
+        }
+        let brimful = brimful.expect("no path length fits inside the field cap");
+        one.send(&brimful);
+
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode the refusal");
+        assert_eq!(reply.kind, message::MessageType::Error, "the sender was not told");
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.LimitsExceeded")
+        );
+        assert_eq!(reply.fields.reply_serial, Some(7));
+
+        // The sender is still here — that is the half a draft got wrong.
+        one.send(&bus_call("GetId", 8));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
+        assert_eq!(reply.fields.reply_serial, Some(8));
+        two.expect_silence();
+    }
+
+    /// A SENDER cannot evict a RECIPIENT by writing at it.
+    ///
+    /// The per-connection ceiling is one whole maximum message, so two large
+    /// messages back to back exceed it however promptly the recipient reads —
+    /// the first is still in the writer's hands when the second arrives. A
+    /// draft disconnected the recipient for that, and `ListNames` hands every
+    /// name to every caller, so one application could walk the bus and evict
+    /// every other application two frames at a time, at no cost to itself.
+    #[test]
+    fn a_sender_cannot_evict_the_peer_it_writes_to() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        // Two of these are over the recipient's ceiling; one is not. The
+        // recipient never reads either of them.
+        let big = 9 * 1024 * 1024;
+        for serial in 1..=2u32 {
+            let call = message::Builder::method_call(
+                crate::wire::Endian::Little,
+                "/org/example/Thing",
+                Some("org.example.Thing"),
+                "Do",
+            )
+            .destination(&name_two)
+            .serial(serial)
+            .body("ay", |writer| {
+                writer.array("y", |inner| {
+                    inner.append(&vec![0u8; big]);
+                    Ok(())
+                })
+            })
+            .expect("body")
+            .encode()
+            .expect("encode");
+            one.send(&call);
+        }
+
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(reply.kind, message::MessageType::Error);
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.LimitsExceeded"),
+            "the sender was not the one refused"
+        );
+
+        // And the recipient is still THERE — reading proves it, where the
+        // directory does not: `close` shuts the socket down without leaving
+        // the bus, so a name stays listed for as long as it takes the victim's
+        // own thread to notice. A draft of this test asserted on `names()` and
+        // so passed against the very behaviour it was written to forbid.
+        let frame = two.frame();
+        let (got, _) = message::decode(&frame, 0).expect("decode what arrived");
+        assert_eq!(got.kind, message::MessageType::MethodCall);
+        assert_eq!(
+            got.serial, 1,
+            "the recipient got something other than the first message"
+        );
+    }
+
+    /// A bus method checks the SIGNATURE it was called with, not just the
+    /// first argument's type. A draft read `args()[0]` and ignored the rest,
+    /// so a call with a spare argument, or a no-argument method called with a
+    /// body, ran as though it had been called correctly.
+    #[test]
+    fn a_bus_method_checks_the_signature_it_was_called_with() {
+        let (_bus, mut clients) = bus_of(1);
+        let only = clients.pop().expect("one client");
+        let (mut peer, _) = Peer::arrive(only);
+
+        // A no-argument method, called with one.
+        let noisy = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            BUS_PATH,
+            Some(PEER_INTERFACE),
+            "Ping",
+        )
+        .destination(BUS_NAME)
+        .serial(2)
+        .body("s", |writer| writer.string("unasked for"))
+        .expect("body")
+        .encode()
+        .expect("encode");
+        peer.send(&noisy);
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(reply.kind, message::MessageType::Error, "Ping took a body");
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.InvalidArgs")
+        );
+
+        // A one-argument method, called with two.
+        let extra = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            BUS_PATH,
+            Some(BUS_NAME),
+            "GetNameOwner",
+        )
+        .destination(BUS_NAME)
+        .serial(3)
+        .body("ss", |writer| {
+            writer.string(BUS_NAME)?;
+            writer.string("and one more")
+        })
+        .expect("body")
+        .encode()
+        .expect("encode");
+        peer.send(&extra);
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(reply.kind, message::MessageType::Error, "a spare argument was ignored");
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.InvalidArgs")
+        );
+
+        // A string that is not a bus name at all.
+        peer.send(&name_query("GetNameOwner", "not a bus name", 4));
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(reply.kind, message::MessageType::Error);
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.InvalidArgs"),
+            "a string that cannot be owned was looked up rather than refused"
+        );
+
+        // And the connection survives all three.
+        peer.send(&bus_call("GetId", 5));
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(reply.fields.reply_serial, Some(5));
+    }
+
+    /// `Hello` on a foreign INTERFACE is not this broker's `Hello`, on the
+    /// same rule that puts the rest of the interface at one object. A draft
+    /// checked the destination and the path and left the interface out, so
+    /// `org.example.Thing.Hello` earned a unique name.
+    #[test]
+    fn a_hello_on_a_foreign_interface_is_not_hello() {
+        let (mut client, hear) = serving();
+        let foreign = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            BUS_PATH,
+            Some("org.example.Thing"),
+            "Hello",
+        )
+        .destination(BUS_NAME)
+        .serial(1)
+        .encode()
+        .expect("encode");
+        let mut opening = format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+        opening.extend_from_slice(&foreign);
+        client.write_all(&opening).expect("write");
+        match ended(&hear).ended {
+            Ended::Refused(why) => assert!(why.contains("before Hello"), "{why}"),
+            other => panic!("a Hello on a foreign interface gave {other:?}"),
+        }
+    }
+
+    /// A peer whose pid is not knowable is not a peer that is absent.
+    ///
+    /// `SO_PEERCRED` answers 0 for a pid that does not exist in the reader's
+    /// namespace — the case td's jails will produce. A draft answered
+    /// `NameHasNoOwner` for it, which `ListNames` and `GetNameOwner`
+    /// contradict one call later, and made `GetConnectionCredentials` throw
+    /// away a uid the kernel HAD reported. An absent dictionary entry says
+    /// "not known"; a zero says "pid zero"; and "no such name" says something
+    /// else entirely.
+    ///
+    /// A socketpair cannot be made to have such a peer, so the connection is
+    /// put into the directory directly. What is under test is the LOOKUP.
+    #[test]
+    fn a_peer_whose_pid_is_unknown_is_not_a_peer_that_is_absent() {
+        let (bus, mut clients) = bus_of(1);
+        let only = clients.pop().expect("one client");
+        let (mut peer, _) = Peer::arrive(only);
+
+        let (_held, server) = UnixStream::pair().expect("socketpair");
+        let outbox = bus.outbox_for(server);
+        let placeless = bus.join(&outbox, 1000, 0).expect("join");
+
+        // The name is here.
+        peer.send(&name_query("NameHasOwner", &placeless, 2));
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
+
+        // Its uid is knowable.
+        peer.send(&name_query("GetConnectionUnixUser", &placeless, 3));
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(
+            reply.args().first().and_then(crate::wire::Value::as_u32),
+            Some(1000)
+        );
+
+        // Its pid is not, and that is its own answer.
+        peer.send(&name_query("GetConnectionUnixProcessID", &placeless, 4));
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(reply.kind, message::MessageType::Error);
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.UnixProcessIdUnknown"),
+            "an unknowable pid was reported as an unknown name"
+        );
+
+        // And the dictionary reports what it can rather than nothing.
+        peer.send(&name_query("GetConnectionCredentials", &placeless, 5));
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
+        let entries = reply
+            .args()
+            .first()
+            .and_then(crate::wire::Value::as_seq)
+            .expect("a dictionary")
+            .values(16)
+            .expect("read it");
+        let mut keys = Vec::new();
+        for entry in &entries {
+            let pair = entry.as_seq().expect("an entry").values(2).expect("read it");
+            if let Some(key) = pair.first().and_then(crate::wire::Value::as_str) {
+                keys.push(key.to_string());
+            }
+        }
+        assert!(keys.contains(&"UnixUserID".to_string()), "{keys:?}");
+        assert!(
+            !keys.contains(&"ProcessID".to_string()),
+            "an unknowable pid was reported anyway: {keys:?}"
+        );
+    }
+
+    /// A name lookup called with one string argument.
+    fn name_query(member: &str, name: &str, serial: u32) -> Vec<u8> {
+        message::Builder::method_call(crate::wire::Endian::Little, BUS_PATH, Some(BUS_NAME), member)
+            .destination(BUS_NAME)
+            .serial(serial)
+            .body("s", |writer| writer.string(name))
+            .expect("body")
+            .encode()
+            .expect("encode a name query")
     }
 
     #[test]
@@ -988,7 +3098,8 @@ mod tests {
             let (stream, _) = listener.accept().expect("accept");
             let guid = Guid::new(GUID).expect("guid");
             let quota = Quota::new();
-            let mut connection = Connection::accept(stream, guid, &quota).expect("connect");
+            let bus = Bus::new();
+            let mut connection = Connection::accept(stream, guid, &quota, &bus).expect("connect");
             connection.serve()
         });
         let summary = probe(&path, this_uid()).expect("probe");
@@ -1013,7 +3124,8 @@ mod tests {
             // Bound to a local rather than matched inline: the scrutinee's
             // `Result` temporary otherwise lives to the end of this block,
             // which is after `quota` is dropped.
-            let accepted = Connection::accept(stream, guid, &quota);
+            let bus = Bus::new();
+            let accepted = Connection::accept(stream, guid, &quota, &bus);
             if let Ok(mut connection) = accepted {
                 let _ = connection.serve();
             }
@@ -1023,36 +3135,23 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// A message arriving after BEGIN is framed, decoded and answered. Routing
-    /// is rung 14; being ANSWERED is this landing's job, because a caller left
-    /// waiting on a serial hangs rather than fails.
+    /// A message arriving after BEGIN is framed, decoded and answered, and the
+    /// first one a connection is allowed to send is `Hello`. Its answer is the
+    /// name every other peer on this bus will address it by, so the reply is
+    /// checked field by field here rather than through the `Peer` helper the
+    /// routing tests use: this is where the shape of it is pinned.
     #[test]
     fn a_message_after_begin_is_decoded_and_answered() {
         let (mut client, _hear) = serving();
-        let hex: String = this_uid()
-            .to_string()
-            .bytes()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
         // The handshake and the first message in ONE write, which is what
         // libdbus does.
-        let hello = message::Builder::method_call(
-            crate::wire::Endian::Little,
-            "/org/freedesktop/DBus",
-            Some("org.freedesktop.DBus"),
-            "Hello",
-        )
-        .destination("org.freedesktop.DBus")
-        .serial(1)
-        .encode()
-        .expect("encode");
-        let mut opening = format!("\0AUTH EXTERNAL {hex}\r\nBEGIN\r\n").into_bytes();
-        opening.extend_from_slice(&hello);
+        let mut opening = format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+        opening.extend_from_slice(&bus_call("Hello", 1));
         client.write_all(&opening).expect("write");
 
         let mut got = Vec::new();
         let mut chunk = [0u8; 512];
-        // The OK line, then the error reply; read until a whole frame is there.
+        // The OK line, then the reply; read until a whole frame is there.
         while message::frame_len(after_ok(&got)).ok().flatten().is_none() {
             let read = client.read(&mut chunk).expect("read");
             assert_ne!(read, 0, "the bus closed without answering");
@@ -1060,12 +3159,20 @@ mod tests {
         }
         let body = after_ok(&got);
         let (reply, _) = message::decode(body, 0).expect("decode the reply");
-        assert_eq!(reply.kind, message::MessageType::Error);
-        assert_eq!(
-            reply.fields.error_name,
-            Some("org.freedesktop.DBus.Error.NotSupported")
-        );
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
         assert_eq!(reply.fields.reply_serial, Some(1));
+        // The broker says who it is. A reply with no SENDER would leave a
+        // client unable to tell the bus's word from a peer's.
+        assert_eq!(reply.fields.sender, Some(BUS_NAME));
+        assert_eq!(reply.fields.signature, Some("s"));
+        let name = reply
+            .args()
+            .first()
+            .and_then(crate::wire::Value::as_str)
+            .expect("Hello answers with a name");
+        assert_eq!(name, ":1.1", "the first connection on a bus is :1.1");
+        // And it is addressed to the name it just handed out.
+        assert_eq!(reply.fields.destination, Some(":1.1"));
     }
 
     /// Split the OK line off the front of what the bus sent.
@@ -1278,7 +3385,8 @@ mod tests {
         {
             let (_client, server) = UnixStream::pair().expect("socketpair");
             let guid = Guid::new(GUID).expect("guid");
-            let accepted = Connection::accept(server, guid, &quota);
+            let bus = Bus::new();
+            let accepted = Connection::accept(server, guid, &quota, &bus);
             let mut connection = accepted.expect("accept");
             let spare = fs::File::open("/dev/null").expect("/dev/null");
             let owned: OwnedFd = spare.into();
@@ -1362,65 +3470,50 @@ mod tests {
     /// reply must come back, and it must name the ordinary call's serial.
     #[test]
     fn only_a_method_call_expecting_a_reply_is_answered() {
-        let (mut client, _hear) = serving();
+        let (client, _hear) = serving();
+        let (mut peer, name) = Peer::arrive(client);
+        assert_eq!(name, ":1.1");
+
         let signal = message::Builder::signal(
             crate::wire::Endian::Little,
             "/org/example",
             "org.example.Thing",
             "Happened",
         )
-        .serial(1)
+        .serial(2)
         .encode()
         .expect("encode the signal");
         let quiet = message::Builder::method_call(
             crate::wire::Endian::Little,
-            "/org/freedesktop/DBus",
-            Some("org.freedesktop.DBus"),
-            "Hello",
+            BUS_PATH,
+            Some(BUS_NAME),
+            "GetId",
         )
-        .destination("org.freedesktop.DBus")
+        .destination(BUS_NAME)
         .flags(message::FLAG_NO_REPLY_EXPECTED)
-        .serial(2)
-        .encode()
-        .expect("encode the quiet call");
-        let asking = message::Builder::method_call(
-            crate::wire::Endian::Little,
-            "/org/freedesktop/DBus",
-            Some("org.freedesktop.DBus"),
-            "Hello",
-        )
-        .destination("org.freedesktop.DBus")
         .serial(3)
         .encode()
-        .expect("encode the asking call");
+        .expect("encode the quiet call");
+        let asking = bus_call("GetId", 4);
 
-        let mut opening = format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
-        opening.extend_from_slice(&signal);
-        opening.extend_from_slice(&quiet);
-        opening.extend_from_slice(&asking);
-        client.write_all(&opening).expect("write");
+        // All three in ONE write, so the test distinguishes "answered nothing"
+        // from "answered late": exactly one reply must come back, and it must
+        // name the ordinary call's serial.
+        let mut together = signal;
+        together.extend_from_slice(&quiet);
+        together.extend_from_slice(&asking);
+        peer.send(&together);
 
-        let mut got = Vec::new();
-        let mut chunk = [0u8; 512];
-        while message::frame_len(after_ok(&got)).ok().flatten().is_none() {
-            let read = client.read(&mut chunk).expect("read");
-            assert_ne!(read, 0, "the bus closed without answering");
-            got.extend_from_slice(&chunk[..read]);
-        }
-        let body = after_ok(&got);
-        let (reply, used) = message::decode(body, 0).expect("decode the reply");
-        assert_eq!(reply.kind, message::MessageType::Error);
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode the reply");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
         assert_eq!(
             reply.fields.reply_serial,
-            Some(3),
+            Some(4),
             "the answer belongs to the call that asked for one"
         );
         // And that is the ONLY answer: nothing follows it.
-        assert_eq!(
-            body.len(),
-            used,
-            "the bus answered a message that did not ask"
-        );
+        peer.expect_silence();
     }
 
     /// A bus that accepts and then says nothing does not hold `probe` for
@@ -1465,25 +3558,18 @@ mod tests {
     fn each_reply_carries_its_own_serial() {
         let (mut client, _hear) = serving();
         let mut opening = format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
-        for serial in 1..=3u32 {
-            let call = message::Builder::method_call(
-                crate::wire::Endian::Little,
-                "/org/freedesktop/DBus",
-                Some("org.freedesktop.DBus"),
-                "Hello",
-            )
-            .destination("org.freedesktop.DBus")
-            .serial(serial)
-            .encode()
-            .expect("encode");
-            opening.extend_from_slice(&call);
+        // `Hello` once — a second one ends the connection — and then three
+        // calls that can be repeated, which is what this is really about.
+        opening.extend_from_slice(&bus_call("Hello", 1));
+        for serial in 2..=4u32 {
+            opening.extend_from_slice(&bus_call("GetId", serial));
         }
         client.write_all(&opening).expect("write");
 
         let mut got = Vec::new();
         let mut chunk = [0u8; 1024];
         let mut seen = Vec::new();
-        while seen.len() < 3 {
+        while seen.len() < 4 {
             let read = client.read(&mut chunk).expect("read");
             assert_ne!(read, 0, "the bus closed after {} replies", seen.len());
             got.extend_from_slice(&chunk[..read]);
@@ -1501,7 +3587,11 @@ mod tests {
         }
         let serials: Vec<u32> = seen.iter().map(|(serial, _)| *serial).collect();
         let answered: Vec<Option<u32>> = seen.iter().map(|(_, to)| *to).collect();
-        assert_eq!(answered, vec![Some(1), Some(2), Some(3)], "wrong calls answered");
+        assert_eq!(
+            answered,
+            vec![Some(1), Some(2), Some(3), Some(4)],
+            "wrong calls answered"
+        );
         let mut unique = serials.clone();
         unique.sort_unstable();
         unique.dedup();

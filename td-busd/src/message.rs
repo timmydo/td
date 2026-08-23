@@ -236,6 +236,23 @@ pub struct Message<'a> {
     pub serial: u32,
     pub fields: Fields<'a>,
     args: Vec<Value<'a>>,
+    /// The body exactly as it arrived, still in this message's own byte order.
+    ///
+    /// A broker forwards a body rather than reading it, and the only faithful
+    /// way to do that is to copy the bytes. Re-marshalling the decoded `args`
+    /// would work for everything this codec round-trips and would silently
+    /// change any encoding the specification permits but this writer does not
+    /// choose — a non-minimal padding, a different but legal ordering.
+    ///
+    /// FIDELITY is the whole argument. A draft of this comment also claimed it
+    /// was cheaper, which it is not: `encode` validates the body against its
+    /// signature with a full `read_body` walk and then copies it again, so a
+    /// relay walks the body twice and copies it twice either way. The second
+    /// walk is redundant for a body that was just decoded against the same
+    /// signature and byte order, and skipping it is an optimisation with a
+    /// trusted-input footgun in it — recorded in `APPLICATIONS.md` §D rather
+    /// than taken here.
+    body: &'a [u8],
 }
 
 impl<'a> Message<'a> {
@@ -400,9 +417,18 @@ pub fn decode(bytes: &[u8], received_fds: u32) -> Result<(Message<'_>, usize), M
             serial,
             fields,
             args,
+            body,
         },
         total,
     ))
+}
+
+impl<'a> Message<'a> {
+    /// The body as it arrived, for a forwarder to copy. Its byte order is
+    /// `self.endian`, which is the sender's and not necessarily the broker's.
+    pub fn body_bytes(&self) -> &'a [u8] {
+        self.body
+    }
 }
 
 /// `decode` plus the checks that apply to a message arriving FROM A CLIENT.
@@ -643,6 +669,21 @@ impl<'a> Builder<'a> {
         fill(&mut writer)?;
         self.body_signature = signature;
         self.body = writer.into_bytes();
+        Ok(self)
+    }
+
+    /// Take an already-marshalled body verbatim.
+    ///
+    /// The caller owns the correctness of what it passes: these bytes are
+    /// written into the message unread, so they must be a body of `signature`
+    /// in THIS builder's byte order. It exists for forwarding, where both are
+    /// true because the bytes came from a message this broker decoded — and
+    /// where decoding-and-re-marshalling would be a second chance to change
+    /// something a peer is entitled to have delivered unaltered.
+    pub fn body_raw(mut self, signature: &'a str, body: Vec<u8>) -> Result<Self, WireError> {
+        wire::validate_signature(signature)?;
+        self.body_signature = signature;
+        self.body = body;
         Ok(self)
     }
 

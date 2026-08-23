@@ -8,6 +8,7 @@ const MODULES: &[(&str, &str)] = &[
     ("message", include_str!("../../../td-busd/src/message.rs")),
     ("name", include_str!("../../../td-busd/src/name.rs")),
     ("recorded", include_str!("../../../td-busd/src/recorded.rs")),
+    ("registry", include_str!("../../../td-busd/src/registry.rs")),
     ("sys", include_str!("../../../td-busd/src/sys.rs")),
     ("transport", include_str!("../../../td-busd/src/transport.rs")),
     ("wire", include_str!("../../../td-busd/src/wire.rs")),

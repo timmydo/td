@@ -2586,11 +2586,15 @@ attacker. A message count cannot bound memory when message size is
 separately bounded; only bytes can. So: **a per-connection outgoing-queue
 byte ceiling and a global one**, both named constants, with a message
 count kept only as a secondary guard against many tiny messages. Reaching
-the per-connection ceiling disconnects that connection; reaching the
-global one is a broker-level condition that disconnects the largest
-consumer rather than refusing service to everyone, and is logged as a
-distinct diagnostic because it means a policy elsewhere is wrong. The
-test is a client that subscribes broadly and never reads.
+the per-connection ceiling **refuses the SENDER with
+`LimitsExceeded` and leaves the recipient alone** — amended from
+"disconnects that connection", for the reason the landed section below
+gives: the ceiling is one maximum message, so two of them back to back
+exceed it whatever the recipient does, and the sender picks the moment.
+Reaching the global one is a broker-level condition that disconnects the
+largest consumer rather than refusing service to everyone, and is logged
+as a distinct diagnostic because it means a policy elsewhere is wrong.
+The test is a client that subscribes broadly and never reads.
 
 ### `org.freedesktop.DBus`
 
@@ -2970,6 +2974,272 @@ descriptors go to peers, and until rung 14 there are no peers to name, so
 no client sends one to this broker. Rung 14 must make the decoder's count
 the message's DECLARED share of the queue rather than the queue's depth,
 and the test for it is two fd-carrying messages in a single `write`.
+
+### What is landed of the bus interface
+
+Names and directed routing are landed; match rules and name ownership are
+not. Of the `org.freedesktop.DBus` roster above: `Hello` (assigning
+`:1.N`, with anything before it disconnecting and a second one ending the
+connection), `ListNames`, `ListActivatableNames`, `NameHasOwner`,
+`GetNameOwner`, `GetConnectionUnixUser`, `GetConnectionUnixProcessID`,
+`GetConnectionCredentials`, `GetId` and `Peer.Ping`. A `Hello` that omits
+its `DESTINATION` is accepted, because there is nothing else a connection
+with no name could be addressing — the broker is the only peer it can
+reach — and requiring the field made the no-destination case unreachable
+in the routing match while turning a lenient one into a disconnect whose
+stated reason was "Hello before Hello". Absent:
+`RequestName`/`ReleaseName` and the owner queue, `AddMatch`/`RemoveMatch`,
+`Introspectable.Introspect`, `Peer.GetMachineId`, and the
+`NameOwnerChanged`/`NameAcquired`/`NameLost` signals.
+
+**Absent means `UnknownMethod`, not silence.** A client told its match
+rule was installed and then never signalled is worse off than one told
+there is no such method: the first waits, the second fails. So the bus
+answers every call it cannot serve rather than dropping it, and
+`ListActivatableNames` answers with an EMPTY array rather than an error
+because that is the true answer — td has no service activation, and
+nothing on this bus starts because it was called.
+
+A method called with the wrong arguments is `InvalidArgs` and the
+connection continues. That is the same rule read the other way: a bad
+CALL is not a bad peer, and a draft disconnected for a name lookup with
+no name in it — which its own comment said it did not do. The check is
+on the SIGNATURE, not on the first argument's type: a draft read
+`args()[0]` and ignored the rest, so a lookup with a spare argument, or
+a no-argument method called with a body, ran as though it had been
+called correctly. A lookup's argument is also validated as a bus name,
+because a string that cannot be owned by anyone is a malformed question
+rather than a name with no owner. `Hello` is the one method whose
+arguments are not checked, and cannot be: an error reply has to be
+addressed, and a connection that has not said `Hello` has no name to
+address one to.
+
+**The broker's own methods are at the broker's own object.**
+`org.freedesktop.DBus`'s methods are answered only at
+`/org/freedesktop/DBus`; `org.freedesktop.DBus.Peer` is answered wherever
+it is addressed, because the specification puts `Peer` on every object a
+connection exposes. Without the distinction a call to an application's
+own path, addressed to the bus name, would be answered by the broker as
+though it were that application's object. `Hello` is held to the same
+rule on all three counts — the bus's name, the bus's interface and the
+bus's object — which is also what keeps the no-`DESTINATION` case above a
+live branch rather than a dead one. A draft checked the name and the
+object and left the interface out, so `org.example.Thing.Hello` earned a
+unique name.
+
+**The per-caller filter is NOT landed, and this is the gap that matters
+most in this section.** Everything above answers globally: `ListNames`
+reports every unique name on the bus to every caller, and
+`GetConnectionCredentials` reports any peer's uid and pid to any peer.
+The filtering this section specifies — answering only about names the
+caller may `see`, and reporting a name it may not as absent — is the
+policy, and it depends on the sandbox registration this section also
+specifies and which is not built. Naming this plainly rather than letting
+"the methods are implemented" stand for "the policy is implemented":
+today's broker is correct for a single-user session of mutually trusting
+peers, which is what td runs, and it is NOT yet the confinement boundary
+§D describes. The `td.AppId` extension to `GetConnectionCredentials` is
+absent for the same reason.
+
+What IS the broker's word rather than the caller's, already: the uid and
+pid a credential lookup reports are `SO_PEERCRED` taken once at accept
+and held in the directory, so a peer cannot describe itself into a
+different answer. That is the half of the mechanism the policy will sit
+on when it lands.
+
+**Routing is DIRECTED only.** A message naming a `DESTINATION` that is a
+unique name on this bus is delivered to it; one naming a name nobody owns
+is refused with `NameHasNoOwner`; one with no `DESTINATION` splits by
+TYPE. A signal without one is a broadcast, which needs the match rules
+that have not landed, so it is accepted and goes nowhere — the one silent
+drop this increment keeps, for the reason the specification gives: a
+signal has no reply to be missing, and erroring one would be answering a
+message addressed to nobody. A method CALL without one gets the opposite
+treatment. A draft of this section had both dropped, which is exactly the
+failure the paragraph above argues against: the caller is waiting on a
+serial that no route can currently answer, so it is told `NotSupported`
+rather than left to time out.
+
+**`SENDER` is rebuilt, not relayed, and the body is copied.** The broker
+re-encodes the header with the sending connection's unique name in
+`SENDER` — a client-supplied one still disconnects, per the rule above —
+and copies the body byte for byte rather than re-marshalling it. A broker
+has no business re-encoding a payload it does not read: re-marshalling
+would round-trip correctly for everything this codec writes and would
+silently change any encoding the specification permits but this writer
+does not choose, and it would cost the whole body twice. The sender's
+`serial` is preserved, because it is what the sender will match a reply
+against.
+
+**A message carrying descriptors between peers is REFUSED, not delivered
+without them.** Forwarding is the descriptor half of rung 14. Until it
+lands, a peer-directed message with a nonzero `UNIX_FDS` gets
+`NotSupported`, because delivering it stripped would hand the recipient a
+body whose `h` values index nothing.
+
+**And the pipelined-count mismatch recorded above is now LIVE.** A draft
+of this section claimed the refusal above made it unreachable. That is
+false twice over. It is decided in `message.rs`, against the whole
+freight queue, before `dispatch` has looked at the destination at all —
+so a refusal at the routing layer cannot make a decode-layer refusal
+unreachable. And the direction is backwards: the reason the case was
+unreachable is quoted above — *"until rung 14 there are no peers to name,
+so no client sends one to this broker"* — and this landing is what
+creates peers to name. A client that negotiates `UNIX_FD` and pipelines
+two descriptor-carrying messages into one write is disconnected with a
+count mismatch for a count it got right. The fix is the one already
+stated: the decoder's count must become the message's DECLARED share of
+the queue rather than the queue's depth, and it lands with forwarding,
+where the declared share is needed anyway. Recorded as reachable rather
+than left reading as closed.
+
+**One writer per socket.** Each connection has an outgoing queue and a
+thread that drains it, which is what makes the byte ceilings above a
+queue rather than a blocking write: a sender appends and moves on, and a
+peer that will not read fills its own queue instead of stalling whoever
+wrote to it. The handshake's `OK` line goes through that same queue.
+Writing it from the reading thread and routed messages from the writer
+would be two writers on one socket, kept apart only by the order things
+happen to occur in — a bug that would appear the first time a peer was
+busy and never before.
+
+The ceilings themselves are landed as this section specifies: a
+per-connection byte ceiling of one whole maximum message, a bus-wide
+ceiling of four of those, and a message COUNT kept as the secondary
+guard against many tiny frames. Reaching the per-connection ceiling
+tells the SENDER `LimitsExceeded`; reaching the bus ceiling disconnects
+the largest consumer and logs it as the distinct broker-level
+diagnostic.
+
+**Reaching the per-connection ceiling does NOT disconnect the recipient,
+and this section is amended to say so.** The rule as written above
+attributed the fault to the recipient, and the sender chooses when it
+fires: the ceiling is one whole maximum message, so two maximum messages
+back to back exceed it BY CONSTRUCTION — the first is still in the
+writer's hands when the second arrives, however promptly the recipient
+reads. Under the old rule any peer could evict any other with two
+frames, and `ListNames` hands every unique name to every caller, so one
+application could walk the bus and evict every other application at no
+cost to itself. That is a worse denial of service than the one the rule
+existed to prevent, and it is the same argument the bus ceiling is
+written from — *a ceiling an attacker aims at everyone else is not a
+bound* — applied to the case that is aimed at someone else by
+definition. The recipient's memory is still bounded by its own ceiling,
+and a peer that genuinely never reads is removed when it becomes the
+BUS's largest consumer, which is the right test because it compares
+peers rather than trusting whoever wrote last.
+
+Four things about those ceilings were wrong in drafts, and the first
+three are the same mistake in different places: **a bound on a queue is
+not a bound on memory.**
+
+First, the empty-queue exception applies to the per-connection ceiling
+ONLY. Applied to the bus ceiling too it stops being an exception and
+becomes a multiplier — every queue is empty at some moment — and eight
+connections took 134 MiB against a 67 MiB bound.
+
+Second, **the charge lasts until the bytes are ON THE WIRE AND FREED,
+not until the frame leaves the deque, and not until the socket is shut
+down.** A draft uncharged a frame when the writer took
+it, so a writer blocked in `sendmsg` against a peer that had stopped
+reading held a whole maximum message that no counter knew about — and the
+queue it came from now looked empty, so the exception admitted another.
+That is the same multiplier rebuilt one frame lower down, and no test
+could see it, because the tests that measured the ceilings never started
+a writer. What a connection is holding, what the remedy weighs when it
+picks the largest consumer, and the message COUNT backstop all count the
+in-flight frame. A second draft then had `close` reclaim those bytes
+itself, which is earlier still: `close` releases the SOCKET, and the
+blocked `sendmsg` has to return before the allocation is freed. Budget
+released in that window is real budget against memory that is still
+live, so only the writer gives it back — and the bus's remedy waits,
+briefly and boundedly, for the writer of the connection it just closed,
+because otherwise it reports success having freed nothing yet.
+
+Third, **the remedy runs wherever the condition is seen, and it names a
+real consumer.** A draft ran it
+only on the routing path and turned a bus overflow into a failure of
+whoever was calling — so four peers that stop reading fill the budget and
+the next INNOCENT peer to call a bus method, or the next connection to
+reach its `Hello` reply or even its `OK` line, is the one disconnected
+while the four sit there. A ceiling that an attacker aims at everyone
+else is not a bound. Every append now applies the remedy and retries
+once, and the frame is handed back rather than cloned, because cloning a
+16 MiB message to retry it doubles the memory at the moment there is
+least of it. The largest consumer is also re-read before it is acted on:
+sampling each queue under its own lock cannot be one consistent snapshot
+without holding every queue lock at once, which is a far worse
+lock-ordering problem than the unfairness it would fix — but the one
+outcome worth ruling out is disconnecting a peer that is holding
+nothing, and a re-read rules it out. The victim is chosen under the
+directory lock and dealt with without it, so the bounded wait above does
+not stall every other route on the bus.
+
+What the ceilings do NOT bound is the relay's transient cost: `restamp`
+copies the body and `encode` allocates the whole outgoing frame, so a
+16 MiB relay transiently costs about twice that in the sending
+connection's own thread before any of it is charged. `encode` also
+re-validates the body it was handed with a full walk, which is redundant
+for one just decoded against the same signature and byte order. Both are
+recorded rather than fixed: skipping the second walk needs a
+trusted-body path through the codec, which is a footgun to add in a
+review cycle.
+
+**What a connection costs is two descriptors and two threads**, not one
+of each: the writer needs its own handle on the socket, and the reader
+blocks in `recvmsg` while the writer blocks in `sendmsg`. The
+connection-ceiling arithmetic elsewhere in this section still describes
+one apiece.
+
+**A caller whose callee disconnects mid-call waits for ever.** There is
+no pending-reply table, so nothing notices that the connection a call was
+routed to has gone and nothing sends the error `dbus-daemon` sends. This
+is the "left waiting on a serial" case this section argues against
+everywhere else, and it is an absence rather than a decision: the
+`128 pending replies` bound listed above is where it lands.
+
+**The same absence has an integrity half, and it is the more serious
+one.** With nothing tracking which call is outstanding to whom, any peer
+may send a `METHOD_RETURN` or an `ERROR` carrying an arbitrary
+`REPLY_SERIAL` to any other peer — and libdbus and GDBus both match a
+pending call by serial without checking who the reply came from. So peer
+B can answer a call A made to C, and A's client library will hand the
+answer to A's caller. The broker's stamped `SENDER` makes that
+detectable and nothing detects it. The pending-reply table is therefore
+not only an availability fix; it is what makes a reply's origin
+enforceable, and it belongs beside the `see` policy rather than after it.
+
+**A message can be legal to send and impossible to relay.** The broker
+inserts a `SENDER`, and the cap on an incoming header-field array is the
+same number as the cap on an outgoing one — object paths have no length
+bound of their own — so a message whose fields sit within a couple of
+dozen bytes of the ceiling cannot be re-encoded for delivery. It is
+refused with `LimitsExceeded` and the sender stays connected; a draft
+propagated it as a broker fault, which tore the sender down with no
+reply at all for a message this broker had itself accepted. Giving the
+incoming array explicit headroom for the field the broker will add would
+close it properly, and is a change to what td-busd accepts rather than
+to how it relays.
+
+**A pid the kernel cannot report is not a name that has no owner.**
+`SO_PEERCRED` answers 0 for a pid that does not exist in the reader's
+namespace, which is the case td's own jails will produce.
+`GetConnectionUnixProcessID` answers `UnixProcessIdUnknown` for it and
+`GetConnectionCredentials` returns the entries it can fill — `UnixUserID`
+without `ProcessID` — because an absent entry says "not known" where a
+zero says "pid zero". Two drafts got this wrong in opposite directions:
+the first reported `ProcessID: 0`, the second refused the whole call and
+discarded a uid the kernel had reported.
+
+**Foreign interop is checked against three independent implementations**,
+because a broker that only talks to its own tests is a codec with extra
+steps: sd-bus (`busctl list`, `status`, `call`), libdbus 1.12.16
+(`dbus-send --print-reply`), and GDBus 2.86.0 (`gdbus call`) each
+complete the handshake, say `Hello` and use the bus's own interface. The
+one that exercises ROUTING is a `busctl` call to a parked `gdbus`
+connection: sd-bus to GDBus, through td-busd, both `Peer.Ping` and an
+`Introspect` that returns a real body — a full round trip in which the
+broker is the only td code involved.
 
 ---
 
