@@ -99,8 +99,8 @@ not worktree-local.
 
 # Code review: three per commit
 
-Every commit that lands receives three independent reviews over its exact
-`git show HEAD`:
+Every increment is read by three independent reviewers before it lands. They
+review one exact revision of it, which is not always the revision that lands:
 
 1. a code-review subagent using the acting agent's latest strong model;
 2. the other model family's CLI at strong model and high reasoning effort;
@@ -129,25 +129,49 @@ finding or explicitly dismisses it with a reason, and writes its own summary
 into the commit message.
 
 Raw reviewer output goes to uncommitted scratch files. Account for every
-finding; do not paste the raw reports into the commit.
+finding and give each one a disposition, and say how many each reviewer
+raised, so that dropping one leaves a gap in the count rather than no trace at
+all. Do not paste the raw reports into the commit. Nothing checks any of this:
+the scratch files do not outlive the session and `ready` cannot read them, so
+the summary is an honesty protocol and not a verified one.
 
-## Review cycle limit
+## Review cycles and confirmation passes
 
-Schedule at most two complete review cycles for one commit. A cycle is all
-three reviewers examining the same exact commit, including an approved waiver
-or substitute for a slot.
+Schedule one complete panel cycle per commit, at the front, and confirm after
+it. A cycle is all three reviewers over the exact commit, including an
+approved waiver or substitute for a slot. A confirmation pass is the acting
+agent's review subagent alone, reading what changed since the revision the
+panel read.
 
-The first cycle reviews the initial implementation. Reconcile every finding
-and amend. If any reviewer reports a finding that must be fixed or dismissed,
-the amended commit needs the second complete cycle as the acceptance pass. A
-mechanically added summary and trailer block after three no-finding reports
-does not trigger another cycle.
+After the cycle, reconcile every finding, amend, and confirm. Confirm again
+after any further amendment. Adding the summary and trailer block is not a
+change to confirm.
 
-If the second cycle finds a release blocker, disposition it but stop before a
-third review, declaring the commit ready, or pushing. Ask the user whether to
-authorize a third exact-commit cycle. A reviewer may clarify an existing
-report without consuming a cycle only while the reviewed commit is unchanged.
-Never split the changed commit among ad-hoc reviewers to evade the limit.
+Re-run the full panel only when the amendment does one of the following. This
+list is exhaustive: never re-run on a judgment that the changes were large.
+
+- touches a file no reviewer in the cycle saw;
+- amends `UNSAFE.md` or a surface it governs: a new syscall, a new
+  value-pinned request, or a second scoped `#[allow]`;
+- adds a crate, a dependency, or a `[[package]]` entry;
+- changes what a check asserts rather than making an existing assertion pass;
+- follows a confirmation pass that reported a release blocker.
+
+Stop — before another review, before declaring the commit ready, and before
+pushing — when a release blocker survives a panel re-run, when successive
+confirmation passes keep reporting new work instead of converging, or when a
+trigger fires again after a re-run. Ask the user whether to authorize more.
+Never ship a known blocker or split the changed commit among ad-hoc reviewers
+to evade the loop.
+
+A reviewer may clarify an existing report without consuming anything while the
+reviewed commit is unchanged.
+
+Record which revision was reviewed. `ready` checks the shape of the trailers,
+not which revision each reviewer read, so when the landed commit differs from
+the revision the panel saw, the summary names that revision by its full commit
+ID and says what changed after it. Amending makes that object unreachable, so
+the ID identifies the review rather than reproducing it.
 
 ## Codex CLI review
 

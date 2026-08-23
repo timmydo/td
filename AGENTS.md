@@ -212,8 +212,9 @@ boundaries are:
 # Code review
 
 - Each commit receives the required independent subagent and cross-model
-  reviews over its exact `git show`; at most two review cycles are scheduled
-  without explicit user authorization for a third.
+  reviews over its own diff. One panel cycle is scheduled per commit; later
+  passes are the review subagent alone, and re-running the panel needs a
+  named escalation trigger. Stop and ask when the passes stop converging.
 - The acting agent reconciles every finding and records its own summary,
   reviewer identities, and checks in the commit message.
 
