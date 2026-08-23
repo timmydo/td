@@ -7,6 +7,7 @@ use std::io::{IsTerminal, Read, Seek, Write};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Program arguments as raw bytes. A pattern or a filename need not be UTF-8, so
 /// nothing here goes through `String`.
@@ -1119,9 +1120,16 @@ pub struct Walked {
 /// discard the whole walk, which is what `?` here used to do — `grep -r` then
 /// reported nothing at all and blamed the root. GNU searches what it can reach
 /// and reports each directory it cannot.
-pub fn walk(root: &Path, logical: bool) -> Walked {
+///
+/// `prune` is `--exclude-dir`, and it is a parameter of the WALK rather than a
+/// filter over its result because an excluded directory must never be ENTERED:
+/// GNU reports neither a permission error from inside one nor a symlink cycle
+/// through one, and either would still be collected by a walk that filtered
+/// afterwards. It is asked with the directory's path and whether that path is
+/// the root, since the two are matched against different things.
+pub fn walk(root: &Path, logical: bool, prune: &dyn Fn(&Path, bool) -> bool) -> Walked {
     let mut out = Walked { files: Vec::new(), diags: Vec::new(), descended: false };
-    out.descended = walk_from(root, true, logical, &mut Vec::new(), &mut out);
+    out.descended = walk_from(root, true, logical, prune, &mut Vec::new(), &mut out);
     out
 }
 
@@ -1133,6 +1141,7 @@ fn walk_from(
     root: &Path,
     follow: bool,
     logical: bool,
+    prune: &dyn Fn(&Path, bool) -> bool,
     chain: &mut Vec<(u64, u64)>,
     out: &mut Walked,
 ) -> bool {
@@ -1169,6 +1178,22 @@ fn walk_from(
             return true;
         }
     };
+    // The ROOT is excluded only once it has been opened, and the ordering is
+    // measurable: `-r --exclude-dir=X PAT X` reports `Permission denied` when X
+    // is unreadable and says nothing at all when X is readable. GNU's grepdesc
+    // filters a descriptor it already holds, so the open's error outranks the
+    // exclusion. A directory the WALK found is pruned before any open instead,
+    // which is why an unreadable one NESTED under an excluded name stays quiet.
+    //
+    // Gated on `follow` because this function RECURSES: `follow` is true only
+    // for the walk's own root, and the root is the one directory whose name is
+    // matched as an operand rather than on its last component. Ungated, every
+    // nested directory was asked twice and the second question was the wrong
+    // one -- `--exclude-dir='e/f'` then pruned `e/f`, which GNU does not.
+    if follow && prune(root, true) {
+        chain.pop();
+        return true;
+    }
     let mut entries: Vec<PathBuf> = Vec::new();
     for entry in reader {
         match entry {
@@ -1179,12 +1204,19 @@ fn walk_from(
     entries.sort();
     for path in entries {
         match stat(&path, logical) {
-            Ok(meta) if meta.is_dir() => match chain.contains(&ident(&meta)) {
-                true => out.diags.push((path, Diag::Loop)),
-                false => {
-                    walk_from(&path, false, logical, chain, out);
+            // The exclusion is asked BEFORE the cycle test, as GNU's grepdirent
+            // asks it: `-R --exclude-dir=up` over a directory reachable through
+            // itself warns about no loop, because the loop is never reached.
+            Ok(meta) if meta.is_dir() => {
+                if !prune(&path, false) {
+                    match chain.contains(&ident(&meta)) {
+                        true => out.diags.push((path, Diag::Loop)),
+                        false => {
+                            walk_from(&path, false, logical, prune, chain, out);
+                        }
+                    }
                 }
-            },
+            }
             // A SYMLINK found by a physical walk is skipped and never reaches the
             // search: that is `fts`'s FTS_PHYSICAL rather than any policy, so no
             // option turns it back on. A logical walk resolved it before the test
@@ -1240,6 +1272,462 @@ pub fn number(n: u64) -> Vec<u8> {
     }
     digits.reverse();
     digits
+}
+
+/// `fnmatch(3)` with none of its flags, which is what GNU grep's `--include`,
+/// `--exclude` and `--exclude-dir` compare with: `*` crosses a `/` and matches a
+/// leading dot, `?` takes exactly one byte, `[...]` is a set with `!`/`^`
+/// negation and `a-z` ranges, and `\` escapes the byte after it. Bytes rather
+/// than characters, the corpus being scored in the C locale.
+///
+/// Iterative with ONE backtrack point rather than recursive: a pattern of many
+/// stars against a long name would otherwise recurse once per star per position,
+/// and a `--include` glob is attacker-supplied in exactly the way a pattern is.
+pub fn glob_match(pat: &[u8], name: &[u8]) -> bool {
+    glob_match_with(pat, name, caret_negates())
+}
+
+/// glibc reads `POSIXLY_CORRECT` once and keeps the answer for the life of the
+/// process, so a program's own later `setenv` cannot change what a glob means
+/// mid-run. Cached here for that reason, not for speed.
+fn caret_negates() -> bool {
+    static CARET: OnceLock<bool> = OnceLock::new();
+    *CARET.get_or_init(|| !posixly_correct())
+}
+
+/// The matcher proper. `caret` is whether a leading `^` negates a set, which is
+/// the environment's answer rather than the pattern's -- taking it as an
+/// argument is what lets one process test both.
+fn glob_match_with(pat: &[u8], name: &[u8], caret: bool) -> bool {
+    let (mut p, mut n) = (0usize, 0usize);
+    // Where the tail after the most recent `*` restarts when it fails.
+    let mut resume: Option<(usize, usize)> = None;
+    loop {
+        if pat.get(p) == Some(&b'*') {
+            // A run of stars is one star; remembering the first is enough.
+            while pat.get(p) == Some(&b'*') {
+                p = p.saturating_add(1);
+            }
+            resume = Some((p, n));
+            continue;
+        }
+        let step = match p == pat.len() {
+            // Pattern spent: a match only if the name is spent too. Otherwise
+            // fall through and let a `*` behind us eat the rest.
+            true if n == name.len() => return true,
+            true => None,
+            false => glob_step(pat, p, name, n, caret),
+        };
+        match step {
+            Some((np, nn)) => (p, n) = (np, nn),
+            None => match resume {
+                Some((rp, rn)) if rn < name.len() => {
+                    n = rn.saturating_add(1);
+                    p = rp;
+                    resume = Some((rp, n));
+                }
+                _ => return false,
+            },
+        }
+    }
+}
+
+/// One pattern item against one name byte. `None` is a mismatch, which the
+/// caller answers by backtracking rather than by failing outright.
+fn glob_step(pat: &[u8], p: usize, name: &[u8], n: usize, caret: bool) -> Option<(usize, usize)> {
+    let c = *pat.get(p)?;
+    let g = *name.get(n)?;
+    match c {
+        b'?' => Some((p.saturating_add(1), n.saturating_add(1))),
+        // An unclosed `[` is not a set at all: fnmatch reads it as the byte,
+        // which is the literal compare at the bottom of this match.
+        b'[' => match glob_class(pat, p, g, caret) {
+            Class::Closed(next, true) => Some((next, n.saturating_add(1))),
+            Class::Closed(_, false) => None,
+            // The `[` was an ordinary byte after all; the caller re-reads what
+            // follows it as pattern, which is what the literal arm below does.
+            Class::Literal if g == b'[' => Some((p.saturating_add(1), n.saturating_add(1))),
+            Class::Literal => None,
+            Class::Invalid => None,
+        },
+        b'\\' => match pat.get(p.saturating_add(1)) {
+            Some(&e) if e == g => Some((p.saturating_add(2), n.saturating_add(1))),
+            // A TRAILING backslash escapes nothing and matches NOTHING: glibc
+            // answers FNM_NOMATCH there rather than taking it as a literal, so
+            // a `--include=a\` selects no file at all.
+            _ => None,
+        },
+        _ if c == g => Some((p.saturating_add(1), n.saturating_add(1))),
+        _ => None,
+    }
+}
+
+/// How a `[...]` ended.
+enum Class {
+    /// Closed: index just past the `]`, and whether the byte is in the set.
+    Closed(usize, bool),
+    /// Ran off the end at an ordinary position. glibc then reads the `[` as an
+    /// ordinary byte and re-parses what follows -- so `[a` matches `[a`, and
+    /// `[\]` matches `[]` because the escape survives the fallback.
+    Literal,
+    /// Ran off the end INSIDE a range or a `[.`/`[:`/`[=` construct. There is no
+    /// fallback here: glibc answers FNM_NOMATCH for the whole pattern, which is
+    /// why `[a-` matches nothing at all where `[a` matches itself.
+    Invalid,
+}
+
+/// The `[...]` opening at `open`, tested against `g`.
+fn glob_class(pat: &[u8], open: usize, g: u8, caret: bool) -> Class {
+    let mut i = open.saturating_add(1);
+    // `!` always negates. `^` does so only when POSIXLY_CORRECT is UNSET; under
+    // it glibc reads the `^` as an ordinary member, so `[^^]` selects `^` alone.
+    let negate = pat.get(i) == Some(&b'!') || (caret && pat.get(i) == Some(&b'^'));
+    if negate {
+        i = i.saturating_add(1);
+    }
+    let mut found = false;
+    // A `]` FIRST in the set is the byte, not the close -- `[]]` holds one `]`.
+    let mut first = true;
+    loop {
+        // glibc stops TESTING at the first item that matches and walks the rest
+        // of the set instead, with a stricter eye than the scan has: see
+        // `glob_skip`. `[a[=]` selects `[` and `=` and NOT `a`, and that is the
+        // whole of the difference.
+        if found {
+            return match glob_skip(pat, i) {
+                Ok(end) => Class::Closed(end, found != negate),
+                Err(class) => class,
+            };
+        }
+        let Some(&c) = pat.get(i) else { return Class::Literal };
+        if c == b']' && !first {
+            return Class::Closed(i.saturating_add(1), found != negate);
+        }
+        first = false;
+        // `[:alpha:]`, `[.a.]`, `[=a=]`. The delimiter repeats before the `]`.
+        let construct = match (c, pat.get(i.saturating_add(1))) {
+            // A CLASS name is scanned byte by byte, and glibc abandons the
+            // CONSTRUCT -- not the pattern -- the moment a byte cannot belong
+            // to a name, re-reading the `[` as an ordinary item. See
+            // `glob_class_name` for where that boundary sits.
+            (b'[', Some(b':')) => {
+                let body = i.saturating_add(2);
+                match glob_class_name(pat, body) {
+                    Ok(end) => Some((b':', body, end)),
+                    // Not a class after all: the `[` is an ordinary item.
+                    Err(Class::Literal) => None,
+                    Err(class) => return class,
+                }
+            }
+            // `[=x=]` and `[.x.]` take EXACTLY one byte and their terminator
+            // right after it; `glob_seek`-style scanning for a terminator
+            // further along is not what glibc does. Where the shape does not
+            // hold the two part company, and the asymmetry is measured rather
+            // than reasoned: an equivalence class backs off to ordinary items
+            // (`[[=ab]` is the set `[ = a b`) while a collating element VOIDS
+            // the pattern (`[[.a]` and `[[.ab.]]` select nothing at all).
+            (b'[', Some(&kind @ (b'.' | b'='))) => {
+                let body = i.saturating_add(2);
+                let shaped = pat.get(body).is_some()
+                    && pat.get(body.saturating_add(1)) == Some(&kind)
+                    && pat.get(body.saturating_add(2)) == Some(&b']');
+                match (shaped, kind) {
+                    (true, _) => Some((kind, body, body.saturating_add(1))),
+                    (false, b'.') => return Class::Invalid,
+                    (false, _) => None,
+                }
+            }
+            _ => None,
+        };
+        // The low end of whatever comes next, where the pattern resumes, and
+        // whether a COLLATING element produced it -- which changes how the `-`
+        // after it is read.
+        let (lo, mut next, collating) = match construct {
+            Some((kind, body, end)) => {
+                let name = pat.get(body..end).unwrap_or_default();
+                let past = end.saturating_add(2);
+                match kind {
+                    // An UNKNOWN class name is an ERROR, not an empty set:
+                    // glibc gives up on the pattern rather than matching
+                    // nothing, so `[[:bogus:]x]` selects no `x`.
+                    b':' => {
+                        match glob_named_class(name, g) {
+                            Some(true) => found = true,
+                            Some(false) => {}
+                            // An unknown name with nothing found yet gives the
+                            // whole pattern up. There is no "already found"
+                            // case to weigh against it here: the loop returns
+                            // through `glob_skip` the moment anything matches,
+                            // so `found` is false wherever this is reached.
+                            // `[a[:bogus:]z]Q` selecting `aQ` is that walk's
+                            // doing -- it never looks a name up -- not this
+                            // arm's.
+                            None => return Class::Invalid,
+                        }
+                        i = past;
+                        continue;
+                    }
+                    // A COLLATING element of one byte is that byte here, the C
+                    // locale having no others, and it is a range endpoint like
+                    // any other: `[[.a.]-z]` selects `b`, where POSIX regex
+                    // refuses the very same spelling.
+                    b'.' => match name {
+                        [b] => (*b, past, true),
+                        _ => {
+                            i = past;
+                            continue;
+                        }
+                    },
+                    // An EQUIVALENCE class is an item and NOTHING more: it
+                    // cannot end a range, so the `-` in `[[=a=]-z]` is an
+                    // ordinary byte and that set is `a`, `-`, `z` rather than
+                    // the span between them.
+                    _ => {
+                        if name == [g] {
+                            found = true;
+                        }
+                        i = past;
+                        continue;
+                    }
+                }
+            }
+            // `\` escapes inside a bracket too, which POSIX regex does not do.
+            None => match c {
+                b'\\' => match pat.get(i.saturating_add(1)) {
+                    Some(&e) => (e, i.saturating_add(2), false),
+                    None => return Class::Invalid,
+                },
+                _ => (c, i.saturating_add(1), false),
+            },
+        };
+        match glob_range(pat, &mut next, lo, g, collating, &mut found) {
+            Ok(()) => {}
+            Err(end) => return end,
+        }
+        i = next;
+    }
+}
+
+/// `a-z` at `*i`, against the low end already read. Advances past what it takes.
+/// `Err` carries how the whole bracket ends.
+fn glob_range(
+    pat: &[u8],
+    i: &mut usize,
+    lo: u8,
+    g: u8,
+    collating: bool,
+    found: &mut bool,
+) -> Result<(), Class> {
+    let after = i.saturating_add(1);
+    let hi_at = match pat.get(*i) {
+        Some(b'-') => match pat.get(after) {
+            // A `-` running off the END is an unfinished range, and glibc gives
+            // up rather than falling back -- which is the whole difference
+            // between `[a-`, matching nothing, and `[a`, matching `[a`. Except
+            // after a bare `[`, where it falls back after all: a quirk of its
+            // error path, not a rule, since `[[-a]` IS the range `[`..`a` and
+            // selects `]`. Measured, not reasoned.
+            None if lo == b'[' => return Err(Class::Literal),
+            None => return Err(Class::Invalid),
+            // A `-` just before the close is an ordinary byte -- but glibc
+            // decides "this is a range" one way after a COLLATING element and
+            // another after a plain byte, and the two spellings differ by
+            // exactly this case. After a plain byte it is not a range, so the
+            // byte still stands as an item and `[a-]` selects `a`. After
+            // `[.a.]` it IS a range, which skips the item test and then
+            // declines for want of a high end -- so `[[.a.]-]` selects the `-`
+            // and NOT the `a`. Measured; the two lines differ by one clause in
+            // glibc's own source.
+            Some(b']') => None,
+            Some(_) => Some(after),
+        },
+        _ => None,
+    };
+    match hi_at {
+        Some(at) => {
+            let (hi, past) = match (pat.get(at), pat.get(at.saturating_add(1))) {
+                (Some(b'\\'), Some(&e)) => (e, at.saturating_add(2)),
+                (Some(b'\\'), None) => return Err(Class::Invalid),
+                // A collating element closes a range as well as opening one:
+                // `[a-[.z.]]` is `a`..`z`, not `a`..`[`. It is the ONLY
+                // construct that does. A `[:class:]` or `[=equiv=]` after the
+                // `-` is not an endpoint and does not start a construct here
+                // either: the `[` is the endpoint BYTE and the scan resumes at
+                // the `:` or `=`, which then read as ordinary items. So
+                // `[x-[:alpha:]]` is the empty range `x`..`[` plus the items
+                // `:alpha:`, closed by the FIRST `]`, leaving the second `]`
+                // to match literally -- which is why it selects nothing of one
+                // byte. Reading those items as a class instead made
+                // `[x-[:alpha:]]` select `a`, and erroring on them broke the
+                // UNCLOSED `[x-[:alpha:]`, which glibc answers by this same
+                // route. Measured in all three directions.
+                (Some(b'['), Some(b'.')) => {
+                    // Exactly one byte then `.]`, as everywhere else a
+                    // collating element is read; any other shape voids the
+                    // pattern rather than falling back.
+                    let body = at.saturating_add(2);
+                    let shaped = pat.get(body.saturating_add(1)) == Some(&b'.')
+                        && pat.get(body.saturating_add(2)) == Some(&b']');
+                    match (shaped, pat.get(body)) {
+                        (true, Some(&e)) => (e, body.saturating_add(3)),
+                        _ => return Err(Class::Invalid),
+                    }
+                }
+                (Some(&e), _) => (e, at.saturating_add(1)),
+                (None, _) => return Err(Class::Invalid),
+            };
+            if lo <= g && g <= hi {
+                *found = true;
+            }
+            *i = past;
+        }
+        // No high end. The low end stands as an item unless glibc had already
+        // called this a range, which after a collating element it has.
+        None if collating && pat.get(*i) == Some(&b'-') => {}
+        None => {
+            if lo == g {
+                *found = true;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// glibc's post-match walk over the rest of a bracket set. Once an item has
+/// matched, the remainder is walked rather than tested, and the walk re-parses
+/// what the scan already passed under *different* rules -- which is why `[a[=]`
+/// selects `[` and `=` but not `a`: the `a` matches, then the walk meets the
+/// malformed `[=` and voids the whole pattern. A `[:...:]` is only shape-checked
+/// here, its NAME never looked up. The unterminated-set literal fallback still
+/// applies, so `*[[` selects `[[`. Returns the index past the closing `]`.
+/// glibc also voids on a trailing `\` here, but that is not observable: the
+/// fallback re-reads the same trailing `\` in ordinary position, where it
+/// matches nothing either.
+fn glob_skip(pat: &[u8], from: usize) -> Result<usize, Class> {
+    let mut i = from;
+    loop {
+        let Some(&c) = pat.get(i) else { return Err(Class::Literal) };
+        i = i.saturating_add(1);
+        if c == b']' {
+            return Ok(i);
+        }
+        match (c, pat.get(i)) {
+            (b'\\', Some(_)) => i = i.saturating_add(1),
+            (b'[', Some(b':')) => i = glob_skip_name(pat, i)?,
+            (b'[', Some(b'=')) => {
+                let body = i.saturating_add(1);
+                let shaped = pat.get(body).is_some()
+                    && pat.get(body.saturating_add(1)) == Some(&b'=')
+                    && pat.get(body.saturating_add(2)) == Some(&b']');
+                if !shaped {
+                    return Err(Class::Invalid);
+                }
+                i = body.saturating_add(3);
+            }
+            (b'[', Some(b'.')) => match glob_skip_dot(pat, i) {
+                Some(end) => i = end,
+                None => return Err(Class::Invalid),
+            },
+            _ => {}
+        }
+    }
+}
+
+/// `[:` inside the skip walk. The name is never looked up, only shaped: a byte
+/// outside `a`..`y` backs the construct off to its own `:`, which the walk then
+/// reads as an ordinary byte. So `[a[:]` ends at the `]` right after the colon,
+/// while `[a[:zz:]]` runs on to the FIRST `]` and leaves the second one in the
+/// pattern. Running off the end backs off too, and the walk then falls back.
+fn glob_skip_name(pat: &[u8], colon: usize) -> Result<usize, Class> {
+    let mut i = colon;
+    let mut seen = 0usize;
+    loop {
+        i = i.saturating_add(1);
+        seen = seen.saturating_add(1);
+        // glibc gives up on an over-long name before it looks for the `:]`,
+        // so the bound bites one byte sooner here than in the scan.
+        if seen == CLASS_NAME_CAP {
+            return Err(Class::Invalid);
+        }
+        if pat.get(i) == Some(&b':') && pat.get(i.saturating_add(1)) == Some(&b']') {
+            return Ok(i.saturating_add(2));
+        }
+        match pat.get(i) {
+            Some(b'a'..=b'y') => {}
+            _ => return Ok(colon),
+        }
+    }
+}
+
+/// glibc's `CHAR_CLASS_MAX_LENGTH`, which on Linux is the fixed
+/// `CHARCLASS_NAME_MAX` from `bits/local_lim.h` rather than anything a locale
+/// varies.
+const CLASS_NAME_CAP: usize = 2048;
+
+/// `[.` inside the skip walk, which unlike the scan's one-byte collating
+/// element SEARCHES for the next `.]` -- so `[a[.xy.]]` selects `a`.
+fn glob_skip_dot(pat: &[u8], dot: usize) -> Option<usize> {
+    let mut i = dot;
+    loop {
+        i = i.saturating_add(1);
+        match pat.get(i) {
+            None => return None,
+            Some(&b'.') if pat.get(i.saturating_add(1)) == Some(&b']') => {
+                return Some(i.saturating_add(2))
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+/// glibc's class-name scan (`fnmatch_loop.c`): bytes up to a `:` that is
+/// followed by `]`, whose index is returned. `None` means this is NOT a class
+/// after all and the `[` must be re-read as an ordinary item -- glibc decides
+/// that on the first byte outside `a`..`y`, END OF PATTERN included. `z` is
+/// outside on purpose (`c < 'a' || c >= 'z'` there), which is why `[[:az:]]`
+/// selects `a]` as the set `[ : a z :` and a literal `]`. A name that ENDS
+/// properly and is merely UNKNOWN is a different answer, made by the caller.
+///
+/// `Err(Literal)` is that re-read; `Err(Invalid)` is the length bound, which
+/// glibc tests BEFORE it reads the next byte and answers by giving the whole
+/// pattern up rather than by backing off. That is one byte later than the same
+/// bound in `glob_skip_name`, which tests after reading.
+fn glob_class_name(pat: &[u8], from: usize) -> Result<usize, Class> {
+    let mut i = from;
+    loop {
+        if i.saturating_sub(from) == CLASS_NAME_CAP {
+            return Err(Class::Invalid);
+        }
+        let Some(&c) = pat.get(i) else { return Err(Class::Literal) };
+        if c == b':' && pat.get(i.saturating_add(1)) == Some(&b']') {
+            return Ok(i);
+        }
+        if !matches!(c, b'a'..=b'y') {
+            return Err(Class::Literal);
+        }
+        i = i.saturating_add(1);
+    }
+}
+
+/// The ASCII classes, as `regex.rs` spells them -- the crate is scored in the C
+/// locale, so each is its `is_ascii_*` predicate. `None` is a name that is not a
+/// class at all, which is an error rather than an empty set.
+fn glob_named_class(name: &[u8], g: u8) -> Option<bool> {
+    Some(match name {
+        b"alpha" => g.is_ascii_alphabetic(),
+        b"digit" => g.is_ascii_digit(),
+        b"alnum" => g.is_ascii_alphanumeric(),
+        b"upper" => g.is_ascii_uppercase(),
+        b"lower" => g.is_ascii_lowercase(),
+        b"space" => g.is_ascii_whitespace() || g == 0x0b,
+        b"blank" => g == b' ' || g == b'\t',
+        b"punct" => g.is_ascii_punctuation(),
+        b"print" => g.is_ascii_graphic() || g == b' ',
+        b"graph" => g.is_ascii_graphic(),
+        b"cntrl" => g.is_ascii_control(),
+        b"xdigit" => g.is_ascii_hexdigit(),
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -1811,5 +2299,141 @@ mod tests {
         let mut rec = Records::new(src, b'\n');
         assert!(rec.next().unwrap());
         assert_eq!(rec.line(), b"ax\x00y");
+    }
+
+    /// Every row is glibc `fnmatch(PATTERN, NAME, 0)`'s own answer, taken from
+    /// a C oracle rather than from POSIX: most of the rules below are glibc
+    /// quirks that no reading of the standard predicts, and the differential
+    /// harness that found them is not committed, so these rows are what is
+    /// left holding them.
+    #[test]
+    fn a_caret_negates_a_set_only_when_posixly_correct_is_unset() {
+        // Whether `^` negates is the ENVIRONMENT's answer, not the pattern's:
+        // glibc reads POSIXLY_CORRECT and, under it, `^` is an ordinary member.
+        // `!` is unconditional. Every row measured against fnmatch(3) both ways.
+        let rows: &[(&[u8], &[u8], bool, bool)] = &[
+            (b"[^^]", b"^", false, true),
+            (b"[^^]", b"a", true, false),
+            (b"[^a]", b"b", true, false),
+            (b"[^a]", b"^", true, true),
+            (b"[!a]", b"b", true, true),
+            (b"[^]", b"^", false, true),
+        ];
+        for (pat, name, unset, set) in rows {
+            assert_eq!(glob_match_with(pat, name, true), *unset, "{pat:?} {name:?} unset");
+            assert_eq!(glob_match_with(pat, name, false), *set, "{pat:?} {name:?} set");
+        }
+    }
+
+    #[test]
+    fn an_over_long_class_name_in_the_scan_voids_rather_than_backing_off() {
+        // The scan has the same bound as the walk and answers differently at
+        // it: past the bound glibc gives the pattern up instead of re-reading
+        // the `[` as an item, so the `!` that would have ended the name never
+        // gets to. It counts one byte later than the walk does.
+        let pat = |n: usize| {
+            let mut p = b"[[:".to_vec();
+            p.resize(p.len().saturating_add(n), b'a');
+            p.extend_from_slice(b"!]");
+            p
+        };
+        assert!(glob_match_with(&pat(2047), b"[", true), "2047 backs off");
+        assert!(!glob_match_with(&pat(2048), b"[", true), "2048 gives the pattern up");
+    }
+
+    #[test]
+    fn an_over_long_class_name_in_the_walk_voids_where_one_byte_less_does_not() {
+        // glibc counts the name's bytes before it looks for the `:]`, so its
+        // bound bites one byte sooner in the walk than in the scan. Both rows
+        // were measured against fnmatch(3).
+        let pat = |n: usize| {
+            let mut p = b"[a[:".to_vec();
+            p.resize(p.len().saturating_add(n), b'a');
+            p.extend_from_slice(b":]]");
+            p
+        };
+        assert!(glob_match_with(&pat(2046), b"a", true), "2046 is still a set");
+        assert!(!glob_match_with(&pat(2047), b"a", true), "2047 gives the pattern up");
+    }
+
+    #[test]
+    fn glob_match_answers_as_glibc_fnmatch_does() {
+        let cases: &[(&str, &str, bool, &str)] = &[
+            ("*.c", "a.c", true, "a plain star"),
+            ("*.c", "a.h", false, ""),
+            ("?.c", "a.c", true, "one byte, exactly one"),
+            ("?.c", "ab.c", false, ""),
+            ("*", "a/b", true, "a star crosses a slash, there being no FNM_PATHNAME"),
+            ("*", ".hidden", true, "and matches a leading dot, there being no FNM_PERIOD"),
+            ("[ab].c", "b.c", true, "a set"),
+            ("[!ab].c", "c.c", true, "and its negation"),
+            ("[^ab].c", "c.c", true, "^ negates too"),
+            ("[a-c].c", "b.c", true, "a range"),
+            ("[c-a].c", "b.c", false, ""),
+            ("a\\*c", "a*c", true, "a backslash escapes the star"),
+            ("a\\*c", "abc", false, ""),
+            ("a\\", "a\\", false, "a TRAILING backslash matches nothing at all"),
+            ("a\\", "a", false, ""),
+            ("[abc", "[abc", true, "an unclosed bracket falls back to a literal ["),
+            ("[a-", "[a-", false, "except mid-RANGE, where it matches nothing"),
+            ("[[-", "[[-", true, "and except [[-, which falls back anyway"),
+            ("[[.a", "[[.a", false, "mid-[. matches nothing"),
+            ("[[:bogus:]]", "a", false, "an unknown class name aborts the pattern"),
+            ("[a[:bogus:]]", "a", true, "unless an item already matched, when the scan carries on"),
+            ("[:alpha:]", "a", true, "a bare [: with no :] is literal while the bracket closes"),
+            ("[:alpha:]", ":", true, "the same pattern is the SET of those bytes"),
+            ("[[.a.]-c]", "b", true, "only a COLLATING element may end a range"),
+            // glibc asks "is this a range?" differently after a collating
+            // element than after a plain byte, and these four rows are the
+            // whole of the difference.
+            ("[[.a.]-]", "a", false, "after `[.a.]` a `-]` IS a range, so the item is never tested"),
+            ("[[.a.]-]", "-", true, "...but the `-` it declines to use is still an item"),
+            ("[a-]", "a", true, "after a plain byte the same `-]` is NOT a range, so `a` stands"),
+            ("[[=a=]-]", "a", true, "and an equivalence class is not a collating element"),
+            ("[[.a.]-x]", "b", true, "a genuine range from a collating low end is unaffected"),
+            ("[a-[.z.]]", "q", true, "a COLLATING element ends a range: this is [a-z]"),
+            ("[a-[:alpha:]]", "a", false, "a CLASS does not, so the `[` is the endpoint BYTE"),
+            ("[a-[:alpha:]]", "a]", true, "...the bracket closes at the FIRST ], and the second is literal"),
+            ("[a-[=z=]]", "b", false, "an equivalence class is not an endpoint either"),
+            ("[a-[=z=]q]", "q", false, "`q` is past that first ], so it is not in the set"),
+            ("[x-[:alpha:]", "a", true, "unclosed: x..[ is empty and `:alpha:` are the items"),
+            ("[x-[:alpha:]", "x", false, "...and `x` is not among them, which is what tells the two apart"),
+            ("[[:alpha:]-c]", "-", true, "BEFORE the -, the class is an item and the - a byte"),
+            ("[[=a=]-c]", "-", true, "the same for an equivalence class"),
+            ("[[.a.]-c]", "b", true, "but a collating element there DOES open a range"),
+            ("[[.a.]-c]", "-", false, ""),
+            ("[[=a=]-c]", "b", false, "[=x=] is a plain item, so the - beside it is a byte"),
+            ("[[=a=]-c]", "-", true, "and that byte is matchable"),
+            ("[[:alpha:]-c]", "-", true, "a class is a plain item too"),
+            ("[[:alpha:]]", "q", true, "a class inside a bracket is a class"),
+            ("[[:digit:]]", "q", false, ""),
+            // Once an item matches, glibc re-walks the REST of the set under
+            // different rules than the scan that got there. These pin that walk.
+            ("[a[=]", "a", false, "a malformed [= in the walk voids the whole pattern"),
+            ("[a[=]", "[", true, "...so the set is exactly the two bytes the scan read first"),
+            ("[a[=]", "=", true, ""),
+            ("[a[.xy.]]", "a", true, "the walk SEARCHES for the next .], multi-byte or not"),
+            ("[a[.xy.]]", "x", false, "where the scan takes one byte, so it never matched here"),
+            ("[a[:]", "a", true, "a bad class name backs the walk off to its own colon"),
+            ("[a[:zz:]]", "a", false, "z is outside a..y, so this backs off and ends at the FIRST ]"),
+            ("[a[:zz:]]", "a]", true, "...leaving the second ] in the pattern, which is what proves it"),
+            ("[a[:alpha:]]", "a", true, "a well-formed class name is shape-checked, never looked up"),
+            ("*[[", "[[", true, "but an unterminated set still falls back after a match"),
+            ("*[a[.xy.]]", "xa", true, "and a void is local to ONE star attempt, not the match"),
+            ("low/c.c", "low/c.c", true, "the slash is an ordinary byte here"),
+            ("", "", true, "the empty pattern matches only the empty name"),
+            ("", "a", false, ""),
+            ("*", "", true, "a star matches nothing at all"),
+        ];
+        for (pat, name, want, why) in cases {
+            assert_eq!(
+                // The flag is stated rather than read from the environment:
+                // this table is about the pattern, and a maintainer with
+                // POSIXLY_CORRECT exported must not get a different answer.
+                glob_match_with(pat.as_bytes(), name.as_bytes(), true),
+                *want,
+                "fnmatch({pat:?}, {name:?}) is {want}: {why}"
+            );
+        }
     }
 }

@@ -447,8 +447,9 @@ sed (td-txt) 0.1.0
 
 #### --help prints td-txt's usage, not GNU's option manual
 # Same bargain as --version: exit 0 with a real answer, but the answer names the
-# options td-txt HAS. Reprinting GNU's help would advertise --color, -P and the
-# include/exclude globs this applet refuses two cases below.
+# options td-txt HAS. Reprinting GNU's help would advertise --color and -P,
+# which this applet refuses. The usage line names no long option at all, so
+# serving the --include/--exclude family did not change it.
 ## argv: grep --help
 ## stdout:
 usage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
@@ -576,60 +577,14 @@ usage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] 
 ## stderr-contains: invalid option -- 'P'
 ## status: 2
 
-#### grep refuses --include rather than searching everything
-# A glob filter that is silently ignored SEARCHES MORE than the caller asked,
-# so a refusal is the only safe reading. All four of GNU's filters are in the
-# option table now and refuse from their arm rather than by being unknown --
-# which they had to be, since `--exclude' is a prefix of `--exclude-from' and
-# `--exclude-dir', and leaving the family out made `--e' and `--ex' resolve to
-# `--extended-regexp' here where GNU calls them ambiguous. The diagnostic names
-# the OPTION and not the whole argument, because the argument is no longer part
-# of what was not understood.
-## argv: grep -r --include=*.c a .
-## file x.txt:
-a
-## END
-## stdout-json: ""
-## status: 2
-## stderr-json: "grep: unsupported option '--include'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
-
-#### and --exclude, its other half, which fails the OTHER way round
-# Ignoring `--exclude` searches more than was asked exactly as ignoring
-# `--include` does; it is pinned separately because the module doc claims BOTH
-# are refused, and a claim about two options that tests one is a claim about
-# one.
-## argv: grep -r --exclude=*.c a .
-## file x.txt:
-a
-## END
-## stdout-json: ""
-## status: 2
-## stderr-json: "grep: unsupported option '--exclude'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
-
-#### and --exclude-from, which reads its globs from a FILE
-# Not a duplicate of the two above: this one takes a PATH rather than a glob,
-# so it is the one whose argument the refusal never opens.
-## argv: grep -r --exclude-from=pats a .
-## file x.txt:
-a
-## END
-## stdout-json: ""
-## status: 2
-## stderr-json: "grep: unsupported option '--exclude-from'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
-
-#### and --exclude-dir, which prunes the WALK rather than the file list
-## argv: grep -r --exclude-dir=d a .
-## file x.txt:
-a
-## END
-## stdout-json: ""
-## status: 2
-## stderr-json: "grep: unsupported option '--exclude-dir'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
-
 #### --e is ambiguous now, where it used to resolve to --extended-regexp
-# The reason the family had to enter the table together. Before it, `grep --e
-# pat' was `-E' here and an ambiguity in GNU -- a silent difference in what got
-# COMPILED, not a diagnostic. GNU's line is identical to this one.
+# The reason the family had to enter the table together, and it outlived the
+# refusal that first put them there: the four are SERVED now, and `--e' is
+# ambiguous because they are spelled the way GNU spells them. Before the family
+# arrived, `grep --e pat' was `-E' here and an ambiguity in GNU -- a silent
+# difference in what got COMPILED, not a diagnostic. GNU's first line is
+# identical to this one; only the usage line below it is td-txt's, which is the
+# whole of what still diverges.
 ## argv: grep --e a
 ## stdin:
 a
@@ -1717,3 +1672,31 @@ a
 ## stdout-json: ""
 ## stderr-json: "sed: read error on D: Is a directory\n"
 ## status: 4
+
+#### --exclude-from reads its file ONCE, where GNU reads it twice and loses it
+# GNU keeps TWO exclude lists -- one for names the walk produced, one for names
+# written on the command line -- and `--exclude-from' is added to both by
+# reading the file once per list (grep.c's `for (int cmd = 0; cmd < 2; cmd++)').
+# A regular file is opened twice and both lists get the globs. A NON-SEEKABLE
+# source is not: `-', `/dev/stdin', a fifo and a process substitution are all
+# drained by the FIRST read, so GNU's command-line list ends up EMPTY and
+# `grep --exclude-from=- PAT operand' does not exclude the operand it was just
+# told to. Measured: with `a.c' on stdin, GNU prints d/a.c and exits 0, while
+# the walked half of the same run (`-r ... d') DOES exclude it -- so the option
+# half-works rather than failing.
+#
+# td-txt keeps one list and reads the file once, so both halves see the globs.
+# This is a deliberate divergence and not an oversight: reproducing it would
+# mean reading the argument twice on purpose so that one of the two answers
+# could come out empty, which is an artifact of GNU's data structure rather
+# than a behavior anything could depend on deliberately.
+## argv: grep --exclude-from=- -l hit d/a.c
+## file d/a.c:
+hit
+## END
+## stdin:
+a.c
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1

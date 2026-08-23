@@ -2564,6 +2564,14 @@ td-txt-authored case files
     thirteen and NOT here, because `--g` and `--p` are unambiguous in GNU and
     so never reach this sweep's both-ambiguous bucket at all.
 
+    Those four filter names are SERVED now, not refused -- see the file-filter
+    entry below. Nothing in this entry's counts moves with that: the rows and
+    their order are unchanged, so `--e`, `--ex` and `--exc` stay ambiguous
+    exactly as recorded, and what the rows buy this entry they go on buying.
+    What changed is the dispatch behind them, which is a distinction this entry
+    already draws -- a name is in that table to be RESOLVED, which is not the
+    same as being served.
+
     How much of "GNU's declaration positions" a test can actually hold is
     narrower than the phrase suggests, and the boundary was measured rather
     than assumed. A position is observable only through a prefix that matches
@@ -3447,6 +3455,258 @@ td-txt-authored case files
     showed it -- `x\b*` matches where `x\b*y` does not. A corner probed only
     through one syntactic frame will confirm whatever that frame implies.
 
+  The FILE FILTER -- `--include`, `--exclude`, `--exclude-from`,
+  `--exclude-dir` -- is served, and every rule below was measured against GNU
+  grep 3.11 rather than reasoned about. The manual is better than an earlier
+  draft of this entry credited it for: grep(1) does give the split between a
+  suffix and a base name, "the last matching one wins", "a file is included
+  unless the first such option is --include", and the redundant trailing
+  slashes on `--exclude-dir`. What it does not give is everything that follows those --
+  the ORDER of the open against the selection, that `--exclude-dir` prunes
+  where `--include` does not, the two exemptions, what a blank or NUL-bearing
+  `--exclude-from` line does, and the whole of `fnmatch`'s cornered behaviour.
+  Those were measured.
+
+    The list is ORDERED GROUPS, not two sets. Consecutive options of one kind
+    form a group (gnulib's exclude SEGMENTS), the groups are asked NEWEST
+    first, and the first group holding a matching glob decides. A name no glob
+    matches falls to the OPPOSITE of the OLDEST group's kind -- so the default
+    is "skip" exactly when the first such option given was an `--include`.
+    That is why `--exclude=a.c --include=a.c` searches `a.c` and the same pair
+    reversed does not, and both orders are pinned. `--exclude-from` is
+    exclude-KIND, which the blank-line pair below is what actually shows;
+    whether it merges with an adjacent `--exclude` into one group or sits in
+    its own is not observable, since two same-kind groups always answer alike.
+
+    A blank line in an `--exclude-from` file contributes NOTHING, not an empty
+    glob, and the difference is visible rather than cosmetic: a group that
+    exists at all sets the default for every unmatched name, so one empty glob
+    would invert the answer for names no glob mentions. Measured both ways, and
+    both are pinned with a control that differs only in the file's contents.
+    A NUL in such a line ENDS the glob and the rest of the line is dropped,
+    GNU holding each pattern as a C string -- `a.c\0junk` excludes `a.c`. The
+    two rules are not the same test and the order matters: the empty test is on
+    the LINE, the truncation happens after it, so `\0zz` is a non-empty line
+    whose glob is empty and it DOES open a group. Both directions pinned.
+
+    `--exclude-from` is also where td-txt deliberately parts from GNU, and the
+    case is in divergence.test.txt. GNU keeps the two lists above as two
+    separate structures and adds the option to both by reading its file once
+    per list. A regular file is opened twice and both get the globs; a
+    NON-SEEKABLE source -- `-`, `/dev/stdin`, a fifo, a process substitution --
+    is drained by the first read, so GNU's command-line list ends up EMPTY and
+    `grep --exclude-from=- PAT operand` does not exclude that operand, while
+    the walked half of the same run does. td-txt keeps one list, reads once,
+    and both halves see the globs. Reproducing GNU would mean reading the
+    argument twice on purpose so one of the two answers could come out empty,
+    which is an artifact of its data structure rather than behavior to match.
+
+    WHAT the glob is matched against depends on where the name came from. A
+    command-line operand is matched whole and then at every `/` boundary, so
+    `--include=low/c.c` selects the operand `deep/mid/low/c.c` while
+    `--include=ow/c.c` does not -- a suffix begins at a component. Repeated
+    slashes are not collapsed (`/a.c` selects `d//a.c`). A name the WALK
+    produced is its bare last component, matched whole. The two lists never
+    cross: `--exclude` is asked only about files and `--exclude-dir` only about
+    directories, so `--exclude=mid` still descends into a directory named
+    `mid`.
+
+    The ORDER of the open and the selection is the part no reading would
+    supply, and it splits on the same command_line flag GNU's grepdirent
+    guards with. A name the walk FOUND is filtered before it is opened, so an
+    unreadable file no glob selects is passed over in silence. A COMMAND-LINE
+    name is opened FIRST and filtered only if the open succeeded, so the
+    error outranks the exclusion: `--include=zzz PAT unreadable.c` reports
+    `Permission denied` and exits 2, where the same option over a readable
+    file says nothing and exits 1. The same asymmetry runs through
+    directories: a NESTED directory is pruned before any open, but the walk's
+    ROOT is opened first, so `-r --exclude-dir=X PAT X` is silent when X is
+    readable and reports `Permission denied` when it is not.
+
+    Pruning is not post-filtering. An excluded directory is never entered, so
+    neither a permission error inside it nor a symlink CYCLE through it is
+    reported -- `-R --exclude-dir=up` over a directory reachable through
+    itself warns about no loop at all. `--include` does not prune: GNU still
+    enters a directory no glob selects and still reports what it cannot read
+    there.
+
+    Two exemptions. `-` is stdin and neither list's business: `--exclude='*'`
+    still reads it and still names it `(standard input)`. And the implied `.`
+    of a bare `grep -r PAT` is exempt as a ROOT (GNU's `omit_dot_slash`) while
+    everything below it is not, so `--exclude-dir='*'` still searches the
+    working directory's own files but prunes its subdirectories. Naming `.`
+    explicitly is not exempt, and the pair is pinned together.
+
+    The glob itself is `fnmatch(3)` with no flags, and the matcher was built
+    against a C oracle rather than from POSIX: 5.6 million structured and
+    random pattern/name pairs through glibc's `fnmatch`, which forced rules no
+    reading predicts -- a trailing `\` matches nothing; an unclosed `[` falls
+    back to a literal EXCEPT mid-range or mid-`[.`, and `[[-` falls back
+    anyway; an unknown class name aborts the pattern unless an item has
+    already matched; and `[:` with no `:]` is literal while the bracket still
+    closes.
+
+    Range ENDPOINTS are the subtlest of them, and the rule is ASYMMETRIC in a
+    way two drafts of this entry got wrong in opposite directions before the
+    oracle settled it. Only a COLLATING element ends a range: `[a-[.z.]]` is
+    `[a-z]`. A `[:class:]` or `[=equiv=]` after the `-` does not end one AND
+    does not start a construct there either -- the `[` is simply the endpoint
+    BYTE, and the scan resumes at the `:` or `=`, which then read as ordinary
+    items. So `[a-[:alpha:]]` is the empty range `a`..`[` plus the items
+    `:alpha:`, closed by the FIRST `]`, which leaves the second `]` to match
+    literally: it selects nothing of one byte and it DOES select `a]`. That
+    last pair is what proves the reading, and it is a test row.
+
+    Before the `-` the same construct IS a construct: `[[:alpha:]-c]` is the
+    alphabetic set plus a literal `-` plus `c`, and selects a file named `-`.
+    A collating element there opens a range instead: `[[.a.]-c]` is `a`..`c`
+    and does not select `-`. Both drafts that failed here failed by reading one
+    of these two positions into the other -- treating the class after the `-`
+    as an item made `[a-[:alpha:]]` select `a`, and treating it as an error
+    broke the UNCLOSED `[x-[:alpha:]`, which glibc answers by this same route
+    (empty range, `:alpha:` as items, selects `a` and not `x`). All of it is
+    pinned, as corpus cases and as oracle rows in the matcher's own test.
+
+    That asymmetry is also where a locale trap lives. A collating element is
+    locale-dependent, and GNU grep adopts the environment's locale while a C
+    program that never calls `setlocale` stays in the C locale. So the oracle
+    answers for the C locale -- the right one, since the harness runs every
+    case under LC_ALL=C -- while a golden captured by running GNU grep in the
+    authoring host's en_US.utf8 does not: `--include='[a-[.z.]]'` selects `q`
+    under LC_ALL=C and nothing under UTF-8. The generator that captured these
+    goldens had to be corrected for exactly that, and it is the same warning
+    the C-locale paragraph at the end of this file gives for `-w`.
+
+    Whether a leading `^` NEGATES a set is the environment's answer rather
+    than the pattern's. glibc reads POSIXLY_CORRECT once per process and, when
+    it is set, `^` is an ordinary member -- so `--include='[^^]'` selects a
+    file named `^` under POSIXLY_CORRECT and skips it without. `!` negates
+    either way. This was missed here entirely until a reviewer found it: the C
+    oracle below never had POSIXLY_CORRECT in its environment, so millions of
+    pairs agreed on an axis that was never varied. The corpus now runs both
+    ways and a golden pair pins each.
+
+    No pattern/name pair is known to disagree. The matcher answers as glibc
+    answers on 13,855,604 of them, run under both settings of POSIXLY_CORRECT
+    for 27,711,208 checks: the 5,672,340 this landing started with, 3,620,106
+    generated dense in the bracket metacharacters, 4,413,398 aimed at the walk
+    below once it was understood -- every pattern of five bytes or fewer over
+    the thirteen bytes `[ ] : = . - ! \ a z y * ?` against six names, plus two
+    million longer random ones -- and 149,760 built last, exhaustive over
+    range ENDPOINTS: every opener, low fragment, dash run, high fragment and
+    closing, crossed with fifteen names.
+
+    That last corpus exists because reviewers found two wrong answers that the
+    first four had all agreed on, and the reason they agreed is worth keeping.
+    The exhaustive part of the big corpus stops at five bytes; `[[.a.]-]` is
+    eight, and the random part never emitted a collating element immediately
+    followed by `-]`. The blind spot was pattern LENGTH, not density -- more
+    of the same random bytes would never have found it. What found it was a
+    reader who went back to glibc's source and noticed that one line of it
+    computes the same predicate two different ways.
+
+    Those pairs live in a throwaway harness, not in this repository, and the
+    same is true of the end-to-end sweep further down. What SHIPS is the table
+    of oracle-measured rows in the matcher's own test and the goldens here.
+    The millions are how the rules were found and how a change is checked
+    before it lands; they are not something a later reader can re-run from the
+    tree, and no number in this entry should be read as a committed test.
+
+    Getting there meant reading glibc instead of sampling it. Earlier drafts
+    of this entry recorded SEVEN residual pairs, then four, called them
+    unreachable and permanent, and were wrong twice over. Every one of them
+    came from a single thing this matcher did not model: once an item in a
+    set matches, glibc walks the REST of that set a second time under rules
+    that are not the scan's. Two attempts to reconstruct that walk from
+    measurement failed, the second badly enough to put 99 new mismatches into
+    a corpus that had been clean. What closed it was reading
+    `posix/fnmatch_loop.c` from the glibc the oracle links against -- 2.41 on
+    this host -- and taking three rules from it that no amount of sampling
+    had suggested:
+
+    - a set that never closes still falls back to a literal `[` from inside
+      the walk, so `*[[` selects a name ending in `[[`;
+    - a class NAME in the walk is never looked up, only shaped, and the first
+      byte outside `a`..`y` abandons the construct back to its own `:`
+      instead of voiding. `z` is outside that bound, so `[a[:zz:]]` ends at
+      the FIRST `]` and leaves the second one in the pattern;
+    - the walk's `[.` SEARCHES for the next `.]` where the scan takes exactly
+      one byte, so `[a[.xy.]]` selects `a` and not `x`.
+
+    Each of the three is a corpus case. Two more rules from the same read are
+    implemented but have no corpus case, the case format not carrying a
+    two-kilobyte argument comfortably. glibc bounds a class NAME at
+    CHAR_CLASS_MAX_LENGTH, which on Linux is the fixed CHARCLASS_NAME_MAX of
+    2048, in BOTH the walk and the scan, and the two count at different
+    points: the walk counts after reading and the scan before, so the bound
+    bites a byte sooner in the walk. They also answer differently past it --
+    the walk backs off elsewhere but voids here, and the scan, which would
+    otherwise re-read the `[` as an ordinary item, voids instead. Measured at
+    the byte in both: `[a[:` plus 2046 `a`s plus `:]]` selects `a` and 2047
+    does not; `[[:` plus 2047 `a`s plus `!]` selects `[` and 2048 does not.
+    Four rows in the matcher's own test hold those two boundaries.
+
+    An earlier draft of this paragraph said the scan's bound was unobservable
+    and left it out. It was wrong twice: the scan had no bound at all, and the
+    pair above tells the two apart. A reviewer measured it. The lesson is the
+    one this whole entry keeps relearning -- "no pair can tell them apart" is
+    a claim about a search, and it is worth only as much as the search behind
+    it.
+
+    A fifth rule was read and deliberately NOT taken. glibc voids on a
+    trailing `\` inside the walk, but no pattern/name pair can show it: the
+    literal fallback re-reads that same trailing `\` in ordinary position,
+    where it matches nothing either. Implementing it would have added a
+    branch no test could ever hold, so the matcher records it in a comment
+    and does without.
+
+    Whether a `-` opens a RANGE is decided twice in glibc's source, and not
+    by the same expression. After an ordinary byte it is
+    `*p == '-' && p[1] != '\0' && p[1] != ']'`; after a COLLATING element the
+    last clause is simply missing. So `[[.a.]-]` IS a range, which skips the
+    test that would have made `a` an item, and then declines for want of a
+    high end -- leaving a set of just the `-`. One character shorter, `[a-]`
+    is not a range and selects `a`. An equivalence class takes the ordinary
+    path, so `[[=a=]-]` selects `a` too. All three are corpus cases; without
+    the third a reader would reasonably guess the rule was about constructs
+    rather than about collating elements alone.
+
+    The same reading corrected a claim this file used to make about ranges. A
+    `[:class:]` after a `-` does not void the pattern; the `[` becomes the
+    endpoint BYTE, so `[a-[:alpha:]]` is an inverted range that matches
+    nothing, then `:alpha:` as ordinary bytes, closing at the first `]` and
+    leaving the second one literal. It selects `a]` and `:]`, which is what
+    tells that model from the old one.
+
+    Validation was differential end to end as well: randomised argv over a
+    fixture carrying symlinks, a dangling link, an unreadable directory and
+    option ABBREVIATIONS, 144,000 invocations compared against grep 3.11 on
+    status and output, all of them against the code as it stands, and half of
+    them under a POSIXLY_CORRECT the other half does not set. That axis is not
+    decorative: reverting the `^` rule above puts 55 mismatches into a 4,000
+    -case run of a seed that is otherwise clean. It earned its cost: reading
+    the code had not shown that the root prune ran on every RECURSION -- the
+    walk recurses and the guard was ungated, so `--exclude-dir='e/f'` pruned
+    `e/f`, which GNU does not --
+    nor the open-versus-filter ordering above, which the first implementation
+    had backwards for every COMMAND-LINE name: it decided them before the
+    open, so an operand it could not read was skipped in silence instead of
+    reported. It had the WALK's half right, which is why only half the shapes
+    showed.
+
+    Neither is a corpus case, and neither can be. The case format has `file`
+    and `env` and nothing that creates a symlink, an unreadable directory or
+    an empty one, so the two shapes that found these bugs live only in that
+    throwaway fixture. An earlier draft of this entry said both were pinned.
+    They are pinned by a harness that does not ship, which is a weaker thing,
+    and the reason to say so here is that the next person to touch the prune
+    will not learn it from a failing test.
+
+    A caveat for anyone adding a golden here: the corpus cases answer in ONE
+    line or none on purpose. td-txt sorts each directory and GNU takes the
+    kernel's order, a divergence recorded elsewhere, so a case listing two
+    siblings would pin that order instead of the filter.
+
   Goldens are C-locale. Under LC_ALL=C — the only locale td's image sets, and what
   every case here was captured under — GNU `grep -w '\.*'` selects `.a`; under a
   UTF-8 locale the same GNU binary selects nothing. Re-derive a `-w` golden without
@@ -3479,23 +3739,37 @@ td-txt-authored case files
   oracle against a new case and confirm it does NOT match, comparing status,
   stdout AND stderr: for every refusal here the whole divergence is the
   diagnostic, so a check that reads only status and stdout reports agreement.
-  70 cases, of which 68 differ; the other TWO are counts GNU never finishes, so
-  they are not comparable by construction and their divergence is the
-  non-finishing itself. This number had gone STALE -- it read 36 while the file
-  held 33, five commits having touched the file without re-running it, which is
-  the failure the sentence at the end of this paragraph is written against. It
-  was 32 until the `-f DIR` decision arrived from the gap list above with FOUR,
-  each confirmed against GNU sed 4.9 as this paragraph requires. 32 was also
-  the count when the `-NUM` decision landed, and that was
-  a DIFFERENT 32: `sed -l N` was retired when the option was
-  implemented, which is the one way a case leaves this file -- td-txt stopped
-  diverging -- and the usage line after a missing option argument replaced it.
-  Re-run it when adding one: the count in this sentence is part of what it
-  asserts, and it was wrong once already between writing it and checking it.
-  What the `-l` landing re-ran was the EIGHT sed cases, against GNU sed 4.9; the
-  grep ones were not re-run, that host having no GNU grep any more (its `grep`
-  is ugrep), which is the same reason a grep golden cannot be captured there
-  today.
+  67 cases, and this count was taken by RUNNING the whole file against both
+  oracles rather than by adjusting the previous number: GNU grep 3.11 and GNU
+  sed 4.9 under LC_ALL=C, every fixture materialized, every case compared on
+  status, stdout and stderr exactly as that case asserts them. SIXTY-TWO
+  differ. TWO are the `-NUM` waits GNU never returns from, not comparable by
+  construction, their divergence being the non-finishing itself. The remaining
+  THREE are this paragraph's own warning coming true, and running is what found
+  them: `sed --version=x`, `sed --help=x` and `grep --version=x` assert stderr
+  only as a SUBSTRING, GNU prints that substring too, and the divergence each
+  exists for is the usage block AFTER it. Read on FULL stderr they do differ --
+  GNU reprints its option manual where td-txt prints one usage line -- so that
+  reading counts 65, and it is where the previous 68 came from: 68 less the
+  four departures below plus the one arrival is exactly 65. They are named
+  rather than tightened: asserting the whole of GNU's manual here would pin
+  upstream's help text into this file.
+
+  It was 70 before this landing. FOUR cases left when `--include`, `--exclude`,
+  `--exclude-from` and `--exclude-dir` stopped being refusals, which is the one
+  way a case leaves this file -- td-txt stopped diverging -- and ONE arrived,
+  `--exclude-from` reading its file once where GNU reads it twice. The number
+  had also gone STALE once, reading 36 while the file held 33, five commits
+  having touched it without re-running; before that it was 32 twice over, once
+  when the `-f DIR` decision arrived with FOUR and once when `-NUM` landed and
+  retired `sed -l N`. Re-run it when adding one: the count in this sentence is
+  part of what it asserts, and it has been wrong more than once.
+
+  One trap in re-running, which cost a whole set of measurements here: the
+  oracle must be a real GNU binary named by PATH. An earlier landing could not
+  re-run the grep half at all, that host's `grep` being ugrep, and reaching for
+  the bare name rather than the absolute path silently answers with whatever
+  `grep` is.
 
 
 Overlay
@@ -3511,7 +3785,7 @@ Overlay
                          td-txt/target/release/td-txt td-txt/spec > td-txt/spec/expectations.txt
 
                      It is NOT empty: 22 xfail entries and no skips,
-                     against 2592 of a 2614-case corpus passing -- 99.16%.
+                     against 2640 of a 2662-case corpus passing -- 99.17%.
                      This line read "EMPTY today" long after it stopped being
                      true, which is why the count now sits beside the claim.
 

@@ -15,12 +15,15 @@
 //! * output this one does not produce — `--color`/`--colour`, whose escapes
 //!   would need a second output path and a terminal test, and
 //!   `-T`/`--initial-tab`;
-//! * a file filter — `--include`, `--exclude`, `--exclude-from` and
-//!   `--exclude-dir`, and `-I`, which is `--binary-files=without-match`: the
-//!   one value of that option not served, the other two being the default and
-//!   `-a`'s;
+//! * one value of an option that IS served — `-I`, which is
+//!   `--binary-files=without-match`, the other two values being the default
+//!   and `-a`'s;
 //! * nothing at all — `-u` and `-U`/`--binary`, whose second answer a POSIX
 //!   system does not have.
+//!
+//! `--include`, `--exclude`, `--exclude-from` and `--exclude-dir` were on that
+//! list and are served now; `Globs` below carries the selection model and
+//! `walk`'s `prune` carries the one that decides descent.
 //!
 //! Each is DIAGNOSED and never a silent no-op: `invalid option` for the short
 //! spellings, `unrecognized option` for the long ones — getopt's own split and
@@ -32,24 +35,24 @@
 //! directions, one sorting by prefix geometry and one crediting a single row
 //! with an effect that needed its whole group gone.
 //!
-//! Remove ONE row and only `--binary` changes what runs: it resolved to
-//! `--binary-files` and took the next argv as its value, so a refusal became
-//! a successful search. Every other single removal still ends in an error,
-//! because the siblings that remain keep the abbreviation ambiguous — which
-//! is exactly why these names arrived in GROUPS, and the group is the unit
-//! the effect belongs to. Drop all three `--exclude*` and `--e` resolves to
-//! `--extended-regexp`: `grep --e 'a+'` then matches `a` and `aa` as an ERE
-//! where the refusal it replaced ran nothing. Drop both `--include` and
-//! `--initial-tab` and `--in` resolves to `--invert-match`, printing the
-//! NON-matching lines and exiting 0.
+//! Remove ONE row and only `--binary` changes what RUNS: it resolves to
+//! `--binary-files` and takes the next argv as its value, so `grep --binary
+//! text a` searches and exits 0 where the refusal ran nothing. Drop any other
+//! row named above and every prefix that reached it still ends in an error:
+//! a prefix that was ambiguous stays ambiguous, and one that used to resolve
+//! to the row either lands on a SIBLING — `--colo` finds `--colour` once
+//! `--color` is gone — or reports `unrecognized` against the argument where
+//! it said `unsupported` against the option. That is re-measured row by row
+//! against the table as it stands, not inherited: the filter family has since
+//! moved from this roster to being served, and a counterfactual about a table
+//! does not survive the table changing.
 //!
-//! For the rest, absence changes only the DIAGNOSTIC — `--exclude-from` and
-//! `--exclude-dir` report `unrecognized` against the whole argument instead
-//! of `unsupported` against the option, `--initial-tab` and `--perl-regexp`
-//! likewise — because a name absent from the table is absent from every
-//! ambiguity list and from every abbreviation that would reach it. Each named
-//! above is pinned in spec/divergence.test.txt, except `--i`/`--in`, which
-//! stopped diverging when `--initial-tab` landed and moved to
+//! Those four filter names still pay the older debt even though they are in
+//! the table to be SERVED now: they are what keeps `--e`, `--ex` and `--exc`
+//! ambiguous here as they are in GNU, where without them `--e` would resolve
+//! to `--extended-regexp` and compile an ERE nobody asked for. Each refused
+//! name above is pinned in spec/divergence.test.txt, and so is that ambiguity;
+//! `--i`/`--in` stopped diverging when `--initial-tab` landed and moved to
 //! spec/grep-cli.test.txt. BOTH rosters are complete now — the short one
 //! swept against grep.c:486, the long one against grep.c:504 — with ONE
 //! name deliberately left out: `--unix-byte-offsets`. It is the only GNU
@@ -134,6 +137,162 @@ enum Syntax {
     Fixed,
 }
 
+/// Which way a `--include`/`--exclude` group answers for the names it matches.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    Include,
+    Exclude,
+}
+
+/// One selection list, held as GROUPS -- maximal runs of a single kind in
+/// command-line order, which is what gnulib's exclude SEGMENTS are.
+///
+/// The grouping is load-bearing rather than tidiness. Groups are asked NEWEST
+/// first, so `--exclude='*.c' --include=a.c` searches `a.c` where the same pair
+/// written the other way round does not. `--exclude-from` joins the run its
+/// neighbouring `--exclude`s form, since only the KIND starts a new group.
+#[derive(Default)]
+struct Globs {
+    groups: Vec<(Pick, Vec<Pat>)>,
+}
+
+impl Globs {
+    /// Extends the newest group when the kind matches and opens one otherwise,
+    /// which is the whole of what makes a group a maximal run.
+    fn push(&mut self, pick: Pick, glob: Vec<u8>) {
+        let pat = Pat::new(glob);
+        match self.groups.last_mut() {
+            Some((kind, globs)) if *kind == pick => globs.push(pat),
+            _ => self.groups.push((pick, vec![pat])),
+        }
+    }
+
+    /// Whether `name` is searched rather than skipped.
+    fn selects(&self, name: &[u8], command_line: bool) -> bool {
+        for (pick, globs) in self.groups.iter().rev() {
+            if globs.iter().any(|g| glob_hit(g, name, command_line)) {
+                return *pick == Pick::Include;
+            }
+        }
+        // No group matched, so the OLDEST decides by its OPPOSITE: a list
+        // opening with `--include` selects nothing else, one opening with
+        // `--exclude` selects everything else, and an empty list selects all.
+        !matches!(self.groups.first(), Some((Pick::Include, _)))
+    }
+}
+
+/// One glob and WHICH of GNU's two matchers answers for it. gnulib routes a
+/// pattern holding none of `? * [` to a hash segment -- an exact compare after
+/// `\` unescaping -- and only the rest to `fnmatch`. Reading everything as a
+/// glob is wrong twice over: `--include='a\'` selects a file literally named
+/// `a\` where fnmatch answers NOMATCH for a trailing backslash, and the two
+/// paths disagree about where a suffix may start in a name holding `//`.
+enum Pat {
+    /// Has a wildcard: `fnmatch`, and a suffix starts only after a `/` that is
+    /// NOT followed by another `/`.
+    Glob(Vec<u8>),
+    /// Has none: an exact compare, and a suffix starts after EVERY `/`.
+    Literal(Vec<u8>),
+}
+
+impl Pat {
+    fn new(glob: Vec<u8>) -> Self {
+        match has_wildcards(&glob) {
+            true => Self::Glob(glob),
+            false => Self::Literal(unescape(&glob)),
+        }
+    }
+
+    fn matches(&self, name: &[u8]) -> bool {
+        match self {
+            Self::Glob(pat) => crate::util::glob_match(pat, name),
+            Self::Literal(pat) => pat.as_slice() == name,
+        }
+    }
+}
+
+/// gnulib's `fnmatch_pattern_has_wildcards`: a `\` HIDES the byte after it, so
+/// `a\*c` holds no wildcard at all and is the literal name `a*c`.
+fn has_wildcards(pat: &[u8]) -> bool {
+    let mut i = 0;
+    while let Some(&c) = pat.get(i) {
+        match c {
+            b'\\' if pat.get(i.saturating_add(1)).is_some() => i = i.saturating_add(2),
+            b'?' | b'*' | b'[' => return true,
+            _ => i = i.saturating_add(1),
+        }
+    }
+    false
+}
+
+/// gnulib's `unescape_pattern`: a `\` before any byte drops the `\` and keeps
+/// the byte. A TRAILING `\` has nothing after it and is kept as itself, which
+/// is the whole of why `--include='a\'` names the file `a\`.
+fn unescape(pat: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(pat.len());
+    let mut i = 0;
+    while let Some(&c) = pat.get(i) {
+        match (c, pat.get(i.saturating_add(1))) {
+            (b'\\', Some(&next)) => {
+                out.push(next);
+                i = i.saturating_add(2);
+            }
+            _ => {
+                out.push(c);
+                i = i.saturating_add(1);
+            }
+        }
+    }
+    out
+}
+
+/// Whether one pattern answers for `name`. A name the WALK produced is ANCHORED
+/// -- its bare last component, matched whole. A `command_line` name is matched
+/// whole and then again at each `/`, so the operand `deep/mid/low/c.c` is
+/// selected by `low/c.c` and not by `ow/c.c`: a suffix starts at a component.
+/// Where a RUN of slashes falls, the two matchers part company -- gnulib's
+/// fnmatch path skips a `/` whose next byte is another `/` and its hash path
+/// does not, so `d//a.c` is selected by the literal `/a.c` and not by `/a.?`.
+fn glob_hit(pat: &Pat, name: &[u8], command_line: bool) -> bool {
+    if !command_line {
+        return pat.matches(last_component(name));
+    }
+    if pat.matches(name) {
+        return true;
+    }
+    let mut i = 0;
+    while let Some(&c) = name.get(i) {
+        i = i.saturating_add(1);
+        if c != b'/' {
+            continue;
+        }
+        if matches!(pat, Pat::Glob(_)) && name.get(i) == Some(&b'/') {
+            continue;
+        }
+        if name.get(i..).is_some_and(|tail| pat.matches(tail)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn last_component(name: &[u8]) -> &[u8] {
+    match name.iter().rposition(|b| *b == b'/') {
+        Some(at) => name.get(at.saturating_add(1)..).unwrap_or(name),
+        None => name,
+    }
+}
+
+/// The two lists, which never cross: `--include`/`--exclude`/`--exclude-from`
+/// are asked about FILES and `--exclude-dir` about DIRECTORIES. So
+/// `--exclude=mid` still descends into a directory named `mid`, and
+/// `--exclude-dir=c.c` still searches a file named `c.c`.
+#[derive(Default)]
+struct Selection {
+    files: Globs,
+    dirs: Globs,
+}
+
 struct Conf {
     syntax: Syntax,
     icase: bool,
@@ -172,6 +331,8 @@ struct Conf {
     null_data: bool,
     /// `-a`: treat a file containing NUL as text instead of reporting a match.
     text: bool,
+    /// `--include`/`--exclude`/`--exclude-from`/`--exclude-dir`.
+    selection: Selection,
 }
 
 impl Default for Conf {
@@ -201,6 +362,7 @@ impl Default for Conf {
             both: None,
             null_data: false,
             text: false,
+            selection: Selection::default(),
         }
     }
 }
@@ -1140,6 +1302,16 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
         if implied_cwd {
             files.push(b".".to_vec());
         }
+        // `--exclude-dir` decides DESCENT, so it is the walk's own business
+        // rather than a filter over what the walk returned: an excluded
+        // directory is never entered, and neither a permission error inside one
+        // nor a symlink cycle through one is reported. The implied `.` is exempt
+        // as a ROOT (GNU's `omit_dot_slash`) while everything below it is not,
+        // so a bare `grep -r --exclude-dir='*' PAT` still searches the working
+        // directory's own files.
+        let prune = |path: &std::path::Path, root: bool| -> bool {
+            !(root && implied_cwd) && !conf.selection.dirs.selects(&path_bytes(path), root)
+        };
         for f in &files {
             // `-` is stdin under `-r` too; there is nothing to walk and no
             // directory, so it neither descends nor names on its own.
@@ -1147,7 +1319,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                 inputs.push(Operand::named(f.clone()));
                 continue;
             }
-            let found = walk(&crate::util::path_from_bytes(f), conf.logical);
+            let found = walk(&crate::util::path_from_bytes(f), conf.logical, &prune);
             descended |= found.descended;
             // The synthesized `.` must not reach a DIAGNOSTIC either: GNU names the
             // same file the same way whether it is reporting it or matching in it.
@@ -1158,7 +1330,19 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                     false => b,
                 }
             };
-            inputs.extend(found.files.iter().map(|f| Operand {
+            // `--include`/`--exclude` do NOT prune: GNU still enters a directory
+            // no glob selects and still reports what it cannot read there.
+            //
+            // Only what the walk FOUND is decided here, on its last component,
+            // and it is decided BEFORE the open -- so an unreadable file no glob
+            // selects is passed over in silence. The walk's ROOT is a
+            // command-line name and is left alone: it is filtered after its open
+            // in the search loop, where an open that FAILED reports instead.
+            let picked = found
+                .files
+                .iter()
+                .filter(|f| f.root || conf.selection.files.selects(&path_bytes(&f.path), false));
+            inputs.extend(picked.map(|f| Operand {
                 name: shown(&f.path),
                 from_walk: true,
                 // The walk's ROOT is a command-line name to the device policy,
@@ -1241,6 +1425,22 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                 continue;
             }
         };
+        // A COMMAND-LINE name is selected only once it has been opened, which is
+        // where GNU asks it too (`grepdesc`, on a descriptor it already holds).
+        // The ordering is the whole of the rule: an operand that would not be
+        // selected is still REPORTED when the open failed, so `--include=zzz PAT
+        // unreadable.c` says `Permission denied` where the same option over a
+        // readable one says nothing. stdin is exempt, and a name the WALK found
+        // was decided before it got here.
+        if op.command_line && !(path.as_slice() == b"-" && !from_walk) {
+            let keep = match input.is_dir() {
+                true => grep.conf.selection.dirs.selects(path, true),
+                false => grep.conf.selection.files.selects(path, true),
+            };
+            if !keep {
+                continue;
+            }
+        }
         // A READ that fails part way is reported inside, because with a
         // streaming reader it can happen after output has already gone out --
         // a directory under `-d read` being the reachable case, which is what
@@ -1640,11 +1840,7 @@ fn parse_long(
         // at all differs and is the module doc's. The usage block goes with it
         // because this is an OPTION error, where the value errors above are
         // GNU's `die()` and print none.
-        b"exclude"
-        | b"exclude-from"
-        | b"exclude-dir"
-        | b"include"
-        | b"binary"
+        b"binary"
         | b"initial-tab"
         | b"perl-regexp"
         | b"color"
@@ -1668,6 +1864,56 @@ fn parse_long(
                 .map_err(|e| LongErr::Message(name_in("", &path, &format!(": {}", errmsg(&e)))))?;
             push_file(patterns, &bytes);
             *pattern_seen = true;
+        }
+        b"include" => conf.selection.files.push(Pick::Include, need(value)?),
+        b"exclude" => conf.selection.files.push(Pick::Exclude, need(value)?),
+        b"exclude-from" => {
+            let path = need(value)?;
+            let bytes = read_input(&path)
+                .map_err(|e| LongErr::Message(name_in("", &path, &format!(": {}", errmsg(&e)))))?;
+            for line in bytes.split(|b| *b == b'\n') {
+                // gnulib walks back over TRAILING whitespace and drops the line
+                // outright if that reaches its start, so `*.h ` is the glob
+                // `*.h` and a line of spaces is no glob at all. Leading
+                // whitespace is kept. A CRLF file loses every glob without
+                // this, the `\r` being part of each line.
+                let end = line
+                    .iter()
+                    .rposition(|b| !matches!(b, b' ' | b'\t' | 0x0b | 0x0c | b'\r'))
+                    .map_or(0, |at| at.saturating_add(1));
+                let line = line.get(..end).unwrap_or_default();
+                // An empty LINE contributes NOTHING -- not an empty glob. The
+                // difference is visible: a group that exists at all sets the
+                // default for every name no glob matches, so an --exclude-from
+                // of blank lines must leave `--include='*.c'` selecting only
+                // `*.c`, which one empty exclude glob would silently invert.
+                if line.is_empty() {
+                    continue;
+                }
+                // GNU holds each glob as a C string, so a NUL ENDS it and the
+                // rest of the line is dropped: `a.c\0junk` excludes `a.c`. The
+                // test above is on the LINE and this truncation happens after
+                // it, which is not the same test -- a line of just `\0zz` is a
+                // non-empty line whose glob is empty, and GNU does open a group
+                // for it. Measured both ways round.
+                let glob = match line.iter().position(|b| *b == 0) {
+                    Some(at) => line.get(..at).unwrap_or_default(),
+                    None => line,
+                };
+                conf.selection.files.push(Pick::Exclude, glob.to_vec());
+            }
+        }
+        b"exclude-dir" => {
+            let mut v = need(value)?;
+            // GNU strips trailing slashes from the PATTERN (gnulib's
+            // `strip_trailing_slashes`, which keeps a lone `/`), so
+            // `--exclude-dir=sub/` is `--exclude-dir=sub`. Nothing strips them
+            // from the NAME, which is why the operand `d/` escapes
+            // `--exclude-dir=d`: its last component is empty.
+            while v.len() > 1 && v.last() == Some(&b'/') {
+                v.pop();
+            }
+            conf.selection.dirs.push(Pick::Exclude, v);
         }
         b"max-count" => {
             let v = need(value)?;
@@ -2515,4 +2761,95 @@ mod tests {
         assert_eq!(argmatch(b"skip-al", &names).ok(), Some(1));
         assert!(matches!(argmatch(b"nope", &names), Err(NoMatch::Invalid)));
     }
+
+    fn globs(spec: &[(Pick, &str)]) -> Globs {
+        let mut g = Globs::default();
+        for (pick, pat) in spec {
+            g.push(*pick, pat.as_bytes().to_vec());
+        }
+        g
+    }
+
+    /// The group rule, which is the whole of why this is a list of ordered
+    /// groups rather than an include set and an exclude set. Each row is
+    /// measured against GNU grep 3.11; the corpus pins the same pairs end to
+    /// end, and these pin the decision alone.
+    #[test]
+    fn the_newest_matching_group_decides_and_the_oldest_sets_the_default() {
+        let inc = globs(&[(Pick::Include, "*.c")]);
+        assert!(inc.selects(b"a.c", false), "the glob matches");
+        assert!(!inc.selects(b"a.h", false), "no group matches, and the oldest is an include");
+
+        let exc = globs(&[(Pick::Exclude, "*.c")]);
+        assert!(!exc.selects(b"a.c", false));
+        assert!(exc.selects(b"a.h", false), "the oldest is an exclude, so the default is to search");
+
+        // The same two options in each order. `a.c` matches BOTH, so only the
+        // group order can decide it -- and it decides opposite ways.
+        let ei = globs(&[(Pick::Exclude, "a.c"), (Pick::Include, "a.c")]);
+        let ie = globs(&[(Pick::Include, "a.c"), (Pick::Exclude, "a.c")]);
+        assert!(ei.selects(b"a.c", false), "the include is newest");
+        assert!(!ie.selects(b"a.c", false), "the exclude is newest");
+        // And `b.h` matches neither, so each falls to its OLDEST group's
+        // opposite -- which is the other way round again.
+        assert!(ei.selects(b"b.h", false));
+        assert!(!ie.selects(b"b.h", false));
+    }
+
+    /// A run of one kind is ONE group: a glob anywhere in it answers for the
+    /// whole run, and a name it does not name falls through to the group
+    /// BEFORE it rather than to the default. Measured -- GNU answers this
+    /// triple 0, 1, 1.
+    #[test]
+    fn consecutive_options_of_one_kind_are_a_single_group() {
+        let g = globs(&[
+            (Pick::Include, "keep.c"),
+            (Pick::Exclude, "zzz"),
+            (Pick::Exclude, "*.h"),
+        ]);
+        assert_eq!(g.groups.len(), 2, "the two excludes are one group, not two");
+        assert!(g.selects(b"keep.c", false), "past the exclude group to the include");
+        assert!(!g.selects(b"x.h", false), "named by the newest group");
+        assert!(!g.selects(b"other.txt", false), "no group names it, and the oldest is an include");
+    }
+
+    /// A COMMAND-LINE name is matched whole and then at every `/`; a name the
+    /// WALK produced is its bare last component. The same glob therefore
+    /// answers differently depending only on where the name came from.
+    #[test]
+    fn a_command_line_name_is_matched_at_every_slash_and_a_walked_one_is_not() {
+        let g = globs(&[(Pick::Include, "low/c.c")]);
+        assert!(g.selects(b"deep/mid/low/c.c", true), "a suffix at a component");
+        assert!(!g.selects(b"deep/mid/low/c.c", false), "the walk offers `c.c` alone");
+
+        // The other direction, and the one that tells the walk's rule from a
+        // whole-path compare: a bare last component answers for a walked name.
+        // Without this row, replacing the walk's rule with a whole-path match
+        // left the test GREEN -- the case above passes either way.
+        let base = globs(&[(Pick::Include, "c.c")]);
+        assert!(base.selects(b"deep/mid/low/c.c", false), "matched on `c.c`");
+        assert!(base.selects(b"deep/mid/low/c.c", true), "the last suffix is that same `c.c`");
+
+        let partial = globs(&[(Pick::Include, "ow/c.c")]);
+        assert!(
+            !partial.selects(b"deep/mid/low/c.c", true),
+            "a suffix begins at a component, never inside one"
+        );
+
+        // Repeated slashes are not collapsed: each one starts a suffix, so the
+        // tail after the FIRST of a pair still begins with a slash.
+        let slashed = globs(&[(Pick::Include, "/a.c")]);
+        assert!(slashed.selects(b"d//a.c", true));
+        assert!(!slashed.selects(b"d/a.c", true));
+    }
+
+    /// An empty list is not a filter: every name is searched, whichever side
+    /// asks. The `--exclude-from` of blank lines depends on this.
+    #[test]
+    fn an_empty_list_selects_everything() {
+        let g = Globs::default();
+        assert!(g.selects(b"anything", true));
+        assert!(g.selects(b"anything", false));
+    }
+
 }

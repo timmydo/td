@@ -7618,3 +7618,533 @@ grep: Unmatched ( or \(
 ## END
 ## status: 2
 
+
+#### --include searches only what its globs name
+# The default that goes with it is the load-bearing half: a name no glob in the
+# list matches is SKIPPED, because the oldest group is an --include.
+## argv: grep -r --include=*.c -l hit d
+## file d/a.c:
+hit
+## END
+## file d/b.h:
+hit
+## END
+## stdout-json: "d/a.c\n"
+## stderr-json: ""
+## status: 0
+
+#### --exclude is the same list read the other way round
+# Same list, opposite default: nothing matches `*.h' except b.h, and the rest
+# are searched because the oldest group is an --exclude.
+## argv: grep -r --exclude=*.h -l hit d
+## file d/a.c:
+hit
+## END
+## file d/b.h:
+hit
+## END
+## stdout-json: "d/a.c\n"
+## stderr-json: ""
+## status: 0
+
+#### the NEWEST group that matches decides
+# Options form groups -- maximal runs of one kind -- and the groups are asked
+# newest first. Here the --include is newest, so a.c is searched despite the
+# --exclude that names it.
+## argv: grep -r --exclude=a.c --include=a.c -l hit d/a.c
+## file d/a.c:
+hit
+## END
+## stdout-json: "d/a.c\n"
+## stderr-json: ""
+## status: 0
+
+#### and the same two written the other way round decide differently
+# The pair reversed: the --exclude is newest and matches, so a.c is skipped.
+# This case and the one above are the whole reason the list is kept as ordered
+# groups rather than as two sets.
+## argv: grep -r --include=a.c --exclude=a.c -l hit d/a.c
+## file d/a.c:
+hit
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### a command-line operand is matched at every slash boundary
+# Not just its last component: the whole operand is tried, then each suffix
+# that starts just after a `/'.
+## argv: grep --include=low/c.c -l hit deep/mid/low/c.c
+## file deep/mid/low/c.c:
+hit
+## END
+## stdout-json: "deep/mid/low/c.c\n"
+## stderr-json: ""
+## status: 0
+
+#### but a suffix starts at a component, never inside one
+# `ow/c.c' is a tail of the operand's BYTES and not of its components, so it
+# selects nothing.
+## argv: grep --include=ow/c.c -l hit deep/mid/low/c.c
+## file deep/mid/low/c.c:
+hit
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### a name the WALK found is matched on its last component alone
+# `mid/low/c.c' would select this as an OPERAND, by the suffix rule above, and
+# selects nothing here because what the walk hands over is `c.c' alone.
+## argv: grep -r --include=mid/low/c.c -l hit deep
+## file deep/mid/low/c.c:
+hit
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### and that last component is matched whole
+# The other half of the case above: `c.c' does select it.
+## argv: grep -r --include=c.c -l hit deep
+## file deep/mid/low/c.c:
+hit
+## END
+## stdout-json: "deep/mid/low/c.c\n"
+## stderr-json: ""
+## status: 0
+
+#### --exclude-dir prunes the descent
+# d/skip is never entered, so nothing under it is searched or reported.
+## argv: grep -r --exclude-dir=skip -l hit d
+## file d/keep.c:
+hit
+## END
+## file d/skip/x.c:
+hit
+## END
+## stdout-json: "d/keep.c\n"
+## stderr-json: ""
+## status: 0
+
+#### --exclude-dir answers without -r as well
+# A directory operand is asked even where there is no walk, and the exclusion
+# replaces the diagnostic: exit 1 in silence, where the unfiltered search
+# below reports `Is a directory' and exits 2.
+## argv: grep --exclude-dir=d hit d
+## file d/a.c:
+hit
+## END
+## file d/b.h:
+hit
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### the same operand without the exclusion still reports
+# The case above only means something next to this one.
+## argv: grep hit d
+## file d/a.c:
+hit
+## END
+## file d/b.h:
+hit
+## END
+## stdout-json: ""
+## stderr-json: "grep: d: Is a directory\n"
+## status: 2
+
+#### the file list is never asked about a directory
+# --exclude names the directory `sub' and the walk descends into it anyway.
+## argv: grep -r --exclude=sub -l hit d/sub
+## file d/sub/c.c:
+hit
+## END
+## stdout-json: "d/sub/c.c\n"
+## stderr-json: ""
+## status: 0
+
+#### and the directory list is never asked about a file
+# --exclude-dir names the file `a.c' and it is searched anyway.
+## argv: grep -r --exclude-dir=a.c -l hit d/a.c
+## file d/a.c:
+hit
+## END
+## stdout-json: "d/a.c\n"
+## stderr-json: ""
+## status: 0
+
+#### --exclude-from reads one glob per line
+# One per line, and the line is a glob like any other `--exclude' would take.
+# The `globs' line is inert here -- that file sits beside `d' rather than in
+# it, so no name the walk produces can match it -- and only `*.h' does any
+# work. Its KIND, that it excludes rather than includes, is what the
+# blank-line pair below pins.
+## argv: grep -r --exclude-from=globs -l hit d
+## file d/a.c:
+hit
+## END
+## file d/b.h:
+hit
+## END
+## file globs:
+*.h
+globs
+## END
+## stdout-json: "d/a.c\n"
+## stderr-json: ""
+## status: 0
+
+#### a blank line in an --exclude-from adds no glob at all
+# It must add nothing rather than an empty glob, and the difference shows in
+# the DEFAULT: one empty exclude glob would open an exclude group, and the
+# oldest group is what every unmatched name falls back to. b.h matches no glob
+# here, so it is searched if that group exists and skipped if it does not.
+## argv: grep -r --exclude-from=globs --include=*.c -l hit d
+## file d/b.h:
+hit
+## END
+## file globs:
+
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### and the same run with a real glob in that file does open one
+# The comparison the case above needs: one glob that matches nothing still
+# creates the group, and b.h is searched because of it.
+## argv: grep -r --exclude-from=globs --include=*.c -l hit d
+## file d/b.h:
+hit
+## END
+## file globs:
+zzz
+## END
+## stdout-json: "d/b.h\n"
+## stderr-json: ""
+## status: 0
+
+#### - is exempt from the file list
+# stdin is not a name the globs are asked about, so `--exclude=*' does not
+# silence it.
+## argv: grep --exclude=* -l hit -
+## stdin:
+hit
+## END
+## stdout-json: "(standard input)\n"
+## stderr-json: ""
+## status: 0
+
+#### an operand that fails to open is reported rather than filtered
+# The selection is asked only of a name that OPENED, so the error outranks it.
+## argv: grep --include=zzz hit nosuch
+## stdout-json: ""
+## stderr-json: "grep: nosuch: No such file or directory\n"
+## status: 2
+
+#### a trailing slash on an --exclude-dir glob is stripped
+# `sub/' is `sub'.
+## argv: grep -r --exclude-dir=sub/ -l hit d/sub
+## file d/sub/c.c:
+hit
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### a trailing slash on the OPERAND defeats the same match
+# Nothing strips the name, so the last component of `d/' is empty and `d'
+# matches neither it nor the whole operand.
+## argv: grep -r --exclude-dir=d -l hit d/
+## file d/a.c:
+hit
+## END
+## stdout-json: "d/a.c\n"
+## stderr-json: ""
+## status: 0
+
+#### the implied . of a bare -r is exempt as a ROOT
+# `grep -r PAT' with no operand walks the working directory, and that
+# synthesized root is not asked -- GNU's omit_dot_slash. Everything BELOW it
+# still is, so `*' prunes sub and leaves top.c.
+## argv: grep -r --exclude-dir=* -l hit
+## file sub/in.c:
+hit
+## END
+## file top.c:
+hit
+## END
+## stdout-json: "top.c\n"
+## stderr-json: ""
+## status: 0
+
+#### naming that same directory explicitly is not exempt
+# The case above only means something next to this one.
+## argv: grep -r --exclude-dir=* -l hit .
+## file sub/in.c:
+hit
+## END
+## file top.c:
+hit
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### an --exclude-from that cannot be read is an error, like -f
+# It takes a PATH where the other three take a glob, so it is the one that can
+# fail before any search starts.
+## argv: grep --exclude-from=nosuch hit d/a.c
+## file d/a.c:
+hit
+## END
+## stdout-json: ""
+## stderr-json: "grep: nosuch: No such file or directory\n"
+## status: 2
+
+#### a -r root that is a FILE is still a command-line name
+# The walk produced it, but it is the operand as written, so the slash-boundary
+# rule applies where a name found UNDER a directory would be matched on its
+# last component alone.
+## argv: grep -r --include=d/a.c -l hit d/a.c
+## file d/a.c:
+hit
+## END
+## stdout-json: "d/a.c\n"
+## stderr-json: ""
+## status: 0
+
+#### a NUL ends an --exclude-from glob, and the rest of the line is dropped
+# GNU holds each glob as a C string. `a.c\0junk' is the glob `a.c', which is
+# why this excludes the file the line appears to name something else.
+## argv: grep --exclude-from=globs -l hit d/a.c
+## file d/a.c:
+hit
+## END
+## file globs:
+a.c junk
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### a line that is empty only AFTER that NUL still opens a group
+# The empty-line test is on the LINE and the truncation happens after it, so
+# the two are not the same test. `\0zz' is a non-empty line whose glob is
+# empty: it matches nothing, but the exclude GROUP it opens becomes the oldest
+# and so hands every unmatched name the opposite answer -- b.h is searched
+# here where the blank-line case above, over the very same fixture, leaves it
+# skipped. Only the file's CONTENTS differ between the two.
+## argv: grep -r --exclude-from=globs --include=*.c -l hit d
+## file d/b.h:
+hit
+## END
+## file globs:
+ zz
+## END
+## stdout-json: "d/b.h\n"
+## stderr-json: ""
+## status: 0
+
+#### a CLASS as a range's high end is the `[' BYTE, not a class
+# Only a collating element ends a range. A `[:class:]' does not, and glibc
+# does not give the pattern up either: the `[' becomes the endpoint byte, so
+# this is the INVERTED range `a'..`[' -- which matches nothing -- followed by
+# `:alpha:' read as ordinary bytes, closing at the FIRST `]'. The second `]'
+# is a literal the name must then end with. So it selects neither `a' nor `q'
+# -- and it DOES select `a]'. Both halves are needed: a pattern read as simply
+# void would also pass over `a' and `q', and only `a]' tells the two apart.
+## argv: grep -r --include=[a-[:alpha:]] -l hit d
+## file d/a:
+hit
+## END
+## file d/q:
+hit
+## END
+## file d/a]:
+hit
+## END
+## stdout-json: "d/a]\n"
+## stderr-json: ""
+## status: 0
+
+#### a COLLATING element does end one, and the same shape then matches
+# `[a-[.z.]]' is `[a-z]'. The case above only means something beside this one.
+## argv: grep -r --include=[a-[.z.]] -l hit d
+## file d/q:
+hit
+## END
+## stdout-json: "d/q\n"
+## stderr-json: ""
+## status: 0
+
+#### on the LOW side the same construct is an item and the - is a byte
+# The asymmetry is glibc's: a class BEFORE the `-' does not start a range, so
+# `[[:alpha:]-c]' is the alphabetic set plus a literal `-' plus `c', and it
+# selects a file named `-'.
+## argv: grep -r --include=[[:alpha:]-c] -l hit d
+## file d/-:
+hit
+## END
+## stdout-json: "d/-\n"
+## stderr-json: ""
+## status: 0
+
+#### the OLDEST group decides what an unmatched name gets
+# A name no glob names at all falls to the OPPOSITE of the oldest group's
+# kind. Both globs here name a.c and neither names b.h, so b.h reaches the
+# default, and the oldest group is an --exclude -- so it is searched.
+## argv: grep -r --exclude=a.c --include=a.c -l hit d/b.h
+## file d/b.h:
+hit
+## END
+## stdout-json: "d/b.h\n"
+## stderr-json: ""
+## status: 0
+
+#### once an item matches, the REST of the set is read by other rules
+# glibc walks what the scan already passed a second time. There `[.xy.]' is a
+# SEARCH for the next `.]', where the scan takes exactly one byte and gives a
+# multi-byte one up. So `a' matches and the walk closes the set. `x' is the
+# byte a one-byte reading of `[.xy.]' would have collected, and it is NOT
+# selected, which is what makes this about the walk rather than the scan.
+## argv: grep -r --include=[a[.xy.]] -l hit t
+## file t/a:
+hit
+## END
+## file t/x:
+hit
+## END
+## stdout-json: "t/a\n"
+## stderr-json: ""
+## status: 0
+
+#### but a malformed `[=' in that walk gives the whole pattern up
+# The set is then exactly the bytes the scan had read before it: `a' matches
+# the item and is LOST to the walk, while `=' is selected, having matched
+# before the walk ever ran.
+## argv: grep -r --include=[a[=] -l hit t
+## file t/a:
+hit
+## END
+## file t/=:
+hit
+## END
+## stdout-json: "t/=\n"
+## stderr-json: ""
+## status: 0
+
+#### a bad class NAME in that walk backs off instead, to its own colon
+# glibc reads a class name there without ever looking it up, and abandons the
+# construct at the first byte outside `a'..`y'. `z' is outside -- the bound is
+# exclusive -- so the `:' is re-read as an ordinary byte and the set ends at
+# the FIRST `]', leaving the second one a literal the name must end with. So
+# `a' is passed over and `a]' is selected. The second file is the whole point:
+# over `a' alone, a pattern simply given up would answer the same.
+## argv: grep -r --include=[a[:zz:]] -l hit t
+## file t/a:
+hit
+## END
+## file t/a]:
+hit
+## END
+## stdout-json: "t/a]\n"
+## stderr-json: ""
+## status: 0
+
+#### the same backoff with no name at all closes the set instead
+# One byte shorter and the `]' the class name never reached is the set's own.
+## argv: grep -r --include=[a[:] -l hit t
+## file t/a:
+hit
+## END
+## stdout-json: "t/a\n"
+## stderr-json: ""
+## status: 0
+
+#### and a set that never closes still falls back to a literal `['
+# The fallback is not the scan's alone: this matches an item, runs off the end
+# of the pattern inside the walk, and still re-reads the `[' as an ordinary
+# byte -- so `*[[' selects a name ending in `[['.
+## argv: grep -r --include=*[[ -l hit t
+## file t/x[[:
+hit
+## END
+## stdout-json: "t/x[[\n"
+## stderr-json: ""
+## status: 0
+
+#### whether `^' negates a set is the ENVIRONMENT's answer, not the pattern's
+# glibc reads POSIXLY_CORRECT, and under it a leading `^' is an ordinary member
+# rather than a negation. So `[^^]' is "not a caret" here and selects nothing.
+## argv: grep -r --include=[^^] -l hit t
+## file t/^:
+hit
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### and the same glob over the same file selects it under POSIXLY_CORRECT
+# The pair is the assertion: one run cannot show that the environment decides.
+## argv: grep -r --include=[^^] -l hit t
+## env POSIXLY_CORRECT: 1
+## file t/^:
+hit
+## END
+## stdout-json: "t/^\n"
+## stderr-json: ""
+## status: 0
+
+#### `!' negates either way, which is what makes the pair above about `^'
+## argv: grep -r --include=[!a] -l hit t
+## env POSIXLY_CORRECT: 1
+## file t/^:
+hit
+## END
+## stdout-json: "t/^\n"
+## stderr-json: ""
+## status: 0
+
+#### ...and without it, which is the half that makes "either way" true
+## argv: grep -r --include=[!a] -l hit t
+## file t/^:
+hit
+## END
+## stdout-json: "t/^\n"
+## stderr-json: ""
+## status: 0
+
+#### a `-]' after a COLLATING element is a range, so the element is not an item
+# glibc asks "is this a range?" one way after `[.x.]' and another after a plain
+# byte, and the two spellings differ by exactly this case. Being a range skips
+# the item test, and then there is no high end to use, so `a' is not selected.
+## argv: grep -r --include=[[.a.]-] -l hit d
+## file d/a:
+hit
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### where the same shape after a plain byte leaves the byte an item
+# The control the case above needs: one character shorter and `a' is selected.
+## argv: grep -r --include=[a-] -l hit d
+## file d/a:
+hit
+## END
+## stdout-json: "d/a\n"
+## stderr-json: ""
+## status: 0
+
+#### and an equivalence class is not a collating element for this purpose
+## argv: grep -r --include=[[=a=]-] -l hit d
+## file d/a:
+hit
+## END
+## stdout-json: "d/a\n"
+## stderr-json: ""
+## status: 0
+
