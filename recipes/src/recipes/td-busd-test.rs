@@ -19,9 +19,10 @@ pub fn recipe() -> Recipe {
         },
         Step::WriteFile {
             path: "{out}/result".into(),
-            content: "PASS: td-busd is a static target executable whose D-Bus codec selftest \
-runs there — every type round-tripped in both byte orders, the committed body and message \
-streams marshalled and decoded byte for byte, and every committed malformed encoding refused\n"
+            content: "PASS: td-busd is a static target executable whose D-Bus selftest runs \
+there — every type round-tripped in both byte orders, the committed body and message streams \
+marshalled and decoded byte for byte, every committed malformed encoding refused, and every \
+committed auth transcript answered byte for byte\n"
                 .into(),
             exec: false,
         },
@@ -36,7 +37,7 @@ streams marshalled and decoded byte for byte, and every committed malformed enco
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-busd-test: build the dependency-free target D-Bus broker, assert it is static, and run its codec selftest on the target build"
+echo ">> recipe-check td-busd-test: build the dependency-free target D-Bus broker, assert it is static, and run its codec and handshake selftest on the target build"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-busd-test 1
 "#,

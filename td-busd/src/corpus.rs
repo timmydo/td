@@ -10,6 +10,7 @@
 //! The same table is what the shipped binary's `selftest` runs, so the target
 //! build decodes exactly what the host tests decode.
 
+use crate::auth::{self, AuthError, Guid, Handshake, PeerIdentity};
 use crate::message::{self, Message, MessageError, MessageType};
 use crate::wire::{self, Endian, Limits, WireError, Writer};
 
@@ -656,6 +657,566 @@ pub fn describe(message: &Message<'_>) -> Result<String, String> {
     Ok(parts.join(" "))
 }
 
+/// The GUID the committed transcripts are written against. A real broker reads
+/// one per instance; this one is fixed so the replies below can be bytes.
+pub const CORPUS_GUID: &str = "0123456789abcdef0123456789abcdef";
+
+/// The uid every transcript authenticates as, hex-encoded as `31303030`.
+pub const CORPUS_UID: u32 = 1000;
+
+/// One committed auth transcript, fed as the peer wrote it.
+pub struct Transcript {
+    pub name: &'static str,
+    /// The peer's bytes, leading NUL included.
+    pub client: &'static [u8],
+    /// What the broker must reply, byte for byte.
+    pub reply: &'static str,
+    /// What the connection looks like afterwards.
+    pub uid: Option<u32>,
+    pub unix_fd: bool,
+    pub begun: bool,
+    /// Bytes the handshake must NOT have consumed, because they are the
+    /// message stream that followed `BEGIN` in the same write.
+    pub left: usize,
+}
+
+pub const TRANSCRIPTS: &[Transcript] = &[
+    // §D's transcript exactly, in one write — which is how a client that does
+    // not wait for each reply actually sends it.
+    Transcript {
+        name: "the specified EXTERNAL handshake",
+        client: b"\x00AUTH EXTERNAL 31303030\r\nNEGOTIATE_UNIX_FD\r\nBEGIN\r\n",
+        reply: "OK 0123456789abcdef0123456789abcdef\r\nAGREE_UNIX_FD\r\n",
+        uid: Some(CORPUS_UID),
+        unix_fd: true,
+        begun: true,
+        left: 0,
+    },
+    // A client that never negotiates descriptor passing still gets a session;
+    // what it loses is any message carrying one, which the message layer asks
+    // `unix_fd()` about rather than this module refusing here.
+    Transcript {
+        name: "a handshake that skips NEGOTIATE_UNIX_FD",
+        client: b"\x00AUTH EXTERNAL 31303030\r\nBEGIN\r\n",
+        reply: "OK 0123456789abcdef0123456789abcdef\r\n",
+        uid: Some(CORPUS_UID),
+        unix_fd: false,
+        begun: true,
+        left: 0,
+    },
+    // sd-bus's spelling: an empty identity opens the DATA exchange, and an
+    // empty DATA means "whoever the credential says I am".
+    Transcript {
+        name: "an empty EXTERNAL through the DATA exchange",
+        client: b"\x00AUTH EXTERNAL\r\nDATA\r\nBEGIN\r\n",
+        reply: "DATA\r\nOK 0123456789abcdef0123456789abcdef\r\n",
+        uid: Some(CORPUS_UID),
+        unix_fd: false,
+        begun: true,
+        left: 0,
+    },
+    // A client that tries a mechanism this broker does not serve and falls back
+    // to one it does. Which mechanism a real client tries first is its own
+    // business — libdbus prefers EXTERNAL and reaches ANONYMOUS last — and the
+    // property here is only that REJECTED leaves a retry possible. A broker
+    // that treated the first attempt as fatal would drop clients that work
+    // everywhere else.
+    Transcript {
+        name: "a client that probes ANONYMOUS first",
+        client: b"\x00AUTH ANONYMOUS\r\nAUTH EXTERNAL 31303030\r\nBEGIN\r\n",
+        reply: "REJECTED EXTERNAL\r\nOK 0123456789abcdef0123456789abcdef\r\n",
+        uid: Some(CORPUS_UID),
+        unix_fd: false,
+        begun: true,
+        left: 0,
+    },
+    // BEGIN and the first message in one write. `left` is the whole of what
+    // this fixture is for: a handshake that consumed its buffer would eat the
+    // message, and the peer would look like one that never spoke.
+    Transcript {
+        name: "BEGIN pipelined with the first message",
+        client: b"\x00AUTH EXTERNAL 31303030\r\nBEGIN\r\nl\x01\x00\x01",
+        reply: "OK 0123456789abcdef0123456789abcdef\r\n",
+        uid: Some(CORPUS_UID),
+        unix_fd: false,
+        begun: true,
+        left: 4,
+    },
+    // CANCEL unwinds an attempt that had already authenticated AND negotiated
+    // descriptor passing. What the peer keeps is nothing: the attempt that
+    // succeeds afterwards never asked for a capability, and must not have one.
+    Transcript {
+        name: "an authenticated connection that cancels and starts over",
+        client: b"\x00AUTH EXTERNAL 31303030\r\nNEGOTIATE_UNIX_FD\r\nCANCEL\r\n\
+AUTH EXTERNAL 31303030\r\nBEGIN\r\n",
+        reply: "OK 0123456789abcdef0123456789abcdef\r\nAGREE_UNIX_FD\r\n\
+REJECTED EXTERNAL\r\nOK 0123456789abcdef0123456789abcdef\r\n",
+        uid: Some(CORPUS_UID),
+        unix_fd: false,
+        begun: true,
+        left: 0,
+    },
+    // ERROR is the peer saying it did not understand us. It unwinds exactly as
+    // CANCEL does, and is a separate arm, so the corpus runs both.
+    Transcript {
+        name: "an authenticated connection whose peer reports an error",
+        client: b"\x00AUTH EXTERNAL 31303030\r\nNEGOTIATE_UNIX_FD\r\nERROR bad\r\n\
+AUTH EXTERNAL 31303030\r\nBEGIN\r\n",
+        reply: "OK 0123456789abcdef0123456789abcdef\r\nAGREE_UNIX_FD\r\n\
+REJECTED EXTERNAL\r\nOK 0123456789abcdef0123456789abcdef\r\n",
+        uid: Some(CORPUS_UID),
+        unix_fd: false,
+        begun: true,
+        left: 0,
+    },
+    // An unknown command is answered ERROR and changes nothing, so the
+    // handshake it interrupted still completes.
+    Transcript {
+        name: "an unknown command between two that work",
+        client: b"\x00WHO ARE YOU\r\nAUTH EXTERNAL 31303030\r\nBEGIN\r\n",
+        reply: "ERROR\r\nOK 0123456789abcdef0123456789abcdef\r\n",
+        uid: Some(CORPUS_UID),
+        unix_fd: false,
+        begun: true,
+        left: 0,
+    },
+];
+
+/// One handshake that must be refused, and the refusal it must produce.
+///
+/// Every one of these is STRUCTURAL — the connection ends. A mechanism this
+/// broker does not serve and an identity that does not resolve are `REJECTED`
+/// replies instead, and live in `TRANSCRIPTS` above, because a peer may retry
+/// them.
+pub struct AuthRefusal {
+    pub name: &'static str,
+    pub client: &'static [u8],
+    pub error: AuthError,
+}
+
+pub const AUTH_REFUSALS: &[AuthRefusal] = &[
+    AuthRefusal {
+        name: "a connection that does not open with a NUL",
+        client: b"AUTH EXTERNAL 31303030\r\n",
+        error: AuthError::MissingNulPrefix(b'A'),
+    },
+    AuthRefusal {
+        name: "a line ended LF without CR",
+        client: b"\x00AUTH EXTERNAL 31303030\n",
+        error: AuthError::BareNewline,
+    },
+    AuthRefusal {
+        name: "a CR that no LF followed",
+        client: b"\x00AUTH\rEXTERNAL\r\n",
+        error: AuthError::StrayCarriageReturn,
+    },
+    AuthRefusal {
+        name: "a NUL inside an auth line",
+        client: b"\x00AUTH EXTERNAL\x0031303030\r\n",
+        error: AuthError::InteriorNul,
+    },
+    AuthRefusal {
+        name: "an auth line that is not ASCII",
+        client: b"\x00AUTH EXTERNAL \xc3\xa9\r\n",
+        error: AuthError::NonAscii,
+    },
+    AuthRefusal {
+        name: "BEGIN before authenticating",
+        client: b"\x00BEGIN\r\n",
+        error: AuthError::PrematureBegin,
+    },
+    AuthRefusal {
+        name: "BEGIN from inside the DATA exchange",
+        client: b"\x00AUTH EXTERNAL\r\nBEGIN\r\n",
+        error: AuthError::PrematureBegin,
+    },
+    // The runner feeds this one twice: the first feed stops AT `BEGIN` by
+    // design, and it is the second that must refuse.
+    AuthRefusal {
+        name: "auth spoken after BEGIN",
+        client: b"\x00AUTH EXTERNAL 31303030\r\nBEGIN\r\n",
+        error: AuthError::AfterBegin,
+    },
+    // BEGIN either starts the stream or ends the connection. It cannot be
+    // answered ERROR: the peer that sent this believes the stream has begun.
+    AuthRefusal {
+        name: "BEGIN with an argument",
+        client: b"\x00AUTH EXTERNAL 31303030\r\nBEGIN now\r\n",
+        error: AuthError::BeginWithArgument,
+    },
+];
+
+/// Identities and mechanisms that must not authenticate, each answered
+/// `REJECTED` rather than closing the connection.
+pub const AUTH_REJECTIONS: &[(&str, &[u8])] = &[
+    ("ANONYMOUS", b"\x00AUTH ANONYMOUS\r\n"),
+    ("DBUS_COOKIE_SHA1", b"\x00AUTH DBUS_COOKIE_SHA1 6162\r\n"),
+    ("a bare AUTH", b"\x00AUTH\r\n"),
+    ("an identity that is not hex", b"\x00AUTH EXTERNAL zzzz\r\n"),
+    ("an identity of odd length", b"\x00AUTH EXTERNAL 313\r\n"),
+    ("an identity that is not numeric", b"\x00AUTH EXTERNAL 6162\r\n"),
+    // "+1000": numeric to `parse`, and a second text for one uid.
+    ("an identity carrying a sign", b"\x00AUTH EXTERNAL 2b31303030\r\n"),
+    ("an identity that is not this peer", b"\x00AUTH EXTERNAL 39\r\n"),
+];
+
+/// One command that is right for another state. The specification answers
+/// every such command `ERROR` in every server state and moves nothing, which
+/// is a third class beside `REJECTED` and a closed connection: a peer that has
+/// already authenticated and re-sends `AUTH` must not be told its
+/// authentication failed.
+pub struct AuthErrorCase {
+    pub name: &'static str,
+    /// Puts the handshake in the phase the command is wrong for.
+    pub prefix: &'static [u8],
+    /// Answered `ERROR`, moving nothing.
+    pub command: &'static [u8],
+    /// Finishes the handshake the command interrupted, which is how the corpus
+    /// checks that nothing moved rather than taking the reply's word for it.
+    pub finish: &'static [u8],
+}
+
+const AUTHED: &[u8] = b"\x00AUTH EXTERNAL 31303030\r\n";
+const FROM_AUTH: &[u8] = b"AUTH EXTERNAL 31303030\r\nBEGIN\r\n";
+
+pub const AUTH_ERRORS: &[AuthErrorCase] = &[
+    // The case with a real consequence: REJECTED here would tell a client to
+    // tear down an attempt that succeeded, and libdbus would answer it by
+    // trying the next mechanism.
+    AuthErrorCase {
+        name: "AUTH from a peer that has already authenticated",
+        prefix: AUTHED,
+        command: b"AUTH EXTERNAL 31303030\r\n",
+        finish: b"BEGIN\r\n",
+    },
+    AuthErrorCase {
+        name: "AUTH inside the DATA exchange",
+        prefix: b"\x00AUTH EXTERNAL\r\n",
+        command: b"AUTH EXTERNAL 31303030\r\n",
+        finish: b"DATA\r\nBEGIN\r\n",
+    },
+    AuthErrorCase {
+        name: "DATA outside the DATA exchange",
+        prefix: b"\x00",
+        command: b"DATA 31303030\r\n",
+        finish: FROM_AUTH,
+    },
+    AuthErrorCase {
+        name: "NEGOTIATE_UNIX_FD before authenticating",
+        prefix: b"\x00",
+        command: b"NEGOTIATE_UNIX_FD\r\n",
+        finish: FROM_AUTH,
+    },
+    AuthErrorCase {
+        name: "CANCEL with no attempt to cancel",
+        prefix: b"\x00",
+        command: b"CANCEL\r\n",
+        finish: FROM_AUTH,
+    },
+    // Neither takes an argument, so one carrying an argument is not the
+    // command it resembles.
+    AuthErrorCase {
+        name: "NEGOTIATE_UNIX_FD with an argument",
+        prefix: AUTHED,
+        command: b"NEGOTIATE_UNIX_FD now\r\n",
+        finish: b"BEGIN\r\n",
+    },
+    AuthErrorCase {
+        name: "an unknown command",
+        prefix: b"\x00",
+        command: b"WHO ARE YOU\r\n",
+        finish: FROM_AUTH,
+    },
+    // The same, but from `Ready`, which is the phase where an unwind would
+    // actually be visible: a case that runs in `Auth` cannot tell "moved
+    // nothing" from "reset to where it already was".
+    AuthErrorCase {
+        name: "an unknown command from an authenticated peer",
+        prefix: AUTHED,
+        command: b"WHO ARE YOU\r\n",
+        finish: b"BEGIN\r\n",
+    },
+];
+
+fn check_auth() -> Result<(), String> {
+    let guid = Guid::new(CORPUS_GUID).map_err(|e| format!("the corpus guid: {e}"))?;
+    let peer = PeerIdentity::unmapped(CORPUS_UID);
+
+    for transcript in TRANSCRIPTS {
+        // Fed whole and then one byte at a time: a socket delivers whatever it
+        // delivers, and a handshake that only works on tidy boundaries works
+        // only in tests.
+        for chunk in [transcript.client.len(), 1] {
+            let mut shake = Handshake::new(peer, guid);
+            let mut reply = Vec::new();
+            let mut at = 0usize;
+            while at < transcript.client.len() && !shake.begun() {
+                let Some(end) = at.checked_add(chunk).map(|end| end.min(transcript.client.len()))
+                else {
+                    break;
+                };
+                let Some(bytes) = transcript.client.get(at..end) else {
+                    break;
+                };
+                let fed = shake
+                    .feed(bytes)
+                    .map_err(|e| format!("{}: refused at byte {at}: {e}", transcript.name))?;
+                reply.extend_from_slice(&fed.reply);
+                let Some(next) = at.checked_add(fed.consumed) else {
+                    break;
+                };
+                at = next;
+                if fed.consumed < bytes.len() {
+                    break;
+                }
+            }
+            let left = transcript.client.len().saturating_sub(at);
+            let spoken = String::from_utf8(reply)
+                .map_err(|_| format!("{}: replied with non-UTF-8", transcript.name))?;
+            if spoken != transcript.reply {
+                return Err(format!(
+                    "{} (chunk {chunk}): replied differently from its committed expectation\n  expected: {:?}\n  replied:  {spoken:?}",
+                    transcript.name, transcript.reply
+                ));
+            }
+            if shake.uid() != transcript.uid {
+                return Err(format!(
+                    "{} (chunk {chunk}): authenticated as {:?} rather than {:?}",
+                    transcript.name,
+                    shake.uid(),
+                    transcript.uid
+                ));
+            }
+            if shake.unix_fd() != transcript.unix_fd {
+                return Err(format!(
+                    "{} (chunk {chunk}): descriptor passing is {} and must be {}",
+                    transcript.name,
+                    shake.unix_fd(),
+                    transcript.unix_fd
+                ));
+            }
+            if shake.begun() != transcript.begun {
+                return Err(format!(
+                    "{} (chunk {chunk}): begun is {} and must be {}",
+                    transcript.name,
+                    shake.begun(),
+                    transcript.begun
+                ));
+            }
+            if left != transcript.left {
+                return Err(format!(
+                    "{} (chunk {chunk}): left {left} bytes unconsumed and must leave {}",
+                    transcript.name, transcript.left
+                ));
+            }
+        }
+    }
+
+    for refusal in AUTH_REFUSALS {
+        let mut shake = Handshake::new(peer, guid);
+        match shake.feed(refusal.client) {
+            Ok(_) if !shake.begun() => {
+                return Err(format!("{}: was accepted and must not be", refusal.name))
+            }
+            // `auth spoken after BEGIN` needs the second feed to surface, since
+            // the first stops at BEGIN by design.
+            Ok(_) => match shake.feed(b"BEGIN\r\n") {
+                Err(error) if error == refusal.error => {}
+                other => {
+                    return Err(format!(
+                        "{}: the second feed gave {other:?} rather than {:?}",
+                        refusal.name, refusal.error
+                    ))
+                }
+            },
+            Err(error) if error == refusal.error => {}
+            Err(error) => {
+                return Err(format!(
+                    "{}: refused with {error:?} rather than {:?}",
+                    refusal.name, refusal.error
+                ))
+            }
+        }
+    }
+
+    for (name, client) in AUTH_REJECTIONS {
+        let mut shake = Handshake::new(peer, guid);
+        let fed = shake
+            .feed(client)
+            .map_err(|e| format!("{name}: ended the connection rather than rejecting: {e}"))?;
+        if fed.reply != b"REJECTED EXTERNAL\r\n" {
+            return Err(format!(
+                "{name}: replied {:?} rather than REJECTED EXTERNAL",
+                String::from_utf8_lossy(&fed.reply)
+            ));
+        }
+        if shake.uid().is_some() || shake.begun() {
+            return Err(format!("{name}: authenticated anyway"));
+        }
+        // Rejection is retryable, which is what makes the probe order work.
+        let fed = shake
+            .feed(b"AUTH EXTERNAL 31303030\r\n")
+            .map_err(|e| format!("{name}: could not retry after REJECTED: {e}"))?;
+        if shake.uid() != Some(CORPUS_UID) {
+            return Err(format!(
+                "{name}: a retry after REJECTED did not authenticate: {:?}",
+                String::from_utf8_lossy(&fed.reply)
+            ));
+        }
+    }
+
+    for case in AUTH_ERRORS {
+        let mut shake = Handshake::new(peer, guid);
+        shake
+            .feed(case.prefix)
+            .map_err(|e| format!("{}: its prefix was refused: {e}", case.name))?;
+        let before = (shake.uid(), shake.unix_fd());
+        let fed = shake
+            .feed(case.command)
+            .map_err(|e| format!("{}: ended the connection: {e}", case.name))?;
+        if fed.reply != b"ERROR\r\n" {
+            return Err(format!(
+                "{}: replied {:?} rather than ERROR",
+                case.name,
+                String::from_utf8_lossy(&fed.reply)
+            ));
+        }
+        if (shake.uid(), shake.unix_fd()) != before || shake.begun() {
+            return Err(format!("{}: moved the state", case.name));
+        }
+        shake
+            .feed(case.finish)
+            .map_err(|e| format!("{}: the interrupted handshake broke: {e}", case.name))?;
+        if shake.uid() != Some(CORPUS_UID) || !shake.begun() {
+            return Err(format!(
+                "{}: the handshake it interrupted did not complete",
+                case.name
+            ));
+        }
+    }
+
+    // The accumulating line cap is the memory bound, and it is exact: §D
+    // bounds a line over 4 KiB, and the CRLF that ends one is not part of it.
+    let mut shake = Handshake::new(peer, guid);
+    let mut full = vec![0u8];
+    full.extend(std::iter::repeat_n(b'A', auth::MAX_LINE));
+    full.extend_from_slice(b"\r\n");
+    let fed = shake
+        .feed(&full)
+        .map_err(|e| format!("a line of exactly the cap was refused: {e}"))?;
+    if fed.reply != b"ERROR\r\n" {
+        return Err(format!(
+            "a line of exactly the cap replied {:?} rather than ERROR",
+            String::from_utf8_lossy(&fed.reply)
+        ));
+    }
+    // One byte more, and across reads — or the bound is per read, not a bound.
+    let mut shake = Handshake::new(peer, guid);
+    let mut over = vec![0u8];
+    over.extend(std::iter::repeat_n(b'A', auth::MAX_LINE + 1));
+    match shake.feed(&over) {
+        Err(AuthError::LineTooLong) => {}
+        other => return Err(format!("an overlong line was taken: {other:?}")),
+    }
+    let mut shake = Handshake::new(peer, guid);
+    shake
+        .feed(b"\x00")
+        .map_err(|e| format!("the NUL was refused: {e}"))?;
+    let chunk = vec![b'A'; 1024];
+    let mut bounded = false;
+    for _ in 0..8 {
+        if shake.feed(&chunk).is_err() {
+            bounded = true;
+            break;
+        }
+    }
+    if !bounded {
+        return Err("an unterminated line was buffered past the cap".to_string());
+    }
+
+    // The command budget is what keeps a rejected peer from probing forever.
+    let mut shake = Handshake::new(peer, guid);
+    shake
+        .feed(b"\x00")
+        .map_err(|e| format!("the NUL was refused: {e}"))?;
+    for _ in 0..auth::MAX_COMMANDS {
+        shake
+            .feed(b"AUTH ANONYMOUS\r\n")
+            .map_err(|e| format!("a probe inside the budget was refused: {e}"))?;
+    }
+    match shake.feed(b"AUTH EXTERNAL 31303030\r\n") {
+        Err(AuthError::TooManyCommands) => {}
+        other => {
+            return Err(format!(
+                "a peer past the command budget was served: {other:?}"
+            ))
+        }
+    }
+
+    // A mapped peer is ADMITTED by the uid it believes it is — the thing that
+    // stops being equality the day per-app uids land — and CHARGED to the
+    // credential. Every legal spelling of the handshake must give one answer,
+    // or a client picks its own identity by picking how it asks.
+    let mapped = PeerIdentity::mapped(100_000, CORPUS_UID);
+    for (spelling, client) in [
+        ("a stated identity", &b"\x00AUTH EXTERNAL 31303030\r\n"[..]),
+        ("an empty DATA", &b"\x00AUTH EXTERNAL\r\nDATA\r\n"[..]),
+        ("a stated DATA", &b"\x00AUTH EXTERNAL\r\nDATA 31303030\r\n"[..]),
+    ] {
+        let mut shake = Handshake::new(mapped, guid);
+        shake
+            .feed(client)
+            .map_err(|e| format!("a mapped peer was refused {spelling}: {e}"))?;
+        if shake.uid() != Some(mapped.credential()) {
+            return Err(format!(
+                "a mapped peer using {spelling} was charged to {:?} rather than its credential {}",
+                shake.uid(),
+                mapped.credential()
+            ));
+        }
+    }
+    // A STATED claim that does not resolve is refused — and that is the whole
+    // of what the claim does. EXTERNAL admits by credential, so the same peer
+    // is admitted one line later by not stating one. Pinned here because it
+    // reads like a gate and is not: nothing later should treat a connection's
+    // uid as having been checked against something the peer said.
+    let mut shake = Handshake::new(mapped, guid);
+    let fed = shake
+        .feed(b"\x00AUTH EXTERNAL 313030303030\r\n")
+        .map_err(|e| format!("a mapped peer claiming its credential ended: {e}"))?;
+    if fed.reply != b"REJECTED EXTERNAL\r\n" || shake.uid().is_some() {
+        return Err("a mapped peer was admitted on an identity it cannot see".to_string());
+    }
+    shake
+        .feed(b"AUTH EXTERNAL\r\nDATA\r\n")
+        .map_err(|e| format!("a refused peer could not fall back to an empty DATA: {e}"))?;
+    if shake.uid() != Some(mapped.credential()) {
+        return Err(format!(
+            "an empty DATA after a refused claim gave {:?} rather than the credential",
+            shake.uid()
+        ));
+    }
+
+    // Every error ends the connection, so it LATCHES. Otherwise a transport
+    // that logs and keeps reading splices the two halves of an identity across
+    // a violated line, and the line cap holds only as long as the caller
+    // chooses to hang up.
+    let mut shake = Handshake::new(peer, guid);
+    match shake.feed(b"\x00AUTH EXTERNAL 3130\n") {
+        Err(AuthError::BareNewline) => {}
+        other => return Err(format!("a bare LF gave {other:?}")),
+    }
+    match shake.feed(b"3030\r\n") {
+        Err(AuthError::BareNewline) => {}
+        other => return Err(format!("a failed handshake kept reading: {other:?}")),
+    }
+    if shake.uid().is_some() || shake.begun() {
+        return Err("a handshake authenticated across a fatal error".to_string());
+    }
+
+    Ok(())
+}
+
 fn check_messages() -> Result<(), String> {
     for stream in MESSAGES {
         for (endian, bytes) in [(Endian::Little, stream.little), (Endian::Big, stream.big)] {
@@ -988,16 +1549,23 @@ pub fn selftest() -> Result<String, String> {
     }
 
     check_messages()?;
+    check_auth()?;
 
     Ok(format!(
         "td-busd: the D-Bus codec round-trips every type in both byte orders, \
 marshals and decodes {} committed bodies and {} committed messages byte for \
 byte, and refuses {} malformed bodies and {} malformed messages in each byte \
-order",
+order; {} auth transcripts reply byte for byte whole and a byte at a time, \
+{} malformed handshakes and {} rejected identities are refused, and {} \
+recoverable command errors move nothing",
         STREAMS.len(),
         MESSAGES.len(),
         REFUSALS.len(),
-        MUTATIONS.len()
+        MUTATIONS.len(),
+        TRANSCRIPTS.len(),
+        AUTH_REFUSALS.len(),
+        AUTH_REJECTIONS.len(),
+        AUTH_ERRORS.len()
     ))
 }
 

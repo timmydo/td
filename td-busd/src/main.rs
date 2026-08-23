@@ -11,6 +11,7 @@
 //! smuggles in. `run` and `probe` are the names `APPLICATIONS.md` §A's
 //! supervision units already spell; both refuse until it lands.
 
+mod auth;
 mod corpus;
 mod message;
 mod name;
@@ -51,6 +52,7 @@ fn main() {
 #[cfg(test)]
 const SOURCES: &[(&str, &str)] = &[
     ("main", include_str!("main.rs")),
+    ("auth", include_str!("auth.rs")),
     ("corpus", include_str!("corpus.rs")),
     ("message", include_str!("message.rs")),
     ("name", include_str!("name.rs")),
