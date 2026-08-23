@@ -18,6 +18,8 @@ needs them:
 - For login or credentials, read `td-login/THREAT-MODEL.md`.
 - For compositor/UI, service supervision, or installation, read the matching
   `td-compositor/DESIGN.md`, `td-svc/DESIGN.md`, or `td-install/DESIGN.md`.
+- Before changing target compiler flags, ELF debug handling, profiler code, or
+  profiler image integration, read `td-profiler/DESIGN.md`.
 
 Those documents are normative. If code changes an invariant they state,
 amend the corresponding document in the same landing.
@@ -131,6 +133,26 @@ The final image uses uutils for its core userland and does not carry the GNU
 bootstrap userland forward. The source-bootstrap toolchain, glibc, kernel,
 boot/firmware components, and explicitly reviewed non-Rust packages are the
 exceptions.
+
+## Target user-mode profiling contract
+
+Every source-built user-mode artifact that ships and can appear in a runtime
+stack keeps frame pointers. This includes the source-built compiler, libc and
+userland closure; rustc, the in-tree standard library, Cargo, td-owned
+programs, dependency crates, and native objects compiled by Cargo build
+scripts. It is one target-wide policy, not a per-recipe release-profile
+choice. A recipe may not weaken it without amending this contract and
+`td-profiler/DESIGN.md`.
+
+Every such ELF also has a deterministic, path-remapped debug companion in the
+same recipe output and system image. Bootstrap seeds, build-only intermediates,
+the kernel, firmware, marked foreign payloads, hand-written assembly, and the
+exact coverage and reproducibility rules are specified in
+`td-profiler/DESIGN.md`; profiler output reports every boundary explicitly.
+
+This is a target contract whose enforcement lands in the first
+`td-profiler/DESIGN.md` implementation increment; until that increment is in
+the base, it describes the intended state rather than the current artifacts.
 
 # Principles
 
