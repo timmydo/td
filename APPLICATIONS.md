@@ -500,6 +500,24 @@ both the bus and the compositor. Both are `restart=always`: a crashed
 broker must return before the next portal call, and td-svc's backoff
 bounds the loop.
 
+**The `busd` unit has LANDED**, with two things this sketch did not
+settle. It `requires=seat` as well as ordering after it, and not for the
+reason a first draft gave: there is no race. td-svc will not start a
+unit until every `after=` dependency has SETTLED, so `after=seat` alone
+already keeps the broker behind td-seatd. What `requires=` adds is that
+a FAILED seat settles too — with ordering alone the broker is released
+onto a session that does not exist, binds a socket in a
+`/run/user/1000` td-seatd never made, and prints a healthy marker on a
+machine with no seat, no compositor and no way to run anything. The
+marker would then mean less than it appears to, which is the one thing
+this design is careful about everywhere else. (`requires=` supplies the
+ordering edge by itself; the `after=` is kept because the declared edge
+set is pinned by a test and reads better stated than inferred.) And the
+boot asserts the outcome rather than trusting the unit: `/etc/bootsuccess`
+probes the RUNNING broker in its health farm and prints a marker the
+image oracle requires — §D below. `[portal]` is not landed: td-portal
+does not exist yet.
+
 **`exec-as` has LANDED** (rung 2), with three details this sketch did not
 settle. It is a SUBCOMMAND rather than an applet — `td-login exec-as`,
 never a `/bin/exec-as` symlink — for the reason `verify-credentials` is
@@ -3240,6 +3258,96 @@ one that exercises ROUTING is a `busctl` call to a parked `gdbus`
 connection: sd-bus to GDBus, through td-busd, both `Peer.Ping` and an
 `Introspect` that returns a real body — a full round trip in which the
 broker is the only td code involved.
+
+### What is landed of the bus on the image
+
+**The broker is a boot job, and the boot proves it.** `[busd]` runs
+`/bin/td-busd run --socket /run/user/1000/bus` through `td-login
+exec-as tester`, and its `ready=` is a real `td-busd probe`: a client
+that connects, completes `AUTH EXTERNAL` under the uid the kernel
+reports for it, and reads back a well-formed `OK <guid>`. A broker that
+bound the path and cannot serve it therefore never reaches ready, and
+td-svc marks the unit failed rather than reporting it up.
+
+It does not restart it, and the difference is worth knowing before
+relying on `restart=always`: a readiness probe that never succeeds
+changes the unit's PHASE and leaves the process running, while
+`restart=` is evaluated when a process EXITS. So `restart=always` covers
+a broker that dies, which is the common case, and not one that is up and
+not serving. Nothing re-probes a unit once it has failed that way.
+
+It `requires=seat`, and that is the load-bearing half rather than the
+`after=` — but not because ordering is weak. A unit does not start until
+every `after=` dependency has settled, so `after=seat` alone already
+keeps the broker behind td-seatd; a draft of this section described a
+race that td-svc does not have. What `requires=` adds is that a FAILED
+seat settles too. With ordering alone the broker is released onto a
+machine whose seat assignment did not happen: `bind` creates a missing
+parent 0700 rather than refusing — deliberately, so a caller that made
+its own directory is not turned away from a path it owns — so the broker
+comes up, serves, and prints a healthy marker on a system with no seat,
+no compositor and nothing that could use a bus. That is a marker saying
+more than it knows, which is the failure this whole section is written
+against. It also leaves `/run/user` itself created by an unprivileged
+process rather than by the component whose job that is.
+
+The same draft claimed clients would "look in the right place and find
+nothing". They would not: td-seatd adopts an existing runtime directory,
+`chown`s and `chmod`s it rather than replacing it, and the path is the
+same literal string on both sides. The problem was never the path.
+
+`/etc/bootsuccess` then probes the RUNNING broker in its health farm and
+prints `TD-BUSD-RUN-OK`, which the image oracle requires. What that adds
+over `ready=` is a failed BOOT, not a diagnostic: td-svc already logs
+`readiness probe did not succeed in time` to the console, and the
+broker — which declares no `log=` and so inherits td-svc's stdio — already
+puts its own `cannot listen on …` there. Both land inside the tail the
+oracle prints. What was missing is that a bus which never came up left
+the boot GREEN, and a deployment marked successful is the thing that is
+hard to walk back.
+
+So the bus now stands beside uutils, ripgrep+fd, sshd, td-util, td-txt,
+td-init and td-login: a deployment is not healthy without it. That is a
+real decision and not a formality, because `healthy` gates
+`td-boot success`, which is what clears the attempt budget — so a broker
+that cannot come up will, after the attempt budget is spent, roll the
+machine back to `previous`. Rolling back for a bus that nothing on the
+image talks to yet looks disproportionate, and the argument for it is
+`sshd`, which is in the same farm on the same terms and which nothing on
+the image talks to either: both are shipped system services whose
+absence means the deployment is not what it claims to be, and rolling
+back to a deployment that HAS them is the fail-safe direction. The
+precedent that points the other way — the jailed fixture, which prints
+its evidence from a separate unit precisely so it cannot block
+`bootsuccess` — is about MUTABLE USER STATE, which is a different thing
+from immutable shipped infrastructure.
+
+The probe is also the eighth `su` block in that farm and the only one
+with a bounded wait of its own, which is why the guest's per-iteration
+budget and the host's boot ceiling both moved with it.
+
+**What the marker does NOT say.** It is the handshake and nothing more,
+because `probe` is the handshake and nothing more. Nothing on this image
+says `Hello`, owns a unique name, or has a message routed to it; those
+are held up host-side and against sd-bus, libdbus and GDBus, and the
+portal is what will hold them up here. Read a green marker as *the bus
+is reachable*, not as *the bus works*.
+
+It also checks a PATH and not a pid. The probe has no association with
+the unit's process or generation, so what it establishes is that
+something at `/run/user/1000/bus` completed the handshake as the login
+user — not that the process td-svc supervises is the one that answered.
+Nothing else on this image binds that path, which is what makes the
+marker worth having; the day something else could, this is the
+assumption to re-check rather than a claim to keep repeating.
+
+**Nothing consumes it yet, and it ships anyway.** A broker with no
+clients is not obviously worth booting. The argument for booting it is
+that the parts most likely to be wrong are exactly the parts only a boot
+can exercise — which user the unit runs as, which directory exists at
+the moment it binds, and whether the socket the unit names is the socket
+a client finds — and landing those before the portal rests on them is
+cheaper than diagnosing them underneath it.
 
 ---
 

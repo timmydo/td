@@ -8,8 +8,9 @@ use crate::ladder::{
     SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
     SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
-    TD_INIT_RUNTIME_MARKER, TD_JAIL_FIXTURE_BOOT_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
-    TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER,
+    TD_BUSD_RUNTIME_MARKER, TD_INIT_RUNTIME_MARKER, TD_JAIL_FIXTURE_BOOT_MARKER,
+    TD_JAIL_SECCOMP_PROBE_MARKER, TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER,
+    TD_SANDBOX_KERNEL_MARKER,
     TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
@@ -18,15 +19,25 @@ use crate::td_boot_protocol;
 
 const BOOT_SUCCESS_RETRY_SECS: u8 = 3;
 const BOOT_SUCCESS_RETRY_MAX_SECS: u8 = 10;
-/// What ONE iteration of the boot-success loop may cost on a slow TCG guest: seven
+/// What ONE iteration of the boot-success loop may cost on a slow TCG guest: eight
 /// `su` probe blocks, four `td-boot update` passes and a `rollback`. Exactly ONE of
 /// those copies an image; what the rest add is deployment-sized READS, and the
 /// distinction is worth the words because the fixture's own size budget turns on it
 /// — see BOOTSUCCESS below. Named rather than spelled twice because the td-svc
 /// backstop and the host's own ceiling are both derived from it, and a figure that
 /// drifted between them would leave one of the two killing a healthy boot.
+///
+/// The eighth block is the session-bus probe, and it costs BOTH: the `su`, `sh` and
+/// `td-busd` it forks like every other block, and a bounded wait none of the others
+/// have. `td-busd probe` allows five seconds over the connect and the answer
+/// together — one deadline, not one each, which is why five and not ten — and a
+/// broker that is wedged rather than absent spends all five, where an absent one
+/// costs nothing because `connect` is refused at once. So this is +7 and not +5: two
+/// for an eighth block's spawn, which is the per-block share the old 45 implied, and
+/// five for a wait the old figure had no equivalent of. A budget that covered only
+/// the healthy path would not be a backstop.
 #[cfg(test)]
-const BOOT_SUCCESS_ITERATION_BUDGET_SECS: u32 = 45;
+const BOOT_SUCCESS_ITERATION_BUDGET_SECS: u32 = 52;
 const BOOT_FAIL_PARK_WAIT_SECS: u8 = 30;
 const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
 
@@ -810,12 +821,13 @@ fn td_svc_conf_etc_name() -> &'static str {
 /// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
 /// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
 /// regression this catches: the boot comes up missing a service and says nothing.
-const TD_SVC_UNITS: [&str; 13] = [
+const TD_SVC_UNITS: [&str; 14] = [
     "hostname",
     "td-firstboot",
     "rootcheck",
     "seat",
     "netup",
+    "busd",
     "wayland",
     "terminal",
     "jail-fixture",
@@ -849,7 +861,7 @@ mod svc_timeouts {
     /// also resolves (3s x 3) and reaches (5s connect) a real host.
     pub const NETUP: u32 = 300;
     /// The script's own retry loop is clamped to BOOT_SUCCESS_RETRY_MAX_SECS iterations,
-    /// but each runs a large probe farm (seven `su` blocks) and can run four
+    /// but each runs a large probe farm (eight `su` blocks) and can run four
     /// transactional `td-boot update` passes plus a `rollback`, so an iteration is worth
     /// seconds on a slow disk, not one. Two of the four are cheap by construction — a
     /// refusal and an idle tick each read a bounded manifest and stop.
@@ -866,7 +878,19 @@ mod svc_timeouts {
     /// the same bytes, and the FALLBACK's payload digests verified by `verify_slot` —
     /// the fallback being the deployment that is running, since this fixture has two
     /// deployments and not three.
-    pub const BOOTSUCCESS: u32 = 900;
+    ///
+    /// Raised from 900 by the session-bus probe, and by the rule rather than by a
+    /// measurement: this backstop must clear the guest loop's own worst case TWICE,
+    /// and an eighth `su` block moved that worst case from 450s to 520s. What the
+    /// number bounds is a HANG — the loop exits as soon as it is healthy — so the
+    /// cost of the increase is only how long a wedged health target takes to be
+    /// called one.
+    ///
+    /// Nothing relates this to the host's own ceiling and nothing should: at 1050
+    /// against a 540s `DEFAULT_BOOT_TIMEOUT_SECS` this can never fire under the QEMU
+    /// oracle, which is correct — the oracle is not the only thing that boots this
+    /// image, and on real hardware there is no host to give up first.
+    pub const BOOTSUCCESS: u32 = 1050;
     /// The park handshake: a grep and a 1s sleep, clamped to BOOT_FAIL_PARK_WAIT_SECS.
     pub const BOOTFAIL: u32 = 300;
 }
@@ -950,6 +974,25 @@ fn build_td_svc_conf() -> String {
          after=rootcheck\n\
          timeout={netup}\n\
          \n\
+         # The session bus. `after=seat` AND `requires=seat` because td-seatd is\n\
+         # what makes the /run/user/{ui_uid} the broker binds inside: without it\n\
+         # `bind` would create that directory itself, 0700 and owned by whoever\n\
+         # ran first, which is a different machine from the one this table\n\
+         # describes. Nothing on this image speaks D-Bus yet — the portal is the\n\
+         # first consumer — so this starts a broker for clients that do not exist,\n\
+         # deliberately: the unit, the uid it runs as and the socket path become\n\
+         # observable on a real boot BEFORE anything depends on them being right.\n\
+         # `exec-as` rather than `su -c`, so the argv is literal and the\n\
+         # environment is the unit's rather than the boot path's.\n\
+         [busd]\n\
+         type=daemon\n\
+         exec=/bin/td-login exec-as {ui_user} -- /bin/td-busd run --socket /run/user/{ui_uid}/bus\n\
+         after=seat\n\
+         requires=seat\n\
+         ready=/bin/td-login exec-as {ui_user} -- /bin/td-busd probe /run/user/{ui_uid}/bus\n\
+         ready-timeout=30\n\
+         restart=always\n\
+         \n\
          # No shell-owned device setup: td-seatd assigned the nodes, td-login drops\n\
          # credentials, and the compositor opens only those fixed paths.\n\
          [wayland]\n\
@@ -1004,7 +1047,7 @@ fn build_td_svc_conf() -> String {
          [bootsuccess]\n\
          type=oneshot\n\
          exec=/etc/bootsuccess\n\
-         after={sysinit},wayland,terminal\n\
+         after={sysinit},busd,wayland,terminal\n\
          requires=terminal\n\
          timeout={bootsuccess}\n\
          \n\
@@ -1840,7 +1883,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          case \"$wait\" in ''|*[!0-9]*|0) wait={BOOT_SUCCESS_RETRY_SECS};; esac\n\
          [ \"$wait\" -gt {BOOT_SUCCESS_RETRY_MAX_SECS} ] && wait={BOOT_SUCCESS_RETRY_MAX_SECS}\n\
          n=0\n\
-         mu=0; mrf=0; ms=0; mtu=0; mti=0; mtl=0; mtt=0\n\
+         mu=0; mrf=0; ms=0; mtu=0; mti=0; mtl=0; mtt=0; mtb=0\n\
          msk=0; mtj=0; mts=1\n\
          if /bin/su -s /bin/sh {} -c \
          '{sandbox_kernel_probes}[ \"$k\" = 1 ]'; then \
@@ -1919,6 +1962,12 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          if /bin/su -s /bin/sh {} -c \
          '{td_txt_probes}[ \"$t\" = 1 ]'; then \
          [ \"$mtt\" = 1 ] || {{ echo {TD_TXT_RUNTIME_MARKER}; mtt=1; }}; else healthy=0; fi; \
+         if /bin/su -s /bin/sh {} -c \
+         'b=$(/bin/td-busd probe /run/user/{UI_UID}/bus 2>&1) || \
+         {{ echo \"td-busd: the session bus did not answer on /run/user/{UI_UID}/bus: \
+         $b\"; \
+         exit 1; }}'; then \
+         [ \"$mtb\" = 1 ] || {{ echo {TD_BUSD_RUNTIME_MARKER}; mtb=1; }}; else healthy=0; fi; \
          [ \"$msk\" = 1 ] || healthy=0; \
          [ \"$mtj\" = 1 ] || healthy=0; \
          [ \"$mts\" = 1 ] || healthy=0; \
@@ -1971,6 +2020,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          n=$((n+1)); /bin/td-util sleep 1; \
          done\n\
          fail\n",
+        sys.autologin,
         sys.autologin,
         sys.autologin,
         sys.autologin,
@@ -2560,6 +2610,12 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         from: "{in:td-compositor}".into(),
         dest: "{root}/real-root{in:td-compositor}".into(),
     });
+    // The session bus broker: static, dependency-free, and copied directly like
+    // the rest of the session substrate above it.
+    steps.push(Step::CopyTree {
+        from: "{in:td-busd}".into(),
+        dest: "{root}/real-root{in:td-busd}".into(),
+    });
     // Stage the dynamically linked userland and every transitively referenced store item
     // at its canonical absolute path. uutils, ripgrep, and fd pull their td glibc closure;
     // sshd additionally pulls the aws-lc crypto C lib. The engine admits only direct recipe
@@ -2682,6 +2738,12 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     steps.push(Step::Symlink {
         target: "{in:td-compositor}/bin/td-term".into(),
         link: "{root}/real-root/bin/td-term".into(),
+    });
+    // /bin/td-busd — the session bus. Named in full by the busd unit's exec and
+    // ready lines; no basename dispatch and no applet farm.
+    steps.push(Step::Symlink {
+        target: "{in:td-busd}/bin/td-busd".into(),
+        link: "{root}/real-root/bin/td-busd".into(),
     });
     // /bin/td-util is the multicall's own entry (`td-util <applet>`, and `--list`); the loop
     // below is the argv[0] farm the diagnostics names resolve through.
@@ -2946,6 +3008,8 @@ fn shape_check() -> String {
      uidemo=\"{root}/real-root{in:td-compositor}/bin/td-ui-demo\"; { [ -f \"$uidemo\" ] && [ -x \"$uidemo\" ]; } || { echo 'root tree: td-ui-demo is not packed and executable' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-term\" 2>/dev/null)\" = \"{in:td-compositor}/bin/td-term\" ] || { echo 'root tree: /bin/td-term is not a symlink to the staged terminal' >&2; exit 1; }; \
      tdterm=\"{root}/real-root{in:td-compositor}/bin/td-term\"; { [ -f \"$tdterm\" ] && [ -x \"$tdterm\" ]; } || { echo 'root tree: td-term is not packed/executable at real-root{in:td-compositor}/bin/td-term - the /bin/td-term symlink would dangle' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/td-busd\" 2>/dev/null)\" = \"{in:td-busd}/bin/td-busd\" ] || { echo 'root tree: /bin/td-busd is not a symlink to the staged session bus broker - the busd unit names it in full, so this is the only thing standing between that unit and exec-ing nothing' >&2; exit 1; }; \
+     tdbusd=\"{root}/real-root{in:td-busd}/bin/td-busd\"; { [ -f \"$tdbusd\" ] && [ -x \"$tdbusd\" ]; } || { echo 'root tree: td-busd is not packed/executable at real-root{in:td-busd}/bin/td-busd - the /bin/td-busd symlink would dangle' >&2; exit 1; }; \
      for a in @APPLICATIONS@; do \
          [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = /bin/td-jail ] || { echo \"root tree: /bin/$a is not an application launcher pointing to /bin/td-jail - another packed /bin provider replaced it\" >&2; exit 1; }; \
      done; \
@@ -2959,7 +3023,7 @@ fn shape_check() -> String {
      : 'the plan identical. the_declared_edges_are_exactly_these pins the edge set on'; \
      : 'the host; this pins that td-svc itself still resolves them this way.'; \
      svcpos() { printf '%s\\n' \"$tdsplan\" | grep -n -E \"^[0-9]+\\. $1\\$\" | cut -d: -f1; }; \
-     hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); st=$(svcpos seat); nu=$(svcpos netup); wl=$(svcpos wayland); tm=$(svcpos terminal); jf=$(svcpos jail-fixture); je=$(svcpos jail-fixture-evidence); bs=$(svcpos bootsuccess); sd=$(svcpos sshd); gr=$(svcpos greeter); \
+     hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); st=$(svcpos seat); nu=$(svcpos netup); wl=$(svcpos wayland); tm=$(svcpos terminal); jf=$(svcpos jail-fixture); je=$(svcpos jail-fixture-evidence); bs=$(svcpos bootsuccess); sd=$(svcpos sshd); gr=$(svcpos greeter); bd=$(svcpos busd); \
      [ \"$hn\" -lt \"$fb\" ] || { echo 'td-svc would not serialize hostname before td-firstboot - init ran every sysinit line to completion before the next, and td-svc starts settled units in the same pass' >&2; exit 1; }; \
      [ \"$fb\" -lt \"$rc\" ] || { echo 'td-svc would start rootcheck before td-firstboot - rootcheck asserts the identity td-firstboot mints is readable' >&2; exit 1; }; \
      [ \"$rc\" -lt \"$nu\" ] || { echo 'td-svc would start netup before rootcheck - networking must follow the read-only-root self-check' >&2; exit 1; }; \
@@ -2967,6 +3031,7 @@ fn shape_check() -> String {
      [ \"$fb\" -lt \"$sd\" ] || { echo 'td-svc would start sshd before td-firstboot - sshd is fail-closed on the host key td-firstboot mints, so it would refuse to start on every boot' >&2; exit 1; }; \
      [ \"$nu\" -lt \"$gr\" ] || { echo 'td-svc would start the greeter before netup' >&2; exit 1; }; \
      [ \"$rc\" -lt \"$st\" ] && [ \"$st\" -lt \"$wl\" ] && [ \"$wl\" -lt \"$tm\" ] && [ \"$wl\" -lt \"$jf\" ] && [ \"$jf\" -lt \"$je\" ] && [ \"$tm\" -lt \"$bs\" ] || { echo 'td-svc would not serialize rootcheck -> seat -> wayland -> terminal+jailed fixture evidence and independent bootsuccess' >&2; exit 1; }; \
+     [ \"$st\" -lt \"$bd\" ] && [ \"$bd\" -lt \"$bs\" ] || { echo 'td-svc would not serialize seat -> busd -> bootsuccess - the broker binds inside the runtime directory td-seatd makes, and /etc/bootsuccess probes the RUNNING broker rather than a selftest' >&2; exit 1; }; \
      mkdir -p '{root}/pivot-probe' && cp \"$tdi\" '{root}/pivot-probe/init' || { echo 'root tree: could not build the switch_root probe NEWROOT' >&2; exit 1; }; \
      tdipiv=$(\"$tdi\" switch_root '{root}/pivot-probe' /init 2>&1) && { echo 'td-init switch_root ACCEPTED a NEWROOT that is not a mount point - the last refusal standing between a bad pivot and a panicked kernel is gone' >&2; exit 1; }; \
      case \"$tdipiv\" in *'not a mount point'*) : ;; *) echo \"td-init switch_root refused a non-mount NEWROOT for the WRONG reason, so the mount-point guard is untested: $tdipiv\" >&2; exit 1;; esac; \
@@ -3262,6 +3327,9 @@ pub fn recipe() -> Recipe {
         //   and the selected fixture launch both run on every boot.
         // td-seatd/td-compositor: the static single-user UI substrate and demo client,
         // copied directly.
+        // td-busd: the static session D-Bus broker. No consumer on this image yet;
+        //   it is here so the unit, its uid and its socket path are exercised by a
+        //   real boot before the portal and the applications depend on them.
         .native_inputs(&[
             "busybox-x86-64",
             "linux-x86-64",
@@ -3283,6 +3351,7 @@ pub fn recipe() -> Recipe {
             "td-jail",
             "td-seatd",
             "td-compositor",
+            "td-busd",
         ])
         .steps(steps);
     let application_inputs = application_payload_inputs(&SYSTEM);
@@ -3874,7 +3943,7 @@ mod tests {
                 // The loop is clamped to this many iterations; budget a slow one each.
                 (BOOT_SUCCESS_RETRY_MAX_SECS as u32)
                     .saturating_mul(BOOT_SUCCESS_ITERATION_BUDGET_SECS),
-                "clamped iterations of seven su probe blocks, four td-boot updates and \
+                "clamped iterations of eight su probe blocks, four td-boot updates and \
                  a rollback",
             ),
             (
@@ -3923,6 +3992,7 @@ mod tests {
             ("rootcheck", vec!["td-firstboot"]),
             ("seat", vec!["rootcheck"]),
             ("netup", vec!["rootcheck"]),
+            ("busd", vec!["seat"]),
             ("wayland", vec!["seat"]),
             ("terminal", vec!["wayland"]),
             ("jail-fixture", vec!["wayland"]),
@@ -3932,7 +4002,7 @@ mod tests {
                 sysinit
                     .iter()
                     .copied()
-                    .chain(["wayland", "terminal"])
+                    .chain(["busd", "wayland", "terminal"])
                     .collect(),
             ),
             ("bootfail", sysinit.to_vec()),
@@ -3946,6 +4016,49 @@ mod tests {
                 "{unit}'s after= is not what the boot order was reviewed against"
             );
         }
+    }
+
+    /// The session bus is a unit, runs as the UI user, and binds where the seat
+    /// assignment put the runtime directory.
+    ///
+    /// Every path is spelled out rather than derived at boot: `exec-as` empties the
+    /// environment, so nothing here can come from `XDG_RUNTIME_DIR` or from
+    /// whatever the boot path happened to export. The `ready=` line is `td-busd
+    /// probe`, which completes the `EXTERNAL` handshake under the uid the kernel
+    /// reports for it — so a broker that bound the path and cannot serve it never
+    /// reaches ready, and td-svc restarts it rather than leaving /etc/bootsuccess
+    /// probing a socket with nothing behind it.
+    #[test]
+    fn the_session_bus_runs_unprivileged_where_the_seat_put_its_runtime_dir() {
+        assert_eq!(
+            unit_key("busd", "exec"),
+            Some(format!(
+                "/bin/td-login exec-as {UI_USER} -- /bin/td-busd run \
+                 --socket /run/user/{UI_UID}/bus"
+            )),
+            "the broker must be started by literal argv as the UI user"
+        );
+        assert_eq!(
+            unit_key("busd", "ready"),
+            Some(format!(
+                "/bin/td-login exec-as {UI_USER} -- /bin/td-busd probe \
+                 /run/user/{UI_UID}/bus"
+            )),
+            "readiness must be a real client completing the handshake"
+        );
+        assert_eq!(unit_key("busd", "type").as_deref(), Some("daemon"));
+        assert_eq!(unit_key("busd", "restart").as_deref(), Some("always"));
+        assert_eq!(
+            unit_key("busd", "requires").as_deref(),
+            Some("seat"),
+            "without the seat there is no /run/user/{UI_UID} to bind in, and `bind` \
+             would silently make one"
+        );
+        assert!(
+            ordered_before("busd", "bootsuccess"),
+            "/etc/bootsuccess probes the RUNNING broker, so it must be ordered \
+             after the unit that starts it"
+        );
     }
 
     /// init ran `::sysinit:` lines ONE AT A TIME, each to completion. td-svc has no such
@@ -6247,6 +6360,29 @@ mod tests {
                 && bootsuccess.contains("/run/td-jail-seccomp-probe/probe")
                 && bootsuccess.contains("[ ! -w /run/td-jail-seccomp-probe/filter.bpf ]")
                 && bootsuccess.contains(TD_JAIL_SECCOMP_PROBE_MARKER)
+                && bootsuccess.contains(&format!(
+                    "/bin/td-busd probe /run/user/{UI_UID}/bus"
+                ))
+                && bootsuccess.contains(TD_BUSD_RUNTIME_MARKER)
+                // The GATE, and the whole leg, not merely that the command and
+                // the marker both appear somewhere in the script. Moving the
+                // `echo` out of the `then` branch, or dropping `healthy=0`
+                // from the `else`, leaves both `contains` above matching while
+                // the oracle greens a boot with a dead bus — which is the one
+                // thing this leg exists to prevent. Every farm beside it is
+                // pinned leg-whole for the same reason; see the td-login
+                // assertion and its comment further down.
+                && bootsuccess.contains(&format!(
+                    "[ \"$mtb\" = 1 ] || {{ echo {TD_BUSD_RUNTIME_MARKER}; mtb=1; }}; \
+                     else healthy=0; fi"
+                ))
+                // And the probe's own words reach the console. The oracle's
+                // failure text asks the reader to tell a refused bind from a
+                // refused uid from a bus that accepted and said nothing, and
+                // only the probe knows which of those it was: a leg that
+                // redirected the diagnostic to /dev/null would leave one fixed
+                // sentence on ttyS0 for five different faults.
+                && bootsuccess.contains("/run/user/1000/bus: $b\"; exit 1; }")
                 && bootsuccess.contains("[ \"$mtj\" = 1 ] || healthy=0")
                 && bootsuccess.contains("[ \"$mts\" = 1 ] || healthy=0")
                 && bootsuccess
@@ -8386,6 +8522,50 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         assert!(
             native_inputs.iter().any(|i| i == "td-svc"),
             "td-svc must be a declared native input, or {{in:td-svc}} does not resolve"
+        );
+    }
+
+    /// td-busd must be PACKED, not merely symlinked and listed as an input.
+    ///
+    /// The same rent td-svc pays above, for the same reason and with one extra
+    /// one. Being a recipe INPUT makes `{in:td-busd}` resolve at build time and
+    /// puts nothing on the image; only a CopyTree (static) or a
+    /// StageRuntimeClosure (dynamic) does that. So a symlink alone resolves in
+    /// the recipe text and dangles on the erofs root.
+    ///
+    /// The extra reason is that this one would be quiet. td-svc dangling means
+    /// PID 1 execs nothing and the machine has no userland; a dangling
+    /// /bin/td-busd means one daemon fails to start, td-svc restarts it for
+    /// ever, and the only thing that notices is the health probe — which runs
+    /// in `shape_check`'s tier, needs the loop toolchain, and so is exactly the
+    /// tier a host-side change cannot reach. This test is what makes the
+    /// mistake visible where the change is made.
+    #[test]
+    fn td_busd_is_packed_and_not_merely_symlinked() {
+        let steps = real_root_steps(&SYSTEM);
+        assert!(
+            steps.iter().any(|s| matches!(
+                s,
+                Step::CopyTree { from, dest }
+                    if from == "{in:td-busd}" && dest == "{root}/real-root{in:td-busd}"
+            )),
+            "td-busd must be CopyTree'd into the real root (static, empty closure) - a \
+             symlink alone dangles on the image and the busd unit execs nothing"
+        );
+        assert!(
+            steps.iter().any(|s| matches!(
+                s,
+                Step::Symlink { target, link }
+                    if target == "{in:td-busd}/bin/td-busd"
+                        && link == "{root}/real-root/bin/td-busd"
+            )),
+            "/bin/td-busd must symlink into the store td-busd package - the busd \
+             unit names it in full, in both its exec and its ready line"
+        );
+        let native_inputs = recipe().native_inputs.expect("system native inputs");
+        assert!(
+            native_inputs.iter().any(|i| i == "td-busd"),
+            "td-busd must be a declared native input, or {{in:td-busd}} does not resolve"
         );
     }
 }

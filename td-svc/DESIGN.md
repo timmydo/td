@@ -189,8 +189,19 @@ dependency comes back is the control socket's job.
 `after=` is **ordering**. A dependent waits for its dependency to reach a
 *decision*, not to succeed: a failed dependency is logged and skips nothing
 — matching today's `sysinit`, where a failed job is reported and later jobs
-run anyway. `requires=` is the opt-in strict form; no shipped unit needs it,
-and per **I5** it can never apply to a `tty=` service.
+run anyway. `requires=` is the opt-in strict form. The shipped table uses it where a
+dependency's failure makes the dependent meaningless rather than merely
+degraded — the graphical chain (`wayland requires=seat`,
+`terminal requires=wayland`, `bootsuccess requires=terminal`) and the session
+bus (`busd requires=seat`) — and per **I5** it can never apply to a `tty=`
+service. An earlier version of this paragraph said no shipped unit needed it,
+which the graphical chain already contradicted.
+
+Note what `requires=` does NOT change, since the difference is easy to read
+backwards: `after=` is already enough to keep a dependent behind its
+dependency, because a unit does not start until every dependency has settled.
+What `requires=` adds is that a FAILED dependency settles too — so ordering
+alone releases the dependent onto a world its dependency never built.
 
 Strictness is not the default because the shipped scripts do not support the
 reasoning that would justify it: `/etc/rootcheck` ends in

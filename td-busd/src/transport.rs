@@ -1463,6 +1463,72 @@ pub fn probe(path: &Path, uid: u32) -> Result<String, String> {
     probe_within(path, uid, PROBE_TIMEOUT)
 }
 
+/// `UnixStream::connect` with a deadline, which `std` does not offer for a
+/// unix socket the way it does for TCP.
+///
+/// The connect runs on a thread of its own and the caller waits on a channel.
+/// A thread blocked in `connect` is NOT joined and cannot be: the call it is
+/// in has no timeout, which is the whole reason this exists. It is left
+/// running, and that is sound only because of what this function is for —
+/// `probe` is one short-lived process whose next act is to exit, so the thread
+/// is reclaimed by process teardown a moment later. Do not lift this into a
+/// long-lived process without giving the thread a way to be cancelled.
+///
+/// The `send` on the far side is deliberately ignored: after a timeout nobody
+/// is receiving, and a connect that succeeds late has its stream dropped by
+/// the channel, which closes it.
+fn connect_within(path: &Path, timeout: std::time::Duration) -> Result<UnixStream, String> {
+    let owned = path.to_path_buf();
+    connect_by(path, timeout, move || {
+        UnixStream::connect(&owned)
+            .map_err(|error| format!("connect {}: {error}", owned.display()))
+    })
+}
+
+/// `connect_within` with the connect itself as an argument.
+///
+/// The seam is here for the same reason `probe_within` takes its wait as an
+/// argument: the branch worth testing is the one where the connect NEVER
+/// returns, and provoking that through a real socket means filling a listen
+/// backlog whose depth is a property of the std version and the host. A test
+/// that needs several thousand threads to be reliable is not a test of this
+/// logic. So the timeout is proven against a connect that is defined not to
+/// return, and what stays outside the test is the kernel fact that a real one
+/// can behave that way — `unix_stream_connect` waits on the connecting
+/// socket's `SO_SNDTIMEO`, which is unset until after `connect` returns.
+fn connect_by<F>(
+    path: &Path,
+    timeout: std::time::Duration,
+    connect: F,
+) -> Result<UnixStream, String>
+where
+    F: FnOnce() -> Result<UnixStream, String> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("td-busd-probe-connect".into())
+        .spawn(move || {
+            let _ = tx.send(connect());
+        })
+        .map_err(|error| format!("cannot start the connect thread: {error}"))?;
+    match rx.recv_timeout(timeout) {
+        Ok(outcome) => outcome,
+        // The listener exists — otherwise `connect` would have refused at once
+        // — and is not accepting. Said as its own sentence because it is a
+        // different fault from a bus that accepts and then says nothing, and
+        // the console line is all the operator gets.
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "connect {}: the bus did not accept in time",
+            path.display()
+        )),
+        // The thread died without sending, which it has no path to do.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(format!(
+            "connect {}: the connect thread ended without an answer",
+            path.display()
+        )),
+    }
+}
+
 /// `probe` with the wait as an argument, so a test can prove the timeout
 /// exists without spending `PROBE_TIMEOUT` to do it.
 fn probe_within(
@@ -1472,8 +1538,19 @@ fn probe_within(
 ) -> Result<String, String> {
     use std::io::{Read, Write};
 
-    let stream = UnixStream::connect(path)
-        .map_err(|error| format!("connect {}: {error}", path.display()))?;
+    // ONE deadline for the whole probe, and it starts HERE rather than after
+    // the connect. `connect(2)` on a unix socket whose accept queue is full
+    // blocks against the SENDER's `SO_SNDTIMEO`, which is unset until the
+    // socket exists — so a timeout installed after the call cannot bound the
+    // call. A listener that binds and never accepts therefore held this for
+    // ever, and once `/etc/bootsuccess` calls the probe with no wrapper of its
+    // own, "for ever" is the health target and then the boot: the host kills
+    // the VM on its own ceiling and reports a bare timeout with no guest-side
+    // reason in it, which is the one failure the whole timeout chain exists to
+    // prevent. td-svc's `ready=` survived it by group-killing each attempt;
+    // nothing else did.
+    let deadline = std::time::Instant::now() + timeout;
+    let stream = connect_within(path, timeout)?;
     // Safe `std` on a descriptor this process owns, so nothing joins the
     // roster for it.
     stream
@@ -1492,12 +1569,12 @@ fn probe_within(
         .write_all(format!("\0AUTH EXTERNAL {hex}\r\n").as_bytes())
         .map_err(|error| format!("write AUTH: {error}"))?;
 
-    // ONE deadline for the whole answer, not one per read. A socket timeout
-    // is an INACTIVITY timeout: a wedged or squatting listener that dribbles a
+    // The same deadline the connect was held to, so the answer gets what the
+    // connect did not spend rather than a fresh allowance. A socket timeout is
+    // an INACTIVITY timeout: a wedged or squatting listener that dribbles a
     // byte just inside it holds the probe for `MAX_LINE` times the timeout —
     // hours, on a check `ready=` is waiting for. The per-read timeout is
     // narrowed to what is left of the deadline as it goes.
-    let deadline = std::time::Instant::now() + timeout;
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     while !line.ends_with(b"\r\n") {
@@ -3514,6 +3591,70 @@ mod tests {
         );
         // And that is the ONLY answer: nothing follows it.
         peer.expect_silence();
+    }
+
+    /// A CONNECT that never returns is given up on, which is a different
+    /// fault from the silent bus below and was not bounded at all before.
+    ///
+    /// `connect(2)` on a unix socket whose accept queue is full blocks against
+    /// the connecting socket's `SO_SNDTIMEO`, and a timeout installed after
+    /// `UnixStream::connect` has returned cannot bound a call that has not
+    /// returned. `ready=` survived that because td-svc group-kills each probe
+    /// attempt; `/etc/bootsuccess` calls the probe with no wrapper of its own,
+    /// so an unbounded connect there hangs the health target until the HOST
+    /// kills the VM — a bare timeout with no guest-side reason in it, which is
+    /// the failure the whole boot budget exists to prevent.
+    #[test]
+    fn a_connect_that_never_returns_is_given_up_on() {
+        let (tell, hear) = mpsc::channel();
+        thread::spawn(move || {
+            // Run it on its own thread so that a `connect_by` which does NOT
+            // give up fails this test rather than hanging it.
+            let outcome = connect_by(
+                Path::new("/nonexistent/bus"),
+                std::time::Duration::from_millis(150),
+                || {
+                    thread::sleep(std::time::Duration::from_secs(30));
+                    Err("waited for a connect that should have been abandoned".into())
+                },
+            );
+            let _ = tell.send(outcome);
+        });
+        match hear.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok(_)) => panic!("a connect that never returned produced a stream"),
+            Ok(Err(why)) => assert!(
+                why.contains("did not accept in time"),
+                "gave up for another reason: {why}"
+            ),
+            Err(_) => panic!("the connect was never given up on"),
+        }
+    }
+
+    /// The probe's wait is ONE deadline over connect and answer together, not
+    /// one each. Two deadlines would let a bus that is slow to accept AND slow
+    /// to answer hold the probe for twice `PROBE_TIMEOUT`, and the boot budget
+    /// is derived from the single figure.
+    #[test]
+    fn the_probes_deadline_covers_the_connect_and_the_answer_together() {
+        let dir = scratch("one-deadline");
+        let path = dir.join("bus");
+        let bound = bind(&path).expect("bind");
+        // Accept, and then never answer: the connect is instant, so all of the
+        // wait is spent on the read.
+        let held = thread::spawn(move || bound.listener().accept().map(|(stream, _)| stream));
+
+        let wait = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let outcome = probe_within(&path, this_uid(), wait);
+        let spent = started.elapsed();
+        assert!(outcome.is_err(), "a silent bus answered");
+        assert!(
+            spent < wait.saturating_mul(2),
+            "the probe spent {spent:?} against a {wait:?} deadline, so the connect \
+             and the answer are being given a deadline each"
+        );
+        drop(held.join());
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// A bus that accepts and then says nothing does not hold `probe` for

@@ -271,7 +271,13 @@ pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 /// Raising it costs only how long a HUNG boot takes to be called one.
 /// It does not change what the guest does: the wait token derived from it is clamped
 /// in the generated scripts, so the retry budgets are the same at either value.
-pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 480;
+///
+/// Raised again, for the same reason and by the same route: the session-bus probe is
+/// an eighth `su` block in the health farm, and it is the only one with a bounded
+/// wait of its own — `td-busd probe` allows five seconds for an `OK` line, which a
+/// broker that is WEDGED rather than absent will spend in full. That went into the
+/// guest's per-iteration budget, and this follows it.
+pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 540;
 pub const QEMU_GUEST_WAIT_MARGIN_SECS: u64 = 30;
 
 /// Printed after the running system installs and activates a verified candidate
@@ -374,6 +380,32 @@ pub const TD_INIT_RUNTIME_MARKER: &str = "TD-INIT-RUN-OK";
 /// still means one thing — this crate's credential switch produced the credentials
 /// it named — proven now through both front ends the image has rather than one.
 pub const TD_LOGIN_RUNTIME_MARKER: &str = "TD-LOGIN-RUN-OK";
+
+/// Printed by `/etc/bootsuccess` only after the session bus answered a real
+/// client on the real socket: `td-busd probe`, as the unprivileged login user,
+/// connects to `/run/user/1000/bus`, completes `AUTH EXTERNAL` under the uid the
+/// kernel reports for it, and reads back a well-formed `OK <guid>` line.
+///
+/// This is evidence for the DAEMON, which the broker's own tests are not: those
+/// bind a socket in a temporary directory and probe it inside one process, so
+/// they hold up the transport and say nothing about the unit. What only the image
+/// can show is that the socket the unit names is reachable, as the login user, in
+/// the `/run/user/1000` td-seatd made, by a SEPARATE process.
+///
+/// Said that way deliberately. The probe checks a PATH, not a pid: it has no
+/// association with the unit's process or generation, so what it strictly proves
+/// is that SOMETHING there completed the handshake. Nothing else on this image
+/// binds that path, which is why the marker is worth having — but the difference
+/// matters the moment something else could, and calling this "the broker this unit
+/// started" would be claiming a link the probe does not check.
+///
+/// It stops at the handshake, which is what `probe` is. `Hello`, the unique
+/// names, the bus's own interface and directed routing are held up host-side and
+/// against sd-bus, libdbus and GDBus; nothing on this image speaks D-Bus yet to
+/// hold them up HERE, and the portal (APPLICATIONS.md §E) is what will. Recording
+/// the limit is the point: a green marker here means the bus is reachable, not
+/// that anything has been routed over it.
+pub const TD_BUSD_RUNTIME_MARKER: &str = "TD-BUSD-RUN-OK";
 
 /// Printed by the unprivileged compositor only after its first framebuffer
 /// paint succeeded and its mode-0600 Wayland socket is listening.

@@ -97,6 +97,12 @@ const TD_INIT_RUNTIME_MARKER: &str = td_recipe::ladder::TD_INIT_RUNTIME_MARKER;
 /// `/proc/self/status` and they matched exactly. This is the only marker that asserts the
 /// RESULT of a credential change rather than that something ran.
 const TD_LOGIN_RUNTIME_MARKER: &str = td_recipe::ladder::TD_LOGIN_RUNTIME_MARKER;
+/// Printed by the root-owned health target once a real client, as the unprivileged
+/// login user, completed the `EXTERNAL` handshake against the session bus td-svc
+/// started and read back a well-formed `OK <guid>`. The broker's own tests bind a
+/// socket inside one process; this is the only place the UNIT, the uid it runs as
+/// and the runtime directory td-seatd made are all exercised at once.
+const TD_BUSD_RUNTIME_MARKER: &str = td_recipe::ladder::TD_BUSD_RUNTIME_MARKER;
 /// Printed by the greeter's kernel-capability farm, as the unprivileged login user,
 /// once the RUNNING kernel has been observed to carry the sandbox features §0 pins
 /// that can be witnessed from `/proc` — every one but `CONFIG_MEMCG`, which needs a
@@ -248,6 +254,7 @@ struct ConsoleEvidence {
     td_txt_runtime: bool,
     td_init_runtime: bool,
     td_login_runtime: bool,
+    td_busd_runtime: bool,
     td_sandbox_kernel: bool,
     td_jail_transition: bool,
     td_jail_seccomp: bool,
@@ -838,7 +845,9 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          ({TD_UTIL_RUNTIME_MARKER}), td-txt's grep+sed answering correctly over the live \
          /proc ({TD_TXT_RUNTIME_MARKER}), the td-init boot glue ({TD_INIT_RUNTIME_MARKER}) and a \
          td-login credential switch the switched process read back and confirmed \
-         ({TD_LOGIN_RUNTIME_MARKER}), confirmed on the RUNNING kernel that the namespaces, \
+         ({TD_LOGIN_RUNTIME_MARKER}), answered an unprivileged client's EXTERNAL handshake on \
+         the session bus started by its own unit ({TD_BUSD_RUNTIME_MARKER}), \
+         confirmed on the RUNNING kernel that the namespaces, \
          seccomp filtering, inotify and cgroup pids controller a jail needs are all there \
          ({TD_SANDBOX_KERNEL_MARKER}), exercised td-jail's unprivileged namespace transition \
          on that target kernel, removed every capability, installed and read back its filter, \
@@ -1227,6 +1236,39 @@ fn validate_system_boot(
              before `setgroups(2)` drops the uid and silently keeps root's supplementary \
              groups, and every other marker here still prints. See \
              td-login/THREAT-MODEL.md. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_busd_runtime {
+        return Err(format!(
+            "the root/userland/sshd/td-util/td-init/td-login health checks passed, but the \
+             session-bus marker ({TD_BUSD_RUNTIME_MARKER:?}) was absent — no client completed \
+             the `EXTERNAL` handshake against `/run/user/1000/bus`. Read the console line \
+             first: it carries the PROBE's own words (`td-busd: the session bus did not \
+             answer on …: …`), which is what tells a refused bind from a refused uid from a \
+             bus that accepted and then said nothing. \
+             The seat is not in doubt, and not because any marker says so — the `seat` unit \
+             prints none. The route is that `/etc/bootsuccess` is what printed every marker \
+             already checked above, and it runs at all only through \
+             `bootsuccess requires=terminal`, `terminal requires=wayland`, \
+             `wayland requires=seat`; a seat that failed would have stopped the chain and \
+             this validation would have ended at the uutils marker long before here. \
+             So this is the broker: `bind` refused the path (a stale socket with a live \
+             listener, or a non-socket sitting on it), the process crashed and `restart=` \
+             could not keep it up, or the handshake refused the uid the kernel reported for \
+             the probe. Note what td-svc does NOT do — a readiness probe that never succeeds \
+             marks the unit failed and leaves the PROCESS running, and `restart=` is \
+             evaluated when a process exits, so a broker that is up and not serving is never \
+             restarted and never re-probed. \
+             td-busd-test covers the codec, the handshake and a bind/probe loopback in the \
+             build sandbox; what only this can see is that the path the unit names answers, \
+             as the login user, in the runtime directory the seat assignment made. That is a \
+             PATH and not a pid: strictly it says a broker is reachable there, not that this \
+             unit's process is the one answering — nothing else on this image binds it, which \
+             is what makes the marker worth having and is also the assumption to re-check the \
+             day something else could. It proves the bus is REACHABLE and nothing more: \
+             nothing on this image says `Hello` or routes a message yet. \
+             Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -3092,6 +3134,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_TXT_RUNTIME_MARKER.len(),
         TD_INIT_RUNTIME_MARKER.len(),
         TD_LOGIN_RUNTIME_MARKER.len(),
+        TD_BUSD_RUNTIME_MARKER.len(),
         TD_SANDBOX_KERNEL_MARKER.len(),
         TD_JAIL_TRANSITION_MARKER.len(),
         exact_line_window(TD_JAIL_SECCOMP_PROBE_MARKER),
@@ -3232,6 +3275,11 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         &mut evidence.td_login_runtime,
         buf,
         TD_LOGIN_RUNTIME_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.td_busd_runtime,
+        buf,
+        TD_BUSD_RUNTIME_MARKER.as_bytes(),
     );
     latch_marker(
         &mut evidence.td_sandbox_kernel,
@@ -4141,7 +4189,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 39] {
+    fn all_console_markers() -> [&'static str; 40] {
         [
             MARKER,
             EROFS_MARKER,
@@ -4175,6 +4223,7 @@ mod tests {
             TD_TXT_RUNTIME_MARKER,
             TD_INIT_RUNTIME_MARKER,
             TD_LOGIN_RUNTIME_MARKER,
+            TD_BUSD_RUNTIME_MARKER,
             TD_SANDBOX_KERNEL_MARKER,
             TD_JAIL_TRANSITION_MARKER,
             TD_JAIL_SECCOMP_PROBE_MARKER,
@@ -4419,6 +4468,7 @@ mod tests {
             SSHD_MARKER,
             TD_UTIL_RUNTIME_MARKER,
             TD_TXT_RUNTIME_MARKER,
+            TD_BUSD_RUNTIME_MARKER,
             TD_JAIL_TRANSITION_MARKER,
             TD_JAIL_SECCOMP_PROBE_MARKER,
             TD_JAIL_FIXTURE_BOOT_MARKER,
@@ -4474,6 +4524,7 @@ mod tests {
         assert!(evidence.sshd);
         assert!(evidence.td_util_runtime);
         assert!(evidence.td_txt_runtime);
+        assert!(evidence.td_busd_runtime);
         assert!(evidence.td_jail_transition);
         assert!(evidence.td_jail_seccomp);
         assert!(evidence.td_jail_fixture);
