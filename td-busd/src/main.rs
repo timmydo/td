@@ -15,6 +15,7 @@ mod auth;
 mod corpus;
 mod message;
 mod name;
+mod recorded;
 mod wire;
 
 use std::env;
@@ -56,6 +57,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("corpus", include_str!("corpus.rs")),
     ("message", include_str!("message.rs")),
     ("name", include_str!("name.rs")),
+    ("recorded", include_str!("recorded.rs")),
     ("wire", include_str!("wire.rs")),
 ];
 

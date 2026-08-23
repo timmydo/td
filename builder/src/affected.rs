@@ -1034,6 +1034,18 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // shipped binary's own codec selftest: the same committed byte streams the
     // host tests decode, decoded by the target build. Host cargo holds the Rust
     // rules and the no-unsafe confinement test.
+    //
+    // spec/ holds recorded-conversation DATA and examples/ the recorder that
+    // writes it. Both are host-side interop tooling — src/recorded.rs replays
+    // them under cfg(test), so the recipe never stages them — and both already
+    // match `td-busd/*`, since `glob_match` is fnmatch WITHOUT FNM_PATHNAME and
+    // its star crosses `/`. They are named in the assertions below rather than
+    // here: an added alternative would change no decision while implying the
+    // star stops at a separator.
+    //
+    // The recipe-checks selection below is wider than these two paths need,
+    // since the recipe never sees them. That over-selection predates this and
+    // is left alone rather than special-cased here.
     if pattern_matches(
         "td-busd/*|td-busd/src/*|td-busd/Cargo.toml|td-busd/Cargo.lock",
         p,
@@ -1963,6 +1975,12 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-busd/src/main.rs", "recipe-checks");
     assert_preflight!("td-busd/src/wire.rs", "cargo-test");
     assert_preflight!("td-busd/src/message.rs", "cargo-test");
+    // The interop corpus and its recorder ride the host cargo preflight, which
+    // is what replays them. Regression pins rather than verified-red evidence:
+    // `td-busd/*` already matches both, so these passed before the corpus
+    // existed and would notice only a future narrowing of the matcher.
+    assert_preflight!("td-busd/spec/libdbus-listnames.conversation", "cargo-test");
+    assert_preflight!("td-busd/examples/dbus-capture.rs", "cargo-test");
     assert_target!("td-busd/Cargo.lock", "check");
     assert_target!("td-busd/Cargo.lock", "recipe-checks");
     // td-sh mirrors td-kexec: standalone std-only crate, main.rs include_str!'d into

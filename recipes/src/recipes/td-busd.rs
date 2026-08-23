@@ -6,6 +6,7 @@ const MODULES: &[(&str, &str)] = &[
     ("corpus", include_str!("../../../td-busd/src/corpus.rs")),
     ("message", include_str!("../../../td-busd/src/message.rs")),
     ("name", include_str!("../../../td-busd/src/name.rs")),
+    ("recorded", include_str!("../../../td-busd/src/recorded.rs")),
     ("wire", include_str!("../../../td-busd/src/wire.rs")),
 ];
 

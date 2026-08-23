@@ -1,0 +1,187 @@
+td-busd interop corpus — recorded D-Bus conversations
+=====================================================
+
+Bytes that a real D-Bus client and the reference `dbus-daemon` actually
+exchanged, replayed against this crate by ../src/recorded.rs. Recorded by
+../examples/dbus-capture.rs.
+
+
+Why this exists beside the hand-laid corpus
+-------------------------------------------
+
+`src/corpus.rs` holds encodings laid out by hand from the specification, and
+they are what proves this crate agrees with the specification AS THE AUTHOR
+READ IT. A misreading passes those tests too, because the same reading wrote
+both the code and the fixture.
+
+Recordings are the other kind of evidence. Nobody wrote down what the reply
+should be; the reference implementation did, and the client on the other side
+is the one td has to interoperate with. The two kinds fail differently and
+neither replaces the other:
+
+  hand-laid   covers what SHOULD happen, including refusals no real client
+              ever sends, and can be written before the code exists
+  recorded    covers what DOES happen, including the spellings, pipelining and
+              framing real clients use that nobody would think to invent
+
+What a recording does NOT carry is upstream's INTENT. It is one session
+between one client and one daemon version; where it and the specification
+disagree, the specification wins and the recording is evidence about a
+particular implementation. (Vendoring dbus's own `test/data/auth/*.auth-script`
+suite would add the intent half. It is not here yet — see "Not yet done".)
+
+
+Format
+------
+
+One `.conversation` file per recorded session. Line-oriented, ASCII:
+
+    # comment                    ignored
+    name: <case>                 required, once
+    note: <text>                 optional, once
+    C <hex>                      one read's worth of bytes from the CLIENT
+    S <hex>                      one read's worth of bytes from the DAEMON
+
+Frames appear in the order they crossed. **Frame boundaries are data, not
+formatting** — each `C`/`S` line is exactly what one `read(2)` returned, and
+the boundaries are the part real clients get interestingly wrong:
+
+  * libdbus sends the leading NUL and `AUTH EXTERNAL <hex>` in ONE write, then
+    `BEGIN\r\n` and its first message in ANOTHER — so a handshake that
+    consumed its whole buffer would swallow the `Hello` and the peer would
+    look like one that connected and never spoke.
+  * sd-bus (busctl) sends `\0AUTH EXTERNAL\r\nDATA\r\nNEGOTIATE_UNIX_FD\r\n
+    BEGIN\r\n` as a SINGLE write, before reading any reply at all. One `feed`
+    of that must produce three replies and stop at `BEGIN`.
+
+A reader that normalized frames away would lose both cases.
+
+
+Provenance
+----------
+
+  Reference daemon:  D-Bus Message Bus Daemon 1.15.8
+                     /gnu/store/01dmmnlj3mqc6cmms83fkayzz9gbk2yh-dbus-1.15.8
+  Recorded as:       uid 1001, on the build host, against a private session bus
+                     started with `dbus-daemon --session --print-address --fork`
+  Recorder:          ../examples/dbus-capture.rs (this tree)
+
+  libdbus-listnames.conversation
+    client:  dbus-send 1.15.8 (libdbus)
+    command: dbus-send --session --dest=org.freedesktop.DBus --type=method_call
+             --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames
+    covers:  the specified transcript; Hello pipelined with BEGIN; a method
+             call and its reply; the unsolicited NameAcquired signal
+
+  libdbus-introspect.conversation
+    client:  dbus-send 1.15.8 (libdbus)
+    command: as above, member org.freedesktop.DBus.Introspectable.Introspect
+    covers:  a reply whose body is one large string, several KiB
+
+  libdbus-addmatch.conversation
+    client:  dbus-send 1.15.8 (libdbus)
+    command: dbus-send --session --dest=org.freedesktop.DBus --type=method_call
+             --print-reply /org/freedesktop/DBus org.freedesktop.DBus.AddMatch
+             "string:type='signal',interface='org.freedesktop.DBus',\
+member='NameOwnerChanged'"
+    covers:  a match rule with the escaping §D's parser has to handle
+
+  libdbus-becomemonitor.conversation
+    client:  dbus-monitor 1.15.8 (libdbus)
+    command: dbus-monitor --address unix:path=<socket>
+    covers:  BecomeMonitor — which §D REFUSES, so this is a recording of
+             traffic td-busd must reject rather than serve. Note dbus-monitor
+             1.15.8 does NOT call AddMatch: it passes an empty rule array to
+             BecomeMonitor, which is why AddMatch above is a separate file
+
+  sdbus-busctl.conversation
+    client:  busctl, elogind 255 (sd-bus)
+    command: busctl --address=unix:path=<socket> list --no-pager
+    covers:  the empty `AUTH EXTERNAL` + `DATA` spelling, and the entire
+             handshake pipelined into one write
+
+These are recordings of protocol traffic, not copied dbus source: no file here
+is derived from dbus's own source tree. The traffic was produced by running the
+programs above, which are packaged by Guix at the store path named.
+
+
+Descriptor passing
+------------------
+
+`dbus-capture` forwards bytes and cannot forward SCM_RIGHTS: doing so needs
+`UNSAFE.md` surface #10, which this crate does not have. A recording of a
+conversation that passed a descriptor would therefore hold a message whose
+UNIX_FDS field describes descriptors the bytes do not carry.
+
+Two guards, because the first one is a judgement call and the second is not:
+
+  1. the recorder REFUSES to write a conversation in which `AGREE_UNIX_FD`
+     was seen, unless `--allow-fds` says the operator has checked it;
+  2. `src/recorded.rs` decodes every recorded message and asserts that none
+     declares a descriptor — mechanical, in the crate where the decoder lives,
+     and not dependent on the operator having been right.
+
+Every file here was recorded with `--allow-fds` (all five negotiate it; none
+passes a descriptor), and guard 2 is what actually holds the claim — guard 1
+only makes an operator look. Guard 2 is also stricter than it appears:
+`decode_from_client(bytes, 0)` refuses any message declaring a descriptor
+before the assertion is reached, so the assertion states the property rather
+than being the only thing enforcing it.
+
+
+Re-recording
+------------
+
+    cargo build --manifest-path td-busd/Cargo.toml --example dbus-capture
+    dbus-daemon --session --print-address --fork      # note the unix:path=...
+
+    td-busd/target/debug/examples/dbus-capture \
+        --listen /tmp/td-capture.sock \
+        --upstream <the daemon's socket path> \
+        --name <case> --note <what it covers> --allow-fds \
+        --out td-busd/spec/<case>.conversation &
+
+    <client> --address unix:path=/tmp/td-capture.sock ...
+
+The recorder stops on a half-second silence (`--idle-ms`) rather than on EOF,
+so a client that holds its connection open — `dbus-monitor` does — still
+produces a file. It gives up waiting for a client after ten seconds
+(`--accept-ms`); the usual cause is a client `--address` that does not name
+the recorder's socket.
+
+A re-recording against a different daemon gets a different GUID, and one made
+by a different user states a different uid. Both are read out of the recording
+itself, so the replay does not need updating — except for `RECORDER_UID` in
+../src/recorded.rs, which is the fallback for the `DATA` spelling, where the
+client states no identity for the reader to find.
+
+Note what the replay does NOT take from the recording: the credential. The
+peer is built MAPPED, claiming the recorded uid but credentialed as a sentinel
+no recording contains, so that "charged to the credential" and "charged to the
+claim" are different answers. Built the obvious way they would coincide, and
+the corpus would not notice a broker that recorded whatever the client said.
+The GUID gets the same treatment in a second replay.
+
+Adding a file here means adding it to `RECORDINGS` in ../src/recorded.rs. A
+file nothing replays is worse than no file, and `the_corpus_is_whole` reads
+this directory and compares it against that list, so an unlisted file reds.
+
+
+Not yet done
+------------
+
+  * dbus's own `test/data/auth/*.auth-script` suite, which would carry
+    upstream's intent rather than one session's behaviour. The dbus source
+    tarball is not realized in this machine's store, only its derivation, so
+    the file list could not be confirmed from here.
+  * A recording is replayed by DIRECTION, not by interleaving: swapping a
+    client and a daemon frame in a file would not be noticed. Causal order is
+    guaranteed by the recorder instead, which logs a frame before forwarding
+    it, so a reply can never be recorded ahead of the request that caused it.
+  * Recordings of td-busd ITSELF answering a real client. That needs the
+    socket, which needs surface #10. Until then a recording is replayed
+    through `Handshake::feed` and the decoder directly, which covers the
+    parsing and the replies but not the transport.
+  * Routing, names and match rules (rung 14). When those land the recordings
+    grow into whole call/reply exchanges, and this corpus is the shape they
+    go in.
