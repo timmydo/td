@@ -25,12 +25,12 @@ repository. A recipe either **seeds** from a prebuilt upstream artifact
 pinned by URL and `sha256`, or builds from source; the two produce the
 same kind of package and the choice is per application (§B.3).
 
-That removes the network stack, the signature trust root and the
-repository format from this design entirely: there is no OSTree client,
-no GVariant reader, no OpenPGP verification, no HTTP and no TLS on the
-target. The signature that matters is checked once by a human when the
-pin is reviewed — the same way td already trusts the kernel tarball and
-the Rust bootstrap snapshot.
+That removes the network stack, the signature trust root and the repository
+format from the **target**. There is no target-side OSTree client, GVariant
+reader, OpenPGP verification, HTTP or TLS. §B.3.1 selects a bounded
+control-plane reader for exact Flathub commit graphs; the signature that
+authorizes each commit is still checked by a human when the pin is reviewed,
+the same way td already trusts the kernel tarball and Rust bootstrap snapshot.
 
 The cost is that the curated set is td's to maintain: a seed bump is a
 pin review plus a rebuild, and no application td has not packaged can be
@@ -1089,34 +1089,189 @@ setuid, setgid and sticky mode bits. Its empty typed permission policy and the
 `empty-runtime` environment table compile into `spec`; its recipe check also
 runs the registered-store closure proof described below.
 
-This is the cheapest complete exercise of the seed/trust path; it deliberately
-does not answer E1/E1b for a graphical toolkit runtime.
+This is the cheapest complete exercise of the seed/trust path. It did not
+answer the graphical-runtime question; the package-only Firefox experiment
+below now does.
 
-**Which upstream artifact, per application, is a real question**, and it
-is E1b's (§V.0) rather than this document's to answer:
+#### B.3.1 The Firefox deploy-tree proof
 
-- **Applications are usually easy.** Mozilla publishes official Firefox
-  binaries as plain tarballs at stable release URLs — upstream's own
-  artifact, needing no flatpak on the dev host. Most applications that
-  ship Linux binaries at all ship them this way.
-- **The runtime is the hard half.** A flatpak runtime such as Freedesktop
-  SDK is distributed *only* through OSTree, so it cannot be pinned as a
-  file. Three alternatives, none requiring hosting: pin a set of **distro
-  packages** (Debian `.deb` files are plain files at stable URLs with
-  published hashes, and collectively provide a complete glib/GTK/ICU
-  stack); **build the runtime from source**; or write a
-  **control-plane-only OSTree or OCI importer**.
+The selected binary-distribution route is a bounded, control-plane-only
+Flatpak deploy importer. It is not a Flatpak client on the target, and it is
+not permission compatibility. The importer converts one reviewed application
+commit and one reviewed runtime commit into the same td package/runtime shape
+every other application uses.
 
-  The third is refused on **cost, not principle** — §Z forbids td
-  *serving* bytes, and a control-plane fetcher pulling upstream-owned
-  digest-pinned objects from upstream's own repository hosts nothing. But
-  an OSTree importer is GVariant plus repo modes plus
-  `.filez`/`.dirtree`/`.dirmeta` handling, and a `.deb` is `ar` plus
-  `tar` plus a hash. A later reader reaching for it should have to argue
-  past the price, not past a claim of impossibility.
+The package-only experiment pulled Flathub into an isolated scratch
+installation with host Guix's Flatpak 1.16.6, deliberately omitting every
+related extension, including the locale and graphics extensions. It did not
+execute Firefox and did not touch the system image. Mutable refs were used only
+to discover the current commits; these are the immutable objects that were
+inspected:
 
-That asymmetry relocates the project's difficulty: **the application is
-not the hard part, the runtime is.**
+| role | ref | commit | deployed/download size |
+|---|---|---|---|
+| application | `app/org.mozilla.firefox/x86_64/stable` | `86ba63a1c2378a9525b495e1ba2c3ed9dc71ee92f67e45d8016cc4972024b410` | 333.8 MB / 125.6 MB |
+| runtime | `runtime/org.freedesktop.Platform/x86_64/25.08` | `bd44a6230581917d04f89812a4c21090c304d390edb73995af1c2f9fd8abf4e8` | 659.9 MB / 257.1 MB |
+
+Both commits have a good Flathub signature rooted at fingerprint
+`6E5C 05D9 79C7 6DAF 93C0 8135 4184 DD4D 907A 7CAE`. Their OSTree content
+checksums are respectively
+`e511b540f42135f8703d6ea0f65abe3b798f93d4ab73ad27bf272d372a72fac3`
+and
+`e8c3f71b355e2248fba4e04492de33242355ddd4b552f809ea06292859200c72`.
+Flathub marks `org.mozilla.firefox` manually verified and publishes a manifest
+link into Mozilla's mutable `mozilla-central` tree. That link does not
+authenticate this exact build. The stronger build-specific evidence is in the
+signed deploy: its `application.ini` says Firefox 154.0, build ID
+`20260812182057`, source repository
+`https://hg.mozilla.org/releases/mozilla-release`, and source stamp
+`9ce1ee6baeb9a3c326dbd180bdece65d8fc2eadc`, the
+`FIREFOX_154_0_RELEASE` changeset.
+
+This answers E1's layout question. The application deploy's `files/` tree is
+the hierarchy td mounts at `/app`; the platform deploy's `files/` tree is the
+hierarchy td mounts at `/usr`. The application tree had 480 children: 184
+directories, 151 regular files and 145 symlinks. The runtime tree had 18,201
+children: 1,947 directories, 13,744 regular files and 2,510 symlinks. Neither
+tree contained a device, FIFO or socket node, and neither contained a setuid or
+setgid regular file. The two base refs total 993.7 MB deployed, versus the
+approximately 1.4 GB uncompressed closure of the host Guix `mpv` package. Their
+separate compressed-transfer figure is 382.7 MB; it is not compared with the
+uncompressed Guix closure. Both figures exclude every related extension. The
+659.9 MB deployed runtime, whose transfer is 257.1 MB, is shared by every
+application on the same runtime major.
+
+The proof is deliberately not called a td package landing. Flathub publishes
+an OSTree repository rather than a stable deploy tarball, and invoking the
+caller's `flatpak` from a recipe would make the derivation depend on ambient
+programs, remote configuration and a mutable ref. A locally exported tarball
+would instead make td its distributor. Neither is admissible. The repository
+workstream must implement and review the importer before these bytes can be a
+recipe input.
+
+The importer contract is narrower than Flatpak:
+
+1. The input names an architecture, exact app/runtime refs and exact commit
+   hashes. A branch name alone is a refusal. Pin review records the signing-key
+   fingerprint and independently verifies the signatures; the fixed commit
+   and every fetched object hash then preserve that decision during builds.
+2. Only the two commit-reachable `files/` trees are materialized. Summary
+   browsing, updates, installation state, exports, permissions and activation
+   metadata are not imported. The target has no OSTree or Flatpak code.
+3. The object count, aggregate decoded bytes, path count, path length and file
+   size are bounded before publication. Hash, type, mode or tree-reference
+   mismatches fail closed, and a temporary tree is renamed into place only
+   after complete validation.
+4. Device nodes, FIFOs, sockets, setid/sticky bits and file capabilities are
+   refused. So are all xattrs and ACLs, rather than copying only the ones the
+   importer understands. Every node is materialized as root-owned, timestamps
+   are normalized to a fixed value, and directory and regular-file modes are
+   canonicalized. Symlinks are retained only when lexical resolution stays in
+   the assembled `/app` or `/usr` trees or names an explicitly synthesized
+   jail path. The current application has 102 absolute locale links under
+   `/app`; selecting or omitting the locale extension must be explicit rather
+   than leaving an accidental set of dangling links.
+5. td generates the manifest, spec and launcher from reviewed typed data after
+   import. Flatpak's permissions are evidence for that review, never launch
+   authority. Unknown or broader permissions are refused rather than copied
+   as strings.
+6. A dynamic-package validator binds the entry, application-private DSOs and
+   runtime by the builder-authenticated declaration. It accepts a bounded
+   shebang only when its interpreter resolves in the selected runtime, walks
+   every ELF interpreter/needed-library edge without consulting the host, and
+   refuses an unresolved edge or an ambient path. No imported executable runs
+   during conversion or checking.
+7. A commit carrying `xa.extra-data-sources`, or any other declaration that
+   obtains payload bytes from outside the signed commit-reachable object graph,
+   is refused. The inspected application and runtime do not use extra data.
+
+The inspected Firefox entry is a short `#!/bin/bash` wrapper that sets
+`TMPDIR=$XDG_CACHE_HOME/tmp` and execs `/app/lib/firefox/firefox`. Its ELF
+interpreter is `/lib64/ld-linux-x86-64.so.2`, supplied by the platform under
+`/usr/lib64`. Therefore dynamic Flatpak packages also require a reviewed
+runtime-major environment policy, synthetic `/bin`, `/lib`, `/lib64` and
+`/sbin` aliases into `/usr`, and a bounded `/etc` assembled from td policy plus
+selected runtime data. Runtime links into Flatpak's `/run/host` are never
+allowed to recreate that host view; DNS, certificates, fonts, timezone and
+machine identity receive td-owned paths from §G. Those are jail/runtime tasks,
+not reasons to reshape the imported trees.
+
+#### B.3.2 The Firefox platform stop line
+
+The application packaging workstream stops after this proof until the
+following bus and Wayland capabilities land. This is a dependency boundary:
+the bus and compositor workstreams own their implementations, while a later
+application increment re-runs the proof against the then-current exact
+Flathub commits.
+
+Those capabilities are necessary, not a claim that Firefox becomes ready when
+they land. The resumed application workstream still owns the bounded importer
+and dynamic validator from §B.3.1, the runtime aliases and synthesized `/etc`,
+the narrowed td permission and resource policy, and image-capacity accounting
+for the 993.7 MB base deploy. It must also complete E2's toolkit and nested
+sandbox experiments and the exact §H Firefox oracle. `td-portal` itself is a
+separate platform prerequisite. None of those obligations is discharged by
+the bus/compositor list below.
+
+For `td-busd`, full Firefox fidelity needs:
+
+- the per-caller policy and per-jail identity handshake, so Firefox cannot
+  borrow the fixture, portal or another application's names and quotas;
+- `RequestName`/`ReleaseName` with the bounded owner queue for
+  `org.mozilla.firefox.*` and `org.mpris.MediaPlayer2.firefox.*`;
+- `AddMatch`/`RemoveMatch`, authenticated pending-reply ownership and sender
+  validation, so portal, MPRIS, file-manager and accessibility signals and
+  replies cannot be spoofed or delivered across applications;
+- complete bounded `SCM_RIGHTS` forwarding in both directions for portal file
+  results, with descriptor indices and counts tied to the message that owns
+  them;
+- per-instance portal activation and Request/Session handle routing. The
+  portal namespace remains reserved even while the portal is restarting;
+- a deliberate decision for the imported requests to
+  `org.a11y.Bus`, `org.gtk.vfs.*`, `org.freedesktop.FileManager1` and the
+  system-bus `org.freedesktop.NetworkManager`. They are not silently granted.
+  Accessibility additionally needs §S's second AT-SPI bus; NetworkManager
+  either gets a narrow mediated status interface or Firefox runs without that
+  integration.
+
+The current broker has authentication, `Hello`, names-and-directed routing,
+receive-side descriptor adoption and global quotas, but not the capabilities
+above. In particular its missing per-caller filter is why the image currently
+asserts exactly one shipped application. A second real application must not
+weaken that assertion.
+
+For `td-compositor`, the minimum useful Firefox target is Software WebRender
+over `wl_shm`; dmabuf must remain unadvertised until it works. The platform
+gap is:
+
+- land `wl_subcompositor` and `wl_data_device_manager` v3 with selection;
+  §F classifies both as first-window blockers for the pinned runtime;
+- finish popup pointer grabs, outside-click dismissal and edge constraint
+  solving, so browser menus are usable rather than merely drawable;
+- add `zxdg_exporter_v2`/`zxdg_importer_v2`, so Firefox and GTK can give portal
+  dialogs an authenticated Wayland parent handle;
+- add primary selection and data-device clipboard transfer, then bounded drag
+  and drop;
+- add `wp_viewporter` and `xdg_activation_v1` for correct scaling and launch
+  focus, and relative-pointer plus pointer-constraints for pointer lock;
+- add text-input/input-method only with an actual IME, and fractional-scale and
+  presentation timing when td supports non-unit scale;
+- before admitting a browser trace, replace the fixture-sized shm/object
+  assumptions with §F's per-client pool, aggregate-byte, surface-dimension,
+  hidden-subsurface and callback-queue bounds. A 1080p browser copying through
+  fbdev is a functionality proof, not a video-performance claim;
+- treat `zwp_linux_dmabuf_v1`, explicit synchronization and DRI as a later
+  hardware-rendering increment. They are required for full GPU and hardware
+  video fidelity, not for the first offline page painted by Software
+  WebRender.
+
+Flatpak's authored context is intentionally not the td policy: it asks for
+X11/fallback-X11, `devices=all`, `features=devel`, PulseAudio, PC/SC, CUPS,
+network, persistent `.mozilla`, and several filesystem and bus grants. td
+refuses X11, blanket devices and devel for the first browser proof; uses the
+private application home, Wayland, network and narrowly resolved download
+grant; and adds audio, printing, smart cards and broader integration only in
+their own reviewed increments.
 
 **Replacing a seed with a source build changes nothing above the
 recipe.** The manifest, identity, permissions, jail, store path shape and
@@ -1226,12 +1381,12 @@ for one has to argue past this rather than rediscover it:
 
 | not built | why |
 |---|---|
-| **OSTree client** (repo modes, `.filez`/`.dirtree`/`.dirmeta`, GVariant) | Against a **curated dozen pins** a general repository client is a format tower serving a handful of URLs, and it is the most expensive kind of code here — a trust-path parser of attacker-controlled bytes — where a recipe is the cheapest. A control-plane importer is a different question and §B.3 prices it |
-| **Summary, index, refs, static deltas** | All are incremental-update machinery for a repository td does not talk to. A pin bump plus a rebuild is td's update mechanism. |
+| **target-side OSTree client** (repo modes, `.filez`/`.dirtree`/`.dirmeta`, GVariant) | Still refused. §B.3.1 selects a bounded control-plane deploy importer for reviewed exact commits; it does not put repository or installation machinery in the distribution. |
+| **runtime summary browsing, refs and updates** | Still refused. The control-plane importer may resolve only the exact pinned commit/object graph. A pin bump plus a rebuild is td's update mechanism; a mutable ref is discovery input at review time, never derivation input. |
 | **OpenPGP verification** | The signature is checked by a human at pin review, as it is for every other fixed-output input. An implementation on the target would be a parser for attacker-supplied input serving a trust decision already made elsewhere. |
 | **HTTP/TLS on the target** | Nothing on the target fetches. The control plane's `td-net` already does this, under the existing dependency exception. |
 | **a target-side `fsck`/`verify` verb** | Refused. A package is in a read-only image admitted by a signed manifest, so a userspace hash sweep would re-check it with a weaker mechanism (§B.5). This refusal has flipped three times as the layout moved, which is the entry's real content: **a refusal argued from a layout is only as settled as the layout.** |
-| **OCI / container registries** | A second foreign format with the same objection as the first, and no application td wants is distributed only that way. |
+| **OCI / container registries** | A second foreign format with the same objection as the first. The selected Firefox experiment uses Flathub's signed OSTree commits directly; an OCI translation would add a second parser without removing the first. |
 
 ### B.7 Reuse from the control plane
 
@@ -5381,7 +5536,7 @@ whose answers are not already a section of their own:
 
 | question | answer |
 |---|---|
-| curated set or open Flathub | **curated, built by recipes** — runtime EOL and update policy then fall out of the pin, and a Flathub signature never enters the picture |
+| curated set or open Flathub | **curated, built by recipes** — §B.3.1 may seed one reviewed app/runtime pair from exact signed Flathub commits, but there is no open repository or target-side install and runtime EOL/update policy still follow the pin |
 | performance gates | no metric targets yet; **QEMU is the only target until daily-usable** |
 | filesystem-grant strictness | **per-package permission config**, Flatseal-shaped |
 | microphone | **stub the interface now**, implement later |
@@ -5530,8 +5685,9 @@ cgroup resource caps, the Wayland protocol ladder, the
 virtio-gpu/dmabuf path, the permission schema and spec compiler, per-app
 machine-ids, timezone policy, the bounded `Exec=` parser, and §S's
 accessibility work. Months of work with **zero decision risk**. Build
-that. Do not build an OSTree/OpenPGP stack or a 200-package desktop
-graph.
+that. Do not build a general OSTree/OpenPGP stack or a 200-package desktop
+graph; §B.3.1's bounded exact-commit importer is the deliberately smaller
+exception.
 
 **The sharpest formulation of the whole question, and the rule to
 follow:** *the package provenance decision need not be irreversible; the
@@ -5542,20 +5698,21 @@ The experiments that settle what is left, none longer than a week:
 
 | # | experiment | settles |
 |---|---|---|
-| **E1** | copy a GTK4 application's and its runtime's `files/` trees out of flatpak; run under plain `bwrap` with §C's mount plan against stock sway, with no flatpak, ostree or portal daemon present | whether a deploy tree is a self-contained hierarchy — the assumption the whole model rests on. One afternoon, and the decisive one |
-| **E1b** | for the same application, identify what upstream publishes at a stable URL with a hash, and run §B.3's unpack-and-lay-out against it | seed or source-build, per application. Untouched, and the harder half — Flathub publishes no deploy tarball |
+| **E1 — package half answered (§B.3.1)** | inspect the signed Firefox 154.0 and Freedesktop 25.08 deploy commits without executing the app; map their exact `files/` trees to `/app` and `/usr` | the deploy hierarchy is the right package/runtime split, has no special or setid files, and at 993.7 MB deployed is smaller than the roughly 1.4 GB uncompressed standalone Guix closure. Its separate compressed transfer is 382.7 MB. Execution waits on the dynamic-runtime/jail, bus and Wayland stop line rather than using host `bwrap` as a substitute for td-jail |
+| **E1b — route selected, importer not landed** | fetch and materialize the same exact signed Flathub commits through a bounded control-plane importer | Flathub publishes no stable deploy tarball, so an ambient `flatpak` recipe and a locally hosted export are both refused. §B.3.1 is the importer contract |
 | **E2** | `gtk4-demo` behind a global-filtering proxy; llvmpipe-over-shm in the pinned runtime; the ten-minute Firefox nested-userns check | §F's toolkit requirements and §C's open question. The most expensive possible surprise is here: if GTK4's cairo path has rotted, the GL-less story weakens with no GPU to fall back on |
 | **E3** | a Meson-world pilot — recipes for `pkgconf`, Ninja, Meson, a native CPython, then GLib and a Wayland-only `gtk3-demo` | td's *actual* per-package source cost, the number with the widest error bars. Near `cmake-x86-64`'s cost and the source track is real; a multi-week fight per package and the hybrid is permanent posture |
 | **E4** | the §0 cgroup pins plus a fixture under `memory.max=64M` with a `memory.oom.group` readback in the QEMU oracle | §P's mechanism |
 | **E5** | `glxinfo` inside a jail on virtio-gpu QEMU with the runtime's GL extension mounted | §M's first step |
 | **E6** | `RLIMIT_AS=2G` on Firefox; record the crash | closes the rlimits-versus-cgroups argument with data |
 
-**Points of no return.** Landing a GVariant/OSTree/OpenPGP tower is one —
-sunk cost will argue for keeping it, so do not start it before E1 has
-run. Landing LLVM-with-Clang, Node and WASI toolchain recipes is the
-other, and pays off only if source Firefox is genuinely pursued. Dropping
-the OSTree client is the *reversible* commitment: if td later wants
-target-side installs, the client can be built then, against a platform
+**Points of no return.** Landing a general GVariant/OSTree/OpenPGP tower is one
+— sunk cost will argue for keeping it. E1 has now run and selects only the
+bounded exact-commit importer in §B.3.1, not that tower. Landing
+LLVM-with-Clang, Node and WASI toolchain recipes is the
+other, and pays off only if source Firefox is genuinely pursued. Refusing a
+target-side OSTree client remains the *reversible* commitment: if td later
+wants target-side installs, the client can be built then, against a platform
 that already runs the applications.
 
 ## S. Accessibility, and AI agents as a first-class consumer
@@ -5620,11 +5777,12 @@ than for reading.
 
 ### V.0 Two things land before anyone starts
 
-**E1 and E1b** (§R). One afternoon each, and they test the assumption the
-model rests on. If a deploy tree needs something generated at install
-time, an undocumented environment variable, or a portal before it will
-draw, that is the finding — and it is worth far more before four agents
-start than after.
+**E1's package half has run and E1b has a selected contract** (§B.3.1 and
+§R). The execution half stays behind the documented dynamic-runtime, bus and
+Wayland stop line. If that later run finds something generated at install time,
+an undocumented environment variable or a portal required before first paint,
+that is the finding; the package inspection is not allowed to predeclare the
+execution result.
 
 **The new-crate de-collision.** Adding a crate touches three central
 tables, and every one is a line four agents will edit at once:
@@ -6080,10 +6238,11 @@ Three consequences that are easy to violate by accident:
    pinning a locally-assembled tree means publishing it somewhere. This
    is exactly what §B.3's earlier draft did by archiving a flatpak deploy
    tree, and it is why that step was rewritten.
-2. **Prefer upstreams that publish plain files.** Where a project ships
-   only through a repository protocol of its own — a flatpak runtime
-   through OSTree, say — the choices are a distro's plain package files,
-   or building from source (§B.3). Not hosting a repackaged copy.
+2. **Prefer upstreams that publish plain files.** Where a project ships only
+   through a repository protocol of its own — a Flatpak runtime through
+   OSTree, say — the choices are a distro's plain package files, building from
+   source, or §B.3.1's bounded control-plane import of exact upstream-hosted
+   objects. Never host a repackaged copy.
 3. **Delta and chunking machinery is not needed** and should not be
    built speculatively. It optimizes repeated pulls from a server that
    does not exist.
