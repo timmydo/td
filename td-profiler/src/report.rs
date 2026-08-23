@@ -14,13 +14,13 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 pub const SCHEMA: u32 = 1;
-pub const MAX_REPORT_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_REPORT_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_CAPTURE_METADATA_BYTES: u64 = 1024 * 1024;
 pub(crate) const MAX_FAILURE_MARKER_BYTES: u64 = 16 * 1024;
 pub(crate) const MAX_PROFILE_CPUS: usize = 4096;
 const FIXED_METADATA_RESERVE_BYTES: u64 = 4096;
 const PER_CPU_METADATA_RESERVE_BYTES: u64 = 96;
-const MAX_REPORT_EXPANSION_BYTES: usize = 64 * 1024 * 1024;
+const MAX_REPORT_EXPANSION_BYTES: usize = 128 * 1024 * 1024;
 const O_NOFOLLOW: i32 = 0o400_000;
 const O_CLOEXEC: i32 = 0o2_000_000;
 
@@ -69,6 +69,30 @@ struct HotspotKey {
     build_id: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct LineKey {
+    image: ImageKey,
+    symbol_resolved: bool,
+    line_resolved: bool,
+    function_address: u64,
+    object_address: u64,
+    function: Vec<u8>,
+    object: Vec<u8>,
+    build_id: Vec<u8>,
+    source_file: Vec<u8>,
+    source_line: u64,
+    source_column: u64,
+    discriminator: u64,
+}
+
+struct StackRows {
+    hotspots: BTreeMap<HotspotKey, u64>,
+    lines: BTreeMap<LineKey, u64>,
+    unresolved_stacks: u64,
+    line_resolved_samples: u64,
+    line_unresolved_samples: u64,
+}
+
 pub fn generate(
     capture: &Path,
     meta: &Meta,
@@ -80,15 +104,17 @@ pub fn generate(
         OutputBudget::with_limit(MAX_REPORT_BYTES.saturating_sub(MAX_CAPTURE_METADATA_BYTES));
     let mut expansion = ExpansionBudget::new();
     write_processes(capture, analysis, &budget)?;
-    let (hotspots, unresolved_stacks) =
-        write_stacks(capture, analysis, symbolizer, &budget, &mut expansion)?;
-    write_hotspots(capture, hotspots, &budget)?;
+    let rows = write_stacks(capture, analysis, symbolizer, &budget, &mut expansion)?;
+    write_hotspots(capture, rows.hotspots, &budget)?;
+    write_lines(capture, rows.lines, &budget)?;
     write_manifest(
         capture,
         meta,
         analysis,
         unknown_records,
-        unresolved_stacks,
+        rows.unresolved_stacks,
+        rows.line_resolved_samples,
+        rows.line_unresolved_samples,
         symbolizer,
         &budget,
         &mut expansion,
@@ -115,6 +141,7 @@ pub fn write_pending_manifest(
             "{},\"samples\":{},\"tasks\":{},\"mappings\":{},\"context_switches\":{},\
              \"lost\":{},\"corrupt\":{},\"ignored_perf_records\":{},\
              \"unknown_raw_records\":0,\"omitted_errors\":{},\"unresolved_stacks\":0,\
+             \"line_resolved_samples\":0,\"line_unresolved_samples\":0,\
              \"objects\":[],\"errors\":[],\"report_incomplete\":true}}",
             prefix,
             analysis.sample_records,
@@ -232,15 +259,17 @@ fn regenerate_partial(
     let (analysis, unknown_records) = analyze_capture(capture, partial, budget)?;
     let prefix = regenerated_manifest_prefix(prefix, analysis.sample_records)?;
     let mut symbolizer = Symbolizer::from_index(index);
-    let (hotspots, unresolved_stacks) =
-        write_stacks(partial, &analysis, &mut symbolizer, budget, &mut expansion)?;
-    write_hotspots(partial, hotspots, budget)?;
+    let rows = write_stacks(partial, &analysis, &mut symbolizer, budget, &mut expansion)?;
+    write_hotspots(partial, rows.hotspots, budget)?;
+    write_lines(partial, rows.lines, budget)?;
     write_manifest_tail(
         partial,
         &prefix,
         &analysis,
         unknown_records,
-        unresolved_stacks,
+        rows.unresolved_stacks,
+        rows.line_resolved_samples,
+        rows.line_unresolved_samples,
         &symbolizer,
         budget,
         &mut expansion,
@@ -466,7 +495,7 @@ fn write_stacks(
     symbolizer: &mut Symbolizer,
     budget: &OutputBudget,
     expansion: &mut ExpansionBudget,
-) -> Result<(BTreeMap<HotspotKey, u64>, u64), String> {
+) -> Result<StackRows, String> {
     symbolizer.begin_report();
     expansion.claim(
         analysis
@@ -484,7 +513,10 @@ fn write_stacks(
     let mut structured = output(capture.join("stacks.jsonl"), budget)?;
     let mut folded = output(capture.join("stacks.folded"), budget)?;
     let mut hotspots: BTreeMap<HotspotKey, u64> = BTreeMap::new();
+    let mut lines: BTreeMap<LineKey, u64> = BTreeMap::new();
     let mut unresolved_stacks = 0u64;
+    let mut line_resolved_samples = 0u64;
+    let mut line_unresolved_samples = 0u64;
 
     for (stack, count) in rows {
         let (start_kind, start_value) = start_identity(&stack.image.start);
@@ -573,6 +605,22 @@ fn write_stacks(
                     entry.insert(*count);
                 }
             }
+            let key = line_key(&stack.image, frame, symbol);
+            if key.line_resolved {
+                line_resolved_samples = line_resolved_samples.saturating_add(*count);
+            } else {
+                line_unresolved_samples = line_unresolved_samples.saturating_add(*count);
+            }
+            match lines.entry(key) {
+                Entry::Occupied(mut entry) => {
+                    let samples = entry.get().saturating_add(*count);
+                    *entry.get_mut() = samples;
+                }
+                Entry::Vacant(entry) => {
+                    expansion.claim(line_heap_bytes(frame, symbol), "source-line keys")?;
+                    entry.insert(*count);
+                }
+            }
         }
         drop(resolved);
         drop(reported_state);
@@ -580,7 +628,13 @@ fn write_stacks(
     }
     finish(structured, "stacks.jsonl")?;
     finish(folded, "stacks.folded")?;
-    Ok((hotspots, unresolved_stacks))
+    Ok(StackRows {
+        hotspots,
+        lines,
+        unresolved_stacks,
+        line_resolved_samples,
+        line_unresolved_samples,
+    })
 }
 
 fn reported_stack_state(base: &StackState, resolved: &[Option<Resolved>]) -> StackState {
@@ -622,6 +676,14 @@ fn write_frame(
     .map_err(|e| e.to_string())?;
     if let Some(resolved) = resolved {
         write!(file, ",{}", resolved_json(resolved)).map_err(|e| e.to_string())?;
+    } else {
+        write!(
+            file,
+            ",\"line_resolved\":false,{},\"source_line\":null,\
+             \"source_column\":null,\"discriminator\":null",
+            json::named_bytes("source_file", &[])
+        )
+        .map_err(|e| e.to_string())?;
     }
     file.write_all(b"}").map_err(|e| e.to_string())
 }
@@ -643,6 +705,42 @@ fn hotspot_key(image: &ImageKey, frame: &Frame, resolved: Option<&Resolved>) -> 
             function: Vec::new(),
             object: frame.path.clone(),
             build_id: Vec::new(),
+        },
+    }
+}
+
+fn line_key(image: &ImageKey, frame: &Frame, resolved: Option<&Resolved>) -> LineKey {
+    match resolved {
+        Some(resolved) => {
+            let source = resolved.source.as_ref();
+            LineKey {
+                image: image.clone(),
+                symbol_resolved: true,
+                line_resolved: source.is_some(),
+                function_address: resolved.function_address,
+                object_address: source.map_or(resolved.object_address, |_| 0),
+                function: resolved.function.clone(),
+                object: resolved.object.clone(),
+                build_id: resolved.build_id.clone(),
+                source_file: source.map_or_else(Vec::new, |value| value.file.clone()),
+                source_line: source.map_or(0, |value| value.line),
+                source_column: source.map_or(0, |value| value.column),
+                discriminator: source.map_or(0, |value| value.discriminator),
+            }
+        }
+        None => LineKey {
+            image: image.clone(),
+            symbol_resolved: false,
+            line_resolved: false,
+            function_address: 0,
+            object_address: frame.relative.unwrap_or(frame.address),
+            function: Vec::new(),
+            object: frame.path.clone(),
+            build_id: Vec::new(),
+            source_file: Vec::new(),
+            source_line: 0,
+            source_column: 0,
+            discriminator: 0,
         },
     }
 }
@@ -682,6 +780,67 @@ fn write_hotspots(
     finish(file, "hotspots.jsonl")
 }
 
+fn write_lines(
+    capture: &Path,
+    lines: BTreeMap<LineKey, u64>,
+    budget: &OutputBudget,
+) -> Result<(), String> {
+    let mut rows: Vec<_> = lines.into_iter().collect();
+    rows.sort_by(|(left_key, left_count), (right_key, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_key.cmp(right_key))
+    });
+    let mut file = output(capture.join("lines.jsonl"), budget)?;
+    for (line, count) in rows {
+        let (start_kind, start_value) = start_identity(&line.image.start);
+        let function_address = line
+            .symbol_resolved
+            .then_some(line.function_address)
+            .map_or_else(|| "null".into(), |value| value.to_string());
+        let object_address = (!line.line_resolved)
+            .then_some(line.object_address)
+            .map_or_else(|| "null".into(), |value| value.to_string());
+        let source_line = line
+            .line_resolved
+            .then_some(line.source_line)
+            .map_or_else(|| "null".into(), |value| value.to_string());
+        let source_column = line
+            .line_resolved
+            .then_some(line.source_column)
+            .map_or_else(|| "null".into(), |value| value.to_string());
+        let discriminator = line
+            .line_resolved
+            .then_some(line.discriminator)
+            .map_or_else(|| "null".into(), |value| value.to_string());
+        writeln!(
+            file,
+            "{{\"schema\":{SCHEMA},\"pid\":{},\"start_kind\":\"{}\",\"start_value\":{},\
+             \"generation\":{},\"symbol_resolved\":{},\"line_resolved\":{},{},{},\
+             \"build_id\":\"{}\",\"function_address\":{},\"object_address\":{},{},\
+             \"source_line\":{},\"source_column\":{},\"discriminator\":{},\"samples\":{}}}",
+            line.image.pid,
+            start_kind,
+            start_value,
+            line.image.generation,
+            line.symbol_resolved,
+            line.line_resolved,
+            json::named_bytes("object", &line.object),
+            json::named_bytes("function", &line.function),
+            json::hex(&line.build_id),
+            function_address,
+            object_address,
+            json::named_bytes("source_file", &line.source_file),
+            source_line,
+            source_column,
+            discriminator,
+            count
+        )
+        .map_err(|e| format!("write lines.jsonl: {e}"))?;
+    }
+    finish(file, "lines.jsonl")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_manifest(
     capture: &Path,
@@ -689,6 +848,8 @@ fn write_manifest(
     analysis: &state::Analysis,
     unknown_records: u64,
     unresolved_stacks: u64,
+    line_resolved_samples: u64,
+    line_unresolved_samples: u64,
     symbolizer: &Symbolizer,
     budget: &OutputBudget,
     expansion: &mut ExpansionBudget,
@@ -700,6 +861,8 @@ fn write_manifest(
         analysis,
         unknown_records,
         unresolved_stacks,
+        line_resolved_samples,
+        line_unresolved_samples,
         symbolizer,
         budget,
         expansion,
@@ -767,6 +930,8 @@ fn write_manifest_tail(
     analysis: &state::Analysis,
     unknown_records: u64,
     unresolved_stacks: u64,
+    line_resolved_samples: u64,
+    line_unresolved_samples: u64,
     symbolizer: &Symbolizer,
     budget: &OutputBudget,
     expansion: &mut ExpansionBudget,
@@ -831,6 +996,7 @@ fn write_manifest_tail(
         "{}{regenerated_json},\"samples\":{},\"tasks\":{},\"mappings\":{},\"context_switches\":{},\
          \"lost\":{},\"corrupt\":{},\"ignored_perf_records\":{},\"unknown_raw_records\":{},\
          \"omitted_errors\":{},\"unresolved_stacks\":{},\
+         \"line_resolved_samples\":{},\"line_unresolved_samples\":{},\
          \"objects\":[{}],\"errors\":[{}]}}",
         prefix,
         analysis.sample_records,
@@ -843,6 +1009,8 @@ fn write_manifest_tail(
         unknown_records,
         omitted_errors,
         unresolved_stacks,
+        line_resolved_samples,
+        line_unresolved_samples,
         identities,
         error_json
     )
@@ -930,6 +1098,7 @@ fn resolved_json_expansion(resolved: &Resolved) -> usize {
         resolved.debug.len(),
         resolved.build_id.len(),
         resolved.provenance.len(),
+        resolved.source.as_ref().map_or(0, |value| value.file.len()),
     ]
     .into_iter()
     .fold(std::mem::size_of::<Resolved>(), usize::saturating_add)
@@ -949,6 +1118,22 @@ fn hotspot_heap_bytes(frame: &Frame, resolved: Option<&Resolved>) -> usize {
     std::mem::size_of::<HotspotKey>()
         .saturating_add(fields)
         .saturating_add(64)
+        .saturating_mul(2)
+}
+
+fn line_heap_bytes(frame: &Frame, resolved: Option<&Resolved>) -> usize {
+    let fields = match resolved {
+        Some(resolved) => resolved
+            .function
+            .len()
+            .saturating_add(resolved.object.len())
+            .saturating_add(resolved.build_id.len())
+            .saturating_add(resolved.source.as_ref().map_or(0, |value| value.file.len())),
+        None => frame.path.len().saturating_add(32),
+    };
+    std::mem::size_of::<LineKey>()
+        .saturating_add(fields)
+        .saturating_add(96)
         .saturating_mul(2)
 }
 
@@ -1068,10 +1253,10 @@ fn finish(mut file: Output, label: &str) -> Result<(), String> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::{
-        effective_rate_millihz, finish, folded_escape, hotspot_key, output, regenerate,
-        reported_stack_state, validate_identity_metadata, write_pending_manifest, ExpansionBudget,
-        Meta, OutputBudget, RegenerationLock, MAX_CAPTURE_METADATA_BYTES, MAX_FAILURE_MARKER_BYTES,
-        MAX_PROFILE_CPUS, MAX_REPORT_BYTES, MAX_REPORT_EXPANSION_BYTES,
+        effective_rate_millihz, finish, folded_escape, hotspot_key, line_key, output, regenerate,
+        reported_stack_state, validate_identity_metadata, write_lines, write_pending_manifest,
+        ExpansionBudget, Meta, OutputBudget, RegenerationLock, MAX_CAPTURE_METADATA_BYTES,
+        MAX_FAILURE_MARKER_BYTES, MAX_PROFILE_CPUS, MAX_REPORT_BYTES, MAX_REPORT_EXPANSION_BYTES,
     };
     use crate::event::{Event, Kind, StartIdentity};
     use crate::state::{Frame, ImageKey, StackState};
@@ -1096,6 +1281,7 @@ mod tests {
             object_address: 1,
             function_address: 1,
             assembly_boundary: false,
+            source: None,
         };
         assert_eq!(
             reported_stack_state(&StackState::Complete, &[Some(resolved.clone())]),
@@ -1138,6 +1324,7 @@ mod tests {
             object_address,
             function_address: 0x100,
             assembly_boundary: false,
+            source: None,
         };
         assert_eq!(
             hotspot_key(&image, &frame(0x111), Some(&resolved(0x111))),
@@ -1147,10 +1334,84 @@ mod tests {
         assert!(!unresolved.resolved);
         assert!(unresolved.function.is_empty());
         assert_eq!(unresolved.function_address, 0x133);
+
+        let located = |object_address, line| Resolved {
+            source: Some(crate::dwarf::Location {
+                file: b"/td-build/src/main.rs".to_vec(),
+                line,
+                column: 7,
+                discriminator: 0,
+            }),
+            ..resolved(object_address)
+        };
+        assert_eq!(
+            line_key(&image, &frame(0x111), Some(&located(0x111, 9))),
+            line_key(&image, &frame(0x122), Some(&located(0x122, 9)))
+        );
+        assert_ne!(
+            line_key(&image, &frame(0x111), Some(&located(0x111, 9))),
+            line_key(&image, &frame(0x111), Some(&located(0x111, 10)))
+        );
+        let unresolved_line = line_key(&image, &frame(0x133), Some(&resolved(0x133)));
+        assert!(unresolved_line.symbol_resolved);
+        assert!(!unresolved_line.line_resolved);
+        assert_eq!(unresolved_line.object_address, 0x133);
+    }
+
+    #[test]
+    fn resolved_line_rows_serialize_every_location_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "td-profiler-resolved-line-row-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let image = ImageKey {
+            pid: 7,
+            start: StartIdentity::ProcTicks(11),
+            generation: 2,
+        };
+        let frame = Frame {
+            address: 0x101,
+            relative: Some(0x101),
+            major: 1,
+            minor: 2,
+            inode: 3,
+            inode_generation: 0,
+            path: b"mapped".to_vec(),
+        };
+        let resolved = Resolved {
+            function: b"work".to_vec(),
+            object: b"/td/store/object/bin/work".to_vec(),
+            debug: b"/td/store/object/lib/debug/bin/work.debug".to_vec(),
+            build_id: vec![0xab; 20],
+            provenance: b"store-item=object".to_vec(),
+            object_address: 0x101,
+            function_address: 0x100,
+            assembly_boundary: false,
+            source: Some(crate::dwarf::Location {
+                file: b"src/main.rs".to_vec(),
+                line: 42,
+                column: 7,
+                discriminator: 3,
+            }),
+        };
+        let mut rows = std::collections::BTreeMap::new();
+        rows.insert(line_key(&image, &frame, Some(&resolved)), 9);
+        write_lines(&root, rows, &OutputBudget::new()).unwrap();
+        let row = std::fs::read_to_string(root.join("lines.jsonl")).unwrap();
+        assert!(row.contains("\"symbol_resolved\":true,\"line_resolved\":true"));
+        assert!(row.contains("\"function_address\":256,\"object_address\":null"));
+        assert!(row.contains("\"source_file\":\"src/main.rs\""));
+        assert!(row
+            .contains("\"source_line\":42,\"source_column\":7,\"discriminator\":3,\"samples\":9"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn live_report_and_failure_metadata_share_one_fixed_allowance() {
+        assert_eq!(MAX_REPORT_BYTES, 128 * 1024 * 1024);
+        assert_eq!(MAX_REPORT_EXPANSION_BYTES, 128 * 1024 * 1024);
         let derived = MAX_REPORT_BYTES - MAX_CAPTURE_METADATA_BYTES;
         assert_eq!(derived + MAX_CAPTURE_METADATA_BYTES, MAX_REPORT_BYTES);
         const { assert!(MAX_FAILURE_MARKER_BYTES < MAX_CAPTURE_METADATA_BYTES) };
@@ -1320,6 +1581,15 @@ mod tests {
         assert!(manifest.contains("\"regenerated\":true"));
         assert!(manifest.contains("\"samples\":1"));
         assert!(manifest.contains("\"effective_rate_millihz\":1000"));
+        assert!(manifest.contains("\"line_resolved_samples\":0"));
+        assert!(manifest.contains("\"line_unresolved_samples\":1"));
+        let lines = std::fs::read_to_string(capture.join("regenerated/lines.jsonl")).unwrap();
+        assert!(lines.contains("\"symbol_resolved\":false"));
+        assert!(lines.contains("\"line_resolved\":false"));
+        let stacks = std::fs::read_to_string(capture.join("regenerated/stacks.jsonl")).unwrap();
+        assert!(stacks.contains(
+            "\"line_resolved\":false,\"source_file\":\"\",\"source_file_bytes\":\"\",\"source_line\":null"
+        ));
         assert!(regenerate(&capture, None)
             .unwrap_err()
             .contains("already exists"));

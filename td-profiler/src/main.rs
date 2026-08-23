@@ -6,6 +6,7 @@
 mod collector;
 mod contract;
 mod cpuset;
+mod dwarf;
 mod event;
 mod evidence;
 mod index;

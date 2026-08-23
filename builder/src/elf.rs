@@ -64,6 +64,16 @@ const SHF_ALLOC: u64 = 2;
 const SHF_COMPRESSED: u64 = 0x800;
 const MAX_SECTION_NAME_TABLE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SECTION_HEADER_BYTES: usize = 4096;
+const MAX_PROFILE_LINE_SECTION_BYTES: u64 = 32 * 1024 * 1024;
+
+fn validate_line_address_shape(address_size: u8, segment_size: u8) -> Result<(), String> {
+    if !matches!(address_size, 1 | 2 | 4 | 8) || segment_size != 0 {
+        return Err(format!(
+            ".debug_line has unsupported address/segment sizes {address_size}/{segment_size}"
+        ));
+    }
+    Ok(())
+}
 
 fn u16le(b: &[u8], off: usize) -> Result<u16, String> {
     let end = off
@@ -438,6 +448,12 @@ impl FileElf {
 
         let names_header = read_header(&mut file, shstrndx)?;
         let names_kind = u32le(&names_header, 4)?;
+        if names_kind != SHT_STRTAB {
+            return Err(format!(
+                "{}: ELF section-name table is not SHT_STRTAB",
+                path.display()
+            ));
+        }
         let (names_offset, names_size) = range(&names_header, names_kind != SHT_NOBITS)?;
         if names_size > MAX_SECTION_NAME_TABLE_BYTES {
             return Err(format!(
@@ -598,11 +614,11 @@ impl FileElf {
                     .first()
                     .copied()
                     .ok_or(".debug_line address size is absent")?;
-                if !(1..=8).contains(&address_size) {
-                    return Err(format!(
-                        ".debug_line has invalid address size {address_size}"
-                    ));
-                }
+                let segment_size = sizes
+                    .get(1)
+                    .copied()
+                    .ok_or(".debug_line segment size is absent")?;
+                validate_line_address_shape(address_size, segment_size)?;
                 cursor = cursor
                     .checked_add(2)
                     .ok_or(".debug_line cursor overflows")?;
@@ -845,6 +861,10 @@ pub fn assert_debug_pair(runtime: &Path, debug: &Path) -> Result<(), String> {
     }
     let mut has_symbols = false;
     let mut has_lines = false;
+    let mut seen_symbols = false;
+    let mut seen_lines = false;
+    let mut seen_line_strings = false;
+    let mut seen_debug_strings = false;
     for index in 0..debug_elf.sections.len() {
         let section = debug_elf
             .sections
@@ -852,13 +872,47 @@ pub fn assert_debug_pair(runtime: &Path, debug: &Path) -> Result<(), String> {
             .copied()
             .ok_or("debug section index vanished during validation")?;
         let name = debug_elf.section_name(&section)?;
+        let seen = if name == b".symtab" {
+            Some(&mut seen_symbols)
+        } else if name == b".debug_line" {
+            Some(&mut seen_lines)
+        } else if name == b".debug_line_str" {
+            Some(&mut seen_line_strings)
+        } else if name == b".debug_str" {
+            Some(&mut seen_debug_strings)
+        } else {
+            None
+        };
+        if let Some(seen) = seen {
+            if *seen {
+                return Err(format!(
+                    "{}: duplicate {} section is outside the profiled companion policy",
+                    debug.display(),
+                    String::from_utf8_lossy(name)
+                ));
+            }
+            *seen = true;
+        }
         let is_symbols = section.kind == SHT_SYMTAB && name == b".symtab";
         let is_lines = section.kind == SHT_PROGBITS && name == b".debug_line";
-        let is_compressed_lines = name == b".zdebug_line"
-            || (name == b".debug_line" && section.flags & SHF_COMPRESSED != 0);
-        if is_compressed_lines {
+        let line_data =
+            name == b".debug_line" || name == b".debug_line_str" || name == b".debug_str";
+        let compressed_line_data = name == b".zdebug_line"
+            || name == b".zdebug_line_str"
+            || name == b".zdebug_str"
+            || (line_data && section.flags & SHF_COMPRESSED != 0);
+        if compressed_line_data {
             return Err(format!(
                 "{}: compressed {} is outside the deterministic companion policy",
+                debug.display(),
+                String::from_utf8_lossy(name)
+            ));
+        }
+        if line_data
+            && (section.kind != SHT_PROGBITS || section.size > MAX_PROFILE_LINE_SECTION_BYTES)
+        {
+            return Err(format!(
+                "{}: {} has unsupported type or exceeds {MAX_PROFILE_LINE_SECTION_BYTES} bytes",
                 debug.display(),
                 String::from_utf8_lossy(name)
             ));
@@ -1671,7 +1725,7 @@ mod tests {
         with_lines: bool,
         with_symbols: bool,
     ) -> Vec<u8> {
-        let names = b"\0.shstrtab\0.note.gnu.build-id\0.symtab\0.debug_line\0.strtab\0.text\0.bss\0.debug_gdb_scripts\0";
+        let names = b"\0.shstrtab\0.note.gnu.build-id\0.symtab\0.debug_line\0.strtab\0.text\0.bss\0.debug_gdb_scripts\0.debug_line_str\0";
         let name_offset = |name: &[u8]| {
             names
                 .windows(name.len())
@@ -1704,9 +1758,11 @@ mod tests {
         let lines_off = symtab_off + symtab_size;
         let strtab_off = lines_off + lines.len();
         let allocated_debug_off = strtab_off + symbol_names.len();
-        let shoff = (allocated_debug_off + 1 + 7) & !7;
+        let line_strings = b"/td-build/src\0";
+        let line_strings_off = allocated_debug_off + 1;
+        let shoff = (line_strings_off + line_strings.len() + 7) & !7;
         let shentsize = 64usize;
-        let shnum = 8usize;
+        let shnum = 9usize;
         let mut bytes = vec![0u8; shoff + shentsize * shnum];
         bytes[0..4].copy_from_slice(EI_MAG);
         bytes[EI_CLASS] = 2;
@@ -1722,6 +1778,8 @@ mod tests {
         bytes[symtab_off + 24..symtab_off + 28].copy_from_slice(&1u32.to_le_bytes());
         bytes[lines_off..lines_off + lines.len()].copy_from_slice(&lines);
         bytes[strtab_off..strtab_off + symbol_names.len()].copy_from_slice(symbol_names);
+        bytes[line_strings_off..line_strings_off + line_strings.len()]
+            .copy_from_slice(line_strings);
         let nobits_off = bytes.len() + 4096;
 
         let mut section = |index: usize,
@@ -1800,6 +1858,21 @@ mod tests {
             0,
             0,
         );
+        let line_string_name: &[u8] = if with_lines {
+            b".debug_line_str"
+        } else {
+            b".text"
+        };
+        section(
+            8,
+            line_string_name,
+            SHT_PROGBITS,
+            0,
+            line_strings_off,
+            line_strings.len(),
+            0,
+            0,
+        );
         bytes
     }
 
@@ -1812,9 +1885,29 @@ mod tests {
             .copy_from_slice(&value.to_le_bytes());
     }
 
+    fn profile_section_u32(bytes: &mut [u8], section: usize, field: usize, value: u32) {
+        let shoff = u64le(bytes, 0x28).unwrap() as usize;
+        let start = shoff + section * 64 + field;
+        bytes
+            .get_mut(start..start + 4)
+            .unwrap()
+            .copy_from_slice(&value.to_le_bytes());
+    }
+
     fn profile_section_offset(bytes: &[u8], section: usize) -> usize {
         let shoff = u64le(bytes, 0x28).unwrap() as usize;
         u64le(bytes, shoff + section * 64 + 0x18).unwrap() as usize
+    }
+
+    fn profile_duplicate_section_name(bytes: &mut [u8], source: usize, target: usize) {
+        let shoff = u64le(bytes, 0x28).unwrap() as usize;
+        let source = shoff + source * 64;
+        let target = shoff + target * 64;
+        let name = bytes.get(source..source + 4).unwrap().to_vec();
+        bytes
+            .get_mut(target..target + 4)
+            .unwrap()
+            .copy_from_slice(&name);
     }
 
     #[test]
@@ -1839,6 +1932,30 @@ mod tests {
         assert!(is_runtime_elf(&runtime).unwrap());
         assert_eq!(read_build_id(&runtime).unwrap(), id);
         assert_debug_pair(&runtime, &debug).unwrap();
+
+        let mut wrong_names_type = synth_profiled_elf(&[id], true, true);
+        profile_section_u32(&mut wrong_names_type, 1, 4, SHT_PROGBITS);
+        std::fs::write(&debug, wrong_names_type).unwrap();
+        let error = assert_debug_pair(&runtime, &debug).unwrap_err();
+        assert!(
+            error.contains("section-name table is not SHT_STRTAB"),
+            "unexpected error: {error}"
+        );
+
+        for (source, label) in [
+            (3, ".symtab"),
+            (4, ".debug_line"),
+            (8, ".debug_line_str"),
+        ] {
+            let mut duplicate = synth_profiled_elf(&[id], true, true);
+            profile_duplicate_section_name(&mut duplicate, source, 7);
+            std::fs::write(&debug, duplicate).unwrap();
+            let error = assert_debug_pair(&runtime, &debug).unwrap_err();
+            assert!(
+                error.contains(&format!("duplicate {label} section")),
+                "unexpected error: {error}"
+            );
+        }
 
         std::fs::write(&runtime, synth_profiled_elf(&[id], false, true)).unwrap();
         let err = assert_debug_pair(&runtime, &debug).unwrap_err();
@@ -1890,6 +2007,15 @@ mod tests {
             "unexpected error: {err}"
         );
 
+        let mut malformed = synth_profiled_elf(&[id], true, true);
+        profile_section_u64(&mut malformed, 8, 0x08, SHF_COMPRESSED);
+        std::fs::write(&debug, &malformed).unwrap();
+        let err = assert_debug_pair(&runtime, &debug).unwrap_err();
+        assert!(
+            err.contains("compressed .debug_line_str"),
+            "unexpected error: {err}"
+        );
+
         let mut mixed = synth_profiled_elf(&[id], true, true);
         let lines = profile_section_offset(&mixed, 4);
         mixed
@@ -1922,6 +2048,19 @@ mod tests {
             "unexpected error: {err}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn profiled_line_address_shape_matches_the_runtime_parser() {
+        for address_size in [1, 2, 4, 8] {
+            validate_line_address_shape(address_size, 0).unwrap();
+        }
+        assert!(validate_line_address_shape(3, 0)
+            .unwrap_err()
+            .contains("unsupported address/segment sizes 3/0"));
+        assert!(validate_line_address_shape(8, 1)
+            .unwrap_err()
+            .contains("unsupported address/segment sizes 8/1"));
     }
 
     #[test]

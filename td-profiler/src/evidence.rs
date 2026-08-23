@@ -8,10 +8,11 @@ use std::time::{Duration, Instant};
 
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_CAPTURE_ROOT_ENTRIES: usize = 256;
-const REQUIRED_FILES: [&str; 6] = [
+const REQUIRED_FILES: [&str; 7] = [
     "manifest.json",
     "processes.jsonl",
     "hotspots.jsonl",
+    "lines.jsonl",
     "stacks.jsonl",
     "stacks.folded",
     "samples.bin",
@@ -168,11 +169,18 @@ fn validate(capture: &Path, boot_id: &str, uid: u32, gid: u32) -> Result<(), Str
             ));
         }
     }
-    if number(&manifest, "\"samples\":")? == 0 {
+    let samples = number(&manifest, "\"samples\":")?;
+    if samples == 0 {
         return Err("current-boot capture contains no user-mode samples".into());
     }
     if manifest.contains("\"objects\":[]") {
         return Err("current-boot capture contains no indexed store objects".into());
+    }
+    let line_samples = number(&manifest, "\"line_resolved_samples\":")?
+        .checked_add(number(&manifest, "\"line_unresolved_samples\":")?)
+        .ok_or("capture line-sample count overflows")?;
+    if line_samples == 0 || line_samples > samples {
+        return Err("capture has inconsistent sampled-leaf line coverage".into());
     }
     let raw_path = capture.join("samples.bin");
     let mut raw =

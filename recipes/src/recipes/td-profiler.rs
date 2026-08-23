@@ -11,6 +11,7 @@ const MODULES: &[(&str, &str)] = &[
     ("collector", include_str!("../../../td-profiler/src/collector.rs")),
     ("contract", include_str!("../../../td-profiler/src/contract.rs")),
     ("cpuset", include_str!("../../../td-profiler/src/cpuset.rs")),
+    ("dwarf", include_str!("../../../td-profiler/src/dwarf.rs")),
     ("evidence", include_str!("../../../td-profiler/src/evidence.rs")),
     ("event", include_str!("../../../td-profiler/src/event.rs")),
     ("index", include_str!("../../../td-profiler/src/index.rs")),
@@ -137,7 +138,7 @@ mod tests {
         declared.sort_unstable();
         written.sort_unstable();
         assert_eq!(written, declared);
-        assert_eq!(written.len(), 13);
+        assert_eq!(written.len(), 14);
     }
 
     #[test]

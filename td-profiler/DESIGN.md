@@ -8,8 +8,9 @@ recipes, image, and this document disagree, one of them is a bug.
 A running td deployment continuously produces bounded, local files that show
 where every observed user-mode process spends CPU time. The files are useful
 without a hosted service or an interactive profiler UI: an authorized human
-or AI agent can read process summaries, function hot spots, folded stacks, and
-the provenance of the executable and symbols used to resolve each address.
+or AI agent can read process summaries, function and source-line hot spots,
+folded stacks, and the provenance of the executable and symbols used to
+resolve each address.
 
 Sampling is statistical. A short-lived task may execute between samples, and
 the absence of samples does not prove that a task used no CPU. `td-profiler`
@@ -97,6 +98,15 @@ excludes that build-only toolchain. Changing either is reviewed with the
 corresponding size report. This keeps the always-available data useful for
 function and source-line attribution without turning every deployment into a
 full debugger SDK.
+
+The line program and its `.debug_line_str` or `.debug_str` path tables remain
+uncompressed. Pair validation rejects both ELF `SHF_COMPRESSED` and legacy
+`.zdebug_*` forms for those sections, so the dependency-free runtime reader is
+the checked consumer of every accepted companion rather than silently relying
+on a decompressor that is absent from the image. It also rejects duplicate
+named line/string sections and sections above the runtime's 32-MiB input
+ceiling. The runtime reads `.debug_str` only when a line-table `DW_FORM_strp`
+actually refers to it.
 
 The deployment bundle records `deployment/debug-size` beside `root.erofs`.
 It remains a derived build report rather than a boot payload: the exact
@@ -219,12 +229,15 @@ pipeline has at most one active roster and one processing roster, for a
 256-MiB aggregate roster ceiling. Time-indexed analysis of the processing
 capture may add at most 128 MiB, including event-order and cross-CPU ambiguity
 indexes and each distinct retained stack once rather than every matching
-sample. Report/symbol materialization has a separate 64 MiB peak expansion
+sample. Report/symbol materialization has a separate 128 MiB peak expansion
 budget for retained ordering/aggregate state plus one transient resolved stack.
 The object
-inventory and the LRU set of parsed symbol tables each have independent
-128-MiB heap ceilings; the former also caps the aggregate program-segment
-roster at one million entries. Deployment identity metadata is JSON-expanded
+inventory and the LRU set of parsed symbol and line tables each have independent
+128-MiB heap ceilings. Loading one cold companion has its own 128-MiB transient
+ceiling before the retained LRU is evicted back below its ceiling, so the
+combined cold-load peak is 256 MiB and the cache remains effective. The object
+inventory also caps the aggregate program-segment roster at one million entries.
+Deployment identity metadata is JSON-expanded
 and bounded before collection, and the supported CPU roster is capped at
 4,096 so the pending manifest fits its reservation. Crossing a bound fails the
 startup attempt or capture explicitly. A carry-forward overflow preserves the
@@ -310,6 +323,35 @@ addresses remain in the structured stack evidence and do not split one
 resolved function into many hotspots. Recursive equal frames remain distinct
 after the one kernel-repeated leaf IP is removed.
 
+Line lookup parses bounded DWARF version 2 through 5 line programs from the
+exact indexed companion. It reports remapped source-path bytes, line, column,
+and discriminator over the line program's half-open address ranges. A malformed
+or unsupported line table is a bounded symbolization diagnostic, but it does
+not discard an independently verified function symbol. Every structured frame
+therefore states `line_resolved`; missing line coverage has null numeric fields
+and empty source-path bytes rather than a guessed neighboring row.
+Indexed runtime objects are little-endian ELF64 x86-64, so version 2 through 4
+line programs use eight-byte addresses; version 5 also carries and validates
+its explicit address and segment sizes.
+`lines.jsonl` mirrors the leaf-instruction semantics of `hotspots.jsonl`. It
+aggregates by process image, object, function start, and source location when a
+line resolves. An unresolved line retains the exact object address so distinct
+unknown instructions are not silently merged. Its resolved and unresolved
+sample totals in the manifest count sampled leaf frames, not every caller in a
+callchain.
+
+One object accepts at most 32 MiB of `.debug_line`, 32 MiB for either external
+line-string section, one million retained line ranges, and 4,096 bytes in one
+reported source path. One unit may declare at most 200,000 transient
+file/directory entries; the section byte ceiling bounds aggregate work across
+units. The section-name roster, symbol state, raw line-parser inputs, and all
+transient and retained line-parser heap state share the 128-MiB object-load
+ceiling. Unit rosters are released between units, and duplicate temporary
+source paths are released after interning, so this is a peak rather than a
+lifetime-allocation counter. Cached parsed objects share the independently
+stated 128-MiB LRU ceiling. Crossing either fails line attribution explicitly
+rather than allocating beyond it.
+
 The symbolizer never opens a path through a sampled process's mutable root as
 trusted metadata. Store paths are immutable. The first version never copies a
 non-store mapping into a capture; it labels the captured display path and
@@ -331,6 +373,7 @@ directory. A completed capture contains:
 manifest.json       schema, deployment, interval, rate, CPUs, loss, errors
 processes.jsonl     one process/image generation and its accounted samples
 hotspots.jsonl      sorted process/object/function aggregates
+lines.jsonl         sorted process/object/function/source-line aggregates
 stacks.jsonl        sorted stack aggregates with state, reason, and count
 stacks.folded       deterministic folded stacks with integer sample counts
 samples.bin         versioned raw records needed for re-symbolization
@@ -347,7 +390,7 @@ remains partial rather than exceeding the metadata allowance. If analysis or
 derived generation fails, it still publishes `samples.bin` with a bounded
 `report-error.txt` marker. The pending manifest and failure marker share a
 one-MiB metadata allowance, while all other original derived output shares the
-remaining 63 MiB. Such a capture intentionally need not contain the four
+remaining 127 MiB. Such a capture intentionally need not contain the five
 summary files or a complete derived manifest: its canonical incomplete
 manifest preserves the metadata needed by `td-profiler report`. Raw evidence
 is preferable to deleting the only record of the failure, and the report can
@@ -368,6 +411,8 @@ placed in a JSON string or replaced. The binary stream has an explicit magic,
 endian marker, schema version, record lengths, and reserved fields that must be
 zero. Unknown raw-schema record kinds are skipped by length and reported;
 well-formed unmodeled kernel perf kinds use the known ignored-event record.
+Report schema 1 permits additive derived fields and files; the raw schema is
+separately versioned, and this increment does not change it.
 
 The version-one task body records a `u32` identity tag (`0` unknown, `1`
 `/proc` start ticks, `2` perf fork time), a zero `u32`, its `u64` value, the
@@ -383,7 +428,8 @@ so PID reuse and exec generations survive rotation without replaying history.
 - configured and effective sample rates, aggregate coverage duration, and the
   CPUs covered;
 - sample, task, mapping, context-switch, lost, corrupt, ignored-perf,
-  omitted-diagnostic, and unresolved counts;
+  omitted-diagnostic, unresolved-stack, line-resolved-sample, and
+  line-unresolved-sample counts;
 - every collection error with its CPU and monotonic time range, and every
   symbolization error with explicit null CPU/time fields;
 - runtime/debug build identities and store paths used by the report.
@@ -458,8 +504,13 @@ confirmed, its next processing worker creates the partial directory without
 blocking the ring-drain thread. Thus the allowance remains
 real while the daemon and offline analysis run concurrently, rather than
 becoming an eventual ceiling enforced only at the next rotation. The complete
-capture reservation includes the raw stream, the original 64-MiB report slice,
-and one regenerated report slice. Boot UUID
+capture reservation includes the raw stream, the original 128-MiB report slice,
+and one regenerated report slice, for 320 MiB. With the two-GiB aggregate
+ceiling and that active-capture reservation, the 128-MiB regeneration floor
+limits otherwise-empty completed captures to 13; when entries consume their
+complete maximum, only five additional partial/quarantine entries fit beside
+the required completed-report reservation. The 24-entry count ceiling is
+therefore a secondary guard rather than a promised history depth. Boot UUID
 lexical order cannot stand in for chronology, and malformed partials which
 became quarantines are eventually reclaimed under the same count and byte
 policy. Rotation first
@@ -560,6 +611,12 @@ design:
    AI-readable summaries for a known CPU workload, or a precise
    unsupported-permission diagnostic on a host where collection cannot be
    exercised.
+
+The source-line reporting increment consumes the already-required line tables
+with a dependency-free bounded DWARF reader, adds deterministic `lines.jsonl`,
+and places the same source location on structured frames. It changes no
+sampling or raw-capture schema, so an older capture can gain line attribution
+through offline regeneration against the same indexed symbol closure.
 
 A release is conforming only when the built kernel exposes the required perf
 event ABI, the collector remains outside jails, every shipped source-built

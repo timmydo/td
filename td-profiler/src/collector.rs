@@ -2791,7 +2791,15 @@ mod tests {
         }
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), MAX_CAPTURE_COUNT);
         prune(&root).unwrap();
-        assert_eq!(capture_entry_count(&root), 19);
+        let byte_limited_partials =
+            (super::MAX_TOTAL_BYTES - super::MAX_CAPTURE_BYTES - crate::report::MAX_REPORT_BYTES)
+                / super::MAX_CAPTURE_BYTES;
+        let expected = usize::try_from(byte_limited_partials)
+            .unwrap()
+            .saturating_mul(2)
+            .saturating_add(1)
+            .min(MAX_CAPTURE_COUNT - 1);
+        assert_eq!(capture_entry_count(&root), expected);
         assert!(root.join("only-complete").is_dir());
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2839,7 +2847,14 @@ mod tests {
         )
         .unwrap();
         assert!(root.join("00-published").is_dir());
-        assert_eq!(capture_entry_count(&root), MAX_CAPTURE_COUNT - 1);
+        let byte_limited = usize::try_from(
+            (super::MAX_TOTAL_BYTES - super::MAX_CAPTURE_BYTES) / crate::report::MAX_REPORT_BYTES,
+        )
+        .unwrap();
+        assert_eq!(
+            capture_entry_count(&root),
+            byte_limited.min(MAX_CAPTURE_COUNT - 1)
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
