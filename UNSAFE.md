@@ -1010,22 +1010,40 @@ the probe to open `/proc/self/status`, transfer its live descriptor with
 safe `IntoRawFd`, verify that it is above stderr, and feed it through the
 same sweep before stage 2 proves that only stdio survived.
 
-The mount wrapper is reached only with the compiled probe plan. Stage 1
-makes the tree private, replaces its scratch `/tmp` with a fresh tmpfs,
-builds another tmpfs as the root, binds only null/zero/full/random/urandom
-as individually read-only mounts into a fresh nosuid/noexec `/dev`, mounts
-fresh devpts and `/dev/shm`, mounts fresh `/tmp` and `/var/tmp`, and
-remounts `/dev` read-only. Probe mode overlays the current executable as one
-read-only, nosuid, nodev, executable file bind inside the otherwise-noexec
-`/tmp`, and source-identity checks that bind before detaching the old root;
-application mode never creates it. Stage 2 mounts a
+The mount wrapper is reached only with the compiled probe plan or the closed
+application plan resolved from a builder-authenticated spec. Stage 1 makes the
+tree private, replaces its scratch `/tmp` with a fresh tmpfs, builds another
+tmpfs as the root, binds only null/zero/full/random/urandom as individually
+read-only mounts into a fresh nosuid/noexec `/dev`, mounts fresh devpts and
+`/dev/shm`, mounts fresh `/tmp` and `/var/tmp`, and remounts `/dev` read-only.
+Probe mode overlays the current executable as one read-only, nosuid, nodev,
+executable file bind inside the otherwise-noexec `/tmp`, and source-identity
+checks that bind before detaching the old root; application mode never creates
+it. Application filesystem sources are canonicalized outside the namespace;
+reserved aliases and overlapping allowed grants are refused, deny
+intersections remove the containing grant before creation, and source
+type/device/inode are checked before and after the bind. Regular files require
+exactly one hardlink throughout the transition. Every source, target, and
+visible nested mount is preflighted before creation. Mountinfo device/root
+identity comparison covers every visible mount below reserved trees, home
+trees, denied sources, and other allowed sources, closing bind-mount aliases
+that path canonicalization cannot see. Grant targets that overlap fixed
+application state, `/oldroot`, `/root-write-probe`, or compiled jail mounts are
+refused rather than replacing their readbacks. Directories use recursive
+binds. Every mountinfo row below each
+target is remounted `nosuid,nodev,noexec`, deepest first, and every row is also
+read-only for a read-only grant; both stages read the complete policy back.
+Only the jail target and typed mode cross into stage-2 argv. An absolute target
+can have the same spelling as its host source, but stage 2 never interprets it
+as mount authority. Stage 2 mounts a
 fresh procfs for the PID namespace it inhabits while the old procfs is
 still visible (the kernel's `mount_too_revealing` rule requires that),
 pivots, changes directory to `/`, detaches the old root, removes its
 mount point, and remounts the new root read-only. It reads mountinfo back,
 requires only PID 1 in procfs, checks the exact root and device entries,
-device numbers, modes and every device-bind flag, and proves the base
-root, `/dev`, and device binds are read-only while procfs, devpts,
+exhaustively checks every grant-created scaffold outside the dynamic private
+home, checks device numbers, modes and every device-bind flag, and proves the
+base root, `/dev`, and device binds are read-only while procfs, devpts,
 bounded `/dev/shm`, `/tmp`, and `/var/tmp` carry their compiled writable,
 no-exec flags and size ceilings. The application action additionally reads
 back its bounded private `/run`. Read-only bind metadata does not prevent the
@@ -1038,8 +1056,9 @@ create-new path and unlink it before writing through the open descriptor, so
 ordinary completion and every failure after unlink leave no state litter. They
 do not sweep prefix-matching residue because an application may own such a
 lookalike. Interruption in the single create/unlink syscall window can leave the
-empty probe name behind; a same-uid process can also rename that name during the
-window, but it already has direct authority over the application state tree.
+empty `.td-jail-write-probe-*` name behind in a writable application-state or
+granted host directory. A same-uid process can also rename that name during the
+window, but it already has direct authority over each writable probe target.
 
 `capset(2)` and `capget(2)` use capability ABI v3 and a compiled
 two-word structure. `prctl(2)` has exactly EIGHT operations:
@@ -1118,15 +1137,20 @@ Namespace exit removes the probe-only mount.
 The same transition now has one closed application action. A `/bin` symlink
 selects a name by argv[0]; safe Rust reads the immutable image configuration,
 sorted registry and canonical builder-owned spec, then accepts only the
-builder-authenticated spec with exactly the Wayland socket grant. The runtime
-parser closes the spec grammar and socket policy; the image compiler selects
-the fixture's empty runtime. Stage 1 binds authenticated package/runtime
-trees read-only, the exact compositor
-socket read-only, application-owned persistent state read-write, and one
-application-owned volatile runtime directory read-write. Package and runtime
-binds are builder-authenticated. State sources are canonicalized and checked
-for the application uid, private mode, source device and subtree root before
-stage 2 can enter them, so the shipped `/home -> /var/home` alias and
+builder-authenticated spec with the Wayland socket and the closed typed
+filesystem subset. The runtime parser closes the spec grammar and uses the
+shared permission type's exhaustive Wayland-plus-filesystem predicate; adding
+another policy field cannot silently widen this rung. The image compiler
+selects the fixture's empty runtime. Stage 1 binds
+authenticated package/runtime trees read-only, the exact compositor socket
+read-only, application-owned persistent state read-write, one application-owned
+volatile runtime directory read-write, and only the resolved filesystem
+grants. Package and runtime binds are builder-authenticated. State sources are
+canonicalized and checked for the application uid, private mode, source device
+and subtree root before stage 2 can enter them. Grant sources are canonicalized
+to regular files or directories, refused when they alias a reserved tree, and
+pinned by type/device/inode across the bind. Thus the shipped
+`/home -> /var/home` alias and
 mountinfo's escaped path fields resolve to the same identity the kernel
 records. This is not isolation from an unsandboxed same-uid process, which can
 replace its own state path during launch; that process already has direct
@@ -1144,8 +1168,9 @@ grammar-revalidated there; binding them to the authenticated spec remains
 stage 1's job. Stage 2
 itself execs with an empty environment; only the final ordinary application
 child receives the compiled environment after the capability and filter
-readbacks. Stage 2's argv includes the one-use proof token, entry, environment
-and application arguments. Before launch it becomes non-dumpable, so procfs
+readbacks. Stage 2's argv includes the one-use proof token, entry, environment,
+filesystem jail targets and typed modes, and application arguments. Before
+launch it becomes non-dumpable, so procfs
 denies the unprivileged child PID 1's `fd`, `exe`, and `environ` entries but
 continues to expose `/proc/1/cmdline`. None of the stage-2 argv values may be a
 secret; the child's own arguments and environment are likewise

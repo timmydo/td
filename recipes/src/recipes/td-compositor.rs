@@ -219,8 +219,10 @@ pub fn recipe() -> Recipe {
 mod tests {
     use super::*;
     use crate::ladder::{
-        TD_JAIL_FIXTURE_ALIAS, TD_JAIL_FIXTURE_ENTRY, TD_POINTER_ABSOLUTE_MARKER,
-        TD_TERM_RUNTIME_MARKER, TD_UI_CLIENT_RUNTIME_MARKER, TD_WAYLAND_RUNTIME_MARKER,
+        TD_JAIL_FIXTURE_ALIAS, TD_JAIL_FIXTURE_DOWNLOAD_TARGET, TD_JAIL_FIXTURE_ENTRY,
+        TD_JAIL_FIXTURE_GRANT_FILE, TD_JAIL_FIXTURE_GRANT_ROOT,
+        TD_JAIL_FIXTURE_PICTURES_TARGET, TD_POINTER_ABSOLUTE_MARKER, TD_TERM_RUNTIME_MARKER,
+        TD_UI_CLIENT_RUNTIME_MARKER, TD_WAYLAND_RUNTIME_MARKER,
     };
 
     #[test]
@@ -264,6 +266,18 @@ mod tests {
             "pub(crate) const JAIL_FIXTURE_ENTRY: &str = \"{TD_JAIL_FIXTURE_ENTRY}\";"
         )));
         assert!(client.contains(&format!(
+            "pub(crate) const JAIL_FIXTURE_GRANT_FILE: &str = \"{TD_JAIL_FIXTURE_GRANT_FILE}\";"
+        )));
+        assert!(client.contains(&format!(
+            "pub(crate) const JAIL_FIXTURE_DOWNLOAD_TARGET: &str = \"{TD_JAIL_FIXTURE_DOWNLOAD_TARGET}\";"
+        )));
+        assert!(client.contains(&format!(
+            "pub(crate) const JAIL_FIXTURE_PICTURES_TARGET: &str = \"{TD_JAIL_FIXTURE_PICTURES_TARGET}\";"
+        )));
+        assert!(client.contains(&format!(
+            "pub(crate) const JAIL_FIXTURE_GRANT_ROOT: &str = \"{TD_JAIL_FIXTURE_GRANT_ROOT}\";"
+        )));
+        assert!(client.contains(&format!(
             "pub(crate) const JAIL_FIXTURE_UID: u32 = {};",
             td_engine::application_spec::APPLICATION_UID
         )));
@@ -272,6 +286,7 @@ mod tests {
             "const JAIL_FIXTURE_BOUNDARY_EXIT_CODE: i32 = 71;",
             "const JAIL_FIXTURE_MOUNTS_EXIT_CODE: i32 = 72;",
             "const JAIL_FIXTURE_LOOPBACK_EXIT_CODE: i32 = 73;",
+            "const JAIL_FIXTURE_FILESYSTEM_EXIT_CODE: i32 = 74;",
         ] {
             assert!(client.contains(row), "fixture source lacks {row}");
         }

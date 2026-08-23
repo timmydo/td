@@ -1009,12 +1009,14 @@ system Flatpak repository or td system state in, and `~/.local` cannot smuggle
 the per-user repository in.
 The package and application-state roots remain configuration, not paths baked
 into this context-free parser. The rung-6 spec preserves these typed grants;
-rung 9's immutable-base mount plan accepts no caller paths. The launch-time
-extension scheduled at rung 12b resolves `~/`, XDG names and absolute sources
-against the current configuration, then refuses every alias or overlap with
-those roots before file-type checks, mount-target separation and deny-wins
-merging within the policy and against immutable defaults. The format does not
-pretend a lexical parser performed those filesystem operations.
+rung 9's immutable-base mount plan accepts no caller paths. Rung 12b now
+resolves the builder-authenticated immutable defaults from the spec: `~/`, XDG
+names and absolute sources are interpreted against the current configuration,
+then every alias or overlap with reserved roots is refused before file-type
+checks, mount-target separation and deny-wins merging. A mutable per-user
+override file is not launch authority yet; its exact path, ownership and editor
+lifecycle remain a separate landing. The format does not pretend a lexical
+parser performed those filesystem operations.
 
 Session-bus keys are exact well-known names, never unique names or wildcards,
 and their values are the ordered capabilities `see`, `talk` and `own`.
@@ -1863,10 +1865,11 @@ the minimal `/dev`, tmpfs `/run`, the exact Wayland socket, the session
 bus socket of step 12 and the five persistent state directories, and a
 read-back-up loopback interface in the otherwise-empty network namespace.
 It deliberately leaves `/etc`, `/sys`, `/var/lib`, `/var/cache`,
-`.flatpak-info`, extension mounts, network sharing and authored
-filesystem/resource grants absent; a spec requesting any policy beyond
-exactly `sockets=wayland` is refused. Later rungs fill those named rows
-without making their absence a degraded launch mode.
+`.flatpak-info`, extension mounts, network sharing, mutable permission
+overrides and resource grants absent. It accepts exactly `sockets=wayland`
+plus the closed filesystem subset below; any other policy is refused. Later
+rungs fill those named rows without making their absence a degraded launch
+mode.
 
 The bus is bound unconditionally and is deliberately not a `sockets=`
 permission, which is what step 12 has said since it was written. It is
@@ -1878,8 +1881,8 @@ per-caller policy at all. Its PRESENCE is a launch precondition as well:
 or non-socket `/run/user/1000/bus` fails the launch of every application,
 including one that never opens D-Bus. §D records what all of that costs.
 
-The compiled application
-environment crosses the internal exec only as bounded, canonical argv data:
+The compiled application environment crosses the internal exec only as
+bounded, canonical argv data:
 stage 2 starts empty and applies those entries only to the final child after
 its capability and seccomp readbacks. The internal argv also carries the
 one-use stage proof token. Before spawning the application, PID 1 becomes
@@ -1910,12 +1913,14 @@ deployment health has finished, missing evidence or completion releases the
 greeter when that complete bounded allowance expires, so
 QEMU reports the missing marker instead of waiting for the full boot ceiling.
 The fixture keeps its stdout and stderr on `/dev/null`, so it cannot forge the
-console marker. Confinement failures instead use phase-specific exits 70--73
-for status/capability, procfs/host-boundary, mount, and loopback verification;
+console marker. Confinement failures instead use phase-specific exits 70--74
+for status/capability, procfs/host-boundary, mount, loopback, and filesystem
+grant verification;
 PID 1 reports the raw application status through td-jail's bounded diagnostic.
 The fixture is deliberately both autostarted and present in the launcher, so a
 button press may create a second instance over the same state roots. This rung's
-client writes no persistent state; a stateful application must declare and
+client leaves no persistent state on normal completion; a stateful application
+must declare and
 enforce its single-instance or multi-profile policy before using both paths.
 
 Probe mode alone overlays one read-only executable bind at
@@ -2005,7 +2010,8 @@ on a load-bearing bind is fatal, never degraded:
         environment names -- binding their PARENT as $HOME instead
         would leave all five unreachable and every XDG_* pointing at
         a fresh empty dotdir, which an earlier draft of this step did)
-        plus one bind per granted --filesystem
+    Each granted --filesystem is a separate bind at its declared jail target;
+    an absolute target need not be below $HOME.
 15  stage 1 makes exactly `CAP_SYS_ADMIN` inheritable and ambient, drops
     every bounding bit while `CAP_SETPCAP` remains effective, reads the
     bounding set back empty, then spawns stage 2. Stage 2 reads back
@@ -2156,12 +2162,29 @@ argument as `losetup` re-reading its read-only flag out of sysfs.
 
 ### Filesystem grants
 
-Implemented: `xdg-download`, `xdg-documents`, `xdg-pictures`,
-`xdg-music`, `xdg-videos`, `xdg-desktop`, subpaths of the launching user's
-real home, and explicit absolute paths, each with `:ro`/`:rw`, and `:create`
-only below that real home. `~/` does not name the app-private `/home/td`.
-Deny entries override grants. td creates a granted xdg directory on first use,
-since a fresh td image has no `~/Downloads`.
+Implemented for the builder-authenticated immutable defaults:
+`xdg-download`, `xdg-documents`, `xdg-pictures`, `xdg-music`, `xdg-videos`,
+`xdg-desktop`, subpaths of the launching user's real home, and explicit
+absolute paths, each with `:ro`/`:rw`, and `:create` only below that real home.
+`~/` resolves from the real home but is mounted under the corresponding
+`/home/td` path; it does not name the private home while authority is resolved.
+td creates every granted XDG directory on first use, even without an explicit
+`:create`, since a fresh image has no `~/Downloads`; explicit `:create` is only
+needed for a home-relative spelling. Creation walks one component at a time
+and refuses links; a missing source without implicit or explicit creation, or
+any invalid component, refuses the whole launch. XDG names are directory
+contracts and refuse an existing non-directory; existing explicit sources may
+be regular files or directories.
+
+Deny is conservative: if a denied source or jail target intersects an allowed
+grant, the whole allowed grant is removed before `:create` can mutate the
+host, so denying a child cannot expose or create it through a granted parent.
+Two spellings that canonicalize to the same source and target merge with
+read-only winning. Deny and allowed-grant comparisons include every visible
+mount identity below each source. A distinct bind alias or any other overlap
+between allowed sources or targets refuses the launch rather than relying on
+mount order. The current rung does not read a mutable per-user override; that
+lifecycle remains pending.
 
 **Refused, deliberately stricter than upstream:** `filesystem=host`,
 `filesystem=home`, `/`, `/usr`, `/bin`, `/app`, `/run`, `/proc`, `/sys`,
@@ -2171,10 +2194,42 @@ since a fresh td image has no `~/Downloads`.
 package and application-state roots are also refused after source resolution,
 whatever their spelling. An app that genuinely needs blanket home access gets
 a reviewed per-app override rather than a default.
-Sources are canonicalized before
-the app starts and targets checked component by component; no mount
-target may be an ancestor or descendant of `/app`, `/usr`,
-`/.flatpak-info`, the bus, or the private portal socket.
+Sources are canonicalized before the app starts; source type, device and inode
+are checked before and after the bind. Regular-file grants require a link count
+of exactly one throughout the transition, conservatively refusing hardlink
+aliases that path and mount identities cannot distinguish. Canonical paths are
+not the only alias. The single-link rule applies to an explicit regular-file
+grant root; a directory grant authorizes entries reachable inside that tree.
+The source and every nested mount are also compared by mountinfo device/root
+identity with every visible mount below the reserved trees and all users'
+homes. An alias of the launching user's own real-home subtree remains
+admissible. Every source and target is preflighted before any `:create`
+mutation, then revalidated afterward. Targets in the
+fresh root are checked component by component and may not replace or overlap
+`/app`, `/usr`, `/run`, `/proc`, `/sys`, `/dev`, `/tmp`, `/var/tmp`, `/etc`,
+`/boot`, `/.flatpak-info`, `/oldroot`, `/root-write-probe`, the private-home
+root, or its fixed config, cache, data and local-state mounts. Directory grants
+are recursive binds. Every mount
+at or below a granted target is enumerated from mountinfo and remounted
+`nosuid,nodev,noexec`; a read-only grant additionally makes every nested mount
+read-only, deepest first. Stage 1 and stage 2 independently read those rows
+back. Stage 2 exactly enumerates every fresh scaffold outside the dynamic
+private home, stopping at each declared grant root. The shipped fixture proves
+read-write Downloads, read-only Pictures, and a read-only regular-file grant
+whose `0600` application-owned source is created on writable `/var` before
+`switch_root`. It also recursively binds a read-only
+`/mnt/td-jail-fixture-pictures` source containing a separately writable nested
+tmpfs. The client requires the root and nested directory to have different
+devices before testing both as read-only, so omitting `MS_REC` cannot satisfy
+the oracle. The fixture root is `1777` on immutable EROFS so its write refusal
+cannot be attributed to directory permissions. Deployment initialization
+conditionally mounts that tmpfs once
+before `switch_root`; it is not a restartable root service following mutable
+user state. A process killed in the create/unlink window of stage 2's writable
+grant probe can leave one randomly named `.td-jail-write-probe-*` file in that
+host directory. The fixture client has the same window for one
+`.td-jail-rw-*` file in Downloads. The application user can remove either;
+normal error paths unlink them.
 
 ### Environment
 
@@ -4319,9 +4374,9 @@ Each row is one landing or a small family, leaving the tree green.
 | 9 | **mount transition — LANDED**: inherited-FD closure, a private compiled tmpfs root with individually read-only allowlisted device binds and immutable metadata, fresh devpts/shm/tmp/var-tmp, capability-v3 set/get readbacks, an exact ambient/inheritable `CAP_SYS_ADMIN` exec bridge, an empty/read-back bounding set, stage-2 procfs for its own PID namespace, pivot + old-root detach, mountinfo/device/mode/writability readbacks, and host plus target-kernel probes; application launch still refuses | none |
 | 10 | **capability drop/readback + PID-1 reaper — LANDED**: ambient is explicitly cleared before effective/permitted/inheritable become empty, all five sets are read back zero, and a copied static internal helper leaves a zero-capability grandchild for PID 1's bounded `wait4(-1)` oracle; ordinary application launch still refuses | none |
 | 11 | **const BPF assembler, standard filter, interpreter tests, build-host and target probes — LANDED**: stage 2 sets and reads back no-new-privileges, validates and installs the constant policy, requires `Seccomp: 2`, and its filtered PID-1 descendants inherit the same restriction; the non-shipped td-GCC probe is injected only into the disposable QEMU volume | none |
-| 12 | **fixture package shipped in the image and launched by `/bin/<fixture>` — LANDED**: the static `td-compositor` artifact's fixture personality is copied through an ordinary declared input into a generated application package with an empty payload-only runtime and exactly `sockets=wayland`; the image selects it into the immutable registry and `/bin` farm, its supervised boot unit and the compositor launcher both enter through `/bin/td-jail-fixture`, and td-jail accepts only the canonical index/spec subset this rung implements. Stage 1 canonicalizes, mounts and source-identity-checks immutable `/app` and `/usr`, the exact compositor socket, bounded private tmpfs trees, the five persistent state directories, and one private volatile runtime directory; stage 2 verifies the mount plan, clears capabilities, installs seccomp, holds a parent-death pipe, replaces application stdio with null descriptors, preserves the direct application's status, and gives survivors bounded TERM/KILL reap phases. The client publishes readiness through that volatile bind only after confinement readback and a presented frame; a separate readiness-gated evidence unit emits the exact QEMU marker without making mutable application state deployment-success authority | **first jailed pixels on the QEMU screen** |
+| 12 | **fixture package shipped in the image and launched by `/bin/<fixture>` — LANDED**: the static `td-compositor` artifact's fixture personality is copied through an ordinary declared input into a generated application package with an empty payload-only runtime and a canonical application spec; the image selects it into the immutable registry and `/bin` farm, its supervised boot unit and the compositor launcher both enter through `/bin/td-jail-fixture`, and td-jail accepts only the canonical index/spec subset implemented by the landed rungs. Stage 1 canonicalizes, mounts and source-identity-checks immutable `/app` and `/usr`, the exact compositor socket, bounded private tmpfs trees, the five persistent state directories, and one private volatile runtime directory; stage 2 verifies the mount plan, clears capabilities, installs seccomp, holds a parent-death pipe, replaces application stdio with null descriptors, preserves the direct application's status, and gives survivors bounded TERM/KILL reap phases. The client publishes readiness through that volatile bind only after confinement readback and a presented frame; a separate readiness-gated evidence unit emits the exact QEMU marker without making mutable application state deployment-success authority | **first jailed pixels on the QEMU screen** |
 | 12a | the same fixture under `--host`, asserting the degradation report (§X.5) | host mode works, and says what it could not enforce |
-| 12b | realize the typed filesystem grants: canonical source resolution, alias/overlap refusal, separate bind targets and deny-wins merging | a jailed app can open only an explicitly granted host path |
+| 12b | **immutable typed filesystem grants — LANDED**: canonical source resolution and identity pinning, reserved alias refusal, deny-wins/overlap merging, separate recursive bind targets, nested-mount hardening and stage-1/stage-2 readback. Mutable per-user overrides remain a later lifecycle landing | a jailed app can open only a builder-authenticated explicitly granted host path |
 | 12c | realize the typed memory/task policy with hard enforcement and readback; `cpu-max` remains refused until the kernel bandwidth controller lands | application resource limits are effective rather than metadata |
 | 13 | `td-busd` codec, auth, surface #10 | none |
 | 14 | names, routing, match rules, descriptor passing | none |

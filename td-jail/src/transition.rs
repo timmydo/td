@@ -1,5 +1,8 @@
 use crate::{
-    authority::{self, LaunchPlan},
+    authority::{
+        self, decode_mountinfo_path, mount_identity_for_path, path_is_same_or_child,
+        paths_overlap, FilesystemGrant, FilesystemSourceKind, LaunchPlan,
+    },
     seccomp, sys,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -7,7 +10,6 @@ use std::ffi::{CString, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::IntoRawFd;
-use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -20,6 +22,7 @@ const STAGE2_ARG: &str = "--internal-stage-2";
 const STAGE2_PROBE_ARG: &str = "--probe";
 const STAGE2_LAUNCH_ARG: &str = "--launch";
 const STAGE2_ENVIRONMENT_ARG: &str = "--environment";
+const STAGE2_FILESYSTEMS_ARG: &str = "--filesystems";
 const STAGE2_ARGUMENTS_ARG: &str = "--arguments";
 const REAPER_CHILD_ARG: &str = "--internal-reaper-child";
 const REAPER_ORPHAN_ARG: &str = "--internal-reaper-orphan";
@@ -153,8 +156,16 @@ pub enum Stage2Action {
     Launch {
         entry: String,
         environment: Vec<(OsString, OsString)>,
+        filesystems: Vec<Stage2Filesystem>,
         arguments: Vec<OsString>,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Stage2Filesystem {
+    target: PathBuf,
+    read_only: bool,
+    source_kind: FilesystemSourceKind,
 }
 
 pub fn parse_mode<I>(mut args: I) -> io::Result<Mode>
@@ -244,12 +255,54 @@ where
             environment.push((key, value));
         }
         authority::validate_environment_list(&environment, uid)?;
+        if args.next().as_deref() != Some(STAGE2_FILESYSTEMS_ARG.as_ref()) {
+            return Err(usage_error());
+        }
+        let filesystem_count = parse_count(args.next(), "filesystem count")?;
+        if filesystem_count > crate::permissions::MAX_FILESYSTEM_ENTRIES {
+            return Err(usage_error());
+        }
+        let mut filesystems = Vec::with_capacity(filesystem_count);
+        let mut previous: Option<PathBuf> = None;
+        for _ in 0..filesystem_count {
+            let target = args
+                .next()
+                .ok_or_else(usage_error)?
+                .into_string()
+                .map_err(|_| usage_error())?;
+            let target = PathBuf::from(target);
+            authority::validate_filesystem_target(&target)?;
+            if previous.as_ref().is_some_and(|prior| prior >= &target) {
+                return Err(usage_error());
+            }
+            if filesystems
+                .iter()
+                .any(|grant: &Stage2Filesystem| paths_overlap(&grant.target, &target))
+            {
+                return Err(usage_error());
+            }
+            let mode = args.next().ok_or_else(usage_error)?;
+            let (read_only, source_kind) = match mode.to_str() {
+                Some("ro-dir") => (true, FilesystemSourceKind::Directory),
+                Some("rw-dir") => (false, FilesystemSourceKind::Directory),
+                Some("ro-file") => (true, FilesystemSourceKind::File),
+                Some("rw-file") => (false, FilesystemSourceKind::File),
+                _ => return Err(usage_error()),
+            };
+            previous = Some(target.clone());
+            filesystems.push(Stage2Filesystem {
+                target,
+                read_only,
+                source_kind,
+            });
+        }
         if args.next().as_deref() != Some(STAGE2_ARGUMENTS_ARG.as_ref()) {
             return Err(usage_error());
         }
         return Ok(Stage2Action::Launch {
             entry,
             environment,
+            filesystems,
             arguments: authority::collect_arguments(args)?,
         });
     }
@@ -280,11 +333,13 @@ fn stage2_launch_arguments(
     identity: Identity,
     entry: &str,
     environment: &[(OsString, OsString)],
+    filesystems: &[FilesystemGrant],
     arguments: &[OsString],
 ) -> Vec<OsString> {
     let mut stage2 = Vec::with_capacity(
-        9usize
+        11usize
             .saturating_add(environment.len().saturating_mul(2))
+            .saturating_add(filesystems.len().saturating_mul(2))
             .saturating_add(arguments.len()),
     );
     stage2.extend([
@@ -302,6 +357,18 @@ fn stage2_launch_arguments(
             .iter()
             .flat_map(|(key, value)| [key.clone(), value.clone()]),
     );
+    stage2.push(OsString::from(STAGE2_FILESYSTEMS_ARG));
+    stage2.push(OsString::from(filesystems.len().to_string()));
+    for filesystem in filesystems {
+        stage2.push(filesystem.target.as_os_str().to_os_string());
+        let mode = match (filesystem.read_only, filesystem.source_kind) {
+            (true, FilesystemSourceKind::Directory) => "ro-dir",
+            (false, FilesystemSourceKind::Directory) => "rw-dir",
+            (true, FilesystemSourceKind::File) => "ro-file",
+            (false, FilesystemSourceKind::File) => "rw-file",
+        };
+        stage2.push(OsString::from(mode));
+    }
     stage2.push(OsString::from(STAGE2_ARGUMENTS_ARG));
     stage2.extend(arguments.iter().cloned());
     stage2
@@ -610,6 +677,271 @@ fn mount_bind(source: &Path, target: &str) -> io::Result<()> {
         .map_err(|e| io::Error::other(format!("bind {source} at {target}: {e}")))
 }
 
+fn mount_filesystem_grant(grant: &FilesystemGrant) -> io::Result<()> {
+    authority::validate_filesystem_target(&grant.target)?;
+    require_filesystem_source_identity(grant)?;
+    let target = prepare_filesystem_target(&grant.target, grant.source_kind)?;
+    let source = grant.source.to_str().ok_or_else(|| {
+        io::Error::other(format!(
+            "filesystem grant source is not UTF-8: {}",
+            grant.source.display()
+        ))
+    })?;
+    let target_text = target.to_str().ok_or_else(|| {
+        io::Error::other(format!(
+            "filesystem grant target is not UTF-8: {}",
+            target.display()
+        ))
+    })?;
+    let source_c = cstring(source)?;
+    let target_c = cstring(target_text)?;
+    let flags = sys::MS_BIND
+        | if grant.source_kind == FilesystemSourceKind::Directory {
+            sys::MS_REC
+        } else {
+            0
+        };
+    sys::mount(Some(&source_c), &target_c, None, flags, None).map_err(|error| {
+        io::Error::other(format!(
+            "bind filesystem grant {} at {}: {error}",
+            grant.source.display(),
+            grant.target.display()
+        ))
+    })?;
+    apply_grant_mount_policy(&target, grant.read_only)?;
+    let target_metadata = fs::symlink_metadata(&target)?;
+    if target_metadata.dev() != grant.source_device
+        || target_metadata.ino() != grant.source_inode
+        || (target_metadata.file_type().is_dir()
+            != (grant.source_kind == FilesystemSourceKind::Directory))
+        || (target_metadata.file_type().is_file()
+            != (grant.source_kind == FilesystemSourceKind::File))
+        || (grant.source_kind == FilesystemSourceKind::File && target_metadata.nlink() != 1)
+    {
+        return Err(io::Error::other(format!(
+            "filesystem grant target {} does not retain the authenticated source identity",
+            grant.target.display()
+        )));
+    }
+    require_filesystem_source_identity(grant)?;
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    require_bind_source(&mountinfo, &grant.source, &target)?;
+    require_grant_mount_policy(
+        &mountinfo,
+        &Stage2Filesystem {
+            target,
+            read_only: grant.read_only,
+            source_kind: grant.source_kind,
+        },
+    )
+}
+
+fn require_filesystem_source_identity(grant: &FilesystemGrant) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(&grant.source)?;
+    let kind_matches = match grant.source_kind {
+        FilesystemSourceKind::Directory => metadata.file_type().is_dir(),
+        FilesystemSourceKind::File => metadata.file_type().is_file(),
+    };
+    if !kind_matches
+        || metadata.dev() != grant.source_device
+        || metadata.ino() != grant.source_inode
+        || (grant.source_kind == FilesystemSourceKind::File && metadata.nlink() != 1)
+    {
+        return Err(io::Error::other(format!(
+            "filesystem grant source {} changed after authority resolution",
+            grant.source.display()
+        )));
+    }
+    Ok(())
+}
+
+fn prepare_filesystem_target(
+    target: &Path,
+    source_kind: FilesystemSourceKind,
+) -> io::Result<PathBuf> {
+    let relative = target
+        .strip_prefix("/")
+        .map_err(|_| io::Error::other("filesystem target is not absolute"))?;
+    let mut current = PathBuf::from(NEW_ROOT);
+    let components = relative.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component.as_os_str());
+        let final_component = index + 1 == components.len();
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                let expected_directory =
+                    !final_component || source_kind == FilesystemSourceKind::Directory;
+                if (expected_directory && !metadata.file_type().is_dir())
+                    || (!expected_directory && !metadata.file_type().is_file())
+                {
+                    return Err(io::Error::other(format!(
+                        "filesystem grant target component {} has the wrong type",
+                        current.display()
+                    )));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if final_component && source_kind == FilesystemSourceKind::File {
+                    drop(
+                        OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&current)?,
+                    );
+                } else {
+                    create_dir(
+                        current.to_str().ok_or_else(|| {
+                            io::Error::other("filesystem target component is not UTF-8")
+                        })?,
+                        if final_component { 0o700 } else { 0o755 },
+                    )?;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(current)
+}
+
+#[derive(Clone, Debug)]
+struct MountPolicyRow {
+    mountpoint: PathBuf,
+    read_only: bool,
+    options: BTreeSet<String>,
+}
+
+fn grant_mount_rows(mountinfo: &str, target: &Path) -> io::Result<Vec<MountPolicyRow>> {
+    let mut rows = Vec::new();
+    let mut seen = BTreeSet::new();
+    for line in mountinfo.lines() {
+        let left = line
+            .split_once(" - ")
+            .ok_or_else(|| io::Error::other("mountinfo row has no separator"))?
+            .0;
+        let mut fields = left.split_whitespace();
+        let mountpoint = fields
+            .nth(4)
+            .ok_or_else(|| io::Error::other("mountinfo row has no mount point"))?;
+        let options = fields
+            .next()
+            .ok_or_else(|| io::Error::other("mountinfo row has no mount options"))?
+            .split(',')
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let mountpoint = decode_mountinfo_path(mountpoint)?;
+        if !path_is_same_or_child(&mountpoint, target) {
+            continue;
+        }
+        if !seen.insert(mountpoint.clone()) {
+            return Err(io::Error::other(format!(
+                "mountinfo repeats filesystem grant mountpoint {}",
+                mountpoint.display()
+            )));
+        }
+        rows.push(MountPolicyRow {
+            read_only: options.contains("ro"),
+            mountpoint,
+            options,
+        });
+    }
+    if !seen.contains(target) {
+        return Err(io::Error::other(format!(
+            "mountinfo contains no filesystem grant target {}",
+            target.display()
+        )));
+    }
+    Ok(rows)
+}
+
+fn sort_grant_mount_rows(rows: &mut [MountPolicyRow]) {
+    rows.sort_by(|left, right| {
+        right
+            .mountpoint
+            .components()
+            .count()
+            .cmp(&left.mountpoint.components().count())
+            .then_with(|| right.mountpoint.cmp(&left.mountpoint))
+    });
+}
+
+fn apply_grant_mount_policy(target: &Path, read_only: bool) -> io::Result<()> {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    let mut rows = grant_mount_rows(&mountinfo, target)?;
+    sort_grant_mount_rows(&mut rows);
+    for row in rows {
+        let path = row.mountpoint.to_str().ok_or_else(|| {
+            io::Error::other(format!(
+                "filesystem grant mountpoint is not UTF-8: {}",
+                row.mountpoint.display()
+            ))
+        })?;
+        let target_c = cstring(path)?;
+        let flags = grant_mount_policy_flags(read_only || row.read_only);
+        sys::mount(None, &target_c, None, flags, None).map_err(|error| {
+            io::Error::other(format!(
+                "apply filesystem grant policy at {}: {error}",
+                row.mountpoint.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn grant_mount_policy_flags(read_only: bool) -> usize {
+    let mut flags =
+        sys::MS_REMOUNT | sys::MS_BIND | sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC;
+    if read_only {
+        flags |= sys::MS_RDONLY;
+    }
+    flags
+}
+
+fn require_grant_mount_policy(mountinfo: &str, filesystem: &Stage2Filesystem) -> io::Result<()> {
+    let rows = grant_mount_rows(mountinfo, &filesystem.target)?;
+    for row in rows {
+        for required in ["nosuid", "nodev", "noexec"] {
+            if !row.options.contains(required) {
+                return Err(io::Error::other(format!(
+                    "filesystem grant mount {} lacks {required}",
+                    row.mountpoint.display()
+                )));
+            }
+        }
+        if filesystem.read_only && !row.options.contains("ro") {
+            return Err(io::Error::other(format!(
+                "read-only filesystem grant has writable mount {}",
+                row.mountpoint.display()
+            )));
+        }
+        if !filesystem.read_only
+            && row.mountpoint == filesystem.target
+            && !row.options.contains("rw")
+        {
+            return Err(io::Error::other(format!(
+                "read-write filesystem grant target {} is not writable",
+                row.mountpoint.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn require_writable_file(path: &Path) -> io::Result<()> {
+    OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map(drop)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "open read-write filesystem grant {} for writing: {error}",
+                    path.display()
+                ),
+            )
+        })
+}
+
 fn remount_read_only(path: &str, flags: usize) -> io::Result<()> {
     let target = cstring(path)?;
     sys::mount(
@@ -777,11 +1109,23 @@ fn prepare_mount_plan(
         // (`is_local_mountpoint` -> `EBUSY`) and the app has no `CAP_SYS_ADMIN`
         // to unmount it.
         mount_private_bind(&application.bus_socket, &bus, true)?;
+        for filesystem in &application.filesystems {
+            mount_filesystem_grant(filesystem)?;
+        }
         let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
         for (source, target) in [
-            (application.package_files.as_path(), format!("{NEW_ROOT}/app")),
-            (application.runtime_files.as_path(), format!("{NEW_ROOT}/usr")),
-            (application.state.home.as_path(), format!("{NEW_ROOT}/home/td")),
+            (
+                application.package_files.as_path(),
+                format!("{NEW_ROOT}/app"),
+            ),
+            (
+                application.runtime_files.as_path(),
+                format!("{NEW_ROOT}/usr"),
+            ),
+            (
+                application.state.home.as_path(),
+                format!("{NEW_ROOT}/home/td"),
+            ),
             (
                 application.state.config.as_path(),
                 format!("{NEW_ROOT}/home/td/.config"),
@@ -1220,149 +1564,6 @@ fn require_mount_super_option(mountinfo: &str, target: &str, required: &str) -> 
     )))
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct MountIdentity {
-    device: String,
-    root: PathBuf,
-}
-
-#[derive(Clone, Debug)]
-struct MountRow {
-    id: u64,
-    parent: u64,
-    device: String,
-    root: PathBuf,
-    mountpoint: PathBuf,
-}
-
-fn root_mount_row(rows: &[MountRow]) -> Option<MountRow> {
-    for row in rows.iter().rev() {
-        if row.mountpoint == Path::new("/") {
-            return Some(row.clone());
-        }
-    }
-    None
-}
-
-fn child_mount_row(rows: &[MountRow], parent: u64) -> Option<MountRow> {
-    for row in rows.iter().rev() {
-        if row.parent == parent {
-            return Some(row.clone());
-        }
-    }
-    None
-}
-
-fn decode_mountinfo_path(field: &str) -> io::Result<PathBuf> {
-    let mut decoded = Vec::with_capacity(field.len());
-    let mut bytes = field.as_bytes().iter().copied();
-    while let Some(byte) = bytes.next() {
-        if byte != b'\\' {
-            decoded.push(byte);
-            continue;
-        }
-        let escape = [bytes.next(), bytes.next(), bytes.next()];
-        let value = match escape {
-            [Some(b'0'), Some(b'4'), Some(b'0')] => b' ',
-            [Some(b'0'), Some(b'1'), Some(b'1')] => b'\t',
-            [Some(b'0'), Some(b'1'), Some(b'2')] => b'\n',
-            [Some(b'1'), Some(b'3'), Some(b'4')] => b'\\',
-            _ => {
-                return Err(io::Error::other(
-                    "mountinfo contains an invalid path escape",
-                ));
-            }
-        };
-        decoded.push(value);
-    }
-    Ok(PathBuf::from(OsString::from_vec(decoded)))
-}
-
-fn mount_identity_for_path(mountinfo: &str, path: &Path) -> io::Result<MountIdentity> {
-    let mut rows = BTreeMap::<usize, Vec<MountRow>>::new();
-    let mut mount_ids = BTreeSet::new();
-    for line in mountinfo.lines() {
-        let left = line
-            .split_once(" - ")
-            .ok_or_else(|| io::Error::other("mountinfo row has no separator"))?
-            .0;
-        let mut fields = left.split_whitespace();
-        let id = fields
-            .next()
-            .ok_or_else(|| io::Error::other("mountinfo row has no mount ID"))?
-            .parse::<u64>()
-            .map_err(|error| io::Error::other(format!("invalid mount ID: {error}")))?;
-        let parent = fields
-            .next()
-            .ok_or_else(|| io::Error::other("mountinfo row has no parent ID"))?
-            .parse::<u64>()
-            .map_err(|error| io::Error::other(format!("invalid mount parent ID: {error}")))?;
-        if !mount_ids.insert(id) {
-            return Err(io::Error::other(format!(
-                "mountinfo repeats mount ID {id}"
-            )));
-        }
-        let device = fields
-            .next()
-            .ok_or_else(|| io::Error::other("mountinfo row has no device"))?;
-        let root = fields
-            .next()
-            .ok_or_else(|| io::Error::other("mountinfo row has no root"))?;
-        let mountpoint = fields
-            .next()
-            .ok_or_else(|| io::Error::other("mountinfo row has no mount point"))?;
-        let root = decode_mountinfo_path(root)?;
-        let mountpoint = decode_mountinfo_path(mountpoint)?;
-        if path.strip_prefix(&mountpoint).is_err() {
-            continue;
-        }
-        let depth = mountpoint.components().count();
-        rows.entry(depth).or_default().push(MountRow {
-            id,
-            parent,
-            device: device.to_string(),
-            root,
-            mountpoint,
-        });
-    }
-    let mut selected: Option<MountRow> = None;
-    let mut selected_ids = BTreeSet::new();
-    for rows_at_depth in rows.into_values() {
-        if selected.is_none() {
-            selected = root_mount_row(&rows_at_depth);
-            if let Some(row) = &selected {
-                selected_ids.insert(row.id);
-            }
-        }
-        while let Some(parent) = selected.as_ref().map(|row| row.id) {
-            let Some(next) = child_mount_row(&rows_at_depth, parent) else {
-                break;
-            };
-            if !selected_ids.insert(next.id) {
-                return Err(io::Error::other("mountinfo parent tree contains a cycle"));
-            }
-            selected = Some(next);
-        }
-    }
-    let selected = selected
-        .ok_or_else(|| io::Error::other(format!("mountinfo does not cover {}", path.display())))?;
-    let relative = path.strip_prefix(&selected.mountpoint).map_err(|error| {
-        io::Error::other(format!(
-            "selected mount {} does not cover {}: {error}",
-            selected.mountpoint.display(),
-            path.display()
-        ))
-    })?;
-    let mut root = selected.root;
-    if !relative.as_os_str().is_empty() {
-        root.push(relative);
-    }
-    Ok(MountIdentity {
-        device: selected.device,
-        root,
-    })
-}
-
 fn require_bind_source(mountinfo: &str, source: &Path, target: &Path) -> io::Result<()> {
     let source_identity = mount_identity_for_path(mountinfo, source)?;
     let target_identity = mount_identity_for_path(mountinfo, target)?;
@@ -1429,23 +1630,80 @@ fn require_read_only_mount(path: &str, token: &[u8; TOKEN_LEN]) -> io::Result<()
     }
 }
 
-fn require_mount_plan(
+fn grant_scaffold_names(
     application: bool,
+    filesystems: &[Stage2Filesystem],
+) -> io::Result<BTreeMap<PathBuf, BTreeSet<String>>> {
+    let root = if application {
+        ["app", "dev", "home", "proc", "run", "tmp", "usr", "var"].as_slice()
+    } else {
+        ["dev", "proc", "tmp", "var"].as_slice()
+    };
+    let mut expected = BTreeMap::from([
+        (
+            PathBuf::from("/"),
+            root.iter().map(|name| (*name).to_string()).collect(),
+        ),
+        (PathBuf::from("/var"), BTreeSet::from(["tmp".to_string()])),
+    ]);
+    if application {
+        expected.insert(
+            PathBuf::from("/home"),
+            BTreeSet::from(["td".to_string()]),
+        );
+    }
+    for filesystem in filesystems {
+        let mut parent = PathBuf::from("/");
+        for component in filesystem.target.components() {
+            let name = component.as_os_str();
+            if name == "/" {
+                continue;
+            }
+            if path_is_same_or_child(&parent, Path::new("/home/td")) {
+                break;
+            }
+            let name = name
+                .to_str()
+                .ok_or_else(|| io::Error::other("filesystem target component is not UTF-8"))?;
+            expected
+                .entry(parent.clone())
+                .or_default()
+                .insert(name.to_string());
+            parent.push(name);
+            if parent == filesystem.target {
+                break;
+            }
+            if parent == Path::new("/home/td") {
+                break;
+            }
+            expected.entry(parent.clone()).or_default();
+        }
+    }
+    Ok(expected)
+}
+
+fn require_mount_plan(
+    filesystems: Option<&[Stage2Filesystem]>,
     token: &[u8; TOKEN_LEN],
     identity: Identity,
 ) -> io::Result<()> {
+    let application = filesystems.is_some();
     if fs::symlink_metadata(OLD_ROOT).is_ok() || fs::symlink_metadata("/etc").is_ok() {
         return Err(io::Error::other(
             "detached host root remains reachable in the fresh root",
         ));
     }
-    let root_names = if application {
-        &["app", "dev", "home", "proc", "run", "tmp", "usr", "var"][..]
-    } else {
-        &["dev", "proc", "tmp", "var"][..]
-    };
-    require_names("/", root_names)?;
-    require_names("/var", &["tmp"])?;
+    for (path, expected) in grant_scaffold_names(application, filesystems.unwrap_or_default())? {
+        let path_text = path
+            .to_str()
+            .ok_or_else(|| io::Error::other("filesystem scaffold path is not UTF-8"))?;
+        if read_dir_names(path_text)? != expected {
+            return Err(io::Error::other(format!(
+                "fresh scaffold {} entries do not match the mount plan",
+                path.display()
+            )));
+        }
+    }
     require_mode("/", 0o755)?;
     require_mode("/dev", 0o755)?;
     require_mode("/dev/shm", 0o1777)?;
@@ -1527,7 +1785,7 @@ fn require_mount_plan(
     }
 
     if application {
-        require_names("/home", &["td"])?;
+        let filesystems = filesystems.unwrap_or_default();
         require_names("/run", &["user"])?;
         let runtime = format!("/run/user/{}", identity.uid);
         require_mode(&runtime, 0o700)?;
@@ -1603,6 +1861,33 @@ fn require_mount_plan(
         require_writable_directory("/home/td", token)?;
         for path in ["/app", "/usr"] {
             require_read_only_mount(path, token)?;
+        }
+        for filesystem in filesystems {
+            require_grant_mount_policy(&mountinfo, filesystem)?;
+            match (filesystem.source_kind, filesystem.read_only) {
+                (FilesystemSourceKind::Directory, true) => {
+                    require_read_only_mount(
+                        filesystem
+                            .target
+                            .to_str()
+                            .ok_or_else(|| io::Error::other("filesystem target is not UTF-8"))?,
+                        token,
+                    )?;
+                }
+                (FilesystemSourceKind::Directory, false) => {
+                    require_writable_directory(
+                        filesystem
+                            .target
+                            .to_str()
+                            .ok_or_else(|| io::Error::other("filesystem target is not UTF-8"))?,
+                        token,
+                    )?;
+                }
+                (FilesystemSourceKind::File, true) => {}
+                (FilesystemSourceKind::File, false) => {
+                    require_writable_file(&filesystem.target)?;
+                }
+            }
         }
     } else {
         require_names("/tmp", &["td-jail-reaper-probe"])?;
@@ -1991,11 +2276,11 @@ pub fn run_stage2(
     require_stage2_capabilities()?;
     enter_mount_plan()?;
     let mount_probe_token = random_token()?;
-    require_mount_plan(
-        matches!(action, Stage2Action::Launch { .. }),
-        &mount_probe_token,
-        identity,
-    )?;
+    let filesystems = match &action {
+        Stage2Action::Probe => None,
+        Stage2Action::Launch { filesystems, .. } => Some(filesystems.as_slice()),
+    };
+    require_mount_plan(filesystems, &mount_probe_token, identity)?;
     clear_and_require_empty_capabilities()?;
     install_standard_seccomp_filter()?;
     match action {
@@ -2006,6 +2291,7 @@ pub fn run_stage2(
         Stage2Action::Launch {
             entry,
             environment,
+            filesystems: _,
             arguments,
         } => {
             sys::set_dumpable(false)?;
@@ -2184,6 +2470,7 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
         identity,
         &application.entry,
         &application.environment,
+        &application.filesystems,
         &application.arguments,
     );
     let mut command = Command::new(executable);
@@ -2287,6 +2574,10 @@ mod tests {
     )]
 
     use super::*;
+    use crate::authority::{
+        mount_identities_outside_allowed_home, mount_tree_identities,
+        require_grant_mount_identities, MountIdentity,
+    };
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2457,18 +2748,32 @@ mod tests {
                 "wayland-0",
                 "XDG_RUNTIME_DIR",
                 "/run/user/1000",
+                STAGE2_FILESYSTEMS_ARG,
+                "1",
+                "/home/td/Downloads",
+                "rw-dir",
                 STAGE2_ARGUMENTS_ARG,
                 "--flag",
             ]))
             .unwrap(),
             Mode::Stage2 {
-                action: Stage2Action::Launch { entry, environment, arguments },
+                action: Stage2Action::Launch {
+                    entry,
+                    environment,
+                    filesystems,
+                    arguments,
+                },
                 ..
             } if entry == "/app/bin/app"
                 && environment.first() == Some(&(
                     OsString::from("DBUS_SESSION_BUS_ADDRESS"),
                     OsString::from("unix:path=/run/user/1000/bus"),
                 ))
+                && filesystems == [Stage2Filesystem {
+                    target: PathBuf::from("/home/td/Downloads"),
+                    read_only: false,
+                    source_kind: FilesystemSourceKind::Directory,
+                }]
                 && arguments == [OsString::from("--flag")]
         ));
         assert!(parse_mode(args(&[STAGE2_ARG, &encoded])).is_err());
@@ -2481,6 +2786,8 @@ mod tests {
             STAGE2_LAUNCH_ARG,
             "/usr/bin/app",
             STAGE2_ENVIRONMENT_ARG,
+            "0",
+            STAGE2_FILESYSTEMS_ARG,
             "0",
             STAGE2_ARGUMENTS_ARG,
         ]))
@@ -2502,6 +2809,8 @@ mod tests {
             "/home/td",
             "XDG_RUNTIME_DIR",
             "/run/user/1000",
+            STAGE2_FILESYSTEMS_ARG,
+            "0",
             STAGE2_ARGUMENTS_ARG,
         ]))
         .is_err());
@@ -2531,11 +2840,20 @@ mod tests {
             ),
         ];
         let arguments = vec![OsString::from("--flag")];
+        let filesystems = vec![FilesystemGrant {
+            source: PathBuf::from("/host/downloads"),
+            target: PathBuf::from("/home/td/Downloads"),
+            read_only: false,
+            source_kind: FilesystemSourceKind::Directory,
+            source_device: 1,
+            source_inode: 2,
+        }];
         let emitted = stage2_launch_arguments(
             &token,
             identity,
             "/app/bin/app",
             &environment,
+            &filesystems,
             &arguments,
         );
         assert_eq!(
@@ -2546,6 +2864,11 @@ mod tests {
                 action: Stage2Action::Launch {
                     entry: "/app/bin/app".into(),
                     environment,
+                    filesystems: vec![Stage2Filesystem {
+                        target: PathBuf::from("/home/td/Downloads"),
+                        read_only: false,
+                        source_kind: FilesystemSourceKind::Directory,
+                    }],
                     arguments,
                 },
             }
@@ -2830,5 +3153,256 @@ mod tests {
                 root: PathBuf::from("/child/file"),
             }
         );
+    }
+
+    #[test]
+    fn grant_mount_identity_refuses_reserved_and_other_home_aliases() {
+        let base = "1 0 8:1 / / rw - ext4 root rw\n\
+                    2 1 0:2 / /run rw - tmpfs run rw\n\
+                    3 2 0:3 / /run/shm rw - tmpfs shm rw\n\
+                    4 1 0:4 / /home/other rw - btrfs other rw\n\
+                    5 1 0:5 / /home/tester/Media rw - btrfs own rw\n";
+        let source = Path::new("/mnt/grant");
+        let allowed_home = Path::new("/home/tester");
+        let home_roots = [PathBuf::from("/home")];
+
+        let check = |mountinfo: &str| {
+            require_grant_mount_identities(
+                source,
+                &mount_tree_identities(mountinfo, source).unwrap(),
+                &mount_tree_identities(mountinfo, Path::new("/run")).unwrap(),
+                &mount_tree_identities(mountinfo, Path::new("/home")).unwrap(),
+                &mount_tree_identities(mountinfo, allowed_home).unwrap(),
+                &mount_identities_outside_allowed_home(
+                    mountinfo,
+                    &home_roots,
+                    allowed_home,
+                )
+                .unwrap(),
+            )
+        };
+
+        let reserved_alias =
+            format!("{base}6 1 0:3 / /mnt/grant/nested rw - tmpfs shm rw\n");
+        assert!(require_grant_mount_identities(
+            source,
+            &mount_tree_identities(&reserved_alias, source).unwrap(),
+            &mount_tree_identities(&reserved_alias, Path::new("/run")).unwrap(),
+            &mount_tree_identities(&reserved_alias, Path::new("/home")).unwrap(),
+            &mount_tree_identities(&reserved_alias, allowed_home).unwrap(),
+            &mount_identities_outside_allowed_home(
+                &reserved_alias,
+                &home_roots,
+                allowed_home,
+            )
+            .unwrap(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("aliases a reserved mount"));
+
+        let other_home =
+            format!("{base}6 1 0:4 / /mnt/grant/nested rw - btrfs other rw\n");
+        assert!(check(&other_home)
+            .unwrap_err()
+            .to_string()
+            .contains("aliases another home mount"));
+
+        let mixed_homes = format!(
+            "{base}6 1 0:4 / /mnt/grant/other rw - btrfs other rw\n\
+             7 1 0:5 / /mnt/grant/own rw - btrfs own rw\n"
+        );
+        assert!(check(&mixed_homes)
+            .unwrap_err()
+            .to_string()
+            .contains("aliases another home mount"));
+
+        let duplicated_home_identity = format!(
+            "{base}6 1 0:5 / /mnt/grant/own rw - btrfs own rw\n\
+             7 4 0:5 / /home/other/own-alias rw - btrfs own rw\n"
+        );
+        assert!(check(&duplicated_home_identity)
+            .unwrap_err()
+            .to_string()
+            .contains("aliases another home mount"));
+
+        for admitted in [
+            format!("{base}6 1 0:6 / /mnt/grant/nested rw - tmpfs nested rw\n"),
+            format!("{base}6 1 8:1 /home/tester/Projects /mnt/grant/nested rw - ext4 root rw\n"),
+            format!("{base}6 1 0:5 / /mnt/grant/nested rw - btrfs own rw\n"),
+        ] {
+            check(&admitted).unwrap();
+        }
+    }
+
+    #[test]
+    fn grant_mount_rows_are_unique_present_and_sorted_deepest_first() {
+        let mountinfo = "1 0 0:1 / / rw - tmpfs root rw\n\
+                         2 1 0:2 / /grant rw,nosuid,nodev,noexec - tmpfs grant rw\n\
+                         3 2 0:3 / /grant/a rw,nosuid,nodev,noexec - tmpfs a rw\n\
+                         4 2 0:4 / /grant/z rw,nosuid,nodev,noexec - tmpfs z rw\n\
+                         5 3 0:5 / /grant/a/deep rw,nosuid,nodev,noexec - tmpfs deep rw\n";
+        let mut rows = grant_mount_rows(mountinfo, Path::new("/grant")).unwrap();
+        sort_grant_mount_rows(&mut rows);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.mountpoint.as_path())
+                .collect::<Vec<_>>(),
+            [
+                Path::new("/grant/a/deep"),
+                Path::new("/grant/z"),
+                Path::new("/grant/a"),
+                Path::new("/grant"),
+            ]
+        );
+        assert!(grant_mount_rows(
+            &mountinfo.replace("/grant rw", "/other rw"),
+            Path::new("/grant"),
+        )
+        .is_err());
+        let duplicate =
+            format!("{mountinfo}6 1 0:6 / /grant rw,nosuid,nodev,noexec - tmpfs duplicate rw\n");
+        assert!(grant_mount_rows(&duplicate, Path::new("/grant")).is_err());
+    }
+
+    #[test]
+    fn grant_mount_policy_flags_are_exact() {
+        let hardened = sys::MS_REMOUNT
+            | sys::MS_BIND
+            | sys::MS_NOSUID
+            | sys::MS_NODEV
+            | sys::MS_NOEXEC;
+        assert_eq!(grant_mount_policy_flags(false), hardened);
+        assert_eq!(grant_mount_policy_flags(true), hardened | sys::MS_RDONLY);
+    }
+
+    #[test]
+    fn grant_scaffolds_are_exhaustive_outside_private_home() {
+        let base = grant_scaffold_names(true, &[]).unwrap();
+        assert_eq!(
+            base.get(Path::new("/home")),
+            Some(&BTreeSet::from(["td".to_string()]))
+        );
+        let filesystems = [
+            Stage2Filesystem {
+                target: PathBuf::from("/mnt/media/pictures"),
+                read_only: true,
+                source_kind: FilesystemSourceKind::Directory,
+            },
+            Stage2Filesystem {
+                target: PathBuf::from("/var/fixture-file"),
+                read_only: true,
+                source_kind: FilesystemSourceKind::File,
+            },
+            Stage2Filesystem {
+                target: PathBuf::from("/home/td/Downloads"),
+                read_only: false,
+                source_kind: FilesystemSourceKind::Directory,
+            },
+            Stage2Filesystem {
+                target: PathBuf::from("/home/tester/Projects"),
+                read_only: false,
+                source_kind: FilesystemSourceKind::Directory,
+            },
+        ];
+        let names = grant_scaffold_names(true, &filesystems).unwrap();
+        assert_eq!(
+            names.get(Path::new("/mnt")),
+            Some(&BTreeSet::from(["media".to_string()]))
+        );
+        assert_eq!(
+            names.get(Path::new("/mnt/media")),
+            Some(&BTreeSet::from(["pictures".to_string()]))
+        );
+        assert_eq!(
+            names.get(Path::new("/var")),
+            Some(&BTreeSet::from([
+                "fixture-file".to_string(),
+                "tmp".to_string(),
+            ]))
+        );
+        assert_eq!(
+            names.get(Path::new("/home")),
+            Some(&BTreeSet::from(["td".to_string(), "tester".to_string()]))
+        );
+        assert!(!names.contains_key(Path::new("/home/td")));
+        assert_eq!(
+            names.get(Path::new("/home/tester")),
+            Some(&BTreeSet::from(["Projects".to_string()]))
+        );
+    }
+
+    #[test]
+    fn writable_regular_file_probe_opens_without_changing_content() {
+        let directory = temporary_directory().unwrap();
+        let file = directory.join("grant-file");
+        fs::write(&file, b"application-owned").unwrap();
+        require_writable_file(&file).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"application-owned");
+        fs::remove_file(&file).unwrap();
+        fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn regular_file_identity_refuses_a_late_hardlink() {
+        let directory = temporary_directory().unwrap();
+        let file = directory.join("grant-file");
+        fs::write(&file, b"application-owned").unwrap();
+        let metadata = fs::symlink_metadata(&file).unwrap();
+        let grant = FilesystemGrant {
+            source: file.clone(),
+            target: PathBuf::from("/grant-file"),
+            read_only: true,
+            source_kind: FilesystemSourceKind::File,
+            source_device: metadata.dev(),
+            source_inode: metadata.ino(),
+        };
+        require_filesystem_source_identity(&grant).unwrap();
+        let alias = directory.join("grant-file-alias");
+        fs::hard_link(&file, &alias).unwrap();
+        assert!(require_filesystem_source_identity(&grant).is_err());
+        fs::remove_file(alias).unwrap();
+        fs::remove_file(file).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn filesystem_grant_readback_covers_every_nested_mount() {
+        let read_only = Stage2Filesystem {
+            target: PathBuf::from("/grant"),
+            read_only: true,
+            source_kind: FilesystemSourceKind::Directory,
+        };
+        let nested = "10 1 0:1 / / rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n\
+                      11 10 0:2 / /grant ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n\
+                      12 11 0:3 / /grant/nested ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n";
+        require_grant_mount_policy(nested, &read_only).unwrap();
+        assert!(require_grant_mount_policy(
+            &nested.replace(
+                "/grant/nested ro,nosuid,nodev,noexec",
+                "/grant/nested rw,nosuid,nodev,noexec"
+            ),
+            &read_only,
+        )
+        .is_err());
+        assert!(require_grant_mount_policy(
+            &nested.replace(
+                "/grant/nested ro,nosuid,nodev,noexec",
+                "/grant/nested ro,nosuid,nodev"
+            ),
+            &read_only,
+        )
+        .is_err());
+
+        let read_write = Stage2Filesystem {
+            target: PathBuf::from("/grant"),
+            read_only: false,
+            source_kind: FilesystemSourceKind::Directory,
+        };
+        let mixed = nested.replace(
+            "/grant ro,nosuid,nodev,noexec",
+            "/grant rw,nosuid,nodev,noexec",
+        );
+        require_grant_mount_policy(&mixed, &read_write).unwrap();
     }
 }

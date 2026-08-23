@@ -6,6 +6,13 @@
 #![deny(unsafe_code)]
 
 mod authority;
+#[allow(dead_code)]
+#[cfg_attr(test, allow(clippy::unwrap_used))]
+#[cfg_attr(
+    not(feature = "target-recipe"),
+    path = "../../engine/src/permissions.rs"
+)]
+mod permissions;
 mod seccomp;
 mod sys;
 mod transition;
@@ -55,6 +62,7 @@ mod confinement {
 
     const AUTHORITY: &str = include_str!("authority.rs");
     const MAIN: &str = include_str!("main.rs");
+    const PERMISSIONS: &str = include_str!("../../engine/src/permissions.rs");
     const SECCOMP: &str = include_str!("seccomp.rs");
     const SYS: &str = include_str!("sys.rs");
     const TRANSITION: &str = include_str!("transition.rs");
@@ -68,6 +76,8 @@ mod confinement {
         assert_eq!(shipped_main.matches("#[allow(unsafe_code)]").count(), 0);
         assert_eq!(AUTHORITY.matches("#[allow(unsafe_code)]").count(), 0);
         assert_eq!(AUTHORITY.matches("unsafe {").count(), 0);
+        assert_eq!(PERMISSIONS.matches("#[allow(unsafe_code)]").count(), 0);
+        assert_eq!(PERMISSIONS.matches("unsafe {").count(), 0);
         assert_eq!(SECCOMP.matches("#[allow(unsafe_code)]").count(), 0);
         assert_eq!(SECCOMP.matches("unsafe {").count(), 0);
         assert_eq!(TRANSITION.matches("#[allow(unsafe_code)]").count(), 0);
@@ -176,6 +186,26 @@ mod confinement {
             2
         );
         assert_eq!(TRANSITION.matches("sys::unshare_namespaces(").count(), 2);
+        assert!(TRANSITION.contains(
+            "let flags = sys::MS_BIND\n        | if grant.source_kind == FilesystemSourceKind::Directory {\n            sys::MS_REC"
+        ));
+        assert_eq!(
+            TRANSITION
+                .matches("let flags = grant_mount_policy_flags(read_only || row.read_only);")
+                .count(),
+            1
+        );
+        let grant_flags = TRANSITION
+            .split_once("fn grant_mount_policy_flags")
+            .unwrap()
+            .1
+            .split_once("fn require_grant_mount_policy")
+            .unwrap()
+            .0;
+        assert!(grant_flags.contains(
+            "sys::MS_REMOUNT | sys::MS_BIND | sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC"
+        ));
+        assert!(grant_flags.contains("flags |= sys::MS_RDONLY;"));
         for call in [
             "sys::close(",
             "sys::bring_up_loopback(",

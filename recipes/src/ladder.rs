@@ -24,6 +24,12 @@ pub const TD_JAIL_FIXTURE_NAME: &str = "td-jail-fixture";
 pub const TD_JAIL_FIXTURE_ENTRY: &str = "/app/bin/td-compositor";
 pub const TD_JAIL_FIXTURE_ALIAS: &str = "org.td.JailFixture";
 pub const TD_JAIL_FIXTURE_DISPLAY_NAME: &str = "Jail Fixture";
+pub const TD_JAIL_FIXTURE_DOWNLOAD_PERMISSION: &str = "xdg-download";
+pub const TD_JAIL_FIXTURE_DOWNLOAD_TARGET: &str = "/home/td/Downloads";
+pub const TD_JAIL_FIXTURE_PICTURES_PERMISSION: &str = "xdg-pictures";
+pub const TD_JAIL_FIXTURE_PICTURES_TARGET: &str = "/home/td/Pictures";
+pub const TD_JAIL_FIXTURE_GRANT_FILE: &str = "/var/td-jail-fixture-file";
+pub const TD_JAIL_FIXTURE_GRANT_ROOT: &str = "/mnt/td-jail-fixture-pictures";
 pub const TD_JAIL_FIXTURE_SEARCH_TERMS: &[&str] =
     &["jail", "fixture", "sandbox", "wayland"];
 pub const TD_APPLICATION_CONFIG_TEXT: &str = concat!(

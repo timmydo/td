@@ -8,11 +8,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_PERMISSION_FILE_BYTES: usize = 16 * 1024;
-const MAX_FILESYSTEM_ENTRIES: usize = 128;
+pub const MAX_FILESYSTEM_ENTRIES: usize = 128;
 const MAX_BUS_POLICY_ENTRIES: usize = 128;
 const MAX_FILESYSTEM_LOCATION_BYTES: usize = 4096;
 const MAX_BUS_NAME_BYTES: usize = 255;
-const RESERVED_FILESYSTEM_TREES: &[&str] = &[
+pub const RESERVED_FILESYSTEM_TREES: &[&str] = &[
     "/app",
     "/usr",
     "/bin",
@@ -377,6 +377,23 @@ impl PermissionPolicy {
 
     pub fn resources(&self) -> ResourceLimits {
         self.resources
+    }
+
+    pub fn is_wayland_filesystem_only(&self) -> bool {
+        let PermissionPolicy {
+            network,
+            sockets,
+            allow_devel,
+            filesystems: _,
+            session_bus,
+            resources,
+        } = self;
+        !network
+            && sockets.len() == 1
+            && sockets.contains(&PermissionSocket::Wayland)
+            && !allow_devel
+            && session_bus.is_empty()
+            && resources.is_empty()
     }
 
     /// Canonical bytes for either immutable defaults or an operator override.
@@ -1016,6 +1033,31 @@ mod tests {
         let parsed = PermissionPolicy::parse("# no grants\nformat = 1\n").unwrap();
         assert_eq!(parsed, PermissionPolicy::new());
         assert_eq!(parsed.to_keyfile(), "format=1\n");
+    }
+
+    #[test]
+    fn jail_subset_is_exactly_wayland_plus_filesystems() {
+        let admitted = PermissionPolicy::new()
+            .with_socket(PermissionSocket::Wayland)
+            .unwrap()
+            .with_filesystem("xdg-download", FilesystemAccess::ReadWrite, false)
+            .unwrap();
+        assert!(admitted.is_wayland_filesystem_only());
+        assert!(!PermissionPolicy::new().is_wayland_filesystem_only());
+        assert!(!admitted
+            .clone()
+            .with_socket(PermissionSocket::PulseAudio)
+            .unwrap()
+            .is_wayland_filesystem_only());
+        assert!(!admitted
+            .clone()
+            .with_network()
+            .unwrap()
+            .is_wayland_filesystem_only());
+        assert!(!admitted
+            .with_pids_max(8)
+            .unwrap()
+            .is_wayland_filesystem_only());
     }
 
     #[test]

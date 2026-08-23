@@ -6,6 +6,10 @@ const MODULES: &[(&str, &str)] = &[
         "authority",
         include_str!("../../../td-jail/src/authority.rs"),
     ),
+    (
+        "permissions",
+        include_str!("../../../engine/src/permissions.rs"),
+    ),
     ("seccomp", include_str!("../../../td-jail/src/seccomp.rs")),
     ("sys", include_str!("../../../td-jail/src/sys.rs")),
     (
@@ -86,6 +90,8 @@ pub fn recipe() -> Recipe {
                 rustc,
                 "--edition",
                 "2021",
+                "--cfg",
+                "feature=\"target-recipe\"",
                 "-C",
                 "opt-level=s",
                 "--target",
@@ -138,7 +144,7 @@ mod tests {
     use td_engine::application::{ApplicationDeclaration, ApplicationProvenance};
     use td_engine::application_spec::ApplicationSpec;
     use td_engine::launcher::ApplicationRegistry;
-    use td_engine::permissions::{PermissionPolicy, PermissionSocket};
+    use td_engine::permissions::{FilesystemAccess, PermissionPolicy, PermissionSocket};
 
     #[allow(dead_code)]
     mod target_authority {
@@ -371,7 +377,14 @@ mod tests {
             .expect("fixture manifest");
         let permissions = PermissionPolicy::new()
             .with_socket(PermissionSocket::Wayland)
-            .expect("Wayland policy");
+            .and_then(|permissions| {
+                permissions.with_filesystem(
+                    "xdg-download",
+                    FilesystemAccess::ReadWrite,
+                    true,
+                )
+            })
+            .expect("Wayland and filesystem policy");
         let spec = ApplicationSpec::compile(
             &manifest,
             "/td/store/0123456789abcdefghijklmnopqrstuv-empty-runtime-1",
@@ -436,8 +449,6 @@ mod tests {
             ("RUNTIME_PREFIX", "runtime="),
             ("ENTRY_PREFIX", "entry="),
             ("ENVIRONMENT_SECTION", "[Environment]"),
-            ("CONTEXT_SECTION", "[Context]"),
-            ("WAYLAND_POLICY", "sockets=wayland"),
         ] {
             assert!(
                 authority.contains(&format!("const {constant}: &str = {value:?};")),
@@ -447,5 +458,7 @@ mod tests {
                 .lines()
                 .any(|line| line == value || line.starts_with(value)));
         }
+        assert!(spec.contains("[Context]\nsockets=wayland\n"));
+        assert!(spec.contains("[Filesystem]\nxdg-download=rw:create\n"));
     }
 }

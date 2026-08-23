@@ -9,8 +9,8 @@ use crate::ladder::{
     SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
     TD_BUSD_RUNTIME_MARKER, TD_INIT_RUNTIME_MARKER, TD_JAIL_FIXTURE_BOOT_MARKER,
-    TD_JAIL_SECCOMP_PROBE_MARKER, TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER,
-    TD_SANDBOX_KERNEL_MARKER,
+    TD_JAIL_FIXTURE_GRANT_FILE, TD_JAIL_FIXTURE_GRANT_ROOT, TD_JAIL_SECCOMP_PROBE_MARKER,
+    TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER,
     TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
@@ -272,6 +272,8 @@ const SYSTEM: SystemDef = SystemDef {
 const UI_USER: &str = "tester";
 const UI_UID: u32 = td_engine::application_spec::APPLICATION_UID;
 const UI_GID: u32 = 1000;
+#[cfg(test)]
+const UI_HOME: &str = "/home/tester";
 // ────────────────────────────────────────────────────────────────────────────────
 
 /// The real-root `/bin` is split across six closed applet farms plus the
@@ -1198,14 +1200,20 @@ fn build_deployment_init(sys: &SystemDef) -> String {
             init.push_str(&format!(" /sysroot/var{}", user.home));
         }
     }
-    init.push_str(
-        "\n/bin/sh -c 'umask 077; /bin/td-util mkdir -p /sysroot/var/root'\n\
+    init.push_str(&format!(
+        "\nif /bin/td-util test -d /sysroot{TD_JAIL_FIXTURE_GRANT_ROOT}/nested; then\n\
+         /bin/mount -t tmpfs -o nosuid,nodev,noexec,mode=0700,uid={UI_UID},gid={UI_GID},size=1048576 tmpfs /sysroot{TD_JAIL_FIXTURE_GRANT_ROOT}/nested\n\
+         /bin/td-util printf '%s\\n' td-jail-file-grant-v1 > /sysroot{TD_JAIL_FIXTURE_GRANT_FILE}\n\
+         /bin/td-util chown {UI_UID}:{UI_GID} /sysroot{TD_JAIL_FIXTURE_GRANT_FILE}\n\
+         /bin/td-util chmod 0600 /sysroot{TD_JAIL_FIXTURE_GRANT_FILE}\n\
+         fi\n\
+         /bin/sh -c 'umask 077; /bin/td-util mkdir -p /sysroot/var/root'\n\
          /bin/td-util rm -rf /sysroot/var/run\n\
          /bin/td-util ln -s /run /sysroot/var/run\n\
          /bin/td-util chown 0:0 /sysroot/var /sysroot/var/log /sysroot/var/home /sysroot/var/root\n\
          /bin/td-util chmod 0755 /sysroot/var /sysroot/var/log /sysroot/var/home\n\
-         /bin/td-util chmod 0700 /sysroot/var/root\n",
-    );
+         /bin/td-util chmod 0700 /sysroot/var/root\n"
+    ));
     for user in sys.users {
         if user.home != "/root" {
             init.push_str(&format!(
@@ -2543,6 +2551,8 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         "/etc",
         "/bin",
         "/mnt",
+        "/mnt/td-jail-fixture-pictures",
+        "/mnt/td-jail-fixture-pictures/nested",
         "/var",
         "/td",
         "/td/store",
@@ -3202,9 +3212,9 @@ pub fn recipe() -> Recipe {
         path: "{out}".into(),
     });
 
-    // 1) Stage the real-root tree in build scratch. shadow gets a follow-up chmod 0600 (WriteFile can
-    //    only set 0644/0755, and a world-readable shadow — even with empty/locked
-    //    passwords — should not regress from the old gen_init_cpio 0600).
+    // 1) Stage the real-root tree in build scratch. WriteFile/MkDir expose only
+    //    their fixed modes. Keep the immutable fixture root permissive so its
+    //    target write refusal cannot come from directory mode.
     steps.extend(real_root_steps(&SYSTEM));
     steps.push(
         Step::run(
@@ -3212,7 +3222,7 @@ pub fn recipe() -> Recipe {
             &[
                 POST_BOOTSTRAP_SH,
                 "-c",
-                "chmod 0600 '{root}/real-root/etc/shadow'",
+                "chmod 0600 '{root}/real-root/etc/shadow' && chmod 1777 '{root}/real-root/mnt/td-jail-fixture-pictures'",
             ],
         )
         .env("PATH", &post_bootstrap_path()),
@@ -4425,7 +4435,10 @@ mod tests {
                 .iter()
                 .find(|user| user.name == SYSTEM.autologin)
                 .is_some_and(|user| {
-                    user.name == UI_USER && user.uid == UI_UID && user.gid == UI_GID
+                    user.name == UI_USER
+                        && user.uid == UI_UID
+                        && user.gid == UI_GID
+                        && user.home == UI_HOME
                 }),
             "the first UI profile is deliberately one fixed seat: build_td_svc_conf, \
              td-seatd, XDG_RUNTIME_DIR, and WAYLAND_DISPLAY all bind tester 1000:1000; \
@@ -6331,6 +6344,59 @@ mod tests {
                 "{link} must not also be materialized as a root-image directory"
             );
         }
+    }
+
+    #[test]
+    fn fixture_grant_oracles_are_prepared_once_before_switch_root() {
+        let steps = real_root_steps(&SYSTEM);
+        for path in [
+            format!("{{root}}/real-root{TD_JAIL_FIXTURE_GRANT_ROOT}"),
+            format!("{{root}}/real-root{TD_JAIL_FIXTURE_GRANT_ROOT}/nested"),
+        ] {
+            assert!(steps.iter().any(
+                |step| matches!(step, Step::MkDir { path: actual } if actual == &path)
+            ));
+        }
+        let init = build_deployment_init(&SYSTEM);
+        let guard = format!(
+            "if /bin/td-util test -d /sysroot{TD_JAIL_FIXTURE_GRANT_ROOT}/nested; then"
+        );
+        let nested_mount = format!(
+            "/bin/mount -t tmpfs -o nosuid,nodev,noexec,mode=0700,uid={UI_UID},gid={UI_GID},size=1048576 tmpfs /sysroot{TD_JAIL_FIXTURE_GRANT_ROOT}/nested"
+        );
+        let file_write = format!(
+            "/bin/td-util printf '%s\\n' td-jail-file-grant-v1 > /sysroot{TD_JAIL_FIXTURE_GRANT_FILE}"
+        );
+        assert_eq!(init.matches(&nested_mount).count(), 1);
+        assert_eq!(init.matches(&guard).count(), 1);
+        assert_eq!(init.matches(&file_write).count(), 1);
+        assert!(init.contains(&format!(
+            "/bin/td-util chown {UI_UID}:{UI_GID} /sysroot{TD_JAIL_FIXTURE_GRANT_FILE}\n/bin/td-util chmod 0600 /sysroot{TD_JAIL_FIXTURE_GRANT_FILE}"
+        )));
+        assert!(
+            init.find(&guard) < init.find(&nested_mount)
+                && init.find(&nested_mount) < init.find(&file_write)
+                && init.find(&file_write) < init.find("exec /bin/switch_root /sysroot /init"),
+            "the guarded mount and writable file oracle must precede switch_root"
+        );
+        let image_recipe = recipe();
+        let mode_command = image_recipe
+            .steps
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find_map(|step| match step {
+                Step::Run { argv, .. } => argv
+                    .iter()
+                    .find(|argument| argument.contains("chmod 1777")),
+                _ => None,
+            })
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(mode_command.contains(&format!(
+            "chmod 1777 '{{root}}/real-root{TD_JAIL_FIXTURE_GRANT_ROOT}'"
+        )));
+        assert!(!mode_command.contains("chmod 0777"));
     }
 
     #[test]

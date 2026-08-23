@@ -1,7 +1,7 @@
 use crate::application::ApplicationDeclaration;
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 use td_engine::launcher::LauncherDeclaration;
-use td_engine::permissions::{PermissionPolicy, PermissionSocket};
+use td_engine::permissions::{FilesystemAccess, PermissionPolicy, PermissionSocket};
 
 const APPLICATION_ENTRY: &str = crate::ladder::TD_JAIL_FIXTURE_ENTRY;
 const APPLICATION_ALIAS: &str = crate::ladder::TD_JAIL_FIXTURE_ALIAS;
@@ -20,8 +20,36 @@ pub fn recipe() -> Recipe {
     else {
         return invalid_recipe("launcher");
     };
-    let Ok(permissions) =
-        PermissionPolicy::new().with_socket(PermissionSocket::Wayland)
+    let Ok(permissions) = PermissionPolicy::new()
+        .with_socket(PermissionSocket::Wayland)
+        .and_then(|permissions| {
+            permissions.with_filesystem(
+                crate::ladder::TD_JAIL_FIXTURE_DOWNLOAD_PERMISSION,
+                FilesystemAccess::ReadWrite,
+                true,
+            )
+        })
+        .and_then(|permissions| {
+            permissions.with_filesystem(
+                crate::ladder::TD_JAIL_FIXTURE_PICTURES_PERMISSION,
+                FilesystemAccess::ReadOnly,
+                true,
+            )
+        })
+        .and_then(|permissions| {
+            permissions.with_filesystem(
+                crate::ladder::TD_JAIL_FIXTURE_GRANT_FILE,
+                FilesystemAccess::ReadOnly,
+                false,
+            )
+        })
+        .and_then(|permissions| {
+            permissions.with_filesystem(
+                crate::ladder::TD_JAIL_FIXTURE_GRANT_ROOT,
+                FilesystemAccess::ReadOnly,
+                false,
+            )
+        })
     else {
         return invalid_recipe("permissions");
     };
@@ -87,7 +115,11 @@ mod tests {
                 .as_ref()
                 .expect("permissions")
                 .to_keyfile(),
-            "format=1\n\n[Context]\nsockets=wayland\n"
+            format!(
+                "format=1\n\n[Context]\nsockets=wayland\n\n[Filesystem]\n{}=ro\n{}=ro\nxdg-download=rw:create\nxdg-pictures=ro:create\n",
+                crate::ladder::TD_JAIL_FIXTURE_GRANT_ROOT,
+                crate::ladder::TD_JAIL_FIXTURE_GRANT_FILE,
+            )
         );
     }
 }

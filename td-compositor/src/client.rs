@@ -18,6 +18,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, UdpSocket};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -28,10 +29,15 @@ const PRESENT_TIMEOUT: Duration = Duration::from_secs(20);
 pub(crate) const JAIL_FIXTURE_ID: &str = "org.td.JailFixture";
 pub(crate) const JAIL_FIXTURE_ENTRY: &str = "/app/bin/td-compositor";
 pub(crate) const JAIL_FIXTURE_UID: u32 = 1000;
+pub(crate) const JAIL_FIXTURE_DOWNLOAD_TARGET: &str = "/home/td/Downloads";
+pub(crate) const JAIL_FIXTURE_PICTURES_TARGET: &str = "/home/td/Pictures";
+pub(crate) const JAIL_FIXTURE_GRANT_FILE: &str = "/var/td-jail-fixture-file";
+pub(crate) const JAIL_FIXTURE_GRANT_ROOT: &str = "/mnt/td-jail-fixture-pictures";
 const JAIL_FIXTURE_STATUS_EXIT_CODE: i32 = 70;
 const JAIL_FIXTURE_BOUNDARY_EXIT_CODE: i32 = 71;
 const JAIL_FIXTURE_MOUNTS_EXIT_CODE: i32 = 72;
 const JAIL_FIXTURE_LOOPBACK_EXIT_CODE: i32 = 73;
+const JAIL_FIXTURE_FILESYSTEM_EXIT_CODE: i32 = 74;
 
 pub(crate) struct ClientRunFailure {
     message: String,
@@ -870,6 +876,85 @@ fn verify_jail_loopback() -> Result<(), String> {
     Ok(())
 }
 
+fn verify_jail_filesystems() -> Result<(), String> {
+    let mut probe_bytes = [0_u8; 8];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut random| random.read_exact(&mut probe_bytes))
+        .map_err(|e| format!("read filesystem-grant probe randomness: {e}"))?;
+    let probe_tag = u64::from_le_bytes(probe_bytes);
+    let writable = format!("{JAIL_FIXTURE_DOWNLOAD_TARGET}/.td-jail-rw-{probe_tag:016x}");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&writable)
+        .map_err(|e| format!("create read-write filesystem grant {writable}: {e}"))?;
+    let content = (|| {
+        file.write_all(b"td-jail-filesystem-rw-v1")
+            .map_err(|e| format!("write read-write filesystem grant {writable}: {e}"))?;
+        drop(file);
+        fs::read(&writable)
+            .map_err(|e| format!("read read-write filesystem grant {writable}: {e}"))
+    })();
+    let removed = fs::remove_file(&writable)
+        .map_err(|e| format!("remove read-write filesystem grant probe {writable}: {e}"));
+    let content = content?;
+    removed?;
+    if content != b"td-jail-filesystem-rw-v1" {
+        return Err("read-write filesystem grant changed the probe payload".into());
+    }
+
+    let nested = format!("{JAIL_FIXTURE_GRANT_ROOT}/nested");
+    let root_device = fs::metadata(JAIL_FIXTURE_GRANT_ROOT)
+        .map_err(|e| format!("stat filesystem-grant root: {e}"))?
+        .dev();
+    let nested_device = fs::metadata(&nested)
+        .map_err(|e| format!("stat nested filesystem-grant mount: {e}"))?
+        .dev();
+    if root_device == nested_device {
+        return Err("recursive filesystem grant did not carry its nested mount".into());
+    }
+    let file_content = fs::read(JAIL_FIXTURE_GRANT_FILE)
+        .map_err(|e| format!("read regular-file filesystem grant: {e}"))?;
+    if file_content != b"td-jail-file-grant-v1\n" {
+        return Err("regular-file filesystem grant changed its payload".into());
+    }
+    match OpenOptions::new().write(true).open(JAIL_FIXTURE_GRANT_FILE) {
+        Err(error) if error.kind() == std::io::ErrorKind::ReadOnlyFilesystem => {}
+        Err(error) => {
+            return Err(format!(
+                "read-only regular-file grant refused a writer for {error}, not read-only-filesystem"
+            ));
+        }
+        Ok(file) => {
+            drop(file);
+            return Err("read-only regular-file grant accepted a writer".into());
+        }
+    }
+    for directory in [
+        JAIL_FIXTURE_PICTURES_TARGET,
+        JAIL_FIXTURE_GRANT_ROOT,
+        nested.as_str(),
+    ] {
+        let probe = format!("{directory}/.td-jail-ro-{probe_tag:016x}");
+        match OpenOptions::new().write(true).create_new(true).open(&probe) {
+            Err(error) if error.kind() == std::io::ErrorKind::ReadOnlyFilesystem => {}
+            Err(error) => {
+                return Err(format!(
+                    "read-only filesystem grant refused {probe} for {error}, not read-only-filesystem"
+                ));
+            }
+            Ok(file) => {
+                drop(file);
+                let _ = fs::remove_file(&probe);
+                return Err(format!(
+                    "read-only filesystem grant accepted a write at {probe}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn verify_jail_fixture() -> Result<(), ClientRunFailure> {
     verify_jail_status().map_err(|message| ClientRunFailure {
         message,
@@ -886,6 +971,10 @@ fn verify_jail_fixture() -> Result<(), ClientRunFailure> {
     verify_jail_loopback().map_err(|message| ClientRunFailure {
         message,
         exit_code: JAIL_FIXTURE_LOOPBACK_EXIT_CODE,
+    })?;
+    verify_jail_filesystems().map_err(|message| ClientRunFailure {
+        message,
+        exit_code: JAIL_FIXTURE_FILESYSTEM_EXIT_CODE,
     })?;
     Ok(())
 }
@@ -1105,6 +1194,7 @@ mod tests {
         assert_eq!(JAIL_FIXTURE_BOUNDARY_EXIT_CODE, 71);
         assert_eq!(JAIL_FIXTURE_MOUNTS_EXIT_CODE, 72);
         assert_eq!(JAIL_FIXTURE_LOOPBACK_EXIT_CODE, 73);
+        assert_eq!(JAIL_FIXTURE_FILESYSTEM_EXIT_CODE, 74);
     }
 
     fn test_connection(stream: UnixStream) -> Connection {

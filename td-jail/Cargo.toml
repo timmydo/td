@@ -11,6 +11,9 @@ license = "GPL-3.0-or-later"
 name = "td-jail"
 path = "src/main.rs"
 
+[features]
+target-recipe = []
+
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"

@@ -14,6 +14,10 @@ pub mod catalog;
 // `td_recipe::json::` paths are unchanged.
 pub use td_engine::json;
 pub mod ladder;
+#[cfg(test)]
+pub mod permissions {
+    pub use td_engine::permissions::*;
+}
 // The deployment contract, loaded ONCE for the whole lib. Two recipes name it —
 // the installer check and the system image — and a `#[path]` include in each
 // would load the same file twice, giving them distinct types for one contract.
