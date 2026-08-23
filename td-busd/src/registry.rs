@@ -462,6 +462,10 @@ struct Registered {
     /// name the raw-syscall module to do it.
     uid: u32,
     pid: i32,
+    /// The application this peer's lineage proved it belongs to, or `None` for
+    /// one that is not a confined application. Decided at accept and stored,
+    /// never recomputed — see `app_id` below.
+    app_id: Option<String>,
 }
 
 struct Directory {
@@ -532,6 +536,7 @@ impl Bus {
         outbox: &Arc<Outbox>,
         uid: u32,
         pid: i32,
+        app_id: Option<String>,
     ) -> Result<(), String> {
         let mut directory = self
             .directory
@@ -542,6 +547,7 @@ impl Bus {
             outbox: Arc::clone(outbox),
             uid,
             pid,
+            app_id,
         });
         Ok(())
     }
@@ -556,7 +562,7 @@ impl Bus {
         pid: i32,
     ) -> Result<String, String> {
         let unique = self.reserve()?;
-        self.publish(&unique, outbox, uid, pid)?;
+        self.publish(&unique, outbox, uid, pid, None)?;
         Ok(unique)
     }
 
@@ -594,6 +600,22 @@ impl Bus {
             .iter()
             .find(|peer| peer.unique == name)
             .map(|peer| (peer.uid, peer.pid))
+    }
+
+    /// The application id behind a name, for peers that have one.
+    ///
+    /// Resolved once at accept and stored, not recomputed per query. That is
+    /// deliberate rather than a cache: the lineage §D proves is the one that
+    /// existed when the connection was made, and re-walking it later would
+    /// answer about a process tree that has moved on — an application whose
+    /// intermediate ancestors have since exited would stop being itself.
+    pub fn app_id(&self, name: &str) -> Option<String> {
+        let directory = self.directory.lock().ok()?;
+        directory
+            .peers
+            .iter()
+            .find(|peer| peer.unique == name)
+            .and_then(|peer| peer.app_id.clone())
     }
 
     /// Every unique name currently on the bus, in the order they joined.

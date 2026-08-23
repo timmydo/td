@@ -2965,9 +2965,24 @@ then is there a stage-2 pid to name. So:
 2. **Stage 1 completes the registration** with `{stage-2 pid, start
    time}` under that token, on its own broker connection — the pid is
    what `Command::spawn` returned, already in the broker's namespace for
-   §A's reason. Only then does the broker accept connections for the
-   instance. (§A's parent-death pipe is not this channel: it runs stage 1
-   → stage 2, and the broker is on neither end.)
+   §A's reason. (§A's parent-death pipe is not this channel: it runs
+   stage 1 → stage 2, and the broker is on neither end.)
+3. **Only then does stage 1 release stage 2**, and this is a requirement
+   on the JAIL rather than a description of the broker. A draft of this
+   list said "only then does the broker accept connections for the
+   instance", which is not something the broker does or could do: it
+   accepts every connection and answers the identity question about it.
+   `Command::spawn` returns with stage 2 already runnable, so between
+   phase two and the release there is a window in which stage 2 — or the
+   application it execs — can connect. §E refuses a strict descendant of
+   a pending registrant, correctly, and §D fixes identity AT ACCEPT, so
+   that connection is denied for its whole life even though the
+   registration completes a millisecond later. §A already has the gate:
+   stage 2 blocks on the proof pipe, and the write that releases it must
+   come after `Complete` succeeds. On any failure stage 1 kills and
+   reaps stage 2 instead of releasing it — the same requirement as
+   "stage 1 refuses to proceed without the token", stated at the point
+   where it is actually enforceable.
 
 That token is also what makes §A.0's completeness invariant checkable:
 **stage 1 refuses to proceed without it**, so entering the jail without
@@ -3273,19 +3288,245 @@ reports every unique name on the bus to every caller, and
 `GetConnectionCredentials` reports any peer's uid and pid to any peer.
 The filtering this section specifies — answering only about names the
 caller may `see`, and reporting a name it may not as absent — is the
-policy, and it depends on the sandbox registration this section also
-specifies and which is not built. Naming this plainly rather than letting
-"the methods are implemented" stand for "the policy is implemented":
-today's broker is correct for a single-user session of mutually trusting
-peers, which is what td runs, and it is NOT yet the confinement boundary
-§D describes. The `td.AppId` extension to `GetConnectionCredentials` is
-absent for the same reason.
+policy. Naming this plainly rather than letting "the methods are
+implemented" stand for "the policy is implemented": today's broker is
+correct for a single-user session of mutually trusting peers, which is
+what td runs, and it is NOT yet the confinement boundary §D describes.
+
+What the filter DEPENDS on has now landed, which is the difference
+between this and the previous statement of the same gap. The registration
+protocol and the lineage walk are built, `GetConnectionCredentials`
+carries `td.AppId` for a connection whose lineage proved one, and nothing
+consults any of it to decide an answer yet. The identity is established
+and unused, deliberately: an identity that is wrong is worse than one
+that is missing, and landing the oracle before anything depends on it is
+what makes the first denial reviewable on its own.
 
 What IS the broker's word rather than the caller's, already: the uid and
 pid a credential lookup reports are `SO_PEERCRED` taken once at accept
 and held in the directory, so a peer cannot describe itself into a
-different answer. That is the half of the mechanism the policy will sit
-on when it lands.
+different answer. `td.AppId` joins them on the same terms — decided at
+accept from the kernel's pid, stored, and never recomputed, because a
+lineage is a statement about a process tree at an instant and re-walking
+it later would answer about a tree that has moved on.
+
+### What is landed of jail identity
+
+**Registration is `td.Jail1` at `/td/Jail1`.** §D specifies the two
+phases and their contents and does not name a wire interface, so this
+landing chose one: `Register(s instance, s app_id, as services) -> s
+token` and `Complete(s token, u pid)`, on td's own interface at td's own
+object rather than as additions to `org.freedesktop.DBus`. That
+interface belongs to the specification, and private methods hung off it
+would be indistinguishable from standard surface to anything that
+introspects the bus. The name carries a version from the start for the
+same reason `org.freedesktop.systemd1` does: this is a private protocol
+between two td programs, and one digit now is cheaper than a flag day
+later.
+
+The start time is NOT an argument to `Complete`. §D describes the record
+as `{stage-2 pid, start time}` and the broker reads the second field out
+of `/proc` for itself, because it is the field every later reuse check
+rests on and a registrant-supplied value would be the one part of the
+record the registrant chooses. A pid that is already gone completes
+nothing.
+
+**The pid is not taken on trust either, and a draft did take it.** Under
+that version any session peer could open a registration and complete it
+with any pid it could read; completing with pid 1 makes every later
+connection in the session walk into the attacker's instance and be handed
+its app id. Two checks close it, and both are things the broker sees for
+itself rather than assertions about the caller: the connection that
+completes must be the connection that opened, and the pid must be a CHILD
+of that connection's process.
+
+That is a requirement on td-jail rather than an observation about it,
+and it is recorded here as one: stage 1 must be the same PROCESS that
+performed phase one, and stage 2 must be its direct child, which is what
+`Command::spawn` produces. A launcher that registered on behalf of a
+sibling would be refused.
+
+The same process, and deliberately not the same CONNECTION. A draft
+claimed the connection, which is the stronger rule and would break the
+only launcher there is: §A step 0 closes every descriptor above stderr
+between the `unshare` and the spawn, so the connection stage 0
+registered on is gone before stage 1 has a pid to report. Stage 1
+reconnects. What holds across both phases is the pid, because
+`unshare(CLONE_NEWPID)` does not move the caller. This also rules out a
+tempting cleanup: dropping a pending registration when the connection
+that opened it closes would discard every legitimate registration at
+exactly the moment §A sweeps descriptors.
+
+None of this makes the app id authentic: the v1 exposure above stands,
+and a rogue can still call its own child `firefox`. It is the difference
+between mislabelling a process you already own and relabelling somebody
+else's.
+
+**The app id is graded as a td identity, not as a bus name.** A draft
+used the bus-name grammar, which is wrong in both directions: §B's
+identity section defines an application's identity as a short flat name
+— `firefox`, `darktable` — and a bus name requires an interior `.`, so
+every real td identity would have been refused while `:1.7`, a unique
+name the broker hands out and nobody may claim, would have been
+accepted. The broker now applies the same 1–32-byte language td-jail's
+`validate_application_name` applies. Predeclared service names are held
+to the WELL-KNOWN name grammar for the matching reason: a service is a
+name the instance intends to own, and a unique name is not ownable.
+
+**The token is 16 bytes of `/dev/urandom`, not a serial.** A draft
+reasoned that it need not resist guessing, because anything able to guess
+it could call `Register` itself. That covers creating a new instance and
+misses the move that matters: CONSUMING somebody else's in-flight
+registration. The real stage 1's `Complete` then fails — and by then
+stage 2 has been spawned, because its pid is what that call was going to
+carry — so a live jail exists with no registration on record, which is
+exactly the `Unconfined` answer §E exists to prevent. An unreadable
+`/dev/urandom` refuses the registration, because every fallback is a
+predictable token.
+
+`NO_REPLY_EXPECTED` withdraws the reply, not the work. Both registration
+methods are dispatched ABOVE the broker's no-reply guard: a `Complete`
+dropped for want of a reply would leave a running stage 2 with no record,
+which is the same `Unconfined` again. A draft had them below it, on the
+strength of a comment stating that no bus method changed state — true
+when it was written, false once these landed.
+
+Moving them there cost a guard that had been holding by accident. Only
+a METHOD_CALL may be dispatched as a method, and `wants_reply` is false
+for every other type, so nothing below the no-reply guard could ever
+run for a signal. Above it, a SIGNAL named `Register` at `/td/Jail1`
+registered an instance. Both arms now test the message type the way
+`Hello`'s caller always has.
+
+**The walk validates edges, and one of §D's two invariants does the
+work.** Both are implemented and both are red-checked separately —
+recorded start times must be unchanged on a second read, and a parent's
+must not exceed its child's — and the second is what catches the
+substitution the first can miss, exactly as this section predicted. The
+separately part was a review finding: one fixture killed both checks at
+once, so weakening the re-read alone passed the suite, and staging a hop
+that changes BETWEEN the two reads is what distinguishes them. A third check did not survive: a draft also
+required each hop's recorded ppid to equal the parent the walk moved to,
+which cannot fail, because the walk builds the chain by following that
+ppid. Removing a check that cannot fire is worth recording, because a
+reader counting defences would otherwise count three.
+
+`/proc/<pid>/stat` is parsed by splitting at the LAST `)`. The second
+field is `comm`, it may contain spaces and parentheses, and it is
+attacker-controlled through `prctl(PR_SET_NAME)` — so a process named
+`") 1 999999"` forges its own ppid against any parser that tokenizes the
+line. This is the sort of thing that is obvious once written down and
+absent from most implementations.
+
+**Two lifecycle rules §D does not state, both availability first and
+both with a security edge §D does not name.** An instance whose stage-2
+process is gone is REAPED rather than refused for ever: the accounting
+pass cannot distinguish "this instance ended" from "this instance's pid
+may have been reused underneath the walk I just did", so without reaping
+one ordinary application exit would make `Unconfined` unsayable for every
+later connection until the broker restarted. Reaping is safe on this
+section's own terms — stage 2 is PID 1 of the instance's pid namespace,
+so killing it kills the namespace, and a dead instance has no live
+descendants to misattribute.
+
+But a dropped record travels with the walk. A draft pruned the registry
+and then answered off the pruned copy, which quietly converted §E's own
+`Unknown` case into `Unconfined`: "a registered stage-2 pid is no longer
+where the registry says" is the observation §E denies on, because that
+pid may already have been taken by something in the chain about to be
+walked. A second draft refused every connection that observed any reap,
+which is sound and too broad — a rogue can schedule it, by registering
+its own child, completing, killing it, and letting the next connection
+trip over the stale record, and because identity is fixed at accept that
+connection is denied for its whole life.
+
+What makes an answer unsound is narrower and checkable: the dropped pid
+standing in THIS connection's lineage. That is the only way its reuse
+could have bent the chain, and it is checked against the walked chain
+rather than assumed. Peers elsewhere in the process tree are answered
+normally, and the record is gone either way, which is what keeps a jail
+that simply exited from denying the session for ever.
+
+An instance the broker could not READ is a third case and is treated as
+neither. `fs::read` fails for reasons that say nothing about the
+process — `EMFILE`, `ENOMEM`, a line that does not parse — and a draft
+read every failure as death: the connection that observed it was
+refused, which
+looks safe, but the record was dropped, and the NEXT connection from
+inside that live jail resolved `Unconfined`. Only `ENOENT` licenses
+dropping a record. Anything else refuses without reaping.
+
+And a registration that stands between its phases for longer than
+`PENDING_LIFETIME` is dropped, loudly. §E's rule is that a registration
+in flight makes `Unconfined` unsayable, and what §E does not say is that
+the party who could clean up a half-finished one is exactly the party
+that is no longer there — so a stage 0 that died between the phases
+would deny the session until the broker restarted.
+
+Which peers it denies is narrowed to the registrant's strict
+DESCENDANTS, and the narrowing matters in both directions. A first
+version refused `Unconfined` to every peer while any registration was
+open: safe, and wide enough that any uid-1000 process could deny the
+whole session by opening a registration it never finished. It can be
+narrowed exactly, because stage 2 is a CHILD of the registrant —
+`unshare(CLONE_NEWPID)` moves the caller's children into the new
+namespace rather than the caller — so every peer that could belong to a
+pending instance descends from the pid that opened it. The registrant
+itself is excluded, or the broker would deny the connection whose next
+message is `Complete`.
+
+The deadline is swept by `Register` and by `Complete` as well as by
+`resolve`. Without that a token older than the deadline completes
+whenever no `resolve` happened to sweep it first, which makes the
+deadline a property of traffic rather than of time.
+
+`Register` sweeps BOTH sides of the ceiling, pending and live. Otherwise
+it is a one-way ratchet: 64 abandoned registrations, or 64 instances
+whose jails exited without any connection ever arriving, refuse every
+later launch until some connection happens along. A first fix swept only
+the pending side and left the identical defect in the neighbouring
+collection.
+
+An expiry is fail-CLOSED only because of an invariant that lives in
+another component: `Complete` then finds no token, and §D requires stage
+1 to refuse to proceed without one. A stage 1 that ignored a failed
+`Complete` and launched anyway would produce an application the broker
+has no record of, which resolves `Unconfined` — full portal access for
+the process that is certainly confined. That is the single most
+important thing for the increment that wires td-jail to get right, and
+it is why the expiry logs rather than passing quietly.
+
+**The peer's own pid is not proved, and this is the gap that has to close
+before the filter.** The walk validates every ancestor edge and says
+nothing about its own starting point, which arrives from `SO_PEERCRED`.
+The kernel samples that at `connect(2)` and holds a `struct pid`
+reference — which keeps the struct alive without reserving the number,
+so `free_pid` returns the number to the allocator when the connecting
+process is reaped and `pid_vnr` still reports it. A peer that connects,
+passes its socket to a sibling and exits can therefore have its pid
+recycled before the broker reads it, with the delay under the peer's
+control through the listen backlog. The walk then describes whichever
+process now holds that number, and the dangerous direction is a confined
+peer resolving `Unconfined`.
+
+Nothing inside the walk can close it: the first read is already too
+late. `SO_PEERPIDFD` closes it, for the reason this section already
+gives for pidfds — they name a process rather than a number and cannot
+be recycled by definition. It is a second value-pinned `getsockopt`
+option on surface #10, so it is an `UNSAFE.md` amendment rather than
+something the landing that found it could take, and it is a precondition
+of the per-caller filter in the same way the filter is a precondition of
+anything in a jail opening the bus.
+
+**Nothing registers yet.** td-jail does not perform this protocol until
+the next increment, so every connection on the image today resolves
+`Unconfined` and no `td.AppId` is reported. The registration methods are
+live surface a uid-1000 process can call, which is what §D says the v1
+exposure is: registration is authenticated by uid, every session peer is
+uid 1000, and the app id is a string the registrant supplies. The walk is
+sound about WHICH instance a connection belongs to and says nothing about
+whether that instance is what it calls itself. Per-app uids are the fix
+and this is the third argument for scheduling them.
 
 **Routing is DIRECTED only.** A message naming a `DESTINATION` that is a
 unique name on this bus is delivered to it; one naming a name nobody owns

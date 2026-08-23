@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::auth::{Guid, Handshake, PeerIdentity, GUID_LEN};
+use crate::lineage::{Identity, Instances, RealProcfs};
 use crate::message;
 use crate::registry::{Bus, Outbox, Overflow, Rejected};
 use crate::sys::{self, PeerCredential};
@@ -31,6 +32,24 @@ use crate::wire::{WireError, Writer};
 pub const BUS_NAME: &str = "org.freedesktop.DBus";
 pub const BUS_PATH: &str = "/org/freedesktop/DBus";
 pub const PEER_INTERFACE: &str = "org.freedesktop.DBus.Peer";
+/// td's own interface and object, for the jail registration §D specifies.
+///
+/// Versioned in the name from the start, the way `org.freedesktop.systemd1`
+/// is: this is a private protocol between two td programs, and the cost of
+/// being able to run an old registrant against a new broker later is one digit
+/// now. It is deliberately NOT hung off `org.freedesktop.DBus` — that
+/// interface belongs to the specification, and adding private methods to it
+/// would make td's extension indistinguishable from standard surface to
+/// anything that introspects the bus.
+pub const JAIL_INTERFACE: &str = "td.Jail1";
+pub const JAIL_PATH: &str = "/td/Jail1";
+/// The most bytes an instance name may carry.
+///
+/// It is a registry key and it reaches diagnostics, so it is bounded and
+/// spelled from a closed character set rather than trusted: `open` stores it,
+/// `resolve` reports it, and an unbounded string from a peer would be a way to
+/// put arbitrary bytes into the broker's own log lines.
+pub const MAX_INSTANCE_NAME: usize = 64;
 
 /// The largest frame `message::frame_len` can return, and so the most this
 /// will ever hold for one message.
@@ -357,6 +376,17 @@ pub struct Connection<'a> {
     quota: &'a Quota,
     /// The directory this connection is routed through.
     bus: &'a Bus,
+    /// Every jail instance the broker knows, for the registration methods and
+    /// for the identity below.
+    instances: &'a Instances,
+    /// Which jailed instance this peer belongs to, decided ONCE at accept.
+    ///
+    /// §D says "at accept", and the timing is the point rather than an
+    /// optimisation: a lineage is a statement about a process tree at an
+    /// instant, and the instant that matters is the one the kernel attached
+    /// this socket to a pid. Resolving later would let an application change
+    /// what it is by outliving its own ancestors.
+    identity: Identity,
     /// Where this connection's outgoing frames go. Written by a thread of its
     /// own, so a peer that will not read cannot stall whoever sent to it.
     outbox: Arc<Outbox>,
@@ -425,9 +455,16 @@ impl<'a> Connection<'a> {
         guid: Guid<'a>,
         quota: &'a Quota,
         bus: &'a Bus,
+        instances: &'a Instances,
     ) -> io::Result<Self> {
         let credential = sys::peer_credential(&stream)?;
         let guid_text = guid.as_str();
+        // Before the handshake, because this is the kernel's account of the
+        // peer and the handshake is the peer's account of itself. An `Unknown`
+        // here is not yet a refusal — nothing consults this until the policy
+        // filter lands — but it is recorded now so the answer is the one taken
+        // at accept rather than one taken whenever it was first needed.
+        let identity = instances.resolve(&RealProcfs, credential.pid);
         // The writer's half of the socket. Cloned here rather than later
         // because a connection without an outbox has no way to be answered,
         // and the failure to make one belongs at accept where it can be seen.
@@ -439,6 +476,8 @@ impl<'a> Connection<'a> {
             credential,
             quota,
             bus,
+            instances,
+            identity,
             outbox,
             unique: None,
             next_serial: 1,
@@ -763,10 +802,11 @@ impl<'a> Connection<'a> {
     /// `Hello`: the connection earns its unique name and is told what it is.
     ///
     /// `wants_reply` is honoured here as everywhere else. A `Hello` carrying
-    /// `NO_REPLY_EXPECTED` is a strange thing for a client to send, but it is
-    /// the one bus method that changes state, so it still earns the name and
-    /// simply is not answered — a draft answered it regardless, which made
-    /// this the single method that ignored the flag.
+    /// `NO_REPLY_EXPECTED` is a strange thing for a client to send, but it
+    /// changes state, so it still earns the name and simply is not answered —
+    /// a draft answered it regardless, which made this the single method that
+    /// ignored the flag. The `td.Jail1` pair follows the same rule from the
+    /// other side of `bus_method`'s guard.
     fn say_hello(
         &mut self,
         message: &message::Message<'_>,
@@ -802,7 +842,13 @@ impl<'a> Connection<'a> {
         // Routable only now: the reply is already ahead of anything another
         // peer can aim at this name.
         self.bus
-            .publish(&unique, &self.outbox, self.credential.uid, self.credential.pid)
+            .publish(
+                &unique,
+                &self.outbox,
+                self.credential.uid,
+                self.credential.pid,
+                self.identity.app_id().map(str::to_string),
+            )
             .map_err(|why| Ended::Failed(format!("cannot name a peer: {why}")))
     }
 
@@ -836,8 +882,39 @@ impl<'a> Connection<'a> {
         // call to `/org/example/Thing` addressed to the bus name would be
         // answered by the broker as though it were that object.
         let here = on_the_bus_object(message);
-        // A peer that is not waiting gets no answer, but the work above still
-        // has to happen for the ones that change state. None of these do.
+        // td's own interface, at td's own object. It is NOT on
+        // `org.freedesktop.DBus`: that interface is the specification's, and a
+        // broker that hangs private methods off it is inventing standard
+        // surface. A separate object keeps the rule that §D's "the broker's
+        // own methods are at the broker's own object" states — each interface
+        // answers where it lives, and nothing else.
+        //
+        // These two sit ABOVE the no-reply guard, which a draft did not do.
+        // `NO_REPLY_EXPECTED` means "do not send me the reply", not "do not do
+        // the work", and together with `Hello` these are the only bus methods
+        // that change anything. A `Complete` dropped for want of a reply would
+        // leave a jailed application with no registration on record, which
+        // resolves `Unconfined` — the one answer §E exists to prevent.
+        //
+        // Which makes the TYPE guard explicit rather than incidental. The
+        // no-reply guard was doing that job by accident: `wants_reply` is
+        // false for every message type that is not a method call, so nothing
+        // below it could ever run for a signal. Moving these two above it took
+        // them out from behind that, and a review found a SIGNAL named
+        // `Register` at this path registering an instance. `say_hello`'s
+        // caller has always tested the kind explicitly; these two now do too.
+        let is_call = message.kind == message::MessageType::MethodCall;
+        match member {
+            "Register" if is_call && on_the_jail_object(message) && on(JAIL_INTERFACE) => {
+                return self.jail_register(message, wants_reply);
+            }
+            "Complete" if is_call && on_the_jail_object(message) && on(JAIL_INTERFACE) => {
+                return self.jail_complete(message, wants_reply);
+            }
+            _ => {}
+        }
+        // Everything below is a question rather than a change, so a peer that
+        // is not waiting for an answer simply gets none.
         if !wants_reply {
             return Ok(());
         }
@@ -960,6 +1037,7 @@ impl<'a> Connection<'a> {
                 match self.credentials_for(&asked) {
                     Some((uid, pid)) => {
                         let pid = usable_pid(pid);
+                        let app_id = self.bus.app_id(&asked);
                         self.answer(message, "a{sv}", move |writer| {
                             writer.array("{sv}", |array| {
                                 array.dict_entry(|entry| {
@@ -978,6 +1056,20 @@ impl<'a> Connection<'a> {
                                         })
                                     })?;
                                 }
+                                // §D's td-owned extension, present only for a
+                                // peer whose lineage PROVED an instance. An
+                                // `Unconfined` or `Unknown` peer has no entry
+                                // rather than an empty one: this key means
+                                // "the broker established that this
+                                // connection is this application", and a
+                                // sentinel would invite a reader to treat a
+                                // failure to establish that as an answer.
+                                if let Some(app_id) = app_id {
+                                    array.dict_entry(|entry| {
+                                        entry.string("td.AppId")?;
+                                        entry.variant("s", |value| value.string(&app_id))
+                                    })?;
+                                }
                                 Ok(())
                             })
                         })
@@ -988,9 +1080,86 @@ impl<'a> Connection<'a> {
             _ => self.refuse(
                 message,
                 "org.freedesktop.DBus.Error.UnknownMethod",
-                "td-busd serves Hello, the name and credential lookups and \
-                 directed routing; the rest of org.freedesktop.DBus lands with \
-                 match rules",
+                "td-busd serves Hello, the name and credential lookups, \
+                 directed routing and td.Jail1 registration; the rest of \
+                 org.freedesktop.DBus lands with match rules",
+            ),
+        }
+    }
+
+    /// Phase one: `Register(s instance, s app_id, as services) -> s token`.
+    ///
+    /// Called by stage 0 before it unshares anything, because the pid the
+    /// record needs does not exist yet. §D is explicit that this is
+    /// authenticated by uid and that in v1 every session peer is uid 1000 — so
+    /// the app id is a string the registrant supplies, the walk is sound about
+    /// WHICH instance a connection belongs to and says nothing about whether
+    /// that instance is what it calls itself, and per-app uids are the fix.
+    /// That is recorded in §D rather than papered over here.
+    fn jail_register(
+        &mut self,
+        message: &message::Message<'_>,
+        wants_reply: bool,
+    ) -> Result<(), Ended> {
+        let Some((instance, app_id, services)) =
+            self.registration_arguments(message, wants_reply)?
+        else {
+            return Ok(());
+        };
+        match self.instances.open(
+            &RealProcfs,
+            &instance,
+            &app_id,
+            services,
+            self.credential.uid,
+            self.credential.pid,
+        ) {
+            Ok(token) if wants_reply => {
+                self.answer(message, "s", move |writer| writer.string(&token))
+            }
+            // A registrant that asked for no reply has still registered; it
+            // simply cannot use what it did not wait for.
+            Ok(_) => Ok(()),
+            Err(why) => self.refuse_if_wanted(
+                message,
+                "td.Jail1.Error.Refused",
+                &why,
+                wants_reply,
+            ),
+        }
+    }
+
+    /// Phase two: `Complete(s token, u pid) -> ()`.
+    ///
+    /// The start time is not an argument. It is the field every later reuse
+    /// check rests on, so the broker reads it out of `/proc` for itself rather
+    /// than accepting the one number of the record that the registrant would
+    /// otherwise choose.
+    fn jail_complete(
+        &mut self,
+        message: &message::Message<'_>,
+        wants_reply: bool,
+    ) -> Result<(), Ended> {
+        let Some((token, pid)) = self.completion_arguments(message, wants_reply)? else {
+            return Ok(());
+        };
+        // The completing connection's own pid is an argument the registry
+        // needs and the caller cannot supply: it is what makes "a registrant
+        // may bind its own child and nothing else" checkable.
+        match self.instances.complete(
+            &RealProcfs,
+            &token,
+            pid,
+            self.credential.uid,
+            self.credential.pid,
+        ) {
+            Ok(()) if wants_reply => self.answer(message, "", |_| Ok(())),
+            Ok(()) => Ok(()),
+            Err(why) => self.refuse_if_wanted(
+                message,
+                "td.Jail1.Error.Refused",
+                &why,
+                wants_reply,
             ),
         }
     }
@@ -1070,6 +1239,38 @@ impl<'a> Connection<'a> {
         Ok(false)
     }
 
+    /// `takes`, for a method that runs whether or not its caller is waiting.
+    ///
+    /// The check is the same; only the complaint is conditional. A caller that
+    /// set `NO_REPLY_EXPECTED` gets no `InvalidArgs` — sending one would be the
+    /// unsolicited reply the flag forbids — but its message is still graded,
+    /// because the answer decides whether the state change below happens.
+    fn takes_if_wanted(
+        &mut self,
+        message: &message::Message<'_>,
+        signature: &str,
+        wants_reply: bool,
+    ) -> Result<bool, Ended> {
+        if !wants_reply {
+            return Ok(message.fields.signature.unwrap_or("") == signature);
+        }
+        self.takes(message, signature)
+    }
+
+    /// `refuse`, suppressed for a caller that said it does not want a reply.
+    fn refuse_if_wanted(
+        &mut self,
+        message: &message::Message<'_>,
+        name: &str,
+        text: &str,
+        wants_reply: bool,
+    ) -> Result<(), Ended> {
+        if !wants_reply {
+            return Ok(());
+        }
+        self.refuse(message, name, text)
+    }
+
     /// The one bus name a name lookup was called with, or an `InvalidArgs`
     /// reply for the caller.
     ///
@@ -1102,6 +1303,122 @@ impl<'a> Connection<'a> {
                 Ok(None)
             }
         }
+    }
+
+    /// `Register`'s three arguments, validated, or a refusal already sent.
+    ///
+    /// Every one of them is checked here rather than in the registry, for the
+    /// reason every other wire argument in this file is: the registry's job is
+    /// to say what may be registered, and the wire's job is to make sure what
+    /// reached it is the shape it claims. A registry that also had to defend
+    /// against malformed strings would be two graders for one rule.
+    fn registration_arguments(
+        &mut self,
+        message: &message::Message<'_>,
+        wants_reply: bool,
+    ) -> Result<Option<(String, String, Vec<String>)>, Ended> {
+        if !self.takes_if_wanted(message, "ssas", wants_reply)? {
+            return Ok(None);
+        }
+        let args = message.args();
+        let instance = args.first().and_then(crate::wire::Value::as_str);
+        let app_id = args.get(1).and_then(crate::wire::Value::as_str);
+        let names = args.get(2).and_then(|value| value.as_seq());
+        let (Some(instance), Some(app_id), Some(names)) = (instance, app_id, names) else {
+            self.refuse_if_wanted(
+                message,
+                "org.freedesktop.DBus.Error.InvalidArgs",
+                "Register takes an instance name, an application id and a list \
+                 of service names",
+                wants_reply,
+            )?;
+            return Ok(None);
+        };
+        if !valid_instance_name(instance) {
+            self.refuse_if_wanted(
+                message,
+                "org.freedesktop.DBus.Error.InvalidArgs",
+                "that is not an instance name",
+                wants_reply,
+            )?;
+            return Ok(None);
+        }
+        if !valid_application_id(app_id) {
+            self.refuse_if_wanted(
+                message,
+                "org.freedesktop.DBus.Error.InvalidArgs",
+                "that is not an application id",
+                wants_reply,
+            )?;
+            return Ok(None);
+        }
+        let Ok(values) = names.values(crate::lineage::MAX_SERVICES) else {
+            self.refuse_if_wanted(
+                message,
+                "org.freedesktop.DBus.Error.InvalidArgs",
+                "that service list cannot be read",
+                wants_reply,
+            )?;
+            return Ok(None);
+        };
+        let mut services = Vec::with_capacity(values.len());
+        for value in &values {
+            match value.as_str() {
+                // A WELL-KNOWN name. A predeclared service is a name the
+                // instance intends to own, and a unique name — `:1.7` — is
+                // the broker's to hand out and nobody's to claim, so
+                // `valid_bus_name` was the wrong grader here too.
+                Some(name) if crate::name::valid_well_known_name(name) => {
+                    services.push(name.to_string());
+                }
+                _ => {
+                    self.refuse_if_wanted(
+                        message,
+                        "org.freedesktop.DBus.Error.InvalidArgs",
+                        "a predeclared service must be a bus name",
+                        wants_reply,
+                    )?;
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some((instance.to_string(), app_id.to_string(), services)))
+    }
+
+    /// `Complete`'s two arguments, validated, or a refusal already sent.
+    fn completion_arguments(
+        &mut self,
+        message: &message::Message<'_>,
+        wants_reply: bool,
+    ) -> Result<Option<(String, i32)>, Ended> {
+        if !self.takes_if_wanted(message, "su", wants_reply)? {
+            return Ok(None);
+        }
+        let args = message.args();
+        let token = args.first().and_then(crate::wire::Value::as_str);
+        let pid = args.get(1).and_then(crate::wire::Value::as_u32);
+        let (Some(token), Some(pid)) = (token, pid) else {
+            self.refuse_if_wanted(
+                message,
+                "org.freedesktop.DBus.Error.InvalidArgs",
+                "Complete takes a token and a pid",
+                wants_reply,
+            )?;
+            return Ok(None);
+        };
+        // `u` on the wire and `i32` in `/proc`: a pid that does not survive the
+        // conversion is not a pid this kernel ever issued, and refusing it here
+        // keeps the registry from having to have an opinion about it.
+        let Ok(pid) = i32::try_from(pid) else {
+            self.refuse_if_wanted(
+                message,
+                "org.freedesktop.DBus.Error.InvalidArgs",
+                "that is not a pid",
+                wants_reply,
+            )?;
+            return Ok(None);
+        };
+        Ok(Some((token.to_string(), pid)))
     }
 
     /// A method return to whoever sent `message`, with a body this bus writes.
@@ -1398,6 +1715,55 @@ fn on_the_bus_object(message: &message::Message<'_>) -> bool {
     message.fields.path == Some(BUS_PATH)
 }
 
+fn on_the_jail_object(message: &message::Message<'_>) -> bool {
+    message.fields.path == Some(JAIL_PATH)
+}
+
+/// The most bytes in a td application identity.
+const MAX_APPLICATION_ID: usize = 32;
+
+/// An application identity, in the language §D's identity section defines.
+///
+/// NOT a bus name, which a draft used and a review caught. A td application's
+/// identity is a short flat name — `firefox`, `darktable` — and reverse DNS is
+/// an alias for wires td does not own, not the identity. `valid_bus_name` is
+/// wrong in both directions here: it refuses every real td identity, because
+/// a bus name needs a `.` and these do not have one, and it accepts `:1.7`,
+/// which is a unique connection name the broker hands out. td-jail carries
+/// this same grammar in `validate_application_name`; the crates are separate
+/// dependency-free locks, so this is a second copy of one normative rule
+/// rather than a second rule.
+fn valid_application_id(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_APPLICATION_ID
+        && !name.starts_with('-')
+        && name != "."
+        && !name.contains("..")
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+}
+
+/// An instance name: non-empty, bounded, and drawn from a closed set.
+///
+/// Not a bus name, because it is not one — it names a launch rather than
+/// something ownable, and borrowing that grammar would imply it could be
+/// owned. It is the application-id language with a longer ceiling and no
+/// leading-dash rule, for the ordinary reason: this string is compared,
+/// logged and reported, and a name that can look like a path invites
+/// somebody later to treat it as one. `/` is excluded by the character set;
+/// `..` anywhere and a bare `.` are excluded by name, which is broader than
+/// "a `.` run and nothing else" and deliberately so — `a..b` is refused.
+fn valid_instance_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_INSTANCE_NAME
+        && name != "."
+        && !name.contains("..")
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+}
+
 /// A pid this broker is willing to report, or `None` for one it cannot.
 ///
 /// `SO_PEERCRED` answers 0 for a peer whose pid does not exist in the reader's
@@ -1673,7 +2039,9 @@ fn loopback_at(path: &Path, uid: u32) -> Result<String, String> {
                     // an ordinary blocking one.
                     Ok((stream, _)) => {
                         let bus = Bus::new();
-                        let accepted = Connection::accept(stream, guid, &quota, &bus);
+                        let instances = Instances::new();
+                        let accepted =
+                            Connection::accept(stream, guid, &quota, &bus, &instances);
                         if let Ok(mut connection) = accepted {
                             let _ = connection.serve();
                         }
@@ -1703,6 +2071,7 @@ fn loopback_at(path: &Path, uid: u32) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lineage::Procfs;
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
     use std::sync::mpsc;
@@ -1749,6 +2118,90 @@ mod tests {
         }
     }
 
+    /// A `td.Jail1` call, at td's own object.
+    fn jail_call<F>(member: &str, serial: u32, signature: &str, fill: F) -> Vec<u8>
+    where
+        F: FnOnce(&mut Writer) -> Result<(), WireError>,
+    {
+        message::Builder::method_call(
+            crate::wire::Endian::Little,
+            JAIL_PATH,
+            Some(JAIL_INTERFACE),
+            member,
+        )
+        .destination(BUS_NAME)
+        .serial(serial)
+        .body(signature, fill)
+        .expect("encode a jail call")
+        .encode()
+        .expect("encode a jail call")
+    }
+
+    fn register_call(instance: &str, app_id: &str, serial: u32) -> Vec<u8> {
+        let instance = instance.to_string();
+        let app_id = app_id.to_string();
+        jail_call("Register", serial, "ssas", move |writer| {
+            writer.string(&instance)?;
+            writer.string(&app_id)?;
+            writer.array("s", |_| Ok(()))
+        })
+    }
+
+    /// The reply's error name, or `None` for a method return.
+    fn error_of(frame: &[u8]) -> Option<String> {
+        let (reply, _) = message::decode(frame, 0).expect("decode a reply");
+        reply.fields.error_name.map(str::to_string)
+    }
+
+    /// A served connection whose PEER is already a registered instance.
+    ///
+    /// The client end of a socketpair made in this process has this process's
+    /// own pid, so registering that pid as an instance's stage-2 pid is what
+    /// makes the accepted connection resolve `Jailed` — the same thing a real
+    /// jailed application achieves by descending from its stage 2. Registering
+    /// through the library rather than over the wire is deliberate: the
+    /// identity is taken AT ACCEPT, so a registration that arrived on this
+    /// same connection would be too late to describe it.
+    ///
+    /// The registrant is this process's PARENT rather than this process,
+    /// because that is the shape the registry insists on: a registrant may
+    /// bind its own child and nothing else. The test harness stands in for
+    /// stage 1 and this process stands in for the stage 2 it spawned.
+    fn serving_as(app_id: &str) -> (UnixStream, mpsc::Receiver<Outcome>) {
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+            .expect("client read timeout");
+        let app_id = app_id.to_string();
+        let (tell, hear) = mpsc::channel();
+        thread::spawn(move || {
+            let guid = Guid::new(GUID).expect("guid");
+            let quota = Quota::new();
+            let bus = Bus::new();
+            let instances = Instances::new();
+            let pid = i32::try_from(std::process::id()).expect("a pid fits");
+            let crate::lineage::Reading::Of(mine) = RealProcfs.stat(pid) else {
+                panic!("this process has a /proc entry");
+            };
+            let parent = mine.ppid;
+            let token = instances
+                .open(&RealProcfs, "fixture", &app_id, Vec::new(), this_uid(), parent)
+                .expect("phase one");
+            instances
+                .complete(&RealProcfs, &token, pid, this_uid(), parent)
+                .expect("phase two");
+            let mut connection =
+                Connection::accept(server, guid, &quota, &bus, &instances).expect("accept");
+            let ended = connection.serve();
+            let _ = tell.send(Outcome {
+                ended,
+                credential: connection.credential(),
+                uid: connection.authenticated_uid(),
+            });
+        });
+        (client, hear)
+    }
+
     /// A served connection, and the client end of it.
     ///
     /// The client carries a read timeout for the reason `ended` above carries
@@ -1764,7 +2217,9 @@ mod tests {
             let guid = Guid::new(GUID).expect("guid");
             let quota = Quota::new();
             let bus = Bus::new();
-            let mut connection = Connection::accept(server, guid, &quota, &bus).expect("accept");
+            let instances = Instances::new();
+            let mut connection =
+                Connection::accept(server, guid, &quota, &bus, &instances).expect("accept");
             let ended = connection.serve();
             let _ = tell.send(Outcome {
                 ended,
@@ -1799,13 +2254,17 @@ mod tests {
         thread::spawn(move || {
             let quota = Quota::new();
             let bus = serving;
+            let instances = Instances::new();
             thread::scope(|scope| {
                 for server in servers {
                     let quota = &quota;
                     let bus = &*bus;
+                    let instances = &instances;
                     let spawned = thread::Builder::new().spawn_scoped(scope, move || {
                         let guid = Guid::new(GUID).expect("guid");
-                        if let Ok(mut connection) = Connection::accept(server, guid, quota, bus) {
+                        if let Ok(mut connection) =
+                            Connection::accept(server, guid, quota, bus, instances)
+                        {
                             let _ = connection.serve();
                         }
                     });
@@ -2054,6 +2513,553 @@ mod tests {
         );
         assert_eq!(reply.fields.reply_serial, Some(5));
         assert_eq!(reply.fields.sender, Some(BUS_NAME));
+    }
+
+    /// Registration is two calls, and the second is what makes the instance
+    /// resolvable. §D splits it because the pid the record needs does not
+    /// exist when the instance does.
+    #[test]
+    fn registration_takes_two_calls_over_the_bus() {
+        let (mut client, _hear) = serving();
+        let mut opening =
+            format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+        opening.extend_from_slice(&bus_call("Hello", 1));
+        opening.extend_from_slice(&register_call("fixture", "fixture", 2));
+        client.write_all(&opening).expect("write");
+
+        let mut peer = Peer {
+            stream: client,
+            held: Vec::new(),
+            lines: 1,
+        };
+        let _hello = peer.frame();
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode Register's reply");
+        assert_eq!(
+            reply.kind,
+            message::MessageType::MethodReturn,
+            "Register was refused: {:?}",
+            reply.fields.error_name
+        );
+        let token = reply
+            .args()
+            .first()
+            .and_then(crate::wire::Value::as_str)
+            .expect("Register answers with a token")
+            .to_string();
+
+        // Phase two, with this process's own pid — and it is REFUSED, which
+        // is the rule rather than a limitation of the harness. A registrant
+        // may bind its own CHILD, and this connection's process is not its own
+        // child. A test living in one process cannot stage a real stage 2
+        // without spawning a binary it would then have to declare as an input,
+        // so the successful path is pinned in `lineage`'s tests where `/proc`
+        // is injected. What the wire has to show is that both calls travel,
+        // that phase one's token comes back, and that the registry's refusal
+        // reaches the caller as an error rather than being swallowed.
+        let pid = std::process::id();
+        let token_again = token.clone();
+        peer.send(&jail_call("Complete", 3, "su", move |writer| {
+            writer.string(&token_again)?;
+            writer.uint32(pid);
+            Ok(())
+        }));
+        let frame = peer.frame();
+        assert_eq!(
+            error_of(&frame).as_deref(),
+            Some("td.Jail1.Error.Refused"),
+            "a pid the registrant did not spawn was bound to its instance"
+        );
+
+        // And the token survives that refusal. A registration burned by a
+        // failed attempt would be a way for one bad argument — or one hostile
+        // guess — to kill a launch that is still in progress.
+        peer.send(&jail_call("Complete", 4, "su", move |writer| {
+            writer.string(&token)?;
+            writer.uint32(1);
+            Ok(())
+        }));
+        let frame = peer.frame();
+        assert_eq!(
+            error_of(&frame).as_deref(),
+            Some("td.Jail1.Error.Refused"),
+            "the second attempt failed for the wrong reason"
+        );
+    }
+
+    /// A SIGNAL named `Register` is not a call to `Register`.
+    ///
+    /// The specification reserves method dispatch for `METHOD_CALL`, and until
+    /// these two arms moved above the no-reply guard that was enforced by
+    /// accident: `wants_reply` is false for every other type, so nothing below
+    /// the guard could run for a signal. A review found the gap by sending
+    /// one, and it registered.
+    #[test]
+    fn a_signal_named_register_does_not_register() {
+        let (mut client, _hear) = serving();
+        let shout = message::Builder::signal(
+            crate::wire::Endian::Little,
+            JAIL_PATH,
+            JAIL_INTERFACE,
+            "Register",
+        )
+        .destination(BUS_NAME)
+        .serial(2)
+        .body("ssas", |writer| {
+            writer.string("shouted")?;
+            writer.string("fixture")?;
+            writer.array("s", |_| Ok(()))
+        })
+        .expect("encode")
+        .encode()
+        .expect("encode");
+
+        let mut opening =
+            format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+        opening.extend_from_slice(&bus_call("Hello", 1));
+        opening.extend_from_slice(&shout);
+        client.write_all(&opening).expect("write");
+
+        let mut peer = Peer {
+            stream: client,
+            held: Vec::new(),
+            lines: 1,
+        };
+        let _hello = peer.frame();
+
+        // If the signal had registered, this would be refused as a duplicate.
+        peer.send(&register_call("shouted", "fixture", 3));
+        assert_eq!(
+            error_of(&peer.frame()),
+            None,
+            "a signal registered the instance"
+        );
+    }
+
+    /// `NO_REPLY_EXPECTED` withdraws the REPLY, not the work.
+    ///
+    /// A draft returned from `bus_method`'s no-reply guard before reaching the
+    /// two `td.Jail1` arms, on the strength of a comment saying no bus method
+    /// changed state — true when it was written and false once these landed.
+    /// A `Complete` dropped that way is the dangerous one: stage 2 is already
+    /// running, and an application with no registration on record resolves
+    /// `Unconfined`.
+    #[test]
+    fn a_registration_that_wants_no_reply_still_registers() {
+        let (mut client, _hear) = serving();
+        let quiet = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            JAIL_PATH,
+            Some(JAIL_INTERFACE),
+            "Register",
+        )
+        .destination(BUS_NAME)
+        .flags(message::FLAG_NO_REPLY_EXPECTED)
+        .serial(2)
+        .body("ssas", |writer| {
+            writer.string("quiet")?;
+            writer.string("fixture")?;
+            writer.array("s", |_| Ok(()))
+        })
+        .expect("encode")
+        .encode()
+        .expect("encode");
+
+        let mut opening =
+            format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+        opening.extend_from_slice(&bus_call("Hello", 1));
+        opening.extend_from_slice(&quiet);
+        client.write_all(&opening).expect("write");
+
+        let mut peer = Peer {
+            stream: client,
+            held: Vec::new(),
+            lines: 1,
+        };
+        let _hello = peer.frame();
+
+        // Nothing comes back for the quiet call, so the only way to see it is
+        // its effect: the instance name is taken, and a second registration
+        // under the same name is refused.
+        peer.send(&register_call("quiet", "fixture", 3));
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(
+            reply.fields.reply_serial,
+            Some(3),
+            "the quiet Register was answered after all"
+        );
+        assert_eq!(
+            error_of(&frame).as_deref(),
+            Some("td.Jail1.Error.Refused"),
+            "the quiet Register did not register"
+        );
+
+        // And the same for `Complete`, which is the one that matters: a
+        // dropped completion leaves a running stage 2 with no record. Sent
+        // quietly with a token that was never issued, the refusal it would
+        // have produced is suppressed and the connection carries on — so what
+        // this leg shows is that the message was consumed rather than
+        // disconnecting the peer, and the arm above it that the registry
+        // reached at all.
+        let quiet_complete = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            JAIL_PATH,
+            Some(JAIL_INTERFACE),
+            "Complete",
+        )
+        .destination(BUS_NAME)
+        .flags(message::FLAG_NO_REPLY_EXPECTED)
+        .serial(4)
+        .body("su", |writer| {
+            writer.string("not-a-token")?;
+            writer.uint32(1);
+            Ok(())
+        })
+        .expect("encode")
+        .encode()
+        .expect("encode");
+        peer.send(&quiet_complete);
+        peer.send(&bus_call("GetId", 5));
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(
+            reply.fields.reply_serial,
+            Some(5),
+            "the quiet Complete was answered"
+        );
+    }
+
+    /// A helper that exists to be somebody's child.
+    ///
+    /// It blocks until its stdin closes, so the test that spawned it decides
+    /// when it ends, and it does nothing at all unless that test spawned it.
+    #[test]
+    fn a_child_that_waits_for_its_parent() {
+        if std::env::var_os("TD_BUSD_TEST_CHILD").is_none() {
+            return;
+        }
+        let mut ignored = Vec::new();
+        let _ = std::io::stdin().read_to_end(&mut ignored);
+    }
+
+    /// Phase two, completed for real, over the wire.
+    ///
+    /// The registry's rule is that a registrant may bind its own CHILD, so a
+    /// test in one process needs an actual child to reach the successful path
+    /// at all. A draft asserted only the refusal and claimed a real child
+    /// would mean declaring a binary as a build input; a review pointed out
+    /// that `current_exe()` is this test binary, already a build output, and
+    /// that td-jail's own suite re-enters it exactly this way. Without this,
+    /// a broker that refused every completion would pass the wire suite.
+    #[test]
+    fn a_registration_completes_over_the_bus_for_a_real_child() {
+        let Ok(executable) = std::env::current_exe() else {
+            return;
+        };
+        let child = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "transport::tests::a_child_that_waits_for_its_parent",
+                "--nocapture",
+            ])
+            .env("TD_BUSD_TEST_CHILD", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else {
+            return;
+        };
+        let held = child.stdin.take();
+
+        let (mut client, _hear) = serving();
+        let mut opening =
+            format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+        opening.extend_from_slice(&bus_call("Hello", 1));
+        opening.extend_from_slice(&register_call("real", "fixture", 2));
+        client.write_all(&opening).expect("write");
+        let mut peer = Peer {
+            stream: client,
+            held: Vec::new(),
+            lines: 1,
+        };
+        let _hello = peer.frame();
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode Register's reply");
+        let token = reply
+            .args()
+            .first()
+            .and_then(crate::wire::Value::as_str)
+            .map(str::to_string);
+
+        let outcome = token.map(|token| {
+            let pid = child.id();
+            peer.send(&jail_call("Complete", 3, "su", move |writer| {
+                writer.string(&token)?;
+                writer.uint32(pid);
+                Ok(())
+            }));
+            error_of(&peer.frame())
+        });
+
+        // Release the child before asserting, so a failure does not leave it
+        // running.
+        drop(held);
+        let _ = child.wait();
+
+        assert_eq!(
+            outcome,
+            Some(None),
+            "completing with the registrant's own child was refused"
+        );
+    }
+
+    /// Every argument is checked at the wire rather than in the registry.
+    #[test]
+    fn registration_refuses_arguments_that_are_not_what_they_claim() {
+        let (mut client, _hear) = serving();
+        let mut opening =
+            format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+        opening.extend_from_slice(&bus_call("Hello", 1));
+        client.write_all(&opening).expect("write");
+        let mut peer = Peer {
+            stream: client,
+            held: Vec::new(),
+            lines: 1,
+        };
+        let _hello = peer.frame();
+
+        // A name that is a `.` run and nothing else, which the grammar's
+        // comment claims to exclude and a draft did not: `/` was refused and
+        // `..` — the one the comment names — was not.
+        for path_shaped in ["..", ".", "a..b"] {
+            peer.send(&register_call(path_shaped, "fixture", 2));
+            assert_eq!(
+                error_of(&peer.frame()).as_deref(),
+                Some("org.freedesktop.DBus.Error.InvalidArgs"),
+                "instance name {path_shaped:?} was accepted"
+            );
+        }
+
+        // An instance name that could be read as a path.
+        peer.send(&register_call("../elsewhere", "fixture", 2));
+        assert_eq!(
+            error_of(&peer.frame()).as_deref(),
+            Some("org.freedesktop.DBus.Error.InvalidArgs"),
+            "a path-shaped instance name was accepted"
+        );
+
+        // An application id that could never be a bus name, which is what §D
+        // reports it as.
+        peer.send(&register_call("fixture", "not a name", 3));
+        assert_eq!(
+            error_of(&peer.frame()).as_deref(),
+            Some("org.freedesktop.DBus.Error.InvalidArgs"),
+            "an unnameable application id was accepted"
+        );
+
+        // A predeclared service that is not a bus name either.
+        peer.send(&jail_call("Register", 4, "ssas", |writer| {
+            writer.string("fixture")?;
+            writer.string("fixture")?;
+            writer.array("s", |array| array.string("nope"))
+        }));
+        assert_eq!(
+            error_of(&peer.frame()).as_deref(),
+            Some("org.freedesktop.DBus.Error.InvalidArgs"),
+            "an unnameable service was accepted"
+        );
+
+        // A predeclared service that IS a bus name and still cannot be one:
+        // `:1.7` is a unique name, which the broker hands out and nobody may
+        // claim. A draft graded services with `valid_bus_name`, which accepts
+        // it.
+        peer.send(&jail_call("Register", 5, "ssas", |writer| {
+            writer.string("fixture")?;
+            writer.string("fixture")?;
+            writer.array("s", |array| array.string(":1.7"))
+        }));
+        assert_eq!(
+            error_of(&peer.frame()).as_deref(),
+            Some("org.freedesktop.DBus.Error.InvalidArgs"),
+            "a unique name was accepted as a predeclared service"
+        );
+
+        // A token nobody issued.
+        peer.send(&jail_call("Complete", 6, "su", |writer| {
+            writer.string("not-a-token")?;
+            writer.uint32(std::process::id());
+            Ok(())
+        }));
+        assert_eq!(
+            error_of(&peer.frame()).as_deref(),
+            Some("td.Jail1.Error.Refused"),
+            "an unissued token completed a registration"
+        );
+    }
+
+    /// The app id is a td identity, not a bus name.
+    ///
+    /// A draft graded it with `valid_bus_name`, which a review showed is wrong
+    /// in both directions: §D's identity section defines a td application's
+    /// identity as a short FLAT name — `firefox`, `darktable` — with reverse
+    /// DNS reserved as an alias for wires td does not own. A bus name requires
+    /// an interior `.`, so every real td identity would have been refused, and
+    /// `:1.7` would have been accepted although it is a unique connection name
+    /// the broker hands out and nobody can be.
+    #[test]
+    fn the_application_id_is_a_flat_td_name() {
+        let (mut client, _hear) = serving();
+        let mut opening =
+            format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+        opening.extend_from_slice(&bus_call("Hello", 1));
+        client.write_all(&opening).expect("write");
+        let mut peer = Peer {
+            stream: client,
+            held: Vec::new(),
+            lines: 1,
+        };
+        let _hello = peer.frame();
+
+        let mut serial = 2;
+        for (which, good) in ["fixture", "firefox", "td-jail-fixture", "org.td.Alias"]
+            .into_iter()
+            .enumerate()
+        {
+            // A fresh instance name each time, or the second one is refused
+            // for the name rather than graded on its id.
+            peer.send(&register_call(&format!("i{which}"), good, serial));
+            assert_eq!(
+                error_of(&peer.frame()),
+                None,
+                "application id {good:?} was refused"
+            );
+            serial += 1;
+        }
+
+        for bad in [
+            ":1.7",                              // the broker's to hand out
+            "org.td..alias",                     // a `.` run
+            "-leading",                          // an id that reads as a flag
+            ".",
+            "",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // 33 bytes
+        ] {
+            peer.send(&register_call("rejected", bad, serial));
+            assert_eq!(
+                error_of(&peer.frame()).as_deref(),
+                Some("org.freedesktop.DBus.Error.InvalidArgs"),
+                "application id {bad:?} was accepted"
+            );
+            serial += 1;
+        }
+    }
+
+    /// `td.Jail1` answers at td's own object and nowhere else.
+    ///
+    /// The same rule §D states for the broker's own interface, applied to
+    /// td's: a `Register` addressed to `/org/freedesktop/DBus` is not this
+    /// method, and answering it there would put private surface on the
+    /// specification's object.
+    #[test]
+    fn jail_registration_is_not_answered_on_the_bus_object() {
+        let (mut client, _hear) = serving();
+        let misplaced = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            BUS_PATH,
+            Some(JAIL_INTERFACE),
+            "Register",
+        )
+        .destination(BUS_NAME)
+        .serial(2)
+        .body("ssas", |writer| {
+            writer.string("fixture")?;
+            writer.string("fixture")?;
+            writer.array("s", |_| Ok(()))
+        })
+        .expect("body")
+        .encode()
+        .expect("encode");
+        let mut opening =
+            format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+        opening.extend_from_slice(&bus_call("Hello", 1));
+        opening.extend_from_slice(&misplaced);
+        client.write_all(&opening).expect("write");
+        let mut peer = Peer {
+            stream: client,
+            held: Vec::new(),
+            lines: 1,
+        };
+        let _hello = peer.frame();
+        assert_eq!(
+            error_of(&peer.frame()).as_deref(),
+            Some("org.freedesktop.DBus.Error.UnknownMethod"),
+            "td.Jail1 answered on the specification's own object"
+        );
+    }
+
+    /// A confined peer's credentials carry `td.AppId`; an unconfined one's do
+    /// not.
+    ///
+    /// The absence is as load-bearing as the presence: the key means "the
+    /// broker established that this connection is this application", and an
+    /// empty or sentinel value would invite a reader to treat a failure to
+    /// establish that as an answer.
+    #[test]
+    fn a_confined_peers_credentials_carry_its_app_id() {
+        for (harness, expected) in [
+            (serving_as("fixture"), Some("fixture")),
+            (serving(), None),
+        ] {
+            let (mut client, _hear) = harness;
+            let mut opening =
+                format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+            opening.extend_from_slice(&bus_call("Hello", 1));
+            client.write_all(&opening).expect("write");
+            let mut peer = Peer {
+                stream: client,
+                held: Vec::new(),
+                lines: 1,
+            };
+            let frame = peer.frame();
+            let (hello, _) = message::decode(&frame, 0).expect("decode Hello");
+            let me = hello
+                .args()
+                .first()
+                .and_then(crate::wire::Value::as_str)
+                .expect("a unique name")
+                .to_string();
+
+            peer.send(&name_query("GetConnectionCredentials", &me, 2));
+            let frame = peer.frame();
+            let (reply, _) = message::decode(&frame, 0).expect("decode credentials");
+            let entries = reply
+                .args()
+                .first()
+                .and_then(crate::wire::Value::as_seq)
+                .expect("a dictionary came back")
+                .values(16)
+                .expect("read the dictionary");
+            let mut app_id = None;
+            for entry in &entries {
+                let pair = entry
+                    .as_seq()
+                    .expect("a dict entry")
+                    .values(2)
+                    .expect("read the entry");
+                if pair.first().and_then(crate::wire::Value::as_str) != Some("td.AppId") {
+                    continue;
+                }
+                app_id = pair
+                    .get(1)
+                    .and_then(crate::wire::Value::as_seq)
+                    .and_then(|variant| variant.values(1).ok())
+                    .and_then(|held| held.first().and_then(crate::wire::Value::as_str))
+                    .map(str::to_string);
+            }
+            assert_eq!(app_id.as_deref(), expected, "td.AppId was {app_id:?}");
+        }
     }
 
     /// The same call with NO_REPLY_EXPECTED gets no error either: a sender
@@ -2635,9 +3641,8 @@ mod tests {
     }
 
     /// `Hello` honours `NO_REPLY_EXPECTED` like every other method. It still
-    /// earns the name — it is the one bus method that changes state — but a
-    /// draft answered it regardless, which made it the single method that
-    /// ignored the flag.
+    /// earns the name, because it changes state, but a draft answered it
+    /// regardless, which made it the single method that ignored the flag.
     #[test]
     fn a_hello_that_wants_no_reply_still_earns_a_name() {
         let (bus, mut clients) = bus_of(1);
@@ -3176,7 +4181,9 @@ mod tests {
             let guid = Guid::new(GUID).expect("guid");
             let quota = Quota::new();
             let bus = Bus::new();
-            let mut connection = Connection::accept(stream, guid, &quota, &bus).expect("connect");
+            let instances = Instances::new();
+            let mut connection =
+                Connection::accept(stream, guid, &quota, &bus, &instances).expect("connect");
             connection.serve()
         });
         let summary = probe(&path, this_uid()).expect("probe");
@@ -3202,7 +4209,8 @@ mod tests {
             // `Result` temporary otherwise lives to the end of this block,
             // which is after `quota` is dropped.
             let bus = Bus::new();
-            let accepted = Connection::accept(stream, guid, &quota, &bus);
+            let instances = Instances::new();
+            let accepted = Connection::accept(stream, guid, &quota, &bus, &instances);
             if let Ok(mut connection) = accepted {
                 let _ = connection.serve();
             }
@@ -3463,7 +4471,8 @@ mod tests {
             let (_client, server) = UnixStream::pair().expect("socketpair");
             let guid = Guid::new(GUID).expect("guid");
             let bus = Bus::new();
-            let accepted = Connection::accept(server, guid, &quota, &bus);
+            let instances = Instances::new();
+            let accepted = Connection::accept(server, guid, &quota, &bus, &instances);
             let mut connection = accepted.expect("accept");
             let spare = fs::File::open("/dev/null").expect("/dev/null");
             let owned: OwnedFd = spare.into();

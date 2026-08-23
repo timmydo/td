@@ -1,0 +1,1920 @@
+//! Which jailed instance a connection belongs to, proved rather than asserted.
+//!
+//! `SO_PEERCRED` gives the broker a pid in its OWN namespace, which is the
+//! useful half: a jailed application sees itself as pid 1 of a nested
+//! namespace and cannot describe itself out of the number the kernel attached
+//! to its socket. What that number does not say is which application it is.
+//! §D's answer is descent: the broker holds each instance's stage-2 pid, and a
+//! connection belongs to the instance whose stage-2 pid is one of its
+//! ancestors.
+//!
+//! The obvious implementation of that is wrong, and §D says why. Checking the
+//! connecting pid's start time before and after the walk closes pid reuse at
+//! the ENDPOINTS and nowhere else: an intermediate ancestor can exit and have
+//! its pid reused between two hops, after which the walk continues up a
+//! lineage that is not the one it started in and can land on the registered
+//! stage-2 pid by a path that never existed. Both endpoints are exactly what
+//! they claim to be while the chain between them is fiction.
+//!
+//! So every EDGE is validated. Each hop records `(pid, starttime)`, and the
+//! completed chain is checked twice over:
+//!
+//! * every recorded start time must be unchanged on a second read, and
+//! * a parent's start time must be **less than or equal to** its child's.
+//!
+//! The second is the cheap one and it is the one that catches the race the
+//! first can miss: a process that reuses a dead pid necessarily started later
+//! than the child which already named that pid as its parent, so the
+//! substitution shows up as a parent younger than its own child. A chain
+//! failing either check is `Unknown` and is denied — never retried, because a
+//! retry against an active attacker is a loop rather than a resolution.
+//!
+//! This is a sampled view of `/proc` and that is a real limitation rather than
+//! an implementation detail. §D names the durable fix: a kernel-maintained
+//! boundary, either pidfds held from creation or `cgroup.procs` membership of
+//! the per-instance cgroup §P already delegates. Take the cgroup oracle when
+//! that delegation lands; this walk is the fallback for the ordering where it
+//! has not, which is the ordering td is in.
+//!
+//! # The peer's own pid is not proved, and nothing here can prove it
+//!
+//! Everything above is about ANCESTORS. The pid this module is asked about
+//! arrives from `SO_PEERCRED`, and it is not sound in the same way — a review
+//! found this and it is worth stating exactly, because the walk being careful
+//! makes it easy to assume the starting point was.
+//!
+//! The kernel samples peer credentials at `connect(2)` and keeps a `struct
+//! pid` reference. A reference keeps the STRUCT alive; it does not reserve the
+//! NUMBER, which `free_pid` returns to the allocator when the connecting
+//! process is reaped. `pid_vnr` then reports the number the struct still
+//! carries. So a peer that connects, passes its socket to a sibling through
+//! `SCM_RIGHTS` and exits can have its pid recycled before the broker reads
+//! it, and this walk will faithfully describe whichever process holds that
+//! number now. The attacker controls the delay by filling the listen backlog,
+//! and the dangerous direction is a confined peer resolving `Unconfined`,
+//! which is privilege UP.
+//!
+//! No amount of care inside the walk closes this: its first read is already
+//! too late, and there is no earlier observation to compare against.
+//! `SO_PEERPIDFD` is the fix, for the reason §D gives for pidfds generally —
+//! a pidfd names a process rather than a number and cannot be recycled by
+//! definition. It is a second value-pinned `getsockopt` option on surface #10
+//! and therefore an `UNSAFE.md` amendment, which is why it is recorded here
+//! rather than taken in the landing that found it. It has to land before any
+//! policy decision rests on this answer.
+
+use std::collections::BTreeSet;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// How far up a lineage the walk will climb before giving up.
+///
+/// A chain this long is pathological — a jailed peer's ancestry to its stage-2
+/// pid is a handful of hops, and an unconfined one's to pid 1 is tens — but
+/// the bound is what keeps a hostile `/proc` from turning one accept into
+/// unbounded work. Exceeding it is `Unknown`, which denies: a walk that ran
+/// out of patience has not proved anything, and this module's whole rule is
+/// that an unproved lineage is refused.
+const MAX_DEPTH: usize = 1024;
+
+/// The three answers, and the middle one is the point.
+///
+/// `Unconfined` is a POSITIVE result rather than a default, which is what lets
+/// §E rest full portal access on it. It means the walk terminated without
+/// meeting any registered stage-2 pid AND every registered instance was
+/// accounted for at query time — so "descends from none of them" is a
+/// statement about a complete registry rather than an absence of evidence.
+/// Anything that is merely unproved is `Unknown`, and `Unknown` is denied by
+/// both the broker and the portal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Identity {
+    Jailed { app_id: String, instance: String },
+    Unconfined,
+    /// Carries why, because a denial nobody can explain is a bug report with
+    /// no content: every arm below names the ambiguity it hit.
+    Unknown(String),
+}
+
+impl Identity {
+    /// The `td.AppId` value §D adds to `GetConnectionCredentials`, when there
+    /// is one. Absent for everything else — an entry that is missing says "not
+    /// known", which is the same rule the uid and pid entries already follow.
+    pub fn app_id(&self) -> Option<&str> {
+        match self {
+            Self::Jailed { app_id, .. } => Some(app_id.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// One process as `/proc/<pid>/stat` describes it, reduced to the three fields
+/// this walk needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stat {
+    pub ppid: i32,
+    /// Field 22: start time in clock ticks since boot. Compared, never
+    /// interpreted — the unit does not matter to any rule here, only that two
+    /// reads of the same live process agree and that a parent's is not larger
+    /// than its child's.
+    pub starttime: u64,
+}
+
+/// What one `/proc/<pid>/stat` read established.
+///
+/// Three values rather than an `Option`, because the difference between them
+/// is a privilege boundary. A review found the two-valued version fails open:
+/// `Option` collapses "this pid does not exist" into "this read did not
+/// work", the reap treats the second as the first, and one transient `EMFILE`
+/// or `ENOMEM` therefore drops a LIVE instance from the registry. The
+/// connection that observed it is refused, but the next connection from
+/// inside that jail walks a registry with no record of it and resolves
+/// `Unconfined` — full portal access for a process that is certainly
+/// confined, with no attacker required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reading {
+    /// The process is there, and this is what it says.
+    Of(Stat),
+    /// The pid does not exist. This is the only reading that licenses
+    /// dropping a record, because it is the only one that says something
+    /// about the PROCESS rather than about the read.
+    Gone,
+    /// The read failed some other way, or the line did not parse. Nothing
+    /// follows about the process, so nothing may be concluded about it.
+    Unreadable,
+}
+
+/// Where the walk reads process state from.
+///
+/// A trait rather than a direct `/proc` read because the interesting cases are
+/// races: a pid that changes identity BETWEEN two reads is the whole reason
+/// the edge validation exists, and there is no way to stage that against the
+/// real kernel without losing to timing. The tests drive a table that can
+/// answer differently on the second read; production reads `/proc`.
+pub trait Procfs {
+    fn stat(&self, pid: i32) -> Reading;
+}
+
+/// `/proc/<pid>/stat`, parsed the only way it can safely be parsed.
+///
+/// The second field is the executable name in parentheses and may contain both
+/// spaces and parentheses — `comm` is attacker-controlled through
+/// `prctl(PR_SET_NAME)` and the file name — so splitting the line on
+/// whitespace and indexing is a bug that a process called `") 1 999999"` can
+/// exploit to forge its own ppid. The only correct split is at the LAST `)`,
+/// after which the remaining fields are positional and safe.
+pub struct RealProcfs;
+
+impl Procfs for RealProcfs {
+    fn stat(&self, pid: i32) -> Reading {
+        stat_of(std::path::Path::new(&format!("/proc/{pid}/stat")))
+    }
+}
+
+/// One `stat` file, read and parsed.
+///
+/// Split from `RealProcfs::stat` only so a test can point it at a file it
+/// wrote: the path this reads in production is not one a test can create.
+///
+/// The read is BYTES, not a string. `comm` is not required to be UTF-8 — the
+/// same `prctl(PR_SET_NAME)` that can put a `)` in it can put a stray 0x80 in
+/// it — so reading this file as text lets any process make its own `/proc`
+/// entry unreadable to the broker. That is not a parse failure the walk
+/// shrugs off: `is_still_there` reads "unreadable" as "gone", and an instance
+/// wrongly reaped is one whose descendants stop being recognised. Everything
+/// after the last `)` is the kernel's own ASCII, so that part converts.
+fn stat_of(path: &std::path::Path) -> Reading {
+    match std::fs::read(path) {
+        Ok(raw) => match parse_stat(&raw) {
+            Some(stat) => Reading::Of(stat),
+            None => Reading::Unreadable,
+        },
+        // `/proc/<pid>/stat` answers `ENOENT` for a pid that does not exist,
+        // and a zombie still has an entry — so this really is "the process
+        // has ended", and it is the ONLY error that says so. Anything else,
+        // `EMFILE` and `ENOMEM` included, is the broker's problem rather than
+        // a fact about the process, and it is answered as such. There is a
+        // narrow third case: the process can exit between the open and the
+        // read, which surfaces as `ESRCH` rather than `ENOENT`. That lands
+        // here as `Unreadable`, which costs one refusal and one more pass
+        // before the record is reaped.
+        Err(why) if why.kind() == std::io::ErrorKind::NotFound => Reading::Gone,
+        Err(_) => Reading::Unreadable,
+    }
+}
+
+/// Fields 4 (`ppid`) and 22 (`starttime`) out of a `stat` line.
+///
+/// After the last `)` the first field is `state`, which is field 3 — so field
+/// N is at offset N-3 in what remains.
+fn parse_stat(raw: &[u8]) -> Option<Stat> {
+    let close = raw.iter().rposition(|byte| *byte == b')')?;
+    let rest = std::str::from_utf8(raw.get(close + 1..)?).ok()?;
+    let mut fields = rest.split_ascii_whitespace();
+    // state, then ppid.
+    let _state = fields.next()?;
+    let ppid = fields.next()?.parse::<i32>().ok()?;
+    // starttime is field 22 and ppid was field 4, so seventeen fields stand
+    // between the two.
+    let starttime = fields.nth(17)?.parse::<u64>().ok()?;
+    Some(Stat { ppid, starttime })
+}
+
+/// A registered jail instance, complete: phase two has bound a pid to it.
+#[derive(Debug, Clone)]
+pub struct Instance {
+    pub instance: String,
+    pub app_id: String,
+    /// Stage 2's pid in the BROKER's namespace, read out of stage 1 rather
+    /// than announced by stage 2 — a record the confined process supplies is a
+    /// record the confined process chooses.
+    pub pid: i32,
+    pub starttime: u64,
+    /// Names this instance may activate on its own private listener.
+    ///
+    /// Predeclared at phase one because §D puts them there, and stored unread
+    /// until activation lands. Carrying them now rather than adding them later
+    /// is what keeps the registration protocol from needing a breaking change
+    /// the moment it acquires its first real consumer: `td.Jail1` is versioned
+    /// for that eventuality, and spending the version on a field the design
+    /// already specifies would be spending it badly.
+    #[allow(dead_code, reason = "read by activation; predeclared here per §D")]
+    pub services: Vec<String>,
+}
+
+/// How long a registration may stand between its two phases.
+///
+/// This is not a policy knob, it is the fix for an availability hole: a
+/// pending registration makes `Unconfined` unsayable for EVERY connection, so
+/// a stage 0 that registered and then died — killed, crashed, or refused by
+/// its own mount plan — would deny the whole session until the broker
+/// restarted. Nothing else prunes it, because the registrant is exactly the
+/// party that is no longer there.
+///
+/// Generous rather than tight, because the cost of being wrong in the two
+/// directions is not symmetric. Expiring early breaks a legitimate launch;
+/// expiring late leaves the session degraded a little longer, and the whole
+/// window is already bounded by `MAX_INSTANCES`. Everything stage 1 does
+/// between the phases — unshare, build the root, spawn — is sub-second on any
+/// machine that can run a compositor.
+pub const PENDING_LIFETIME: Duration = Duration::from_secs(60);
+
+/// Registration in flight: the instance exists, has no pid, and accepts
+/// nothing.
+#[derive(Debug, Clone)]
+struct Pending {
+    token: String,
+    instance: String,
+    app_id: String,
+    services: Vec<String>,
+    /// The uid that opened phase one. Phase two must come from the same uid.
+    /// In v1 every session peer is uid 1000 so this refuses nothing today —
+    /// §D is explicit that registration is authenticated by uid and that the
+    /// app id is therefore a string the registrant supplies. It is written now
+    /// because per-app uids (§L v2) make this line the whole check, and a
+    /// check added later is a check that was missing in between.
+    uid: u32,
+    /// When phase one ran, for `PENDING_LIFETIME`.
+    opened: Instant,
+    /// The pid that opened phase one, which is what narrows the blast radius
+    /// of an incomplete registration.
+    ///
+    /// A pending instance has no stage-2 pid on record, so a peer belonging to
+    /// it would walk straight past and off the top — and `Unconfined` there
+    /// would hand full portal access to the one process that is certainly
+    /// confined. The first version of this refused `Unconfined` to EVERY peer
+    /// while any registration was open, which is safe and far too broad: any
+    /// uid-1000 process could open one, never complete it, and deny the whole
+    /// session.
+    ///
+    /// It can be narrowed exactly, because stage 2 is a CHILD of the registrant
+    /// — stage 0 registers before it unshares, and `unshare(CLONE_NEWPID)`
+    /// moves the caller's children into the new namespace rather than the
+    /// caller — so every peer that could belong to a pending instance is a
+    /// strict descendant of the pid that opened it. Peers elsewhere in the
+    /// process tree are unaffected, and a rogue registration now blocks only
+    /// the rogue's own descendants.
+    registrant: i32,
+}
+
+/// Every instance the broker knows, pending and complete.
+///
+/// Registration is two-phase because the pid does not exist when the instance
+/// does: stage 0 unshares nothing yet and has no stage-2 pid to name, so it
+/// opens with `{instance, app-id, services}` and receives a one-shot token,
+/// and stage 1 completes with the pid `Command::spawn` returned. A connection
+/// arriving between the two phases resolves against a registry that does not
+/// yet contain the instance — it fails closed, as §D requires, rather than
+/// being queued.
+pub struct Instances {
+    inner: Mutex<State>,
+}
+
+#[derive(Default)]
+struct State {
+    pending: Vec<Pending>,
+    live: Vec<Instance>,
+}
+
+/// The most registrations that may be open at once, and the most instances
+/// that may be live.
+///
+/// Both are the same number and both are the accept path's problem rather than
+/// an aesthetic one: `resolve` re-reads every live instance's pid before it
+/// will answer `Unconfined`, so an unbounded registry turns one connection
+/// into unbounded `/proc` reads. A registrant that fills this is refused.
+pub const MAX_INSTANCES: usize = 64;
+
+/// The most service names one instance may predeclare.
+pub const MAX_SERVICES: usize = 32;
+
+impl Default for Instances {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Instances {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(State::default()),
+        }
+    }
+
+    /// Phase one: the instance exists and has no pid. Returns its one-shot
+    /// token.
+    ///
+    /// The token binds two calls together: it is what makes "stage 1 refuses
+    /// to proceed without the token stage 0 obtained" checkable, and what
+    /// makes a second attempt to bind a pid an error rather than a takeover.
+    ///
+    /// It has to be unguessable, which a draft got wrong by reasoning that
+    /// anything able to guess it could simply call `Register` itself. That
+    /// covers creating a new instance and misses the interesting move:
+    /// CONSUMING somebody else's in-flight registration. The real stage 1's
+    /// `Complete` then fails — and by then stage 2 has already been spawned,
+    /// because its pid is what `Complete` was going to carry. A live jail with
+    /// no registration on record is exactly the `Unconfined` answer §E exists
+    /// to prevent. See `fresh_token`.
+    pub fn open(
+        &self,
+        procfs: &dyn Procfs,
+        instance: &str,
+        app_id: &str,
+        services: Vec<String>,
+        uid: u32,
+        registrant: i32,
+    ) -> Result<String, String> {
+        self.open_at(
+            procfs,
+            instance,
+            app_id,
+            services,
+            uid,
+            registrant,
+            Instant::now(),
+        )
+    }
+
+    /// `open` with the clock supplied, so the sweep it performs can be
+    /// asserted rather than waited for.
+    #[allow(clippy::too_many_arguments, reason = "one clock past rustc's six")]
+    fn open_at(
+        &self,
+        procfs: &dyn Procfs,
+        instance: &str,
+        app_id: &str,
+        services: Vec<String>,
+        uid: u32,
+        registrant: i32,
+        now: Instant,
+    ) -> Result<String, String> {
+        if services.len() > MAX_SERVICES {
+            return Err(format!(
+                "an instance may predeclare at most {MAX_SERVICES} service names"
+            ));
+        }
+        // Read outside the lock: it touches a device file, and the registry is
+        // on the accept path.
+        let token = fresh_token()?;
+        // BOTH sides of the ceiling are swept, not just the pending one. A
+        // draft swept only pendings, and a review pointed out that leaves the
+        // identical ratchet in the neighbouring collection: an instance whose
+        // jail exited is reaped by `resolve` alone, so a launcher whose
+        // applications never touch the bus fills all 64 slots and every later
+        // `Register` is refused for good. This reads `/proc` outside the lock,
+        // for the reason `resolve_against` gives.
+        self.sweep_live(procfs);
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| "the instance registry is poisoned".to_string())?;
+        // Registrations that were abandoned do not get to hold slots. Without
+        // this the ceiling is a one-way ratchet: `resolve` is the only other
+        // sweep, so 64 half-finished registrations refuse every launch until
+        // some connection happens to arrive.
+        sweep_pending(&mut state, now);
+        if state.pending.len() + state.live.len() >= MAX_INSTANCES {
+            return Err(format!("already tracking {MAX_INSTANCES} instances"));
+        }
+        if state.pending.iter().any(|p| p.instance == instance)
+            || state.live.iter().any(|i| i.instance == instance)
+        {
+            return Err(format!("instance {instance:?} is already registered"));
+        }
+        state.pending.push(Pending {
+            token: token.clone(),
+            instance: instance.to_string(),
+            app_id: app_id.to_string(),
+            services,
+            uid,
+            opened: now,
+            registrant,
+        });
+        Ok(token)
+    }
+
+    /// Phase two: bind a pid to the instance the token opened.
+    ///
+    /// The START TIME is read here rather than accepted from the caller. A
+    /// registrant-supplied start time would be the one field of the record
+    /// that the registrant chooses, and it is the field every later reuse
+    /// check rests on — so the broker reads it for itself, and a pid that is
+    /// already gone completes nothing.
+    ///
+    /// The PID is not taken on trust either, and a draft did take it. Under
+    /// that version any session peer could open a registration and complete it
+    /// with any pid it could read: completing with pid 1 makes every later
+    /// connection in the session walk into the attacker's instance and be
+    /// handed its app id. Two checks close it, and both are things the broker
+    /// sees for itself rather than assertions about the caller:
+    ///
+    /// - the PROCESS that completes must be the process that opened, so a
+    ///   guessed or stolen token is not enough on its own;
+    /// - the pid must be a CHILD of that process, which is what stage 2 is —
+    ///   stage 1 spawns it directly, so `/proc` records the registrant as its
+    ///   parent.
+    ///
+    /// The process and not the CONNECTION, which a draft claimed and a review
+    /// caught. One connection would be the stronger rule and it would break
+    /// the only launcher there is: td-jail closes every descriptor above
+    /// stderr between `unshare` and the spawn (§A step 0), so the connection
+    /// stage 0 registered on is gone by the time stage 1 has a pid to report.
+    /// Stage 1 reconnects, and it is the same PROCESS throughout because
+    /// `unshare(CLONE_NEWPID)` does not move the caller.
+    ///
+    /// Together they say a registrant may label its own child and nothing
+    /// else. That is not authenticity — §D's v1 exposure stands, and a rogue
+    /// can still call its own child `org.mozilla.firefox` — but it is the
+    /// difference between mislabelling a process you already own and
+    /// relabelling somebody else's.
+    ///
+    /// This is a requirement on td-jail rather than an observation about it,
+    /// and §D records it as one: a launcher that registered on behalf of a
+    /// sibling rather than a descendant would be refused here.
+    pub fn complete(
+        &self,
+        procfs: &dyn Procfs,
+        token: &str,
+        pid: i32,
+        uid: u32,
+        completer: i32,
+    ) -> Result<(), String> {
+        self.complete_at(procfs, token, pid, uid, completer, Instant::now())
+    }
+
+    /// `complete` with the clock supplied, so the expiry rule can be asserted
+    /// here rather than only where `resolve` happens to sweep.
+    #[allow(clippy::too_many_arguments, reason = "one clock past rustc's six")]
+    fn complete_at(
+        &self,
+        procfs: &dyn Procfs,
+        token: &str,
+        pid: i32,
+        uid: u32,
+        completer: i32,
+        now: Instant,
+    ) -> Result<(), String> {
+        // No `pid <= 0` guard. The wire converts from `u32`, so only zero can
+        // arrive, and `/proc/0/stat` answers `ENOENT` like any other absent
+        // pid — the read below refuses it with a reason rather than a special
+        // case. A draft had one, and a review named it the same dead branch
+        // shaped like a safety check that this module already removed once.
+        //
+        // Before the lock, for the reason `resolve_against` gives: a `/proc`
+        // read can block, and one unreadable process must not stall every
+        // other accept. Reading first also means a transient failure does not
+        // consume the token.
+        let stat = match procfs.stat(pid) {
+            Reading::Of(stat) => stat,
+            Reading::Gone => return Err(format!("pid {pid} does not exist")),
+            Reading::Unreadable => {
+                return Err(format!("pid {pid} has no readable /proc entry"))
+            }
+        };
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| "the instance registry is poisoned".to_string())?;
+        // A token that stood too long is gone before it is looked up, rather
+        // than surviving until some connection happens to sweep.
+        sweep_pending(&mut state, now);
+        let Some(at) = state.pending.iter().position(|p| p.token == token) else {
+            return Err("no registration is open under that token".to_string());
+        };
+        let Some(pending) = state.pending.get(at) else {
+            return Err("no registration is open under that token".to_string());
+        };
+        if pending.uid != uid {
+            return Err(format!(
+                "registration was opened by uid {} and completed by uid {uid}",
+                pending.uid
+            ));
+        }
+        // The process, not the connection — see this method's doc comment.
+        if pending.registrant != completer {
+            return Err(format!(
+                "registration was opened by pid {} and completed by pid {completer}",
+                pending.registrant
+            ));
+        }
+        if stat.ppid != completer {
+            return Err(format!("pid {pid} is not a child of the registering process"));
+        }
+        if state.live.iter().any(|i| i.pid == pid) {
+            return Err(format!("pid {pid} is already bound to an instance"));
+        }
+        // Consumed on completion, so a second attempt to bind a pid to this
+        // instance finds no token rather than replacing the record.
+        let pending = state.pending.swap_remove(at);
+        state.live.push(Instance {
+            instance: pending.instance,
+            app_id: pending.app_id,
+            pid,
+            starttime: stat.starttime,
+            services: pending.services,
+        });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn live_count(&self) -> usize {
+        self.inner.lock().map(|s| s.live.len()).unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn pending_count(&self) -> usize {
+        self.inner.lock().map(|s| s.pending.len()).unwrap_or(0)
+    }
+
+    /// Sweep, then report the registrant pids of the registrations that
+    /// remain — which is what the walk needs, and what asking twice would
+    /// race with itself to get.
+    fn expire_pending(&self, now: Instant) -> Result<Vec<i32>, ()> {
+        match self.inner.lock() {
+            Ok(mut state) => {
+                sweep_pending(&mut state, now);
+                Ok(state.pending.iter().map(|p| p.registrant).collect())
+            }
+            Err(_) => Err(()),
+        }
+    }
+
+    /// Which instance this pid belongs to, or a named reason it cannot be
+    /// said.
+    ///
+    /// Three things happen here and only the middle one is the walk.
+    ///
+    /// FIRST, instances whose stage-2 process is gone are reaped. Without this
+    /// a jail that simply exited would make `Unconfined` unsayable for every
+    /// later connection for as long as the broker ran — the accounting pass
+    /// below cannot tell "this instance ended" from "this instance's pid may
+    /// have been reused underneath the walk I just did", so it refuses, and a
+    /// registry nobody prunes turns every ordinary application exit into a
+    /// permanent denial for everybody. Reaping is safe for the reason §E gives
+    /// for the whole design: stage 2 is PID 1 of the instance's pid namespace,
+    /// so killing it kills the namespace, and a dead instance has no live
+    /// descendants left to misattribute.
+    ///
+    /// SECOND, the walk, outside the lock.
+    ///
+    /// THIRD, a registration IN FLIGHT makes `Unconfined` unsayable, which is
+    /// §E's own list of `Unknown` cases and not a conservative extra. Between
+    /// phase one and phase two an instance has no pid on record, so a peer
+    /// descending from it walks straight past and off the top — and answering
+    /// `Unconfined` there would hand full portal access to the one process
+    /// that is definitely confined. `Jailed` is still answerable while a
+    /// registration is pending, because that answer rests on a positive match
+    /// rather than on the registry being complete.
+    pub fn resolve(&self, procfs: &dyn Procfs, pid: i32) -> Identity {
+        self.resolve_at(procfs, pid, Instant::now())
+    }
+
+    /// `resolve` with the clock supplied, so the expiry rule can be asserted
+    /// rather than waited for.
+    ///
+    /// The sweep is INSIDE this function on purpose: a draft left the test
+    /// calling `expire_pending` itself and then checking `resolve`, which
+    /// passes just as happily if `resolve` stops sweeping at all.
+    fn resolve_at(&self, procfs: &dyn Procfs, pid: i32, now: Instant) -> Identity {
+        let Ok(pending) = self.expire_pending(now) else {
+            return Identity::Unknown("the instance registry is poisoned".to_string());
+        };
+        let live = match self.inner.lock() {
+            Ok(state) => state.live.clone(),
+            Err(_) => return Identity::Unknown("the instance registry is poisoned".to_string()),
+        };
+        let (gone, unsure) = self.sweep_live(procfs);
+        if let Some(why) = unsure {
+            return Identity::Unknown(why);
+        }
+        // A record that was just dropped travels WITH the walk rather than
+        // refusing ahead of it. A draft refused every connection that observed
+        // any reap — sound, and too broad: a review pointed out that one peer
+        // can then deny an arbitrary connection at will, by registering its
+        // own child, completing, killing it, and letting the next connection
+        // trip over the stale record. Because identity is decided once at
+        // accept, that connection is denied for its whole life. What actually
+        // makes an answer unsound is narrower and checkable: the dropped pid
+        // standing in THIS connection's lineage, which is the only way its
+        // reuse could have bent the chain.
+        let reaped: Vec<i32> = gone.iter().map(|(_, pid, _)| *pid).collect();
+        let live: Vec<Instance> = live
+            .into_iter()
+            .filter(|instance| {
+                !gone.iter().any(|(name, pid, starttime)| {
+                    *name == instance.instance
+                        && *pid == instance.pid
+                        && *starttime == instance.starttime
+                })
+            })
+            .collect();
+        resolve_against(procfs, &live, &pending, &reaped, pid)
+    }
+
+    /// Drop every live record whose process is certainly gone, and report
+    /// what was dropped and the first instance that could not be read at all.
+    ///
+    /// Reaping is decided outside the lock and applied under it, keyed on the
+    /// pid and start time that were seen to be gone — so an instance that
+    /// registered again in between is not removed by a decision taken about
+    /// its predecessor.
+    fn sweep_live(&self, procfs: &dyn Procfs) -> (Vec<(String, i32, u64)>, Option<String>) {
+        let live = match self.inner.lock() {
+            Ok(state) => state.live.clone(),
+            Err(_) => {
+                return (
+                    Vec::new(),
+                    Some("the instance registry is poisoned".to_string()),
+                )
+            }
+        };
+        let mut gone: Vec<(String, i32, u64)> = Vec::new();
+        let mut unsure: Option<String> = None;
+        for instance in &live {
+            match standing_of(procfs, instance) {
+                Standing::There => {}
+                Standing::Gone => {
+                    gone.push((
+                        instance.instance.clone(),
+                        instance.pid,
+                        instance.starttime,
+                    ));
+                }
+                // Refused, and NOT reaped. The distinction is the whole point
+                // of `Reading`: dropping a record the broker merely failed to
+                // read would hand the next connection from inside that jail an
+                // `Unconfined` answer.
+                Standing::Unsure => {
+                    unsure = Some(format!(
+                        "instance {:?} is registered at pid {} and that process \
+                         could not be read",
+                        instance.instance, instance.pid
+                    ));
+                }
+            }
+        }
+        if !gone.is_empty() {
+            self.reap(&gone);
+        }
+        (gone, unsure)
+    }
+
+    /// Drop exactly the records that were seen to be gone.
+    fn reap(&self, gone: &[(String, i32, u64)]) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.live.retain(|instance| {
+                !gone.iter().any(|(name, pid, starttime)| {
+                    *name == instance.instance
+                        && *pid == instance.pid
+                        && *starttime == instance.starttime
+                })
+            });
+        }
+    }
+}
+
+/// Drop registrations that stood too long between their phases.
+///
+/// Both callers hold the lock already, which is why this takes the state
+/// rather than the registry.
+fn sweep_pending(state: &mut State, now: Instant) {
+    let before = state.pending.len();
+    state
+        .pending
+        .retain(|p| now.duration_since(p.opened) < PENDING_LIFETIME);
+    let expired = before.saturating_sub(state.pending.len());
+    if expired > 0 {
+        // Loudly, because the consequence is a launch that fails much later
+        // and somewhere else: `Complete` will find no token, and §D requires
+        // stage 1 to refuse to proceed without one. A silent expiry would make
+        // that refusal look like a bug in the jail.
+        eprintln!(
+            "td-busd: {expired} jail registration(s) expired unfinished after \
+             {PENDING_LIFETIME:?}"
+        );
+    }
+}
+
+/// A fresh one-shot registration token: 16 bytes of `/dev/urandom`, hex.
+///
+/// A draft used a monotone counter and the instance name. That is derivable —
+/// a peer's own registrations tell it the counter, and `open`'s two distinct
+/// refusals are a name oracle — and `open` says why a derivable token is not
+/// merely untidy.
+///
+/// An unreadable `/dev/urandom` refuses the registration rather than falling
+/// back, because every fallback is a predictable token.
+fn fresh_token() -> Result<String, String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open("/dev/urandom")
+        .map_err(|why| format!("no randomness for a registration token: {why}"))?;
+    let mut bytes = [0u8; 16];
+    file.read_exact(&mut bytes)
+        .map_err(|why| format!("no randomness for a registration token: {why}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// One hop of the walk, as it was seen on the way up.
+#[derive(Debug, Clone, Copy)]
+struct Hop {
+    pid: i32,
+    starttime: u64,
+}
+
+/// The walk itself, over a snapshot of the live instances.
+///
+/// Split out from `Instances::resolve` so it holds no lock: every `/proc` read
+/// below can block, and holding the registry across them would let one
+/// unreadable process stall every other accept.
+fn resolve_against(
+    procfs: &dyn Procfs,
+    live: &[Instance],
+    pending: &[i32],
+    reaped: &[i32],
+    pid: i32,
+) -> Identity {
+    if pid <= 0 {
+        return Identity::Unknown(format!("pid {pid} is not a process"));
+    }
+    let mut chain: Vec<Hop> = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut cursor = pid;
+    let mut found: Option<&Instance> = None;
+
+    loop {
+        if chain.len() >= MAX_DEPTH {
+            return Identity::Unknown(format!(
+                "the lineage of pid {pid} is deeper than {MAX_DEPTH} processes"
+            ));
+        }
+        // A `/proc` that repeats a pid on the way up is not a tree. It cannot
+        // happen against a live kernel, and a walk that trusts it loops.
+        if !seen.insert(cursor) {
+            return Identity::Unknown(format!("the lineage of pid {pid} repeats pid {cursor}"));
+        }
+        let stat = match procfs.stat(cursor) {
+            Reading::Of(stat) => stat,
+            // Both deny. The walk has no use for the distinction — a lineage
+            // it cannot read is a lineage it cannot vouch for either way — and
+            // only the registry's own bookkeeping cares which it was.
+            Reading::Gone => {
+                return Identity::Unknown(format!("pid {cursor} does not exist"));
+            }
+            Reading::Unreadable => {
+                return Identity::Unknown(format!("pid {cursor} has no readable /proc entry"));
+            }
+        };
+        chain.push(Hop {
+            pid: cursor,
+            starttime: stat.starttime,
+        });
+        // A registered stage-2 pid whose start time matches is the answer. One
+        // whose start time does NOT match is a reused pid rather than that
+        // instance, and is not treated as a match — the accounting pass below
+        // is what turns that into a refusal.
+        if let Some(instance) = live
+            .iter()
+            .find(|i| i.pid == cursor && i.starttime == stat.starttime)
+        {
+            found = Some(instance);
+            break;
+        }
+        if cursor == 1 || stat.ppid <= 0 {
+            break;
+        }
+        cursor = stat.ppid;
+    }
+
+    if let Some(reason) = chain_is_broken(procfs, &chain) {
+        return Identity::Unknown(reason);
+    }
+
+    // A pid this lookup just dropped from the registry, standing in this
+    // connection's lineage, is the case the reap cannot answer around: that
+    // instance ended, its pid may already belong to the hop the walk passed
+    // through, and every hop above it was reached by trusting that hop. NOT
+    // gated on `found`, because a positive match further up was reached
+    // through the same suspect hop.
+    if let Some(hop) = chain.iter().find(|hop| reaped.contains(&hop.pid)) {
+        return Identity::Unknown(format!(
+            "pid {} was dropped from the registry during this lookup and this \
+             connection's lineage passes through it",
+            hop.pid
+        ));
+    }
+
+    // A registration in flight for one of this peer's ANCESTORS means the
+    // stage 2 it would belong to may not be on record yet. Strict ancestors
+    // only: the registrant itself is stage 0/1, an ordinary unconfined process
+    // that has to stay able to make the very call that completes the
+    // registration. Blocking it would be a self-lock — the broker would deny
+    // the connection whose next message is `Complete`.
+    if found.is_none() {
+        if let Some(hop) = chain
+            .iter()
+            .skip(1)
+            .find(|hop| pending.contains(&hop.pid))
+        {
+            return Identity::Unknown(format!(
+                "a registration opened by pid {} is still in flight, and this \
+                 connection descends from it",
+                hop.pid
+            ));
+        }
+    }
+
+    match found {
+        Some(instance) => Identity::Jailed {
+            app_id: instance.app_id.clone(),
+            instance: instance.instance.clone(),
+        },
+        // `Unconfined` is the claim that this pid descends from NO registered
+        // instance, which is only worth anything if every registered instance
+        // is still where the registry says it is. An instance whose stage-2
+        // pid has died may have had that pid reused — possibly by something in
+        // the chain just walked — and then "descends from none of them" is a
+        // statement about a registry that no longer describes the machine.
+        None => match unaccounted_instance(procfs, live) {
+            Some(reason) => Identity::Unknown(reason),
+            None => Identity::Unconfined,
+        },
+    }
+}
+
+/// Re-read every hop and check the two invariants. `None` is a good chain.
+fn chain_is_broken(procfs: &dyn Procfs, chain: &[Hop]) -> Option<String> {
+    for hop in chain {
+        match procfs.stat(hop.pid) {
+            Reading::Of(now) if now.starttime == hop.starttime => {}
+            Reading::Of(now) => {
+                return Some(format!(
+                    "pid {} was replaced during the walk: start time {} became {}",
+                    hop.pid, hop.starttime, now.starttime
+                ));
+            }
+            Reading::Gone => return Some(format!("pid {} left during the walk", hop.pid)),
+            Reading::Unreadable => {
+                return Some(format!("pid {} became unreadable during the walk", hop.pid));
+            }
+        }
+    }
+    // Adjacent pairs, child first. Only ONE thing is worth checking here, and
+    // a draft checked two: it also required each child's recorded ppid to
+    // equal the parent the walk moved to. That can never fail, because the
+    // walk BUILDS the chain by following that ppid — the two values are made
+    // equal one line apart, and a test written to break the link could only
+    // break it by rewriting `/proc` in a way the walk never reads.
+    //
+    // What does the work is the ordering. A parent may not be younger than its
+    // own child, and a reused pid cannot avoid being: whatever took the pid
+    // had to start after the original exited, and the original was still alive
+    // when the child named it as parent, so the impostor is necessarily
+    // younger than the child that points at it.
+    for pair in chain.windows(2) {
+        let (Some(child), Some(parent)) = (pair.first(), pair.get(1)) else {
+            continue;
+        };
+        if parent.starttime > child.starttime {
+            return Some(format!(
+                "pid {} started after its child {}, so its pid was reused",
+                parent.pid, child.pid
+            ));
+        }
+    }
+    None
+}
+
+/// Where this instance's stage-2 process stands.
+///
+/// The start time is what makes this a question about the PROCESS rather than
+/// about the number: a pid that has been reused answers "yes" to "does this
+/// pid exist" and is a different process entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Standing {
+    /// Still the process the registry recorded.
+    There,
+    /// Certainly not: either the pid is unused or it belongs to a process that
+    /// started later. Both are final, and for the same reason — the process
+    /// the registry recorded has ended.
+    Gone,
+    /// The broker could not tell. Nothing may be concluded and nothing may be
+    /// dropped; see `Reading`.
+    Unsure,
+}
+
+fn standing_of(procfs: &dyn Procfs, instance: &Instance) -> Standing {
+    match procfs.stat(instance.pid) {
+        Reading::Of(now) if now.starttime == instance.starttime => Standing::There,
+        Reading::Of(_) => Standing::Gone,
+        Reading::Gone => Standing::Gone,
+        Reading::Unreadable => Standing::Unsure,
+    }
+}
+
+/// The first live instance that is no longer where the registry says, if any.
+///
+/// `Instances::resolve` reaps these before it calls the walk, so in production
+/// this reports only an instance that died between that reap and this check —
+/// which is exactly the race §E names, and which denies rather than reaps
+/// because a process that vanished mid-answer has not been shown to be absent
+/// from the lineage just walked.
+fn unaccounted_instance(procfs: &dyn Procfs, live: &[Instance]) -> Option<String> {
+    for instance in live {
+        match standing_of(procfs, instance) {
+            Standing::There => {}
+            Standing::Gone => {
+                return Some(format!(
+                    "instance {:?} is registered at pid {} and that process is gone",
+                    instance.instance, instance.pid
+                ));
+            }
+            Standing::Unsure => {
+                return Some(format!(
+                    "instance {:?} is registered at pid {} and that process \
+                     could not be read",
+                    instance.instance, instance.pid
+                ));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    /// A `/proc` the test writes, and can change between reads.
+    #[derive(Default)]
+    struct Table {
+        now: RefCell<BTreeMap<i32, Stat>>,
+        /// Reads served so far, so a test can swap a process in after the walk
+        /// has passed it and before the re-read reaches it.
+        reads: RefCell<usize>,
+        /// `(after_n_reads, pid, replacement)` — applied once.
+        swap: RefCell<Option<(usize, i32, Option<Stat>)>>,
+        /// Pids whose entry exists but cannot be read, which is a different
+        /// answer from a pid that is not there.
+        unreadable: RefCell<BTreeSet<i32>>,
+    }
+
+    impl Table {
+        fn with(rows: &[(i32, i32, u64)]) -> Self {
+            let table = Table::default();
+            for (pid, ppid, starttime) in rows {
+                table.now.borrow_mut().insert(
+                    *pid,
+                    Stat {
+                        ppid: *ppid,
+                        starttime: *starttime,
+                    },
+                );
+            }
+            table
+        }
+
+        fn swap_after(&self, reads: usize, pid: i32, replacement: Option<Stat>) {
+            *self.swap.borrow_mut() = Some((reads, pid, replacement));
+        }
+
+        /// The process is there and the broker cannot read it — `EMFILE`, or
+        /// a line that does not parse.
+        fn hide(&self, pid: i32) {
+            self.unreadable.borrow_mut().insert(pid);
+        }
+    }
+
+    impl Procfs for Table {
+        fn stat(&self, pid: i32) -> Reading {
+            let mut reads = self.reads.borrow_mut();
+            *reads += 1;
+            let due = {
+                let swap = self.swap.borrow();
+                swap.filter(|(at, _, _)| *reads > *at)
+            };
+            if let Some((_, target, replacement)) = due {
+                *self.swap.borrow_mut() = None;
+                match replacement {
+                    Some(stat) => self.now.borrow_mut().insert(target, stat),
+                    None => self.now.borrow_mut().remove(&target),
+                };
+            }
+            if self.unreadable.borrow().contains(&pid) {
+                return Reading::Unreadable;
+            }
+            match self.now.borrow().get(&pid).copied() {
+                Some(stat) => Reading::Of(stat),
+                None => Reading::Gone,
+            }
+        }
+    }
+
+    fn instance(name: &str, pid: i32, starttime: u64) -> Instance {
+        Instance {
+            instance: name.to_string(),
+            app_id: format!("org.td.{name}"),
+            pid,
+            starttime,
+            services: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_descendant_of_a_registered_stage_two_is_that_instance() {
+        // 1 <- 100 (stage 2) <- 200 (the app) <- 300 (a child of the app)
+        let table = Table::with(&[(1, 0, 1), (100, 1, 10), (200, 100, 20), (300, 200, 30)]);
+        let live = [instance("one", 100, 10)];
+        assert_eq!(
+            resolve_against(&table, &live, &[], &[], 300),
+            Identity::Jailed {
+                app_id: "org.td.one".to_string(),
+                instance: "one".to_string()
+            }
+        );
+        // And the stage-2 process itself resolves to its own instance.
+        assert_eq!(
+            resolve_against(&table, &live, &[], &[], 100),
+            Identity::Jailed {
+                app_id: "org.td.one".to_string(),
+                instance: "one".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_process_descending_from_no_instance_is_unconfined() {
+        let table = Table::with(&[(1, 0, 1), (100, 1, 10), (400, 1, 40)]);
+        let live = [instance("one", 100, 10)];
+        assert_eq!(resolve_against(&table, &live, &[], &[], 400), Identity::Unconfined);
+        // An empty registry is the same claim about a smaller set, and it must
+        // not accidentally be `Unknown` — the broker starts here, and every
+        // peer on a bus with no jails is unconfined.
+        assert_eq!(resolve_against(&table, &[], &[], &[], 400), Identity::Unconfined);
+    }
+
+    /// The finding §D was written against: the substitution the ENDPOINT check
+    /// cannot see, caught while the walk is still in the middle of it.
+    ///
+    /// The walk starts at 300, whose parent is 200. After it has read 300 and
+    /// before it reads 200, the real 200 exits and its pid is taken by a
+    /// process that is a child of the registered stage-2 pid. The walk then
+    /// climbs the impostor to 100 and lands on the instance by a path that
+    /// never existed — and both endpoints are exactly what they claim to be,
+    /// so re-reading 300 and 100 proves nothing.
+    ///
+    /// The impostor's start time is what gives it away, and it cannot be
+    /// chosen: to take pid 200 it had to start after the original 200 exited,
+    /// and the original was alive when 300 named it as parent, so the impostor
+    /// is necessarily YOUNGER than 300. A draft of this test gave it a start
+    /// time of 25 against a child of 30 and then reported that the check had
+    /// failed to fire; the fixture was a history that cannot happen.
+    #[test]
+    fn an_intermediate_ancestor_replaced_mid_walk_is_not_a_lineage() {
+        let live = [instance("one", 100, 10)];
+        // Undisturbed, 300 is unconfined: its parent 200 is a child of pid 1.
+        let table = Table::with(&[(1, 0, 1), (100, 1, 10), (200, 1, 20), (300, 200, 30)]);
+        assert_eq!(resolve_against(&table, &live, &[], &[], 300), Identity::Unconfined);
+
+        // Now let the walk read the impostor: swapped in after the first read
+        // (300) and before the second (200).
+        let table = Table::with(&[(1, 0, 1), (100, 1, 10), (200, 1, 20), (300, 200, 30)]);
+        table.swap_after(1, 200, Some(Stat { ppid: 100, starttime: 35 }));
+        match resolve_against(&table, &live, &[], &[], 300) {
+            Identity::Unknown(why) => assert!(
+                why.contains("was reused"),
+                "the substitution must be named: {why}"
+            ),
+            other => panic!("a substituted ancestor resolved as {other:?}"),
+        }
+    }
+
+    /// The other half of the same race: the ancestor exits and nothing takes
+    /// its pid, so the re-read finds it simply gone.
+    #[test]
+    fn an_ancestor_that_leaves_during_the_walk_is_unknown() {
+        let table = Table::with(&[(1, 0, 1), (200, 1, 20), (300, 200, 30)]);
+        // Reads are 300, 200, 1 for the walk; drop 200 once the walk is past it.
+        table.swap_after(3, 200, None);
+        match resolve_against(&table, &[], &[], &[], 300) {
+            Identity::Unknown(why) => assert!(why.contains("left during the walk"), "{why}"),
+            other => panic!("a vanished ancestor resolved as {other:?}"),
+        }
+    }
+
+    /// The invariant that catches what the re-read can miss: a parent cannot
+    /// be younger than its own child.
+    #[test]
+    fn a_parent_younger_than_its_child_is_a_reused_pid() {
+        // 300's parent is 200, but 200 started AFTER 300 — impossible for a
+        // real parent, and exactly what a reused pid looks like once it has
+        // settled and both reads agree about it.
+        let table = Table::with(&[(1, 0, 1), (100, 1, 10), (200, 100, 90), (300, 200, 30)]);
+        let live = [instance("one", 100, 10)];
+        match resolve_against(&table, &live, &[], &[], 300) {
+            Identity::Unknown(why) => assert!(
+                why.contains("was reused"),
+                "the reuse must be named: {why}"
+            ),
+            other => panic!("a parent younger than its child resolved as {other:?}"),
+        }
+    }
+
+    /// `Unconfined` is a claim about a COMPLETE registry, so an instance the
+    /// broker can no longer find makes it unsayable for everybody.
+    #[test]
+    fn an_instance_whose_stage_two_is_gone_makes_unconfined_unsayable() {
+        let table = Table::with(&[(1, 0, 1), (400, 1, 40)]);
+        let live = [instance("one", 100, 10)];
+        match resolve_against(&table, &live, &[], &[], 400) {
+            Identity::Unknown(why) => assert!(why.contains("that process is gone"), "{why}"),
+            other => panic!("a stale registry still answered {other:?}"),
+        }
+        // A pid that came BACK as a different process is the same ambiguity:
+        // the registry's start time is what distinguishes them.
+        let table = Table::with(&[(1, 0, 1), (100, 1, 77), (400, 1, 40)]);
+        match resolve_against(&table, &live, &[], &[], 400) {
+            Identity::Unknown(why) => assert!(why.contains("that process is gone"), "{why}"),
+            other => panic!("a reused instance pid still answered {other:?}"),
+        }
+    }
+
+    /// A peer the walk cannot read denies, whichever way it cannot read it.
+    ///
+    /// The walk has no use for the distinction between "gone" and "could not
+    /// be read" — a lineage it cannot read is one it cannot vouch for either
+    /// way — but the reasons are named separately, because the registry's
+    /// bookkeeping does care and a shared message would hide which happened.
+    #[test]
+    fn a_peer_whose_own_proc_entry_is_unreadable_is_unknown() {
+        let table = Table::with(&[(1, 0, 1), (600, 1, 60)]);
+        match resolve_against(&table, &[], &[], &[], 500) {
+            Identity::Unknown(why) => assert!(why.contains("does not exist"), "{why}"),
+            other => panic!("a peer that is not there resolved as {other:?}"),
+        }
+        table.hide(600);
+        match resolve_against(&table, &[], &[], &[], 600) {
+            Identity::Unknown(why) => assert!(why.contains("no readable /proc entry"), "{why}"),
+            other => panic!("an unreadable peer resolved as {other:?}"),
+        }
+        assert!(matches!(
+            resolve_against(&table, &[], &[], &[], 0),
+            Identity::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn a_lineage_that_loops_is_refused_rather_than_walked_for_ever() {
+        let table = Table::with(&[(10, 20, 1), (20, 10, 1)]);
+        match resolve_against(&table, &[], &[], &[], 10) {
+            Identity::Unknown(why) => assert!(why.contains("repeats pid"), "{why}"),
+            other => panic!("a cyclic /proc resolved as {other:?}"),
+        }
+    }
+
+    /// `comm` is attacker-controlled and may contain spaces AND parentheses,
+    /// so the parse splits at the last `)` rather than tokenizing the line.
+    #[test]
+    fn stat_is_parsed_past_a_comm_that_looks_like_fields() {
+        let hostile = "42 (evil) 1 999999) S 7 42 42 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 \
+                       4242 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0";
+        let parsed = parse_stat(hostile.as_bytes());
+        assert_eq!(
+            parsed,
+            Some(Stat {
+                ppid: 7,
+                starttime: 4242
+            }),
+            "a comm containing ') 1 999999' forged its own ppid"
+        );
+
+        let ordinary = "1 (td-init) S 0 1 1 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 \
+                        7 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0";
+        assert_eq!(
+            parse_stat(ordinary.as_bytes()),
+            Some(Stat {
+                ppid: 0,
+                starttime: 7
+            })
+        );
+
+        assert_eq!(parse_stat(b"nonsense with no paren"), None);
+        assert_eq!(parse_stat(b"1 (short) S 0"), None);
+
+    }
+
+    /// A `comm` that is not UTF-8 must not make a process unreadable.
+    ///
+    /// Any process can set its own name to arbitrary bytes, and the broker
+    /// reads "unreadable" as "gone" — which reaps a live instance and stops
+    /// its descendants being recognised. The check has to go through the file
+    /// read rather than through `parse_stat` alone, because the read is where
+    /// the conversion would happen.
+    #[test]
+    fn a_stat_file_whose_comm_is_not_utf8_still_parses() {
+        let mut raw = b"42 (ev".to_vec();
+        raw.push(0x80);
+        raw.extend_from_slice(
+            b"l) S 7 42 42 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 \
+              4242 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0",
+        );
+        let mut path = std::env::temp_dir();
+        path.push(format!("td-busd-stat-{}", std::process::id()));
+        if std::fs::write(&path, &raw).is_err() {
+            return;
+        }
+        let parsed = stat_of(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            parsed,
+            Reading::Of(Stat {
+                ppid: 7,
+                starttime: 4242
+            }),
+            "a comm that is not UTF-8 made a live process unreadable"
+        );
+        // And a path that is not there is GONE rather than merely unreadable,
+        // which is the distinction the reap rests on.
+        assert_eq!(stat_of(&path), Reading::Gone);
+    }
+
+    /// An instance the broker could not READ is not an instance it has been
+    /// shown is gone.
+    ///
+    /// `fs::read` fails for reasons that have nothing to do with the process —
+    /// `EMFILE` and `ENOMEM` among them — and a draft treated every failure as
+    /// death. The connection that observed it was refused, which looks safe,
+    /// but the record was dropped: the NEXT connection from inside that jail
+    /// walked a registry with no record of it and resolved `Unconfined`. No
+    /// attacker is required, only a busy machine.
+    #[test]
+    fn an_instance_that_cannot_be_read_is_refused_rather_than_reaped() {
+        let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (400, 1, 40)]);
+        let instances = Instances::new();
+        let token = instances
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .expect("phase one opens");
+        instances
+            .complete(&table, &token, 100, 1000, 900)
+            .expect("phase two completes");
+
+        table.hide(100);
+        match instances.resolve(&table, 400) {
+            Identity::Unknown(why) => assert!(why.contains("could not be read"), "{why}"),
+            other => panic!("an unreadable instance resolved as {other:?}"),
+        }
+        assert_eq!(
+            instances.live_count(),
+            1,
+            "a read the broker fumbled dropped a live instance"
+        );
+    }
+
+    /// The FIRST of the two edge invariants: a hop whose start time changes
+    /// between the walk's read and the re-read is not the process the walk
+    /// passed.
+    ///
+    /// A review found this untested, and untested here means something
+    /// specific: deleting the whole re-read loop went red through the
+    /// "left during the walk" case, and the mid-walk substitution test staged
+    /// its impostor early enough that both reads agreed and the ORDERING check
+    /// killed it. Nothing staged a hop that changed BETWEEN the two reads, so
+    /// weakening the arm to `Some(_) => {}` passed everything.
+    #[test]
+    fn an_ancestor_replaced_between_the_two_reads_is_unknown() {
+        let table = Table::with(&[(1, 0, 1), (100, 1, 10), (200, 100, 20), (300, 200, 30)]);
+        let live = [instance("one", 100, 10)];
+        // The walk reads 300, 200, 100 and stops at the match, so the swap
+        // lands after read three: the walk saw 200 at start time 20 and the
+        // re-read sees 25. And 25 is younger than 200's own recorded 20 while
+        // still older than its child's 30, so the ordering check cannot fire
+        // and only the re-read can.
+        table.swap_after(
+            3,
+            200,
+            Some(Stat {
+                ppid: 100,
+                starttime: 25,
+            }),
+        );
+        match resolve_against(&table, &live, &[], &[], 300) {
+            Identity::Unknown(why) => assert!(why.contains("was replaced"), "{why}"),
+            other => panic!("a hop replaced between the two reads resolved as {other:?}"),
+        }
+    }
+
+    /// A registered pid is a match only if its START TIME matches too.
+    ///
+    /// The pid alone is a number the kernel reissues. Without the start time
+    /// the walk hands a recycled pid the previous tenant's app id, which is a
+    /// false `Jailed` — the same failure class the ordering invariant exists
+    /// to prevent, one step earlier.
+    #[test]
+    fn a_registered_pid_whose_start_time_differs_is_not_that_instance() {
+        // 100 is registered at start time 10 and `/proc` says 77: the number
+        // came back, the process did not.
+        let table = Table::with(&[(1, 0, 1), (100, 1, 77)]);
+        let live = [instance("one", 100, 10)];
+        match resolve_against(&table, &live, &[], &[], 100) {
+            Identity::Unknown(why) => assert!(why.contains("that process is gone"), "{why}"),
+            other => panic!("a recycled instance pid resolved as {other:?}"),
+        }
+    }
+
+    /// One pid may stand for one instance.
+    ///
+    /// Without this two instances can claim the same stage-2 pid and the
+    /// walk's `find` silently picks whichever was registered first — an
+    /// attribution decided by registration order rather than by the process
+    /// tree.
+    #[test]
+    fn one_pid_binds_to_one_instance() {
+        let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
+        let instances = Instances::new();
+        let first = instances
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .expect("phase one opens");
+        let second = instances
+            .open(&table, "two", "org.td.Two", Vec::new(), 1000, 900)
+            .expect("a second instance opens");
+        instances
+            .complete(&table, &first, 100, 1000, 900)
+            .expect("the first binding takes");
+        let clash = instances
+            .complete(&table, &second, 100, 1000, 900)
+            .expect_err("two instances bound the same pid");
+        assert!(clash.contains("already bound"), "{clash}");
+    }
+
+    /// The walk is bounded. A `/proc` deep enough to exhaust it is refused
+    /// rather than walked, and the cycle guard does not cover this: a very
+    /// long chain repeats nothing.
+    #[test]
+    fn a_lineage_deeper_than_the_ceiling_is_refused() {
+        let rows: Vec<(i32, i32, u64)> = (1..=(MAX_DEPTH as i32 + 8))
+            .map(|pid| (pid, pid - 1, pid as u64))
+            .collect();
+        let table = Table::with(&rows);
+        let deepest = MAX_DEPTH as i32 + 8;
+        match resolve_against(&table, &[], &[], &[], deepest) {
+            Identity::Unknown(why) => assert!(why.contains("deeper than"), "{why}"),
+            other => panic!("an unbounded lineage resolved as {other:?}"),
+        }
+    }
+
+    /// Reaping is keyed on the PROCESS — name, pid and start time together —
+    /// not on the name.
+    ///
+    /// The decision to reap is taken outside the lock and applied under it, so
+    /// an instance that registered again under the same name in between must
+    /// survive a decision that was taken about its predecessor. Keying on the
+    /// name alone would drop the live one, and its descendants would resolve
+    /// `Unconfined`.
+    #[test]
+    fn reaping_is_keyed_on_the_process_rather_than_the_name() {
+        let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
+        let instances = Instances::new();
+        let token = instances
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .expect("phase one opens");
+        instances
+            .complete(&table, &token, 100, 1000, 900)
+            .expect("phase two completes");
+        // Decisions taken about something that is not this record. Each leg
+        // differs from the live record in exactly ONE of the three fields, so
+        // dropping any one of them from the key fails here rather than
+        // needing all three to be wrong at once.
+        for stale in [
+            ("one".to_string(), 100, 10),  // same name and pid, older process
+            ("one".to_string(), 700, 95),  // same name and start time, other pid
+            ("two".to_string(), 100, 95),  // same pid and start time, other name
+        ] {
+            instances.reap(std::slice::from_ref(&stale));
+            assert_eq!(
+                instances.live_count(),
+                1,
+                "a reap decision about {stale:?} dropped a different instance"
+            );
+        }
+        instances.reap(&[("one".to_string(), 100, 95)]);
+        assert_eq!(instances.live_count(), 0, "the matching record survived");
+    }
+
+    /// A registrant may bind its own CHILD and nothing else.
+    ///
+    /// Without this any session peer could open a registration and complete it
+    /// with any pid it can read. Completing with pid 1 is the sharp version:
+    /// every later connection in the session walks through pid 1, so every one
+    /// of them would land in the attacker's instance and be handed its app id.
+    #[test]
+    fn phase_two_may_bind_only_the_registrants_own_child() {
+        // 700 is a perfectly readable process that 900 did not spawn.
+        let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (700, 1, 70)]);
+        let instances = Instances::new();
+        let token = instances
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .expect("phase one opens");
+
+        for stranger in [1, 700] {
+            let error = instances
+                .complete(&table, &token, stranger, 1000, 900)
+                .expect_err("a stranger's pid completed the registration");
+            assert!(error.contains("not a child"), "{error}");
+        }
+        // The token survives every refusal, or a failed attempt would be a way
+        // to deny somebody else's launch.
+        instances
+            .complete(&table, &token, 100, 1000, 900)
+            .expect("the registrant's own child completes");
+    }
+
+    /// And phase two must come from the connection that opened phase one.
+    ///
+    /// The token is unguessable, but "unguessable" is a probability and this
+    /// is a check. It is also what makes the child rule mean anything: the
+    /// parent it compares against is the caller's own process.
+    #[test]
+    fn phase_two_must_come_from_the_connection_that_opened_it() {
+        let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (901, 1, 91)]);
+        let instances = Instances::new();
+        let token = instances
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .expect("phase one opens");
+        let error = instances
+            .complete(&table, &token, 100, 1000, 901)
+            .expect_err("another connection completed the registration");
+        assert!(error.contains("completed by pid 901"), "{error}");
+    }
+
+    /// An expired token completes nothing, and does not wait for a connection
+    /// to happen along and sweep it.
+    #[test]
+    fn an_expired_token_completes_nothing() {
+        let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
+        let instances = Instances::new();
+        let token = instances
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .expect("phase one opens");
+        let Some(later) = Instant::now()
+            .checked_add(PENDING_LIFETIME)
+            .and_then(|t| t.checked_add(Duration::from_secs(1)))
+        else {
+            return;
+        };
+        let error = instances
+            .complete_at(&table, &token, 100, 1000, 900, later)
+            .expect_err("an expired registration completed");
+        assert!(error.contains("no registration is open"), "{error}");
+        assert_eq!(instances.live_count(), 0);
+    }
+
+    /// The token is a secret, not a serial number.
+    ///
+    /// A draft used a counter and the instance name, which a peer can derive:
+    /// its own registrations tell it the counter and `open`'s two distinct
+    /// refusals are a name oracle. Guessing one lets an attacker CONSUME
+    /// somebody else's in-flight registration, after which the real stage 1
+    /// fails — with stage 2 already spawned and no record of it.
+    #[test]
+    fn tokens_are_unguessable_rather_than_serial() {
+        // No process is looked up here; the sweep just finds nothing.
+        let table = Table::default();
+        let instances = Instances::new();
+        let first = instances
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .expect("phase one opens");
+        let second = instances
+            .open(&table, "two", "org.td.One", Vec::new(), 1000, 900)
+            .expect("a second registration opens");
+        assert_ne!(first, second);
+        for token in [&first, &second] {
+            assert_eq!(token.len(), 32, "{token} is not 128 bits of hex");
+            assert!(
+                token.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "{token} is not hex"
+            );
+        }
+        assert!(!first.contains("one") && !second.contains("two"));
+
+        // The assertions above are all satisfied by a zero-padded counter,
+        // which a review demonstrated by writing one. Two things separate a
+        // secret from a serial and neither is shape. Consecutive counter
+        // values share every character but the last few, so the FIRST HALVES
+        // must differ...
+        assert_ne!(
+            first.get(..16),
+            second.get(..16),
+            "consecutive tokens share a prefix, which is what a counter does"
+        );
+        // ...and a counter restarts with the registry, so two fresh registries
+        // would hand out the same first token for the same instance name.
+        let elsewhere = Instances::new();
+        let same_name = elsewhere
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .expect("a second registry opens");
+        assert_ne!(
+            first, same_name,
+            "two registries issued the same token, which is what a counter does"
+        );
+    }
+
+    /// The parse runs against the real kernel too, because a hand-written
+    /// fixture only proves the parser agrees with the author's reading of
+    /// `proc(5)`.
+    #[test]
+    fn the_real_proc_entry_for_this_process_parses() {
+        let me = std::process::id();
+        let Ok(pid) = i32::try_from(me) else {
+            return;
+        };
+        let Reading::Of(stat) = RealProcfs.stat(pid) else {
+            panic!("this process has no readable /proc entry");
+        };
+        assert!(stat.ppid > 0, "a test process has a parent");
+        assert!(stat.starttime > 0, "a running process started at some point");
+        // And this process descends from no registered instance, which is the
+        // one identity assertion that can be made against a live machine.
+        let instances = Instances::new();
+        assert_eq!(instances.resolve(&RealProcfs, pid), Identity::Unconfined);
+    }
+
+    #[test]
+    fn registration_is_two_phase_and_its_token_is_one_shot() {
+        // 900 registers and 100 is its child, which is the shape a real
+        // stage 0 and its stage 2 have. 110 is a second child of 900, for the
+        // one-shot leg below.
+        let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (110, 900, 96)]);
+        let instances = Instances::new();
+        let token = instances
+            .open(&table, "one", "org.td.One", vec!["ca.desrt.dconf".to_string()], 1000, 900)
+            .expect("phase one opens");
+
+        // Between the phases the instance is not resolvable, and the peer
+        // fails CLOSED rather than being queued or called unconfined.
+        assert!(matches!(
+            instances.resolve(&table, 100),
+            Identity::Unknown(_)
+        ));
+        assert_eq!(instances.live_count(), 0);
+
+        instances
+            .complete(&table, &token, 100, 1000, 900)
+            .expect("phase two completes");
+        assert_eq!(instances.live_count(), 1);
+        assert_eq!(
+            instances.resolve(&table, 100),
+            Identity::Jailed {
+                app_id: "org.td.One".to_string(),
+                instance: "one".to_string()
+            }
+        );
+
+        // One shot: the TOKEN is consumed. A draft re-completed with the same
+        // pid, which the "already bound to an instance" rule refuses on its
+        // own — so deleting the consumption changed nothing the test could
+        // see. A second CHILD is what separates them: under a non-consuming
+        // token it binds a second live instance under one instance name, each
+        // burning a `MAX_INSTANCES` slot, where a duplicate `Register` would
+        // have been refused outright.
+        let again = instances.complete(&table, &token, 110, 1000, 900);
+        assert!(again.is_err(), "a consumed token bound a second pid");
+        assert_eq!(instances.live_count(), 1, "one token bound two instances");
+    }
+
+    #[test]
+    fn phase_two_must_come_from_the_uid_that_opened_phase_one() {
+        let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
+        let instances = Instances::new();
+        let token = instances
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .expect("phase one opens");
+        let wrong = instances.complete(&table, &token, 100, 1001, 900);
+        assert!(wrong.is_err(), "another uid completed the registration");
+        // And the token survives a refused attempt rather than being burned by
+        // it, or anyone could deny a launch by guessing at it once.
+        assert!(instances.complete(&table, &token, 100, 1000, 900).is_ok());
+    }
+
+    #[test]
+    fn a_pid_that_is_already_gone_completes_nothing() {
+        let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
+        let instances = Instances::new();
+        let token = instances
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .expect("phase one opens");
+        let error = instances
+            .complete(&table, &token, 700, 1000, 900)
+            .expect_err("a pid with no /proc entry must not complete");
+        assert!(error.contains("does not exist"), "{error}");
+
+        // And a pid the broker merely could not READ does not complete
+        // either: the record's start time would have to be invented.
+        table.hide(100);
+        let error = instances
+            .complete(&table, &token, 100, 1000, 900)
+            .expect_err("an unreadable pid must not complete");
+        assert!(error.contains("no readable /proc entry"), "{error}");
+    }
+
+    #[test]
+    fn the_registry_is_bounded_and_refuses_a_repeated_instance() {
+        // No process is looked up here; the sweep just finds nothing.
+        let table = Table::default();
+        let instances = Instances::new();
+        for which in 0..MAX_INSTANCES {
+            instances
+                .open(&table, &format!("i{which}"), "org.td.One", Vec::new(), 1000, 900)
+                .expect("under the ceiling");
+        }
+        assert!(instances.open(&table, "more", "org.td.One", Vec::new(), 1000, 900).is_err());
+
+        let fresh = Instances::new();
+        fresh
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .expect("first");
+        assert!(
+            fresh.open(&table, "one", "org.td.Other", Vec::new(), 1000, 900).is_err(),
+            "a second registration took over a live instance name"
+        );
+        // A fresh name, or this leg never reaches the service ceiling: it
+        // would be refused for the duplicate instance name instead, and the
+        // ceiling could be deleted without failing anything.
+        assert!(fresh
+            .open(&table, "two", "org.td.One", vec![String::new(); MAX_SERVICES + 1], 1000, 900)
+            .is_err());
+    }
+
+    /// The instance ceiling is not a one-way ratchet.
+    ///
+    /// `resolve` is not the only sweep, and if it were the ceiling would be
+    /// reachable and permanent: filling the registry with registrations that
+    /// are never completed would refuse every later launch until some
+    /// connection happened along, which on a session bus with nothing
+    /// connecting is never.
+    #[test]
+    fn abandoned_registrations_do_not_hold_the_ceiling_for_ever() {
+        // No process is looked up here; the sweep just finds nothing.
+        let table = Table::default();
+        let instances = Instances::new();
+        for which in 0..MAX_INSTANCES {
+            instances
+                .open(&table, &format!("i{which}"), "org.td.One", Vec::new(), 1000, 900)
+                .expect("under the ceiling");
+        }
+        assert!(instances
+            .open(&table, "more", "org.td.One", Vec::new(), 1000, 900)
+            .is_err());
+
+        let Some(later) = Instant::now()
+            .checked_add(PENDING_LIFETIME)
+            .and_then(|t| t.checked_add(Duration::from_secs(1)))
+        else {
+            return;
+        };
+        instances
+            .open_at(&table, "more", "org.td.One", Vec::new(), 1000, 900, later)
+            .expect("the abandoned registrations no longer hold their slots");
+        assert_eq!(instances.pending_count(), 1);
+    }
+
+    /// And the same for the LIVE side of the ceiling.
+    ///
+    /// `resolve` is the only other sweep and it needs an incoming connection,
+    /// so a launcher whose applications exit without ever touching the bus
+    /// fills all 64 slots with dead instances and every later `Register` is
+    /// refused for good. A review found this after the pending half was fixed:
+    /// the same ratchet, in the neighbouring collection.
+    #[test]
+    fn instances_whose_jails_exited_do_not_hold_the_ceiling_either() {
+        let mut rows = vec![(1, 0, 1), (900, 1, 90)];
+        for which in 0..MAX_INSTANCES as i32 {
+            rows.push((1000 + which, 900, 95));
+        }
+        let table = Table::with(&rows);
+        let instances = Instances::new();
+        for which in 0..MAX_INSTANCES as i32 {
+            let token = instances
+                .open(&table, &format!("i{which}"), "fixture", Vec::new(), 1000, 900)
+                .expect("under the ceiling");
+            instances
+                .complete(&table, &token, 1000 + which, 1000, 900)
+                .expect("phase two completes");
+        }
+        assert_eq!(instances.live_count(), MAX_INSTANCES);
+        assert!(instances
+            .open(&table, "more", "fixture", Vec::new(), 1000, 900)
+            .is_err());
+
+        // Every jail exits, and no connection arrives to notice.
+        let after = Table::with(&[(1, 0, 1), (900, 1, 90)]);
+        instances
+            .open(&after, "more", "fixture", Vec::new(), 1000, 900)
+            .expect("dead instances still held their slots");
+    }
+
+    /// An instance whose jail has exited is REAPED, not refused for ever.
+    ///
+    /// This is the lifecycle case, and getting it wrong is a denial of service
+    /// with no attacker in it: every application exit would leave a record the
+    /// accounting pass trips over, and one ordinary launch-and-quit would make
+    /// `Unconfined` unsayable for the rest of the broker's life.
+    #[test]
+    fn an_instance_whose_jail_exited_is_reaped_rather_than_refused_for_ever() {
+        let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (400, 1, 40)]);
+        let instances = Instances::new();
+        let token = instances
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .expect("phase one opens");
+        instances
+            .complete(&table, &token, 100, 1000, 900)
+            .expect("phase two completes");
+        assert_eq!(instances.live_count(), 1);
+
+        // The jail exits: pid 100 is no longer anywhere. A peer whose lineage
+        // never touched it is answered normally — the record is stale, not
+        // ambiguous, for THIS connection — and the record is dropped in the
+        // same call.
+        let after = Table::with(&[(1, 0, 1), (900, 1, 90), (400, 1, 40)]);
+        assert_eq!(instances.resolve(&after, 400), Identity::Unconfined);
+        assert_eq!(instances.live_count(), 0, "the dead instance was not reaped");
+    }
+
+    /// The reap refuses the connection it actually endangers, and only that
+    /// one.
+    ///
+    /// A dropped record matters to a lookup exactly when the dropped pid
+    /// stands in that lookup's lineage: the instance ended, the number may
+    /// already belong to the hop the walk went through, and every hop above
+    /// was reached by trusting it. A draft refused EVERY connection that
+    /// observed any reap, which a review showed a rogue can schedule at will —
+    /// register a child, complete, kill it, and the next connection is denied,
+    /// for its whole life, because identity is decided once at accept.
+    #[test]
+    fn a_reaped_pid_in_this_lineage_refuses_and_elsewhere_does_not() {
+        // The jail's stage 2 is 100. It exits and pid 100 comes back as a
+        // different process — start time 95 became 77 — which is what makes
+        // the walk through it unsound rather than merely stale.
+        let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
+        let instances = Instances::new();
+        let token = instances
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .expect("phase one opens");
+        instances
+            .complete(&table, &token, 100, 1000, 900)
+            .expect("phase two completes");
+
+        let after = Table::with(&[(1, 0, 1), (100, 1, 77), (400, 100, 80), (500, 1, 50)]);
+        match instances.resolve(&after, 400) {
+            Identity::Unknown(why) => assert!(why.contains("passes through it"), "{why}"),
+            other => panic!("a peer descending from a reaped pid resolved as {other:?}"),
+        }
+        assert_eq!(instances.live_count(), 0, "the dead instance was not reaped");
+        // A peer elsewhere in the tree is unaffected, which is the half a
+        // blanket refusal gave away.
+        assert_eq!(instances.resolve(&after, 500), Identity::Unconfined);
+    }
+
+    /// A registration between its two phases has no stage-2 pid on record, so
+    /// a peer descending from it would walk straight past — and `Unconfined`
+    /// is the one answer that must not be given to the process that is
+    /// certainly confined.
+    ///
+    /// The rule is scoped to DESCENDANTS of the registrant, and the scoping is
+    /// the security-relevant part twice over. Too wide and any uid-1000
+    /// process denies the whole session by opening a registration it never
+    /// finishes. Too narrow — excluding nothing — and the peer that is about
+    /// to be confined is called unconfined.
+    #[test]
+    fn a_registration_in_flight_covers_the_registrants_descendants() {
+        // 900 is the registrant (stage 0/1). 950 is a child of it, standing in
+        // for the stage 2 that has not been registered yet. 400 is elsewhere.
+        let table = Table::with(&[
+            (1, 0, 1),
+            (400, 1, 40),
+            (900, 1, 90),
+            (950, 900, 95),
+            (960, 950, 96),
+        ]);
+        let instances = Instances::new();
+        assert_eq!(instances.resolve(&table, 400), Identity::Unconfined);
+
+        let token = instances
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .expect("phase one opens");
+
+        // A peer that could belong to the pending instance is refused...
+        for peer in [950, 960] {
+            match instances.resolve(&table, peer) {
+                Identity::Unknown(why) => assert!(why.contains("in flight"), "{why}"),
+                other => panic!("pid {peer} resolved as {other:?} mid-registration"),
+            }
+        }
+        // ...a peer elsewhere in the tree is not, which is what keeps an
+        // abandoned registration from denying the session.
+        assert_eq!(instances.resolve(&table, 400), Identity::Unconfined);
+        // ...and the REGISTRANT itself is not, or the broker would deny the
+        // connection whose next message completes the registration.
+        assert_eq!(instances.resolve(&table, 900), Identity::Unconfined);
+
+        instances
+            .complete(&table, &token, 950, 1000, 900)
+            .expect("phase two completes");
+        assert_eq!(instances.resolve(&table, 400), Identity::Unconfined);
+        assert_eq!(
+            instances.resolve(&table, 960),
+            Identity::Jailed {
+                app_id: "org.td.One".to_string(),
+                instance: "one".to_string()
+            }
+        );
+    }
+
+    /// A registration whose second phase never comes must not deny the
+    /// session for ever.
+    ///
+    /// The registrant is the one party that could clean this up and it is
+    /// exactly the party that is gone, so nothing but a deadline can. Without
+    /// it one stage 0 that died between the phases would leave every later
+    /// connection `Unknown` until the broker restarted.
+    #[test]
+    fn a_registration_that_is_never_completed_expires() {
+        let table = Table::with(&[(1, 0, 1), (900, 1, 90), (950, 900, 95)]);
+        let instances = Instances::new();
+        instances
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .expect("phase one opens");
+        assert_eq!(instances.pending_count(), 1);
+        assert!(matches!(
+            instances.resolve(&table, 950),
+            Identity::Unknown(_)
+        ));
+
+        // The clock is an argument to RESOLVE, not to a sweep the test runs
+        // itself. A draft called `expire_pending` here and then checked
+        // `resolve`, which passes just as happily if `resolve` stops sweeping
+        // at all — the regression it existed to catch was invisible to it.
+        let later = Instant::now()
+            .checked_add(PENDING_LIFETIME)
+            .and_then(|t| t.checked_add(Duration::from_secs(1)));
+        let Some(later) = later else {
+            return;
+        };
+        assert_eq!(instances.resolve_at(&table, 950, later), Identity::Unconfined);
+        assert_eq!(instances.pending_count(), 0, "resolve did not sweep");
+    }
+
+    #[test]
+    fn app_id_is_reported_only_for_a_jailed_connection() {
+        assert_eq!(
+            Identity::Jailed {
+                app_id: "org.td.One".to_string(),
+                instance: "one".to_string()
+            }
+            .app_id(),
+            Some("org.td.One")
+        );
+        assert_eq!(Identity::Unconfined.app_id(), None);
+        assert_eq!(Identity::Unknown("why".to_string()).app_id(), None);
+    }
+}

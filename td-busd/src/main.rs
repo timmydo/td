@@ -15,15 +15,25 @@
 //! `RequestName` and `AddMatch` are `UnknownMethod` until then and nothing on
 //! this bus broadcasts.
 //!
+//! Rung 15's first increment is here too, on td's own interface rather than
+//! the specification's: `td.Jail1.Register` and `td.Jail1.Complete` at
+//! `/td/Jail1` record which jailed instance a process belongs to, and
+//! `lineage` answers that question for a connection. Nothing consults the
+//! answer to decide anything yet.
+//!
 //! What no call gets is silence. A caller waiting on a serial that will never
 //! be answered hangs rather than fails, so a call this broker cannot serve is
-//! ANSWERED with an error saying so rather than dropped. A signal, a reply, or
-//! a call marked `NO_REPLY_EXPECTED` is consumed without one, because nothing
-//! is waiting on it and the specification reserves replies for calls.
+//! ANSWERED with an error saying so rather than dropped. A signal or a reply
+//! is consumed without one, because nothing is waiting on it and the
+//! specification reserves replies for calls. A CALL marked
+//! `NO_REPLY_EXPECTED` is consumed without a reply too — but the two
+//! registration methods still do their work, because the flag withdraws the
+//! answer and not the request.
 
 mod auth;
 mod authscript;
 mod corpus;
+mod lineage;
 mod message;
 mod name;
 mod recorded;
@@ -82,6 +92,9 @@ fn run(socket: &Path) -> Result<String, String> {
     // guid text, which each thread re-validates into a `Guid` of its own.
     let quota = Arc::new(transport::Quota::new());
     let bus = Arc::new(registry::Bus::new());
+    // Every jail instance this broker knows. Shared with every connection
+    // thread: the registration methods write it and every accept reads it.
+    let instances = Arc::new(lineage::Instances::new());
     let guid_text = Arc::new(text);
     // Consecutive failed accepts. Reset by any success, so a busy bus that
     // sheds the occasional peer never approaches the ceiling.
@@ -158,12 +171,13 @@ fn run(socket: &Path) -> Result<String, String> {
         };
         let text = Arc::clone(&guid_text);
         let directory = Arc::clone(&bus);
+        let registered = Arc::clone(&instances);
         let spawned = thread::Builder::new().spawn(move || {
             // `admitted` is moved in, so this peer's place in the quota is
             // given back when this thread ends, however it ends.
             let _admitted = admitted;
             match auth::Guid::new(text.as_str()) {
-                Ok(guid) => serve_one(stream, guid, &_admitted, &directory),
+                Ok(guid) => serve_one(stream, guid, &_admitted, &directory, &registered),
                 Err(error) => eprintln!("td-busd: bad guid: {error:?}"),
             }
         });
@@ -184,8 +198,9 @@ fn serve_one(
     guid: auth::Guid<'_>,
     admitted: &transport::Admitted,
     bus: &registry::Bus,
+    instances: &lineage::Instances,
 ) {
-    match transport::Connection::accept(stream, guid, admitted.quota(), bus) {
+    match transport::Connection::accept(stream, guid, admitted.quota(), bus, instances) {
         Ok(mut connection) => {
             let peer = connection.credential();
             let ended = connection.serve();
@@ -252,6 +267,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("transport", include_str!("transport.rs")),
     ("authscript", include_str!("authscript.rs")),
     ("corpus", include_str!("corpus.rs")),
+    ("lineage", include_str!("lineage.rs")),
     ("message", include_str!("message.rs")),
     ("name", include_str!("name.rs")),
     ("recorded", include_str!("recorded.rs")),
