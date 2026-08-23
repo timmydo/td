@@ -11,6 +11,7 @@ compile_error!("td-jail is x86_64-linux only (raw syscall ABI)");
 const SYS_CLOSE: usize = 3;
 const SYS_IOCTL: usize = 16;
 const SYS_WAIT4: usize = 61;
+const SYS_KILL: usize = 62;
 const SYS_CAPGET: usize = 125;
 const SYS_CAPSET: usize = 126;
 const SYS_PIVOT_ROOT: usize = 155;
@@ -57,6 +58,9 @@ const PR_CAP_AMBIENT_CLEAR_ALL: usize = 4;
 
 const PID_ANY: usize = -1_isize as usize;
 const WNOHANG: usize = 1;
+pub(crate) const SIGKILL: i32 = 9;
+pub(crate) const SIGTERM: i32 = 15;
+const ESRCH: i32 = 3;
 const EINTR: i32 = 4;
 const ECHILD: i32 = 10;
 const SECCOMP_SET_MODE_FILTER: usize = 1;
@@ -198,6 +202,35 @@ pub fn wait_any(nohang: bool) -> io::Result<Reaped> {
         0,
     );
     classify_wait(ret, status)
+}
+
+pub fn terminate_namespace() -> io::Result<()> {
+    signal_namespace(SIGTERM)
+}
+
+pub fn kill_namespace() -> io::Result<()> {
+    signal_namespace(SIGKILL)
+}
+
+fn signal_namespace(signal: i32) -> io::Result<()> {
+    classify_signal(syscall5(SYS_KILL, PID_ANY, signal as usize, 0, 0, 0))
+}
+
+fn classify_signal(ret: isize) -> io::Result<()> {
+    if ret == 0 || ret == -(ESRCH as isize) {
+        return Ok(());
+    }
+    if ret < 0 {
+        return Err(io::Error::from_raw_os_error(-ret as i32));
+    }
+    Err(io::Error::other(format!(
+        "kill returned unexpected positive value {ret}"
+    )))
+}
+
+pub fn wait_signal(status: i32) -> Option<i32> {
+    let signal = status & 0x7f;
+    (signal != 0 && signal != 0x7f).then_some(signal)
 }
 
 fn classify_wait(ret: isize, status: i32) -> io::Result<Reaped> {
@@ -427,8 +460,14 @@ pub fn no_new_privileges() -> io::Result<bool> {
 }
 
 pub fn set_parent_death_signal() -> io::Result<()> {
-    const SIGKILL: usize = 9;
-    check(syscall5(SYS_PRCTL, PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0))
+    check(syscall5(
+        SYS_PRCTL,
+        PR_SET_PDEATHSIG,
+        SIGKILL as usize,
+        0,
+        0,
+        0,
+    ))
 }
 
 pub fn set_dumpable(dumpable: bool) -> io::Result<()> {
@@ -545,11 +584,14 @@ mod tests {
         assert_eq!(SECCOMP_SET_MODE_FILTER, 1);
         assert_eq!(SECCOMP_MAX_FILTER_INSNS, 4096);
         assert_eq!(SYS_IOCTL, 16);
+        assert_eq!(SYS_KILL, 62);
         assert_eq!(SIOCGIFFLAGS, 0x8913);
         assert_eq!(SIOCSIFFLAGS, 0x8914);
         assert_eq!(IFF_UP, 1);
         assert_eq!(PID_ANY, usize::MAX);
         assert_eq!(WNOHANG, 1);
+        assert_eq!(SIGKILL, 9);
+        assert_eq!(SIGTERM, 15);
     }
 
     #[test]
@@ -620,5 +662,22 @@ mod tests {
             Reaped::NoChildren
         );
         assert_eq!(classify_wait(-22, 0).unwrap_err().raw_os_error(), Some(22));
+    }
+
+    #[test]
+    fn namespace_signal_accepts_targets_or_an_empty_namespace() {
+        classify_signal(0).unwrap();
+        classify_signal(-(ESRCH as isize)).unwrap();
+        assert_eq!(classify_signal(-1).unwrap_err().raw_os_error(), Some(1));
+        assert!(classify_signal(1).is_err());
+    }
+
+    #[test]
+    fn raw_wait_status_decodes_only_terminating_signals() {
+        assert_eq!(wait_signal(SIGTERM), Some(SIGTERM));
+        assert_eq!(wait_signal(SIGKILL | 0x80), Some(SIGKILL));
+        assert_eq!(wait_signal(0), None);
+        assert_eq!(wait_signal(1 << 8), None);
+        assert_eq!(wait_signal(0x7f), None);
     }
 }

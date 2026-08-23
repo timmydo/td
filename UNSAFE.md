@@ -46,7 +46,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `ioctl(2)` |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
-| 9 | `td-jail` | `close(2)`, `ioctl(2)` with two value-pinned requests, `wait4(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `seccomp(2)` with one value-pinned operation |
+| 9 | `td-jail` | `close(2)`, `ioctl(2)` with two value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `seccomp(2)` with one value-pinned operation |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering: it is host-side, and no
@@ -974,10 +974,11 @@ virtual fd table that stands in for `dup2` — is reachable through safe
 
 ## 9. `td-jail` — the application sandbox
 
-The landed `td-jail` surface carries exactly ELEVEN syscalls on x86-64
+The landed `td-jail` surface carries exactly TWELVE syscalls on x86-64
 through one `syscall5` body: `unshare(2)`, `close(2)`, `ioctl(2)`,
-`wait4(2)`, `mount(2)`, `umount2(2)`, `pivot_root(2)`, `capset(2)`,
-`capget(2)`, and `prctl(2)`, plus `seccomp(2)` with exactly one operation:
+`wait4(2)`, `kill(2)`, `mount(2)`, `umount2(2)`, `pivot_root(2)`,
+`capset(2)`, `capget(2)`, and `prctl(2)`, plus `seccomp(2)` with exactly
+one operation:
 `SECCOMP_SET_MODE_FILTER`=1 and flags zero.
 The unshare wrapper accepts only the two compiled namespace sets the
 application design permits:
@@ -1091,13 +1092,25 @@ an exact marker line. Reaper descendants require the installed restriction
 and filter readbacks too.
 
 `wait4(2)` is pinned to pid -1, a null rusage pointer, and either zero or
-`WNOHANG`. Through that single-file bind, the transition probe launches a
+`WNOHANG`. `kill(2)` is likewise closed: its pid is always -1 and its signal
+is exactly `SIGTERM` or `SIGKILL`; callers choose only between two
+argument-free wrappers. After the direct application exits, PID 1 sends
+`SIGTERM`, polls and reaps for two seconds, then repeatedly sends `SIGKILL`
+while polling and reaping for at most two more seconds. If PID 1 has not yet
+observed `ECHILD`, it exits with an error and kernel PID-namespace teardown
+supplies the final hard stop. Reap accounting is fixed-size rather than
+proportional to a hostile child table.
+
+Through the probe-only single-file bind, the transition probe launches a
 zero-capability child that creates a grandchild and
 exits without waiting, then requires PID 1 to reap both the direct child
 and the reparented orphan with successful raw statuses under one bounded
 deadline. Only after `ECHILD` makes the report pipe nonblocking does it
-read the orphan PID and verify the exact collected set; namespace exit removes
-the probe-only mount.
+read the orphan PID and verify the exact collected set. It then creates two
+long-lived reparented orphans: the production survivor cleanup must reap the
+first exact PID with `SIGTERM`, and its shared hard-phase implementation must
+reap the second exact PID with `SIGKILL`, both under the installed filter.
+Namespace exit removes the probe-only mount.
 The same transition now has one closed application action. A `/bin` symlink
 selects a name by argv[0]; safe Rust reads the immutable image configuration,
 sorted registry and canonical builder-owned spec, then accepts only the
@@ -1117,12 +1130,14 @@ authority over all application state. The
 volatile runtime bind carries the fixture's readiness socket across the
 otherwise-private `/run`; safe Rust on the host probes the per-application
 end before trusted QEMU evidence. Stage 2
-performs the same mount/capability/filter readbacks before spawning the entry
-and reaps the namespace to `ECHILD`; the transition probe separately exercises
-the bound orphan-reaper fixture. No caller supplies a mount, filter, namespace
-or raw syscall argument. The application entry, environment and argv cross the
-authenticated stage boundary as inert argv data and are grammar-revalidated
-there; binding them to the authenticated spec remains stage 1's job. Stage 2
+performs the same mount/capability/filter readbacks before spawning the entry.
+It preserves the direct entry's status while bounded survivor cleanup drains
+the namespace to `ECHILD`; the transition probe exercises both natural orphan
+reaping and forced survivor cleanup. No caller supplies a mount, filter,
+namespace or raw syscall argument. The application entry, environment and
+argv cross the authenticated stage boundary as inert argv data and are
+grammar-revalidated there; binding them to the authenticated spec remains
+stage 1's job. Stage 2
 itself execs with an empty environment; only the final ordinary application
 child receives the compiled environment after the capability and filter
 readbacks. Stage 2's argv includes the one-use proof token, entry, environment
@@ -1148,12 +1163,12 @@ terminal state. The readiness socket is same-UID evidence rather than an
 authenticated peer: another uid-1000 process can satisfy the probe, so this is
 an image-test oracle, not hostile-payload attestation.
 
-Deliberately NOT in this surface yet are the other two calls in
-`APPLICATIONS.md`'s target-state draft: `kill` and `prlimit64`.
-Each arrives only with the rung that uses and tests it; the
-roadmap is not advance authorization for dormant wrappers.
+Deliberately NOT in this surface yet is the remaining call in
+`APPLICATIONS.md`'s target-state draft: `prlimit64`. It arrives only with the
+rung that uses and tests it; the roadmap is not advance authorization for a
+dormant wrapper.
 There is likewise no `fork`, `pre_exec`, `clone`, `setns`, or caller-
-supplied namespace, mount set, or BPF program. A twelfth syscall, a ninth
+supplied namespace, mount set, or BPF program. A thirteenth syscall, a ninth
 prctl operation, a second seccomp operation or nonzero seccomp flag, a fourth
 ambient sub-operation, or a third unshare flag set
 is an amendment here.

@@ -194,9 +194,9 @@ mod tests {
         assert!(transition.contains("fn mount_reaper_probe(executable: &Path)"));
         assert!(!transition.contains("fs::copy(executable"));
         assert!(transition.contains(
-            "Stage2Action::Probe => {\n            probe_pid1_reaper()?;"
+            "Stage2Action::Probe => {\n            probe_pid1_lifecycle()?;"
         ));
-        assert_eq!(transition.matches("probe_pid1_reaper()?").count(), 1);
+        assert_eq!(transition.matches("probe_pid1_lifecycle()?").count(), 1);
         assert!(transition.contains(".stdin(Stdio::from(null_input))"));
         assert!(transition.contains(".stdout(Stdio::from(null_output))"));
         assert!(transition.contains(".stderr(Stdio::from(null_error))"));
@@ -231,9 +231,43 @@ mod tests {
             filter < nondumpable && nondumpable < watcher && watcher < application,
             "stage 2 must install confinement before it creates a thread or launches the app"
         );
+        assert!(transition.contains("if pid == application_pid {"));
         assert!(transition.contains(
-            "if pid == application_pid && application_status.is_none()"
+            "application_status = Some(status);\n                    break;"
         ));
+        assert!(transition.contains(
+            "Some(_) => terminate_and_reap_survivors().err(),\n        None => None,"
+        ));
+        assert_eq!(transition.matches("terminate_and_reap_survivors()?").count(), 1);
+        assert!(transition.contains("Some(_) => terminate_and_reap_survivors().err(),"));
+        assert!(transition.contains("sys::terminate_namespace,"));
+        assert!(transition.contains(
+            "const SURVIVOR_TERM_TIMEOUT: Duration = Duration::from_secs(2);"
+        ));
+        assert!(transition.contains(
+            "const SURVIVOR_KILL_TIMEOUT: Duration = Duration::from_secs(2);"
+        ));
+        assert!(transition.contains(
+            "drain(SURVIVOR_TERM_TIMEOUT, &mut reaped, false)? == DrainOutcome::Drained"
+        ));
+        assert!(transition.contains(
+            "drain(SURVIVOR_KILL_TIMEOUT, &mut reaped, true)? == DrainOutcome::Drained"
+        ));
+        assert!(transition.contains("probe_pid1_survivor_cleanup()"));
+        assert!(transition.contains(
+            "require_single_survivor_signal(&term_reaped, term_pid, sys::SIGTERM, \"TERM cleanup\")"
+        ));
+        assert!(transition.contains(
+            "require_single_survivor_signal(&kill_reaped, kill_pid, sys::SIGKILL, \"KILL cleanup\")"
+        ));
+        let descendant_parent = transition
+            .split_once("fn run_descendant_parent")
+            .expect("descendant parent")
+            .1
+            .split_once("pub fn run_reaper_orphan")
+            .expect("descendant orphan")
+            .0;
+        assert!(descendant_parent.contains(".stdout(Stdio::null())"));
         let writable_probe = transition
             .split_once("fn require_writable_directory")
             .expect("writable probe")

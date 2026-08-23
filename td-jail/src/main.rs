@@ -34,6 +34,8 @@ fn run() -> std::io::Result<()> {
         } => transition::run_stage2(token, identity, action),
         transition::Mode::ReaperChild => transition::run_reaper_child(),
         transition::Mode::ReaperOrphan => transition::run_reaper_orphan(),
+        transition::Mode::SurvivorChild => transition::run_survivor_child(),
+        transition::Mode::SurvivorOrphan => transition::run_survivor_orphan(),
     }
 }
 
@@ -79,6 +81,7 @@ mod confinement {
             "const SYS_CLOSE: usize = 3;",
             "const SYS_IOCTL: usize = 16;",
             "const SYS_WAIT4: usize = 61;",
+            "const SYS_KILL: usize = 62;",
             "const SYS_CAPGET: usize = 125;",
             "const SYS_CAPSET: usize = 126;",
             "const SYS_PIVOT_ROOT: usize = 155;",
@@ -90,7 +93,7 @@ mod confinement {
         ] {
             assert!(SYS.contains(syscall), "missing syscall pin: {syscall}");
         }
-        assert_eq!(SYS.matches("const SYS_").count(), 11);
+        assert_eq!(SYS.matches("const SYS_").count(), 12);
         assert!(SYS.contains("const BASE_NAMESPACE_FLAGS: usize ="));
         assert!(SYS.contains("const ISOLATED_NETWORK_FLAGS: usize ="));
         for flag in [
@@ -123,6 +126,16 @@ mod confinement {
         assert_eq!(SYS.matches("const PR_CAP_AMBIENT_").count(), 3);
         assert!(SYS.contains("pub const CAP_SETPCAP: u32 = 8;"));
         assert!(SYS.contains("pub const CAP_SYS_ADMIN: u32 = 21;"));
+        assert!(SYS.contains("pub(crate) const SIGKILL: i32 = 9;"));
+        assert!(SYS.contains("pub(crate) const SIGTERM: i32 = 15;"));
+        assert!(SYS.contains(
+            "pub fn terminate_namespace() -> io::Result<()> {\n    signal_namespace(SIGTERM)\n}"
+        ));
+        assert!(SYS.contains(
+            "pub fn kill_namespace() -> io::Result<()> {\n    signal_namespace(SIGKILL)\n}"
+        ));
+        assert_eq!(shipped_sys.matches("SYS_KILL,").count(), 1);
+        assert_eq!(shipped_sys.matches("signal_namespace(").count(), 3);
         assert!(SYS.contains("std::ptr::from_mut(&mut data) as usize"));
         assert!(SYS.contains("std::ptr::from_ref(&data) as usize"));
         assert!(SYS.contains("check(syscall5(SYS_UNSHARE, flags, 0, 0, 0, 0))"));
@@ -167,6 +180,7 @@ mod confinement {
             "sys::close(",
             "sys::bring_up_loopback(",
             "sys::wait_any(",
+            "sys::kill_namespace(",
             "sys::mount(",
             "sys::pivot_root(",
             "sys::umount_detach(",
@@ -186,6 +200,7 @@ mod confinement {
         ] {
             assert!(TRANSITION.contains(call), "missing syscall caller: {call}");
         }
+        assert!(TRANSITION.contains("sys::terminate_namespace,"));
         assert!(!shipped_main.contains("sys::"));
         assert!(!AUTHORITY.contains("sys::"));
         assert!(!TRANSITION.contains("pre_exec"));
@@ -196,7 +211,7 @@ mod confinement {
         assert!(TRANSITION.contains("require_descriptor_closed(descriptor)?;"));
         assert!(TRANSITION.contains("clear_and_require_empty_capabilities()?;"));
         assert!(TRANSITION.contains("install_standard_seccomp_filter()?;"));
-        assert!(TRANSITION.contains("probe_pid1_reaper()?;"));
+        assert!(TRANSITION.contains("probe_pid1_lifecycle()?;"));
         assert_eq!(TRANSITION.matches(".env_clear()").count(), 2);
         assert_eq!(TRANSITION.matches(".envs(").count(), 1);
         assert!(SECCOMP.contains("pub(crate) const STANDARD_FILTER:"));

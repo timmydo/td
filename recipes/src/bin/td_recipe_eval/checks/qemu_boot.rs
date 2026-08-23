@@ -842,7 +842,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          seccomp filtering, inotify and cgroup pids controller a jail needs are all there \
          ({TD_SANDBOX_KERNEL_MARKER}), exercised td-jail's unprivileged namespace transition \
          on that target kernel, removed every capability, installed and read back its filter, \
-         and reaped a filtered descendant as PID 1 ({TD_JAIL_TRANSITION_MARKER}); a \
+         naturally reaped filtered descendants as PID 1, and exercised bounded TERM/KILL \
+         survivor cleanup ({TD_JAIL_TRANSITION_MARKER}); a \
          non-shipped target probe exercised its errno and kill actions \
          ({TD_JAIL_SECCOMP_PROBE_MARKER}), then assigned the single-user \
          graphical seat and brought \

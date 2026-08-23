@@ -581,8 +581,13 @@ intermediate states.
 **Stage 2 does not exec the app over itself.** A PID 1 that is Firefox
 reaps only its own children, and orphaned grandchildren pile up as
 zombies — so stage 2 stays resident as an init: spawn, `wait4(-1)` until
-the app exits, propagate the status, terminate survivors. `wait4(2)` is
-on surface #9 for it.
+the app exits, preserve the status, give survivors two seconds after
+namespace-wide `SIGTERM`, then force and reap them for at most two more
+seconds with repeated namespace-wide `SIGKILL`. `wait4(2)` and `kill(2)`
+are on surface #9 for it; PID-namespace teardown is the final hard stop.
+The four seconds bound PID 1's userspace polling, not a task's exit from an
+uninterruptible kernel sleep. An entry that backgrounds work and exits does
+not transfer lifecycle ownership: those descendants enter survivor cleanup.
 
 A draft called that "~40 lines" and used the number to argue the crate
 holding surface #9 stays auditable. It does not survive §D: stage 2 also
@@ -1886,9 +1891,11 @@ enforce its single-instance or multi-profile policy before using both paths.
 Probe mode alone overlays one read-only executable bind at
 `/tmp/td-jail-reaper-probe` after mounting `/tmp` noexec. It is the current
 trusted `td-jail` inode, source-identity checked before the old root is detached,
-and exists only long enough to prove that PID 1 reaps a direct child and its
-orphan. Application mode never creates that mount, so its entire `/tmp` remains
-noexec.
+and exists only long enough to prove that PID 1 naturally reaps a direct child
+and its orphan, terminates and reaps a second long-lived orphan through the
+production survivor-cleanup path, then force-kills and reaps a third through
+the same hard-phase implementation. Application mode never creates that mount,
+so its entire `/tmp` remains noexec.
 
 Every bind is read-only unless marked **rw**, and a failed read-only remount
 on a load-bearing bind is fatal, never degraded:
@@ -1988,8 +1995,17 @@ on a load-bearing bind is fatal, never degraded:
 18  seccomp(SECCOMP_SET_MODE_FILTER, 0, &prog)
 19  READBACK: /proc/self/status says NoNewPrivs: 1 and Seccomp: 2,
     or stage 2 refuses to spawn anything
-20  spawn argv; wait4(-1) as the namespace's reaper
+20  spawn argv; wait4(-1) as the namespace's reaper until the direct entry
+    exits; preserve that status; kill(-1, SIGTERM), poll/reap for at most two
+    seconds, then repeatedly kill(-1, SIGKILL) while polling/reaping for at
+    most two more seconds; if PID 1 still has not observed ECHILD, fail and
+    let PID namespace teardown provide the final hard stop
 ```
+
+The two deadlines bound PID 1's polling, not kernel completion for a task in
+uninterruptible sleep. Backgrounding work does not detach it from this
+lifecycle; once the direct entry exits, every remaining descendant is a
+survivor.
 
 `pivot_root` and not `chroot`: chroot is escapable by design for a
 process that can chdir out through a descriptor, and it keeps the old
@@ -2321,7 +2337,7 @@ and policy rungs land with callers and tests.
 The quoted block is the completed target, not the current roster; it
 intentionally retains the future thirteen-call count and `jail.rs`
 caller. Only the unquoted, implemented roster in `UNSAFE.md` authorizes
-today's eleven calls and `transition.rs` caller.
+today's twelve calls and `transition.rs` caller.
 
 > ## 9. `td-jail` — the application sandbox
 >
@@ -3634,7 +3650,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 9 | **mount transition — LANDED**: inherited-FD closure, a private compiled tmpfs root with individually read-only allowlisted device binds and immutable metadata, fresh devpts/shm/tmp/var-tmp, capability-v3 set/get readbacks, an exact ambient/inheritable `CAP_SYS_ADMIN` exec bridge, an empty/read-back bounding set, stage-2 procfs for its own PID namespace, pivot + old-root detach, mountinfo/device/mode/writability readbacks, and host plus target-kernel probes; application launch still refuses | none |
 | 10 | **capability drop/readback + PID-1 reaper — LANDED**: ambient is explicitly cleared before effective/permitted/inheritable become empty, all five sets are read back zero, and a copied static internal helper leaves a zero-capability grandchild for PID 1's bounded `wait4(-1)` oracle; ordinary application launch still refuses | none |
 | 11 | **const BPF assembler, standard filter, interpreter tests, build-host and target probes — LANDED**: stage 2 sets and reads back no-new-privileges, validates and installs the constant policy, requires `Seccomp: 2`, and its filtered PID-1 descendants inherit the same restriction; the non-shipped td-GCC probe is injected only into the disposable QEMU volume | none |
-| 12 | **fixture package shipped in the image and launched by `/bin/<fixture>` — LANDED**: the static `td-compositor` artifact's fixture personality is copied through an ordinary declared input into a generated application package with an empty payload-only runtime and exactly `sockets=wayland`; the image selects it into the immutable registry and `/bin` farm, its supervised boot unit and the compositor launcher both enter through `/bin/td-jail-fixture`, and td-jail accepts only the canonical index/spec subset this rung implements. Stage 1 canonicalizes, mounts and source-identity-checks immutable `/app` and `/usr`, the exact compositor socket, bounded private tmpfs trees, the five persistent state directories, and one private volatile runtime directory; stage 2 verifies the mount plan, clears capabilities, installs seccomp, holds a parent-death pipe, replaces application stdio with null descriptors, launches and reaps. The client publishes readiness through that volatile bind only after confinement readback and a presented frame; a separate readiness-gated evidence unit emits the exact QEMU marker without making mutable application state deployment-success authority | **first jailed pixels on the QEMU screen** |
+| 12 | **fixture package shipped in the image and launched by `/bin/<fixture>` — LANDED**: the static `td-compositor` artifact's fixture personality is copied through an ordinary declared input into a generated application package with an empty payload-only runtime and exactly `sockets=wayland`; the image selects it into the immutable registry and `/bin` farm, its supervised boot unit and the compositor launcher both enter through `/bin/td-jail-fixture`, and td-jail accepts only the canonical index/spec subset this rung implements. Stage 1 canonicalizes, mounts and source-identity-checks immutable `/app` and `/usr`, the exact compositor socket, bounded private tmpfs trees, the five persistent state directories, and one private volatile runtime directory; stage 2 verifies the mount plan, clears capabilities, installs seccomp, holds a parent-death pipe, replaces application stdio with null descriptors, preserves the direct application's status, and gives survivors bounded TERM/KILL reap phases. The client publishes readiness through that volatile bind only after confinement readback and a presented frame; a separate readiness-gated evidence unit emits the exact QEMU marker without making mutable application state deployment-success authority | **first jailed pixels on the QEMU screen** |
 | 12a | the same fixture under `--host`, asserting the degradation report (§X.5) | host mode works, and says what it could not enforce |
 | 12b | realize the typed filesystem grants: canonical source resolution, alias/overlap refusal, separate bind targets and deny-wins merging | a jailed app can open only an explicitly granted host path |
 | 12c | realize the typed memory/task policy with hard enforcement and readback; `cpu-max` remains refused until the kernel bandwidth controller lands | application resource limits are effective rather than metadata |

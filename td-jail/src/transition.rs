@@ -23,6 +23,8 @@ const STAGE2_ENVIRONMENT_ARG: &str = "--environment";
 const STAGE2_ARGUMENTS_ARG: &str = "--arguments";
 const REAPER_CHILD_ARG: &str = "--internal-reaper-child";
 const REAPER_ORPHAN_ARG: &str = "--internal-reaper-orphan";
+const SURVIVOR_CHILD_ARG: &str = "--internal-survivor-child";
+const SURVIVOR_ORPHAN_ARG: &str = "--internal-survivor-orphan";
 pub const TRANSITION_MARKER: &str = "TD-JAIL-TRANSITION-OK";
 const STAGE2_MARKER: &str = "TD-JAIL-STAGE2-OK";
 const TOKEN_LEN: usize = 32;
@@ -38,6 +40,9 @@ const OLD_ROOT: &str = "/oldroot";
 const REAPER_PROBE_PATH: &str = "/tmp/td-jail-reaper-probe";
 const REAPER_TIMEOUT: Duration = Duration::from_secs(2);
 const REAPER_POLL: Duration = Duration::from_millis(5);
+const SURVIVOR_TERM_TIMEOUT: Duration = Duration::from_secs(2);
+const SURVIVOR_KILL_TIMEOUT: Duration = Duration::from_secs(2);
+const SURVIVOR_PROBE_LIFETIME: Duration = Duration::from_secs(30);
 const STAGE2_OUTPUT_LIMIT: usize = 4096;
 const WRITE_PROBE_PREFIX: &str = ".td-jail-write-probe-";
 
@@ -62,6 +67,29 @@ struct NamespaceSnapshot {
     pid: PathBuf,
     uts: PathBuf,
     network: PathBuf,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct SurvivorReap {
+    count: u64,
+    sole_child: Option<(i32, i32)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrainOutcome {
+    Drained,
+    DeadlineExpired,
+}
+
+impl SurvivorReap {
+    fn record(&mut self, pid: i32, status: i32) {
+        self.sole_child = if self.count == 0 {
+            Some((pid, status))
+        } else {
+            None
+        };
+        self.count = self.count.saturating_add(1);
+    }
 }
 
 impl NamespaceSnapshot {
@@ -115,6 +143,8 @@ pub enum Mode {
     },
     ReaperChild,
     ReaperOrphan,
+    SurvivorChild,
+    SurvivorOrphan,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -166,6 +196,18 @@ where
             return Err(usage_error());
         }
         return Ok(Mode::ReaperOrphan);
+    }
+    if mode == SURVIVOR_CHILD_ARG {
+        if args.next().is_some() {
+            return Err(usage_error());
+        }
+        return Ok(Mode::SurvivorChild);
+    }
+    if mode == SURVIVOR_ORPHAN_ARG {
+        if args.next().is_some() {
+            return Err(usage_error());
+        }
+        return Ok(Mode::SurvivorOrphan);
     }
     Err(usage_error())
 }
@@ -1573,6 +1615,14 @@ fn require_empty_child_capabilities() -> io::Result<()> {
 }
 
 pub fn run_reaper_child() -> io::Result<()> {
+    run_descendant_parent(REAPER_ORPHAN_ARG)
+}
+
+pub fn run_survivor_child() -> io::Result<()> {
+    run_descendant_parent(SURVIVOR_ORPHAN_ARG)
+}
+
+fn run_descendant_parent(orphan_argument: &str) -> io::Result<()> {
     if std::process::id() == 1 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -1581,7 +1631,7 @@ pub fn run_reaper_child() -> io::Result<()> {
     }
     require_empty_child_capabilities()?;
     let child = Command::new(REAPER_PROBE_PATH)
-        .arg(REAPER_ORPHAN_ARG)
+        .arg(orphan_argument)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1594,6 +1644,14 @@ pub fn run_reaper_child() -> io::Result<()> {
 }
 
 pub fn run_reaper_orphan() -> io::Result<()> {
+    run_descendant_orphan(Duration::from_millis(100))
+}
+
+pub fn run_survivor_orphan() -> io::Result<()> {
+    run_descendant_orphan(SURVIVOR_PROBE_LIFETIME)
+}
+
+fn run_descendant_orphan(lifetime: Duration) -> io::Result<()> {
     if std::process::id() == 1 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -1601,11 +1659,27 @@ pub fn run_reaper_orphan() -> io::Result<()> {
         ));
     }
     require_empty_child_capabilities()?;
-    std::thread::sleep(Duration::from_millis(100));
+    std::thread::sleep(lifetime);
     Ok(())
 }
 
-fn probe_pid1_reaper() -> io::Result<()> {
+fn read_reported_pid(reader: impl Read, role: &str) -> io::Result<i32> {
+    let mut report = String::new();
+    reader.take(33).read_to_string(&mut report)?;
+    let encoded = report
+        .strip_suffix('\n')
+        .ok_or_else(|| io::Error::other(format!("{role} report lacks its line terminator")))?;
+    if encoded.is_empty() || !encoded.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(io::Error::other(format!(
+            "{role} returned an invalid PID: {report:?}"
+        )));
+    }
+    encoded
+        .parse::<i32>()
+        .map_err(|e| io::Error::other(format!("{role} PID is invalid: {e}")))
+}
+
+fn probe_pid1_lifecycle() -> io::Result<()> {
     let mut child = Command::new(REAPER_PROBE_PATH)
         .arg(REAPER_CHILD_ARG)
         .stdin(Stdio::null())
@@ -1649,19 +1723,7 @@ fn probe_pid1_reaper() -> io::Result<()> {
     }
 
     // ECHILD guarantees no descendant can retain the report pipe writer.
-    let mut report = String::new();
-    stdout.take(33).read_to_string(&mut report)?;
-    let encoded = report
-        .strip_suffix('\n')
-        .ok_or_else(|| io::Error::other("reaper child report lacks its line terminator"))?;
-    if encoded.is_empty() || !encoded.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(io::Error::other(format!(
-            "reaper child returned an invalid orphan PID: {report:?}"
-        )));
-    }
-    let orphan_pid = encoded
-        .parse::<i32>()
-        .map_err(|e| io::Error::other(format!("reaper orphan PID is invalid: {e}")))?;
+    let orphan_pid = read_reported_pid(stdout, "reaper orphan")?;
     if direct_pid <= 1 || orphan_pid <= 1 || direct_pid == orphan_pid {
         return Err(io::Error::other(format!(
             "reaper probe PIDs are direct={direct_pid}, orphan={orphan_pid}"
@@ -1671,6 +1733,93 @@ fn probe_pid1_reaper() -> io::Result<()> {
     if reaped != expected {
         return Err(io::Error::other(format!(
             "PID 1 reaped {reaped:?}, expected {expected:?}"
+        )));
+    }
+    probe_pid1_survivor_cleanup()
+}
+
+fn probe_pid1_survivor_cleanup() -> io::Result<()> {
+    let term_pid = spawn_survivor_orphan("TERM survivor")?;
+    let term_reaped = terminate_and_reap_survivors()?;
+    require_single_survivor_signal(&term_reaped, term_pid, sys::SIGTERM, "TERM cleanup")?;
+
+    let kill_pid = spawn_survivor_orphan("KILL survivor")?;
+    let mut kill_reaped = SurvivorReap::default();
+    let outcome = reap_survivors_until(
+        Instant::now() + SURVIVOR_KILL_TIMEOUT,
+        &mut kill_reaped,
+        true,
+    )?;
+    if outcome != DrainOutcome::Drained {
+        return Err(io::Error::other(format!(
+            "survivor KILL probe missed ECHILD before its deadline: {kill_reaped:?}"
+        )));
+    }
+    require_single_survivor_signal(&kill_reaped, kill_pid, sys::SIGKILL, "KILL cleanup")
+}
+
+fn spawn_survivor_orphan(role: &str) -> io::Result<i32> {
+    let mut child = Command::new(REAPER_PROBE_PATH)
+        .arg(SURVIVOR_CHILD_ARG)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| io::Error::other(format!("spawn {role} parent: {e}")))?;
+    let deadline = Instant::now() + REAPER_TIMEOUT;
+    let direct_pid = i32::try_from(child.id())
+        .map_err(|e| io::Error::other(format!("survivor child PID is invalid: {e}")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("survivor child stdout pipe was not created"))?;
+    drop(child);
+
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "PID 1 did not reap the {role} parent before the deadline"
+            )));
+        }
+        match sys::wait_any(true)? {
+            sys::Reaped::Child { pid, status } if pid == direct_pid && status == 0 => break,
+            sys::Reaped::Child { pid, status } => {
+                return Err(io::Error::other(format!(
+                    "{role} probe reaped unexpected child {pid} with raw status {status:#x}"
+                )));
+            }
+            sys::Reaped::NotYet => std::thread::sleep(REAPER_POLL),
+            sys::Reaped::NoChildren => {
+                return Err(io::Error::other(format!(
+                    "{role} parent disappeared without a wait status"
+                )));
+            }
+        }
+    }
+
+    // run_descendant_parent gives the orphan /dev/null, so the reaped parent
+    // was the report pipe's only writer.
+    let orphan_pid = read_reported_pid(stdout, role)?;
+    if direct_pid <= 1 || orphan_pid <= 1 || direct_pid == orphan_pid {
+        return Err(io::Error::other(format!(
+            "{role} PIDs are direct={direct_pid}, orphan={orphan_pid}"
+        )));
+    }
+    Ok(orphan_pid)
+}
+
+fn require_single_survivor_signal(
+    reaped: &SurvivorReap,
+    expected_pid: i32,
+    expected_signal: i32,
+    role: &str,
+) -> io::Result<()> {
+    let observed = reaped
+        .sole_child
+        .and_then(|(pid, status)| sys::wait_signal(status).map(|signal| (pid, signal)));
+    if reaped.count != 1 || observed != Some((expected_pid, expected_signal)) {
+        return Err(io::Error::other(format!(
+            "{role} reaped {reaped:?}, expected PID {expected_pid} by signal {expected_signal}"
         )));
     }
     Ok(())
@@ -1811,7 +1960,7 @@ pub fn run_stage2(
     install_standard_seccomp_filter()?;
     match action {
         Stage2Action::Probe => {
-            probe_pid1_reaper()?;
+            probe_pid1_lifecycle()?;
             writeln!(io::stdout(), "{STAGE2_MARKER} pid=1")
         }
         Stage2Action::Launch {
@@ -1878,22 +2027,92 @@ fn run_application(
     loop {
         match sys::wait_any(false)? {
             sys::Reaped::Child { pid, status } => {
-                if pid == application_pid && application_status.is_none() {
+                if pid == application_pid {
                     application_status = Some(status);
+                    break;
                 }
             }
             sys::Reaped::NotYet => continue,
             sys::Reaped::NoChildren => break,
         }
     }
-    match application_status {
-        Some(0) => Ok(()),
-        Some(status) => Err(io::Error::other(format!(
+    let cleanup_error = match application_status {
+        Some(_) => terminate_and_reap_survivors().err(),
+        None => None,
+    };
+    match (application_status, cleanup_error) {
+        (Some(0), None) => Ok(()),
+        (Some(status), None) => Err(io::Error::other(format!(
             "application entry returned raw status {status:#x}"
         ))),
-        None => Err(io::Error::other(
+        (Some(status), Some(error)) => Err(io::Error::other(format!(
+            "application entry returned raw status {status:#x}; survivor cleanup failed: {error}"
+        ))),
+        (None, _) => Err(io::Error::other(
             "application entry disappeared without a wait status",
         )),
+    }
+}
+
+fn terminate_and_reap_survivors() -> io::Result<SurvivorReap> {
+    terminate_and_reap_survivors_with(sys::terminate_namespace, |timeout, reaped, force_kill| {
+        reap_survivors_until(Instant::now() + timeout, reaped, force_kill)
+    })
+}
+
+fn terminate_and_reap_survivors_with<T, D>(
+    mut terminate: T,
+    mut drain: D,
+) -> io::Result<SurvivorReap>
+where
+    T: FnMut() -> io::Result<()>,
+    D: FnMut(Duration, &mut SurvivorReap, bool) -> io::Result<DrainOutcome>,
+{
+    let mut reaped = SurvivorReap::default();
+    terminate()?;
+    if drain(SURVIVOR_TERM_TIMEOUT, &mut reaped, false)? == DrainOutcome::Drained {
+        return Ok(reaped);
+    }
+
+    if drain(SURVIVOR_KILL_TIMEOUT, &mut reaped, true)? == DrainOutcome::Drained {
+        return Ok(reaped);
+    }
+    Err(io::Error::other(format!(
+        "survivor cleanup reached the SIGKILL deadline before PID 1 observed ECHILD: {reaped:?}"
+    )))
+}
+
+fn reap_survivors_until(
+    deadline: Instant,
+    reaped: &mut SurvivorReap,
+    force_kill: bool,
+) -> io::Result<DrainOutcome> {
+    loop {
+        if force_kill {
+            sys::kill_namespace()?;
+        }
+        match sys::wait_any(true)? {
+            sys::Reaped::Child { pid, status } => {
+                reaped.record(pid, status);
+                if Instant::now() >= deadline {
+                    return match sys::wait_any(true)? {
+                        sys::Reaped::Child { pid, status } => {
+                            reaped.record(pid, status);
+                            Ok(DrainOutcome::DeadlineExpired)
+                        }
+                        sys::Reaped::NotYet => Ok(DrainOutcome::DeadlineExpired),
+                        sys::Reaped::NoChildren => Ok(DrainOutcome::Drained),
+                    };
+                }
+            }
+            sys::Reaped::NotYet => {
+                if Instant::now() >= deadline {
+                    return Ok(DrainOutcome::DeadlineExpired);
+                }
+                std::thread::sleep(REAPER_POLL);
+            }
+            sys::Reaped::NoChildren => return Ok(DrainOutcome::Drained),
+        }
     }
 }
 
@@ -2072,8 +2291,90 @@ mod tests {
             parse_mode(args(&[REAPER_ORPHAN_ARG])).unwrap(),
             Mode::ReaperOrphan
         );
+        assert_eq!(
+            parse_mode(args(&[SURVIVOR_CHILD_ARG])).unwrap(),
+            Mode::SurvivorChild
+        );
+        assert_eq!(
+            parse_mode(args(&[SURVIVOR_ORPHAN_ARG])).unwrap(),
+            Mode::SurvivorOrphan
+        );
         assert!(parse_mode(args(&[REAPER_CHILD_ARG, "extra"])).is_err());
         assert!(parse_mode(args(&[REAPER_ORPHAN_ARG, "extra"])).is_err());
+        assert!(parse_mode(args(&[SURVIVOR_CHILD_ARG, "extra"])).is_err());
+        assert!(parse_mode(args(&[SURVIVOR_ORPHAN_ARG, "extra"])).is_err());
+    }
+
+    #[test]
+    fn survivor_reap_summary_does_not_grow_with_the_child_table() {
+        let mut reaped = SurvivorReap::default();
+        reaped.record(2, sys::SIGTERM);
+        assert_eq!(
+            reaped,
+            SurvivorReap {
+                count: 1,
+                sole_child: Some((2, sys::SIGTERM)),
+            }
+        );
+        reaped.record(3, sys::SIGKILL);
+        assert_eq!(
+            reaped,
+            SurvivorReap {
+                count: 2,
+                sole_child: None,
+            }
+        );
+    }
+
+    #[test]
+    fn survivor_cleanup_escalates_and_preserves_the_hard_phase_result() {
+        let terminated = std::cell::Cell::new(false);
+        let calls = std::cell::RefCell::new(Vec::new());
+        let outcomes = std::cell::RefCell::new(std::collections::VecDeque::from([
+            DrainOutcome::DeadlineExpired,
+            DrainOutcome::Drained,
+        ]));
+        let reaped = terminate_and_reap_survivors_with(
+            || {
+                terminated.set(true);
+                Ok(())
+            },
+            |timeout, reaped, force_kill| {
+                calls.borrow_mut().push((timeout, force_kill));
+                if force_kill {
+                    reaped.record(3, sys::SIGKILL);
+                }
+                Ok(outcomes.borrow_mut().pop_front().unwrap())
+            },
+        )
+        .unwrap();
+        assert!(terminated.get());
+        assert_eq!(
+            calls.into_inner(),
+            [
+                (SURVIVOR_TERM_TIMEOUT, false),
+                (SURVIVOR_KILL_TIMEOUT, true),
+            ]
+        );
+        assert_eq!(
+            reaped,
+            SurvivorReap {
+                count: 1,
+                sole_child: Some((3, sys::SIGKILL)),
+            }
+        );
+    }
+
+    #[test]
+    fn survivor_cleanup_fails_when_both_deadlines_expire() {
+        let error = terminate_and_reap_survivors_with(
+            || Ok(()),
+            |_, _, _| Ok(DrainOutcome::DeadlineExpired),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("SIGKILL deadline before PID 1 observed ECHILD"));
     }
 
     #[test]
