@@ -1609,6 +1609,18 @@ impl Client {
         }
     }
 
+    /// Give up the seat's grab without taking anything off the screen. The
+    /// pixels are `unmap_popup`'s; this is the record that outlives them.
+    fn release_popup_grab(&mut self, surface: u32) -> Result<(), String> {
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .release_grab(SurfaceKey {
+                client: self.id,
+                object: surface,
+            })
+    }
+
     /// Take a popup off the screen. Named by its wl_surface, which is what the
     /// scene knows it by.
     /// Clears the surface's bytes as `unmap_surface` does. A popup's pixels
@@ -3496,6 +3508,14 @@ impl Client {
                         );
                     }
                     self.remove_object(message.object)?;
+                    // The seat's grab belongs to the OBJECT that took it, and
+                    // the object is what just went: the wl_surface outlives
+                    // it and may be given another xdg_popup, which would
+                    // otherwise map holding a grab it never asked for. Not
+                    // folded into `unmap_popup`, because that one is also the
+                    // null attach — a take-down of the pixels alone, after
+                    // which this popup is still the popup that grabbed.
+                    self.release_popup_grab(surface)?;
                     self.unmap_popup(surface)?;
                     let Some(Object::XdgSurface {
                         role_object,
@@ -3519,10 +3539,12 @@ impl Client {
                     *configure = Arc::new(Mutex::new(ConfigureTracker::new()));
                     Ok(())
                 }
-                // grab. RECORDED and checked, not yet acted on: nothing here
-                // closes a menu because a click landed outside it, so what
-                // this buys is the chain the protocol reads through the flag
-                // and the answers a client can already earn.
+                // grab. Recorded, checked, and ACTED ON in one respect: the
+                // menu that holds the seat's grab is the one the keyboard is
+                // pointed at. What is still not acted on is the pointer —
+                // nothing here closes a menu because a click landed outside
+                // it, and nothing withholds a click from the surface under
+                // it.
                 1 => {
                     let seat = args.u32()?;
                     // The serial is read and not checked. It should name
@@ -3613,7 +3635,28 @@ impl Client {
                         return Err(format!("xdg_popup {} is not a popup", message.object));
                     };
                     *grabbed = true;
-                    Ok(())
+                    // Two records of one fact, for two questions. The flag
+                    // above is the SHELL's: whether this popup may be nested
+                    // under, which the chain walk reads and which outlives an
+                    // unmap because the object does. The scene's is the
+                    // SEAT's: which mapped popup holds the keyboard, dropped
+                    // wherever a popup leaves the screen. A menu that took
+                    // itself down with a null attach still answers the walk
+                    // and no longer holds the seat, and those are the right
+                    // two answers rather than a drift between them.
+                    //
+                    // After the flag because the mutable borrow above has to
+                    // end before the runtime lock is taken, and the order
+                    // costs nothing either way: a poisoned lock ends this
+                    // connection, and the only reader of the shell flag is
+                    // this client's own thread.
+                    self.runtime
+                        .lock()
+                        .map_err(|_| "runtime lock poisoned".to_string())?
+                        .grab_popup(SurfaceKey {
+                            client: self.id,
+                            object: surface,
+                        })
                 }
                 _ => Err(format!("unsupported xdg_popup request {}", message.opcode)),
             },
@@ -10917,6 +10960,197 @@ mod tests {
         client
             .dispatch(request(21, 2, hanging).unwrap(), &mut VecDeque::new())
             .unwrap();
+    }
+
+    /// The grab, end to end: a menu that took one has the keyboard from the
+    /// moment it maps, and the window it hangs off has it back the moment it
+    /// goes.
+    ///
+    /// The seam this covers is where the two layers meet. The shell records
+    /// the grab on its own object and hands it to the SEAT, and the seat is
+    /// what the keyboard is answered from — a landing that recorded only the
+    /// first would pass every chain test in this file and leave the menu
+    /// typing into the window underneath.
+    #[test]
+    fn a_menu_that_grabbed_holds_the_keyboard_from_the_moment_it_maps() {
+        let pool_path = std::env::temp_dir().join(format!(
+            "td-wayland-popup-grab-keyboard-{}-{}.pool",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&pool_path, [0x21u8, 0x43, 0x65, 0]).unwrap();
+        let (mut client, mut peer, runtime, framebuffer_path) =
+            grabbable_popup_on_a_window("popup-grab-keyboard", &pool_path);
+        let focus = || runtime.lock().unwrap().keyboard_snapshot().focus;
+        assert_eq!(focus(), Some(POPUP_PARENT_KEY));
+
+        // The grab alone moves nothing, because the popup has no pixels yet —
+        // and the protocol will not let it grab once it has.
+        grab(&mut client, 14, 70).unwrap();
+        assert_eq!(focus(), Some(POPUP_PARENT_KEY));
+
+        map_popup_surface(&mut client, &mut peer, 6, 13, 8, &pool_path);
+        assert_eq!(focus(), Some(POPUP_KEY));
+
+        // Down with a null attach, which is how a toolkit closes a menu it
+        // means to open again.
+        let mut detach = wire::Builder::new();
+        detach.u32(0);
+        detach.i32(0);
+        detach.i32(0);
+        client
+            .dispatch(request(6, 1, detach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(focus(), Some(POPUP_PARENT_KEY));
+
+        // And painting it back does NOT take the keyboard again: the grab
+        // went with the menu, and `invalid_grab` means this popup can never
+        // ask for another.
+        map_popup_surface(&mut client, &mut peer, 6, 13, 28, &pool_path);
+        assert!(
+            runtime.lock().unwrap().popup_placement(POPUP_KEY).is_some(),
+            "the menu did not come back"
+        );
+        assert_eq!(focus(), Some(POPUP_PARENT_KEY));
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
+    }
+
+    /// `grabbable_popup` with two differences, both needed by the tests that
+    /// are about the KEYBOARD rather than about placement or accounting.
+    ///
+    /// The parent is a real WINDOW, with a buffer: a role'd surface with no
+    /// buffer is in no layout, holds no focus, and a menu taking the keyboard
+    /// from nothing and giving it back to nothing would say nothing about
+    /// either half.
+    ///
+    /// And the positioner puts the menu ON that window. The shared
+    /// `menu_rules` anchor at y=26 and the tiled window in these fixtures is
+    /// 12 tall, so the menu every other popup test places lands 14 pixels
+    /// clear of the surface it hangs off — legal, mapped, and never DRAWN.
+    /// That is fine for placement and accounting and fatal here, since a menu
+    /// that is not drawn correctly holds no keyboard.
+    fn grabbable_popup_on_a_window(
+        stem: &str,
+        pool_path: &PathBuf,
+    ) -> (Client, UnixStream, Arc<Mutex<Runtime>>, PathBuf) {
+        let (mut client, mut peer, runtime, framebuffer_path) = popup_fixture(stem);
+        adopt_role(&mut client);
+        commit(&mut client).unwrap();
+        let mut size = wire::Builder::new();
+        size.i32(40);
+        size.i32(8);
+        client
+            .dispatch(request(30, 1, size).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut anchor_rect = wire::Builder::new();
+        for value in [0, 0, 4, 4] {
+            anchor_rect.i32(value);
+        }
+        client
+            .dispatch(request(30, 2, anchor_rect).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut anchor = wire::Builder::new();
+        anchor.u32(6);
+        client
+            .dispatch(request(30, 3, anchor).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut gravity = wire::Builder::new();
+        gravity.u32(8);
+        client
+            .dispatch(request(30, 4, gravity).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        get_popup(&mut client, 14, 9, 30).unwrap();
+        client.insert(70, Object::Seat { version: 3 }).unwrap();
+
+        // The parent's configure is the one the fixture's own commit sent.
+        let parent_serial = drain_messages(&mut peer)
+            .iter()
+            .rev()
+            .find_map(|message| {
+                ((message.object, message.opcode) == (9, XDG_SURFACE_CONFIGURE))
+                    .then(|| wire::Cursor::new(&message.payload).u32().unwrap())
+            })
+            .unwrap();
+        let mut ack = wire::Builder::new();
+        ack.u32(parent_serial);
+        client
+            .dispatch(request(9, 4, ack).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .insert(
+                4,
+                Object::Buffer(Buffer {
+                    serial: 4,
+                    file: Arc::new(File::open(pool_path).unwrap()),
+                    offset: 0,
+                    width: 1,
+                    height: 1,
+                    stride: 4,
+                    format: SHM_XRGB8888,
+                }),
+            )
+            .unwrap();
+        let mut attach = wire::Builder::new();
+        attach.u32(4);
+        attach.i32(0);
+        attach.i32(0);
+        client
+            .dispatch(request(5, 1, attach).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        commit(&mut client).unwrap();
+        (client, peer, runtime, framebuffer_path)
+    }
+
+    /// The grab dies with the OBJECT that took it, which the mapping rule
+    /// cannot cover. A wl_surface outlives its xdg_popup and may be given
+    /// another, so a grab left behind by a destroy is one the NEXT popup on
+    /// that surface would map holding — a menu that never asked for the
+    /// keyboard, taking it.
+    ///
+    /// Never mapped in between, deliberately: a mapping that ended would drop
+    /// the grab by the other road and the test would pass without the destroy
+    /// releasing anything.
+    #[test]
+    fn a_grab_dies_with_the_popup_that_took_it_not_with_its_surface() {
+        let pool_path = std::env::temp_dir().join(format!(
+            "td-wayland-popup-grab-destroy-{}-{}.pool",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&pool_path, [0x21u8, 0x43, 0x65, 0]).unwrap();
+        let (mut client, mut peer, runtime, framebuffer_path) =
+            grabbable_popup_on_a_window("popup-grab-destroy", &pool_path);
+        let focus = || runtime.lock().unwrap().keyboard_snapshot().focus;
+        assert_eq!(focus(), Some(POPUP_PARENT_KEY));
+
+        grab(&mut client, 14, 70).unwrap();
+        client
+            .dispatch(
+                request(14, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+
+        // A second popup on the SAME wl_surface and xdg_surface, which the
+        // destroy above freed to take another role object. It takes no grab.
+        get_popup(&mut client, 15, 9, 30).unwrap();
+        map_popup_surface(&mut client, &mut peer, 6, 13, 8, &pool_path);
+        assert!(
+            runtime.lock().unwrap().popup_placement(POPUP_KEY).is_some(),
+            "the second menu did not map"
+        );
+        assert_eq!(focus(), Some(POPUP_PARENT_KEY));
+
+        let _ = fs::remove_file(&framebuffer_path);
+        let _ = fs::remove_file(&pool_path);
     }
 
     /// `invalid_grab` is the whole of what `xdg_popup` can refuse, and it is

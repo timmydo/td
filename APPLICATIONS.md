@@ -3208,9 +3208,9 @@ the menu.
 
 What is deliberately still absent is the part that makes a menu *behave*:
 constraint adjustment is recorded and not acted on, so a popup near a screen
-edge runs past it instead of sliding or flipping; `xdg_popup.grab` is recorded
-and checked, but nothing routes input through a grab, so a click outside a
-menu does not close it — the client must notice and destroy it. What td DOES
+edge runs past it instead of sliding or flipping; and a grab now takes the
+KEYBOARD but not the pointer, so a click outside a menu does not close it —
+the client must notice and destroy it. What td DOES
 signal now is its own dismissal: every popup a take-down cascades over is sent
 `xdg_popup.popup_done`, deepest first, so a menu whose window went is no
 longer open as far as its client knows — and is unmapped at the same time, as
@@ -3224,12 +3224,24 @@ Answering an initial commit with a dismissal rather than a configure is a
 deliberate divergence from xdg_surface's unconditional wording, recorded with
 its reasoning in `td-compositor/DESIGN.md` §3. Where the parent is still
 there, a re-map gets its serial back but not a second placement, which
-`xdg_wm_base` version 1 has no event to revise. What remains of THIS row is
-grab-driven dismissal, the one named at the top of this paragraph; constraint
-solving has a row of its own further down. `td-compositor/DESIGN.md` §3 lists
-what is still open across all of them — constraint adjustment, grabs, and
-reposition, with the unenforced "parent must be mapped first" rule and the
-dismissal cascade's placement-versus-object-graph gap recorded beside them.
+`xdg_wm_base` version 1 has no event to revise. The grab itself is no longer
+only a record: the topmost grabbing popup has keyboard focus, which is what
+the protocol requires of one, bounded two ways that are td's own and recorded
+as divergences: the menu must have a pixel on screen, and it must hang off the
+FOCUSED window. The second is what makes a grab safe to honour — without it a
+background client could take every key typed with no way for the operator to
+get the keyboard back, which review demonstrated — and it leaves the two
+gestures that move focus as the way to take the seat back. A menu can now be
+driven with the arrow keys and closed with the Escape its own client sees.
+Focus-follows-mouse is suspended
+for the length of a grab, so the window under the menu is the one that has the
+keyboard back when it closes. What remains of THIS row is the pointer half — a
+click outside a menu closing it, the one named at the top of this paragraph;
+constraint solving has a row of its own further down.
+`td-compositor/DESIGN.md` §3 lists what is still open across all of them —
+constraint adjustment, grabs, and reposition, with the unenforced "parent must
+be mapped first" rule and the dismissal cascade's placement-versus-object-graph
+gap recorded beside them.
 Several conformance gaps beside them are closed: `xdg_wm_base`'s error codes
 are raised on the shell object rather than on the xdg_surface the request
 arrived at, that shell object may not be destroyed before the surfaces it
@@ -3257,7 +3269,7 @@ by them, and records why a tile ignores them and what an offset cannot reach.
 | `wl_subcompositor` | absent | **B** | 2,500–4,000 |
 | `wl_data_device_manager` v3, selection | absent | **B** | 4,000–6,000 (DnD later, +~900) |
 | `xdg_positioner` + `get_popup` | **landed** | — | ~900 — spent. Rules recorded and copied at `get_popup`; anchor, gravity and offset resolved on independent axes; the popup floats over its parent, above the tiles and below td's own bar, hit-tested first (though never over the bar), placed by its window geometry, required to abut its parent, stacked by td's own order, and relative to the parent so a submenu hangs off the menu that opened it. A null parent is refused (td implements no protocol that could supply one later) and a zero-area anchor rectangle is accepted as a point |
-| popup grabs + dismissal | **part** | **U** | 1,200–2,000, ~600 spent — `popup_done` is now sent for every popup a take-down cascades over, deepest first, which is the order the protocol makes a client destroy nested popups in; a menu whose window went is no longer left open to its client. The surface is UNMAPPED with it, which the protocol makes the same act: the configure tracker is reset, so a client that ignores the event and repaints gets `unconfigured_buffer` instead of its menu back, and the dismissal is enforced rather than advised. A popup whose parent went before its own initial commit is dismissed AT that commit rather than configured and then refunded, taking the placed submenus down with it, deepest first, and one that maps again under a live parent gets the xdg_surface serial alone, since version 1 has no event that may revise a placement. `grab` is now recorded and checked. The chain is walked to a toplevel rather than read one level deep, since a menu whose window went keeps both its grab and its role object and would otherwise go on lending grabs to submenus opened under it. Only an ungrabbed popup parent is an error, `invalid_popup_parent` on the shell object; a chain that is dismissed, orphaned or gone gets the dismissal the protocol asks for instead of a closed connection. `invalid_grab` refuses a grab after the popup has ever been mapped, and the seat must name a `wl_seat`. What is NOT enforced is that the parent is the topmost grabbing popup — the protocol names no error for it and td has no single grab stack yet. Nothing routes input to a grab, so a click outside a menu still does not close it, and that is the rest of the row. The input-event serial is read and not checked: td keeps no ledger of issued input serials to check one against |
+| popup grabs + dismissal | **part** | **U** | 1,200–2,000, ~800 spent — `popup_done` is now sent for every popup a take-down cascades over, deepest first, which is the order the protocol makes a client destroy nested popups in; a menu whose window went is no longer left open to its client. The surface is UNMAPPED with it, which the protocol makes the same act: the configure tracker is reset, so a client that ignores the event and repaints gets `unconfigured_buffer` instead of its menu back, and the dismissal is enforced rather than advised. A popup whose parent went before its own initial commit is dismissed AT that commit rather than configured and then refunded, taking the placed submenus down with it, deepest first, and one that maps again under a live parent gets the xdg_surface serial alone, since version 1 has no event that may revise a placement. `grab` is now recorded and checked. The chain is walked to a toplevel rather than read one level deep, since a menu whose window went keeps both its grab and its role object and would otherwise go on lending grabs to submenus opened under it. Only an ungrabbed popup parent is an error, `invalid_popup_parent` on the shell object; a chain that is dismissed, orphaned or gone gets the dismissal the protocol asks for instead of a closed connection. `invalid_grab` refuses a grab after the popup has ever been mapped, and the seat must name a `wl_seat`. The grab now takes the KEYBOARD: the topmost grabbing popup has focus, read off the same stacking order the paint uses, and bounded two ways td records as divergences from the protocol's "always" — the menu must have a pixel on screen, and it must hang off the focused window. The second is the operator's way back: without it a background client's popup was an inescapable keystroke sink, since the override outranks click-to-focus and `Super+arrow` and a grab suspends focus-follows-mouse. The seat's record is dropped when a mapping ends, and separately when the popup object or its surface is destroyed, so neither a menu painted back nor a reused id holds a grab it never asked for. Focus-follows-mouse is suspended for the grab's length, so the window under the menu is what focus falls back to. What is NOT enforced is that the parent is the topmost grabbing popup — the protocol names no error for it, so a branching client gets the keyboard on whichever branch it mapped last. Nothing routes the POINTER through a grab, so a click outside a menu still does not close it, and that is the rest of the row. The input-event serial is read and not checked: td keeps no ledger of issued input serials to check one against |
 | popup protocol conformance (error object, permanent role, `not_the_topmost_popup`, `defunct_surfaces`, `already_constructed`) | **landed** | — | ~350 — spent. `xdg_wm_base`'s errors name the shell object rather than the xdg_surface they arrived at, and it outlives the surfaces it made so that id stays meaningful; a surface's role kind outlives its role object, so a former menu cannot come back as a tiled window; and a menu may not be destroyed before the submenu hanging off it |
 | shell edges across id reuse | **landed** | — | ~600 — spent. Neither shell edge keeps a number the client has back: a popup's parent edge is broken when the surface it names is destroyed, and a wl_surface's role edge is retired when its xdg_surface is. So a reissued id cannot re-parent a menu onto an unrelated window, commit a surface through a stranger's role object, close a popup cycle, or answer a `not_the_topmost_popup` scan for a submenu that does not exist. Per surface rather than a sweep, so one window closing leaves other windows' menus alone. The byte accounting it left open is the row below |
 | popup byte accounting across a cascade | **landed** | — | ~120 — spent. A take-down reports the menus it dropped and the client's ledger gives back exactly those, rather than a second walk of the parent edges — which by then reads the edges that walk removed. An application that opens and closes menus is no longer charged for buffers td discarded, and so no longer approaches its own ceiling for holding nothing. All three refunds are reachable, including the one at `wl_surface.destroy`, which looked dead: `get_popup` refuses a parent with no role object, so no new menu can hang off a window whose toplevel has gone — but an existing one only has to be REPAINTED, since its popup object outlives the toplevel and puts the placement back in the scene. Dismissal now unmaps, so that repaint is a whole mapping again rather than a bare attach; it reaches the same refund by a longer road |
@@ -3660,7 +3672,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 16 | `td-portal` personality: Request/Session core, Settings, Account | GTK settings call works |
 | 17 | Wayland A: `set_window_geometry`, decoration manager, ARGB golden, single-pixel-buffer; **the GDK and llvmpipe experiments run and their answers land in DESIGN.md** | none |
 | 18 | Wayland B: `wl_subcompositor` | none |
-| 19 | Wayland C: `xdg_positioner`/`xdg_popup` LANDED — grabs and constraint solving are what is left of this rung | a menu appears where its client asked; it does not yet close on a click outside or slide clear of a screen edge |
+| 19 | Wayland C: `xdg_positioner`/`xdg_popup` LANDED — click-outside dismissal and constraint solving are what is left of this rung | a menu appears where its client asked and takes the keyboard while it is up; it does not yet close on a click outside or slide clear of a screen edge |
 | 20 | clipboard (data-device v3) — client cursors LANDED separately (`1c4b7f88`), so this rung is the clipboard alone | paste, and the I-beam already arrived |
 | 21 | xdg-foreign + private portal socket + dialog placement | modal portal window |
 | 22 | FileChooser, OpenURI, Screenshot, Notification | file dialog visible |

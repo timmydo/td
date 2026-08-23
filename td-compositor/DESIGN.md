@@ -1089,11 +1089,13 @@ wrong is a compositor that never paints again.
 Three parts are incomplete and a fourth has landed, and each is a landing of
 its own. **Constraint adjustment** is recorded and not acted on: every bit of
 it is permission for td to move a popup that does not fit, so a menu near an
-edge extends past it rather than sliding or flipping. **Grabs** are recorded
-and checked, not acted on — nothing routes input through one, so a client that
-expects a click outside to close its menu must still notice and destroy it. td
-does dismiss a popup whose grab it will not hold, which is the protocol's own
-answer to a denied grab rather than td closing a menu on a user's behalf.
+edge extends past it rather than sliding or flipping. **Grabs** are recorded,
+checked, and half acted on: the topmost grabbing popup has the KEYBOARD,
+bounded as below, and nothing routes the pointer through a grab — so a client
+that expects a click outside to close its menu must still notice and destroy
+it. td does dismiss a popup whose grab it will not hold, which is the
+protocol's own answer to a denied grab rather than td closing a menu on a
+user's behalf.
 **Dismissal is signalled where td dismisses, and nowhere else.** Every popup a
 take-down cascades over is sent `xdg_popup.popup_done`, deepest first — the
 order the protocol makes a client destroy nested popups in, so a client that
@@ -1113,11 +1115,13 @@ lower one whatever order the placements happened in, and whatever the client
 did. That td does not enforce the mapping rule is a gap of its own, recorded
 here rather than relied on.
 
-What a recorded grab buys, with nothing yet routing input to it, is the CHAIN
-and the answers a client can already earn. The protocol lets a grabbing popup
-hang off a toplevel or off another popup that grabbed, and nothing else, so
-one popup's answer is the next one's precondition — which is why the flag is
-kept rather than the request being dropped on the floor.
+What a recorded grab buys is the CHAIN, the answers a client can already
+earn, and the KEYBOARD. The protocol lets a grabbing popup hang off a toplevel
+or off another popup that grabbed, and nothing else, so one popup's answer is
+the next one's precondition — which is why the flag is kept rather than the
+request being dropped on the floor. What a grab does NOT yet buy is anything
+about the pointer: no click outside a menu closes it, and no click is withheld
+from the surface under it.
 
 The check is a WALK rather than a look at the parent. The rule reads one level
 but is inductive: a popup is only a grabbing parent while the thing IT hangs
@@ -1160,8 +1164,13 @@ issued: `next_serial` mints and forgets, where the configure serials
 Refusing what cannot be verified would reject every honest client, so the
 argument is dropped and this is the gap — a client may quote any number.
 Closing it means recording issued input serials with the events that carried
-them and expiring them, which is worth doing when a grab does something, since
-until then there is no authority to forge.
+them and expiring them. That was triaged as worth doing "when a grab does
+something", and a grab now does something, so the trigger has fired: an
+unverifiable serial is the difference between a menu the operator opened and
+one a client asserted. What keeps it from being a way to take the keyboard is
+the focused-window bound below, not the serial — a client whose window is not
+focused gets nothing whatever it quotes. The ledger is owed with the
+dismissal path.
 
 A dismissal is not permanent state. td supports painting a dismissed popup
 back — the whole mapping dance after a take-down is for that — so the flag
@@ -1169,15 +1178,137 @@ that ends the walk is cleared when td configures the popup again. Keeping it
 for the object's life would turn away a submenu opened under a menu that is up
 again, for a take-down that is over.
 
+A grab is recorded TWICE, and the two records answer different questions. The
+shell keeps a flag on the popup object: whether this popup may be nested
+under, which is what the walk above reads, and which outlives an unmap because
+the object does. The scene keeps the SEAT's set: which mapped popup holds the
+keyboard now, dropped wherever a MAPPING ends — the popup's own unmap, its
+parent's, the cascade under either — and separately wherever the OBJECT or
+its wl_surface is destroyed, including with the client. A menu that mapped and
+then took itself down with a null attach therefore still answers the walk and
+no longer holds the seat, and those are the two right answers rather than a
+drift between them.
+
+Those are two conditions rather than one because a grab is taken BEFORE the
+first buffer, the protocol having refused one after. `grab`, a null attach and
+an initial commit reach the unmap path with nothing ever mapped, and a first
+draft dropped the grab there — deleting it before the menu had opened, which
+review caught. The destroy roads carry it instead, and they are the ones that
+have to: a wl_surface outlives its xdg_popup and may be given another, and a
+destroyed surface's id is reusable once `delete_id` has been sent, so those
+are the two moments a key can come back naming something else.
+
+Dropping the seat's record with the popup is not hygiene. td supports painting
+a dismissed menu back, and `invalid_grab` means a popup that has mapped can
+never ask for another grab, so a second mapping is a menu that provably holds
+none. A grab kept beside the popup rather than dropped with it would hand the
+keyboard to exactly that menu.
+
+**The topmost grabbing popup has the keyboard**, which is the protocol's rule
+and not a preference: "the top most grabbing popup will always have keyboard
+focus". Topmost is read off the scene's own stacking order, the same one the
+paint and the hit test use, so the menu that has the keyboard is the menu
+drawn over the others and the one a click lands on. A popup that grabbed and
+has not mapped is not a candidate: the grab request must precede the first
+buffer, and focusing pixels that do not exist would take the keyboard off the
+window behind for a menu the operator cannot see.
+
+Two bounds narrow "always", and both are DIVERGENCES from that word rather
+than readings of it. They are stated here as such.
+
+The first is that the menu must be on screen. A menu over a window on another
+workspace, or behind a stacked sibling, is RETAINED rather than dismissed —
+the paragraph on workspace switches below is the statement of that — so its
+grab is still recorded, and one holding the keyboard there would leave the
+window the operator is looking at unable to be typed into. Review argued the
+protocol's alternative: dismiss the whole grab chain on a workspace switch and
+send `popup_done`. That is the more faithful reading and td cannot take it
+here, because td retains popups across a switch as a matter of policy already
+and dismissing needs the path this landing does not build. It should be
+revisited when the pointer closes menus.
+
+The predicate is the drawn-ness one, in two halves. `popup_rect` resolves a
+chain to a visible tile with every link abutting; `on_screen` then asks whether
+the rectangle it resolved has a pixel inside the output and below the bar,
+because `popup_rect` does not clip. Two shapes fail the second. A CHAIN does — a
+TILED leaf is inset from the output by the gap, so a menu abutting one always
+keeps a pixel, and it takes a menu at the edge with a submenu hung off the part
+of it already outside. A popup on a FULLSCREEN window does too, which the
+confirmation pass pointed out: that leaf is flush with the output on three sides
+and with the bar on the fourth, which `on_screen` measures alike, so a single
+menu abutting it has nowhere inside to land. It is NOT the same predicate as the
+hit test, which also asks about the input region: a menu that takes no clicks
+can still take keys, and should.
+
+What the drawn check adds over the focus bound is narrower than the two cases
+above suggest, and writing the bound down is what showed it. EVERY way a parent
+hides is already under the focus bound. `Layout::focused` is the ACTIVE
+workspace's focused leaf, so a parent on another workspace is not it. A GROUPED
+container — stacked or tabbed alike, the two being one `run` — shows the leaf it
+has focused, so a grouped-away parent is not it either, and cannot be made
+focused without being shown. A leaf a sibling's fullscreen hides is not it
+because the layout holds fullscreen and focus equal, and checks that it does.
+The drawn check does its own work where the parent is focused and shown and the
+MENU is what is not drawn: placed clear of its parent so no chain resolves, or
+resolved and then clipped off the output.
+
+The second bound is that the menu must hang off the FOCUSED window, and it is
+the one that makes a grab safe to honour at all. Review demonstrated the
+alternative against a first draft: a background client with any visible tile
+called `grab`, mapped a one-pixel popup, and took every key the operator
+typed. Nothing could get the keyboard back — the override beats click-to-focus
+and `Super+arrow` alike, a grab suspends focus-follows-mouse, and no click
+outside closes a menu yet — short of closing the offending window. Tying the
+grab to the focused window leaves the menu of the window in use in charge,
+which is the case the protocol is about, and gives the operator back the two
+gestures they already have. The grab is not dropped when focus leaves, only
+outranked; focusing that window again puts its menu back in charge.
+
+Focus-follows-mouse is a way IN and not a way out, which the confirmation pass
+drew out and which is a consequence of the suspension rather than a rule of
+its own. The pointer crossing onto a background client's tile hands its
+grabbing menu the seat; the grab then suspends the pointer, so moving off that
+tile does not hand it back. `Super+arrow` and a click do. It is the reason the
+recovery gestures matter and not only the bound that makes them work.
+
+Reading the top off the stack also answers what happens when it goes, and for
+a LINEAR chain answers it the way the protocol asks: "if the topmost grabbing
+popup is destroyed, the grab will be returned to the parent of the popup, if
+that parent previously had an explicit grab". A submenu closing hands the
+keyboard back to the menu it hung off when that menu grabbed, and to the
+window when it did not, because up one link and "whatever is left holding one"
+are the same place.
+
+They are not the same place in a BRANCH, which review pointed out and which is
+the branch the paragraph below declines to refuse. With a grabbing menu A, a
+grabbing child B, and a second grabbing child C mapped last, destroying C
+returns the keyboard to B where the protocol names A. The stack answers "the
+topmost grab left" and the protocol answers "up one link", and only a branch
+tells them apart — a state the protocol's own parent rule reads as
+disallowed.
+
+Popups are in no layout, so this is an OVERRIDE rather than a focus the layout
+could hold. `Layout::focused` goes on naming the window underneath for as long
+as the menu is up, which is what the menu closing falls back to with no second
+record to keep in step. A modal overlay is not consulted, because it never
+was: the launcher and the cheat sheet stop keys at the input layer rather than
+by moving focus, so a menu under one is focused exactly as the window under
+one is, and hears no more than it does.
+
 One thing the walk does NOT enforce is that the parent is the topmost grabbing
 popup. The protocol requires the parent to be "an xdg_toplevel surface or
 another xdg_popup with an explicit grab" and names no error for a second child
 opened under a menu whose submenu already holds the top, so refusing one would
 turn away a client the protocol permits. Review read the rule as demanding the
-active top; it is recorded here rather than acted on because td models grabs
-as a per-popup fact and not yet as one active stack, and nothing routes input
-through them, so a branch cannot yet send a click or a key to the wrong menu.
-The stack is owed when the routing lands.
+active top, and the strongest text for that reading is the sentence after it —
+"if the parent is another xdg_popup it means that the popups are nested, with
+this popup now being the topmost popup" — which describes what a grab MAKES
+true rather than naming a fault when it is not. The seat has an ordered answer
+now, so the consequence is no longer abstract: a client that opens such a
+branch gets the keyboard on whichever branch it mapped LAST, and the sibling
+that was up first keeps none. That is deterministic and it is not what a
+branching client means; the reading that would have refused the second grab is
+recorded here rather than acted on.
 
 Signalling is only HALF of a dismissal, and the protocol puts both halves in
 one sentence: "a popup_done event will be sent out, and at the same time the
@@ -2243,12 +2374,26 @@ most recently focused, so sweeping the pointer down a stack's run of bands
 flips through the windows it presents, one per band crossed — the same thing
 clicking each band in turn already did.
 
-Three things suspend it, and each would otherwise aim the keyboard somewhere
+Four things suspend it, and each would otherwise aim the keyboard somewhere
 the operator did not. A modal launcher owns the screen and keeps focus for as
 long as it is up. A DRAG carries the pointer across other windows on purpose,
-and focus belongs to the window being carried. And a client holding an
-implicit grab owns the pointer until it lets go, which is the same reason a
-press made during one establishes nothing.
+and focus belongs to the window being carried. A client holding an implicit
+grab owns the pointer until it lets go, which is the same reason a press made
+during one establishes nothing. And a MENU holding the seat's explicit grab
+suspends it for the length of that grab — not because the keyboard would move,
+since the override above holds it either way, but because the FALLBACK would:
+the pointer crossing a neighbouring tile on its way to a menu item would leave
+that tile focused when the menu closed, and the band would light up saying so
+while the menu was still up. A menu is opened ON a window, and closing it puts
+the keyboard back where it was rather than wherever the hand passed over.
+
+Click-to-focus is NOT suspended by a menu's grab, and that is deliberate: it
+is half of how the operator takes the seat back. A press on another window
+moves the layout's focus, and a grab holds the keyboard only while it hangs
+off the FOCUSED window, so the press ends the menu's hold. `Super+arrow` is
+the other half and works the same way. Neither DISMISSES the menu — the client
+is told nothing and its popup stays drawn over its own window — which is the
+part the pointer landing owes.
 
 That grab is sampled BEFORE the frame, because the frame is what ends one: a
 report carrying the last release along with its motion clears the grab in the

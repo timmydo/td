@@ -367,6 +367,42 @@ impl Runtime {
         Ok(())
     }
 
+    /// A popup took the seat's explicit grab, which is what hands it the
+    /// keyboard: "the top most grabbing popup will always have keyboard
+    /// focus".
+    ///
+    /// Answers focus rather than settling. A grab changes who is listening
+    /// and not one pixel — the menu is drawn the same whether it holds the
+    /// seat or not — so there is no paint to owe. It is answered at all,
+    /// rather than left to the commit that maps the menu, because the
+    /// ORDERING that makes this a no-op today is the shell's rule and not
+    /// this layer's: a grab arrives before the first buffer, so the popup is
+    /// never in the stack yet and `topmost_grab` cannot name it. A grab that
+    /// did change the answer and was not answered here would hold the
+    /// keyboard on the window behind until something unrelated settled.
+    pub fn grab_popup(&mut self, key: SurfaceKey) -> Result<(), String> {
+        if !self.scene.grab_popup(key) {
+            return Ok(());
+        }
+        self.refresh_focus()
+    }
+
+    /// The seat's grab given up without the pixels going anywhere, which is
+    /// the shape both object-lifetime ends have: the xdg_popup destroyed, and
+    /// the wl_surface destroyed. `Scene::release_grab` says why both are
+    /// separate from a mapping ending.
+    ///
+    /// Answers focus for `grab_popup`'s reason and its mirror: if the popup
+    /// giving this up was the one holding the keyboard, the keyboard is owed
+    /// to whatever is left holding one, and no caller is guaranteed to settle
+    /// afterwards.
+    pub fn release_grab(&mut self, key: SurfaceKey) -> Result<(), String> {
+        if !self.scene.release_grab(key) {
+            return Ok(());
+        }
+        self.refresh_focus()
+    }
+
     #[cfg(test)]
     pub fn popup_placement(&self, key: SurfaceKey) -> Option<PopupPlacement> {
         self.scene.popup_placement(key)
@@ -816,7 +852,31 @@ impl Runtime {
         // — DESIGN.md §"KEYBOARD focus FOLLOWS THE POINTER" is the statement
         // of it, kept in one place because this had already drifted from it
         // once.
-        let hovered = if moved && !modal && self.dragging.is_none() && !grabbed {
+        // A menu holding the seat suspends it too, the fourth of the
+        // suspensions that section states. Not because the keyboard would
+        // move — `keyboard_target` overrides it either way — but because the
+        // FALLBACK would: the pointer crossing a neighbouring tile on its way
+        // to a menu item would leave that tile focused when the menu closed,
+        // and the band would light up saying so while the menu was still up.
+        // A menu is opened ON a window, and closing it puts the keyboard back
+        // where it was rather than wherever the hand passed over.
+        //
+        // Asked LAST, and only when everything before it would have focused
+        // something — the opposite of `grabbed` above, and for the opposite
+        // reason. That one is sampled early because the frame ENDS it;
+        // nothing in this call can start or end a POPUP grab, so where this
+        // is asked cannot change the answer, and asking it walks the
+        // arrangement that the reports which moved nothing should not pay
+        // for.
+        let hovered = if moved
+            && !modal
+            && self.dragging.is_none()
+            && !grabbed
+            && self
+                .scene
+                .topmost_grab(self.framebuffer.width, self.framebuffer.height)
+                .is_none()
+        {
             self.scene
                 .window_at_pointer(self.framebuffer.width, self.framebuffer.height)
         } else {
@@ -1211,7 +1271,7 @@ impl Runtime {
         // exhausted — are exactly the moments a stale cursor would be least
         // explicable.
         let mut failures = Vec::new();
-        match self.keyboard.set_focus(self.scene.focused()) {
+        match self.keyboard.set_focus(self.keyboard_target()) {
             Ok(keyboard) => self.publish_keyboard(keyboard),
             Err(error) => failures.push(error),
         }
@@ -1234,6 +1294,26 @@ impl Runtime {
             return Ok(());
         }
         Err(failures.join("; "))
+    }
+
+    /// Where the keyboard points. A grabbing menu takes it from the window
+    /// underneath for as long as it holds one, which is the protocol's rule
+    /// and not a preference: "the top most grabbing popup will always have
+    /// keyboard focus". Everything else is the layout's focused tile.
+    ///
+    /// Popups are in no layout, so this is an OVERRIDE rather than a focus
+    /// the layout could hold. `scene.focused()` keeps naming the window
+    /// underneath throughout, which is what the menu closing falls back to
+    /// with no second record to keep in step.
+    ///
+    /// A modal overlay is not consulted, because it never was: the launcher
+    /// and the cheat sheet stop keys at the input layer rather than by moving
+    /// this, so a menu under one is focused exactly as the window under one
+    /// is, and hears no more than it does.
+    fn keyboard_target(&self) -> Option<SurfaceKey> {
+        self.scene
+            .topmost_grab(self.framebuffer.width, self.framebuffer.height)
+            .or_else(|| self.scene.focused())
     }
 
     /// Point the scene at the client the pointer model now focuses, so a
@@ -1339,6 +1419,23 @@ mod tests {
             time,
             button: POINTER_BUTTON_LEFT,
             state: PointerButtonState::Released,
+        }
+    }
+
+    /// `recv_event` without the wait. Every keyboard event is published
+    /// synchronously inside the runtime call that caused it, so by the time
+    /// that call returns the channel either holds the event or never will —
+    /// and a test whose subject is a focus that may not happen must say so
+    /// rather than block. `recv_event` is right for the tests that expect an
+    /// event unconditionally and would hang only if the compositor broke.
+    fn taken_event(receiver: &Receiver<KeyboardDelivery>) -> KeyboardEvent {
+        match receiver.try_recv() {
+            Ok(KeyboardDelivery::Event(event)) => event.event,
+            Ok(KeyboardDelivery::Pointer(frame)) => {
+                panic!("unexpected pointer frame for client {}", frame.client)
+            }
+            Ok(KeyboardDelivery::DeleteId(id)) => panic!("unexpected queued delete_id for {id}"),
+            Err(error) => panic!("no keyboard event was published: {error}"),
         }
     }
 
@@ -4920,6 +5017,250 @@ mod tests {
         assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
 
         goto(&mut runtime, one.rect.x + 2, one.rect.y + 2);
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+    }
+
+    /// A menu holding the seat's grab has the keyboard, and hands it back to
+    /// the window underneath when it goes. Asserted through the EVENTS the
+    /// client is sent rather than the snapshot alone: a focus the compositor
+    /// believes in and never tells anyone about types into nothing.
+    #[test]
+    fn a_grabbing_menu_takes_the_keyboard_and_gives_it_back() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-menu-keyboard-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let subscription = runtime.subscribe_keyboard(1).unwrap();
+        let (events, stop) = subscription.split();
+        let window = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let menu = SurfaceKey {
+            client: 1,
+            object: 20,
+        };
+        runtime.commit(window, surface([1, 2, 3, 0])).unwrap();
+        assert!(matches!(
+            taken_event(&events),
+            KeyboardEvent::Enter { surface, .. } if surface == window
+        ));
+        taken_event(&events);
+
+        // The grab arrives before the first buffer, which is the only order
+        // the shell allows, so it moves nothing on its own.
+        runtime.grab_popup(menu).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(window));
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+
+        runtime
+            .commit_popup(
+                menu,
+                Some(surface([7, 8, 9, 0])),
+                PopupPlacement {
+                    parent: window,
+                    x: 5,
+                    y: 7,
+                    width: 100,
+                    height: 100,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            taken_event(&events),
+            KeyboardEvent::Leave { surface: window }
+        );
+        assert!(matches!(
+            taken_event(&events),
+            KeyboardEvent::Enter { surface, .. } if surface == menu
+        ));
+        taken_event(&events);
+
+        // And the keys go there, which is the whole point of the focus.
+        runtime
+            .key(KeyInput {
+                time: 5,
+                key: 30,
+                state: KeyState::Pressed,
+            })
+            .unwrap();
+        assert!(matches!(
+            taken_event(&events),
+            KeyboardEvent::Key { surface, .. } if surface == menu
+        ));
+
+        // The window under it kept the LAYOUT's focus throughout, which is
+        // what the menu going hands back with nothing to restore.
+        assert_eq!(runtime.scene.focused(), Some(window));
+        runtime.unmap_popup(menu).unwrap();
+        assert_eq!(taken_event(&events), KeyboardEvent::Leave { surface: menu });
+        assert!(matches!(
+            taken_event(&events),
+            KeyboardEvent::Enter { surface, ref keys } if surface == window && keys == &[30]
+        ));
+        taken_event(&events);
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+
+        // This layer does not enforce the shell's ordering, and its own
+        // contract is that recording a grab ANSWERS focus rather than leaving
+        // it to whatever settles next. The shell makes that a no-op in
+        // practice, since a grab arrives before the first buffer, so it is
+        // asserted here on this layer's terms: a second menu mapped WITHOUT a
+        // grab leaves the keyboard where it is, and takes it the moment one
+        // is recorded.
+        let second = SurfaceKey {
+            client: 1,
+            object: 21,
+        };
+        runtime
+            .commit_popup(
+                second,
+                Some(surface([2, 4, 6, 0])),
+                PopupPlacement {
+                    parent: window,
+                    x: 5,
+                    y: 7,
+                    width: 100,
+                    height: 100,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(window));
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+        runtime.grab_popup(second).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+        assert_eq!(
+            taken_event(&events),
+            KeyboardEvent::Leave { surface: window }
+        );
+        assert!(matches!(
+            taken_event(&events),
+            KeyboardEvent::Enter { surface, .. } if surface == second
+        ));
+        taken_event(&events);
+
+        // Giving the grab up answers focus on its own, which is this layer's
+        // contract as much as taking one is. Its only caller unmaps in the
+        // same breath and would settle anyway, so it is asserted here where
+        // nothing else can be doing the work: the menu stays mapped and only
+        // the record goes.
+        runtime.release_grab(second).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(window));
+        assert!(runtime.popup_placement(second).is_some(), "the menu went");
+        assert_eq!(
+            taken_event(&events),
+            KeyboardEvent::Leave { surface: second }
+        );
+        assert!(matches!(
+            taken_event(&events),
+            KeyboardEvent::Enter { surface, .. } if surface == window
+        ));
+        taken_event(&events);
+
+        stop.stop();
+        runtime.unsubscribe_keyboard(1);
+    }
+
+    /// A menu holding the seat suspends focus-follows-mouse. The keyboard
+    /// could not move anyway — the grab overrides it — so what this protects
+    /// is what the menu closing falls BACK to: the pointer crossing a
+    /// neighbouring tile on its way to a menu item must not leave that tile
+    /// focused, and its band must not light up saying so while the menu is
+    /// still up.
+    #[test]
+    fn a_menu_holding_the_seat_suspends_focus_follows_mouse() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-menu-hover-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let first = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let second = SurfaceKey {
+            client: 2,
+            object: 20,
+        };
+        let menu = SurfaceKey {
+            client: 2,
+            object: 21,
+        };
+        runtime.commit(first, surface([1, 2, 3, 0])).unwrap();
+        runtime.commit(second, surface([4, 5, 6, 0])).unwrap();
+        let goto = |runtime: &mut Runtime, x: usize, y: usize| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            runtime
+                .pointer_frame(
+                    1,
+                    i32::try_from(x).unwrap() - at_x,
+                    i32::try_from(y).unwrap() - at_y,
+                    &[],
+                    PointerScroll::default(),
+                )
+                .unwrap();
+        };
+        let tile = |runtime: &Runtime, key: SurfaceKey| {
+            let placements = runtime.scene.tiled_placements(240, 120);
+            let at = placements
+                .iter()
+                .position(|placement| placement.key == key)
+                .unwrap();
+            placements.get(at).unwrap().rect
+        };
+        let one = tile(&runtime, first);
+
+        // Hover moves focus before the grab, which is what makes the same
+        // motion afterwards a measurement of the suspension rather than of
+        // the pointer never having been there.
+        goto(&mut runtime, one.x + 2, one.y + 2);
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+        assert_eq!(runtime.scene.focused(), Some(first));
+
+        let two = tile(&runtime, second);
+        goto(&mut runtime, two.x + 2, two.y + 2);
+        assert_eq!(runtime.scene.focused(), Some(second));
+        runtime.grab_popup(menu).unwrap();
+        runtime
+            .commit_popup(
+                menu,
+                Some(surface([7, 8, 9, 0])),
+                PopupPlacement {
+                    parent: second,
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(menu));
+
+        // Over the OTHER window now, and the tile it left keeps the focus it
+        // will be given back.
+        goto(&mut runtime, one.x + 2, one.y + 2);
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(menu));
+        assert_eq!(runtime.scene.focused(), Some(second));
+
+        runtime.unmap_popup(menu).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+        // And the suspension is over with it: the same motion moves focus
+        // again, so this withheld hover for the grab's duration rather than
+        // for good.
+        goto(&mut runtime, one.x + 4, one.y + 4);
         assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
     }
 

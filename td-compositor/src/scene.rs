@@ -4,7 +4,7 @@ use crate::launcher::{LaunchRequest, Launcher, LauncherAction};
 use crate::layout::{Axis, Command, DropKind, Layout, Placement, Presentation, Rect, ViewLayout};
 use crate::ui;
 use crate::MAX_UI_DIMENSION;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 pub const SHM_ARGB8888: u32 = 0;
@@ -763,6 +763,20 @@ pub struct Scene {
     /// is disturbed by it.
     popups: BTreeMap<SurfaceKey, PlacedPopup>,
     popup_order: u64,
+    /// The popups holding an explicit grab. Kept beside `popups` rather than
+    /// inside `PlacedPopup` because a grab is taken BEFORE the popup is
+    /// mapped — the protocol refuses one after — so at the moment it is
+    /// recorded there is no placement to put it in.
+    ///
+    /// It is the SEAT's record, one set for the whole scene, where the shell
+    /// keeps a per-popup flag of the same fact for a different question: the
+    /// shell's answers whether a popup may be nested under, this one answers
+    /// which popup holds the seat now. The difference that matters is here:
+    /// this is dropped when a MAPPING ends, so a menu that unmapped itself
+    /// holds nothing — and separately when the object or its surface is
+    /// destroyed, which is the only road a popup that grabbed and never
+    /// mapped has, having no mapping to end.
+    grabs: BTreeSet<SurfaceKey>,
     titles: BTreeMap<SurfaceKey, String>,
     layout: Layout,
     pointer_x: i32,
@@ -798,6 +812,7 @@ impl Scene {
             geometries: BTreeMap::new(),
             popups: BTreeMap::new(),
             popup_order: 0,
+            grabs: BTreeSet::new(),
             titles: BTreeMap::new(),
             layout: Layout::new(),
             pointer_x: 0,
@@ -1082,6 +1097,113 @@ impl Scene {
         Ok(())
     }
 
+    /// This popup holds the seat's grab. Answers whether that was news, so a
+    /// caller need not re-answer focus for a grab it already recorded.
+    ///
+    /// Recorded for a popup that is not on screen yet, which is the only time
+    /// it can be: the grab request must precede the first buffer. Until the
+    /// popup maps it is a grab nobody can be focused on, which `topmost_grab`
+    /// expresses by reading the stack rather than this set.
+    pub fn grab_popup(&mut self, key: SurfaceKey) -> bool {
+        self.grabs.insert(key)
+    }
+
+    /// The topmost popup holding a grab, which is the one the protocol gives
+    /// the keyboard to. Read off the same stacking order the paint and the
+    /// hit test use, so the menu that has the keyboard is the menu drawn over
+    /// the others and the one a click lands on.
+    ///
+    /// A grabbing popup holds it only while it hangs off the FOCUSED window,
+    /// and that is td's own limit on the protocol's "always". Without it a
+    /// grab is a keystroke sink with no way out: the override below beats
+    /// click-to-focus and `Super+arrow` alike, a grab suspends
+    /// focus-follows-mouse, and nothing yet closes a menu on a click outside
+    /// — so any client with a visible tile could take every key the operator
+    /// typed, invisibly, until they closed its window. Review demonstrated
+    /// exactly that. Tying the grab to the focused window leaves the menu of
+    /// the window you are using in charge and gives the operator the two
+    /// gestures they already have to take the seat back.
+    ///
+    /// It is a divergence, recorded in DESIGN.md §3 with the alternative:
+    /// dismissing the chain outright, which needs the dismissal path this
+    /// increment does not build.
+    ///
+    /// SHOWN is the rest of it, and takes BOTH halves of what being on screen
+    /// means. `popup_rect` answers the first: the chain resolves to a visible
+    /// tile and every link abuts, so a menu over a window on another
+    /// workspace, or behind a stacked sibling, reaches no rectangle. It does
+    /// not answer the second, which review also caught: it resolves
+    /// rectangles without clipping, so a menu abutting its parent and lying
+    /// wholly past the output edge, or wholly inside the strip the bar is
+    /// painted over, has a rectangle and no pixels.
+    ///
+    /// A popup that grabbed and has not mapped is not a candidate either: it
+    /// is in `grabs` and not in the stack.
+    ///
+    /// The empty case is answered before any placement is built, because the
+    /// pointer path asks on every report and almost never has a grab.
+    pub fn topmost_grab(&self, width: usize, height: usize) -> Option<SurfaceKey> {
+        if self.grabs.is_empty() {
+            return None;
+        }
+        let focused = self.layout.focused()?;
+        let placements = self.tiled_placements(width, height);
+        let mut stack = self.popups_stacked();
+        stack.retain(|key| {
+            self.grabs.contains(key)
+                // Pixels, as the paint and the hit test both require. The
+                // `popups` ⊆ `surfaces` invariant holds only because every
+                // path pairs the two, and it is written down nowhere.
+                && self.surfaces.contains_key(key)
+                && self.popup_root(*key) == Some(focused)
+                && self
+                    .popup_rect(*key, &placements)
+                    .is_some_and(|rect| on_screen(rect, width, height))
+        });
+        stack.pop()
+    }
+
+    /// The grab alone, for the two ends a mapping does not have. The seat's
+    /// record is dropped with a mapping that ENDS — see `forget_popup` — and
+    /// these are the roads where no mapping is involved: the xdg_popup object
+    /// being destroyed, and the wl_surface being destroyed. Both matter for
+    /// the same reason, that a key can come back: a wl_surface outlives its
+    /// xdg_popup and may be given another, and a destroyed surface's id is
+    /// reusable once `delete_id` has been sent. Either way the next popup to
+    /// wear this key would map holding a grab it never asked for.
+    ///
+    /// These are also the only roads a popup that grabbed and never mapped
+    /// has. `drop_popups_of` cascades over `popups`, which such a popup is
+    /// not in, so destroying its PARENT's surface leaves its grab recorded.
+    /// That is inert rather than wrong — the stack it would have to be on to
+    /// reach the keyboard is built from `popups` too — and it is freed when
+    /// its own object or surface goes, or with its client.
+    pub fn release_grab(&mut self, key: SurfaceKey) -> bool {
+        self.grabs.remove(&key)
+    }
+
+    /// A popup leaves the scene. A MAPPING that ends takes the seat's grab
+    /// with it, and that is not bookkeeping: a menu comes back by being
+    /// committed again, and one that silently kept the grab it took before
+    /// would hold the keyboard on a second mapping the protocol will not let
+    /// it grab for — `invalid_grab` is exactly "tried to grab after being
+    /// mapped", so the same having-mapped that makes a re-grab illegal is
+    /// what ends this one.
+    ///
+    /// A popup that was never mapped has no mapping to end, and this is the
+    /// half a first draft got wrong. A grab arrives BEFORE the first buffer,
+    /// and a client may legally attach a null buffer and commit in between —
+    /// that is an initial commit, not a take-down — so dropping the grab for
+    /// every caller of this would lose it for a menu that had not yet opened.
+    /// The roads that are not a mapping ending go through `release_grab`.
+    fn forget_popup(&mut self, key: SurfaceKey) -> bool {
+        let mapped = self.popups.remove(&key).is_some();
+        if mapped {
+            self.grabs.remove(&key);
+        }
+        mapped
+    }
+
     /// A popup taken down, by a null attach or by its role object going away.
     /// Its pixels go with it: an unmapped popup is not a window that might come
     /// back to the same tile, it is a menu that has been dismissed. Its
@@ -1089,7 +1211,7 @@ impl Scene {
     /// hang off, and one left behind would be spending the scene's byte
     /// ceiling on a rectangle no chain can reach.
     pub fn unmap_popup(&mut self, key: SurfaceKey) -> (bool, Vec<SurfaceKey>) {
-        let drawn = self.popups.remove(&key).is_some();
+        let drawn = self.forget_popup(key);
         self.discard_pixels(key);
         (drawn, self.drop_popups_of(key))
     }
@@ -1120,7 +1242,7 @@ impl Scene {
                 .map(|(child, _)| *child)
                 .collect();
             for child in children {
-                self.popups.remove(&child);
+                self.forget_popup(child);
                 self.discard_pixels(child);
                 dropped.push(child);
             }
@@ -1131,6 +1253,17 @@ impl Scene {
             scanned = scanned.saturating_add(1);
         }
         dropped
+    }
+
+    /// How many grabs the seat is holding a record of, INCLUDING any for
+    /// popups that are not on the stack. `topmost_grab` cannot show one of
+    /// those, which is exactly why the count is exposed: a departing client's
+    /// entry is invisible on screen and its keys can never come back, so what
+    /// a stale one costs is a set that grows with every client that ever
+    /// opened a menu.
+    #[cfg(test)]
+    pub(crate) fn grabs_held(&self) -> usize {
+        self.grabs.len()
     }
 
     #[cfg(test)]
@@ -1316,7 +1449,7 @@ impl Scene {
 
     pub fn unmap(&mut self, key: SurfaceKey) -> (bool, Vec<SurfaceKey>) {
         let layout_changed = self.layout.contains(key);
-        self.popups.remove(&key);
+        self.forget_popup(key);
         let dropped = self.drop_popups_of(key);
         self.discard_pixels(key);
         self.layout.unmap(key);
@@ -1333,7 +1466,10 @@ impl Scene {
         let layout_changed = self.layout.contains(key);
         self.discard_pixels(key);
         self.geometries.remove(&key);
-        self.popups.remove(&key);
+        // The SURFACE is gone, so the grab goes whether or not this popup was
+        // ever mapped: the id is reusable once `delete_id` has been sent.
+        self.release_grab(key);
+        self.forget_popup(key);
         // Every popup this surface was the PARENT of goes too, and their
         // submenus with them. A menu whose window has gone is a rectangle
         // floating over whatever tile the layout gives that space to next.
@@ -1375,6 +1511,7 @@ impl Scene {
         self.input_regions.retain(|key, _| key.client != client);
         self.geometries.retain(|key, _| key.client != client);
         self.popups.retain(|key, _| key.client != client);
+        self.grabs.retain(|key| key.client != client);
         self.titles.retain(|key, _| key.client != client);
         self.surface_bytes = self.surface_bytes.saturating_sub(removed);
         // Cursor surfaces are not in `surfaces`, so the sweep above misses
@@ -2687,6 +2824,23 @@ fn overlaps(a: ImageRect, b: ImageRect) -> bool {
         && b.x < end(a.x, a.width)
         && a.y < end(b.y, b.height)
         && b.y < end(a.y, a.height)
+}
+
+/// Any pixel of this rectangle inside the output and below the bar. The bar
+/// is painted after the popups, so a menu reaching only into that strip is
+/// already invisible there — the rule `popup_target_from` applies to the
+/// pointer, applied here to the keyboard for the same reason.
+///
+/// Half-open on every edge, because a rectangle that only TOUCHES the output
+/// covers none of it.
+fn on_screen(rect: ImageRect, width: usize, height: usize) -> bool {
+    let span =
+        |start: i64, len: usize| start.saturating_add(i64::try_from(len).unwrap_or(i64::MAX));
+    let bar = i64::try_from(BAR_HEIGHT).unwrap_or(i64::MAX);
+    span(rect.x, rect.width) > 0
+        && span(rect.y, rect.height) > bar
+        && rect.x < i64::try_from(width).unwrap_or(i64::MAX)
+        && rect.y < i64::try_from(height).unwrap_or(i64::MAX)
 }
 
 /// Whether a popup may hang off this parent — the protocol's requirement that
@@ -6571,6 +6725,375 @@ mod tests {
             .unwrap();
         scene.remove_client(key.client);
         assert_eq!(scene.popup_placement(menu), None);
+    }
+
+    /// The seat goes to the topmost GRABBING popup, which is not the topmost
+    /// popup. A submenu opened without a grab is drawn over the menu that has
+    /// one and the menu keeps the keyboard — reading the stack alone would
+    /// hand it to a surface that asked for nothing.
+    #[test]
+    fn the_seats_grab_is_the_topmost_menu_that_took_one() {
+        let (mut scene, _frame, width, height, _stride, key, _rect) = popup_output();
+        let menu = popup_key(20);
+        let submenu = popup_key(21);
+        assert_eq!(scene.topmost_grab(width, height), None);
+
+        assert!(scene.grab_popup(menu));
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        assert_eq!(scene.topmost_grab(width, height), Some(menu));
+
+        // Drawn over the menu — `popup_stack` is placement order and puts it
+        // last — and holding nothing.
+        scene
+            .commit_popup(submenu, surface(SUBMENU, 6, 6), placed(menu, 10, 2, 6))
+            .unwrap();
+        assert_eq!(scene.popup_stack(), vec![menu, submenu]);
+        assert_eq!(scene.topmost_grab(width, height), Some(menu));
+
+        // And when it does take one it takes the seat with it, because now it
+        // is both the topmost popup and the topmost grabbing one.
+        assert!(scene.grab_popup(submenu));
+        assert_eq!(scene.topmost_grab(width, height), Some(submenu));
+        // A second grab from the same popup is not news, which is what lets a
+        // caller skip re-answering focus for it.
+        assert!(!scene.grab_popup(submenu));
+    }
+
+    /// A grab is taken before the popup maps — the protocol refuses one after
+    /// — so between the request and the first buffer there is a grab with no
+    /// pixels. It holds the seat for nobody: focusing a menu that is not on
+    /// screen would take the keyboard off the window behind for something the
+    /// operator cannot see or type into.
+    #[test]
+    fn a_menu_that_grabbed_before_it_mapped_holds_nothing_yet() {
+        let (mut scene, _frame, width, height, _stride, key, _rect) = popup_output();
+        let menu = popup_key(20);
+        assert!(scene.grab_popup(menu));
+        assert_eq!(scene.topmost_grab(width, height), None);
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        assert_eq!(scene.topmost_grab(width, height), Some(menu));
+
+        // A take-down of a popup that was never MAPPED keeps the grab, and
+        // this leg asserted the opposite until review found the client
+        // sequence it breaks. `grab` must precede the first buffer, and a
+        // client may legally attach a null buffer and commit in between — an
+        // initial commit, not a dismissal — which reaches `unmap_popup` with
+        // nothing mapped. Dropping the grab there loses it for a menu that
+        // has not opened yet.
+        //
+        // The reasoning that got it wrong was about a real hazard aimed at
+        // the wrong call: a wl_surface outlives its xdg_popup and may be
+        // given another. That belongs to `release_grab`, which the object's
+        // destroy and the surface's both go through, and is covered below.
+        let (mut scene, _frame, width, height, _stride, key, _rect) = popup_output();
+        assert!(scene.grab_popup(menu));
+        assert!(!scene.unmap_popup(menu).0, "an undrawn popup was drawn");
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        assert_eq!(scene.topmost_grab(width, height), Some(menu));
+
+        // What DOES take it before the first buffer is the object going, by
+        // either road, since the key can come back wearing another popup.
+        let (mut scene, _frame, width, height, _stride, key, _rect) = popup_output();
+        assert!(scene.grab_popup(menu));
+        assert!(scene.release_grab(menu));
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        assert_eq!(scene.topmost_grab(width, height), None);
+
+        let (mut scene, _frame, width, height, _stride, key, _rect) = popup_output();
+        assert!(scene.grab_popup(menu));
+        scene.remove(menu);
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        assert_eq!(scene.topmost_grab(width, height), None);
+    }
+
+    /// Every road off the screen takes the grab with it. Each is a separate
+    /// leg because each is a separate removal in this file, and a grab left
+    /// behind by any one of them is the keyboard pointed at a menu that is
+    /// gone.
+    #[test]
+    fn a_menu_that_left_the_screen_left_its_grab_there() {
+        let menu = popup_key(20);
+        let submenu = popup_key(21);
+        let open = |scene: &mut Scene, key: SurfaceKey, width: usize, height: usize| {
+            scene.grab_popup(menu);
+            scene
+                .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+                .unwrap();
+            scene.grab_popup(submenu);
+            scene
+                .commit_popup(submenu, surface(SUBMENU, 6, 6), placed(menu, 10, 2, 6))
+                .unwrap();
+            assert_eq!(scene.topmost_grab(width, height), Some(submenu));
+        };
+
+        // Its own unmap, and the CASCADE with it: the submenu is dropped by
+        // the menu going, not by a call naming it, so the grab has to be
+        // dropped where the popup is rather than where the caller is.
+        let (mut scene, _frame, width, height, _stride, key, _rect) = popup_output();
+        open(&mut scene, key, width, height);
+        scene.unmap_popup(submenu);
+        assert_eq!(scene.topmost_grab(width, height), Some(menu));
+        open(&mut scene, key, width, height);
+        scene.unmap_popup(menu);
+        assert_eq!(scene.topmost_grab(width, height), None);
+
+        // The parent window unmapped, which drops both through the same
+        // cascade from a different door.
+        let (mut scene, _frame, width, height, _stride, key, _rect) = popup_output();
+        open(&mut scene, key, width, height);
+        scene.unmap(key);
+        assert_eq!(scene.topmost_grab(width, height), None);
+
+        // The parent window destroyed.
+        let (mut scene, _frame, width, height, _stride, key, _rect) = popup_output();
+        open(&mut scene, key, width, height);
+        scene.remove(key);
+        assert_eq!(scene.topmost_grab(width, height), None);
+
+        // The menu's OWN surface destroyed, which reaches `remove` by the
+        // arm that is not the cascade.
+        let (mut scene, _frame, width, height, _stride, key, _rect) = popup_output();
+        open(&mut scene, key, width, height);
+        scene.remove(submenu);
+        assert_eq!(scene.topmost_grab(width, height), Some(menu));
+
+        // The client gone, which sweeps by client rather than by key. Its
+        // keys can never come back — a client id is issued once — so the
+        // stack alone cannot tell a swept set from a kept one, and the count
+        // is what says the record went rather than merely being unreachable.
+        let (mut scene, _frame, width, height, _stride, key, _rect) = popup_output();
+        open(&mut scene, key, width, height);
+        assert_eq!(scene.grabs_held(), 2);
+        scene.remove_client(key.client);
+        assert_eq!(scene.topmost_grab(width, height), None);
+        assert_eq!(scene.grabs_held(), 0);
+    }
+
+    /// A menu the CASCADE took down does not come back holding its grab. The
+    /// submenu here is dropped by its parent going rather than by any call
+    /// naming it, and its surface outlives that: a client may commit it again,
+    /// and the protocol will not let it grab again, so a grab left in the set
+    /// by the cascade is one the second mapping never asked for.
+    #[test]
+    fn a_submenu_the_cascade_took_down_comes_back_holding_nothing() {
+        let (mut scene, _frame, width, height, _stride, key, _rect) = popup_output();
+        let menu = popup_key(20);
+        let submenu = popup_key(21);
+        let menu_place = placed(key, 5, 7, 10);
+        let submenu_place = placed(menu, 10, 2, 6);
+        scene.grab_popup(menu);
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), menu_place)
+            .unwrap();
+        scene.grab_popup(submenu);
+        scene
+            .commit_popup(submenu, surface(SUBMENU, 6, 6), submenu_place)
+            .unwrap();
+        assert_eq!(scene.topmost_grab(width, height), Some(submenu));
+
+        // One call, two popups off the screen: the submenu is in the returned
+        // cascade rather than named by the caller.
+        let (drawn, dropped) = scene.unmap_popup(menu);
+        assert!(drawn);
+        assert_eq!(dropped, vec![submenu]);
+        assert_eq!(scene.grabs_held(), 0);
+
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), menu_place)
+            .unwrap();
+        scene
+            .commit_popup(submenu, surface(SUBMENU, 6, 6), submenu_place)
+            .unwrap();
+        assert_eq!(scene.popup_stack(), vec![menu, submenu]);
+        assert_eq!(scene.topmost_grab(width, height), None);
+    }
+
+    /// A menu painted back does not get the seat back. td supports committing
+    /// a popup that unmapped itself, and the protocol refuses a grab from a
+    /// popup that has mapped — `invalid_grab` is exactly "tried to grab after
+    /// being mapped" — so a second mapping is a menu that can never hold one
+    /// again. A grab kept beside the popup rather than dropped with it would
+    /// hand the keyboard to precisely that menu.
+    #[test]
+    fn a_menu_painted_back_does_not_take_the_keyboard_again() {
+        let (mut scene, _frame, width, height, _stride, key, _rect) = popup_output();
+        let menu = popup_key(20);
+        let place = placed(key, 5, 7, 10);
+        assert!(scene.grab_popup(menu));
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), place)
+            .unwrap();
+        assert_eq!(scene.topmost_grab(width, height), Some(menu));
+        scene.unmap_popup(menu);
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), place)
+            .unwrap();
+        assert_eq!(scene.popup_stack(), vec![menu]);
+        assert_eq!(scene.topmost_grab(width, height), None);
+    }
+
+    /// A menu the screen is not showing holds no keyboard. A workspace switch
+    /// or a stacked sibling RETAINS a popup rather than dismissing it — the
+    /// client was told nothing and the menu is still its own — so the grab is
+    /// still recorded, and answering with it would leave the window the
+    /// operator IS looking at unable to be typed into.
+    ///
+    /// Both of those hide a menu by hiding its PARENT, and the focus bound
+    /// covers a hidden parent already, so the first half of this test pins
+    /// the retention rather than the drawn check. The leg that isolates the
+    /// drawn check is the last one, where the parent is focused and shown.
+    ///
+    /// SHOWN is `popup_rect`'s question, the same one the paint and the press
+    /// ask through the one order `popups_stacked` keeps. It is not the whole
+    /// predicate: `on_screen` clips what `popup_rect` resolves, and the hit
+    /// test additionally asks about the input region, so a menu that takes no
+    /// clicks can still take keys.
+    #[test]
+    fn a_menu_the_screen_is_not_showing_holds_no_keyboard() {
+        let (mut scene, _frame, width, height, _stride, key, _rect) = popup_output();
+        let menu = popup_key(20);
+        assert!(scene.grab_popup(menu));
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        assert_eq!(scene.topmost_grab(width, height), Some(menu));
+
+        // STACKED AWAY is the case worth having, as it is for the paint: the
+        // parent is still in the arrangement with a rectangle of its own, and
+        // only `visible` says the sibling in front is what that space shows.
+        scene.command(Command::SetPresentation(
+            crate::layout::Presentation::Stacked,
+        ));
+        let sibling = SurfaceKey {
+            client: 4,
+            object: 10,
+        };
+        scene.commit(sibling, surface(SUBMENU, 40, 40)).unwrap();
+
+        assert_eq!(scene.topmost_grab(width, height), None);
+
+        // Both bounds answer that, and NEITHER can be held still while the
+        // other moves: a stacked container shows the leaf it has focused, so
+        // mapping the sibling hid the parent by focusing the sibling, and
+        // putting focus back is what would show it again. Measured, not
+        // reasoned — an earlier draft of this leg refocused the parent first
+        // to isolate visibility, and the menu came back with the keyboard.
+        //
+        // Which is a fact about the two bounds rather than about this test.
+        // `Layout::focused` is the ACTIVE workspace's focused leaf, so the
+        // other way a parent hides — being on another workspace — is under
+        // the focus bound too. The drawn check earns its place below, where
+        // the parent is focused and shown and the MENU is the thing that is
+        // not drawn.
+        assert_eq!(scene.grabs_held(), 1);
+        assert!(scene.focus_key(key));
+        assert_eq!(scene.topmost_grab(width, height), Some(menu));
+
+        // A menu placed clear of its parent is the same answer by the same
+        // road: `popup_rect` reaches no abutting rectangle, so it is drawn
+        // nowhere and typed into by nobody.
+        let (mut scene, _frame, width, height, _stride, key, _rect) = popup_output();
+        assert!(scene.grab_popup(menu));
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 4000, 10))
+            .unwrap();
+        assert_eq!(scene.topmost_grab(width, height), None);
+    }
+
+    /// A menu on a window that is not FOCUSED holds no keyboard, and a menu
+    /// that holds it loses it the moment the operator focuses something else.
+    ///
+    /// This is the escape hatch, and without it a grab is a keystroke sink.
+    /// The override beats click-to-focus and `Super+arrow` alike, a grab
+    /// suspends focus-follows-mouse, and nothing yet closes a menu on a click
+    /// outside — so a background client with any visible tile could take
+    /// every key typed until the operator closed its window. Review
+    /// demonstrated that against the first draft.
+    #[test]
+    fn a_menu_on_a_window_that_is_not_focused_holds_no_keyboard() {
+        let (mut scene, _frame, width, height, _stride, key, _rect) = popup_output();
+        let other = SurfaceKey {
+            client: 5,
+            object: 30,
+        };
+        let menu = popup_key(20);
+        scene.commit(other, surface(SUBMENU, 40, 40)).unwrap();
+        assert_eq!(scene.focused(), Some(other));
+
+        // A background client's menu, on its own visible tile, taking a grab
+        // the operator never asked for.
+        assert!(scene.grab_popup(menu));
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        assert_eq!(scene.topmost_grab(width, height), None);
+
+        // Focused, and it is in charge — which is the case the protocol is
+        // about, a menu on the window being used.
+        assert!(scene.focus_key(key));
+        assert_eq!(scene.topmost_grab(width, height), Some(menu));
+
+        // And the operator takes the seat back by focusing elsewhere, which
+        // is the gesture `Super+arrow` and a click on another tile both make.
+        // The grab is still RECORDED: nothing dismissed the menu, and
+        // focusing its window again puts it back in charge.
+        assert!(scene.focus_key(other));
+        assert_eq!(scene.topmost_grab(width, height), None);
+        assert_eq!(scene.grabs_held(), 1);
+        assert!(scene.focus_key(key));
+        assert_eq!(scene.topmost_grab(width, height), Some(menu));
+    }
+
+    /// A menu with a rectangle and no PIXELS holds no keyboard either.
+    /// `popup_rect` resolves a chain without clipping it, so a rectangle can
+    /// be entirely past the output edge and still resolve. Review caught it.
+    ///
+    /// Two shapes reach that state, which is worth writing down because it
+    /// bounds how much the check is worth. A CHAIN does: a TILED leaf is
+    /// inset from the output by the gap and a popup must abut its parent, so
+    /// a menu hanging off one always keeps a pixel, and it takes a menu at
+    /// the edge with a submenu hung off the part of it already outside. A
+    /// popup on a FULLSCREEN window does too, which the confirmation pass
+    /// pointed out — that leaf is flush with the output on three sides and
+    /// with the bar on the fourth, which `on_screen` measures alike, so a
+    /// single menu abutting it has nowhere inside to land. The chain is what
+    /// this test builds, being the harder of the two to arrive at.
+    #[test]
+    fn a_menu_with_a_rectangle_and_no_pixels_holds_no_keyboard() {
+        let (mut scene, _frame, width, height, _stride, key, rect) = popup_output();
+        let menu = popup_key(20);
+        let submenu = popup_key(21);
+        let reach = i32::try_from(rect.width).unwrap() - 2;
+        scene
+            .commit_popup(menu, surface(MENU, 100, 10), placed(key, reach, 0, 100))
+            .unwrap();
+        assert!(scene.grab_popup(submenu));
+        scene
+            .commit_popup(submenu, surface(SUBMENU, 40, 10), placed(menu, 100, 0, 40))
+            .unwrap();
+        assert_eq!(
+            scene.topmost_grab(width, height),
+            None,
+            "a submenu drawn nowhere took the keyboard"
+        );
+
+        // Pulled back inside the output, the same submenu does hold it, so
+        // what is measured is the clipping rather than the chain being
+        // refused somewhere along the way.
+        scene
+            .commit_popup(submenu, surface(SUBMENU, 40, 10), placed(menu, -40, 0, 40))
+            .unwrap();
+        assert_eq!(scene.topmost_grab(width, height), Some(submenu));
     }
 
     /// A popup whose parent is not on screen is not drawn. The parent may be on
