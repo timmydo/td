@@ -40,11 +40,14 @@
 #   td-busd/        — the target-built session D-Bus broker: the wire codec, and
 #                     eventually the socket, auth and per-connection policy that
 #                     APPLICATIONS.md §D specifies. Pure std with no syscall
-#                     surface until surface #10 lands with the transport.
+#                     surface until its reviewed transport surface lands.
 #   td-seatd/       — the target-built single-user framebuffer/evdev seat
 #                     assigner; pure safe std with no broker daemon.
 #   td-compositor/  — the target-built software Wayland compositor; its only
 #                     unsafe is the confined SCM_RIGHTS syscall layer.
+#   td-profiler/    — the target-built continuous system profiler and offline
+#                     report generator; dependency-free, with its perf/ring
+#                     syscall surface confined and recorded in UNSAFE.md.
 #   td-install/     — the disk installer: GPT + the FAT32 EFI System Partition
 #                     + the td volume, onto a block device or a regular file.
 #                     Pure std, sharing the engine GPT/FAT32/CRC-32 writers and
@@ -57,7 +60,7 @@
 [workspace]
 resolver = "2"
 members = ["builder", "recipes", "engine"]
-exclude = ["net", "td-kexec", "td-jail", "td-busd", "td-sh", "td-txt", "td-netd", "td-boot", "td-install", "td-util", "td-init", "td-firstboot", "td-seatd", "td-compositor", "td-review", "td-svc", "tests/sshd"]
+exclude = ["net", "td-kexec", "td-jail", "td-busd", "td-sh", "td-txt", "td-netd", "td-boot", "td-install", "td-util", "td-init", "td-firstboot", "td-seatd", "td-compositor", "td-profiler", "td-review", "td-svc", "tests/sshd"]
 
 [profile.release]
 # Keep the release profile explicit and minimal so the reproducibility oracle

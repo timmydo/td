@@ -1057,6 +1057,17 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // The collector is a standalone dependency-free crate. Increment two has
+    // no target recipe yet, so its exact tests, clippy lints, raw-format checks,
+    // and unsafe-confinement assertions live in the cargo preflight alone.
+    if pattern_matches(
+        "td-profiler/*|td-profiler/src/*|td-profiler/Cargo.toml|td-profiler/Cargo.lock|td-profiler/DESIGN.md",
+        p,
+    ) {
+        sel.add_preflight("cargo-test");
+        return;
+    }
+
     // td-install: the disk installer. Same standalone-crate shape as td-boot, and
     // it shares that crate's `protocol.rs` plus the engine GPT/FAT32/CRC-32
     // writers through `#[path]`, so host cargo is what holds its Rust rules and
@@ -1985,6 +1996,12 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("td-busd/examples/dbus-capture.rs", "cargo-test");
     assert_target!("td-busd/Cargo.lock", "check");
     assert_target!("td-busd/Cargo.lock", "recipe-checks");
+    assert_preflight!("td-profiler/src/main.rs", "cargo-test");
+    assert_preflight!("td-profiler/src/perf.rs", "cargo-test");
+    assert_preflight!("td-profiler/src/raw.rs", "cargo-test");
+    assert_preflight!("td-profiler/Cargo.lock", "cargo-test");
+    assert_no_target!("td-profiler/src/main.rs", "check");
+    assert_no_target!("td-profiler/src/main.rs", "recipe-checks");
     // td-sh mirrors td-kexec: standalone std-only crate, main.rs include_str!'d into
     // its recipe, so host cargo preflight + the recipe-checks static-link proof.
     assert_target!("td-sh/src/main.rs", "check");
@@ -2477,7 +2494,7 @@ fn dependency_free(lock: &str, text: &str, expected: usize) -> Result<(), String
 /// enforcement — so in the only tier that executes, this is where the
 /// dependency-free claim is actually checked. `--frozen` does not stand in: it
 /// demands that the committed lock RESOLVE, not that it be empty.
-const DEPENDENCY_FREE_LOCKS: [(&str, usize); 17] = [
+const DEPENDENCY_FREE_LOCKS: [(&str, usize); 18] = [
     ("Cargo.lock", 3),
     ("td-kexec/Cargo.lock", 1),
     ("td-jail/Cargo.lock", 1),
@@ -2494,6 +2511,7 @@ const DEPENDENCY_FREE_LOCKS: [(&str, usize); 17] = [
     ("td-install/Cargo.lock", 1),
     ("td-seatd/Cargo.lock", 1),
     ("td-compositor/Cargo.lock", 1),
+    ("td-profiler/Cargo.lock", 1),
     ("td-review/Cargo.lock", 1),
 ];
 
@@ -2505,7 +2523,7 @@ const DEPENDENCY_FREE_LOCKS: [(&str, usize); 17] = [
 /// binary are one text — which makes `recipes`, and therefore `cargo test
 /// --workspace`, a READER of those files. Checked against the tree rather than
 /// trusted, in `unembedded_crates_are_really_unembedded`.
-const UNEMBEDDED_CRATES: [&str; 1] = ["td-review"];
+const UNEMBEDDED_CRATES: [&str; 2] = ["td-profiler", "td-review"];
 
 /// Files under `builder/src` that are NOT the build engine, and so do not owe
 /// the from-source behavioural tier the rest of that directory does.
@@ -2578,7 +2596,7 @@ fn cmd_manifest_crate(cmd: &str) -> Option<&str> {
 /// What the `cargo-test` preflight runs, in order. A const so the lock roster
 /// above can be checked against it: a crate tested here whose lock is not
 /// guarded there would be dependency-free by assertion only.
-const CARGO_TEST_CMDS: [&str; 34] = [
+const CARGO_TEST_CMDS: [&str; 36] = [
     "cargo test --frozen --workspace",
     "cargo test --frozen --manifest-path td-kexec/Cargo.toml",
     "cargo test --frozen --manifest-path td-jail/Cargo.toml",
@@ -2595,6 +2613,7 @@ const CARGO_TEST_CMDS: [&str; 34] = [
     "cargo test --frozen --manifest-path td-svc/Cargo.toml",
     "cargo test --frozen --manifest-path td-seatd/Cargo.toml",
     "cargo test --frozen --manifest-path td-compositor/Cargo.toml",
+    "cargo test --frozen --manifest-path td-profiler/Cargo.toml",
     "cargo test --frozen --manifest-path td-review/Cargo.toml -- --include-ignored",
     "cargo clippy --frozen --workspace",
     "cargo clippy --frozen --manifest-path td-kexec/Cargo.toml",
@@ -2612,6 +2631,7 @@ const CARGO_TEST_CMDS: [&str; 34] = [
     "cargo clippy --frozen --manifest-path td-svc/Cargo.toml --all-targets",
     "cargo clippy --frozen --manifest-path td-seatd/Cargo.toml --all-targets",
     "cargo clippy --frozen --manifest-path td-compositor/Cargo.toml --all-targets",
+    "cargo clippy --frozen --manifest-path td-profiler/Cargo.toml --all-targets",
     "cargo clippy --frozen --manifest-path td-review/Cargo.toml --all-targets",
 ];
 
@@ -2644,7 +2664,7 @@ fn run_preflight(root: &Path, name: &str, changed: &[String]) -> i32 {
             // so --workspace lints/tests all three in one invocation; the target
             // programs (td-kexec, td-jail, td-sh, td-txt, td-netd, td-boot, td-util,
             // td-init, td-firstboot, td-login, td-svc, td-seatd, and
-            // td-compositor) are
+            // td-compositor, and td-profiler) are
             // standalone crates and ride the preflight explicitly, as does the
             // host-side td-review integrator tool. td-sh's conformance corpus run
             // is NOT `#[ignore]`d: this plain `cargo test` runs the whole corpus,
@@ -4752,7 +4772,7 @@ mod tests {
                 "  builder/src/main.rs",
                 "",
                 "Selected checks:",
-                "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-jail/Cargo.toml + --manifest-path td-busd/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-txt/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml + --manifest-path td-install/Cargo.toml + --manifest-path td-util/Cargo.toml + --manifest-path td-init/Cargo.toml + --manifest-path td-firstboot/Cargo.toml + --manifest-path td-login/Cargo.toml + --manifest-path td-svc/Cargo.toml + --manifest-path td-seatd/Cargo.toml + --manifest-path td-compositor/Cargo.toml + --manifest-path td-review/Cargo.toml -- --include-ignored",
+                "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-jail/Cargo.toml + --manifest-path td-busd/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-txt/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml + --manifest-path td-install/Cargo.toml + --manifest-path td-util/Cargo.toml + --manifest-path td-init/Cargo.toml + --manifest-path td-firstboot/Cargo.toml + --manifest-path td-login/Cargo.toml + --manifest-path td-svc/Cargo.toml + --manifest-path td-seatd/Cargo.toml + --manifest-path td-compositor/Cargo.toml + --manifest-path td-profiler/Cargo.toml + --manifest-path td-review/Cargo.toml -- --include-ignored",
                 "  td-builder check check-engine check",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
@@ -4776,7 +4796,7 @@ mod tests {
                 "",
                 "Selected checks:",
                 "  bash -n start tests/*.sh ci/*.sh tools/*.sh",
-                "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-jail/Cargo.toml + --manifest-path td-busd/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-txt/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml + --manifest-path td-install/Cargo.toml + --manifest-path td-util/Cargo.toml + --manifest-path td-init/Cargo.toml + --manifest-path td-firstboot/Cargo.toml + --manifest-path td-login/Cargo.toml + --manifest-path td-svc/Cargo.toml + --manifest-path td-seatd/Cargo.toml + --manifest-path td-compositor/Cargo.toml + --manifest-path td-review/Cargo.toml -- --include-ignored",
+                "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-jail/Cargo.toml + --manifest-path td-busd/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-txt/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml + --manifest-path td-install/Cargo.toml + --manifest-path td-util/Cargo.toml + --manifest-path td-init/Cargo.toml + --manifest-path td-firstboot/Cargo.toml + --manifest-path td-login/Cargo.toml + --manifest-path td-svc/Cargo.toml + --manifest-path td-seatd/Cargo.toml + --manifest-path td-compositor/Cargo.toml + --manifest-path td-profiler/Cargo.toml + --manifest-path td-review/Cargo.toml -- --include-ignored",
                 "  td-builder check check",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",

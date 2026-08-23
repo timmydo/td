@@ -3,7 +3,7 @@
 This file is the normative record of every `unsafe` in td. It exists
 because the roster is the point: the value of writing these down is being
 able to count them and see each one's justification beside the others,
-which is exactly what stops a tenth being added quietly. Where this file
+which is exactly what stops an eleventh being added quietly. Where this file
 and the code disagree, one of them is a bug.
 
 ## The rule
@@ -12,14 +12,16 @@ In the control-plane engine the only `unsafe` is the raw-syscall layer
 (`builder/src/sys.rs` and its callers `nar.rs`/`sandbox.rs`), which carry
 `#![allow(unsafe_code)]` so `builder` can be `libc`-free. Every other
 engine crate (the shared `engine` lib and
-`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TEN
+`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are ELEVEN
 target-side exceptions, each a standalone crate OUTSIDE the
-`builder`/`recipes`/`engine` workspace whose only `unsafe` is that same
-`syscall`-instruction layer under a scoped `#[allow]` (the crate itself
-`#![deny(unsafe_code)]`s). NINE of the ten are exactly that and nothing
-more. The tenth, `td-busd`, carries a second scoped allow of a DIFFERENT
-shape — a descriptor adoption rather than an instruction — and §10 is
-where that difference is argued, because §6 turned the same allow down.
+`builder`/`recipes`/`engine` workspace with a scoped `#[allow]` around its
+recorded raw Linux boundary (the crate itself `#![deny(unsafe_code)]`s).
+The first nine confine that boundary to their syscall-instruction layer.
+The tenth, `td-busd`, carries a second scoped allow of a DIFFERENT shape —
+a descriptor adoption rather than an instruction — and §10 is where that
+difference is argued, because §6 turned the same allow down. The eleventh,
+`td-profiler`, also owns the pointer accesses into the perf ring mapping
+whose lifetime and bounds that same module controls.
 
 Do not add `unsafe` anywhere else; a new `unsafe` surface is a reviewed
 amendment recorded HERE. A new syscall in an existing surface, a new
@@ -51,6 +53,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with two value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `seccomp(2)` with one value-pinned operation |
 | 10 | `td-busd` | `recvmsg(2)`, `sendmsg(2)`, `getsockopt(2)` with one value-pinned option; plus a SECOND scoped allow for descriptor adoption — see [§10](#10-td-busd--the-session-bus-broker) |
+| 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)` |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering: it is host-side, and no
@@ -1286,3 +1289,53 @@ ever borrows a descriptor `std` already owns. There is no `mmap`, no
 uid and never assumes one. A fourth syscall, a second socket option, or a
 third scoped allow is an amendment here and to `APPLICATIONS.md` §D in the
 same landing.
+
+## 11. `td-profiler` — continuous system observation
+
+The profiler carries exactly NINE syscalls through one x86-64 `syscall6`
+instruction: `perf_event_open(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)`,
+`close(2)`, `clock_gettime(2)`, `setgroups(2)`, `setgid(2)`, and `setuid(2)`.
+One module-level allowance covers that instruction, atomic acquire/release
+accesses to the kernel-owned perf ring head and tail, bounded metadata-header
+reads used to validate the data offset and size, and the bounded copy from the
+data mapping after the acquired head. `Ring` owns the mapping, checks the
+kernel-returned data offset and power-of-two size against the exact mapped
+extent, refuses an overrun or malformed record, copies bytes before they leave
+the module, advances `data_tail` with the acquire/release ordering the ABI
+requires, and unmaps on drop. No raw pointer reaches collection or reporting
+code.
+
+`perf_event_open` receives one of two compiled 128-byte attribute layouts. The
+metadata event is `PERF_COUNT_SW_DUMMY` and pins mmap, mmap2, comm+exec, task,
+`sample_id_all`, `use_clockid`, and the identifier/TID/time/CPU trailer. The raw
+schema accepts context-switch records for forward compatibility, but this
+layout does not request them until off-CPU attribution is modeled. The sampling
+event is `PERF_COUNT_SW_CPU_CLOCK`, frequency mode, the same clock and identity
+fields plus IP and callchain, and excludes kernel and hypervisor execution.
+Both are system-wide for one compiled CPU number, with pid and group fd -1 and
+only `PERF_FLAG_FD_CLOEXEC`; the caller supplies the rate but no event type,
+sample layout, flags word, pid, or group.
+
+The `ioctl` entry point is private to this module and is reached with exactly
+four pinned requests: `PERF_EVENT_IOC_ENABLE`, `PERF_EVENT_IOC_DISABLE`,
+`PERF_EVENT_IOC_SET_OUTPUT`, and `PERF_EVENT_IOC_ID`. SET_OUTPUT redirects the
+CPU-clock event into that CPU's metadata ring; ID writes one live `u64`; enable
+and disable take argument zero. `mmap` is exactly shared read/write over the
+metadata descriptor at offset zero for one metadata page plus a power-of-two
+data page count. `munmap` receives only the owned pair. `close` receives only
+the two event descriptors created by this module.
+
+`clock_gettime` is pinned to `CLOCK_MONOTONIC`, the clock selected in both event
+attributes, so startup fences, ring records, and capture coverage share one
+domain. The credential calls occur exactly once in the security order
+`setgroups(0, NULL)`, `setgid(profiler)`, `setuid(profiler)`, after event setup
+and startup inventory and before sampling is enabled. Collection reads
+`/proc/self/status` through safe `std` and refuses unless all four uid/gid slots
+and the empty supplementary group list agree.
+
+Deliberately absent are ptrace, BPF, sockets, `openat`, `statx`, caller-supplied
+ioctl requests, another perf event type, kernel samples, and a signal handler.
+Ordinary capture files, `/proc` and `/sys` reads, fsync, and atomic rename use
+safe `std`. A tenth syscall, a fifth request, another event layout, a second
+scoped unsafe allowance, or any pointer escape from `sys.rs` is an amendment
+here and in `td-profiler/DESIGN.md`.
