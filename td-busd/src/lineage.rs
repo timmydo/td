@@ -336,6 +336,22 @@ pub struct Instance {
     pub services: Vec<String>,
 }
 
+/// A caller the transport has PROVED, rather than a number it was told.
+///
+/// The pid comes from `SO_PEERPIDFD` and the start time from `/proc`, read
+/// between two agreeing reads of that pidfd -- so the pair names one PROCESS.
+/// A pid on its own is a number the allocator recycles, which is the whole
+/// subject of this module; a pid plus the start time of the process that held
+/// it is the identity every other rule here is written in terms of.
+///
+/// The registry does not construct one. It is made where the socket is, in the
+/// transport, because that is the only place a pidfd for the peer exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Caller {
+    pub pid: i32,
+    pub starttime: u64,
+}
+
 /// How long a registration may stand between its two phases.
 ///
 /// This is not a policy knob, it is the fix for an availability hole: a
@@ -388,7 +404,14 @@ struct Pending {
     /// strict descendant of the pid that opened it. Peers elsewhere in the
     /// process tree are unaffected, and a rogue registration now blocks only
     /// the rogue's own descendants.
-    registrant: i32,
+    ///
+    /// A `Caller` and not a pid, because phase two arrives on a DIFFERENT
+    /// connection and comparing numbers across that gap is the mistake the
+    /// walk stopped making one commit ago and the registry went on making. If
+    /// the registrant ends between the phases and its number is reused, the
+    /// process holding it is not the one that opened, and a number-only check
+    /// cannot say so.
+    registrant: Caller,
 }
 
 /// Every instance the broker knows, pending and complete.
@@ -457,7 +480,7 @@ impl Instances {
         app_id: &str,
         services: Vec<String>,
         uid: u32,
-        registrant: i32,
+        registrant: Caller,
     ) -> Result<String, String> {
         self.open_at(
             procfs,
@@ -480,7 +503,7 @@ impl Instances {
         app_id: &str,
         services: Vec<String>,
         uid: u32,
-        registrant: i32,
+        registrant: Caller,
         now: Instant,
     ) -> Result<String, String> {
         if services.len() > MAX_SERVICES {
@@ -572,7 +595,7 @@ impl Instances {
         token: &str,
         pid: i32,
         uid: u32,
-        completer: i32,
+        completer: Caller,
     ) -> Result<(), String> {
         self.complete_at(procfs, token, pid, uid, completer, Instant::now())
     }
@@ -586,7 +609,7 @@ impl Instances {
         token: &str,
         pid: i32,
         uid: u32,
-        completer: i32,
+        completer: Caller,
         now: Instant,
     ) -> Result<(), String> {
         // No `pid <= 0` guard. The wire converts from `u32`, so only zero can
@@ -626,13 +649,43 @@ impl Instances {
             ));
         }
         // The process, not the connection — see this method's doc comment.
-        if pending.registrant != completer {
+        //
+        // A PID AND A START TIME, because the two phases arrive on different
+        // connections and a bare number is a comparison across a gap the
+        // registrant need not survive. The division of labour is exact, and a
+        // review made this comment state it rather than overstate it: the
+        // TRANSPORT establishes that each caller is a process that has not
+        // been reaped, reading its start time inside the pidfd bracket, and
+        // this comparison establishes that the two callers are the same one.
+        // Neither half is the other's spare.
+        //
+        // TWO checks and not one conjunction. A reviewer's mutation joined
+        // them with `&&`, which passes for a caller that differs in exactly
+        // one field -- a different pid that started in the same clock tick
+        // would then complete somebody else's token -- and every test at the
+        // time differed in both. The cross-product case is pinned below.
+        if pending.registrant.pid != completer.pid {
             return Err(format!(
-                "registration was opened by pid {} and completed by pid {completer}",
-                pending.registrant
+                "registration was opened by pid {} and completed by pid {}",
+                pending.registrant.pid, completer.pid
             ));
         }
-        if stat.ppid != completer {
+        if pending.registrant.starttime != completer.starttime {
+            return Err(format!(
+                "the process that opened this registration at pid {} has ended, \
+                 and that pid now belongs to something else",
+                pending.registrant.pid
+            ));
+        }
+        // A child of the COMPLETER, which the two checks above have just
+        // established is the process that opened. The child's own pid stays a
+        // number, soundly: the registrant may only name a process whose parent
+        // it currently is, so if the child it meant had been reaped and its
+        // number reused, the reusing process would have to be another of the
+        // registrant's own children to pass. The worst available is
+        // mislabelling a process it already owns, which is §D's v1 exposure,
+        // rather than reaching one it does not.
+        if stat.ppid != completer.pid {
             return Err(format!("pid {pid} is not a child of the registering process"));
         }
         if state.live.iter().any(|i| i.pid == pid) {
@@ -657,14 +710,14 @@ impl Instances {
     }
 
     #[cfg(test)]
-    fn pending_count(&self) -> usize {
+    pub(crate) fn pending_count(&self) -> usize {
         self.inner.lock().map(|s| s.pending.len()).unwrap_or(0)
     }
 
     /// Sweep, then report the registrant pids of the registrations that
     /// remain — which is what the walk needs, and what asking twice would
     /// race with itself to get.
-    fn expire_pending(&self, now: Instant) -> Result<Vec<i32>, ()> {
+    fn expire_pending(&self, now: Instant) -> Result<Vec<Caller>, ()> {
         match self.inner.lock() {
             Ok(mut state) => {
                 sweep_pending(&mut state, now);
@@ -912,7 +965,7 @@ struct Hop {
 fn resolve_against(
     procfs: &dyn Procfs,
     live: &[Instance],
-    pending: &[i32],
+    pending: &[Caller],
     reaped: &[i32],
     pid: i32,
 ) -> Identity {
@@ -993,11 +1046,18 @@ fn resolve_against(
     // registration. Blocking it would be a self-lock — the broker would deny
     // the connection whose next message is `Complete`.
     if found.is_none() {
-        if let Some(hop) = chain
-            .iter()
-            .skip(1)
-            .find(|hop| pending.contains(&hop.pid))
-        {
+        // Matched on the PAIR, not on the number. A pending registrant that
+        // ended and whose pid was handed on would otherwise deny `Unconfined`
+        // to the new holder's descendants for the rest of
+        // `PENDING_LIFETIME` — which is precisely the availability lever this
+        // rule was narrowed to descendants to avoid, aimed at a process that
+        // never registered anything. The pair has been on record since the
+        // registry started taking a proved caller; this spends it.
+        if let Some(hop) = chain.iter().skip(1).find(|hop| {
+            pending
+                .iter()
+                .any(|opener| opener.pid == hop.pid && opener.starttime == hop.starttime)
+        }) {
             return Identity::Unknown(format!(
                 "a registration opened by pid {} is still in flight, and this \
                  connection descends from it",
@@ -1191,6 +1251,28 @@ mod tests {
         /// the chain, the sweep reads each live instance's stage-2 pid.
         fn pidfd_after_stat_of(&self, pid: i32, answer: Named) {
             *self.pidfd_after_stat_of.borrow_mut() = Some((pid, answer));
+        }
+
+        /// The pair the transport would have proved for `pid`: its number
+        /// and the start time this table currently gives it.
+        ///
+        /// Deliberately NOT a `stat` call. Several tests arm `swap_after` on
+        /// the read counter, and a helper that went through `Procfs` would
+        /// shift every one of them by however many callers it has.
+        fn caller(&self, pid: i32) -> Caller {
+            let starttime = self
+                .now
+                .borrow()
+                .get(&pid)
+                .map(|stat| stat.starttime)
+                .unwrap_or(0);
+            Caller { pid, starttime }
+        }
+
+        /// The same NUMBER, a different process — what the allocator does
+        /// when it wraps and hands a freed pid to the next caller of `fork`.
+        fn replace(&self, pid: i32, stat: Stat) {
+            self.now.borrow_mut().insert(pid, stat);
         }
 
         /// The process is there and the broker cannot read it — `EMFILE`, or
@@ -1487,10 +1569,10 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (400, 1, 40)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
             .expect("phase one opens");
         instances
-            .complete(&table, &token, 100, 1000, 900)
+            .complete(&table, &token, 100, 1000, table.caller(900))
             .expect("phase two completes");
 
         table.hide(100);
@@ -1567,16 +1649,16 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
         let instances = Instances::new();
         let first = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
             .expect("phase one opens");
         let second = instances
-            .open(&table, "two", "org.td.Two", Vec::new(), 1000, 900)
+            .open(&table, "two", "org.td.Two", Vec::new(), 1000, table.caller(900))
             .expect("a second instance opens");
         instances
-            .complete(&table, &first, 100, 1000, 900)
+            .complete(&table, &first, 100, 1000, table.caller(900))
             .expect("the first binding takes");
         let clash = instances
-            .complete(&table, &second, 100, 1000, 900)
+            .complete(&table, &second, 100, 1000, table.caller(900))
             .expect_err("two instances bound the same pid");
         assert!(clash.contains("already bound"), "{clash}");
     }
@@ -1610,10 +1692,10 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
             .expect("phase one opens");
         instances
-            .complete(&table, &token, 100, 1000, 900)
+            .complete(&table, &token, 100, 1000, table.caller(900))
             .expect("phase two completes");
         // Decisions taken about something that is not this record. Each leg
         // differs from the live record in exactly ONE of the three fields, so
@@ -1647,19 +1729,19 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (700, 1, 70)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
             .expect("phase one opens");
 
         for stranger in [1, 700] {
             let error = instances
-                .complete(&table, &token, stranger, 1000, 900)
+                .complete(&table, &token, stranger, 1000, table.caller(900))
                 .expect_err("a stranger's pid completed the registration");
             assert!(error.contains("not a child"), "{error}");
         }
         // The token survives every refusal, or a failed attempt would be a way
         // to deny somebody else's launch.
         instances
-            .complete(&table, &token, 100, 1000, 900)
+            .complete(&table, &token, 100, 1000, table.caller(900))
             .expect("the registrant's own child completes");
     }
 
@@ -1673,12 +1755,92 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (901, 1, 91)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
             .expect("phase one opens");
         let error = instances
-            .complete(&table, &token, 100, 1000, 901)
+            .complete(&table, &token, 100, 1000, table.caller(901))
             .expect_err("another connection completed the registration");
         assert!(error.contains("completed by pid 901"), "{error}");
+    }
+
+    /// The registrant's pid was handed on between the two phases, and the
+    /// process wearing it now completes nothing.
+    ///
+    /// This is the case a bare number cannot see. `Register` and `Complete`
+    /// arrive on DIFFERENT connections — td-jail closes every descriptor above
+    /// stderr between them — so phase two's caller is compared against a
+    /// number the registry wrote down, and a number is precisely what the
+    /// allocator recycles. 900 opens, 900 ends, the allocator wraps, and 900
+    /// is somebody else who calls `Complete` with a child of its own. Every
+    /// other check passes: the uid matches, the token is live and unguessed,
+    /// and the pid being bound really is the caller's own child. Only the
+    /// start time says these are two processes.
+    #[test]
+    fn a_registrants_recycled_pid_completes_nothing() {
+        let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
+        let instances = Instances::new();
+        let token = instances
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .expect("phase one opens");
+
+        table.replace(900, Stat { ppid: 1, starttime: 91 });
+        let error = instances
+            .complete(&table, &token, 100, 1000, table.caller(900))
+            .expect_err("a stranger wearing the registrant's pid completed it");
+        assert!(error.contains("now belongs to something else"), "{error}");
+
+        // The registration is not consumed by the refusal. It belongs to a
+        // process that has ended, so it expires on its own clock rather than
+        // being burned by somebody else's attempt — the same rule every other
+        // refusal here follows.
+        assert_eq!(instances.pending_count(), 1);
+        assert_eq!(instances.live_count(), 0);
+    }
+
+    /// A DIFFERENT process that started in the same clock tick completes
+    /// nothing either.
+    ///
+    /// The cross-product case, and it exists because a reviewer's mutation
+    /// joined the two refusals with `&&`: the pid check and the start-time
+    /// check both passed over a caller that differs in exactly one field,
+    /// because every test at the time differed in both. 901 here has 900's
+    /// start time to the tick, which is ordinary — `starttime` is measured in
+    /// clock ticks since boot and two processes forked together share one.
+    #[test]
+    fn a_different_process_of_the_same_age_completes_nothing() {
+        let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (901, 1, 90)]);
+        let instances = Instances::new();
+        let token = instances
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .expect("phase one opens");
+        let error = instances
+            .complete(&table, &token, 100, 1000, table.caller(901))
+            .expect_err("a same-aged stranger completed the registration");
+        assert!(error.contains("completed by pid 901"), "{error}");
+        assert_eq!(instances.pending_count(), 1, "the token was consumed");
+    }
+
+    /// And the start-time comparison refuses in BOTH directions.
+    ///
+    /// A recycled pid necessarily starts later, so `<` passes every test `!=`
+    /// passes and a reviewer's mutation to it survived. The rule is "the same
+    /// process", not "no younger than", and a clock that is not monotonic
+    /// across a `/proc` read — or a `starttime` this broker reads from a
+    /// namespace it did not expect — should refuse rather than accept.
+    #[test]
+    fn a_start_time_that_differs_either_way_completes_nothing() {
+        for theirs in [89, 91] {
+            let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
+            let instances = Instances::new();
+            let token = instances
+                .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+                .expect("phase one opens");
+            table.replace(900, Stat { ppid: 1, starttime: theirs });
+            let error = instances
+                .complete(&table, &token, 100, 1000, table.caller(900))
+                .expect_err("a process of another age completed the registration");
+            assert!(error.contains("now belongs to something else"), "{error}");
+        }
     }
 
     /// An expired token completes nothing, and does not wait for a connection
@@ -1688,7 +1850,7 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
             .expect("phase one opens");
         let Some(later) = Instant::now()
             .checked_add(PENDING_LIFETIME)
@@ -1697,7 +1859,7 @@ mod tests {
             return;
         };
         let error = instances
-            .complete_at(&table, &token, 100, 1000, 900, later)
+            .complete_at(&table, &token, 100, 1000, table.caller(900), later)
             .expect_err("an expired registration completed");
         assert!(error.contains("no registration is open"), "{error}");
         assert_eq!(instances.live_count(), 0);
@@ -1712,14 +1874,16 @@ mod tests {
     /// fails — with stage 2 already spawned and no record of it.
     #[test]
     fn tokens_are_unguessable_rather_than_serial() {
-        // No process is looked up here; the sweep just finds nothing.
-        let table = Table::default();
+        // The registrant IS looked up now — phase one records when it
+        // started, so that phase two can tell the same process from a later
+        // one wearing its pid. Nothing else here is.
+        let table = Table::with(&[(900, 1, 90)]);
         let instances = Instances::new();
         let first = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
             .expect("phase one opens");
         let second = instances
-            .open(&table, "two", "org.td.One", Vec::new(), 1000, 900)
+            .open(&table, "two", "org.td.One", Vec::new(), 1000, table.caller(900))
             .expect("a second registration opens");
         assert_ne!(first, second);
         for token in [&first, &second] {
@@ -1745,7 +1909,7 @@ mod tests {
         // would hand out the same first token for the same instance name.
         let elsewhere = Instances::new();
         let same_name = elsewhere
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
             .expect("a second registry opens");
         assert_ne!(
             first, same_name,
@@ -1902,10 +2066,10 @@ mod tests {
         let clean = Table::with(rows);
         let instances = Instances::new();
         let token = instances
-            .open(&clean, "one", "org.td.One", Vec::new(), 1000, 900)
+            .open(&clean, "one", "org.td.One", Vec::new(), 1000, clean.caller(900))
             .expect("phase one opens");
         instances
-            .complete(&clean, &token, 400, 1000, 900)
+            .complete(&clean, &token, 400, 1000, clean.caller(900))
             .expect("phase two completes");
         assert_eq!(instances.resolve(&clean, 401), jailed);
 
@@ -1914,10 +2078,10 @@ mod tests {
         let table = Table::with(rows);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
             .expect("phase one opens");
         instances
-            .complete(&table, &token, 400, 1000, 900)
+            .complete(&table, &token, 400, 1000, table.caller(900))
             .expect("phase two completes");
         // 401's own chain tops out at the registered instance, so pid 1 is
         // never read here; 400 is, by the walk's first hop AND by the sweep.
@@ -1949,10 +2113,10 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (400, 900, 95), (401, 400, 96)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
             .expect("phase one opens");
         instances
-            .complete(&table, &token, 400, 1000, 900)
+            .complete(&table, &token, 400, 1000, table.caller(900))
             .expect("phase two completes");
         table.pidfd_after_stat_of(400, Named::Reaped);
         match instances.resolve(&table, 401) {
@@ -1994,10 +2158,10 @@ mod tests {
         table.pidfd_always(Named::Pid(401));
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
             .expect("phase one opens");
         instances
-            .complete(&table, &token, 400, 1000, 900)
+            .complete(&table, &token, 400, 1000, table.caller(900))
             .expect("phase two completes");
         // 7 is not in the table at all, so a walk that started from the
         // descriptor number would answer `Unknown`.
@@ -2018,7 +2182,7 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (110, 900, 96)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", vec!["ca.desrt.dconf".to_string()], 1000, 900)
+            .open(&table, "one", "org.td.One", vec!["ca.desrt.dconf".to_string()], 1000, table.caller(900))
             .expect("phase one opens");
 
         // Between the phases the instance is not resolvable, and the peer
@@ -2030,7 +2194,7 @@ mod tests {
         assert_eq!(instances.live_count(), 0);
 
         instances
-            .complete(&table, &token, 100, 1000, 900)
+            .complete(&table, &token, 100, 1000, table.caller(900))
             .expect("phase two completes");
         assert_eq!(instances.live_count(), 1);
         assert_eq!(
@@ -2048,7 +2212,7 @@ mod tests {
         // token it binds a second live instance under one instance name, each
         // burning a `MAX_INSTANCES` slot, where a duplicate `Register` would
         // have been refused outright.
-        let again = instances.complete(&table, &token, 110, 1000, 900);
+        let again = instances.complete(&table, &token, 110, 1000, table.caller(900));
         assert!(again.is_err(), "a consumed token bound a second pid");
         assert_eq!(instances.live_count(), 1, "one token bound two instances");
     }
@@ -2058,13 +2222,13 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
             .expect("phase one opens");
-        let wrong = instances.complete(&table, &token, 100, 1001, 900);
+        let wrong = instances.complete(&table, &token, 100, 1001, table.caller(900));
         assert!(wrong.is_err(), "another uid completed the registration");
         // And the token survives a refused attempt rather than being burned by
         // it, or anyone could deny a launch by guessing at it once.
-        assert!(instances.complete(&table, &token, 100, 1000, 900).is_ok());
+        assert!(instances.complete(&table, &token, 100, 1000, table.caller(900)).is_ok());
     }
 
     #[test]
@@ -2072,10 +2236,10 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
             .expect("phase one opens");
         let error = instances
-            .complete(&table, &token, 700, 1000, 900)
+            .complete(&table, &token, 700, 1000, table.caller(900))
             .expect_err("a pid with no /proc entry must not complete");
         assert!(error.contains("does not exist"), "{error}");
 
@@ -2083,36 +2247,38 @@ mod tests {
         // either: the record's start time would have to be invented.
         table.hide(100);
         let error = instances
-            .complete(&table, &token, 100, 1000, 900)
+            .complete(&table, &token, 100, 1000, table.caller(900))
             .expect_err("an unreadable pid must not complete");
         assert!(error.contains("no readable /proc entry"), "{error}");
     }
 
     #[test]
     fn the_registry_is_bounded_and_refuses_a_repeated_instance() {
-        // No process is looked up here; the sweep just finds nothing.
-        let table = Table::default();
+        // The registrant IS looked up now — phase one records when it
+        // started, so that phase two can tell the same process from a later
+        // one wearing its pid. Nothing else here is.
+        let table = Table::with(&[(900, 1, 90)]);
         let instances = Instances::new();
         for which in 0..MAX_INSTANCES {
             instances
-                .open(&table, &format!("i{which}"), "org.td.One", Vec::new(), 1000, 900)
+                .open(&table, &format!("i{which}"), "org.td.One", Vec::new(), 1000, table.caller(900))
                 .expect("under the ceiling");
         }
-        assert!(instances.open(&table, "more", "org.td.One", Vec::new(), 1000, 900).is_err());
+        assert!(instances.open(&table, "more", "org.td.One", Vec::new(), 1000, table.caller(900)).is_err());
 
         let fresh = Instances::new();
         fresh
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
             .expect("first");
         assert!(
-            fresh.open(&table, "one", "org.td.Other", Vec::new(), 1000, 900).is_err(),
+            fresh.open(&table, "one", "org.td.Other", Vec::new(), 1000, table.caller(900)).is_err(),
             "a second registration took over a live instance name"
         );
         // A fresh name, or this leg never reaches the service ceiling: it
         // would be refused for the duplicate instance name instead, and the
         // ceiling could be deleted without failing anything.
         assert!(fresh
-            .open(&table, "two", "org.td.One", vec![String::new(); MAX_SERVICES + 1], 1000, 900)
+            .open(&table, "two", "org.td.One", vec![String::new(); MAX_SERVICES + 1], 1000, table.caller(900))
             .is_err());
     }
 
@@ -2125,16 +2291,18 @@ mod tests {
     /// connecting is never.
     #[test]
     fn abandoned_registrations_do_not_hold_the_ceiling_for_ever() {
-        // No process is looked up here; the sweep just finds nothing.
-        let table = Table::default();
+        // The registrant IS looked up now — phase one records when it
+        // started, so that phase two can tell the same process from a later
+        // one wearing its pid. Nothing else here is.
+        let table = Table::with(&[(900, 1, 90)]);
         let instances = Instances::new();
         for which in 0..MAX_INSTANCES {
             instances
-                .open(&table, &format!("i{which}"), "org.td.One", Vec::new(), 1000, 900)
+                .open(&table, &format!("i{which}"), "org.td.One", Vec::new(), 1000, table.caller(900))
                 .expect("under the ceiling");
         }
         assert!(instances
-            .open(&table, "more", "org.td.One", Vec::new(), 1000, 900)
+            .open(&table, "more", "org.td.One", Vec::new(), 1000, table.caller(900))
             .is_err());
 
         let Some(later) = Instant::now()
@@ -2144,7 +2312,7 @@ mod tests {
             return;
         };
         instances
-            .open_at(&table, "more", "org.td.One", Vec::new(), 1000, 900, later)
+            .open_at(&table, "more", "org.td.One", Vec::new(), 1000, table.caller(900), later)
             .expect("the abandoned registrations no longer hold their slots");
         assert_eq!(instances.pending_count(), 1);
     }
@@ -2166,21 +2334,21 @@ mod tests {
         let instances = Instances::new();
         for which in 0..MAX_INSTANCES as i32 {
             let token = instances
-                .open(&table, &format!("i{which}"), "fixture", Vec::new(), 1000, 900)
+                .open(&table, &format!("i{which}"), "fixture", Vec::new(), 1000, table.caller(900))
                 .expect("under the ceiling");
             instances
-                .complete(&table, &token, 1000 + which, 1000, 900)
+                .complete(&table, &token, 1000 + which, 1000, table.caller(900))
                 .expect("phase two completes");
         }
         assert_eq!(instances.live_count(), MAX_INSTANCES);
         assert!(instances
-            .open(&table, "more", "fixture", Vec::new(), 1000, 900)
+            .open(&table, "more", "fixture", Vec::new(), 1000, table.caller(900))
             .is_err());
 
         // Every jail exits, and no connection arrives to notice.
         let after = Table::with(&[(1, 0, 1), (900, 1, 90)]);
         instances
-            .open(&after, "more", "fixture", Vec::new(), 1000, 900)
+            .open(&after, "more", "fixture", Vec::new(), 1000, after.caller(900))
             .expect("dead instances still held their slots");
     }
 
@@ -2195,10 +2363,10 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (400, 1, 40)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
             .expect("phase one opens");
         instances
-            .complete(&table, &token, 100, 1000, 900)
+            .complete(&table, &token, 100, 1000, table.caller(900))
             .expect("phase two completes");
         assert_eq!(instances.live_count(), 1);
 
@@ -2229,10 +2397,10 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
             .expect("phase one opens");
         instances
-            .complete(&table, &token, 100, 1000, 900)
+            .complete(&table, &token, 100, 1000, table.caller(900))
             .expect("phase two completes");
 
         let after = Table::with(&[(1, 0, 1), (100, 1, 77), (400, 100, 80), (500, 1, 50)]);
@@ -2251,6 +2419,74 @@ mod tests {
     /// is the one answer that must not be given to the process that is
     /// certainly confined.
     ///
+    /// A pending registrant that ended does not deny the process that
+    /// inherited its number.
+    ///
+    /// The pending rule is deliberately narrow — descendants of the registrant
+    /// and nobody else — because the wide version let any uid-1000 process
+    /// deny the whole session by opening a registration it never finished.
+    /// Matching on the NUMBER alone gives that lever back to chance: 900 ends
+    /// with its registration open, the allocator hands 900 to something else,
+    /// and every descendant of that innocent process is denied `Unconfined`
+    /// for the rest of `PENDING_LIFETIME`. The record has carried the
+    /// registrant's start time since the registry started taking a proved
+    /// caller, so the comparison is over a process.
+    #[test]
+    fn a_pending_registrant_that_ended_denies_nobody() {
+        let table = Table::with(&[(1, 0, 1), (900, 1, 90), (950, 900, 95)]);
+        let instances = Instances::new();
+        instances
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .expect("phase one opens");
+        // While the registrant that opened it is still there, its descendant
+        // is denied -- which is the rule working.
+        match instances.resolve(&table, 950) {
+            Identity::Unknown(why) => assert!(why.contains("in flight"), "{why}"),
+            other => panic!("a pending instance's descendant resolved {other:?}"),
+        }
+
+        // The registrant ends and its number is handed on. 950 is now a child
+        // of a process that never registered anything.
+        table.replace(900, Stat { ppid: 1, starttime: 91 });
+        assert_eq!(
+            instances.resolve(&table, 950),
+            Identity::Unconfined,
+            "a stranger wearing the registrant's pid denied its descendants"
+        );
+    }
+
+    /// And the other half of the pair: sharing the registrant's START TIME is
+    /// not enough either.
+    ///
+    /// A start time is a tick count since boot, so processes forked together
+    /// share one freely — 700 here is nothing to do with the registration and
+    /// began in the same tick. Matching on it alone would deny `Unconfined` to
+    /// a swathe of the process tree chosen by nothing but boot timing, which
+    /// is the wide rule this one was narrowed from.
+    #[test]
+    fn a_pending_registration_denies_nobody_who_merely_shares_its_age() {
+        let table = Table::with(&[
+            (1, 0, 1),
+            (900, 1, 90),
+            (950, 900, 95),
+            (700, 1, 90),
+            (750, 700, 96),
+        ]);
+        let instances = Instances::new();
+        instances
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .expect("phase one opens");
+        match instances.resolve(&table, 950) {
+            Identity::Unknown(why) => assert!(why.contains("in flight"), "{why}"),
+            other => panic!("the registrant's own descendant resolved {other:?}"),
+        }
+        assert_eq!(
+            instances.resolve(&table, 750),
+            Identity::Unconfined,
+            "a process that merely shares the registrant's start time was denied"
+        );
+    }
+
     /// The rule is scoped to DESCENDANTS of the registrant, and the scoping is
     /// the security-relevant part twice over. Too wide and any uid-1000
     /// process denies the whole session by opening a registration it never
@@ -2271,7 +2507,7 @@ mod tests {
         assert_eq!(instances.resolve(&table, 400), Identity::Unconfined);
 
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
             .expect("phase one opens");
 
         // A peer that could belong to the pending instance is refused...
@@ -2289,7 +2525,7 @@ mod tests {
         assert_eq!(instances.resolve(&table, 900), Identity::Unconfined);
 
         instances
-            .complete(&table, &token, 950, 1000, 900)
+            .complete(&table, &token, 950, 1000, table.caller(900))
             .expect("phase two completes");
         assert_eq!(instances.resolve(&table, 400), Identity::Unconfined);
         assert_eq!(
@@ -2313,7 +2549,7 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (950, 900, 95)]);
         let instances = Instances::new();
         instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
             .expect("phase one opens");
         assert_eq!(instances.pending_count(), 1);
         assert!(matches!(

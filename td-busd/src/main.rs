@@ -574,6 +574,112 @@ mod tests {
         );
     }
 
+    /// The registry's two arms are told who is calling by the KERNEL.
+    ///
+    /// `credential.pid` is a number sampled at `connect(2)`, and both arms
+    /// used it. The difference is invisible to a test that runs both ends in
+    /// one process — there the two answers agree, and would agree under the
+    /// mutation — and visible only once the caller has been reaped and its
+    /// number handed on, which no in-process test can stage on demand. So the
+    /// source is pinned: the pid the registry is given comes from
+    /// `caller_pid`, and the sampled number appears in these two arms not at
+    /// all.
+    #[test]
+    fn the_registry_is_told_who_is_calling_by_the_kernel() {
+        // COMMENTS STRIPPED FIRST. A reviewer defeated the raw-text version by
+        // commenting the guard out: the text `self.caller(&RealProcfs)` was
+        // still there to be counted while the behaviour was gone, and all 236
+        // tests passed. td-jail's confinement module learnt this the same way
+        // and its comment says so; this is the same stripper.
+        let transport = without_line_comments(&without_block_comments(source("transport")));
+        let Some(from) = transport.find("fn jail_register(") else {
+            panic!("the registration arm is gone");
+        };
+        let Some(span) = transport[from..].find("fn credentials_for(") else {
+            panic!("the two arms no longer end where this test slices them");
+        };
+        let arms = transport.get(from..from + span).unwrap_or("");
+        assert_eq!(
+            arms.matches("self.caller(&RealProcfs)").count(),
+            2,
+            "a registry arm stopped asking the kernel who is calling"
+        );
+        // Every mention of the sampled credential EXCEPT its uid, which is
+        // the one field that legitimately comes from `SO_PEERCRED`: §D says
+        // registration is authenticated by uid. Counting the whole word and
+        // subtracting `.uid` rather than searching for `.pid` is deliberate —
+        // one alias binding, `let sampled = self.credential;`, walks past the
+        // narrower spelling, and a reviewer wrote exactly that mutation.
+        let sampled = format!("self.{}", "credential");
+        let uid = format!("{sampled}.uid");
+        assert_eq!(
+            arms.matches(&sampled)
+                .count()
+                .saturating_sub(arms.matches(&uid).count()),
+            0,
+            "a registry arm went back to the number sampled at connect"
+        );
+    }
+
+    /// Comments out, so that commenting a check out is not a way to pass the
+    /// test that pins it. Lifted from `td-jail/src/main.rs`, which arrived at
+    /// it the same way; the two crates are separate dependency-free locks and
+    /// cannot share the helper.
+    fn without_block_comments(source: &str) -> String {
+        let mut out = String::with_capacity(source.len());
+        let mut rest = source;
+        let mut depth = 0_usize;
+        loop {
+            let open = rest.find("/*");
+            let close = rest.find("*/");
+            match (depth, open, close) {
+                (0, None, _) => {
+                    out.push_str(rest);
+                    return out;
+                }
+                (0, Some(at), _) => {
+                    out.push_str(rest.get(..at).unwrap_or(""));
+                    rest = rest.get(at.saturating_add(2)..).unwrap_or("");
+                    depth = 1;
+                }
+                (_, Some(at), Some(shut)) if at < shut => {
+                    rest = rest.get(at.saturating_add(2)..).unwrap_or("");
+                    depth = depth.saturating_add(1);
+                }
+                (_, _, Some(shut)) => {
+                    rest = rest.get(shut.saturating_add(2)..).unwrap_or("");
+                    depth = depth.saturating_sub(1);
+                }
+                (_, _, None) => return out,
+            }
+        }
+    }
+
+    fn without_line_comments(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| match line.split_once("//") {
+                Some((code, _)) => code,
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The stripper stands between a commented-out guard and a green suite, so
+    /// it is tested rather than assumed.
+    #[test]
+    fn comments_are_stripped_including_nested_and_unterminated_blocks() {
+        assert_eq!(without_block_comments("a/*b*/c"), "ac");
+        assert_eq!(without_block_comments("a/*b/*c*/d*/e"), "ae");
+        assert_eq!(without_block_comments("a/*b\nc*/d"), "ad");
+        assert_eq!(without_block_comments("a/*b"), "a");
+        assert_eq!(without_block_comments("plain"), "plain");
+        // A `*/` with nothing open is not a comment and is left alone.
+        assert_eq!(without_block_comments("a*/b"), "a*/b");
+        assert_eq!(without_line_comments("keep // drop\nkeep2"), "keep \nkeep2");
+    }
+
     /// The adoption's ORDERING in `peer_pidfd`, which is the INVERSE of
     /// `receive`'s and is the one thing about this surface a reader is most
     /// likely to "fix".

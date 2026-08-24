@@ -32,8 +32,16 @@
 //! `unshare` and the spawn. So each call here opens its own connection and
 //! drops it. What ties the phases together is the token and the fact that
 //! both calls come from the same PROCESS — `unshare(CLONE_NEWPID)` does not
-//! move the caller, so the pid the broker reads from `SO_PEERCRED` is the same
-//! both times, which is exactly what §D's completion rule compares.
+//! move the caller, and nothing between the phases `exec`s, so both the pid
+//! and the start time the broker reads are the same at each call.
+//!
+//! Both, because that is what §D's completion rule compares. The broker takes
+//! the caller's pid from `SO_PEERPIDFD` rather than `SO_PEERCRED` — the two
+//! render the same number, but only the descriptor says the number has not
+//! been freed — and reads the start time from `/proc` between two agreeing
+//! reads of it. A launcher that registered from one process and completed
+//! from another, or that let stage 1 end and its number be reused between the
+//! phases, is refused.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;

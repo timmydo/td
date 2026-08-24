@@ -3374,8 +3374,9 @@ claimed the connection, which is the stronger rule and would break the
 only launcher there is: §A step 0 closes every descriptor above stderr
 between the `unshare` and the spawn, so the connection stage 0
 registered on is gone before stage 1 has a pid to report. Stage 1
-reconnects. What holds across both phases is the pid, because
-`unshare(CLONE_NEWPID)` does not move the caller. This also rules out a
+reconnects. What holds across both phases is the pid — and, since the
+landing below, the pid together with the start time the broker read at
+phase one — because `unshare(CLONE_NEWPID)` does not move the caller. This also rules out a
 tempting cleanup: dropping a pending registration when the connection
 that opened it closes would discard every legitimate registration at
 exactly the moment §A sweeps descriptors.
@@ -3567,6 +3568,77 @@ A kernel without `SO_PEERPIDFD` (below 6.5; td pins 7.x) answers
 failure. Refusing the CONNECTION would take the session bus down
 entirely, and would do it to the compositor and the terminal as readily
 as to a jail.
+
+**The two registration calls are told who is calling the same way, and
+the pending record is a pid AND a start time.** The paragraphs above
+fixed the identity walk and left the registry sampling: `Register` and
+`Complete` were handed `SO_PEERCRED.pid`, so the recycled number that
+would have misdescribed a connection could equally open a registration
+in somebody else's name — and `Complete`'s "the same process that opened
+it" rule compared two numbers across a gap the registrant need not
+survive. The gap is not removable: §A closes every descriptor above
+stderr between the phases, so the two calls necessarily arrive on
+different connections. That is what makes a number the wrong instrument
+for the comparison rather than merely an imprecise one.
+
+Two changes, and neither is sufficient alone. First, the broker takes
+the caller's pid from a fresh `SO_PEERPIDFD` at each of the two calls
+and refuses a caller it cannot identify; that covers a registrant which
+has already been REAPED, whose stale number the socket still reports.
+Second, the record stores the registrant's start time and phase two
+compares it; that covers a registrant whose number has already been
+handed to a live process, which the liveness oracle by itself would
+identify quite correctly as somebody — just not as the process that
+opened.
+
+**What the pidfd buys at a registry call is liveness and not a different
+number**, and a review corrected a draft of this section that implied
+otherwise. `SO_PEERCRED` and `SO_PEERPIDFD` render the same
+`sk->sk_peer_pid`, so whenever the descriptor names a pid at all it is
+the pid the socket already reported. The difference is what each can be
+asked: the socket keeps reporting its number after the process behind it
+has been reaped and the allocator has handed the number on; the
+descriptor says whether that has happened. "Reaped" and not "exited" is
+exact — a zombie's `fdinfo` still reports its pid, which is right,
+because an unreaped pid is an unavailable pid and availability is the
+only property at issue.
+
+**The start time is read inside the same two-read bracket the walk
+uses**, and a review found the version without it. The broker reads the
+pidfd, reads `/proc/<pid>/stat`, and reads the pidfd again requiring the
+same pid; only then is the pair a caller. One read is not enough for the
+reason it was not enough for the walk: the peer can be reaped and its
+number reused between the pidfd read and the `stat`, and phase one would
+record the impostor's start time — while the peer that transferred its
+socket away before dying still has a controller on the other end to take
+delivery of the token. Both later checks would then agree with each
+other about a process that was never this connection's peer. The
+registry therefore reads no `/proc` entry for its own caller at all; it
+is handed a pair, because a read outside the bracket cannot say whose
+entry it read.
+
+**The pending-registration rule matches that pair too.** A registration
+in flight denies `Unconfined` to the registrant's strict descendants,
+and matching the registrant by number alone handed that lever to chance:
+a registrant that ended with its registration open would deny every
+descendant of whichever process next received its number, for the rest
+of `PENDING_LIFETIME` and without that process having registered
+anything.
+
+A kernel without `SO_PEERPIDFD` now refuses LAUNCHES and not merely
+identity. `Register` and `Complete` are refused along with everything
+else the descriptor is needed for, and §D requires stage 1 to refuse to
+proceed without its token, so on such a host no jailed application
+starts. That is the fail-closed direction and it is stated rather than
+discovered: td pins 7.x, and a broker that cannot tell one process from
+another should not be recording which application a process belongs to.
+
+The pid `Complete` NAMES — stage 2's — stays a bare number, and soundly.
+A registrant may only name a process whose parent it currently is, so a
+stage-2 number that was reaped and reused can only be reused by another
+of the registrant's own children. The worst available is mislabelling a
+process it already owns, which is the v1 app-id exposure recorded above,
+rather than a reach into somebody else's.
 
 **td-jail performs this protocol, and the image's one application does
 it at boot.** Every jailed application is a registered instance and

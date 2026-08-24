@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::auth::{Guid, Handshake, PeerIdentity, GUID_LEN};
-use crate::lineage::{Identity, Instances, RealProcfs};
+use crate::lineage::{Caller, Identity, Instances, Named, Procfs, Reading, RealProcfs};
 use crate::message;
 use crate::registry::{Bus, Outbox, Overflow, Rejected};
 use crate::sys::{self, PeerCredential};
@@ -506,6 +506,79 @@ impl<'a> Connection<'a> {
             freight: Vec::new(),
             frame: Vec::new(),
         })
+    }
+
+    /// Which process is on this connection, proved rather than sampled.
+    ///
+    /// **What the pidfd buys is liveness, not a different number**, and a
+    /// review corrected an earlier draft of this comment that implied
+    /// otherwise. `SO_PEERCRED` and `SO_PEERPIDFD` render the same
+    /// `sk->sk_peer_pid`, so whenever `named_by` answers a pid at all it is
+    /// the pid `credential.pid` already held. The difference is the question
+    /// each can answer: the socket's number is a value the kernel sampled at
+    /// `connect(2)` and will keep reporting after the process behind it has
+    /// been reaped and the allocator has handed the number on, at which point
+    /// a registry keyed on it attributes the registration to whoever holds it
+    /// now. The descriptor answers whether that has happened. So this is
+    /// `credential.pid` plus the kernel's word that it has not been freed --
+    /// and the word is the whole of the value.
+    ///
+    /// Taken fresh at each registry call rather than kept from accept. Kept,
+    /// it would be one descriptor per connection held for the whole of its
+    /// life to answer a question two methods ask at most twice per launch --
+    /// and `Complete` arrives on a DIFFERENT connection from `Register`
+    /// anyway, because td-jail closes every descriptor above stderr between
+    /// the two, so a handle cached at accept would not span the pair that
+    /// needs it.
+    ///
+    /// `None` means the peer could not be identified, and both callers refuse
+    /// on it. What this proves is exactly one thing: the pair names a process
+    /// that is this connection's peer and has NOT BEEN REAPED, so its number
+    /// is still exclusively its own. Not "is running" -- a zombie's `fdinfo`
+    /// still reports its pid, which is right, because an unreaped pid is an
+    /// unavailable pid and availability is the only property at issue.
+    /// Proving the two PHASES are the same process is the registry's job, and
+    /// it uses the start time.
+    ///
+    /// `Unreadable` is `None` as firmly as `Reaped` is, and that arm is why
+    /// this takes an injected `/proc` rather than reaching for `RealProcfs`
+    /// itself. It means the broker could not read the descriptor's `fdinfo` —
+    /// `EMFILE`, or a format it does not recognise — which is precisely the
+    /// state in which falling back to the sampled number would be worst. No
+    /// live kernel can be made to produce it on demand, so a version that
+    /// answered `Some(self.credential.pid)` there survived the whole suite
+    /// until the seam was here.
+    ///
+    /// The `/proc` read is BRACKETED by two reads of the pidfd, exactly as
+    /// `resolve`'s walk is, and a review found the version without it. One
+    /// read is not enough: the peer can be reaped and its number reused
+    /// between the pidfd read and the `stat`, and phase one would then record
+    /// the impostor's start time — while the peer that transferred its socket
+    /// away before dying still has a controller on the other end to take
+    /// delivery of the token. Both later checks would agree with each other
+    /// about a process that was never this connection's peer. With the second
+    /// read the argument is the walk's: if the pidfd names the same pid
+    /// afterwards, the peer was never reaped in between, so its number was
+    /// never free, so the `/proc` entry read while it ran was the peer's.
+    ///
+    /// The descriptor is held across both reads. Dropping it in between would
+    /// return its NUMBER to this process's descriptor table, and the second
+    /// read could then be of something else entirely.
+    fn caller(&self, procfs: &dyn Procfs) -> Option<Caller> {
+        let pidfd = sys::peer_pidfd(&self.stream).ok()?;
+        let Named::Pid(pid) = procfs.named_by(pidfd.as_raw_fd()) else {
+            return None;
+        };
+        let Reading::Of(stat) = procfs.stat(pid) else {
+            return None;
+        };
+        match procfs.named_by(pidfd.as_raw_fd()) {
+            Named::Pid(again) if again == pid => Some(Caller {
+                pid,
+                starttime: stat.starttime,
+            }),
+            _ => None,
+        }
     }
 
     /// A peer whose pidfd the kernel would not give.
@@ -1137,13 +1210,21 @@ impl<'a> Connection<'a> {
         else {
             return Ok(());
         };
+        let Some(registrant) = self.caller(&RealProcfs) else {
+            return self.refuse_if_wanted(
+                message,
+                "td.Jail1.Error.Refused",
+                "the registering process could not be identified",
+                wants_reply,
+            );
+        };
         match self.instances.open(
             &RealProcfs,
             &instance,
             &app_id,
             services,
             self.credential.uid,
-            self.credential.pid,
+            registrant,
         ) {
             Ok(token) if wants_reply => {
                 self.answer(message, "s", move |writer| writer.string(&token))
@@ -1174,15 +1255,28 @@ impl<'a> Connection<'a> {
         let Some((token, pid)) = self.completion_arguments(message, wants_reply)? else {
             return Ok(());
         };
-        // The completing connection's own pid is an argument the registry
+        // The completing connection's own caller is an argument the registry
         // needs and the caller cannot supply: it is what makes "a registrant
-        // may bind its own child and nothing else" checkable.
+        // may bind its own child and nothing else" checkable. Proved rather
+        // than sampled, and this is the only reader of the completer's
+        // `/proc` entry now -- the registry stopped reading it, because a read
+        // outside the pidfd bracket cannot say whose entry it read. A
+        // completer already REAPED (not merely exited: a zombie still has an
+        // entry and an unavailable number) is refused here.
+        let Some(completer) = self.caller(&RealProcfs) else {
+            return self.refuse_if_wanted(
+                message,
+                "td.Jail1.Error.Refused",
+                "the completing process could not be identified",
+                wants_reply,
+            );
+        };
         match self.instances.complete(
             &RealProcfs,
             &token,
             pid,
             self.credential.uid,
-            self.credential.pid,
+            completer,
         ) {
             Ok(()) if wants_reply => self.answer(message, "", |_| Ok(())),
             Ok(()) => Ok(()),
@@ -2234,11 +2328,23 @@ mod tests {
                 panic!("this process has a /proc entry");
             };
             let parent = mine.ppid;
+            // The registrant is this process's PARENT, which is what makes
+            // the accepted connection a strict descendant of a live instance.
+            // A pidfd for an arbitrary process is unobtainable here --
+            // `pidfd_open` is not on surface #10's roster — so the pair the
+            // transport would have proved is stated instead.
+            let crate::lineage::Reading::Of(theirs) = RealProcfs.stat(parent) else {
+                panic!("this process's parent has a /proc entry");
+            };
+            let registrant = crate::lineage::Caller {
+                pid: parent,
+                starttime: theirs.starttime,
+            };
             let token = instances
-                .open(&RealProcfs, "fixture", &app_id, Vec::new(), this_uid(), parent)
+                .open(&RealProcfs, "fixture", &app_id, Vec::new(), this_uid(), registrant)
                 .expect("phase one");
             instances
-                .complete(&RealProcfs, &token, pid, this_uid(), parent)
+                .complete(&RealProcfs, &token, pid, this_uid(), registrant)
                 .expect("phase two");
             let mut connection =
                 Connection::accept(server, guid, &quota, &bus, &instances).expect("accept");
@@ -4230,36 +4336,9 @@ mod tests {
     /// ignored helper below. Waiting for that child is what reaps it.
     #[test]
     fn a_peer_reaped_before_accept_is_not_unconfined() {
-        if !pidfd_available() {
-            return;
-        }
-        let path = scratch("reaped");
-        let Ok(listener) = UnixListener::bind(&path) else {
+        let Some(stream) = a_reaped_peers_connection("reaped") else {
             return;
         };
-        let Ok(exe) = std::env::current_exe() else {
-            return;
-        };
-        let ran = std::process::Command::new(exe)
-            .args([
-                "--exact",
-                "--ignored",
-                "--quiet",
-                "--test-threads=1",
-                REAPED_HELPER,
-            ])
-            .env(REAPED_SOCKET, &path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let _ = fs::remove_file(&path);
-        let Ok(status) = ran else {
-            return;
-        };
-        assert!(status.success(), "the helper process did not connect");
-        // `status()` waited, so the connector is reaped. Whatever is in the
-        // backlog now belongs to a process that does not exist.
-        let (stream, _) = listener.accept().expect("the helper's connection");
 
         let credential = sys::peer_credential(&stream).expect("peercred");
         assert!(
@@ -4289,11 +4368,334 @@ mod tests {
         }
     }
 
+    /// A connection whose peer is gone, or `None` where one cannot be staged.
+    ///
+    /// The connector has to be a separate PROCESS, and this crate has no
+    /// `fork`: surface #10's roster is three syscalls and `fork` is not one
+    /// of them. So the test binary re-runs ITSELF with a filter naming the
+    /// ignored helper below. Waiting for that child is what reaps it, and the
+    /// connection it left sits in the backlog until the caller accepts it.
+    fn a_reaped_peers_connection(tag: &str) -> Option<UnixStream> {
+        if !pidfd_available() {
+            return None;
+        }
+        let path = scratch(tag);
+        let listener = UnixListener::bind(&path).ok()?;
+        let exe = std::env::current_exe().ok()?;
+        let ran = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "--ignored",
+                "--quiet",
+                "--test-threads=1",
+                REAPED_HELPER,
+            ])
+            .env(REAPED_SOCKET, &path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = fs::remove_file(&path);
+        let status = ran.ok()?;
+        assert!(status.success(), "the helper process did not connect");
+        // `status()` waited, so the connector is reaped. Whatever is in the
+        // backlog now belongs to a process that does not exist.
+        let (stream, _) = listener.accept().expect("the helper's connection");
+        Some(stream)
+    }
+
+    /// A connection whose owner is gone REGISTERS NOTHING.
+    ///
+    /// The identity walk stopped trusting `SO_PEERCRED`'s number one commit
+    /// ago; the registry went on trusting it, and `Register` is where trusting
+    /// it costs something — the number names whoever holds it now, and the
+    /// instance's name and services would be recorded against them. The peer
+    /// here is genuinely reaped, so the sampled number is stale by
+    /// construction, and it is still positive and plausible, which is why the
+    /// contrast is asserted rather than described.
+    ///
+    /// The recycled-number half of the same attack cannot be staged — a test
+    /// cannot make the allocator wrap — so it is pinned in `lineage`'s tests
+    /// against an injected `/proc`. Between them the two halves cover the pair
+    /// this commit adds.
+    #[test]
+    fn a_reaped_peer_registers_nothing() {
+        let Some(stream) = a_reaped_peers_connection("reaped-register") else {
+            return;
+        };
+        let guid = Guid::new(GUID).expect("guid");
+        let quota = Quota::new();
+        let bus = Bus::new();
+        let instances = Instances::new();
+        let mut connection =
+            Connection::accept(stream, guid, &quota, &bus, &instances).expect("accept");
+
+        // The number the registry used to be handed is right there, and it
+        // looks like every other pid.
+        assert!(
+            connection.credential.pid > 0,
+            "the sampled number this refusal has to beat was not there"
+        );
+        assert_eq!(
+            connection.caller(&RealProcfs),
+            None,
+            "a peer that no longer exists was identified as the caller"
+        );
+
+        // This connection never said `Hello` and never will: its peer was gone
+        // before the socket was accepted. A refusal has to be ADDRESSED, so
+        // the name that Hello would have assigned is set here directly —
+        // otherwise this arm reports "a reply was built before Hello" and the
+        // refusal under test never gets built.
+        connection.unique = Some(":1.1".to_string());
+        let call = register_call("one", "org.td.One", 2);
+        let (message, _) = message::decode(&call, 0).expect("decode a Register");
+        connection.jail_register(&message, true).expect("the arm ran");
+
+        let frame = connection.outbox.take().expect("a refusal was queued");
+        assert_eq!(
+            error_of(&frame).as_deref(),
+            Some("td.Jail1.Error.Refused"),
+            "a registration was answered for a process that does not exist"
+        );
+        let (reply, _) = message::decode(&frame, 0).expect("decode the refusal");
+        let why = reply
+            .args()
+            .first()
+            .and_then(crate::wire::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        assert!(why.contains("could not be identified"), "{why}");
+        assert_eq!(
+            instances.pending_count(),
+            0,
+            "a registration was opened for a process that does not exist"
+        );
+    }
+
+    /// A `/proc` the test drives, because the states this seam has to refuse
+    /// are ones no live kernel produces on demand.
+    ///
+    /// `after_stat` is what the SECOND pidfd read answers, and it is keyed on
+    /// a `stat` having happened rather than on a count of pidfd reads. That
+    /// distinction is the whole point of the knob: a count says "the second
+    /// one" wherever the second one sits, so it cannot tell a read taken after
+    /// the `/proc` read from one taken immediately after the first — and the
+    /// mutation that deletes the bracket's second read entirely has to fail
+    /// this fake, not satisfy it. The same lesson, and the same shape, as
+    /// `lineage`'s own table.
+    struct Staged {
+        first: Named,
+        after_stat: Option<Named>,
+        stat: Reading,
+        read: std::cell::Cell<bool>,
+    }
+
+    impl Staged {
+        fn new(first: Named, stat: Reading) -> Self {
+            Staged {
+                first,
+                after_stat: None,
+                stat,
+                read: std::cell::Cell::new(false),
+            }
+        }
+
+        fn then(mut self, after_stat: Named) -> Self {
+            self.after_stat = Some(after_stat);
+            self
+        }
+    }
+
+    fn a_stat(starttime: u64) -> Reading {
+        Reading::Of(crate::lineage::Stat { ppid: 1, starttime })
+    }
+
+    impl Procfs for Staged {
+        fn stat(&self, _pid: i32) -> Reading {
+            self.read.set(true);
+            self.stat
+        }
+
+        fn named_by(&self, _pidfd: std::os::fd::RawFd) -> Named {
+            match (self.read.get(), self.after_stat) {
+                (true, Some(after)) => after,
+                _ => self.first,
+            }
+        }
+    }
+
+    /// Every state in which this seam must prove nothing, against a real
+    /// socket whose peer is alive and whose sampled number is CORRECT.
+    ///
+    /// That last part is what makes the table sharp rather than decorative: a
+    /// fallback to `self.credential.pid` would be right about the number in
+    /// every row here, and still wrong, because a broker that cannot read its
+    /// oracle has no business preferring the value the oracle exists to
+    /// qualify.
+    #[test]
+    fn a_caller_the_broker_cannot_prove_is_not_a_caller() {
+        if !pidfd_available() {
+            return;
+        }
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        let guid = Guid::new(GUID).expect("guid");
+        let quota = Quota::new();
+        let bus = Bus::new();
+        let instances = Instances::new();
+        let connection =
+            Connection::accept(server, guid, &quota, &bus, &instances).expect("accept");
+        let me = i32::try_from(std::process::id()).expect("a pid fits");
+        assert_eq!(
+            connection.credential.pid, me,
+            "the number a fallback would have used was not even wrong"
+        );
+
+        let cases: [(&str, Staged); 6] = [
+            // The oracle cannot be read: EMFILE, or an `fdinfo` this broker
+            // does not recognise.
+            ("an unreadable pidfd", Staged::new(Named::Unreadable, a_stat(7))),
+            // ...and it is refused even when the /proc read would succeed,
+            // which is the case a fake answering `Unreadable` to BOTH
+            // questions cannot distinguish. A mutation lived here.
+            (
+                "an unreadable pidfd over a readable entry",
+                Staged::new(Named::Unreadable, a_stat(7)).then(Named::Pid(me)),
+            ),
+            // The peer is gone before the walk starts.
+            ("a reaped pidfd", Staged::new(Named::Reaped, a_stat(7))),
+            // The entry behind a named pid is not there.
+            ("no /proc entry", Staged::new(Named::Pid(me), Reading::Gone)),
+            (
+                "an unreadable /proc entry",
+                Staged::new(Named::Pid(me), Reading::Unreadable),
+            ),
+            // And the bracket's own case: the peer was named, its entry was
+            // read, and by the second read it had been reaped -- so the entry
+            // that was read may have been somebody else's.
+            (
+                "reaped during the lookup",
+                Staged::new(Named::Pid(me), a_stat(7)).then(Named::Reaped),
+            ),
+        ];
+        for (what, procfs) in cases {
+            assert_eq!(connection.caller(&procfs), None, "{what} proved a caller");
+        }
+
+        // A pid that CHANGED between the two reads is the same refusal: the
+        // number was free in between, so the entry read while it was free
+        // describes nobody in particular.
+        let moved = Staged::new(Named::Pid(me), a_stat(7)).then(Named::Pid(me + 1));
+        assert_eq!(connection.caller(&moved), None, "the bracket accepted a new pid");
+
+        // The control: both reads agree and the entry is readable, so the
+        // pair is proved and carries the start time that was read.
+        let good = Staged::new(Named::Pid(me), a_stat(7)).then(Named::Pid(me));
+        assert_eq!(
+            connection.caller(&good),
+            Some(Caller {
+                pid: me,
+                starttime: 7
+            })
+        );
+        drop(client);
+    }
+
+    /// The seam against the LIVE kernel, which is the half no fake can prove.
+    ///
+    /// Every other test of `caller` drives an injected `/proc`, so together
+    /// they establish that the code agrees with the fakes. This one
+    /// establishes that the fakes are describing the kernel: a socketpair's
+    /// peer is this process, so the pair that comes back is one the test can
+    /// check rather than merely print.
+    #[test]
+    fn the_real_proc_path_proves_this_connections_own_peer() {
+        if !pidfd_available() {
+            return;
+        }
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        let guid = Guid::new(GUID).expect("guid");
+        let quota = Quota::new();
+        let bus = Bus::new();
+        let instances = Instances::new();
+        let connection =
+            Connection::accept(server, guid, &quota, &bus, &instances).expect("accept");
+        assert_eq!(
+            connection.credential.pid,
+            i32::try_from(std::process::id()).expect("a pid fits"),
+            "the number the fallback would have used was not even the right one"
+        );
+        // Through the REAL /proc, on a socketpair whose peer is this process:
+        // the pair proves out and names us. Every other test of this seam
+        // drives an injected `/proc`, so without this one the whole seam could
+        // agree with the fakes and disagree with the kernel.
+        assert_eq!(
+            connection.caller(&RealProcfs).map(|caller| caller.pid),
+            Some(i32::try_from(std::process::id()).expect("a pid fits"))
+        );
+        drop(client);
+    }
+
+    /// A connection whose owner is gone COMPLETES nothing either.
+    ///
+    /// The twin of the test above, and it exists because two reviewers found
+    /// the same hole independently: `Complete`'s guard had only a source-level
+    /// pin, and a mutation that commented the guard out — or aliased the
+    /// sampled credential past it — left all 236 tests passing. `Register`
+    /// had the staged test; phase two, which is the call that actually binds
+    /// a pid to an instance, had none.
+    ///
+    /// The token is a fabrication, and that is what makes the assertion
+    /// sharp: if the guard is gone the registry answers "no registration is
+    /// open under that token", and if it is there the call never reaches the
+    /// registry at all.
+    #[test]
+    fn a_reaped_peer_completes_nothing() {
+        let Some(stream) = a_reaped_peers_connection("reaped-complete") else {
+            return;
+        };
+        let guid = Guid::new(GUID).expect("guid");
+        let quota = Quota::new();
+        let bus = Bus::new();
+        let instances = Instances::new();
+        let mut connection =
+            Connection::accept(stream, guid, &quota, &bus, &instances).expect("accept");
+        assert!(connection.credential.pid > 0);
+        assert_eq!(connection.caller(&RealProcfs), None);
+
+        connection.unique = Some(":1.1".to_string());
+        let token = "0123456789abcdef0123456789abcdef".to_string();
+        let call = jail_call("Complete", 2, "su", move |writer| {
+            writer.string(&token)?;
+            writer.uint32(1);
+            Ok(())
+        });
+        let (message, _) = message::decode(&call, 0).expect("decode a Complete");
+        connection.jail_complete(&message, true).expect("the arm ran");
+
+        let frame = connection.outbox.take().expect("a refusal was queued");
+        assert_eq!(
+            error_of(&frame).as_deref(),
+            Some("td.Jail1.Error.Refused"),
+            "a completion was answered for a process that does not exist"
+        );
+        let (reply, _) = message::decode(&frame, 0).expect("decode the refusal");
+        let why = reply
+            .args()
+            .first()
+            .and_then(crate::wire::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            why.contains("could not be identified"),
+            "the guard was skipped and the registry answered instead: {why}"
+        );
+    }
+
     /// Connect to the socket named in the environment, then exit. A helper
-    /// process for the test above and nothing else; without the variable it
+    /// process for the tests above and nothing else; without the variable it
     /// does nothing, so a plain `--ignored` run of the suite is harmless.
     #[test]
-    #[ignore = "a helper process for a_peer_reaped_before_accept_is_not_unconfined"]
+    #[ignore = "a helper process for the reaped-peer tests"]
     fn connects_to_the_socket_named_in_the_environment() {
         let Ok(path) = std::env::var(REAPED_SOCKET) else {
             return;
