@@ -23,6 +23,7 @@ use std::sync::Arc;
 use crate::auth::{Guid, Handshake, PeerIdentity, GUID_LEN};
 use crate::lineage::{Caller, Identity, Instances, Named, Procfs, Reading, RealProcfs};
 use crate::message;
+use crate::policy;
 use crate::registry::{Bus, Outbox, Overflow, Rejected};
 use crate::sys::{self, PeerCredential};
 use crate::wire::{WireError, Writer};
@@ -462,10 +463,11 @@ impl<'a> Connection<'a> {
         let credential = sys::peer_credential(&stream)?;
         let guid_text = guid.as_str();
         // Before the handshake, because this is the kernel's account of the
-        // peer and the handshake is the peer's account of itself. An `Unknown`
-        // here is not yet a refusal — nothing consults this until the policy
-        // filter lands — but it is recorded now so the answer is the one taken
-        // at accept rather than one taken whenever it was first needed.
+        // peer and the handshake is the peer's account of itself. It is taken
+        // once, here, so that every later answer is the one that was true at
+        // accept rather than one taken whenever it was first needed: a
+        // lineage is a statement about a process tree at an instant, and
+        // re-walking it later would answer about a tree that has moved on.
         //
         // The pidfd rather than `credential.pid`: the credential carries a
         // NUMBER sampled at connect, and a peer that has since been reaped can
@@ -473,10 +475,14 @@ impl<'a> Connection<'a> {
         // handle answers it and the number cannot.
         //
         // A pidfd this kernel will not give is an identity this broker cannot
-        // establish, so it is `Unknown` — which denies — rather than an accept
-        // failure. Refusing the CONNECTION would take the bus down entirely on
-        // a kernel below 6.5, and would do it to the compositor and the
-        // terminal as readily as to a jail.
+        // establish, so it is `Unknown` — which `policy` denies every peer to
+        // — rather than an accept failure. The connection is still SERVED
+        // because a denial a peer can read beats a socket that closed without
+        // saying why; it is not served because it is trusted. Below Linux 6.5
+        // no peer can be identified at all, so on such a host every
+        // connection lands here and this bus routes nothing between peers.
+        // That is fail-closed working as intended rather than a fallback, and
+        // it is why the image pins 7.x.
         let identity = match sys::peer_pidfd(&stream) {
             // Dropped at the end of this expression, and deliberately: the
             // answer is taken once, here, and never recomputed, so holding one
@@ -1008,14 +1014,36 @@ impl<'a> Connection<'a> {
         // `Register` at this path registering an instance. `say_hello`'s
         // caller has always tested the kind explicitly; these two now do too.
         let is_call = message.kind == message::MessageType::MethodCall;
-        match member {
-            "Register" if is_call && on_the_jail_object(message) && on(JAIL_INTERFACE) => {
-                return self.jail_register(message, wants_reply);
+        let jail_method = matches!(member, "Register" | "Complete")
+            && is_call
+            && on_the_jail_object(message)
+            && on(JAIL_INTERFACE);
+        if jail_method {
+            // The one live `AccessDenied` on this bus. Registration is
+            // authenticated by uid and in v1 every session peer shares one,
+            // so a confined application reaching this interface could name
+            // its own instance and app id — the record every later answer
+            // about it is derived from. Denied rather than reported absent,
+            // which is the opposite of the rule for names: the interface is
+            // not a secret, and a peer that may not use it is better told so
+            // than left calling a method that seems not to exist.
+            if !policy::may_register(&self.identity) {
+                return self.refuse_if_wanted(
+                    message,
+                    "org.freedesktop.DBus.Error.AccessDenied",
+                    "td.Jail1 is for callers this broker has placed outside a jail",
+                    wants_reply,
+                );
             }
-            "Complete" if is_call && on_the_jail_object(message) && on(JAIL_INTERFACE) => {
-                return self.jail_complete(message, wants_reply);
-            }
-            _ => {}
+            return match member {
+                "Register" => self.jail_register(message, wants_reply),
+                "Complete" => self.jail_complete(message, wants_reply),
+                // Unreachable through `jail_method`, which names the same two.
+                // Spelled out anyway: a third member added to that list would
+                // otherwise arrive here and be COMPLETED, twenty lines away
+                // from the edit that caused it.
+                _ => Ok(()),
+            };
         }
         // Everything below is a question rather than a change, so a peer that
         // is not waiting for an answer simply gets none.
@@ -1042,6 +1070,7 @@ impl<'a> Connection<'a> {
                 }
                 let mut names = vec![BUS_NAME.to_string()];
                 names.extend(self.bus.names());
+                names.retain(|name| self.may_see(name));
                 self.answer(message, "as", move |writer| {
                     writer.array("s", |inner| {
                         for name in &names {
@@ -1064,7 +1093,8 @@ impl<'a> Connection<'a> {
                 let Some(asked) = self.bus_name_argument(message)? else {
                     return Ok(());
                 };
-                let held = asked == BUS_NAME || self.bus.route(&asked).is_some();
+                let held = self.may_see(&asked)
+                    && (asked == BUS_NAME || self.bus.route(&asked).is_some());
                 self.answer(message, "b", move |writer| {
                     writer.bool(held);
                     Ok(())
@@ -1076,7 +1106,9 @@ impl<'a> Connection<'a> {
                 };
                 // The bus owns its own name, and says so: a client that asks
                 // who `org.freedesktop.DBus` is should not be told nobody.
-                if asked == BUS_NAME || self.bus.route(&asked).is_some() {
+                if self.may_see(&asked)
+                    && (asked == BUS_NAME || self.bus.route(&asked).is_some())
+                {
                     self.answer(message, "s", move |writer| writer.string(&asked))
                 } else {
                     self.refuse(
@@ -1293,6 +1325,16 @@ impl<'a> Connection<'a> {
     /// not here. The broker's own name is answered from this process, which is
     /// the truthful answer: `org.freedesktop.DBus` IS td-busd.
     fn credentials_for(&self, name: &str) -> Option<(u32, i32)> {
+        // Gated here rather than at each of the three callers: §D singles
+        // these out because another instance's host pid is both an identifier
+        // for `/proc` spelunking outside the jail and the input to the
+        // lineage walk this broker's identity story rests on. `None` is the
+        // same answer the callers already give for a name that is not here,
+        // which is what makes an invisible peer indistinguishable from an
+        // absent one.
+        if !self.may_see(name) {
+            return None;
+        }
         if name == BUS_NAME {
             // The bus is this process. Reading `/proc/self` rather than calling
             // `getuid` keeps the roster at three syscalls, for the reason
@@ -1313,6 +1355,15 @@ impl<'a> Connection<'a> {
             "org.freedesktop.DBus.Error.NameHasNoOwner",
             "no such connection on this bus",
         )
+    }
+
+    /// Whether this caller may learn that `name` exists.
+    ///
+    /// Every answer the broker gives about a name goes through here, so a
+    /// name a caller may not see is absent in the same way whichever way it
+    /// asks.
+    fn may_see(&self, name: &str) -> bool {
+        policy::may_see(&self.identity, self.unique.as_deref(), name)
     }
 
     /// This connection's unique name.
@@ -1598,7 +1649,44 @@ impl<'a> Connection<'a> {
                 Ok(())
             };
         }
-        let Some(outbox) = self.bus.route(destination) else {
+        // A destination this caller may not reach is reported ABSENT, not
+        // denied, and that is deliberate. §D asks for `AccessDenied` for what
+        // the default policy does not permit, and separately that a name the
+        // caller may not see is reported as absent "rather than as an error
+        // that confirms it exists". For a DIRECTED SEND the two rules meet,
+        // and the second one governs: a sandboxed peer's talk set and see set
+        // are the same set, so anything it may not send to is also something
+        // it may not know is there, and answering `AccessDenied` would
+        // announce the peer it was refused. `AccessDenied` is reached where a
+        // caller may see the interface and still not use it, which is
+        // `td.Jail1`.
+        //
+        // Asked BEFORE the directory: `route` walks the peer list and stops
+        // early when it finds the name, so deciding after it would leave the
+        // refusal's TIMING dependent on the fact the refusal exists to
+        // withhold. The lookups above short-circuit for the same reason.
+        //
+        // A REPLY is not filtered, and that is the difference between a
+        // policy on who may be addressed and one on what may be sent. A
+        // method return or an error is addressed by `reply_serial` to a
+        // caller that already reached this connection, so filtering it by the
+        // sender's talk set silently drops the answer to a call the broker
+        // itself delivered — leaving the caller to time out and the callee
+        // told nothing. §D grants a sandbox the portal's REPLIES, so the
+        // symmetric direction cannot be a denial. What this does not yet do
+        // is prove a reply answers a real call: that is pending-reply
+        // ownership, which lands with match rules, and until it does a
+        // confined peer can still address a forged reply anywhere — exactly
+        // as every peer could before this filter existed, so it is a residual
+        // rather than a regression. APPLICATIONS.md §B.3.2 records that
+        // `RequestName` must not land before it is closed.
+        let originates = !matches!(
+            message.kind,
+            message::MessageType::MethodReturn | message::MessageType::Error
+        );
+        let permitted = !originates
+            || policy::may_talk(&self.identity, self.unique.as_deref(), destination);
+        let Some(outbox) = permitted.then(|| self.bus.route(destination)).flatten() else {
             // §D's one consistent story: a name with no owner is absent, and
             // the caller is told so rather than left waiting.
             return if wants_reply {
@@ -2411,6 +2499,141 @@ mod tests {
             let quota = Quota::new();
             let bus = serving;
             let instances = Instances::new();
+            thread::scope(|scope| {
+                for server in servers {
+                    let quota = &quota;
+                    let bus = &*bus;
+                    let instances = &instances;
+                    let spawned = thread::Builder::new().spawn_scoped(scope, move || {
+                        let guid = Guid::new(GUID).expect("guid");
+                        if let Ok(mut connection) =
+                            Connection::accept(server, guid, quota, bus, instances)
+                        {
+                            let _ = connection.serve();
+                        }
+                    });
+                    spawned.expect("spawn a connection thread");
+                }
+            });
+        });
+        (bus, clients)
+    }
+
+    /// A bus whose peers are all CONFINED, which is what makes the filter
+    /// observable.
+    ///
+    /// Both ends of a socketpair are this test process, so every connection
+    /// resolves to the same identity — register the fixture instance against
+    /// this process and every peer on the bus is `Jailed`. That is the shape
+    /// the filter is about: a sandboxed peer looking at another peer it has
+    /// no business seeing. `bus_of` registers nothing and so is the
+    /// unconfined control for the same tests.
+    fn confined_bus_of(peers: usize) -> (Arc<Bus>, Vec<UnixStream>) {
+        let (bus, _instances, clients) = confined_bus_watching(peers);
+        (bus, clients)
+    }
+
+    /// The same, handing back the registry. A refusal that nevertheless did
+    /// the work is invisible from the wire, so the test that cares reads the
+    /// registry instead.
+    fn confined_bus_watching(peers: usize) -> (Arc<Bus>, Arc<Instances>, Vec<UnixStream>) {
+        let mut clients = Vec::new();
+        let mut servers = Vec::new();
+        for _ in 0..peers {
+            let (client, server) = UnixStream::pair().expect("socketpair");
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                .expect("client read timeout");
+            clients.push(client);
+            servers.push(server);
+        }
+        let bus = Arc::new(Bus::new());
+        let serving = Arc::clone(&bus);
+        let instances = Arc::new(Instances::new());
+        let registry = Arc::clone(&instances);
+        thread::spawn(move || {
+            let quota = Quota::new();
+            let bus = serving;
+            let instances = registry;
+            let pid = i32::try_from(std::process::id()).expect("a pid fits");
+            let crate::lineage::Reading::Of(mine) = RealProcfs.stat(pid) else {
+                panic!("this process has a /proc entry");
+            };
+            let crate::lineage::Reading::Of(theirs) = RealProcfs.stat(mine.ppid) else {
+                panic!("this process's parent has a /proc entry");
+            };
+            let registrant = crate::lineage::Caller {
+                pid: mine.ppid,
+                starttime: theirs.starttime,
+            };
+            let token = instances
+                .open(&RealProcfs, "fixture", "fixture", Vec::new(), this_uid(), registrant)
+                .expect("phase one");
+            instances
+                .complete(&RealProcfs, &token, pid, this_uid(), registrant)
+                .expect("phase two");
+            thread::scope(|scope| {
+                for server in servers {
+                    let quota = &quota;
+                    let bus = &*bus;
+                    let instances = &*instances;
+                    let spawned = thread::Builder::new().spawn_scoped(scope, move || {
+                        let guid = Guid::new(GUID).expect("guid");
+                        if let Ok(mut connection) =
+                            Connection::accept(server, guid, quota, bus, instances)
+                        {
+                            let _ = connection.serve();
+                        }
+                    });
+                    spawned.expect("spawn a connection thread");
+                }
+            });
+        });
+        (bus, instances, clients)
+    }
+
+    /// A bus whose peers all resolve `Unknown`, which nothing else here can
+    /// produce.
+    ///
+    /// Phase one is opened against this process's parent and never completed.
+    /// §E refuses a strict descendant of a PENDING registrant — deliberately,
+    /// since a connection arriving between the two phases is ambiguous — so
+    /// every connection from this process resolves `Unknown` for as long as
+    /// the registration stays open. That is the only way to reach the arm
+    /// from a test, and without it the `Unknown` policy is asserted only
+    /// where it is written.
+    fn unknown_bus_of(peers: usize) -> (Arc<Bus>, Vec<UnixStream>) {
+        let mut clients = Vec::new();
+        let mut servers = Vec::new();
+        for _ in 0..peers {
+            let (client, server) = UnixStream::pair().expect("socketpair");
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                .expect("client read timeout");
+            clients.push(client);
+            servers.push(server);
+        }
+        let bus = Arc::new(Bus::new());
+        let serving = Arc::clone(&bus);
+        thread::spawn(move || {
+            let quota = Quota::new();
+            let bus = serving;
+            let instances = Instances::new();
+            let pid = i32::try_from(std::process::id()).expect("a pid fits");
+            let crate::lineage::Reading::Of(mine) = RealProcfs.stat(pid) else {
+                panic!("this process has a /proc entry");
+            };
+            let crate::lineage::Reading::Of(theirs) = RealProcfs.stat(mine.ppid) else {
+                panic!("this process's parent has a /proc entry");
+            };
+            let registrant = crate::lineage::Caller {
+                pid: mine.ppid,
+                starttime: theirs.starttime,
+            };
+            // Opened and deliberately NOT completed.
+            instances
+                .open(&RealProcfs, "pending", "pending", Vec::new(), this_uid(), registrant)
+                .expect("phase one");
             thread::scope(|scope| {
                 for server in servers {
                     let quota = &quota;
@@ -3743,6 +3966,476 @@ mod tests {
         assert_eq!(
             reply.args().first().and_then(crate::wire::Value::as_str),
             Some(":1.1")
+        );
+    }
+
+    /// The filter, end to end: a confined peer is not told about a peer it
+    /// may not see, whichever way it asks.
+    ///
+    /// Four questions with one answer between them. §D's objection to doing
+    /// this piecemeal is that an error which confirms a name exists is not a
+    /// filter, so the interesting assertion is not that any one call refuses
+    /// — it is that all four agree, and that the unconfined control below
+    /// disagrees with all four.
+    #[test]
+    fn a_confined_peer_is_told_nothing_about_a_peer_it_may_not_see() {
+        if !pidfd_available() {
+            return;
+        }
+        let (_bus, mut clients) = confined_bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (_two, name_two) = Peer::arrive(second);
+
+        // ListNames: the broker and itself, and nothing else.
+        one.send(&bus_call("ListNames", 2));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode ListNames");
+        let listed: Vec<String> = reply
+            .args()
+            .first()
+            .and_then(crate::wire::Value::as_seq)
+            .expect("an array came back")
+            .values(64)
+            .expect("read the array")
+            .iter()
+            .filter_map(crate::wire::Value::as_str)
+            .map(str::to_string)
+            .collect();
+        assert!(listed.contains(&BUS_NAME.to_string()), "{listed:?}");
+        assert!(
+            listed.contains(&name_one),
+            "a peer cannot see itself: {listed:?}"
+        );
+        assert!(
+            !listed.contains(&name_two),
+            "the filter leaked a name: {listed:?}"
+        );
+
+        // GetNameOwner: absent.
+        one.send(&name_query("GetNameOwner", &name_two, 3));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode GetNameOwner");
+        assert_eq!(reply.kind, message::MessageType::Error);
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.NameHasNoOwner")
+        );
+
+        // NameHasOwner: false, rather than an error that admits it.
+        one.send(&name_query("NameHasOwner", &name_two, 4));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode NameHasOwner");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
+        assert!(
+            matches!(reply.args().first(), Some(crate::wire::Value::Bool(false))),
+            "the filter admitted a name it had just hidden: {:?}",
+            reply.args().first()
+        );
+
+        // And the credentials, which are what §D singles out: another
+        // instance's host pid is the input to the lineage walk itself.
+        one.send(&name_query("GetConnectionUnixProcessID", &name_two, 5));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode the pid lookup");
+        assert_eq!(reply.kind, message::MessageType::Error);
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.NameHasNoOwner"),
+            "a sandbox was handed another peer's host pid"
+        );
+    }
+
+    /// The control. The same questions on a bus with no registered instance
+    /// are answered in full, because an unconfined peer is a positive grant
+    /// rather than a peer the broker failed to place.
+    #[test]
+    fn an_unconfined_peer_is_still_told_everything() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (_two, name_two) = Peer::arrive(second);
+
+        one.send(&name_query("GetNameOwner", &name_two, 2));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
+
+        one.send(&name_query("GetConnectionUnixProcessID", &name_two, 3));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(
+            reply.args().first().and_then(crate::wire::Value::as_u32),
+            Some(std::process::id())
+        );
+
+        // The POSITIVE half of `NameHasOwner`, which nothing else asserts: a
+        // reviewer replaced the whole expression with `false` and the entire
+        // suite stayed green, because the confined test wants `false` and no
+        // other test reads the boolean at all. Without this the one assertion
+        // that is ABOUT "false rather than an error" cannot fail.
+        one.send(&name_query("NameHasOwner", &name_two, 4));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert!(
+            matches!(reply.args().first(), Some(crate::wire::Value::Bool(true))),
+            "a visible name was reported absent: {:?}",
+            reply.args().first()
+        );
+
+        one.send(&bus_call("ListNames", 5));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode ListNames");
+        let listed: Vec<String> = reply
+            .args()
+            .first()
+            .and_then(crate::wire::Value::as_seq)
+            .expect("an array came back")
+            .values(64)
+            .expect("read the array")
+            .iter()
+            .filter_map(crate::wire::Value::as_str)
+            .map(str::to_string)
+            .collect();
+        assert!(listed.contains(&name_two), "{listed:?}");
+    }
+
+    /// A REPLY is not filtered, and a draft of this commit dropped every one.
+    ///
+    /// `route` was filtering by message type-blind talk set, so a method
+    /// return or an error from a confined peer to a peer outside its talk set
+    /// vanished — no delivery and, since a reply wants no reply, no error
+    /// either. Anyone who called into a jailed application waited until they
+    /// timed out, and §D grants a sandbox the portal's replies, so the
+    /// symmetric direction cannot be a denial.
+    ///
+    /// This asserts the rule as built, INCLUDING its residual: the broker
+    /// does not yet check that a reply answers a real call, so the forged one
+    /// this test sends is delivered. That is pending-reply ownership, which
+    /// lands with match rules; before this filter existed every peer could do
+    /// the same, so it is a residual and not a regression.
+    #[test]
+    fn a_reply_is_delivered_where_a_call_would_be_refused() {
+        if !pidfd_available() {
+            return;
+        }
+        let (_bus, mut clients) = confined_bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        // A CALL to the same peer is refused, which is the contrast that
+        // makes the delivery below mean something.
+        one.send(&peer_call(&name_two, 2, "anyone"));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode the refusal");
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.NameHasNoOwner")
+        );
+
+        let answer = message::Builder::method_return(crate::wire::Endian::Little, 7)
+            .destination(&name_two)
+            .serial(3)
+            .encode()
+            .expect("encode a reply");
+        one.send(&answer);
+        let frame = two.frame();
+        let (delivered, _) = message::decode(&frame, 0).expect("decode the delivered reply");
+        assert_eq!(delivered.kind, message::MessageType::MethodReturn);
+        assert_eq!(delivered.fields.reply_serial, Some(7));
+        assert_eq!(
+            delivered.fields.sender,
+            Some(name_one.as_str()),
+            "the broker's word about who sent it"
+        );
+    }
+
+    /// A confined peer cannot reach a peer it cannot see, and is told the
+    /// same story on the send path as on the lookup path.
+    #[test]
+    fn a_confined_peer_cannot_send_to_a_peer_it_may_not_see() {
+        if !pidfd_available() {
+            return;
+        }
+        let (_bus, mut clients) = confined_bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        one.send(&peer_call(&name_two, 2, "anyone"));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode the refusal");
+        assert_eq!(reply.kind, message::MessageType::Error);
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.NameHasNoOwner"),
+            "a refusal that names the peer is not a filter"
+        );
+        // And it did not arrive anyway, which the error alone does not say.
+        two.expect_silence();
+    }
+
+    /// `td.Jail1` is the one place a confined caller is DENIED rather than
+    /// told nothing is there. It is the interface that decides what a
+    /// confined application is, and registration is authenticated only by
+    /// uid — which in v1 every session peer shares.
+    #[test]
+    fn a_confined_peer_may_not_register_an_instance() {
+        if !pidfd_available() {
+            return;
+        }
+        let (client, _hear) = serving_as("fixture");
+        let (mut peer, _) = Peer::arrive(client);
+        let call = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            JAIL_PATH,
+            Some(JAIL_INTERFACE),
+            "Register",
+        )
+        .destination(BUS_NAME)
+        .serial(2)
+        .body("ssas", |writer| {
+            writer.string("mine")?;
+            writer.string("mine")?;
+            writer.array("s", |_| Ok(()))
+        })
+        .expect("body")
+        .encode()
+        .expect("encode");
+        peer.send(&call);
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode the refusal");
+        assert_eq!(reply.kind, message::MessageType::Error);
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.AccessDenied"),
+            "a confined peer registered an instance"
+        );
+    }
+
+    /// A peer the broker could not place gets less than a sandboxed one, and
+    /// gets it consistently.
+    ///
+    /// The consistency is the point and a draft failed it: `Unknown` denied
+    /// everything including the caller's OWN name, while `Hello` had just
+    /// handed that name over and the broker went on answering `GetId` and
+    /// `Ping` — so the bus both told a peer its name and denied it had one.
+    /// The rule is that an unplaceable peer keeps what it has already been
+    /// told and gets nothing else, portal included.
+    #[test]
+    fn an_unplaceable_peer_keeps_only_what_it_has_been_told() {
+        if !pidfd_available() {
+            return;
+        }
+        let (_bus, mut clients) = unknown_bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (_two, name_two) = Peer::arrive(second);
+
+        // Its own name resolves — `Peer::arrive`'s barrier already proved
+        // that, since the barrier IS a GetNameOwner for the caller's own
+        // name and it would have failed for a peer denied its own name.
+        one.send(&name_query("GetNameOwner", &name_one, 2));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode own name");
+        assert_eq!(
+            reply.kind,
+            message::MessageType::MethodReturn,
+            "the bus denied a peer the name it had just given it"
+        );
+
+        // And the broker still answers it, which is what makes the above a
+        // consistency requirement rather than a courtesy.
+        one.send(&bus_call("GetId", 3));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode GetId");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
+
+        // Another peer: absent.
+        one.send(&name_query("GetNameOwner", &name_two, 4));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.NameHasNoOwner")
+        );
+
+        // That this peer really is UNPLACEABLE rather than confined, which
+        // the assertions above do not settle on their own: a `Jailed` peer
+        // would answer them identically. `td.AppId` is present exactly when
+        // the lineage proved an application, so its absence rules out
+        // `Jailed` — and the hidden peer above rules out `Unconfined`, which
+        // would have been told everything. Between them the arm is pinned.
+        //
+        // The remaining difference between this arm and `Jailed` — the
+        // portal grant — is NOT observable here and is not asserted here:
+        // nothing can own a portal name until td-portal exists, so both arms
+        // answer "no owner". It is pinned in `policy`'s own tests instead.
+        one.send(&name_query("GetConnectionCredentials", &name_one, 5));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode credentials");
+        let entries = reply
+            .args()
+            .first()
+            .and_then(crate::wire::Value::as_seq)
+            .expect("a dictionary came back")
+            .values(16)
+            .expect("read the dictionary");
+        for entry in &entries {
+            let pair = entry
+                .as_seq()
+                .expect("a dict entry")
+                .values(2)
+                .expect("read the entry");
+            assert_ne!(
+                pair.first().and_then(crate::wire::Value::as_str),
+                Some("td.AppId"),
+                "an unplaceable peer was reported as a confined application"
+            );
+        }
+
+        // And ListNames shows it the broker and itself, and no one else.
+        one.send(&bus_call("ListNames", 6));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode ListNames");
+        let listed: Vec<String> = reply
+            .args()
+            .first()
+            .and_then(crate::wire::Value::as_seq)
+            .expect("an array came back")
+            .values(64)
+            .expect("read the array")
+            .iter()
+            .filter_map(crate::wire::Value::as_str)
+            .map(str::to_string)
+            .collect();
+        assert!(listed.contains(&name_one), "{listed:?}");
+        assert!(!listed.contains(&name_two), "the filter leaked: {listed:?}");
+    }
+
+    /// The registration gate covers BOTH phases and does not depend on
+    /// anybody waiting for the answer.
+    ///
+    /// `Complete` matters at least as much as `Register` — it is the call
+    /// that binds a pid to an instance — and `NO_REPLY_EXPECTED` matters
+    /// because §D is explicit that withdrawing the reply withdraws the reply
+    /// and NOT the work, so a gate placed after that check would do nothing
+    /// for a caller that simply did not ask for an answer.
+    #[test]
+    fn the_registration_gate_holds_for_both_phases_and_without_a_reply() {
+        if !pidfd_available() {
+            return;
+        }
+        let (_bus, instances, mut clients) = confined_bus_watching(1);
+        let only = clients.pop().expect("one client");
+        let (mut peer, name) = Peer::arrive(only);
+
+        // That this peer is JAILED rather than merely unplaceable, which the
+        // refusals below cannot say for themselves: `may_register` denies
+        // both arms with the same error, so a regression that made every peer
+        // `Unknown` would leave this test green while proving nothing about
+        // confinement. `td.AppId` is present exactly when a lineage proved an
+        // application.
+        peer.send(&name_query("GetConnectionCredentials", &name, 9));
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode credentials");
+        let entries = reply
+            .args()
+            .first()
+            .and_then(crate::wire::Value::as_seq)
+            .expect("a dictionary came back")
+            .values(16)
+            .expect("read the dictionary");
+        let confined = entries.iter().any(|entry| {
+            entry
+                .as_seq()
+                .and_then(|pair| pair.values(2).ok())
+                .and_then(|pair| pair.first().and_then(crate::wire::Value::as_str))
+                == Some("td.AppId")
+        });
+        assert!(confined, "this peer is not a confined application");
+        let before = instances.pending_count();
+
+        let register = |serial: u32, flags: u8| {
+            let mut call = message::Builder::method_call(
+                crate::wire::Endian::Little,
+                JAIL_PATH,
+                Some(JAIL_INTERFACE),
+                "Register",
+            )
+            .destination(BUS_NAME)
+            .serial(serial);
+            if flags != 0 {
+                call = call.flags(flags);
+            }
+            call.body("ssas", |writer| {
+                writer.string("mine")?;
+                writer.string("mine")?;
+                writer.array("s", |_| Ok(()))
+            })
+            .expect("body")
+            .encode()
+            .expect("encode")
+        };
+
+        // Phase one, refused.
+        peer.send(&register(2, 0));
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.AccessDenied")
+        );
+
+        // Phase two, refused — and named separately because it is the call
+        // that binds a pid to an instance.
+        let complete = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            JAIL_PATH,
+            Some(JAIL_INTERFACE),
+            "Complete",
+        )
+        .destination(BUS_NAME)
+        .serial(3)
+        .body("su", |writer| {
+            writer.string("a token this peer should never get to spend")?;
+            writer.uint32(1);
+            Ok(())
+        })
+        .expect("body")
+        .encode()
+        .expect("encode");
+        peer.send(&complete);
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.AccessDenied"),
+            "a confined peer completed a registration"
+        );
+
+        // And with the reply withdrawn there is no answer — but the WORK
+        // must not have happened either, which no answer can report. §D is
+        // explicit that withdrawing the reply withdraws the reply and not the
+        // work, so a gate that sat below the no-reply check would register
+        // this instance and say nothing. The registry is what says so: a
+        // successful phase one leaves a pending registration behind.
+        peer.send(&register(4, message::FLAG_NO_REPLY_EXPECTED));
+        peer.expect_silence();
+        peer.send(&bus_call("GetId", 5));
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(reply.fields.reply_serial, Some(5), "the connection broke");
+        assert_eq!(
+            instances.pending_count(),
+            before,
+            "a refused Register opened a registration anyway"
         );
     }
 

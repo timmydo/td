@@ -1241,10 +1241,33 @@ For `td-busd`, full Firefox fidelity needs:
   integration.
 
 The current broker has authentication, `Hello`, names-and-directed routing,
-receive-side descriptor adoption and global quotas, but not the capabilities
-above. In particular its missing per-caller filter is why the image currently
-asserts exactly one shipped application. A second real application must not
-weaken that assertion.
+receive-side descriptor adoption, global quotas, and — since the landing
+recorded in §D's "what is landed" — the per-caller filter and the per-jail
+identity it reads. The first bullet above is therefore PARTLY discharged: a
+confined connection is resolved to its instance and answered accordingly, so
+it cannot see or ADDRESS the fixture or another application's peers. Not
+"reach": the shared budget below is still a way to affect a peer this filter
+will not name. It can
+see and reach the portal namespace, which is the grant that bullet exists to
+scope rather than something withheld.
+
+What is NOT discharged in that bullet: quotas remain global rather than
+per-caller, and are charged per PID, so a multiprocess jail takes more than
+one share; the name half cannot exist before `RequestName` does; and the
+filter decides WHO may be addressed without yet deciding WHAT may be sent,
+so a sandboxed peer permitted to call the portal is at present equally
+permitted to send it a signal or a method return. That last one is dormant
+while no portal name can be owned, and it is a hard constraint on the two
+bullets below rather than a gap to be closed here: `RequestName` must not
+land before message-type policy and pending-reply ownership, or the first
+owner of a portal name inherits a spoofing path. The remaining bullets are
+otherwise untouched.
+
+The image's assertion of exactly one shipped application no longer rests on
+the filter being absent. It now rests on the rest of this list — a second
+application would need names, match rules and portal routing to be useful,
+and none of those is filtered per caller yet because none of them exists. A
+second real application must not weaken that assertion.
 
 For `td-compositor`, the minimum useful Firefox target is Software WebRender
 over `wl_shm`; dmabuf must remain unadvertised until it works. The platform
@@ -3255,8 +3278,8 @@ and the test for it is two fd-carrying messages in a single `write`.
 
 ### What is landed of the bus interface
 
-Names and directed routing are landed; match rules and name ownership are
-not. Of the `org.freedesktop.DBus` roster above: `Hello` (assigning
+Names, directed routing and the per-caller filter are landed; match rules
+and name ownership are not. Of the `org.freedesktop.DBus` roster above: `Hello` (assigning
 `:1.N`, with anything before it disconnecting and a second one ending the
 connection), `ListNames`, `ListActivatableNames`, `NameHasOwner`,
 `GetNameOwner`, `GetConnectionUnixUser`, `GetConnectionUnixProcessID`,
@@ -3305,25 +3328,123 @@ live branch rather than a dead one. A draft checked the name and the
 object and left the interface out, so `org.example.Thing.Hello` earned a
 unique name.
 
-**The per-caller filter is NOT landed, and this is the gap that matters
-most in this section.** Everything above answers globally: `ListNames`
-reports every unique name on the bus to every caller, and
-`GetConnectionCredentials` reports any peer's uid and pid to any peer.
-The filtering this section specifies — answering only about names the
-caller may `see`, and reporting a name it may not as absent — is the
-policy. Naming this plainly rather than letting "the methods are
-implemented" stand for "the policy is implemented": today's broker is
-correct for a single-user session of mutually trusting peers, which is
-what td runs, and it is NOT yet the confinement boundary §D describes.
+**The per-caller filter is landed.** It was the gap that mattered most
+in this section, and the shape of it was: everything answered globally,
+so `ListNames` reported every unique name on the bus to every caller and
+`GetConnectionCredentials` reported any peer's uid and pid to any peer.
+The broker was correct for a single-user session of mutually trusting
+peers and was not the confinement boundary §D describes. It now is, for
+the surface it has.
 
-What the filter DEPENDS on has now landed, which is the difference
-between this and the previous statement of the same gap. The registration
-protocol and the lineage walk are built, `GetConnectionCredentials`
-carries `td.AppId` for a connection whose lineage proved one, and nothing
-consults any of it to decide an answer yet. The identity is established
-and unused, deliberately: an identity that is wrong is worse than one
-that is missing, and landing the oracle before anything depends on it is
-what makes the first denial reviewable on its own.
+`policy` decides, from the three-valued identity and nothing else.
+`Unconfined` is unrestricted, which is the positive grant §E specifies
+rather than a fallback. `Unknown` is denied every other peer,
+which is the ambiguous case failing closed: a peer whose lineage the
+broker could not prove must not collect the grant it was unable to
+demonstrate. It keeps the broker and its own unique name, and that is a
+consistency requirement rather than a softening — the connection has
+already been told both, and a first draft that hid them had the bus deny a
+peer the name `Hello` had just handed it while still answering its
+`GetId`. `Jailed` is the same plus the reserved
+`org.freedesktop.portal.*` namespace, so an unplaceable peer is strictly
+below a sandboxed one rather than differently placed.
+
+Below Linux 6.5 no peer can be identified at all, so every connection is
+`Unknown` and the bus routes nothing between peers. That is fail-closed
+behaving as specified rather than a degradation to be worked around, and
+it is one more reason the image pins 7.x. Nothing else — §D's default sandboxed policy grants the
+portal and the `org.freedesktop.DBus` subset, and the portal is how a
+sandbox asks for anything outside itself.
+
+Three consequences worth stating rather than discovering. First, until
+`td-portal` exists and can own a portal name, a confined application can
+reach the BROKER and nothing else; the portal side of the policy names a
+namespace nobody can yet own, so it is written and unexercised rather than
+"built". That is the honest state, not a defect, and it is why the portal
+bullets remain in §B.3.2. Second, an instance's connections cannot see EACH
+OTHER: §D's default grants the portal and the broker, and same-instance
+peer-to-peer traffic is not among them. If a real application turns out to
+need it, that is a reviewed widening with its own argument, not something to
+assume. Third, this filter decides WHO may be addressed and not WHAT may be
+sent — see §B.3.2 for why that constrains the order the remaining bullets
+may land in.
+
+What this filter does NOT make private is everything a peer shares with
+every other peer rather than learns by asking. Unique names are handed out
+from one sequential counter and never reused, so a peer that reconnects can
+count the arrivals it did not see. Admission is capped globally and before
+identity is resolved. The outgoing budget is bus-wide, and §D's remedy for
+exhausting it disconnects the LARGEST CONSUMER — which is a receiver, so a
+peer permitted to talk to the portal can pressure the portal off the bus by
+talking to it. These are shared-resource observation and denial of service,
+not the directed-message boundary this section is about, and per-caller
+quotas are where they get addressed.
+
+**Which methods a confined peer may call is settled the other way, and
+this is the part a draft got backwards.** The whole
+`org.freedesktop.DBus` roster stays callable; it is the ANSWERS that are
+filtered. A `see` policy expressed as refused calls is a filter on
+questions nobody needed to ask, and it would also tell the caller that
+the thing it asked about is the kind of thing that exists.
+
+**A name the caller may not see is ABSENT on every path that ANSWERS A
+QUESTION about it, the send path included.** What a peer can infer from
+what it shares with every other peer is a separate matter, and the last
+paragraph of this subsection is where that is accounted for. `ListNames` omits it, `NameHasOwner` answers false,
+`GetNameOwner` and the three credential lookups answer `NameHasNoOwner`,
+and a directed message to it that WANTS A REPLY is refused with
+`NameHasNoOwner` — not `AccessDenied`. One that wants no reply is dropped
+in silence, which is the rule the broker already followed for a name with
+no owner and is the same story told to a caller who is not listening.
+
+**A REPLY is exempt, because the filter is about who may be ADDRESSED and
+not about what may be sent.** A method return or an error is addressed by
+`reply_serial` to a caller that already reached this connection, so
+filtering it by the sender's talk set drops the answer to a call the broker
+itself delivered — the caller waits until it times out and the callee is
+told nothing. §D grants a sandbox the portal's replies, so the symmetric
+direction cannot be a denial. The broker does not yet check that a reply
+answers a REAL call; that is pending-reply ownership, landing with match
+rules, and until then a confined peer can address a forged reply anywhere —
+which every peer could do before this filter existed, so it is a residual
+rather than something this introduced. §B.3.2 records it as a constraint on
+the order the remaining bullets may land in.
+
+A peer's own credentials, host pid included, are exempt with its own name.
+The reason to withhold a host pid is that ANOTHER instance's is an
+identifier for spelunking outside the jail and an input to the lineage
+walk; neither argument reaches a peer's own number, and hiding it would
+have two lookups disagree about one name.
+
+§D asks for `AccessDenied` for what the default policy does not permit and
+separately that an unseeable name be reported absent "rather than as an
+error that confirms it exists". On a directed send the two rules meet, and
+the second governs — but not for the reason a draft of this gave. The
+reason is NOT that `AccessDenied` is inherently a disclosure: the policy is
+consulted before the directory is, so a refusal is issued without the
+broker having looked, and its timing does not depend on whether the name is
+there. The reason is that `AccessDenied` would DISAGREE with the four
+lookups. A caller told "no owner" by `GetNameOwner` and `AccessDenied` by a
+send has learnt from the contradiction exactly what both answers were
+shaped to withhold. Every one of these answers goes through one `may_see`
+for that reason: a filter whose paths disagree is a hint.
+
+**`td.Jail1` is the one live `AccessDenied`.** A confined caller is
+refused the registration interface outright rather than told it is not
+there. It is not a secret — the difference from a name is that a peer
+which may not use an interface is better told so than left calling a
+method that appears not to exist — and it is the interface that CREATES
+confinement records: registration is authenticated by uid, every v1
+session peer shares one, and a jailed peer that could register would name
+its own instance and app id, which is the record every later answer about
+it derives from.
+
+What the filter depended on had already landed, which is what made this
+increment reviewable on its own: the registration protocol and the
+lineage walk were built and `GetConnectionCredentials` already carried
+`td.AppId`, with nothing consulting any of it to decide an answer. An
+identity that is wrong is worse than one that is missing, so the oracle
+landed first and the first denial landed second.
 
 What IS the broker's word rather than the caller's, already: the uid and
 pid a credential lookup reports are `SO_PEERCRED` taken once at accept

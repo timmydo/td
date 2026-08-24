@@ -36,6 +36,7 @@ mod corpus;
 mod lineage;
 mod message;
 mod name;
+mod policy;
 mod recorded;
 mod registry;
 mod sys;
@@ -270,6 +271,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("lineage", include_str!("lineage.rs")),
     ("message", include_str!("message.rs")),
     ("name", include_str!("name.rs")),
+    ("policy", include_str!("policy.rs")),
     ("recorded", include_str!("recorded.rs")),
     ("registry", include_str!("registry.rs")),
     ("wire", include_str!("wire.rs")),
@@ -653,6 +655,39 @@ mod tests {
             ),
             (queued, published) => {
                 panic!("say_hello no longer both answers and publishes: {queued:?} {published:?}")
+            }
+        }
+    }
+
+    /// The policy is consulted BEFORE the directory on the send path.
+    ///
+    /// An ordering, so no behavioural test can hold it: both orders refuse
+    /// the same message with the same error, and only the TIMING differs.
+    /// `route` walks the peer list and stops early when it finds the name, so
+    /// deciding after it makes a refusal take a different amount of work
+    /// depending on whether the name it will not admit to is there — which is
+    /// the one fact the refusal is shaped to withhold. A reviewer found the
+    /// first draft in the wrong order, and a mutation putting it back
+    /// survived the whole suite.
+    #[test]
+    fn the_send_path_asks_the_policy_before_the_directory() {
+        let transport = without_line_comments(&without_block_comments(source("transport")));
+        let Some(from) = transport.find("fn route(") else {
+            panic!("the routing arm is gone");
+        };
+        let Some(span) = transport[from..].find("fn deliver(") else {
+            panic!("the routing arm no longer ends where this test slices it");
+        };
+        let body = transport.get(from..from + span).unwrap_or("");
+        let asked = body.find("may_talk(");
+        let looked = body.find("self.bus.route(");
+        match (asked, looked) {
+            (Some(asked), Some(looked)) => assert!(
+                asked < looked,
+                "the directory is consulted before the policy"
+            ),
+            (asked, looked) => {
+                panic!("the send path no longer both asks and looks: {asked:?} {looked:?}")
             }
         }
     }
