@@ -377,7 +377,7 @@ directory. A completed capture contains:
 
 ```text
 manifest.json       schema, deployment, interval, rate, CPUs, loss, errors
-overview.jsonl      bounded first-look process, function, line, quality rows
+overview.jsonl      bounded first-look process, stack, function, line, quality rows
 processes.jsonl     one process/image generation and its accounted samples
 hotspots.jsonl      sorted process/object/function aggregates
 lines.jsonl         sorted process/object/function/source-line aggregates
@@ -425,23 +425,38 @@ increment does not change it.
 `overview.jsonl` is the bounded entry point for an authorized human or agent
 which should not have to ingest a report near the complete derived-output
 ceiling merely to decide where to look. It contains at most the first 32 rows
-from each already sorted process, function-hotspot, and source-line report,
-with a one-based rank and integer millionths of all captured samples. Each
-overview name `N` has a lowercase hexadecimal `N_bytes_prefix` of at most
+from each already sorted process, call-stack, function-hotspot, and source-line
+report, with a one-based rank and integer millionths of all captured samples.
+Rows are grouped in that order. A call-stack row includes its process/image and
+thread identity, attribution state and nonempty reason when incomplete, sampled
+user-frame count, and the exact `stacks.folded` stack encoding without its
+sample-count suffix. The synthetic incomplete-state marker is not included in
+the user-frame count. Its reason must exactly match the escaped reason in that
+marker. The encoding is retained only through its root-side first 1,024 bytes
+and carries its full encoded length and a truncation flag. The stack rank is
+also the one-based line number in the canonically sorted `stacks.jsonl` and
+`stacks.folded` files, so a reader which needs the omitted leaf-side bytes can
+open that one complete row without an ambiguous identity join. The separately
+ranked hotspot and source-line rows provide the first-look leaf attribution;
+the complete stack files remain the sources of truth.
+
+Each overview name `N` has a lowercase hexadecimal `N_bytes_prefix` of at most
 1,024 bytes, its exact `N_bytes_length`, and an `N_truncated` boolean. An
 untruncated valid UTF-8 value also has the JSON-escaped `N` field; the complete
-report's `N_bytes` remains the exact identity. The entire overview is
-independently capped at two MiB as well as charged to the complete report
-allowance. A regression renders the maximum current row roster with the
-maximum-expansion field contents, so adding fields cannot silently turn this
-convenience-file limit into complete report failure. A final capture row
-records the complete row counts, the per-kind display limit, loss, corruption
-and omitted-diagnostic counts, and sample-weighted complete, truncated,
-unresolved, line-resolved, and line-unresolved totals. Thus a reader can judge
-both prominence and attribution quality before opening the complete JSONL
-files. The overview is derived from the same in-memory aggregates while their
-canonical ordering is being written; it is not a second analysis or an
-independent source of truth. Its fixed 97-row ceiling is part of report schema
+report's corresponding `N_bytes`, where present, remains the exact identity.
+The entire overview is independently capped at two MiB as well as charged to
+the complete report allowance. A regression renders the maximum current row
+roster with the maximum-expansion field contents, so adding fields cannot
+silently turn this convenience-file limit into complete report failure. A
+final capture row records the complete row counts, the per-kind display limit,
+loss, corruption and omitted-diagnostic counts, and sample-weighted complete,
+truncated, unresolved, line-resolved, and line-unresolved totals. Evidence
+requires displayed stack-state sums to equal those totals when all stacks fit,
+or not exceed them when only the top 32 are present. Thus a reader can judge
+prominence, caller context, and attribution quality before opening the complete
+JSONL files. The overview is derived from the same in-memory aggregates while
+their canonical ordering is being written; it is not a second analysis or an
+independent source of truth. Its fixed 129-row ceiling is part of report schema
 1, and offline regeneration produces it under the same publication boundary.
 
 The version-one task body records a `u32` identity tag (`0` unknown, `1`

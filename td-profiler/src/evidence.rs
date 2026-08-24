@@ -353,7 +353,7 @@ pub(crate) fn validate_overview(
     }
     let lines: Vec<_> = overview.lines().collect();
     let maximum = crate::report::OVERVIEW_ROWS_PER_KIND
-        .saturating_mul(3)
+        .saturating_mul(4)
         .saturating_add(1);
     if lines.is_empty() || lines.len() > maximum {
         return Err(format!(
@@ -412,8 +412,10 @@ pub(crate) fn validate_overview(
         .get(..lines.len().saturating_sub(1))
         .unwrap_or_default();
     let mut offset = 0usize;
+    let mut displayed_stack_samples = OverviewStackSamples::default();
     for (kind, total) in [
         ("process", summary.process_rows),
+        ("stack", summary.stack_rows),
         ("hotspot", summary.hotspot_rows),
         ("line", summary.line_rows),
     ] {
@@ -429,19 +431,69 @@ pub(crate) fn validate_overview(
             .get(offset..end)
             .ok_or_else(|| format!("capture overview omits advertised top-ranked {kind} rows"))?;
         for (index, row) in rows.iter().enumerate() {
-            validate_overview_row(row, kind, index.saturating_add(1), samples)?;
+            if let Some((state, samples)) =
+                validate_overview_row(row, kind, index.saturating_add(1), samples)?
+            {
+                displayed_stack_samples.add(state, samples)?;
+            }
         }
         offset = end;
     }
     if offset != ranked.len() {
         return Err("capture overview contains unadvertised ranked rows".into());
     }
+    let total_stack_samples = OverviewStackSamples {
+        complete: summary.complete_stack_samples,
+        truncated: summary.truncated_stack_samples,
+        unresolved: summary.unresolved_stack_samples,
+    };
+    let complete_roster = summary.stack_rows <= crate::report::OVERVIEW_ROWS_PER_KIND as u64;
+    if (complete_roster && displayed_stack_samples != total_stack_samples)
+        || (!complete_roster && displayed_stack_samples.exceeds(&total_stack_samples))
+    {
+        return Err("capture overview stack rows disagree with its state totals".into());
+    }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum OverviewStackState {
+    Complete,
+    Truncated,
+    Unresolved,
+}
+
+#[derive(Default, Eq, PartialEq)]
+struct OverviewStackSamples {
+    complete: u64,
+    truncated: u64,
+    unresolved: u64,
+}
+
+impl OverviewStackSamples {
+    fn add(&mut self, state: OverviewStackState, samples: u64) -> Result<(), String> {
+        let total = match state {
+            OverviewStackState::Complete => &mut self.complete,
+            OverviewStackState::Truncated => &mut self.truncated,
+            OverviewStackState::Unresolved => &mut self.unresolved,
+        };
+        *total = total
+            .checked_add(samples)
+            .ok_or("capture overview displayed stack samples overflow")?;
+        Ok(())
+    }
+
+    fn exceeds(&self, total: &Self) -> bool {
+        self.complete > total.complete
+            || self.truncated > total.truncated
+            || self.unresolved > total.unresolved
+    }
 }
 
 struct OverviewSummary {
     samples: u64,
     process_rows: u64,
+    stack_rows: u64,
     hotspot_rows: u64,
     line_rows: u64,
     complete_stack_samples: u64,
@@ -459,6 +511,7 @@ fn parse_overview_summary(row: &str) -> Result<OverviewSummary, String> {
     cursor.header("capture", None)?;
     let samples = cursor.named_u64("samples")?;
     let process_rows = cursor.named_u64("process_rows")?;
+    let stack_rows = cursor.named_u64("stack_rows")?;
     let hotspot_rows = cursor.named_u64("hotspot_rows")?;
     let line_rows = cursor.named_u64("line_rows")?;
     let limit = cursor.named_u64("rows_per_kind_limit")?;
@@ -468,6 +521,7 @@ fn parse_overview_summary(row: &str) -> Result<OverviewSummary, String> {
     let summary = OverviewSummary {
         samples,
         process_rows,
+        stack_rows,
         hotspot_rows,
         line_rows,
         complete_stack_samples: cursor.named_u64("complete_stack_samples")?,
@@ -483,7 +537,12 @@ fn parse_overview_summary(row: &str) -> Result<OverviewSummary, String> {
     Ok(summary)
 }
 
-fn validate_overview_row(row: &str, kind: &str, rank: usize, samples: u64) -> Result<(), String> {
+fn validate_overview_row(
+    row: &str,
+    kind: &str,
+    rank: usize,
+    samples: u64,
+) -> Result<Option<(OverviewStackState, u64)>, String> {
     let mut cursor = OverviewCursor::new(row);
     cursor.header(kind, Some(rank as u64))?;
     cursor.named_u64("pid")?;
@@ -501,12 +560,59 @@ fn validate_overview_row(row: &str, kind: &str, rank: usize, samples: u64) -> Re
         return Err(format!("capture overview has invalid {kind} start value"));
     }
     cursor.named_u64("generation")?;
+    let mut stack_state = None;
     match kind {
         "process" => {
             cursor.named_bytes("comm")?;
             cursor.named_bool("observed")?;
             cursor.named_bool("baseline_valid")?;
             cursor.named_bool("exited")?;
+        }
+        "stack" => {
+            cursor.named_u64("tid")?;
+            let state = cursor.named_string("state")?;
+            let (state_name, parsed_state) = match state.as_slice() {
+                b"complete" => ("complete", OverviewStackState::Complete),
+                b"truncated" => ("truncated", OverviewStackState::Truncated),
+                b"unresolved" => ("unresolved", OverviewStackState::Unresolved),
+                _ => return Err("capture overview stack has an invalid state".into()),
+            };
+            stack_state = Some(parsed_state);
+            let reason = cursor.named_bytes("reason")?;
+            cursor.named_u64("frame_count")?;
+            let folded = cursor.named_bytes("folded")?;
+            let expected_prefix_length = usize::try_from(
+                folded
+                    .length
+                    .min(crate::report::OVERVIEW_FIELD_PREFIX_BYTES as u64),
+            )
+            .map_err(|_| "capture overview folded prefix length overflows")?;
+            if folded.length == 0
+                || folded.prefix.len() != expected_prefix_length
+                || folded
+                    .prefix
+                    .iter()
+                    .any(|byte| !(0x21..=0x7e).contains(byte))
+            {
+                return Err("capture overview stack has an invalid folded encoding".into());
+            }
+            if matches!(parsed_state, OverviewStackState::Complete) {
+                if reason.length != 0 || folded.prefix.starts_with(b"[td:") {
+                    return Err("capture overview complete stack fields disagree".into());
+                }
+            } else {
+                if reason.length == 0 || reason.truncated {
+                    return Err("capture overview incomplete stack fields disagree".into());
+                }
+                let mut marker = Vec::new();
+                crate::report::write_folded_marker(&mut marker, state_name, &reason.prefix)?;
+                let compared = marker.len().min(folded.prefix.len());
+                let marker_prefix = marker.get(..compared).unwrap_or_default();
+                let folded_prefix = folded.prefix.get(..compared).unwrap_or_default();
+                if folded.length < marker.len() as u64 || folded_prefix != marker_prefix {
+                    return Err("capture overview incomplete stack fields disagree".into());
+                }
+            }
         }
         "hotspot" => {
             cursor.named_bool("resolved")?;
@@ -546,11 +652,18 @@ fn validate_overview_row(row: &str, kind: &str, rank: usize, samples: u64) -> Re
             "capture overview has an invalid {kind} sample share"
         ));
     }
-    cursor.finish()
+    cursor.finish()?;
+    Ok(stack_state.map(|state| (state, row_samples)))
 }
 
 struct OverviewCursor<'a> {
     rest: &'a str,
+}
+
+struct OverviewByteField {
+    prefix: Vec<u8>,
+    length: u64,
+    truncated: bool,
 }
 
 impl<'a> OverviewCursor<'a> {
@@ -612,7 +725,7 @@ impl<'a> OverviewCursor<'a> {
         self.hex(maximum_bytes)
     }
 
-    fn named_bytes(&mut self, name: &str) -> Result<(), String> {
+    fn named_bytes(&mut self, name: &str) -> Result<OverviewByteField, String> {
         self.literal(",")?;
         let text_name = format!("\"{name}\":");
         let text = if let Some(rest) = self.rest.strip_prefix(&text_name) {
@@ -642,7 +755,11 @@ impl<'a> OverviewCursor<'a> {
                 "capture overview {name} text disagrees with its byte prefix"
             ));
         }
-        Ok(())
+        Ok(OverviewByteField {
+            prefix,
+            length,
+            truncated,
+        })
     }
 
     fn named(&mut self, name: &str) -> Result<(), String> {
@@ -1107,6 +1224,15 @@ mod tests {
                      \"comm_bytes_length\":1,\"comm_truncated\":false,\"observed\":true,\
                      \"baseline_valid\":true,\"exited\":false,\"samples\":7,\
                      \"sample_share_millionths\":1000000}\n\
+                     {\"schema\":1,\"kind\":\"stack\",\"rank\":1,\"pid\":7,\
+                     \"start_kind\":\"proc-start-ticks\",\"start_value\":9,\
+                     \"generation\":1,\"tid\":7,\"state\":\"complete\",\
+                     \"reason\":\"\",\"reason_bytes_prefix\":\"\",\
+                     \"reason_bytes_length\":0,\"reason_truncated\":false,\
+                     \"frame_count\":1,\"folded\":\"main\",\
+                     \"folded_bytes_prefix\":\"6d61696e\",\"folded_bytes_length\":4,\
+                     \"folded_truncated\":false,\"samples\":7,\
+                     \"sample_share_millionths\":1000000}\n\
                      {\"schema\":1,\"kind\":\"hotspot\",\"rank\":1,\"pid\":7,\
                      \"start_kind\":\"proc-start-ticks\",\"start_value\":9,\
                      \"generation\":1,\"resolved\":false,\"object\":\"\",\
@@ -1130,15 +1256,15 @@ mod tests {
                      \"source_column\":null,\"discriminator\":null,\"samples\":7,\
                      \"sample_share_millionths\":1000000}\n\
                      {\"schema\":1,\"kind\":\"capture\",\"samples\":7,\
-                     \"process_rows\":1,\"hotspot_rows\":1,\"line_rows\":1,\
-                     \"rows_per_kind_limit\":32,\"complete_stack_samples\":2,\
-                     \"truncated_stack_samples\":3,\"unresolved_stack_samples\":2,\
+                     \"process_rows\":1,\"stack_rows\":1,\"hotspot_rows\":1,\"line_rows\":1,\
+                     \"rows_per_kind_limit\":32,\"complete_stack_samples\":7,\
+                     \"truncated_stack_samples\":0,\"unresolved_stack_samples\":0,\
                      \"line_resolved_samples\":4,\"line_unresolved_samples\":3,\
                      \"lost\":0,\"corrupt\":0,\"omitted_errors\":0}\n";
         std::fs::write(&path, valid).unwrap();
         let manifest = "{\"lost\":0,\"corrupt\":0,\"omitted_errors\":0}";
-        validate_overview(&root, manifest, 7, 2, 3, 2, 4, 3).unwrap();
-        assert!(validate_overview(&root, manifest, 8, 2, 3, 2, 4, 3)
+        validate_overview(&root, manifest, 7, 7, 0, 0, 4, 3).unwrap();
+        assert!(validate_overview(&root, manifest, 8, 7, 0, 0, 4, 3)
             .unwrap_err()
             .contains("samples does not match"));
 
@@ -1150,7 +1276,7 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(validate_overview(&root, manifest, 7, 2, 3, 2, 4, 3)
+        assert!(validate_overview(&root, manifest, 7, 7, 0, 0, 4, 3)
             .unwrap_err()
             .contains("canonical"));
 
@@ -1159,16 +1285,132 @@ mod tests {
             valid.replace("\"process_rows\":1", "\"process_rows\":2"),
         )
         .unwrap();
-        assert!(validate_overview(&root, manifest, 7, 2, 3, 2, 4, 3)
+        assert!(validate_overview(&root, manifest, 7, 7, 0, 0, 4, 3)
             .unwrap_err()
             .contains("expected a process row"));
+
+        std::fs::write(
+            &path,
+            valid.replace("\"state\":\"complete\"", "\"state\":\"truncated\""),
+        )
+        .unwrap();
+        assert!(validate_overview(&root, manifest, 7, 7, 0, 0, 4, 3)
+            .unwrap_err()
+            .contains("incomplete stack fields disagree"));
+
+        std::fs::write(
+            &path,
+            valid
+                .replace(
+                    "\"folded_bytes_prefix\":\"6d61696e\"",
+                    "\"folded_bytes_prefix\":\"206d61696e\"",
+                )
+                .replace("\"folded\":\"main\"", "\"folded\":\" main\"")
+                .replace("\"folded_bytes_length\":4", "\"folded_bytes_length\":5"),
+        )
+        .unwrap();
+        assert!(validate_overview(&root, manifest, 7, 7, 0, 0, 4, 3)
+            .unwrap_err()
+            .contains("invalid folded encoding"));
+
+        let unresolved = valid
+            .replace("\"state\":\"complete\"", "\"state\":\"unresolved\"")
+            .replace(
+                "\"reason\":\"\",\"reason_bytes_prefix\":\"\",\
+                 \"reason_bytes_length\":0,\"reason_truncated\":false",
+                "\"reason\":\"alpha\",\"reason_bytes_prefix\":\"616c706861\",\
+                 \"reason_bytes_length\":5,\"reason_truncated\":false",
+            )
+            .replace(
+                "\"folded\":\"main\",\
+                 \"folded_bytes_prefix\":\"6d61696e\",\"folded_bytes_length\":4",
+                "\"folded\":\"[td:unresolved:alpha];main\",\
+                 \"folded_bytes_prefix\":\
+                 \"5b74643a756e7265736f6c7665643a616c7068615d3b6d61696e\",\
+                 \"folded_bytes_length\":26",
+            )
+            .replace(
+                "\"complete_stack_samples\":7",
+                "\"complete_stack_samples\":0",
+            )
+            .replace(
+                "\"unresolved_stack_samples\":0",
+                "\"unresolved_stack_samples\":7",
+            );
+        std::fs::write(&path, &unresolved).unwrap();
+        validate_overview(&root, manifest, 7, 0, 0, 7, 4, 3).unwrap();
+
+        std::fs::write(
+            &path,
+            unresolved
+                .replace("[td:unresolved:alpha];main", "[td:unresolved:beta];main")
+                .replace(
+                    "5b74643a756e7265736f6c7665643a616c7068615d3b6d61696e",
+                    "5b74643a756e7265736f6c7665643a626574615d3b6d61696e",
+                )
+                .replace("\"folded_bytes_length\":26", "\"folded_bytes_length\":25"),
+        )
+        .unwrap();
+        assert!(validate_overview(&root, manifest, 7, 0, 0, 7, 4, 3)
+            .unwrap_err()
+            .contains("incomplete stack fields disagree"));
+
+        for (changed, expected) in [
+            (
+                valid.replace("\"state\":\"complete\"", "\"state\":\"invalid\""),
+                "invalid state",
+            ),
+            (
+                valid
+                    .replace("\"folded\":\"main\",", "\"folded\":\"\",")
+                    .replace("\"folded_bytes_prefix\":\"6d61696e\"", "\"folded_bytes_prefix\":\"\"")
+                    .replace("\"folded_bytes_length\":4", "\"folded_bytes_length\":0"),
+                "invalid folded encoding",
+            ),
+            (
+                valid
+                    .replace("\"folded\":\"main\"", "\"folded\":\"[td:complete:fake];main\"")
+                    .replace(
+                        "\"folded_bytes_prefix\":\"6d61696e\"",
+                        "\"folded_bytes_prefix\":\"5b74643a636f6d706c6574653a66616b655d3b6d61696e\"",
+                    )
+                    .replace("\"folded_bytes_length\":4", "\"folded_bytes_length\":23"),
+                "complete stack fields disagree",
+            ),
+            (
+                valid.replace("\"stack_rows\":1", "\"stack_rows\":2"),
+                "expected a stack row",
+            ),
+        ] {
+            std::fs::write(&path, changed).unwrap();
+            assert!(validate_overview(&root, manifest, 7, 7, 0, 0, 4, 3)
+                .unwrap_err()
+                .contains(expected));
+        }
+
+        std::fs::write(
+            &path,
+            valid
+                .replace(
+                    "\"complete_stack_samples\":7",
+                    "\"complete_stack_samples\":6",
+                )
+                .replace(
+                    "\"unresolved_stack_samples\":0",
+                    "\"unresolved_stack_samples\":1",
+                ),
+        )
+        .unwrap();
+        assert!(validate_overview(&root, manifest, 7, 6, 0, 1, 4, 3)
+            .unwrap_err()
+            .contains("stack rows disagree with its state totals"));
 
         std::fs::write(
             &path,
             vec![b'x'; crate::report::MAX_OVERVIEW_BYTES as usize + 1],
         )
         .unwrap();
-        assert!(validate_overview(&root, manifest, 7, 2, 3, 2, 4, 3)
+        assert!(validate_overview(&root, manifest, 7, 7, 0, 0, 4, 3)
             .unwrap_err()
             .contains("exceeds its"));
         std::fs::remove_dir_all(root).unwrap();

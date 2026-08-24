@@ -89,6 +89,7 @@ struct LineKey {
 }
 
 struct StackRows {
+    stack_rows: usize,
     hotspots: BTreeMap<HotspotKey, u64>,
     lines: BTreeMap<LineKey, u64>,
     unresolved_stacks: u64,
@@ -111,7 +112,14 @@ pub fn generate(
     let mut expansion = ExpansionBudget::new();
     let mut overview = output_bounded(capture.join("overview.jsonl"), &budget, MAX_OVERVIEW_BYTES)?;
     let process_rows = write_processes(capture, analysis, &budget, &mut overview)?;
-    let rows = write_stacks(capture, analysis, symbolizer, &budget, &mut expansion)?;
+    let rows = write_stacks(
+        capture,
+        analysis,
+        symbolizer,
+        &budget,
+        &mut expansion,
+        &mut overview,
+    )?;
     let hotspot_rows = write_hotspots(capture, rows.hotspots, &budget, &mut overview, analysis)?;
     let line_rows = write_lines(capture, rows.lines, &budget, &mut overview, analysis)?;
     write_overview_summary(
@@ -119,6 +127,7 @@ pub fn generate(
         analysis,
         symbolizer,
         process_rows,
+        rows.stack_rows,
         hotspot_rows,
         line_rows,
         rows.complete_stack_samples,
@@ -287,7 +296,14 @@ fn regenerate_partial(
     let mut symbolizer = Symbolizer::from_index(index);
     let mut overview = output_bounded(partial.join("overview.jsonl"), budget, MAX_OVERVIEW_BYTES)?;
     let process_rows = write_processes(partial, &analysis, budget, &mut overview)?;
-    let rows = write_stacks(partial, &analysis, &mut symbolizer, budget, &mut expansion)?;
+    let rows = write_stacks(
+        partial,
+        &analysis,
+        &mut symbolizer,
+        budget,
+        &mut expansion,
+        &mut overview,
+    )?;
     let hotspot_rows = write_hotspots(partial, rows.hotspots, budget, &mut overview, &analysis)?;
     let line_rows = write_lines(partial, rows.lines, budget, &mut overview, &analysis)?;
     write_overview_summary(
@@ -295,6 +311,7 @@ fn regenerate_partial(
         &analysis,
         &symbolizer,
         process_rows,
+        rows.stack_rows,
         hotspot_rows,
         line_rows,
         rows.complete_stack_samples,
@@ -570,6 +587,7 @@ fn write_stacks(
     symbolizer: &mut Symbolizer,
     budget: &OutputBudget,
     expansion: &mut ExpansionBudget,
+    overview: &mut Output,
 ) -> Result<StackRows, String> {
     symbolizer.begin_report();
     expansion.claim(
@@ -596,13 +614,17 @@ fn write_stacks(
     let mut line_resolved_samples = 0u64;
     let mut line_unresolved_samples = 0u64;
 
-    for (stack, count) in rows {
+    let stack_rows = rows.len();
+    for (index, (stack, count)) in rows.into_iter().enumerate() {
         let (start_kind, start_value) = start_identity(&stack.image.start);
         let mut transient_bytes = stack
             .frames
             .len()
             .saturating_mul(std::mem::size_of::<Option<Resolved>>());
-        expansion.claim(transient_bytes, "resolved-frame roster")?;
+        if index < OVERVIEW_ROWS_PER_KIND {
+            transient_bytes = transient_bytes.saturating_add(OVERVIEW_FIELD_PREFIX_BYTES);
+        }
+        expansion.claim(transient_bytes, "resolved-frame and overview-prefix roster")?;
         let mut resolved = Vec::with_capacity(stack.frames.len());
         for frame in &stack.frames {
             let max_resolved = expansion.remaining().saturating_sub(512) / 8;
@@ -653,32 +675,29 @@ fn write_stacks(
             .write_all(b"]}\n")
             .map_err(|e| format!("write stacks.jsonl: {e}"))?;
 
-        let mut first_name = true;
-        if !matches!(reported_state, StackState::Complete) {
-            write!(folded, "[td:{}:", state_name(&reported_state)).map_err(|e| e.to_string())?;
-            write_folded_escape(&mut folded, state_reason(&reported_state))?;
-            folded.write_all(b"]").map_err(|e| e.to_string())?;
-            first_name = false;
-        }
-        for (frame, symbol) in stack.frames.iter().zip(&resolved).rev() {
-            if !first_name {
-                folded.write_all(b";").map_err(|e| e.to_string())?;
+        if index < OVERVIEW_ROWS_PER_KIND {
+            let mut prefix = OverviewPrefix::new();
+            {
+                let mut outputs = FoldedOverview {
+                    folded: &mut folded,
+                    prefix: &mut prefix,
+                };
+                write_folded_stack(&mut outputs, stack, &resolved, &reported_state)?;
             }
-            let name = symbol
-                .as_ref()
-                .map(|value| value.function.as_slice())
-                .unwrap_or_else(|| frame.path.as_slice());
-            let fallback;
-            let name = if name.is_empty() {
-                fallback = format!("0x{:x}", frame.address);
-                fallback.as_bytes()
-            } else {
-                name
-            };
-            write_folded_escape(&mut folded, name)?;
-            first_name = false;
+            writeln!(folded, " {count}").map_err(|e| e.to_string())?;
+            write_overview_stack(
+                overview,
+                index,
+                stack,
+                &reported_state,
+                &prefix,
+                *count,
+                analysis.sample_records,
+            )?;
+        } else {
+            write_folded_stack(&mut folded, stack, &resolved, &reported_state)?;
+            writeln!(folded, " {count}").map_err(|e| e.to_string())?;
         }
-        writeln!(folded, " {count}").map_err(|e| e.to_string())?;
 
         if let Some(frame) = stack.frames.first() {
             let symbol = resolved.first().and_then(Option::as_ref);
@@ -717,6 +736,7 @@ fn write_stacks(
     finish(structured, "stacks.jsonl")?;
     finish(folded, "stacks.folded")?;
     Ok(StackRows {
+        stack_rows,
         hotspots,
         lines,
         unresolved_stacks,
@@ -726,6 +746,84 @@ fn write_stacks(
         line_resolved_samples,
         line_unresolved_samples,
     })
+}
+
+fn write_overview_stack(
+    overview: &mut Output,
+    index: usize,
+    stack: &state::StackKey,
+    reported_state: &StackState,
+    folded: &OverviewPrefix,
+    count: u64,
+    samples: u64,
+) -> Result<(), String> {
+    let (start_kind, start_value) = start_identity(&stack.image.start);
+    writeln!(
+        overview,
+        "{{\"schema\":{SCHEMA},\"kind\":\"stack\",\"rank\":{},\"pid\":{},\
+         \"start_kind\":\"{}\",\"start_value\":{},\"generation\":{},\"tid\":{},\
+         \"state\":\"{}\",{},\"frame_count\":{},{},\"samples\":{},\
+         \"sample_share_millionths\":{}}}",
+        index.saturating_add(1),
+        stack.image.pid,
+        start_kind,
+        start_value,
+        stack.image.generation,
+        stack.tid,
+        state_name(reported_state),
+        overview_bytes("reason", state_reason(reported_state)),
+        stack.frames.len(),
+        overview_prefix("folded", &folded.bytes, folded.length),
+        count,
+        sample_share_millionths(count, samples),
+    )
+    .map_err(|e| format!("write overview stack row: {e}"))
+}
+
+fn write_folded_stack(
+    file: &mut impl Write,
+    stack: &state::StackKey,
+    resolved: &[Option<Resolved>],
+    reported_state: &StackState,
+) -> Result<(), String> {
+    let mut first_name = true;
+    if !matches!(reported_state, StackState::Complete) {
+        write_folded_marker(
+            file,
+            state_name(reported_state),
+            state_reason(reported_state),
+        )?;
+        first_name = false;
+    }
+    for (frame, symbol) in stack.frames.iter().zip(resolved).rev() {
+        if !first_name {
+            file.write_all(b";").map_err(|e| e.to_string())?;
+        }
+        let name = symbol
+            .as_ref()
+            .map(|value| value.function.as_slice())
+            .unwrap_or_else(|| frame.path.as_slice());
+        let fallback;
+        let name = if name.is_empty() {
+            fallback = format!("0x{:x}", frame.address);
+            fallback.as_bytes()
+        } else {
+            name
+        };
+        write_folded_escape(file, name)?;
+        first_name = false;
+    }
+    Ok(())
+}
+
+pub(crate) fn write_folded_marker(
+    file: &mut impl Write,
+    state: &str,
+    reason: &[u8],
+) -> Result<(), String> {
+    write!(file, "[td:{state}:").map_err(|e| e.to_string())?;
+    write_folded_escape(file, reason)?;
+    file.write_all(b"]").map_err(|e| e.to_string())
 }
 
 fn reported_stack_state(base: &StackState, resolved: &[Option<Resolved>]) -> StackState {
@@ -1039,6 +1137,7 @@ fn write_overview_summary(
     analysis: &state::Analysis,
     symbolizer: &Symbolizer,
     process_rows: usize,
+    stack_rows: usize,
     hotspot_rows: usize,
     line_rows: usize,
     complete_stack_samples: u64,
@@ -1053,7 +1152,7 @@ fn write_overview_summary(
     writeln!(
         overview,
         "{{\"schema\":{SCHEMA},\"kind\":\"capture\",\"samples\":{},\
-         \"process_rows\":{},\"hotspot_rows\":{},\"line_rows\":{},\
+         \"process_rows\":{},\"stack_rows\":{},\"hotspot_rows\":{},\"line_rows\":{},\
          \"rows_per_kind_limit\":{OVERVIEW_ROWS_PER_KIND},\
          \"complete_stack_samples\":{},\"truncated_stack_samples\":{},\
          \"unresolved_stack_samples\":{},\"line_resolved_samples\":{},\
@@ -1061,6 +1160,7 @@ fn write_overview_summary(
          \"omitted_errors\":{}}}",
         analysis.sample_records,
         process_rows,
+        stack_rows,
         hotspot_rows,
         line_rows,
         complete_stack_samples,
@@ -1086,18 +1186,33 @@ pub(crate) fn sample_share_millionths(samples: u64, total: u64) -> u64 {
 struct OverviewBytes<'a> {
     name: &'a str,
     bytes: &'a [u8],
+    length: usize,
 }
 
 fn overview_bytes<'a>(name: &'a str, bytes: &'a [u8]) -> OverviewBytes<'a> {
-    OverviewBytes { name, bytes }
+    OverviewBytes {
+        name,
+        bytes,
+        length: bytes.len(),
+    }
+}
+
+fn overview_prefix<'a>(name: &'a str, bytes: &'a [u8], length: usize) -> OverviewBytes<'a> {
+    debug_assert!(bytes.len() <= length);
+    debug_assert!(bytes.len() <= OVERVIEW_FIELD_PREFIX_BYTES);
+    OverviewBytes {
+        name,
+        bytes,
+        length,
+    }
 }
 
 impl std::fmt::Display for OverviewBytes<'_> {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let length = self.bytes.len();
+        let length = self.length;
         let prefix = self
             .bytes
-            .get(..length.min(OVERVIEW_FIELD_PREFIX_BYTES))
+            .get(..self.bytes.len().min(OVERVIEW_FIELD_PREFIX_BYTES))
             .unwrap_or_default();
         let truncated = prefix.len() != length;
         if !truncated {
@@ -1126,6 +1241,56 @@ impl std::fmt::Display for OverviewBytes<'_> {
             "\",\"{}_bytes_length\":{},\"{}_truncated\":{}",
             self.name, length, self.name, truncated
         )
+    }
+}
+
+struct OverviewPrefix {
+    bytes: Vec<u8>,
+    length: usize,
+}
+
+impl OverviewPrefix {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::with_capacity(OVERVIEW_FIELD_PREFIX_BYTES),
+            length: 0,
+        }
+    }
+}
+
+impl Write for OverviewPrefix {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.length = self
+            .length
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("overview field length overflow"))?;
+        let remaining = OVERVIEW_FIELD_PREFIX_BYTES.saturating_sub(self.bytes.len());
+        let retained = remaining.min(bytes.len());
+        self.bytes
+            .extend_from_slice(bytes.get(..retained).unwrap_or_default());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct FoldedOverview<'a> {
+    folded: &'a mut Output,
+    prefix: &'a mut OverviewPrefix,
+}
+
+impl Write for FoldedOverview<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.folded.write(bytes)?;
+        self.prefix
+            .write_all(bytes.get(..written).unwrap_or_default())?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.folded.flush()
     }
 }
 
@@ -1582,10 +1747,11 @@ mod tests {
     use super::{
         effective_rate_millihz, finish, folded_escape, generate, hotspot_key, line_key, output,
         output_bounded, overview_bytes, regenerate, reported_stack_state,
-        validate_identity_metadata, write_lines, write_overview_hotspot, write_overview_line,
-        write_overview_process, write_overview_summary, write_pending_manifest, ExpansionBudget,
-        HotspotKey, LineKey, Meta, OutputBudget, RegenerationLock, MAX_CAPTURE_METADATA_BYTES,
-        MAX_FAILURE_MARKER_BYTES, MAX_PROFILE_CPUS, MAX_REPORT_BYTES, MAX_REPORT_EXPANSION_BYTES,
+        validate_identity_metadata, write_folded_stack, write_lines, write_overview_hotspot,
+        write_overview_line, write_overview_process, write_overview_stack, write_overview_summary,
+        write_pending_manifest, ExpansionBudget, HotspotKey, LineKey, Meta, OutputBudget,
+        OverviewPrefix, RegenerationLock, MAX_CAPTURE_METADATA_BYTES, MAX_FAILURE_MARKER_BYTES,
+        MAX_PROFILE_CPUS, MAX_REPORT_BYTES, MAX_REPORT_EXPANSION_BYTES,
     };
     use crate::event::{Event, Kind, StartIdentity};
     use crate::state::{Analysis, Frame, ImageKey, ProcessSummary, StackKey, StackState};
@@ -1597,6 +1763,46 @@ mod tests {
     fn folded_symbols_cannot_enter_the_reserved_namespace() {
         assert_eq!(folded_escape(b"[td:fake]"), "\\x5btd:fake]");
         assert_eq!(folded_escape(b"a;b c\\d"), "a\\x3bb\\x20c\\x5cd");
+    }
+
+    #[test]
+    fn overview_folded_prefix_is_exact_without_materializing_the_complete_stack() {
+        let stack = StackKey {
+            image: ImageKey {
+                pid: 7,
+                start: StartIdentity::ProcTicks(9),
+                generation: 1,
+            },
+            tid: 7,
+            state: StackState::Complete,
+            frames: vec![Frame {
+                address: 0x100,
+                relative: Some(0x100),
+                major: 1,
+                minor: 2,
+                inode: 3,
+                inode_generation: 0,
+                path: vec![b' '; 1_100],
+            }],
+        };
+        let reported = StackState::Unresolved(b"symbol-coverage-unavailable".to_vec());
+        let resolved = vec![None];
+        let mut complete = Vec::new();
+        write_folded_stack(&mut complete, &stack, &resolved, &reported).unwrap();
+        let mut prefix = OverviewPrefix::new();
+        write_folded_stack(&mut prefix, &stack, &resolved, &reported).unwrap();
+
+        assert_eq!(prefix.length, complete.len());
+        assert_eq!(
+            prefix.bytes,
+            complete.get(..super::OVERVIEW_FIELD_PREFIX_BYTES).unwrap()
+        );
+        let rendered = format!(
+            "{}",
+            super::overview_prefix("folded", &prefix.bytes, prefix.length)
+        );
+        assert!(rendered.contains(&format!("\"folded_bytes_length\":{}", complete.len())));
+        assert!(rendered.contains("\"folded_truncated\":true"));
     }
 
     #[test]
@@ -1803,14 +2009,19 @@ mod tests {
         generate(&root, &meta, &mut symbolizer, &analysis, 0).unwrap();
 
         let overview = std::fs::read_to_string(root.join("overview.jsonl")).unwrap();
-        assert_eq!(overview.lines().count(), 97);
+        assert_eq!(overview.lines().count(), 129);
         assert_eq!(overview.matches("\"kind\":\"process\"").count(), 32);
+        assert_eq!(overview.matches("\"kind\":\"stack\"").count(), 32);
         assert_eq!(overview.matches("\"kind\":\"hotspot\"").count(), 32);
         assert_eq!(overview.matches("\"kind\":\"line\"").count(), 32);
         assert_eq!(overview.matches("\"kind\":\"capture\"").count(), 1);
         assert!(overview.contains("\"kind\":\"process\",\"rank\":1,\"pid\":40"));
+        assert!(overview.contains("\"kind\":\"stack\",\"rank\":1,\"pid\":40"));
+        assert!(overview.contains(
+            "\"folded\":\"[td:unresolved:symbol-coverage-unavailable];/mapped/process-40\""
+        ));
         assert!(!overview.contains("\"rank\":33"));
-        assert!(overview.contains("\"samples\":820,\"process_rows\":40"));
+        assert!(overview.contains("\"samples\":820,\"process_rows\":40,\"stack_rows\":40"));
         assert!(overview.contains("\"unresolved_stack_samples\":820"));
         assert!(overview.contains("\"line_unresolved_samples\":820"));
         assert!(overview
@@ -1847,6 +2058,17 @@ mod tests {
         let invalid = format!("{}", overview_bytes("field", &[0xff]));
         assert!(!invalid.starts_with("\"field\":"));
         assert!(invalid.contains("\"field_bytes_prefix\":\"ff\""));
+
+        let mut prefix = OverviewPrefix::new();
+        prefix.write_all(&long).unwrap();
+        assert_eq!(prefix.bytes.len(), super::OVERVIEW_FIELD_PREFIX_BYTES);
+        assert_eq!(prefix.length, super::OVERVIEW_FIELD_PREFIX_BYTES + 1);
+        let rendered = format!(
+            "{}",
+            super::overview_prefix("field", &prefix.bytes, prefix.length)
+        );
+        assert!(rendered.contains("\"field_bytes_length\":1025"));
+        assert!(rendered.contains("\"field_truncated\":true"));
 
         let path = std::env::temp_dir().join(format!(
             "td-profiler-overview-output-bound-test-{}",
@@ -1896,7 +2118,7 @@ mod tests {
             build_id: vec![u8::MAX; 20],
         };
         let line = LineKey {
-            image,
+            image: image.clone(),
             symbol_resolved: true,
             line_resolved: true,
             function_address: u64::MAX,
@@ -1904,13 +2126,44 @@ mod tests {
             function: bytes.clone(),
             object: bytes.clone(),
             build_id: vec![u8::MAX; 20],
-            source_file: bytes,
+            source_file: bytes.clone(),
             source_line: u64::MAX,
             source_column: u64::MAX,
             discriminator: u64::MAX,
         };
+        let stack = StackKey {
+            image,
+            tid: u32::MAX,
+            state: StackState::Unresolved(bytes.clone()),
+            frames: vec![
+                Frame {
+                    address: u64::MAX,
+                    relative: Some(u64::MAX),
+                    major: u32::MAX,
+                    minor: u32::MAX,
+                    inode: u64::MAX,
+                    inode_generation: u64::MAX,
+                    path: Vec::new(),
+                };
+                4_097
+            ],
+        };
+        let folded = OverviewPrefix {
+            bytes: vec![b'\\'; super::OVERVIEW_FIELD_PREFIX_BYTES],
+            length: super::OVERVIEW_FIELD_PREFIX_BYTES,
+        };
         for index in 0..super::OVERVIEW_ROWS_PER_KIND {
             write_overview_process(&mut overview, index, &process, u64::MAX).unwrap();
+            write_overview_stack(
+                &mut overview,
+                index,
+                &stack,
+                &stack.state,
+                &folded,
+                u64::MAX,
+                u64::MAX,
+            )
+            .unwrap();
             write_overview_hotspot(&mut overview, index, &hotspot, u64::MAX, u64::MAX).unwrap();
             write_overview_line(&mut overview, index, &line, u64::MAX, u64::MAX).unwrap();
         }
@@ -1928,6 +2181,7 @@ mod tests {
             usize::MAX,
             usize::MAX,
             usize::MAX,
+            usize::MAX,
             u64::MAX,
             u64::MAX,
             u64::MAX,
@@ -1937,7 +2191,7 @@ mod tests {
         .unwrap();
         finish(overview, "maximum overview").unwrap();
         let size = std::fs::metadata(&path).unwrap().len();
-        assert!(size > 1024 * 1024);
+        assert!(size > 1_900_000);
         assert!(size <= super::MAX_OVERVIEW_BYTES);
         std::fs::remove_file(path).unwrap();
     }
@@ -2128,6 +2382,7 @@ mod tests {
         ));
         let overview = std::fs::read_to_string(capture.join("regenerated/overview.jsonl")).unwrap();
         assert!(overview.contains("\"kind\":\"process\",\"rank\":1,\"pid\":7"));
+        assert!(overview.contains("\"kind\":\"stack\",\"rank\":1,\"pid\":7"));
         assert!(overview
             .lines()
             .last()
