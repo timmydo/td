@@ -2871,7 +2871,9 @@ connection however many rules match.
 
 ### Sandbox policy
 
-At accept: `SO_PEERCRED` → pid → the registered jail instance. The
+At accept: `SO_PEERPIDFD` → `fdinfo` → pid → the registered jail
+instance, bracketed by a second read of the same pidfd (see the
+peer-identity subsection below for why the number alone will not do). The
 default sandboxed policy may own no name; may call the
 `org.freedesktop.DBus` subset above; may call any
 `org.freedesktop.portal.*` member and receive its replies and **directed**
@@ -2911,9 +2913,13 @@ this project exists for: a nested Firefox child can change its mount
 namespace and so change what `/proc/<pid>/root/.flatpak-info` resolves
 to. So the broker holds `{instance, app-id, stage-2 pid, start time,
 permitted service names}`, and a connection is authenticated by **descent
-from that registered PID 1**. `SO_PEERCRED.pid` is expressed in
-the *broker's* pid namespace, so it stays meaningful even though the app
-sees itself in a nested one. A process whose lineage cannot be proven is
+from that registered PID 1**. The pid the broker starts from is expressed
+in the *broker's* pid namespace, so it stays meaningful even though the app
+sees itself in a nested one — true of `SO_PEERCRED.pid`, and true of the
+`Pid:` line a pidfd's `fdinfo` carries, which is what the accept path
+actually reads and which reports in the namespace of the process doing the
+reading. `NSpid:` is the per-namespace chain and is deliberately not
+consulted: its innermost entry is 1 for every jail. A process whose lineage cannot be proven is
 denied. Unsandboxed same-uid connections are unrestricted — td's existing
 trust model, stated explicitly in §E — but **"unsandboxed" is a proved
 answer here and not a fallback**, because the two sentences you just read
@@ -2945,7 +2951,12 @@ active attacker is a loop rather than a resolution.
 This is a walk over `/proc` and it is inherently a sampled view. The
 durable fix is a kernel-maintained boundary — a delegated cgroup whose
 membership the kernel maintains, or pidfds held from the moment each
-process is created, which cannot be reused by definition. §P already
+process is created. A pidfd is a handle on a process rather than on a
+number, so a boundary expressed in pidfds is not subject to pid reuse;
+note that this is a claim about the HANDLE, and that the pid NUMBER a
+pidfd reports does return to the allocator once the process is reaped,
+which is why the peer-identity use below re-reads rather than assuming.
+§P already
 delegates a cgroup per instance for resource caps; **using
 `cgroup.procs` membership as the identity oracle instead of a `/proc`
 walk is the better design and costs nothing new**, since the cgroup must
@@ -3068,10 +3079,11 @@ no close of its own to make. Keeping the row as drafted would have
 rostered a syscall no line of code issues, which is the failure this file
 exists to prevent, pointed the other way.
 
-`getsockopt` accepts only `SOL_SOCKET`/`SO_PEERCRED` with a fixed
-`[i32; 3]` buffer whose length is pinned in the shipped build, since the
-kernel writes exactly `sizeof(struct ucred)` through the pointer — and the
-landed wrapper compares the length the kernel writes BACK against that
+`getsockopt` accepts only `SOL_SOCKET` with `SO_PEERCRED` or
+`SO_PEERPIDFD`, each pinned at its own call site. `SO_PEERCRED` uses a
+fixed `[i32; 3]` buffer whose length is pinned in the shipped build, since
+the kernel writes exactly `sizeof(struct ucred)` through the pointer — and
+the landed wrapper compares the length the kernel writes BACK against that
 size before believing the words, because a short write leaves a zeroed uid
 that reads exactly like `root`. `recvmsg` pins `MSG_CMSG_CLOEXEC` and a
 control buffer sized for exactly 64 descriptors; `sendmsg` pins
@@ -3496,35 +3508,62 @@ the process that is certainly confined. That is the single most
 important thing for the increment that wires td-jail to get right, and
 it is why the expiry logs rather than passing quietly.
 
-**The peer's own pid is not proved, and this is the gap that has to close
-before the filter.** The walk validates every ancestor edge and says
-nothing about its own starting point, which arrives from `SO_PEERCRED`.
-The kernel samples that at `connect(2)` and holds a `struct pid`
-reference — which keeps the struct alive without reserving the number,
-so `free_pid` returns the number to the allocator when the connecting
-process is reaped and `pid_vnr` still reports it. A peer that connects,
-passes its socket to a sibling and exits can therefore have its pid
-recycled before the broker reads it, with the delay under the peer's
-control through the listen backlog. The walk then describes whichever
-process now holds that number, and the dangerous direction is a confined
-peer resolving `Unconfined`.
+**The peer's own pid is proved by a pidfd, and this is how.** The walk
+validates every ancestor edge and says nothing about its own starting
+point. `SO_PEERCRED` cannot supply one. The kernel samples peer
+credentials at `connect(2)` and holds a `struct pid` reference — which
+keeps the struct alive without reserving the number, so `free_pid`
+returns the number to the allocator when the connecting process is
+reaped and `pid_vnr` still reports it. A peer that connects, passes its
+socket to a sibling and exits can therefore have its pid recycled before
+the broker reads it, with the delay under the peer's control through the
+listen backlog. The walk would then describe whichever process now holds
+that number, and the dangerous direction is a confined peer resolving
+`Unconfined`.
 
-Nothing inside the walk can close it: the first read is already too
-late. `SO_PEERPIDFD` closes it, for the reason this section already
-gives for pidfds — they name a process rather than a number and cannot
-be recycled by definition. It is a second value-pinned `getsockopt`
-option on surface #10, so it is an `UNSAFE.md` amendment rather than
-something the landing that found it could take, and it is a precondition
-of the per-caller filter in the same way the filter is a precondition of
-anything in a jail opening the bus.
+So the broker takes the pid from `SO_PEERPIDFD` instead — a second
+value-pinned `getsockopt` option on surface #10, recorded in `UNSAFE.md`
+§10. **The argument is liveness, not reservation, and an earlier draft of
+this section had it wrong.** That draft said a pidfd "cannot be recycled
+by definition"; the claim is true of the HANDLE and false of the NUMBER.
+Holding a pidfd across a reap does not stop the pid being handed out
+again, which is measured rather than reasoned about. What the descriptor
+buys is the ability to ask: `/proc/self/fdinfo/<pidfd>` reports the pid
+while the process is alive AND while it is a zombie, and `-1` once it has
+been reaped — and a reap is exactly what has to happen before a number
+can be reused.
+
+Hence the rule, and **both halves are load-bearing**: read the pidfd
+before the walk, to learn which pid to start from and to refuse a peer
+that has already been reaped; read it again after every `/proc` read that
+an ANSWER rests on, and require the same pid. The qualifier is exact: a
+lookup that refuses part-way — an instance the sweep could not read, a
+broken chain — returns before the second read, and is refused on the
+strength of having read something it could not vouch for rather than on
+any conclusion drawn from it. The second read is the one the
+soundness rests on — if the pidfd names the peer at the end, the peer was
+never reaped in between, so its number was never free, so every `/proc`
+read taken while the lookup ran was a read of this peer. One read alone
+does not get there: the peer can be reaped and its number reused between
+that read and the walk, and the walk's own re-read of hop zero would then
+find the impostor's start time unchanged and pass. The check applies to a
+`Jailed` answer as much as to an `Unconfined` one, since a recycled pid
+that lands on a registered instance misattributes one application's
+connection to another.
+
+A kernel without `SO_PEERPIDFD` (below 6.5; td pins 7.x) answers
+`ENOPROTOOPT`, which is `Unknown` — denied — rather than an accept
+failure. Refusing the CONNECTION would take the session bus down
+entirely, and would do it to the compositor and the terminal as readily
+as to a jail.
 
 **td-jail performs this protocol, and the image's one application does
 it at boot.** Every jailed application is a registered instance and
 reports `td.AppId`; everything else on the session bus still resolves
 `Unconfined`, which is right — the compositor and the terminal are not
-in jails. The caveat above is unchanged and is the reason the filter
-still cannot land on this alone: registration is authenticated by uid,
-every session peer is uid 1000, and the app id is a string the
+in jails. The app-id caveat below is unchanged and is the reason the
+filter still cannot land on this alone: registration is authenticated by
+uid, every session peer is uid 1000, and the app id is a string the
 registrant supplies. The walk is sound about WHICH instance a connection
 belongs to and says nothing about whether that instance is what it calls
 itself. Per-app uids are the fix and this is the third argument for

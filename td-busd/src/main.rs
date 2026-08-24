@@ -513,6 +513,11 @@ mod tests {
     /// Two scoped allows, of two DIFFERENT shapes, and one assembly body.
     /// §D turned down a hand-rolled descriptor owner precisely to take the
     /// second one, so its count is a decision and not an accident.
+    ///
+    /// The adoption has two CALLERS — `receive` and `peer_pidfd` — and stays
+    /// one allow, which is the property worth pinning: a second adoption site
+    /// is a second place to get the ordering rule wrong, and the ordering rule
+    /// is the whole discipline `UNSAFE.md` §10 records for it.
     #[test]
     fn the_syscall_layer_is_exactly_two_allows_and_one_instruction() {
         let keyword = format!("un{}", "safe");
@@ -539,6 +544,103 @@ mod tests {
             sys.matches("OwnedFd::from_raw_fd").count(),
             1,
             "the adoption appears once and nowhere else"
+        );
+    }
+
+    /// The ACCEPT arm, not just the helper it calls.
+    ///
+    /// `a_kernel_that_gives_no_pidfd_leaves_the_peer_unidentified` asserts
+    /// what `unidentifiable` returns and says nothing about `accept` still
+    /// calling it. On a kernel that HAS the option every test takes the `Ok`
+    /// arm, so mutating the `Err` arm to `Unconfined` — the exact fail-open
+    /// this whole design exists to prevent — leaves the helper and its test
+    /// untouched. A review found that mutation surviving the entire suite.
+    #[test]
+    fn the_accept_path_refuses_a_peer_it_cannot_identify() {
+        let transport = source("transport");
+        assert!(
+            transport.contains("Err(why) => Self::unidentifiable(&why),"),
+            "accept no longer routes a missing pidfd to unidentifiable"
+        );
+        // And the answer it must never reach appears nowhere in the module.
+        // `Unconfined` is a conclusion only `lineage` is in a position to
+        // draw, and the transport naming it at all would be the shape of the
+        // mutation above.
+        let grant = format!("Identity::{}", "Unconfined");
+        assert_eq!(
+            transport.matches(&grant).count(),
+            0,
+            "the transport names the grant only lineage may conclude"
+        );
+    }
+
+    /// The adoption's ORDERING in `peer_pidfd`, which is the INVERSE of
+    /// `receive`'s and is the one thing about this surface a reader is most
+    /// likely to "fix".
+    ///
+    /// `receive` adopts before it refuses, because every descriptor a
+    /// `recvmsg` reports is already installed and a refusal ahead of the
+    /// adoption leaks one per malformed message. `peer_pidfd` refuses before
+    /// it adopts, so that `adopt` is never handed a negative number —
+    /// `OwnedFd` has a validity niche and `-1` is outside it. `UNSAFE.md` §10
+    /// records both orders and says which is which.
+    ///
+    /// Pinned in the source because no behaviour can hold it: every kernel td
+    /// runs on answers a whole `i32` or fails, so the wrong order passes every
+    /// test there is. What it does NOT hold is the case a first draft credited
+    /// it with — a wrong option number answering a full `i32` of not-a-
+    /// descriptor. That one aborts the process either way, and
+    /// `the_two_socket_options_are_pinned_by_value` is what stands in front of
+    /// it.
+    #[test]
+    fn the_pidfd_is_judged_before_it_is_adopted() {
+        let sys = source("sys");
+        let body = sys
+            .split_once("pub fn peer_pidfd")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .unwrap_or("<no peer_pidfd>");
+        let adopt = body.find("adopt(number)");
+        let judge = body.find("check_pidfd_answer(");
+        assert!(
+            adopt.is_some() && judge.is_some(),
+            "peer_pidfd no longer has the shape this test reads"
+        );
+        assert!(judge < adopt, "the pidfd is adopted before it is judged");
+        // And the judgement is PROPAGATED. `io::Result` is `#[must_use]`, so
+        // dropping the `?` on the floor takes a deliberate binding to silence
+        // — which is exactly the shape a plausible refactor has, and which no
+        // behaviour can catch on a kernel that never gives a bad answer.
+        assert!(
+            body.contains("check_pidfd_answer(number, length)?;"),
+            "peer_pidfd does not propagate what it judged"
+        );
+    }
+
+    /// The socket options, by number.
+    ///
+    /// Both are pinned at their own call site rather than taken as arguments:
+    /// a wrapper accepting a level and an option name would be a general
+    /// `getsockopt`, and the roster says two named reads. A third appearing
+    /// here is an `UNSAFE.md` amendment rather than a diff.
+    #[test]
+    fn the_two_socket_options_are_pinned_by_value() {
+        let sys = source("sys");
+        for (name, value) in [("SO_PEERCRED", "17"), ("SO_PEERPIDFD", "77")] {
+            assert!(
+                sys.contains(&format!("const {name}: i32 = {value};")),
+                "{name} is not pinned to {value}"
+            );
+            assert_eq!(
+                sys.matches(&format!("{name} as usize")).count(),
+                1,
+                "{name} is passed to more than one call"
+            );
+        }
+        assert_eq!(
+            sys.matches("const SO_").count(),
+            2,
+            "surface #10 reads two options"
         );
     }
 

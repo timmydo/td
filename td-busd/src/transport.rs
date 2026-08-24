@@ -14,7 +14,7 @@
 
 use std::fs;
 use std::io;
-use std::os::fd::{OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -83,10 +83,12 @@ pub const MAX_CONNECTIONS: usize = 64;
 /// service, since one jailed app reaches it by opening 64 sockets and saying
 /// nothing, and every other application is then locked off the bus.
 ///
-/// §D maps a peer to its instance by `SO_PEERCRED.pid` through the registered
-/// jail instance, and that registry lands with the integration rung. Until it
-/// does, the pid IS the finest identity this broker has, so the share is
-/// counted per pid: an approximation that is wrong only where one instance
+/// §D maps a peer to its instance through the registered jail instance, and
+/// does it from the pidfd rather than from this number — see `lineage`. The
+/// QUOTA still counts per `SO_PEERCRED.pid`, which is the right trade for a
+/// rate limit: the cost of a recycled number here is a miscounted share, and
+/// the accept path already refuses a peer whose pid cannot be proved. So the
+/// share is counted per pid: an approximation that is wrong only where one instance
 /// spans several processes, and right about the case §D names. The number is
 /// a quarter of the ceiling, so four busy peers still fit and no single one
 /// can lock the rest out.
@@ -464,7 +466,25 @@ impl<'a> Connection<'a> {
         // here is not yet a refusal — nothing consults this until the policy
         // filter lands — but it is recorded now so the answer is the one taken
         // at accept rather than one taken whenever it was first needed.
-        let identity = instances.resolve(&RealProcfs, credential.pid);
+        //
+        // The pidfd rather than `credential.pid`: the credential carries a
+        // NUMBER sampled at connect, and a peer that has since been reaped can
+        // have had that number handed to somebody else. `lineage` says why the
+        // handle answers it and the number cannot.
+        //
+        // A pidfd this kernel will not give is an identity this broker cannot
+        // establish, so it is `Unknown` — which denies — rather than an accept
+        // failure. Refusing the CONNECTION would take the bus down entirely on
+        // a kernel below 6.5, and would do it to the compositor and the
+        // terminal as readily as to a jail.
+        let identity = match sys::peer_pidfd(&stream) {
+            // Dropped at the end of this expression, and deliberately: the
+            // answer is taken once, here, and never recomputed, so holding one
+            // descriptor per connection would spend an fd on a question
+            // nothing asks again.
+            Ok(pidfd) => instances.resolve(&RealProcfs, pidfd.as_raw_fd()),
+            Err(why) => Self::unidentifiable(&why),
+        };
         // The writer's half of the socket. Cloned here rather than later
         // because a connection without an outbox has no way to be answered,
         // and the failure to make one belongs at accept where it can be seen.
@@ -486,6 +506,17 @@ impl<'a> Connection<'a> {
             freight: Vec::new(),
             frame: Vec::new(),
         })
+    }
+
+    /// A peer whose pidfd the kernel would not give.
+    ///
+    /// Split out of `accept` so the arm can be redded at all: every kernel td
+    /// runs on answers `SO_PEERPIDFD`, so nothing a test can do reaches this
+    /// branch through the real call, and a mutation of it to `Unconfined` —
+    /// which is the whole failure this design exists to prevent — survived the
+    /// entire suite before the seam was here.
+    fn unidentifiable(why: &io::Error) -> Identity {
+        Identity::Unknown(format!("the peer's pidfd could not be taken: {why}"))
     }
 
     pub fn credential(&self) -> PeerCredential {
@@ -2079,6 +2110,11 @@ mod tests {
 
     const GUID: &str = "00112233445566778899aabbccddeeff";
 
+    /// The ignored helper's full test path, and the variable that tells it
+    /// where to connect.
+    const REAPED_HELPER: &str = "transport::tests::connects_to_the_socket_named_in_the_environment";
+    const REAPED_SOCKET: &str = "TD_BUSD_TEST_REAPED_SOCKET";
+
     fn scratch(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!(
@@ -2090,6 +2126,20 @@ mod tests {
                 .unwrap_or(0)
         ));
         path
+    }
+
+    /// Whether this kernel answers `SO_PEERPIDFD` at all.
+    ///
+    /// Below Linux 6.5 it does not, and on such a host NO peer can be
+    /// identified — so the tests that are about identity have nothing to
+    /// assert rather than something to fail. The image pins 7.x, so on the
+    /// target none of these guards is taken; they are for developer and CI
+    /// hosts, which `cargo test` also runs on.
+    fn pidfd_available() -> bool {
+        match UnixStream::pair() {
+            Ok((_client, server)) => sys::peer_pidfd(&server).is_ok(),
+            Err(_) => false,
+        }
     }
 
     fn this_uid() -> u32 {
@@ -3023,6 +3073,11 @@ mod tests {
     /// establish that as an answer.
     #[test]
     fn a_confined_peers_credentials_carry_its_app_id() {
+        // The `Jailed` half of this rests on the accept path identifying the
+        // peer, which needs the option.
+        if !pidfd_available() {
+            return;
+        }
         for (harness, expected) in [
             (serving_as("fixture"), Some("fixture")),
             (serving(), None),
@@ -4136,6 +4191,142 @@ mod tests {
         assert!(one.bytes().all(|byte| byte.is_ascii_hexdigit()), "{one}");
         assert!(Guid::new(&one).is_ok(), "{one} is not a guid");
         assert_ne!(one, two, "two buses would claim the same identity");
+    }
+
+    /// A kernel that will not give a pidfd leaves the peer UNIDENTIFIED, not
+    /// unconfined.
+    ///
+    /// `ENOPROTOOPT` is what a kernel below 6.5 answers, and the tempting
+    /// reading of it is "no jails here, carry on" — which hands full portal
+    /// access to every confined process on the machine. There is no way to
+    /// provoke this branch on a kernel that has the option, so the mapping is
+    /// asserted directly.
+    #[test]
+    fn a_kernel_that_gives_no_pidfd_leaves_the_peer_unidentified() {
+        // ENOPROTOOPT, which is what the option's absence looks like.
+        let refusal = io::Error::from_raw_os_error(92);
+        match Connection::unidentifiable(&refusal) {
+            Identity::Unknown(why) => assert!(why.contains("pidfd"), "{why}"),
+            other => panic!("a missing pidfd resolved {other:?}"),
+        }
+    }
+
+    /// The socket a reaped peer left behind, staged against the live kernel.
+    ///
+    /// This is the attack the commit exists for, so it is worth STAGING
+    /// rather than describing. A peer connects, exits, and is reaped while
+    /// its connection sits in the listen backlog — a delay a real peer
+    /// controls by filling that backlog. `SO_PEERCRED` still reports its
+    /// number, which the allocator has already taken back; the pidfd reports
+    /// that there is no longer a process there.
+    ///
+    /// Everywhere else this transition is a fixture the author wrote, which
+    /// proves the parser agrees with the author rather than with the kernel.
+    /// Three reviews said so independently.
+    ///
+    /// The connector has to be a separate PROCESS, and this crate has no
+    /// `fork`: surface #10's roster is three syscalls and `fork` is not one
+    /// of them. So the test binary re-runs ITSELF with a filter naming the
+    /// ignored helper below. Waiting for that child is what reaps it.
+    #[test]
+    fn a_peer_reaped_before_accept_is_not_unconfined() {
+        if !pidfd_available() {
+            return;
+        }
+        let path = scratch("reaped");
+        let Ok(listener) = UnixListener::bind(&path) else {
+            return;
+        };
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let ran = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "--ignored",
+                "--quiet",
+                "--test-threads=1",
+                REAPED_HELPER,
+            ])
+            .env(REAPED_SOCKET, &path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = fs::remove_file(&path);
+        let Ok(status) = ran else {
+            return;
+        };
+        assert!(status.success(), "the helper process did not connect");
+        // `status()` waited, so the connector is reaped. Whatever is in the
+        // backlog now belongs to a process that does not exist.
+        let (stream, _) = listener.accept().expect("the helper's connection");
+
+        let credential = sys::peer_credential(&stream).expect("peercred");
+        assert!(
+            credential.pid > 0,
+            "SO_PEERCRED reported no pid for a peer it sampled at connect"
+        );
+
+        let Ok(pidfd) = sys::peer_pidfd(&stream) else {
+            // A kernel that refuses outright for a reaped peer is the other
+            // denial, and accept maps it to the same answer.
+            let refused = Connection::unidentifiable(&io::Error::from_raw_os_error(3));
+            assert!(matches!(refused, Identity::Unknown(_)));
+            return;
+        };
+        assert_eq!(
+            RealProcfs.named_by(pidfd.as_raw_fd()),
+            crate::lineage::Named::Reaped,
+            "a reaped peer's pidfd still named a live process"
+        );
+        // The registry is empty, so a walk from `credential.pid` would answer
+        // `Unconfined` — full portal access for a connection whose owner is
+        // gone and whose number may already be somebody else's.
+        let instances = Instances::new();
+        match instances.resolve(&RealProcfs, pidfd.as_raw_fd()) {
+            Identity::Unknown(why) => assert!(why.contains("reaped"), "{why}"),
+            other => panic!("a reaped peer resolved {other:?}"),
+        }
+    }
+
+    /// Connect to the socket named in the environment, then exit. A helper
+    /// process for the test above and nothing else; without the variable it
+    /// does nothing, so a plain `--ignored` run of the suite is harmless.
+    #[test]
+    #[ignore = "a helper process for a_peer_reaped_before_accept_is_not_unconfined"]
+    fn connects_to_the_socket_named_in_the_environment() {
+        let Ok(path) = std::env::var(REAPED_SOCKET) else {
+            return;
+        };
+        UnixStream::connect(path).expect("the helper could not connect");
+    }
+
+    /// `SO_PEERPIDFD` against the live kernel, which is the half no fixture
+    /// can prove: that the option number is the right one, that the kernel
+    /// installs a real descriptor for it, and that the descriptor's `fdinfo`
+    /// names the process on the other end of the socket.
+    ///
+    /// A socketpair's peer is this process, so the pid it names is one this
+    /// test can check rather than merely print.
+    #[test]
+    fn the_peers_pidfd_names_the_process_on_the_other_end() {
+        if !pidfd_available() {
+            return;
+        }
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        let pidfd = sys::peer_pidfd(&server).expect("the kernel gave a pidfd");
+        let me = i32::try_from(std::process::id()).expect("a pid fits");
+        assert_eq!(
+            RealProcfs.named_by(pidfd.as_raw_fd()),
+            crate::lineage::Named::Pid(me),
+            "the peer's pidfd named some other process"
+        );
+        // And it agrees with the credential the same socket carries. That is
+        // the only cross-check available while both ends are alive: the two
+        // can differ ONLY once the peer has been reaped, which is precisely
+        // the case the pidfd exists to catch and this test cannot stage.
+        assert_eq!(sys::peer_credential(&server).expect("peercred").pid, me);
+        drop(client);
     }
 
     #[test]

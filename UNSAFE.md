@@ -52,7 +52,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with two value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `seccomp(2)` with one value-pinned operation |
-| 10 | `td-busd` | `recvmsg(2)`, `sendmsg(2)`, `getsockopt(2)` with one value-pinned option; plus a SECOND scoped allow for descriptor adoption — see [§10](#10-td-busd--the-session-bus-broker) |
+| 10 | `td-busd` | `recvmsg(2)`, `sendmsg(2)`, `getsockopt(2)` with two value-pinned options; plus a SECOND scoped allow for descriptor adoption — see [§10](#10-td-busd--the-session-bus-broker) |
 | 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)` |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
@@ -1232,7 +1232,8 @@ is an amendment here.
 `td-busd` carries THREE syscalls through one `syscall5` body in
 `td-busd/src/sys.rs`: `recvmsg(2)` and `sendmsg(2)` for the SCM_RIGHTS
 descriptor passing D-Bus requires of a broker, and `getsockopt(2)` for
-exactly ONE value-pinned option, `SO_PEERCRED` at `SOL_SOCKET`. The body is
+exactly TWO value-pinned options at `SOL_SOCKET`, `SO_PEERCRED` and
+`SO_PEERPIDFD`. The body is
 `syscall5` rather than td-compositor's `syscall3` because `getsockopt`
 takes five arguments; the two message calls use three of the five and pass
 zero for the rest.
@@ -1242,12 +1243,41 @@ nothing else to check a client's asserted uid against, and the kernel's
 answer is the only account of it that the client cannot write. Stable Rust
 does not expose it: `UnixStream::peer_cred` is gated behind
 `peer_credentials_unix_socket` (rust#42839) and has been since 2017, so
-this is an unstable-API gap rather than a preference. The wrapper takes no
-caller-supplied level or option — there is no general `getsockopt` here,
-only `peer_credential` — and it checks the length the kernel writes back
-against `sizeof(struct ucred)` before believing the three words, because a
-short write would otherwise leave a zeroed uid that reads exactly like
-`root`.
+this is an unstable-API gap rather than a preference.
+
+`SO_PEERPIDFD` (value 77, Linux 6.5 and later; td pins a 7.x kernel) is
+read because `SO_PEERCRED`'s pid is a NUMBER and the broker's identity
+model needs a PROCESS. The kernel samples peer credentials at `connect(2)`
+and holds a `struct pid` reference; that keeps the struct alive and does
+not reserve the number, which `free_pid` returns to the allocator once the
+connecting process is reaped. A peer that connects, hands its socket to a
+sibling through SCM_RIGHTS and exits can therefore have its pid recycled
+before the broker reads it, and any `/proc` walk built on that number then
+describes somebody else — the dangerous direction being a confined peer
+resolving unconfined. `SO_PEERPIDFD` returns a descriptor naming the
+process itself, and `td-busd/src/lineage.rs` reads
+`/proc/self/fdinfo/<pidfd>` before and after its walk: for as long as the
+kernel still reports a pid there, the process has not been reaped, so its
+number was never free, so every `/proc` read taken in between belongs to
+it. Stable `std` has no spelling of this option at all, so unlike
+`SO_PEERCRED` it is not even an unstable-API gap.
+
+The pidfd is a liveness ORACLE and not a reservation. The distinction is
+worth stating because an earlier draft of `APPLICATIONS.md` §D got it
+wrong: holding a pidfd across a reap does not stop the pid NUMBER being
+handed out again, which is measured rather than reasoned about — a held
+pidfd saw its number reused after some thirty thousand forks. What the
+descriptor buys is the ability to ask, and the answer is exact: the pid
+while the process is alive, the pid while it is a zombie, and `-1` once it
+has been reaped.
+
+Neither wrapper takes a caller-supplied level or option — there is no
+general `getsockopt` here, only `peer_credential` and `peer_pidfd` — and
+each checks the length the kernel writes back before believing what was
+written. A short `ucred` would leave a zeroed uid that reads exactly like
+`root`; a short `SO_PEERPIDFD` write is a partly written `i32`, and
+adopting an arbitrary descriptor number this process does not own would
+hand the broker somebody else's socket to call the peer's identity.
 
 `MSG_CMSG_CLOEXEC` is requested on every receive so a forwarded descriptor
 cannot leak through a concurrent `exec`, and `MSG_NOSIGNAL` on every send
@@ -1280,15 +1310,54 @@ handed between two applications that is a semantic change, not a
 different route to the same place.
 
 The adoption appears ONCE, in one private function, and a confinement test
-pins that count. Its discipline is an ordering rule rather than a
-condition: EVERY descriptor a `recvmsg` returns is adopted into an
-`OwnedFd` BEFORE `MSG_CTRUNC` is examined, before the count is compared
-against the message's UNIX_FDS field, and before any parsing. The kernel
-installed those descriptors whether or not the message that carried them
-is one this broker will accept, so any check that returns early ahead of
-the adoption leaks a descriptor per malformed message — a remote fd-table
-exhaustion reachable by a client that only has to be malformed, not
-authenticated. Refusal happens after ownership, never instead of it.
+pins that count. Two callers reach it — `receive` and `peer_pidfd` — and
+the count that matters is the SITE, because a second adoption site is a
+second place to get the ordering rule wrong.
+
+That discipline is an ordering rule rather than a condition, and **the two
+callers order it OPPOSITELY**. This is the most confusable thing about this
+surface, so both directions are stated here and each is pinned by a test.
+
+`receive` adopts BEFORE it refuses. EVERY descriptor a `recvmsg` returns is
+adopted into an `OwnedFd` before `MSG_CTRUNC` is examined, before the count
+is compared against the message's UNIX_FDS field, and before any parsing.
+The kernel installed those descriptors whether or not the message that
+carried them is one this broker will accept, so a check that returns early
+ahead of the adoption leaks a descriptor per malformed message — a remote
+fd-table exhaustion reachable by a client that only has to be malformed,
+not authenticated. There, refusal happens after ownership, never instead of
+it.
+
+`peer_pidfd` refuses BEFORE it adopts, and **what that buys is narrower
+than a first version of this paragraph claimed.** It keeps `adopt` from
+ever seeing a negative number: `OwnedFd` has a validity niche and
+constructing one from `-1` is unsound on its own terms, independently of
+which descriptor would be closed. That is the whole of it.
+
+It does NOT prevent adopting a descriptor this process never received, and
+the first version said it did. A short write cannot produce a foreign
+descriptor here: `number` starts at `-1`, this surface is x86-64 by
+construction, and a partial write fills from the low byte up — so any
+partial answer stays negative and is refused whichever way the two
+statements are ordered. What CAN produce one is a wrong option number,
+since a different option answers a whole `i32` of something else; a
+mutation to `SO_PASSPIDFD` yields `0`, and adopting stdin aborts the process
+on the double close. Neither the ordering nor the length check catches that.
+The value pin at the constant and its confinement test are what catch it,
+and the first version of this paragraph narrated that abort as the thing
+the reordering fixed. It fixed nothing about it.
+
+The length is checked because `getsockopt` clamps to whatever the caller
+asks for, and a short ask is answered short. Measured against the kernel
+rather than inferred: ask for two bytes and it writes two, reports two, and
+installs the pidfd regardless — a descriptor whose number was never
+delivered and which therefore cannot be closed. So asking for exactly
+`sizeof(int)` is the load-bearing part, the check is what notices a kernel
+that answers otherwise, and "installed alongside a short length" is a real
+kernel behaviour rather than the self-contradiction an earlier draft called
+it. Such a leak would also not be bounded by the connection ceiling:
+connections come and go, so one leak per accept exhausts the table over
+time rather than plateauing.
 
 ### Deliberately not here
 
@@ -1308,7 +1377,7 @@ in `td-busd/src/transport.rs` rather than an oversight. There is no
 `std` `UnixListener`/`UnixStream` do all of those, and the raw layer only
 ever borrows a descriptor `std` already owns. There is no `mmap`, no
 `fcntl`, and no credential-changing call of any kind: this broker reads a
-uid and never assumes one. A fourth syscall, a second socket option, or a
+uid and never assumes one. A fourth syscall, a THIRD socket option, or a
 third scoped allow is an amendment here and to `APPLICATIONS.md` §D in the
 same landing.
 

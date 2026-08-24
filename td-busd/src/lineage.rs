@@ -36,34 +36,49 @@
 //! that delegation lands; this walk is the fallback for the ordering where it
 //! has not, which is the ordering td is in.
 //!
-//! # The peer's own pid is not proved, and nothing here can prove it
+//! # The peer's own pid, and why a pidfd is what proves it
 //!
-//! Everything above is about ANCESTORS. The pid this module is asked about
-//! arrives from `SO_PEERCRED`, and it is not sound in the same way — a review
-//! found this and it is worth stating exactly, because the walk being careful
-//! makes it easy to assume the starting point was.
+//! Everything above is about ANCESTORS. The pid the walk STARTS from is a
+//! separate problem, and the walk being careful makes it easy to assume the
+//! starting point was.
 //!
-//! The kernel samples peer credentials at `connect(2)` and keeps a `struct
-//! pid` reference. A reference keeps the STRUCT alive; it does not reserve the
-//! NUMBER, which `free_pid` returns to the allocator when the connecting
-//! process is reaped. `pid_vnr` then reports the number the struct still
-//! carries. So a peer that connects, passes its socket to a sibling through
-//! `SCM_RIGHTS` and exits can have its pid recycled before the broker reads
-//! it, and this walk will faithfully describe whichever process holds that
-//! number now. The attacker controls the delay by filling the listen backlog,
-//! and the dangerous direction is a confined peer resolving `Unconfined`,
-//! which is privilege UP.
+//! `SO_PEERCRED` is not sound for it. The kernel samples peer credentials at
+//! `connect(2)` and keeps a `struct pid` reference; a reference keeps the
+//! STRUCT alive and does not reserve the NUMBER, which `free_pid` returns to
+//! the allocator when the connecting process is reaped, after which `pid_vnr`
+//! still reports it. A peer that connects, passes its socket to a sibling
+//! through `SCM_RIGHTS` and exits can therefore have its pid recycled before
+//! the broker reads it — with the delay under its own control, by filling the
+//! listen backlog — and the walk would faithfully describe whichever process
+//! holds that number now. The dangerous direction is a confined peer
+//! resolving `Unconfined`, which is privilege UP.
 //!
-//! No amount of care inside the walk closes this: its first read is already
-//! too late, and there is no earlier observation to compare against.
-//! `SO_PEERPIDFD` is the fix, for the reason §D gives for pidfds generally —
-//! a pidfd names a process rather than a number and cannot be recycled by
-//! definition. It is a second value-pinned `getsockopt` option on surface #10
-//! and therefore an `UNSAFE.md` amendment, which is why it is recorded here
-//! rather than taken in the landing that found it. It has to land before any
-//! policy decision rests on this answer.
+//! So the pid is taken from `SO_PEERPIDFD` instead, and the argument is a
+//! liveness one rather than the "a pidfd cannot be recycled" one §D first
+//! gave. That claim is true of the HANDLE and false of the NUMBER: holding a
+//! pidfd across a reap does not stop the pid being handed out again, which is
+//! measured rather than assumed. What a pidfd gives is the ability to ask.
+//! `/proc/self/fdinfo/<pidfd>` reports the pid while the process is alive AND
+//! while it is a zombie, and `-1` once it has been reaped — and a reap is
+//! exactly what has to happen before a number can be reused.
+//!
+//! Hence the rule, and both halves are load-bearing:
+//!
+//! * read the pidfd BEFORE the walk, to learn which pid to start from and to
+//!   refuse a peer that is already reaped, and
+//! * read it AGAIN after every `/proc` read this lookup makes, and require
+//!   the same pid.
+//!
+//! The second read is the one the soundness rests on. If the pidfd names the
+//! peer at the end, the peer was never reaped between `connect(2)` and that
+//! moment, so its number was never free, so every `/proc/<pid>` read taken in
+//! between was a read of this peer. One read alone does not get there: the
+//! peer can be reaped and its number reused in the window between the first
+//! read and the walk, and the walk's own re-read of hop zero would then find
+//! the impostor's start time unchanged and pass.
 
 use std::collections::BTreeSet;
+use std::os::fd::RawFd;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -143,6 +158,24 @@ pub enum Reading {
     Unreadable,
 }
 
+/// What a pidfd names, read now.
+///
+/// A pidfd is not a pid. It names a `struct pid`, and the kernel reports a
+/// NUMBER for it only while that struct is still allocated to a process. These
+/// are the three things `/proc/self/fdinfo/<fd>` can say, and the difference
+/// between the last two is a privilege boundary in the same way `Reading`'s is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Named {
+    /// The pidfd names this pid and the process has not been reaped, so the
+    /// number is still that process's and cannot have been recycled.
+    Pid(i32),
+    /// The process has been reaped: the kernel reports `-1`, and the number it
+    /// held is back in the allocator. Nothing may be concluded from it.
+    Reaped,
+    /// The read failed, or the line did not parse. Nothing follows.
+    Unreadable,
+}
+
 /// Where the walk reads process state from.
 ///
 /// A trait rather than a direct `/proc` read because the interesting cases are
@@ -152,6 +185,15 @@ pub enum Reading {
 /// answer differently on the second read; production reads `/proc`.
 pub trait Procfs {
     fn stat(&self, pid: i32) -> Reading;
+
+    /// What `pidfd` — a descriptor THIS process holds and keeps open across
+    /// the call — names right now.
+    ///
+    /// On the same trait as `stat` because the two are read against each
+    /// other: the whole soundness argument is that no reap happened between
+    /// the first of these reads and the last, and a fake that could stage one
+    /// side and not the other could not stage the race at all.
+    fn named_by(&self, pidfd: RawFd) -> Named;
 }
 
 /// `/proc/<pid>/stat`, parsed the only way it can safely be parsed.
@@ -168,6 +210,59 @@ impl Procfs for RealProcfs {
     fn stat(&self, pid: i32) -> Reading {
         stat_of(std::path::Path::new(&format!("/proc/{pid}/stat")))
     }
+
+    fn named_by(&self, pidfd: RawFd) -> Named {
+        named_by(std::path::Path::new(&format!("/proc/self/fdinfo/{pidfd}")))
+    }
+}
+
+/// One pidfd's `fdinfo`, read and parsed. Split from the impl for the reason
+/// `stat_of` is: production reads a path no test can create.
+///
+/// The `Pid:` line is the kernel's own, reported in the READER's pid
+/// namespace — the same namespace `SO_PEERCRED` answers in, which is what
+/// makes the two comparable at all. `NSpid:` is deliberately not consulted: it
+/// is the pid inside the process's OWN namespace, which for a jailed peer is 1.
+///
+/// A failed read is `Unreadable` and never `Reaped`. This descriptor is one
+/// this process holds, so its `fdinfo` entry exists; anything that stops it
+/// being read is the broker's problem and says nothing about the peer. Getting
+/// that backwards would turn one `EMFILE` into a denial that reads like a
+/// reaped peer.
+fn named_by(path: &std::path::Path) -> Named {
+    let Ok(raw) = std::fs::read(path) else {
+        return Named::Unreadable;
+    };
+    let mut answer = None;
+    for line in raw.split(|byte| *byte == b'\n') {
+        // A PREFIX match. `NSpid:` would not match a substring search either
+        // — the kernel spells it with a lower-case `p` — so the reason for
+        // the prefix is not that one, and a review caught the comment giving
+        // it. The reason is that a prefix is what "this line IS the pid" means,
+        // and a substring search would accept a `Pid:` appearing anywhere in
+        // any future line of this file.
+        let Some(rest) = line.strip_prefix(b"Pid:") else {
+            continue;
+        };
+        // A SECOND `Pid:` line is not something to pick a winner from. The
+        // kernel emits exactly one; a file with two is a file this code does
+        // not understand, and "take the first" would let `Pid: 400` followed
+        // by `Pid: -1` read as live. Refused instead of resolved.
+        if answer.is_some() {
+            return Named::Unreadable;
+        }
+        let Ok(text) = std::str::from_utf8(rest) else {
+            return Named::Unreadable;
+        };
+        answer = Some(match text.trim().parse::<i32>() {
+            // `-1` is how a pidfd says its process has been reaped. Any other
+            // non-positive number is not a pid, and is not read as one.
+            Ok(-1) => Named::Reaped,
+            Ok(pid) if pid > 0 => Named::Pid(pid),
+            _ => Named::Unreadable,
+        });
+    }
+    answer.unwrap_or(Named::Unreadable)
 }
 
 /// One `stat` file, read and parsed.
@@ -579,12 +674,24 @@ impl Instances {
         }
     }
 
-    /// Which instance this pid belongs to, or a named reason it cannot be
+    /// Which instance this peer belongs to, or a named reason it cannot be
     /// said.
     ///
-    /// Three things happen here and only the middle one is the walk.
+    /// The argument is a pidfd the CALLER owns and keeps open across the call
+    /// — `RawFd` because a fake has no descriptor to borrow, and there is no
+    /// safe way to build a `BorrowedFd` from a number a test invented. A
+    /// closed descriptor here is not so much a soundness hole as a reused
+    /// number naming something else entirely, so the ownership rule is the
+    /// caller's to keep; the accept path keeps it by holding the `OwnedFd` for
+    /// the length of this call and no longer.
     ///
-    /// FIRST, instances whose stage-2 process is gone are reaped. Without this
+    /// Five things happen here and only the middle one is the walk.
+    ///
+    /// FIRST, the pidfd says which pid to start from — and refuses outright if
+    /// the peer has already been reaped, which is the case `SO_PEERCRED`
+    /// cannot tell apart from a live peer.
+    ///
+    /// SECOND, instances whose stage-2 process is gone are reaped. Without this
     /// a jail that simply exited would make `Unconfined` unsayable for every
     /// later connection for as long as the broker ran — the accounting pass
     /// below cannot tell "this instance ended" from "this instance's pid may
@@ -595,9 +702,9 @@ impl Instances {
     /// so killing it kills the namespace, and a dead instance has no live
     /// descendants left to misattribute.
     ///
-    /// SECOND, the walk, outside the lock.
+    /// THIRD, the walk, outside the lock.
     ///
-    /// THIRD, a registration IN FLIGHT makes `Unconfined` unsayable, which is
+    /// FOURTH, a registration IN FLIGHT makes `Unconfined` unsayable, which is
     /// §E's own list of `Unknown` cases and not a conservative extra. Between
     /// phase one and phase two an instance has no pid on record, so a peer
     /// descending from it walks straight past and off the top — and answering
@@ -605,8 +712,12 @@ impl Instances {
     /// that is definitely confined. `Jailed` is still answerable while a
     /// registration is pending, because that answer rests on a positive match
     /// rather than on the registry being complete.
-    pub fn resolve(&self, procfs: &dyn Procfs, pid: i32) -> Identity {
-        self.resolve_at(procfs, pid, Instant::now())
+    ///
+    /// FIFTH and last, the pidfd is read again. Every `/proc` read above is
+    /// attributable to this peer only if the peer was never reaped while they
+    /// were happening, and this is the read that establishes it.
+    pub fn resolve(&self, procfs: &dyn Procfs, peer: RawFd) -> Identity {
+        self.resolve_at(procfs, peer, Instant::now())
     }
 
     /// `resolve` with the clock supplied, so the expiry rule can be asserted
@@ -615,7 +726,27 @@ impl Instances {
     /// The sweep is INSIDE this function on purpose: a draft left the test
     /// calling `expire_pending` itself and then checking `resolve`, which
     /// passes just as happily if `resolve` stops sweeping at all.
-    fn resolve_at(&self, procfs: &dyn Procfs, pid: i32, now: Instant) -> Identity {
+    fn resolve_at(&self, procfs: &dyn Procfs, peer: RawFd, now: Instant) -> Identity {
+        let pid = match procfs.named_by(peer) {
+            Named::Pid(pid) => pid,
+            // Not `Unconfined`, and the difference matters: a reaped peer is
+            // precisely the process whose pid may already belong to somebody
+            // else, so there is nothing left here to be unconfined ABOUT.
+            Named::Reaped => {
+                return Identity::Unknown(
+                    "the peer was reaped before it could be identified, and the \
+                     pid its socket reports is free for reuse"
+                        .to_string(),
+                )
+            }
+            Named::Unreadable => {
+                return Identity::Unknown(
+                    "the peer's pidfd could not be read, so which process \
+                     connected is not established"
+                        .to_string(),
+                )
+            }
+        };
         let Ok(pending) = self.expire_pending(now) else {
             return Identity::Unknown("the instance registry is poisoned".to_string());
         };
@@ -648,7 +779,19 @@ impl Instances {
                 })
             })
             .collect();
-        resolve_against(procfs, &live, &pending, &reaped, pid)
+        let identity = resolve_against(procfs, &live, &pending, &reaped, pid);
+        // The read the whole thing rests on, and it is applied to EVERY answer
+        // rather than only to `Unconfined`. A `Jailed` answer reached through
+        // a recycled pid attributes one application's connection to another,
+        // which is a smaller privilege move than reaching `Unconfined` and is
+        // still a wrong one.
+        match procfs.named_by(peer) {
+            Named::Pid(again) if again == pid => identity,
+            _ => Identity::Unknown(format!(
+                "pid {pid} did not survive this lookup, so nothing read from \
+                 /proc while it ran is attributable to the peer"
+            )),
+        }
     }
 
     /// Drop every live record whose process is certainly gone, and report
@@ -983,8 +1126,9 @@ fn unaccounted_instance(procfs: &dyn Procfs, live: &[Instance]) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
+    use std::os::fd::AsRawFd;
 
     /// A `/proc` the test writes, and can change between reads.
     #[derive(Default)]
@@ -998,6 +1142,23 @@ mod tests {
         /// Pids whose entry exists but cannot be read, which is a different
         /// answer from a pid that is not there.
         unreadable: RefCell<BTreeSet<i32>>,
+        /// What every pidfd read answers, from the first. For the cases that
+        /// are about the peer's state when the lookup STARTED.
+        pidfd_always: RefCell<Option<Named>>,
+        /// `(pid, answer)`: every pidfd read taken after this table has served
+        /// a `stat` for `pid` answers `answer`.
+        ///
+        /// Keyed on a `/proc` read rather than on a count of pidfd reads, and
+        /// that is the whole point of the knob. A count says "the second one"
+        /// wherever the second one sits, so it cannot tell a read taken after
+        /// the walk from one taken immediately after the first — which is the
+        /// single-read version this design says is unsound. A review moved the
+        /// second read up to just below the first, and up to just after the
+        /// sweep, and moved the first read down past the sweep, and all three
+        /// mutations passed the whole suite against a counted fake.
+        pidfd_after_stat_of: RefCell<Option<(i32, Named)>>,
+        /// Set once that `stat` has been served.
+        pidfd_armed: Cell<bool>,
     }
 
     impl Table {
@@ -1017,6 +1178,19 @@ mod tests {
 
         fn swap_after(&self, reads: usize, pid: i32, replacement: Option<Stat>) {
             *self.swap.borrow_mut() = Some((reads, pid, replacement));
+        }
+
+        /// Every pidfd read answers this, including the first.
+        fn pidfd_always(&self, answer: Named) {
+            *self.pidfd_always.borrow_mut() = Some(answer);
+        }
+
+        /// Every pidfd read taken AFTER a `stat` for `pid` answers `answer`.
+        ///
+        /// Pick a `pid` that only the stage being tested reads: the walk reads
+        /// the chain, the sweep reads each live instance's stage-2 pid.
+        fn pidfd_after_stat_of(&self, pid: i32, answer: Named) {
+            *self.pidfd_after_stat_of.borrow_mut() = Some((pid, answer));
         }
 
         /// The process is there and the broker cannot read it — `EMFILE`, or
@@ -1041,6 +1215,11 @@ mod tests {
                     None => self.now.borrow_mut().remove(&target),
                 };
             }
+            if let Some((target, _)) = *self.pidfd_after_stat_of.borrow() {
+                if target == pid {
+                    self.pidfd_armed.set(true);
+                }
+            }
             if self.unreadable.borrow().contains(&pid) {
                 return Reading::Unreadable;
             }
@@ -1048,6 +1227,21 @@ mod tests {
                 Some(stat) => Reading::Of(stat),
                 None => Reading::Gone,
             }
+        }
+
+        /// The fake's convention: a pidfd is NUMBERED with the pid it names,
+        /// so a test that has nothing to say about pidfds passes the pid it
+        /// always passed and gets the answer it always got.
+        fn named_by(&self, pidfd: RawFd) -> Named {
+            if let Some(answer) = *self.pidfd_always.borrow() {
+                return answer;
+            }
+            if self.pidfd_armed.get() {
+                if let Some((_, answer)) = *self.pidfd_after_stat_of.borrow() {
+                    return answer;
+                }
+            }
+            Named::Pid(pidfd)
         }
     }
 
@@ -1573,10 +1767,247 @@ mod tests {
         };
         assert!(stat.ppid > 0, "a test process has a parent");
         assert!(stat.starttime > 0, "a running process started at some point");
-        // And this process descends from no registered instance, which is the
-        // one identity assertion that can be made against a live machine.
+    }
+
+    /// `fdinfo`, the four things it can say, against files rather than the
+    /// kernel. The live half of this is in `transport`, which is the one
+    /// module allowed to take a pidfd.
+    #[test]
+    fn a_pidfd_names_its_process_until_that_process_is_reaped() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("td-busd-fdinfo-{}", std::process::id()));
+        let write = |body: &str| std::fs::write(&path, body).is_ok();
+
+        // A live pidfd, laid out the way the kernel lays one out. `NSpid` is
+        // the line most likely to be mistaken for the answer: it is the pid
+        // inside the process's OWN namespace, which for a jailed peer is 1,
+        // and reading it would make every jail look like init.
+        if !write("pos:\t0\nflags:\t02000002\nmnt_id:\t16\nino:\t9\nPid:\t4242\nNSpid:\t1\n") {
+            return;
+        }
+        assert_eq!(named_by(&path), Named::Pid(4242));
+
+        // Reaped, and `-1` is the only thing that licenses that answer.
+        assert!(write("pos:\t0\nPid:\t-1\nNSpid:\t-1\n"));
+        assert_eq!(named_by(&path), Named::Reaped);
+
+        // Neither. An `fdinfo` with no `Pid:` line is what EVERY descriptor
+        // that is not a pidfd looks like, and it must not read as a process.
+        assert!(write("pos:\t0\nflags:\t02000002\nmnt_id:\t16\nino:\t9\n"));
+        assert_eq!(named_by(&path), Named::Unreadable);
+
+        // A `Pid:` that is not a number, and one that is a number no process
+        // has. Zero is what `SO_PEERCRED` answers for a peer outside the
+        // reader's namespace, so it is a value this code sees in practice.
+        assert!(write("Pid:\tnonsense\n"));
+        assert_eq!(named_by(&path), Named::Unreadable);
+        assert!(write("Pid:\t0\n"));
+        assert_eq!(named_by(&path), Named::Unreadable);
+
+        // TWO `Pid:` lines is a file this parser does not understand, and
+        // taking the first would read `400` and ignore the `-1` under it.
+        assert!(write("Pid:\t400\nNSpid:\t400\nPid:\t-1\n"));
+        assert_eq!(named_by(&path), Named::Unreadable);
+
+        let _ = std::fs::remove_file(&path);
+        // A descriptor whose `fdinfo` cannot be read says NOTHING about the
+        // peer, and in particular does not say it was reaped — which would
+        // turn one `EMFILE` into a denial that reads like an attack.
+        assert_eq!(named_by(&path), Named::Unreadable);
+    }
+
+    /// And against the live kernel, for the half a fixture cannot prove: an
+    /// ordinary descriptor's real `fdinfo` has no `Pid:` line in it.
+    #[test]
+    fn a_descriptor_that_is_not_a_pidfd_names_no_process() {
+        let Ok(file) = std::fs::File::open("/proc/self/stat") else {
+            return;
+        };
+        assert_eq!(
+            RealProcfs.named_by(file.as_raw_fd()),
+            Named::Unreadable,
+            "a plain file was read as a process"
+        );
+        assert_eq!(RealProcfs.named_by(RawFd::MAX), Named::Unreadable);
+    }
+
+    /// A peer reaped before the broker ever looked. `SO_PEERCRED` cannot tell
+    /// this from a live peer — the number it reports may belong to somebody
+    /// else by now — and the pidfd can.
+    #[test]
+    fn a_peer_that_was_already_reaped_is_not_unconfined() {
+        let table = Table::with(&[(1, 0, 1), (400, 1, 40)]);
+        table.pidfd_always(Named::Reaped);
         let instances = Instances::new();
-        assert_eq!(instances.resolve(&RealProcfs, pid), Identity::Unconfined);
+        match instances.resolve(&table, 400) {
+            Identity::Unknown(why) => assert!(why.contains("reaped"), "{why}"),
+            other => panic!("a reaped peer resolved {other:?}"),
+        }
+    }
+
+    /// A pidfd the broker could not read is an identity it has not
+    /// established, which denies. The `/proc` entries are all present and
+    /// perfectly readable, so nothing else in the walk objects.
+    #[test]
+    fn a_peer_whose_pidfd_cannot_be_read_is_not_unconfined() {
+        let table = Table::with(&[(1, 0, 1), (400, 1, 40)]);
+        table.pidfd_always(Named::Unreadable);
+        let instances = Instances::new();
+        match instances.resolve(&table, 400) {
+            Identity::Unknown(why) => assert!(why.contains("pidfd"), "{why}"),
+            other => panic!("an unreadable pidfd resolved {other:?}"),
+        }
+    }
+
+    /// The read the whole argument rests on: a peer reaped DURING the lookup.
+    ///
+    /// Everything the walk itself read stays self-consistent — this table
+    /// never changes — so the start-time invariants see nothing wrong, which
+    /// is exactly the case a single pidfd read at the start would miss. The
+    /// peer is reaped, its number goes back to the allocator, and every
+    /// `/proc` read this lookup took becomes a read of whatever holds that
+    /// number next. Only the SECOND pidfd read catches it.
+    #[test]
+    fn a_peer_reaped_during_the_lookup_is_refused_though_the_walk_agreed() {
+        // Same rows, same walk: without the reap this is `Unconfined`.
+        let clean = Table::with(&[(1, 0, 1), (400, 1, 40)]);
+        assert_eq!(Instances::new().resolve(&clean, 400), Identity::Unconfined);
+
+        let table = Table::with(&[(1, 0, 1), (400, 1, 40)]);
+        // Pid 1 is the top of the chain and nothing but the WALK reads it, so
+        // the reap lands strictly inside the bracket: the first pidfd read
+        // hands back 400, the walk runs, and only the read after it says the
+        // process has gone. A second read taken any earlier still sees 400,
+        // which is what makes this test fail for the single-read version
+        // rather than pass for it.
+        table.pidfd_after_stat_of(1, Named::Reaped);
+        match Instances::new().resolve(&table, 400) {
+            Identity::Unknown(why) => assert!(why.contains("did not survive this lookup"), "{why}"),
+            other => panic!("a peer reaped mid-lookup resolved {other:?}"),
+        }
+    }
+
+    /// And a `Jailed` answer is re-checked too. Reaching one through a
+    /// recycled pid attributes one application's connection to another, which
+    /// is a smaller move than reaching `Unconfined` and is still a wrong one —
+    /// so the check is not gated on which answer the walk produced.
+    #[test]
+    fn a_jailed_answer_is_re_checked_against_the_pidfd_as_well() {
+        let rows = &[(1, 0, 1), (900, 1, 90), (400, 900, 95), (401, 400, 96)];
+        let jailed = Identity::Jailed {
+            app_id: "org.td.One".to_string(),
+            instance: "one".to_string(),
+        };
+
+        let clean = Table::with(rows);
+        let instances = Instances::new();
+        let token = instances
+            .open(&clean, "one", "org.td.One", Vec::new(), 1000, 900)
+            .expect("phase one opens");
+        instances
+            .complete(&clean, &token, 400, 1000, 900)
+            .expect("phase two completes");
+        assert_eq!(instances.resolve(&clean, 401), jailed);
+
+        // The identical registry and the identical walk, with the peer reaped
+        // underneath it.
+        let table = Table::with(rows);
+        let instances = Instances::new();
+        let token = instances
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .expect("phase one opens");
+        instances
+            .complete(&table, &token, 400, 1000, 900)
+            .expect("phase two completes");
+        // 401's own chain tops out at the registered instance, so pid 1 is
+        // never read here; 400 is, by the walk's first hop AND by the sweep.
+        // The sweep half is `the_bracket_opens_before_the_registry_sweep`.
+        table.pidfd_after_stat_of(401, Named::Reaped);
+        match instances.resolve(&table, 401) {
+            Identity::Unknown(why) => assert!(why.contains("did not survive this lookup"), "{why}"),
+            other => panic!("a jailed answer survived a mid-lookup reap: {other:?}"),
+        }
+    }
+
+    /// The bracket opens before the registry SWEEP, not just before the walk.
+    ///
+    /// `sweep_live` reads `/proc` for every registered instance and drops
+    /// records on what it finds — and a dropped record changes the answer,
+    /// through `reaped`. Those reads are attributable to this peer for exactly
+    /// the reason the walk's are: the peer had not been reaped while they
+    /// happened. So the first pidfd read has to come before them.
+    ///
+    /// The reap is armed on the live instance's own stage-2 pid, which the
+    /// SWEEP reads before the walk reaches it. If the first read has been
+    /// moved down past the sweep it is already armed when it happens, and the
+    /// refusal changes from "did not survive this lookup" to "reaped before it
+    /// could be identified" — which is why this asserts the exact reason
+    /// rather than merely `Unknown`. A review moved that read and the whole
+    /// suite stayed green.
+    #[test]
+    fn the_bracket_opens_before_the_registry_sweep() {
+        let table = Table::with(&[(1, 0, 1), (900, 1, 90), (400, 900, 95), (401, 400, 96)]);
+        let instances = Instances::new();
+        let token = instances
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .expect("phase one opens");
+        instances
+            .complete(&table, &token, 400, 1000, 900)
+            .expect("phase two completes");
+        table.pidfd_after_stat_of(400, Named::Reaped);
+        match instances.resolve(&table, 401) {
+            Identity::Unknown(why) => assert!(
+                why.contains("did not survive this lookup"),
+                "the peer read as already reaped, so the bracket opened after \
+                 the sweep rather than before it: {why}"
+            ),
+            other => panic!("a peer reaped during the sweep resolved {other:?}"),
+        }
+    }
+
+    /// The second read compares the PID, and not merely that some pid came
+    /// back.
+    ///
+    /// Today a pidfd can only go from naming its process to naming nothing, so
+    /// the comparison is belt-and-braces — and it is pinned rather than left
+    /// to a comment, because "the kernel cannot answer that" is exactly the
+    /// kind of claim that stops being true one release later.
+    #[test]
+    fn the_second_pidfd_read_must_name_the_same_process() {
+        let table = Table::with(&[(1, 0, 1), (400, 1, 40), (401, 1, 41)]);
+        table.pidfd_after_stat_of(1, Named::Pid(401));
+        match Instances::new().resolve(&table, 400) {
+            Identity::Unknown(why) => {
+                assert!(why.contains("did not survive this lookup"), "{why}")
+            }
+            other => panic!("a pidfd that changed process resolved {other:?}"),
+        }
+    }
+
+    /// The pid the walk starts from comes from the PIDFD, not from anything
+    /// the caller passed alongside it. Under the fake's numbering convention
+    /// the two are the same, so this test breaks the convention: the fd is
+    /// numbered 7 and names pid 401, and the answer must be 401's.
+    #[test]
+    fn the_walk_starts_from_the_pid_the_pidfd_names() {
+        let table = Table::with(&[(1, 0, 1), (900, 1, 90), (400, 900, 95), (401, 400, 96)]);
+        table.pidfd_always(Named::Pid(401));
+        let instances = Instances::new();
+        let token = instances
+            .open(&table, "one", "org.td.One", Vec::new(), 1000, 900)
+            .expect("phase one opens");
+        instances
+            .complete(&table, &token, 400, 1000, 900)
+            .expect("phase two completes");
+        // 7 is not in the table at all, so a walk that started from the
+        // descriptor number would answer `Unknown`.
+        assert_eq!(
+            instances.resolve(&table, 7),
+            Identity::Jailed {
+                app_id: "org.td.One".to_string(),
+                instance: "one".to_string()
+            }
+        );
     }
 
     #[test]

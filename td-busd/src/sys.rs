@@ -7,10 +7,13 @@
 //!
 //! * `recvmsg(2)` and `sendmsg(2)`, because stable Rust exposes no ancillary
 //!   data API and SCM_RIGHTS is how D-Bus passes a descriptor at all.
-//! * `getsockopt(2)`, for `SO_PEERCRED` alone. `UnixStream::peer_cred` exists
-//!   and is unstable (`peer_credentials_unix_socket`, rust#42839); td builds on
-//!   a pinned toolchain but ships no feature gates, so the credential this
-//!   broker's entire identity model rests on is read here instead.
+//! * `getsockopt(2)`, for two value-pinned options and nothing else.
+//!   `SO_PEERCRED` is the uid `EXTERNAL` admits by: `UnixStream::peer_cred`
+//!   exists and is unstable (`peer_credentials_unix_socket`, rust#42839), and
+//!   td builds on a pinned toolchain but ships no feature gates, so the
+//!   credential this broker's identity model rests on is read here instead.
+//!   `SO_PEERPIDFD` is the peer's own identity, and stable `std` has no
+//!   spelling of it at all.
 //!
 //! `close(2)` is deliberately NOT here, and its absence is the point of the
 //! second allow below. §D's draft roster carried it from an earlier design that
@@ -32,6 +35,10 @@ const SYS_GETSOCKOPT: usize = 55;
 
 const SOL_SOCKET: i32 = 1;
 const SO_PEERCRED: i32 = 17;
+/// `SO_PEERPIDFD`, Linux 6.5 and later; td pins a 7.x kernel. A kernel without
+/// it answers `ENOPROTOOPT`, which `lineage` reads as an identity it could not
+/// establish — so the old-kernel case denies rather than falling open.
+const SO_PEERPIDFD: i32 = 77;
 const SCM_RIGHTS: i32 = 1;
 
 /// The kernel had more ancillary data than the control buffer could hold. The
@@ -135,8 +142,10 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
     result
 }
 
-/// The one descriptor adoption, a scoped allow of a DIFFERENT shape from the
-/// syscall layer above and recorded separately in `UNSAFE.md` §10.
+/// The one descriptor adoption SITE, a scoped allow of a DIFFERENT shape from
+/// the syscall layer above and recorded separately in `UNSAFE.md` §10. Two
+/// callers reach it; the allow stays one, which is the property the
+/// confinement test pins.
 ///
 /// td-compositor reopens a received descriptor through `/proc/self/fd/N`
 /// instead, and that is unavailable here: opening a `/proc/self/fd` entry that
@@ -145,8 +154,10 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
 /// # Safety
 ///
 /// `fd` must be a descriptor the kernel has just installed in this process and
-/// that nothing else owns. The sole caller is `receive`, which passes each
-/// number `recvmsg` returned exactly once.
+/// that nothing else owns. Two callers, and they order the adoption against
+/// their refusals OPPOSITELY — see each, and `UNSAFE.md` §10. `receive` adopts
+/// every number `recvmsg` returned before it examines anything. `peer_pidfd`
+/// refuses first, because the number it would adopt is itself in doubt.
 #[allow(unsafe_code)]
 fn adopt(fd: RawFd) -> OwnedFd {
     // SAFETY: as documented above — a freshly installed descriptor, adopted
@@ -186,10 +197,10 @@ pub struct PeerCredential {
     pub gid: u32,
 }
 
-/// `SO_PEERCRED`, the only socket option this broker reads. The option is
-/// pinned at the call site rather than taken as an argument: a wrapper that
-/// accepted a level and a name would be a general `getsockopt`, and the roster
-/// says this one.
+/// `SO_PEERCRED`, one of the two socket options this broker reads. Each is
+/// pinned at its own call site rather than taken as an argument: a wrapper
+/// that accepted a level and a name would be a general `getsockopt`, and the
+/// roster names two reads.
 pub fn peer_credential(stream: &UnixStream) -> io::Result<PeerCredential> {
     let mut ucred = [0i32; UCRED_WORDS];
     let mut length = u32::try_from(std::mem::size_of_val(&ucred)).unwrap_or(0);
@@ -228,6 +239,102 @@ fn decode_ucred(ucred: &[i32; UCRED_WORDS], length: u32) -> io::Result<PeerCrede
         uid: word(1) as u32,
         gid: word(2) as u32,
     })
+}
+
+/// `SO_PEERPIDFD`: a handle on the process that called `connect(2)`, rather
+/// than the number `SO_PEERCRED` reports for it.
+///
+/// That distinction is the whole reason this option is on the roster.
+/// `SO_PEERCRED` samples a `struct pid` at connect and `pid_vnr` reads a
+/// number off it; the reference keeps the STRUCT alive and does NOT reserve
+/// the number, so a peer that connects and is then reaped can have its pid
+/// handed to some other process before the broker ever looks. This returns a
+/// descriptor naming the process itself, and `lineage` uses it as a liveness
+/// oracle: for as long as the kernel still reports a pid for this descriptor,
+/// that process has not been reaped, so its number cannot have been recycled
+/// underneath a `/proc` walk.
+///
+/// It is an oracle and not a reservation, which is the part that is easy to
+/// get wrong and was: holding this descriptor does not stop the NUMBER being
+/// reused once the process is reaped. Measured, not assumed — a pidfd held
+/// across a reap saw its pid number handed out again after some thirty
+/// thousand forks. What the descriptor gives is the ability to ASK.
+///
+/// **This call refuses BEFORE it adopts, which is the inverse of `receive`,
+/// and the reason is narrower than a first draft of this comment claimed.**
+/// What the order buys is that `adopt` is never handed a negative number:
+/// `OwnedFd` has a validity niche, and constructing one from `-1` is
+/// unsound in a way that has nothing to do with which descriptor gets closed.
+/// It does NOT prevent adopting a descriptor this process never received, and
+/// the first draft said it did.
+///
+/// The number cannot be a foreign descriptor by way of a short write, because
+/// `number` starts at `-1` and the kernel fills an `i32` from the low byte up
+/// on this architecture: any partial write leaves the top byte `0xFF` and the
+/// value negative. It CAN be a foreign descriptor if the option number is
+/// wrong, because a different option answers a whole `i32` of something else
+/// — a mutation to `SO_PASSPIDFD` yields `0`, and adopting stdin aborts the
+/// process on the double close. No ordering and no length check catches that.
+/// The value pin on `SO_PEERPIDFD` and its confinement test are what do, and
+/// the first draft of this comment used that abort to justify an ordering
+/// change that would not have prevented it.
+///
+/// The length is checked because `getsockopt` clamps to whatever the caller
+/// asks for. Measured on this kernel: ask for two bytes and it writes two,
+/// reports two, and **installs the pidfd anyway** — a descriptor with no
+/// recoverable number, leaked. So asking for exactly `size_of::<i32>()` is
+/// what keeps the answer whole, and the check is what notices a kernel that
+/// answers otherwise.
+pub fn peer_pidfd(stream: &UnixStream) -> io::Result<OwnedFd> {
+    let mut number: i32 = -1;
+    let mut length = u32::try_from(std::mem::size_of_val(&number)).unwrap_or(0);
+    errno_result(
+        syscall5(
+            SYS_GETSOCKOPT,
+            stream.as_raw_fd() as usize,
+            SOL_SOCKET as usize,
+            SO_PEERPIDFD as usize,
+            (&mut number as *mut i32) as usize,
+            (&mut length as *mut u32) as usize,
+        ),
+        "getsockopt(SO_PEERPIDFD)",
+    )?;
+    // Judged first, adopted after — see the inversion above. The whole
+    // judgement is one call so that it is one thing to test and one thing to
+    // keep ahead of the adoption; a second condition spelled out here would be
+    // a second condition with no test able to reach it.
+    check_pidfd_answer(number, length)?;
+    Ok(adopt(number))
+}
+
+/// Everything that has to be true before the number is a descriptor, split
+/// out for the reason `decode_ucred` is split out: neither branch is one a
+/// kernel this runs on takes, and a branch that cannot be redded is one nobody
+/// can claim is right.
+///
+/// A short answer means the kernel is not the one this code was written
+/// against, and nothing may be concluded from a number it only partly wrote.
+/// The descriptor it installed alongside that short write is LEAKED and cannot
+/// be otherwise — its number was never delivered — which is why the request
+/// length is pinned at the call rather than repaired here.
+///
+/// The negative case is here rather than at the call site for the same reason
+/// the length is: `adopt` must never see it, and a condition inlined into
+/// `peer_pidfd` would be one no test could reach.
+fn check_pidfd_answer(number: i32, length: u32) -> io::Result<()> {
+    if usize::try_from(length).unwrap_or(0) != std::mem::size_of_val(&number) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("getsockopt(SO_PEERPIDFD): kernel returned {length} bytes"),
+        ));
+    }
+    if number < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("getsockopt(SO_PEERPIDFD): kernel returned descriptor {number}"),
+        ));
+    }
+    Ok(())
 }
 
 /// One `recvmsg`'s worth: the bytes read, and every descriptor that came with
@@ -680,6 +787,38 @@ mod tests {
         // A LONGER answer is refused too: it means the struct grew, so the
         // three words are no longer the whole of what the kernel is saying.
         assert!(decode_ucred(&words, full as u32 + 4).is_err());
+    }
+
+    /// What the kernel has to have said before the number is treated as a
+    /// descriptor.
+    ///
+    /// Unlike the `ucred` case above, neither branch is reachable through the
+    /// real call — every kernel td runs on writes the whole `i32` and a
+    /// non-negative descriptor, or fails — so the function is checked directly
+    /// and the ORDER is checked by a source-level pin in `main`. Between them
+    /// they cover what believing a bad answer would do: adopt an arbitrary
+    /// number as a descriptor and close a socket this broker never received.
+    #[test]
+    fn a_pidfd_answer_the_kernel_did_not_fully_give_is_refused() {
+        let full = std::mem::size_of::<i32>() as u32;
+        check_pidfd_answer(9, full).expect("a whole i32 naming a descriptor");
+        for short in [0u32, 1, 2, 3] {
+            match check_pidfd_answer(9, short) {
+                Ok(()) => panic!("{short} bytes was read as a descriptor"),
+                Err(refusal) => assert_eq!(refusal.kind(), io::ErrorKind::InvalidData),
+            }
+        }
+        // A LONGER answer means the option no longer returns what this code
+        // thinks it returns.
+        assert!(check_pidfd_answer(9, full + 4).is_err());
+        // And a negative number is not a descriptor however long it is.
+        // `adopt(-1)` would be a descriptor the kernel never installed.
+        for absent in [-1i32, i32::MIN] {
+            assert!(
+                check_pidfd_answer(absent, full).is_err(),
+                "{absent} was read as a descriptor"
+            );
+        }
     }
 
     /// Every received descriptor arrives close-on-exec. Read back from
