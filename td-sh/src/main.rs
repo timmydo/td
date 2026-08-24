@@ -689,14 +689,223 @@ mod confinement {
         SOURCES.iter().map(|(_, t)| t.matches(needle).count()).sum()
     }
 
-    /// The same, ignoring comment lines. Prose that NAMES the lint or an alias
-    /// is not a second surface, and these files explain themselves at length.
+    /// The same, ignoring comments. Prose that NAMES the lint or an alias is
+    /// not a second surface, and these files explain themselves at length.
+    ///
+    /// A BLOCK comment counts as prose too, which the line filter alone could
+    /// not manage: `/* pub table */` between two tokens carries a
+    /// declaration's text, so widening the declaration loses a match and the
+    /// decoy pays it straight back -- a green tree over a broken rule.
     fn code_only(text: &str) -> String {
-        text.lines()
+        uncommented(text)
+            .lines()
             .map(str::trim)
-            .filter(|l| !l.starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Comments out, literals through untouched.
+    ///
+    /// Literal-aware because it has to be: this crate writes shell globs as
+    /// DATA -- `split("dir/*")` in `expand.rs`, `pat("*/")` in `pattern.rs` --
+    /// so a scan that could not tell a literal from a comment would swallow
+    /// every line between one file's `/*` and the next file's `*/`. That is
+    /// the same failure as the decoy, arriving from the other side: text
+    /// removed is a match lost, and a lost match reds a count that should
+    /// hold. Newlines inside a comment are KEPT so line-shaped needles below
+    /// cannot straddle what was removed.
+    fn uncommented(text: &str) -> String {
+        let src: Vec<char> = text.chars().collect();
+        let at = |k: usize| src.get(k).copied();
+        let word = |k: usize| at(k).is_some_and(|c| c.is_alphanumeric() || c == '_');
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0;
+        while let Some(c) = at(i) {
+            // A raw string ends at a quote followed by its OWN number of `#`.
+            // Only a LEADING `r` starts one: not the `r` ending a name, and
+            // not the `r` NAMING a lifetime -- `'r"x"` is a lifetime and a
+            // string, and reading it as a raw string swallowed whatever came
+            // after. `b` and `c` prefix one too.
+            let opener = !word(i.wrapping_sub(1)) && at(i.wrapping_sub(1)) != Some('\'');
+            let raw = match c {
+                'r' if opener => Some(i + 1),
+                'b' | 'c' if opener && at(i + 1) == Some('r') => Some(i + 2),
+                _ => None,
+            };
+            if let Some(mut h) = raw {
+                let opens = h;
+                while at(h) == Some('#') {
+                    h += 1;
+                }
+                if at(h) == Some('"') {
+                    let hashes = h - opens;
+                    for k in i..=h {
+                        if let Some(ch) = at(k) {
+                            out.push(ch);
+                        }
+                    }
+                    i = h + 1;
+                    while let Some(ch) = at(i) {
+                        out.push(ch);
+                        i += 1;
+                        if ch == '"' && (0..hashes).all(|k| at(i + k) == Some('#')) {
+                            for k in 0..hashes {
+                                if let Some(hc) = at(i + k) {
+                                    out.push(hc);
+                                }
+                            }
+                            i += hashes;
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            }
+            match c {
+                '/' if at(i + 1) == Some('/') => {
+                    while at(i).is_some_and(|n| n != '\n') {
+                        i += 1;
+                    }
+                }
+                '/' if at(i + 1) == Some('*') => {
+                    // A comment SEPARATES tokens, so one leaves a space
+                    // behind: `Fun/**/cs` is two tokens and joining them
+                    // would synthesise an identifier the source never had.
+                    out.push(' ');
+                    // Rust's block comments NEST, so a depth and not a search
+                    // for the first `*/`.
+                    let mut depth = 1usize;
+                    i += 2;
+                    while depth > 0 && i < src.len() {
+                        if at(i) == Some('/') && at(i + 1) == Some('*') {
+                            depth += 1;
+                            i += 2;
+                        } else if at(i) == Some('*') && at(i + 1) == Some('/') {
+                            depth -= 1;
+                            i += 2;
+                        } else {
+                            if at(i) == Some('\n') {
+                                out.push('\n');
+                            }
+                            i += 1;
+                        }
+                    }
+                }
+                '"' => {
+                    out.push(c);
+                    i += 1;
+                    while let Some(ch) = at(i) {
+                        out.push(ch);
+                        i += 1;
+                        if ch == '\\' {
+                            if let Some(esc) = at(i) {
+                                out.push(esc);
+                                i += 1;
+                            }
+                        } else if ch == '"' {
+                            break;
+                        }
+                    }
+                }
+                // `'a'` is a literal and `'static` is a lifetime. The escape
+                // decides the first, a quote two characters along the second.
+                '\'' if at(i + 1) == Some('\\') || at(i + 2) == Some('\'') => {
+                    out.push(c);
+                    i += 1;
+                    while let Some(ch) = at(i) {
+                        out.push(ch);
+                        i += 1;
+                        if ch == '\\' {
+                            if let Some(esc) = at(i) {
+                                out.push(esc);
+                                i += 1;
+                            }
+                        } else if ch == '\'' {
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// What `code_only` must and must not remove. A comment that carries a
+    /// declaration's text would otherwise PAY for a match that widening the
+    /// declaration lost; a literal that carries the same characters must
+    /// survive, because this crate writes shell globs as DATA and removing
+    /// the code between two of them reds a count that should hold.
+    #[test]
+    fn comments_go_and_literals_stay() {
+        let open = concat!("/", "*");
+        let shut = concat!("*", "/");
+        // The decoy: a block comment carrying a declaration.
+        assert_eq!(code_only(&format!("let a = 1;\n{open} struct Funcs {shut}\n")), "let a = 1;\n");
+        // Nested, as Rust allows.
+        assert_eq!(code_only(&format!("a{open} b {open} c {shut} d {shut}e")), "a e");
+        // A line comment, as before.
+        assert_eq!(code_only("keep // drop\n"), "keep");
+        // An opener INSIDE a line comment opens nothing.
+        assert_eq!(code_only(&format!("// {open}\nkept\n")), "\nkept");
+        // Literals survive whole -- both shapes are already in this crate.
+        let glob = format!("split(\"dir{open}\");");
+        assert_eq!(code_only(&glob), glob);
+        let pat = format!("pat(\"{shut}\");");
+        assert_eq!(code_only(&pat), pat);
+        // And the code BETWEEN two of them is not swallowed.
+        let pair = format!("{glob}\nkeepme\n{pat}");
+        assert!(code_only(&pair).contains("keepme"), "code between two literals was swallowed");
+        // A raw string keeps its hashes and its contents.
+        let raw = "let r = r#\"a\"b\"#;";
+        assert_eq!(code_only(raw), raw);
+        // A lifetime is not a character literal.
+        let life = "fn f<'a>(x: &'a str) -> &'a str { x }";
+        assert_eq!(code_only(life), life);
+        // A character literal is one.
+        let ch = "let c = '\\'';";
+        assert_eq!(code_only(ch), ch);
+        // A C raw string is a literal too, and its `#` count ends it -- read
+        // as anything else, the opener inside it starts a comment that eats
+        // the rest of the file.
+        let craw = format!("let s = cr#\"x\"{open}\"#;");
+        assert_eq!(code_only(&craw), craw);
+        // A LIFETIME called `r` in front of a string is not a raw string.
+        let life_r = format!("m!('r \"x\" {open} gone {shut})");
+        assert_eq!(code_only(&life_r), "m!('r \"x\"  )");
+        // A comment separates tokens, so removing one leaves them separate.
+        assert_eq!(code_only(&format!("Fun{open}{shut}cs")), "Fun cs");
+        // And a comment spanning LINES keeps them apart: without the newlines
+        // inside it, `foo` and `bar` below join into one line and a
+        // line-shaped needle straddles what was removed.
+        assert_eq!(code_only(&format!("foo\n{open} c\n{shut} bar")), "foo\n\nbar");
+        // The forms below are the ones that DIVERGE. Review found the first
+        // draft of each passing with the arm it was meant to pin removed: a
+        // space after `'r`, a `'\''` for the character arm, and a `br` body
+        // with no quote in it all read the same either way.
+        //
+        // A lifetime named `r` ABUTTING a string. Read as a raw string it
+        // ends at the escaped quote and the scan desyncs from there.
+        let life = format!("m!('r\"a\\\"b\") {open} gone {shut} after");
+        let out = code_only(&life);
+        assert!(!out.contains("gone"), "comment survived a lifetime: {out}");
+        assert!(out.contains("after"), "code after it was eaten: {out}");
+        // A character literal holding a QUOTE. Without the character arm it
+        // opens a string and the comment after it reads as code -- the crate
+        // has 31 of these, most of them in `lexer.rs`.
+        let quote = format!("let q = '\"'; {open} gone {shut} after");
+        let out = code_only(&quote);
+        assert!(!out.contains("gone"), "comment survived a char literal: {out}");
+        assert!(out.contains("after"), "code after it was eaten: {out}");
+        // The `br` prefix, twin of the `cr` case above. The body needs a
+        // quote in it or both readings consume the same span.
+        let braw = format!("let s = br#\"x\"{open}\"#; after");
+        let out = code_only(&braw);
+        assert!(out.contains("after"), "a byte raw string was mis-ended: {out}");
+        assert_eq!(out, braw, "a byte raw string is a literal, kept whole");
     }
 
     fn count_code(needle: &str) -> usize {
@@ -739,16 +948,18 @@ mod confinement {
     /// What privacy cannot state about itself, in two parts. Both guard the
     /// accidental edit, and neither is sound against an author working
     /// around it. The compiler guards the `&Func` path against every other
-    /// module; nothing guards it inside `funcs.rs`. The commit message
-    /// measures all three gaps: the in-module one, the forwarder, and a
-    /// decoy comment against the declaration pin.
+    /// module; nothing guards it inside `funcs.rs`. Two gaps stay measured
+    /// and open: the in-module one and the `complete.rs` forwarder. The
+    /// third, a decoy comment against the declaration pin, is closed --
+    /// `code_only` removes comments now.
     ///
     /// The map's DECLARATION. Any visibility on it puts every module back in
     /// a position to answer a lookup without the `/` rule, and this is one
     /// crate, so `pub(crate)` is `pub` by another name. Pinned as the whole
     /// squeezed declaration with its braces, so no modifier fits in any
-    /// spelling or on any line -- but this is an exact count over text that
-    /// keeps block comments, so a decoy comment buys the match back.
+    /// spelling or on any line. The count is over text `code_only` has taken
+    /// the comments out of, so a decoy carrying the declaration cannot pay
+    /// for the match that widening it loses.
     ///
     /// The modules that NAME the enumeration. `defined_names().any(|n| n == w)`
     /// answers a word question, and privacy cannot tell asking from listing.
@@ -823,10 +1034,19 @@ mod confinement {
         assert_eq!(sys.matches(block).count(), 1);
     }
 
-    /// `sys.rs` carries no BLOCK comment, which is what makes the line-based
-    /// `code_only` strip complete for the one file that may hold `unsafe`: a
-    /// `/* */` between two tokens would otherwise hide a construct from every
-    /// scan here without changing what the compiler sees.
+    /// `sys.rs` carries no block comment at all. That used to be what made a
+    /// LINE-based strip complete for the one file that may hold `unsafe`;
+    /// `code_only` handles block comments now, so it is a backstop instead
+    /// and it stays as one. The strip is a hand-written scan of Rust's
+    /// literal grammar, and review found two spellings it had wrong -- a C
+    /// raw string, and a lifetime in front of a string -- each of which ended
+    /// a literal early and let the text after it read as a comment. Both are
+    /// fixed and pinned. A third would hide a construct from every scan here
+    /// without changing what the compiler sees, and this file is the one
+    /// where that costs the most, so a BLOCK comment there does not depend
+    /// on the scan being right. Only that class: a mis-lexed literal can
+    /// still run a `//` to the end of its line, which this does not catch.
+    /// It also means `sys.rs` may not hold `/*` as data.
     #[test]
     fn the_syscall_module_has_no_block_comments() {
         assert!(
