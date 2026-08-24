@@ -272,12 +272,17 @@ fn expand_raw(sh: &mut Shell, w: &Word, force_quoted: bool, splitting: bool) -> 
                     });
                 }
             }
-            Seg::Cmd { code, quoted, line } => {
+            Seg::Cmd {
+                code,
+                quoted,
+                line,
+                backtick,
+            } => {
                 let q = *quoted || force_quoted;
                 if q {
                     cur.had_quotes = true;
                 }
-                let out = command_subst(sh, code, *line)?;
+                let out = command_subst(sh, code, *line, *backtick)?;
                 push_expanded(&mut cur.chars, &out, q);
             }
             // The path is `expanded`, like a command substitution's bytes and

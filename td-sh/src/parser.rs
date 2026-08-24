@@ -33,15 +33,40 @@ pub fn parse_aliased_at(src: &str, aliases: &Aliases, line: u32) -> Syn<List> {
     drain(Units::at(src, line), aliases)
 }
 
-/// The same for a command-substitution BODY, where a word that only closes a
-/// construct is NOT refused. ash reads an old-style `` `…` `` body with
-/// `list(2)`, which ends the list at one of them and never checks what is
-/// left, so `` echo `fi` `` is empty output and status 0 there; refusing would
-/// stop a script ash runs. `$( )` does refuse in ash and does not here, which
-/// is the half of this still owed.
-pub fn parse_subst_body(src: &str, aliases: &Aliases, line: u32) -> Syn<List> {
+/// The same for a command-substitution BODY. `backtick` is which spelling wrote
+/// it, which decides what a word that can only CLOSE a construct means there.
+///
+/// ash reads all three spellings with ONE parser (`parsebackq`, ash.c:13132),
+/// which calls `list(2)`: its `tokendlist` check ENDS the list at such a word
+/// rather than refusing it. What differs is what the caller then does with the
+/// word the list stopped on. An old-style `` `…` `` clears `tokpushback` and
+/// drops it -- silently, with status 0, along with the rest of the body -- so
+/// `` echo `echo A; fi; echo B` `` prints `A`. `$( )` and `<( )`/`>( )` instead
+/// demand a `)` and raise on anything else, so the same body is a syntax error
+/// naming the word.
+///
+/// Ending is narrower than the refusal it replaces, not a carve-out from it:
+/// `list(2)` is consulted only where a list ITEM may start, so a closer after
+/// `&&`, `||`, `|` or `!`, or inside a nested `( )`, `{ }`, `if` or loop, is a
+/// syntax error in a backtick body too, and `while` is why -- a closer read as
+/// a command name in a loop body never terminates.
+///
+/// Refusing at the word rather than ending and then demanding `)` reaches the
+/// same status and names the same token; only ash's `(expecting ")")` suffix is
+/// missing. This shell does build that suffix -- `{ echo A; )` names `"}"` here
+/// exactly as ash does -- but not at THIS refusal, which reports the word where
+/// ash reports the terminator its caller wanted.
+///
+/// WHEN it refuses also differs, and that is not this rule's doing: a body is
+/// parsed where it is EXPANDED, not where it is read, so a refusal lands after
+/// earlier commands have run and never lands at all in a branch not taken. ash
+/// parses the whole script first and refuses before running any of it. The same
+/// lateness lets an alias defined earlier in the same parse unit reach a body
+/// that ash reads with no alias in force. Both belong to deferred body parsing,
+/// which is its own increment. All rows measured against busybox ash 1.37.0.
+pub fn parse_subst_body(src: &str, aliases: &Aliases, line: u32, backtick: bool) -> Syn<List> {
     let mut units = Units::at(src, line);
-    units.refuse_closers = false;
+    units.end_at_closer = backtick;
     drain(units, aliases)
 }
 
@@ -93,6 +118,16 @@ fn is_cond_unary(w: &str) -> bool {
 /// `until`/`{` are absent because each does start one.
 const CANNOT_START_COMMAND: &[&str] =
     &["then", "else", "elif", "fi", "do", "done", "esac", "in", "}"];
+
+/// ash's `tokendlist` (ash.c:8643) restricted to its reserved WORDS: the ones
+/// that END a list where a list item may start, rather than being refused
+/// there. `in` is the one word on the list above that is absent here -- it
+/// cannot start a command either, but it does not end a list, so
+/// `` echo `echo A; in` `` is a syntax error in ash where `` echo `echo A; fi` ``
+/// is not (both measured). `tokendlist`'s non-word members are handled by
+/// `at_backtick_end` directly (`)`, `;;`) or by `at_eof` (a closing backtick,
+/// end of file).
+const ENDS_A_LIST: &[&str] = &["then", "else", "elif", "fi", "do", "done", "esac", "}"];
 
 /// What ash takes as the body of a `function NAME` written WITHOUT parentheses
 /// (ash.c:12132). `[[` is on it because this build has BASH_TEST2; a word, a
@@ -178,9 +213,10 @@ pub struct Units {
     /// Set once the scan has yielded its `Eof` or its error. Without it a fetch
     /// past the end would pull again and append a SECOND `Eof` every time.
     spent: bool,
-    /// Whether a word that only CLOSES a construct is a syntax error here. Off
-    /// for a substitution body; see `parse_subst_body`.
-    refuse_closers: bool,
+    /// Whether a word that can only CLOSE a construct ENDS the list where a
+    /// list item may start, rather than being refused. On for a backtick body
+    /// only; see `parse_subst_body`.
+    end_at_closer: bool,
 }
 
 /// What a streaming source hands back. `Eof` and `Failed` are distinct because a
@@ -232,7 +268,7 @@ impl Units {
             scan,
             pending: None,
             hit_end: false,
-            refuse_closers: true,
+            end_at_closer: false,
             pos: 0,
             depth: 0,
             budget: 0,
@@ -362,7 +398,7 @@ impl Units {
         let mut items = Vec::new();
         loop {
             self.open_command()?;
-            if self.at_eof() {
+            if self.at_eof() || self.at_backtick_end() {
                 return Ok(List { items });
             }
             let and_or = self.parse_and_or()?;
@@ -386,7 +422,11 @@ impl Units {
                 break;
             }
         }
-        if self.at_eof() {
+        // ash's `list()` raises here only when `chknl` is clear, which is
+        // `list(1)` -- the top level. `list(2)` pushes the token back and ends
+        // the list, so a backtick body stops at anything that is not a
+        // separator: `` `echo A )` `` and `` `echo A ((` `` print `A` there.
+        if self.at_eof() || self.end_at_closer {
             return Ok(List { items });
         }
         Err(self.unexpected(None))
@@ -585,6 +625,27 @@ impl Units {
 
     fn at_eof(&mut self) -> bool {
         matches!(self.peek(), None | Some(Tok::Eof))
+    }
+
+    /// A backtick body's `list(2)` end, at a position where a list item may
+    /// START. Only `parse_unit` asks, so this is the body's OUTERMOST list and
+    /// nothing else, which is where ash consults `tokendlist`. The token is left
+    /// unread, so the next `parse_unit` stops at once with no items and `drain`
+    /// ends -- discarding the rest of the body without running or reporting it,
+    /// and without even LEXING it, as ash does.
+    ///
+    /// `)` and `;;` are `tokendlist` members too (TRP and TENDCASE), and no
+    /// other machinery takes them here: `parse_list`'s terminators serve nested
+    /// bodies, and this list has none. Its closing backtick and end of file are
+    /// already `at_eof`.
+    fn at_backtick_end(&mut self) -> bool {
+        if !self.end_at_closer {
+            return false;
+        }
+        if matches!(self.peek_op(), Some(Op::RParen | Op::DSemi)) {
+            return true;
+        }
+        matches!(self.peek_reserved(), Some(w) if ENDS_A_LIST.contains(&w))
     }
 
     fn peek_op(&mut self) -> Option<Op> {
@@ -847,17 +908,19 @@ impl Units {
         if self.peek_reserved() == Some("[[") {
             return self.parse_cond();
         }
-        // A second `!`, or one opening a stage that is not the head. Ungated
-        // unlike the closers below: `TNOT` carries no `tokendlist` bit
-        // (ash.c:8657), so it does not end a backtick body the way they do.
+        // A second `!`, or one opening a stage that is not the head. `TNOT`
+        // carries no `tokendlist` bit (ash.c:8657), so unlike the closers below
+        // it never ends a backtick body -- `` `! fi` `` is a syntax error.
         if self.peek_reserved() == Some("!") {
             return Err("syntax error: unexpected \"!\"".into());
         }
         // Before the function-definition test, or `fi() { … }` defines one where
-        // ash refuses it. The text is ash's spelling exactly.
-        let refuse = self.refuse_closers;
+        // ash refuses it. The text is ash's spelling exactly. `at_backtick_end`
+        // diverts only the OUTERMOST list-item start of a backtick body, so a
+        // NESTED one still arrives here -- which is why `` `(echo A; fi)` `` is
+        // refused rather than ended.
         if let Some(w) = self.peek_reserved() {
-            if refuse && CANNOT_START_COMMAND.contains(&w) {
+            if CANNOT_START_COMMAND.contains(&w) {
                 return Err(format!("syntax error: unexpected \"{w}\"").into());
             }
         }
@@ -1583,6 +1646,27 @@ mod tests {
         for w in CANNOT_START_COMMAND {
             assert!(is_reserved(w), "{w} is not a reserved word");
         }
+    }
+
+    /// The two lists are ash's two, and they are NOT the same list. Every word
+    /// that ends a list also cannot start a command, so `at_backtick_end` can
+    /// only ever divert a word `parse_command` would have refused -- but the
+    /// converse fails on exactly one word. `in` is refused and does not end a
+    /// list (ash.c:8670 clears its `tokendlist` bit), so reusing either list
+    /// for the other job would silently change one of them: an `in` in a
+    /// backtick body would stop being a syntax error, or an `fi` there would
+    /// start being one.
+    #[test]
+    fn a_word_that_ends_a_list_is_a_strict_subset_of_the_words_that_cannot_start_one() {
+        for w in ENDS_A_LIST {
+            assert!(CANNOT_START_COMMAND.contains(w), "{w} ends a list but may start a command");
+            assert!(is_reserved(w), "{w} is not a reserved word");
+        }
+        let extra: Vec<_> = CANNOT_START_COMMAND
+            .iter()
+            .filter(|w| !ENDS_A_LIST.contains(w))
+            .collect();
+        assert_eq!(extra, [&"in"], "the two lists differ by more than `in`");
     }
 
     /// The flag and the message are separate things, and the alias splice is

@@ -98,10 +98,14 @@ pub enum Seg {
     /// `$(...)` / backticks — the raw source, parsed when the word is expanded.
     /// `line` is where that source starts, which `$LINENO` inside it counts on
     /// from; a backtick body is renumbered from 1, as dash renumbers it.
+    /// `backtick` is which spelling wrote it, which the parser needs because
+    /// the two disagree about a word that can only close a construct; see
+    /// `parser::parse_subst_body`.
     Cmd {
         code: String,
         quoted: bool,
         line: u32,
+        backtick: bool,
     },
     /// `$((...))` — the inner text is itself a word (it may contain `$x`), so it
     /// is expanded first and then evaluated as an arithmetic expression.

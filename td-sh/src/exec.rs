@@ -2223,12 +2223,12 @@ where
 /// `$(...)` / `` `...` ``: run the code with stdout captured, strip trailing
 /// newlines, and return the text. Runs in a subshell so its state changes do not
 /// leak, matching POSIX.
-pub fn command_subst(sh: &mut Shell, code: &str, line: u32) -> R<String> {
+pub fn command_subst(sh: &mut Shell, code: &str, line: u32, backtick: bool) -> R<String> {
     // Nesting is bounded centrally in `run_command` (the substituted body re-enters
     // there), so `$( $( … ) )` errors instead of overflowing the stack.
     // Counted so an assignment-only command can adopt the last substitution's $?.
     sh.cmdsubst_count = sh.cmdsubst_count.wrapping_add(1);
-    let mut out = process::capture_stdout(sh, code, line)?;
+    let mut out = process::capture_stdout(sh, code, line, backtick)?;
     while out.ends_with('\n') {
         out.pop();
     }
@@ -4158,12 +4158,7 @@ mod tests {
         let (status, _, err) = run("case x in x) fi;; esac");
         assert_eq!(status, 2);
         assert!(err.contains("unexpected \"fi\""), "{err}");
-        // A substitution BODY is not refused: ash reads an old-style `` `…` ``
-        // with `list(2)`, which ends its list at one of these and never checks,
-        // so the script runs. Refusing would stop one ash runs.
-        for src in ["echo `fi`", "echo `echo a; done`", "echo `}`"] {
-            assert_eq!(run(src).0, 0, "{src:?} must not stop the script");
-        }
+        // A substitution body is its own rule; see the test below.
         // `}` is a closing word again because `function name { … }` is a
         // construct now; before it was, refusing that `}` stopped a script
         // that only CONTAINED one in a branch never taken.
@@ -4171,6 +4166,123 @@ mod tests {
             run("if false; then function f { :; }; fi; echo alive"),
             (0, "alive\n".to_string(), String::new())
         );
+    }
+
+    /// The same word inside a command substitution, where the SPELLING decides
+    /// what it means. ash reads all three spellings with one parser
+    /// (`parsebackq`, ash.c:13132) calling `list(2)`, whose `tokendlist` check
+    /// ENDS the list at such a word instead of refusing it; what differs is the
+    /// caller. An old-style `` `…` `` clears `tokpushback` and drops the word
+    /// and the rest of the body, silently and with status 0. `$( )` and
+    /// `<( )`/`>( )` demand a `)` and raise on anything else.
+    ///
+    /// This shell ran the word as a command NAME in every spelling: wrong
+    /// output where ash stops the list, no refusal where ash refuses, and --
+    /// for a closer sitting in a loop body -- an endless `fi: not found` that
+    /// never terminated, the very failure the refusal above exists to stop.
+    #[test]
+    fn a_closing_word_ends_a_backtick_body_and_refuses_the_other_spellings() {
+        // Where a list item may start, the backtick body STOPS. Pinned by the
+        // OUTPUT: what precedes the word ran and what follows it did not, which
+        // "did not refuse" would not distinguish.
+        for (src, want) in [
+            ("echo `echo A; fi; echo B`", "A\n"),
+            ("echo `echo A\nfi\necho B`", "A\n"),
+            ("echo `fi; echo B`", "\n"),
+            ("echo `echo a; done`", "a\n"),
+            ("echo `}`", "\n"),
+            ("echo \"`echo A; fi; echo B`\"", "A\n"),
+            // Not read as a function NAME either: the list ends before
+            // `at_func_def` is asked, so nothing is defined and nothing warns.
+            ("`fi() { echo B; }`; echo done", "done\n"),
+            // The discarded region is not even LEXED: the token the list
+            // stopped on is left unread, so nothing past it is pulled. An
+            // unterminated quote or here-document there is not an error, and a
+            // here-document opened BEFORE it still has its body read -- ash
+            // calls `parseheredoc` after `list(2)` for exactly that.
+            ("echo `echo A; fi; \'unterminated`", "A\n"),
+            ("echo `echo A; fi; )`", "A\n"),
+            ("echo `echo A\nfi\nread x <<EOF\nB\n`", "A\n"),
+            ("echo `read x <<EOF\nA\nEOF\necho $x\nfi\necho B`", "A\n"),
+            // `tokendlist` is not only reserved words: `)` is TRP and `;;` is
+            // TENDCASE, and both end the list the same way -- at a list item
+            // start, and after an and_or, where ash's `list()` pushes back
+            // anything that is not a separator instead of raising, because
+            // `list(2)` sets `chknl` and only `list(1)` clears it.
+            ("echo `echo A; )`", "A\n"),
+            ("echo `echo A; ;;`", "A\n"),
+            ("echo `echo A )`", "A\n"),
+            ("echo `echo A ;;`", "A\n"),
+            ("echo `echo A ) echo B`", "A\n"),
+            ("echo `)`", "\n"),
+            ("echo `;;`", "\n"),
+            // A `;;` that ends a case ARM is the same token: ash reads an arm
+            // body with `list(2)` too (ash.c:12351).
+            ("echo `case x in x) echo A; esac;; esac`", "A\n"),
+            // Every site that builds a backtick segment must say so, and three
+            // of the five are reached only through these spellings: a `${ }`
+            // default and an arithmetic body both scan through `scan_dq_run`,
+            // and a here-document body through `heredoc_body_word`. Without a
+            // row each, those sites could claim `$( )` and no test would know.
+            ("echo \"${u-`echo A; fi; echo B`}\"", "A\n"),
+            ("echo $((1 + `echo 1; fi; echo 9`))", "2\n"),
+            ("read x <<E\n`echo A; fi; echo B`\nE\necho $x", "A\n"),
+            ("echo \"`echo A; fi; echo B`\"", "A\n"),
+        ] {
+            assert_eq!(run(src), (0, want.to_string(), String::new()), "{src:?}");
+        }
+        // A body that ran NOTHING answers 0, rather than the status the
+        // subshell inherited: ash returns from `evalbackcmd` before it forks.
+        // Ending at a closer is only the newest way to be empty -- an empty
+        // backtick pair and an empty `$( )` were already reporting the previous
+        // command's status, and a discarded tail must not contribute one.
+        for (src, want) in [
+            ("false; x=`fi`; echo \"$?\"", "0\n"),
+            ("false; x=``; echo \"$?\"", "0\n"),
+            ("false; x=$(); echo \"$?\"", "0\n"),
+            ("false; `fi`; echo \"$?\"", "0\n"),
+            ("true; x=`echo A; fi; false`; echo \"$?\" \"$x\"", "0 A\n"),
+            ("true; x=`false`; echo \"$?\"", "1\n"),
+            // errexit sees the 0, so the script is not stopped by a status the
+            // substitution never produced.
+            ("set -e; ! true; x=`fi`; echo alive", "alive\n"),
+        ] {
+            assert_eq!(run(src), (0, want.to_string(), String::new()), "{src:?}");
+        }
+        // The other two spellings refuse the same word in the same position.
+        for (src, want) in [
+            ("echo $(echo A; fi; echo B)", "fi"),
+            ("echo $(fi)", "fi"),
+            ("echo $(}() { echo B; })", "}"),
+            ("echo <(fi)", "fi"),
+            ("cat >(done)", "done"),
+        ] {
+            let (status, out, err) = run(src);
+            assert_eq!((status, out.as_str()), (2, ""), "{src:?}");
+            // ash adds `(expecting ")")` here. This shell builds that suffix
+            // elsewhere (`{ echo A; )` names `"}"`) but not at this refusal;
+            // the TOKEN named is the same.
+            assert!(err.contains(&format!("unexpected \"{want}\"")), "{src:?}: {err}");
+        }
+        // `list(2)` is consulted only where a list ITEM may start, so a
+        // backtick body refuses everywhere else -- including the position that
+        // would otherwise never terminate. A timeout here IS the regression.
+        for src in [
+            "echo `echo A && fi`",
+            "echo `echo A || fi`",
+            "echo `echo A | fi`",
+            "echo `! fi`",
+            "echo `(echo A; fi)`",
+            "echo `{ echo A; fi; }`",
+            "echo `while true; do fi; done`",
+            // `in` cannot start a command but is NOT on `tokendlist`, so it is
+            // refused where `fi` in the same place ends the list.
+            "echo `echo A; in; echo B`",
+        ] {
+            let (status, out, err) = run(src);
+            assert_eq!((status, out.as_str()), (2, ""), "{src:?}");
+            assert!(err.contains("unexpected \""), "{src:?}: {err}");
+        }
     }
 
     /// `!` negates a PIPELINE, and ash takes at most one of them, at the head.

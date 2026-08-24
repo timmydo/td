@@ -1683,11 +1683,21 @@ pub fn fork_shell(sh: &Shell) -> Subshell {
 
 /// `$(code)`: run `code` in a subshell with stdout captured to a buffer, and
 /// return the captured bytes as text.
-pub fn capture_stdout(sh: &mut Shell, code: &str, line: u32) -> R<String> {
-    let list = match crate::parser::parse_subst_body(code, &sh.aliases, line) {
+pub fn capture_stdout(sh: &mut Shell, code: &str, line: u32, backtick: bool) -> R<String> {
+    let list = match crate::parser::parse_subst_body(code, &sh.aliases, line, backtick) {
         Ok(l) => l,
         Err(e) => return Err(sh.fatal(&e.msg, 2)),
     };
+    // ash makes no child for an empty body: `evalbackcmd` returns at
+    // `if (n == NULL)` (ash.c:6608) before it forks. So a substitution that ran
+    // NOTHING answers 0, where the subshell would otherwise report the status
+    // it inherited. An empty body is not only a body that ended at a closer --
+    // an empty backtick pair and an empty `$( )` are two more, and both were
+    // already reporting the previous command's status.
+    if list.items.is_empty() {
+        sh.set_status(0);
+        return Ok(String::new());
+    }
     let buf = Arc::new(Mutex::new(Vec::new()));
     let mut child = fork_shell(sh);
     child.fds.set(1, Fd::WriteBuf(buf.clone()));
@@ -1845,7 +1855,9 @@ impl Drop for ProcSub {
 /// `write` is the `>(` direction: the body READS what the outer command writes,
 /// so the body gets descriptor 0 and this shell keeps the write end.
 pub fn open_procsub(sh: &mut Shell, code: &str, write: bool, line: u32) -> R<String> {
-    let list = match crate::parser::parse_subst_body(code, &sh.aliases, line) {
+    // `false`: there is no backtick spelling of a process substitution, and ash
+    // refuses a closing word in one (`echo <(fi)` is a syntax error there).
+    let list = match crate::parser::parse_subst_body(code, &sh.aliases, line, false) {
         Ok(l) => l,
         Err(e) => return Err(sh.fatal(&e.msg, 2)),
     };

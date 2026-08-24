@@ -1550,6 +1550,7 @@ impl Lexer {
                         code,
                         quoted: false,
                         line: BACKTICK_LINE,
+                        backtick: true,
                     });
                 }
                 '$' => self.scan_dollar(&mut buf, false)?,
@@ -1621,6 +1622,7 @@ impl Lexer {
                         code,
                         quoted: true,
                         line: BACKTICK_LINE,
+                        backtick: true,
                     });
                 }
                 '$' => self.scan_dollar(&mut buf, true)?,
@@ -1671,6 +1673,7 @@ impl Lexer {
                         code,
                         quoted: true,
                         line: BACKTICK_LINE,
+                        backtick: true,
                     });
                 }
                 '$' => self.scan_dollar(buf, true)?,
@@ -1781,6 +1784,7 @@ impl Lexer {
                         code,
                         quoted: in_dq,
                         line,
+                        backtick: false,
                     });
                 }
             }
@@ -2284,6 +2288,7 @@ fn heredoc_body_word(body: &str, line: u32) -> Syn<Word> {
                     code,
                     quoted: true,
                     line: BACKTICK_LINE,
+                    backtick: true,
                 });
             }
             '$' => lx.scan_dollar(&mut buf, true)?,
