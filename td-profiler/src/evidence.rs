@@ -150,7 +150,14 @@ const ATTRIBUTION_SOURCE_LINE_START: u64 = line!() as u64 + 2;
 fn td_profiler_attribution_workload(mut state: u64) -> u64 {
     let mut round = 0u64;
     while round != 16_384 {
-        state = state.rotate_left(13).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ round;
+        // Keep the hot instructions in this source file. Calling an inlined
+        // primitive helper such as rotate_left assigns its machine code to
+        // core's intrinsic source line, which makes a source-line proof depend
+        // on the profiler rarely sampling the surrounding loop machinery.
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state ^= round;
         round += 1;
     }
     state
@@ -253,18 +260,14 @@ fn validate(
     if manifest.len() as u64 > MAX_MANIFEST_BYTES {
         return Err("capture manifest exceeds its evidence bound".into());
     }
-    for required in [
-        format!("\"boot_id\":\"{boot_id}\""),
-        "\"lost\":0".into(),
-        "\"corrupt\":0".into(),
-        "\"errors\":[]".into(),
-    ] {
+    for required in [format!("\"boot_id\":\"{boot_id}\"")] {
         if !manifest.contains(&required) {
             return Err(format!(
                 "capture manifest lacks required evidence {required}"
             ));
         }
     }
+    validate_integrity_counters(&manifest)?;
     let samples = number(&manifest, "\"samples\":")?;
     if samples == 0 {
         return Err("current-boot capture contains no user-mode samples".into());
@@ -292,6 +295,66 @@ fn validate(
             "capture has no line-resolved {ATTRIBUTION_FUNCTION_FRAGMENT} sample in \
              {ATTRIBUTION_SOURCE_FILE}:{ATTRIBUTION_SOURCE_LINE_START}..={ATTRIBUTION_SOURCE_LINE_END}"
         ));
+    }
+    Ok(())
+}
+
+fn validate_integrity_counters(manifest: &str) -> Result<(), String> {
+    let lost = number(manifest, "\"lost\":")?;
+    if lost != 0 {
+        return Err(format!("capture reports {lost} lost perf record(s)"));
+    }
+    let corrupt = number(manifest, "\"corrupt\":")?;
+    if corrupt != 0 {
+        let errors = manifest
+            .find("\"errors\":[")
+            .and_then(|start| manifest.get(start..))
+            .unwrap_or("errors unavailable");
+        let mut end = errors.len().min(1024);
+        while !errors.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        return Err(format!(
+            "capture reports {corrupt} corrupt perf record(s); {}",
+            errors.get(..end).unwrap_or("errors unavailable")
+        ));
+    }
+    let omitted = number(manifest, "\"omitted_errors\":")?;
+    if omitted != 0 {
+        return Err(format!("capture omitted {omitted} bounded diagnostic(s)"));
+    }
+    validate_symbolization_errors(manifest)?;
+    Ok(())
+}
+
+fn validate_symbolization_errors(manifest: &str) -> Result<(), String> {
+    let marker = "\"errors\":[";
+    let errors = manifest
+        .find(marker)
+        .and_then(|start| manifest.get(start.saturating_add(marker.len())..))
+        .ok_or("capture manifest has no errors array")?;
+    if errors.starts_with(']') {
+        return Ok(());
+    }
+
+    // The canonical writer emits every error object with `cpu` first. Analysis
+    // diagnostics carry a number; symbolization diagnostics carry null. Quotes
+    // inside the byte-string message are escaped, so they cannot imitate this
+    // raw object-field prefix.
+    let field = "{\"cpu\":";
+    let mut cursor = errors;
+    let mut entries = 0usize;
+    while let Some(start) = cursor.find(field) {
+        entries = entries.saturating_add(1);
+        cursor = cursor
+            .get(start.saturating_add(field.len())..)
+            .ok_or("capture manifest has a malformed errors array")?;
+        if !cursor.starts_with("null,") {
+            return Err("capture reports a non-symbolization analysis diagnostic".into());
+        }
+    }
+    if entries == 0 {
+        return Err("capture manifest has a malformed errors array".into());
     }
     Ok(())
 }
@@ -426,9 +489,9 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::{
         attribution_row, attribution_rows, capture_sequence, cmdline_has_token, current_captures,
-        evidence_marker, number, ATTRIBUTION_FUNCTION_FRAGMENT, ATTRIBUTION_MARKER,
-        ATTRIBUTION_SOURCE_FILE, ATTRIBUTION_SOURCE_LINE_END, ATTRIBUTION_SOURCE_LINE_START,
-        CAPTURE_MARKER, MAX_ATTRIBUTION_ROW_BYTES,
+        evidence_marker, number, validate_integrity_counters, ATTRIBUTION_FUNCTION_FRAGMENT,
+        ATTRIBUTION_MARKER, ATTRIBUTION_SOURCE_FILE, ATTRIBUTION_SOURCE_LINE_END,
+        ATTRIBUTION_SOURCE_LINE_START, CAPTURE_MARKER, MAX_ATTRIBUTION_ROW_BYTES,
     };
     use std::io::Cursor;
 
@@ -439,6 +502,36 @@ mod tests {
             17
         );
         assert!(number("{\"samples\":null}", "\"samples\":").is_err());
+    }
+
+    #[test]
+    fn integrity_accepts_symbolization_diagnostics_but_not_loss_or_corruption() {
+        assert!(validate_integrity_counters(
+            "{\"lost\":0,\"corrupt\":0,\"omitted_errors\":0,\"errors\":[{\"cpu\":null,\"start_ns\":null,\"end_ns\":null,\"count\":1,\"message\":\"unresolved\"}]}"
+        )
+        .is_ok());
+        assert!(validate_integrity_counters(
+            "{\"lost\":2,\"corrupt\":0,\"omitted_errors\":0,\"errors\":[]}"
+        )
+        .unwrap_err()
+        .contains("2 lost"));
+        let error = validate_integrity_counters(
+            "{\"lost\":0,\"corrupt\":3,\"omitted_errors\":0,\"errors\":[{\"cpu\":0,\"message\":\"bad task\"}]}",
+        )
+        .unwrap_err();
+        assert!(error.contains("3 corrupt"));
+        assert!(error.contains("bad task"));
+
+        assert!(validate_integrity_counters(
+            "{\"lost\":0,\"corrupt\":0,\"omitted_errors\":1,\"errors\":[]}"
+        )
+        .unwrap_err()
+        .contains("omitted 1"));
+        assert!(validate_integrity_counters(
+            "{\"lost\":0,\"corrupt\":0,\"omitted_errors\":0,\"errors\":[{\"cpu\":0,\"message\":\"carry-forward omitted\"}]}"
+        )
+        .unwrap_err()
+        .contains("non-symbolization"));
     }
 
     #[test]

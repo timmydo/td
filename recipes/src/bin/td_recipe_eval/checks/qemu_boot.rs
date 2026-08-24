@@ -115,6 +115,7 @@ const TD_JAIL_SECCOMP_PROBE_MARKER: &str = td_recipe::ladder::TD_JAIL_SECCOMP_PR
 const TD_JAIL_FIXTURE_BOOT_MARKER: &str = td_recipe::ladder::TD_JAIL_FIXTURE_BOOT_MARKER;
 const TD_PROFILER_ATTRIBUTION_MARKER: &str =
     td_recipe::td_profiler_contract::ATTRIBUTION_MARKER;
+const TD_PROFILER_EVIDENCE_CONSOLE_PREFIX: &str = "profiler-evidence: ";
 const TD_JAIL_SECCOMP_PROBE_PATH: &str = "@var/lib/td-test/td-jail-seccomp-probe";
 
 /// Printed after the unprivileged software compositor paints and listens.
@@ -1325,11 +1326,13 @@ fn validate_system_boot(
     }
     if !result.evidence.td_profiler_attribution {
         return Err(format!(
-            "the userland health checks passed, but the continuous-profiler attribution marker \
-             ({TD_PROFILER_ATTRIBUTION_MARKER:?}) was absent — the root opener could not create \
+            "the userland health checks passed, but the continuous-profiler attribution console \
+             line ({TD_PROFILER_EVIDENCE_CONSOLE_PREFIX}{TD_PROFILER_ATTRIBUTION_MARKER}) was \
+             absent — the root opener could not create \
              per-CPU perf events, the dedicated profiler identity could not publish its \
-             bounded capture, or persisted lines.jsonl did not attribute the deterministic \
-             {} workload to {} and a source line inside that function. Last serial output:\n{}",
+             bounded capture, the td-svc service name or console framing drifted, or persisted \
+             lines.jsonl did not attribute the deterministic {} workload to {} and a source \
+             line inside that function. Last serial output:\n{}",
             td_recipe::td_profiler_contract::ATTRIBUTION_FUNCTION_FRAGMENT,
             td_recipe::td_profiler_contract::ATTRIBUTION_SOURCE_FILE,
             tail(&result.console, 80)
@@ -3158,7 +3161,9 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_JAIL_TRANSITION_MARKER.len(),
         exact_line_window(TD_JAIL_SECCOMP_PROBE_MARKER),
         exact_line_window(TD_JAIL_FIXTURE_BOOT_MARKER),
-        exact_line_window(TD_PROFILER_ATTRIBUTION_MARKER),
+        TD_PROFILER_EVIDENCE_CONSOLE_PREFIX
+            .len()
+            .saturating_add(exact_line_window(TD_PROFILER_ATTRIBUTION_MARKER)),
         TD_WAYLAND_RUNTIME_MARKER.len(),
         TD_POINTER_ABSOLUTE_MARKER.len(),
         TD_TERM_RUNTIME_MARKER.len(),
@@ -3321,9 +3326,10 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         buf,
         TD_JAIL_FIXTURE_BOOT_MARKER.as_bytes(),
     );
-    latch_line_marker(
+    latch_prefixed_line_marker(
         &mut evidence.td_profiler_attribution,
         buf,
+        TD_PROFILER_EVIDENCE_CONSOLE_PREFIX.as_bytes(),
         TD_PROFILER_ATTRIBUTION_MARKER.as_bytes(),
     );
     latch_marker(
@@ -3397,6 +3403,15 @@ fn latch_marker(found: &mut bool, haystack: &[u8], marker: &[u8]) {
 }
 
 fn latch_line_marker(found: &mut bool, haystack: &[u8], marker: &[u8]) {
+    latch_prefixed_line_marker(found, haystack, b"", marker);
+}
+
+fn latch_prefixed_line_marker(
+    found: &mut bool,
+    haystack: &[u8],
+    prefix: &[u8],
+    marker: &[u8],
+) {
     if *found {
         return;
     }
@@ -3404,10 +3419,15 @@ fn latch_line_marker(found: &mut bool, haystack: &[u8], marker: &[u8]) {
         if haystack.get(start - 1) != Some(&b'\n') {
             continue;
         }
-        let Some(after) = start.checked_add(marker.len()) else {
+        let Some(marker_at) = start.checked_add(prefix.len()) else {
             return;
         };
-        if haystack.get(start..after) != Some(marker) {
+        let Some(after) = marker_at.checked_add(marker.len()) else {
+            return;
+        };
+        if haystack.get(start..marker_at) != Some(prefix)
+            || haystack.get(marker_at..after) != Some(marker)
+        {
             continue;
         }
         let after_cr = after.checked_add(1).and_then(|index| haystack.get(index));
@@ -4362,6 +4382,68 @@ mod tests {
             b"target",
         );
         assert!(evidence.td_jail_fixture);
+    }
+
+    #[test]
+    fn profiler_evidence_requires_the_exact_supervisor_console_line() {
+        let mut evidence = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_PROFILER_ATTRIBUTION_MARKER}\n").as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_profiler_attribution);
+
+        latch_console_evidence(
+            &mut evidence,
+            format!(
+                "\nprofiler: {TD_PROFILER_EVIDENCE_CONSOLE_PREFIX}{TD_PROFILER_ATTRIBUTION_MARKER}\n"
+            )
+            .as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_profiler_attribution);
+
+        latch_console_evidence(
+            &mut evidence,
+            format!(
+                "\n{TD_PROFILER_EVIDENCE_CONSOLE_PREFIX}{TD_PROFILER_ATTRIBUTION_MARKER}\r\n"
+            )
+            .as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_profiler_attribution);
+    }
+
+    #[test]
+    fn prefixed_profiler_marker_line_survives_a_read_boundary() {
+        const CHUNK: usize = 8192;
+        let seq = AtomicU64::new(2450);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        let path = dir.join("console.log");
+        let line = format!(
+            "{TD_PROFILER_EVIDENCE_CONSOLE_PREFIX}{TD_PROFILER_ATTRIBUTION_MARKER}"
+        );
+        let start = CHUNK - (line.len() - 1);
+        let mut bytes = vec![b'x'; start];
+        *bytes.last_mut().unwrap() = b'\n';
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+        fs::write(&path, bytes).unwrap();
+
+        let mut file = None;
+        let mut buffer = Vec::new();
+        let mut evidence = ConsoleEvidence::default();
+        drain_console_to_eof(
+            &path,
+            &mut file,
+            &mut buffer,
+            b"target-never-appears",
+            &mut evidence,
+        )
+        .unwrap();
+        assert!(evidence.td_profiler_attribution);
     }
 
     #[test]

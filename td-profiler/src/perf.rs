@@ -63,21 +63,26 @@ pub fn decode(record: &[u8], ring_cpu: u32, sequence: u64) -> Result<Event, Stri
             "perf record says CPU {cpu} but came from ring {ring_cpu}"
         ));
     }
-    let (pid, tid) = match kind {
+    let (pid, tid, time_ns) = match kind {
         PERF_RECORD_FORK | PERF_RECORD_EXIT => {
             require_min_len(body, 24, "task")?;
-            if le64(body, 16)? != time_ns {
-                return Err("perf task body and trailer times disagree".into());
+            // FORK/EXIT have their own event timestamp before the sample-id
+            // trailer. Linux populates the trailer first and the task body
+            // later, so the two clock reads are not an equality invariant.
+            // The fixed task field is the event's semantic timestamp.
+            let body_time_ns = le64(body, 16)?;
+            if body_time_ns < time_ns {
+                return Err("perf task body time precedes trailer time".into());
             }
-            (le32(body, 0)?, le32(body, 8)?)
+            (le32(body, 0)?, le32(body, 8)?, body_time_ns)
         }
         PERF_RECORD_COMM | PERF_RECORD_MMAP | PERF_RECORD_MMAP2 => {
             if body.len() < 8 {
                 return Err("perf process record has no pid/tid fields".into());
             }
-            (le32(body, 0)?, le32(body, 4)?)
+            (le32(body, 0)?, le32(body, 4)?, time_ns)
         }
-        _ => (trailer_pid, trailer_tid),
+        _ => (trailer_pid, trailer_tid, time_ns),
     };
     let event_kind = match kind {
         PERF_RECORD_FORK => Kind::Fork {
@@ -416,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn task_records_use_the_body_identity_and_cross_check_time() {
+    fn task_records_use_the_body_identity_and_event_time() {
         let event = decode(&fork_record(), 2, 4).unwrap();
         assert_eq!((event.pid, event.tid, event.time_ns), (9, 9, 77));
         assert!(matches!(
@@ -432,9 +437,16 @@ mod tests {
             .get_mut(24..32)
             .unwrap()
             .copy_from_slice(&78u64.to_le_bytes());
+        let event = decode(&mismatched, 2, 4).unwrap();
+        assert_eq!((event.pid, event.tid, event.time_ns), (9, 9, 78));
+
+        mismatched
+            .get_mut(24..32)
+            .unwrap()
+            .copy_from_slice(&76u64.to_le_bytes());
         assert!(decode(&mismatched, 2, 4)
             .unwrap_err()
-            .contains("times disagree"));
+            .contains("body time precedes trailer"));
     }
 
     #[test]

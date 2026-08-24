@@ -144,7 +144,13 @@ The metadata and sampling event for one CPU redirect into one ring with
 `PERF_EVENT_IOC_SET_OUTPUT`, so kernel ring order breaks same-CPU timestamp
 ties. Atomic acquire/release accesses to the kernel-shared head and tail
 publish complete records without a Rust data race. Rings merge by monotonic
-time, then CPU number and per-ring sequence.
+time, then CPU number and per-ring sequence. `PERF_RECORD_FORK` and
+`PERF_RECORD_EXIT` carry a fixed body timestamp in addition to the optional
+sample-ID trailer timestamp. The kernel obtains them with independent clock
+reads, so td-profiler orders task events by the fixed body field and does not
+invent an equality requirement between the two. Both reads use the event's
+monotonic clock and the trailer is populated first, so a body timestamp which
+precedes its trailer remains a corrupt record.
 Equal-time records on different CPUs which would impose conflicting state on
 one task mark that task interval ambiguous; CPU-number order is serialization,
 not invented causality. This includes one state mutation concurrent with a
@@ -615,9 +621,20 @@ design:
    the line-table-local `evidence.rs` source emitted by the bounded DWARF-v4
    reader, and a line inside the function. Rejected completed captures are
    immutable and scanned only once, and the workload alternates equal work and
-   rest slices. Normal boots do not run the synthetic workload and retain the
-   generic complete-capture evidence path. A host where collection cannot be
-   exercised instead requires a precise unsupported-permission diagnostic.
+   rest slices. Its hot loop uses primitive shift/XOR instructions attributed
+   directly to `evidence.rs`; an inlined library intrinsic whose machine code
+   carries the library's source location is not valid evidence. Normal boots do
+   not run the synthetic workload and retain the generic complete-capture
+   evidence path. Both evidence paths require zero lost and corrupt perf
+   records, zero omitted diagnostics, and no analysis diagnostics. Fully
+   recorded, bounded symbolization diagnostics remain report data rather than
+   invalidating an otherwise complete capture; the QEMU path independently
+   requires the exact named function and source-line attribution it exists to
+   prove. The host recognizes that result as the exact
+   `profiler-evidence: TD-PROFILER-ATTRIBUTION-OK` console line emitted through
+   td-svc's service-name prefix, not as an unframed marker substring. A host
+   where collection cannot be exercised instead requires a precise
+   unsupported-permission diagnostic.
 
 The source-line reporting increment consumes the already-required line tables
 with a dependency-free bounded DWARF reader, adds deterministic `lines.jsonl`,
