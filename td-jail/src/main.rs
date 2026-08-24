@@ -6,6 +6,7 @@
 #![deny(unsafe_code)]
 
 mod authority;
+mod bus;
 #[allow(dead_code)]
 #[cfg_attr(test, allow(clippy::unwrap_used))]
 #[cfg_attr(
@@ -58,9 +59,10 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod confinement {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::panic, clippy::unwrap_used)]
 
     const AUTHORITY: &str = include_str!("authority.rs");
+    const BUS: &str = include_str!("bus.rs");
     const MAIN: &str = include_str!("main.rs");
     const PERMISSIONS: &str = include_str!("../../engine/src/permissions.rs");
     const SECCOMP: &str = include_str!("seccomp.rs");
@@ -76,12 +78,170 @@ mod confinement {
         assert_eq!(shipped_main.matches("#[allow(unsafe_code)]").count(), 0);
         assert_eq!(AUTHORITY.matches("#[allow(unsafe_code)]").count(), 0);
         assert_eq!(AUTHORITY.matches("unsafe {").count(), 0);
+        // The bus client reaches its socket through `std`, so it names no
+        // syscall of its own and adds nothing to surface #9.
+        assert_eq!(BUS.matches("#[allow(unsafe_code)]").count(), 0);
+        assert_eq!(BUS.matches("unsafe {").count(), 0);
         assert_eq!(PERMISSIONS.matches("#[allow(unsafe_code)]").count(), 0);
         assert_eq!(PERMISSIONS.matches("unsafe {").count(), 0);
         assert_eq!(SECCOMP.matches("#[allow(unsafe_code)]").count(), 0);
         assert_eq!(SECCOMP.matches("unsafe {").count(), 0);
         assert_eq!(TRANSITION.matches("#[allow(unsafe_code)]").count(), 0);
         assert_eq!(TRANSITION.matches("unsafe {").count(), 0);
+    }
+
+    /// §D's two-phase registration is an ORDERING, and no type expresses it.
+    ///
+    /// Both halves are load-bearing and both fail quietly if moved:
+    ///
+    /// Phase one must precede the SPAWN, so that the pending registration
+    /// exists before anything inside the jail can connect. §D puts it before
+    /// the `unshare` too, which is the cheap half: a refused registration then
+    /// costs no namespaces, no mounts and no child to reap.
+    ///
+    /// A draft of this comment claimed the broker would otherwise record a pid
+    /// it could not see. That is false — `unshare(CLONE_NEWPID)` does not move
+    /// the caller and stage 1 keeps the old root — and the assertion is kept
+    /// for the reasons above rather than the reason first given for it.
+    ///
+    /// Phase two must run before the write that releases stage 2, because that
+    /// write is what lets the application run. `Command::spawn` has already
+    /// returned by then, so completing afterwards leaves a window in which the
+    /// application can connect while its registration is still pending. The
+    /// broker fixes identity at accept, so such a connection stays wrong for
+    /// its whole life however fast the completion then lands. Moved, this is a
+    /// race that passes every test on an unloaded machine.
+    ///
+    /// A failed completion must kill the jail. An application the broker has
+    /// no record of resolves `Unconfined` — full portal access for the one
+    /// process on the system that is certainly confined.
+    /// Rust source with its block comments removed, nesting included.
+    ///
+    /// Nesting matters because Rust allows it and because the naive version —
+    /// stop at the first `*/` — leaves the tail of an outer comment behind,
+    /// which is where commented-out code would reappear. An unterminated `/*`
+    /// swallows the rest, which is what the compiler does with it too.
+    fn without_block_comments(source: &str) -> String {
+        let mut out = String::with_capacity(source.len());
+        let mut rest = source;
+        let mut depth = 0_usize;
+        loop {
+            let open = rest.find("/*");
+            let close = rest.find("*/");
+            match (depth, open, close) {
+                (0, None, _) => {
+                    out.push_str(rest);
+                    return out;
+                }
+                (0, Some(at), _) => {
+                    out.push_str(rest.get(..at).unwrap_or(""));
+                    rest = rest.get(at.saturating_add(2)..).unwrap_or("");
+                    depth = 1;
+                }
+                (_, Some(at), Some(shut)) if at < shut => {
+                    rest = rest.get(at.saturating_add(2)..).unwrap_or("");
+                    depth = depth.saturating_add(1);
+                }
+                (_, _, Some(shut)) => {
+                    rest = rest.get(shut.saturating_add(2)..).unwrap_or("");
+                    depth = depth.saturating_sub(1);
+                }
+                (_, _, None) => return out,
+            }
+        }
+    }
+
+    /// And its line comments.
+    fn without_line_comments(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| match line.split_once("//") {
+                Some((code, _)) => code,
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The stripper is the thing standing between a commented-out phase two
+    /// and a green suite, so it is tested rather than assumed.
+    #[test]
+    fn comments_are_stripped_including_nested_and_unterminated_blocks() {
+        assert_eq!(without_block_comments("a/*b*/c"), "ac");
+        assert_eq!(without_block_comments("a/*b/*c*/d*/e"), "ae");
+        assert_eq!(without_block_comments("a/*b\nc*/d"), "ad");
+        assert_eq!(without_block_comments("a/*b"), "a");
+        assert_eq!(without_block_comments("plain"), "plain");
+        // A `*/` with nothing open is not a comment and is left alone.
+        assert_eq!(without_block_comments("a*/b"), "a*/b");
+        assert_eq!(without_line_comments("keep // drop\nkeep2"), "keep \nkeep2");
+        // The combination is what the test below uses, and the order matters:
+        // a `//` inside a block comment must not end the block early.
+        let both = without_line_comments(&without_block_comments("x/*\n// y\n*/z"));
+        assert!(!both.contains('y'), "{both:?}");
+        assert!(both.contains('x') && both.contains('z'), "{both:?}");
+    }
+
+    #[test]
+    fn the_registration_brackets_the_launch() {
+        let body = TRANSITION
+            .split_once("pub fn launch_application")
+            .unwrap()
+            .1
+            .split_once("fn read_launch_diagnostic")
+            .unwrap()
+            .0;
+        // Comments are STRIPPED before anything is looked for. A draft of this
+        // test searched the raw text, so commenting a line out — the ordinary
+        // way somebody debugs a launch — left every assertion passing while
+        // the behaviour was gone.
+        //
+        // BLOCK comments are stripped first, and a draft handled only line
+        // comments. A reviewer wrapped phase two in `/* */` — the ordinary way
+        // to comment out a multi-line block, and phase two is a multi-line
+        // block — and every test stayed green while the jail released an
+        // application it had never registered.
+        let launch = without_line_comments(&without_block_comments(body));
+        let at = |needle: &str| {
+            launch
+                .find(needle)
+                .unwrap_or_else(|| panic!("launch_application no longer contains {needle}"))
+        };
+        assert!(at("bus::register(") < at("sys::unshare_namespaces("));
+        assert!(at("bus::register(") < at("close_inherited_descriptors()"));
+        assert!(at("bus::complete(") < at("proof_writer.write_all(&token)"));
+        // The spawn is anchored too, and not because §D asks for it. Without
+        // it the three assertions above hold while `command.spawn()` sits
+        // ABOVE the unshare — every string still in order, and the child in
+        // the host's namespaces. The sandbox would be gone and this test would
+        // be green.
+        assert!(at("sys::unshare_namespaces(") < at("command.spawn()"));
+        assert!(at("command.spawn()") < at("bus::complete("));
+
+        let refused = launch
+            .split_once("bus::complete(")
+            .unwrap()
+            .1
+            .split_once("proof_writer.write_all(&token)")
+            .unwrap()
+            .0;
+        // All three, because killing is not the property — not releasing is.
+        // A refactor that killed the child, wrote the proof anyway and then
+        // returned the stored error would satisfy a `child.kill()` check on
+        // its own, and would have released a jail the broker has no record of.
+        assert!(
+            refused.contains("child.kill()"),
+            "a refused completion no longer kills the jail it opened"
+        );
+        assert!(
+            refused.contains("child.wait()"),
+            "a refused completion no longer reaps the jail it killed"
+        );
+        assert!(
+            refused.contains("return Err("),
+            "a refused completion no longer stops the launch, so the proof \
+             write below it now runs and releases an unregistered jail"
+        );
     }
 
     #[test]

@@ -31,6 +31,13 @@ const SURVIVOR_ORPHAN_ARG: &str = "--internal-survivor-orphan";
 pub const TRANSITION_MARKER: &str = "TD-JAIL-TRANSITION-OK";
 const STAGE2_MARKER: &str = "TD-JAIL-STAGE2-OK";
 const TOKEN_LEN: usize = 32;
+/// Bytes of randomness in an instance name's suffix.
+///
+/// Sixteen hex characters onto a name of at most 32 leaves 49, inside the
+/// broker's 64-byte instance-name ceiling. It is a uniqueness suffix and not a
+/// secret — the broker's own token is the secret — so the width only has to
+/// make a collision between two live launches implausible.
+const INSTANCE_SUFFIX_LEN: usize = 8;
 const TEST_LEAK_ENV: &str = "TD_JAIL_TEST_LEAK_FD";
 const MAX_CAPABILITY: u32 = 63;
 const SYS_ADMIN_MASK: u64 = 1_u64 << sys::CAP_SYS_ADMIN;
@@ -478,6 +485,33 @@ fn random_token() -> io::Result<[u8; TOKEN_LEN]> {
     let mut token = [0_u8; TOKEN_LEN];
     fs::File::open("/dev/urandom")?.read_exact(&mut token)?;
     Ok(token)
+}
+
+/// A name for one launch of one application.
+///
+/// §D's instance name identifies a LAUNCH, not an application: two windows of
+/// the same program are two instances, and the broker refuses a name that is
+/// already registered. So it carries a random suffix rather than the pid — a
+/// pid is unique among live processes and is reissued, which is the property
+/// this module spends its time not relying on elsewhere.
+///
+/// The proof token is deliberately not reused here. That token is a one-shot
+/// secret that authenticates stage 2 through the pipe; an instance name is an
+/// identifier, compared by the broker and echoed back in its refusals — the
+/// duplicate-registration error quotes it. Nothing today puts an instance name
+/// on the wire to another peer, but a name goes where names go, and a secret
+/// spent as one stops being a secret at whichever of those places comes first.
+fn instance_name(application: &str) -> io::Result<String> {
+    let mut suffix = [0_u8; INSTANCE_SUFFIX_LEN];
+    fs::File::open("/dev/urandom")?.read_exact(&mut suffix)?;
+    let mut name = String::with_capacity(application.len() + 1 + suffix.len() * 2);
+    name.push_str(application);
+    name.push('-');
+    for byte in suffix {
+        name.push(encode_nibble(byte >> 4));
+        name.push(encode_nibble(byte & 0x0f));
+    }
+    Ok(name)
 }
 
 fn encode_token(token: &[u8; TOKEN_LEN]) -> String {
@@ -2454,6 +2488,40 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
     let token = random_token()?;
     let executable = std::env::current_exe()?;
 
+    // Phase one. What is load-bearing is that it precedes the SPAWN: the
+    // pending registration has to exist before any process that could connect
+    // from inside the jail does. Before the unshare as well, which §D
+    // specifies and which buys the cheap half — a refused registration costs
+    // no namespaces, no mounts and no child to reap.
+    //
+    // It is NOT because the broker would otherwise fail to see this pid. A
+    // draft of this comment said so and it is false: `unshare(CLONE_NEWPID)`
+    // does not move the caller, the identity map keeps this process at uid
+    // 1000, a pathname AF_UNIX socket is indifferent to a new network
+    // namespace, and stage 1 keeps the old root — only stage 2 pivots. A
+    // registration opened after the unshare would name exactly the same pid,
+    // which is also why phase two below can open a fresh connection at all.
+    // Recorded because two reviewers had to find it.
+    //
+    // The connection is opened and dropped rather than held:
+    // `close_inherited_descriptors` closes every descriptor above stderr, so
+    // no connection survives into phase two. That is the real reason §D
+    // compares the same PROCESS across the phases rather than the same
+    // connection.
+    //
+    // No predeclared service names yet. §D carries them for app-local
+    // activation, which lands with the activation listener; an empty list is
+    // the honest statement that this instance may own none.
+    let instance = instance_name(&application.name)?;
+    let registration = crate::bus::register(
+        &application.bus_socket,
+        identity.uid,
+        &instance,
+        &application.name,
+        &[],
+    )
+    .map_err(|e| io::Error::other(format!("register jail instance {instance:?}: {e}")))?;
+
     sys::unshare_namespaces(true)?;
     install_identity_maps(identity)?;
     NamespaceSnapshot::read()?.require_all_changed(&before)?;
@@ -2500,6 +2568,42 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
             "verify launch-stage PID namespace: {error}; stage 2 {status}{diagnostic}"
         )));
     }
+    // Phase two, and it comes BEFORE the proof write on purpose. That write is
+    // what releases stage 2, and `Command::spawn` has already returned with
+    // stage 2 runnable — so completing afterwards would leave a window in
+    // which the application connects while its registration is still pending.
+    // The broker refuses a strict descendant of a pending registrant, which is
+    // right, and it fixes identity AT ACCEPT, so such a connection is denied
+    // for its whole life however quickly the registration then completes.
+    //
+    // A failed completion kills the jail rather than launching one the broker
+    // has no record of: an unregistered application resolves `Unconfined`,
+    // which is full portal access for the one process that is certainly
+    // confined. This is §D's "stage 1 refuses to proceed without the token",
+    // placed where it is actually enforceable.
+    if let Err(error) = crate::bus::complete(
+        &application.bus_socket,
+        identity.uid,
+        &registration,
+        child.id(),
+    ) {
+        let _ = child.kill();
+        let status = child.wait();
+        drop(proof_writer);
+        let diagnostic = match read_launch_diagnostic(&mut stage2_error) {
+            Ok(response) if response.trim().is_empty() => String::new(),
+            Ok(response) => format!("; diagnostic: {}", response.trim()),
+            Err(read_error) => format!("; diagnostic unavailable: {read_error}"),
+        };
+        let status = match status {
+            Ok(status) => status.to_string(),
+            Err(wait_error) => format!("wait failed: {wait_error}"),
+        };
+        return Err(io::Error::other(format!(
+            "complete jail instance {instance:?}: {error}; stage 2 {status}{diagnostic}"
+        )));
+    }
+
     if let Err(error) = proof_writer.write_all(&token) {
         let _ = child.kill();
         let status = child.wait();
@@ -2604,6 +2708,122 @@ mod tests {
             .map(|value| OsString::from(*value))
             .collect::<Vec<_>>()
             .into_iter()
+    }
+
+    /// The ceiling `td-busd` declares for one of the two names this module
+    /// sends it, read out of that crate's own source.
+    ///
+    /// The two crates are separate dependency-free locks, so neither can name
+    /// the other's constant. Restating the number here would be the same
+    /// assumption with a comment on it; reading it is a check. The file is
+    /// reached under `#[cfg(test)]` only, so the recipe — which stages
+    /// `src/*.rs` and nothing else — never expands it into the target build.
+    fn broker_ceiling(source: &str, name: &str) -> usize {
+        let declaration = format!("const {name}: usize = ");
+        let at = source
+            .find(&declaration)
+            .unwrap_or_else(|| panic!("td-busd no longer declares {name}"));
+        let rest = &source[at + declaration.len()..];
+        let end = rest
+            .find(';')
+            .unwrap_or_else(|| panic!("td-busd's {name} declaration is unterminated"));
+        rest[..end]
+            .trim()
+            .replace('_', "")
+            .parse()
+            .unwrap_or_else(|_| panic!("td-busd's {name} is not a literal this can read"))
+    }
+
+    /// §D's instance name is the application's own name and a fresh suffix.
+    ///
+    /// Fresh matters: the broker refuses a name that is already registered, so
+    /// a suffix that repeated would make the second window of a program fail
+    /// to launch. That is why it is not the pid — a pid is unique only among
+    /// live processes, and this module spends the rest of its length not
+    /// relying on that.
+    #[test]
+    fn an_instance_name_is_the_application_and_a_fresh_suffix() {
+        let one = instance_name("firefox").unwrap();
+        let two = instance_name("firefox").unwrap();
+        assert!(one.starts_with("firefox-"), "{one}");
+        assert_eq!(one.len(), "firefox-".len() + INSTANCE_SUFFIX_LEN * 2);
+        assert_ne!(one, two, "two launches were given the same instance name");
+        for name in [&one, &two] {
+            let suffix = &name["firefox-".len()..];
+            assert!(
+                suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+                "the suffix is not lowercase hex: {suffix}"
+            );
+        }
+    }
+
+    /// Every instance name this module can build is one the broker's grammar
+    /// accepts.
+    ///
+    /// The predicate is restated from td-busd's `valid_instance_name` rather
+    /// than imported — separate locks — and the ceilings the two must agree on
+    /// are read out of td-busd's source in the next test rather than restated.
+    ///
+    /// The application names are chosen for the ways this could go wrong: one
+    /// ending in a dot and one starting with one, since a `..` anywhere is
+    /// refused and appending to a name is where one could appear; the longest
+    /// name `authority` will accept; and the shortest.
+    #[test]
+    fn an_instance_name_satisfies_the_brokers_grammar() {
+        let longest = "a".repeat(crate::authority::MAX_APPLICATION_NAME_BYTES);
+        let applications = [
+            "firefox",
+            "td-jail-fixture",
+            "a",
+            "a.",
+            ".a",
+            "x.y_z-1",
+            &longest,
+        ];
+        for application in applications {
+            for _ in 0..64 {
+                let name = instance_name(application).unwrap();
+                assert!(!name.is_empty());
+                assert_ne!(name, ".");
+                assert!(!name.contains(".."), "{name}");
+                assert!(
+                    name.bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric()
+                            || matches!(byte, b'-' | b'_' | b'.')),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    /// And the broker's ceilings admit every name this module can build.
+    ///
+    /// Both ways of getting this wrong fail at launch rather than at build:
+    /// a name too long is refused by the broker, which is a boot-time failure
+    /// for the fixture and a dead application for anyone else. Neither ceiling
+    /// is reachable from here, so this reads them.
+    ///
+    /// `cargo test` for this crate is reached whenever td-busd changes:
+    /// `affected.rs` narrows the cargo table only when every changed path is
+    /// inside an unembedded crate, and td-busd is embedded by a recipe, so a
+    /// change to it takes the whole table.
+    #[test]
+    fn the_brokers_ceilings_admit_every_name_this_module_can_build() {
+        const BROKER: &str = include_str!("../../td-busd/src/transport.rs");
+        let application = crate::authority::MAX_APPLICATION_NAME_BYTES;
+        assert!(
+            application <= broker_ceiling(BROKER, "MAX_APPLICATION_ID"),
+            "an application name this crate accepts is longer than an app id \
+             td-busd accepts, so those applications cannot launch"
+        );
+        assert!(
+            application + 1 + INSTANCE_SUFFIX_LEN * 2
+                <= broker_ceiling(BROKER, "MAX_INSTANCE_NAME"),
+            "the longest instance name this module builds is longer than an \
+             instance name td-busd accepts, so those applications cannot launch"
+        );
     }
 
     #[test]

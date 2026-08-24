@@ -1052,10 +1052,11 @@ fn build_td_svc_conf() -> String {
          # what makes the /run/user/{ui_uid} the broker binds inside: without it\n\
          # `bind` would create that directory itself, 0700 and owned by whoever\n\
          # ran first, which is a different machine from the one this table\n\
-         # describes. Nothing on this image speaks D-Bus yet — the portal is the\n\
-         # first consumer — so this starts a broker for clients that do not exist,\n\
-         # deliberately: the unit, the uid it runs as and the socket path become\n\
-         # observable on a real boot BEFORE anything depends on them being right.\n\
+         # describes. td-jail is the first consumer: it registers each launch\n\
+         # with this broker and refuses to release the application if that\n\
+         # fails, so the fixture below now depends on this unit answering and\n\
+         # not merely on its socket existing. `after` and not `requires`, for\n\
+         # the reason recorded at the fixture.\n\
          # `exec-as` rather than `su -c`, so the argv is literal and the\n\
          # environment is the unit's rather than the boot path's.\n\
          [busd]\n\
@@ -4500,8 +4501,12 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
         // ordering edge td-svc may release the fixture the moment the
         // compositor is ready, onto a bus that has not bound.
         //
-        // What the fixture does NOT need is a working broker: it opens no
-        // D-Bus connection. A draft made the edge `requires=busd` anyway, on
+        // The fixture now DOES need a working broker: since §D's registration
+        // landed in td-jail, stage 0 opens a connection and refuses the launch
+        // if `Register` or `Complete` fails, because an application the broker
+        // has no record of resolves `Unconfined`. The edge is still ORDERING
+        // rather than `requires`, and the reason it is has not changed — only
+        // the size of what it covers. A draft made the edge `requires=busd` on
         // the grounds that a FAILED broker settles for ordering too. The
         // grounds are right and the remedy was wrong. td-svc sets
         // `phase = Failed` with `retry_at` on a `restart=always` daemon that
@@ -4511,20 +4516,22 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
         // the boot window would permanently kill the application tier of a
         // machine whose broker recovers a second later.
         //
-        // Ordering alone recovers instead. A socket file outlives the process
-        // that bound it, so the settled-but-crashed case still leaves the path
-        // there; and in the case where the broker never bound at all, the
-        // fixture's own `restart=always` retries it until the broker's does,
-        // which is self-healing where the strict edge was terminal. The
-        // diagnostic that made the strict edge tempting is no longer the
-        // argument for it either: `session_socket` labels its errors, so a
-        // fixture dying on an absent bus now says "session bus
-        // /run/user/1000/bus" rather than a bare ENOENT.
+        // Ordering alone recovers instead. The fixture's own `restart=always`
+        // retries the launch until the broker is answering, which is
+        // self-healing where the strict edge was terminal — and it covers the
+        // broker that is up but not yet serving as well as the one that never
+        // bound, since a registration that fails is a failed launch and a
+        // failed launch is a restart. The diagnostic that made the strict edge
+        // tempting is no longer the argument for it either: `session_socket`
+        // labels its errors, so a fixture dying on an absent bus says "session
+        // bus /run/user/1000/bus" rather than a bare ENOENT, and one dying on
+        // a wedged broker names the instance it could not register.
         assert_eq!(
             unit_key("jail-fixture", "requires").as_deref(),
             Some("wayland"),
             "the packaged fixture must not start without its compositor — and \
-             must not be made strictly dependent on a broker it never opens"
+             must not be made strictly dependent on a broker whose restart \
+             backoff td-svc cannot tell from a permanent failure"
         );
         assert_eq!(
             unit_key("jail-fixture", "restart").as_deref(),

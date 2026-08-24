@@ -631,13 +631,33 @@ mod tests {
         );
     }
 
+    /// `close` takes ownership of a descriptor `std` has given up.
+    ///
+    /// The EBADF half used to live here, as a SECOND close of the same number.
+    /// That is not a test, it is a race with the rest of the binary: the
+    /// kernel hands the freed number to whoever allocates next, so the second
+    /// close either reports EBADF or silently shuts a socket some concurrent
+    /// test just opened. Both happened — the assertion failed once in three
+    /// hundred runs, and on another it took an `authority` test down with it,
+    /// `bind` on a descriptor this had closed between `socket` and `bind`.
+    /// That test predates the bus client entirely; what changed was only how
+    /// many descriptors the binary opens alongside it.
     #[test]
-    fn close_owns_a_transferred_descriptor_and_preserves_ebadf() {
+    fn close_owns_a_transferred_descriptor() {
         let (reader, writer) = io::pipe().unwrap();
         let fd = writer.into_raw_fd();
         close(fd as u32).unwrap();
-        assert_eq!(close(fd as u32).unwrap_err().raw_os_error(), Some(9));
         drop(reader);
+    }
+
+    /// And it reports EBADF for a descriptor that is not one.
+    ///
+    /// A number no process can have open, rather than one just freed, so
+    /// nothing can be allocated into it while this runs. `RLIMIT_NOFILE` is
+    /// what bounds a descriptor and it cannot reach `u32::MAX`.
+    #[test]
+    fn close_preserves_ebadf() {
+        assert_eq!(close(u32::MAX).unwrap_err().raw_os_error(), Some(9));
     }
 
     #[test]

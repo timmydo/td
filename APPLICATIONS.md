@@ -3518,15 +3518,80 @@ something the landing that found it could take, and it is a precondition
 of the per-caller filter in the same way the filter is a precondition of
 anything in a jail opening the bus.
 
-**Nothing registers yet.** td-jail does not perform this protocol until
-the next increment, so every connection on the image today resolves
-`Unconfined` and no `td.AppId` is reported. The registration methods are
-live surface a uid-1000 process can call, which is what §D says the v1
-exposure is: registration is authenticated by uid, every session peer is
-uid 1000, and the app id is a string the registrant supplies. The walk is
-sound about WHICH instance a connection belongs to and says nothing about
-whether that instance is what it calls itself. Per-app uids are the fix
-and this is the third argument for scheduling them.
+**td-jail performs this protocol, and the image's one application does
+it at boot.** Every jailed application is a registered instance and
+reports `td.AppId`; everything else on the session bus still resolves
+`Unconfined`, which is right — the compositor and the terminal are not
+in jails. The caveat above is unchanged and is the reason the filter
+still cannot land on this alone: registration is authenticated by uid,
+every session peer is uid 1000, and the app id is a string the
+registrant supplies. The walk is sound about WHICH instance a connection
+belongs to and says nothing about whether that instance is what it calls
+itself. Per-app uids are the fix and this is the third argument for
+scheduling them.
+
+**What the launcher sends is fixed by its own grammar, not by anything
+the application controls.** The **app id is the application's td name** —
+already the launcher key, the store path shape and the state directory —
+so the bus credential names the same thing the rest of §B does instead of
+introducing a second identity. The two crates cannot share a constant,
+being separate dependency-free locks, so td-jail's
+`validate_application_name` and td-busd's `valid_application_id` are the
+same language written twice; a td-jail test reads BOTH of td-busd's
+ceilings out of that crate's source rather than restating them, because
+a name this side accepts and that side refuses is a launch that fails at
+boot and nowhere earlier.
+
+The **instance name** is that app id, a dash, and sixteen hex characters
+of fresh randomness. It names a LAUNCH rather than a program: two windows
+of one application are two instances, and the broker refuses a name a
+live instance already holds. Hence random rather than the pid — a pid is
+unique only among live processes, which is the property this section
+spends its length not relying on. It is deliberately not the stage-2
+proof token: that token is a one-shot secret, an instance name is an
+identifier the broker compares and quotes back in its refusals, and a
+secret spent as a name stops being one.
+
+The **service list is empty**, and that is the honest statement rather
+than a placeholder. Predeclared names are for app-local activation, which
+needs `RequestName`; until it exists an instance owns none.
+
+**Both orderings in the list above are pinned by a source-level test**,
+in `td-jail/src/main.rs`'s confinement module, because no type expresses
+either. What phase one must precede is the SPAWN: the pending
+registration has to exist before anything inside the jail can connect.
+Putting it before the `unshare` as well is the cheap half — a refused
+registration then costs no namespaces, no mounts and no child to reap.
+
+An earlier version of this paragraph gave a different and false reason:
+that a registration opened after the `unshare` would name a pid the
+broker could not see. It would not. `unshare(CLONE_NEWPID)` does not move
+the caller, the identity map keeps the launcher at uid 1000, a pathname
+AF_UNIX socket is indifferent to a new network namespace, and stage 1
+keeps the old root — which is the same set of facts that lets phase two
+open a fresh connection at all. Two reviewers caught it; it is corrected
+here rather than quietly dropped, because the false version made an
+ordering look load-bearing for a reason it is not.
+
+Phase two after the proof write is the one that is genuinely a race, and
+one that passes every test on an unloaded machine. The test asserts the
+positions of `bus::register`, `sys::unshare_namespaces`,
+`close_inherited_descriptors`, `command.spawn` and
+`proof_writer.write_all` within `launch_application`, over a copy with
+comments stripped, and that the refused-completion branch kills, reaps
+and returns.
+
+**The fixture's supervision edge does not change, and its reason does.**
+`[jail-fixture]` is `after=busd` and `requires=wayland`; it is now a unit
+that genuinely needs a WORKING broker rather than merely a bound socket,
+and `requires=busd` is still wrong for the reason recorded in the recipe:
+td-svc cannot distinguish a `restart=always` daemon inside its backoff
+from a permanently failed one, so one busd crash in the boot window would
+permanently kill the application tier of a machine whose broker recovers
+a second later. The fixture's own `restart=always` is what recovers, and
+it now covers the larger failure it always nominally covered. The gain is
+that the boot gate became an end-to-end test of this protocol: the image's
+one application cannot reach the screen without having registered.
 
 **Routing is DIRECTED only.** A message naming a `DESTINATION` that is a
 unique name on this bus is delivered to it; one naming a name nobody owns
@@ -3840,11 +3905,18 @@ with a bounded wait of its own, which is why the guest's per-iteration
 budget and the host's boot ceiling both moved with it.
 
 **What the marker does NOT say.** It is the handshake and nothing more,
-because `probe` is the handshake and nothing more. Nothing on this image
-says `Hello`, owns a unique name, or has a message routed to it; those
-are held up host-side and against sd-bus, libdbus and GDBus, and the
-portal is what will hold them up here. Read a green marker as *the bus
-is reachable*, not as *the bus works*.
+because `probe` is the handshake and nothing more. Read a green marker as
+*the bus is reachable*, not as *the bus works*.
+
+Since the jail registers, the image is no longer silent on the bus: each
+launch says `Hello` twice, owns two unique names in turn, and has the
+broker's replies routed to it. What that exercises is the handshake,
+`Hello`, and the two `td.Jail1` calls. It does NOT exercise a message
+routed between two peers, a signal, a match rule, a well-known name, or a
+descriptor — and the fixture opens no connection from INSIDE the jail, so
+lineage resolution and `td.AppId` are still not exercised by a boot.
+Those remain held up host-side and against sd-bus, libdbus and GDBus,
+and the portal is what will hold them up here.
 
 It also checks a PATH and not a pid. The probe has no association with
 the unit's process or generation, so what it establishes is that
@@ -3854,13 +3926,15 @@ Nothing else on this image binds that path, which is what makes the
 marker worth having; the day something else could, this is the
 assumption to re-check rather than a claim to keep repeating.
 
-**Nothing consumes it yet, and it ships anyway.** A broker with no
-clients is not obviously worth booting. The argument for booting it is
-that the parts most likely to be wrong are exactly the parts only a boot
-can exercise — which user the unit runs as, which directory exists at
-the moment it binds, and whether the socket the unit names is the socket
-a client finds — and landing those before the portal rests on them is
-cheaper than diagnosing them underneath it.
+**It shipped before anything consumed it, and now the jail does.** The
+argument for booting a broker with no clients was that the parts most
+likely to be wrong are exactly the parts only a boot can exercise — which
+user the unit runs as, which directory exists at the moment it binds, and
+whether the socket the unit names is the socket a client finds — and that
+landing those before the portal rests on them is cheaper than diagnosing
+them underneath it. That argument is now spent in the way it was meant to
+be: the jail is the first consumer, and it found the socket the unit
+named.
 
 ### What is landed of the bus inside the jail
 

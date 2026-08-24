@@ -7,6 +7,7 @@ const MODULES: &[(&str, &str)] = &[
         "authority",
         include_str!("../../../td-jail/src/authority.rs"),
     ),
+    ("bus", include_str!("../../../td-jail/src/bus.rs")),
     (
         "permissions",
         include_str!("../../../engine/src/permissions.rs"),

@@ -26,7 +26,7 @@ const MAX_PASSWD_BYTES: usize = 64 * 1024;
 const MAX_APPLICATION_SPEC_BYTES: usize = 48 * 1024;
 const MAX_APPLICATION_TABLE_BYTES: usize = 1024 * 1024;
 const MAX_APPLICATIONS: usize = 256;
-const MAX_APPLICATION_NAME_BYTES: usize = 32;
+pub(crate) const MAX_APPLICATION_NAME_BYTES: usize = 32;
 pub(crate) const MAX_ENVIRONMENT_ENTRIES: usize = 256;
 const MAX_ENVIRONMENT_NAME_BYTES: usize = 128;
 const MAX_ENVIRONMENT_VALUE_BYTES: usize = 4096;
@@ -36,6 +36,11 @@ const MAX_APPLICATION_ARGUMENT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub(crate) struct LaunchPlan {
+    /// The application's td identity, which is also what the jail registers
+    /// with the broker as this instance's app id. The name is already the
+    /// launcher key, the store path shape and the state directory; §D adds the
+    /// bus credential to that list rather than introducing a second name.
+    pub(crate) name: String,
     pub(crate) package_files: PathBuf,
     pub(crate) runtime_files: PathBuf,
     pub(crate) state: StatePlan,
@@ -206,6 +211,7 @@ where
     )?;
 
     Ok(LaunchPlan {
+        name: name.to_string(),
         package_files,
         runtime_files,
         state,

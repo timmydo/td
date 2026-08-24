@@ -2541,6 +2541,21 @@ mod tests {
             "Register was refused: {:?}",
             reply.fields.error_name
         );
+        // The SENDER on this reply is a cross-crate contract, not decoration.
+        // td-jail authenticates the broker's answers by it — a peer on a
+        // shared session bus can otherwise forge a `Complete` success and free
+        // an unregistered jail — and `answer()` is the path that produces both
+        // of its replies. Deleting `.sender(BUS_NAME)` from it left this
+        // crate's 214 tests and td-jail's 96 all green, and hung the real
+        // client for a full deadline per launch, because a reply this client
+        // does not recognise is SKIPPED rather than refused. That is the
+        // "fails at boot and nowhere earlier" shape, so it is pinned here.
+        assert_eq!(
+            reply.fields.sender,
+            Some(BUS_NAME),
+            "a jail reply lost its SENDER, which is what td-jail authenticates \
+             the broker by"
+        );
         let token = reply
             .args()
             .first()
