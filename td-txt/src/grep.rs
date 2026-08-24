@@ -557,6 +557,12 @@ struct Conf {
     text: bool,
     /// `--include`/`--exclude`/`--exclude-from`/`--exclude-dir`.
     selection: Selection,
+    /// `--label`, the name standard input answers to. It replaces
+    /// `(standard input)` wherever that name surfaces -- prefixes, `-l`, the
+    /// binary notice, and a READ that fails -- and never renames a file
+    /// operand or a walked file, neither of which is standard input. The
+    /// failing read, not a failing open: standard input is never opened here.
+    label: Option<Vec<u8>>,
     /// What separates one context GROUP from the next, and one FILE's output
     /// from the next file's. `None` is `--no-group-separator`, which drops the
     /// line rather than printing an empty one -- `--group-separator=` does that
@@ -599,6 +605,7 @@ impl Default for Conf {
             null_data: false,
             text: false,
             selection: Selection::default(),
+            label: None,
             group_separator: Some(b"--".to_vec()),
             color_when: None,
             colors: None,
@@ -1646,10 +1653,12 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
     let skip_zero_fills = !grep.selects(b"").unwrap_or(true);
     for op in &inputs {
         let (path, from_walk) = (&op.name, op.from_walk);
-        // Named before the read, because a failure names it too: GNU reports
-        // `(standard input): Is a directory`, not `-: Is a directory`.
+        // Named here because ONE value serves every site that shows a name, the
+        // diagnostics included: GNU reports `(standard input): Is a directory`,
+        // not `-: Is a directory`. Not because a diagnostic FORCES it early --
+        // a diagnostic could build the name at the print.
         let display: &[u8] = match path.as_slice() == b"-" && !from_walk {
-            true => b"(standard input)",
+            true => grep.conf.label.as_deref().unwrap_or(b"(standard input)"),
             false => path,
         };
         // The default reads a device named as an operand and skips the same one
@@ -2124,6 +2133,7 @@ fn parse_long(
                 },
             }
         }
+        b"label" => conf.label = Some(need(value)?),
         b"group-separator" => {
             conf.group_separator = Some(need(value)?);
         }
@@ -2136,7 +2146,6 @@ fn parse_long(
         | b"initial-tab"
         | b"perl-regexp"
         | b"no-ignore-case"
-        | b"label"
         | b"line-buffered" => {
             errb(&name_in("unsupported option '--", name, "'"));
             usage();

@@ -9145,3 +9145,200 @@ ms=31
 ## stdout-json: "x\nmatch A\ny\n\t\nw\nmatch B\nv\n"
 ## stderr-json: ""
 ## status: 0
+
+#### --label renames STANDARD INPUT, which is the only thing it renames
+# Without it the name is `(standard input)'. It is a NAME, not a prefix
+# switch: -H is what asks for the name at all, and this decides what it is.
+## argv: grep --label=LBL -H match
+## stdin-json: "x\nmatch A\ny\n"
+## stdout-json: "LBL:match A\n"
+## stderr-json: ""
+## status: 0
+
+#### and without it that name is (standard input), parentheses included
+## argv: grep -H match
+## stdin-json: "x\nmatch A\ny\n"
+## stdout-json: "(standard input):match A\n"
+## stderr-json: ""
+## status: 0
+
+#### the label is not a reason to PRINT a name, so alone it shows nothing
+# One input, so filenames are off and there is no name to replace. GNU
+# accepts the option and prints an unprefixed line.
+## argv: grep --label=LBL match
+## stdin-json: "x\nmatch A\ny\n"
+## stdout-json: "match A\n"
+## stderr-json: ""
+## status: 0
+
+#### -h takes away the name -H asked for, leaving the label unshown
+# The label decides what the name IS; -H, -h and the operand count decide
+# whether there is one at all.
+## argv: grep --label=LBL -H -h match
+## stdin-json: "x\nmatch A\ny\n"
+## stdout-json: "match A\n"
+## stderr-json: ""
+## status: 0
+
+#### and the other order shows it, which is what makes this LAST-wins
+# Both orders are here on purpose. `-H -h' alone cannot tell `last wins'
+# from `-h always wins', because -h suppresses on its own; only the pair
+# does. An earlier draft kept one order and asserted the rule in prose.
+## argv: grep --label=LBL -h -H match
+## stdin-json: "x\nmatch A\ny\n"
+## stdout-json: "LBL:match A\n"
+## stderr-json: ""
+## status: 0
+
+#### a second operand turns names on, and only the `-' one is labelled
+# The sharpest case for `only standard input': f keeps its own name in the
+# same run that renames the other input.
+## argv: grep --label=LBL match - f
+## stdin-json: "x\nmatch A\ny\n"
+## file-json f: "match B\n"
+## stdout-json: "LBL:match A\nf:match B\n"
+## stderr-json: ""
+## status: 0
+
+#### and a FILE operand is never renamed, even as the only operand
+# No stdin fixture: nothing here reads it.
+## argv: grep --label=LBL -H match f
+## file-json f: "match B\n"
+## stdout-json: "f:match B\n"
+## stderr-json: ""
+## status: 0
+
+#### a file the WALK found under a directory operand keeps its PATH
+# The label is set and renames nothing here: the walk prints the path it
+# built. The bare-name form of this rule is the case BELOW.
+## argv: grep --label=LBL -H -r match d
+## file-json d/-: "match A\n"
+## stdout-json: "d/-:match A\n"
+## stderr-json: ""
+## status: 0
+
+#### a WALKED file named exactly `-' is not standard input either
+# The sharp form of `provenance, not spelling': the label is set and the name
+# is the one spelling that means stdin on a command line, and the walk still
+# prints it as the path it is. ONE entry in the directory on purpose -- td-txt
+# sorts a directory where GNU takes readdir order, so a second file would pin
+# that divergence instead of this rule.
+## argv: grep --label=LBL -rn match
+## file-json -: "match A\n"
+## stdout-json: "-:1:match A\n"
+## stderr-json: ""
+## status: 0
+
+#### an EMPTY label is a name of no bytes, so the prefix is a bare colon
+# Accepted rather than refused, and not the same as not passing the option.
+## argv: grep --label= -H match
+## stdin-json: "x\nmatch A\ny\n"
+## stdout-json: ":match A\n"
+## stderr-json: ""
+## status: 0
+
+#### the LAST --label wins
+## argv: grep --label=A --label=B -H match
+## stdin-json: "x\nmatch A\ny\n"
+## stdout-json: "B:match A\n"
+## stderr-json: ""
+## status: 0
+
+#### -l prints the label, that being where the name goes
+## argv: grep --label=LBL -l match
+## stdin-json: "x\nmatch A\ny\n"
+## stdout-json: "LBL\n"
+## stderr-json: ""
+## status: 0
+
+#### and -L prints it too, at exit 1
+## argv: grep --label=LBL -L nomatch
+## stdin-json: "x\nmatch A\ny\n"
+## stdout-json: "LBL\n"
+## stderr-json: ""
+## status: 1
+
+#### --null puts its NUL after the label, as after any other name
+## argv: grep --label=LBL --null -l match
+## stdin-json: "x\nmatch A\ny\n"
+## stdout-json: "LBL\u0000"
+## stderr-json: ""
+## status: 0
+
+#### -o -b prefixes the label and the offset together
+## argv: grep --label=LBL -o -b -H match
+## stdin-json: "x\nmatch A\ny\n"
+## stdout-json: "LBL:2:match\n"
+## stderr-json: ""
+## status: 0
+
+#### under -z the label prefixes a NUL-terminated record
+## argv: grep --label=LBL -z -H match
+## stdin-json: "match A\u0000q\u0000"
+## stdout-json: "LBL:match A\u0000"
+## stderr-json: ""
+## status: 0
+
+#### the label prefixes CONTEXT lines with `-' as it prefixes matches with `:'
+# Two groups, so the separator is here too -- the label is on both sides of
+# it and on the context line as well as the selected one.
+## argv: grep --label=LBL -H -C1 match
+## stdin-json: "match A\ny\nz\nw\nmatch A\n"
+## stdout-json: "LBL:match A\nLBL-y\n--\nLBL-w\nLBL:match A\n"
+## stderr-json: ""
+## status: 0
+
+#### under --color the label is painted with fn, being the file NAME
+# Not `se': the label takes the FILENAME capability. Repointed here rather
+# than asserted -- fn=33 moves the label and leaves the `:' on se's own 36,
+# which is what shows the label is a name and not a decoration of the
+# prefix. The default 35 would have proved neither.
+## argv: grep --label=LBL --color=always -H match
+## stdin-json: "x\nmatch A\ny\n"
+## env GREP_COLORS: fn=33
+## stdout-json: "\u001b[33m\u001b[KLBL\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K A\n"
+## stderr-json: ""
+## status: 0
+
+#### --lab resolves, no other long name starting --la existing
+## argv: grep --lab=LBL -H match
+## stdin-json: "x\nmatch A\ny\n"
+## stdout-json: "LBL:match A\n"
+## stderr-json: ""
+## status: 0
+
+#### --la is the shortest prefix that resolves, --l wanting four names
+# `--l' is ambiguous across --label, --line-buffered, --line-number and
+# --line-regexp; one more byte leaves only this one.
+## argv: grep --la=LBL -H match
+## stdin-json: "x\nmatch A\ny\n"
+## stdout-json: "LBL:match A\n"
+## stderr-json: ""
+## status: 0
+
+#### the binary-file notice names the LABEL, and it goes to stderr
+# The name reaches a DIAGNOSTIC, not only the output stream. That is not
+# evidence the name must be settled before the read -- a diagnostic could
+# build it at the print -- but evidence that ONE value serves every site
+# that shows a name, the errors included.
+## argv: grep --label=LBL -H match
+## stdin-json: "match A\n\u0000zz\n"
+## stdout-json: ""
+## stderr-json: "grep: LBL: binary file matches\n"
+## status: 0
+
+#### and unlabelled that same notice says (standard input)
+## argv: grep -H match
+## stdin-json: "match A\n\u0000zz\n"
+## stdout-json: ""
+## stderr-json: "grep: (standard input): binary file matches\n"
+## status: 0
+
+#### --label takes a REQUIRED argument, so it eats the next argv
+# `-H' becomes the LABEL here, which leaves no -H to ask for the name, so
+# one input prints unprefixed and the label is never shown.
+## argv: grep --label -H match
+## stdin-json: "x\nmatch A\ny\n"
+## stdout-json: "match A\n"
+## stderr-json: ""
+## status: 0

@@ -229,22 +229,6 @@ a
 ## status: 2
 ## stderr-contains: invalid option -- 'X'
 
-#### grep refuses --label, which names STANDARD INPUT in every prefixed line
-# Only standard input: measured, `grep --label=X -H a f1' prints `f1:a' and
-# leaves the operand's own name alone, while the same command reading `-'
-# prints `X:a'. A draft of this case said it renamed any operand and used a
-# file fixture, which would have demonstrated nothing -- GNU's own output for
-# it is unchanged by the option. Ignoring it prints the literal `(standard
-# input)' instead of the name a caller supplied to make a pipeline's output
-# readable, which is the whole of what the option is for.
-## argv: grep --label=X -H a -
-## stdin:
-a
-## END
-## stdout-json: ""
-## status: 2
-## stderr-json: "grep: unsupported option '--label'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
-
 #### and --line-buffered, which is a FLUSHING policy and not an output change
 # The one refusal here whose output would be byte-identical if accepted as a
 # no-op: line buffering changes WHEN bytes appear, never which. It is refused

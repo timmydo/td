@@ -3980,6 +3980,95 @@ td-txt-authored case files
     nothing was added for it -- checked rather than assumed, since the reflex
     on landing an option is to pin its errors again.
 
+  The LABEL -- `--label=NAME` -- is served. It renames STANDARD INPUT and
+  nothing else, and the entry is short because that one sentence is nearly the
+  whole option. What is worth writing down is how far "renames" reaches and
+  what "standard input" turns out to mean.
+
+    It reaches every place the name surfaces that this implementation reaches
+    at all -- see the descriptor gap below -- and that is more places than the
+    output stream. The match prefix and the context prefix take it, so do `-l`
+    and `-L`, so does `--null` (the NUL lands after the label), so do `-o -b`
+    and `-z`, and under `--color` it is painted with `fn` -- the FILE NAME
+    capability -- rather than anything belonging to the prefix. It also
+    reaches two DIAGNOSTICS on stderr: the binary-file notice and a READ that
+    fails. Not an OPEN that fails -- standard input is never opened here, and
+    an earlier draft of this entry said "the failure to open" in four places.
+    The correction matters because the wrong word carried a wrong argument
+    with it: a read-failure diagnostic does NOT force the name to be settled
+    before the read, since it could be built at the print. NOTHING forces it.
+    What is true is smaller -- the name is ONE value that every site naming an
+    input reads, which is why the option costs one substitution rather than a
+    dozen, and why it reaches the diagnostics without being asked to.
+
+    "Standard input" means PROVENANCE, not spelling. A `-` operand is renamed;
+    a file the walk found is not, even when it is named exactly `-`. GNU
+    agrees, measured both ways round, and BOTH halves are goldens.
+
+    That second golden nearly did not exist. This entry first claimed the
+    corpus could not host it -- a walked bare `-` needing the walk to start at
+    `.`, where the harness plants its argv[0] symlink -- and the mutation that
+    drops the provenance guard was recorded as reding no corpus case "because
+    the corpus cannot reach it". Both halves were wrong. `run_case` builds the
+    symlink BESIDE the child's working directory (`workdir/<applet>`) and runs
+    the child in `workdir/cwd`, which holds only the case's own files. The walk
+    sees nothing the case did not create. The mutation now reds that golden,
+    and the directory is given ONE entry on purpose: td-txt sorts a directory
+    where GNU takes readdir order, so a second file would pin that divergence
+    instead of this rule.
+
+    The option is not a reason to PRINT a name. With one input and no `-H`
+    there is no name to replace, so `--label=LBL` alone shows nothing, and
+    `-h` suppresses a labelled name exactly as it suppresses any other. The
+    label decides what the name IS; `-H`, `-h` and the operand count decide
+    whether there is one.
+
+    Two smaller measured facts: an EMPTY label is accepted and gives a bare
+    `:` prefix, which is not the same as omitting the option; and the argument
+    is REQUIRED, so `--label -H match` takes `-H` as the label and then has no
+    `-H` left to ask for a name -- the label is set and never shown.
+
+    The default it replaces is `(standard input)`, parentheses included, which
+    is pinned twice: once in the prefix and once in the binary notice, because
+    those are two different code paths reaching one name.
+
+    A PRE-EXISTING divergence surfaced while checking how far the name
+    reaches, and it is recorded here rather than fixed, being a different
+    increment from this option. When standard input is a bad DESCRIPTOR --
+    fd 0 closed, or open write-only -- GNU reports
+    `grep: (standard input): Bad file descriptor` and exits 2. td-txt reports
+    nothing and exits 1, having treated the unreadable descriptor as an empty
+    input. Measured three ways (`0<&-`, `0>/dev/null`, `0>` a regular file),
+    identical each time, and identical with `--label` set except for the name
+    GNU prints. This is not about `--label`: the labelled and unlabelled runs
+    diverge the same way, and the option only made it visible by drawing
+    attention to the diagnostic path. Nothing in the corpus could have caught
+    it -- `run_case` always hands the child a working pipe -- which is the
+    same blind spot the read-failure Rust test exists for.
+
+    NO defect was found, and as in the entry above that is a measurement:
+    22,400 combinations -- 8 label settings x 20 sets drawn from
+    `-H`/`-h`/`-n`/`-b`/`-o`, `--null`, `-c`/`-l`/`-L`/`-q`, `-z`, `--color`,
+    `-A0`, `-m`, `-v`, `-r` and `-i` x 7 operand shapes x 5 stdin bodies,
+    binary and NUL-separated among them, x 4 patterns -- differ from GNU in
+    zero cases of stdout, status AND stderr. One caveat for a re-run: the `-r`
+    shapes use a single-entry directory. Give one two entries and 240 of these
+    diverge on ORDER, td-txt sorting where GNU takes readdir order, which is a
+    pinned divergence of its own and not a regression.
+
+    The stderr agreement is the part worth having: it is where the two
+    diagnostics live.
+
+    One thing this entry got wrong before it was written down, and the shape
+    is familiar. A golden added to pin "the label misses a walked file" used a
+    file at `d/-`, and its comment claimed the name was "the one spelling that
+    means stdin". It is not -- the walked path is `d/-`, never `-` -- so the
+    case pinned something weaker than it said, and a mutation dropping the
+    provenance guard sailed past it. The comment now says what the case shows,
+    and the sharp form went where it can actually run. The mutation that
+    caught this was run because the previous landing's review had asked for
+    exactly that check on exactly that kind of claim.
+
   Goldens are C-locale. Under LC_ALL=C — the only locale td's image sets, and what
   every case here was captured under — GNU `grep -w '\.*'` selects `.a`; under a
   UTF-8 locale the same GNU binary selects nothing. Re-derive a `-w` golden without
@@ -4012,10 +4101,10 @@ td-txt-authored case files
   oracle against a new case and confirm it does NOT match, comparing status,
   stdout AND stderr: for every refusal here the whole divergence is the
   diagnostic, so a check that reads only status and stdout reports agreement.
-  67 cases, and this count was taken by RUNNING the whole file against both
+  62 cases, and this count was taken by RUNNING the whole file against both
   oracles rather than by adjusting the previous number: GNU grep 3.11 and GNU
   sed 4.9 under LC_ALL=C, every fixture materialized, every case compared on
-  status, stdout and stderr exactly as that case asserts them. SIXTY-TWO
+  status, stdout and stderr exactly as that case asserts them. FIFTY-SEVEN
   differ. TWO are the `-NUM` waits GNU never returns from, not comparable by
   construction, their divergence being the non-finishing itself. The remaining
   THREE are this paragraph's own warning coming true, and running is what found
@@ -4023,16 +4112,23 @@ td-txt-authored case files
   only as a SUBSTRING, GNU prints that substring too, and the divergence each
   exists for is the usage block AFTER it. Read on FULL stderr they do differ --
   GNU reprints its option manual where td-txt prints one usage line -- so that
-  reading counts 65, and it is where the previous 68 came from: 68 less the
-  four departures below plus the one arrival is exactly 65. They are named
-  rather than tightened: asserting the whole of GNU's manual here would pin
-  upstream's help text into this file.
+  reading counts 60. They are named rather than tightened: asserting the whole
+  of GNU's manual here would pin upstream's help text into this file.
 
-  It was 70 before this landing. FOUR cases left when `--include`, `--exclude`,
-  `--exclude-from` and `--exclude-dir` stopped being refusals, which is the one
-  way a case leaves this file -- td-txt stopped diverging -- and ONE arrived,
-  `--exclude-from` reading its file once where GNU reads it twice. The number
-  had also gone STALE once, reading 36 while the file held 33, five commits
+  It was 63 before this landing, and ONE case left when `--label` stopped being
+  a refusal. The full chain, measured from history rather than reasoned:
+  SEVENTY at the landing that added grep's last five long names, SIXTY-SEVEN
+  when `--include`, `--exclude`, `--exclude-from` and `--exclude-dir` stopped
+  being refusals -- four departures and ONE arrival, `--exclude-from` reading
+  its file once where GNU reads it twice -- then SIXTY-FIVE with `--color`,
+  SIXTY-THREE with the group separator, and SIXTY-TWO here. A case leaves this
+  file exactly one way: td-txt stops diverging. An earlier draft of THIS
+  sentence said seventy and credited the glob-filter departures, which were
+  three landings back; the number was corrected by re-running and the chain by
+  reading the file at each landing.
+
+  The number had also gone STALE once, reading 36 while the file held 33, five
+  commits
   having touched it without re-running; before that it was 32 twice over, once
   when the `-f DIR` decision arrived with FOUR and once when `-NUM` landed and
   retired `sed -l N`. Re-run it when adding one: the count in this sentence is
@@ -4058,7 +4154,7 @@ Overlay
                          td-txt/target/release/td-txt td-txt/spec > td-txt/spec/expectations.txt
 
                      It is NOT empty: 22 xfail entries and no skips,
-                     against 2739 of a 2761-case corpus passing -- 99.20%.
+                     against 2761 of a 2783-case corpus passing -- 99.21%.
                      This line read "EMPTY today" long after it stopped being
                      true, which is why the count now sits beside the claim.
 

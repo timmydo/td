@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 2761;
+const CORPUS_FLOOR: usize = 2783;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -538,6 +538,16 @@ fn grep_r_searches_a_walked_file_named_dash() -> Result<(), Box<dyn std::error::
     let out = grep_in(&dir, &["-rn", "a"])?;
     assert_eq!(out.status.code(), Some(0), "want exit 0, got {out:?}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "-:1:a\nother:1:a\n");
+
+    // And `--label` does not reach it either: the option renames standard
+    // input, which this file is not, however it is spelled. Measured -- GNU
+    // prints the same bytes with the label set.
+    // Compared against the UNLABELLED run rather than a literal because the
+    // claim is about the LABEL, not about the bytes: this asserts that setting
+    // it changes nothing here, whatever the two names above happen to be.
+    let labelled = grep_in(&dir, &["--label=LBL", "-rn", "a"])?;
+    assert_eq!(labelled.status.code(), Some(0), "want exit 0, got {labelled:?}");
+    assert_eq!(labelled.stdout, out.stdout, "the label reached a walked file");
     Ok(())
 }
 
@@ -2152,6 +2162,48 @@ fn a_bad_directories_argument_is_quoted_the_way_gnu_quotes_it()
     Ok(())
 }
 
+/// `--label` renames standard input wherever that name surfaces, and the sharpest
+/// place is a DIAGNOSTIC rather than the output stream. Standard input is never
+/// OPENED here, so what fails is a READ. That does not by itself argue the name
+/// must be settled early -- a diagnostic could build it at the print. What it
+/// shows is that ONE value serves every site that names an input.
+///
+/// A corpus case cannot ask for this one: `run_case` always gives the child a
+/// PIPE (`Stdio::piped()` in src/lib.rs) and feeds it bytes, so no case can make
+/// standard input a directory. Checked by reading that code. The neighbouring
+/// claim about a WALKED file named `-` was checked the same way and was WRONG --
+/// the harness plants its argv[0] symlink beside the case's cwd, not in it -- so
+/// that one is a golden now.
+///
+/// A bad stdin DESCRIPTOR is a different and PRE-EXISTING divergence -- GNU
+/// diagnoses `Bad file descriptor` and exits 2 where this exits 1 in silence,
+/// labelled or not -- recorded in spec/README and not addressed here.
+///
+/// Measured against GNU grep 3.11 under `LC_ALL=C`.
+#[test]
+fn a_label_renames_standard_input_in_the_read_failure_too()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("label-dir-stdin")?;
+    // No `-d` here on purpose: measured, every `-d` action answers a directory
+    // ARRIVING AS STANDARD INPUT the same way. `-d` decides what a NAMED
+    // directory operand does, which is a different question.
+    for (args, want) in [
+        (&["--label=LBL", "match", "-"][..], &b"grep: LBL: Is a directory\n"[..]),
+        (&["match", "-"][..], &b"grep: (standard input): Is a directory\n"[..]),
+    ] {
+        let out = std::process::Command::new(bin())
+            .arg("grep")
+            .args(args)
+            .stdin(std::fs::File::open(&dir.0)?)
+            .current_dir(&dir.0)
+            .output()?;
+        assert_eq!(out.stderr, want, "{args:?} did not name standard input as GNU does");
+        assert!(out.stdout.is_empty(), "{args:?} printed output");
+        assert_eq!(out.status.code(), Some(2), "{args:?} status");
+    }
+    Ok(())
+}
+
 /// `-f -` reading a DIRECTORY is the same deliberate refusal the four
 /// `spec/divergence.test.txt` cases pin for the named spelling, and the corpus
 /// cannot say it: a case supplies stdin as BYTES, so there is no way to
@@ -3366,7 +3418,9 @@ fn a_failing_stderr_does_not_abort_grep() -> Result<(), Box<dyn std::error::Erro
         (&["grep", "--max-count"], 2),
         (&["grep", "--i"], 2),
         (&["grep", "--count=3"], 2),
-        (&["grep", "--label"], 2),
+        // `--label` sat here until it was SERVED, at which point it moved to
+        // the missing-argument site above and left this one unreached.
+        (&["grep", "--line-buffered"], 2),
         // The argmatch list, whose own lines panicked separately from the
         // usage line under them. Status 1, not 2 -- which is also the one
         // path GNU answers differently here (see spec/README).
