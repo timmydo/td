@@ -85,3 +85,11 @@ td-install/target/
 # rustc in its recipes; the gate uses a scratch CARGO_TARGET_DIR.
 td-compositor/target/
 td-seatd/target/
+
+# td-profiler: built in-tree by the HOST preflight (`td-builder
+# affected-checks --run`), which unlike the 325-cargo-test gate neither sets
+# nor clears CARGO_TARGET_DIR -- it inherits whatever the caller has, so with
+# no override it writes here. Without this line the preflight's own build
+# leaves the output untracked, and `ready` refuses every LATER run over paths
+# that route to a check.
+td-profiler/target/
