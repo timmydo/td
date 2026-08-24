@@ -1022,10 +1022,12 @@ fn build_td_svc_conf() -> String {
          console=yes\n\
          \n\
          # A trusted one-shot prints the shared boot marker only after one current-boot\n\
-         # capture has nonzero samples, complete reports, and no loss/corruption.\n\
+         # capture has nonzero samples, complete reports, and no loss/corruption. On\n\
+         # the exact QEMU autotest token it also supplies a deterministic CPU workload\n\
+         # and requires the persisted line report to attribute that named function.\n\
          [profiler-evidence]\n\
          type=oneshot\n\
-         exec=/bin/td-profiler evidence {profiler_capture_root} --timeout-secs {profiler_evidence_timeout_secs} --uid {profiler_uid} --gid {profiler_read_gid}\n\
+         exec=/bin/td-profiler evidence {profiler_capture_root} --timeout-secs {profiler_evidence_timeout_secs} --uid {profiler_uid} --gid {profiler_read_gid} --attribution-cmdline-token {profiler_attribution_cmdline_token}\n\
          after=profiler\n\
          requires=profiler\n\
          timeout={profiler_evidence_service_timeout_secs}\n\
@@ -1174,6 +1176,7 @@ fn build_td_svc_conf() -> String {
         profiler_capture_root = PROFILER_CAPTURE_ROOT,
         profiler_evidence_timeout_secs = PROFILER_EVIDENCE_TIMEOUT_SECS,
         profiler_evidence_service_timeout_secs = PROFILER_EVIDENCE_SERVICE_TIMEOUT_SECS,
+        profiler_attribution_cmdline_token = AUTOTEST_CMDLINE_TOKEN,
         fixture_name = APPLICATION_FIXTURE_NAME,
         fixture_marker = TD_JAIL_FIXTURE_BOOT_MARKER,
         fixture_evidence = APPLICATION_FIXTURE_EVIDENCE,
@@ -3666,7 +3669,12 @@ mod tests {
                 .contains(PROFILER_CAPTURE_ROOT)
         );
         let evidence = unit_key("profiler-evidence", "exec").unwrap_or_default();
-        for required in ["--timeout-secs 180", "--uid 997", "--gid 996"] {
+        for required in [
+            "--timeout-secs 180",
+            "--uid 997",
+            "--gid 996",
+            "--attribution-cmdline-token td.autotest=1",
+        ] {
             assert!(evidence.contains(required), "evidence unit omitted {required}");
         }
         assert_eq!(

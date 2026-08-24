@@ -113,7 +113,8 @@ const TD_SANDBOX_KERNEL_MARKER: &str = td_recipe::ladder::TD_SANDBOX_KERNEL_MARK
 const TD_JAIL_TRANSITION_MARKER: &str = td_recipe::ladder::TD_JAIL_TRANSITION_MARKER;
 const TD_JAIL_SECCOMP_PROBE_MARKER: &str = td_recipe::ladder::TD_JAIL_SECCOMP_PROBE_MARKER;
 const TD_JAIL_FIXTURE_BOOT_MARKER: &str = td_recipe::ladder::TD_JAIL_FIXTURE_BOOT_MARKER;
-const TD_PROFILER_CAPTURE_MARKER: &str = td_recipe::td_profiler_contract::CAPTURE_MARKER;
+const TD_PROFILER_ATTRIBUTION_MARKER: &str =
+    td_recipe::td_profiler_contract::ATTRIBUTION_MARKER;
 const TD_JAIL_SECCOMP_PROBE_PATH: &str = "@var/lib/td-test/td-jail-seccomp-probe";
 
 /// Printed after the unprivileged software compositor paints and listens.
@@ -265,7 +266,7 @@ struct ConsoleEvidence {
     td_jail_transition: bool,
     td_jail_seccomp: bool,
     td_jail_fixture: bool,
-    td_profiler_capture: bool,
+    td_profiler_attribution: bool,
     td_wayland_runtime: bool,
     td_pointer_absolute: bool,
     td_term_runtime: bool,
@@ -1322,13 +1323,15 @@ fn validate_system_boot(
             tail(&result.console, 80)
         ));
     }
-    if !result.evidence.td_profiler_capture {
+    if !result.evidence.td_profiler_attribution {
         return Err(format!(
-            "the userland health checks passed, but the continuous-profiler marker \
-             ({TD_PROFILER_CAPTURE_MARKER:?}) was absent — the root opener could not create \
+            "the userland health checks passed, but the continuous-profiler attribution marker \
+             ({TD_PROFILER_ATTRIBUTION_MARKER:?}) was absent — the root opener could not create \
              per-CPU perf events, the dedicated profiler identity could not publish its \
-             bounded capture, or the current-boot capture contained no samples, indexed \
-             objects, or AI-readable reports. Last serial output:\n{}",
+             bounded capture, or persisted lines.jsonl did not attribute the deterministic \
+             {} workload to {} and a source line inside that function. Last serial output:\n{}",
+            td_recipe::td_profiler_contract::ATTRIBUTION_FUNCTION_FRAGMENT,
+            td_recipe::td_profiler_contract::ATTRIBUTION_SOURCE_FILE,
             tail(&result.console, 80)
         ));
     }
@@ -3155,7 +3158,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_JAIL_TRANSITION_MARKER.len(),
         exact_line_window(TD_JAIL_SECCOMP_PROBE_MARKER),
         exact_line_window(TD_JAIL_FIXTURE_BOOT_MARKER),
-        TD_PROFILER_CAPTURE_MARKER.len(),
+        exact_line_window(TD_PROFILER_ATTRIBUTION_MARKER),
         TD_WAYLAND_RUNTIME_MARKER.len(),
         TD_POINTER_ABSOLUTE_MARKER.len(),
         TD_TERM_RUNTIME_MARKER.len(),
@@ -3318,10 +3321,10 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         buf,
         TD_JAIL_FIXTURE_BOOT_MARKER.as_bytes(),
     );
-    latch_marker(
-        &mut evidence.td_profiler_capture,
+    latch_line_marker(
+        &mut evidence.td_profiler_attribution,
         buf,
-        TD_PROFILER_CAPTURE_MARKER.as_bytes(),
+        TD_PROFILER_ATTRIBUTION_MARKER.as_bytes(),
     );
     latch_marker(
         &mut evidence.td_wayland_runtime,
@@ -4258,7 +4261,7 @@ mod tests {
             TD_JAIL_TRANSITION_MARKER,
             TD_JAIL_SECCOMP_PROBE_MARKER,
             TD_JAIL_FIXTURE_BOOT_MARKER,
-            TD_PROFILER_CAPTURE_MARKER,
+            TD_PROFILER_ATTRIBUTION_MARKER,
             TD_WAYLAND_RUNTIME_MARKER,
             TD_POINTER_ABSOLUTE_MARKER,
             TD_TERM_RUNTIME_MARKER,

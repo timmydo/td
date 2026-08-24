@@ -608,9 +608,16 @@ design:
    credential drop. Tests distinguish whole-baseline startup loss from a
    per-task snapshot failure and pin the three-attempt nonzero failure path.
    The system test proves the daemon produces a complete manifest and
-   AI-readable summaries for a known CPU workload, or a precise
-   unsupported-permission diagnostic on a host where collection cannot be
-   exercised.
+   AI-readable summaries for a known CPU workload. On the exact QEMU autotest
+   kernel token, the trusted evidence process spends the capture interval in a
+   no-inline named function. It reads the persisted `lines.jsonl` and emits a
+   distinct host marker only after a row attributes samples to that function,
+   the line-table-local `evidence.rs` source emitted by the bounded DWARF-v4
+   reader, and a line inside the function. Rejected completed captures are
+   immutable and scanned only once, and the workload alternates equal work and
+   rest slices. Normal boots do not run the synthetic workload and retain the
+   generic complete-capture evidence path. A host where collection cannot be
+   exercised instead requires a precise unsupported-permission diagnostic.
 
 The source-line reporting increment consumes the already-required line tables
 with a dependency-free bounded DWARF reader, adds deterministic `lines.jsonl`,

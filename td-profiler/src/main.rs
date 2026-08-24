@@ -82,6 +82,7 @@ fn evidence_command(arguments: &[OsString]) -> Result<(), String> {
     let mut timeout = Duration::from_secs(30);
     let mut uid = None;
     let mut gid = None;
+    let mut attribution_cmdline_token = None;
     let mut at = 1usize;
     while at < arguments.len() {
         let option = arguments
@@ -95,6 +96,9 @@ fn evidence_command(arguments: &[OsString]) -> Result<(), String> {
             }
             "--uid" => uid = Some(number(take(arguments, &mut at, option)?, option)?),
             "--gid" => gid = Some(number(take(arguments, &mut at, option)?, option)?),
+            "--attribution-cmdline-token" => {
+                attribution_cmdline_token = Some(text(take(arguments, &mut at, option)?, option)?);
+            }
             other => return Err(format!("unknown evidence option {other}")),
         }
     }
@@ -103,6 +107,7 @@ fn evidence_command(arguments: &[OsString]) -> Result<(), String> {
         timeout,
         uid.ok_or("evidence requires --uid")?,
         gid.ok_or("evidence requires --gid")?,
+        attribution_cmdline_token.as_deref(),
     )
 }
 
@@ -248,7 +253,8 @@ fn usage() -> String {
      [--object-index PATH|--no-object-index]  # maintenance writer; writes \
      ABSOLUTE-CAPTURE/regenerated\n       td-profiler index ROOT OUTPUT \
      [--exclude-registry REGISTRY APPLICATION_ROOTS]\n       td-profiler evidence CAPTURE-ROOT \
-     [--timeout-secs N] --uid N --gid N\n       td-profiler probe"
+     [--timeout-secs N] --uid N --gid N \
+     [--attribution-cmdline-token TOKEN]\n       td-profiler probe"
         .into()
 }
 
