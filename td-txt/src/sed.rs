@@ -1958,13 +1958,14 @@ impl Fd0 {
 /// by the `-s`/`-i` caller that has to decide whether the file may be rewritten.
 enum Src {
     Open(Input),
-    /// Descriptor 0, UNBUFFERED. `Input::Stdin` reads through `std::io::Stdin`,
-    /// which is a `BufReader`: a 4 KiB request takes 8 KiB off the descriptor, so
-    /// what a `q` leaves in a pipe would be std's buffer size rather than
-    /// `BLOCK`. Measured before this existed -- `sed 1q` over 20000 bytes left
-    /// 11808 where GNU leaves 15904, one whole block too few. Where the duplicate
-    /// cannot be had, `-u`'s block of ONE is defeated the same way and for the
-    /// same reason -- which is the case the give-back already declines in.
+    /// Descriptor 0, UNBUFFERED. The fallback `Input::Stdin(None)` reads through
+    /// `std::io::Stdin`, which is a `BufReader`: a 4 KiB request takes 8 KiB off
+    /// the descriptor, so what a `q` leaves in a pipe would be std's buffer size
+    /// rather than `BLOCK`. Measured before this existed -- `sed 1q` over 20000
+    /// bytes left 11808 where GNU leaves 15904, one whole block too few. Where
+    /// the duplicate cannot be had, `-u`'s block of ONE is defeated the same way
+    /// and for the same reason -- which is the case the give-back already
+    /// declines in.
     Raw(std::fs::File),
 }
 
@@ -1978,19 +1979,16 @@ impl std::io::Read for Src {
 }
 
 /// The reader for an opened operand, and whether what it takes off descriptor 0
-/// can be HANDED BACK. Stdin goes through a raw duplicate so `BLOCK` is what
-/// reaches the kernel; a duplication that fails falls back to the buffered path
-/// rather than failing the run — EMFILE must not turn a working run into an error
-/// — and the give-back goes with it, because `std::io::Stdin` takes 8 KiB off the
-/// descriptor for a 4 KiB request. Seeking back by what the reader counted would
-/// then land a block short, and the next reader would SKIP that block: not
-/// repositioning at all is the honest answer, and it is what happened before any
-/// of this existed.
-fn source_of(input: Input) -> (Src, bool) {
-    if !input.is_stdin() {
-        return (Src::Open(input), false);
-    }
-    match crate::util::stdin_unbuffered() {
+/// can be HANDED BACK. Stdin goes through the raw duplicate the OPEN input holds
+/// so `BLOCK` is what reaches the kernel; an input whose duplication failed falls
+/// back to the buffered path rather than failing the run — EMFILE must not turn a
+/// working run into an error — and the give-back goes with it, because
+/// `std::io::Stdin` takes 8 KiB off the descriptor for a 4 KiB request. Seeking
+/// back by what the reader counted would then land a block short, and the next
+/// reader would SKIP that block: not repositioning at all is the honest answer,
+/// and it is what happened before any of this existed.
+fn source_of(mut input: Input) -> (Src, bool) {
+    match input.take_stdin_dup() {
         Some(file) => (Src::Raw(file), true),
         None => (Src::Open(input), false),
     }
@@ -2131,7 +2129,7 @@ impl Stream {
             }
         }
         if self.fd0.is_none() {
-            self.open_fd0(Input::Stdin);
+            self.open_fd0(Input::stdin());
         }
         let Some(fd0) = self.fd0.as_mut() else {
             return Ok(None);

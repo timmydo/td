@@ -125,7 +125,18 @@ pub fn errmsg(e: &std::io::Error) -> String {
 /// an empty file to grep. A DIRECTORY operand is the reachable case of the second:
 /// `open(2)` on one succeeds and the first read fails.
 pub enum Input {
-    Stdin,
+    /// Descriptor 0, held as a DUPLICATE to read through. `std::io::Stdin`
+    /// answers `Ok(0)` where the descriptor answers `EBADF`: std maps that one
+    /// error on the standard streams to end of input, so a descriptor 0 that is
+    /// write-only reads as an empty input and the diagnostic GNU prints for it
+    /// is not reachable at all. A dup shares the file DESCRIPTION, so reading it
+    /// moves descriptor 0 itself and a second reader of the same description
+    /// sees what this one left.
+    ///
+    /// `None` when the duplication failed, which falls back to the buffered path
+    /// rather than failing the run: EMFILE must not turn a working run into an
+    /// error.
+    Stdin(Option<std::fs::File>),
     File(std::fs::File),
 }
 
@@ -158,7 +169,7 @@ impl Input {
         nonblock: bool,
     ) -> std::io::Result<Self> {
         if dash_is_stdin && path == b"-" {
-            return Ok(Self::Stdin);
+            return Ok(Self::stdin());
         }
         use std::os::unix::fs::OpenOptionsExt;
         let mut opts = std::fs::OpenOptions::new();
@@ -169,6 +180,33 @@ impl Input {
         Ok(Self::File(opts.open(path_from_bytes(path))?))
     }
 
+    /// Descriptor 0 as an input, duplicated so reads reach the descriptor rather
+    /// than std's wrapper over it. One dup per OPEN, not one per run: two `-`
+    /// operands make two, which share the file DESCRIPTION and so share a
+    /// position, but are not one reader. A caller that needs a single reader
+    /// still arranges it -- sed's `open_fd0` does, and drops the second
+    /// operand's `Input` and with it the dup it had just made.
+    pub fn stdin() -> Self {
+        Self::Stdin(stdin_unbuffered())
+    }
+
+    /// Move the duplicate out, for a caller that reads descriptor 0 through its
+    /// own reader and must not make a SECOND dup to do it. `None` for a file
+    /// operand and for a stdin whose dup failed; both mean the same thing to the
+    /// caller, which is that it has no descriptor of its own to read or seek.
+    ///
+    /// A THIRD `None` is not the same thing: a stdin whose dup has ALREADY been
+    /// taken still answers `is_stdin`, and reading it falls back to the wrapper
+    /// with the `EBADF` masking that returns. No caller does that today -- the
+    /// only one consumes the `Input` when it takes the dup -- and one that meant
+    /// to read afterwards would have to keep the dup instead.
+    pub fn take_stdin_dup(&mut self) -> Option<std::fs::File> {
+        match self {
+            Self::Stdin(dup) => dup.take(),
+            Self::File(_) => None,
+        }
+    }
+
     /// Whether the OPEN descriptor is a directory. Stdin is never one for this
     /// purpose even when it genuinely is: GNU exempts it by DESCRIPTOR, so
     /// `grep -d skip x - < somedir` reports `(standard input): Is a directory`
@@ -176,7 +214,7 @@ impl Input {
     /// `-d skip` pass over a pipe.
     pub fn is_dir(&self) -> bool {
         match self {
-            Self::Stdin => false,
+            Self::Stdin(_) => false,
             Self::File(file) => file.metadata().is_ok_and(|m| m.is_dir()),
         }
     }
@@ -192,7 +230,7 @@ impl Input {
     /// over a pipe.
     pub fn is_device(&self) -> bool {
         match self {
-            Self::Stdin => false,
+            Self::Stdin(_) => false,
             Self::File(file) => file.metadata().is_ok_and(|m| {
                 use std::os::unix::fs::FileTypeExt;
                 let t = m.file_type();
@@ -224,7 +262,7 @@ impl Input {
     /// that over-read may hand the surplus back. Asked of the OPEN input rather
     /// than by re-deciding what `-` meant, as `error_name` is.
     pub fn is_stdin(&self) -> bool {
-        matches!(self, Self::Stdin)
+        matches!(self, Self::Stdin(_))
     }
 
     /// How a READ failure names this input. GNU registers the standard input STREAM
@@ -235,7 +273,7 @@ impl Input {
     /// wrong.
     pub fn error_name(&self, path: &[u8]) -> Vec<u8> {
         match self {
-            Self::Stdin => b"stdin".to_vec(),
+            Self::Stdin(_) => b"stdin".to_vec(),
             Self::File(_) => path.to_vec(),
         }
     }
@@ -246,8 +284,13 @@ impl Input {
     pub fn read_all(&mut self) -> Result<Vec<u8>, (std::io::Error, Vec<u8>)> {
         let mut buf = Vec::new();
         let read = match self {
-            Self::Stdin => std::io::stdin().lock().read_to_end(&mut buf),
-            Self::File(file) => {
+            Self::Stdin(None) => std::io::stdin().lock().read_to_end(&mut buf),
+            // ONE path for every descriptor held as a `File`, the stdin
+            // DUPLICATE included: the size hint and its clamp must not depend on
+            // which operand spelling produced the descriptor. `-f -` over a file
+            // whose metadata is enormous has to answer as `-f NAME` over that
+            // same file does, and before this arm shared the path it did not.
+            Self::Stdin(Some(file)) | Self::File(file) => {
                 // Size the buffer from the metadata, as `fs::read` does -- but
                 // CLAMPED. That number comes from the filesystem and need not be a
                 // size anything can hold (a sparse file, `/proc/kcore`), and
@@ -267,16 +310,19 @@ impl Input {
 }
 
 /// Descriptor 0 as an UNBUFFERED reader, sharing the file description so reads
-/// through it move fd 0 itself.
+/// through it move fd 0 itself. `Input::stdin` is the only caller: the duplicate
+/// belongs to the open input, so no reader has to make one.
 ///
-/// `std::io::Stdin` is a `BufReader` with an 8 KiB buffer, and a read SMALLER
-/// than that takes the whole 8 KiB off the descriptor -- so a reader asking for
-/// 4 KiB blocks would leave a pipe positioned by std's buffer size rather than by
-/// the block size it chose, and what a `q` leaves behind would not be its own
-/// decision. `None` if the descriptor cannot be duplicated, which leaves the
-/// caller to fall back rather than fail: EMFILE here must not turn a working run
-/// into an error.
-pub fn stdin_unbuffered() -> Option<std::fs::File> {
+/// Two things need the descriptor rather than the wrapper. `std::io::Stdin` maps
+/// `EBADF` on the standard streams to end of input, which hides a write-only
+/// descriptor 0 completely. And it is a `BufReader`: its buffer is 8 KiB, and a
+/// read SMALLER than that takes the whole 8 KiB off the descriptor -- so a reader
+/// asking for 4 KiB blocks would leave a pipe positioned by std's buffer size
+/// rather than by the block size it chose, and what a `q` leaves behind would not
+/// be its own decision. `None` if the descriptor cannot be duplicated, which
+/// leaves the caller to fall back rather than fail: EMFILE here must not turn a
+/// working run into an error.
+fn stdin_unbuffered() -> Option<std::fs::File> {
     let dup = std::io::stdin().as_fd().try_clone_to_owned().ok()?;
     Some(std::fs::File::from(dup))
 }
@@ -402,7 +448,8 @@ fn is_device(meta: &std::fs::Metadata) -> bool {
 impl std::io::Read for Input {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
-            Self::Stdin => std::io::stdin().lock().read(buf),
+            Self::Stdin(Some(fd0)) => fd0.read(buf),
+            Self::Stdin(None) => std::io::stdin().lock().read(buf),
             Self::File(file) => file.read(buf),
         }
     }

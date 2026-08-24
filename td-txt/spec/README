@@ -2970,6 +2970,24 @@ td-txt-authored case files
     absolute, and this is the one case where GNU's answer comes from a stat it
     makes and this cannot.
 
+    Its WRITE-ONLY sibling looked identical from outside -- same diagnostic,
+    same exit 2, same silence here -- and was not this at all: that one was a
+    read-path defect, std mapping `EBADF` to end of input, and it is closed.
+    This entry is the CLOSED descriptor alone.
+
+  - `grep -m` does not REPOSITION standard input, where GNU does. With `-m NUM`
+    and a regular-file stdin, GNU leaves the descriptor just after the last
+    matching line it printed, so `{ grep -m1 L1; cat; } < f` over `L1 L2 L3`
+    prints `L2 L3` there and nothing here. Measured on a 3,600,000-byte
+    fixture: GNU leaves 3599988 bytes and td-txt 3501696, where under `-q` both
+    leave 3501696 -- so a `-q` comparison cannot see this and a `-m` one can.
+    It is POSIX's "shall not consume more input than it needs", and sed already
+    does it: `give_back_stdin` has exactly one caller and it is sed's.
+    Pre-existing, and only now mechanically within reach, since grep holds a
+    duplicate of descriptor 0 it could seek. A REVIEWER found it; neither sweep
+    could, both comparing status, stdout and stderr rather than where the
+    descriptor was left.
+
   - The ORDER of a `-r` listing, which td-txt sorts and GNU takes from the
     directory: `grep -rl a tree` answers `tree/sub/g` before `tree/f` in GNU and
     the other way here. Deliberate -- a sorted walk is reproducible where a
@@ -4046,6 +4064,14 @@ td-txt-authored case files
     it -- `run_case` always hands the child a working pipe -- which is the
     same blind spot the read-failure Rust test exists for.
 
+    NARROWED for the write-only half by the landing below, which reads
+    descriptor 0 through a duplicate of it -- narrowed rather than closed,
+    because a duplication that fails falls back and masks it again. The
+    closed-fd half is NOT the same defect and stays. Grouping the three
+    measurements under one cause is where this paragraph was coarse: they
+    agree in OUTCOME without agreeing in mechanism, and only two of the three
+    were ever a read-path bug.
+
     NO defect was found, and as in the entry above that is a measurement:
     22,400 combinations -- 8 label settings x 20 sets drawn from
     `-H`/`-h`/`-n`/`-b`/`-o`, `--null`, `-c`/`-l`/`-L`/`-q`, `-z`, `--color`,
@@ -4068,6 +4094,141 @@ td-txt-authored case files
     and the sharp form went where it can actually run. The mutation that
     caught this was run because the previous landing's review had asked for
     exactly that check on exactly that kind of claim.
+
+  A BAD DESCRIPTOR on standard input is a READ FAILURE, and grep reports one
+  now. The `--label` landing above met it and deferred it, correctly: it is a
+  read-path fix and not an option. The whole of it is that descriptor 0 is read
+  through a DUPLICATE of itself.
+
+    `std::io::Stdin` maps `EBADF` on the standard streams to end of input.
+    That is std being deliberate rather than a bug, and it is invisible until
+    the descriptor really is bad: a write-only descriptor 0 read through it
+    answers `Ok(0)`, which nothing can tell from an empty file. So grep exited
+    1 in silence where GNU exits 2 with `grep: (standard input): Bad file
+    descriptor`. A duplicate of the same descriptor is an ordinary `File` and
+    does no such mapping, so the error arrives.
+
+    sed was ALREADY right, and this is sed's mechanism rather than a new one.
+    It reads descriptor 0 through a raw duplicate so its own BLOCK size reaches
+    the kernel instead of std's 8 KiB buffer -- the give-back needs that -- and
+    it got the `EBADF` for free. `Input::stdin` now makes the duplicate once at
+    open and the `Stdin` variant carries it, so both applets read the
+    descriptor rather than the wrapper, and the duplicate is made in ONE place
+    they share -- where before, sed made one and grep made none.
+
+    The variant carries an `Option` and the `None` is not decoration: a
+    duplication that FAILS leaves the buffered path rather than failing the
+    run, because EMFILE must not turn a working run into an error. That rule
+    is sed's, kept.
+
+    Reading through the duplicate does not change what is read. A dup shares
+    the file DESCRIPTION, so the position and the end of it belong to
+    descriptor 0 either way. What could have moved is how much comes off a pipe
+    at a time, std's buffer no longer being in the way; grep's requests are
+    whole blocks, which a `BufReader` passes straight through, so the
+    prediction was that nothing moves. That prediction is not the evidence.
+    Measured against the parent binary over a 3,600,000-byte input, `-q` and
+    `-m1` leave the next reader exactly what they left before: 3501696 bytes
+    from a regular file, 3534464 from a pipe. Those are PARENT-relative figures
+    and not GNU-relative ones, which is a distinction worth making because the
+    `-q` number happens to equal GNU's and the `-m1` number does not: GNU
+    repositions standard input under `-m` and grep here does not. That is a
+    pre-existing divergence and it now has a gap entry of its own. This landing
+    is the enabling half of any future fix, grep holding a SEEKABLE duplicate
+    of descriptor 0 where before it held nothing seekable at all.
+
+    Two sweeps, both zero. FIFTY-TWO runs cross 26 argument shapes -- `-q`,
+    `-c`, `-l`, `-L`, `-o`, `-z`, `-s`, `-H`, `-h`, `--label`, `-n`, `-v`,
+    `-f -`, `-r`, `-d skip`, `-D skip` and six operand arrangements -- against
+    two bad descriptors, a write-only regular file and a write-only
+    `/dev/null`: no difference from GNU in status, stdout or stderr. ONE
+    HUNDRED AND TWENTY-THREE runs cross 27 grep shapes and 14 sed shapes, the
+    `R /dev/stdin` interleavings among them, with stdin a pipe, a regular file
+    and a directory: no difference either. The second sweep is the one that
+    matters for a SHARED read path, the fix touching what sed reads through as
+    much as what grep does.
+
+    The FALLBACK is a residual divergence, and a reviewer found it where two
+    sweeps had not. When the duplication itself fails, the applet reads through
+    the wrapper again and the masking comes back with it. Measured at
+    `ulimit -n 4` with descriptor 0 write-only: grep is silent at 1 where GNU
+    is 2, and sed is 0 where GNU is 4; at a limit of 5 both match again. So
+    this landing NARROWS the divergence rather than closing it -- every bad
+    descriptor was masked before and only one whose dup fails is now -- and
+    the entry above says narrowed for that reason.
+
+    `read_all` reads the duplicate through the SAME arm a named file uses, and
+    that is a correction made during review rather than the shape it landed
+    in. The first version gave the duplicate an arm of its own, which skipped
+    the size-hint clamp sitting directly beside it, so `-f -` over a file whose
+    metadata reports terabytes would have answered differently from `-f NAME`
+    over that same file. Both are now `out of memory` at exit 2, which is what
+    a NAMED huge file already did on the parent binary. GNU reads on instead
+    and is still reading when a five-second timeout kills it, so that
+    out-of-memory answer is a pre-existing divergence this landing extends to
+    stdin, not a new one. The reviewer called it a panic; it is not, std's
+    `default_read_to_end` reserving through `try_reserve` and reporting rather
+    than aborting -- but the asymmetry it pointed at was real.
+
+    A CLOSED descriptor 0 is NOT this case and still differs from GNU. Rust
+    opens `/dev/null` over any closed standard descriptor before `main`, so
+    what the applet is handed is a real, readable, empty descriptor: there is
+    nothing to detect and no read to fail. Confirmed directly rather than
+    inferred -- a Rust program with fd 0 closed reads `/proc/self/fd/0` as
+    `/dev/null`, where `ls` in the same shell reports no such path. The gap
+    entry above keeps it.
+
+    The corpus can say none of this: `run_case` always hands the child a
+    working pipe. A write-only descriptor is expressible in safe test code --
+    an `OpenOptions::new().write(true)` file passed as stdin -- so it is a Rust
+    test, over grep, grep under `--label`, and sed. The closed one needs
+    `pre_exec`; `lib.rs` denies `unsafe_code`, `main.rs` forbids it, and td-txt
+    has no `UNSAFE.md` entry, so pinning one divergence would cost an amendment
+    there. It is recorded and not pinned, and that reason is itself checkable.
+
+    Five mutations, the unit being failing tests over the WHOLE suite. Read
+    `Input::Stdin` through the wrapper again: ONE, failing at the new test's
+    FIRST grep row -- both grep rows read through `Input::read`, but the
+    assertion ends the loop at the first, so "the grep row" would understate
+    what the mutation breaks.
+    Never make the duplicate: SEVEN -- the new test plus six existing sed
+    give-back and corpus tests, sed falling back to the buffered path too. Make
+    sed ignore the duplicate the input holds: the same SEVEN, and there the new
+    test fails on its SED row, which is what shows that row is load-bearing
+    rather than decoration. This entry nearly recorded the second of those as
+    ONE: that number came from a FILTERED run and would have been written down
+    as if it were the suite. Re-running it over the suite is what made it
+    seven.
+
+    FOUR claims in this entry were wrong when the reviewers reached it, and
+    the shape is the one this workstream keeps meeting: each was a number or a
+    scope that no run backed. `stdin_unbuffered` was said to go from two
+    callers to one; it went from one to one, sed having been its only caller
+    and `Input::stdin` being it now. The input was called 3 MB where the file
+    is 3,600,000 bytes -- which, as a reviewer noticed, is SMALLER than two of
+    the leftover figures quoted beside it, so the sentence refuted itself in
+    place. "Four `-d` spellings" is three spellings and a default. And "the
+    mutation reds them" was false of every row but one, for the reason the
+    paragraph below now gives. None of the four was found by a sweep: sweeps
+    compare runs, and a sentence about runs is not one.
+
+    The fifth mutation found a HOLE instead of confirming a guard, and it is
+    the part of this landing worth carrying forward. Descriptor 0 is exempt
+    from `-d` BY DESCRIPTOR in GNU, and `is_dir` answering `false` for it is
+    what keeps `grep -d skip match - < dir` a diagnostic rather than a skip.
+    Mutating that arm reded NOTHING. The exemption was documented twice --
+    once on `is_dir` itself, and once in the entry above, which says in prose
+    that every `-d` action answers a directory arriving as stdin the same way
+    -- and checked by nothing. Its twin `is_device` WAS guarded, by the corpus,
+    which is why the hole was in one of a matched pair rather than both.
+    Three `-d` spellings and the default are now pinned against GNU 3.11
+    goldens, and the mutation reds the `-d skip` row -- the only one the
+    exemption can reach, `open_search` short-circuiting on `skip_dirs` and
+    grep's other `is_dir` site exempting stdin by provenance. That row is LAST
+    in the table so the mutation has to let the other three pass before it
+    fails. The claim was older than this landing; what found it was
+    mutating an arm the diff happened to touch, which is the cheapest check
+    this workstream has and the one that keeps paying.
 
   Goldens are C-locale. Under LC_ALL=C — the only locale td's image sets, and what
   every case here was captured under — GNU `grep -w '\.*'` selects `.a`; under a

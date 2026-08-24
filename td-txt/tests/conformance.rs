@@ -2204,6 +2204,110 @@ fn a_label_renames_standard_input_in_the_read_failure_too()
     Ok(())
 }
 
+/// Descriptor 0 is exempt from `-d` whatever the action, so a directory that
+/// ARRIVES AS STANDARD INPUT is reported rather than skipped or walked. GNU
+/// tests `desc != STDIN_FILENO` before it asks the question at all, which is why
+/// no action can reach it. The corpus cannot say this: a case supplies stdin as
+/// BYTES, so the harness always hands the child a pipe.
+///
+/// The neighbouring test says in prose that every `-d` action answers this the
+/// same way; this is the run that shows it. Goldens from GNU grep 3.11.
+#[test]
+fn every_directories_action_reports_a_directory_arriving_as_standard_input(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("dirstdin-actions")?;
+    let want = &b"grep: (standard input): Is a directory\n"[..];
+    // `-d skip` LAST on purpose. It is the ONLY row the exemption can reach --
+    // `open_search` short-circuits on `skip_dirs`, and grep's other `is_dir`
+    // site exempts stdin by provenance -- so a mutation of that arm has to let
+    // the other three pass before it fails, which is what makes the red
+    // attributable to the arm rather than to the row order.
+    for args in [
+        &["-d", "read", "match", "-"][..],
+        &["-d", "recurse", "match", "-"][..],
+        &["match", "-"][..],
+        &["-d", "skip", "match", "-"][..],
+    ] {
+        let out = std::process::Command::new(bin())
+            .arg("grep")
+            .args(args)
+            .stdin(std::fs::File::open(&dir.0)?)
+            .current_dir(&dir.0)
+            .output()?;
+        assert_eq!(out.stderr, want, "{args:?} did not report the directory");
+        assert!(out.stdout.is_empty(), "{args:?} printed output");
+        assert_eq!(out.status.code(), Some(2), "{args:?} status");
+    }
+    Ok(())
+}
+
+/// A WRITE-ONLY descriptor 0 is a read failure, not an empty input.
+/// The corpus cannot say this either: a case supplies stdin as BYTES, so the
+/// harness always hands the child a pipe.
+///
+/// It is reachable only because descriptor 0 is read through a DUPLICATE of it.
+/// `std::io::Stdin` maps `EBADF` on the standard streams to end of input, so
+/// reading through it reports a write-only descriptor 0 as an empty file --
+/// grep exited 1 in silence where GNU exits 2 with a diagnostic, and sed exited
+/// 0 where GNU exits 4. The duplicate is an ordinary `File`, which does not do
+/// that mapping.
+///
+/// TWO neighbouring cases are NOT this one and both still differ from GNU, so
+/// the name says write-only rather than "cannot be read". A CLOSED descriptor 0
+/// is not bad by the time anything here runs: Rust opens `/dev/null` over a
+/// closed standard descriptor before `main`, so what td-txt is handed is a real,
+/// readable, empty descriptor. And when the DUPLICATION ITSELF fails the applet
+/// falls back to `std::io::Stdin` and the masking returns -- measured at
+/// `ulimit -n 4`, where grep is silent at 1 against GNU's 2 and sed is 0 against
+/// GNU's 4, both matching again at 5.
+///
+/// Neither is pinned here. Handing a child a closed descriptor or a descriptor
+/// limit needs `pre_exec`, and td-txt denies and forbids `unsafe_code` with no
+/// `UNSAFE.md` entry, so pinning either would cost an amendment there.
+#[test]
+fn a_write_only_descriptor_zero_is_a_read_failure_not_an_empty_input(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("badfd-stdin")?;
+    let path = dir.0.join("write-only");
+    for (args, want, code) in [
+        (
+            &["grep", "match"][..],
+            &b"grep: (standard input): Bad file descriptor\n"[..],
+            2,
+        ),
+        // The name the last landing made configurable reaches this diagnostic
+        // too, because one value serves every site that shows a name.
+        (
+            &["grep", "--label=LBL", "match"][..],
+            &b"grep: LBL: Bad file descriptor\n"[..],
+            2,
+        ),
+        // sed already read the descriptor through a duplicate of its own, so
+        // this is the behaviour that stands rather than one this landing gained.
+        // It is pinned so the shared duplicate cannot be withdrawn silently.
+        (
+            &["sed", "-n", "p"][..],
+            &b"sed: read error on stdin: Bad file descriptor\n"[..],
+            4,
+        ),
+    ] {
+        let stdin = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)?;
+        let out = std::process::Command::new(bin())
+            .args(args)
+            .stdin(stdin)
+            .current_dir(&dir.0)
+            .output()?;
+        assert_eq!(out.stderr, want, "{args:?} did not report the bad descriptor");
+        assert!(out.stdout.is_empty(), "{args:?} printed output");
+        assert_eq!(out.status.code(), Some(code), "{args:?} status");
+    }
+    Ok(())
+}
+
 /// `-f -` reading a DIRECTORY is the same deliberate refusal the four
 /// `spec/divergence.test.txt` cases pin for the named spelling, and the corpus
 /// cannot say it: a case supplies stdin as BYTES, so there is no way to
