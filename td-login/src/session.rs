@@ -2,14 +2,17 @@
 //!
 //! Everything that needs root — the terminal hand-over, reading the account
 //! database, deciding the working directory — happens in the applet BEFORE a
-//! `Session` is built. `enter` then drops privilege and execs, in that order and
-//! nothing between: it is the only caller of `creds::apply` in the crate, which
+//! `Session` is built. `enter` first attempts the fixed session-cgroup join while
+//! it may still be root, then drops privilege and execs with nothing between
+//! those last two operations. It is the only caller of `creds::apply` in the crate, which
 //! `main.rs`'s confinement test asserts, so there is exactly one place where
 //! td-login stops being root.
 
+use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
+use crate::cgroup;
 use crate::creds::{self, Credentials};
 use crate::db::Account;
 
@@ -154,7 +157,7 @@ pub fn login_arg0(shell: &str) -> String {
     format!("-{}", crate::basename(shell))
 }
 
-/// Drop privilege, then exec. Never returns on success.
+/// Attempt the session-cgroup join, drop privilege, then exec. Never returns on success.
 ///
 /// `creds::apply` verifies the switch against `/proc/self/status` before this
 /// returns, so an `exec` below always runs with credentials the kernel has
@@ -162,6 +165,12 @@ pub fn login_arg0(shell: &str) -> String {
 /// — that is the whole ordering contract of THREAT-MODEL.md §2 expressed as
 /// control flow.
 pub fn enter(session: &Session) -> Result<u8, String> {
+    if let Err(error) = cgroup::join(session.creds.target_uid()) {
+        let _ = writeln!(
+            io::stderr(),
+            "td-login: cannot enter the application session cgroup: {error}"
+        );
+    }
     creds::apply(&session.creds)?;
 
     let mut command = Command::new(&session.program);

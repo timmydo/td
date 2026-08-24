@@ -310,6 +310,7 @@ impl ApplicationSpec {
                 ));
             }
         }
+        self.permissions.resources().complete_or_default()?;
         let size = self.to_keyfile().len();
         if size > MAX_APPLICATION_SPEC_BYTES {
             return Err(format!(
@@ -434,6 +435,10 @@ mod tests {
             .unwrap()
             .with_session_bus("org.example.Search", BusAccess::Talk)
             .unwrap()
+            .with_memory_high(48 * 1024 * 1024)
+            .unwrap()
+            .with_memory_max(64 * 1024 * 1024)
+            .unwrap()
             .with_pids_max(32)
             .unwrap();
         let spec = ApplicationSpec::compile(
@@ -517,6 +522,24 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("no compiled environment policy"), "{error}");
+    }
+
+    #[test]
+    fn compiler_refuses_incomplete_or_unaligned_resource_policy() {
+        let runtime = "/td/store/0123456789abcdfghijklmnpqrsvwxyz-empty-runtime-1";
+        let partial = PermissionPolicy::new().with_pids_max(32).unwrap();
+        let error = ApplicationSpec::compile(&manifest(), runtime, partial).unwrap_err();
+        assert!(error.contains("must set memory-high, memory-max and pids-max together"));
+
+        let unaligned = PermissionPolicy::new()
+            .with_memory_high(48 * 1024 * 1024 + 1)
+            .unwrap()
+            .with_memory_max(64 * 1024 * 1024)
+            .unwrap()
+            .with_pids_max(32)
+            .unwrap();
+        let error = ApplicationSpec::compile(&manifest(), runtime, unaligned).unwrap_err();
+        assert!(error.contains("must be aligned to the 4096-byte target page size"));
     }
 
     #[test]

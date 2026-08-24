@@ -1,5 +1,6 @@
 use crate::permissions::{
-    FilesystemAccess, PermissionPolicy, MAX_FILESYSTEM_ENTRIES, RESERVED_FILESYSTEM_TREES,
+    FilesystemAccess, PermissionPolicy, ResourceLimits, MAX_FILESYSTEM_ENTRIES,
+    RESERVED_FILESYSTEM_TREES,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -13,8 +14,9 @@ const CONFIG_PATH: &str = "/etc/td-app.conf";
 const REGISTRY_PATH: &str = "/etc/td-applications.tsv";
 const PACKAGE_ROOT: &str = "/td/store";
 const STATE_ROOT: &str = ".td/app";
+pub(crate) const CGROUP_ROOT: &str = "/sys/fs/cgroup/td-user-1000";
 pub(crate) const RUNTIME_ROOT_NAME: &str = "td-app";
-const CONFIG: &str = "format=1\npackage-root=/td/store\nstate-root=.td/app\nregistry=/etc/td-applications.tsv\nlauncher-table=/etc/td-launcher.tsv\n";
+const CONFIG: &str = "format=1\npackage-root=/td/store\nstate-root=.td/app\nregistry=/etc/td-applications.tsv\nlauncher-table=/etc/td-launcher.tsv\ncgroup-root=/sys/fs/cgroup/td-user-1000\n";
 const SPEC_FORMAT: &str = "format=1";
 const NAME_PREFIX: &str = "name=";
 const RUNTIME_PREFIX: &str = "runtime=";
@@ -47,9 +49,50 @@ pub(crate) struct LaunchPlan {
     pub(crate) wayland_socket: PathBuf,
     pub(crate) bus_socket: PathBuf,
     pub(crate) filesystems: Vec<FilesystemGrant>,
+    pub(crate) resources: ResolvedResourceLimits,
     pub(crate) entry: String,
     pub(crate) environment: Vec<(OsString, OsString)>,
     pub(crate) arguments: Vec<OsString>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResolvedResourceLimits {
+    pub(crate) memory_high_bytes: u64,
+    pub(crate) memory_max_bytes: u64,
+    pub(crate) pids_max: u32,
+}
+
+impl ResolvedResourceLimits {
+    fn from_policy(resources: ResourceLimits) -> io::Result<Self> {
+        let resources = resources
+            .complete_or_default()
+            .map_err(|error| invalid(format!("application resource policy: {error}")))?;
+        let (Some(memory_high_bytes), Some(memory_max_bytes), Some(pids_max)) = (
+            resources.memory_high_bytes(),
+            resources.memory_max_bytes(),
+            resources.pids_max(),
+        ) else {
+            return Err(invalid("application resource baseline is incomplete"));
+        };
+        Ok(Self {
+            memory_high_bytes,
+            memory_max_bytes,
+            pids_max,
+        })
+    }
+
+    pub(crate) fn from_stage2(
+        memory_high_bytes: u64,
+        memory_max_bytes: u64,
+        pids_max: u32,
+    ) -> io::Result<Self> {
+        let policy = PermissionPolicy::new()
+            .with_memory_high(memory_high_bytes)
+            .and_then(|policy| policy.with_memory_max(memory_max_bytes))
+            .and_then(|policy| policy.with_pids_max(pids_max))
+            .map_err(|error| invalid(format!("invalid stage-2 resource limits: {error}")))?;
+        Self::from_policy(policy.resources())
+    }
 }
 
 #[derive(Debug)]
@@ -126,34 +169,10 @@ where
         ));
     }
     let arguments = collect_arguments(arguments)?;
-    let config = read_bounded(CONFIG_PATH, MAX_CONFIG_BYTES)?;
-    if config != CONFIG {
-        return Err(invalid(
-            "application configuration is not the compiled product configuration",
-        ));
-    }
-
-    let registry_text = read_bounded(REGISTRY_PATH, MAX_APPLICATION_TABLE_BYTES)?;
-    let package = registry_entry(&registry_text, name)?
-        .ok_or_else(|| invalid(format!("application {name:?} is not installed")))?;
-    let package = canonical_store_directory(&package, "application package")?;
-    // Installation authenticated the manifest; launch pins its immutable
-    // package-layout slot without interpreting recipe metadata again.
-    require_regular(&package.join("manifest"), "application manifest")?;
+    let (package, spec) = read_application_spec(name)?;
 
     let package_files =
         canonical_child_directory(&package, "files", "application files")?;
-    let spec_path = package.join("spec");
-    require_regular(&spec_path, "application spec")?;
-    let spec_text = read_bounded_path(&spec_path, MAX_APPLICATION_SPEC_BYTES)?;
-    let spec = parse_spec(&spec_text)?;
-    if spec.name != name {
-        return Err(invalid(format!(
-            "application spec names {:?}, but argv[0] selected {name:?}",
-            spec.name
-        )));
-    }
-
     let runtime = PathBuf::from(&spec.runtime);
     let runtime = canonical_store_directory(&runtime, "application runtime")?;
     let runtime_files =
@@ -209,6 +228,7 @@ where
         &wayland_socket,
         &bus_socket,
     )?;
+    let resources = ResolvedResourceLimits::from_policy(spec.permissions.resources())?;
 
     Ok(LaunchPlan {
         name: name.to_string(),
@@ -218,10 +238,46 @@ where
         wayland_socket,
         bus_socket,
         filesystems,
+        resources,
         entry: spec.entry,
         environment,
         arguments,
     })
+}
+
+pub(crate) fn resolve_resource_limits(name: &str) -> io::Result<ResolvedResourceLimits> {
+    let (_, spec) = read_application_spec(name)?;
+    ResolvedResourceLimits::from_policy(spec.permissions.resources())
+}
+
+fn read_application_spec(name: &str) -> io::Result<(PathBuf, ParsedSpec)> {
+    validate_application_name(name)?;
+    let config = read_bounded(CONFIG_PATH, MAX_CONFIG_BYTES)?;
+    if config != CONFIG {
+        return Err(invalid(
+            "application configuration is not the compiled product configuration",
+        ));
+    }
+
+    let registry_text = read_bounded(REGISTRY_PATH, MAX_APPLICATION_TABLE_BYTES)?;
+    let package = registry_entry(&registry_text, name)?
+        .ok_or_else(|| invalid(format!("application {name:?} is not installed")))?;
+    let package = canonical_store_directory(&package, "application package")?;
+    // Installation authenticated the manifest; launch pins its immutable
+    // package-layout slot without interpreting recipe metadata again.
+    require_regular(&package.join("manifest"), "application manifest")?;
+
+    let spec_path = package.join("spec");
+    require_regular(&spec_path, "application spec")?;
+    let spec_text = read_bounded_path(&spec_path, MAX_APPLICATION_SPEC_BYTES)?;
+    let spec = parse_spec(&spec_text)?;
+    if spec.name != name {
+        return Err(invalid(format!(
+            "application spec names {:?}, but argv[0] selected {name:?}",
+            spec.name
+        )));
+    }
+    Ok((package, spec))
 }
 
 pub(crate) fn collect_arguments<I>(arguments: I) -> io::Result<Vec<OsString>>
@@ -388,11 +444,12 @@ fn parse_spec(text: &str) -> io::Result<ParsedSpec> {
     if permissions.to_keyfile() != permission_text {
         return Err(invalid("application spec permissions are not canonical"));
     }
-    if !permissions.is_wayland_filesystem_only() {
+    if !permissions.is_wayland_filesystem_resources_only() {
         return Err(invalid(
             "application requests policy not implemented by this td-jail rung",
         ));
     }
+    ResolvedResourceLimits::from_policy(permissions.resources())?;
     Ok(ParsedSpec {
         name,
         runtime,
@@ -1337,7 +1394,7 @@ fn registry_entry(text: &str, selected: &str) -> io::Result<Option<PathBuf>> {
     Ok(found)
 }
 
-fn validate_application_name(name: &str) -> io::Result<()> {
+pub(crate) fn validate_application_name(name: &str) -> io::Result<()> {
     if name.is_empty()
         || name.len() > MAX_APPLICATION_NAME_BYTES
         || name.starts_with('-')
@@ -1879,9 +1936,10 @@ mod tests {
 
     #[test]
     fn product_configuration_is_exact() {
-        assert!(CONFIG.ends_with("launcher-table=/etc/td-launcher.tsv\n"));
+        assert!(CONFIG.ends_with("cgroup-root=/sys/fs/cgroup/td-user-1000\n"));
         assert_eq!(PACKAGE_ROOT, "/td/store");
         assert_eq!(REGISTRY_PATH, "/etc/td-applications.tsv");
+        assert_eq!(CGROUP_ROOT, "/sys/fs/cgroup/td-user-1000");
         assert_eq!(RUNTIME_ROOT_NAME, "td-app");
         assert_eq!(test_limits().len(), 8);
     }
@@ -1963,16 +2021,67 @@ mod tests {
         let spec = parse_spec(&filesystem).unwrap();
         assert_eq!(spec.permissions.filesystems().count(), 2);
 
+        let resources = text.replace(
+            "sockets=wayland\n",
+            "sockets=wayland\n\n[Resources]\nmemory-high=50331648\nmemory-max=67108864\npids-max=32\n",
+        );
+        let spec = parse_spec(&resources).unwrap();
+        assert_eq!(
+            ResolvedResourceLimits::from_policy(spec.permissions.resources()).unwrap(),
+            ResolvedResourceLimits {
+                memory_high_bytes: 50_331_648,
+                memory_max_bytes: 67_108_864,
+                pids_max: 32,
+            }
+        );
+        assert_eq!(
+            ResolvedResourceLimits::from_policy(parse_spec(text).unwrap().permissions.resources())
+                .unwrap(),
+            ResolvedResourceLimits {
+                memory_high_bytes: crate::permissions::DEFAULT_MEMORY_HIGH_BYTES,
+                memory_max_bytes: crate::permissions::DEFAULT_MEMORY_MAX_BYTES,
+                pids_max: crate::permissions::DEFAULT_PIDS_MAX,
+            }
+        );
+
+        assert_eq!(
+            ResolvedResourceLimits::from_stage2(50_331_648, 67_108_864, 32).unwrap(),
+            ResolvedResourceLimits {
+                memory_high_bytes: 50_331_648,
+                memory_max_bytes: 67_108_864,
+                pids_max: 32,
+            }
+        );
+        assert!(ResolvedResourceLimits::from_stage2(4096, u64::MAX, 1).is_err());
+        assert!(ResolvedResourceLimits::from_stage2(4096, 8192, u32::MAX).is_err());
+
+        let partial = text.replace(
+            "sockets=wayland\n",
+            "sockets=wayland\n\n[Resources]\npids-max=4\n",
+        );
+        assert!(parse_spec(&partial)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap()
+            .contains("must set memory-high, memory-max and pids-max"));
+        let unaligned = text.replace(
+            "sockets=wayland\n",
+            "sockets=wayland\n\n[Resources]\nmemory-high=50331649\nmemory-max=67108864\npids-max=32\n",
+        );
+        assert!(parse_spec(&unaligned)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap()
+            .contains("4096-byte target page size"));
+
         for invalid in [
             text.replace(
                 "HOME=/home/td\nWAYLAND_DISPLAY=wayland-0",
                 "WAYLAND_DISPLAY=wayland-0\nHOME=/home/td",
             ),
             text.replace("HOME=/home/td", "HOME= /home/td"),
-            text.replace(
-                "sockets=wayland\n",
-                "sockets=wayland\n\n[Resources]\npids-max=4\n",
-            ),
+            partial,
+            unaligned,
             text.replace("/app/bin/fixture", "/app/bin/../fixture"),
             filesystem.replace(
                 "xdg-download=rw:create\nxdg-pictures=ro:create",

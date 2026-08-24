@@ -42,6 +42,12 @@ Adversaries considered:
 Explicitly **not** in the model: an attacker who already has uid 0
 (nothing here can constrain them), physical DMA, and the kernel itself.
 
+The resource boundary is also an asset. The application identity must enter
+the delegated `td-user-1000/session` cgroup before it loses root, otherwise a
+later unprivileged td-jail cannot move its child into a sibling per-instance
+leaf: cgroup v2 requires write authority at the source/destination common
+ancestor.
+
 ## 2. The core invariant: ordering, and then proof
 
 The bug class this program exists to not have is **partial credential
@@ -65,6 +71,23 @@ change**. Every one of these is a real, historical escalation:
   `CapEff`.
 
 td-login answers this in three layers.
+
+Before Layer 1, `session::enter` performs one non-credential root operation:
+for uid 1000 it writes its own pid to the fixed
+`/sys/fs/cgroup/td-user-1000/session/cgroup.procs` and requires
+`/proc/self/cgroup` to read back exactly `0::/td-user-1000/session`. Root
+sessions do nothing; any other nonroot uid has no configured delegation. No
+argv or account-database field selects the path. This uses safe filesystem I/O
+and does not widen the unsafe surface. It must precede `creds::apply`; after the
+uid drop, a process still outside the delegated subtree cannot acquire the
+common-ancestor permission needed to enter it.
+
+Placement failure is diagnosed but does not withhold a login session. The
+cgroup is an application-resource boundary, not credential authority, and the
+serial console must survive a failed delegation setup. td-jail independently
+requires the delegated root and exact child membership before release, so an
+unplaced session can use the console but cannot launch an application while
+claiming resource enforcement.
 
 **Layer 1 — one site, correct order.** `creds::apply` is the *only*
 function in the crate that changes credentials, and it does so in this
@@ -266,7 +289,8 @@ It follows that:
   revisit if td ever grows an account whose shell is a confinement.
 - `su` to *yourself* is a no-op switch — `apply` returns early when the
   kernel's view already equals the target — so it neither needs nor
-  attempts privilege.
+  attempts privilege. The session-cgroup join is independently idempotent: a
+  same-user invocation already in the leaf performs no write.
 
 This is why the crate is `#![deny(unsafe_code)]` with a three-syscall
 exception rather than a program with a carefully audited setuid entry
@@ -438,3 +462,7 @@ assert equality against `/proc/self/status`.
   supplementary set. A switch that "worked" but left a residual group
   attached prints no marker and reds the boot oracle — which is the one
   failure mode every other check on the image would pass.
+- The jailed fixture is the cgroup-placement evidence. Its QEMU marker is
+  withheld unless td-jail observes the active per-instance sibling leaf with
+  the exact configured caps; that migration can succeed only when the
+  td-login-started session entered the delegated subtree first.

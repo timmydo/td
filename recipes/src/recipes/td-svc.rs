@@ -51,6 +51,7 @@ const MAIN_RS: &str = include_str!("../../../td-svc/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
     ("backoff", include_str!("../../../td-svc/src/backoff.rs")),
     ("cad", include_str!("../../../td-svc/src/cad.rs")),
+    ("cgroup", include_str!("../../../td-svc/src/cgroup.rs")),
     ("control", include_str!("../../../td-svc/src/control.rs")),
     ("evict", include_str!("../../../td-svc/src/evict.rs")),
     ("logs", include_str!("../../../td-svc/src/logs.rs")),
@@ -208,5 +209,21 @@ mod tests {
              stale and this test is now vacuous",
             declared.len()
         );
+    }
+
+    #[test]
+    fn delegated_cgroup_paths_match_the_distribution_hierarchy() {
+        let cgroup = MODULES
+            .iter()
+            .find_map(|(name, source)| (*name == "cgroup").then_some(*source))
+            .expect("cgroup source");
+        assert!(cgroup.contains(&format!(
+            "const DELEGATE: &str = {:?};",
+            crate::ladder::TD_APPLICATION_CGROUP_ROOT
+        )));
+        assert!(cgroup.contains(&format!(
+            "const SESSION: &str = {:?};",
+            crate::ladder::TD_APPLICATION_CGROUP_SESSION
+        )));
     }
 }

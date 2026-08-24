@@ -177,6 +177,12 @@ const PROFILER_CAPTURE_SECS: u16 = 60;
 const PROFILER_EVIDENCE_TIMEOUT_SECS: u16 = 180;
 const PROFILER_EVIDENCE_SERVICE_TIMEOUT_SECS: u16 = 195;
 const APPLICATION_FIXTURE_NAME: &str = crate::ladder::TD_JAIL_FIXTURE_NAME;
+const APPLICATION_FIXTURE_DOWNLOAD_SOURCE: &str = "/var/home/tester/Downloads";
+const APPLICATION_FIXTURE_PICTURES_SOURCE: &str = "/var/home/tester/Pictures";
+const APPLICATION_FIXTURE_XDG_MOUNTS_MARKER: &str =
+    "/run/td-jail-fixture-xdg-mounted";
+const APPLICATION_FIXTURE_GRANT_FILE_ROOT: &str = "/mnt/td-jail-fixture-file";
+const APPLICATION_FIXTURE_GRANT_FILE_SOURCE: &str = "/mnt/td-jail-fixture-file/grant";
 const APPLICATION_FIXTURE_EVIDENCE_PATH: &str = "/run/td-jail-fixture-evidence-ok";
 const APPLICATION_FIXTURE_EVIDENCE_TMP_PATH: &str =
     "/run/.td-jail-fixture-evidence.tmp";
@@ -835,6 +841,7 @@ fn build_inittab() -> String {
         "::sysinit:/bin/mount -t devtmpfs devtmpfs /dev\n\
          ::sysinit:/bin/mount -t proc proc /proc\n\
          ::sysinit:/bin/mount -t sysfs sysfs /sys\n\
+         ::sysinit:/bin/mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup\n\
          ::sysinit:/bin/devpts\n\
          ::respawn:/bin/td-svc run -f {TD_SVC_CONF}\n"
     )
@@ -1115,7 +1122,7 @@ fn build_td_svc_conf() -> String {
          # spawn-ready state; the marker after atomic publication is the authority.\n\
          [jail-fixture-evidence]\n\
          type=daemon\n\
-         exec=/bin/sh -c 'n=0; while [ \"$n\" -lt {fixture_evidence_wait} ]; do if /bin/td-login exec-as {ui_user} -- /bin/td-ui-demo probe /run/user/{ui_uid}/{application_runtime_root}/{fixture_name}/ready >/dev/null 2>&1; then /bin/rm -f {fixture_evidence_tmp_path} {fixture_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {fixture_evidence} > {fixture_evidence_tmp_path} && /bin/td-util chmod 0644 {fixture_evidence_tmp_path} && /bin/mv {fixture_evidence_tmp_path} {fixture_evidence_path} && /bin/echo {fixture_marker} && /bin/td-util printf \"%s\\n\" {fixture_completion} > {fixture_completion_tmp_path} && /bin/td-util chmod 0644 {fixture_completion_tmp_path} && /bin/mv {fixture_completion_tmp_path} {fixture_completion_path} && exit 0; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'\n\
+         exec=/bin/sh -c 'n=0; while [ \"$n\" -lt {fixture_evidence_wait} ]; do if /bin/td-login exec-as {ui_user} -- /bin/td-ui-demo probe /run/user/{ui_uid}/{application_runtime_root}/{fixture_name}/ready >/dev/null 2>&1 && /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-resource-caps {fixture_name}; then /bin/rm -f {fixture_evidence_tmp_path} {fixture_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {fixture_evidence} > {fixture_evidence_tmp_path} && /bin/td-util chmod 0644 {fixture_evidence_tmp_path} && /bin/mv {fixture_evidence_tmp_path} {fixture_evidence_path} && /bin/echo {fixture_marker} && /bin/td-util printf \"%s\\n\" {fixture_completion} > {fixture_completion_tmp_path} && /bin/td-util chmod 0644 {fixture_completion_tmp_path} && /bin/mv {fixture_completion_tmp_path} {fixture_completion_path} && exit 0; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'\n\
          after=jail-fixture\n\
          restart=never\n\
          \n\
@@ -1265,12 +1272,30 @@ fn build_deployment_init(sys: &SystemDef) -> String {
         }
     }
     init.push_str(&format!(
-        "\nif /bin/td-util test -d /sysroot{TD_JAIL_FIXTURE_GRANT_ROOT}/nested; then\n\
-         /bin/mount -t tmpfs -o nosuid,nodev,noexec,mode=0700,uid={UI_UID},gid={UI_GID},size=1048576 tmpfs /sysroot{TD_JAIL_FIXTURE_GRANT_ROOT}/nested\n\
-         /bin/td-util printf '%s\\n' td-jail-file-grant-v1 > /sysroot{TD_JAIL_FIXTURE_GRANT_FILE}\n\
-         /bin/td-util chown {UI_UID}:{UI_GID} /sysroot{TD_JAIL_FIXTURE_GRANT_FILE}\n\
-         /bin/td-util chmod 0600 /sysroot{TD_JAIL_FIXTURE_GRANT_FILE}\n\
+        "\nif /bin/td-util readlink /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} >/dev/null 2>&1; then\n\
+           echo 'td-init: fixture Downloads source is a symlink; XDG grants disabled' >&2\n\
+         elif /bin/td-util readlink /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE} >/dev/null 2>&1; then\n\
+           echo 'td-init: fixture Pictures source is a symlink; XDG grants disabled' >&2\n\
+         elif /bin/td-util test -e /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} && ! /bin/td-util test -d /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE}; then\n\
+           echo 'td-init: fixture Downloads source is not a directory; XDG grants disabled' >&2\n\
+         elif /bin/td-util test -e /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE} && ! /bin/td-util test -d /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE}; then\n\
+           echo 'td-init: fixture Pictures source is not a directory; XDG grants disabled' >&2\n\
+         elif /bin/td-util mkdir -p /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE}; then\n\
+           /bin/td-util chown {UI_UID}:{UI_GID} /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE}\n\
+           /bin/td-util chmod 0700 /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE}\n\
+           /bin/mount -o bind /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE}\n\
+           /bin/mount -o bind /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE} /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE}\n\
+           /bin/td-util printf '' > /sysroot{APPLICATION_FIXTURE_XDG_MOUNTS_MARKER}\n\
+         else\n\
+           echo 'td-init: cannot prepare fixture XDG sources; XDG grants disabled' >&2\n\
          fi\n\
+         /bin/mount -t tmpfs -o nosuid,nodev,noexec,mode=0700,uid={UI_UID},gid={UI_GID},size=1048576 tmpfs /sysroot{TD_JAIL_FIXTURE_GRANT_ROOT}/nested\n\
+         /bin/mount -t tmpfs -o nosuid,nodev,noexec,mode=0700,uid={UI_UID},gid={UI_GID},size=1048576 tmpfs /sysroot{APPLICATION_FIXTURE_GRANT_FILE_ROOT}\n\
+         /bin/td-util printf '%s\\n' td-jail-file-grant-v1 > /sysroot{APPLICATION_FIXTURE_GRANT_FILE_SOURCE}\n\
+         /bin/td-util chown {UI_UID}:{UI_GID} /sysroot{APPLICATION_FIXTURE_GRANT_FILE_SOURCE}\n\
+         /bin/td-util chmod 0600 /sysroot{APPLICATION_FIXTURE_GRANT_FILE_SOURCE}\n\
+         /bin/td-util printf '' > /sysroot{TD_JAIL_FIXTURE_GRANT_FILE}\n\
+         /bin/mount -o bind /sysroot{APPLICATION_FIXTURE_GRANT_FILE_SOURCE} /sysroot{TD_JAIL_FIXTURE_GRANT_FILE}\n\
          /bin/sh -c 'umask 077; /bin/td-util mkdir -p /sysroot/var/root'\n\
          /bin/td-util rm -rf /sysroot/var/run\n\
          /bin/td-util ln -s /run /sysroot/var/run\n\
@@ -1359,6 +1384,13 @@ fn build_shutdown() -> String {
         "#!/bin/sh\n\
          ok=1\n\
          /bin/td-init sync || {{ echo 'td-shutdown: sync failed' >&2; ok=0; }}\n\
+         /bin/umount {TD_JAIL_FIXTURE_GRANT_FILE} || {{ echo 'td-shutdown: umount fixture file failed' >&2; ok=0; }}\n\
+         /bin/umount {APPLICATION_FIXTURE_GRANT_FILE_ROOT} || {{ echo 'td-shutdown: umount fixture file source failed' >&2; ok=0; }}\n\
+         /bin/umount {TD_JAIL_FIXTURE_GRANT_ROOT}/nested || {{ echo 'td-shutdown: umount nested fixture Pictures failed' >&2; ok=0; }}\n\
+         if /bin/td-util test -e {APPLICATION_FIXTURE_XDG_MOUNTS_MARKER}; then\n\
+           /bin/umount {APPLICATION_FIXTURE_DOWNLOAD_SOURCE} || {{ echo 'td-shutdown: umount fixture Downloads failed' >&2; ok=0; }}\n\
+           /bin/umount {APPLICATION_FIXTURE_PICTURES_SOURCE} || {{ echo 'td-shutdown: umount fixture Pictures failed' >&2; ok=0; }}\n\
+         fi\n\
          /bin/umount /var || {{ echo 'td-shutdown: umount /var failed' >&2; ok=0; }}\n\
          /bin/umount -a -r --exclude /run || {{ echo 'td-shutdown: final unmount failed' >&2; ok=0; }}\n\
          /bin/td-util test \"$ok\" = 1 && echo {SYSTEM_SHUTDOWN_MARKER}\n"
@@ -1810,10 +1842,8 @@ const SANDBOX_KERNEL_STATUS_FIELDS: [(&str, &str, &str); 2] = [
 /// The kernel says so itself, once, on the console: "/proc/cgroups lists only v1
 /// controllers, use cgroup.controllers of root cgroup for v2 info".
 ///
-/// So MEMCG has no runtime witness at this rung. Its `cgroup.controllers` reading needs
-/// a mounted cgroup2, which is td-svc's landing with the resource caps; until then the
-/// producer's `.config` guard is the only assertion, and `every_sandbox_symbol_...`
-/// names it as a deliberate exception rather than letting it look covered.
+/// MEMCG's runtime witness is therefore the mounted cgroup2 table below rather than
+/// this legacy table.
 ///
 /// The match is anchored on the `enabled` column and not just the name, because a
 /// `cgroup_disable=pids` on the command line leaves the row in place and clears that
@@ -1824,6 +1854,21 @@ const SANDBOX_KERNEL_CONTROLLERS: [(&str, &str, &str); 1] = [(
     "CONFIG_CGROUP_PIDS",
     "pids.max never exists, so nothing bounds a fork bomb inside a jail",
 )];
+
+/// The controllers the mounted unified hierarchy must actually expose. Unlike
+/// `/proc/cgroups`, this is authoritative for the v2 memory controller.
+const SANDBOX_KERNEL_CGROUP2_CONTROLLERS: [(&str, &str, &str); 2] = [
+    (
+        "memory",
+        "CONFIG_MEMCG",
+        "memory.high and memory.max never exist, so a jail has no aggregate memory cap",
+    ),
+    (
+        "pids",
+        "CONFIG_CGROUP_PIDS",
+        "pids.max never exists in cgroup v2, so a jail cannot contain a fork bomb",
+    ),
+];
 
 /// The per-namespace ucount ceilings, one per `CLONE_NEW*` td-jail's single `unshare(2)`
 /// asks for. Each is a kill switch a compiled-in namespace cannot survive: set to 0, the
@@ -1885,6 +1930,14 @@ fn build_sandbox_kernel_probes() -> String {
             "/bin/grep -Eq \"^{controller}[[:space:]].*[[:space:]]1$\" /proc/cgroups || \
              {{ echo \"kernel: /proc/cgroups does not list {controller} as enabled \
              ({symbol} off, or cgroup_disable={controller}) — {cost}\"; k=0; }}; "
+        ));
+    }
+    for (controller, symbol, cost) in SANDBOX_KERNEL_CGROUP2_CONTROLLERS {
+        p.push_str(&format!(
+            "/bin/grep -Eq \"(^|[[:space:]]){controller}([[:space:]]|$)\" \
+             /sys/fs/cgroup/cgroup.controllers || \
+             {{ echo \"kernel: cgroup2 does not expose {controller} \
+             ({symbol} off, disabled, or not mounted) — {cost}\"; k=0; }}; "
         ));
     }
     for (limit, clone_flag) in SANDBOX_KERNEL_UCOUNTS {
@@ -2652,6 +2705,7 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         "/etc",
         "/bin",
         "/mnt",
+        "/mnt/td-jail-fixture-file",
         "/mnt/td-jail-fixture-pictures",
         "/mnt/td-jail-fixture-pictures/nested",
         "/var",
@@ -3739,6 +3793,7 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
                 "::sysinit:/bin/mount -t devtmpfs devtmpfs /dev",
                 "::sysinit:/bin/mount -t proc proc /proc",
                 "::sysinit:/bin/mount -t sysfs sysfs /sys",
+                "::sysinit:/bin/mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup",
                 "::sysinit:/bin/devpts",
                 &format!("::respawn:/bin/td-svc run -f {TD_SVC_CONF}"),
             ],
@@ -3910,7 +3965,7 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
         );
         let evidence = unit_key("jail-fixture-evidence", "exec").unwrap_or_default();
         assert!(evidence.starts_with(&format!(
-            "/bin/sh -c 'n=0; while [ \"$n\" -lt {APPLICATION_FIXTURE_EVIDENCE_WAIT_ITERATIONS} ]; do if /bin/td-login exec-as tester -- /bin/td-ui-demo probe /run/user/1000/{APPLICATION_RUNTIME_ROOT}/{APPLICATION_FIXTURE_NAME}/ready >/dev/null 2>&1; then "
+            "/bin/sh -c 'n=0; while [ \"$n\" -lt {APPLICATION_FIXTURE_EVIDENCE_WAIT_ITERATIONS} ]; do if /bin/td-login exec-as tester -- /bin/td-ui-demo probe /run/user/1000/{APPLICATION_RUNTIME_ROOT}/{APPLICATION_FIXTURE_NAME}/ready >/dev/null 2>&1 && /bin/td-login exec-as tester -- /bin/td-jail --probe-resource-caps {APPLICATION_FIXTURE_NAME}; then "
         )));
         assert!(evidence.contains(&format!(
             "/bin/rm -f {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} {APPLICATION_FIXTURE_COMPLETION_TMP_PATH}"
@@ -3987,7 +4042,7 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
                     let readiness =
                         unit == "jail-fixture" && key == "ready" && after == expected_ready;
                     let expected_evidence = format!(
-                        " probe /run/user/1000/{APPLICATION_RUNTIME_ROOT}/{APPLICATION_FIXTURE_NAME}/ready >/dev/null 2>&1; then /bin/rm -f {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} && /bin/td-util printf \"%s\\n\" {APPLICATION_FIXTURE_EVIDENCE} > {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} && /bin/td-util chmod 0644 {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} && /bin/mv {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} {APPLICATION_FIXTURE_EVIDENCE_PATH} && /bin/echo {TD_JAIL_FIXTURE_BOOT_MARKER} && /bin/td-util printf \"%s\\n\" {APPLICATION_FIXTURE_COMPLETION} > {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} && /bin/td-util chmod 0644 {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} && /bin/mv {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} {APPLICATION_FIXTURE_COMPLETION_PATH} && exit 0; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'"
+                        " probe /run/user/1000/{APPLICATION_RUNTIME_ROOT}/{APPLICATION_FIXTURE_NAME}/ready >/dev/null 2>&1 && /bin/td-login exec-as tester -- /bin/td-jail --probe-resource-caps {APPLICATION_FIXTURE_NAME}; then /bin/rm -f {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} && /bin/td-util printf \"%s\\n\" {APPLICATION_FIXTURE_EVIDENCE} > {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} && /bin/td-util chmod 0644 {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} && /bin/mv {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} {APPLICATION_FIXTURE_EVIDENCE_PATH} && /bin/echo {TD_JAIL_FIXTURE_BOOT_MARKER} && /bin/td-util printf \"%s\\n\" {APPLICATION_FIXTURE_COMPLETION} > {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} && /bin/td-util chmod 0644 {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} && /bin/mv {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} {APPLICATION_FIXTURE_COMPLETION_PATH} && exit 0; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'"
                     );
                     let evidence = unit == "jail-fixture-evidence"
                         && key == "exec"
@@ -4703,6 +4758,17 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
              make those generated before changing the graphical account"
         );
         assert_eq!(
+            [
+                APPLICATION_FIXTURE_DOWNLOAD_SOURCE,
+                APPLICATION_FIXTURE_PICTURES_SOURCE,
+            ],
+            [
+                format!("/var{UI_HOME}/Downloads"),
+                format!("/var{UI_HOME}/Pictures"),
+            ],
+            "the fixture XDG bind mounts must follow the fixed UI profile's real home"
+        );
+        assert_eq!(
             unit_key("seat", "exec"),
             Some(format!(
                 "/bin/td-seatd assign --uid {UI_UID} --gid {UI_GID}"
@@ -5019,7 +5085,8 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
         assert_eq!(
             build_application_config(),
             "format=1\npackage-root=/td/store\nstate-root=.td/app\n\
-             registry=/etc/td-applications.tsv\nlauncher-table=/etc/td-launcher.tsv\n"
+             registry=/etc/td-applications.tsv\nlauncher-table=/etc/td-launcher.tsv\n\
+             cgroup-root=/sys/fs/cgroup/td-user-1000\n"
         );
         for path in [
             APPLICATION_CONFIG,
@@ -6492,13 +6559,40 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
              EIO and a greeter that cannot reach td-svc looks like a hang with no explanation"
         );
         let shutdown = build_shutdown();
+        let xdg_guard = format!(
+            "if /bin/td-util test -e {APPLICATION_FIXTURE_XDG_MOUNTS_MARKER}; then"
+        );
+        let download_unmount = format!(
+            "/bin/umount {APPLICATION_FIXTURE_DOWNLOAD_SOURCE} || {{"
+        );
+        let pictures_unmount = format!(
+            "/bin/umount {APPLICATION_FIXTURE_PICTURES_SOURCE} || {{"
+        );
         assert!(
             shutdown.contains("/bin/td-init sync || {")
+                && shutdown.contains(&download_unmount)
+                && shutdown.contains(&pictures_unmount)
+                && shutdown.contains(&format!(
+                    "/bin/umount {TD_JAIL_FIXTURE_GRANT_FILE} || {{"
+                ))
+                && shutdown.contains(&format!(
+                    "/bin/umount {APPLICATION_FIXTURE_GRANT_FILE_ROOT} || {{"
+                ))
+                && shutdown.contains(&format!(
+                    "/bin/umount {TD_JAIL_FIXTURE_GRANT_ROOT}/nested || {{"
+                ))
                 && shutdown.contains("/bin/umount /var || {")
                 && shutdown.contains("/bin/umount -a -r --exclude /run || {")
                 && shutdown.contains("/bin/td-util test \"$ok\" = 1")
                 && shutdown.contains(SYSTEM_SHUTDOWN_MARKER),
             "the teardown must attempt every safety step and emit its marker only when all pass"
+        );
+        assert_eq!(shutdown.matches(&xdg_guard).count(), 1);
+        assert!(
+            shutdown.find(&xdg_guard) < shutdown.find(&download_unmount)
+                && shutdown.find(&download_unmount) < shutdown.find(&pictures_unmount)
+                && shutdown.find(&pictures_unmount) < shutdown.find("/bin/umount /var || {"),
+            "fixture XDG self-binds must be released only when init installed them"
         );
     }
 
@@ -6543,7 +6637,9 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
             "stage-1 init must mount persistent @var, keep runtime state volatile, and link /var/run into /run"
         );
         assert!(
-            !init.contains("tmpfs /sysroot/var")
+            !init.lines().any(|line| {
+                line.contains("-t tmpfs") && line.trim_end().ends_with(" /sysroot/var")
+            })
                 && !init.contains("-t overlay")
                 && !init.contains(" /sysroot/etc"),
             "stage-1 init must not restore tmpfs state or an overlay over immutable /etc"
@@ -6624,6 +6720,7 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
     fn fixture_grant_oracles_are_prepared_once_before_switch_root() {
         let steps = real_root_steps(&SYSTEM);
         for path in [
+            format!("{{root}}/real-root{APPLICATION_FIXTURE_GRANT_FILE_ROOT}"),
             format!("{{root}}/real-root{TD_JAIL_FIXTURE_GRANT_ROOT}"),
             format!("{{root}}/real-root{TD_JAIL_FIXTURE_GRANT_ROOT}/nested"),
         ] {
@@ -6632,26 +6729,99 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
             ));
         }
         let init = build_deployment_init(&SYSTEM);
-        let guard = format!(
-            "if /bin/td-util test -d /sysroot{TD_JAIL_FIXTURE_GRANT_ROOT}/nested; then"
+        let source_mkdir = format!(
+            "elif /bin/td-util mkdir -p /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE}; then"
+        );
+        let download_mount = format!(
+            "/bin/mount -o bind /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE}"
+        );
+        let pictures_mount = format!(
+            "/bin/mount -o bind /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE} /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE}"
+        );
+        let download_link_guard = format!(
+            "if /bin/td-util readlink /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} >/dev/null 2>&1; then"
+        );
+        let pictures_link_guard = format!(
+            "elif /bin/td-util readlink /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE} >/dev/null 2>&1; then"
+        );
+        let download_directory_guard = format!(
+            "elif /bin/td-util test -e /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} && ! /bin/td-util test -d /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE}; then"
+        );
+        let pictures_directory_guard = format!(
+            "elif /bin/td-util test -e /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE} && ! /bin/td-util test -d /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE}; then"
+        );
+        let source_chown = format!(
+            "/bin/td-util chown {UI_UID}:{UI_GID} /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE}"
+        );
+        let source_chmod = format!(
+            "/bin/td-util chmod 0700 /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE}"
+        );
+        let mount_marker = format!(
+            "/bin/td-util printf '' > /sysroot{APPLICATION_FIXTURE_XDG_MOUNTS_MARKER}"
         );
         let nested_mount = format!(
             "/bin/mount -t tmpfs -o nosuid,nodev,noexec,mode=0700,uid={UI_UID},gid={UI_GID},size=1048576 tmpfs /sysroot{TD_JAIL_FIXTURE_GRANT_ROOT}/nested"
         );
-        let file_write = format!(
-            "/bin/td-util printf '%s\\n' td-jail-file-grant-v1 > /sysroot{TD_JAIL_FIXTURE_GRANT_FILE}"
+        let file_mount = format!(
+            "/bin/mount -t tmpfs -o nosuid,nodev,noexec,mode=0700,uid={UI_UID},gid={UI_GID},size=1048576 tmpfs /sysroot{APPLICATION_FIXTURE_GRANT_FILE_ROOT}"
         );
+        let file_write = format!(
+            "/bin/td-util printf '%s\\n' td-jail-file-grant-v1 > /sysroot{APPLICATION_FIXTURE_GRANT_FILE_SOURCE}"
+        );
+        let file_target = format!(
+            "/bin/td-util printf '' > /sysroot{TD_JAIL_FIXTURE_GRANT_FILE}"
+        );
+        let file_bind = format!(
+            "/bin/mount -o bind /sysroot{APPLICATION_FIXTURE_GRANT_FILE_SOURCE} /sysroot{TD_JAIL_FIXTURE_GRANT_FILE}"
+        );
+        assert_eq!(init.matches(&source_mkdir).count(), 1);
+        assert_eq!(init.matches(&download_link_guard).count(), 1);
+        assert_eq!(init.matches(&pictures_link_guard).count(), 1);
+        assert_eq!(init.matches(&download_directory_guard).count(), 1);
+        assert_eq!(init.matches(&pictures_directory_guard).count(), 1);
+        assert_eq!(init.matches(&source_chown).count(), 1);
+        assert_eq!(init.matches(&source_chmod).count(), 1);
+        assert_eq!(init.matches(&download_mount).count(), 1);
+        assert_eq!(init.matches(&pictures_mount).count(), 1);
+        assert_eq!(init.matches(&mount_marker).count(), 1);
         assert_eq!(init.matches(&nested_mount).count(), 1);
-        assert_eq!(init.matches(&guard).count(), 1);
+        assert_eq!(init.matches(&file_mount).count(), 1);
+        assert!(!init.contains("if /bin/td-util test -d /sysroot/mnt/td-jail-fixture"));
         assert_eq!(init.matches(&file_write).count(), 1);
+        assert_eq!(init.matches(&file_target).count(), 1);
+        assert_eq!(init.matches(&file_bind).count(), 1);
         assert!(init.contains(&format!(
-            "/bin/td-util chown {UI_UID}:{UI_GID} /sysroot{TD_JAIL_FIXTURE_GRANT_FILE}\n/bin/td-util chmod 0600 /sysroot{TD_JAIL_FIXTURE_GRANT_FILE}"
+            "/bin/td-util chown {UI_UID}:{UI_GID} /sysroot{APPLICATION_FIXTURE_GRANT_FILE_SOURCE}\n/bin/td-util chmod 0600 /sysroot{APPLICATION_FIXTURE_GRANT_FILE_SOURCE}"
         )));
+        let xdg_setup = init
+            .split_once(&download_link_guard)
+            .expect("fixture XDG setup start")
+            .1
+            .split_once(&nested_mount)
+            .expect("fixture XDG setup end")
+            .0;
+        assert_eq!(xdg_setup.matches("XDG grants disabled").count(), 5);
         assert!(
-            init.find(&guard) < init.find(&nested_mount)
-                && init.find(&nested_mount) < init.find(&file_write)
-                && init.find(&file_write) < init.find("exec /bin/switch_root /sysroot /init"),
-            "the guarded mount and writable file oracle must precede switch_root"
+            !xdg_setup.contains("exit 1"),
+            "untrusted persistent XDG entries must disable fixture grants, not abort init"
+        );
+        assert!(
+            init.find(&download_link_guard) < init.find(&pictures_link_guard)
+                && init.find(&pictures_link_guard) < init.find(&download_directory_guard)
+                && init.find(&download_directory_guard) < init.find(&pictures_directory_guard)
+                && init.find(&pictures_directory_guard) < init.find(&source_mkdir)
+                && init.find(&source_mkdir) < init.find(&source_chown)
+                && init.find(&source_chown) < init.find(&source_chmod)
+                && init.find(&source_chmod) < init.find(&download_mount)
+                && init.find(&download_mount) < init.find(&pictures_mount)
+                && init.find(&pictures_mount) < init.find(&mount_marker)
+                && init.find(&mount_marker) < init.find(&nested_mount)
+                && init.find(&nested_mount) < init.find(&file_mount)
+                && init.find(&file_mount) < init.find(&file_write)
+                && init.find(&file_write) < init.find(&file_target)
+                && init.find(&file_target) < init.find(&file_bind)
+                && init.find(&file_bind) < init.find("exec /bin/switch_root /sysroot /init"),
+            "the mount and writable file oracle must precede switch_root"
         );
         let image_recipe = recipe();
         let mode_command = image_recipe
@@ -7862,13 +8032,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// An exception list rather than a silent gap: a symbol that is merely missing from
     /// the probes looks identical to one nobody got round to, and this is the difference
     /// between the two.
-    const SANDBOX_SYMBOLS_WITHOUT_A_RUNTIME_WITNESS: [(&str, &str); 1] = [(
-        "CONFIG_MEMCG",
-        "memcg registers legacy_cftypes only under CONFIG_MEMCG_V1, which is n here, so \
-         proc_cgroupstats_show's cgroup1_subsys_absent() filter drops `memory` from \
-         /proc/cgroups. Its witness is cgroup.controllers on a mounted cgroup2, which \
-         arrives with td-svc's delegation.",
-    )];
+    const SANDBOX_SYMBOLS_WITHOUT_A_RUNTIME_WITNESS: [(&str, &str); 0] = [];
 
     /// Each pinned symbol is observed at RUNTIME by a probe that names it, and each
     /// probed symbol is one the kernel recipe actually pins. A pin with no probe ships a
@@ -7904,6 +8068,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             .iter()
             .chain(SANDBOX_KERNEL_STATUS_FIELDS.iter())
             .chain(SANDBOX_KERNEL_CONTROLLERS.iter())
+            .chain(SANDBOX_KERNEL_CGROUP2_CONTROLLERS.iter())
             .map(|(_, symbol, _)| *symbol)
             .collect();
         for symbol in &probed {
@@ -7945,6 +8110,11 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
                 )),
                 "no leg greps /proc/cgroups for {controller} with its enabled column"
             );
+        }
+        for (controller, _, _) in SANDBOX_KERNEL_CGROUP2_CONTROLLERS {
+            assert!(probes.contains(&format!(
+                "\"(^|[[:space:]]){controller}([[:space:]]|$)\" /sys/fs/cgroup/cgroup.controllers ||"
+            )));
         }
         for (limit, clone_flag) in SANDBOX_KERNEL_UCOUNTS {
             assert!(
@@ -8026,6 +8196,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         let legs = SANDBOX_KERNEL_NODES.len()
             + SANDBOX_KERNEL_STATUS_FIELDS.len()
             + SANDBOX_KERNEL_CONTROLLERS.len()
+            + SANDBOX_KERNEL_CGROUP2_CONTROLLERS.len()
             + SANDBOX_KERNEL_UCOUNTS.len() * 3;
         assert_eq!(
             probes.matches("k=0").count(),

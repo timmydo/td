@@ -20,6 +20,10 @@ pub const TD_APPLICATION_RUNTIME_ROOT: &str = "td-app";
 pub const TD_APPLICATION_CONFIG_PATH: &str = "/etc/td-app.conf";
 pub const TD_APPLICATION_REGISTRY: &str = "/etc/td-applications.tsv";
 pub const TD_APPLICATION_LAUNCHER_TABLE: &str = "/etc/td-launcher.tsv";
+pub const TD_APPLICATION_CGROUP_ROOT: &str = "/sys/fs/cgroup/td-user-1000";
+pub const TD_APPLICATION_CGROUP_SESSION: &str =
+    "/sys/fs/cgroup/td-user-1000/session";
+pub const TD_APPLICATION_CGROUP_MEMBERSHIP_ROOT: &str = "/td-user-1000";
 pub const TD_JAIL_FIXTURE_NAME: &str = "td-jail-fixture";
 pub const TD_JAIL_FIXTURE_ENTRY: &str = "/app/bin/td-compositor";
 pub const TD_JAIL_FIXTURE_ALIAS: &str = "org.td.JailFixture";
@@ -38,6 +42,7 @@ pub const TD_APPLICATION_CONFIG_TEXT: &str = concat!(
     "state-root=.td/app\n",
     "registry=/etc/td-applications.tsv\n",
     "launcher-table=/etc/td-launcher.tsv\n",
+    "cgroup-root=/sys/fs/cgroup/td-user-1000\n",
 );
 
 /// The td-built bootstrap shell (catalog stem). `bash-mesboot` is bash 2.05b
@@ -961,12 +966,25 @@ mod tests {
         assert_eq!(
             super::TD_APPLICATION_CONFIG_TEXT,
             format!(
-                "format=1\npackage-root={}\nstate-root={}\nregistry={}\nlauncher-table={}\n",
+                "format=1\npackage-root={}\nstate-root={}\nregistry={}\nlauncher-table={}\ncgroup-root={}\n",
                 super::TD_APPLICATION_PACKAGE_ROOT,
                 super::TD_APPLICATION_STATE_ROOT,
                 super::TD_APPLICATION_REGISTRY,
                 super::TD_APPLICATION_LAUNCHER_TABLE,
+                super::TD_APPLICATION_CGROUP_ROOT,
             )
+        );
+    }
+
+    #[test]
+    fn application_cgroup_paths_share_one_hierarchy() {
+        assert_eq!(
+            super::TD_APPLICATION_CGROUP_SESSION,
+            format!("{}/session", super::TD_APPLICATION_CGROUP_ROOT)
+        );
+        assert_eq!(
+            super::TD_APPLICATION_CGROUP_ROOT.strip_prefix("/sys/fs/cgroup"),
+            Some(super::TD_APPLICATION_CGROUP_MEMBERSHIP_ROOT)
         );
     }
 

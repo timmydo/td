@@ -56,7 +56,7 @@ use crate::types::{Recipe, Step};
 // single `rustc src/main.rs` pulls them all in — but only if every module file is
 // present next to it in {src}. MODULES is held to those `mod` lines by
 // `the_recipe_writes_out_exactly_the_modules_the_crate_declares` below rather than
-// by a comment asking; the crate's own `src_holds_exactly_the_ten_scanned_modules`
+// by a comment asking; the crate's own `src_holds_exactly_the_eleven_scanned_modules`
 // is the other half of the pin, from the directory side.
 //
 // Every source below is written out with a WriteFile, which the ladder
@@ -70,6 +70,7 @@ const MAIN_RS: &str = include_str!("../../../td-login/src/main.rs");
 
 // (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.
 const MODULES: &[(&str, &str)] = &[
+    ("cgroup", include_str!("../../../td-login/src/cgroup.rs")),
     ("creds", include_str!("../../../td-login/src/creds.rs")),
     ("db", include_str!("../../../td-login/src/db.rs")),
     ("exec_as", include_str!("../../../td-login/src/exec_as.rs")),
@@ -264,5 +265,24 @@ mod tests {
             );
         }
         assert!(source("nosuch").is_none());
+    }
+
+    #[test]
+    fn session_cgroup_paths_match_the_distribution_hierarchy() {
+        let cgroup = source("cgroup").expect("cgroup source");
+        assert!(cgroup.contains(&format!(
+            "const SESSION_PROCS: &str = {:?};",
+            format!(
+                "{}/cgroup.procs",
+                crate::ladder::TD_APPLICATION_CGROUP_SESSION
+            )
+        )));
+        assert!(cgroup.contains(&format!(
+            "const SESSION_MEMBERSHIP: &str = {:?};",
+            format!(
+                "0::{}/session",
+                crate::ladder::TD_APPLICATION_CGROUP_MEMBERSHIP_ROOT
+            )
+        )));
     }
 }

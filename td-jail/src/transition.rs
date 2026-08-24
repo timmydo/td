@@ -1,28 +1,34 @@
 use crate::{
     authority::{
         self, decode_mountinfo_path, mount_identity_for_path, path_is_same_or_child,
-        paths_overlap, FilesystemGrant, FilesystemSourceKind, LaunchPlan,
+        paths_overlap,
+        FilesystemGrant, FilesystemSourceKind, LaunchPlan, ResolvedResourceLimits,
     },
-    seccomp, sys,
+    cgroup, seccomp, sys,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::IntoRawFd;
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub const PROBE_ARG: &str = "--probe-transition";
+pub const RESOURCE_PROBE_ARG: &str = "--probe-resource-caps";
 const FILTER_ARG: &str = "--internal-write-seccomp-filter";
+const CGROUP_CLEANUP_ARG: &str = "--internal-cgroup-cleanup";
+const CGROUP_CLEANUP_WATCH_ARG: &str = "--internal-cgroup-cleanup-watch";
+const CGROUP_CLEANUP_READY: [u8; 1] = [1];
 const STAGE2_ARG: &str = "--internal-stage-2";
 const STAGE2_PROBE_ARG: &str = "--probe";
 const STAGE2_LAUNCH_ARG: &str = "--launch";
 const STAGE2_ENVIRONMENT_ARG: &str = "--environment";
 const STAGE2_FILESYSTEMS_ARG: &str = "--filesystems";
+const STAGE2_RESOURCES_ARG: &str = "--resources";
 const STAGE2_ARGUMENTS_ARG: &str = "--arguments";
 const REAPER_CHILD_ARG: &str = "--internal-reaper-child";
 const REAPER_ORPHAN_ARG: &str = "--internal-reaper-orphan";
@@ -145,7 +151,16 @@ fn require_child_pid_namespace_changed(before: &NamespaceSnapshot, child: u32) -
 #[derive(Debug, Eq, PartialEq)]
 pub enum Mode {
     Probe,
+    ResourceProbe {
+        application: String,
+    },
     WriteFilter,
+    CgroupCleanupBootstrap {
+        membership: String,
+    },
+    CgroupCleanupWatcher {
+        membership: String,
+    },
     Stage2 {
         token: [u8; TOKEN_LEN],
         identity: Identity,
@@ -164,8 +179,26 @@ pub enum Stage2Action {
         entry: String,
         environment: Vec<(OsString, OsString)>,
         filesystems: Vec<Stage2Filesystem>,
+        resources: ResolvedResourceLimits,
+        cgroup_membership: String,
         arguments: Vec<OsString>,
     },
+}
+
+#[derive(Clone, Copy)]
+struct Stage2ResourceBinding<'a> {
+    limits: ResolvedResourceLimits,
+    membership: &'a str,
+}
+
+struct CgroupCleanup {
+    child: Option<Child>,
+    keepalive: Option<io::PipeWriter>,
+}
+
+struct ManagedCgroup {
+    instance: Option<cgroup::Instance>,
+    cleanup: Option<CgroupCleanup>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -186,11 +219,47 @@ where
         }
         return Ok(Mode::Probe);
     }
+    if mode == RESOURCE_PROBE_ARG {
+        let application = args
+            .next()
+            .ok_or_else(usage_error)?
+            .into_string()
+            .map_err(|_| usage_error())?;
+        if args.next().is_some() {
+            return Err(usage_error());
+        }
+        authority::validate_application_name(&application)?;
+        return Ok(Mode::ResourceProbe { application });
+    }
     if mode == FILTER_ARG {
         if args.next().is_some() {
             return Err(usage_error());
         }
         return Ok(Mode::WriteFilter);
+    }
+    if mode == CGROUP_CLEANUP_ARG {
+        let membership = args
+            .next()
+            .ok_or_else(usage_error)?
+            .into_string()
+            .map_err(|_| usage_error())?;
+        if args.next().is_some() {
+            return Err(usage_error());
+        }
+        cgroup::validate_expected_membership(&membership)?;
+        return Ok(Mode::CgroupCleanupBootstrap { membership });
+    }
+    if mode == CGROUP_CLEANUP_WATCH_ARG {
+        let membership = args
+            .next()
+            .ok_or_else(usage_error)?
+            .into_string()
+            .map_err(|_| usage_error())?;
+        if args.next().is_some() {
+            return Err(usage_error());
+        }
+        cgroup::validate_expected_membership(&membership)?;
+        return Ok(Mode::CgroupCleanupWatcher { membership });
     }
     if mode == STAGE2_ARG {
         let encoded = args.next().ok_or_else(usage_error)?;
@@ -303,6 +372,20 @@ where
                 source_kind,
             });
         }
+        if args.next().as_deref() != Some(STAGE2_RESOURCES_ARG.as_ref()) {
+            return Err(usage_error());
+        }
+        let memory_high_bytes = parse_u64(args.next(), "memory-high")?;
+        let memory_max_bytes = parse_u64(args.next(), "memory-max")?;
+        let pids_max = parse_id(args.next(), "pids-max")?;
+        let resources =
+            ResolvedResourceLimits::from_stage2(memory_high_bytes, memory_max_bytes, pids_max)?;
+        let cgroup_membership = args
+            .next()
+            .ok_or_else(usage_error)?
+            .into_string()
+            .map_err(|_| usage_error())?;
+        cgroup::validate_expected_membership(&cgroup_membership)?;
         if args.next().as_deref() != Some(STAGE2_ARGUMENTS_ARG.as_ref()) {
             return Err(usage_error());
         }
@@ -310,10 +393,26 @@ where
             entry,
             environment,
             filesystems,
+            resources,
+            cgroup_membership,
             arguments: authority::collect_arguments(args)?,
         });
     }
     Err(usage_error())
+}
+
+fn parse_u64(value: Option<OsString>, name: &str) -> io::Result<u64> {
+    value
+        .ok_or_else(usage_error)?
+        .to_str()
+        .ok_or_else(usage_error)?
+        .parse()
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid stage-2 {name}: {error}"),
+            )
+        })
 }
 
 fn parse_id(value: Option<OsString>, name: &str) -> io::Result<u32> {
@@ -341,10 +440,11 @@ fn stage2_launch_arguments(
     entry: &str,
     environment: &[(OsString, OsString)],
     filesystems: &[FilesystemGrant],
+    resources: Stage2ResourceBinding<'_>,
     arguments: &[OsString],
 ) -> Vec<OsString> {
     let mut stage2 = Vec::with_capacity(
-        11usize
+        16usize
             .saturating_add(environment.len().saturating_mul(2))
             .saturating_add(filesystems.len().saturating_mul(2))
             .saturating_add(arguments.len()),
@@ -376,6 +476,13 @@ fn stage2_launch_arguments(
         };
         stage2.push(OsString::from(mode));
     }
+    stage2.extend([
+        OsString::from(STAGE2_RESOURCES_ARG),
+        OsString::from(resources.limits.memory_high_bytes.to_string()),
+        OsString::from(resources.limits.memory_max_bytes.to_string()),
+        OsString::from(resources.limits.pids_max.to_string()),
+        OsString::from(resources.membership),
+    ]);
     stage2.push(OsString::from(STAGE2_ARGUMENTS_ARG));
     stage2.extend(arguments.iter().cloned());
     stage2
@@ -398,7 +505,7 @@ fn parse_count(value: Option<OsString>, name: &str) -> io::Result<usize> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "bare td-jail accepts only --probe-transition; installed applications are selected by argv[0]",
+        "bare td-jail accepts only --probe-transition or --probe-resource-caps NAME; installed applications are selected by argv[0]",
     )
 }
 
@@ -573,7 +680,7 @@ fn cstring(value: &str) -> io::Result<CString> {
     CString::new(value).map_err(|_| io::Error::other(format!("path contains NUL: {value:?}")))
 }
 
-fn close_inherited_descriptors() -> io::Result<()> {
+fn close_inherited_descriptors(preserve: Option<u32>) -> io::Result<()> {
     let mut descriptors = Vec::new();
     for entry in fs::read_dir("/proc/self/fd")? {
         let name = entry?
@@ -585,7 +692,7 @@ fn close_inherited_descriptors() -> io::Result<()> {
                 "/proc/self/fd contained nonnumeric entry {name:?}: {e}"
             ))
         })?;
-        if descriptor > 2 {
+        if descriptor > 2 && Some(descriptor) != preserve {
             descriptors.push(descriptor);
         }
     }
@@ -2202,7 +2309,7 @@ pub fn probe_transition() -> io::Result<()> {
     sys::bring_up_loopback()
         .map_err(|e| io::Error::other(format!("bring up isolated loopback: {e}")))?;
     let test_leak = install_test_leak_if_requested()?;
-    close_inherited_descriptors()?;
+    close_inherited_descriptors(None)?;
     if let Some(descriptor) = test_leak {
         require_descriptor_closed(descriptor)?;
     }
@@ -2269,6 +2376,139 @@ pub fn probe_transition() -> io::Result<()> {
     writeln!(io::stdout(), "{TRANSITION_MARKER} pid=1")
 }
 
+pub fn probe_resource_caps(application: &str) -> io::Result<()> {
+    let identity = current_identity()?;
+    if identity.uid == 0 || identity.gid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "td-jail requires the nonzero application identity",
+        ));
+    }
+    let limits = authority::resolve_resource_limits(application)?;
+    let diagnostic = cgroup::probe_active(application, limits, identity.uid, identity.gid)?;
+    writeln!(io::stdout(), "{diagnostic}")
+}
+
+pub fn run_cgroup_cleanup_bootstrap(membership: &str) -> io::Result<()> {
+    let _identity = cleanup_identity()?;
+    cgroup::validate_expected_membership(membership)?;
+    let session = sys::start_new_session()?;
+    require_detached_cleanup_session(session, &fs::read_to_string("/proc/self/stat")?)?;
+
+    let executable = std::env::current_exe()?;
+    let mut command = Command::new(executable);
+    command
+        .arg(CGROUP_CLEANUP_WATCH_ARG)
+        .arg(membership)
+        .env_clear()
+        .current_dir("/")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let mut watcher = command
+        .spawn()
+        .map_err(|error| io::Error::other(format!("spawn cgroup cleanup watcher: {error}")))?;
+    drop(command);
+    let status = loop {
+        match watcher.wait() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            result => break result?,
+        }
+    };
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "cgroup cleanup watcher exited unsuccessfully: {status}"
+        )))
+    }
+}
+
+pub fn run_cgroup_cleanup_watcher(membership: &str) -> io::Result<()> {
+    let identity = cleanup_identity()?;
+    cgroup::validate_expected_membership(membership)?;
+    let session = sys::start_new_session()?;
+    require_detached_cleanup_session(session, &fs::read_to_string("/proc/self/stat")?)?;
+    {
+        let mut readiness = io::stdout().lock();
+        readiness.write_all(&CGROUP_CLEANUP_READY)?;
+        readiness.flush()?;
+    }
+    wait_for_parent_end(&mut io::stdin())?;
+    cgroup::remove_abandoned(membership, identity.uid, identity.gid)
+}
+
+fn cleanup_identity() -> io::Result<Identity> {
+    let identity = current_identity()?;
+    if identity.uid == 0 || identity.gid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "td-jail cgroup cleanup requires the nonzero application identity",
+        ));
+    }
+    Ok(identity)
+}
+
+fn require_detached_cleanup_session(expected: u32, stat: &str) -> io::Result<()> {
+    let (_, fields) = stat
+        .rsplit_once(") ")
+        .ok_or_else(|| io::Error::other("/proc/self/stat has no command-field terminator"))?;
+    let mut fields = fields.split_whitespace();
+    let _state = fields
+        .next()
+        .ok_or_else(|| io::Error::other("/proc/self/stat has no state field"))?;
+    let _parent = fields
+        .next()
+        .ok_or_else(|| io::Error::other("/proc/self/stat has no parent field"))?;
+    let process_group = parse_proc_stat_u32(&mut fields, "process group")?;
+    let session = parse_proc_stat_u32(&mut fields, "session")?;
+    let terminal = fields
+        .next()
+        .ok_or_else(|| io::Error::other("/proc/self/stat has no controlling-terminal field"))?
+        .parse::<i64>()
+        .map_err(|error| {
+            io::Error::other(format!(
+                "invalid /proc/self/stat controlling-terminal field: {error}"
+            ))
+        })?;
+    if process_group != expected || session != expected || terminal != 0 {
+        return Err(io::Error::other(format!(
+            "cleanup helper containment read back as process-group={process_group}, \
+             session={session}, controlling-terminal={terminal}; expected detached session \
+             {expected}"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_proc_stat_u32<'a>(
+    fields: &mut impl Iterator<Item = &'a str>,
+    name: &str,
+) -> io::Result<u32> {
+    fields
+        .next()
+        .ok_or_else(|| io::Error::other(format!("/proc/self/stat has no {name} field")))?
+        .parse()
+        .map_err(|error| io::Error::other(format!("invalid /proc/self/stat {name}: {error}")))
+}
+
+fn wait_for_parent_end(reader: &mut impl Read) -> io::Result<()> {
+    let mut byte = [0_u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cgroup cleanup keepalive carried unexpected data",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 pub fn run_stage2(
     expected: [u8; TOKEN_LEN],
     expected_identity: Identity,
@@ -2326,8 +2566,12 @@ pub fn run_stage2(
             entry,
             environment,
             filesystems: _,
+            resources,
+            cgroup_membership,
             arguments,
         } => {
+            cgroup::require_current_membership(&cgroup_membership)?;
+            sys::set_and_require_data_limit(resources.memory_max_bytes)?;
             sys::set_dumpable(false)?;
             if sys::dumpable()? {
                 return Err(io::Error::other("PID 1 remained dumpable"));
@@ -2476,6 +2720,165 @@ fn reap_survivors_until(
     }
 }
 
+impl CgroupCleanup {
+    fn spawn(executable: &Path, membership: &str) -> io::Result<Self> {
+        let (reader, writer) = io::pipe()?;
+        let (mut ready_reader, ready_writer) = io::pipe()?;
+        let mut command = Command::new(executable);
+        command
+            .arg(CGROUP_CLEANUP_ARG)
+            .arg(membership)
+            .env_clear()
+            .current_dir("/")
+            .stdin(Stdio::from(reader))
+            .stdout(Stdio::from(ready_writer))
+            .stderr(Stdio::inherit());
+        let mut child = command
+            .spawn()
+            .map_err(|error| io::Error::other(format!("spawn cgroup cleanup helper: {error}")))?;
+        drop(command);
+        let mut readiness = [0_u8; 1];
+        let armed = ready_reader
+            .read_exact(&mut readiness)
+            .and_then(|()| {
+                if readiness == CGROUP_CLEANUP_READY {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "cgroup cleanup helper returned an invalid readiness byte",
+                    ))
+                }
+            });
+        drop(ready_reader);
+        if let Err(error) = armed {
+            drop(writer);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                error.kind(),
+                format!("arm cgroup cleanup helper: {error}"),
+            ));
+        }
+        Ok(Self {
+            child: Some(child),
+            keepalive: Some(writer),
+        })
+    }
+
+    fn keepalive_descriptor(&self) -> io::Result<u32> {
+        let descriptor = self
+            .keepalive
+            .as_ref()
+            .ok_or_else(|| io::Error::other("cgroup cleanup keepalive is already closed"))?
+            .as_raw_fd();
+        u32::try_from(descriptor)
+            .map_err(|error| io::Error::other(format!("invalid cleanup descriptor: {error}")))
+    }
+
+    fn close_and_wait(&mut self) -> io::Result<()> {
+        drop(self.keepalive.take());
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        let status = loop {
+            match child.wait() {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                result => break result?,
+            }
+        };
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "cgroup cleanup helper exited unsuccessfully: {status}"
+            )))
+        }
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        self.close_and_wait()
+    }
+}
+
+impl Drop for CgroupCleanup {
+    fn drop(&mut self) {
+        let _ = self.close_and_wait();
+    }
+}
+
+impl ManagedCgroup {
+    fn create(
+        executable: &Path,
+        instance: &str,
+        limits: ResolvedResourceLimits,
+        identity: Identity,
+    ) -> io::Result<Self> {
+        let membership = cgroup::membership_for_instance(instance)?;
+        let cleanup = CgroupCleanup::spawn(executable, &membership)?;
+        match cgroup::Instance::create(instance, limits, identity.uid, identity.gid) {
+            Ok(instance) => Ok(Self {
+                instance: Some(instance),
+                cleanup: Some(cleanup),
+            }),
+            Err(error) => match cleanup.finish() {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(io::Error::other(format!(
+                    "{error}; cgroup cleanup helper: {cleanup}"
+                ))),
+            },
+        }
+    }
+
+    fn membership(&self) -> io::Result<&str> {
+        self.instance
+            .as_ref()
+            .map(cgroup::Instance::membership)
+            .ok_or_else(|| io::Error::other("application cgroup is already finished"))
+    }
+
+    fn keepalive_descriptor(&self) -> io::Result<u32> {
+        self.cleanup
+            .as_ref()
+            .ok_or_else(|| io::Error::other("cgroup cleanup helper is already finished"))?
+            .keepalive_descriptor()
+    }
+
+    fn attach(&self, pid: u32) -> io::Result<()> {
+        self.instance
+            .as_ref()
+            .ok_or_else(|| io::Error::other("application cgroup is already finished"))?
+            .attach(pid)
+    }
+
+    fn finish(mut self) -> io::Result<cgroup::Report> {
+        let cgroup_result = self
+            .instance
+            .take()
+            .ok_or_else(|| io::Error::other("application cgroup is already finished"))?
+            .report_and_release();
+        let cleanup_result = self
+            .cleanup
+            .take()
+            .ok_or_else(|| io::Error::other("cgroup cleanup helper is already finished"))?
+            .finish();
+        match (cgroup_result, cleanup_result) {
+            (Ok(report), Ok(())) => Ok(report),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(cgroup), Err(cleanup)) => Err(io::Error::other(format!(
+                "{cgroup}; cgroup cleanup helper: {cleanup}"
+            ))),
+        }
+    }
+}
+
+impl Drop for ManagedCgroup {
+    fn drop(&mut self) {
+        drop(self.instance.take());
+        drop(self.cleanup.take());
+    }
+}
+
 pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
     let identity = current_identity()?;
     if identity.uid == 0 || identity.gid == 0 {
@@ -2487,6 +2890,15 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
     let before = NamespaceSnapshot::read()?;
     let token = random_token()?;
     let executable = std::env::current_exe()?;
+
+    let instance = instance_name(&application.name)?;
+    let application_cgroup = ManagedCgroup::create(
+        &executable,
+        &instance,
+        application.resources,
+        identity,
+    )?;
+    let cleanup_descriptor = application_cgroup.keepalive_descriptor()?;
 
     // Phase one. What is load-bearing is that it precedes the SPAWN: the
     // pending registration has to exist before any process that could connect
@@ -2503,16 +2915,14 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
     // which is also why phase two below can open a fresh connection at all.
     // Recorded because two reviewers had to find it.
     //
-    // The connection is opened and dropped rather than held:
-    // `close_inherited_descriptors` closes every descriptor above stderr, so
-    // no connection survives into phase two. That is the real reason §D
-    // compares the same PROCESS across the phases rather than the same
-    // connection.
+    // The connection is opened and dropped rather than held. The descriptor
+    // sweep preserves only the cleanup keepalive, so no connection survives
+    // into phase two. That is the real reason §D compares the same PROCESS
+    // across the phases rather than the same connection.
     //
     // No predeclared service names yet. §D carries them for app-local
     // activation, which lands with the activation listener; an empty list is
     // the honest statement that this instance may own none.
-    let instance = instance_name(&application.name)?;
     let registration = crate::bus::register(
         &application.bus_socket,
         identity.uid,
@@ -2522,133 +2932,170 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
     )
     .map_err(|e| io::Error::other(format!("register jail instance {instance:?}: {e}")))?;
 
-    sys::unshare_namespaces(true)?;
-    install_identity_maps(identity)?;
-    NamespaceSnapshot::read()?.require_all_changed(&before)?;
-    sys::bring_up_loopback()
-        .map_err(|e| io::Error::other(format!("bring up isolated loopback: {e}")))?;
-    close_inherited_descriptors()?;
-    prepare_mount_plan(identity, &executable, Some(&application))?;
-    prepare_capability_bridge()?;
+    let launch_result = (|| -> io::Result<()> {
+        sys::unshare_namespaces(true)?;
+        install_identity_maps(identity)?;
+        NamespaceSnapshot::read()?.require_all_changed(&before)?;
+        sys::bring_up_loopback()
+            .map_err(|e| io::Error::other(format!("bring up isolated loopback: {e}")))?;
+        close_inherited_descriptors(Some(cleanup_descriptor))?;
+        prepare_mount_plan(identity, &executable, Some(&application))?;
+        prepare_capability_bridge()?;
 
-    let (proof_reader, mut proof_writer) = io::pipe()?;
-    let (mut stage2_error, stage2_error_writer) = io::pipe()?;
-    let stage2_arguments = stage2_launch_arguments(
-        &token,
-        identity,
-        &application.entry,
-        &application.environment,
-        &application.filesystems,
-        &application.arguments,
-    );
-    let mut command = Command::new(executable);
-    command
-        .args(&stage2_arguments)
-        .env_clear()
-        .stdin(Stdio::from(proof_reader))
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stage2_error_writer));
-    let mut child = command.spawn()?;
-    drop(command);
+        let (proof_reader, mut proof_writer) = io::pipe()?;
+        let (mut stage2_error, stage2_error_writer) = io::pipe()?;
+        let stage2_arguments = stage2_launch_arguments(
+            &token,
+            identity,
+            &application.entry,
+            &application.environment,
+            &application.filesystems,
+            Stage2ResourceBinding {
+                limits: application.resources,
+                membership: application_cgroup.membership()?,
+            },
+            &application.arguments,
+        );
+        let mut command = Command::new(executable);
+        command
+            .args(&stage2_arguments)
+            .env_clear()
+            .stdin(Stdio::from(proof_reader))
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stage2_error_writer));
+        let mut child = command.spawn()?;
+        drop(command);
 
-    if let Err(error) = require_child_pid_namespace_changed(&before, child.id()) {
-        let _ = child.kill();
-        let status = child.wait();
-        drop(proof_writer);
-        let diagnostic = match read_launch_diagnostic(&mut stage2_error) {
-            Ok(response) if response.trim().is_empty() => String::new(),
-            Ok(response) => format!("; diagnostic: {}", response.trim()),
-            Err(read_error) => format!("; diagnostic unavailable: {read_error}"),
-        };
-        let status = match status {
-            Ok(status) => status.to_string(),
-            Err(wait_error) => format!("wait failed: {wait_error}"),
-        };
-        return Err(io::Error::other(format!(
-            "verify launch-stage PID namespace: {error}; stage 2 {status}{diagnostic}"
-        )));
-    }
-    // Phase two, and it comes BEFORE the proof write on purpose. That write is
-    // what releases stage 2, and `Command::spawn` has already returned with
-    // stage 2 runnable — so completing afterwards would leave a window in
-    // which the application connects while its registration is still pending.
-    // The broker refuses a strict descendant of a pending registrant, which is
-    // right, and it fixes identity AT ACCEPT, so such a connection is denied
-    // for its whole life however quickly the registration then completes.
-    //
-    // A failed completion kills the jail rather than launching one the broker
-    // has no record of: an unregistered application resolves `Unconfined`,
-    // which is full portal access for the one process that is certainly
-    // confined. This is §D's "stage 1 refuses to proceed without the token",
-    // placed where it is actually enforceable.
-    if let Err(error) = crate::bus::complete(
-        &application.bus_socket,
-        identity.uid,
-        &registration,
-        child.id(),
-    ) {
-        let _ = child.kill();
-        let status = child.wait();
-        drop(proof_writer);
-        let diagnostic = match read_launch_diagnostic(&mut stage2_error) {
-            Ok(response) if response.trim().is_empty() => String::new(),
-            Ok(response) => format!("; diagnostic: {}", response.trim()),
-            Err(read_error) => format!("; diagnostic unavailable: {read_error}"),
-        };
-        let status = match status {
-            Ok(status) => status.to_string(),
-            Err(wait_error) => format!("wait failed: {wait_error}"),
-        };
-        return Err(io::Error::other(format!(
-            "complete jail instance {instance:?}: {error}; stage 2 {status}{diagnostic}"
-        )));
-    }
-
-    if let Err(error) = proof_writer.write_all(&token) {
-        let _ = child.kill();
-        let status = child.wait();
-        drop(proof_writer);
-        let diagnostic = match read_launch_diagnostic(&mut stage2_error) {
-            Ok(response) if response.trim().is_empty() => String::new(),
-            Ok(response) => format!("; diagnostic: {}", response.trim()),
-            Err(read_error) => format!("; diagnostic unavailable: {read_error}"),
-        };
-        let status = match status {
-            Ok(status) => status.to_string(),
-            Err(wait_error) => format!("wait failed: {wait_error}"),
-        };
-        return Err(io::Error::other(format!(
-            "write launch-stage proof: {error}; stage 2 {status}{diagnostic}"
-        )));
-    }
-    let response = match read_launch_diagnostic(&mut stage2_error) {
-        Ok(response) => response,
-        Err(error) => {
+        if let Err(error) = require_child_pid_namespace_changed(&before, child.id()) {
             let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-    };
-    let status = child.wait()?;
-    drop(proof_writer);
-    if !status.success() {
-        let detail = response.trim();
-        if !detail.is_empty() {
+            let status = child.wait();
+            drop(proof_writer);
+            let diagnostic = match read_launch_diagnostic(&mut stage2_error) {
+                Ok(response) if response.trim().is_empty() => String::new(),
+                Ok(response) => format!("; diagnostic: {}", response.trim()),
+                Err(read_error) => format!("; diagnostic unavailable: {read_error}"),
+            };
+            let status = match status {
+                Ok(status) => status.to_string(),
+                Err(wait_error) => format!("wait failed: {wait_error}"),
+            };
             return Err(io::Error::other(format!(
-                "application jail exited unsuccessfully: {status}: {detail}"
+                "verify launch-stage PID namespace: {error}; stage 2 {status}{diagnostic}"
             )));
         }
-        return Err(io::Error::other(format!(
-            "application jail exited unsuccessfully: {status}"
-        )));
+        if let Err(error) = application_cgroup.attach(child.id()) {
+            let _ = child.kill();
+            let status = child.wait();
+            drop(proof_writer);
+            let diagnostic = match read_launch_diagnostic(&mut stage2_error) {
+                Ok(response) if response.trim().is_empty() => String::new(),
+                Ok(response) => format!("; diagnostic: {}", response.trim()),
+                Err(read_error) => format!("; diagnostic unavailable: {read_error}"),
+            };
+            let status = match status {
+                Ok(status) => status.to_string(),
+                Err(wait_error) => format!("wait failed: {wait_error}"),
+            };
+            return Err(io::Error::other(format!(
+                "attach launch-stage PID to application cgroup: {error}; stage 2 {status}{diagnostic}"
+            )));
+        }
+        // Phase two, and it comes BEFORE the proof write on purpose. That write is
+        // what releases stage 2, and `Command::spawn` has already returned with
+        // stage 2 runnable — so completing afterwards would leave a window in
+        // which the application connects while its registration is still pending.
+        // The broker refuses a strict descendant of a pending registrant, which is
+        // right, and it fixes identity AT ACCEPT, so such a connection is denied
+        // for its whole life however quickly the registration then completes.
+        //
+        // A failed completion kills the jail rather than launching one the broker
+        // has no record of: an unregistered application resolves `Unconfined`,
+        // which is full portal access for the one process that is certainly
+        // confined. This is §D's "stage 1 refuses to proceed without the token",
+        // placed where it is actually enforceable.
+        if let Err(error) = crate::bus::complete(
+            &application.bus_socket,
+            identity.uid,
+            &registration,
+            child.id(),
+        ) {
+            let _ = child.kill();
+            let status = child.wait();
+            drop(proof_writer);
+            let diagnostic = match read_launch_diagnostic(&mut stage2_error) {
+                Ok(response) if response.trim().is_empty() => String::new(),
+                Ok(response) => format!("; diagnostic: {}", response.trim()),
+                Err(read_error) => format!("; diagnostic unavailable: {read_error}"),
+            };
+            let status = match status {
+                Ok(status) => status.to_string(),
+                Err(wait_error) => format!("wait failed: {wait_error}"),
+            };
+            return Err(io::Error::other(format!(
+                "complete jail instance {instance:?}: {error}; stage 2 {status}{diagnostic}"
+            )));
+        }
+
+        if let Err(error) = proof_writer.write_all(&token) {
+            let _ = child.kill();
+            let status = child.wait();
+            drop(proof_writer);
+            let diagnostic = match read_launch_diagnostic(&mut stage2_error) {
+                Ok(response) if response.trim().is_empty() => String::new(),
+                Ok(response) => format!("; diagnostic: {}", response.trim()),
+                Err(read_error) => format!("; diagnostic unavailable: {read_error}"),
+            };
+            let status = match status {
+                Ok(status) => status.to_string(),
+                Err(wait_error) => format!("wait failed: {wait_error}"),
+            };
+            return Err(io::Error::other(format!(
+                "write launch-stage proof: {error}; stage 2 {status}{diagnostic}"
+            )));
+        }
+        let response = match read_launch_diagnostic(&mut stage2_error) {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        let status = child.wait()?;
+        drop(proof_writer);
+        if !status.success() {
+            let detail = response.trim();
+            if !detail.is_empty() {
+                return Err(io::Error::other(format!(
+                    "application jail exited unsuccessfully: {status}: {detail}"
+                )));
+            }
+            return Err(io::Error::other(format!(
+                "application jail exited unsuccessfully: {status}"
+            )));
+        }
+        if !response.is_empty() {
+            return Err(io::Error::other(format!(
+                "successful application jail returned a diagnostic: {:?}",
+                response.trim()
+            )));
+        }
+        Ok(())
+    })();
+    let cgroup_result = application_cgroup.finish();
+    match (launch_result, cgroup_result) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Err(error), Ok(report)) => Err(io::Error::other(format!(
+            "{error}; application cgroup diagnostics: {}",
+            report.diagnostic()
+        ))),
+        (Ok(()), Err(error)) => Err(io::Error::other(format!(
+            "application exited successfully but cgroup cleanup failed: {error}"
+        ))),
+        (Err(launch), Err(cgroup)) => Err(io::Error::other(format!(
+            "{launch}; application cgroup cleanup: {cgroup}"
+        ))),
     }
-    if !response.is_empty() {
-        return Err(io::Error::other(format!(
-            "successful application jail returned a diagnostic: {:?}",
-            response.trim()
-        )));
-    }
-    Ok(())
 }
 
 fn read_launch_diagnostic(reader: &mut impl Read) -> io::Result<String> {
@@ -2834,6 +3281,34 @@ mod tests {
         assert!(parse_mode(args(&[PROBE_ARG, "extra"])).is_err());
         assert_eq!(parse_mode(args(&[FILTER_ARG])).unwrap(), Mode::WriteFilter);
         assert!(parse_mode(args(&[FILTER_ARG, "extra"])).is_err());
+        let membership = "/td-user-1000/app-0123456789abcdef";
+        assert_eq!(
+            parse_mode(args(&[CGROUP_CLEANUP_ARG, membership])).unwrap(),
+            Mode::CgroupCleanupBootstrap {
+                membership: membership.into(),
+            }
+        );
+        assert!(parse_mode(args(&[CGROUP_CLEANUP_ARG])).is_err());
+        assert!(parse_mode(args(&[CGROUP_CLEANUP_ARG, "/elsewhere/app"])).is_err());
+        assert!(parse_mode(args(&[CGROUP_CLEANUP_ARG, membership, "extra"])).is_err());
+        assert_eq!(
+            parse_mode(args(&[CGROUP_CLEANUP_WATCH_ARG, membership])).unwrap(),
+            Mode::CgroupCleanupWatcher {
+                membership: membership.into(),
+            }
+        );
+        assert!(parse_mode(args(&[CGROUP_CLEANUP_WATCH_ARG])).is_err());
+        assert!(parse_mode(args(&[
+            CGROUP_CLEANUP_WATCH_ARG,
+            "/elsewhere/app"
+        ]))
+        .is_err());
+        assert!(parse_mode(args(&[
+            CGROUP_CLEANUP_WATCH_ARG,
+            membership,
+            "extra"
+        ]))
+        .is_err());
         assert_eq!(
             parse_mode(args(&[REAPER_CHILD_ARG])).unwrap(),
             Mode::ReaperChild
@@ -2875,6 +3350,13 @@ mod tests {
                 sole_child: None,
             }
         );
+    }
+
+    #[test]
+    fn cgroup_cleanup_keepalive_accepts_only_eof() {
+        wait_for_parent_end(&mut io::empty()).unwrap();
+        let error = wait_for_parent_end(&mut io::Cursor::new([1_u8])).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -2972,6 +3454,11 @@ mod tests {
                 "1",
                 "/home/td/Downloads",
                 "rw-dir",
+                STAGE2_RESOURCES_ARG,
+                "50331648",
+                "67108864",
+                "32",
+                "/td-user-1000/app-0123456789abcdef",
                 STAGE2_ARGUMENTS_ARG,
                 "--flag",
             ]))
@@ -2981,6 +3468,8 @@ mod tests {
                     entry,
                     environment,
                     filesystems,
+                    resources,
+                    cgroup_membership,
                     arguments,
                 },
                 ..
@@ -2994,6 +3483,12 @@ mod tests {
                     read_only: false,
                     source_kind: FilesystemSourceKind::Directory,
                 }]
+                && resources == ResolvedResourceLimits {
+                    memory_high_bytes: 50_331_648,
+                    memory_max_bytes: 67_108_864,
+                    pids_max: 32,
+                }
+                && cgroup_membership == "/td-user-1000/app-0123456789abcdef"
                 && arguments == [OsString::from("--flag")]
         ));
         assert!(parse_mode(args(&[STAGE2_ARG, &encoded])).is_err());
@@ -3060,6 +3555,12 @@ mod tests {
             ),
         ];
         let arguments = vec![OsString::from("--flag")];
+        let resources = ResolvedResourceLimits {
+            memory_high_bytes: 50_331_648,
+            memory_max_bytes: 67_108_864,
+            pids_max: 32,
+        };
+        let membership = "/td-user-1000/app-0123456789abcdef";
         let filesystems = vec![FilesystemGrant {
             source: PathBuf::from("/host/downloads"),
             target: PathBuf::from("/home/td/Downloads"),
@@ -3074,6 +3575,10 @@ mod tests {
             "/app/bin/app",
             &environment,
             &filesystems,
+            Stage2ResourceBinding {
+                limits: resources,
+                membership,
+            },
             &arguments,
         );
         assert_eq!(
@@ -3089,10 +3594,25 @@ mod tests {
                         read_only: false,
                         source_kind: FilesystemSourceKind::Directory,
                     }],
+                    resources,
+                    cgroup_membership: membership.into(),
                     arguments,
                 },
             }
         );
+    }
+
+    #[test]
+    fn resource_probe_mode_is_named_and_bounded() {
+        assert_eq!(
+            parse_mode(args(&[RESOURCE_PROBE_ARG, "td-jail-fixture"])).unwrap(),
+            Mode::ResourceProbe {
+                application: "td-jail-fixture".into(),
+            }
+        );
+        assert!(parse_mode(args(&[RESOURCE_PROBE_ARG])).is_err());
+        assert!(parse_mode(args(&[RESOURCE_PROBE_ARG, "bad/name"])).is_err());
+        assert!(parse_mode(args(&[RESOURCE_PROBE_ARG, "app", "extra"])).is_err());
     }
 
     #[test]
@@ -3624,5 +4144,21 @@ mod tests {
             "/grant rw,nosuid,nodev,noexec",
         );
         require_grant_mount_policy(&mixed, &read_write).unwrap();
+    }
+
+    #[test]
+    fn cleanup_readiness_requires_a_detached_session() {
+        let detached = "123 (td-jail helper) S 1 123 123 0 0 0 0\n";
+        require_detached_cleanup_session(123, detached).unwrap();
+        assert!(require_detached_cleanup_session(
+            123,
+            "123 (td-jail helper) S 1 123 122 0 0 0 0\n"
+        )
+        .is_err());
+        assert!(require_detached_cleanup_session(
+            123,
+            "123 (td-jail ) helper) S 1 123 123 34817 0 0 0\n"
+        )
+        .is_err());
     }
 }

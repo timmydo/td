@@ -36,6 +36,10 @@ impl Credentials {
         Credentials { uid, gid, groups }
     }
 
+    pub(crate) fn target_uid(&self) -> u32 {
+        self.uid
+    }
+
     /// Does the kernel's view equal what was asked for? ALL FOUR uid columns and
     /// ALL FOUR gid columns, not just the effective one: a switch that left a
     /// saved uid of 0 behind is a process one `setuid(0)` away from being root

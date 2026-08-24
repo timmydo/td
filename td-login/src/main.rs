@@ -30,6 +30,7 @@
 //! `td-login <applet> [args]` form covers the un-symlinked case, and
 //! `td-login verify-credentials …` is the boot oracle's readback probe.
 
+mod cgroup;
 mod creds;
 mod db;
 mod exec_as;
@@ -833,8 +834,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            9,
-            "expected nine modules beside the crate root"
+            10,
+            "expected ten modules beside the crate root"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model.
@@ -846,7 +847,7 @@ mod confinement {
         }
     }
 
-    /// `src/` holds these ten files and nothing else.
+    /// `src/` holds these eleven files and nothing else.
     ///
     /// The scan above proves every `mod` line has a file and every file has a
     /// `mod` line, which is a closed loop that says nothing about WHICH files:
@@ -857,14 +858,14 @@ mod confinement {
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and
     /// compiles perfectly well through the constructs refused below.
     #[test]
-    fn src_holds_exactly_the_ten_scanned_modules() {
+    fn src_holds_exactly_the_eleven_scanned_modules() {
         let (rs, other) = walk();
         let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
             paths,
             [
-                "creds.rs", "db.rs", "exec_as.rs", "login.rs", "main.rs", "session.rs",
-                "status.rs", "su.rs", "sys.rs", "tty.rs",
+                "cgroup.rs", "creds.rs", "db.rs", "exec_as.rs", "login.rs", "main.rs",
+                "session.rs", "status.rs", "su.rs", "sys.rs", "tty.rs",
             ],
             "the crate's file set changed"
         );
@@ -1294,6 +1295,14 @@ mod confinement {
                 text.matches(&needle).count()
             );
         }
+        let session = source("session.rs");
+        assert!(
+            session
+                .find("cgroup::join(session.creds.target_uid())")
+                .unwrap_or(usize::MAX)
+                < session.find(&needle).unwrap_or(0),
+            "the fixed session cgroup join must be attempted while td-login is still root"
+        );
     }
 
     /// No second credential mechanism.

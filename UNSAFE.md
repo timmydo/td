@@ -51,7 +51,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `ioctl(2)` |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
-| 9 | `td-jail` | `close(2)`, `ioctl(2)` with two value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `seccomp(2)` with one value-pinned operation |
+| 9 | `td-jail` | `close(2)`, `ioctl(2)` with two value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation |
 | 10 | `td-busd` | `recvmsg(2)`, `sendmsg(2)`, `getsockopt(2)` with two value-pinned options; plus a SECOND scoped allow for descriptor adoption — see [§10](#10-td-busd--the-session-bus-broker) |
 | 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)` |
 
@@ -234,6 +234,12 @@ what it says — including the ORDER of the three calls, which no compiler
 checks; a fourth syscall, or relaxing the fail-closed authentication
 policy, is an amendment there AND here.
 
+Before those credential calls, uid 1000 attempts to join its fixed delegated
+session cgroup through safe filesystem writes and exact `/proc/self/cgroup`
+readback. Failure is diagnosed without withholding the console; td-jail still
+fails closed unless the placement succeeded. No caller selects the path, and
+this adds no syscall to the unsafe roster.
+
 ## 5. `td-svc` — the service supervisor
 
 The `td-svc` service supervisor, whose one `syscall2` body in
@@ -266,7 +272,10 @@ because every assertion above is about source TEXT and a `kill` that
 returned `Ok(())` without issuing anything satisfies all of them.
 
 Everything else td-svc needs is still reachable through safe `std`, which
-is what keeps that surface at one. `td-svc/DESIGN.md` is its normative
+is what keeps that surface at one. That includes cgroup-v2 delegation:
+PID 1 mounts the hierarchy through the existing audited mount applet, while
+td-svc creates cgroups, enables controllers at the root exception, and
+changes ownership through safe filesystem APIs. `td-svc/DESIGN.md` is its normative
 specification, recording both that and the invariants no compiler checks
 (no `pre_exec`, liveness read from `/proc` rather than inferred from an
 exit status, and a console that is neither skippable nor indefinitely
@@ -1003,10 +1012,10 @@ the same in both directions, and costs only the text of the word.
 
 ## 9. `td-jail` — the application sandbox
 
-The landed `td-jail` surface carries exactly TWELVE syscalls on x86-64
+The landed `td-jail` surface carries exactly FOURTEEN syscalls on x86-64
 through one `syscall5` body: `unshare(2)`, `close(2)`, `ioctl(2)`,
-`wait4(2)`, `kill(2)`, `mount(2)`, `umount2(2)`, `pivot_root(2)`,
-`capset(2)`, `capget(2)`, and `prctl(2)`, plus `seccomp(2)` with exactly
+`wait4(2)`, `kill(2)`, `setsid(2)`, `mount(2)`, `umount2(2)`, `pivot_root(2)`,
+`capset(2)`, `capget(2)`, `prctl(2)`, and `prlimit64(2)`, plus `seccomp(2)` with exactly
 one operation:
 `SECCOMP_SET_MODE_FILTER`=1 and flags zero.
 The unshare wrapper accepts only the two compiled namespace sets the
@@ -1113,6 +1122,14 @@ effective, permitted, inheritable and ambient to equal exactly
 clears ambient first, empties effective, permitted and inheritable, and
 requires all five capability rows to be zero.
 
+`prlimit64(2)` is reached only through `set_and_require_data_limit`. Both
+calls fix pid to self (`0`) and resource to `RLIMIT_DATA`=2. The first sets
+the soft and hard limits to the same authenticated `memory-max` byte count;
+the second supplies no new limit and reads the exact two-u64 structure back.
+Stage 2 performs both before it creates its watcher thread or application
+child. No caller selects a pid, resource, unequal soft/hard pair, or old-limit
+destination.
+
 After capability removal, stage 2 validates the compiled constant cBPF
 program, sets and reads back no-new-privileges, installs that exact program,
 and requires `/proc/self/status` to report `NoNewPrivs: 1` and `Seccomp: 2`.
@@ -1164,7 +1181,7 @@ selects a name by argv[0]; safe Rust reads the immutable image configuration,
 sorted registry and canonical builder-owned spec, then accepts only the
 builder-authenticated spec with the Wayland socket and the closed typed
 filesystem subset. The runtime parser closes the spec grammar and uses the
-shared permission type's exhaustive Wayland-plus-filesystem predicate; adding
+shared permission type's exhaustive Wayland-plus-filesystem-and-resources predicate; adding
 another policy field cannot silently widen this rung. The image compiler
 selects the fixture's empty runtime. Stage 1 binds
 authenticated package/runtime trees read-only, the exact compositor socket
@@ -1184,6 +1201,24 @@ volatile runtime bind carries the fixture's readiness socket across the
 otherwise-private `/run`; safe Rust on the host probes the per-application
 end before trusted QEMU evidence. Stage 2
 performs the same mount/capability/filter readbacks before spawning the entry.
+Before stage 2 is released, stage 1 creates one direct child of the delegated
+`/sys/fs/cgroup/td-user-1000` root, writes and exactly reads back
+`memory.high`, `memory.max`, `memory.oom.group=1`, and `pids.max`, and moves
+the blocked stage-2 pid through `cgroup.procs`. Stage 2 re-reads its exact
+unified membership from procfs before setting `RLIMIT_DATA`. The cgroup
+filesystem remains masked by the mount plan, so the application cannot move
+itself into a sibling. Before the leaf exists, stage 1 starts a cleanup
+bootstrap with cwd `/` and retains a close-on-exec pipe. The bootstrap issues
+`setsid(2)`, proves its new session and zero controlling-terminal field, and
+only then spawns the watcher. The watcher issues the same proved detachment and
+sends one readiness byte. It was therefore never present in a terminal-member
+snapshot that could still signal the bootstrap and stage 1 after readiness.
+Stage 1 does not create the leaf until it receives that byte.
+After PID 1 and its descendants are reaped, stage 1 reads `memory.events` and
+`memory.peak`, releases the leaf to the watcher, and closes the pipe. Normal
+exit, signal, and abort therefore use the same bounded drain and removal. The
+watcher's detached session survives both process-group and controlling-terminal
+shutdown. Controller operations remain safe filesystem I/O.
 It preserves the direct entry's status while bounded survivor cleanup drains
 the namespace to `ECHILD`; the transition probe exercises both natural orphan
 reaping and forced survivor cleanup. No caller supplies a mount, filter,
@@ -1217,12 +1252,8 @@ terminal state. The readiness socket is same-UID evidence rather than an
 authenticated peer: another uid-1000 process can satisfy the probe, so this is
 an image-test oracle, not hostile-payload attestation.
 
-Deliberately NOT in this surface yet is the remaining call in
-`APPLICATIONS.md`'s target-state draft: `prlimit64`. It arrives only with the
-rung that uses and tests it; the roadmap is not advance authorization for a
-dormant wrapper.
 There is likewise no `fork`, `pre_exec`, `clone`, `setns`, or caller-
-supplied namespace, mount set, or BPF program. A thirteenth syscall, a ninth
+supplied namespace, mount set, or BPF program. A fifteenth syscall, a ninth
 prctl operation, a second seccomp operation or nonzero seccomp flag, a fourth
 ambient sub-operation, or a third unshare flag set
 is an amendment here.

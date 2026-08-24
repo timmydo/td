@@ -7,6 +7,7 @@
 
 mod authority;
 mod bus;
+mod cgroup;
 #[allow(dead_code)]
 #[cfg_attr(test, allow(clippy::unwrap_used))]
 #[cfg_attr(
@@ -34,7 +35,16 @@ fn run() -> std::io::Result<()> {
     }
     match transition::parse_mode(arguments)? {
         transition::Mode::Probe => transition::probe_transition(),
+        transition::Mode::ResourceProbe { application } => {
+            transition::probe_resource_caps(&application)
+        }
         transition::Mode::WriteFilter => transition::write_standard_filter(),
+        transition::Mode::CgroupCleanupBootstrap { membership } => {
+            transition::run_cgroup_cleanup_bootstrap(&membership)
+        }
+        transition::Mode::CgroupCleanupWatcher { membership } => {
+            transition::run_cgroup_cleanup_watcher(&membership)
+        }
         transition::Mode::Stage2 {
             token,
             identity,
@@ -63,6 +73,7 @@ mod confinement {
 
     const AUTHORITY: &str = include_str!("authority.rs");
     const BUS: &str = include_str!("bus.rs");
+    const CGROUP: &str = include_str!("cgroup.rs");
     const MAIN: &str = include_str!("main.rs");
     const PERMISSIONS: &str = include_str!("../../engine/src/permissions.rs");
     const SECCOMP: &str = include_str!("seccomp.rs");
@@ -82,6 +93,8 @@ mod confinement {
         // syscall of its own and adds nothing to surface #9.
         assert_eq!(BUS.matches("#[allow(unsafe_code)]").count(), 0);
         assert_eq!(BUS.matches("unsafe {").count(), 0);
+        assert_eq!(CGROUP.matches("#[allow(unsafe_code)]").count(), 0);
+        assert_eq!(CGROUP.matches("unsafe {").count(), 0);
         assert_eq!(PERMISSIONS.matches("#[allow(unsafe_code)]").count(), 0);
         assert_eq!(PERMISSIONS.matches("unsafe {").count(), 0);
         assert_eq!(SECCOMP.matches("#[allow(unsafe_code)]").count(), 0);
@@ -207,8 +220,9 @@ mod confinement {
                 .find(needle)
                 .unwrap_or_else(|| panic!("launch_application no longer contains {needle}"))
         };
+        assert!(at("ManagedCgroup::create(") < at("bus::register("));
         assert!(at("bus::register(") < at("sys::unshare_namespaces("));
-        assert!(at("bus::register(") < at("close_inherited_descriptors()"));
+        assert!(at("bus::register(") < at("close_inherited_descriptors("));
         assert!(at("bus::complete(") < at("proof_writer.write_all(&token)"));
         // The spawn is anchored too, and not because §D asks for it. Without
         // it the three assertions above hold while `command.spawn()` sits
@@ -217,6 +231,9 @@ mod confinement {
         // be green.
         assert!(at("sys::unshare_namespaces(") < at("command.spawn()"));
         assert!(at("command.spawn()") < at("bus::complete("));
+        assert!(at("ManagedCgroup::create(") < at("sys::unshare_namespaces("));
+        assert!(at("application_cgroup.attach(child.id())") < at("bus::complete("));
+        assert!(at("application_cgroup.attach(child.id())") < at("proof_writer.write_all(&token)"));
 
         let refused = launch
             .split_once("bus::complete(")
@@ -245,6 +262,64 @@ mod confinement {
     }
 
     #[test]
+    fn cleanup_helper_owns_the_abandoned_leaf_protocol() {
+        let managed = TRANSITION
+            .split_once("impl ManagedCgroup")
+            .unwrap()
+            .1
+            .split_once("pub fn launch_application")
+            .unwrap()
+            .0;
+        let at = |needle: &str| {
+            managed
+                .find(needle)
+                .unwrap_or_else(|| panic!("managed cgroup no longer contains {needle}"))
+        };
+        assert!(at("CgroupCleanup::spawn(") < at("cgroup::Instance::create("));
+        assert!(managed.contains("drop(self.instance.take());\n        drop(self.cleanup.take());"));
+        let bootstrap = TRANSITION
+            .split_once("pub fn run_cgroup_cleanup_bootstrap")
+            .unwrap()
+            .1
+            .split_once("pub fn run_cgroup_cleanup_watcher")
+            .unwrap()
+            .0;
+        let watcher = TRANSITION
+            .split_once("pub fn run_cgroup_cleanup_watcher")
+            .unwrap()
+            .1
+            .split_once("fn cleanup_identity")
+            .unwrap()
+            .0;
+        assert!(
+            bootstrap.find("require_detached_cleanup_session(")
+                < bootstrap.find("Command::new(executable)")
+        );
+        assert!(
+            watcher.find("require_detached_cleanup_session(")
+                < watcher.find("readiness.write_all(&CGROUP_CLEANUP_READY)")
+        );
+        assert_eq!(TRANSITION.matches("sys::start_new_session()?").count(), 2);
+        assert_eq!(TRANSITION.matches(".current_dir(\"/\")").count(), 2);
+        assert!(TRANSITION.contains("read_exact(&mut readiness)"));
+        assert!(TRANSITION.contains("close_inherited_descriptors(Some(cleanup_descriptor))?;"));
+        assert!(MAIN.contains("run_cgroup_cleanup_bootstrap(&membership)"));
+        assert!(MAIN.contains("run_cgroup_cleanup_watcher(&membership)"));
+        assert_eq!(CGROUP.matches("wait_until_empty(&directory)").count(), 1);
+        let abandoned = CGROUP
+            .split_once("pub(crate) fn remove_abandoned")
+            .unwrap()
+            .1
+            .split_once("pub(crate) fn probe_active")
+            .unwrap()
+            .0;
+        assert!(
+            abandoned.find("fs::symlink_metadata(&directory)")
+                < abandoned.find("require_delegation(root, uid, gid)?")
+        );
+    }
+
+    #[test]
     fn syscall_and_argument_rosters_are_pinned() {
         let shipped_sys = SYS.split_once("#[cfg(test)]").unwrap().0;
         for syscall in [
@@ -252,6 +327,7 @@ mod confinement {
             "const SYS_IOCTL: usize = 16;",
             "const SYS_WAIT4: usize = 61;",
             "const SYS_KILL: usize = 62;",
+            "const SYS_SETSID: usize = 112;",
             "const SYS_CAPGET: usize = 125;",
             "const SYS_CAPSET: usize = 126;",
             "const SYS_PIVOT_ROOT: usize = 155;",
@@ -259,11 +335,12 @@ mod confinement {
             "const SYS_MOUNT: usize = 165;",
             "const SYS_UMOUNT2: usize = 166;",
             "const SYS_UNSHARE: usize = 272;",
+            "const SYS_PRLIMIT64: usize = 302;",
             "const SYS_SECCOMP: usize = 317;",
         ] {
             assert!(SYS.contains(syscall), "missing syscall pin: {syscall}");
         }
-        assert_eq!(SYS.matches("const SYS_").count(), 12);
+        assert_eq!(SYS.matches("const SYS_").count(), 14);
         assert!(SYS.contains("const BASE_NAMESPACE_FLAGS: usize ="));
         assert!(SYS.contains("const ISOLATED_NETWORK_FLAGS: usize ="));
         for flag in [
@@ -314,10 +391,15 @@ mod confinement {
         assert!(SYS.contains("const SIOCSIFFLAGS: usize = 0x8914;"));
         assert!(SYS.contains("const IFF_UP: i16 = 0x1;"));
         assert_eq!(shipped_sys.matches("SYS_IOCTL,").count(), 2);
+        assert_eq!(shipped_sys.matches("SYS_SETSID,").count(), 1);
         assert_eq!(shipped_sys.matches("SIOCGIFFLAGS,").count(), 1);
         assert_eq!(shipped_sys.matches("SIOCSIFFLAGS,").count(), 1);
         assert_eq!(shipped_sys.matches("read_interface_flags(fd,").count(), 2);
         assert_eq!(shipped_sys.matches("write_interface_flags(fd,").count(), 1);
+        assert_eq!(shipped_sys.matches("SYS_PRLIMIT64,").count(), 2);
+        assert!(SYS.contains("const RLIMIT_DATA: usize = 2;"));
+        assert!(SYS.contains("struct Rlimit64"));
+        assert!(SYS.contains("std::mem::size_of::<Rlimit64>(), 16"));
         assert!(!shipped_sys.contains("request: usize"));
         assert!(SYS.contains("std::mem::size_of::<IfreqFlags>(), 40"));
         assert!(SYS.contains("SYS_SECCOMP,\n        SECCOMP_SET_MODE_FILTER,\n        0,"));
@@ -371,6 +453,7 @@ mod confinement {
             "sys::bring_up_loopback(",
             "sys::wait_any(",
             "sys::kill_namespace(",
+            "sys::start_new_session(",
             "sys::mount(",
             "sys::pivot_root(",
             "sys::umount_detach(",
@@ -386,6 +469,7 @@ mod confinement {
             "sys::no_new_privileges(",
             "sys::set_dumpable(",
             "sys::dumpable(",
+            "sys::set_and_require_data_limit(",
             "sys::install_seccomp_filter(",
         ] {
             assert!(TRANSITION.contains(call), "missing syscall caller: {call}");
@@ -393,8 +477,10 @@ mod confinement {
         assert!(TRANSITION.contains("sys::terminate_namespace,"));
         assert!(!shipped_main.contains("sys::"));
         assert!(!AUTHORITY.contains("sys::"));
+        assert!(!CGROUP.contains("sys::"));
         assert!(!TRANSITION.contains("pre_exec"));
-        assert!(!TRANSITION.contains("CommandExt"));
+        assert!(!TRANSITION.contains("use std::os::unix::process::CommandExt;"));
+        assert!(!TRANSITION.contains(".process_group(0)"));
         assert!(!TRANSITION.contains("fork("));
         assert!(TRANSITION.contains("const TEST_LEAK_ENV: &str = \"TD_JAIL_TEST_LEAK_FD\";"));
         assert!(TRANSITION.contains(".into_raw_fd()"));
@@ -402,7 +488,7 @@ mod confinement {
         assert!(TRANSITION.contains("clear_and_require_empty_capabilities()?;"));
         assert!(TRANSITION.contains("install_standard_seccomp_filter()?;"));
         assert!(TRANSITION.contains("probe_pid1_lifecycle()?;"));
-        assert_eq!(TRANSITION.matches(".env_clear()").count(), 2);
+        assert_eq!(TRANSITION.matches(".env_clear()").count(), 4);
         assert_eq!(TRANSITION.matches(".envs(").count(), 1);
         assert!(SECCOMP.contains("pub(crate) const STANDARD_FILTER:"));
         assert!(SECCOMP.contains("const OFFSET_NR: u32 = 0;"));

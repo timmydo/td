@@ -34,10 +34,13 @@ pub const RESERVED_FILESYSTEM_TREES: &[&str] = &[
     "/var/lib/flatpak",
 ];
 const PAGE_SIZE_BYTES: u64 = 4096;
-// One below Linux x86-64's page-counter `max` sentinel.
-const MAX_MEMORY_BYTES: u64 = ((i64::MAX as u64) / PAGE_SIZE_BYTES) * PAGE_SIZE_BYTES - 1;
+// The largest aligned value below Linux x86-64's page-counter `max` sentinel.
+const MAX_MEMORY_BYTES: u64 = (((i64::MAX as u64) / PAGE_SIZE_BYTES) - 1) * PAGE_SIZE_BYTES;
 // Linux x86-64's PID_MAX_LIMIT, which bounds pids.max.
 const MAX_PIDS: u32 = 4 * 1024 * 1024;
+pub const DEFAULT_MEMORY_HIGH_BYTES: u64 = 1024 * 1024 * 1024;
+pub const DEFAULT_MEMORY_MAX_BYTES: u64 = 1280 * 1024 * 1024;
+pub const DEFAULT_PIDS_MAX: u32 = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PermissionSocket {
@@ -213,6 +216,47 @@ impl ResourceLimits {
         self.pids_max
     }
 
+    /// The launch-time baseline: omission means the reviewed defaults, never
+    /// an unlimited cgroup. An explicit resource policy is atomic so a partial
+    /// edit cannot silently mix operator intent with unrelated defaults.
+    pub fn complete_or_default(self) -> Result<ResourceLimits, String> {
+        let ResourceLimits {
+            memory_high_bytes,
+            memory_max_bytes,
+            pids_max,
+        } = self;
+        let completed = match (memory_high_bytes, memory_max_bytes, pids_max) {
+            (None, None, None) => ResourceLimits {
+                memory_high_bytes: Some(DEFAULT_MEMORY_HIGH_BYTES),
+                memory_max_bytes: Some(DEFAULT_MEMORY_MAX_BYTES),
+                pids_max: Some(DEFAULT_PIDS_MAX),
+            },
+            (Some(memory_high_bytes), Some(memory_max_bytes), Some(pids_max)) => ResourceLimits {
+                memory_high_bytes: Some(memory_high_bytes),
+                memory_max_bytes: Some(memory_max_bytes),
+                pids_max: Some(pids_max),
+            },
+            _ => {
+                return Err(
+                    "an explicit resource policy must set memory-high, memory-max and pids-max together"
+                        .into(),
+                )
+            }
+        };
+        completed.validate()?;
+        for (name, value) in [
+            ("memory-high", completed.memory_high_bytes),
+            ("memory-max", completed.memory_max_bytes),
+        ] {
+            if value.is_some_and(|bytes| !bytes.is_multiple_of(PAGE_SIZE_BYTES)) {
+                return Err(format!(
+                    "{name} must be aligned to the {PAGE_SIZE_BYTES}-byte target page size"
+                ));
+            }
+        }
+        Ok(completed)
+    }
+
     fn is_empty(self) -> bool {
         self.memory_high_bytes.is_none()
             && self.memory_max_bytes.is_none()
@@ -379,21 +423,20 @@ impl PermissionPolicy {
         self.resources
     }
 
-    pub fn is_wayland_filesystem_only(&self) -> bool {
+    pub fn is_wayland_filesystem_resources_only(&self) -> bool {
         let PermissionPolicy {
             network,
             sockets,
             allow_devel,
             filesystems: _,
             session_bus,
-            resources,
+            resources: _,
         } = self;
         !network
             && sockets.len() == 1
             && sockets.contains(&PermissionSocket::Wayland)
             && !allow_devel
             && session_bus.is_empty()
-            && resources.is_empty()
     }
 
     /// Canonical bytes for either immutable defaults or an operator override.
@@ -1042,22 +1085,31 @@ mod tests {
             .unwrap()
             .with_filesystem("xdg-download", FilesystemAccess::ReadWrite, false)
             .unwrap();
-        assert!(admitted.is_wayland_filesystem_only());
-        assert!(!PermissionPolicy::new().is_wayland_filesystem_only());
+        assert!(admitted.is_wayland_filesystem_resources_only());
+        assert!(!PermissionPolicy::new().is_wayland_filesystem_resources_only());
         assert!(!admitted
             .clone()
             .with_socket(PermissionSocket::PulseAudio)
             .unwrap()
-            .is_wayland_filesystem_only());
+            .is_wayland_filesystem_resources_only());
         assert!(!admitted
             .clone()
             .with_network()
             .unwrap()
-            .is_wayland_filesystem_only());
-        assert!(!admitted
+            .is_wayland_filesystem_resources_only());
+        let resource_policy = admitted
+            .clone()
+            .with_memory_high(4096)
+            .unwrap()
+            .with_memory_max(8192)
+            .unwrap()
+            .with_pids_max(8)
+            .unwrap();
+        assert!(resource_policy.is_wayland_filesystem_resources_only());
+        assert!(admitted
             .with_pids_max(8)
             .unwrap()
-            .is_wayland_filesystem_only());
+            .is_wayland_filesystem_resources_only());
     }
 
     #[test]
@@ -1281,11 +1333,11 @@ mod tests {
             ("memory-max=max", "unsigned decimal"),
             (
                 "memory-max=9223372036854771712",
-                "maximum admitted byte count 9223372036854771711",
+                "maximum admitted byte count 9223372036854767616",
             ),
             (
                 "memory-max=99999999999999999999999",
-                "maximum admitted byte count 9223372036854771711",
+                "maximum admitted byte count 9223372036854767616",
             ),
             ("pids-max=0", "greater than zero"),
             ("pids-max=4194305", "kernel task limit 4194304"),
@@ -1314,13 +1366,44 @@ mod tests {
         assert!(PermissionPolicy::new()
             .with_memory_max(MAX_MEMORY_BYTES + 1)
             .unwrap_err()
-            .contains("maximum admitted byte count 9223372036854771711"));
+            .contains("maximum admitted byte count 9223372036854767616"));
 
         PermissionPolicy::new().with_pids_max(MAX_PIDS).unwrap();
         assert!(PermissionPolicy::new()
             .with_pids_max(MAX_PIDS + 1)
             .unwrap_err()
             .contains("kernel task limit 4194304"));
+
+        let defaults = PermissionPolicy::new()
+            .resources()
+            .complete_or_default()
+            .unwrap();
+        assert_eq!(
+            defaults.memory_high_bytes(),
+            Some(DEFAULT_MEMORY_HIGH_BYTES)
+        );
+        assert_eq!(defaults.memory_max_bytes(), Some(DEFAULT_MEMORY_MAX_BYTES));
+        assert_eq!(defaults.pids_max(), Some(DEFAULT_PIDS_MAX));
+
+        let incomplete = PermissionPolicy::new()
+            .with_pids_max(32)
+            .unwrap()
+            .resources()
+            .complete_or_default()
+            .unwrap_err();
+        assert!(incomplete.contains("must set memory-high, memory-max and pids-max"));
+
+        let unaligned = PermissionPolicy::new()
+            .with_memory_high(DEFAULT_MEMORY_HIGH_BYTES + 1)
+            .unwrap()
+            .with_memory_max(DEFAULT_MEMORY_MAX_BYTES)
+            .unwrap()
+            .with_pids_max(DEFAULT_PIDS_MAX)
+            .unwrap()
+            .resources()
+            .complete_or_default()
+            .unwrap_err();
+        assert!(unaligned.contains("4096-byte target page size"));
     }
 
     #[test]

@@ -330,7 +330,7 @@ symbol that is `default y` behind a dependency somebody may pin later
 arrives unasked. `td-jail` omits `CLONE_NEWIPC` on the strength of it
 being off, so the guard is what makes that a decision.
 
-**`MEMCG` has no runtime witness at this rung, and the reason is a trap
+**`MEMCG` needed a different runtime witness, and the reason is a trap
 worth carrying into §P.** `/proc/cgroups` is the obvious place to look
 for a controller, and it does not list `memory` on this kernel even
 though `CONFIG_MEMCG=y`: `proc_cgroupstats_show` skips any subsystem
@@ -339,13 +339,14 @@ and memcg registers its `legacy_cftypes` under `#ifdef CONFIG_MEMCG_V1`,
 which resolves to `n` here. The kernel says as much itself, once, on the
 console: *"/proc/cgroups lists only v1 controllers, use cgroup.controllers
 of root cgroup for v2 info"*. `pids` is listed because it registers v1
-files unconditionally, so the greeter asserts that one — anchored on the
+files unconditionally, so the greeter also asserts that legacy view — anchored on the
 `enabled` column, since `cgroup_disable=pids` leaves the row and clears
 it, which is the one failure no config guard can see.
 
 The consequence for §P is that **`cgroup.controllers` on a mounted
 cgroup2 is the only interface that answers "is the memory controller
-available"**, so td-svc's delegation landing owns that assertion. A first
+available"**. The resource-cap landing makes both `memory` and `pids` there
+image assertions. A first
 draft of this rung probed `memory` in `/proc/cgroups` and would have
 failed every boot; it was caught in review rather than in QEMU.
 
@@ -1023,15 +1024,20 @@ and their values are the ordered capabilities `see`, `talk` and `own`.
 Applications cannot own the broker or reserved `org.freedesktop.portal.*` and
 `org.freedesktop.impl.portal.*` names. Resource values are bounded positive
 decimal integers. Memory is a byte count capped at
-9,223,372,036,854,771,711, one below the first value the pinned kernel rounds
-to its unlimited page-counter sentinel, and `pids-max` is a task/TID count
+9,223,372,036,854,767,616, the largest 4096-byte-aligned value below the first
+value the pinned kernel rounds to its unlimited page-counter sentinel, and
+`pids-max` is a task/TID count
 capped at the kernel's 4,194,304-task limit. `cpu-max` is
 recognized but refused until td enables and guards the kernel CPU bandwidth
 controller. `memory-high` must be below `memory-max` when both appear, and the
 format has no spelling for an unlimited resource.
-The spec compiler now embeds the immutable defaults. Applying operator
-overrides, resolving grant sources and enforcing the documented non-unlimited
-runtime baseline belong to the launch-time mount/resource plan.
+The spec compiler embeds the immutable authored policy. At launch, omission
+selects the reviewed non-unlimited baseline: `memory-high=1073741824`,
+`memory-max=1342177280`, and `pids-max=1024`. An explicit resource section is
+atomic — all three keys are required — and both memory values must be aligned
+to the target's 4096-byte page size so kernel readback is exact rather than a
+silently rounded value. Mutable operator overrides remain a later lifecycle
+landing.
 
 **The runtime/application split is the one piece of flatpak's
 architecture worth adopting wholesale.** A runtime is just another
@@ -2258,10 +2264,11 @@ The remaining third is honest to state rather than to paper over: the
 process is still *in* the caller's session, so the operator's Ctrl-C
 reaches it, and a future policy that binds `/dev/tty` (a terminal
 application is a real thing to want) would reopen the hole in full.
-**Closing it properly needs `setsid(2)`, which is a FOURTEENTH syscall and
-therefore an `UNSAFE.md` amendment** — deferred, because nothing on the
-first ladder wants a terminal, and recorded here so it is a planned
-amendment rather than something discovered later. `CommandExt`'s stable
+**Closing it properly needs `setsid(2)`. Surface #9 now carries that syscall
+only for the two internal cgroup-cleanup processes; issuing it in the application
+transition is still a new reviewed caller and `UNSAFE.md` amendment** —
+deferred, because nothing on the first ladder wants a terminal, and recorded
+here so it is planned rather than discovered later. `CommandExt`'s stable
 `process_group` is `setpgid` and does not create a session, so it is not
 the way round it. Until then, **`devices=tty` does not exist as a policy
 key**: it is refused by the parser like `devices=dri`, so the first
@@ -2370,17 +2377,22 @@ at or below a granted target is enumerated from mountinfo and remounted
 read-only, deepest first. Stage 1 and stage 2 independently read those rows
 back. Stage 2 exactly enumerates every fresh scaffold outside the dynamic
 private home, stopping at each declared grant root. The shipped fixture proves
-read-write Downloads, read-only Pictures, and a read-only regular-file grant
-whose `0600` application-owned source is created on writable `/var` before
-`switch_root`. It also recursively binds a read-only
+read-write Downloads, read-only Pictures, and a read-only regular-file grant.
+The two XDG sources are made distinct self-bind mounts before `switch_root`:
+they retain the graphical user's persistent storage and normal capacity while
+their mount roots no longer alias the reserved state subtree on the same Btrfs
+volume. The regular-file source lives on a separate dedicated tmpfs and is
+bind-mounted at the fixture's existing `/var/td-jail-fixture-file` path. The
+fixture also recursively binds
+a read-only
 `/mnt/td-jail-fixture-pictures` source containing a separately writable nested
 tmpfs. The client requires the root and nested directory to have different
 devices before testing both as read-only, so omitting `MS_REC` cannot satisfy
 the oracle. The fixture root is `1777` on immutable EROFS so its write refusal
 cannot be attributed to directory permissions. Deployment initialization
-conditionally mounts that tmpfs once
-before `switch_root`; it is not a restartable root service following mutable
-user state. A process killed in the create/unlink window of stage 2's writable
+mounts the two self-binds and two fixture tmpfs instances once before
+`switch_root`; it is not a restartable root service following mutable user
+state. A process killed in the create/unlink window of stage 2's writable
 grant probe can leave one randomly named `.td-jail-write-probe-*` file in that
 host directory. The fixture client has the same window for one
 `.td-jail-rw-*` file in Downloads. The application user can remove either;
@@ -2574,15 +2586,13 @@ orphan oracle. Rung 11 adds `seccomp(2)` plus no-new-privileges operations,
 the exact compiled policy and its interpreter, build-host, and target-kernel
 oracles. The remaining calls below are not authorized until their own launch
 and policy rungs land with callers and tests.
-The quoted block is the completed target, not the current roster; it
-intentionally retains the future thirteen-call count and `jail.rs`
-caller. Only the unquoted, implemented roster in `UNSAFE.md` authorizes
-today's twelve calls and `transition.rs` caller.
+The quoted block is the completed target mirrored by the implemented roster in
+`UNSAFE.md`; `transition.rs` is the sole caller.
 
 > ## 9. `td-jail` — the application sandbox
 >
 > The `td-jail` application sandbox, whose one `syscall5` body in
-> `td-jail/src/sys.rs` carries EXACTLY THIRTEEN syscalls — `unshare(2)` with
+> `td-jail/src/sys.rs` carries EXACTLY FOURTEEN syscalls — `unshare(2)` with
 > a value-pinned namespace set, `close(2)` for inherited descriptors,
 > `mount(2)`, `umount2(2)` and
 > `pivot_root(2)` for the validated mount plan, `capset(2)` with
@@ -2608,10 +2618,11 @@ today's twelve calls and `transition.rs` caller.
 > backstop — which is here because `std` exposes NO rlimit API at all,
 > and because setting only the soft limit is a bound the application may
 > raise on itself, so both halves of the pair are written before `exec`
-> and read back through the same call — and `ioctl(2)` with exactly TWO
+> and read back through the same call — `setsid(2)` for the cgroup cleanup
+> processes' controlling-terminal detachment, and `ioctl(2)` with exactly TWO
 > value-pinned requests
 > (`SIOCGIFFLAGS`=0x8913, `SIOCSIFFLAGS`=0x8914, argument a pinned 40-byte
-> `ifreq`, interface name pinned to `lo`) — reached only from `jail.rs`,
+> `ifreq`, interface name pinned to `lo`) — reached only from `transition.rs`,
 > the module that executes a mount plan. Two of those are amendments the
 > maintainer's premise bought rather than avoided, and each replaced
 > something worse:
@@ -2670,15 +2681,16 @@ today's twelve calls and `transition.rs` caller.
 > design, a jail more privileged than its caller being the thing user
 > namespaces exist to not need); `setns(2)` (the constructor never joins
 > a namespace a caller supplied); `sethostname(2)` (the UTS namespace is
-> unshared and the name inherited); `setsid(2)`/`TIOCSCTTY` — **excluded
-> for a corrected reason**: the earlier draft said an app gets no
+> unshared and the name inherited); `TIOCSCTTY` — **excluded for a corrected
+> reason**: the earlier draft said an app gets no
 > controlling terminal, which was simply false, since a session is
-> inherited and nothing here creates a new one. They are excluded because
+> inherited and nothing in its transition creates a new one. It is excluded because
 > the jail closes the terminal off by *removing what reaches it* (no
 > `/dev/tty` node, no inherited descriptor — see the mount plan's step 0
 > and the note below it) rather than by detaching the session, and
-> because a real terminal policy would need `setsid(2)` as a documented
-> FOURTEENTH-syscall amendment rather than as an assumption; `statfs(2)`
+> because the cleanup helper's `setsid(2)` does not change the application
+> session. A real terminal policy would need a documented ioctl-request
+> amendment rather than an assumption; `statfs(2)`
 > (nothing in this design issues it — with packages in the image,
 > nothing writes gigabytes at launch); `mmap(2)` (nothing here maps anything —
 > but see §M, which anticipates that the GPU path WILL need a
@@ -2686,14 +2698,13 @@ today's twelve calls and `transition.rs` caller.
 > syscall-instruction layer); and any `ioctl` request beyond the two
 > `ifreq` ones — in particular no terminal or device control, the
 > jail's other relationship to `ioctl` being that its FILTER denies two
-> of them. A FOURTEENTH syscall — `setsid(2)` is the one already
-> anticipated, if a terminal policy is ever served — a third ioctl
-> request, a seventh prctl
+> of them. A FIFTEENTH syscall, a third ioctl
+> request, a ninth prctl
 > operation, a fourth `PR_CAP_AMBIENT` sub-operation, a second seccomp
 > flag, an arch
 > beyond x86-64, or a caller-supplied BPF program is an amendment here;
 > `td-jail/src/main.rs`'s confinement tests assert the roster and its
-> THIRTEEN value-pinned numbers, the six prctl and one seccomp operation
+> FOURTEEN value-pinned numbers, the eight prctl and one seccomp operation
 > values, the namespace and mount flag rosters, the whole `asm!` block
 > including which register each argument lands in and that
 > `options(nomem)` stays absent (the kernel reads the filter program and
@@ -4886,7 +4897,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 12 | **fixture package shipped in the image and launched by `/bin/<fixture>` — LANDED**: the static `td-compositor` artifact's fixture personality is copied through an ordinary declared input into a generated application package with an empty payload-only runtime and a canonical application spec; the image selects it into the immutable registry and `/bin` farm, its supervised boot unit and the compositor launcher both enter through `/bin/td-jail-fixture`, and td-jail accepts only the canonical index/spec subset implemented by the landed rungs. Stage 1 canonicalizes, mounts and source-identity-checks immutable `/app` and `/usr`, the exact compositor socket, bounded private tmpfs trees, the five persistent state directories, and one private volatile runtime directory; stage 2 verifies the mount plan, clears capabilities, installs seccomp, holds a parent-death pipe, replaces application stdio with null descriptors, preserves the direct application's status, and gives survivors bounded TERM/KILL reap phases. The client publishes readiness through that volatile bind only after confinement readback and a presented frame; a separate readiness-gated evidence unit emits the exact QEMU marker without making mutable application state deployment-success authority | **first jailed pixels on the QEMU screen** |
 | 12a | the same fixture under `--host`, asserting the degradation report (§X.5) | host mode works, and says what it could not enforce |
 | 12b | **immutable typed filesystem grants — LANDED**: canonical source resolution and identity pinning, reserved alias refusal, deny-wins/overlap merging, separate recursive bind targets, nested-mount hardening and stage-1/stage-2 readback. Mutable per-user overrides remain a later lifecycle landing | a jailed app can open only a builder-authenticated explicitly granted host path |
-| 12c | realize the typed memory/task policy with hard enforcement and readback; `cpu-max` remains refused until the kernel bandwidth controller lands | application resource limits are effective rather than metadata |
+| 12c | **typed memory/task policy — LANDED**: cgroup2 is mounted by PID 1; PID 1 and system services remain at the hierarchy root under cgroup v2's root exception while td-svc enables `memory`/`pids` top-down and delegates an empty user subtree; td-jail creates one direct per-instance leaf, writes and exactly reads `memory.high`, `memory.max`, `memory.oom.group=1`, and `pids.max`, moves blocked stage 2 before release, verifies membership, sets and reads equal hard/soft `RLIMIT_DATA`, reports `memory.events`/`memory.peak`, and removes the empty leaf. Omitted policy gets the documented finite baseline; partial or page-rounded policy is refused. The 48 MiB/64 MiB/32-task fixture and active-cgroup probe gate the QEMU marker. `cpu-max` remains refused until the kernel bandwidth controller lands | application resource limits are effective rather than metadata |
 | 13 | `td-busd` codec, auth, surface #10 | none |
 | 14 | names, routing, match rules, descriptor passing | none |
 | 15 | per-app policy, lineage identity, in-jail activation | none |
@@ -5928,8 +5939,18 @@ virtual reservations" suggests: `RLIMIT_DATA` tracks memory a process has
 actually made writable, `RLIMIT_AS` tracks every mapping including
 reservations that will never be touched, and Firefox reserves liberally.
 An `RLIMIT_AS` cap tight enough to matter kills it for reasons unrelated
-to memory used; an `RLIMIT_DATA` cap does not, but it is a real bound
-rather than a generous one and wants measuring before a number is picked.
+to memory used. `td-jail` instead sets both halves of `RLIMIT_DATA` to the
+authenticated `memory-max` value exactly. It is a per-process backstop to the
+aggregate cgroup ceiling, not a separately tuned policy number.
+
+Private writable thread stacks count at their reserved size, not at the pages
+they have faulted in. A runtime using glibc's usual 8 MiB pthread stack can
+therefore reach a 64 MiB fixture limit at roughly eight threads even while its
+physical footprint is smaller. `pids-max` is an independent ceiling, not a
+promise that every admitted task can reserve a default-sized stack. This is an
+intentional cost of keeping the per-process backstop equal to `memory-max`;
+applications that need a different thread/stack ratio need a larger reviewed
+resource policy or smaller explicitly configured stacks.
 
 (`builder/src/sys.rs`'s comment carries the loose version and should be
 tightened when that crate is next touched — noted here rather than fixed,
@@ -5981,6 +6002,11 @@ rather than deferring them. The shape:
   harmless to include.) The failure mode is worth stating because it is
   not "permission denied" but "the file is not there", which reads like
   a kernel-config problem and is not one.
+  Delegation is not an isolation boundary against a trusted, unconfined
+  process with the same uid: such a process has the same authority to change
+  child controls. The confined application cannot do that because cgroupfs is
+  masked inside its mount namespace; td's other uid-1000 session components
+  are therefore part of the trusted session boundary.
 - **Two cgroup-v2 rules make that delegation fail if it is a bare
   `chown`, and both reviewers found it independently.** Controllers are
   enabled TOP-DOWN — `memory` must already be in the parent's
@@ -5993,14 +6019,28 @@ rather than deferring them. The shape:
   wrong and the write to `cgroup.subtree_control` fails `EBUSY` — a
   different failure from the `ENOENT` above and, unlike it, one that
   points at the file rather than at the design.
+- `td-login` moves a uid-1000 session into that fixed `session` leaf while it
+  is still root and reads the unified membership back before dropping
+  credentials. Stage 1 therefore starts in the session leaf; when it moves
+  blocked stage 2 into a sibling per-instance leaf, the delegated root is the
+  source/destination common ancestor and uid 1000 owns the required control files.
 - `td-jail` creates one cgroup per instance, writes `memory.max`,
   `memory.high` and `pids.max` from the app's permission file, then moves
   stage 2 into it *before* spawning the app, so every descendant is inside by
   construction. Version 1 refuses `cpu-max`; a later format may write
   `cpu.max` only after td enables and guards the kernel bandwidth controller.
-- Writes are ordinary file writes to `cgroup.procs` and the limit
-  attributes — **no new syscall, no roster amendment**. This is the
-  rare case where the capable mechanism is also the safe one.
+- Before creating the leaf, stage 1 starts a cleanup bootstrap with cwd `/` and
+  retains a close-on-exec keepalive pipe. The bootstrap enters and proves a new
+  session before spawning the watcher; the watcher enters and proves its own
+  new session before sending readiness. A stale terminal-member snapshot may
+  still kill stage 1 and the bootstrap, but cannot name the later-born watcher.
+  Normal exit collects diagnostics, releases the leaf to that watcher, and
+  closes the pipe; signal or abort closes it implicitly. All three paths
+  therefore use the same bounded drain and removal without consuming the
+  bounded active scan. `setsid(2)` is surface #9's fourteenth syscall;
+  controller operations remain ordinary safe filesystem I/O.
+  Failure to drain within ten seconds makes even a clean entry status a launch
+  failure; td does not report success while charged descendants remain live.
 - `memory.high` before `memory.max` matters: `high` throttles and
   reclaims, `max` invokes the OOM killer inside the cgroup. A browser
   that gets slow near its ceiling is better behaviour than one that
@@ -6022,10 +6062,14 @@ rather than deferring them. The shape:
   killed for memory should say so, since an OOM kill inside a cgroup is
   otherwise indistinguishable from a crash.
 
-Per-app values live in the same per-package permission file as the
-filesystem and device grants (decision 9), with a documented default
-rather than unlimited — *unlimited* is the setting that produced the
-complaint.
+The landed hierarchy leaves PID 1 and system services at the hierarchy root,
+which cgroup v2 explicitly exempts from the no-internal-process rule, beside
+the empty delegated `td-user-1000` root. Application sessions and per-instance
+leaves are the only descendants placed under the delegated subtree.
+Per-app values live in the same per-package permission file as the filesystem
+and device grants (decision 9). Omission means 1 GiB high, 1.25 GiB max, and
+1024 tasks rather than unlimited — *unlimited* is the setting that produced
+the complaint.
 
 ---
 
@@ -6056,7 +6100,7 @@ The experiments that settle what is left, none longer than a week:
 | **E1b — route selected, importer not landed** | fetch and materialize the same exact signed Flathub commits through a bounded control-plane importer | Flathub publishes no stable deploy tarball, so an ambient `flatpak` recipe and a locally hosted export are both refused. §B.3.1 is the importer contract |
 | **E2** | `gtk4-demo` behind a global-filtering proxy; llvmpipe-over-shm in the pinned runtime; the ten-minute Firefox nested-userns check | §F's toolkit requirements and §C's open question. The most expensive possible surprise is here: if GTK4's cairo path has rotted, the GL-less story weakens with no GPU to fall back on |
 | **E3** | a Meson-world pilot — recipes for `pkgconf`, Ninja, Meson, a native CPython, then GLib and a Wayland-only `gtk3-demo` | td's *actual* per-package source cost, the number with the widest error bars. Near `cmake-x86-64`'s cost and the source track is real; a multi-week fight per package and the hybrid is permanent posture |
-| **E4** | the §0 cgroup pins plus a fixture under `memory.max=64M` with a `memory.oom.group` readback in the QEMU oracle | §P's mechanism |
+| **E4 — COMPLETE** | the §0 cgroup pins plus a fixture under `memory.high=48M`, `memory.max=64M`, `pids.max=32`, with active membership and `memory.oom.group` readback gating the QEMU oracle | §P's mechanism works on the target kernel |
 | **E5** | `glxinfo` inside a jail on virtio-gpu QEMU with the runtime's GL extension mounted | §M's first step |
 | **E6** | `RLIMIT_AS=2G` on Firefox; record the crash | closes the rlimits-versus-cgroups argument with data |
 

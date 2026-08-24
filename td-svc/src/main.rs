@@ -20,6 +20,7 @@
 
 mod backoff;
 mod cad;
+mod cgroup;
 mod control;
 mod evict;
 mod logs;
@@ -241,6 +242,11 @@ fn main() -> ExitCode {
             }
         },
         Route::Run { path } => {
+            if let Err(error) = cgroup::delegate_session() {
+                emit_err(&format!(
+                    "td-svc: application cgroup delegation failed: {error}\n"
+                ));
+            }
             let (units, problems) = load(&path);
             for problem in &problems {
                 emit_err(&format!("td-svc: {problem}\n"));
@@ -714,8 +720,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            10,
-            "expected ten modules beside the crate root"
+            11,
+            "expected eleven modules beside the crate root"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model.
@@ -727,7 +733,7 @@ mod confinement {
         }
     }
 
-    /// `src/` holds these eleven files and nothing else.
+    /// `src/` holds these twelve files and nothing else.
     ///
     /// The scan above proves every `mod` line has a file and every file has a
     /// `mod` line, which is a closed loop that says nothing about WHICH files:
@@ -738,7 +744,7 @@ mod confinement {
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and
     /// compiles perfectly well through the constructs refused below.
     #[test]
-    fn src_holds_exactly_the_eleven_scanned_modules() {
+    fn src_holds_exactly_the_twelve_scanned_modules() {
         let (rs, other) = walk();
         let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
@@ -746,6 +752,7 @@ mod confinement {
             [
                 "backoff.rs",
                 "cad.rs",
+                "cgroup.rs",
                 "control.rs",
                 "evict.rs",
                 "logs.rs",

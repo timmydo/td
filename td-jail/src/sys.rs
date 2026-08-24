@@ -12,6 +12,7 @@ const SYS_CLOSE: usize = 3;
 const SYS_IOCTL: usize = 16;
 const SYS_WAIT4: usize = 61;
 const SYS_KILL: usize = 62;
+const SYS_SETSID: usize = 112;
 const SYS_CAPGET: usize = 125;
 const SYS_CAPSET: usize = 126;
 const SYS_PIVOT_ROOT: usize = 155;
@@ -19,6 +20,7 @@ const SYS_PRCTL: usize = 157;
 const SYS_MOUNT: usize = 165;
 const SYS_UMOUNT2: usize = 166;
 const SYS_UNSHARE: usize = 272;
+const SYS_PRLIMIT64: usize = 302;
 const SYS_SECCOMP: usize = 317;
 
 const CLONE_NEWNS: usize = 0x0002_0000;
@@ -55,6 +57,7 @@ const PR_CAP_AMBIENT: usize = 47;
 const PR_CAP_AMBIENT_IS_SET: usize = 1;
 const PR_CAP_AMBIENT_RAISE: usize = 2;
 const PR_CAP_AMBIENT_CLEAR_ALL: usize = 4;
+const RLIMIT_DATA: usize = 2;
 
 const PID_ANY: usize = -1_isize as usize;
 const WNOHANG: usize = 1;
@@ -123,6 +126,13 @@ struct IfreqFlags {
     name: [u8; 16],
     flags: i16,
     padding: [u8; 22],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+struct Rlimit64 {
+    cur: u64,
+    max: u64,
 }
 
 impl CapabilityDataPair {
@@ -202,6 +212,12 @@ pub fn wait_any(nohang: bool) -> io::Result<Reaped> {
         0,
     );
     classify_wait(ret, status)
+}
+
+pub fn start_new_session() -> io::Result<u32> {
+    let session = value(syscall5(SYS_SETSID, 0, 0, 0, 0, 0))?;
+    u32::try_from(session)
+        .map_err(|error| io::Error::other(format!("setsid returned an invalid id: {error}")))
 }
 
 pub fn terminate_namespace() -> io::Result<()> {
@@ -488,6 +504,37 @@ pub fn dumpable() -> io::Result<bool> {
     )
 }
 
+pub fn set_and_require_data_limit(bytes: u64) -> io::Result<()> {
+    let requested = Rlimit64 {
+        cur: bytes,
+        max: bytes,
+    };
+    check(syscall5(
+        SYS_PRLIMIT64,
+        0,
+        RLIMIT_DATA,
+        std::ptr::from_ref(&requested) as usize,
+        0,
+        0,
+    ))?;
+    let mut actual = Rlimit64 { cur: 0, max: 0 };
+    check(syscall5(
+        SYS_PRLIMIT64,
+        0,
+        RLIMIT_DATA,
+        0,
+        std::ptr::from_mut(&mut actual) as usize,
+        0,
+    ))?;
+    if actual != requested {
+        return Err(io::Error::other(format!(
+            "RLIMIT_DATA read back as soft={} hard={}, expected {bytes}",
+            actual.cur, actual.max
+        )));
+    }
+    Ok(())
+}
+
 pub fn install_seccomp_filter(instructions: &[SockFilter]) -> io::Result<()> {
     if instructions.len() > SECCOMP_MAX_FILTER_INSNS {
         return Err(io::Error::new(
@@ -585,9 +632,13 @@ mod tests {
         assert_eq!(SECCOMP_MAX_FILTER_INSNS, 4096);
         assert_eq!(SYS_IOCTL, 16);
         assert_eq!(SYS_KILL, 62);
+        assert_eq!(SYS_SETSID, 112);
+        assert_eq!(SYS_PRLIMIT64, 302);
         assert_eq!(SIOCGIFFLAGS, 0x8913);
         assert_eq!(SIOCSIFFLAGS, 0x8914);
         assert_eq!(IFF_UP, 1);
+        assert_eq!(RLIMIT_DATA, 2);
+        assert_eq!(std::mem::size_of::<Rlimit64>(), 16);
         assert_eq!(PID_ANY, usize::MAX);
         assert_eq!(WNOHANG, 1);
         assert_eq!(SIGKILL, 9);

@@ -8,6 +8,7 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-jail/src/authority.rs"),
     ),
     ("bus", include_str!("../../../td-jail/src/bus.rs")),
+    ("cgroup", include_str!("../../../td-jail/src/cgroup.rs")),
     (
         "permissions",
         include_str!("../../../engine/src/permissions.rs"),
@@ -191,6 +192,20 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_paths_match_the_distribution_hierarchy() {
+        let authority = source("authority").expect("authority source");
+        assert!(authority.contains(&format!(
+            "pub(crate) const CGROUP_ROOT: &str = {:?};",
+            crate::ladder::TD_APPLICATION_CGROUP_ROOT
+        )));
+        let cgroup = source("cgroup").expect("cgroup source");
+        assert!(cgroup.contains(&format!(
+            "const DELEGATE_COMPONENT: &str = {:?};",
+            crate::ladder::TD_APPLICATION_CGROUP_MEMBERSHIP_ROOT.trim_start_matches('/')
+        )));
+    }
+
+    #[test]
     fn production_launch_reaps_without_running_the_diagnostic_fixture() {
         let transition = source("transition").expect("transition source");
         assert!(transition.contains(
@@ -206,7 +221,7 @@ mod tests {
         assert!(transition.contains(".stdout(Stdio::from(null_output))"));
         assert!(transition.contains(".stderr(Stdio::from(null_error))"));
         assert!(transition.contains("let (mut stage2_error, stage2_error_writer) = io::pipe()?;"));
-        assert!(transition.contains("let mut child = command.spawn()?;\n    drop(command);"));
+        assert!(transition.contains("let mut child = command.spawn()?;\n        drop(command);"));
         assert!(transition.contains("sys::set_dumpable(false)?;"));
         assert!(transition.contains("sys::set_parent_death_signal()?;"));
         assert!(transition.contains("start_stage1_liveness_watcher()?;"));
@@ -214,6 +229,7 @@ mod tests {
         let sys = source("sys").expect("syscall source");
         for row in [
             "const SYS_IOCTL: usize = 16;",
+            "const SYS_SETSID: usize = 112;",
             "const SIOCGIFFLAGS: usize = 0x8913;",
             "const SIOCSIFFLAGS: usize = 0x8914;",
             "struct IfreqFlags",
@@ -229,12 +245,18 @@ mod tests {
         let watcher = transition
             .find("start_stage1_liveness_watcher()?;")
             .expect("liveness watcher");
+        let data_limit = transition
+            .find("sys::set_and_require_data_limit(resources.memory_max_bytes)?;")
+            .expect("data limit");
         let application = transition
             .find("run_application(&entry, &environment, &arguments)")
             .expect("application launch");
         assert!(
-            filter < nondumpable && nondumpable < watcher && watcher < application,
-            "stage 2 must install confinement before it creates a thread or launches the app"
+            filter < data_limit
+                && data_limit < nondumpable
+                && nondumpable < watcher
+                && watcher < application,
+            "stage 2 must install confinement and the inherited data limit before it creates a thread or launches the app"
         );
         assert!(transition.contains("if pid == application_pid {"));
         assert!(transition.contains(
@@ -383,7 +405,10 @@ mod tests {
                     true,
                 )
             })
-            .expect("Wayland and filesystem policy");
+            .and_then(|permissions| permissions.with_memory_high(48 * 1024 * 1024))
+            .and_then(|permissions| permissions.with_memory_max(64 * 1024 * 1024))
+            .and_then(|permissions| permissions.with_pids_max(32))
+            .expect("Wayland, filesystem and resource policy");
         let spec = ApplicationSpec::compile(
             &manifest,
             "/td/store/0123456789abcdefghijklmnopqrstuv-empty-runtime-1",
@@ -459,5 +484,8 @@ mod tests {
         }
         assert!(spec.contains("[Context]\nsockets=wayland\n"));
         assert!(spec.contains("[Filesystem]\nxdg-download=rw:create\n"));
+        assert!(spec.contains(
+            "[Resources]\nmemory-high=50331648\nmemory-max=67108864\npids-max=32\n"
+        ));
     }
 }
