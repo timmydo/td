@@ -15,8 +15,9 @@ const MAX_ATTRIBUTION_ROW_BYTES: u64 = 64 * 1024;
 const EVIDENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ATTRIBUTION_WORK_SLICE: Duration = Duration::from_millis(50);
 const ATTRIBUTION_REST_SLICE: Duration = Duration::from_millis(50);
-const REQUIRED_FILES: [&str; 7] = [
+const REQUIRED_FILES: [&str; 8] = [
     "manifest.json",
+    "overview.jsonl",
     "processes.jsonl",
     "hotspots.jsonl",
     "lines.jsonl",
@@ -275,12 +276,34 @@ fn validate(
     if manifest.contains("\"objects\":[]") {
         return Err("current-boot capture contains no indexed store objects".into());
     }
-    let line_samples = number(&manifest, "\"line_resolved_samples\":")?
-        .checked_add(number(&manifest, "\"line_unresolved_samples\":")?)
+    let complete_stack_samples = number(&manifest, "\"complete_stack_samples\":")?;
+    let truncated_stack_samples = number(&manifest, "\"truncated_stack_samples\":")?;
+    let unresolved_stack_samples = number(&manifest, "\"unresolved_stack_samples\":")?;
+    let stack_samples = complete_stack_samples
+        .checked_add(truncated_stack_samples)
+        .and_then(|count| count.checked_add(unresolved_stack_samples))
+        .ok_or("capture stack-sample count overflows")?;
+    if stack_samples != samples {
+        return Err("capture has inconsistent sample-weighted stack coverage".into());
+    }
+    let line_resolved_samples = number(&manifest, "\"line_resolved_samples\":")?;
+    let line_unresolved_samples = number(&manifest, "\"line_unresolved_samples\":")?;
+    let line_samples = line_resolved_samples
+        .checked_add(line_unresolved_samples)
         .ok_or("capture line-sample count overflows")?;
     if line_samples == 0 || line_samples > samples {
         return Err("capture has inconsistent sampled-leaf line coverage".into());
     }
+    validate_overview(
+        capture,
+        &manifest,
+        samples,
+        complete_stack_samples,
+        truncated_stack_samples,
+        unresolved_stack_samples,
+        line_resolved_samples,
+        line_unresolved_samples,
+    )?;
     let raw_path = capture.join("samples.bin");
     let mut raw =
         fs::File::open(&raw_path).map_err(|e| format!("open {}: {e}", raw_path.display()))?;
@@ -297,6 +320,446 @@ fn validate(
         ));
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_overview(
+    capture: &Path,
+    manifest: &str,
+    samples: u64,
+    complete_stack_samples: u64,
+    truncated_stack_samples: u64,
+    unresolved_stack_samples: u64,
+    line_resolved_samples: u64,
+    line_unresolved_samples: u64,
+) -> Result<(), String> {
+    let path = capture.join("overview.jsonl");
+    let mut bytes = Vec::new();
+    fs::File::open(&path)
+        .map_err(|error| format!("open overview {}: {error}", path.display()))?
+        .take(crate::report::MAX_OVERVIEW_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read overview {}: {error}", path.display()))?;
+    if bytes.len() as u64 > crate::report::MAX_OVERVIEW_BYTES {
+        return Err(format!(
+            "capture overview exceeds its {}-byte evidence bound",
+            crate::report::MAX_OVERVIEW_BYTES
+        ));
+    }
+    let overview = std::str::from_utf8(&bytes)
+        .map_err(|_| format!("overview {} is not UTF-8 JSONL", path.display()))?;
+    if !overview.ends_with('\n') {
+        return Err("capture overview is not newline-terminated JSONL".into());
+    }
+    let lines: Vec<_> = overview.lines().collect();
+    let maximum = crate::report::OVERVIEW_ROWS_PER_KIND
+        .saturating_mul(3)
+        .saturating_add(1);
+    if lines.is_empty() || lines.len() > maximum {
+        return Err(format!(
+            "capture overview has {} rows outside 1..={maximum}",
+            lines.len()
+        ));
+    }
+    let summary = parse_overview_summary(lines.last().copied().unwrap_or_default())?;
+    for (field, actual, expected) in [
+        ("samples", summary.samples, samples),
+        (
+            "complete_stack_samples",
+            summary.complete_stack_samples,
+            complete_stack_samples,
+        ),
+        (
+            "truncated_stack_samples",
+            summary.truncated_stack_samples,
+            truncated_stack_samples,
+        ),
+        (
+            "unresolved_stack_samples",
+            summary.unresolved_stack_samples,
+            unresolved_stack_samples,
+        ),
+        (
+            "line_resolved_samples",
+            summary.line_resolved_samples,
+            line_resolved_samples,
+        ),
+        (
+            "line_unresolved_samples",
+            summary.line_unresolved_samples,
+            line_unresolved_samples,
+        ),
+        ("lost", summary.lost, number(manifest, "\"lost\":")?),
+        (
+            "corrupt",
+            summary.corrupt,
+            number(manifest, "\"corrupt\":")?,
+        ),
+        (
+            "omitted_errors",
+            summary.omitted_errors,
+            number(manifest, "\"omitted_errors\":")?,
+        ),
+    ] {
+        if actual != expected {
+            return Err(format!(
+                "capture overview {field} does not match its manifest"
+            ));
+        }
+    }
+
+    let ranked = lines
+        .get(..lines.len().saturating_sub(1))
+        .unwrap_or_default();
+    let mut offset = 0usize;
+    for (kind, total) in [
+        ("process", summary.process_rows),
+        ("hotspot", summary.hotspot_rows),
+        ("line", summary.line_rows),
+    ] {
+        let shown = usize::try_from(total.min(crate::report::OVERVIEW_ROWS_PER_KIND as u64))
+            .map_err(|_| "capture overview displayed-row count overflows")?;
+        if shown == 0 {
+            return Err(format!("capture overview has no {kind} rows"));
+        }
+        let end = offset
+            .checked_add(shown)
+            .ok_or("capture overview ranked-row count overflows")?;
+        let rows = ranked
+            .get(offset..end)
+            .ok_or_else(|| format!("capture overview omits advertised top-ranked {kind} rows"))?;
+        for (index, row) in rows.iter().enumerate() {
+            validate_overview_row(row, kind, index.saturating_add(1), samples)?;
+        }
+        offset = end;
+    }
+    if offset != ranked.len() {
+        return Err("capture overview contains unadvertised ranked rows".into());
+    }
+    Ok(())
+}
+
+struct OverviewSummary {
+    samples: u64,
+    process_rows: u64,
+    hotspot_rows: u64,
+    line_rows: u64,
+    complete_stack_samples: u64,
+    truncated_stack_samples: u64,
+    unresolved_stack_samples: u64,
+    line_resolved_samples: u64,
+    line_unresolved_samples: u64,
+    lost: u64,
+    corrupt: u64,
+    omitted_errors: u64,
+}
+
+fn parse_overview_summary(row: &str) -> Result<OverviewSummary, String> {
+    let mut cursor = OverviewCursor::new(row);
+    cursor.header("capture", None)?;
+    let samples = cursor.named_u64("samples")?;
+    let process_rows = cursor.named_u64("process_rows")?;
+    let hotspot_rows = cursor.named_u64("hotspot_rows")?;
+    let line_rows = cursor.named_u64("line_rows")?;
+    let limit = cursor.named_u64("rows_per_kind_limit")?;
+    if limit != crate::report::OVERVIEW_ROWS_PER_KIND as u64 {
+        return Err("capture overview has a different ranked-row limit".into());
+    }
+    let summary = OverviewSummary {
+        samples,
+        process_rows,
+        hotspot_rows,
+        line_rows,
+        complete_stack_samples: cursor.named_u64("complete_stack_samples")?,
+        truncated_stack_samples: cursor.named_u64("truncated_stack_samples")?,
+        unresolved_stack_samples: cursor.named_u64("unresolved_stack_samples")?,
+        line_resolved_samples: cursor.named_u64("line_resolved_samples")?,
+        line_unresolved_samples: cursor.named_u64("line_unresolved_samples")?,
+        lost: cursor.named_u64("lost")?,
+        corrupt: cursor.named_u64("corrupt")?,
+        omitted_errors: cursor.named_u64("omitted_errors")?,
+    };
+    cursor.finish()?;
+    Ok(summary)
+}
+
+fn validate_overview_row(row: &str, kind: &str, rank: usize, samples: u64) -> Result<(), String> {
+    let mut cursor = OverviewCursor::new(row);
+    cursor.header(kind, Some(rank as u64))?;
+    cursor.named_u64("pid")?;
+    let start_kind = cursor.named_string("start_kind")?;
+    if !matches!(
+        start_kind.as_slice(),
+        b"unknown" | b"proc-start-ticks" | b"perf-fork-time-ns"
+    ) {
+        return Err(format!(
+            "capture overview has invalid {kind} start identity"
+        ));
+    }
+    let start_value = cursor.named_u64("start_value")?;
+    if (start_kind == b"unknown") != (start_value == 0) {
+        return Err(format!("capture overview has invalid {kind} start value"));
+    }
+    cursor.named_u64("generation")?;
+    match kind {
+        "process" => {
+            cursor.named_bytes("comm")?;
+            cursor.named_bool("observed")?;
+            cursor.named_bool("baseline_valid")?;
+            cursor.named_bool("exited")?;
+        }
+        "hotspot" => {
+            cursor.named_bool("resolved")?;
+            cursor.named_bytes("object")?;
+            cursor.named_bytes("function")?;
+            cursor.named_hex("build_id", 20)?;
+            cursor.named_u64("function_address")?;
+        }
+        "line" => {
+            let symbol_resolved = cursor.named_bool("symbol_resolved")?;
+            let line_resolved = cursor.named_bool("line_resolved")?;
+            cursor.named_bytes("object")?;
+            cursor.named_bytes("function")?;
+            cursor.named_hex("build_id", 20)?;
+            let function_address = cursor.named_nullable_u64("function_address")?;
+            let object_address = cursor.named_nullable_u64("object_address")?;
+            cursor.named_bytes("source_file")?;
+            let source_line = cursor.named_nullable_u64("source_line")?;
+            let source_column = cursor.named_nullable_u64("source_column")?;
+            let discriminator = cursor.named_nullable_u64("discriminator")?;
+            if (line_resolved && !symbol_resolved)
+                || function_address.is_some() != symbol_resolved
+                || object_address.is_some() == line_resolved
+                || source_line.is_some() != line_resolved
+                || source_column.is_some() != line_resolved
+                || discriminator.is_some() != line_resolved
+            {
+                return Err("capture overview line resolution fields disagree".into());
+            }
+        }
+        _ => return Err("capture overview contains an unknown ranked-row kind".into()),
+    }
+    let row_samples = cursor.named_u64("samples")?;
+    let share = cursor.named_u64("sample_share_millionths")?;
+    if share != crate::report::sample_share_millionths(row_samples, samples) {
+        return Err(format!(
+            "capture overview has an invalid {kind} sample share"
+        ));
+    }
+    cursor.finish()
+}
+
+struct OverviewCursor<'a> {
+    rest: &'a str,
+}
+
+impl<'a> OverviewCursor<'a> {
+    fn new(row: &'a str) -> Self {
+        Self { rest: row }
+    }
+
+    fn header(&mut self, kind: &str, rank: Option<u64>) -> Result<(), String> {
+        self.literal("{\"schema\":")?;
+        if self.u64()? != u64::from(crate::report::SCHEMA) {
+            return Err("capture overview row has an unsupported schema".into());
+        }
+        if self.named_string("kind")? != kind.as_bytes() {
+            return Err(format!("capture overview expected a {kind} row"));
+        }
+        if let Some(rank) = rank {
+            if self.named_u64("rank")? != rank {
+                return Err(format!("capture overview has a noncanonical {kind} rank"));
+            }
+        }
+        Ok(())
+    }
+
+    fn named_u64(&mut self, name: &str) -> Result<u64, String> {
+        self.named(name)?;
+        self.u64()
+    }
+
+    fn named_nullable_u64(&mut self, name: &str) -> Result<Option<u64>, String> {
+        self.named(name)?;
+        if let Some(rest) = self.rest.strip_prefix("null") {
+            self.rest = rest;
+            Ok(None)
+        } else {
+            self.u64().map(Some)
+        }
+    }
+
+    fn named_bool(&mut self, name: &str) -> Result<bool, String> {
+        self.named(name)?;
+        if let Some(rest) = self.rest.strip_prefix("true") {
+            self.rest = rest;
+            Ok(true)
+        } else if let Some(rest) = self.rest.strip_prefix("false") {
+            self.rest = rest;
+            Ok(false)
+        } else {
+            Err(format!("capture overview {name} is not a boolean"))
+        }
+    }
+
+    fn named_string(&mut self, name: &str) -> Result<Vec<u8>, String> {
+        self.named(name)?;
+        self.string()
+    }
+
+    fn named_hex(&mut self, name: &str, maximum_bytes: usize) -> Result<Vec<u8>, String> {
+        self.named(name)?;
+        self.hex(maximum_bytes)
+    }
+
+    fn named_bytes(&mut self, name: &str) -> Result<(), String> {
+        self.literal(",")?;
+        let text_name = format!("\"{name}\":");
+        let text = if let Some(rest) = self.rest.strip_prefix(&text_name) {
+            self.rest = rest;
+            let value = self.string()?;
+            self.literal(",")?;
+            Some(value)
+        } else {
+            None
+        };
+        self.literal(&format!("\"{name}_bytes_prefix\":"))?;
+        let prefix = self.hex(crate::report::OVERVIEW_FIELD_PREFIX_BYTES)?;
+        let length = self.named_u64(&format!("{name}_bytes_length"))?;
+        let truncated = self.named_bool(&format!("{name}_truncated"))?;
+        let prefix_length = prefix.len() as u64;
+        if truncated != (prefix_length != length) || prefix_length > length {
+            return Err(format!(
+                "capture overview {name} prefix length is inconsistent"
+            ));
+        }
+        let expected_text = (!truncated)
+            .then(|| std::str::from_utf8(&prefix).ok())
+            .flatten()
+            .map(str::as_bytes);
+        if text.as_deref() != expected_text {
+            return Err(format!(
+                "capture overview {name} text disagrees with its byte prefix"
+            ));
+        }
+        Ok(())
+    }
+
+    fn named(&mut self, name: &str) -> Result<(), String> {
+        self.literal(&format!(",\"{name}\":"))
+    }
+
+    fn u64(&mut self) -> Result<u64, String> {
+        let digits = self.rest.bytes().take_while(u8::is_ascii_digit).count();
+        let value = self
+            .rest
+            .get(..digits)
+            .ok_or("capture overview has an invalid integer")?;
+        if value.is_empty() || (value.len() > 1 && value.starts_with('0')) {
+            return Err("capture overview has a noncanonical integer".into());
+        }
+        self.rest = self
+            .rest
+            .get(digits..)
+            .ok_or("capture overview integer exceeds its row")?;
+        value
+            .parse()
+            .map_err(|_| "capture overview integer overflows".into())
+    }
+
+    fn string(&mut self) -> Result<Vec<u8>, String> {
+        self.literal("\"")?;
+        let mut out = Vec::new();
+        let bytes = self.rest.as_bytes();
+        let mut index = 0usize;
+        while let Some(byte) = bytes.get(index).copied() {
+            match byte {
+                b'"' => {
+                    self.rest = self
+                        .rest
+                        .get(index.saturating_add(1)..)
+                        .ok_or("capture overview string exceeds its row")?;
+                    return Ok(out);
+                }
+                b'\\' => {
+                    let escaped = bytes
+                        .get(index.saturating_add(1))
+                        .copied()
+                        .ok_or("capture overview has an incomplete string escape")?;
+                    match escaped {
+                        b'"' | b'\\' | b'/' => out.push(escaped),
+                        b'b' => out.push(8),
+                        b'f' => out.push(12),
+                        b'n' => out.push(b'\n'),
+                        b'r' => out.push(b'\r'),
+                        b't' => out.push(b'\t'),
+                        b'u' => {
+                            let end = index.saturating_add(6);
+                            let digits = self
+                                .rest
+                                .get(index.saturating_add(2)..end)
+                                .ok_or("capture overview has an incomplete Unicode escape")?;
+                            let scalar = u32::from_str_radix(digits, 16)
+                                .map_err(|_| "capture overview has an invalid Unicode escape")?;
+                            let character = char::from_u32(scalar)
+                                .ok_or("capture overview has an invalid Unicode scalar")?;
+                            let mut encoded = [0u8; 4];
+                            out.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+                            index = end;
+                            continue;
+                        }
+                        _ => return Err("capture overview has an invalid string escape".into()),
+                    }
+                    index = index.saturating_add(2);
+                }
+                0..=0x1f => return Err("capture overview string has a control byte".into()),
+                _ => {
+                    out.push(byte);
+                    index = index.saturating_add(1);
+                }
+            }
+        }
+        Err("capture overview has an unterminated string".into())
+    }
+
+    fn hex(&mut self, maximum_bytes: usize) -> Result<Vec<u8>, String> {
+        let encoded = self.string()?;
+        if encoded.len() % 2 != 0 || encoded.len() > maximum_bytes.saturating_mul(2) {
+            return Err("capture overview has an invalid hexadecimal field length".into());
+        }
+        let mut out = Vec::with_capacity(encoded.len() / 2);
+        let (pairs, _) = encoded.as_chunks::<2>();
+        for [high, low] in pairs {
+            let high = hex_nibble(*high)?;
+            let low = hex_nibble(*low)?;
+            out.push((high << 4) | low);
+        }
+        Ok(out)
+    }
+
+    fn literal(&mut self, literal: &str) -> Result<(), String> {
+        self.rest = self
+            .rest
+            .strip_prefix(literal)
+            .ok_or_else(|| format!("capture overview row lacks canonical {literal}"))?;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        self.literal("}")?;
+        if !self.rest.is_empty() {
+            return Err("capture overview row has trailing content".into());
+        }
+        Ok(())
+    }
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err("capture overview hexadecimal field is not lowercase".into()),
+    }
 }
 
 fn validate_integrity_counters(manifest: &str) -> Result<(), String> {
@@ -489,9 +952,10 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::{
         attribution_row, attribution_rows, capture_sequence, cmdline_has_token, current_captures,
-        evidence_marker, number, validate_integrity_counters, ATTRIBUTION_FUNCTION_FRAGMENT,
-        ATTRIBUTION_MARKER, ATTRIBUTION_SOURCE_FILE, ATTRIBUTION_SOURCE_LINE_END,
-        ATTRIBUTION_SOURCE_LINE_START, CAPTURE_MARKER, MAX_ATTRIBUTION_ROW_BYTES,
+        evidence_marker, number, validate_integrity_counters, validate_overview,
+        ATTRIBUTION_FUNCTION_FRAGMENT, ATTRIBUTION_MARKER, ATTRIBUTION_SOURCE_FILE,
+        ATTRIBUTION_SOURCE_LINE_END, ATTRIBUTION_SOURCE_LINE_START, CAPTURE_MARKER,
+        MAX_ATTRIBUTION_ROW_BYTES,
     };
     use std::io::Cursor;
 
@@ -626,6 +1090,88 @@ mod tests {
         assert_eq!(evidence_marker(false), CAPTURE_MARKER);
         assert_eq!(evidence_marker(true), ATTRIBUTION_MARKER);
         assert_ne!(CAPTURE_MARKER, ATTRIBUTION_MARKER);
+    }
+
+    #[test]
+    fn overview_evidence_requires_the_complete_bounded_ranked_schema() {
+        let root = std::env::temp_dir().join(format!(
+            "td-profiler-overview-evidence-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("overview.jsonl");
+        let valid = "{\"schema\":1,\"kind\":\"process\",\"rank\":1,\"pid\":7,\
+                     \"start_kind\":\"proc-start-ticks\",\"start_value\":9,\
+                     \"generation\":1,\"comm\":\"a\",\"comm_bytes_prefix\":\"61\",\
+                     \"comm_bytes_length\":1,\"comm_truncated\":false,\"observed\":true,\
+                     \"baseline_valid\":true,\"exited\":false,\"samples\":7,\
+                     \"sample_share_millionths\":1000000}\n\
+                     {\"schema\":1,\"kind\":\"hotspot\",\"rank\":1,\"pid\":7,\
+                     \"start_kind\":\"proc-start-ticks\",\"start_value\":9,\
+                     \"generation\":1,\"resolved\":false,\"object\":\"\",\
+                     \"object_bytes_prefix\":\"\",\"object_bytes_length\":0,\
+                     \"object_truncated\":false,\"function\":\"\",\
+                     \"function_bytes_prefix\":\"\",\"function_bytes_length\":0,\
+                     \"function_truncated\":false,\"build_id\":\"\",\
+                     \"function_address\":0,\"samples\":7,\
+                     \"sample_share_millionths\":1000000}\n\
+                     {\"schema\":1,\"kind\":\"line\",\"rank\":1,\"pid\":7,\
+                     \"start_kind\":\"proc-start-ticks\",\"start_value\":9,\
+                     \"generation\":1,\"symbol_resolved\":false,\"line_resolved\":false,\
+                     \"object\":\"\",\"object_bytes_prefix\":\"\",\
+                     \"object_bytes_length\":0,\"object_truncated\":false,\
+                     \"function\":\"\",\"function_bytes_prefix\":\"\",\
+                     \"function_bytes_length\":0,\"function_truncated\":false,\
+                     \"build_id\":\"\",\"function_address\":null,\
+                     \"object_address\":0,\"source_file\":\"\",\
+                     \"source_file_bytes_prefix\":\"\",\"source_file_bytes_length\":0,\
+                     \"source_file_truncated\":false,\"source_line\":null,\
+                     \"source_column\":null,\"discriminator\":null,\"samples\":7,\
+                     \"sample_share_millionths\":1000000}\n\
+                     {\"schema\":1,\"kind\":\"capture\",\"samples\":7,\
+                     \"process_rows\":1,\"hotspot_rows\":1,\"line_rows\":1,\
+                     \"rows_per_kind_limit\":32,\"complete_stack_samples\":2,\
+                     \"truncated_stack_samples\":3,\"unresolved_stack_samples\":2,\
+                     \"line_resolved_samples\":4,\"line_unresolved_samples\":3,\
+                     \"lost\":0,\"corrupt\":0,\"omitted_errors\":0}\n";
+        std::fs::write(&path, valid).unwrap();
+        let manifest = "{\"lost\":0,\"corrupt\":0,\"omitted_errors\":0}";
+        validate_overview(&root, manifest, 7, 2, 3, 2, 4, 3).unwrap();
+        assert!(validate_overview(&root, manifest, 8, 2, 3, 2, 4, 3)
+            .unwrap_err()
+            .contains("samples does not match"));
+
+        std::fs::write(
+            &path,
+            valid.replace(
+                "{\"schema\":1,\"kind\":\"process\",\"rank\":1,\"pid\":7",
+                "{\"schema\":1,\"kind\":\"process\",\"rank\":1,\"x\":0,\"pid\":7",
+            ),
+        )
+        .unwrap();
+        assert!(validate_overview(&root, manifest, 7, 2, 3, 2, 4, 3)
+            .unwrap_err()
+            .contains("canonical"));
+
+        std::fs::write(
+            &path,
+            valid.replace("\"process_rows\":1", "\"process_rows\":2"),
+        )
+        .unwrap();
+        assert!(validate_overview(&root, manifest, 7, 2, 3, 2, 4, 3)
+            .unwrap_err()
+            .contains("expected a process row"));
+
+        std::fs::write(
+            &path,
+            vec![b'x'; crate::report::MAX_OVERVIEW_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(validate_overview(&root, manifest, 7, 2, 3, 2, 4, 3)
+            .unwrap_err()
+            .contains("exceeds its"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

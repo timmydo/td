@@ -15,12 +15,15 @@ use std::rc::Rc;
 
 pub const SCHEMA: u32 = 1;
 pub const MAX_REPORT_BYTES: u64 = 128 * 1024 * 1024;
+pub const MAX_OVERVIEW_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAX_CAPTURE_METADATA_BYTES: u64 = 1024 * 1024;
 pub(crate) const MAX_FAILURE_MARKER_BYTES: u64 = 16 * 1024;
 pub(crate) const MAX_PROFILE_CPUS: usize = 4096;
 const FIXED_METADATA_RESERVE_BYTES: u64 = 4096;
 const PER_CPU_METADATA_RESERVE_BYTES: u64 = 96;
 const MAX_REPORT_EXPANSION_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const OVERVIEW_ROWS_PER_KIND: usize = 32;
+pub(crate) const OVERVIEW_FIELD_PREFIX_BYTES: usize = 1024;
 const O_NOFOLLOW: i32 = 0o400_000;
 const O_CLOEXEC: i32 = 0o2_000_000;
 
@@ -89,6 +92,9 @@ struct StackRows {
     hotspots: BTreeMap<HotspotKey, u64>,
     lines: BTreeMap<LineKey, u64>,
     unresolved_stacks: u64,
+    complete_stack_samples: u64,
+    truncated_stack_samples: u64,
+    unresolved_stack_samples: u64,
     line_resolved_samples: u64,
     line_unresolved_samples: u64,
 }
@@ -103,16 +109,34 @@ pub fn generate(
     let budget =
         OutputBudget::with_limit(MAX_REPORT_BYTES.saturating_sub(MAX_CAPTURE_METADATA_BYTES));
     let mut expansion = ExpansionBudget::new();
-    write_processes(capture, analysis, &budget)?;
+    let mut overview = output_bounded(capture.join("overview.jsonl"), &budget, MAX_OVERVIEW_BYTES)?;
+    let process_rows = write_processes(capture, analysis, &budget, &mut overview)?;
     let rows = write_stacks(capture, analysis, symbolizer, &budget, &mut expansion)?;
-    write_hotspots(capture, rows.hotspots, &budget)?;
-    write_lines(capture, rows.lines, &budget)?;
+    let hotspot_rows = write_hotspots(capture, rows.hotspots, &budget, &mut overview, analysis)?;
+    let line_rows = write_lines(capture, rows.lines, &budget, &mut overview, analysis)?;
+    write_overview_summary(
+        &mut overview,
+        analysis,
+        symbolizer,
+        process_rows,
+        hotspot_rows,
+        line_rows,
+        rows.complete_stack_samples,
+        rows.truncated_stack_samples,
+        rows.unresolved_stack_samples,
+        rows.line_resolved_samples,
+        rows.line_unresolved_samples,
+    )?;
+    finish(overview, "overview.jsonl")?;
     write_manifest(
         capture,
         meta,
         analysis,
         unknown_records,
         rows.unresolved_stacks,
+        rows.complete_stack_samples,
+        rows.truncated_stack_samples,
+        rows.unresolved_stack_samples,
         rows.line_resolved_samples,
         rows.line_unresolved_samples,
         symbolizer,
@@ -141,6 +165,8 @@ pub fn write_pending_manifest(
             "{},\"samples\":{},\"tasks\":{},\"mappings\":{},\"context_switches\":{},\
              \"lost\":{},\"corrupt\":{},\"ignored_perf_records\":{},\
              \"unknown_raw_records\":0,\"omitted_errors\":{},\"unresolved_stacks\":0,\
+             \"complete_stack_samples\":0,\"truncated_stack_samples\":0,\
+             \"unresolved_stack_samples\":0,\
              \"line_resolved_samples\":0,\"line_unresolved_samples\":0,\
              \"objects\":[],\"errors\":[],\"report_incomplete\":true}}",
             prefix,
@@ -256,18 +282,37 @@ fn regenerate_partial(
     budget: &OutputBudget,
 ) -> Result<(), String> {
     let mut expansion = ExpansionBudget::new();
-    let (analysis, unknown_records) = analyze_capture(capture, partial, budget)?;
+    let (analysis, unknown_records) = analyze_capture(capture)?;
     let prefix = regenerated_manifest_prefix(prefix, analysis.sample_records)?;
     let mut symbolizer = Symbolizer::from_index(index);
+    let mut overview = output_bounded(partial.join("overview.jsonl"), budget, MAX_OVERVIEW_BYTES)?;
+    let process_rows = write_processes(partial, &analysis, budget, &mut overview)?;
     let rows = write_stacks(partial, &analysis, &mut symbolizer, budget, &mut expansion)?;
-    write_hotspots(partial, rows.hotspots, budget)?;
-    write_lines(partial, rows.lines, budget)?;
+    let hotspot_rows = write_hotspots(partial, rows.hotspots, budget, &mut overview, &analysis)?;
+    let line_rows = write_lines(partial, rows.lines, budget, &mut overview, &analysis)?;
+    write_overview_summary(
+        &mut overview,
+        &analysis,
+        &symbolizer,
+        process_rows,
+        hotspot_rows,
+        line_rows,
+        rows.complete_stack_samples,
+        rows.truncated_stack_samples,
+        rows.unresolved_stack_samples,
+        rows.line_resolved_samples,
+        rows.line_unresolved_samples,
+    )?;
+    finish(overview, "overview.jsonl")?;
     write_manifest_tail(
         partial,
         &prefix,
         &analysis,
         unknown_records,
         rows.unresolved_stacks,
+        rows.complete_stack_samples,
+        rows.truncated_stack_samples,
+        rows.unresolved_stack_samples,
         rows.line_resolved_samples,
         rows.line_unresolved_samples,
         &symbolizer,
@@ -345,16 +390,11 @@ fn remove_stale_partial(path: &Path) -> Result<(), String> {
     }
 }
 
-fn analyze_capture(
-    source: &Path,
-    output_directory: &Path,
-    budget: &OutputBudget,
-) -> Result<(state::Analysis, u64), String> {
+fn analyze_capture(source: &Path) -> Result<(state::Analysis, u64), String> {
     let samples =
         File::open(source.join("samples.bin")).map_err(|e| format!("open samples.bin: {e}"))?;
     let decoded = raw::read(BufReader::new(samples))?;
     let analysis = state::analyze(&decoded.events)?;
-    write_processes(output_directory, &analysis, budget)?;
     Ok((analysis, decoded.unknown_records))
 }
 
@@ -458,7 +498,8 @@ fn write_processes(
     capture: &Path,
     analysis: &state::Analysis,
     budget: &OutputBudget,
-) -> Result<(), String> {
+    overview: &mut Output,
+) -> Result<usize, String> {
     let mut processes: Vec<_> = analysis.processes.values().collect();
     processes.sort_by(|left, right| {
         right
@@ -467,7 +508,8 @@ fn write_processes(
             .then_with(|| left.key.cmp(&right.key))
     });
     let mut file = output(capture.join("processes.jsonl"), budget)?;
-    for process in processes {
+    let row_count = processes.len();
+    for (index, process) in processes.into_iter().enumerate() {
         let (start_kind, start_value) = start_identity(&process.key.start);
         writeln!(
             file,
@@ -485,8 +527,41 @@ fn write_processes(
             process.samples
         )
         .map_err(|e| format!("write processes.jsonl: {e}"))?;
+        if index < OVERVIEW_ROWS_PER_KIND {
+            write_overview_process(overview, index, process, analysis.sample_records)?;
+        }
     }
-    finish(file, "processes.jsonl")
+    finish(file, "processes.jsonl")?;
+    Ok(row_count)
+}
+
+fn write_overview_process(
+    overview: &mut Output,
+    index: usize,
+    process: &state::ProcessSummary,
+    samples: u64,
+) -> Result<(), String> {
+    let (start_kind, start_value) = start_identity(&process.key.start);
+    writeln!(
+        overview,
+        "{{\"schema\":{SCHEMA},\"kind\":\"process\",\"rank\":{},\"pid\":{},\
+         \"start_kind\":\"{}\",\"start_value\":{},\"generation\":{},\
+         {},\
+         \"observed\":{},\"baseline_valid\":{},\"exited\":{},\"samples\":{},\
+         \"sample_share_millionths\":{}}}",
+        index.saturating_add(1),
+        process.key.pid,
+        start_kind,
+        start_value,
+        process.key.generation,
+        overview_bytes("comm", &process.comm),
+        process.observed,
+        process.valid_baseline,
+        process.exited,
+        process.samples,
+        sample_share_millionths(process.samples, samples),
+    )
+    .map_err(|e| format!("write overview process row: {e}"))
 }
 
 fn write_stacks(
@@ -515,6 +590,9 @@ fn write_stacks(
     let mut hotspots: BTreeMap<HotspotKey, u64> = BTreeMap::new();
     let mut lines: BTreeMap<LineKey, u64> = BTreeMap::new();
     let mut unresolved_stacks = 0u64;
+    let mut complete_stack_samples = 0u64;
+    let mut truncated_stack_samples = 0u64;
+    let mut unresolved_stack_samples = 0u64;
     let mut line_resolved_samples = 0u64;
     let mut line_unresolved_samples = 0u64;
 
@@ -537,8 +615,18 @@ fn write_stacks(
             resolved.push(value);
         }
         let reported_state = reported_stack_state(&stack.state, &resolved);
-        if !matches!(reported_state, StackState::Complete) {
-            unresolved_stacks = unresolved_stacks.saturating_add(1);
+        match &reported_state {
+            StackState::Complete => {
+                complete_stack_samples = complete_stack_samples.saturating_add(*count);
+            }
+            StackState::Truncated(_) => {
+                unresolved_stacks = unresolved_stacks.saturating_add(1);
+                truncated_stack_samples = truncated_stack_samples.saturating_add(*count);
+            }
+            StackState::Unresolved(_) => {
+                unresolved_stacks = unresolved_stacks.saturating_add(1);
+                unresolved_stack_samples = unresolved_stack_samples.saturating_add(*count);
+            }
         }
         write!(
             structured,
@@ -632,6 +720,9 @@ fn write_stacks(
         hotspots,
         lines,
         unresolved_stacks,
+        complete_stack_samples,
+        truncated_stack_samples,
+        unresolved_stack_samples,
         line_resolved_samples,
         line_unresolved_samples,
     })
@@ -749,15 +840,18 @@ fn write_hotspots(
     capture: &Path,
     hotspots: BTreeMap<HotspotKey, u64>,
     budget: &OutputBudget,
-) -> Result<(), String> {
+    overview: &mut Output,
+    analysis: &state::Analysis,
+) -> Result<usize, String> {
     let mut rows: Vec<_> = hotspots.into_iter().collect();
     rows.sort_by(|(left_key, left_count), (right_key, right_count)| {
         right_count
             .cmp(left_count)
             .then_with(|| left_key.cmp(right_key))
     });
+    let row_count = rows.len();
     let mut file = output(capture.join("hotspots.jsonl"), budget)?;
-    for (hotspot, count) in rows {
+    for (index, (hotspot, count)) in rows.into_iter().enumerate() {
         let (start_kind, start_value) = start_identity(&hotspot.image.start);
         writeln!(
             file,
@@ -776,23 +870,60 @@ fn write_hotspots(
             count
         )
         .map_err(|e| format!("write hotspots.jsonl: {e}"))?;
+        if index < OVERVIEW_ROWS_PER_KIND {
+            write_overview_hotspot(overview, index, &hotspot, count, analysis.sample_records)?;
+        }
     }
-    finish(file, "hotspots.jsonl")
+    finish(file, "hotspots.jsonl")?;
+    Ok(row_count)
+}
+
+fn write_overview_hotspot(
+    overview: &mut Output,
+    index: usize,
+    hotspot: &HotspotKey,
+    count: u64,
+    samples: u64,
+) -> Result<(), String> {
+    let (start_kind, start_value) = start_identity(&hotspot.image.start);
+    writeln!(
+        overview,
+        "{{\"schema\":{SCHEMA},\"kind\":\"hotspot\",\"rank\":{},\"pid\":{},\
+         \"start_kind\":\"{}\",\"start_value\":{},\"generation\":{},\
+         \"resolved\":{},{},{},\"build_id\":\"{}\",\"function_address\":{},\
+         \"samples\":{},\"sample_share_millionths\":{}}}",
+        index.saturating_add(1),
+        hotspot.image.pid,
+        start_kind,
+        start_value,
+        hotspot.image.generation,
+        hotspot.resolved,
+        overview_bytes("object", &hotspot.object),
+        overview_bytes("function", &hotspot.function),
+        json::hex(&hotspot.build_id),
+        hotspot.function_address,
+        count,
+        sample_share_millionths(count, samples),
+    )
+    .map_err(|e| format!("write overview hotspot row: {e}"))
 }
 
 fn write_lines(
     capture: &Path,
     lines: BTreeMap<LineKey, u64>,
     budget: &OutputBudget,
-) -> Result<(), String> {
+    overview: &mut Output,
+    analysis: &state::Analysis,
+) -> Result<usize, String> {
     let mut rows: Vec<_> = lines.into_iter().collect();
     rows.sort_by(|(left_key, left_count), (right_key, right_count)| {
         right_count
             .cmp(left_count)
             .then_with(|| left_key.cmp(right_key))
     });
+    let row_count = rows.len();
     let mut file = output(capture.join("lines.jsonl"), budget)?;
-    for (line, count) in rows {
+    for (index, (line, count)) in rows.into_iter().enumerate() {
         let (start_kind, start_value) = start_identity(&line.image.start);
         let function_address = line
             .symbol_resolved
@@ -837,8 +968,165 @@ fn write_lines(
             count
         )
         .map_err(|e| format!("write lines.jsonl: {e}"))?;
+        if index < OVERVIEW_ROWS_PER_KIND {
+            write_overview_line(overview, index, &line, count, analysis.sample_records)?;
+        }
     }
-    finish(file, "lines.jsonl")
+    finish(file, "lines.jsonl")?;
+    Ok(row_count)
+}
+
+fn write_overview_line(
+    overview: &mut Output,
+    index: usize,
+    line: &LineKey,
+    count: u64,
+    samples: u64,
+) -> Result<(), String> {
+    let (start_kind, start_value) = start_identity(&line.image.start);
+    let function_address = line
+        .symbol_resolved
+        .then_some(line.function_address)
+        .map_or_else(|| "null".into(), |value| value.to_string());
+    let object_address = (!line.line_resolved)
+        .then_some(line.object_address)
+        .map_or_else(|| "null".into(), |value| value.to_string());
+    let source_line = line
+        .line_resolved
+        .then_some(line.source_line)
+        .map_or_else(|| "null".into(), |value| value.to_string());
+    let source_column = line
+        .line_resolved
+        .then_some(line.source_column)
+        .map_or_else(|| "null".into(), |value| value.to_string());
+    let discriminator = line
+        .line_resolved
+        .then_some(line.discriminator)
+        .map_or_else(|| "null".into(), |value| value.to_string());
+    writeln!(
+        overview,
+        "{{\"schema\":{SCHEMA},\"kind\":\"line\",\"rank\":{},\"pid\":{},\
+         \"start_kind\":\"{}\",\"start_value\":{},\"generation\":{},\
+         \"symbol_resolved\":{},\"line_resolved\":{},{},{},\"build_id\":\"{}\",\
+         \"function_address\":{},\"object_address\":{},{},\"source_line\":{},\
+         \"source_column\":{},\"discriminator\":{},\"samples\":{},\
+         \"sample_share_millionths\":{}}}",
+        index.saturating_add(1),
+        line.image.pid,
+        start_kind,
+        start_value,
+        line.image.generation,
+        line.symbol_resolved,
+        line.line_resolved,
+        overview_bytes("object", &line.object),
+        overview_bytes("function", &line.function),
+        json::hex(&line.build_id),
+        function_address,
+        object_address,
+        overview_bytes("source_file", &line.source_file),
+        source_line,
+        source_column,
+        discriminator,
+        count,
+        sample_share_millionths(count, samples),
+    )
+    .map_err(|e| format!("write overview line row: {e}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_overview_summary(
+    overview: &mut Output,
+    analysis: &state::Analysis,
+    symbolizer: &Symbolizer,
+    process_rows: usize,
+    hotspot_rows: usize,
+    line_rows: usize,
+    complete_stack_samples: u64,
+    truncated_stack_samples: u64,
+    unresolved_stack_samples: u64,
+    line_resolved_samples: u64,
+    line_unresolved_samples: u64,
+) -> Result<(), String> {
+    let omitted_errors = analysis
+        .omitted_errors
+        .saturating_add(symbolizer.omitted_errors());
+    writeln!(
+        overview,
+        "{{\"schema\":{SCHEMA},\"kind\":\"capture\",\"samples\":{},\
+         \"process_rows\":{},\"hotspot_rows\":{},\"line_rows\":{},\
+         \"rows_per_kind_limit\":{OVERVIEW_ROWS_PER_KIND},\
+         \"complete_stack_samples\":{},\"truncated_stack_samples\":{},\
+         \"unresolved_stack_samples\":{},\"line_resolved_samples\":{},\
+         \"line_unresolved_samples\":{},\"lost\":{},\"corrupt\":{},\
+         \"omitted_errors\":{}}}",
+        analysis.sample_records,
+        process_rows,
+        hotspot_rows,
+        line_rows,
+        complete_stack_samples,
+        truncated_stack_samples,
+        unresolved_stack_samples,
+        line_resolved_samples,
+        line_unresolved_samples,
+        analysis.lost_records,
+        analysis.corrupt_records,
+        omitted_errors,
+    )
+    .map_err(|e| format!("write overview capture row: {e}"))
+}
+
+pub(crate) fn sample_share_millionths(samples: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    let share = u128::from(samples).saturating_mul(1_000_000) / u128::from(total);
+    u64::try_from(share).unwrap_or(u64::MAX)
+}
+
+struct OverviewBytes<'a> {
+    name: &'a str,
+    bytes: &'a [u8],
+}
+
+fn overview_bytes<'a>(name: &'a str, bytes: &'a [u8]) -> OverviewBytes<'a> {
+    OverviewBytes { name, bytes }
+}
+
+impl std::fmt::Display for OverviewBytes<'_> {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let length = self.bytes.len();
+        let prefix = self
+            .bytes
+            .get(..length.min(OVERVIEW_FIELD_PREFIX_BYTES))
+            .unwrap_or_default();
+        let truncated = prefix.len() != length;
+        if !truncated {
+            if let Ok(text) = std::str::from_utf8(prefix) {
+                write!(out, "\"{}\":\"", self.name)?;
+                for character in text.chars() {
+                    match character {
+                        '"' => out.write_str("\\\"")?,
+                        '\\' => out.write_str("\\\\")?,
+                        '\n' => out.write_str("\\n")?,
+                        '\r' => out.write_str("\\r")?,
+                        '\t' => out.write_str("\\t")?,
+                        c if c <= '\u{1f}' => write!(out, "\\u{:04x}", c as u32)?,
+                        c => out.write_char(c)?,
+                    }
+                }
+                out.write_str("\",")?;
+            }
+        }
+        write!(out, "\"{}_bytes_prefix\":\"", self.name)?;
+        for byte in prefix {
+            write!(out, "{byte:02x}")?;
+        }
+        write!(
+            out,
+            "\",\"{}_bytes_length\":{},\"{}_truncated\":{}",
+            self.name, length, self.name, truncated
+        )
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -848,6 +1136,9 @@ fn write_manifest(
     analysis: &state::Analysis,
     unknown_records: u64,
     unresolved_stacks: u64,
+    complete_stack_samples: u64,
+    truncated_stack_samples: u64,
+    unresolved_stack_samples: u64,
     line_resolved_samples: u64,
     line_unresolved_samples: u64,
     symbolizer: &Symbolizer,
@@ -861,6 +1152,9 @@ fn write_manifest(
         analysis,
         unknown_records,
         unresolved_stacks,
+        complete_stack_samples,
+        truncated_stack_samples,
+        unresolved_stack_samples,
         line_resolved_samples,
         line_unresolved_samples,
         symbolizer,
@@ -930,6 +1224,9 @@ fn write_manifest_tail(
     analysis: &state::Analysis,
     unknown_records: u64,
     unresolved_stacks: u64,
+    complete_stack_samples: u64,
+    truncated_stack_samples: u64,
+    unresolved_stack_samples: u64,
     line_resolved_samples: u64,
     line_unresolved_samples: u64,
     symbolizer: &Symbolizer,
@@ -996,6 +1293,8 @@ fn write_manifest_tail(
         "{}{regenerated_json},\"samples\":{},\"tasks\":{},\"mappings\":{},\"context_switches\":{},\
          \"lost\":{},\"corrupt\":{},\"ignored_perf_records\":{},\"unknown_raw_records\":{},\
          \"omitted_errors\":{},\"unresolved_stacks\":{},\
+         \"complete_stack_samples\":{},\"truncated_stack_samples\":{},\
+         \"unresolved_stack_samples\":{},\
          \"line_resolved_samples\":{},\"line_unresolved_samples\":{},\
          \"objects\":[{}],\"errors\":[{}]}}",
         prefix,
@@ -1009,6 +1308,9 @@ fn write_manifest_tail(
         unknown_records,
         omitted_errors,
         unresolved_stacks,
+        complete_stack_samples,
+        truncated_stack_samples,
+        unresolved_stack_samples,
         line_resolved_samples,
         line_unresolved_samples,
         identities,
@@ -1200,6 +1502,7 @@ impl OutputBudget {
 struct Output {
     file: BufWriter<File>,
     budget: OutputBudget,
+    file_budget: Option<OutputBudget>,
 }
 
 impl Write for Output {
@@ -1213,10 +1516,27 @@ impl Write for Output {
                 self.budget.limit
             )));
         }
+        let file_remaining = self
+            .file_budget
+            .as_ref()
+            .map(|budget| budget.remaining.get());
+        if let (Some(budget), Some(file_remaining)) = (&self.file_budget, file_remaining) {
+            if length > file_remaining {
+                return Err(io::Error::other(format!(
+                    "report file output exceeds {} bytes",
+                    budget.limit
+                )));
+            }
+        }
         let written = self.file.write(bytes)?;
         self.budget
             .remaining
             .set(remaining.saturating_sub(written as u64));
+        if let (Some(budget), Some(file_remaining)) = (&self.file_budget, file_remaining) {
+            budget
+                .remaining
+                .set(file_remaining.saturating_sub(written as u64));
+        }
         Ok(written)
     }
 
@@ -1238,7 +1558,14 @@ fn output(path: PathBuf, budget: &OutputBudget) -> Result<Output, String> {
     Ok(Output {
         file: BufWriter::new(file),
         budget: budget.clone(),
+        file_budget: None,
     })
+}
+
+fn output_bounded(path: PathBuf, budget: &OutputBudget, limit: u64) -> Result<Output, String> {
+    let mut file = output(path, budget)?;
+    file.file_budget = Some(OutputBudget::with_limit(limit));
+    Ok(file)
 }
 
 fn finish(mut file: Output, label: &str) -> Result<(), String> {
@@ -1253,14 +1580,16 @@ fn finish(mut file: Output, label: &str) -> Result<(), String> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::{
-        effective_rate_millihz, finish, folded_escape, hotspot_key, line_key, output, regenerate,
-        reported_stack_state, validate_identity_metadata, write_lines, write_pending_manifest,
-        ExpansionBudget, Meta, OutputBudget, RegenerationLock, MAX_CAPTURE_METADATA_BYTES,
+        effective_rate_millihz, finish, folded_escape, generate, hotspot_key, line_key, output,
+        output_bounded, overview_bytes, regenerate, reported_stack_state,
+        validate_identity_metadata, write_lines, write_overview_hotspot, write_overview_line,
+        write_overview_process, write_overview_summary, write_pending_manifest, ExpansionBudget,
+        HotspotKey, LineKey, Meta, OutputBudget, RegenerationLock, MAX_CAPTURE_METADATA_BYTES,
         MAX_FAILURE_MARKER_BYTES, MAX_PROFILE_CPUS, MAX_REPORT_BYTES, MAX_REPORT_EXPANSION_BYTES,
     };
     use crate::event::{Event, Kind, StartIdentity};
-    use crate::state::{Frame, ImageKey, StackState};
-    use crate::symbol::Resolved;
+    use crate::state::{Analysis, Frame, ImageKey, ProcessSummary, StackKey, StackState};
+    use crate::symbol::{Resolved, Symbolizer};
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1398,7 +1727,14 @@ mod tests {
         };
         let mut rows = std::collections::BTreeMap::new();
         rows.insert(line_key(&image, &frame, Some(&resolved)), 9);
-        write_lines(&root, rows, &OutputBudget::new()).unwrap();
+        let budget = OutputBudget::new();
+        let mut overview = output(root.join("overview.jsonl"), &budget).unwrap();
+        let analysis = Analysis {
+            sample_records: 9,
+            ..Analysis::default()
+        };
+        write_lines(&root, rows, &budget, &mut overview, &analysis).unwrap();
+        finish(overview, "overview.jsonl").unwrap();
         let row = std::fs::read_to_string(root.join("lines.jsonl")).unwrap();
         assert!(row.contains("\"symbol_resolved\":true,\"line_resolved\":true"));
         assert!(row.contains("\"function_address\":256,\"object_address\":null"));
@@ -1409,11 +1745,211 @@ mod tests {
     }
 
     #[test]
+    fn overview_is_a_bounded_ranked_entry_point_with_weighted_quality() {
+        let root =
+            std::env::temp_dir().join(format!("td-profiler-overview-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let mut analysis = Analysis::default();
+        for pid in 1..=40u32 {
+            let samples = u64::from(pid);
+            let image = ImageKey {
+                pid,
+                start: StartIdentity::ProcTicks(u64::from(pid)),
+                generation: 0,
+            };
+            analysis.processes.insert(
+                image.clone(),
+                ProcessSummary {
+                    key: image.clone(),
+                    comm: format!("process-{pid}").into_bytes(),
+                    observed: true,
+                    valid_baseline: true,
+                    exited: false,
+                    samples,
+                },
+            );
+            analysis.stacks.insert(
+                StackKey {
+                    image,
+                    tid: pid,
+                    state: StackState::Complete,
+                    frames: vec![Frame {
+                        address: 0x1000 + u64::from(pid),
+                        relative: Some(0x1000 + u64::from(pid)),
+                        major: 1,
+                        minor: 2,
+                        inode: u64::from(pid),
+                        inode_generation: 0,
+                        path: format!("/mapped/process-{pid}").into_bytes(),
+                    }],
+                },
+                samples,
+            );
+            analysis.sample_records = analysis.sample_records.saturating_add(samples);
+        }
+        let meta = Meta {
+            profiler_build: "profiler".into(),
+            deployment: "deployment".into(),
+            boot_id: "boot".into(),
+            start_ns: 1,
+            end_ns: 2,
+            wall_start_seconds: 3,
+            rate_hz: 99,
+            cpus: vec![0],
+            coverage: vec![(0, 1, 2)],
+        };
+        let mut symbolizer = Symbolizer::from_index(None);
+        generate(&root, &meta, &mut symbolizer, &analysis, 0).unwrap();
+
+        let overview = std::fs::read_to_string(root.join("overview.jsonl")).unwrap();
+        assert_eq!(overview.lines().count(), 97);
+        assert_eq!(overview.matches("\"kind\":\"process\"").count(), 32);
+        assert_eq!(overview.matches("\"kind\":\"hotspot\"").count(), 32);
+        assert_eq!(overview.matches("\"kind\":\"line\"").count(), 32);
+        assert_eq!(overview.matches("\"kind\":\"capture\"").count(), 1);
+        assert!(overview.contains("\"kind\":\"process\",\"rank\":1,\"pid\":40"));
+        assert!(!overview.contains("\"rank\":33"));
+        assert!(overview.contains("\"samples\":820,\"process_rows\":40"));
+        assert!(overview.contains("\"unresolved_stack_samples\":820"));
+        assert!(overview.contains("\"line_unresolved_samples\":820"));
+        assert!(overview
+            .lines()
+            .last()
+            .unwrap()
+            .contains("\"kind\":\"capture\""));
+        let manifest = std::fs::read_to_string(root.join("manifest.json")).unwrap();
+        assert!(manifest.contains("\"complete_stack_samples\":0"));
+        assert!(manifest.contains("\"truncated_stack_samples\":0"));
+        assert!(manifest.contains("\"unresolved_stack_samples\":820"));
+        crate::evidence::validate_overview(&root, &manifest, 820, 0, 0, 820, 0, 820).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn overview_fields_and_file_have_independent_hard_bounds() {
+        let long = vec![b'a'; super::OVERVIEW_FIELD_PREFIX_BYTES + 1];
+        let rendered = format!("{}", overview_bytes("field", &long));
+        assert!(!rendered.starts_with("\"field\":"));
+        assert!(rendered.contains("\"field_bytes_length\":1025"));
+        assert!(rendered.contains("\"field_truncated\":true"));
+        assert_eq!(
+            rendered
+                .split("\"field_bytes_prefix\":\"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
+                .len(),
+            super::OVERVIEW_FIELD_PREFIX_BYTES * 2
+        );
+        let invalid = format!("{}", overview_bytes("field", &[0xff]));
+        assert!(!invalid.starts_with("\"field\":"));
+        assert!(invalid.contains("\"field_bytes_prefix\":\"ff\""));
+
+        let path = std::env::temp_dir().join(format!(
+            "td-profiler-overview-output-bound-test-{}",
+            std::process::id()
+        ));
+        let budget = OutputBudget::new();
+        let mut file = output_bounded(path.clone(), &budget, 3).unwrap();
+        file.write_all(b"123").unwrap();
+        assert!(file
+            .write_all(b"4")
+            .unwrap_err()
+            .to_string()
+            .contains("report file output exceeds 3 bytes"));
+        finish(file, "bounded overview").unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn maximum_expansion_of_the_fixed_overview_roster_fits_its_file_cap() {
+        let path = std::env::temp_dir().join(format!(
+            "td-profiler-overview-maximum-test-{}",
+            std::process::id()
+        ));
+        let budget = OutputBudget::new();
+        let mut overview =
+            output_bounded(path.clone(), &budget, super::MAX_OVERVIEW_BYTES).unwrap();
+        let bytes = vec![0x1f; super::OVERVIEW_FIELD_PREFIX_BYTES];
+        let image = ImageKey {
+            pid: u32::MAX,
+            start: StartIdentity::ProcTicks(u64::MAX),
+            generation: u64::MAX,
+        };
+        let process = ProcessSummary {
+            key: image.clone(),
+            comm: bytes.clone(),
+            observed: true,
+            valid_baseline: true,
+            exited: true,
+            samples: u64::MAX,
+        };
+        let hotspot = HotspotKey {
+            image: image.clone(),
+            resolved: true,
+            function_address: u64::MAX,
+            function: bytes.clone(),
+            object: bytes.clone(),
+            build_id: vec![u8::MAX; 20],
+        };
+        let line = LineKey {
+            image,
+            symbol_resolved: true,
+            line_resolved: true,
+            function_address: u64::MAX,
+            object_address: u64::MAX,
+            function: bytes.clone(),
+            object: bytes.clone(),
+            build_id: vec![u8::MAX; 20],
+            source_file: bytes,
+            source_line: u64::MAX,
+            source_column: u64::MAX,
+            discriminator: u64::MAX,
+        };
+        for index in 0..super::OVERVIEW_ROWS_PER_KIND {
+            write_overview_process(&mut overview, index, &process, u64::MAX).unwrap();
+            write_overview_hotspot(&mut overview, index, &hotspot, u64::MAX, u64::MAX).unwrap();
+            write_overview_line(&mut overview, index, &line, u64::MAX, u64::MAX).unwrap();
+        }
+        let analysis = Analysis {
+            sample_records: u64::MAX,
+            lost_records: u64::MAX,
+            corrupt_records: u64::MAX,
+            omitted_errors: u64::MAX,
+            ..Analysis::default()
+        };
+        write_overview_summary(
+            &mut overview,
+            &analysis,
+            &Symbolizer::from_index(None),
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+        )
+        .unwrap();
+        finish(overview, "maximum overview").unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size > 1024 * 1024);
+        assert!(size <= super::MAX_OVERVIEW_BYTES);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn live_report_and_failure_metadata_share_one_fixed_allowance() {
         assert_eq!(MAX_REPORT_BYTES, 128 * 1024 * 1024);
+        assert_eq!(super::MAX_OVERVIEW_BYTES, 2 * 1024 * 1024);
         assert_eq!(MAX_REPORT_EXPANSION_BYTES, 128 * 1024 * 1024);
         let derived = MAX_REPORT_BYTES - MAX_CAPTURE_METADATA_BYTES;
         assert_eq!(derived + MAX_CAPTURE_METADATA_BYTES, MAX_REPORT_BYTES);
+        assert!(super::MAX_OVERVIEW_BYTES < derived);
         const { assert!(MAX_FAILURE_MARKER_BYTES < MAX_CAPTURE_METADATA_BYTES) };
         validate_identity_metadata("/td/store/profiler", "deployment").unwrap();
         assert!(validate_identity_metadata(&"\u{1}".repeat(200_000), "deployment").is_err());
@@ -1590,6 +2126,13 @@ mod tests {
         assert!(stacks.contains(
             "\"line_resolved\":false,\"source_file\":\"\",\"source_file_bytes\":\"\",\"source_line\":null"
         ));
+        let overview = std::fs::read_to_string(capture.join("regenerated/overview.jsonl")).unwrap();
+        assert!(overview.contains("\"kind\":\"process\",\"rank\":1,\"pid\":7"));
+        assert!(overview
+            .lines()
+            .last()
+            .unwrap()
+            .contains("\"kind\":\"capture\",\"samples\":1"));
         assert!(regenerate(&capture, None)
             .unwrap_err()
             .contains("already exists"));

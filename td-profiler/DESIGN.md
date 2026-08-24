@@ -377,6 +377,7 @@ directory. A completed capture contains:
 
 ```text
 manifest.json       schema, deployment, interval, rate, CPUs, loss, errors
+overview.jsonl      bounded first-look process, function, line, quality rows
 processes.jsonl     one process/image generation and its accounted samples
 hotspots.jsonl      sorted process/object/function aggregates
 lines.jsonl         sorted process/object/function/source-line aggregates
@@ -396,7 +397,7 @@ remains partial rather than exceeding the metadata allowance. If analysis or
 derived generation fails, it still publishes `samples.bin` with a bounded
 `report-error.txt` marker. The pending manifest and failure marker share a
 one-MiB metadata allowance, while all other original derived output shares the
-remaining 127 MiB. Such a capture intentionally need not contain the five
+remaining 127 MiB. Such a capture intentionally need not contain the six
 summary files or a complete derived manifest: its canonical incomplete
 manifest preserves the metadata needed by `td-profiler report`. Raw evidence
 is preferable to deleting the only record of the failure, and the report can
@@ -410,15 +411,38 @@ stack appear in manifest counters rather than as fabricated folded samples.
 
 JSON uses UTF-8, integer nanoseconds and counts, fixed field order, and one
 object per line where applicable. Summaries sort by descending sample count,
-then stable identity fields. A path or name has a human-readable string field
-only when its bytes are valid UTF-8 and always has a lowercase hexadecimal
-`*_bytes` field; consumers use the latter as identity. Invalid bytes are never
-placed in a JSON string or replaced. The binary stream has an explicit magic,
-endian marker, schema version, record lengths, and reserved fields that must be
-zero. Unknown raw-schema record kinds are skipped by length and reported;
-well-formed unmodeled kernel perf kinds use the known ignored-event record.
-Report schema 1 permits additive derived fields and files; the raw schema is
-separately versioned, and this increment does not change it.
+then stable identity fields. In the complete JSONL reports, a path or name has
+a human-readable string field only when its bytes are valid UTF-8 and always
+has a lowercase hexadecimal `*_bytes` field; consumers use the latter as
+identity. Invalid bytes are never placed in a JSON string or replaced. The
+binary stream has an explicit magic, endian marker, schema version, record
+lengths, and reserved fields that must be zero. Unknown raw-schema record
+kinds are skipped by length and reported; well-formed unmodeled kernel perf
+kinds use the known ignored-event record. Report schema 1 permits additive
+derived fields and files; the raw schema is separately versioned, and this
+increment does not change it.
+
+`overview.jsonl` is the bounded entry point for an authorized human or agent
+which should not have to ingest a report near the complete derived-output
+ceiling merely to decide where to look. It contains at most the first 32 rows
+from each already sorted process, function-hotspot, and source-line report,
+with a one-based rank and integer millionths of all captured samples. Each
+overview name `N` has a lowercase hexadecimal `N_bytes_prefix` of at most
+1,024 bytes, its exact `N_bytes_length`, and an `N_truncated` boolean. An
+untruncated valid UTF-8 value also has the JSON-escaped `N` field; the complete
+report's `N_bytes` remains the exact identity. The entire overview is
+independently capped at two MiB as well as charged to the complete report
+allowance. A regression renders the maximum current row roster with the
+maximum-expansion field contents, so adding fields cannot silently turn this
+convenience-file limit into complete report failure. A final capture row
+records the complete row counts, the per-kind display limit, loss, corruption
+and omitted-diagnostic counts, and sample-weighted complete, truncated,
+unresolved, line-resolved, and line-unresolved totals. Thus a reader can judge
+both prominence and attribution quality before opening the complete JSONL
+files. The overview is derived from the same in-memory aggregates while their
+canonical ordering is being written; it is not a second analysis or an
+independent source of truth. Its fixed 97-row ceiling is part of report schema
+1, and offline regeneration produces it under the same publication boundary.
 
 The version-one task body records a `u32` identity tag (`0` unknown, `1`
 `/proc` start ticks, `2` perf fork time), a zero `u32`, its `u64` value, the
@@ -436,6 +460,8 @@ so PID reuse and exec generations survive rotation without replaying history.
 - sample, task, mapping, context-switch, lost, corrupt, ignored-perf,
   omitted-diagnostic, unresolved-stack, line-resolved-sample, and
   line-unresolved-sample counts;
+- sample-weighted complete-stack, truncated-stack, and unresolved-stack
+  counts, whose sum is the captured sample count;
 - every collection error with its CPU and monotonic time range, and every
   symbolization error with explicit null CPU/time fields;
 - runtime/debug build identities and store paths used by the report.
