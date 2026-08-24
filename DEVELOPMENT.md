@@ -97,6 +97,46 @@ it from `git log`; an untracked plan file cannot be the handoff.
 Never use `git stash` in this repository. `refs/stash` is repository-global,
 not worktree-local.
 
+# Test binaries run under a memory ceiling
+
+`.cargo/config.toml` points cargo's `runner` at `td-builder run-capped`, so
+every cargo TEST binary runs under a per-process `RLIMIT_DATA` ceiling: 2 GiB
+for `td-builder`/`td-recipe`/`td-engine`, 1 GiB for every other crate. A test
+that allocates without bound now reds itself instead of driving the machine
+into swap.
+
+This means `cargo test`, `cargo run` and `cargo bench` need
+`target/release/td-builder` to exist. Build it first — the command AGENTS.md
+already documents:
+
+```text
+cargo build --release --manifest-path builder/Cargo.toml
+```
+
+`cargo build` never invokes a runner, so that bootstraps cleanly. A missing
+runner fails loudly, naming the path and `No such file or directory`.
+
+The runner caps only cargo test artifacts, identified by their `-C metadata`
+suffix. `cargo run` binaries have no such suffix and are exec'd unchanged,
+which is what keeps `td-builder check` and each gate's own larger allowance
+untouched.
+
+`TD_RUN_CAPPED_MIB=<mib>` raises or lowers the ceiling for one run. It cannot
+remove it: `0` is refused. If a crate genuinely needs more, raise its entry
+rather than teaching people to switch the ceiling off.
+
+Doctests do not reach the runner and run uncapped — cargo wires a runner into
+rustdoc only when cross-compiling.
+
+Which builder gets used matters, because cargo searches ancestor directories
+for `.cargo/config.toml` and worktrees live under the main checkout at
+`.claude/worktrees/*`. A worktree whose branch already carries this file uses
+its own copy and its own `target/release/td-builder`. A worktree branched
+BEFORE it — or any unrelated crate checked out under the td tree — finds the
+main checkout's config instead and execs the main checkout's builder, so a
+`cargo clean` there makes its tests fail with `No such file or directory`.
+Build the release binary in whichever checkout supplies the config.
+
 # Code review: three per commit
 
 Every increment is read by three independent reviewers before it lands. They

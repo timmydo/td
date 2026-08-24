@@ -539,11 +539,22 @@ mod tests {
         // aborted the xz real-tarball decode running on a sibling thread) and
         // restore the original soft limit afterwards.
         let (orig_soft, hard) = get_rlimit(RLIMIT_DATA).expect("getrlimit");
-        let target = if hard == RLIM_INFINITY {
+        let ceiling = if hard == RLIM_INFINITY {
             1u64 << 36 // 64 GiB — finite, but never binding for a test
         } else {
             hard.min(1u64 << 36)
         };
+        // Strictly BELOW the current soft limit, or the readback below stops
+        // discriminating: run-capped (builder/src/run_capped.rs) now sets soft
+        // AND hard to this crate's ceiling before exec, so `orig_soft == hard`
+        // and a `set_rlimit` stubbed to `Ok(())` would satisfy
+        // `soft_after == target` without issuing a syscall at all. One page
+        // below keeps the limit as non-binding as it was.
+        let target = ceiling.min(orig_soft.saturating_sub(4096));
+        assert!(
+            target < orig_soft,
+            "the target must sit below the inherited soft limit or a no-op passes"
+        );
         set_rlimit(RLIMIT_DATA, target, hard).expect("lowering the soft data limit must succeed");
         let (soft_after, hard_after) = get_rlimit(RLIMIT_DATA).expect("getrlimit");
         assert_eq!(soft_after, target, "soft data limit should be exactly the set value");
@@ -576,7 +587,18 @@ mod tests {
             assert_eq!(status & 0x7f, 0, "child should exit normally, not be signalled");
             (status >> 8) & 0xff
         };
-        assert_eq!(run(None), 0, "an uncapped child must be able to map {BIG} bytes");
+        // "Uncapped" means only that THIS test sets no cap; the child still
+        // inherits whatever the process has. run-capped
+        // (builder/src/run_capped.rs) now gives the test binary a finite
+        // ceiling, and `TD_RUN_CAPPED_MIB` can lower it further — below BIG,
+        // this half would red about a property it is not testing. Skip it
+        // there rather than report a misleading failure; the capped half below
+        // is the assertion that carries the claim.
+        let (ambient_soft, _) = get_rlimit(RLIMIT_DATA).expect("getrlimit");
+        let headroom = BIG as u64 + 64 * 1024 * 1024;
+        if ambient_soft >= headroom {
+            assert_eq!(run(None), 0, "an uncapped child must be able to map {BIG} bytes");
+        }
         assert_eq!(
             run(Some(32 * 1024 * 1024)),
             1,

@@ -1,0 +1,19 @@
+# Every cargo TEST binary runs under a per-process memory ceiling, so a runaway
+# reds its own test instead of taking the machine down (builder/src/run_capped.rs).
+#
+# Cargo resolves this relative path against THIS file, not the current
+# directory, so one config covers the workspace and every standalone crate,
+# from the repo root or from inside a crate. `cargo build` never invokes a
+# runner, so `cargo build --release --manifest-path builder/Cargo.toml` — the
+# documented first step — still bootstraps it.
+#
+# The runner execs anything that is not a test artifact unchanged, which is
+# what keeps `cargo run ... -- check` and every gate's own allowance uncapped.
+# Both triples td executes tests on. A runner is declared PER TARGET, so the
+# gnu entry alone would let `cargo test --target x86_64-unknown-linux-musl` —
+# the static control-plane target this repo builds with — run uncapped.
+[target.x86_64-unknown-linux-gnu]
+runner = ["target/release/td-builder", "run-capped"]
+
+[target.x86_64-unknown-linux-musl]
+runner = ["target/release/td-builder", "run-capped"]

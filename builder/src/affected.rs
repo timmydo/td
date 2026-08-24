@@ -751,6 +751,24 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // .cargo/config.toml declares the `runner` every cargo TEST binary is
+    // executed through (builder/src/run_capped.rs), so an edit changes the
+    // memory ceiling every test in the tree runs under, and a broken edit
+    // leaves them uncapped. The cargo-test preflight is the direct check: its
+    // attestation reds when the runner does not apply.
+    //
+    // recipe-rs too, and not for symmetry: the preflight's 36 commands are all
+    // host-gnu, while `recipe_rs` runs `cargo test --target
+    // x86_64-unknown-linux-musl --manifest-path recipes/Cargo.toml` from the
+    // repo root (gate_bodies.rs), so it is the only tier that exercises the
+    // MUSL runner entry. Without it a typo confined to that entry passes the
+    // preflight and dies in the full check.
+    if p == ".cargo/config.toml" {
+        sel.add_preflight("cargo-test");
+        sel.add_target("recipe-rs");
+        return;
+    }
+
     // seed/seed-digests.txt — the compiled seed-digest table (re #469),
     // include_str!-compiled into BOTH planners (td-recipe-eval's
     // seed_digests.rs and td-builder's auto_seed_provenance). The
@@ -2165,6 +2183,14 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // clippy leg that reads it.
     assert_preflight!("td-install/clippy.toml", "cargo-test");
     assert_target!("td-install/clippy.toml", "check");
+    // Same shape one level up: `.cargo/config.toml` is not configuration ABOUT
+    // the checks, it IS one — it names the runner that bounds every test
+    // binary's memory, so an edit runs the tier whose attestation proves the
+    // runner still applies.
+    assert_preflight!(".cargo/config.toml", "cargo-test");
+    // recipe-rs is the ONLY tier that runs a musl-target cargo test, so it is
+    // the only one that would catch a break confined to the musl runner entry.
+    assert_target!(".cargo/config.toml", "recipe-rs");
     // The installer's own specification is documentation, as td-svc's and
     // td-compositor's are: the docs arm runs BEFORE the crate arm, so a spec
     // edit does not drag the crate's checks in behind it.

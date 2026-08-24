@@ -42,6 +42,7 @@ mod mes_boot;
 mod nar;
 mod oci;
 mod ready;
+mod run_capped;
 mod sandbox;
 mod scan;
 mod spawn;
@@ -7780,6 +7781,11 @@ fn main() -> ExitCode {
         // map the branch diff to a right-sized check set + the waive/escalate
         // decision. Run from the repo root. See builder/src/affected.rs.
         Some("affected-checks") => affected::main(&args[2..]),
+        // run-capped <binary> [args...] — the cargo `runner` .cargo/config.toml
+        // points at, so every test binary runs under a memory ceiling and a
+        // runaway reds its test instead of taking the box down. Not user-facing:
+        // cargo constructs the invocation. See builder/src/run_capped.rs.
+        Some("run-capped") => run_capped::main(args.get(2..).unwrap_or(&[])),
         Some("check-host-serve") => check_host::serve_cli(args.get(2..).unwrap_or(&[])),
         Some("check-host-stop") if args.len() == 2 => check_host::stop_cli(),
         // Internal process-lifetime boundary. It is intentionally absent from
