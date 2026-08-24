@@ -621,6 +621,42 @@ mod tests {
         );
     }
 
+    /// `Hello`'s reply is queued BEFORE the name is published, and nothing
+    /// else in this suite says so.
+    ///
+    /// The ordering is load-bearing in the direction that has no observable
+    /// consequence here: publishing first would let another peer's message
+    /// reach a client before the reply that tells the client its own name,
+    /// which is what `say_hello`'s comment exists to prevent. A reviewer
+    /// swapped the two statements and all 241 tests stayed green, so the
+    /// contract lived only in a comment. It is a source-level ordering the
+    /// compiler cannot express, which is what this module is for.
+    ///
+    /// It also underwrites `Peer::arriving`'s barrier, whose whole argument
+    /// is that `publish` is the LAST thing `say_hello` does.
+    #[test]
+    fn a_name_is_published_after_its_hello_is_answered() {
+        let transport = without_line_comments(&without_block_comments(source("transport")));
+        let Some(from) = transport.find("fn say_hello(") else {
+            panic!("say_hello is gone");
+        };
+        let Some(span) = transport[from..].find("fn bus_method(") else {
+            panic!("say_hello no longer ends where this test slices it");
+        };
+        let body = transport.get(from..from + span).unwrap_or("");
+        let queued = body.find("self.queue_own(reply)");
+        let published = body.find(".publish(");
+        match (queued, published) {
+            (Some(queued), Some(published)) => assert!(
+                queued < published,
+                "the name is published before its Hello is answered"
+            ),
+            (queued, published) => {
+                panic!("say_hello no longer both answers and publishes: {queued:?} {published:?}")
+            }
+        }
+    }
+
     /// Comments out, so that commenting a check out is not a way to pass the
     /// test that pins it. Lifted from `td-jail/src/main.rs`, which arrived at
     /// it the same way; the two crates are separate dependency-free locks and

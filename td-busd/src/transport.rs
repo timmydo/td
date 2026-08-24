@@ -2441,9 +2441,14 @@ mod tests {
         lines: usize,
     }
 
+    /// The serial `arriving` spends on its barrier call. Far above anything a
+    /// test writes by hand, so a reply to it can never be mistaken for a reply
+    /// to the test's own first message.
+    const ARRIVAL_BARRIER: u32 = 0xa55e_d000;
+
     impl Peer {
-        /// Authenticate, BEGIN and say `Hello`, all in one write, and return
-        /// the unique name the bus handed out.
+        /// Authenticate, BEGIN, say `Hello`, and return the unique name the
+        /// bus handed out — once that name is actually reachable.
         fn arrive(stream: UnixStream) -> (Self, String) {
             Self::arriving(stream, false)
         }
@@ -2477,6 +2482,38 @@ mod tests {
                 .and_then(crate::wire::Value::as_str)
                 .expect("Hello answers with a name")
                 .to_string();
+            // `say_hello` queues this reply BEFORE `publish` makes the name
+            // routable, so a peer that has read its Hello can still be
+            // invisible to the peer about to look for it. Neither a sleep nor
+            // a poll: the broker serves one connection's messages in order and
+            // `publish` is the last thing `say_hello` does, so a call made
+            // here is necessarily handled after it. Asking for this
+            // connection's own owner both waits for that and asserts it.
+            peer.send(&name_query("GetNameOwner", &name, ARRIVAL_BARRIER));
+            let frame = peer.frame();
+            let (settled, _) =
+                message::decode(&frame, 0).expect("decode the arrival barrier");
+            // Type and sender as well as serial: a reply serial names nothing
+            // on its own, since any peer may route a method return carrying
+            // one.
+            assert_eq!(
+                (
+                    settled.kind,
+                    settled.fields.sender,
+                    settled.fields.reply_serial
+                ),
+                (
+                    message::MessageType::MethodReturn,
+                    Some(BUS_NAME),
+                    Some(ARRIVAL_BARRIER)
+                ),
+                "the arrival barrier was answered by another message"
+            );
+            assert_eq!(
+                settled.args().first().and_then(crate::wire::Value::as_str),
+                Some(name.as_str()),
+                "{name} was not on the bus when its own Hello came back"
+            );
             (peer, name)
         }
 
@@ -2538,6 +2575,13 @@ mod tests {
                     "read failed for the wrong reason: {error}"
                 ),
             }
+            // Put it back. The short wait belongs to this assertion and to
+            // nothing after it: a test that proves silence and then waits for
+            // a frame was waiting 200ms for it, which under load is a
+            // "read: timed out" in place of whatever the test meant to say.
+            self.stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                .expect("read timeout");
         }
 
         /// The connection is gone: the far end has hung up.
@@ -3711,6 +3755,22 @@ mod tests {
         let (bus, mut clients) = bus_of(1);
         let only = clients.pop().expect("one client");
         let (mut peer, _) = Peer::arrive(only);
+
+        // The four pushes below need the WHOLE budget, and this peer's
+        // arrival replies are still charged for it after the peer has read
+        // them: an in-flight frame's bytes come back only from the writer's
+        // `finished`, once the frame is written AND dropped, because the
+        // ceiling bounds live memory rather than queue depth. So the empty bus
+        // this test always assumed is waited for rather than presumed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while bus.queued_bytes() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "this peer's arrival is still charged {} bytes",
+                bus.queued_bytes()
+            );
+            std::thread::yield_now();
+        }
 
         // Four hoarders fill the whole budget between them. They are not real
         // connections — they do not need to be. What is being tested is what
