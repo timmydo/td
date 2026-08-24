@@ -3905,6 +3905,81 @@ td-txt-authored case files
     only in the upstream source. Adding cases to the corpus would have found
     none of the last five.
 
+  The GROUP SEPARATOR -- `--group-separator=SEP` and `--no-group-separator` --
+  is served. It is a small option and the entry is short for that reason, but
+  THREE of its rules are not guessable, and the record of where one of them
+  was nearly pinned is worth more than the rule itself.
+
+    The pair is not two spellings of one setting, which is what the names
+    suggest. `--group-separator=` prints an EMPTY line where the separator
+    would go; `--no-group-separator` prints NOTHING there. One output is a
+    newline longer than the other, and a reading that treats the second as
+    sugar for the first is wrong by exactly that byte. They share a `val` in
+    GNU and differ in arity -- Required against None -- which is also the one
+    place `SYNONYMS`' arity test could ever be the deciding half.
+
+    The separator is BYTES followed by a newline, not a LINE. A value that is
+    itself a newline produces TWO blank lines where the EMPTY value produces
+    one, so the two models differ by exactly the byte the value carries. Six
+    goldens pin it: a space, a tab and a newline each embedded in a longer
+    value, and each of the three alone.
+
+    Those six were nearly not goldens at all. This entry first claimed the
+    corpus could not express them -- `## argv:` being a whitespace split -- and
+    put them in ../tests/conformance.rs on that reasoning. The reasoning was
+    READ off a comment on the `-d` quoting test rather than measured, and it is
+    false: the tokenizer in ../src/lib.rs takes single quotes, double quotes,
+    `\n`, `\t`, `\r` and `\xHH`, so every one of those values has a spelling
+    here. Three probe cases settled it in one run, including one that puts a
+    newline in `-d`'s value, which is the exact thing that comment says no case
+    can do. The comment has been corrected. The lesson is the one this file
+    keeps recording in the other direction: an inherited claim about the
+    HARNESS is worth no more than an inherited claim about GNU, and checking
+    either one costs a single run.
+
+    Its terminator is a NEWLINE even under `-z`, where every record around it
+    ends in NUL. Measured against GNU, not assumed -- the assumption most
+    likely to be made here is the wrong one, since `-z` changes the terminator
+    of everything else on that stream.
+
+    The rest is unsurprising and was measured anyway: the same option divides
+    one FILE's output from the next as divides two context groups within a
+    file; `se` paints it under `--color`, custom text included -- the SAME
+    capability that paints the `:` and `-` prefixes, all three carrying
+    ESC[36m and all three moving together when `GREP_COLORS` repoints `se`,
+    which a golden pins rather than a comment asserting it; the LAST of the
+    pair wins; and with no context option there are no groups, so the option
+    is accepted and never fires. `-A0` still groups -- what makes a group is
+    the GAP between selected lines, not how many context lines print around
+    them.
+
+    Prefix resolution is the one place the two names could have collided and
+    does not. `--no-` separates them from the first byte, so no prefix of one
+    reaches the other, and the SHORTEST that resolves is `--g` for one and
+    `--no-g` for the other: `--g` because no other long name starts with g at
+    all, `--no-g` because `--no-` alone is ambiguous across four names and one
+    more byte settles it. An earlier draft of this entry named `--group` and
+    `--no-group` as the shortest -- two bytes too many in one case and four in
+    the other. Both were measured after the sentence was written rather than
+    before, which is the same order of operations that put the paragraph above
+    in the wrong file.
+
+    NO defect was found. That is the entry's least interesting sentence and its
+    most honest one: 13,728 exhaustive combinations of the option against
+    context, `-z`, `--color`, `-o`, `-v`, `-n`, `-m`, `--null`/`-b` and six
+    file sets, plus 4,000 randomised ones over a wider spread, differ from
+    GNU in zero cases of stdout and status. The colour entry above earned its
+    length by being wrong nine times; this one is short because the option is
+    small, and the sweeps are recorded here so that the absence of findings
+    reads as a measurement rather than as an absence of looking.
+
+    The one divergence is not new and is not this option's: `--group-separator`
+    with no argument, and `--no-group-separator` WITH one, produce GNU's
+    message verbatim and then td-txt's own one-line usage where GNU reprints
+    its option manual. That class is already pinned in divergence.test.txt, so
+    nothing was added for it -- checked rather than assumed, since the reflex
+    on landing an option is to pin its errors again.
+
   Goldens are C-locale. Under LC_ALL=C — the only locale td's image sets, and what
   every case here was captured under — GNU `grep -w '\.*'` selects `.a`; under a
   UTF-8 locale the same GNU binary selects nothing. Re-derive a `-w` golden without
@@ -3983,7 +4058,7 @@ Overlay
                          td-txt/target/release/td-txt td-txt/spec > td-txt/spec/expectations.txt
 
                      It is NOT empty: 22 xfail entries and no skips,
-                     against 2717 of a 2739-case corpus passing -- 99.20%.
+                     against 2739 of a 2761-case corpus passing -- 99.20%.
                      This line read "EMPTY today" long after it stopped being
                      true, which is why the count now sits beside the claim.
 

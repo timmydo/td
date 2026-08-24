@@ -8929,3 +8929,219 @@ ms=31
 ## stdout-json: "\u001b[33m\u001b[Kmatch\u001b[m\u001b[K\n\u001b[33m\u001b[Kmatch\u001b[m\u001b[K two\n\u001b[33m\u001b[Kmatch\u001b[m\u001b[K three\n"
 ## stderr-json: ""
 ## status: 0
+
+#### --group-separator replaces the -- between context groups
+# The default is `--'. This is the whole option: what goes on the line, not
+# whether there is one.
+## argv: grep --group-separator=XX -C1 match f
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## stdout-json: "x\nmatch A\ny\nXX\nw\nmatch B\nv\n"
+## stderr-json: ""
+## status: 0
+
+#### and --no-group-separator drops the LINE rather than emptying it
+# The pair that makes the distinction visible: `--group-separator=' below
+# prints an empty line where this prints none at all.
+## argv: grep --no-group-separator -C1 match f
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## stdout-json: "x\nmatch A\ny\nw\nmatch B\nv\n"
+## stderr-json: ""
+## status: 0
+
+#### an EMPTY --group-separator prints an empty line, which is not the same
+# Its own case because `--no-group-separator' and `--group-separator=' read
+# alike and differ by exactly one newline in the output.
+## argv: grep --group-separator= -C1 match f
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## stdout-json: "x\nmatch A\ny\n\nw\nmatch B\nv\n"
+## stderr-json: ""
+## status: 0
+
+#### the separator also divides one FILE's output from the next
+# Not only context groups within a file. The same option governs both, which
+# is why a two-file run is where the naming `group' is least obvious.
+## argv: grep --group-separator=XX -C1 match f g
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## file-json g: "x\nmatch C\ny\n"
+## stdout-json: "f-x\nf:match A\nf-y\nXX\nf-w\nf:match B\nf-v\nXX\ng-x\ng:match C\ng-y\n"
+## stderr-json: ""
+## status: 0
+
+#### and --no-group-separator drops that between-file line too
+## argv: grep --no-group-separator -C1 match f g
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## file-json g: "x\nmatch C\ny\n"
+## stdout-json: "f-x\nf:match A\nf-y\nf-w\nf:match B\nf-v\ng-x\ng:match C\ng-y\n"
+## stderr-json: ""
+## status: 0
+
+#### the LAST of the pair wins, as for every other option that contradicts
+## argv: grep --group-separator=XX --no-group-separator -C1 match f
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## stdout-json: "x\nmatch A\ny\nw\nmatch B\nv\n"
+## stderr-json: ""
+## status: 0
+
+#### and the other way round
+## argv: grep --no-group-separator --group-separator=XX -C1 match f
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## stdout-json: "x\nmatch A\ny\nXX\nw\nmatch B\nv\n"
+## stderr-json: ""
+## status: 0
+
+#### the separator is terminated by a NEWLINE even under -z
+# Every record around it ends in NUL and the separator still does not:
+# measured against GNU, which writes `XX' and a newline here.
+## argv: grep -z --group-separator=XX -C1 match z
+## file-json z: "a\u0000match D\u0000b\u0000c\u0000d\u0000e\u0000match E\u0000"
+## stdout-json: "a\u0000match D\u0000b\u0000XX\ne\u0000match E\u0000"
+## stderr-json: ""
+## status: 0
+
+#### without context there are no groups, so the separator never appears
+# `--group-separator' is accepted and unused, rather than refused, when
+# nothing would separate.
+## argv: grep --group-separator=XX match f
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## stdout-json: "match A\nmatch B\n"
+## stderr-json: ""
+## status: 0
+
+#### but -A0 still GROUPS, so it appears with zero context lines
+# What makes a group is the GAP between selected lines, not how many context
+# lines print around them.
+## argv: grep --group-separator=XX -A0 match f
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## stdout-json: "match A\nXX\nmatch B\n"
+## stderr-json: ""
+## status: 0
+
+#### under --color the separator is painted with se, whatever its text
+# `se' is the SAME capability that paints the `:' and `-' prefixes: two file
+# operands put the filename prefix on the line and -n adds the line-number
+# one, so this golden carries all THREE kinds -- 20 ESC[36m runs. Measured:
+# GREP_COLORS se=35 repaints every one of the 20, which is what makes them
+# one capability rather than three. (-H is a no-op here, two operands having
+# already turned filenames on, so it is not in the argv.)
+## argv: grep --color=always -n --group-separator=XX -C1 match f g
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## file-json g: "x\nmatch C\ny\n"
+## stdout-json: "\u001b[35m\u001b[Kf\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[K\u001b[32m\u001b[K1\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[Kx\n\u001b[35m\u001b[Kf\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[32m\u001b[K2\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K A\n\u001b[35m\u001b[Kf\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[K\u001b[32m\u001b[K3\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[Ky\n\u001b[36m\u001b[KXX\u001b[m\u001b[K\n\u001b[35m\u001b[Kf\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[K\u001b[32m\u001b[K5\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[Kw\n\u001b[35m\u001b[Kf\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[32m\u001b[K6\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K B\n\u001b[35m\u001b[Kf\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[K\u001b[32m\u001b[K7\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[Kv\n\u001b[36m\u001b[KXX\u001b[m\u001b[K\n\u001b[35m\u001b[Kg\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[K\u001b[32m\u001b[K1\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[Kx\n\u001b[35m\u001b[Kg\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[32m\u001b[K2\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K C\n\u001b[35m\u001b[Kg\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[K\u001b[32m\u001b[K3\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[Ky\n"
+## stderr-json: ""
+## status: 0
+
+#### and --no-group-separator emits no SEPARATOR escape, having no line
+# The same argv but for the option, so the two outputs diff to exactly the
+# separator's own painted run and nothing else.
+## argv: grep --color=always -n --no-group-separator -C1 match f g
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## file-json g: "x\nmatch C\ny\n"
+## stdout-json: "\u001b[35m\u001b[Kf\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[K\u001b[32m\u001b[K1\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[Kx\n\u001b[35m\u001b[Kf\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[32m\u001b[K2\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K A\n\u001b[35m\u001b[Kf\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[K\u001b[32m\u001b[K3\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[Ky\n\u001b[35m\u001b[Kf\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[K\u001b[32m\u001b[K5\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[Kw\n\u001b[35m\u001b[Kf\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[32m\u001b[K6\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K B\n\u001b[35m\u001b[Kf\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[K\u001b[32m\u001b[K7\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[Kv\n\u001b[35m\u001b[Kg\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[K\u001b[32m\u001b[K1\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[Kx\n\u001b[35m\u001b[Kg\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[32m\u001b[K2\u001b[m\u001b[K\u001b[36m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K C\n\u001b[35m\u001b[Kg\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[K\u001b[32m\u001b[K3\u001b[m\u001b[K\u001b[36m\u001b[K-\u001b[m\u001b[Ky\n"
+## stderr-json: ""
+## status: 0
+
+#### and se governs all three at once, which is what makes it ONE capability
+# The painted pair above measures that out of band, in a comment; this case
+# PINS it. Repointing se moves the separator, the filename delimiter and the
+# line-number delimiter together -- so an implementation that hardcoded the
+# separator's colour would pass every other case here and red this one.
+# Measured that way round too: it does.
+## argv: grep --color=always -n --group-separator=XX -C1 match f g
+## env GREP_COLORS: se=35
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## file-json g: "x\nmatch C\ny\n"
+## stdout-json: "\u001b[35m\u001b[Kf\u001b[m\u001b[K\u001b[35m\u001b[K-\u001b[m\u001b[K\u001b[32m\u001b[K1\u001b[m\u001b[K\u001b[35m\u001b[K-\u001b[m\u001b[Kx\n\u001b[35m\u001b[Kf\u001b[m\u001b[K\u001b[35m\u001b[K:\u001b[m\u001b[K\u001b[32m\u001b[K2\u001b[m\u001b[K\u001b[35m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K A\n\u001b[35m\u001b[Kf\u001b[m\u001b[K\u001b[35m\u001b[K-\u001b[m\u001b[K\u001b[32m\u001b[K3\u001b[m\u001b[K\u001b[35m\u001b[K-\u001b[m\u001b[Ky\n\u001b[35m\u001b[KXX\u001b[m\u001b[K\n\u001b[35m\u001b[Kf\u001b[m\u001b[K\u001b[35m\u001b[K-\u001b[m\u001b[K\u001b[32m\u001b[K5\u001b[m\u001b[K\u001b[35m\u001b[K-\u001b[m\u001b[Kw\n\u001b[35m\u001b[Kf\u001b[m\u001b[K\u001b[35m\u001b[K:\u001b[m\u001b[K\u001b[32m\u001b[K6\u001b[m\u001b[K\u001b[35m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K B\n\u001b[35m\u001b[Kf\u001b[m\u001b[K\u001b[35m\u001b[K-\u001b[m\u001b[K\u001b[32m\u001b[K7\u001b[m\u001b[K\u001b[35m\u001b[K-\u001b[m\u001b[Kv\n\u001b[35m\u001b[KXX\u001b[m\u001b[K\n\u001b[35m\u001b[Kg\u001b[m\u001b[K\u001b[35m\u001b[K-\u001b[m\u001b[K\u001b[32m\u001b[K1\u001b[m\u001b[K\u001b[35m\u001b[K-\u001b[m\u001b[Kx\n\u001b[35m\u001b[Kg\u001b[m\u001b[K\u001b[35m\u001b[K:\u001b[m\u001b[K\u001b[32m\u001b[K2\u001b[m\u001b[K\u001b[35m\u001b[K:\u001b[m\u001b[K\u001b[01;31m\u001b[Kmatch\u001b[m\u001b[K C\n\u001b[35m\u001b[Kg\u001b[m\u001b[K\u001b[35m\u001b[K-\u001b[m\u001b[K\u001b[32m\u001b[K3\u001b[m\u001b[K\u001b[35m\u001b[K-\u001b[m\u001b[Ky\n"
+## stderr-json: ""
+## status: 0
+
+#### --group-separator takes a REQUIRED argument, so it eats the next argv
+# `-C1' becomes the separator STRING here, which leaves no context option and
+# so no groups at all -- the two matches print bare. Declared `Arg::Optional'
+# this would take no argument and `-C1' would still be an option.
+## argv: grep --group-separator -C1 match f
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## stdout-json: "match A\nmatch B\n"
+## stderr-json: ""
+## status: 0
+
+#### --group-sep resolves, no other long name starting --group-s existing
+# A prefix, not the name. The pair does not collide: `--no-' separates them
+# from the first byte, so no prefix of one can reach the other.
+## argv: grep --group-sep=XX -C1 match f
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## stdout-json: "x\nmatch A\ny\nXX\nw\nmatch B\nv\n"
+## stderr-json: ""
+## status: 0
+
+#### and --no-group-sep resolves to the OTHER one for the same reason
+## argv: grep --no-group-sep -C1 match f
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## stdout-json: "x\nmatch A\ny\nw\nmatch B\nv\n"
+## stderr-json: ""
+## status: 0
+
+#### the SHORTEST resolving prefix is --g, nothing else starting with g
+# Required arity, so `-C1' becomes the separator string and no context option
+# survives -- the same swallow the full spelling makes.
+## argv: grep --g -C1 match f
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## stdout-json: "match A\nmatch B\n"
+## stderr-json: ""
+## status: 0
+
+#### and --no-g for the other, --no-i/--no-f/--no-m being the rivals
+# `--no-' alone is ambiguous across four names; one more byte settles it.
+## argv: grep --no-g -C1 match f
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## stdout-json: "x\nmatch A\ny\nw\nmatch B\nv\n"
+## stderr-json: ""
+## status: 0
+
+#### a separator value carrying a SPACE, which argv quoting can express
+# `## argv:' is not a bare whitespace split: single quotes are literal, double
+# quotes take \n \t \r \xHH, and a bare \ escapes one byte. The values below are
+# the ones that distinguish "write these bytes, then end the line" from "write
+# this line", and they belong here rather than in a Rust test.
+## argv: grep --group-separator="a b" -C1 match f
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## stdout-json: "x\nmatch A\ny\na b\nw\nmatch B\nv\n"
+## stderr-json: ""
+## status: 0
+
+#### and a TAB, which the same quoting reaches through \t
+## argv: grep --group-separator="a\tb" -C1 match f
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## stdout-json: "x\nmatch A\ny\na\tb\nw\nmatch B\nv\n"
+## stderr-json: ""
+## status: 0
+
+#### and a NEWLINE, which makes the separator TWO lines rather than one
+# The sharpest of the six: a line-shaped model cannot produce this at all.
+## argv: grep --group-separator="a\nb" -C1 match f
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## stdout-json: "x\nmatch A\ny\na\nb\nw\nmatch B\nv\n"
+## stderr-json: ""
+## status: 0
+
+#### a separator that is ONE space is a line holding one space, not a blank one
+## argv: grep --group-separator=" " -C1 match f
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## stdout-json: "x\nmatch A\ny\n \nw\nmatch B\nv\n"
+## stderr-json: ""
+## status: 0
+
+#### and a separator that is ONE newline prints TWO blank lines
+# Its own byte plus the newline that ends it. `--group-separator=' above prints
+# ONE blank line, so these two differ by exactly the byte the value carries.
+## argv: grep --group-separator="\n" -C1 match f
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## stdout-json: "x\nmatch A\ny\n\n\nw\nmatch B\nv\n"
+## stderr-json: ""
+## status: 0
+
+#### and one that is a TAB is a line holding a tab
+## argv: grep --group-separator="\t" -C1 match f
+## file-json f: "x\nmatch A\ny\nz\nw\nmatch B\nv\n"
+## stdout-json: "x\nmatch A\ny\n\t\nw\nmatch B\nv\n"
+## stderr-json: ""
+## status: 0

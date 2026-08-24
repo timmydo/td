@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 2739;
+const CORPUS_FLOOR: usize = 2761;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -2093,9 +2093,14 @@ fn directory_actions_answer_from_the_descriptor_and_leave_r_sticky()
 }
 
 /// `-d`'s bad-argument diagnostic ESCAPES what it quotes, which is the half of
-/// GNU's `quote()` a corpus case cannot ask for: `## argv:` splits on
-/// whitespace, so no case can put a newline — the byte the escape exists for —
-/// into an option's value.
+/// GNU's `quote()` worth pinning. This test once said a corpus case could not
+/// ask for it, `## argv:` being a whitespace split. That is FALSE and was
+/// measured false: the tokenizer takes single quotes, double quotes, `\n`,
+/// `\t`, `\r` and `\xHH`, so every value below has a spelling there. What
+/// survives as a reason to stay here is weaker than the old one and worth
+/// stating honestly: this is a five-value LOOP over one rule. Five goldens with
+/// exact `stderr-json` would say the same thing, the line-count assertion
+/// included, so what this buys is compactness rather than reach.
 ///
 /// Measured against GNU grep 3.11 under `LC_ALL=C`, the locale every golden here
 /// was derived under and the only one td's image sets. A UTF-8 locale would pick

@@ -557,6 +557,11 @@ struct Conf {
     text: bool,
     /// `--include`/`--exclude`/`--exclude-from`/`--exclude-dir`.
     selection: Selection,
+    /// What separates one context GROUP from the next, and one FILE's output
+    /// from the next file's. `None` is `--no-group-separator`, which drops the
+    /// line rather than printing an empty one -- `--group-separator=` does that
+    /// and is `Some(b"")`.
+    group_separator: Option<Vec<u8>>,
     /// `--color`'s WHEN as GIVEN, resolved into `colors` once the scan is over
     /// -- the same shape as `after`/`before`/`both`, which are also kept as
     /// asked for and settled afterwards.
@@ -594,6 +599,7 @@ impl Default for Conf {
             null_data: false,
             text: false,
             selection: Selection::default(),
+            group_separator: Some(b"--".to_vec()),
             color_when: None,
             colors: None,
         }
@@ -2105,10 +2111,6 @@ fn parse_long(
             let v = need(value)?;
             conf.text = binary_files_arg(&v).ok_or(LongErr::Handled)?;
         }
-        // Tabled to be refused rather than served — why each is in the table
-        // at all differs and is the module doc's. The usage block goes with it
-        // because this is an OPTION error, where the value errors above are
-        // GNU's `die()` and print none.
         b"color" | b"colour" => {
             // An OPTIONAL argument, so `value` is the `=VALUE` form or nothing;
             // a bare `--color` is `auto`. An unrecognised WHEN is not an option
@@ -2122,11 +2124,17 @@ fn parse_long(
                 },
             }
         }
+        b"group-separator" => {
+            conf.group_separator = Some(need(value)?);
+        }
+        b"no-group-separator" => conf.group_separator = None,
+        // Tabled to be refused rather than served — why each is in the table
+        // at all differs and is the module doc's. The usage block goes with it
+        // because this is an OPTION error, where the value errors above are
+        // GNU's `die()` and print none.
         b"binary"
         | b"initial-tab"
         | b"perl-regexp"
-        | b"group-separator"
-        | b"no-group-separator"
         | b"no-ignore-case"
         | b"label"
         | b"line-buffered" => {
@@ -2839,12 +2847,17 @@ fn search_file(
                         upto => first_ctx > upto.saturating_add(1),
                     };
                     if gap {
-                        match grep.conf.colors.as_ref() {
-                            Some(c) => {
-                                io(c.wrap(out, &c.se, b"--"))?;
-                                io(out.write(b"\n"))?;
+                        // The separator's own terminator is a NEWLINE even
+                        // under `-z`, where every record around it ends in NUL.
+                        // Measured, not assumed: GNU writes `--\n` there too.
+                        // NOT `sep`: that name is the RECORD terminator in
+                        // this scope, and the contrast is the whole point.
+                        if let Some(group_sep) = grep.conf.group_separator.as_deref() {
+                            match grep.conf.colors.as_ref() {
+                                Some(c) => io(c.wrap(out, &c.se, group_sep))?,
+                                None => io(out.write(group_sep))?,
                             }
-                            None => io(out.write(b"--\n"))?,
+                            io(out.write(b"\n"))?;
                         }
                     }
                     *printed_before = true;

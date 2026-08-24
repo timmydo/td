@@ -272,33 +272,6 @@ a
 ## status: 2
 ## stderr-json: "grep: unsupported option '--no-ignore-case'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
 
-#### and --group-separator, which sets the string printed between -A/-B runs
-## argv: grep --group-separator=XX -A1 a f1
-## file f1:
-a
-## END
-## stdout-json: ""
-## status: 2
-## stderr-json: "grep: unsupported option '--group-separator'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
-
-#### and --no-group-separator, which is that option's OTHER name in GNU
-# Same `val' as `--group-separator' and so the fourth entry in the `SYNONYMS'
-# roster, but the arities differ -- one takes a string, the other takes
-# nothing -- so glibc would NOT collapse them. That difference is untestable
-# and stays so: collapsing needs a prefix matching both names with one of them
-# matched first, and the only string prefixing `group-separator' and
-# `no-group-separator' is the empty one, whose first match is
-# `--basic-regexp'. The roster names the pair for the same reason it names
-# `quiet'/`silent': what makes two names one option is the option, not the
-# letters.
-## argv: grep --no-group-separator -A1 a f1
-## file f1:
-a
-## END
-## stdout-json: ""
-## status: 2
-## stderr-json: "grep: unsupported option '--no-group-separator'\nusage: grep [-abEFGHhicLlnoqRrsVvwxyzZ] [-NUM] [-d ACTION] [-D ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
-
 #### grep refuses -P rather than pretending to have PCRE
 # GNU grep's -P switches to a whole second regex engine (PCRE). td-txt carries
 # one POSIX engine; accepting -P and quietly running POSIX semantics would
