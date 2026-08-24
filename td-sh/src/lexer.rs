@@ -677,6 +677,12 @@ pub fn tokenize_prefix(src: &str, line: u32) -> Lexed {
     }
 }
 
+/// Consecutive tokens that may consume no input before `pull` calls the
+/// tokenizer stuck. One is legitimate -- the newline a banked here-document
+/// owes -- and one is the measured maximum; the rest is headroom. Unbounded,
+/// the run appends to the token vector until the allocator gives out.
+const STALLS_ALLOWED: u32 = 4;
+
 /// What one `pull` produced. `incomplete` means the scan stopped because the
 /// input ran out INSIDE a construct and more of it could finish the job -- the
 /// scanner has been rewound to the last token boundary, so feeding more text and
@@ -796,6 +802,7 @@ impl Scan {
     /// Every token available from the input fed so far.
     pub fn pull(&mut self) -> Chunk {
         let mut toks = Vec::new();
+        let mut stalls = 0u32;
         loop {
             // Taken BEFORE each attempt, because a `next_tok` that fails part way
             // can already have consumed input, armed `awaiting`, or pushed a body.
@@ -811,6 +818,18 @@ impl Scan {
                 }
                 Ok(tok) => {
                     let last = matches!(tok, Tok::Eof);
+                    if last || self.lx.sc.pos > mark.pos {
+                        stalls = 0;
+                    } else {
+                        stalls = stalls.saturating_add(1);
+                        if stalls > STALLS_ALLOWED {
+                            return Chunk {
+                                toks,
+                                incomplete: false,
+                                error: Some("internal error: lexer made no progress".into()),
+                            };
+                        }
+                    }
                     // The line the scanner is on once the token has been
                     // READ, which is dash's: `savelinno` is taken at the top of
                     // `simplecmd` (parser.c:524) with the first token already
@@ -3007,6 +3026,31 @@ mod tests {
             .collect();
         assert_eq!(ops, vec![Op::AndIf]);
         Ok(())
+    }
+
+    /// The one token that legitimately consumes nothing: an unterminated
+    /// here-document banks its body against the end of the input, and the
+    /// newline it owes is returned with the scanner already there. Reachable
+    /// only from a source that pulls twice, which is why it is spelled out
+    /// here rather than left to the corpus.
+    #[test]
+    fn an_unterminated_here_document_owes_a_newline_that_consumes_nothing() {
+        let mut scan = Scan::new("cat <<EOF\nunterminated\n");
+        // The unsealed pull BANKS the body line and returns without rewinding,
+        // which is what leaves the newline owed at the end of the input.
+        let first = scan.pull();
+        assert!(first.incomplete, "the delimiter has not arrived");
+        scan.seal();
+        let chunk = scan.pull();
+        assert!(chunk.error.is_none(), "{:?}", chunk.error);
+        let bodies = scan.take_heredocs();
+        let body = bodies.first().and_then(Word::delimiter);
+        assert_eq!(body.as_ref().map(|(t, _)| t.as_str()), Some("unterminated\n"));
+        // The owed newline is EMITTED, not swallowed. Without this a regression
+        // that returned `Eof` straight away would bank the same body, raise no
+        // error, and still pass -- while no longer reaching the stall at all.
+        let shape: String = chunk.toks.iter().map(|p| format!("{:?} ", p.tok)).collect();
+        assert_eq!(shape.trim(), "Newline Eof");
     }
 
     #[test]
