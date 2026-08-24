@@ -192,7 +192,41 @@ fn connect_within(socket: &Path, budget: Duration) -> io::Result<UnixStream> {
     }
 }
 
-/// `work`'s result, or `None` if it did not finish in `budget`.
+/// `work`'s result, or `None` if it did not finish in `budget` -- and, in
+/// phase two, its result however long it takes, because there no deadline is
+/// possible. See "In phase two there is NO helper" below.
+///
+/// # What is NOT bounded, stated plainly
+///
+/// A phase-two `connect` against a listener that binds the bus path, fills
+/// its backlog and never accepts blocks for ever. Nothing stops it. Three
+/// reviewers checked the supervisor that a draft of this claimed as a
+/// backstop and it is not one: `td-svc` marks a unit whose `ready=` never
+/// succeeds as FAILED, which settles ordering so dependents proceed, and it
+/// neither signals the process nor schedules a retry -- so `restart=always`
+/// has nothing to restart, exactly as `work_that_overruns_its_budget_is_\
+/// given_up_on` below already said. A compositor launch has no readiness
+/// deadline at all and would hold one of its sixteen slots.
+///
+/// That is a real cost of this fix and it is not a regression: phase two
+/// arrived with the registration protocol and its deadline has never once
+/// worked, because the helper it needs cannot exist after the unshare. Every
+/// phase-two connect that has ever run either aborted the launcher or, now,
+/// runs inline. What the fix trades is a certain abort on EVERY launch for a
+/// wedge on a launch whose broker stops accepting between the phases --
+/// having accepted phase one moments earlier under a deadline that does work.
+///
+/// Closing it needs one of two things this commit deliberately does not do.
+/// A bounded connect needs a non-blocking socket, which needs `socket(2)` and
+/// `connect(2)` -- or `fcntl(2)` -- added to `UNSAFE.md` §9's twelve. Or the
+/// connection is opened before the unshare, where a helper is possible, and
+/// held; but §H requires the broker connection to be CLOSED before stage 2 is
+/// spawned rather than merely marked `CLOEXEC`, precisely so the channel that
+/// completes registrations cannot reach the confined side even if process
+/// creation fails, and phase two cannot open before the spawn it needs the
+/// pid of. Splitting `CLONE_NEWPID` out of the unshare so the connect happens
+/// before it runs into the same §H rule. A liveness residual does not buy a
+/// weakening of that.
 ///
 /// Split out from the connect so the deadline can be tested on its own. The
 /// alternative was a test that fills a listener's backlog to make a real
@@ -219,14 +253,85 @@ fn connect_within(socket: &Path, budget: Duration) -> io::Result<UnixStream> {
 /// — so it is left running and the process exits out from under it, which is
 /// what should happen to a launch that has already failed. Nothing unshares
 /// after that: the error propagates out of `launch_application`.
+///
+/// # In phase two there is NO helper, because the kernel refuses one
+///
+/// The paragraph above is about a helper outliving its call and breaking a
+/// later `unshare`. This is the other direction, and it is worse: after
+/// `unshare(CLONE_NEWPID)` the kernel refuses `CLONE_THREAD` outright, because
+/// `copy_process` requires `pid_ns_for_children` to equal the caller's active
+/// pid namespace and `unshare` has just made them differ. `launch_application`
+/// unshares before phase two, so `bus::complete` reached a
+/// `std::thread::spawn` that could not succeed — and `spawn` PANICS rather
+/// than returning an error, so every real launch died there. Measured:
+/// `unshare(NEWUSER|NEWNS)` leaves threads working, adding `NEWPID` gives
+/// `EINVAL`, and the panic message is `failed to spawn thread`.
+///
+/// So the deadline gives way rather than the launch: where the kernel refuses
+/// a helper the work runs INLINE.
+///
+/// # The refusal is DISCOVERED, not predicted
+///
+/// A draft asked first — made a throwaway thread, joined it, and used the
+/// answer. Three reviewers took that apart and they were right. It is a
+/// TOCTOU around a call that still panicked: the probe releases its slot and
+/// the real spawn asks for it again, so a concurrent process taking the last
+/// one under `RLIMIT_NPROC` or the pids cgroup puts this straight back into
+/// the abort. It answers `false` for a transient `EAGAIN` that has nothing to
+/// do with pid namespaces, silently dropping the deadline in an ordinary
+/// process. It costs a thread per launch on the path that does not need one.
+/// And its answer was cacheable without any test noticing — a reviewer wrote
+/// the `OnceLock` version, which is the original defect byte for byte, and all
+/// 103 tests passed.
+///
+/// `Builder::spawn` answers exactly: it returns an error where
+/// `std::thread::spawn` panics. The only difficulty is that it consumes the
+/// closure, so a refusal would take the work with it. Parking the work in a
+/// slot both sides can reach solves that — the helper takes it if it ever
+/// runs, and this side takes it back if the helper never existed. There is no
+/// window between the question and the act, because they are the same act.
 fn within<T: Send + 'static>(
     budget: Duration,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
+    within_spawning(budget, true, work)
+}
+
+/// `within`, with the spawn suppressible.
+///
+/// `may_spawn` is `true` everywhere in the shipped path; `false` exists so a
+/// test can reach the inline arm, which is otherwise reachable only inside a
+/// process that has unshared a pid namespace — and a test harness cannot
+/// become one, since libtest runs tests on a spawned thread even at
+/// `--test-threads=1` and `unshare(CLONE_NEWUSER)` refuses a multithreaded
+/// process. Suppressing the spawn is the only way to red the arm.
+fn within_spawning<T: Send + 'static>(
+    budget: Duration,
+    may_spawn: bool,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
     let (done, waiting) = std::sync::mpsc::channel();
-    let helper = std::thread::spawn(move || {
-        let _ = done.send(work());
-    });
+    // Parked where BOTH sides can reach it: a refused helper leaves it here.
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(work)));
+    let theirs = std::sync::Arc::clone(&slot);
+    let spawned = match may_spawn {
+        true => std::thread::Builder::new().spawn(move || {
+            let taken = theirs.lock().ok().and_then(|mut held| held.take());
+            if let Some(work) = taken {
+                let _ = done.send(work());
+            }
+        }),
+        false => Err(io::Error::other("the spawn is suppressed for a test")),
+    };
+    let helper = match spawned {
+        Ok(helper) => helper,
+        // No helper, so no deadline. Running the work here is what keeps the
+        // launch alive; what it costs is recorded above `connect_within`.
+        Err(_) => {
+            let taken = slot.lock().ok().and_then(|mut held| held.take());
+            return taken.map(|work| work());
+        }
+    };
     let answer = waiting.recv_timeout(budget).ok();
     if answer.is_some() {
         let _ = helper.join();
@@ -1398,6 +1503,99 @@ mod tests {
             shipped.matches("self.stream.write_all(").count(),
             0,
             "a write bypasses the deadline adapter"
+        );
+    }
+
+    /// The work still happens when no helper thread can be had.
+    ///
+    /// This is phase two's whole path. After `unshare(CLONE_NEWPID)` the
+    /// kernel refuses `CLONE_THREAD`, `std::thread::spawn` panics rather than
+    /// returning, and `bus::complete` died there on every real launch. The
+    /// deadline is what gives way; the launch is not.
+    #[test]
+    fn work_that_cannot_be_given_a_helper_still_runs() {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&ran);
+        let answer = within_spawning(Duration::from_millis(200), false, move || {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            "inline"
+        });
+        assert_eq!(answer, Some("inline"), "the work was dropped with the helper");
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+
+        // And work that takes LONGER than the budget still completes, because
+        // there is nothing to time it out with. Stated as a test rather than a
+        // comment, since it is the cost of the fix.
+        let slow = within_spawning(Duration::from_millis(1), false, || {
+            std::thread::sleep(Duration::from_millis(20));
+            "unbounded"
+        });
+        assert_eq!(slow, Some("unbounded"));
+    }
+
+    /// And the deadline still applies where a helper CAN be had, which is the
+    /// other half: without this a fix that suppressed the helper everywhere
+    /// would pass.
+    #[test]
+    fn the_deadline_still_applies_where_a_helper_is_available() {
+        assert_eq!(
+            within(Duration::from_millis(50), || {
+                std::thread::sleep(Duration::from_millis(400));
+                "late"
+            }),
+            None,
+            "the deadline stopped applying on the shipped path"
+        );
+        // The same call the shipped path makes, spelled out, so that the
+        // parameter cannot be flipped without this reddening too.
+        assert_eq!(
+            within_spawning(Duration::from_millis(50), true, || {
+                std::thread::sleep(Duration::from_millis(400));
+                "late"
+            }),
+            None
+        );
+    }
+
+    /// The spawn must be the one that can REFUSE, and the work must survive
+    /// the refusal.
+    ///
+    /// `std::thread::spawn` panics where `Builder::spawn` returns an error, so
+    /// the shipped path may not contain the former at all. And a draft asked a
+    /// throwaway probe thread first, which three reviewers took apart: a
+    /// TOCTOU around a call that still panicked, wrong for a transient
+    /// `EAGAIN`, and cacheable without any test noticing. Nothing here may
+    /// bring that shape back, so the probe's name may not reappear either.
+    #[test]
+    fn the_helper_is_attempted_rather_than_predicted() {
+        let shipped = BUS_SOURCE
+            .split_once("#[cfg(test)]")
+            .unwrap_or((BUS_SOURCE, ""))
+            .0;
+        assert!(
+            shipped.contains("std::thread::Builder::new().spawn(move ||"),
+            "the helper is no longer made by the spawn that can refuse"
+        );
+        assert_eq!(
+            shipped.matches("std::thread::spawn(").count(),
+            0,
+            "thread::spawn panics rather than refusing, and phase two cannot \
+             afford a panic"
+        );
+        assert!(
+            shipped.contains("within_spawning(budget, true, work)"),
+            "`within` no longer attempts a helper on the shipped path"
+        );
+        // The work is parked where the refusal can hand it back, rather than
+        // moved into a closure that a refusal drops.
+        assert!(
+            shipped.contains("let taken = slot.lock().ok().and_then(|mut held| held.take());"),
+            "a refused helper no longer returns the work to this side"
+        );
+        assert_eq!(
+            shipped.matches("a_helper_thread_is_possible").count(),
+            0,
+            "the probe that predicted the refusal is back"
         );
     }
 

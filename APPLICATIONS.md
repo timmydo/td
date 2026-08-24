@@ -3695,7 +3695,63 @@ open a fresh connection at all. Two reviewers caught it; it is corrected
 here rather than quietly dropped, because the false version made an
 ordering look load-bearing for a reason it is not.
 
-Phase two after the proof write is the one that is genuinely a race, and
+**Phase two could not run at all between bf868804 and the commit that
+fixes it.** The facts above -- that stage 1 keeps its pid, its uid and
+its old root across the `unshare`, so it may open a fresh connection for
+phase two -- are all true, and one more fact makes them insufficient:
+after `unshare(CLONE_NEWPID)` the kernel refuses `CLONE_THREAD`
+outright, because `copy_process` requires `pid_ns_for_children` to equal
+the caller's active pid namespace and the `unshare` has just made them
+differ. td-jail's connect deadline is a helper thread,
+`std::thread::spawn` PANICS rather than returning an error when the
+kernel refuses, and so every real launch aborted at `Complete` with
+`failed to spawn thread`.
+
+Measured rather than inferred, in both directions:
+`unshare(NEWUSER|NEWNS)` leaves threads working and adding `NEWPID`
+gives `EINVAL`; and a single-threaded binary that registers, unshares
+for real, spawns a stage 2 and completes against a live broker aborts
+before the fix and answers `OK` after it.
+
+Why the host tests missed it is worth recording, because it applies to
+anything else guarded this way: libtest runs each test on a spawned
+thread even at `--test-threads=1`, so a cargo test process is already
+multithreaded and `unshare(CLONE_NEWUSER)` refuses it with `EINVAL`. The
+whole namespace transition is therefore unreachable from an in-process
+test; only the real launcher, or a purpose-built single-threaded binary,
+gets there. The confinement tests assert the ORDER of the calls in
+`launch_application`, which was correct throughout, and the bus interop
+test talks to a real broker without ever unsharing. The QEMU boot gate
+would have caught it and is not reachable in this environment, so it has
+not been rerun; the fix's evidence is the standalone reproduction rather
+than a boot.
+
+The deadline is what gives way. `within` attempts the helper with
+`Builder::spawn`, which returns an error where `thread::spawn` panics,
+and runs the work inline when the kernel refuses -- with the work parked
+in a slot so a refusal hands it back rather than dropping it. A draft
+PREDICTED the refusal with a throwaway probe thread instead; three
+reviewers took that apart, and the version that discovers it has no
+window between the question and the act.
+
+**Nothing bounds a phase-two connect, and this document said otherwise
+for one commit.** A draft claimed the jail unit's readiness deadline as
+a backstop. It is not one: td-svc marks a unit whose `ready=` never
+succeeds as failed, which settles ordering so dependents proceed, and
+neither signals the process nor schedules a retry -- so `restart=always`
+has nothing to restart -- while a compositor launch has no readiness
+deadline at all. A stage 1 blocked in `connect` therefore stays, with
+its stage 2 alive and blocked reading the proof pipe.
+
+It is a cost of the fix rather than a regression: phase two's deadline
+has never once worked, because the helper it needs cannot exist after
+the unshare, so every phase-two connect that has ever run either aborted
+the launcher or now runs inline. Closing it needs `socket(2)` and
+`connect(2)` -- or `fcntl(2)` -- on `UNSAFE.md` §9's twelve, or a
+connection opened before the unshare and held across the spawn, which §H
+forbids for the reason §H gives: the channel that completes
+registrations must be absent before stage 2 exists, not merely
+close-on-exec. A liveness residual does not buy a weakening of that.Phase two after the proof write is the one that is genuinely a race, and
 one that passes every test on an unloaded machine. The test asserts the
 positions of `bus::register`, `sys::unshare_namespaces`,
 `close_inherited_descriptors`, `command.spawn` and
