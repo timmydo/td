@@ -12,6 +12,7 @@ binutils-mesboot-source 455cqqkkwpx94h5km91l46wldq80dgyl-binutils-mesboot-source
 bison-mesboot-source 091gccsyc4qcsnk4r6p99mqkk259f3ar-bison-mesboot-source
 btrfs-progs-x86-64-source vzy2jr0gnwlzczsxpsy80mr0k26v2jjv-btrfs-progs-x86-64-source
 busybox-x86-64-source 3lfjnlqhk05h0hbqd3ks4jbh4pvw7c01-busybox-x86-64-source
+ca-certificates-source 1nh4w1q566ga153y3h427ai268h934nx-ca-certificates-source
 cmake-x86-64-source arcs0qgnqjhfljjd69mpgnjnanpcrlid-cmake-x86-64-source
 coreutils-mesboot0-source 7dkw301jma5vnzc6x5i09nmh2dn7ak0q-coreutils-mesboot0-source
 diffutils-mesboot0-source ilin34x3xf4shlhs892wchsc0vjyqwb8-diffutils-mesboot0-source

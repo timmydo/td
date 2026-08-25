@@ -345,6 +345,7 @@ mod tests {
             "flex-x86-64-test",
             "elfutils-x86-64-test",
             "btrfs-progs-x86-64-test",
+            "ca-certificates-test",
             "td-boot-test",
             "td-install-test",
             "hello-test",
@@ -380,6 +381,7 @@ mod tests {
             ("flex-x86-64-test", 1),
             ("elfutils-x86-64-test", 1),
             ("btrfs-progs-x86-64-test", 1),
+            ("ca-certificates-test", 1),
             ("td-boot-test", 1),
             ("td-install-test", 1),
             ("hello-test", 1),
@@ -420,9 +422,11 @@ mod tests {
         // three-component Rust 1.95.0 stage0 snapshot + coreutils-0.9.0 (the
         // uutils, ripgrep, and fd userland `.crate` sources) + btrfs-progs 7.0
         // and util-linux 2.42.2 (the persistent-volume writer and its minimal
-        // libraries) + the ripgrep 15.2.0 static application seed.
-        assert_eq!(pins.len(), 57);
+        // libraries) + the ripgrep 15.2.0 static application seed + curl's
+        // dated Mozilla CA extract.
+        assert_eq!(pins.len(), 58);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
+        assert!(pins.iter().any(|pin| pin.key == "ca-certificates-source"));
         assert!(pins.iter().any(|pin| pin.key == "cmake-x86-64-source"));
         assert!(pins.iter().any(|pin| pin.key == "rust-source"));
         assert!(pins.iter().any(|pin| pin.key == "rust-stage0-rustc-source"));

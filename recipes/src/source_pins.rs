@@ -69,6 +69,16 @@ const PINS: &[PinDef] = &[
         file: "busybox-1.37.0.tar.bz2",
     },
     PinDef {
+        key: "ca-certificates-source",
+        aliases: &[],
+        // Mozilla's trust store as rendered in PEM form by curl. Pin the dated
+        // extract rather than curl's moving cacert.pem URL so a reviewed update
+        // changes both the source name and its published adjacent SHA-256.
+        url: "https://curl.se/ca/cacert-2026-08-13.pem",
+        sha256: "f66dff1bdf8f96060b8177976f8b7d9254bc89bc4db933d769f7384d28480bc9",
+        file: "cacert-2026-08-13.pem",
+    },
+    PinDef {
         key: "cmake-x86-64-source",
         aliases: &[],
         // CMake is the one explicitly approved new build-only dependency for the
@@ -617,8 +627,9 @@ mod tests {
         // `.crate` sources) +
         // btrfs-progs 7.0 and util-linux 2.42.2 (the persistent-volume writer
         // and its minimal libuuid/libblkid build closure) + the first reviewed
-        // foreign application seed, upstream ripgrep 15.2.0.
-        assert_eq!(all().len(), 57);
+        // foreign application seed, upstream ripgrep 15.2.0 + curl's dated
+        // Mozilla CA extract.
+        assert_eq!(all().len(), 58);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice
