@@ -2982,11 +2982,29 @@ td-txt-authored case files
     fixture: GNU leaves 3599988 bytes and td-txt 3501696, where under `-q` both
     leave 3501696 -- so a `-q` comparison cannot see this and a `-m` one can.
     It is POSIX's "shall not consume more input than it needs", and sed already
-    does it: `give_back_stdin` has exactly one caller and it is sed's.
-    Pre-existing, and only now mechanically within reach, since grep holds a
-    duplicate of descriptor 0 it could seek. A REVIEWER found it; neither sweep
-    could, both comparing status, stdout and stderr rather than where the
-    descriptor was left.
+    did it. A REVIEWER found it; neither sweep could, both comparing status,
+    stdout and stderr rather than where the descriptor was left.
+
+    CLOSED by the landing below, which calls the same `give_back_stdin` sed
+    does. What survives is a BINARY corner, and it is a different question --
+    how far a binary file is READ, not where the descriptor is left -- so it is
+    the entry that follows rather than a remainder of this one.
+
+  - A BINARY file is read to its FIRST selected record here, where GNU counts
+    on, so `-m` reaches its count in GNU and not here and the two leave the
+    descriptor in different places. Over `L01\n` `L02\0` `X\n` `L03\n`
+    `L04\n` `L05\n` -- NUL being a record terminator in binary mode, which is
+    the entry above this one -- `grep -m2 -v X` leaves 8 in GNU and 22 here.
+    Only the POSITION differs: stdout, stderr and status agree in every one of
+    the 7500 combinations swept.
+
+    The rule GNU follows is NOT known and nothing here guesses one.
+    Non-inverted it stops at the first match as this does (`-m2 0` leaves 22 in
+    both); under `-v` it counts on, but only as far as the record the first NUL
+    ends -- `-m2 -v X` reaches its count and `-m3 -v X` does not. Neither
+    `done_on_match` nor "output was suppressed" explains why `-v` alone changes
+    it, and probing found no property that survives. A Rust test pins it as a
+    divergence rather than leaving it unwritten, so closing it reds something.
 
   - The ORDER of a `-r` listing, which td-txt sorts and GNU takes from the
     directory: `grep -rl a tree` answers `tree/sub/g` before `tree/f` in GNU and
@@ -4133,9 +4151,10 @@ td-txt-authored case files
     and not GNU-relative ones, which is a distinction worth making because the
     `-q` number happens to equal GNU's and the `-m1` number does not: GNU
     repositions standard input under `-m` and grep here does not. That is a
-    pre-existing divergence and it now has a gap entry of its own. This landing
-    is the enabling half of any future fix, grep holding a SEEKABLE duplicate
-    of descriptor 0 where before it held nothing seekable at all.
+    pre-existing divergence and it now has a gap entry of its own -- CLOSED by
+    the landing after this one, which is the fix this sentence called future.
+    This landing is its enabling half, grep holding a SEEKABLE duplicate of
+    descriptor 0 where before it held nothing seekable at all.
 
     Two sweeps, both zero. FIFTY-TWO runs cross 26 argument shapes -- `-q`,
     `-c`, `-l`, `-L`, `-o`, `-z`, `-s`, `-H`, `-h`, `--label`, `-n`, `-v`,
@@ -4229,6 +4248,153 @@ td-txt-authored case files
     fails. The claim was older than this landing; what found it was
     mutating an arm the diff happened to touch, which is the cheapest check
     this workstream has and the one that keeps paying.
+
+  `-m` REPOSITIONS standard input, which is the promise the option exists to
+  make and the one part of it that is not visible in output. GNU: "if the input
+  is standard input from a regular file, and NUM matching lines are output,
+  grep ensures that the standard input is positioned to just after the last
+  matching line before exiting. This enables a calling process to resume a
+  search."
+
+    The rule is ONE thing measured, not four. Reposition when `-m`'s count is
+    REACHED, to the end of the record that reached it, terminator included.
+    Everything else follows from that sentence rather than needing its own:
+    trailing context prints and does not move it, `-A3` landing where `-A0`
+    does; leading context is behind the match and cannot; `-v` counts what it
+    SELECTS, so `-m2 -v L0` stops after `L11`; `-z` counts NUL-terminated
+    records, so the position is a record end and not a line end.
+
+    `-c` repositions and `-l` does not, which looks like a rule about printing
+    and is not. `-q`, `-l` and `-L` settle a file at the FIRST selected record
+    and never count to `-m` at all -- td-txt already broke there, three lines
+    above where the count is tested -- so no count is ever reached and there is
+    nothing to reposition to. `-c` counts like an ordinary search and prints a
+    total at the end. The existing control flow had GNU's split in it already;
+    this landing only had to put the test where the break was.
+
+    `-m0` reads NOTHING, so the descriptor has not moved and the answer is 0
+    rather than a seek back to 0 -- except under `-L`, which takes the short
+    cut's own documented exception, reads once and leaves that. Neither is a
+    reposition and both agree with GNU. A count never reached leaves end of
+    input, which is where reading stopped anyway -- the two collapse, and no
+    case can tell them apart, which is why the rule is stated as "reached"
+    rather than as "the last selected record".
+
+    The seek is RELATIVE, so where reading STARTED does not enter into it: from
+    offset 8 of the same file `-m1` leaves 12, not 4. And the position is
+    EXACT, not block-aligned -- on a 3,000,000-byte input `-m1` leaves 9 where
+    `-q` leaves 98304, one whole block. That pair is the sharpest evidence that
+    a reposition happened rather than a read stopping early.
+
+    It goes through the reader's OWN duplicate of descriptor 0, the one the
+    previous landing put in `Input::Stdin`, and calls the same
+    `give_back_stdin` sed calls. No second dup is made, which is the rule that
+    function's doc already stated for sed and now has two callers to state it
+    for. A failing seek is dropped rather than reported: `give_back_stdin` has
+    already declined everything but a regular file, and turning a search that
+    produced correct output into an error would cost more than the position.
+    That is where grep and sed differ, sed making it fatal, and the difference
+    is which promise the run was making.
+
+    The marker is an END OFFSET rather than a flag. `limit_reached` was already
+    there and is NOT it: it is set only on the branch that keeps draining
+    trailing context, and the common `-m` stop takes the other branch and
+    breaks. A flag would have missed every case without `-A`, which is most of
+    them.
+
+    The BINARY exit needed the same test and not a second rule. A binary file
+    prints its notice and RETURNS, three branches before the count is tested,
+    so `-m1` over one reached its count and left the descriptor unmoved. The
+    fix was to compute the record end and the at-limit test once, above both
+    exits, and let the binary return use them: `-m1` over a binary file now
+    leaves 4 as GNU does, and `-m2`, which never reaches its count there,
+    leaves the end as GNU does too. What is left of that corner is the entry in
+    the gap list, and it is about how far a binary file is READ.
+
+    SEVEN THOUSAND FIVE HUNDRED combinations swept -- 10 fixtures x 5 counts x
+    25 flag sets x 6 patterns -- comparing POSITION as well as status, stdout
+    and stderr, since a sweep reading only the first three is exactly what
+    missed this for as long as it was missed. 7433 agree, and all 67 that do
+    not differ in POSITION alone.
+
+    THREE of those ten fixtures span a fill boundary, and they were added
+    because the first seven could not have found the bug review did: every one
+    of them fitted in a single read, so no fill was ever entirely zeros and the
+    whole skipped-run question was unreachable. A sweep is only as wide as its
+    fixtures, and "5250 combinations" read like breadth while being narrow in
+    the one dimension that mattered.
+
+    Of the 67: SIXTY-ONE are the binary read-depth corner under `-v`, which has
+    its own gap entry, and SIX are `-m0 -L` over a multi-buffer binary file,
+    where GNU stops after 147456 bytes and this reads 196608. That six is not a
+    reposition at all -- `-m0` reaches no count -- and the parent binary
+    answers 196608 too, so it is a pre-existing read-depth difference this
+    sweep is simply the first to look at.
+
+    THIRTY argv rows across four Rust tests each assert a position, and those
+    are the goldens. Forty-seven further offsets were measured against GNU 3.11
+    in the throwaway harness that derived the rule; they are not in the tree,
+    and an earlier draft of this paragraph called them "cases the Rust tests
+    carry", which counted a harness twice and the tests not at all.
+
+    FIVE mutations, the unit being failing tests over the whole suite. Making
+    `reposition_stdin` a no-op: FOUR. Returning the record's START instead of
+    its end: FOUR. Rebuilding the end offset from the record slice instead of
+    from the reader -- which is exactly the bug below -- ONE. Repositioning
+    whenever `-m` was given rather than when its count was reached: FOUR, one
+    of them a CORPUS case and the only one of the five the corpus can see.
+    Dropping the reposition on the binary exit: TWO.
+
+    Those are AS OF the tests this landing ends with, and one of them moved
+    during review. "Never repositioning" was first recorded as TWO, measured by
+    deleting only the tail call -- a narrower experiment than its own label,
+    since the binary exit repositions through a second call site the label
+    covers and the deletion did not. Emptying the function reds four. The label
+    and the experiment now describe the same thing.
+
+    A BUG was found in review and fixed in this landing, and it is the reason
+    the end offset comes from the reader rather than from arithmetic. The first
+    version computed the record's end as "start plus slice length plus
+    separator". That is right for every record shape but one: the reader DROPS
+    a fill that is entirely zeros, crediting the bytes without putting them in
+    `line()`, so a record that spans a dropped run ends further on than the sum
+    says. The seek back then overshot by the whole run -- unbounded, being the
+    length of the run and not one buffer -- and handed the next reader bytes
+    grep had already consumed. `{ grep -z -m1 -c A; cat; } < f` gave `cat` two
+    bytes in GNU and 98306 bytes of re-served input here. Worse than the
+    behaviour it replaced, which merely dropped them.
+
+    `Records::record_end` exists because of it: the reader already tracked the
+    number as `emitted`, and nothing outside could ask. Both reviewers who
+    found this reached it the same way -- by asking which record shapes the
+    arithmetic could not describe -- and neither the 5250-combination sweep nor
+    any test then in the tree could see it, the fixtures all being smaller than
+    one read.
+
+    The REGRESSION test for it took three attempts, which is the part worth
+    keeping. A short leading run put the zeros BEFORE the record rather than
+    inside it, and the old arithmetic got that right. Making both runs far
+    larger "to be safe" was no better: the buffer grows to hold a long open
+    record, so no fill was ever entirely zeros. Only a leading run that is an
+    exact multiple of the fill size reaches the case at all. Two drafts passed
+    against the very code they were written to catch, and only running them
+    against that code said so.
+
+    A BROKEN output pipe is a further difference and is not pinned: with the
+    count reached and a large `-A` still draining, `grep -m1 -A100000 hit |
+    head -c5` leaves 11 here and 98304 in GNU, which is killed by SIGPIPE
+    before it can reposition. Reaching the reposition is this crate's "a closed
+    reader is done" policy rather than an accident, and the position is the one
+    a resuming caller wants; recorded because it is a `-m` position case and
+    the sweep, which never breaks a pipe, cannot see it.
+
+    The corpus can say none of THIS, which is narrower than "none of `-m`": the
+    corpus carries a dozen `-m` cases and they pin its counting, output, status
+    and context perfectly well -- one of the mutations above is caught by one
+    of them. What no case can assert is a descriptor's POSITION, that being
+    neither stdout, status nor stderr, and `run_case` hands the child a pipe,
+    which has no position to leave. So the positioning surface alone is Rust
+    tests, and the sweep above stands in for corpus breadth there.
 
   Goldens are C-locale. Under LC_ALL=C — the only locale td's image sets, and what
   every case here was captured under — GNU `grep -w '\.*'` selects `.a`; under a

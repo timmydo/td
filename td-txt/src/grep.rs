@@ -2712,6 +2712,39 @@ impl Before {
     }
 }
 
+/// Hand descriptor 0 back what `-m` read past the last selected record, so the
+/// next reader of that file description resumes where this search stopped.
+/// GNU's own promise for `-m`: "if the input is standard input from a regular
+/// file, and NUM matching lines are output, grep ensures that the standard
+/// input is positioned to just after the last matching line before exiting".
+///
+/// Only `-m` reaches here, and only on the path that reached its count. The
+/// modes that settle a file WITHOUT counting to it -- `-q`, `-l`, `-L`, which
+/// break at the first selected record -- never set `end`, and GNU leaves those
+/// where the last block landed too.
+///
+/// Through the reader's OWN duplicate of descriptor 0, as sed does: it shares
+/// the file description, so seeking it moves fd 0, and there is no second dup
+/// to fail under descriptor pressure. A stdin whose dup could not be made
+/// carries `None` and is left alone, which is the position that stood before
+/// any of this.
+///
+/// A FAILING seek is dropped rather than reported, and that is a POLICY and not
+/// an impossibility -- this returns `()` because the caller COULD report one and
+/// should not. `give_back_stdin` has already declined everything but a regular
+/// file, and its own doc names what is left: another holder of this file
+/// description can move the offset first, which makes a RELATIVE seek fail or
+/// land somewhere else entirely. That is inherent to handing back an over-read
+/// rather than a defect of it, and turning a search that produced correct output
+/// into an error would cost more than the position is worth. sed decides the
+/// same failure the other way, its whole run being the promise.
+fn reposition_stdin(rec: &mut Records<Input>, end: u64) {
+    let unread = rec.consumed().saturating_sub(end);
+    if let Input::Stdin(Some(fd0)) = rec.source_mut() {
+        let _ = crate::util::give_back_stdin(fd0, unread);
+    }
+}
+
 fn search_file(
     grep: &Grep,
     out: &mut Out,
@@ -2743,6 +2776,12 @@ fn search_file(
     let mut covered: u64 = 0;
     let mut pending_after: usize = 0;
     let mut any = false;
+    // Where the LAST SELECTED record ended, once `-m` has had its fill: the
+    // position GNU leaves standard input at, and `None` until the count is
+    // actually reached. It is an END OFFSET rather than a flag because
+    // `limit_reached` below is set only on the branch that keeps draining
+    // trailing context, and the common `-m` stop takes the other one.
+    let mut stop_at: Option<u64> = None;
 
     let io = |r: std::io::Result<()>| -> Result<(), String> { r.map_err(|e| format!("write error: {}", errmsg(&e))) };
     if grep.settled() {
@@ -2830,6 +2869,17 @@ fn search_file(
         if selected {
             any = true;
             count += 1;
+            // Past the END of this record, separator included: GNU positions
+            // standard input "just after the last matching line". Taken from the
+            // READER rather than rebuilt from `at` and the slice, which is a whole
+            // fill short whenever a run of zeros was joined into the record --
+            // those bytes are in the input and not in `line()`. Read here rather
+            // than at either use because the binary notice below RETURNS, and
+            // both exits owe the same position.
+            let record_end = rec.record_end();
+            // Whether THIS record is the one `-m` was counting to. The two
+            // exits differ in what they print and agree on this.
+            let at_limit = grep.conf.max_count.is_some_and(|m| count >= m);
             if grep.conf.quiet || grep.conf.files_with || grep.conf.files_without {
                 // -l/-L print one summary line below; -q prints nothing. Either
                 // way the answer is settled, so stop reading this file.
@@ -2843,6 +2893,13 @@ fn search_file(
                 // The notice goes to stderr, but GNU still counts the file as
                 // having produced output, so the NEXT file opens with `--`.
                 *printed_before = true;
+                // And it counts as this record's output for `-m` too: a `-m1`
+                // that met its count here leaves standard input after that
+                // record, where a `-m2` stopped by the notice alone never met
+                // one and leaves it where the read landed. Measured both ways.
+                if at_limit {
+                    reposition_stdin(rec, record_end);
+                }
                 return Ok(true);
             }
             if !grep.conf.count {
@@ -2906,7 +2963,8 @@ fn search_file(
                 covered = lineno;
                 pending_after = grep.conf.after_lines();
             }
-            if grep.conf.max_count.is_some_and(|m| count >= m) {
+            if at_limit {
+                stop_at = Some(record_end);
                 // GNU still prints the trailing context of that last match,
                 // `-o` included: what `-o` changes is which lines print, not
                 // how far the drain runs.
@@ -2941,6 +2999,9 @@ fn search_file(
         }
     }
 
+    if let Some(end) = stop_at {
+        reposition_stdin(rec, end);
+    }
     // POSIX: -q writes NOTHING to stdout, so it outranks -c/-l/-L.
     if grep.conf.quiet {
         return Ok(any);

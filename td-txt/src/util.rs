@@ -330,7 +330,10 @@ fn stdin_unbuffered() -> Option<std::fs::File> {
 /// Hand back to descriptor 0 what was read from it and never used, so the next
 /// reader of that file description starts where this applet stopped instead of at
 /// end of file. It is POSIX's "shall not consume more input than it needs", and
-/// what makes `{ sed 1q; cat; } < f` the usable idiom it is meant to be.
+/// what makes `{ sed 1q; cat; } < f` the usable idiom it is meant to be. BOTH
+/// applets call it now: sed for the record its cycle stopped after, grep for the
+/// one `-m` counted to, which is `{ grep -m1 PAT; cat; } < f` and the same
+/// promise under another name.
 ///
 /// A REGULAR file only: a descriptor can answer a position query and still refuse
 /// a negative seek, and the other common stdin -- a pipe -- has nowhere to put
@@ -585,6 +588,16 @@ impl<R: std::io::Read> Records<R> {
     /// than standing as empty records `-B` could show.
     pub fn take_skipped(&mut self) -> (u64, bool) {
         (std::mem::take(&mut self.skipped), std::mem::take(&mut self.skipped_joined))
+    }
+
+    /// Input offset just PAST the record `line()` returns: its separator, and any
+    /// run this reader DROPPED, included. Rebuilding it from `offset()` plus the
+    /// record's own length does not work and is the bug that asked for this
+    /// method -- a zero fill joined into a record moves its end without
+    /// lengthening the slice, so the sum lands a whole fill short. grep's `-m`
+    /// reposition needs this number and nothing weaker.
+    pub fn record_end(&self) -> u64 {
+        self.emitted
     }
 
     /// Bytes taken from the SOURCE so far, which is not what the caller has been

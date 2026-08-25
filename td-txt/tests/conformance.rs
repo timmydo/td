@@ -2241,6 +2241,279 @@ fn every_directories_action_reports_a_directory_arriving_as_standard_input(
     Ok(())
 }
 
+/// `-m` leaves standard input JUST AFTER the last selected record, so a caller
+/// can resume where the search stopped. GNU's own promise, and the reason it is
+/// a promise rather than an accident: "if the input is standard input from a
+/// regular file, and NUM matching lines are output, grep ensures that the
+/// standard input is positioned to just after the last matching line before
+/// exiting. This enables a calling process to resume a search."
+///
+/// The corpus cannot say ANY of this. A case asserts stdout, status and stderr;
+/// the position of a descriptor is none of those, and `run_case` hands the child
+/// a pipe, which has no position to leave. So the whole option lives here.
+///
+/// The rows that DO NOT move it are half the point. `-q`, `-l` and `-L` settle a
+/// file at the first selected record without ever counting to `-m`, so they
+/// leave the descriptor where reading stopped -- 80 here, the whole file
+/// arriving in the first read, which is not the same thing as a block: a block
+/// is 96 KiB and this fixture is 80 bytes. `-m0` reads nothing at all. And a
+/// count that is never reached leaves end of input, which is where reading
+/// stopped anyway.
+///
+/// Positions are read through a CLONE of the descriptor the child was given: a
+/// dup shares the file description, so the parent's `stream_position` is the
+/// child's. Goldens from GNU grep 3.11 under LC_ALL=C.
+#[test]
+fn max_count_leaves_standard_input_after_the_last_selected_record(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Seek;
+    let dir = TempDir::new("mrepos")?;
+    // Twenty four-byte records: `L01\n` .. `L20\n`, so a boundary is a multiple
+    // of four and the arithmetic in each expectation is readable.
+    let path = dir.0.join("f");
+    std::fs::write(&path, (1..=20).map(|i| format!("L{i:02}\n")).collect::<String>())?;
+    for (args, want) in [
+        (&["-m1", "L"][..], 4),
+        (&["-m2", "L"][..], 8),
+        (&["-m3", "L"][..], 12),
+        // Trailing context still PRINTS and still does not move it: GNU says
+        // "regardless of the presence of trailing context lines".
+        (&["-m1", "-A3", "L"][..], 4),
+        // Leading context is behind the match, so it cannot move it either.
+        (&["-m1", "-B1", "L05"][..], 20),
+        // `-v` counts the lines it SELECTS, which is what `-m` counts too:
+        // `L0` misses `L10`..`L20`, so the second selected record is `L11`.
+        (&["-m2", "-v", "L0"][..], 44),
+        // `-c` prints no lines and still repositions, where `-l` prints a name
+        // and does not. The split is GNU's and it is not about printing.
+        (&["-m1", "-c", "L"][..], 4),
+        (&["-m1", "-o", "L"][..], 4),
+        (&["-m1", "-n", "-b", "-H", "L"][..], 4),
+        // Never reaching the count leaves end of input.
+        (&["-m25", "L"][..], 80),
+        (&["-m1", "ZZZ"][..], 80),
+        // `-m0` stops before reading, so nothing has moved.
+        (&["-m0", "L"][..], 0),
+        // The three that settle without counting.
+        (&["-m1", "-q", "L"][..], 80),
+        (&["-m1", "-l", "L"][..], 80),
+        (&["-m1", "-L", "ZZZ"][..], 80),
+    ] {
+        let mut held = std::fs::File::open(&path)?;
+        let given = held.try_clone()?;
+        let out = std::process::Command::new(bin())
+            .arg("grep")
+            .args(args)
+            .stdin(given)
+            .current_dir(&dir.0)
+            .output()?;
+        assert!(out.stderr.is_empty(), "{args:?} wrote to stderr: {:?}", out.stderr);
+        assert_eq!(held.stream_position()?, want, "{args:?} left stdin in the wrong place");
+    }
+    Ok(())
+}
+
+/// A run of zeros JOINED into the counted record still leaves standard input
+/// where the input says, which the record's own length cannot tell you. The
+/// reader DROPS a fill that is entirely zeros -- those bytes never reach
+/// `line()` -- so an end offset rebuilt as "record start plus slice length plus
+/// separator" lands a whole fill short, and the seek back then overshoots by
+/// that much. A reviewer found that shape; it was that arithmetic before, and it
+/// is the reader's own byte accounting now.
+///
+/// The SIZES are what make this case reach the bug, and they are not free
+/// choices. The `A` run must still be an OPEN record when a fill that is
+/// ENTIRELY zeros arrives, so it has to end exactly on a fill boundary: 98304
+/// bytes, mirroring `Records::BUF` (96 KiB). The zero run must then fill at
+/// least one whole read.
+///
+/// TWO drafts of this test passed against the very code it was written to
+/// catch, which is worth more than the test. A short `A` run first meant the
+/// zeros were dropped BEFORE the record rather than joined into it, and the
+/// record's own start already accounted for them. Making both runs 400000 --
+/// "far larger than any fill", which sounds safer -- was no better: the buffer
+/// GROWS to hold a long open record, so no fill was ever entirely zeros. Only
+/// an exact multiple of the fill size reaches it.
+///
+/// That ties this case to a private constant a test cannot read, and the tie is
+/// SILENT: change `Records::BUF` and 196610 is still the right answer, so this
+/// still passes while no longer exercising the join. Named here because nothing
+/// else will say it.
+///
+/// The expectation is arithmetic on the fixture rather than a captured
+/// constant: 98304 `A`, then 98304 NULs, then `B\0TAIL\0`, so the joined record
+/// ends at 98304 + 98304 + 2. GNU grep 3.11 leaves 196610 here too.
+#[test]
+fn a_zero_fill_joined_into_the_counted_record_still_ends_where_the_input_does(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Seek;
+    let dir = TempDir::new("mrepos-join")?;
+    let path = dir.0.join("j");
+    let mut body = vec![b'A'; 98_304];
+    body.extend(std::iter::repeat(0u8).take(98_304));
+    body.extend_from_slice(b"B\0TAIL\0");
+    std::fs::write(&path, &body)?;
+    for args in [&["-z", "-m1", "B$"][..], &["-z", "-m1", "-c", "B$"][..]] {
+        let mut held = std::fs::File::open(&path)?;
+        let given = held.try_clone()?;
+        let out = std::process::Command::new(bin())
+            .arg("grep")
+            .args(args)
+            .stdin(given)
+            .current_dir(&dir.0)
+            .output()?;
+        assert_eq!(out.status.code(), Some(0), "{args:?} status");
+        assert_eq!(
+            held.stream_position()?,
+            98_304 + 98_304 + 2,
+            "{args:?} lost the dropped zero fill when it repositioned"
+        );
+    }
+    // The other arm of the same skip condition, and not a `-z` quirk: in plain
+    // LINE mode the binary verdict turns NULs into separators, so an all-zero
+    // fill is droppable there too. A leading NUL is what makes the verdict fall
+    // on the first read. `TAIL` keeps the expected offset strictly INSIDE the
+    // file, so "never repositioned" cannot pass this row by accident.
+    let path = dir.0.join("p");
+    let mut body = vec![0u8];
+    body.extend(std::iter::repeat(b'A').take(98_303));
+    body.extend(std::iter::repeat(0u8).take(98_304));
+    body.extend_from_slice(b"B\nTAIL\n");
+    std::fs::write(&path, &body)?;
+    for args in [&["-m1", "-c", "A"][..], &["-m1", "A"][..]] {
+        let mut held = std::fs::File::open(&path)?;
+        let given = held.try_clone()?;
+        let out = std::process::Command::new(bin())
+            .arg("grep")
+            .args(args)
+            .stdin(given)
+            .current_dir(&dir.0)
+            .output()?;
+        assert_eq!(out.status.code(), Some(0), "{args:?} status");
+        assert_eq!(
+            held.stream_position()?,
+            98_304 + 98_304 + 2,
+            "{args:?} lost the dropped zero fill in plain line mode"
+        );
+    }
+    Ok(())
+}
+
+/// A BINARY file stops at the first selected record here, where GNU goes on
+/// counting -- so `-m` can reach its count in GNU and not here, and the position
+/// differs when it does. This pins the DIVERGENCE, not agreement, and it exists
+/// so that closing it reds something.
+///
+/// The records are NUL-terminated in binary mode, which is the rule the ledger
+/// entry above this one records: `L01\n` `L02\0` `X\n` `L03\n` `L04\n` `L05\n`,
+/// ending at 4, 8, 10, 14, 18 and 22.
+///
+/// What is NOT known is the rule GNU is following. Non-inverted, GNU stops at
+/// the first match like this does -- `-m2 0` leaves 22 in both -- and under `-v`
+/// it counts on, but only as far as the record the first NUL ends: `-m2 -v X`
+/// reaches its count there and `-m3 -v X` does not, and neither ordinary
+/// `done_on_match` nor "output was suppressed" explains why `-v` alone changes
+/// it. Probing found no property that survives, so nothing here guesses one.
+/// Both columns are measured against GNU grep 3.11.
+#[test]
+fn a_binary_file_stops_at_the_first_selected_record_where_gnu_counts_on(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Seek;
+    let dir = TempDir::new("mrepos-bin")?;
+    let path = dir.0.join("b");
+    std::fs::write(&path, b"L01\nL02\0X\nL03\nL04\nL05\n")?;
+    // (args, this build, GNU 3.11)
+    for (args, want, gnu) in [
+        // Agreeing: the count falls on the FIRST selected record, which is the
+        // one record a binary file is read to here.
+        (&["-m1", "-v", "X"][..], 4, 4),
+        (&["-m1", "0"][..], 4, 4),
+        // Agreeing: the count is never reached in either, so both leave the end.
+        (&["-m3", "-v", "X"][..], 22, 22),
+        (&["-m2", "0"][..], 22, 22),
+        // DIVERGING: GNU counts a second selected record and stops after it.
+        (&["-m2", "-v", "X"][..], 22, 8),
+        (&["-m2", "-v", "ZZZ"][..], 22, 8),
+        (&["-m2", "-v", "-n", "Z"][..], 22, 8),
+    ] {
+        let mut held = std::fs::File::open(&path)?;
+        let given = held.try_clone()?;
+        let out = std::process::Command::new(bin())
+            .arg("grep")
+            .args(args)
+            .stdin(given)
+            .current_dir(&dir.0)
+            .output()?;
+        assert_eq!(
+            out.stderr, b"grep: (standard input): binary file matches\n",
+            "{args:?} notice"
+        );
+        assert_eq!(
+            held.stream_position()?, want,
+            "{args:?} left stdin in the wrong place; GNU 3.11 leaves {gnu}"
+        );
+    }
+    // The fixture above cannot show the SIZE of the gap: both stopping places
+    // are inside one block, so 22 reads as "the end" for either rule. Over a
+    // file LARGER than a block they are far apart -- GNU reads on to end of
+    // input where this stops at the first selected record, which is wherever
+    // the block it arrived in ended. Asserted as the property and not the
+    // number: a block size is an implementation detail, and pinning 98304 here
+    // would red on a buffer change that this entry is not about.
+    let big = dir.0.join("bigb");
+    let mut body = b"L01\nL02\0X\n".to_vec();
+    body.extend((3..300_000).flat_map(|i| format!("L{i:07}\n").into_bytes()));
+    std::fs::write(&big, &body)?;
+    let mut held = std::fs::File::open(&big)?;
+    let given = held.try_clone()?;
+    let out = std::process::Command::new(bin())
+        .arg("grep")
+        .args(["-m2", "L"])
+        .stdin(given)
+        .current_dir(&dir.0)
+        .output()?;
+    assert_eq!(out.status.code(), Some(0), "-m2 over a large binary file");
+    let left = held.stream_position()?;
+    assert!(
+        0 < left && left < body.len() as u64,
+        "-m2 left {left} of {}; this build stops short and GNU 3.11 reads to the end",
+        body.len()
+    );
+    Ok(())
+}
+
+/// The record `-m` counts is the RECORD, so `-z` positions after a NUL-terminated
+/// one. Separate from the test above because it needs its own fixture: the
+/// line-oriented file has no NUL in it, and a `-z` run over that file is one
+/// record long, where end-of-record and end-of-file are the same number and the
+/// case would prove nothing. Goldens from GNU grep 3.11.
+#[test]
+fn max_count_counts_nul_terminated_records_under_z(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Seek;
+    let dir = TempDir::new("mrepos-z")?;
+    let path = dir.0.join("z");
+    let body: Vec<u8> =
+        (1..=20).flat_map(|i| format!("Z{i:02}\0").into_bytes()).collect();
+    std::fs::write(&path, &body)?;
+    for (args, want) in
+        [(&["-z", "-m1", "Z"][..], 4), (&["-z", "-m2", "Z"][..], 8), (&["-z", "-m1", "-c", "Z"][..], 4)]
+    {
+        let mut held = std::fs::File::open(&path)?;
+        let given = held.try_clone()?;
+        let out = std::process::Command::new(bin())
+            .arg("grep")
+            .args(args)
+            .stdin(given)
+            .current_dir(&dir.0)
+            .output()?;
+        assert!(out.stderr.is_empty(), "{args:?} wrote to stderr: {:?}", out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{args:?} status");
+        assert_eq!(held.stream_position()?, want, "{args:?} left stdin in the wrong place");
+    }
+    Ok(())
+}
+
 /// A WRITE-ONLY descriptor 0 is a read failure, not an empty input.
 /// The corpus cannot say this either: a case supplies stdin as BYTES, so the
 /// harness always hands the child a pipe.
