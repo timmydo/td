@@ -612,12 +612,20 @@ mod tests {
         // subtracting `.uid` rather than searching for `.pid` is deliberate —
         // one alias binding, `let sampled = self.credential;`, walks past the
         // narrower spelling, and a reviewer wrote exactly that mutation.
+        //
+        // `self.credentials_for(` is subtracted for a duller reason: it
+        // starts with the same eleven characters, so a helper in this slice
+        // that merely CALLS it reads to the count above as a use of the
+        // sampled credential. That fired once, on a helper that did exactly
+        // that and nothing else.
         let sampled = format!("self.{}", "credential");
         let uid = format!("{sampled}.uid");
+        let resolver = format!("{sampled}s_for(");
         assert_eq!(
             arms.matches(&sampled)
                 .count()
-                .saturating_sub(arms.matches(&uid).count()),
+                .saturating_sub(arms.matches(&uid).count())
+                .saturating_sub(arms.matches(&resolver).count()),
             0,
             "a registry arm went back to the number sampled at connect"
         );

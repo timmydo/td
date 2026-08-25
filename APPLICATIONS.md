@@ -1244,7 +1244,14 @@ For `td-busd`, full Firefox fidelity needs:
 - the per-caller policy and per-jail identity handshake, so Firefox cannot
   borrow the fixture, portal or another application's names and quotas;
 - `RequestName`/`ReleaseName` with the bounded owner queue for
-  `org.mozilla.firefox.*` and `org.mpris.MediaPlayer2.firefox.*`;
+  `org.mozilla.firefox.*` and `org.mpris.MediaPlayer2.firefox.*`. The
+  MECHANISM is landed — see §D — and the GRANT is not: §D's default sandboxed
+  policy owns no name, and the `[Session Bus Policy]` `own` entries that would
+  widen it do not reach the broker yet, because `td.Jail1`'s registration
+  carries an app id, an instance and a predeclared service list and no
+  own-set. Firefox can be routed to by name the moment something may hold one;
+  what is missing is the landing that carries the permission file's own
+  entries through the registration;
 - `AddMatch`/`RemoveMatch` and sender validation, so portal, MPRIS,
   file-manager and accessibility signals cannot be spoofed or delivered
   across applications. Authenticated pending-reply ownership is landed — see
@@ -1263,9 +1270,10 @@ For `td-busd`, full Firefox fidelity needs:
   integration.
 
 The current broker has authentication, `Hello`, names-and-directed routing,
-receive-side descriptor adoption, global quotas, and — since the landing
+receive-side descriptor adoption, global quotas, and — since the landings
 recorded in §D's "what is landed" — the per-caller filter and the per-jail
-identity it reads. The first bullet above is therefore PARTLY discharged: a
+identity it reads, authenticated pending-reply ownership, and well-known
+names with their owner queue. The first bullet above is therefore PARTLY discharged: a
 confined connection is resolved to its instance and answered accordingly, so
 it cannot see or ADDRESS the fixture or another application's peers. Not
 "reach": the shared budget below is still a way to affect a peer this filter
@@ -3316,20 +3324,25 @@ and the test for it is two fd-carrying messages in a single `write`.
 
 ### What is landed of the bus interface
 
-Names, directed routing and the per-caller filter are landed; match rules
-and name ownership are not. Of the `org.freedesktop.DBus` roster above: `Hello` (assigning
+Names, directed routing, the per-caller filter, authenticated
+pending-reply ownership and well-known name ownership are landed; match
+rules are not. Of the `org.freedesktop.DBus` roster above: `Hello` (assigning
 `:1.N`, with anything before it disconnecting and a second one ending the
-connection), `ListNames`, `ListActivatableNames`, `NameHasOwner`,
+connection, and announcing the assigned name like any other name gained),
+`RequestName` and `ReleaseName` with the owner queue, `ListNames`,
+`ListActivatableNames`, `NameHasOwner`,
 `GetNameOwner`, `GetConnectionUnixUser`, `GetConnectionUnixProcessID`,
-`GetConnectionCredentials`, `GetId` and `Peer.Ping`. A `Hello` that omits
+`GetConnectionCredentials`, `GetId` and `Peer.Ping`, plus the directed
+`NameAcquired` and `NameLost` signals. A `Hello` that omits
 its `DESTINATION` is accepted, because there is nothing else a connection
 with no name could be addressing — the broker is the only peer it can
 reach — and requiring the field made the no-destination case unreachable
 in the routing match while turning a lenient one into a disconnect whose
-stated reason was "Hello before Hello". Absent:
-`RequestName`/`ReleaseName` and the owner queue, `AddMatch`/`RemoveMatch`,
+stated reason was "Hello before Hello". Absent: `AddMatch`/`RemoveMatch`,
 `Introspectable.Introspect`, `Peer.GetMachineId`, and the
-`NameOwnerChanged`/`NameAcquired`/`NameLost` signals.
+`NameOwnerChanged` signal — which is the broadcast form of news the
+directed `NameAcquired`/`NameLost` pair already carries to the peers it
+concerns, and which waits for match rules because §D filters it per caller.
 
 **Absent means `UnknownMethod`, not silence.** A client told its match
 rule was installed and then never signalled is worse off than one told
@@ -3838,7 +3851,10 @@ secret spent as a name stops being one.
 
 The **service list is empty**, and that is the honest statement rather
 than a placeholder. Predeclared names are for app-local activation, which
-needs `RequestName`; until it exists an instance owns none.
+needs `RequestName` and the activation path in §D. `RequestName` now exists;
+activation does not, and an instance still owns none — not for want of the
+method but because §D's default sandboxed policy grants no name and nothing
+yet carries a permission file's `own` entries to the broker.
 
 **Both orderings in the list above are pinned by a source-level test**,
 in `td-jail/src/main.rs`'s confinement module, because no type expresses
@@ -4124,6 +4140,124 @@ still outstanding, sending its caller back to waiting for ever — the
 exact failure the table exists to remove, reintroduced by the mechanism
 meant to bound it. A caller at its bound gets `LimitsExceeded`.
 
+**Well-known names are landed**, with the specification's three flags and
+its four answers, the reservation, and a bound on both how many names one
+connection may hold and how many connections may want one name.
+
+`RequestName` answers `PRIMARY_OWNER`, `IN_QUEUE`, `EXISTS` or
+`ALREADY_OWNER`. `ALLOW_REPLACEMENT` and `REPLACE_EXISTING` have to agree
+before a name changes hands, and a displaced holder goes back to the FRONT
+of the queue unless it asked not to be queued — so a name handed over and
+handed back returns to whoever had it rather than to whoever asked longest
+ago, and a holder that said it would not wait does not start waiting because
+somebody took its name. A caller that cannot be given a place — because it
+declined one, or because there is no room left — is told `EXISTS`, which is
+the truthful answer in both cases: the name is taken and this caller does not
+have it. Inventing a fifth code would tell a client library something it has
+no branch for.
+
+A REPLACEMENT is not refused for want of room, because a queue full of
+bystanders must not be able to freeze a handover two peers have agreed on. It
+does not grow the queue either: the displaced holder keeps its place only if
+there is a place to keep, and is otherwise dropped from the queue while still
+being told it lost the name. The bound holds; what gives way is the courtesy
+of being re-queued.
+
+Both bounds are charged on every path that ADDS this connection to a name,
+including taking it from its holder. A draft charged them only on the
+queueing path, so a peer at its limit could go on collecting names by
+displacing consenting owners — reviewers demonstrated 52 names against a
+limit of 32, and a queue of 24 against a limit of 16.
+
+`ReleaseName` answers `RELEASED`, `NON_EXISTENT` or `NOT_OWNER`. Leaving a
+QUEUE is a release and answers `RELEASED`: the specification's distinction is
+between "not yours" and "nobody's", not between owning and waiting.
+
+A well-known name ROUTES, which is the whole use of holding one, and every
+lookup resolves through it: `GetNameOwner` answers the HOLDER's unique name,
+`NameHasOwner` and `ListNames` account for held names, and
+`GetConnectionUnixUser`/`GetConnectionUnixProcessID`/`GetConnectionCredentials`
+answer about whoever is behind the name. The destination a caller wrote is
+not rewritten on the way — a name is how the caller addressed it and the
+`SENDER` is the broker's word about who answered.
+
+This is also what makes the previous landing's forward guard observable at
+last. A call is recorded against the connection the broker RESOLVED rather
+than the name the caller wrote, so a reply from the holder still claims its
+record and a holder's departure still sweeps the calls made to its name.
+Until a name could be held, no test could tell the two apart.
+
+`NameAcquired` and `NameLost` are DIRECTED signals, each to the one
+connection it is about, so they need no subscription and land with the
+machinery this broker already has. They are best effort, and the cost of
+that is worth stating: they are state-machine signals rather than news, so a
+peer that misses `NameLost` goes on believing it holds a name that now routes
+elsewhere. Nothing better is available — the sweep runs from `Drop`, where
+there is nowhere to report to, and disconnecting a recipient for being
+behind is what the budget remedy above exists to avoid, since it did not
+choose when this fired. A failure is therefore LOGGED as a broker-level
+condition: reaching it means a peer's view of the bus and the bus's view of
+it have parted. `NameOwnerChanged` is the broadcast form
+of the same news and is NOT landed: it waits for match rules, and §D filters
+it per caller, which is a subscription-shaped version of the `see` question
+and belongs with the machinery that answers it.
+
+**A grant of a NAME is a grant of everything its holder serves**, and that
+is worth stating because it is the shape of every destination-based bus
+policy including `dbus-daemon`'s. The filter asks whether the caller may
+address the name it wrote; the broker then routes to whoever holds it, and
+the recipient dispatches on object path and interface without consulting the
+destination. So a sandbox permitted to address `org.freedesktop.portal.*`
+can reach ANY interface the portal's connection serves, not only the portal
+ones §D enumerates. Three things bound it today. The holder of a portal name
+will be the connection a supervisor registers as the portal, which is a
+td-owned program rather than an arbitrary peer. Nobody can hold a portal
+name at all until that path exists. And the sandbox cannot reach the
+holder's UNIQUE name — `may_talk` refuses it — so the only way in is the
+name it was granted. Narrowing the grant to an interface set is a real
+option and a separate decision: it has to keep `Peer.Ping` and
+`Introspectable.Introspect` working, which every toolkit calls, so it
+belongs with the portal landing rather than with the machinery that makes
+names holdable.
+
+**Seeing a name includes learning who holds it.** `GetNameOwner` answers
+with the holder's unique name to any caller that may `see` the name asked
+about, without separately asking whether it may see that unique name. That
+is deliberate: it is the question the method exists to answer, and a client
+that cannot resolve a name cannot match the `SENDER` of the replies and
+signals that come back from it, which is how a D-Bus client knows the
+portal's traffic is the portal's. What does NOT follow is reach or
+identity — the caller still may not ADDRESS that unique name, and
+`GetConnectionUnixUser`/`GetConnectionUnixProcessID`/`GetConnectionCredentials`
+still refuse to say anything about it, so the host pid this design's whole
+identity story rests on stays withheld.
+
+That combination is not yet coherent, and saying so is better than
+pretending otherwise: a caller ends up holding an answer it can do nothing
+with. It is unreachable today, since the only names a confined caller may
+see are portal names and nobody may hold one yet, and it becomes live the
+moment the supervisor registers the portal's connection — at which point a
+sandbox would resolve `org.freedesktop.portal.Desktop` to `:1.N` and find
+that everything it may do with the name it may not do with the answer. The
+likely resolution is that a caller which may see a NAME may also see and
+address its HOLDER, which is what a client needs for the portal to work at
+all. That is a policy widening, so it belongs with the portal landing where
+it can be exercised rather than ahead of it.
+
+**Nobody may own a name yet except an unconfined caller, and nobody at all
+may own a reserved one.** §D's default sandboxed policy owns no name and that
+is what the code says; the `[Session Bus Policy]` `own` entries that widen it
+are exact names from an application's permission file and do not reach this
+broker yet. The reservation over `org.freedesktop.DBus`,
+`org.freedesktop.portal.*` and `org.freedesktop.impl.portal.*` holds against
+EVERYONE, including the unconfined callers this design otherwise leaves
+unrestricted — which is the point, since an unsandboxed same-uid process
+claiming `org.freedesktop.portal.Desktop` after a restart is precisely the
+caller the reservation exists to refuse. The connection that will hold those
+names is the one a supervisor registers as the portal at startup, and that
+path does not exist yet, so today the reservation means they are held by
+nobody. A name nobody can take is a name nobody can impersonate.
+
 **A callee that never answers is still not bounded in TIME.** An entry
 leaves the table when the call is answered, when the call could not be
 sent, when the callee departs, or when the caller does. Nothing expires
@@ -4161,13 +4295,14 @@ whole allowance and leave it unable to call anyone.
 
 The callee is recorded as the unique name the broker RESOLVED, never as
 the name the caller wrote. Today the two are the same string, because
-only a unique name routes; when `RequestName` lands they are not, and
+only a unique name routed; since `RequestName` landed they are not, and
 recording the written name would test a reply from the owner against a
 name the owner does not answer to — every genuine reply dropped, and
 every one of those calls invisible to the departure sweep, which looks
-for the departing peer's unique name. That is a forward guard with no
-test yet: a mutation that records the written name survives the suite,
-and it stays unobservable until a well-known name can be owned.
+for the departing peer's unique name. This was written as a forward guard
+with no test, because nothing could observe it while only unique names
+routed. It has one now, both halves: a call by name is answered by its
+holder, and a caller waiting on a name is told when its holder departs.
 
 **What may be SENT, beside who may be addressed.** The `see`/`talk`
 filter decides who a peer may address; message type decides what it may

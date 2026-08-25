@@ -48,6 +48,50 @@ const BUS_NAME: &str = "org.freedesktop.DBus";
 /// applications' portal traffic.
 const PORTAL_PREFIX: &str = "org.freedesktop.portal.";
 
+/// The portal's own implementation side, reserved on the same argument.
+const IMPL_PORTAL_PREFIX: &str = "org.freedesktop.impl.portal.";
+
+/// Whether `name` is one this broker keeps out of general circulation.
+///
+/// §D: applications cannot own the broker or the reserved
+/// `org.freedesktop.portal.*` and `org.freedesktop.impl.portal.*` names, and
+/// the reservation survives the portal's death — a restarted portal
+/// re-registers through the supervised path rather than racing for the name.
+/// The argument is not about sandboxes: an UNSANDBOXED uid-1000 process,
+/// which this design deliberately leaves unrestricted, could otherwise claim
+/// `org.freedesktop.portal.Desktop` after a restart and start receiving
+/// sandboxed applications' portal traffic. That is a same-uid process doing
+/// what same-uid processes may do, which is exactly why the BROKER has to be
+/// the one to refuse it.
+pub fn is_reserved_name(name: &str) -> bool {
+    name == BUS_NAME
+        || is_portal_name(name)
+        || name
+            .strip_prefix(IMPL_PORTAL_PREFIX)
+            .is_some_and(|rest| !rest.is_empty())
+}
+
+/// Whether `caller` may take `name` as a well-known name.
+///
+/// §D's default sandboxed policy MAY OWN NO NAME, and that is what this says.
+/// The widening §D provides for is the `[Session Bus Policy]` `own` entries
+/// in an application's permission file — exact names, never wildcards — and
+/// those do not reach this broker yet: `td.Jail1`'s registration carries an
+/// app id, an instance and a predeclared service list, and no own-set. Until
+/// a landing carries them through, a confined peer asking for a name is
+/// refused rather than quietly granted, which is the direction to be wrong
+/// in.
+///
+/// A reserved name is refused to EVERYONE, including unconfined callers.
+/// The connection that will hold the portal's names is the one a supervisor
+/// registers as the portal at startup, and that path does not exist yet, so
+/// today the reservation means the names are held by nobody. That is
+/// fail-closed rather than a gap: a name nobody can take is a name nobody can
+/// impersonate.
+pub fn may_own(caller: &Identity, name: &str) -> bool {
+    !is_reserved_name(name) && matches!(caller, Identity::Unconfined)
+}
+
 /// Whether `name` is in the reserved portal namespace.
 ///
 /// The bare prefix with nothing after it is NOT a portal name: it is not a
@@ -257,6 +301,46 @@ mod tests {
         assert!(may_signal(&Identity::Unconfined));
         assert!(!may_signal(&jailed()));
         assert!(!may_signal(&Identity::Unknown("unplaceable".into())));
+    }
+
+    /// §D's default sandboxed policy owns no name, and nothing carries an
+    /// own-set to this broker yet.
+    #[test]
+    fn only_an_unconfined_peer_may_own_a_name() {
+        assert!(may_own(&Identity::Unconfined, "org.mozilla.firefox"));
+        assert!(!may_own(&jailed(), "org.mozilla.firefox"));
+        assert!(!may_own(
+            &Identity::Unknown("unplaceable".into()),
+            "org.mozilla.firefox"
+        ));
+    }
+
+    /// The reservation holds against EVERYONE, which is the whole reason it
+    /// is the broker's to enforce: an unsandboxed same-uid process is the
+    /// caller it is there to refuse.
+    #[test]
+    fn nobody_may_own_a_reserved_name() {
+        for name in [
+            BUS_NAME,
+            "org.freedesktop.portal.Desktop",
+            "org.freedesktop.impl.portal.Access",
+        ] {
+            assert!(is_reserved_name(name), "{name} is not reserved");
+            assert!(!may_own(&Identity::Unconfined, name), "{name} was granted");
+            assert!(!may_own(&jailed(), name), "{name} was granted");
+        }
+    }
+
+    /// A prefix on its own is not a reservation, for the same reason a prefix
+    /// on its own is not a portal name: `org.freedesktop.portal` is a name
+    /// somebody could legitimately want, and swallowing it would reserve a
+    /// name §D does not.
+    #[test]
+    fn the_reserved_prefixes_alone_are_not_reserved() {
+        assert!(!is_reserved_name("org.freedesktop.portal"));
+        assert!(!is_reserved_name("org.freedesktop.impl.portal"));
+        assert!(!is_reserved_name("org.freedesktop.portalish.Thing"));
+        assert!(!is_reserved_name("org.mozilla.firefox"));
     }
 
     /// The bare prefix owns nothing and is not in the reservation.

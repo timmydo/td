@@ -24,7 +24,7 @@ use crate::auth::{Guid, Handshake, PeerIdentity, GUID_LEN};
 use crate::lineage::{Caller, Identity, Instances, Named, Procfs, Reading, RealProcfs};
 use crate::message;
 use crate::policy;
-use crate::registry::{Bus, Outbox, Overflow, Rejected, Routing};
+use crate::registry::{Bus, Outbox, Overflow, Rejected, Released, Routing};
 use crate::sys::{self, PeerCredential};
 use crate::wire::{WireError, Writer};
 
@@ -442,7 +442,21 @@ impl Drop for Connection<'_> {
             // argues against everywhere else. Best effort, because this is
             // `Drop` and there is nowhere to report to: a caller that cannot
             // be told is a caller that was already leaving.
-            for call in self.bus.leave(&unique) {
+            // Serialized with every other ownership change, so a peer's
+            // `NameLost` and the next holder's `NameAcquired` cannot
+            // interleave with a third transition's.
+            let ordering = self.bus.ordering();
+            let departure = self.bus.leave(&unique);
+            // Names first, and the order is immaterial: the announcements
+            // and the `NoReply`s go to disjoint sets of connections, since a
+            // peer waiting on a call to this one cannot also be the peer
+            // inheriting a name from it without being told two separate
+            // things it can read in either order.
+            for handover in &departure.handovers {
+                self.announce(handover);
+            }
+            drop(ordering);
+            for call in departure.abandoned {
                 // Numbered from the CALLER's stream, not this one. The sender
                 // stamped below is the broker, which is one sender across the
                 // whole bus, so two peers departing at the same counter value
@@ -992,7 +1006,19 @@ impl<'a> Connection<'a> {
                 self.credential.pid,
                 self.identity.app_id().map(str::to_string),
             )
-            .map_err(|why| Ended::Failed(format!("cannot name a peer: {why}")))
+            .map_err(|why| Ended::Failed(format!("cannot name a peer: {why}")))?;
+        // A unique name is a name this connection now OWNS, and the reference
+        // daemon announces it like any other. The `Hello` reply carries the
+        // same fact, so this is compatibility rather than news: a client that
+        // waits for `NameAcquired` before it considers itself connected would
+        // otherwise wait for ever. After `publish`, because the announcement
+        // is routed through the directory to reach this connection's outbox.
+        self.announce(&crate::registry::Handover {
+            name: unique.clone(),
+            lost: None,
+            gained: Some(unique),
+        });
+        Ok(())
     }
 
     /// The bus's own interface: what a peer may ask the broker itself.
@@ -1078,6 +1104,21 @@ impl<'a> Connection<'a> {
                 _ => Ok(()),
             };
         }
+        // `RequestName` and `ReleaseName` CHANGE something, so they belong up
+        // here with the jail methods rather than below the gate: a caller that
+        // set `NO_REPLY_EXPECTED` has withdrawn the REPLY, not the work, and a
+        // draft that left them below silently did nothing at all for it.
+        let name_method =
+            matches!(member, "RequestName" | "ReleaseName") && is_call && here && on(BUS_NAME);
+        if name_method {
+            return match member {
+                "RequestName" => self.acquire_name(message, wants_reply),
+                "ReleaseName" => self.give_up_name(message, wants_reply),
+                // Unreachable through `name_method`, which names the same two,
+                // and spelled out for the reason the jail dispatch above is.
+                _ => Ok(()),
+            };
+        }
         // Everything below is a question rather than a change, so a peer that
         // is not waiting for an answer simply gets none.
         if !wants_reply {
@@ -1101,8 +1142,11 @@ impl<'a> Connection<'a> {
                 if !self.takes(message, "")? {
                     return Ok(());
                 }
+                // One lock, not two: a connection joining or a name
+                // changing hands between two acquisitions would produce a
+                // list that never described the bus at any instant.
                 let mut names = vec![BUS_NAME.to_string()];
-                names.extend(self.bus.names());
+                names.extend(self.bus.all_names());
                 names.retain(|name| self.may_see(name));
                 self.answer(message, "as", move |writer| {
                     writer.array("s", |inner| {
@@ -1127,7 +1171,7 @@ impl<'a> Connection<'a> {
                     return Ok(());
                 };
                 let held = self.may_see(&asked)
-                    && (asked == BUS_NAME || self.bus.route(&asked).is_some());
+                    && (asked == BUS_NAME || self.bus.owner_of(&asked).is_some());
                 self.answer(message, "b", move |writer| {
                     writer.bool(held);
                     Ok(())
@@ -1139,10 +1183,26 @@ impl<'a> Connection<'a> {
                 };
                 // The bus owns its own name, and says so: a client that asks
                 // who `org.freedesktop.DBus` is should not be told nobody.
-                if self.may_see(&asked)
-                    && (asked == BUS_NAME || self.bus.route(&asked).is_some())
-                {
-                    self.answer(message, "s", move |writer| writer.string(&asked))
+                //
+                // The answer is the OWNER's unique name, which for a unique
+                // name is itself and for a well-known one is whoever holds
+                // it. That is the whole use of the method: a client resolves
+                // a name once and then matches the sender of what arrives.
+                //
+                // The policy is asked BEFORE the directory, as everywhere
+                // else here: `route` gives the reason — deciding after the
+                // lookup leaves the refusal's TIMING dependent on the fact
+                // the refusal exists to withhold — and a draft of this arm
+                // resolved first and filtered the result.
+                let owner = if !self.may_see(&asked) {
+                    None
+                } else if asked == BUS_NAME {
+                    Some(asked.clone())
+                } else {
+                    self.bus.owner_of(&asked)
+                };
+                if let Some(owner) = owner {
+                    self.answer(message, "s", move |writer| writer.string(&owner))
                 } else {
                     self.refuse(
                         message,
@@ -1203,10 +1263,9 @@ impl<'a> Connection<'a> {
                 // whose pid was not knowable, and the second refused the whole
                 // call and threw away a uid the kernel HAD reported. An entry
                 // that is absent says "not known"; a zero says "pid zero".
-                match self.credentials_for(&asked) {
-                    Some((uid, pid)) => {
+                match self.about(&asked) {
+                    Some((uid, pid, app_id)) => {
                         let pid = usable_pid(pid);
-                        let app_id = self.bus.app_id(&asked);
                         self.answer(message, "a{sv}", move |writer| {
                             writer.array("{sv}", |array| {
                                 array.dict_entry(|entry| {
@@ -1390,6 +1449,25 @@ impl<'a> Connection<'a> {
         )
     }
 
+    /// Everything `GetConnectionCredentials` reports, gated as
+    /// `credentials_for` is and taken under ONE lock.
+    ///
+    /// Two lookups would let the name change hands between them and report
+    /// one peer's uid and pid beside another peer's application id, which is
+    /// the claim `td.AppId` exists to make truthfully.
+    fn about(&self, name: &str) -> Option<(u32, i32, Option<String>)> {
+        if !self.may_see(name) {
+            return None;
+        }
+        if name == BUS_NAME {
+            // The broker has no application id of its own; its uid and pid
+            // come from the same place `credentials_for` reads them.
+            let (uid, pid) = self.credentials_for(name)?;
+            return Some((uid, pid, None));
+        }
+        self.bus.about(name)
+    }
+
     /// Whether this caller may learn that `name` exists.
     ///
     /// Every answer the broker gives about a name goes through here, so a
@@ -1512,6 +1590,178 @@ impl<'a> Connection<'a> {
                 Ok(None)
             }
         }
+    }
+
+    /// §D's `RequestName`, with the specification's three flags and four
+    /// answers.
+    ///
+    /// The whole operation is serialized against every other ownership
+    /// change on this bus, announcements included. Without that, two peers
+    /// racing for one name can have their directed signals interleave with
+    /// somebody else's: B replaces A, C replaces B, and if C's `NameLost` for
+    /// B is queued before B's own `NameAcquired`, B is told it lost the name
+    /// and then that it holds it, while C is the holder. The signals are a
+    /// state machine, so their ORDER is the state.
+    fn acquire_name(
+        &mut self,
+        message: &message::Message<'_>,
+        wants_reply: bool,
+    ) -> Result<(), Ended> {
+        let Some((asked, flags)) = self.name_and_flags(message, wants_reply)? else {
+            return Ok(());
+        };
+        if !policy::may_own(&self.identity, &asked) {
+            return self.refuse_if_wanted(
+                message,
+                "org.freedesktop.DBus.Error.AccessDenied",
+                if policy::is_reserved_name(&asked) {
+                    "that name is reserved for this broker and the portal"
+                } else {
+                    "this connection may own no name on this bus"
+                },
+                wants_reply,
+            );
+        }
+        let mine = self.named()?.to_string();
+        let ordering = self.bus.ordering();
+        let (outcome, handover) = self.bus.request_name(&mine, &asked, flags);
+        // The news BEFORE the answer, which is the reference daemon's order
+        // and not `say_hello`'s. `say_hello` puts its reply first because the
+        // peer has no name until it arrives, so anything ahead of it reaches a
+        // connection that does not yet know who it is; here the connection is
+        // established and the question is only which of two of the broker's
+        // own messages a client library sees first. Matching `dbus-daemon` is
+        // worth more than an argument of our own on a point where clients are
+        // tested against it.
+        //
+        // Neither order closes the window this leaves: the name is routable
+        // the moment `request_name` returns, so another peer can land a call
+        // for it ahead of both. That is the shape `say_hello` was restructured
+        // to remove, and it is much less serious here — the recipient has a
+        // name, knows it, and a client library queues an incoming call while
+        // it waits for a reply — but it is a deviation and not a claim to the
+        // contrary.
+        if let Some(handover) = handover {
+            self.announce(&handover);
+        }
+        let code = outcome.code();
+        if wants_reply {
+            self.answer(message, "u", move |writer| {
+                writer.uint32(code);
+                Ok(())
+            })?;
+        }
+        drop(ordering);
+        Ok(())
+    }
+
+    /// §D's `ReleaseName`, serialized with the rest for the same reason.
+    fn give_up_name(
+        &mut self,
+        message: &message::Message<'_>,
+        wants_reply: bool,
+    ) -> Result<(), Ended> {
+        let Some(asked) = self.well_known_argument(message, wants_reply)? else {
+            return Ok(());
+        };
+        let mine = self.named()?.to_string();
+        let ordering = self.bus.ordering();
+        let (outcome, handover) = self.bus.release_name(&mine, &asked);
+        // `NON_EXISTENT` and `NOT_OWNER` are a two-valued oracle for "does
+        // anybody hold this name", and without this any peer could ask it
+        // about any name — straight past the filter the last two landings
+        // built, and past this file's own rule that a name the caller may not
+        // see is reported ABSENT rather than as an error confirming it
+        // exists. Answered as nobody's, which is indistinguishable from the
+        // truth for a name this caller may not see.
+        //
+        // Only the refusal is rewritten. A caller that HELD the name or was
+        // queued for it gets `Done` either way, so nothing legitimate is
+        // touched: a peer cannot be holding a name it may not see without
+        // this broker having granted it one.
+        let outcome = match outcome {
+            Released::NotOwner if !self.may_see(&asked) => Released::NonExistent,
+            outcome => outcome,
+        };
+        let code = outcome.code();
+        if let Some(handover) = handover {
+            self.announce(&handover);
+        }
+        if wants_reply {
+            self.answer(message, "u", move |writer| {
+                writer.uint32(code);
+                Ok(())
+            })?;
+        }
+        drop(ordering);
+        Ok(())
+    }
+
+    /// A well-known name argument, validated, or a refusal already sent.
+    ///
+    /// Well-known rather than any bus name: a unique name is the broker's to
+    /// hand out and never a peer's to ask for, so a request for one is
+    /// refused as an argument rather than answered as a name nobody holds.
+    fn well_known_argument(
+        &mut self,
+        message: &message::Message<'_>,
+        wants_reply: bool,
+    ) -> Result<Option<String>, Ended> {
+        if !self.takes_if_wanted(message, "s", wants_reply)? {
+            return Ok(None);
+        }
+        match message.args().first().and_then(crate::wire::Value::as_str) {
+            Some(text) if crate::name::valid_well_known_name(text) => {
+                Ok(Some(text.to_string()))
+            }
+            _ => {
+                self.refuse_if_wanted(
+                    message,
+                    "org.freedesktop.DBus.Error.InvalidArgs",
+                    "that is not a well-known bus name",
+                    wants_reply,
+                )?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// `RequestName`'s name and flags, validated, or a refusal already sent.
+    ///
+    /// Unknown flag bits are IGNORED rather than refused, which is what the
+    /// specification says and what a client library built against a later
+    /// version needs: a bit this broker does not implement is a request it
+    /// does not honour, not a message it cannot read.
+    fn name_and_flags(
+        &mut self,
+        message: &message::Message<'_>,
+        wants_reply: bool,
+    ) -> Result<Option<(String, u32)>, Ended> {
+        if !self.takes_if_wanted(message, "su", wants_reply)? {
+            return Ok(None);
+        }
+        let args = message.args();
+        let name = args.first().and_then(crate::wire::Value::as_str);
+        let flags = args.get(1).and_then(crate::wire::Value::as_u32);
+        let (Some(name), Some(flags)) = (name, flags) else {
+            self.refuse_if_wanted(
+                message,
+                "org.freedesktop.DBus.Error.InvalidArgs",
+                "RequestName takes a name and flags",
+                wants_reply,
+            )?;
+            return Ok(None);
+        };
+        if !crate::name::valid_well_known_name(name) {
+            self.refuse_if_wanted(
+                message,
+                "org.freedesktop.DBus.Error.InvalidArgs",
+                "that is not a well-known bus name",
+                wants_reply,
+            )?;
+            return Ok(None);
+        }
+        Ok(Some((name.to_string(), flags)))
     }
 
     /// `Register`'s three arguments, validated, or a refusal already sent.
@@ -1658,6 +1908,66 @@ impl<'a> Connection<'a> {
             .encode()
             .map_err(|error| Ended::Failed(format!("reply: {error}")))?;
         self.queue_own(reply)
+    }
+
+    /// Tell the connections a name changed hands about.
+    ///
+    /// `NameAcquired` and `NameLost` are DIRECTED signals -- each goes to the
+    /// one connection it is about -- so they need no subscription and no match
+    /// rule. `NameOwnerChanged` is the broadcast form of the same news and
+    /// waits for match rules to land; §D filters it per caller, which is a
+    /// subscription-shaped version of the `see` question and belongs with the
+    /// machinery that answers it.
+    ///
+    /// Best effort, and the cost of that is worth stating: these are
+    /// STATE-MACHINE signals, not news. A peer that misses `NameLost` goes on
+    /// believing it holds a name that now routes elsewhere. There is nothing
+    /// better available — this runs from `Drop` as well, so there is nowhere
+    /// to report to, and disconnecting a recipient for being behind is the
+    /// thing §D's budget remedy exists to avoid, since it did not choose when
+    /// this fired. So it is LOGGED: a broker-level condition, apart from an
+    /// ordinary refusal, because reaching it means a peer's view of the bus
+    /// and the bus's view of it have parted.
+    fn announce(&self, handover: &crate::registry::Handover) {
+        for (unique, member) in [
+            (handover.lost.as_deref(), "NameLost"),
+            (handover.gained.as_deref(), "NameAcquired"),
+        ] {
+            let Some(unique) = unique else {
+                continue;
+            };
+            let Some(outbox) = self.bus.route(unique) else {
+                continue;
+            };
+            let serial = outbox.take_serial();
+            let built = message::Builder::signal(
+                crate::wire::Endian::Little,
+                BUS_PATH,
+                BUS_NAME,
+                member,
+            )
+            .sender(BUS_NAME)
+            .destination(unique)
+            .serial(serial)
+            .body("s", |writer| writer.string(&handover.name));
+            let Ok(frame) = built
+                .map_err(|_| ())
+                .and_then(|built| built.encode().map_err(|_| ()))
+            else {
+                eprintln!(
+                    "td-busd: cannot build {member} for {unique}: {} is unsayable",
+                    handover.name
+                );
+                continue;
+            };
+            if self.deliver(&outbox, frame).is_err() {
+                eprintln!(
+                    "td-busd: {unique} did not get {member} for {}; \
+                     its view of what it owns is now behind this bus's",
+                    handover.name
+                );
+            }
+        }
     }
 
     /// Un-record a call this connection recorded and then could not send.
@@ -2870,6 +3180,15 @@ mod tests {
         /// How many handshake lines are still to be stepped over. One for the
         /// `OK`, two when `AGREE_UNIX_FD` follows it.
         lines: usize,
+        /// Frames `answer` stepped over, in arrival order, waiting for a
+        /// `frame` that wants them.
+        ///
+        /// The broker announces a name changing hands BEFORE it answers the
+        /// call that changed it, which is the reference daemon's order. A test
+        /// that asks for the ANSWER should not have to know that, and a test
+        /// that asks for the announcement should still find it, so the one
+        /// that arrives early waits here rather than being discarded.
+        deferred: Vec<Vec<u8>>,
     }
 
     /// The serial `arriving` spends on its barrier call. Far above anything a
@@ -2894,6 +3213,7 @@ mod tests {
                 stream,
                 held: Vec::new(),
                 lines: if descriptors { 2 } else { 1 },
+                deferred: Vec::new(),
             };
             let negotiate = if descriptors { "NEGOTIATE_UNIX_FD\r\n" } else { "" };
             let mut opening =
@@ -2913,6 +3233,28 @@ mod tests {
                 .and_then(crate::wire::Value::as_str)
                 .expect("Hello answers with a name")
                 .to_string();
+            // The unique name is announced like any other name gained, and
+            // it arrives after the `Hello` reply because `publish` — which is
+            // what makes this connection routable enough to be told anything
+            // — happens after that reply is queued.
+            let frame = peer.frame();
+            let (gained, _) =
+                message::decode(&frame, 0).expect("decode the arrival announcement");
+            assert_eq!(
+                (
+                    gained.kind,
+                    gained.fields.sender,
+                    gained.fields.member,
+                    gained.args().first().and_then(crate::wire::Value::as_str),
+                ),
+                (
+                    message::MessageType::Signal,
+                    Some(BUS_NAME),
+                    Some("NameAcquired"),
+                    Some(name.as_str()),
+                ),
+                "a peer was not told the name it had just been given"
+            );
             // `say_hello` queues this reply BEFORE `publish` makes the name
             // routable, so a peer that has read its Hello can still be
             // invisible to the peer about to look for it. Neither a sleep nor
@@ -2962,6 +3304,9 @@ mod tests {
         /// The next whole frame, reading until there is one. The handshake's
         /// lines are stepped over on the way past.
         fn frame(&mut self) -> Vec<u8> {
+            if !self.deferred.is_empty() {
+                return self.deferred.remove(0);
+            }
             let mut chunk = [0u8; 1024];
             loop {
                 while self.lines > 0 {
@@ -2989,7 +3334,43 @@ mod tests {
         /// Nothing more arrives. The wait is short because the assertion is
         /// that nothing comes, and a long one would only make the suite slow
         /// at proving it.
+        /// The next frame that ANSWERS a call, holding aside any signal that
+        /// arrives ahead of it.
+        ///
+        /// A name changing hands is announced before the call that changed it
+        /// is answered. Tests that care about the announcement read it with
+        /// `frame`; this is for the ones that care about the answer, and what
+        /// it steps over is kept rather than dropped so a later `frame` still
+        /// sees it.
+        fn answer(&mut self) -> Vec<u8> {
+            let mut stepped: Vec<Vec<u8>> = Vec::new();
+            let found = loop {
+                let frame = self.frame();
+                let Ok((message, _)) = message::decode(&frame, 0) else {
+                    break frame;
+                };
+                if message.kind != message::MessageType::Signal {
+                    break frame;
+                }
+                stepped.push(frame);
+            };
+            // Put back AFTER the loop, never during it: `frame` drains this
+            // list, so a frame deferred inside the loop would be handed
+            // straight back and deferred again, for ever.
+            //
+            // Stepped-over frames first, because `frame` drains from the
+            // front: anything still deferred arrived later than everything
+            // this call passed.
+            stepped.append(&mut self.deferred);
+            self.deferred = stepped;
+            found
+        }
+
         fn expect_silence(&mut self) {
+            assert!(
+                self.deferred.is_empty(),
+                "a frame this test stepped over is still waiting"
+            );
             assert!(self.held.is_empty(), "a frame was already waiting");
             self.stream
                 .set_read_timeout(Some(std::time::Duration::from_millis(200)))
@@ -3098,6 +3479,83 @@ mod tests {
             .expect("encode a reply")
     }
 
+    /// Read the `NameAcquired` a connection is sent for its own unique name.
+    ///
+    /// `Peer::arrive` accounts for it; the tests that lay out their own
+    /// opening bytes have to as well. Asserted rather than discarded, so each
+    /// of them keeps checking that the announcement is where this says it is.
+    fn takes_its_name(peer: &mut Peer) -> String {
+        let frame = peer.frame();
+        let (gained, _) =
+            message::decode(&frame, 0).expect("decode the arrival announcement");
+        assert_eq!(
+            (gained.kind, gained.fields.sender, gained.fields.member),
+            (
+                message::MessageType::Signal,
+                Some(BUS_NAME),
+                Some("NameAcquired")
+            ),
+            "a peer was not told the name it had just been given"
+        );
+        gained
+            .args()
+            .first()
+            .and_then(crate::wire::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// `RequestName(name, flags)`.
+    fn request_name(name: &str, flags: u32, serial: u32) -> Vec<u8> {
+        message::Builder::method_call(crate::wire::Endian::Little, BUS_PATH, Some(BUS_NAME), "RequestName")
+            .destination(BUS_NAME)
+            .serial(serial)
+            .body("su", |writer| {
+                writer.string(name)?;
+                writer.uint32(flags);
+                Ok(())
+            })
+            .expect("body")
+            .encode()
+            .expect("encode a RequestName")
+    }
+
+    /// `ReleaseName(name)`.
+    fn release_name(name: &str, serial: u32) -> Vec<u8> {
+        name_query("ReleaseName", name, serial)
+    }
+
+    /// The `u` a name method answered with, and the serial it answers.
+    fn name_code(frame: &[u8]) -> (u32, Option<u32>) {
+        let (reply, _) = message::decode(frame, 0).expect("decode a name reply");
+        assert_eq!(
+            reply.kind,
+            message::MessageType::MethodReturn,
+            "the broker refused rather than answering: {:?}",
+            reply.fields.error_name
+        );
+        (
+            reply.args().first().and_then(crate::wire::Value::as_u32).unwrap_or(0),
+            reply.fields.reply_serial,
+        )
+    }
+
+    /// The name a `NameAcquired` or `NameLost` signal carries.
+    fn announced(frame: &[u8]) -> (String, String) {
+        let (signal, _) = message::decode(frame, 0).expect("decode an announcement");
+        assert_eq!(signal.kind, message::MessageType::Signal);
+        assert_eq!(signal.fields.sender, Some(BUS_NAME));
+        (
+            signal.fields.member.unwrap_or("").to_string(),
+            signal
+                .args()
+                .first()
+                .and_then(crate::wire::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        )
+    }
+
     /// A directed message reaches the connection its DESTINATION names, and
     /// arrives with the broker's word about who sent it.
     #[test]
@@ -3200,8 +3658,10 @@ mod tests {
             stream: client,
             held: Vec::new(),
             lines: 1,
+            deferred: Vec::new(),
         };
         let _hello = peer.frame();
+        let _gained = takes_its_name(&mut peer);
         let frame = peer.frame();
         let (reply, _) = message::decode(&frame, 0).expect("decode Register's reply");
         assert_eq!(
@@ -3308,8 +3768,10 @@ mod tests {
             stream: client,
             held: Vec::new(),
             lines: 1,
+            deferred: Vec::new(),
         };
         let _hello = peer.frame();
+        let _gained = takes_its_name(&mut peer);
 
         // If the signal had registered, this would be refused as a duplicate.
         peer.send(&register_call("shouted", "fixture", 3));
@@ -3359,8 +3821,10 @@ mod tests {
             stream: client,
             held: Vec::new(),
             lines: 1,
+            deferred: Vec::new(),
         };
         let _hello = peer.frame();
+        let _gained = takes_its_name(&mut peer);
 
         // Nothing comes back for the quiet call, so the only way to see it is
         // its effect: the instance name is taken, and a second registration
@@ -3467,8 +3931,10 @@ mod tests {
             stream: client,
             held: Vec::new(),
             lines: 1,
+            deferred: Vec::new(),
         };
         let _hello = peer.frame();
+        let _gained = takes_its_name(&mut peer);
         let frame = peer.frame();
         let (reply, _) = message::decode(&frame, 0).expect("decode Register's reply");
         let token = reply
@@ -3511,8 +3977,10 @@ mod tests {
             stream: client,
             held: Vec::new(),
             lines: 1,
+            deferred: Vec::new(),
         };
         let _hello = peer.frame();
+        let _gained = takes_its_name(&mut peer);
 
         // A name that is a `.` run and nothing else, which the grammar's
         // comment claims to exclude and a draft did not: `/` was refused and
@@ -3603,8 +4071,10 @@ mod tests {
             stream: client,
             held: Vec::new(),
             lines: 1,
+            deferred: Vec::new(),
         };
         let _hello = peer.frame();
+        let _gained = takes_its_name(&mut peer);
 
         let mut serial = 2;
         for (which, good) in ["fixture", "firefox", "td-jail-fixture", "org.td.Alias"]
@@ -3674,8 +4144,10 @@ mod tests {
             stream: client,
             held: Vec::new(),
             lines: 1,
+            deferred: Vec::new(),
         };
         let _hello = peer.frame();
+        let _gained = takes_its_name(&mut peer);
         assert_eq!(
             error_of(&peer.frame()).as_deref(),
             Some("org.freedesktop.DBus.Error.UnknownMethod"),
@@ -3710,6 +4182,7 @@ mod tests {
                 stream: client,
                 held: Vec::new(),
                 lines: 1,
+                deferred: Vec::new(),
             };
             let frame = peer.frame();
             let (hello, _) = message::decode(&frame, 0).expect("decode Hello");
@@ -3719,6 +4192,7 @@ mod tests {
                 .and_then(crate::wire::Value::as_str)
                 .expect("a unique name")
                 .to_string();
+            assert_eq!(takes_its_name(&mut peer), me);
 
             peer.send(&name_query("GetConnectionCredentials", &me, 2));
             let frame = peer.frame();
@@ -4205,6 +4679,7 @@ mod tests {
             stream: client,
             held: Vec::new(),
             lines: 1,
+            deferred: Vec::new(),
         };
         let frame = peer.frame();
         let (reply, _) = message::decode(&frame, 0).expect("decode");
@@ -5140,6 +5615,1152 @@ mod tests {
         assert_eq!(bus.pending_replies(), 1);
     }
 
+    /// A name goes to whoever asks first, and the asking is announced.
+    #[test]
+    fn a_name_goes_to_whoever_asks_for_it_first() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (mut two, _) = Peer::arrive(second);
+
+        one.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&one.answer()), (1, Some(2)), "not the primary owner");
+        // The answer comes first, then the news, in the order `say_hello`
+        // uses: what this peer asked about goes ahead of what it did not.
+        assert_eq!(
+            announced(&one.frame()),
+            ("NameAcquired".to_string(), "org.example.Thing".to_string())
+        );
+
+        // A second asker without DO_NOT_QUEUE waits.
+        two.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&two.answer()), (2, Some(2)), "not queued");
+        two.expect_silence();
+
+        // Asking again updates the flags and says which place it holds.
+        one.send(&request_name("org.example.Thing", 0, 3));
+        assert_eq!(name_code(&one.answer()), (4, Some(3)), "not already owner");
+        two.send(&request_name("org.example.Thing", 0, 3));
+        assert_eq!(name_code(&two.answer()), (2, Some(3)), "not still queued");
+    }
+
+    /// A caller that will not wait is told the name exists.
+    #[test]
+    fn a_caller_that_will_not_queue_is_told_the_name_exists() {
+        let (bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (mut two, _) = Peer::arrive(second);
+
+        one.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&one.answer()).0, 1);
+        let _ = one.frame();
+
+        two.send(&request_name(
+            "org.example.Thing",
+            crate::registry::NAME_FLAG_DO_NOT_QUEUE,
+            2,
+        ));
+        assert_eq!(name_code(&two.answer()), (3, Some(2)), "not told it exists");
+        assert!(
+            bus.holds(&name_one, "org.example.Thing"),
+            "the refused caller took the name anyway"
+        );
+    }
+
+    /// A well-known name ROUTES, which is the whole use of holding one.
+    ///
+    /// And the reply comes back, which is what the previous rung could not
+    /// test: it recorded the callee as the connection it RESOLVED rather than
+    /// the name the caller wrote, precisely so that a reply from the holder
+    /// would still claim its record. Nothing could observe that while only
+    /// unique names routed.
+    #[test]
+    fn a_call_to_a_well_known_name_reaches_its_holder_and_is_answered() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        two.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&two.answer()).0, 1);
+        let _ = two.frame();
+
+        one.send(&peer_call("org.example.Thing", 5, "a question by name"));
+        let frame = two.frame();
+        let (call, _) = message::decode(&frame, 0).expect("decode the call");
+        assert_eq!(call.fields.sender, Some(name_one.as_str()));
+        assert_eq!(
+            call.fields.destination,
+            Some("org.example.Thing"),
+            "the destination a caller wrote is not rewritten"
+        );
+
+        // The holder answers under its UNIQUE name, and the record was
+        // written against that, so the answer is carried.
+        two.send(&reply_to(&name_one, call.serial, 3));
+        let frame = one.frame();
+        let (answer, _) = message::decode(&frame, 0).expect("decode the answer");
+        assert_eq!(answer.fields.reply_serial, Some(5));
+        assert_eq!(answer.fields.sender, Some(name_two.as_str()));
+    }
+
+    /// A caller waiting on a well-known name is told when its holder goes.
+    ///
+    /// The other half of the same guard: the departure sweep looks for the
+    /// departing peer's UNIQUE name, so a call recorded against the written
+    /// name would be invisible to it and its caller would wait for ever.
+    #[test]
+    fn a_call_by_name_is_answered_when_the_holder_departs() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (mut two, _) = Peer::arrive(second);
+
+        two.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&two.answer()).0, 1);
+        let _ = two.frame();
+
+        one.send(&peer_call("org.example.Thing", 7, "a question by name"));
+        let _ = two.frame();
+        drop(two);
+
+        let frame = one.frame();
+        let (told, _) = message::decode(&frame, 0).expect("decode the error");
+        assert_eq!(
+            told.fields.error_name,
+            Some("org.freedesktop.DBus.Error.NoReply")
+        );
+        assert_eq!(told.fields.reply_serial, Some(7));
+    }
+
+    /// Releasing a name hands it to whoever was waiting.
+    #[test]
+    fn releasing_a_name_advances_the_queue() {
+        let (bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        one.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&one.answer()).0, 1);
+        let _ = one.frame();
+        two.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&two.answer()).0, 2);
+
+        one.send(&release_name("org.example.Thing", 3));
+        assert_eq!(name_code(&one.answer()), (1, Some(3)), "not released");
+        assert_eq!(
+            announced(&one.frame()),
+            ("NameLost".to_string(), "org.example.Thing".to_string())
+        );
+        assert_eq!(
+            announced(&two.frame()),
+            ("NameAcquired".to_string(), "org.example.Thing".to_string())
+        );
+        assert!(bus.holds(&name_two, "org.example.Thing"));
+        assert!(!bus.holds(&name_one, "org.example.Thing"));
+
+        // And it routes to the new holder.
+        one.send(&peer_call("org.example.Thing", 8, "for the new holder"));
+        let frame = two.frame();
+        let (call, _) = message::decode(&frame, 0).expect("decode the call");
+        assert_eq!(call.fields.sender, Some(name_one.as_str()));
+    }
+
+    /// A departing holder hands the name on in the same act as its departure.
+    #[test]
+    fn a_departing_holder_hands_the_name_on() {
+        let (bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        one.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&one.answer()).0, 1);
+        let _ = one.frame();
+        two.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&two.answer()).0, 2);
+
+        drop(one);
+        assert_eq!(
+            announced(&two.frame()),
+            ("NameAcquired".to_string(), "org.example.Thing".to_string())
+        );
+        assert!(bus.holds(&name_two, "org.example.Thing"));
+    }
+
+    /// A holder that consents may be replaced, and goes to the FRONT of the
+    /// queue rather than the back.
+    #[test]
+    fn a_consenting_holder_is_replaced_and_keeps_its_place() {
+        let (bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        one.send(&request_name(
+            "org.example.Thing",
+            crate::registry::NAME_FLAG_ALLOW_REPLACEMENT,
+            2,
+        ));
+        assert_eq!(name_code(&one.answer()).0, 1);
+        let _ = one.frame();
+
+        two.send(&request_name(
+            "org.example.Thing",
+            crate::registry::NAME_FLAG_REPLACE_EXISTING,
+            2,
+        ));
+        assert_eq!(name_code(&two.answer()), (1, Some(2)), "not the new owner");
+        assert_eq!(
+            announced(&two.frame()),
+            ("NameAcquired".to_string(), "org.example.Thing".to_string())
+        );
+        assert_eq!(
+            announced(&one.frame()),
+            ("NameLost".to_string(), "org.example.Thing".to_string())
+        );
+        assert!(bus.holds(&name_two, "org.example.Thing"));
+
+        // The displaced holder is still waiting, and at the front: when the
+        // replacement leaves, the name comes back to it.
+        drop(two);
+        assert_eq!(
+            announced(&one.frame()),
+            ("NameAcquired".to_string(), "org.example.Thing".to_string())
+        );
+        assert!(bus.holds(&name_one, "org.example.Thing"));
+    }
+
+    /// The other half of "both sides": a holder that CONSENTS is still not
+    /// replaced by a caller that did not ask to replace it.
+    #[test]
+    fn a_caller_that_did_not_ask_to_replace_does_not() {
+        let (bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (mut two, _) = Peer::arrive(second);
+
+        one.send(&request_name(
+            "org.example.Thing",
+            crate::registry::NAME_FLAG_ALLOW_REPLACEMENT,
+            2,
+        ));
+        assert_eq!(name_code(&one.answer()).0, 1);
+        let _ = one.frame();
+
+        two.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&two.answer()), (2, Some(2)), "it took the name");
+        assert!(
+            bus.holds(&name_one, "org.example.Thing"),
+            "a consenting holder was replaced by a caller that did not ask"
+        );
+        one.expect_silence();
+    }
+
+    /// A displaced holder goes to the FRONT of the queue, ahead of anyone who
+    /// was already waiting.
+    ///
+    /// Three peers, because with two the front and the back of the queue are
+    /// the same place and the rule cannot be told from its opposite.
+    #[test]
+    fn a_displaced_holder_goes_ahead_of_whoever_was_waiting() {
+        let (bus, mut clients) = bus_of(3);
+        let third = clients.pop().expect("three clients");
+        let second = clients.pop().expect("three clients");
+        let first = clients.pop().expect("three clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (mut two, _) = Peer::arrive(second);
+        let (mut three, _) = Peer::arrive(third);
+
+        one.send(&request_name(
+            "org.example.Thing",
+            crate::registry::NAME_FLAG_ALLOW_REPLACEMENT,
+            2,
+        ));
+        assert_eq!(name_code(&one.answer()).0, 1);
+        let _ = one.frame();
+
+        // Two is waiting BEFORE three arrives, so a queue that appended the
+        // displaced holder would hand the name to two next.
+        two.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&two.answer()).0, 2);
+
+        three.send(&request_name(
+            "org.example.Thing",
+            crate::registry::NAME_FLAG_REPLACE_EXISTING,
+            2,
+        ));
+        assert_eq!(name_code(&three.answer()).0, 1);
+        let _ = three.frame();
+        assert_eq!(
+            announced(&one.frame()),
+            ("NameLost".to_string(), "org.example.Thing".to_string())
+        );
+
+        drop(three);
+        assert_eq!(
+            announced(&one.frame()),
+            ("NameAcquired".to_string(), "org.example.Thing".to_string()),
+            "the name went to whoever asked longest ago rather than back"
+        );
+        assert!(bus.holds(&name_one, "org.example.Thing"));
+        two.expect_silence();
+    }
+
+    /// A displaced holder that asked NOT to be queued is not queued.
+    ///
+    /// The flag says what happens when the name is taken away as well as
+    /// whether to wait for it in the first place.
+    #[test]
+    fn a_displaced_holder_that_will_not_queue_does_not_come_back() {
+        let (bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        one.send(&request_name(
+            "org.example.Thing",
+            crate::registry::NAME_FLAG_ALLOW_REPLACEMENT
+                | crate::registry::NAME_FLAG_DO_NOT_QUEUE,
+            2,
+        ));
+        assert_eq!(name_code(&one.answer()).0, 1);
+        let _ = one.frame();
+
+        two.send(&request_name(
+            "org.example.Thing",
+            crate::registry::NAME_FLAG_REPLACE_EXISTING,
+            2,
+        ));
+        assert_eq!(name_code(&two.answer()).0, 1);
+        let _ = two.frame();
+        assert_eq!(
+            announced(&one.frame()),
+            ("NameLost".to_string(), "org.example.Thing".to_string())
+        );
+
+        // And when the new holder goes, the name goes with it rather than
+        // back to the peer that said it would not wait.
+        drop(two);
+        one.expect_silence();
+        assert!(!bus.holds(&name_one, "org.example.Thing"));
+        assert!(!bus.holds(&name_two, "org.example.Thing"));
+    }
+
+    /// Asking again with different flags CHANGES them.
+    ///
+    /// Nothing pinned this: the one test that re-requested did so with the
+    /// same flags it started with, so an implementation that dropped the
+    /// update on the floor answered identically.
+    #[test]
+    fn asking_again_changes_the_flags_it_carries() {
+        let (bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        // Held WITHOUT consent to replacement, so a replacement now fails.
+        one.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&one.answer()).0, 1);
+        let _ = one.frame();
+        two.send(&request_name(
+            "org.example.Thing",
+            crate::registry::NAME_FLAG_REPLACE_EXISTING,
+            2,
+        ));
+        assert_eq!(name_code(&two.answer()).0, 2, "it was replaced too early");
+
+        // The same peer asks again and now consents.
+        one.send(&request_name(
+            "org.example.Thing",
+            crate::registry::NAME_FLAG_ALLOW_REPLACEMENT,
+            3,
+        ));
+        assert_eq!(name_code(&one.answer()), (4, Some(3)), "not already owner");
+
+        // Which the next replacement can now use.
+        two.send(&request_name(
+            "org.example.Thing",
+            crate::registry::NAME_FLAG_REPLACE_EXISTING,
+            4,
+        ));
+        assert_eq!(
+            name_code(&two.answer()),
+            (1, Some(4)),
+            "the flags never changed"
+        );
+        assert!(bus.holds(&name_two, "org.example.Thing"));
+        assert!(!bus.holds(&name_one, "org.example.Thing"));
+    }
+
+    /// A departing connection gives up EVERY name it held, not the first.
+    ///
+    /// Three at once, because the cleanup removes emptied entries by index
+    /// with `swap_remove` — which moves the last entry into the hole — and
+    /// with one name that arithmetic cannot be told from its opposite. One of
+    /// the three has a peer waiting behind it, so the walk has to both hand a
+    /// name on and drop two entries in the same pass.
+    #[test]
+    fn a_departing_holder_gives_up_every_name_it_held() {
+        let (bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        let mut serial = 2u32;
+        for name in [
+            "org.example.First",
+            "org.example.Second",
+            "org.example.Third",
+        ] {
+            one.send(&request_name(name, 0, serial));
+            assert_eq!(name_code(&one.answer()).0, 1, "{name} was refused");
+            let _ = one.frame();
+            serial = serial.saturating_add(1);
+        }
+        // Two waits behind the middle one only.
+        two.send(&request_name("org.example.Second", 0, 2));
+        assert_eq!(name_code(&two.answer()).0, 2);
+
+        drop(one);
+
+        assert_eq!(
+            announced(&two.frame()),
+            ("NameAcquired".to_string(), "org.example.Second".to_string())
+        );
+        assert!(bus.holds(&name_two, "org.example.Second"));
+
+        // The other two are nobody's, and can be taken. `DO_NOT_QUEUE`, so an
+        // entry that survived its holder would answer `EXISTS` rather than
+        // quietly queueing behind a connection that has gone.
+        let mut serial = 3u32;
+        for name in ["org.example.First", "org.example.Third"] {
+            two.send(&request_name(
+                name,
+                crate::registry::NAME_FLAG_DO_NOT_QUEUE,
+                serial,
+            ));
+            assert_eq!(
+                name_code(&two.answer()),
+                (1, Some(serial)),
+                "{name} outlived the connection that held it"
+            );
+            let _ = two.frame();
+            serial = serial.saturating_add(1);
+        }
+    }
+
+    /// A handover does not grow the queue past its bound.
+    ///
+    /// The replacement itself is not refused for want of room — a queue full
+    /// of bystanders must not be able to freeze a handover two peers have
+    /// agreed on — so what gives way is the courtesy of re-queueing the
+    /// displaced holder. The bound holds either way, and the queue's length
+    /// is invisible from the wire, so this asks the directory.
+    #[test]
+    fn a_handover_does_not_grow_the_queue_past_its_bound() {
+        let peers = crate::registry::MAX_NAME_QUEUE + 1;
+        let (bus, clients) = bus_of(peers);
+        let mut arrived: Vec<Peer> = clients
+            .into_iter()
+            .map(|client| Peer::arrive(client).0)
+            .collect();
+
+        // The holder consents, and the queue fills behind it.
+        for (which, peer) in arrived.iter_mut().enumerate() {
+            if which == crate::registry::MAX_NAME_QUEUE {
+                break;
+            }
+            let flags = if which == 0 {
+                crate::registry::NAME_FLAG_ALLOW_REPLACEMENT
+            } else {
+                0
+            };
+            peer.send(&request_name("org.example.Thing", flags, 2));
+            let expected = if which == 0 { 1 } else { 2 };
+            assert_eq!(name_code(&peer.answer()).0, expected, "peer {which}");
+        }
+        assert_eq!(
+            bus.wanting("org.example.Thing"),
+            crate::registry::MAX_NAME_QUEUE
+        );
+
+        // The last one takes the name from a queue with no room to put the
+        // displaced holder back into.
+        let Some(last) = arrived.get_mut(crate::registry::MAX_NAME_QUEUE) else {
+            panic!("a peer for every place and one more");
+        };
+        last.send(&request_name(
+            "org.example.Thing",
+            crate::registry::NAME_FLAG_REPLACE_EXISTING,
+            2,
+        ));
+        assert_eq!(name_code(&last.answer()).0, 1, "the handover was refused");
+        assert!(
+            bus.wanting("org.example.Thing") <= crate::registry::MAX_NAME_QUEUE,
+            "a handover grew the queue to {}",
+            bus.wanting("org.example.Thing")
+        );
+    }
+
+    /// A WAITING caller's flags are updated too, not only a holder's.
+    ///
+    /// They matter when it reaches the front: a peer that queued without
+    /// consenting to replacement and then changed its mind has to be
+    /// replaceable once it holds the name.
+    #[test]
+    fn asking_again_changes_the_flags_of_a_caller_that_is_waiting() {
+        let (bus, mut clients) = bus_of(3);
+        let third = clients.pop().expect("three clients");
+        let second = clients.pop().expect("three clients");
+        let first = clients.pop().expect("three clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (mut two, _) = Peer::arrive(second);
+        let (mut three, name_three) = Peer::arrive(third);
+
+        one.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&one.answer()).0, 1);
+        let _ = one.frame();
+
+        // Two queues WITHOUT consenting, then changes its mind.
+        two.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&two.answer()).0, 2);
+        two.send(&request_name(
+            "org.example.Thing",
+            crate::registry::NAME_FLAG_ALLOW_REPLACEMENT,
+            3,
+        ));
+        assert_eq!(name_code(&two.answer()), (2, Some(3)), "not still queued");
+
+        // It reaches the front, carrying the flags it asked for second.
+        one.send(&release_name("org.example.Thing", 4));
+        assert_eq!(name_code(&one.answer()).0, 1);
+        let _ = one.frame();
+        assert_eq!(
+            announced(&two.frame()),
+            ("NameAcquired".to_string(), "org.example.Thing".to_string())
+        );
+
+        three.send(&request_name(
+            "org.example.Thing",
+            crate::registry::NAME_FLAG_REPLACE_EXISTING,
+            2,
+        ));
+        assert_eq!(
+            name_code(&three.answer()),
+            (1, Some(2)),
+            "a waiting caller's change of mind was dropped"
+        );
+        assert!(bus.holds(&name_three, "org.example.Thing"));
+    }
+
+    /// A name given up completely can be taken again.
+    ///
+    /// The entry has to GO when its queue empties, not linger holding a name
+    /// nobody owns: a lingering entry answers `EXISTS` to a caller that will
+    /// not queue, and queues a caller that will — behind nobody, for ever.
+    #[test]
+    fn a_name_given_up_completely_can_be_taken_again() {
+        let (bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        one.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&one.answer()).0, 1);
+        let _ = one.frame();
+        one.send(&release_name("org.example.Thing", 3));
+        assert_eq!(name_code(&one.answer()).0, 1);
+        let _ = one.frame();
+
+        // With DO_NOT_QUEUE, so a lingering entry would answer `EXISTS`
+        // rather than quietly queueing behind nobody.
+        two.send(&request_name(
+            "org.example.Thing",
+            crate::registry::NAME_FLAG_DO_NOT_QUEUE,
+            2,
+        ));
+        assert_eq!(
+            name_code(&two.answer()),
+            (1, Some(2)),
+            "a name nobody holds was not free"
+        );
+        assert!(bus.holds(&name_two, "org.example.Thing"));
+    }
+
+    /// A departing peer leaves the QUEUE as well as the ownership.
+    ///
+    /// Otherwise the name is handed to a connection that has gone: it routes
+    /// nowhere, the announcement reaches nobody, and the name is held by a
+    /// socket that is closed.
+    #[test]
+    fn a_departing_peer_leaves_the_queue_it_was_waiting_in() {
+        let (bus, mut clients) = bus_of(3);
+        let third = clients.pop().expect("three clients");
+        let second = clients.pop().expect("three clients");
+        let first = clients.pop().expect("three clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+        let (mut three, name_three) = Peer::arrive(third);
+
+        one.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&one.answer()).0, 1);
+        let _ = one.frame();
+        two.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&two.answer()).0, 2);
+
+        // The waiter goes before the holder does.
+        drop(two);
+        // The departure is another thread's work; wait for it rather than
+        // assuming it has happened.
+        let mut gone = false;
+        for _ in 0..200 {
+            if bus.route(&name_two).is_none() {
+                gone = true;
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(gone, "the waiter never left");
+
+        one.send(&release_name("org.example.Thing", 3));
+        assert_eq!(name_code(&one.answer()).0, 1);
+        let _ = one.frame();
+
+        // Nobody holds it now, so it is there to be taken.
+        three.send(&request_name(
+            "org.example.Thing",
+            crate::registry::NAME_FLAG_DO_NOT_QUEUE,
+            2,
+        ));
+        assert_eq!(
+            name_code(&three.answer()),
+            (1, Some(2)),
+            "the name was handed to a connection that had gone"
+        );
+        assert!(bus.holds(&name_three, "org.example.Thing"));
+    }
+
+    /// Replacement needs BOTH sides to agree.
+    #[test]
+    fn a_holder_that_did_not_consent_is_not_replaced() {
+        let (bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (mut two, _) = Peer::arrive(second);
+
+        one.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&one.answer()).0, 1);
+        let _ = one.frame();
+
+        two.send(&request_name(
+            "org.example.Thing",
+            crate::registry::NAME_FLAG_REPLACE_EXISTING,
+            2,
+        ));
+        assert_eq!(name_code(&two.answer()), (2, Some(2)), "it was replaced");
+        assert!(bus.holds(&name_one, "org.example.Thing"));
+        one.expect_silence();
+    }
+
+    /// Asking again with `DO_NOT_QUEUE` is how a client LEAVES a queue.
+    ///
+    /// A draft updated the flags of a caller already in the queue and
+    /// returned `IN_QUEUE` whatever they said, so a client that changed its
+    /// mind stayed down as a future owner and was told `EXISTS` by a broker
+    /// that still had it waiting.
+    #[test]
+    fn asking_again_without_queueing_leaves_the_queue() {
+        let (bus, mut clients) = bus_of(3);
+        let third = clients.pop().expect("three clients");
+        let second = clients.pop().expect("three clients");
+        let first = clients.pop().expect("three clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (mut two, _) = Peer::arrive(second);
+        let (mut three, name_three) = Peer::arrive(third);
+
+        one.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&one.answer()).0, 1);
+        let _ = one.frame();
+        two.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&two.answer()).0, 2);
+        three.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&three.answer()).0, 2);
+
+        // Two changes its mind, and is told the name exists rather than that
+        // it is still queued.
+        two.send(&request_name(
+            "org.example.Thing",
+            crate::registry::NAME_FLAG_DO_NOT_QUEUE,
+            3,
+        ));
+        assert_eq!(name_code(&two.answer()), (3, Some(3)), "it stayed in the queue");
+
+        // And it really left: the holder's release goes past it to three.
+        one.send(&release_name("org.example.Thing", 4));
+        assert_eq!(name_code(&one.answer()).0, 1);
+        let _ = one.frame();
+        assert_eq!(
+            announced(&three.frame()),
+            ("NameAcquired".to_string(), "org.example.Thing".to_string())
+        );
+        assert!(bus.holds(&name_three, "org.example.Thing"));
+        two.expect_silence();
+    }
+
+    /// A caller already in the queue may still REPLACE a consenting holder.
+    ///
+    /// A draft answered "still queued" to a client that had queued and then
+    /// asked again with `REPLACE_EXISTING`, leaving it waiting on a holder
+    /// that had agreed to be replaced.
+    #[test]
+    fn a_queued_caller_may_still_replace_a_consenting_holder() {
+        let (bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        one.send(&request_name(
+            "org.example.Thing",
+            crate::registry::NAME_FLAG_ALLOW_REPLACEMENT,
+            2,
+        ));
+        assert_eq!(name_code(&one.answer()).0, 1);
+        let _ = one.frame();
+
+        two.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&two.answer()).0, 2, "not queued to begin with");
+
+        two.send(&request_name(
+            "org.example.Thing",
+            crate::registry::NAME_FLAG_REPLACE_EXISTING,
+            3,
+        ));
+        assert_eq!(
+            name_code(&two.answer()),
+            (1, Some(3)),
+            "a queued caller could not take a name offered to it"
+        );
+        assert!(bus.holds(&name_two, "org.example.Thing"));
+        assert_eq!(
+            announced(&two.frame()),
+            ("NameAcquired".to_string(), "org.example.Thing".to_string())
+        );
+        assert_eq!(
+            announced(&one.frame()),
+            ("NameLost".to_string(), "org.example.Thing".to_string())
+        );
+        // And it is in the queue ONCE: when the new holder goes, the name
+        // comes back to the peer that consented, not to a stale second copy
+        // of the peer that took it.
+        drop(two);
+        assert_eq!(
+            announced(&one.frame()),
+            ("NameAcquired".to_string(), "org.example.Thing".to_string())
+        );
+        assert!(bus.holds(&name_one, "org.example.Thing"));
+    }
+
+    /// The per-connection bound is charged when a name is TAKEN as well as
+    /// when it is queued for.
+    ///
+    /// A draft checked it only on the queueing path, so a peer at its bound
+    /// could go on collecting names by displacing consenting owners.
+    #[test]
+    fn taking_a_name_from_its_holder_is_charged_to_the_bound() {
+        let (bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (mut two, _) = Peer::arrive(second);
+
+        // Two fills its allowance with names of its own.
+        let mut serial = 2u32;
+        for which in 0..crate::registry::MAX_NAMES_PER_CONNECTION {
+            two.send(&request_name(&format!("org.example.N{which}"), 0, serial));
+            assert_eq!(name_code(&two.answer()).0, 1);
+            let _ = two.frame();
+            serial = serial.saturating_add(1);
+        }
+
+        // One offers a name up.
+        one.send(&request_name(
+            "org.example.Offered",
+            crate::registry::NAME_FLAG_ALLOW_REPLACEMENT,
+            2,
+        ));
+        assert_eq!(name_code(&one.answer()).0, 1);
+        let _ = one.frame();
+
+        two.send(&request_name(
+            "org.example.Offered",
+            crate::registry::NAME_FLAG_REPLACE_EXISTING,
+            serial,
+        ));
+        assert_eq!(
+            name_code(&two.answer()),
+            (3, Some(serial)),
+            "the bound did not hold against a replacement"
+        );
+        assert!(
+            bus.holds(&name_one, "org.example.Offered"),
+            "a peer at its bound took another name anyway"
+        );
+        one.expect_silence();
+    }
+
+    /// `ReleaseName`'s three answers.
+    #[test]
+    fn releasing_says_which_of_the_three_things_happened() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (mut two, _) = Peer::arrive(second);
+
+        // Nobody holds it.
+        one.send(&release_name("org.example.Nothing", 2));
+        assert_eq!(name_code(&one.answer()), (2, Some(2)), "not non-existent");
+
+        one.send(&request_name("org.example.Thing", 0, 3));
+        assert_eq!(name_code(&one.answer()).0, 1);
+        let _ = one.frame();
+
+        // Somebody holds it and it is not this caller.
+        two.send(&release_name("org.example.Thing", 4));
+        assert_eq!(name_code(&two.answer()), (3, Some(4)), "not refused");
+
+        // A caller that was only WAITING releases too: it no longer wants it.
+        two.send(&request_name("org.example.Thing", 0, 5));
+        assert_eq!(name_code(&two.answer()).0, 2);
+        two.send(&release_name("org.example.Thing", 6));
+        assert_eq!(name_code(&two.answer()), (1, Some(6)), "a waiter cannot leave");
+        // And leaving the queue is not a handover: the holder keeps it and is
+        // told nothing.
+        one.expect_silence();
+    }
+
+    /// `NO_REPLY_EXPECTED` withdraws the REPLY, not the work.
+    ///
+    /// Both of these CHANGE something, so they sit above the gate that answers
+    /// nothing to a caller that is not waiting. A draft left them below it and
+    /// silently did nothing at all — the same shape of mistake the jail
+    /// registration made, and caught the same way: by reading the effect
+    /// rather than the wire, since a call that wants no reply has no wire to
+    /// read.
+    #[test]
+    fn a_name_call_that_wants_no_reply_is_still_performed() {
+        let (bus, mut clients) = bus_of(1);
+        let only = clients.pop().expect("one client");
+        let (mut peer, name) = Peer::arrive(only);
+
+        fn quiet(member: &str, serial: u32) -> message::Builder<'_> {
+            message::Builder::method_call(
+                crate::wire::Endian::Little,
+                BUS_PATH,
+                Some(BUS_NAME),
+                member,
+            )
+            .destination(BUS_NAME)
+            .flags(message::FLAG_NO_REPLY_EXPECTED)
+            .serial(serial)
+        }
+
+        let taken = quiet("RequestName", 2)
+            .body("su", |writer| {
+                writer.string("org.example.Quiet")?;
+                writer.uint32(0);
+                Ok(())
+            })
+            .expect("body")
+            .encode()
+            .expect("encode");
+        peer.send(&taken);
+
+        // No reply — but the announcement still comes, and the directory
+        // agrees.
+        assert_eq!(
+            announced(&peer.frame()),
+            ("NameAcquired".to_string(), "org.example.Quiet".to_string())
+        );
+        assert!(
+            bus.holds(&name, "org.example.Quiet"),
+            "a quiet RequestName did nothing"
+        );
+
+        let given = quiet("ReleaseName", 3)
+            .body("s", |writer| writer.string("org.example.Quiet"))
+            .expect("body")
+            .encode()
+            .expect("encode");
+        peer.send(&given);
+        assert_eq!(
+            announced(&peer.frame()),
+            ("NameLost".to_string(), "org.example.Quiet".to_string())
+        );
+        assert!(
+            !bus.holds(&name, "org.example.Quiet"),
+            "a quiet ReleaseName did nothing"
+        );
+
+        // And a quiet call with the WRONG arguments earns no error, because
+        // the caller said it is not listening for one.
+        let malformed = quiet("RequestName", 4)
+            .body("s", |writer| writer.string("org.example.Quiet"))
+            .expect("body")
+            .encode()
+            .expect("encode");
+        peer.send(&malformed);
+        peer.expect_silence();
+        assert!(!bus.holds(&name, "org.example.Quiet"));
+    }
+
+    /// A reserved name is refused to everyone, including a caller this design
+    /// otherwise leaves unrestricted.
+    #[test]
+    fn a_reserved_name_is_refused_to_an_unconfined_caller() {
+        let (_bus, mut clients) = bus_of(1);
+        let only = clients.pop().expect("one client");
+        let (mut peer, _) = Peer::arrive(only);
+
+        let mut serial = 2u32;
+        for name in [
+            "org.freedesktop.DBus",
+            "org.freedesktop.portal.Desktop",
+            "org.freedesktop.impl.portal.Access",
+        ] {
+            peer.send(&request_name(name, 0, serial));
+            let frame = peer.frame();
+            let (refusal, _) = message::decode(&frame, 0).expect("decode");
+            assert_eq!(
+                refusal.fields.error_name,
+                Some("org.freedesktop.DBus.Error.AccessDenied"),
+                "{name} was not refused"
+            );
+            assert_eq!(refusal.fields.reply_serial, Some(serial));
+            serial = serial.saturating_add(1);
+        }
+    }
+
+    /// §D's default sandboxed policy owns no name.
+    #[test]
+    fn a_confined_peer_may_own_no_name() {
+        if !pidfd_available() {
+            return;
+        }
+        let (bus, mut clients) = confined_bus_of(1);
+        let only = clients.pop().expect("one client");
+        let (mut peer, name) = Peer::arrive(only);
+
+        peer.send(&request_name("org.example.Thing", 0, 2));
+        let frame = peer.frame();
+        let (refusal, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(
+            refusal.fields.error_name,
+            Some("org.freedesktop.DBus.Error.AccessDenied")
+        );
+        assert!(!bus.holds(&name, "org.example.Thing"));
+    }
+
+    /// `ReleaseName` tells a caller nothing the filter would withhold.
+    ///
+    /// Its `NON_EXISTENT` and `NOT_OWNER` answers are a two-valued oracle for
+    /// "does anybody hold this name", and a draft let any peer ask it about
+    /// any name — straight past the filter, and past this file's rule that a
+    /// name the caller may not see is reported ABSENT rather than as an error
+    /// confirming it exists. A confined caller now gets the same answer for a
+    /// name that is held as for one that is not.
+    ///
+    /// The mixed bus, because the two answers have to differ for a caller
+    /// that MAY see the name or the test proves only that the method is
+    /// broken.
+    #[test]
+    fn releasing_a_name_it_may_not_see_tells_a_confined_caller_nothing() {
+        if !pidfd_available() {
+            return;
+        }
+        let (bus, free, jailed) = mixed_bus();
+        let (mut owner, name_owner) = Peer::arrive(free);
+        let (mut confined, _) = Peer::arrive(jailed);
+
+        owner.send(&request_name("org.example.Held", 0, 2));
+        assert_eq!(name_code(&owner.answer()).0, 1);
+        let _ = owner.frame();
+        assert!(bus.holds(&name_owner, "org.example.Held"));
+
+        // Held and unheld are the same answer to a caller that may see
+        // neither.
+        confined.send(&release_name("org.example.Held", 2));
+        let held = name_code(&confined.answer());
+        confined.send(&release_name("org.example.NotHeld", 3));
+        let unheld = name_code(&confined.answer());
+        assert_eq!(
+            (held.0, unheld.0),
+            (2, 2),
+            "a confined caller learned which names are taken"
+        );
+
+        // And the name is still held: the refusal did not release it.
+        assert!(bus.holds(&name_owner, "org.example.Held"));
+
+        // A caller that MAY see the name is still told the truth, so the
+        // answers above are a withholding rather than a method that never
+        // works. `NOT_OWNER` for a visible name is the third answer and is
+        // covered by `releasing_says_which_of_the_three_things_happened`;
+        // what this adds is that the holder can still give its own name up.
+        owner.send(&release_name("org.example.Held", 3));
+        assert_eq!(
+            name_code(&owner.answer()).0,
+            1,
+            "the holder could not release its own name"
+        );
+        assert!(!bus.holds(&name_owner, "org.example.Held"));
+    }
+
+    /// A unique name is the broker's to hand out, never a peer's to ask for.
+    #[test]
+    fn a_unique_name_may_not_be_requested() {
+        let (_bus, mut clients) = bus_of(1);
+        let only = clients.pop().expect("one client");
+        let (mut peer, name) = Peer::arrive(only);
+
+        for asked in [name.as_str(), ":1.999", "not a name"] {
+            peer.send(&request_name(asked, 0, 2));
+            let frame = peer.frame();
+            let (refusal, _) = message::decode(&frame, 0).expect("decode");
+            assert_eq!(
+                refusal.fields.error_name,
+                Some("org.freedesktop.DBus.Error.InvalidArgs"),
+                "{asked} was accepted"
+            );
+        }
+    }
+
+    /// The lookups answer about a well-known name, and about its HOLDER.
+    #[test]
+    fn the_lookups_answer_about_a_name_and_name_its_holder() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        one.send(&name_query("NameHasOwner", "org.example.Thing", 2));
+        let frame = one.frame();
+        let (before, _) = message::decode(&frame, 0).expect("decode");
+        assert!(
+            matches!(before.args().first(), Some(crate::wire::Value::Bool(false))),
+            "an unheld name has an owner"
+        );
+
+        two.send(&request_name("org.example.Thing", 0, 2));
+        assert_eq!(name_code(&two.answer()).0, 1);
+        let _ = two.frame();
+
+        one.send(&name_query("NameHasOwner", "org.example.Thing", 3));
+        let frame = one.frame();
+        let (after, _) = message::decode(&frame, 0).expect("decode");
+        assert!(matches!(
+            after.args().first(),
+            Some(crate::wire::Value::Bool(true))
+        ));
+
+        // The OWNER's unique name, not the name that was asked about.
+        one.send(&name_query("GetNameOwner", "org.example.Thing", 4));
+        let frame = one.frame();
+        let (owner, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(
+            owner.args().first().and_then(crate::wire::Value::as_str),
+            Some(name_two.as_str())
+        );
+
+        one.send(&bus_call("ListNames", 5));
+        let frame = one.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        let listed: Vec<String> = reply
+            .args()
+            .first()
+            .and_then(crate::wire::Value::as_seq)
+            .expect("an array came back")
+            .values(64)
+            .expect("read the array")
+            .iter()
+            .filter_map(crate::wire::Value::as_str)
+            .map(str::to_string)
+            .collect();
+        assert!(
+            listed.contains(&"org.example.Thing".to_string()),
+            "a held name is missing from ListNames: {listed:?}"
+        );
+        assert!(listed.contains(&name_two), "{listed:?}");
+    }
+
+    /// The queue is bounded, and a caller refused for want of room is told
+    /// the same thing a caller that declined to wait is told.
+    #[test]
+    fn the_owner_queue_is_bounded() {
+        let peers = crate::registry::MAX_NAME_QUEUE + 1;
+        let (_bus, clients) = bus_of(peers);
+        let mut arrived: Vec<Peer> = clients
+            .into_iter()
+            .map(|client| Peer::arrive(client).0)
+            .collect();
+
+        for (which, peer) in arrived.iter_mut().enumerate() {
+            peer.send(&request_name("org.example.Thing", 0, 2));
+            let expected = if which == 0 {
+                1
+            } else if which < crate::registry::MAX_NAME_QUEUE {
+                2
+            } else {
+                3
+            };
+            assert_eq!(
+                name_code(&peer.answer()).0,
+                expected,
+                "peer {which} got the wrong answer"
+            );
+        }
+    }
+
+    /// One connection may not hold more names than its bound.
+    #[test]
+    fn a_connection_may_not_hold_more_names_than_its_bound() {
+        let (_bus, mut clients) = bus_of(1);
+        let only = clients.pop().expect("one client");
+        let (mut peer, _) = Peer::arrive(only);
+
+        let mut serial = 2u32;
+        for which in 0..crate::registry::MAX_NAMES_PER_CONNECTION {
+            peer.send(&request_name(&format!("org.example.N{which}"), 0, serial));
+            assert_eq!(name_code(&peer.answer()).0, 1, "name {which} was refused");
+            let _ = peer.frame();
+            serial = serial.saturating_add(1);
+        }
+        peer.send(&request_name("org.example.OneTooMany", 0, serial));
+        assert_eq!(
+            name_code(&peer.answer()),
+            (3, Some(serial)),
+            "the bound did not hold"
+        );
+    }
+
     /// §D's bound, charged per CALLER and refused rather than trimmed.
     ///
     /// Trimming an old entry to make room would un-track a call that is still
@@ -5352,8 +6973,12 @@ mod tests {
             stream: client,
             held: Vec::new(),
             lines: 1,
+            deferred: Vec::new(),
         };
-        // No Hello reply — but the name exists, which the directory can say.
+        // No Hello REPLY — but the name is still announced, because a name
+        // gained is announced whether or not the call that gained it was
+        // answered, and the directory says the same thing.
+        assert_eq!(takes_its_name(&mut peer), ":1.1");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while !bus.names().iter().any(|name| name == ":1.1") {
             assert!(deadline > std::time::Instant::now(), "no name was assigned");
@@ -6834,10 +8459,14 @@ mod tests {
         }
         client.write_all(&opening).expect("write");
 
+        // Five frames, not four: the `NameAcquired` for the unique name is
+        // one of the broker's messages too, and it has to carry a serial of
+        // its own like any other. Counting it is the point rather than an
+        // inconvenience — it comes from the same counter.
         let mut got = Vec::new();
         let mut chunk = [0u8; 1024];
         let mut seen = Vec::new();
-        while seen.len() < 4 {
+        while seen.len() < 5 {
             let read = client.read(&mut chunk).expect("read");
             assert_ne!(read, 0, "the bus closed after {} replies", seen.len());
             got.extend_from_slice(&chunk[..read]);
@@ -6857,7 +8486,7 @@ mod tests {
         let answered: Vec<Option<u32>> = seen.iter().map(|(_, to)| *to).collect();
         assert_eq!(
             answered,
-            vec![Some(1), Some(2), Some(3), Some(4)],
+            vec![Some(1), None, Some(2), Some(3), Some(4)],
             "wrong calls answered"
         );
         let mut unique = serials.clone();

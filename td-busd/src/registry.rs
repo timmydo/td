@@ -521,6 +521,107 @@ struct Pending {
     callee: String,
 }
 
+/// The most well-known names one connection may hold or queue for.
+///
+/// A bound rather than a policy: §D's default sandboxed policy owns no name
+/// at all, so this is what stops an UNCONFINED peer -- which this design
+/// deliberately leaves unrestricted otherwise -- from filling the directory
+/// with names nobody will ever ask for. Thirty-two is `MAX_SERVICES`, and for
+/// the same reason: an instance that predeclares more names than that is
+/// describing something other than an application.
+pub const MAX_NAMES_PER_CONNECTION: usize = 32;
+
+/// The most connections that may want one name at once, owner included.
+///
+/// The queue is the part of `RequestName` that holds memory on behalf of
+/// peers that are not using it, so it is the part that needs a number. A
+/// caller refused for want of room is told `EXISTS`, which is the same answer
+/// it would get for asking without `DO_NOT_QUEUE`'s alternative -- the name
+/// is taken and this caller does not have it.
+pub const MAX_NAME_QUEUE: usize = 16;
+
+/// `RequestName` flags, as the specification numbers them.
+pub const NAME_FLAG_ALLOW_REPLACEMENT: u32 = 0x1;
+pub const NAME_FLAG_REPLACE_EXISTING: u32 = 0x2;
+pub const NAME_FLAG_DO_NOT_QUEUE: u32 = 0x4;
+
+/// What `request_name` did, in the specification's numbering.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Requested {
+    /// The caller holds the name now.
+    PrimaryOwner,
+    /// Somebody else holds it and the caller is waiting behind them.
+    InQueue,
+    /// Somebody else holds it and the caller declined to wait -- or there was
+    /// no room left to wait in.
+    Exists,
+    /// The caller already held it; its flags were updated.
+    AlreadyOwner,
+}
+
+impl Requested {
+    pub fn code(&self) -> u32 {
+        match self {
+            Self::PrimaryOwner => 1,
+            Self::InQueue => 2,
+            Self::Exists => 3,
+            Self::AlreadyOwner => 4,
+        }
+    }
+}
+
+/// What `release_name` did, in the specification's numbering.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Released {
+    /// The caller held it or was queued for it, and no longer is.
+    Done,
+    /// Nobody holds that name.
+    NonExistent,
+    /// Somebody holds it and it is not this caller.
+    NotOwner,
+}
+
+impl Released {
+    pub fn code(&self) -> u32 {
+        match self {
+            Self::Done => 1,
+            Self::NonExistent => 2,
+            Self::NotOwner => 3,
+        }
+    }
+}
+
+/// A name changing hands, for the connections that have to be told.
+///
+/// `NameAcquired` and `NameLost` are DIRECTED signals: each goes to the one
+/// connection it is about, so they need no subscription and land with the
+/// machinery this broker already has. `NameOwnerChanged` is a broadcast and
+/// waits for match rules.
+pub struct Handover {
+    pub name: String,
+    /// The connection that no longer holds it, if there was one.
+    pub lost: Option<String>,
+    /// The connection that holds it now, if anybody does.
+    pub gained: Option<String>,
+}
+
+/// One connection's claim on a well-known name.
+struct Claim {
+    unique: String,
+    /// Whether this holder consents to being replaced by a later caller that
+    /// asks with `REPLACE_EXISTING`.
+    allow_replacement: bool,
+    /// Whether being displaced means leaving rather than going back in the
+    /// queue.
+    do_not_queue: bool,
+}
+
+/// A well-known name and everyone who wants it, the holder first.
+struct Owned {
+    name: String,
+    queue: Vec<Claim>,
+}
+
 /// What resolving a destination and recording a call to it found.
 pub enum Routing {
     /// Nothing on this bus answers to that name.
@@ -532,6 +633,14 @@ pub enum Routing {
     /// The callee's outbox, with the call recorded against the connection
     /// this lookup actually resolved.
     Ready(Arc<Outbox>),
+}
+
+/// What a departing connection left behind.
+pub struct Departure {
+    /// Calls routed to it that will now never be answered.
+    pub abandoned: Vec<Abandoned>,
+    /// Well-known names it was holding, and whoever has them now.
+    pub handovers: Vec<Handover>,
 }
 
 /// A call left unanswered because the peer it was routed to has gone.
@@ -552,12 +661,27 @@ struct Directory {
     /// with two locks a caller could be handed a `NoReply` for a callee that
     /// a concurrent `route` had just found still present, or the reverse.
     pending: Vec<Pending>,
+    /// Well-known names and their queues, under the same lock for the same
+    /// reason: a departing connection gives up its names, hands them to
+    /// whoever was waiting, and stops routing, and a lookup that saw two of
+    /// those three would route to a peer that had already gone.
+    owned: Vec<Owned>,
 }
 
 /// The bus's directory.
 pub struct Bus {
     directory: Mutex<Directory>,
     total_outgoing: Arc<AtomicUsize>,
+    /// Held across an ownership change AND the signals that announce it.
+    ///
+    /// Separate from the directory lock because the announcements need the
+    /// directory to find the outboxes they go to. What it buys is ORDER: the
+    /// directed `NameAcquired`/`NameLost` pair is a state machine, so two
+    /// transitions whose signals interleave tell a peer a false story. B
+    /// replaces A and C replaces B; if C's `NameLost` for B is queued before
+    /// B's own `NameAcquired`, B is told it lost the name and then that it
+    /// holds it, while C is the holder and nothing said so.
+    ordering: Mutex<()>,
 }
 
 impl Default for Bus {
@@ -573,9 +697,22 @@ impl Bus {
                 next: 1,
                 peers: Vec::new(),
                 pending: Vec::new(),
+                owned: Vec::new(),
             }),
             total_outgoing: Arc::new(AtomicUsize::new(0)),
+            ordering: Mutex::new(()),
         }
+    }
+
+    /// Take the ownership-transition order, for as long as the guard lives.
+    ///
+    /// `None` if it is poisoned, which means a thread died mid-transition. The
+    /// caller goes on without it: an unordered announcement is worse than an
+    /// ordered one and better than none, and a broker that stopped handing out
+    /// names because one connection panicked would be a worse failure than the
+    /// one it is guarding against.
+    pub fn ordering(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        self.ordering.lock().ok()
     }
 
     /// Make an outbox for a connection, before it has a name. A connection has
@@ -680,10 +817,13 @@ impl Bus {
         let Ok(mut directory) = self.directory.lock() else {
             return Routing::Absent;
         };
+        let Some(unique) = Self::resolve(&directory, name) else {
+            return Routing::Absent;
+        };
         let Some((outbox, callee)) = directory
             .peers
             .iter()
-            .find(|peer| peer.unique == name)
+            .find(|peer| peer.unique == unique)
             .map(|peer| (Arc::clone(&peer.outbox), peer.unique.clone()))
         else {
             return Routing::Absent;
@@ -759,10 +899,18 @@ impl Bus {
     /// outstanding calls are dropped without ceremony — there is nobody left
     /// to deliver an error to — while the calls made TO it are what comes
     /// back, each with the outbox its error has to reach.
+    ///
+    /// Its well-known names are given up in the same act, and the handovers
+    /// come back with the abandoned calls. All three under the one lock: a
+    /// connection that had stopped routing but still held a name, or still
+    /// routed and had given one up, is a window in which a message goes to a
+    /// socket nobody is reading.
     #[must_use = "the abandoned calls have to be answered, or their callers wait for ever"]
-    pub fn leave(&self, unique: &str) -> Vec<Abandoned> {
+    pub fn leave(&self, unique: &str) -> Departure {
         let mut abandoned = Vec::new();
+        let mut handovers = Vec::new();
         if let Ok(mut directory) = self.directory.lock() {
+            handovers = Self::abandon_names(&mut directory, unique);
             if let Some(at) = directory
                 .peers
                 .iter()
@@ -798,7 +946,10 @@ impl Bus {
             }
             directory.pending = kept;
         }
-        abandoned
+        Departure {
+            abandoned,
+            handovers,
+        }
     }
 
     #[cfg(test)]
@@ -809,13 +960,355 @@ impl Bus {
             .unwrap_or(0)
     }
 
+
+    /// `RequestName`. The caller asks for a well-known name; this says what
+    /// it got.
+    ///
+    /// The specification's four answers and its three flags, with one
+    /// addition: a queue that is FULL answers `Exists`. That is the same
+    /// answer `DO_NOT_QUEUE` gets, and it is the truthful one -- the name is
+    /// taken and this caller does not have it -- where inventing a fifth code
+    /// would tell a client library something it has no branch for.
+    ///
+    /// Validation and policy are the transport's, not this function's: a name
+    /// this reaches is already well-formed and already permitted, because
+    /// deciding either here would put a spelling rule and a confinement rule
+    /// in the directory rather than beside the rules they belong with.
+    ///
+    /// The handover comes back with the answer, and carries the DISPLACED
+    /// holder as well as the new one. A draft reported only the new owner, so
+    /// a peer whose name had been taken from it under `ALLOW_REPLACEMENT` was
+    /// never told: it went on believing it held a name that now routed
+    /// somewhere else, which is the one thing `NameLost` exists to prevent.
+    pub fn request_name(
+        &self,
+        unique: &str,
+        name: &str,
+        flags: u32,
+    ) -> (Requested, Option<Handover>) {
+        let Ok(mut directory) = self.directory.lock() else {
+            return (Requested::Exists, None);
+        };
+        let allow_replacement = flags & NAME_FLAG_ALLOW_REPLACEMENT != 0;
+        let replace_existing = flags & NAME_FLAG_REPLACE_EXISTING != 0;
+        let do_not_queue = flags & NAME_FLAG_DO_NOT_QUEUE != 0;
+
+        // Names this connection already holds or waits for, NOT counting this
+        // one. A caller asking again about a name it is already in the queue
+        // for is not asking for another name, so counting it would make the
+        // bound depend on how many times a client repeated itself.
+        let held_elsewhere = directory
+            .owned
+            .iter()
+            .filter(|owned| owned.name != name)
+            .flat_map(|owned| owned.queue.iter())
+            .filter(|claim| claim.unique == unique)
+            .count();
+
+        let fresh = !directory.owned.iter().any(|owned| owned.name == name);
+        if fresh {
+            if held_elsewhere >= MAX_NAMES_PER_CONNECTION {
+                return (Requested::Exists, None);
+            }
+            directory.owned.push(Owned {
+                name: name.to_string(),
+                queue: vec![Claim {
+                    unique: unique.to_string(),
+                    allow_replacement,
+                    do_not_queue,
+                }],
+            });
+            return (
+                Requested::PrimaryOwner,
+                Some(Handover {
+                    name: name.to_string(),
+                    lost: None,
+                    gained: Some(unique.to_string()),
+                }),
+            );
+        }
+        // `find` rather than an index: a `get_mut` after a `position` is a
+        // branch shaped like a check that can never run, which this codebase
+        // argues is worse than none because the next reader trusts it.
+        let Some(owned) = directory.owned.iter_mut().find(|owned| owned.name == name) else {
+            return (Requested::Exists, None);
+        };
+        let mine = owned
+            .queue
+            .iter()
+            .position(|claim| claim.unique == unique);
+
+        // Already the holder: the flags are updated in place, which is what
+        // asking again is for, and nothing changes hands.
+        if mine == Some(0) {
+            let Some(claim) = owned.queue.first_mut() else {
+                return (Requested::Exists, None);
+            };
+            claim.allow_replacement = allow_replacement;
+            claim.do_not_queue = do_not_queue;
+            return (Requested::AlreadyOwner, None);
+        }
+
+        // The bound is charged when this connection joins a name it was not
+        // already part of — including by DISPLACING the holder. A draft
+        // checked it only on the queueing path, so a peer could hold any
+        // number of names by taking them from consenting owners.
+        if mine.is_none() && held_elsewhere >= MAX_NAMES_PER_CONNECTION {
+            return (Requested::Exists, None);
+        }
+
+        // Replacement is decided BEFORE the caller's existing place in the
+        // queue is, which is the reference daemon's order and matters: a
+        // client that queued and then asked again with `REPLACE_EXISTING`
+        // means to take the name now, and a draft that answered "still
+        // queued" left it waiting on a holder that had agreed to be
+        // replaced.
+        let displaceable = owned
+            .queue
+            .first()
+            .is_some_and(|holder| holder.allow_replacement);
+        if replace_existing && displaceable {
+            if let Some(mine) = mine {
+                owned.queue.remove(mine);
+            }
+            let displaced = owned.queue.remove(0);
+            owned.queue.insert(
+                0,
+                Claim {
+                    unique: unique.to_string(),
+                    allow_replacement,
+                    do_not_queue,
+                },
+            );
+            let lost = displaced.unique.clone();
+            // The displaced holder goes back to the FRONT of the queue, so a
+            // name handed over and handed back returns to whoever had it
+            // rather than to whoever asked longest ago. Unless it asked not
+            // to be queued, or there is no room: a handover must not grow the
+            // queue past its bound, and the alternative — refusing a
+            // replacement two peers agreed on because a THIRD is waiting --
+            // would let a queue full of bystanders freeze the name.
+            if !displaced.do_not_queue && owned.queue.len() < MAX_NAME_QUEUE {
+                owned.queue.insert(1, displaced);
+            }
+            return (
+                Requested::PrimaryOwner,
+                Some(Handover {
+                    name: name.to_string(),
+                    lost: Some(lost),
+                    gained: Some(unique.to_string()),
+                }),
+            );
+        }
+
+        // A caller that will not wait does not stay waiting. Asking again
+        // with `DO_NOT_QUEUE` is how a client leaves a queue it joined, and
+        // leaving it in would answer `EXISTS` to a peer this broker still had
+        // down as a future owner.
+        if do_not_queue {
+            if let Some(mine) = mine {
+                owned.queue.remove(mine);
+            }
+            return (Requested::Exists, None);
+        }
+
+        match mine {
+            Some(mine) => {
+                let Some(claim) = owned.queue.get_mut(mine) else {
+                    return (Requested::Exists, None);
+                };
+                claim.allow_replacement = allow_replacement;
+                claim.do_not_queue = do_not_queue;
+                (Requested::InQueue, None)
+            }
+            None => {
+                if owned.queue.len() >= MAX_NAME_QUEUE {
+                    return (Requested::Exists, None);
+                }
+                owned.queue.push(Claim {
+                    unique: unique.to_string(),
+                    allow_replacement,
+                    do_not_queue,
+                });
+                (Requested::InQueue, None)
+            }
+        }
+    }
+
+    /// `ReleaseName`, with the handover it caused if the caller was holding
+    /// the name.
+    ///
+    /// Leaving a QUEUE is a release too, and answers `Done`: the caller no
+    /// longer wants the name, which is what it asked for. `NotOwner` is for a
+    /// caller that was never in the queue at all -- the specification's
+    /// distinction is between "not yours" and "nobody's", not between owning
+    /// and waiting.
+    pub fn release_name(&self, unique: &str, name: &str) -> (Released, Option<Handover>) {
+        let Ok(mut directory) = self.directory.lock() else {
+            return (Released::NonExistent, None);
+        };
+        let Some(at) = directory.owned.iter().position(|owned| owned.name == name) else {
+            return (Released::NonExistent, None);
+        };
+        // The index is needed below to drop an emptied entry, so this one is
+        // taken by index and re-borrowed rather than found twice.
+        let Some(owned) = directory.owned.get_mut(at) else {
+            return (Released::NonExistent, None);
+        };
+        let Some(mine) = owned
+            .queue
+            .iter()
+            .position(|claim| claim.unique == unique)
+        else {
+            return (Released::NotOwner, None);
+        };
+        owned.queue.remove(mine);
+        if mine != 0 {
+            return (Released::Done, None);
+        }
+        let gained = owned.queue.first().map(|next| next.unique.clone());
+        if owned.queue.is_empty() {
+            directory.owned.swap_remove(at);
+        }
+        (
+            Released::Done,
+            Some(Handover {
+                name: name.to_string(),
+                lost: Some(unique.to_string()),
+                gained,
+            }),
+        )
+    }
+
+    /// Every well-known name this connection holds or waits for, given up.
+    ///
+    /// Called under the directory lock by `leave`, so a departing connection
+    /// stops routing and stops owning as one act.
+    fn abandon_names(directory: &mut Directory, unique: &str) -> Vec<Handover> {
+        let mut handovers = Vec::new();
+        let mut emptied = Vec::new();
+        for (at, owned) in directory.owned.iter_mut().enumerate() {
+            let Some(mine) = owned
+                .queue
+                .iter()
+                .position(|claim| claim.unique == unique)
+            else {
+                continue;
+            };
+            owned.queue.remove(mine);
+            if mine != 0 {
+                continue;
+            }
+            handovers.push(Handover {
+                name: owned.name.clone(),
+                lost: Some(unique.to_string()),
+                gained: owned.queue.first().map(|next| next.unique.clone()),
+            });
+            if owned.queue.is_empty() {
+                emptied.push(at);
+            }
+        }
+        // Back to front, so an index taken above still names the same entry.
+        // Descending, so an index taken above still names the same entry:
+        // `swap_remove` moves the LAST element into the hole, and the last
+        // element always has a higher index than anything left to remove.
+        emptied.sort_unstable();
+        for at in emptied.into_iter().rev() {
+            directory.owned.swap_remove(at);
+        }
+        handovers
+    }
+
+    /// The connection holding `name`, if it is a well-known one somebody
+    /// holds.
+    fn holder(directory: &Directory, name: &str) -> Option<String> {
+        directory
+            .owned
+            .iter()
+            .find(|owned| owned.name == name)
+            .and_then(|owned| owned.queue.first())
+            .map(|claim| claim.unique.clone())
+    }
+
+    /// The unique name behind a destination: itself if it is one, the
+    /// holder's if it is a well-known name somebody holds.
+    pub fn owner_of(&self, name: &str) -> Option<String> {
+        let directory = self.directory.lock().ok()?;
+        Self::resolve(&directory, name)
+    }
+
+    fn resolve(directory: &Directory, name: &str) -> Option<String> {
+        if name.starts_with(':') {
+            return directory
+                .peers
+                .iter()
+                .find(|peer| peer.unique == name)
+                .map(|peer| peer.unique.clone());
+        }
+        Self::holder(directory, name)
+    }
+
+    /// Every name on this bus, unique and well-known, under ONE lock.
+    ///
+    /// Two acquisitions would let a connection join, leave or hand a name on
+    /// between them, and answer with a list that described the bus at no
+    /// instant — a well-known name whose holder's unique name is missing, say.
+    pub fn all_names(&self) -> Vec<String> {
+        let Ok(directory) = self.directory.lock() else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = directory
+            .peers
+            .iter()
+            .map(|peer| peer.unique.clone())
+            .collect();
+        names.sort_by_key(|name| unique_index(name).unwrap_or(u32::MAX));
+        names.extend(
+            directory
+                .owned
+                .iter()
+                .filter(|owned| !owned.queue.is_empty())
+                .map(|owned| owned.name.clone()),
+        );
+        names
+    }
+
+    /// How many connections want `name`, its holder included.
+    ///
+    /// The queue's length is not visible from the wire — a peer is told its
+    /// own place and nothing else — so the bound on it can only be pinned by
+    /// asking the directory.
+    #[cfg(test)]
+    pub(crate) fn wanting(&self, name: &str) -> usize {
+        self.directory.lock().ok().map_or(0, |directory| {
+            directory
+                .owned
+                .iter()
+                .find(|owned| owned.name == name)
+                .map_or(0, |owned| owned.queue.len())
+        })
+    }
+
+    /// Whether this connection holds `name` as its primary owner.
+    #[cfg(test)]
+    pub(crate) fn holds(&self, unique: &str, name: &str) -> bool {
+        let Ok(directory) = self.directory.lock() else {
+            return false;
+        };
+        Self::holder(&directory, name).as_deref() == Some(unique)
+    }
+
     /// The outbox a message addressed to `name` should go to.
+    ///
+    /// A well-known name is resolved to whoever holds it, which is the whole
+    /// point of holding one.
     pub fn route(&self, name: &str) -> Option<Arc<Outbox>> {
         let directory = self.directory.lock().ok()?;
+        let unique = Self::resolve(&directory, name)?;
         directory
             .peers
             .iter()
-            .find(|peer| peer.unique == name)
+            .find(|peer| peer.unique == unique)
             .map(|peer| Arc::clone(&peer.outbox))
     }
 
@@ -825,31 +1318,39 @@ impl Bus {
     /// other end of a call is asking the kernel, through the broker.
     pub fn credentials(&self, name: &str) -> Option<(u32, i32)> {
         let directory = self.directory.lock().ok()?;
+        let unique = Self::resolve(&directory, name)?;
         directory
             .peers
             .iter()
-            .find(|peer| peer.unique == name)
+            .find(|peer| peer.unique == unique)
             .map(|peer| (peer.uid, peer.pid))
     }
 
-    /// The application id behind a name, for peers that have one.
+    /// Everything `GetConnectionCredentials` reports about a name, under ONE
+    /// lock.
     ///
-    /// Resolved once at accept and stored, not recomputed per query. That is
-    /// deliberate rather than a cache: the lineage §D proves is the one that
-    /// existed when the connection was made, and re-walking it later would
-    /// answer about a process tree that has moved on — an application whose
-    /// intermediate ancestors have since exited would stop being itself.
-    pub fn app_id(&self, name: &str) -> Option<String> {
+    /// Two lookups would let the name change hands between them and answer
+    /// with one peer's uid and pid beside another peer's application id --
+    /// and `td.AppId` means "the broker established that this connection is
+    /// this application", which is exactly the claim a mixed answer would
+    /// make falsely.
+    pub fn about(&self, name: &str) -> Option<(u32, i32, Option<String>)> {
         let directory = self.directory.lock().ok()?;
+        let unique = Self::resolve(&directory, name)?;
         directory
             .peers
             .iter()
-            .find(|peer| peer.unique == name)
-            .and_then(|peer| peer.app_id.clone())
+            .find(|peer| peer.unique == unique)
+            .map(|peer| (peer.uid, peer.pid, peer.app_id.clone()))
     }
 
     /// Every unique name currently on the bus, in the order they joined.
-    pub fn names(&self) -> Vec<String> {
+    ///
+    /// The unique half of `all_names`, kept for the tests that need to watch
+    /// a connection join or leave without a well-known name confusing the
+    /// question.
+    #[cfg(test)]
+    pub(crate) fn names(&self) -> Vec<String> {
         let mut names = match self.directory.lock() {
             Ok(directory) => directory
                 .peers
@@ -932,7 +1433,7 @@ mod tests {
         assert_eq!(bus.names(), vec![":1.1".to_string(), ":1.2".to_string()]);
 
         assert!(
-            bus.leave(":1.1").is_empty(),
+            bus.leave(":1.1").abandoned.is_empty(),
             "a peer nobody called abandoned somebody"
         );
         assert_eq!(bus.names(), vec![":1.2".to_string()]);
