@@ -2399,67 +2399,200 @@ fn a_zero_fill_joined_into_the_counted_record_still_ends_where_the_input_does(
     Ok(())
 }
 
-/// A BINARY file stops at the first selected record here, where GNU goes on
-/// counting -- so `-m` can reach its count in GNU and not here, and the position
-/// differs when it does. This pins the DIVERGENCE, not agreement, and it exists
-/// so that closing it reds something.
+/// A BINARY file is read to its FIRST selected record here, where GNU counts
+/// differently -- so `-m` can reach its count in GNU and not here, and the
+/// POSITION differs when it does. No row below differs in stdout, stderr or
+/// status; the descriptor's offset is the whole of it. Eight of the nineteen
+/// rows diverge and eleven agree, and the agreeing ones are here because they
+/// pin the RULE, not because they pin a difference.
 ///
 /// The records are NUL-terminated in binary mode, which is the rule the ledger
-/// entry above this one records: `L01\n` `L02\0` `X\n` `L03\n` `L04\n` `L05\n`,
-/// ending at 4, 8, 10, 14, 18 and 22.
+/// entry above this one records.
 ///
-/// What is NOT known is the rule GNU is following. Non-inverted, GNU stops at
-/// the first match like this does -- `-m2 0` leaves 22 in both -- and under `-v`
-/// it counts on, but only as far as the record the first NUL ends: `-m2 -v X`
-/// reaches its count there and `-m3 -v X` does not, and neither ordinary
-/// `done_on_match` nor "output was suppressed" explains why `-v` alone changes
-/// it. Probing found no property that survives, so nothing here guesses one.
-/// Both columns are measured against GNU grep 3.11.
+/// GNU's counting rule, IN THE SCOPE THESE FIXTURES COVER -- a binary file
+/// whose NUL falls in the FIRST buffer, `-m` at least 1, and none of `-c`,
+/// `-q`, `-l` or `-L`. Selecting matches, GNU counts exactly ONE record: the
+/// first matching one. Under `-v` it counts the first NON-EMPTY run of
+/// non-matching records; a matching record at the scan point is skipped
+/// WITHOUT being counted while the run is still empty. That run ends at the
+/// first matching record WITHIN the counting buffer, or at that buffer's last
+/// complete record -- the buffer bound applies always, not only when nothing
+/// matches. If `-m`'s count lands inside what was counted, the descriptor is
+/// repositioned to the end of that record; otherwise GNU leaves it at end of
+/// input.
+///
+/// The scope list is exact and each item was measured. `-c` leaves GNU
+/// counting normally. `-q` and `-l` settle before the reposition runs, so
+/// `-q -m1 -v X` over the first fixture leaves 22 where the rule predicts 4.
+/// `-m0` reads nothing at all and leaves 0, where "otherwise end of input"
+/// predicts 22. td-txt agrees with GNU in every one of those.
+///
+/// The scope is not decoration. Two measured cases fall outside it and refute
+/// any general reading, and neither is pinned here:
+///
+///   `-c` defeats it. GNU only enters this mode when it is not counting
+///   matches, so `-c -m2 X` over the third fixture counts on and leaves 12
+///   where the rule predicts 16. td-txt AGREES with GNU there, so the defect
+///   would be in the sentence, not the code.
+///
+///   A NUL in a LATER buffer defeats it. Buffers before the NUL count
+///   normally, so over 30000 eight-byte records with matches at records 0, 1
+///   and 15001 and record 15000 replaced by the SEVEN-byte `AAAAAA\0`, `-m3 X`
+///   leaves 120015 where the rule predicts end of input. The short record is
+///   load-bearing: with a uniform eight-byte record there the answer is
+///   120016, and an earlier draft said "eight-byte records" while measuring
+///   this shape. td-txt agrees with GNU either way.
+///
+/// (An earlier draft listed "the run is bounded by the buffer it is counted
+/// in" as a third exception. It is not an exception -- it is a clause of the
+/// rule, and stating it as conditional on "nothing matches" is what made the
+/// rule wrong: with a match present in a LATER buffer, `-m12289 -v X` over
+/// `L\0` + 30000 records leaves end of input where the conditional reading
+/// predicts 98306.)
+///
+/// How far GNU READS is a separate question from where it leaves the
+/// descriptor, and this test cannot see it. Traced on the large fixture below,
+/// `grep -m2 L` does ONE `read` of 98304 on descriptor 0 and then
+/// `lseek(0, 0, SEEK_END)`: GNU reads one buffer and SEEKS past the rest. This
+/// build reads that SAME one buffer and stops at 98304, so the two read alike
+/// here and differ only in where they leave the descriptor. An earlier draft
+/// said GNU "reads LESS than this build, which reads two buffers and stops at
+/// 196608"; that 196608 belongs to a different fixture, one whose first
+/// selected record falls in the second buffer. A position measurement cannot
+/// speak to read depth, and an earlier draft used one to "refute" a correct
+/// read-depth claim.
+///
+/// The rule has now been stated wrongly five times, every time because a
+/// fixture set could not separate two wordings: "as far as the record the first
+/// NUL ends" (refuted by moving the match later); "the run before the first
+/// MATCHING record" (refuted by the fourth fixture, whose first record matches,
+/// where that run is empty and the wording predicts 24 against GNU's 8); "makes
+/// one emit and then stops reading" (retired as false, and it was TRUE -- see
+/// the trace above); and the two scope errors above. The goldens beside every
+/// one of those wordings were correct. That is the point of the scope
+/// paragraph: a green row proves its own offset and nothing about the sentence
+/// beside it.
+///
+/// Every column is measured against GNU grep 3.11 under LC_ALL=C. The scoped
+/// rule was additionally checked by simulating it over 4000 argv/fixture
+/// combinations of randomly built single-buffer binaries in default output mode
+/// and comparing each to GNU: no mismatch. That harness is throwaway and not in
+/// the tree; its scope is exactly the scope stated above, which is why it could
+/// not see any of the three exceptions.
 #[test]
-fn a_binary_file_stops_at_the_first_selected_record_where_gnu_counts_on(
+fn a_binary_file_stops_at_the_first_selected_record_where_gnu_counts_differently(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Seek;
     let dir = TempDir::new("mrepos-bin")?;
     let path = dir.0.join("b");
-    std::fs::write(&path, b"L01\nL02\0X\nL03\nL04\nL05\n")?;
-    // (args, this build, GNU 3.11)
-    for (args, want, gnu) in [
-        // Agreeing: the count falls on the FIRST selected record, which is the
-        // one record a binary file is read to here.
-        (&["-m1", "-v", "X"][..], 4, 4),
-        (&["-m1", "0"][..], 4, 4),
-        // Agreeing: the count is never reached in either, so both leave the end.
-        (&["-m3", "-v", "X"][..], 22, 22),
-        (&["-m2", "0"][..], 22, 22),
-        // DIVERGING: GNU counts a second selected record and stops after it.
-        (&["-m2", "-v", "X"][..], 22, 8),
-        (&["-m2", "-v", "ZZZ"][..], 22, 8),
-        (&["-m2", "-v", "-n", "Z"][..], 22, 8),
+    // (label, fixture, rows of (argv, this build, GNU 3.11)). The GNU column
+    // is DOCUMENTATION, not an assertion: no oracle runs here, so only `want`
+    // reds. Replacing a `gnu` literal with a wrong number leaves the suite
+    // green -- a reviewer checked exactly that. It is the same rule the ledger
+    // states for divergence cases, and it is why the goldens beside a false
+    // sentence stayed green through six wordings.
+    for (label, body, rows) in [
+        (
+            "nul ends the record before the match",
+            &b"L01\nL02\0X\nL03\nL04\nL05\n"[..],
+            &[
+                // Agreeing: the count falls on the FIRST selected record, which
+                // is the one record a binary file is read to here.
+                (&["-m1", "-v", "X"][..], 4u64, 4u64),
+                (&["-m1", "0"][..], 4, 4),
+                // Agreeing: the count is never reached in either, so both leave
+                // the end.
+                (&["-m3", "-v", "X"][..], 22, 22),
+                (&["-m2", "0"][..], 22, 22),
+                // DIVERGING: GNU counts the run of records before the match,
+                // and the count lands inside it.
+                (&["-m2", "-v", "X"][..], 22, 8),
+                // Nothing matches either pattern, so GNU's run is bounded by
+                // the buffer rather than by a match. The count lands on the
+                // same record, which is what makes these agree with the row
+                // above for a different reason.
+                (&["-m2", "-v", "ZZZ"][..], 22, 8),
+                (&["-m2", "-v", "-n", "Z"][..], 22, 8),
+            ][..],
+        ),
+        (
+            "match three records after the nul",
+            &b"A01\nA02\0A03\nA04\nX\nA05\n"[..],
+            &[
+                (&["-m1", "-v", "X"][..], 4, 4),
+                (&["-m2", "-v", "X"][..], 22, 8),
+                // The rows the first fixture cannot produce: "as far as the
+                // record the NUL ends" predicts 22 for both.
+                (&["-m3", "-v", "X"][..], 22, 12),
+                (&["-m4", "-v", "X"][..], 22, 16),
+                // Past the run, so GNU reaches no count either.
+                (&["-m5", "-v", "X"][..], 22, 22),
+            ][..],
+        ),
+        (
+            "two consecutive matching records",
+            &b"A01\nX02\0X03\nA04\n"[..],
+            &[
+                (&["-m1", "X"][..], 8, 8),
+                // Agreeing, and the agreement is the assertion: GNU counts ONE
+                // matching record, not the run of two, so its count is never
+                // reached and neither side repositions. These rows pin the rule
+                // and would NOT red if the divergence closed.
+                (&["-m2", "X"][..], 16, 16),
+                (&["-m3", "X"][..], 16, 16),
+            ][..],
+        ),
+        (
+            "a matching record FIRST, so the leading run is empty",
+            &b"X01\nA02\0A03\nA04\nX05\nA06\n"[..],
+            &[
+                // "The run before the first matching record" is empty here and
+                // predicts 24 for every row. GNU skips X01 without counting it
+                // and counts the first NON-EMPTY run, A02 A03 A04.
+                (&["-m1", "-v", "X"][..], 8, 8),
+                (&["-m2", "-v", "X"][..], 24, 12),
+                (&["-m3", "-v", "X"][..], 24, 16),
+                // The run ends at X05, so the fourth is never counted.
+                (&["-m4", "-v", "X"][..], 24, 24),
+            ][..],
+        ),
     ] {
-        let mut held = std::fs::File::open(&path)?;
-        let given = held.try_clone()?;
-        let out = std::process::Command::new(bin())
-            .arg("grep")
-            .args(args)
-            .stdin(given)
-            .current_dir(&dir.0)
-            .output()?;
-        assert_eq!(
-            out.stderr, b"grep: (standard input): binary file matches\n",
-            "{args:?} notice"
-        );
-        assert_eq!(
-            held.stream_position()?, want,
-            "{args:?} left stdin in the wrong place; GNU 3.11 leaves {gnu}"
-        );
+        std::fs::write(&path, body)?;
+        for (args, want, gnu) in rows {
+            let mut held = std::fs::File::open(&path)?;
+            let given = held.try_clone()?;
+            let out = std::process::Command::new(bin())
+                .arg("grep")
+                .args(*args)
+                .stdin(given)
+                .current_dir(&dir.0)
+                .output()?;
+            // The doc above claims stdout, stderr and status agree with GNU in
+            // every row. Two of the three were claimed and not asserted until a
+            // reviewer said so: the notice is the only thing on either stream,
+            // and the status is a plain match.
+            assert_eq!(
+                out.stderr, b"grep: (standard input): binary file matches\n",
+                "{label}: {args:?} notice"
+            );
+            assert_eq!(out.stdout, b"", "{label}: {args:?} stdout");
+            assert_eq!(out.status.code(), Some(0), "{label}: {args:?} status");
+            assert_eq!(
+                held.stream_position()?,
+                *want,
+                "{label}: {args:?} left stdin in the wrong place; \
+                 GNU 3.11 leaves {gnu}"
+            );
+        }
     }
-    // The fixture above cannot show the SIZE of the gap: both stopping places
-    // are inside one block, so 22 reads as "the end" for either rule. Over a
-    // file LARGER than a block they are far apart -- GNU reads on to end of
-    // input where this stops at the first selected record, which is wherever
-    // the block it arrived in ended. Asserted as the property and not the
-    // number: a block size is an implementation detail, and pinning 98304 here
-    // would red on a buffer change that this entry is not about.
+    // The fixtures above cannot show the SIZE of the gap: every stopping place
+    // is inside one block, so the file's end reads as "the end" for either
+    // rule. Over a file LARGER than a block they are far apart -- GNU ENDS at
+    // end of input (by seeking there, not by reading there) where this stops
+    // at the first selected record, which is wherever the block it arrived in
+    // ended. Asserted as the property and not
+    // the number: a block size is an implementation detail, and pinning 98304
+    // here would red on a buffer change that this entry is not about.
     let big = dir.0.join("bigb");
     let mut body = b"L01\nL02\0X\n".to_vec();
     body.extend((3..300_000).flat_map(|i| format!("L{i:07}\n").into_bytes()));
@@ -2476,7 +2609,7 @@ fn a_binary_file_stops_at_the_first_selected_record_where_gnu_counts_on(
     let left = held.stream_position()?;
     assert!(
         0 < left && left < body.len() as u64,
-        "-m2 left {left} of {}; this build stops short and GNU 3.11 reads to the end",
+        "-m2 left {left} of {}; this build stops short and GNU 3.11 ends at the end",
         body.len()
     );
     Ok(())

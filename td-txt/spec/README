@@ -2986,25 +2986,97 @@ td-txt-authored case files
     stdout and stderr rather than where the descriptor was left.
 
     CLOSED by the landing below, which calls the same `give_back_stdin` sed
-    does. What survives is a BINARY corner, and it is a different question --
-    how far a binary file is READ, not where the descriptor is left -- so it is
-    the entry that follows rather than a remainder of this one.
+    does. What survives is a BINARY corner. This entry long called that corner
+    a question of how far a binary file is READ; strace says otherwise -- on
+    the traced fixture GNU and td-txt read the SAME single buffer, and only
+    where each leaves the descriptor differs. It is the entry that follows
+    rather than a remainder of this one.
 
   - A BINARY file is read to its FIRST selected record here, where GNU counts
-    on, so `-m` reaches its count in GNU and not here and the two leave the
-    descriptor in different places. Over `L01\n` `L02\0` `X\n` `L03\n`
-    `L04\n` `L05\n` -- NUL being a record terminator in binary mode, which is
-    the entry above this one -- `grep -m2 -v X` leaves 8 in GNU and 22 here.
-    Only the POSITION differs: stdout, stderr and status agree in every one of
-    the 7500 combinations swept.
+    DIFFERENTLY, so `-m` reaches its count in GNU and not here and the two
+    leave the descriptor in different places. Over `L01\n` `L02\0` `X\n`
+    `L03\n` `L04\n` `L05\n` -- NUL being a record terminator in binary mode,
+    which is the entry above this one -- `grep -m2 -v X` leaves 8 in GNU and 22
+    here. Only the POSITION differs: stdout, stderr and status agree in every
+    one of the 7500 combinations swept.
 
-    The rule GNU follows is NOT known and nothing here guesses one.
-    Non-inverted it stops at the first match as this does (`-m2 0` leaves 22 in
-    both); under `-v` it counts on, but only as far as the record the first NUL
-    ends -- `-m2 -v X` reaches its count and `-m3 -v X` does not. Neither
-    `done_on_match` nor "output was suppressed" explains why `-v` alone changes
-    it, and probing found no property that survives. A Rust test pins it as a
-    divergence rather than leaving it unwritten, so closing it reds something.
+    The rule GNU follows is known IN A SCOPE, and this entry has now had it
+    wrong six times. What is established: for a binary file whose NUL falls in
+    the FIRST buffer, with `-m` at least 1 and none of `-c`, `-q`, `-l` or
+    `-L`, GNU counts exactly ONE record when selecting matches -- the first
+    matching one -- and under `-v` counts the first NON-EMPTY run of
+    non-matching records, a matching record at the scan point being skipped
+    WITHOUT being counted while the run is still empty. That run ends at the
+    first matching record WITHIN the counting buffer, or at that buffer's last
+    complete record: the buffer bound applies ALWAYS, not only when nothing
+    matches. If `-m`'s count lands inside what was counted, the descriptor is
+    repositioned to the end of that record; otherwise GNU leaves it at end of
+    input.
+
+    The scope list is exact and every item was measured. `-c` leaves GNU
+    counting normally: `-c -m2 X` over `A01\n` `X02\0` `X03\n` `A04\n` leaves
+    12 where the rule predicts 16, and `-c -m4 -v X` over the first fixture
+    leaves 18 where it predicts 22. `-q` and `-l` settle before the reposition
+    runs, so `-q -m1 -v X` leaves 22 where the rule predicts 4. `-m0` reads
+    nothing and leaves 0 where "otherwise end of input" predicts 22. td-txt
+    agrees with GNU in every one of those, so each would be a false sentence
+    above correct code.
+
+    ONE measured case still falls outside the scope and is not pinned: a NUL in
+    a LATER buffer, where the buffers before it count normally. Over 30000
+    eight-byte records with matches at records 0, 1 and 15001, and record 15000
+    replaced by the SEVEN-byte `AAAAAA\0`, `-m3 X` leaves 120015 where the rule
+    predicts end of input. The short record is load-bearing: with a uniform
+    eight-byte record there the answer is 120016, and an earlier draft of this
+    paragraph wrote "eight-byte records" while measuring this shape -- its
+    number was not re-derivable from its own sentence, the very defect the
+    98298 paragraph below was rewritten to fix.
+
+    The buffer bound was the sixth wrong wording, and it was wrong by being
+    stated as conditional. "At the last complete record the counting buffer
+    holds WHEN NOTHING MATCHES" is refuted by putting a match in a later
+    buffer: over `L\0` and 30000 records with the only match at record 20000,
+    `-m12289 -v X` leaves end of input where the conditional reading predicts
+    98306. The fixture that produced the conditional wording used a pattern
+    matching NOTHING, so it could not tell the two readings apart -- the same
+    trap, the sixth time, and a reviewer built the separating fixture.
+
+    How far GNU READS is a different question from where it leaves the
+    descriptor. Traced with strace on the 2.7 MB fixture, `grep -m2 L` does ONE
+    `read` of 98304 bytes on descriptor 0 and then `lseek(0, 0, SEEK_END)`: GNU
+    reads one buffer and SEEKS past the rest. td-txt reads that SAME one buffer
+    and stops at 98304, so on this corner the two read ALIKE and differ only in
+    where they leave the descriptor. An earlier draft said GNU "reads LESS than
+    td-txt, which reads two buffers and stops at 196608"; 196608 belongs to a
+    different fixture, one whose first selected record falls in the second
+    buffer, and the sentence was built on it.
+
+    The six wrong wordings: "as far as the record the first NUL ends", refuted
+    by moving the match three records later, where it predicts 22 for `-m3 -v
+    X` and `-m4 -v X` and GNU answers 12 and 16; "the run before the first
+    MATCHING record", refuted by a fixture whose first record matches, where
+    that run is empty and the wording predicts 24 while GNU leaves 8, 12 and
+    16; "makes one emit and then STOPS READING", retired as false when it was
+    TRUE about reading -- only the inference that the descriptor stops at a
+    buffer boundary was wrong; `-c`; the later-buffer NUL; and the conditional
+    buffer bound above.
+
+    Every one of those sat beside goldens that were correct. That is the
+    durable finding and it has cost six rounds: a green row proves its own
+    offset and nothing whatever about the sentence written beside it. State the
+    SCOPE a measurement covers, and build the fixture that would separate your
+    wording from its nearest rival before writing the wording down.
+
+    It stays a DIVERGENCE rather than becoming a fix. The `-v` run is bounded
+    by GNU's own buffer -- measured: over a two-byte leading record `L\0`
+    followed by 200000 eight-byte records, `-m12288` leaves 98298 and `-m12289`
+    leaves end of input, 98298 being the last complete record inside a
+    98304-byte buffer. (With a bare one-byte NUL lead the same shape gives
+    98297; the leading record is spelled out because an earlier draft wrote
+    "behind a leading NUL" and its number was not re-derivable.) Agreeing
+    everywhere therefore means pinning GNU's buffer geometry into this crate.
+    Nothing here differs in stdout, stderr or status; the descriptor's offset
+    is the whole of it.
 
   - The ORDER of a `-r` listing, which td-txt sorts and GNU takes from the
     directory: `grep -rl a tree` answers `tree/sub/g` before `tree/f` in GNU and
@@ -4309,7 +4381,8 @@ td-txt-authored case files
     exits, and let the binary return use them: `-m1` over a binary file now
     leaves 4 as GNU does, and `-m2`, which never reaches its count there,
     leaves the end as GNU does too. What is left of that corner is the entry in
-    the gap list, and it is about how far a binary file is READ.
+    the gap list, and it is about which records GNU COUNTS -- not, as this
+    sentence said until strace was pointed at it, how far the file is read.
 
     SEVEN THOUSAND FIVE HUNDRED combinations swept -- 10 fixtures x 5 counts x
     25 flag sets x 6 patterns -- comparing POSITION as well as status, stdout
@@ -4331,11 +4404,11 @@ td-txt-authored case files
     answers 196608 too, so it is a pre-existing read-depth difference this
     sweep is simply the first to look at.
 
-    THIRTY argv rows across four Rust tests each assert a position, and those
-    are the goldens. Forty-seven further offsets were measured against GNU 3.11
-    in the throwaway harness that derived the rule; they are not in the tree,
-    and an earlier draft of this paragraph called them "cases the Rust tests
-    carry", which counted a harness twice and the tests not at all.
+    FORTY-TWO argv rows across four Rust tests each assert a position, and
+    those are the goldens. Forty-seven further offsets were measured against
+    GNU 3.11 in the throwaway harness that derived the rule; they are not in
+    the tree, and an earlier draft of this paragraph called them "cases the
+    Rust tests carry", which counted a harness twice and the tests not at all.
 
     FIVE mutations, the unit being failing tests over the whole suite. Making
     `reposition_stdin` a no-op: FOUR. Returning the record's START instead of
@@ -4396,6 +4469,76 @@ td-txt-authored case files
     which has no position to leave. So the positioning surface alone is Rust
     tests, and the sweep above stands in for corpus breadth there.
 
+  A rule this file recorded as NOT KNOWN turned out to be derivable in a SCOPE,
+  and the six wrong wordings it took to find the scope are worth more than the
+  rule. Each was refuted by a fixture the previous set could not build, and
+  each sat beside goldens that were every one of them correct. The wordings and
+  their refutations are in the gap entry above; what belongs here is why they
+  lasted, and what it cost. FIVE of the six were written by this landing.
+
+  The pattern never varied: a fixture set that cannot separate the stated
+  wording from its nearest rival, and a green test taken as evidence for the
+  sentence beside it. The first wording came from ONE fixture whose first NUL
+  ends the record just before the first match, where "stop at the record the
+  NUL ends" and "stop at the first match" are one offset. The second repeated
+  it inside this landing -- three fixtures, all beginning with a NON-matching
+  record, so "the run before the first match" and "the first non-empty run"
+  were also one offset. The sixth repeated it again: a fixture whose pattern
+  matched NOTHING could not tell "bounded by the buffer" from "bounded by the
+  buffer only when nothing matches", and the conditional reading went in.
+
+  The third is the one to learn from, because it ran the other way. "Makes one
+  emit and then stops reading" was retired here as refuted -- and it was TRUE.
+  It was "refuted" with a POSITION measurement, which cannot decide a
+  read-depth question: GNU ends at end of input because it SEEKS there. strace
+  settles what no offset could -- `grep -m2 L` does one `read` of 98304 on
+  descriptor 0 and then `lseek(0, 0, SEEK_END)`. The correction to that
+  correction then overreached in turn, claiming td-txt "reads two buffers and
+  stops at 196608" and so that GNU reads LESS; td-txt reads the same single
+  buffer and stops at 98304, and the 196608 was imported from a fixture whose
+  first selected record falls in the second buffer.
+
+  The fourth and fifth were scope errors: `-c` leaves GNU counting normally,
+  and a NUL in a later buffer leaves the buffers before it counting normally.
+  `-q`, `-l` and `-m0` break the reposition clause for their own reasons and
+  are now named in the scope rather than discovered later. td-txt agrees with
+  GNU in all of them, so each was a false sentence above correct code -- the
+  worst shape a claim takes here, because nothing runs that can contradict it.
+
+  NINETEEN argv rows over four fixtures carry the scoped rule, up from seven
+  over one, every column re-measured under LC_ALL=C against GNU 3.11 and
+  against this build. EIGHT diverge and ELEVEN agree; no row differs in stdout,
+  stderr or status, and the eight that differ differ in position alone. The
+  eleven agreeing rows pin the rule rather than a difference, and every one of
+  them reds under one of the two mutations below, so none is dead weight.
+
+  The GNU column in that table is DOCUMENTATION, not an assertion. No oracle
+  runs in the test, so only the `want` column reds; a reviewer verified this by
+  replacing five `gnu` literals with wrong numbers and watching the suite stay
+  green. That is the mechanism behind every wording above: the goldens were
+  correct, and nothing in the tree was ever going to contradict the sentence.
+
+  Three review rounds, eight reviewers, and the passes did NOT converge -- each
+  round refuted the previous round's correction. Round three found the sixth
+  wording and a trailer that `td-builder ready` rejects. Recorded because the
+  review policy says to stop and ask when passes stop converging, and this is
+  what that looks like from inside.
+
+  TWO mutations, the unit being failing tests over the whole td-txt suite.
+  Making `reposition_stdin` a no-op: FOUR, and it reds five of the nineteen
+  rows. Dropping the `at_limit` test on the binary exit so it repositions
+  unconditionally: ONE, reding the other fourteen. An earlier draft claimed the
+  second mutation "is the reason the new rows exist"; it is not -- five of the
+  parent's seven single-fixture rows already went red under it. The new rows
+  exist to discriminate the RULE, which is a different job from killing a
+  mutant.
+
+  Both counts are suite-wide and were taken by running the whole suite, not
+  read off this test: the row loop aborts at its FIRST failing row and names
+  one row whichever mutation is applied. That is the trap that made an earlier
+  landing here write "the mutation reds them" about rows where exactly one went
+  red.
+
   Goldens are C-locale. Under LC_ALL=C — the only locale td's image sets, and what
   every case here was captured under — GNU `grep -w '\.*'` selects `.a`; under a
   UTF-8 locale the same GNU binary selects nothing. Re-derive a `-w` golden without
@@ -4455,11 +4598,10 @@ td-txt-authored case files
   reading the file at each landing.
 
   The number had also gone STALE once, reading 36 while the file held 33, five
-  commits
-  having touched it without re-running; before that it was 32 twice over, once
-  when the `-f DIR` decision arrived with FOUR and once when `-NUM` landed and
-  retired `sed -l N`. Re-run it when adding one: the count in this sentence is
-  part of what it asserts, and it has been wrong more than once.
+  commits having touched it without re-running; before that it was 32 twice
+  over, once when the `-f DIR` decision arrived with FOUR and once when `-NUM`
+  landed and retired `sed -l N`. Re-run it when adding one: the count in this
+  sentence is part of what it asserts, and it has been wrong more than once.
 
   One trap in re-running, which cost a whole set of measurements here: the
   oracle must be a real GNU binary named by PATH. An earlier landing could not
