@@ -24,31 +24,31 @@ use std::process::ExitCode;
 
 const RESERVED_LAUNCHER_NAMES: &[&str] = &["td-jail", "td-jail-reaper-probe"];
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ApplicationLaunchKind {
+    Product,
+    Host,
+}
+
 fn run() -> std::io::Result<()> {
     let mut arguments = std::env::args_os();
     let argv0 = arguments.next().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "argv[0] is missing")
     })?;
     let name = authority::application_name(&argv0)?;
-    if !RESERVED_LAUNCHER_NAMES.contains(&name) {
-        return transition::launch_application(authority::resolve(name, arguments)?);
-    }
     let mut arguments = arguments.peekable();
-    if name == "td-jail"
-        && arguments
-        .peek()
-        .is_some_and(|argument| authority::is_host_argument(argument))
-    {
-        drop(arguments.next());
-        let config = arguments.next().ok_or_else(host_usage_error)?;
-        let application = arguments.next().ok_or_else(host_usage_error)?;
-        return transition::launch_application(authority::resolve_host(
-            &config,
-            &application,
-            arguments,
-        )?);
+    if application_launch_kind(name, arguments.peek()).is_some() {
+        return transition::spawn_application_session(argv0, arguments);
     }
     match transition::parse_mode(arguments)? {
+        transition::Mode::ApplicationSession {
+            parent,
+            argv0,
+            arguments,
+        } => {
+            transition::contain_application_session(parent)?;
+            launch_selected_application(argv0, arguments.into_iter())
+        }
         transition::Mode::Probe => transition::probe_transition(),
         transition::Mode::ResourceProbe { application } => {
             transition::probe_resource_caps(&application)
@@ -71,6 +71,45 @@ fn run() -> std::io::Result<()> {
         transition::Mode::SurvivorChild => transition::run_survivor_child(),
         transition::Mode::SurvivorOrphan => transition::run_survivor_orphan(),
     }
+}
+
+fn launch_selected_application<I>(argv0: std::ffi::OsString, arguments: I) -> std::io::Result<()>
+where
+    I: Iterator<Item = std::ffi::OsString>,
+{
+    let name = authority::application_name(&argv0)?;
+    let mut arguments = arguments.peekable();
+    match application_launch_kind(name, arguments.peek()) {
+        Some(ApplicationLaunchKind::Product) => {
+            transition::launch_application(authority::resolve(name, arguments)?)
+        }
+        Some(ApplicationLaunchKind::Host) => {
+            drop(arguments.next());
+            let config = arguments.next().ok_or_else(host_usage_error)?;
+            let application = arguments.next().ok_or_else(host_usage_error)?;
+            transition::launch_application(authority::resolve_host(
+                &config,
+                &application,
+                arguments,
+            )?)
+        }
+        None => Err(host_usage_error()),
+    }
+}
+
+fn application_launch_kind(
+    name: &str,
+    first_argument: Option<&std::ffi::OsString>,
+) -> Option<ApplicationLaunchKind> {
+    if !RESERVED_LAUNCHER_NAMES.contains(&name) {
+        return Some(ApplicationLaunchKind::Product);
+    }
+    if name == "td-jail"
+        && first_argument.is_some_and(|argument| authority::is_host_argument(argument))
+    {
+        return Some(ApplicationLaunchKind::Host);
+    }
+    None
 }
 
 fn host_usage_error() -> std::io::Error {
@@ -326,14 +365,23 @@ mod confinement {
             .unwrap()
             .0;
         assert!(
-            bootstrap.find("require_detached_cleanup_session(")
-                < bootstrap.find("Command::new(executable)")
+            bootstrap
+                .find("require_detached_session(")
+                .unwrap_or_else(|| panic!("bootstrap session readback is absent"))
+                < bootstrap
+                    .find("Command::new(executable)")
+                    .unwrap_or_else(|| panic!("watcher spawn is absent"))
         );
         assert!(
-            watcher.find("require_detached_cleanup_session(")
-                < watcher.find("readiness.write_all(&CGROUP_CLEANUP_READY)")
+            watcher
+                .find("require_detached_session(")
+                .unwrap_or_else(|| panic!("watcher session readback is absent"))
+                < watcher
+                    .find("readiness.write_all(&CGROUP_CLEANUP_READY)")
+                    .unwrap_or_else(|| panic!("watcher readiness is absent"))
         );
-        assert_eq!(TRANSITION.matches("sys::start_new_session()?").count(), 2);
+        assert_eq!(bootstrap.matches("sys::start_new_session()?").count(), 1);
+        assert_eq!(watcher.matches("sys::start_new_session()?").count(), 1);
         assert_eq!(TRANSITION.matches(".current_dir(\"/\")").count(), 2);
         assert!(TRANSITION.contains("read_exact(&mut readiness)"));
         assert!(TRANSITION.contains("close_inherited_descriptors(cleanup_descriptor)?;"));
@@ -352,6 +400,53 @@ mod confinement {
             abandoned.find("fs::symlink_metadata(&directory)")
                 < abandoned.find("require_delegation(root, uid, gid)?")
         );
+    }
+
+    #[test]
+    fn application_launch_isolates_or_preserves_supervision_before_authority() {
+        let shipped_main = MAIN.split_once("#[cfg(test)]").unwrap().0;
+        assert!(MAIN.contains("transition::spawn_application_session(argv0, arguments)"));
+        assert_eq!(
+            shipped_main
+                .matches("application_launch_kind(name, arguments.peek())")
+                .count(),
+            2
+        );
+        assert!(TRANSITION.contains("std::process::exit(code)"));
+        assert!(TRANSITION.contains("std::process::exit(128_i32.saturating_add(signal))"));
+        let arm = MAIN
+            .split_once("transition::Mode::ApplicationSession")
+            .unwrap()
+            .1
+            .split_once("transition::Mode::Probe")
+            .unwrap()
+            .0;
+        assert!(
+            arm.find("transition::contain_application_session(parent)?")
+                .unwrap_or_else(|| panic!("application session containment is absent"))
+                < arm
+                    .find("launch_selected_application(argv0")
+                    .unwrap_or_else(|| panic!("authority resolution is absent"))
+        );
+
+        let containment = TRANSITION
+            .split_once("pub fn contain_application_session")
+            .unwrap()
+            .1
+            .split_once("pub fn probe_transition")
+            .unwrap()
+            .0;
+        let at = |needle: &str| {
+            containment
+                .find(needle)
+                .unwrap_or_else(|| panic!("application containment no longer contains {needle}"))
+        };
+        assert!(at("sys::set_parent_death_signal()?") < at("require_direct_parent("));
+        assert!(at("require_direct_parent(") < at("containment.terminal == 0"));
+        assert!(at("containment.terminal == 0") < at("require_supervised_group("));
+        assert!(at("require_direct_parent(") < at("sys::start_new_session()?"));
+        assert!(at("sys::start_new_session()?") < at("require_detached_session("));
+        assert_eq!(TRANSITION.matches("sys::start_new_session()?").count(), 3);
     }
 
     #[test]

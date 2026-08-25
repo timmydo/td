@@ -1029,7 +1029,21 @@ only `SIOCGIFFLAGS`=0x8913 and `SIOCSIFFLAGS`=0x8914 over a pinned 40-byte
 and reads `IFF_UP` back. A safe `std` UDP socket is only the ioctl carrier and
 is dropped before inherited descriptors are swept.
 
-Stage 1 is single-threaded when it issues the call, writes `setgroups`
+The argv0-selected launch parent first spawns and waits on a later-born stage
+1, because that child cannot already be a process-group leader. Stage 1 sets
+`PR_SET_PDEATHSIG=SIGKILL` and reads its exact parent back from procfs to close
+the death-before-set race. A child whose controlling-terminal field is zero
+and whose process group is that exact parent's pid preserves and reads back
+the group, keeping a supervisor's stop containment intact. Every other child
+issues `setsid(2)` and requires its process group and session to equal the
+returned id while the controlling-terminal field is zero. This happens before
+authority resolution, registration, cgroup creation or namespace work. Parent
+death therefore still kills stage 1, whose existing proof-pipe and cleanup
+protocols tear down stage 2 and its cgroup. The new `setsid(2)` caller and use
+of the existing parent-death operation are the application-session amendment;
+no syscall or operation was added.
+
+Stage 1 is single-threaded when it issues the unshare call, writes `setgroups`
 deny before the identity gid map, reads both maps back, and checks that
 the user, mount and UTS namespaces changed. The isolated probe also
 checks its network namespace. It enumerates `/proc/self/fd` and closes

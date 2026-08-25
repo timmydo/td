@@ -13,6 +13,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -20,6 +21,7 @@ use std::time::{Duration, Instant};
 pub const PROBE_ARG: &str = "--probe-transition";
 pub const RESOURCE_PROBE_ARG: &str = "--probe-resource-caps";
 const FILTER_ARG: &str = "--internal-write-seccomp-filter";
+const APPLICATION_SESSION_ARG: &str = "--internal-application-session";
 const CGROUP_CLEANUP_ARG: &str = "--internal-cgroup-cleanup";
 const CGROUP_CLEANUP_WATCH_ARG: &str = "--internal-cgroup-cleanup-watch";
 const CGROUP_CLEANUP_READY: [u8; 1] = [1];
@@ -166,6 +168,11 @@ pub enum Mode {
         application: String,
     },
     WriteFilter,
+    ApplicationSession {
+        parent: u32,
+        argv0: OsString,
+        arguments: Vec<OsString>,
+    },
     CgroupCleanupBootstrap {
         membership: String,
     },
@@ -248,6 +255,15 @@ where
             return Err(usage_error());
         }
         return Ok(Mode::WriteFilter);
+    }
+    if mode == APPLICATION_SESSION_ARG {
+        let parent = parse_positive_pid(args.next())?;
+        let argv0 = args.next().ok_or_else(usage_error)?;
+        return Ok(Mode::ApplicationSession {
+            parent,
+            argv0,
+            arguments: args.collect(),
+        });
     }
     if mode == CGROUP_CLEANUP_ARG {
         let membership = args
@@ -452,6 +468,19 @@ fn parse_id(value: Option<OsString>, name: &str) -> io::Result<u32> {
                 format!("invalid stage-2 {name}: {e}"),
             )
         })
+}
+
+fn parse_positive_pid(value: Option<OsString>) -> io::Result<u32> {
+    let value = value.ok_or_else(usage_error)?;
+    let value = value.to_str().ok_or_else(usage_error)?;
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(usage_error());
+    }
+    let pid = value.parse::<u32>().map_err(|_| usage_error())?;
+    if pid == 0 {
+        return Err(usage_error());
+    }
+    Ok(pid)
 }
 
 fn stage2_launch_arguments(
@@ -2353,6 +2382,47 @@ fn require_single_survivor_signal(
     Ok(())
 }
 
+pub fn spawn_application_session<I>(argv0: OsString, arguments: I) -> io::Result<()>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let executable = std::env::current_exe()?;
+    let mut command = Command::new(executable);
+    command
+        .arg(APPLICATION_SESSION_ARG)
+        .arg(std::process::id().to_string())
+        .arg(argv0)
+        .args(arguments);
+    let status = command.status().map_err(|error| {
+        io::Error::other(format!("spawn application containment bootstrap: {error}"))
+    })?;
+    if status.success() {
+        Ok(())
+    } else if let Some(code) = status.code() {
+        std::process::exit(code)
+    } else if let Some(signal) = status.signal() {
+        std::process::exit(128_i32.saturating_add(signal))
+    } else {
+        Err(io::Error::other(format!(
+            "application launch ended without an exit status: {status}"
+        )))
+    }
+}
+
+pub fn contain_application_session(expected_parent: u32) -> io::Result<()> {
+    sys::set_parent_death_signal()?;
+    let before = fs::read_to_string("/proc/self/stat")?;
+    require_direct_parent(expected_parent, &before)?;
+    let containment = process_containment(&before)?;
+    if containment.terminal == 0 && containment.process_group == expected_parent {
+        let after = fs::read_to_string("/proc/self/stat")?;
+        return require_supervised_group("application launcher", expected_parent, &after);
+    }
+    let session = sys::start_new_session()?;
+    let after = fs::read_to_string("/proc/self/stat")?;
+    require_detached_session("application launcher", session, &after)
+}
+
 pub fn probe_transition() -> io::Result<()> {
     let identity = current_identity()?;
     if identity.uid == 0 || identity.gid == 0 {
@@ -2457,7 +2527,11 @@ pub fn run_cgroup_cleanup_bootstrap(membership: &str) -> io::Result<()> {
     let _identity = cleanup_identity()?;
     cgroup::validate_expected_membership(membership)?;
     let session = sys::start_new_session()?;
-    require_detached_cleanup_session(session, &fs::read_to_string("/proc/self/stat")?)?;
+    require_detached_session(
+        "cgroup cleanup bootstrap",
+        session,
+        &fs::read_to_string("/proc/self/stat")?,
+    )?;
 
     let executable = std::env::current_exe()?;
     let mut command = Command::new(executable);
@@ -2492,7 +2566,11 @@ pub fn run_cgroup_cleanup_watcher(membership: &str) -> io::Result<()> {
     let identity = cleanup_identity()?;
     cgroup::validate_expected_membership(membership)?;
     let session = sys::start_new_session()?;
-    require_detached_cleanup_session(session, &fs::read_to_string("/proc/self/stat")?)?;
+    require_detached_session(
+        "cgroup cleanup watcher",
+        session,
+        &fs::read_to_string("/proc/self/stat")?,
+    )?;
     {
         let mut readiness = io::stdout().lock();
         readiness.write_all(&CGROUP_CLEANUP_READY)?;
@@ -2513,7 +2591,15 @@ fn cleanup_identity() -> io::Result<Identity> {
     Ok(identity)
 }
 
-fn require_detached_cleanup_session(expected: u32, stat: &str) -> io::Result<()> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcessContainment {
+    parent: u32,
+    process_group: u32,
+    session: u32,
+    terminal: i64,
+}
+
+fn process_containment(stat: &str) -> io::Result<ProcessContainment> {
     let (_, fields) = stat
         .rsplit_once(") ")
         .ok_or_else(|| io::Error::other("/proc/self/stat has no command-field terminator"))?;
@@ -2521,9 +2607,7 @@ fn require_detached_cleanup_session(expected: u32, stat: &str) -> io::Result<()>
     let _state = fields
         .next()
         .ok_or_else(|| io::Error::other("/proc/self/stat has no state field"))?;
-    let _parent = fields
-        .next()
-        .ok_or_else(|| io::Error::other("/proc/self/stat has no parent field"))?;
+    let parent = parse_proc_stat_u32(&mut fields, "parent")?;
     let process_group = parse_proc_stat_u32(&mut fields, "process group")?;
     let session = parse_proc_stat_u32(&mut fields, "session")?;
     let terminal = fields
@@ -2535,11 +2619,46 @@ fn require_detached_cleanup_session(expected: u32, stat: &str) -> io::Result<()>
                 "invalid /proc/self/stat controlling-terminal field: {error}"
             ))
         })?;
-    if process_group != expected || session != expected || terminal != 0 {
+    Ok(ProcessContainment {
+        parent,
+        process_group,
+        session,
+        terminal,
+    })
+}
+
+fn require_direct_parent(expected: u32, stat: &str) -> io::Result<()> {
+    let observed = process_containment(stat)?.parent;
+    if observed != expected {
         return Err(io::Error::other(format!(
-            "cleanup helper containment read back as process-group={process_group}, \
-             session={session}, controlling-terminal={terminal}; expected detached session \
-             {expected}"
+            "application launch parent changed from {expected} to {observed} before containment"
+        )));
+    }
+    Ok(())
+}
+
+fn require_detached_session(role: &str, expected: u32, stat: &str) -> io::Result<()> {
+    let containment = process_containment(stat)?;
+    if containment.process_group != expected
+        || containment.session != expected
+        || containment.terminal != 0
+    {
+        return Err(io::Error::other(format!(
+            "{role} containment read back as process-group={}, session={}, \
+             controlling-terminal={}; expected detached session {expected}",
+            containment.process_group, containment.session, containment.terminal
+        )));
+    }
+    Ok(())
+}
+
+fn require_supervised_group(role: &str, expected: u32, stat: &str) -> io::Result<()> {
+    let containment = process_containment(stat)?;
+    if containment.process_group != expected || containment.terminal != 0 {
+        return Err(io::Error::other(format!(
+            "{role} containment read back as process-group={}, controlling-terminal={}; \
+             expected no-terminal supervisor group {expected}",
+            containment.process_group, containment.terminal
         )));
     }
     Ok(())
@@ -3277,6 +3396,7 @@ mod tests {
         mount_identities_outside_allowed_home, mount_tree_identities,
         require_grant_mount_identities, MountIdentity,
     };
+    use std::io::BufRead;
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3429,6 +3549,25 @@ mod tests {
         assert!(parse_mode(args(&[PROBE_ARG, "extra"])).is_err());
         assert_eq!(parse_mode(args(&[FILTER_ARG])).unwrap(), Mode::WriteFilter);
         assert!(parse_mode(args(&[FILTER_ARG, "extra"])).is_err());
+        assert_eq!(
+            parse_mode(args(&[
+                APPLICATION_SESSION_ARG,
+                "42",
+                "/bin/firefox",
+                "--safe-mode",
+            ]))
+            .unwrap(),
+            Mode::ApplicationSession {
+                parent: 42,
+                argv0: OsString::from("/bin/firefox"),
+                arguments: vec![OsString::from("--safe-mode")],
+            }
+        );
+        assert!(parse_mode(args(&[APPLICATION_SESSION_ARG])).is_err());
+        assert!(parse_mode(args(&[APPLICATION_SESSION_ARG, "0", "/bin/firefox"])).is_err());
+        assert!(parse_mode(args(&[APPLICATION_SESSION_ARG, "+42", "/bin/firefox"])).is_err());
+        assert!(parse_mode(args(&[APPLICATION_SESSION_ARG, " 42", "/bin/firefox"])).is_err());
+        assert!(parse_mode(args(&[APPLICATION_SESSION_ARG, "42"])).is_err());
         let membership = "/td-user-1000/app-0123456789abcdef";
         assert_eq!(
             parse_mode(args(&[CGROUP_CLEANUP_ARG, membership])).unwrap(),
@@ -3979,6 +4118,192 @@ mod tests {
     }
 
     #[test]
+    fn application_session_child_helper() {
+        let Some(parent) = std::env::var_os("TD_JAIL_TEST_APPLICATION_SESSION_CHILD") else {
+            return;
+        };
+        let parent = parent.to_str().unwrap().parse().unwrap();
+        contain_application_session(parent).unwrap();
+        let containment =
+            process_containment(&fs::read_to_string("/proc/self/stat").unwrap()).unwrap();
+        writeln!(
+            io::stderr(),
+            "{} {} {} {}",
+            std::process::id(),
+            containment.process_group,
+            containment.session,
+            containment.terminal
+        )
+        .unwrap();
+        io::stderr().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    fn application_session_parent_helper() {
+        if std::env::var_os("TD_JAIL_TEST_APPLICATION_SESSION_PARENT").is_none() {
+            return;
+        }
+        if let Some(parent) =
+            std::env::var_os("TD_JAIL_TEST_APPLICATION_SESSION_PARENT_DETACH_FROM")
+        {
+            contain_application_session(parent.to_str().unwrap().parse().unwrap()).unwrap();
+        }
+        let executable = std::env::current_exe().unwrap();
+        let mut child = Command::new(executable)
+            .args([
+                "--exact",
+                "transition::tests::application_session_child_helper",
+                "--nocapture",
+            ])
+            .env(
+                "TD_JAIL_TEST_APPLICATION_SESSION_CHILD",
+                std::process::id().to_string(),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let mut readiness = String::new();
+        std::io::BufReader::new(stderr)
+            .read_line(&mut readiness)
+            .unwrap();
+        write!(io::stderr(), "{readiness}").unwrap();
+        io::stderr().flush().unwrap();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn killing_the_waiting_parent_kills_the_detached_application_session() {
+        run_application_session_parent_death(false);
+    }
+
+    #[test]
+    fn a_no_terminal_supervisor_group_remains_the_application_stop_scope() {
+        run_application_session_parent_death(true);
+    }
+
+    fn run_application_session_parent_death(supervised_group: bool) {
+        let executable = std::env::current_exe().unwrap();
+        let mut command = Command::new(executable);
+        command
+            .args([
+                "--exact",
+                "transition::tests::application_session_parent_helper",
+                "--nocapture",
+            ])
+            .env("TD_JAIL_TEST_APPLICATION_SESSION_PARENT", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        if supervised_group {
+            command.env(
+                "TD_JAIL_TEST_APPLICATION_SESSION_PARENT_DETACH_FROM",
+                std::process::id().to_string(),
+            );
+        }
+        let mut parent = command.spawn().unwrap();
+        let parent_pid = parent.id();
+        let stderr = parent.stderr.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut readiness = String::new();
+            let result = std::io::BufReader::new(stderr)
+                .read_line(&mut readiness)
+                .map(|_| readiness);
+            let _ = sender.send(result);
+        });
+        let readiness = receiver.recv_timeout(Duration::from_secs(2));
+        let observed = readiness
+            .map_err(|error| io::Error::other(format!("application session readiness: {error}")))
+            .and_then(|result| result)
+            .and_then(|line| parse_application_session_readiness(&line));
+        let before = observed
+            .as_ref()
+            .ok()
+            .map(|(pid, _, _, _)| {
+                fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .and_then(|stat| process_state_and_starttime(&stat))
+            })
+            .transpose();
+
+        parent.kill().unwrap();
+        let _ = parent.wait().unwrap();
+
+        let (pid, process_group, session, terminal) = observed.unwrap();
+        let expected = if supervised_group { parent_pid } else { pid };
+        assert_eq!(process_group, expected);
+        assert_eq!(session, expected);
+        assert_eq!(terminal, 0);
+        let (_, starttime) = before.unwrap().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+                Err(error) => panic!("read application session: {error}"),
+                Ok(stat) => {
+                    let (state, current_starttime) = process_state_and_starttime(&stat).unwrap();
+                    if state == 'Z' || current_starttime != starttime {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        panic!("application session survived its waiting parent");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    fn parse_application_session_readiness(text: &str) -> io::Result<(u32, u32, u32, i64)> {
+        let mut fields = text.split_whitespace();
+        let pid = parse_test_field(&mut fields, "pid")?;
+        let process_group = parse_test_field(&mut fields, "process group")?;
+        let session = parse_test_field(&mut fields, "session")?;
+        let terminal = parse_test_field(&mut fields, "terminal")?;
+        if fields.next().is_some() {
+            return Err(io::Error::other(
+                "application session readiness has extra fields",
+            ));
+        }
+        Ok((pid, process_group, session, terminal))
+    }
+
+    fn parse_test_field<'a, T: std::str::FromStr>(
+        fields: &mut impl Iterator<Item = &'a str>,
+        name: &str,
+    ) -> io::Result<T> {
+        fields
+            .next()
+            .ok_or_else(|| {
+                io::Error::other(format!("application session readiness has no {name}"))
+            })?
+            .parse()
+            .map_err(|_| io::Error::other(format!("invalid application session {name}")))
+    }
+
+    fn process_state_and_starttime(stat: &str) -> io::Result<(char, u64)> {
+        let (_, fields) = stat
+            .rsplit_once(") ")
+            .ok_or_else(|| io::Error::other("process stat has no command terminator"))?;
+        let mut fields = fields.split_whitespace();
+        let state = fields
+            .next()
+            .and_then(|value| value.chars().next())
+            .ok_or_else(|| io::Error::other("process stat has no state"))?;
+        let starttime = fields
+            .nth(18)
+            .ok_or_else(|| io::Error::other("process stat has no starttime"))?
+            .parse()
+            .map_err(|error| io::Error::other(format!("invalid process starttime: {error}")))?;
+        Ok((state, starttime))
+    }
+
+    #[test]
     fn device_number_decoder_matches_the_compiled_roster() {
         fn encode(major: u64, minor: u64) -> u64 {
             ((major & 0xfff) << 8)
@@ -4328,15 +4653,27 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_readiness_requires_a_detached_session() {
+    fn containment_readback_requires_the_parent_and_selected_scope() {
         let detached = "123 (td-jail helper) S 1 123 123 0 0 0 0\n";
-        require_detached_cleanup_session(123, detached).unwrap();
-        assert!(require_detached_cleanup_session(
+        assert_eq!(process_containment(detached).unwrap().parent, 1);
+        require_direct_parent(1, detached).unwrap();
+        require_detached_session("helper", 123, detached).unwrap();
+        require_supervised_group("helper", 123, detached).unwrap();
+        assert!(require_direct_parent(2, detached).is_err());
+        assert!(require_detached_session(
+            "helper",
             123,
             "123 (td-jail helper) S 1 123 122 0 0 0 0\n"
         )
         .is_err());
-        assert!(require_detached_cleanup_session(
+        assert!(require_supervised_group(
+            "helper",
+            123,
+            "123 (td-jail helper) S 1 122 122 0 0 0 0\n"
+        )
+        .is_err());
+        assert!(require_detached_session(
+            "helper",
             123,
             "123 (td-jail ) helper) S 1 123 123 34817 0 0 0\n"
         )

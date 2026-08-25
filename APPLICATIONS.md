@@ -551,11 +551,15 @@ binary exists, and the runtime path is unprivileged end to end.
 
 ```
 td-term ─ /bin/sh                          uid 1000, host pid ns
-└─ /bin/firefox -> td-jail                 argv[0] resolves the store
-   │                                       spec (§A.0); writes the
-   │                                       instance dir + /.flatpak-info,
-   │                                       registers with td-busd, re-execs
-   └─ td-jail [stage 1]                    single-threaded;
+└─ /bin/firefox -> td-jail                 waits in the caller's session;
+   └─ td-jail [stage 1]                    parent-death bound; detached from
+      │                                    an ambient terminal, or kept in a
+      │                                    proved no-terminal supervisor group,
+      │                                    before argv[0] resolves
+      │                                    the store spec (§A.0), writes the
+      │                                    instance dir + /.flatpak-info and
+      │                                    registers with td-busd;
+      │                                    single-threaded;
       │                                    unshare(NEWUSER|NEWNS|NEWPID|
       │                                    NEWUTS[|NEWIPC][|NEWNET]);
       │                                    setgroups=deny, then uid_map
@@ -571,6 +575,22 @@ td-term ─ /bin/sh                          uid 1000, host pid ns
          └─ firefox                        PID 2; interpreter is the
             └─ content processes           RUNTIME's ld.so
 ```
+
+**The launch parent closes the inherited-terminal boundary without escaping an
+existing supervisor boundary.** `setsid(2)` fails for a process-group leader,
+so the process selected by `/bin/<name>` cannot safely issue it itself. It
+spawns a child that cannot yet be that leader, passes its own pid, and waits.
+The child first sets `PR_SET_PDEATHSIG=SIGKILL`, proves that exact parent through
+procfs, then reads its containment before it resolves authority or creates
+application state. A child already in a no-terminal process group led by that
+exact parent stays there and reads the group back; this is the dedicated group
+td-svc records and later drains. Every other child creates and reads back a new
+session with no controlling terminal. Killing the waiting launcher therefore
+kills stage 1; the existing proof pipe then kills stage 2, and the independent
+cgroup watcher drains the leaf. A containment snapshot predating the launch
+cannot name its later-born child. A console snapshot in the brief
+pre-detachment window can later kill stage 1, but it cannot name the still
+later cleanup watcher, so the same parent-death and leaf-drain path holds.
 
 **The two-stage re-exec is the answer to `pre_exec`.** A target crate has
 one scoped `unsafe` allow, in `sys.rs`, and `CommandExt::pre_exec` is
@@ -992,8 +1012,8 @@ would cross the same cap is refused rather than producing an oversized policy.
 `shared` admits only `network`; `sockets` admits `wayland` and `pulseaudio`;
 and `features` admits only `allow-devel`. `devices=dri` is recognized but
 refused until §M's hardware-rendering policy lands, while `devices=tty` names
-the missing controlling-terminal amendment. This makes both future changes a
-policy-table decision rather than an unknown key becoming active by accident.
+the missing fresh-terminal acquisition policy. This makes both future changes
+a policy-table decision rather than an unknown key becoming active by accident.
 
 Filesystem keys are exactly the six `xdg-*` names §C lists, a lexical `~/`
 subpath of the launching user's real home, or an absolute path. `~/` never
@@ -2019,7 +2039,8 @@ package and everything above it, and that is untouched.
 
 ### Namespaces
 
-One `unshare(2)` in single-threaded stage 1:
+After the proved application containment above, one `unshare(2)` in
+single-threaded stage 1:
 
 ```
 CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS [| CLONE_NEWIPC] [| CLONE_NEWNET]
@@ -2274,32 +2295,33 @@ create the pipe, register, close the broker connection, spawn. Stage 2
 performs no sweep of its own — the pipe is the only descriptor it is
 given above stdio, and a second blind loop would have to exempt it.
 
-*The "no controlling terminal" claim was false.* Surface #9's exclusion
-list said an app gets no controlling terminal and therefore needs no
-`setsid(2)`/`TIOCSCTTY` — but a controlling terminal is a property of the
-**session**, and nothing here creates a new one. Stage 2 inherits
-the launcher's session and its controlling terminal, the old mount plan bound
-`/dev/tty` into the jail, and the filter denies only `TIOCSTI` and
-`TIOCLINUX`. An app could therefore reach the operator's terminal through
-`/dev/tty` and through any inherited terminal descriptor. Two thirds of
-that is closed by the two steps above — no `/dev/tty` node, no inherited
-terminal fd, and `/dev/tty` opens `ENXIO` for a process whose session has
-no terminal, which is the state step 0's stdio replacement leaves it in
-for practical purposes.
+*The "no controlling terminal" claim was false.* Surface #9's original
+exclusion said an app got no controlling terminal and therefore needed no
+`setsid(2)`/`TIOCSCTTY`, but a controlling terminal is a property of the
+**session**. Before the fixes in this section, stage 2 inherited the launcher's
+session, the mount plan bound `/dev/tty`, and inherited descriptors survived.
+An app could therefore reach the operator's terminal. Removing `/dev/tty` and
+closing every inherited descriptor fixed the direct paths; the
+application-containment bootstrap fixes the signal and future-reacquisition
+path.
 
-The remaining third is honest to state rather than to paper over: the
-process is still *in* the caller's session, so the operator's Ctrl-C
-reaches it, and a future policy that binds `/dev/tty` (a terminal
-application is a real thing to want) would reopen the hole in full.
-**Closing it properly needs `setsid(2)`. Surface #9 now carries that syscall
-only for the two internal cgroup-cleanup processes; issuing it in the application
-transition is still a new reviewed caller and `UNSAFE.md` amendment** —
-deferred, because nothing on the first ladder wants a terminal, and recorded
-here so it is planned rather than discovered later. `CommandExt`'s stable
-`process_group` is `setpgid` and does not create a session, so it is not
-the way round it. Until then, **`devices=tty` does not exist as a policy
-key**: it is refused by the parser like `devices=dri`, so the first
-person to want it lands the amendment.
+The remaining third is now closed before authority resolution. A later-born
+stage 1 first recognizes one special safe input: a no-terminal process group
+whose id is the exact waiting parent's pid. It stays in and reads back that
+group so td-svc's recorded stop containment continues to cover stage 1, stage
+2 and the application. Otherwise it enters and proves its own session while
+its waiting parent keeps the launch lifecycle. Terminal-generated signals and
+console containment do not reach that detached tree after the readback; a
+console snapshot that names stage 1 before detachment may still deliver its
+already-selected signal, and the parent-death/cleanup path handles it.
+`CommandExt`'s stable `process_group` is only `setpgid` and would not provide
+the terminal boundary.
+
+**`devices=tty` remains refused.** The containment bootstrap prevents
+accidental access; it does not define how a terminal application deliberately
+acquires a fresh controlling terminal. That policy still needs a documented
+`TIOCSCTTY` request, a device grant and readback rather than binding the
+operator's terminal.
 
 *A read-only bind is not recursive, and neither is a read-only remount.*
 Binding a granted directory `:ro` makes that mount read-only and says
@@ -2645,8 +2667,9 @@ The quoted block is the completed target mirrored by the implemented roster in
 > backstop — which is here because `std` exposes NO rlimit API at all,
 > and because setting only the soft limit is a bound the application may
 > raise on itself, so both halves of the pair are written before `exec`
-> and read back through the same call — `setsid(2)` for the cgroup cleanup
-> processes' controlling-terminal detachment, and `ioctl(2)` with exactly TWO
+> and read back through the same call — `setsid(2)` for the application
+> transition and cgroup cleanup processes' controlling-terminal detachment,
+> and `ioctl(2)` with exactly TWO
 > value-pinned requests
 > (`SIOCGIFFLAGS`=0x8913, `SIOCSIFFLAGS`=0x8914, argument a pinned 40-byte
 > `ifreq`, interface name pinned to `lo`) — reached only from `transition.rs`,
@@ -2710,14 +2733,13 @@ The quoted block is the completed target mirrored by the implemented roster in
 > a namespace a caller supplied); `sethostname(2)` (the UTS namespace is
 > unshared and the name inherited); `TIOCSCTTY` — **excluded for a corrected
 > reason**: the earlier draft said an app gets no
-> controlling terminal, which was simply false, since a session is
-> inherited and nothing in its transition creates a new one. It is excluded because
-> the jail closes the terminal off by *removing what reaches it* (no
-> `/dev/tty` node, no inherited descriptor — see the mount plan's step 0
-> and the note below it) rather than by detaching the session, and
-> because the cleanup helper's `setsid(2)` does not change the application
-> session. A real terminal policy would need a documented ioctl-request
-> amendment rather than an assumption; `statfs(2)`
+> controlling terminal, which was false before the application bootstrap
+> established containment. It remains excluded because no terminal policy
+> exists: the jail removes `/dev/tty` and inherited terminal descriptors, and
+> the bootstrap either proves a dedicated no-terminal supervisor group or
+> creates a new session; both paths prove `tty_nr=0`. A real terminal policy
+> would need a
+> documented ioctl-request amendment rather than an assumption; `statfs(2)`
 > (nothing in this design issues it — with packages in the image,
 > nothing writes gigabytes at launch); `mmap(2)` (nothing here maps anything —
 > but see §M, which anticipates that the GPU path WILL need a
@@ -5047,11 +5069,15 @@ packaged selftest, boot oracle — with **network never in the gate**.
    first seed takes the static branch; the dynamic interpreter/library branch
    arrives with the first toolkit seed. These are ordinary recipe checks and run
    in the ordinary recipe gate.
-3. **Jail**: the three seccomp layers of §C, plus in-QEMU assertions from
+3. **Jail**: the three seccomp layers of §C, source invariants pinning the
+   parent-death/containment ordering and a behavioral parent-death regression,
+   plus in-QEMU assertions from
    *inside* a jail — `getuid()==1000`, `/proc/1/exe` is td-jail, host
    processes absent, `/app` and `/usr` reject writes, host `/usr` and
    `/td/store` absent, `/dev/fb0` and `/dev/input` absent, a large
    `/dev/shm` mapping works, `memfd_create` works, both sockets work.
+   The transition-only probes deliberately begin after the application
+   bootstrap; the installed QEMU fixture is what traverses both layers.
 4. **Broker conformance**: committed byte streams with expected decode
    and routing; policy tests driving a fake sandboxed peer through an
    injected identity resolver (a trait, precisely so the test stays
@@ -5254,6 +5280,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 12a | **explicit development-host launch — LANDED**: `td-jail --host CONFIG APPLICATION [ARG...]` resolves the ordinary authenticated manifest/spec through a separately materialized physical package root, maps the caller to the fixed uid/gid 1000 jail identity, binds caller-owned Wayland and local td-busd sockets, preserves the target `/app` and `/usr` layout and the full namespace/mount/capability/seccomp transition, and refuses missing user-namespace or seccomp support. The ordinary rung-12 fixture is the recipe acceptance test; it asserts exactly one named diagnostic each for the unavailable aggregate cgroup caps and direct host-Wayland global filtering. Mapped downstream bus authentication and host forwarding remain §D work | host mode works, and says exactly what it could not enforce |
 | 12b | **immutable typed filesystem grants — LANDED**: canonical source resolution and identity pinning, reserved alias refusal, deny-wins/overlap merging, separate recursive bind targets, nested-mount hardening and stage-1/stage-2 readback. Mutable per-user overrides remain a later lifecycle landing | a jailed app can open only a builder-authenticated explicitly granted host path |
 | 12c | **typed memory/task policy — LANDED**: cgroup2 is mounted by PID 1; PID 1 and system services remain at the hierarchy root under cgroup v2's root exception while td-svc enables `memory`/`pids` top-down and delegates an empty user subtree; td-jail creates one direct per-instance leaf, writes and exactly reads `memory.high`, `memory.max`, `memory.oom.group=1`, and `pids.max`, moves blocked stage 2 before release, verifies membership, sets and reads equal hard/soft `RLIMIT_DATA`, reports `memory.events`/`memory.peak`, and removes the empty leaf. Omitted policy gets the documented finite baseline; partial or page-rounded policy is refused. The 48 MiB/64 MiB/32-task fixture and active-cgroup probe gate the QEMU marker. `cpu-max` remains refused until the kernel bandwidth controller lands | application resource limits are effective rather than metadata |
+| 12d | **application terminal/session containment — LANDED**: the argv0-selected launcher waits on a later-born stage 1; stage 1 binds its lifetime to that exact parent, then either preserves and reads back an existing no-terminal supervisor group or enters and reads back a new session with no controlling terminal. Only then may it resolve authority, register or create state. Parent death still tears down stage 1, stage 2 and the cgroup leaf. `devices=tty` remains refused until a fresh-terminal policy exists | the jail is not an ambient terminal member, and it does not escape a dedicated service stop scope |
 | 13 | `td-busd` codec, auth, surface #10 | none |
 | 14 | names, routing, match rules, descriptor passing | none |
 | 15 | per-app policy, lineage identity, in-jail activation | none |

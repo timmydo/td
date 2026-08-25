@@ -648,7 +648,7 @@ fn apply_context(state: &mut ParseState, key: &str, value: &str) -> Result<(), S
             let unavailable = if devices.contains(&"dri") {
                 "devices=dri is recognized but unavailable until the hardware-rendering policy lands"
             } else {
-                "devices=tty is unavailable until the controlling-terminal isolation amendment lands"
+                "devices=tty is unavailable until the fresh-terminal acquisition policy lands"
             };
             return Err(unavailable.into());
         }
@@ -1172,7 +1172,7 @@ mod tests {
             ("features=devel", "only `allow-devel'"),
             ("devices=dri", "recognized but unavailable"),
             ("devices=dri;unknown", "unknown application device"),
-            ("devices=tty", "controlling-terminal"),
+            ("devices=tty", "fresh-terminal acquisition"),
             ("devices=all", "unknown application device"),
         ] {
             let text = format!("format=1\n[Context]\n{line}\n");
