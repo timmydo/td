@@ -1020,7 +1020,7 @@ mod tests {
     ];
     const SELF_HOSTED_PHASE_MARKERS: [&str; 3] =
         ["rust-toolchain", "gcc-x86-64-self", "binutils-x86-64-self"];
-    const POST_BOOTSTRAP_PROTECTED_INPUT_EXCEPTIONS: [(&str, &str); 6] = [
+    const POST_BOOTSTRAP_PROTECTED_INPUT_EXCEPTIONS: [(&str, &str); 7] = [
         // Identity/codegen audits deliberately look back across the boundary.
         ("rust-userland-auto-test", "rust-stage0"),
         ("gcc-x86-64-self-test", "gcc-x86-64-native"),
@@ -1036,6 +1036,11 @@ mod tests {
         // belongs on the bootstrap side; nothing about it moves post-boundary,
         // so the consumer declares the edge instead.
         ("td-install-test", "btrfs-progs-x86-64"),
+        // Rebuild GNU Make once with the final compiler. The preceding Make is
+        // only the build driver; later packages consume make-x86-64-self.
+        // The frozen UAPI input is a fixed-output source governed by the seed
+        // provenance gate, not a catalog recipe this exception table can name.
+        ("make-x86-64-self", "make-x86-64"),
     ];
     const RECIPE_SHEBANG_INTERPRETERS: [&str; 2] = [super::SH, super::POST_BOOTSTRAP_SH];
     const GUEST_LITERAL_SHEBANGS: [(&str, &str); 12] = [
@@ -1635,7 +1640,7 @@ mod tests {
     /// Only the Rust-toolchain closure and explicitly reviewed bootstrap-side
     /// consumers may declare an internal tool rung. Every other catalog recipe
     /// defaults to the far side of the boundary. The exact exceptions are
-    /// separately reviewed audit or boot-artifact edges.
+    /// separately reviewed audit, transition, or boot-artifact edges.
     #[test]
     fn post_bootstrap_recipes_use_only_reviewed_boundary_inputs() {
         let back_edges = post_bootstrap_back_edges(&catalog::all());

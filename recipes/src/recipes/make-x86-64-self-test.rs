@@ -1,0 +1,124 @@
+use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
+use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
+
+pub fn recipe() -> Recipe {
+    let make = "{in:make-x86-64-self}/bin/make";
+    let debug = "{in:make-x86-64-self}/lib/debug/bin/make.debug";
+    let readelf = "{in:binutils-x86-64-self}/bin/readelf";
+    let mut steps = vec![
+        Step::Require {
+            paths: vec![make.into()],
+            exec: true,
+        },
+        Step::Require {
+            paths: vec![debug.into()],
+            exec: false,
+        },
+        Step::MkDir {
+            path: "{root}/test".into(),
+        },
+        Step::WriteFile {
+            path: "{root}/test/Makefile".into(),
+            content: "V := world\nall: greeting.txt\ngreeting.txt:\n\tprintf 'hello, %s\\n' '$(V)' > $@\nfeatures:\n\t@printf '%s\\n' '$(.FEATURES)'\n.PHONY: all features\n"
+                .into(),
+            exec: false,
+        },
+    ];
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                POST_BOOTSTRAP_SH,
+                "-c",
+                &format!(
+                    "d=$('{readelf}' --debug-dump=info '{debug}' 2>/dev/null) || {{ echo 'cannot read make debug companion' >&2; exit 1; }}; \
+                     main_comp_dir=$(printf '%s\\n' \"$d\" | awk '/DW_AT_name/ && index($0, \"src/main.c\") {{ want=1; next }} want && /DW_AT_comp_dir/ {{ print; exit }}') || exit 1; \
+                     case \"$main_comp_dir\" in *': /td-build') ;; *) echo 'make main.c does not use the canonical source root' >&2; exit 1;; esac; \
+                     if grep -q -a -F 'guix-build' '{debug}'; then echo 'make debug companion exposes a build scratch path' >&2; exit 1; fi"
+                ),
+            ],
+        )
+        .env("PATH", &post_bootstrap_path()),
+    );
+    steps.push(
+        Step::run(
+            "{root}/test",
+            &[
+                make,
+                "SHELL={in:busybox-x86-64}/bin/sh",
+                "CONFIG_SHELL={in:busybox-x86-64}/bin/sh",
+            ],
+        )
+        .env("PATH", &post_bootstrap_path()),
+    );
+    steps.push(
+        Step::run(
+            "{root}/test",
+            &[
+                POST_BOOTSTRAP_SH,
+                "-c",
+                "grep -qx -F 'hello, world' greeting.txt || { echo 'final make did not drive the test build' >&2; exit 1; }; \
+                 v=$(\"{in:make-x86-64-self}/bin/make\" --version) || exit 1; \
+                 printf '%s\\n' \"$v\" | grep -q -F 'GNU Make 4.4.1' || { echo 'final make version mismatch' >&2; exit 1; }; \
+                 features=$(\"{in:make-x86-64-self}/bin/make\" -s features) || exit 1; \
+                 case \" $features \" in *' load '*) echo 'final make still permits runtime plugins' >&2; exit 1;; esac; \
+                 h=$(\"{in:binutils-x86-64-self}/bin/readelf\" -h \"{in:make-x86-64-self}/bin/make\") || exit 1; \
+                 printf '%s\\n' \"$h\" | grep -q -F 'Class:                             ELF64' || { echo 'final make is not ELF64' >&2; exit 1; }; \
+                 printf '%s\\n' \"$h\" | grep -q -F 'Machine:                           Advanced Micro Devices X86-64' || { echo 'final make is not x86-64' >&2; exit 1; }; \
+                 if grep -q -a -F '/gnu/store' \"{in:make-x86-64-self}/bin/make\"; then echo 'final make retains a foreign store reference' >&2; exit 1; fi",
+            ],
+        )
+        .env("PATH", &post_bootstrap_path()),
+    );
+    steps.push(Step::MkDir {
+        path: "{out}".into(),
+    });
+    steps.push(Step::WriteFile {
+        path: "{out}/result".into(),
+        content:
+            "PASS: final GNU Make 4.4.1 is closed to plugins, carries canonical debug information, and drove a real build\n"
+                .into(),
+        exec: false,
+    });
+    steps.push(Step::Require {
+        paths: vec!["{out}/result".into()],
+        exec: false,
+    });
+
+    Recipe::mesboot("make-x86-64-self-test", "1.0")
+        .native_inputs(&[
+            "make-x86-64-self",
+            "binutils-x86-64-self",
+            "busybox-x86-64",
+        ])
+        .steps(steps)
+        .checks(vec![RecipeCheck::new(
+            r#"
+echo ">> recipe-check make-x86-64-self-test: rebuild GNU Make with the final compiler, validate its debug companion, and drive a real build"
+: "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
+exec "$TD_RECIPE_EVAL" check-run make-x86-64-self-test 1
+"#,
+        )
+        .with_runner(CheckRunner::BuildOnly)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recipe;
+
+    #[test]
+    fn test_uses_only_post_bootstrap_inputs() {
+        assert_eq!(
+            recipe()
+                .native_inputs
+                .as_deref()
+                .map(|inputs| inputs.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec![
+                "make-x86-64-self",
+                "binutils-x86-64-self",
+                "busybox-x86-64",
+            ])
+        );
+        assert!(recipe().inputs.is_none());
+    }
+}
