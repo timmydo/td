@@ -189,6 +189,16 @@ const PINS: &[PinDef] = &[
         file: "grep-2.4.tar.gz",
     },
     PinDef {
+        key: "git-x86-64-source",
+        aliases: &[],
+        // Git 2.55.0 is the source-built daily-driver client. Its initial td
+        // configuration keeps local repositories and HTTP(S) remotes while
+        // omitting language runtimes, SSH, WebDAV, and direct OpenSSL use.
+        url: "https://www.kernel.org/pub/software/scm/git/git-2.55.0.tar.xz",
+        sha256: "457fdb04dc8728e007d4688695e6912e6f680727920f2a40bf11eacc17505357",
+        file: "git-2.55.0.tar.xz",
+    },
+    PinDef {
         key: "gcc-10-bridge-source",
         aliases: &[],
         // GCC 10.5.0 is the compatibility bridge from gcc-mesboot 4.9.4 to
@@ -649,9 +659,9 @@ mod tests {
         // btrfs-progs 7.0 and util-linux 2.42.2 (the persistent-volume writer
         // and its minimal libuuid/libblkid build closure) + the first reviewed
         // foreign application seed, upstream ripgrep 15.2.0, LibreSSL 4.3.2,
-        // curl 8.21.0 (the static HTTPS foundation for Git), and curl's dated
-        // Mozilla CA extract.
-        assert_eq!(all().len(), 60);
+        // curl 8.21.0 (the static HTTPS foundation for Git), Git 2.55.0, and
+        // curl's dated Mozilla CA extract.
+        assert_eq!(all().len(), 61);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice

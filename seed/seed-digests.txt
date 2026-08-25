@@ -28,6 +28,7 @@ gcc-464-core 50l0crhlqjqajvfkvjj31bxz842h5fkm-gcc-464-core
 gcc-464-gpp 364rq9bch5a1cli1ifbhihic3vdl52ch-gcc-464-gpp
 gcc-494-source c5ddkcv6f1k52y8za3b6sbq04lpf191p-gcc-494-source
 gcc-core-source vf4mh5x4hyynyi9j8bah0frd4fsyxpp3-gcc-core-source
+git-x86-64-source q7x6s60i03qm90sldhz5fz1812n1qk3h-git-x86-64-source
 glibc-216-source wvrdmqvnxn33akmzz6h5zr1k5s07dx14-glibc-216-source
 glibc-241-source 2lavxgwvm5ppn98l05pqa7sszb4kfkk4-glibc-241-source
 glibc-mesboot0-source 534qradv895g6ygp2dmrniyzpvz4sc5a-glibc-mesboot0-source
