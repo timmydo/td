@@ -661,7 +661,7 @@ fn catalog_seed_universe() -> Result<Vec<SeedInput>, String> {
 /// seed-digests: derive the catalog's whole pinned-seed universe
 /// (`catalog_seed_universe` — every seed any recipe declares, including
 /// recipes whose graphs currently red at planning on OTHER inputs) from the
-/// compiled pins, through the exact `derive_seed_input` path the runner
+/// compiled pins, through the exact `derive_seed_input_for_generator` path the runner
 /// enforces, and print the full seed/seed-digests.txt content — header
 /// comment plus sorted `key basename` rows — on stdout. Requires the warm
 /// source cache, like any ladder run.
@@ -674,7 +674,7 @@ pub fn seed_digests_cli() -> Result<(), String> {
     runner.setup()?;
     let mut rows: BTreeMap<String, String> = BTreeMap::new();
     for input in catalog_seed_universe()? {
-        let derived = runner.derive_seed_input(&input)?;
+        let derived = runner.derive_seed_input_for_generator(&input)?;
         rows.insert(
             input.key().to_string(),
             path_basename_str(&derived)?.to_string(),
@@ -981,6 +981,20 @@ fn seed_store_dir(lw: &Path) -> PathBuf {
 fn generator_db_path(lw: &Path, scratch_id: &str) -> PathBuf {
     lw.join("seed-db")
         .join(format!(".generator-{scratch_id}.db"))
+}
+
+/// A disposable db for one enforcing run's not-yet-authorized cold seeds.
+///
+/// A newly declared seed is ordinarily derived before its row can be added to
+/// `seed/seed-digests.txt`. Interning it straight into the db keyed by the old
+/// table would give that table a row it does not pin; every worktree still on
+/// that table would then reject the whole db. Candidate rows therefore live
+/// here until the compiled table gate passes. Like the generator db, this is a
+/// sibling of the keyed dbs so all writers into the shared seed store derive
+/// the same commit lock.
+fn candidate_db_path(lw: &Path, scratch_id: &str) -> PathBuf {
+    lw.join("seed-db")
+        .join(format!(".candidate-{scratch_id}.db"))
 }
 
 fn seed_db_path(lw: &Path) -> Result<PathBuf, String> {
@@ -1660,8 +1674,8 @@ impl RecipeCheckRunner {
     }
 
     /// Every pin table's seed db on this ladder, sorted so a failure names the same one
-    /// run to run. Dotfiles are skipped: the table GENERATOR's disposable db lives here
-    /// too (see `generator_db_path`) and is deliberately not an authority.
+    /// run to run. Dotfiles are skipped: the table generator and cold-seed candidate
+    /// paths keep their disposable dbs here too, and neither is authority.
     fn seed_dbs(&self) -> Result<Vec<PathBuf>, String> {
         let Some(dir) = self.db.parent() else {
             return Ok(Vec::new());
@@ -1875,7 +1889,12 @@ impl RecipeCheckRunner {
         }
     }
 
-    fn intern_source(&self, intern_name: &str, pin: &SourcePin) -> Result<String, String> {
+    fn intern_source(
+        &self,
+        intern_name: &str,
+        pin: &SourcePin,
+        db: &Path,
+    ) -> Result<String, String> {
         validate_source_file_basename(pin)?;
         let file = self.sources_dir.join(&pin.file);
         if !file.is_file() {
@@ -1885,10 +1904,15 @@ impl RecipeCheckRunner {
             ));
         }
         verify_source_pin(&file, pin)?;
-        self.store_add_recursive(intern_name, &file)
+        self.store_add_recursive_into(intern_name, &file, db)
     }
 
-    fn intern_linux_headers(&self, intern_name: &str, arch: &str) -> Result<String, String> {
+    fn intern_linux_headers(
+        &self,
+        intern_name: &str,
+        arch: &str,
+        db: &Path,
+    ) -> Result<String, String> {
         let pin = source_pin_for_key("linux-source")?;
         validate_source_file_basename(&pin)?;
         let version = linux_version_from_file(&pin.file)?;
@@ -1901,10 +1925,15 @@ impl RecipeCheckRunner {
                 file.display()
             ));
         }
-        self.store_add_recursive(intern_name, &file)
+        self.store_add_recursive_into(intern_name, &file, db)
     }
 
-    fn intern_patch(&self, intern_name: &str, patch: &str) -> Result<String, String> {
+    fn intern_patch(
+        &self,
+        intern_name: &str,
+        patch: &str,
+        db: &Path,
+    ) -> Result<String, String> {
         let file = self
             .root
             .join("seed")
@@ -1913,10 +1942,10 @@ impl RecipeCheckRunner {
         if !file.is_file() {
             return Err(format!("ladder: missing {}", file.display()));
         }
-        self.store_add_recursive(intern_name, &file)
+        self.store_add_recursive_into(intern_name, &file, db)
     }
 
-    fn intern_stage0_source(&self, intern_name: &str) -> Result<String, String> {
+    fn intern_stage0_source(&self, intern_name: &str, db: &Path) -> Result<String, String> {
         let tarball = self.stage0_source_tarball()?;
         let extract = self.scratch.join("stage0-source-extract");
         remove_path_if_exists(&extract)?;
@@ -1938,7 +1967,7 @@ impl RecipeCheckRunner {
                 tarball.display()
             ));
         }
-        self.store_add_recursive(intern_name, &stage0)
+        self.store_add_recursive_into(intern_name, &stage0, db)
     }
 
     /// Stage an IN-TREE source directory for hashing (#469 local-source
@@ -1956,9 +1985,14 @@ impl RecipeCheckRunner {
     /// committed tree, and the compiled seed-digest table is what pins them. This
     /// is the GENERATOR's path (`seed-digests`, which is producing the table and so
     /// cannot be gated by it); the enforcing path is `ensure_local_source`.
-    fn intern_local_source(&self, intern_name: &str, rel: &str) -> Result<String, String> {
+    fn intern_local_source(
+        &self,
+        intern_name: &str,
+        rel: &str,
+        db: &Path,
+    ) -> Result<String, String> {
         let staged = self.stage_local_source(intern_name, rel)?;
-        self.store_add_recursive(intern_name, &staged)
+        self.store_add_recursive_into(intern_name, &staged, db)
     }
 
     /// Realize a local source under the compiled table's authority, in the ONE order
@@ -2069,9 +2103,18 @@ impl RecipeCheckRunner {
     }
 
     fn store_add_recursive(&self, name: &str, src: &Path) -> Result<String, String> {
+        self.store_add_recursive_into(name, src, &self.db)
+    }
+
+    fn store_add_recursive_into(
+        &self,
+        name: &str,
+        src: &Path,
+        db: &Path,
+    ) -> Result<String, String> {
         let src_s = path_str(src)?;
         let store_s = path_str(&self.store)?;
-        let db_s = path_str(&self.db)?;
+        let db_s = path_str(db)?;
         let mut cmd = self.builder_command();
         cmd.arg("store-add-recursive")
             .arg(name)
@@ -2238,7 +2281,23 @@ impl RecipeCheckRunner {
                 return Ok(derived);
             }
         }
-        let derived = self.derive_seed_input(input)?;
+        // A cold derivation must not register authority before the compiled
+        // table accepts it. This is the ordinary development order for a new
+        // seed: add the pin/catalog entry, derive its address, then update the
+        // table. Registering into `self.db` first contaminates the ancestor
+        // table's keyed db and makes every peer worktree reject it wholesale.
+        //
+        // The candidate still enters the SHARED content-addressed store, so a
+        // peer table that later pins the same bytes reuses them. Only its row is
+        // disposable until the gate below succeeds.
+        let candidate_db = candidate_db_path(&self.lw, &self.scratch_id());
+        let derived_result = self.derive_seed_input_into(input, &candidate_db);
+        // Best-effort, like the table generator: a crash or failed unlink may
+        // leave a dotfile, but dotfiles are never authenticated or fscked as
+        // seed authority. Remove it before gating so a rejection normally
+        // leaves only the intentionally shared content-addressed tree.
+        let _ = fs::remove_file(&candidate_db);
+        let derived = derived_result?;
         // The COMPILED table must vouch for the derivation (re #469): pin
         // verification proves the fetched artifact, but a GENERATED seed (the
         // kernel-headers tarball) has no upstream pin — the compiled expected
@@ -2246,27 +2305,52 @@ impl RecipeCheckRunner {
         // being compiled in is what lets td-builder reject a forged map even
         // when invoked directly.
         crate::seed_digests::require(input.key(), path_basename_str(&derived)?)?;
+        // Promote the already-interned candidate only after the gate. Re-adding
+        // from the immutable store tree re-hashes it and merges exactly that row
+        // into this table's db; it does not duplicate the shared bytes.
+        let tree = self.store.join(path_basename_str(&derived)?);
+        let got = self.store_path_recursive(input.key(), &tree)?;
+        if got != derived {
+            return Err(format!(
+                "seed {} derived as {derived} but re-hashes to {got} before promotion — the \
+                 shared candidate tree does not content-address to its own name",
+                input.key()
+            ));
+        }
+        let registered = self.store_add_recursive(input.key(), &tree)?;
+        if registered != derived {
+            return Err(format!(
+                "seed {} derived as {derived} but registered as {registered} after the \
+                 compiled-table gate — the shared candidate tree changed under promotion",
+                input.key()
+            ));
+        }
+        self.record_vouched(&derived);
         self.stage_store_path(&derived)?;
         Ok(derived)
     }
 
-    /// Derive ONE classified seed from its compiled pin — verify, intern, and
-    /// return the content-addressed store path. Shared by the enforcement
-    /// path (`ensure_seed_input`) and the table generator (`seed-digests`),
-    /// so the printed table is produced by the exact derivation the runner
-    /// later enforces.
+    /// Derive ONE classified seed from its compiled pin — verify, intern into
+    /// this runner's selected db, and return the content-addressed store path.
+    /// The table generator selects its disposable db before calling this; the
+    /// enforcement path calls `derive_seed_input_into` with a candidate db so
+    /// both use the exact same derivation without granting authority early.
     ///
     /// GENERATOR-ONLY for a local source: this arm interns UNGATED, which is
     /// correct for the command that is producing the table and wrong for anything
     /// else. `ensure_seed_input` therefore never reaches it — it dispatches local
     /// sources to `ensure_local_source` before this is called.
-    fn derive_seed_input(&self, input: &SeedInput) -> Result<String, String> {
+    fn derive_seed_input_for_generator(&self, input: &SeedInput) -> Result<String, String> {
+        self.derive_seed_input_into(input, &self.db)
+    }
+
+    fn derive_seed_input_into(&self, input: &SeedInput, db: &Path) -> Result<String, String> {
         match input {
-            SeedInput::Stage0 { key } => self.intern_stage0_source(key),
-            SeedInput::Source { key, pin } => self.intern_source(key, pin),
-            SeedInput::LinuxHeaders { key, arch } => self.intern_linux_headers(key, arch),
-            SeedInput::Patch { key, patch } => self.intern_patch(key, patch),
-            SeedInput::LocalSource { key, path } => self.intern_local_source(key, path),
+            SeedInput::Stage0 { key } => self.intern_stage0_source(key, db),
+            SeedInput::Source { key, pin } => self.intern_source(key, pin, db),
+            SeedInput::LinuxHeaders { key, arch } => self.intern_linux_headers(key, arch, db),
+            SeedInput::Patch { key, patch } => self.intern_patch(key, patch, db),
+            SeedInput::LocalSource { key, path } => self.intern_local_source(key, path, db),
         }
     }
 
@@ -5631,6 +5715,119 @@ chmod 755 '{}'
         let _ = fs::remove_dir_all(&lw);
     }
 
+    // The cross-worktree failure this guards happened while adding LibreSSL and
+    // then again while adding the CA bundle. A's new source was cold, so the old
+    // path interned it into the db keyed by the ancestor table and only THEN
+    // called `seed_digests::require`. B still used that ancestor table; its next
+    // build authenticated the whole shared db and rejected A's unpinned row.
+    //
+    // Drive both sides with a real td-builder. First a small compiled-table patch
+    // takes the cold success path through candidate derivation, the table gate,
+    // and keyed-db promotion. Then a tiny worktree-only source verifies its pin
+    // and enters the shared content-addressed store, but the compiled table rejects
+    // its not-yet-added key. That rejection must leave the existing authority db
+    // byte-identical. Verified red with candidate interning changed back to
+    // `derive_seed_input_for_generator(input)`: the db gained A's row before the
+    // rejection.
+    #[test]
+    fn cold_seeds_promote_only_after_this_table_authorizes_them() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("recipes has a repository parent");
+        let tb = repo.join("target/release/td-builder");
+        assert!(
+            is_executable(&tb),
+            "build the required test runner first: cargo build --release --manifest-path \
+             builder/Cargo.toml"
+        );
+
+        let lw = env::temp_dir().join(format!("td-seed-candidate-{}", process::id()));
+        let _ = remove_path_if_exists(&lw);
+        let mut runner = shared_test_runner(&lw);
+        runner.root = repo.to_path_buf();
+        runner.tb = tb;
+        fs::create_dir_all(&runner.sources_dir).unwrap();
+        fs::create_dir_all(&runner.scratch).unwrap();
+        fs::create_dir_all(runner.db.parent().unwrap()).unwrap();
+
+        assert!(!runner.db.exists(), "this table starts with no authority rows");
+        let authorized = runner
+            .ensure_seed_input(&SeedInput::Patch {
+                key: "patch-binutils-boot-2.20.1a".into(),
+                patch: "binutils-boot-2.20.1a".into(),
+            })
+            .expect("a compiled-table patch promotes after its cold derivation");
+        assert!(
+            runner.db_vouches(&authorized),
+            "the successful promotion must register the authorized row"
+        );
+        let b_db_before_rejection = fs::read(&runner.db).unwrap();
+        let items_before_rejection = dir_listing(&runner.store);
+        assert_eq!(
+            items_before_rejection.len(),
+            1,
+            "the authorized patch is the first shared store item"
+        );
+
+        let bytes = b"a worktree-only pinned source\n";
+        let file = "worktree-a-only-source.tar";
+        fs::write(runner.sources_dir.join(file), bytes).unwrap();
+        let key = "worktree-a-only-source";
+        let pin = SourcePin::new(key, "https://example.invalid/a", &sha256sum(bytes), file);
+        let input = SeedInput::Source {
+            key: key.to_string(),
+            pin,
+        };
+
+        let err = runner
+            .ensure_seed_input(&input)
+            .expect_err("the current compiled table does not pin A's new seed");
+        assert!(err.contains("no compiled expected digest"), "got: {err}");
+        assert_eq!(
+            fs::read(&runner.db).unwrap(),
+            b_db_before_rejection,
+            "a rejected candidate must not change this table's authority db"
+        );
+        let shared_items = dir_listing(&runner.store);
+        assert_eq!(
+            shared_items.len(),
+            items_before_rejection.len() + 1,
+            "the immutable candidate bytes stay reusable in the shared store: {shared_items:?}"
+        );
+        let candidate = shared_items
+            .iter()
+            .find(|item| !items_before_rejection.contains(item))
+            .expect("the shared store contains A's candidate in addition to B's patch");
+        let a_table_db = runner
+            .db
+            .parent()
+            .expect("seed db has a parent")
+            .join("aaaaaaaaaaaaaaaa.db");
+        let reused = runner
+            .store_add_recursive_into(
+                key,
+                &runner.store.join(candidate),
+                &a_table_db,
+            )
+            .expect("A's later table can authorize the already-shared bytes");
+        assert!(reused.ends_with(candidate), "reused {reused}, candidate {candidate}");
+        assert_eq!(
+            dir_listing(&runner.store),
+            shared_items,
+            "authorizing A's row must reuse rather than duplicate the shared store item"
+        );
+        assert_eq!(
+            fs::read(&runner.db).unwrap(),
+            b_db_before_rejection,
+            "A's authority stays separate from B's keyed db"
+        );
+        assert!(
+            !candidate_db_path(&lw, &runner.scratch_id()).exists(),
+            "the per-run non-authority db is disposable"
+        );
+        let _ = remove_path_if_exists(&lw);
+    }
+
     // A local source that does not make it through the check leaves the retained seed
     // store and db byte-identical. The tree here is a real, resolvable crate, so the
     // run gets as far as hashing it (which fails: this runner has no builder) — far
@@ -5693,6 +5890,40 @@ chmod 755 '{}'
             gate < intern,
             "ensure_local_source must gate the address BEFORE interning it — interning \
              first poisons the retained seed db for every later plan"
+        );
+    }
+
+    // Promotion has the same wholesale-db hazard as local-source interning: an
+    // address mismatch discovered after `store_add_recursive` has already merged
+    // the row leaves this table unusable. The real-builder regression above proves
+    // the success and rejection semantics; pin the non-writing re-hash before the
+    // authority-writing call because ordinary immutable-store operation cannot
+    // manufacture the corrupt candidate needed to observe this branch dynamically.
+    #[test]
+    fn cold_seed_promotion_checks_the_address_before_registering_authority() {
+        let src = include_str!("check_runner.rs");
+        let body = src
+            .split_once("fn ensure_seed_input(")
+            .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+            .map(|(body, _)| body)
+            .expect("ensure_seed_input must be findable in this file");
+        let cold = body
+            .split_once("let candidate_db = candidate_db_path(")
+            .map(|(_, cold)| cold)
+            .expect("ensure_seed_input must derive cold seeds through a candidate db");
+        let gate = cold
+            .find("seed_digests::require(")
+            .expect("the compiled table must gate the candidate");
+        let check = cold
+            .find("store_path_recursive(")
+            .expect("promotion must re-hash without writing authority");
+        let register = cold
+            .find("store_add_recursive(")
+            .expect("promotion must register the authorized row");
+        assert!(
+            gate < check && check < register,
+            "cold promotion must gate, re-hash without writing, and only then \
+             register authority"
         );
     }
 
@@ -6224,10 +6455,10 @@ chmod 755 '{}'
 
     // `verify-store` fscks EVERY pin table's seed db, not just the running branch's:
     // the store is shared and unkeyed, so an item only a peer table registers is still
-    // this ladder's and must still be re-hashable. The generator's disposable db is
-    // excluded — it is a dotfile and holds no authority.
+    // this ladder's and must still be re-hashable. Disposable generator/candidate
+    // dbs are excluded — they are dotfiles and hold no authority.
     #[test]
-    fn the_fsck_covers_every_keyed_seed_db_and_not_the_generators() {
+    fn the_fsck_covers_every_keyed_seed_db_and_not_disposable_candidates() {
         let lw = env::temp_dir().join(format!("td-fsck-scope-{}", process::id()));
         let _ = fs::remove_dir_all(&lw);
         let runner = shared_test_runner(&lw);
@@ -6241,6 +6472,7 @@ chmod 755 '{}'
         let peer = dir.join("00112233aabbccdd.db");
         fs::write(&peer, b"a peer branch's table").unwrap();
         fs::write(dir.join(".generator-seed-digests-7.db"), b"disposable").unwrap();
+        fs::write(dir.join(".candidate-check-demo-7.db"), b"disposable").unwrap();
         fs::write(dir.join("notes.txt"), b"not a db").unwrap();
 
         let found = runner.seed_dbs().unwrap();
@@ -6265,10 +6497,14 @@ chmod 755 '{}'
         let lw = Path::new("/tmp/some-ladder");
         let keyed = seed_db_path(lw).unwrap();
         let generator = generator_db_path(lw, "seed-digests-4242");
+        let candidate = candidate_db_path(lw, "check-demo-4242");
         assert_ne!(generator, keyed, "the generator must not write the keyed db");
+        assert_ne!(candidate, keyed, "a cold candidate must not write the keyed db");
         assert_eq!(generator.parent(), keyed.parent(), "same commit-lock parent");
+        assert_eq!(candidate.parent(), keyed.parent(), "same commit-lock parent");
         // Distinct per run, so two generators cannot merge into one file.
         assert_ne!(generator, generator_db_path(lw, "seed-digests-4243"));
+        assert_ne!(candidate, candidate_db_path(lw, "check-demo-4243"));
     }
 
     // The seed store moved with the keyed db, and that rename IS the rollout barrier:
