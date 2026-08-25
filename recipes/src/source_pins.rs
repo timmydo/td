@@ -288,6 +288,17 @@ const PINS: &[PinDef] = &[
         file: "hello-2.10.tar.gz",
     },
     PinDef {
+        key: "libressl-x86-64-source",
+        aliases: &[],
+        // LibreSSL 4.3.2 supplies the OpenSSL-compatible TLS implementation
+        // for curl and Git. The recipe builds only static archives and disables
+        // upstream assembly so every eventual shipped instruction remains on
+        // td's checked frame-pointer path.
+        url: "https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-4.3.2.tar.gz",
+        sha256: "edf01aee24c65d69e6a9efcb9d44bcda682ff9d4f3bbbd95e794e1dfa90847b5",
+        file: "libressl-4.3.2.tar.gz",
+    },
+    PinDef {
         key: "linux-source",
         // The 4.14.67 tree stays pinned ONLY as the source of the UAPI kernel
         // headers (`linux-headers` / `linux-headers-x86-64`) that the whole
@@ -627,9 +638,10 @@ mod tests {
         // `.crate` sources) +
         // btrfs-progs 7.0 and util-linux 2.42.2 (the persistent-volume writer
         // and its minimal libuuid/libblkid build closure) + the first reviewed
-        // foreign application seed, upstream ripgrep 15.2.0 + curl's dated
+        // foreign application seed, upstream ripgrep 15.2.0, LibreSSL 4.3.2
+        // (the static TLS foundation for curl and Git), and curl's dated
         // Mozilla CA extract.
-        assert_eq!(all().len(), 58);
+        assert_eq!(all().len(), 59);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice
