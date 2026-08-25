@@ -15,6 +15,7 @@ busybox-x86-64-source 3lfjnlqhk05h0hbqd3ks4jbh4pvw7c01-busybox-x86-64-source
 ca-certificates-source 1nh4w1q566ga153y3h427ai268h934nx-ca-certificates-source
 cmake-x86-64-source arcs0qgnqjhfljjd69mpgnjnanpcrlid-cmake-x86-64-source
 coreutils-mesboot0-source 7dkw301jma5vnzc6x5i09nmh2dn7ak0q-coreutils-mesboot0-source
+curl-x86-64-source 985mgjp6q4y958wwzqs984nkh399jnac-curl-x86-64-source
 diffutils-mesboot0-source ilin34x3xf4shlhs892wchsc0vjyqwb8-diffutils-mesboot0-source
 elfutils-x86-64-source n4g2hjlg72jm5wn0lx9fxplvh2y82d0b-elfutils-x86-64-source
 fd-source rsp3qagl8x7gh5hqpzy93adwfv5pv2ay-fd-source

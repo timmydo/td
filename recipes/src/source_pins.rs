@@ -99,6 +99,16 @@ const PINS: &[PinDef] = &[
         file: "coreutils-5.0.tar.bz2",
     },
     PinDef {
+        key: "curl-x86-64-source",
+        aliases: &[],
+        // curl 8.21.0 supplies Git's source-built HTTP/HTTPS transport. The
+        // recipe keeps only static libcurl and disables every protocol and
+        // optional dependency outside the reviewed HTTP(S) closure.
+        url: "https://curl.se/download/curl-8.21.0.tar.xz",
+        sha256: "aa1b66a70eace83dc624508745646c08ae561de512ab403adffb93ac87fc72e6",
+        file: "curl-8.21.0.tar.xz",
+    },
+    PinDef {
         key: "diffutils-mesboot0-source",
         aliases: &[],
         // GNU diffutils 2.7 — the tcc-era `diffutils` provider (re #469). The exact
@@ -638,10 +648,10 @@ mod tests {
         // `.crate` sources) +
         // btrfs-progs 7.0 and util-linux 2.42.2 (the persistent-volume writer
         // and its minimal libuuid/libblkid build closure) + the first reviewed
-        // foreign application seed, upstream ripgrep 15.2.0, LibreSSL 4.3.2
-        // (the static TLS foundation for curl and Git), and curl's dated
+        // foreign application seed, upstream ripgrep 15.2.0, LibreSSL 4.3.2,
+        // curl 8.21.0 (the static HTTPS foundation for Git), and curl's dated
         // Mozilla CA extract.
-        assert_eq!(all().len(), 59);
+        assert_eq!(all().len(), 60);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice
