@@ -680,7 +680,13 @@ mod tests {
         };
         let body = transport.get(from..from + span).unwrap_or("");
         let asked = body.find("may_talk(");
-        let looked = body.find("self.bus.route(");
+        // Two spellings reach the directory: the plain lookup, and the one
+        // that resolves and records a call under the same lock. The policy
+        // has to precede whichever a future edit puts first.
+        let looked = ["self.bus.route(", "self.bus.route_expecting("]
+            .iter()
+            .filter_map(|needle| body.find(needle))
+            .min();
         match (asked, looked) {
             (Some(asked), Some(looked)) => assert!(
                 asked < looked,
@@ -689,6 +695,44 @@ mod tests {
             (asked, looked) => {
                 panic!("the send path no longer both asks and looks: {asked:?} {looked:?}")
             }
+        }
+    }
+
+    /// A reply is decided by OWNERSHIP, before the talk set is consulted.
+    ///
+    /// The two are different questions and the order records which governs. A
+    /// method return is addressed by `reply_serial` to a caller that already
+    /// reached this connection, so filtering it by the sender's talk set drops
+    /// the answer to a call the broker itself delivered — §D grants a sandbox
+    /// the portal's replies, so the symmetric direction cannot be a denial.
+    /// What replaces the filter is stricter, not weaker: the reply is carried
+    /// only if this connection is the one that call was routed to.
+    ///
+    /// Pinned at the source because the harness cannot reach it. Every peer on
+    /// one test bus shares an identity — both ends of a socketpair are the
+    /// test process — so a bus with a confined callee and an unconfined caller
+    /// cannot be built, and a reply arm that consulted the talk set would pass
+    /// every test in the suite.
+    #[test]
+    fn a_reply_is_decided_by_ownership_and_not_by_the_talk_set() {
+        let transport = without_line_comments(&without_block_comments(source("transport")));
+        let Some(from) = transport.find("fn route(") else {
+            panic!("the routing arm is gone");
+        };
+        let Some(span) = transport[from..].find("fn deliver(") else {
+            panic!("the routing arm no longer ends where this test slices it");
+        };
+        let body = transport.get(from..from + span).unwrap_or("");
+        let claimed = body.find("claim_reply(");
+        let filtered = body.find("may_talk(");
+        match (claimed, filtered) {
+            (Some(claimed), Some(filtered)) => assert!(
+                claimed < filtered,
+                "a reply is filtered by the talk set before its ownership is asked"
+            ),
+            (claimed, filtered) => panic!(
+                "the send path no longer both claims and filters: {claimed:?} {filtered:?}"
+            ),
         }
     }
 

@@ -24,7 +24,7 @@ use crate::auth::{Guid, Handshake, PeerIdentity, GUID_LEN};
 use crate::lineage::{Caller, Identity, Instances, Named, Procfs, Reading, RealProcfs};
 use crate::message;
 use crate::policy;
-use crate::registry::{Bus, Outbox, Overflow, Rejected};
+use crate::registry::{Bus, Outbox, Overflow, Rejected, Routing};
 use crate::sys::{self, PeerCredential};
 use crate::wire::{WireError, Writer};
 
@@ -402,7 +402,6 @@ pub struct Connection<'a> {
     /// that answered every call with serial 1 would be telling a client that
     /// every reply is the same message. It starts at 1 because zero is not a
     /// legal serial.
-    next_serial: u32,
     /// Bytes read and not yet consumed — by the handshake before BEGIN, by the
     /// framer after it.
     inbox: Vec<u8>,
@@ -438,7 +437,42 @@ impl Drop for Connection<'_> {
         // Off the directory before anything else: a name that outlived its
         // connection would route a message to a socket nobody is reading.
         if let Some(unique) = self.unique.take() {
-            self.bus.leave(&unique);
+            // §D: a caller whose callee disconnects mid-call otherwise waits
+            // for ever, which is the "left waiting on a serial" failure it
+            // argues against everywhere else. Best effort, because this is
+            // `Drop` and there is nowhere to report to: a caller that cannot
+            // be told is a caller that was already leaving.
+            for call in self.bus.leave(&unique) {
+                // Numbered from the CALLER's stream, not this one. The sender
+                // stamped below is the broker, which is one sender across the
+                // whole bus, so two peers departing at the same counter value
+                // would otherwise hand one caller two messages from
+                // `org.freedesktop.DBus` carrying the same serial — and that
+                // caller's ordinary broker replies are numbered from the same
+                // place, so the collision does not need two departures.
+                let serial = call.outbox.take_serial();
+                let built = message::Builder::error(
+                    crate::wire::Endian::Little,
+                    "org.freedesktop.DBus.Error.NoReply",
+                    call.serial,
+                )
+                .sender(BUS_NAME)
+                .destination(&call.caller)
+                .serial(serial)
+                .body("s", |writer| {
+                    writer.string("the peer this call was sent to disconnected")
+                });
+                if let Ok(frame) = built.map_err(|_| ()).and_then(|built| {
+                    built.encode().map_err(|_| ())
+                }) {
+                    // Through `deliver`, so §D's bus remedy runs here too. A
+                    // draft pushed straight to the outbox, which is the same
+                    // mistake `deliver` is documented against: during a mass
+                    // disconnect a full bus would bin every `NoReply` in
+                    // silence and never relieve the peer responsible.
+                    let _ = self.deliver(&call.outbox, frame);
+                }
+            }
         }
         self.outbox.close();
         // Whatever is still queued was charged and is about to be closed by
@@ -506,7 +540,6 @@ impl<'a> Connection<'a> {
             identity,
             outbox,
             unique: None,
-            next_serial: 1,
             chunk: vec![0u8; READ_CHUNK],
             inbox: Vec::new(),
             freight: Vec::new(),
@@ -1627,6 +1660,20 @@ impl<'a> Connection<'a> {
         self.queue_own(reply)
     }
 
+    /// Un-record a call this connection recorded and then could not send.
+    ///
+    /// Nameless is not a case: a connection cannot route anything before
+    /// `Hello`, so nothing it recorded can be waiting when `self.unique` is
+    /// `None`.
+    fn forget(&self, recorded: bool, serial: u32) {
+        if !recorded {
+            return;
+        }
+        if let Some(caller) = self.unique.as_deref() {
+            self.bus.forget_reply(caller, serial);
+        }
+    }
+
     /// Deliver to another peer, with this connection's name stamped on it.
     fn route(
         &mut self,
@@ -1666,27 +1713,100 @@ impl<'a> Connection<'a> {
         // refusal's TIMING dependent on the fact the refusal exists to
         // withhold. The lookups above short-circuit for the same reason.
         //
-        // A REPLY is not filtered, and that is the difference between a
-        // policy on who may be addressed and one on what may be sent. A
-        // method return or an error is addressed by `reply_serial` to a
-        // caller that already reached this connection, so filtering it by the
-        // sender's talk set silently drops the answer to a call the broker
-        // itself delivered — leaving the caller to time out and the callee
+        // A REPLY is not filtered by the TALK SET, and that is the
+        // difference between a policy on who may be addressed and one on what
+        // may be sent. A method return or an error is addressed by
+        // `reply_serial` to a caller that already reached this connection, so
+        // filtering it by the sender's talk set drops the answer to a call the
+        // broker itself delivered — the caller times out and the callee is
         // told nothing. §D grants a sandbox the portal's REPLIES, so the
-        // symmetric direction cannot be a denial. What this does not yet do
-        // is prove a reply answers a real call: that is pending-reply
-        // ownership, which lands with match rules, and until it does a
-        // confined peer can still address a forged reply anywhere — exactly
-        // as every peer could before this filter existed, so it is a residual
-        // rather than a regression. APPLICATIONS.md §B.3.2 records that
-        // `RequestName` must not land before it is closed.
-        let originates = !matches!(
-            message.kind,
-            message::MessageType::MethodReturn | message::MessageType::Error
-        );
-        let permitted = !originates
-            || policy::may_talk(&self.identity, self.unique.as_deref(), destination);
-        let Some(outbox) = permitted.then(|| self.bus.route(destination)).flatten() else {
+        // symmetric direction cannot be a denial.
+        //
+        // It is filtered by OWNERSHIP instead, which is the stricter test: a
+        // reply is carried only if this connection is the one that call was
+        // routed to. §D wants that for the integrity half — libdbus and GDBus
+        // both match a pending call by serial without checking who answered,
+        // so without this any peer can answer a call another peer made to a
+        // third, and the client library hands it over as the answer.
+        let reply = match message.kind {
+            message::MessageType::MethodReturn | message::MessageType::Error => {
+                message.fields.reply_serial
+            }
+            _ => None,
+        };
+        let permitted = match reply {
+            // A method return or an error with no `reply_serial` answers
+            // nothing, and the codec refuses one on those two types, so this
+            // arm is dead. It falls through to the rules below rather than
+            // being refused here: writing a second refusal for a case the
+            // decoder has already taken would be a branch shaped like a check
+            // that never runs, and `restamp` rejects the message afterwards
+            // in any event.
+            Some(serial) => self
+                .bus
+                .claim_reply(self.named()?, destination, serial),
+            None => {
+                // Who may be addressed, and then what may be sent to them. A
+                // confined peer may CALL the portal; a directed signal at it
+                // is a channel §D does not grant.
+                policy::may_talk(&self.identity, self.unique.as_deref(), destination)
+                    && (message.kind != message::MessageType::Signal
+                        || policy::may_signal(&self.identity))
+            }
+        };
+        // Recorded BEFORE the message is queued, so the answer cannot reach
+        // a table that does not know the question yet: the callee's reader is
+        // a different thread and is free to run the moment the frame lands in
+        // its outbox.
+        //
+        // Resolved and recorded as ONE act, for the symmetric reason. A
+        // lookup here and a record afterwards leave a window in which the
+        // callee departs: its `leave` sweeps a table that does not mention
+        // this call yet, the record lands behind the sweep, and the caller
+        // waits for ever on a connection that has gone.
+        //
+        // Only a call that WANTS a reply is recorded, because only that has a
+        // serial anybody is waiting on. `NO_REPLY_EXPECTED` says the caller
+        // is not listening, so a "reply" to one is forged by construction and
+        // the ownership test above refuses it without a rule of its own.
+        // `wants_reply` alone: `dispatch` sets it only for a method call
+        // that did not withdraw its reply, and states so once rather than
+        // leaving three places to each happen to drop it. A second test here
+        // would be a dead branch shaped like a safety check, which this file
+        // argues is worse than none because the next reader trusts it.
+        let recorded = wants_reply;
+        let found = if !permitted {
+            None
+        } else if recorded {
+            match self
+                .bus
+                .route_expecting(destination, self.named()?, message.serial)
+            {
+                Routing::Ready(outbox) => Some(outbox),
+                Routing::Absent => None,
+                Routing::TooMany => {
+                    return self.refuse(
+                        message,
+                        "org.freedesktop.DBus.Error.LimitsExceeded",
+                        "this connection has too many calls outstanding",
+                    )
+                }
+                // The specification already requires a serial to be unique
+                // among a connection's undelivered messages. The table needs
+                // it too: with a duplicate allowed, two answers carry one
+                // `reply_serial` to a client that cannot tell them apart.
+                Routing::Repeated => {
+                    return self.refuse(
+                        message,
+                        "org.freedesktop.DBus.Error.InvalidArgs",
+                        "this connection already has a call outstanding on that serial",
+                    )
+                }
+            }
+        } else {
+            self.bus.route(destination)
+        };
+        let Some(outbox) = found else {
             // §D's one consistent story: a name with no owner is absent, and
             // the caller is told so rather than left waiting.
             return if wants_reply {
@@ -1717,6 +1837,7 @@ impl<'a> Connection<'a> {
             Ok(forwarded) => forwarded,
             Err(why) => {
                 eprintln!("td-busd: cannot relay from {sender}: {why}");
+                self.forget(recorded, message.serial);
                 return if wants_reply {
                     self.refuse(
                         message,
@@ -1738,6 +1859,7 @@ impl<'a> Connection<'a> {
             // A peer that genuinely never reads is removed by the BUS ceiling's
             // remedy instead, which picks the largest consumer.
             Err(Overflow::Connection { bytes, frames }) => {
+                self.forget(recorded, message.serial);
                 if wants_reply {
                     self.refuse(
                         message,
@@ -1751,6 +1873,7 @@ impl<'a> Connection<'a> {
                 }
             }
             Err(Overflow::Bus(_)) => {
+                self.forget(recorded, message.serial);
                 if wants_reply {
                     self.refuse(
                         message,
@@ -1762,6 +1885,7 @@ impl<'a> Connection<'a> {
                 }
             }
             Err(Overflow::Closed) => {
+                self.forget(recorded, message.serial);
                 if wants_reply {
                     self.refuse(
                         message,
@@ -1911,10 +2035,16 @@ impl<'a> Connection<'a> {
 
     /// This connection's next outgoing serial. Unique per connection, as the
     /// specification requires, and never zero.
-    fn take_serial(&mut self) -> u32 {
-        let mine = self.next_serial;
-        self.next_serial = self.next_serial.checked_add(1).unwrap_or(1);
-        mine
+    /// The serial for a message the broker ORIGINATES to this peer.
+    ///
+    /// Kept on the outbox rather than here, because the sender it numbers for
+    /// is `org.freedesktop.DBus` and the stream those numbers must stay
+    /// distinct in is the recipient's. A departing peer writes a `NoReply`
+    /// into a caller's outbox from its own thread, so a counter kept per
+    /// connection would number two of the broker's messages to one caller
+    /// from two different places.
+    fn take_serial(&self) -> u32 {
+        self.outbox.take_serial()
     }
 
 }
@@ -2533,6 +2663,84 @@ mod tests {
         (bus, clients)
     }
 
+    /// A bus with one UNCONFINED peer and one CONFINED one, in that order.
+    ///
+    /// Every other helper here gives every peer the same identity, because
+    /// both ends of a socketpair are this process and `Instances` answers
+    /// about a process. The way out is that identity is resolved ONCE, at
+    /// accept, and never recomputed: accepting one connection while no
+    /// instance record exists places it outside a jail, and registering the
+    /// fixture before accepting the second places that one inside. Neither
+    /// accept reads the socket — the answer comes from `SO_PEERPIDFD` — so
+    /// the order is this thread's to choose and does not depend on when a
+    /// client speaks.
+    ///
+    /// It is the only shape in this suite where a message crosses a policy
+    /// boundary, which is what the reply rules are about.
+    fn mixed_bus() -> (Arc<Bus>, UnixStream, UnixStream) {
+        let (free_client, free_server) = UnixStream::pair().expect("socketpair");
+        let (jailed_client, jailed_server) = UnixStream::pair().expect("socketpair");
+        for client in [&free_client, &jailed_client] {
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                .expect("client read timeout");
+        }
+        let bus = Arc::new(Bus::new());
+        let serving = Arc::clone(&bus);
+        thread::spawn(move || {
+            let quota = Quota::new();
+            let bus = serving;
+            let instances = Instances::new();
+            // Accepted with the registry EMPTY, so this process has no
+            // instance and this connection is placed outside a jail.
+            let free = Connection::accept(
+                free_server,
+                Guid::new(GUID).expect("guid"),
+                &quota,
+                &bus,
+                &instances,
+            );
+
+            let pid = i32::try_from(std::process::id()).expect("a pid fits");
+            let crate::lineage::Reading::Of(mine) = RealProcfs.stat(pid) else {
+                panic!("this process has a /proc entry");
+            };
+            let crate::lineage::Reading::Of(theirs) = RealProcfs.stat(mine.ppid) else {
+                panic!("this process's parent has a /proc entry");
+            };
+            let registrant = crate::lineage::Caller {
+                pid: mine.ppid,
+                starttime: theirs.starttime,
+            };
+            let token = instances
+                .open(&RealProcfs, "fixture", "fixture", Vec::new(), this_uid(), registrant)
+                .expect("phase one");
+            instances
+                .complete(&RealProcfs, &token, pid, this_uid(), registrant)
+                .expect("phase two");
+
+            // And this one with the record in place.
+            let jailed = Connection::accept(
+                jailed_server,
+                Guid::new(GUID).expect("guid"),
+                &quota,
+                &bus,
+                &instances,
+            );
+            thread::scope(|scope| {
+                for connection in [free, jailed] {
+                    let spawned = thread::Builder::new().spawn_scoped(scope, move || {
+                        if let Ok(mut connection) = connection {
+                            let _ = connection.serve();
+                        }
+                    });
+                    spawned.expect("spawn a connection thread");
+                }
+            });
+        });
+        (bus, free_client, jailed_client)
+    }
+
     /// The same, handing back the registry. A refusal that nevertheless did
     /// the work is invisible from the wire, so the test that cares reads the
     /// registry instead.
@@ -2850,6 +3058,44 @@ mod tests {
         .expect("body")
         .encode()
         .expect("encode a peer call")
+    }
+
+    /// A method call whose sender is not listening for the answer.
+    fn unanswerable_call(destination: &str, serial: u32) -> Vec<u8> {
+        message::Builder::method_call(
+            crate::wire::Endian::Little,
+            "/org/example/Thing",
+            Some("org.example.Thing"),
+            "Do",
+        )
+        .destination(destination)
+        .serial(serial)
+        .flags(message::FLAG_NO_REPLY_EXPECTED)
+        .encode()
+        .expect("encode a call that wants no reply")
+    }
+
+    /// A signal aimed at one connection rather than broadcast.
+    fn directed_signal(destination: &str, serial: u32) -> Vec<u8> {
+        message::Builder::signal(
+            crate::wire::Endian::Little,
+            "/org/example/Thing",
+            "org.example.Thing",
+            "Happened",
+        )
+        .destination(destination)
+        .serial(serial)
+        .encode()
+        .expect("encode a directed signal")
+    }
+
+    /// A method return addressed to `destination`, answering `answers`.
+    fn reply_to(destination: &str, answers: u32, serial: u32) -> Vec<u8> {
+        message::Builder::method_return(crate::wire::Endian::Little, answers)
+            .destination(destination)
+            .serial(serial)
+            .encode()
+            .expect("encode a reply")
     }
 
     /// A directed message reaches the connection its DESTINATION names, and
@@ -4102,58 +4348,6 @@ mod tests {
         assert!(listed.contains(&name_two), "{listed:?}");
     }
 
-    /// A REPLY is not filtered, and a draft of this commit dropped every one.
-    ///
-    /// `route` was filtering by message type-blind talk set, so a method
-    /// return or an error from a confined peer to a peer outside its talk set
-    /// vanished — no delivery and, since a reply wants no reply, no error
-    /// either. Anyone who called into a jailed application waited until they
-    /// timed out, and §D grants a sandbox the portal's replies, so the
-    /// symmetric direction cannot be a denial.
-    ///
-    /// This asserts the rule as built, INCLUDING its residual: the broker
-    /// does not yet check that a reply answers a real call, so the forged one
-    /// this test sends is delivered. That is pending-reply ownership, which
-    /// lands with match rules; before this filter existed every peer could do
-    /// the same, so it is a residual and not a regression.
-    #[test]
-    fn a_reply_is_delivered_where_a_call_would_be_refused() {
-        if !pidfd_available() {
-            return;
-        }
-        let (_bus, mut clients) = confined_bus_of(2);
-        let second = clients.pop().expect("two clients");
-        let first = clients.pop().expect("two clients");
-        let (mut one, name_one) = Peer::arrive(first);
-        let (mut two, name_two) = Peer::arrive(second);
-
-        // A CALL to the same peer is refused, which is the contrast that
-        // makes the delivery below mean something.
-        one.send(&peer_call(&name_two, 2, "anyone"));
-        let frame = one.frame();
-        let (reply, _) = message::decode(&frame, 0).expect("decode the refusal");
-        assert_eq!(
-            reply.fields.error_name,
-            Some("org.freedesktop.DBus.Error.NameHasNoOwner")
-        );
-
-        let answer = message::Builder::method_return(crate::wire::Endian::Little, 7)
-            .destination(&name_two)
-            .serial(3)
-            .encode()
-            .expect("encode a reply");
-        one.send(&answer);
-        let frame = two.frame();
-        let (delivered, _) = message::decode(&frame, 0).expect("decode the delivered reply");
-        assert_eq!(delivered.kind, message::MessageType::MethodReturn);
-        assert_eq!(delivered.fields.reply_serial, Some(7));
-        assert_eq!(
-            delivered.fields.sender,
-            Some(name_one.as_str()),
-            "the broker's word about who sent it"
-        );
-    }
-
     /// A confined peer cannot reach a peer it cannot see, and is told the
     /// same story on the send path as on the lookup path.
     #[test]
@@ -4436,6 +4630,569 @@ mod tests {
             instances.pending_count(),
             before,
             "a refused Register opened a registration anyway"
+        );
+    }
+
+    /// A reply reaches the caller that asked for it.
+    ///
+    /// The ordinary case, and the one every other test here is the negative
+    /// of: the broker carries an answer because it routed the question.
+    #[test]
+    fn a_reply_reaches_the_caller_that_asked_for_it() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        one.send(&peer_call(&name_two, 5, "a question"));
+        let frame = two.frame();
+        let (call, _) = message::decode(&frame, 0).expect("decode the call");
+        assert_eq!(call.fields.sender, Some(name_one.as_str()));
+
+        two.send(&reply_to(&name_one, call.serial, 2));
+        let frame = one.frame();
+        let (answer, _) = message::decode(&frame, 0).expect("decode the answer");
+        assert_eq!(answer.kind, message::MessageType::MethodReturn);
+        assert_eq!(answer.fields.reply_serial, Some(5));
+        assert_eq!(answer.fields.sender, Some(name_two.as_str()));
+    }
+
+    /// A reply nobody asked for is not carried.
+    ///
+    /// libdbus and GDBus both match a pending call by serial without checking
+    /// who answered, so a peer that can place a `METHOD_RETURN` in front of a
+    /// client is answering on somebody else's behalf. Before the table there
+    /// was nothing to check it against; a draft of the previous commit even
+    /// asserted the delivery, to record the gap honestly.
+    #[test]
+    fn a_reply_nobody_asked_for_is_not_delivered() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (mut two, _) = Peer::arrive(second);
+
+        two.send(&reply_to(&name_one, 4321, 2));
+        one.expect_silence();
+
+        // And the connection that tried it is still serving, because a
+        // forged reply is a bad MESSAGE and not a bad peer: there is no reply
+        // to refuse it with, so it is dropped rather than made fatal.
+        two.send(&bus_call("GetId", 3));
+        let frame = two.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(reply.fields.reply_serial, Some(3));
+    }
+
+    /// The answer must come from the peer the question went to.
+    ///
+    /// This is the case the SENDER field alone cannot fix: the broker stamps
+    /// a truthful sender, and the client library never looks at it. Three
+    /// peers, because two cannot express "somebody else answered".
+    #[test]
+    fn a_reply_from_a_peer_that_was_not_asked_is_not_delivered() {
+        let (_bus, mut clients) = bus_of(3);
+        let third = clients.pop().expect("three clients");
+        let second = clients.pop().expect("three clients");
+        let first = clients.pop().expect("three clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+        let (mut three, _) = Peer::arrive(third);
+
+        one.send(&peer_call(&name_two, 9, "a question for two"));
+        let frame = two.frame();
+        let (call, _) = message::decode(&frame, 0).expect("decode the call");
+
+        // Three answers a question it was never asked, with the right serial.
+        three.send(&reply_to(&name_one, 9, 2));
+        one.expect_silence();
+
+        // And the peer that WAS asked can still answer, so the refusal above
+        // did not consume the record it was checked against.
+        two.send(&reply_to(&name_one, call.serial, 2));
+        let frame = one.frame();
+        let (answer, _) = message::decode(&frame, 0).expect("decode the answer");
+        assert_eq!(answer.fields.reply_serial, Some(9));
+        assert_eq!(answer.fields.sender, Some(name_two.as_str()));
+    }
+
+    /// An answer goes to the peer that ASKED, and nowhere else.
+    ///
+    /// The conjunct this pins is `call.caller == to`. Without it a peer that
+    /// was legitimately called by one peer could address its answer to a
+    /// THIRD, whose client library would match it against whatever that peer
+    /// happens to have outstanding on the same serial.
+    #[test]
+    fn a_reply_may_not_be_readdressed_to_a_peer_that_did_not_ask() {
+        let (_bus, mut clients) = bus_of(3);
+        let third = clients.pop().expect("three clients");
+        let second = clients.pop().expect("three clients");
+        let first = clients.pop().expect("three clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+        let (mut three, name_three) = Peer::arrive(third);
+
+        one.send(&peer_call(&name_two, 31, "a question from one"));
+        let frame = two.frame();
+        let (call, _) = message::decode(&frame, 0).expect("decode the call");
+
+        // Two was asked, and answers THREE with the serial one is waiting on.
+        two.send(&reply_to(&name_three, call.serial, 2));
+        three.expect_silence();
+
+        // The record was not consumed by the attempt, so the peer that asked
+        // is still answerable.
+        two.send(&reply_to(&name_one, call.serial, 3));
+        let frame = one.frame();
+        let (answer, _) = message::decode(&frame, 0).expect("decode the answer");
+        assert_eq!(answer.fields.reply_serial, Some(31));
+        assert_eq!(answer.fields.sender, Some(name_two.as_str()));
+    }
+
+    /// An answer carries the serial of the question it answers.
+    ///
+    /// The conjunct this pins is `call.serial == reply_serial`. Without it a
+    /// peer that was genuinely called could answer with any serial it liked,
+    /// and the caller's library would match it against a DIFFERENT call it
+    /// has outstanding — the same confusion as an answer from a stranger,
+    /// arriving from a peer the caller really is talking to.
+    #[test]
+    fn a_reply_may_not_answer_a_serial_that_was_never_asked() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        one.send(&peer_call(&name_two, 41, "a question from one"));
+        let frame = two.frame();
+        let (call, _) = message::decode(&frame, 0).expect("decode the call");
+        assert_eq!(call.serial, 41);
+
+        // A serial one never sent, from the peer one really did call.
+        two.send(&reply_to(&name_one, 4141, 2));
+        one.expect_silence();
+
+        two.send(&reply_to(&name_one, 41, 3));
+        let frame = one.frame();
+        let (answer, _) = message::decode(&frame, 0).expect("decode the answer");
+        assert_eq!(answer.fields.reply_serial, Some(41));
+        assert_eq!(answer.fields.sender, Some(name_two.as_str()));
+    }
+
+    /// Two callees departing hand one caller two DIFFERENT serials.
+    ///
+    /// The broker is ONE sender, `org.freedesktop.DBus`, and a serial has to
+    /// be unique among a sender's undelivered messages. A sweep is written
+    /// into the caller's outbox by the DEPARTING connection's thread, so a
+    /// counter kept per connection numbered these from two places: two peers
+    /// leaving at the same counter value handed one caller two messages from
+    /// one sender carrying one serial. The counter belongs to the stream the
+    /// messages land in.
+    #[test]
+    fn a_swept_call_is_numbered_from_the_stream_it_lands_in() {
+        let (_bus, mut clients) = bus_of(3);
+        let third = clients.pop().expect("three clients");
+        let second = clients.pop().expect("three clients");
+        let first = clients.pop().expect("three clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+        let (mut three, name_three) = Peer::arrive(third);
+
+        one.send(&peer_call(&name_two, 81, "a question for two"));
+        let _ = two.frame();
+        one.send(&peer_call(&name_three, 82, "a question for three"));
+        let _ = three.frame();
+
+        drop(two);
+        drop(three);
+
+        let mut serials = Vec::new();
+        let mut answered = Vec::new();
+        for _ in 0..2 {
+            let frame = one.frame();
+            let (told, _) = message::decode(&frame, 0).expect("decode the error");
+            assert_eq!(told.fields.sender, Some(BUS_NAME));
+            assert_eq!(
+                told.fields.error_name,
+                Some("org.freedesktop.DBus.Error.NoReply")
+            );
+            serials.push(told.serial);
+            answered.push(told.fields.reply_serial);
+        }
+        assert_ne!(
+            serials.first(), serials.get(1),
+            "two peers left at the same counter value and collided"
+        );
+        answered.sort_unstable();
+        assert_eq!(answered, vec![Some(81), Some(82)]);
+    }
+
+    /// A departing CALLER takes its unanswered questions with it.
+    ///
+    /// The other half of the sweep, and the one nothing was pinning. Without
+    /// it the table only ever grows: a caller that leaves mid-call would hold
+    /// its share of the bound against a name that no longer exists, for as
+    /// long as the broker runs.
+    #[test]
+    fn a_departing_caller_releases_what_it_was_waiting_on() {
+        let (bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        one.send(&peer_call(&name_two, 51, "a question never answered"));
+        let _ = two.frame();
+        assert_eq!(bus.pending_replies(), 1);
+
+        drop(one);
+        // The departure is another thread's work, so this waits for it rather
+        // than assuming it has happened.
+        let mut left = false;
+        for _ in 0..200 {
+            if bus.pending_replies() == 0 {
+                left = true;
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(left, "a departed caller is still holding its share");
+    }
+
+    /// A caller that withdrew its reply is not recorded, and cannot be
+    /// answered.
+    ///
+    /// `NO_REPLY_EXPECTED` says the sender is not listening, so there is no
+    /// serial anybody waits on. That makes a "reply" to one forged by
+    /// construction: the ownership test refuses it without needing a rule of
+    /// its own, which is the argument for recording only calls that want one.
+    #[test]
+    fn a_call_that_wants_no_reply_is_neither_recorded_nor_answerable() {
+        let (bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        one.send(&unanswerable_call(&name_two, 61));
+        let frame = two.frame();
+        let (call, _) = message::decode(&frame, 0).expect("decode the call");
+        assert_eq!(call.serial, 61, "the call was delivered all the same");
+        assert_eq!(
+            bus.pending_replies(),
+            0,
+            "a call nobody is waiting on took a place in the table"
+        );
+
+        two.send(&reply_to(&name_one, 61, 2));
+        one.expect_silence();
+    }
+
+    /// A caller may not have two calls outstanding on one serial.
+    ///
+    /// The specification asks for this anyway — a serial is unique among a
+    /// connection's undelivered messages — and the table needs it: with a
+    /// duplicate allowed, `(caller, serial)` stops naming ONE call, two
+    /// answers carry the same `reply_serial` to a client that cannot tell
+    /// them apart, and un-recording an undelivered call could remove the
+    /// wrong entry and leave a live one untracked.
+    #[test]
+    fn a_caller_may_not_reuse_a_serial_it_is_still_waiting_on() {
+        let (bus, mut clients) = bus_of(3);
+        let third = clients.pop().expect("three clients");
+        let second = clients.pop().expect("three clients");
+        let first = clients.pop().expect("three clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+        let (mut three, name_three) = Peer::arrive(third);
+
+        one.send(&peer_call(&name_two, 71, "a question"));
+        let _ = two.frame();
+        // The same serial, to a different peer.
+        one.send(&peer_call(&name_three, 71, "the same serial"));
+        let frame = one.frame();
+        let (refusal, _) = message::decode(&frame, 0).expect("decode the refusal");
+        assert_eq!(refusal.kind, message::MessageType::Error);
+        assert_eq!(
+            refusal.fields.error_name,
+            Some("org.freedesktop.DBus.Error.InvalidArgs")
+        );
+        assert_eq!(refusal.fields.reply_serial, Some(71));
+        three.expect_silence();
+        assert_eq!(bus.pending_replies(), 1, "the first call was disturbed");
+
+        // Once the first is answered the serial is free again.
+        two.send(&reply_to(&name_one, 71, 2));
+        let frame = one.frame();
+        let (answer, _) = message::decode(&frame, 0).expect("decode the answer");
+        assert_eq!(answer.fields.reply_serial, Some(71));
+        one.send(&peer_call(&name_three, 71, "free again"));
+        let frame = three.frame();
+        let (call, _) = message::decode(&frame, 0).expect("decode the call");
+        assert_eq!(call.fields.sender, Some(name_one.as_str()));
+    }
+
+    /// One question, one answer. A second reply carrying the same serial is
+    /// as forged as a first from the wrong peer.
+    #[test]
+    fn a_serial_is_answered_once() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, name_one) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        one.send(&peer_call(&name_two, 11, "a question"));
+        let frame = two.frame();
+        let (call, _) = message::decode(&frame, 0).expect("decode the call");
+
+        two.send(&reply_to(&name_one, call.serial, 2));
+        let frame = one.frame();
+        let (answer, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(answer.fields.reply_serial, Some(11));
+
+        two.send(&reply_to(&name_one, call.serial, 3));
+        one.expect_silence();
+    }
+
+    /// A caller whose callee disconnects is TOLD, rather than left waiting on
+    /// a serial that will never come.
+    ///
+    /// §D argues against the "left waiting" failure everywhere else and this
+    /// was the one place the broker still committed it.
+    #[test]
+    fn a_caller_is_told_when_the_peer_it_called_disconnects() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        one.send(&peer_call(&name_two, 13, "a question never answered"));
+        // Read at the callee before dropping it, or the call races the
+        // departure and is refused `NameHasNoOwner` by the route instead --
+        // which is the right answer to a different question.
+        let _ = two.frame();
+        drop(two);
+
+        let frame = one.frame();
+        let (told, _) = message::decode(&frame, 0).expect("decode the error");
+        assert_eq!(told.kind, message::MessageType::Error);
+        assert_eq!(
+            told.fields.error_name,
+            Some("org.freedesktop.DBus.Error.NoReply")
+        );
+        assert_eq!(
+            told.fields.reply_serial,
+            Some(13),
+            "the error answers the call that was lost"
+        );
+        assert_eq!(told.fields.sender, Some(BUS_NAME));
+    }
+
+    /// A confined peer may ANSWER a call it was sent, even though it could
+    /// not have placed that call itself.
+    ///
+    /// The talk set governs who may be ADDRESSED; a reply is governed by
+    /// whether it answers a real question. This is the case that separates
+    /// them, and it needs two peers with DIFFERENT identities: the caller is
+    /// outside a jail and may address anybody, the callee is inside one and
+    /// may address only the broker, the portal and itself. Its answer reaches
+    /// a peer it could not have called.
+    #[test]
+    fn a_confined_peer_may_answer_a_call_it_was_sent() {
+        if !pidfd_available() {
+            return;
+        }
+        let (_bus, free, jailed) = mixed_bus();
+        let (mut caller, name_caller) = Peer::arrive(free);
+        let (mut callee, name_callee) = Peer::arrive(jailed);
+
+        // The callee cannot place a call to the caller: it cannot see it.
+        callee.send(&peer_call(&name_caller, 2, "refused"));
+        let frame = callee.frame();
+        let (refusal, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(
+            refusal.fields.error_name,
+            Some("org.freedesktop.DBus.Error.NameHasNoOwner"),
+            "the two peers are not on opposite sides of the policy"
+        );
+
+        // The caller can, because it is outside the jail.
+        caller.send(&peer_call(&name_callee, 3, "a question across the boundary"));
+        let frame = callee.frame();
+        let (call, _) = message::decode(&frame, 0).expect("decode the call");
+        assert_eq!(call.fields.sender, Some(name_caller.as_str()));
+
+        // And the answer crosses back, though the address it is going to is
+        // one the callee may not send anything else to.
+        callee.send(&reply_to(&name_caller, call.serial, 4));
+        let frame = caller.frame();
+        let (answer, _) = message::decode(&frame, 0).expect("decode the answer");
+        assert_eq!(answer.kind, message::MessageType::MethodReturn);
+        assert_eq!(answer.fields.reply_serial, Some(3));
+        assert_eq!(answer.fields.sender, Some(name_callee.as_str()));
+    }
+
+    /// A confined peer may call, and may not signal.
+    ///
+    /// Addressed to its OWN name, which is the one destination a confined
+    /// peer may reach — so the talk set is satisfied and the only thing left
+    /// to refuse the signal is the rule about what may be SENT. Any other
+    /// destination would be refused for being unseeable and would prove
+    /// nothing about message type.
+    #[test]
+    fn a_confined_peer_may_call_but_may_not_signal() {
+        if !pidfd_available() {
+            return;
+        }
+        let (_bus, mut clients) = confined_bus_of(1);
+        let only = clients.pop().expect("one client");
+        let (mut peer, name) = Peer::arrive(only);
+
+        peer.send(&directed_signal(&name, 2));
+        peer.expect_silence();
+
+        // A CALL to the same destination is carried, so the refusal above is
+        // about the message type and not about the address.
+        peer.send(&peer_call(&name, 3, "to myself"));
+        let frame = peer.frame();
+        let (call, _) = message::decode(&frame, 0).expect("decode the call");
+        assert_eq!(call.kind, message::MessageType::MethodCall);
+        assert_eq!(call.fields.sender, Some(name.as_str()));
+    }
+
+    /// The control: an unconfined peer's directed signal is carried.
+    #[test]
+    fn an_unconfined_peer_may_signal() {
+        let (_bus, mut clients) = bus_of(1);
+        let only = clients.pop().expect("one client");
+        let (mut peer, name) = Peer::arrive(only);
+
+        peer.send(&directed_signal(&name, 2));
+        let frame = peer.frame();
+        let (signal, _) = message::decode(&frame, 0).expect("decode the signal");
+        assert_eq!(signal.kind, message::MessageType::Signal);
+        assert_eq!(signal.fields.sender, Some(name.as_str()));
+    }
+
+    /// A call the broker could not relay is not left outstanding.
+    ///
+    /// The record is written BEFORE the queue push, so every path that fails
+    /// after it has to undo it. Left in place the entry is a call nobody will
+    /// ever answer, and it holds the caller's share of the bound until the
+    /// connection ends — and since a relay can fail for reasons a THIRD peer
+    /// caused, one peer could otherwise spend another's whole allowance.
+    ///
+    /// Provoked through re-encoding, which is the one relay failure a test can
+    /// cause deterministically: the broker adds a SENDER field, so a legal
+    /// message whose header fields sit just under the cap cannot be rebuilt.
+    #[test]
+    fn a_call_that_was_not_relayed_is_not_left_outstanding() {
+        let (bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+
+        // The longest object path this codec accepts in a message with these
+        // fields — asked rather than restated, as the re-encoding test does.
+        let mut brimful = None;
+        for len in (65_000..65_500).rev() {
+            let path = format!("/{}", "a".repeat(len));
+            let built = message::Builder::method_call(
+                crate::wire::Endian::Little,
+                &path,
+                Some("org.example.Thing"),
+                "Do",
+            )
+            .destination(&name_two)
+            .serial(21)
+            .encode();
+            if let Ok(frame) = built {
+                brimful = Some(frame);
+                break;
+            }
+        }
+        let brimful = brimful.expect("no path length fits inside the field cap");
+
+        one.send(&brimful);
+        let frame = one.frame();
+        let (refusal, _) = message::decode(&frame, 0).expect("decode the refusal");
+        assert_eq!(
+            refusal.fields.error_name,
+            Some("org.freedesktop.DBus.Error.LimitsExceeded")
+        );
+        assert_eq!(
+            bus.pending_replies(),
+            0,
+            "a call that never reached its callee is still holding a place"
+        );
+
+        // And the caller can still use the place it did not spend: a call
+        // that CAN be relayed is recorded and delivered as usual.
+        one.send(&peer_call(&name_two, 22, "a question that fits"));
+        let frame = two.frame();
+        let (call, _) = message::decode(&frame, 0).expect("decode the call");
+        assert_eq!(call.kind, message::MessageType::MethodCall);
+        assert_eq!(bus.pending_replies(), 1);
+    }
+
+    /// §D's bound, charged per CALLER and refused rather than trimmed.
+    ///
+    /// Trimming an old entry to make room would un-track a call that is still
+    /// outstanding, sending its caller back to waiting for ever — the failure
+    /// the table exists to remove, reintroduced by the mechanism meant to
+    /// bound it.
+    ///
+    /// Three peers, because two cannot tell a per-caller bound from a global
+    /// one: an implementation counting the whole table would pass a test that
+    /// only ever fills it from one connection, and one peer could then stop
+    /// every other peer on the bus from calling anything.
+    #[test]
+    fn a_caller_may_not_outrun_the_pending_reply_bound() {
+        let (bus, mut clients) = bus_of(3);
+        let third = clients.pop().expect("three clients");
+        let second = clients.pop().expect("three clients");
+        let first = clients.pop().expect("three clients");
+        let (mut one, _) = Peer::arrive(first);
+        let (mut two, name_two) = Peer::arrive(second);
+        let (mut three, _) = Peer::arrive(third);
+
+        // Two never answers, so every call stays outstanding.
+        let mut serial = 2u32;
+        for _ in 0..crate::registry::MAX_PENDING_REPLIES {
+            one.send(&peer_call(&name_two, serial, "unanswered"));
+            let _ = two.frame();
+            serial = serial.saturating_add(1);
+        }
+        assert_eq!(bus.pending_replies(), crate::registry::MAX_PENDING_REPLIES);
+
+        one.send(&peer_call(&name_two, serial, "one too many"));
+        let frame = one.frame();
+        let (refusal, _) = message::decode(&frame, 0).expect("decode the refusal");
+        assert_eq!(refusal.kind, message::MessageType::Error);
+        assert_eq!(
+            refusal.fields.error_name,
+            Some("org.freedesktop.DBus.Error.LimitsExceeded")
+        );
+        // The refused call was not recorded, and none of the others was
+        // dropped to make room for it.
+        assert_eq!(bus.pending_replies(), crate::registry::MAX_PENDING_REPLIES);
+        two.expect_silence();
+
+        // And ANOTHER caller is unaffected: the bound is one peer's share of
+        // the table, not the table.
+        three.send(&peer_call(&name_two, 2, "from a caller at nobody's bound"));
+        let frame = two.frame();
+        let (call, _) = message::decode(&frame, 0).expect("decode the call");
+        assert_eq!(call.kind, message::MessageType::MethodCall);
+        assert_eq!(
+            bus.pending_replies(),
+            crate::registry::MAX_PENDING_REPLIES.saturating_add(1),
+            "a second caller's call was charged to the first caller's share"
         );
     }
 

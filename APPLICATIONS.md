@@ -1225,9 +1225,11 @@ For `td-busd`, full Firefox fidelity needs:
   borrow the fixture, portal or another application's names and quotas;
 - `RequestName`/`ReleaseName` with the bounded owner queue for
   `org.mozilla.firefox.*` and `org.mpris.MediaPlayer2.firefox.*`;
-- `AddMatch`/`RemoveMatch`, authenticated pending-reply ownership and sender
-  validation, so portal, MPRIS, file-manager and accessibility signals and
-  replies cannot be spoofed or delivered across applications;
+- `AddMatch`/`RemoveMatch` and sender validation, so portal, MPRIS,
+  file-manager and accessibility signals cannot be spoofed or delivered
+  across applications. Authenticated pending-reply ownership is landed — see
+  §D — so the REPLY half of this bullet is discharged and the match-rule half
+  is not;
 - complete bounded `SCM_RIGHTS` forwarding in both directions for portal file
   results, with descriptor indices and counts tied to the message that owns
   them;
@@ -1253,15 +1255,17 @@ scope rather than something withheld.
 
 What is NOT discharged in that bullet: quotas remain global rather than
 per-caller, and are charged per PID, so a multiprocess jail takes more than
-one share; the name half cannot exist before `RequestName` does; and the
-filter decides WHO may be addressed without yet deciding WHAT may be sent,
-so a sandboxed peer permitted to call the portal is at present equally
-permitted to send it a signal or a method return. That last one is dormant
-while no portal name can be owned, and it is a hard constraint on the two
-bullets below rather than a gap to be closed here: `RequestName` must not
-land before message-type policy and pending-reply ownership, or the first
-owner of a portal name inherits a spoofing path. The remaining bullets are
-otherwise untouched.
+one share; and the name half cannot exist before `RequestName` does.
+
+The ordering constraint this paragraph carried has been DISCHARGED rather
+than deleted, and it is worth keeping the record of why it was here. The
+filter decided who may be addressed without deciding what may be sent, so a
+sandboxed peer permitted to call the portal was equally permitted to send it
+a signal or a forged method return — dormant only because no portal name
+could be owned, and a spoofing path for the first owner of one. Both halves
+are now closed in §D: pending-reply ownership makes a reply's origin
+enforceable, and message-type policy refuses a confined peer's directed
+signals. `RequestName` is no longer blocked on them.
 
 The image's assertion of exactly one shipped application no longer rests on
 the filter being absent. It now rests on the rest of this list — a second
@@ -2919,6 +2923,18 @@ that was not addressed to you is worse than dropping it.
 `[Session Bus Policy]` `see`/`talk`/`own` entries from authenticated
 metadata widen that.
 
+That grant is one-directional and the implementation reads it so. A
+sandbox may CALL a portal member and RECEIVE its replies and directed
+signals; it may not ORIGINATE a directed signal at anything, which is the
+reverse channel and is not among the grants above. Such a signal is
+dropped in silence rather than errored, for the reason the sentence above
+gives about broadcasts: a signal has no reply, so a refusal would be a
+message its sender has no serial for. What the implementation refuses
+with `AccessDenied` is narrower than "everything else" reads — a name a
+caller may not SEE is reported absent instead, since an error confirming
+the name exists is the disclosure the filter is there to prevent. See the
+per-caller filter subsection later in this section.
+
 **Portal names are RESERVED, not merely conventional.** "Broadcasts from
 portal-owned names" is a trust statement, and nothing above made it one:
 `org.freedesktop.portal.*` was a name like any other, so an *unsandboxed*
@@ -3365,9 +3381,10 @@ bullets remain in §B.3.2. Second, an instance's connections cannot see EACH
 OTHER: §D's default grants the portal and the broker, and same-instance
 peer-to-peer traffic is not among them. If a real application turns out to
 need it, that is a reviewed widening with its own argument, not something to
-assume. Third, this filter decides WHO may be addressed and not WHAT may be
-sent — see §B.3.2 for why that constrains the order the remaining bullets
-may land in.
+assume. Third, this filter decides WHO may be addressed and not WHAT may
+be sent; message type is a separate rule, and it now exists — a confined
+peer may CALL and may not originate a directed SIGNAL. See the pending-reply
+paragraphs later in this section.
 
 What this filter does NOT make private is everything a peer shares with
 every other peer rather than learns by asking. Unique names are handed out
@@ -3397,18 +3414,20 @@ and a directed message to it that WANTS A REPLY is refused with
 in silence, which is the rule the broker already followed for a name with
 no owner and is the same story told to a caller who is not listening.
 
-**A REPLY is exempt, because the filter is about who may be ADDRESSED and
-not about what may be sent.** A method return or an error is addressed by
-`reply_serial` to a caller that already reached this connection, so
-filtering it by the sender's talk set drops the answer to a call the broker
-itself delivered — the caller waits until it times out and the callee is
-told nothing. §D grants a sandbox the portal's replies, so the symmetric
-direction cannot be a denial. The broker does not yet check that a reply
-answers a REAL call; that is pending-reply ownership, landing with match
-rules, and until then a confined peer can address a forged reply anywhere —
-which every peer could do before this filter existed, so it is a residual
-rather than something this introduced. §B.3.2 records it as a constraint on
-the order the remaining bullets may land in.
+**A REPLY is exempt from this FILTER, because the filter is about who may
+be ADDRESSED and not about what may be sent.** A method return or an error
+is addressed by `reply_serial` to a caller that already reached this
+connection, so filtering it by the sender's talk set drops the answer to a
+call the broker itself delivered — the caller waits until it times out and
+the callee is told nothing. §D grants a sandbox the portal's replies, so the
+symmetric direction cannot be a denial.
+
+Exempt from the filter is not exempt from every test. A reply is governed by
+OWNERSHIP instead, which is the stricter one: it is carried only when the
+broker's pending-reply table says this connection is the one that call was
+routed to. That table is landed — see the pending-reply paragraphs later in
+this section — and it closes what this passage used to record as a residual,
+that a confined peer could address a forged reply anywhere.
 
 A peer's own credentials, host pid included, are exempt with its own name.
 The reason to withhold a host pid is that ANOTHER instance's is an
@@ -4036,23 +4055,111 @@ blocks in `recvmsg` while the writer blocks in `sendmsg`. The
 connection-ceiling arithmetic elsewhere in this section still describes
 one apiece.
 
-**A caller whose callee disconnects mid-call waits for ever.** There is
-no pending-reply table, so nothing notices that the connection a call was
-routed to has gone and nothing sends the error `dbus-daemon` sends. This
-is the "left waiting on a serial" case this section argues against
-everywhere else, and it is an absence rather than a decision: the
-`128 pending replies` bound listed above is where it lands.
+**The pending-reply table is landed.** The integrity half it was asked
+for is closed. The availability half is closed for the case that motivated
+it — a callee that DISCONNECTS — and open for the case of a callee that
+stays connected and never answers; the residual paragraph below says so.
 
-**The same absence has an integrity half, and it is the more serious
-one.** With nothing tracking which call is outstanding to whom, any peer
-may send a `METHOD_RETURN` or an `ERROR` carrying an arbitrary
-`REPLY_SERIAL` to any other peer — and libdbus and GDBus both match a
-pending call by serial without checking who the reply came from. So peer
-B can answer a call A made to C, and A's client library will hand the
-answer to A's caller. The broker's stamped `SENDER` makes that
-detectable and nothing detects it. The pending-reply table is therefore
-not only an availability fix; it is what makes a reply's origin
-enforceable, and it belongs beside the `see` policy rather than after it.
+The availability half: a caller whose callee disconnects mid-call used to
+wait for ever, because nothing noticed that the connection a call was
+routed to had gone. A departing connection now leaves the directory and
+sweeps its outstanding calls as ONE act under the one lock, and every
+caller waiting on it is sent `org.freedesktop.DBus.Error.NoReply`
+carrying the serial it was waiting on. That is best effort, because it
+happens in `Drop` and there is nowhere left to report a failure to; a
+caller that cannot be reached is one that was already leaving.
+
+The integrity half, which is the more serious one. With nothing tracking
+which call is outstanding to whom, any peer could send a `METHOD_RETURN`
+or an `ERROR` carrying an arbitrary `REPLY_SERIAL` to any other peer —
+and libdbus and GDBus both match a pending call by serial without
+checking who the reply came from, so peer B could answer a call A made to
+C and A's client library would hand the answer to A's caller. The
+broker's stamped `SENDER` made that detectable and nothing detected it.
+A reply is now carried only when the table says this connection is the
+one that call was routed to. A serial is answered ONCE, since a second
+reply bearing it is as forged as a first from the wrong peer.
+
+A forged reply is DROPPED, not refused: there is no reply to a reply, so
+there is nothing to carry an error on, and the sending connection stays
+open because a forged message is a bad message rather than a bad peer.
+
+A caller may not have two calls outstanding on one serial. The
+specification asks for that anyway — a serial is unique among a
+connection's undelivered messages — and the table needs it, because with a
+duplicate allowed `(caller, serial)` stops naming ONE call: two answers
+carry the same `reply_serial` to a client that cannot tell them apart, and
+un-recording an undelivered call could remove the wrong entry and leave a
+live one untracked. A caller that reuses an outstanding serial gets
+`InvalidArgs`.
+
+The bound is §D's `128 pending replies`, charged to the CALLER and
+REFUSED rather than trimmed. Charged to the caller because a callee
+cannot decline to be called, so charging the callee would let one peer
+exhaust another's share by calling it. Refused rather than trimmed
+because dropping an old entry to make room would un-track a call that is
+still outstanding, sending its caller back to waiting for ever — the
+exact failure the table exists to remove, reintroduced by the mechanism
+meant to bound it. A caller at its bound gets `LimitsExceeded`.
+
+**A callee that never answers is still not bounded in TIME.** An entry
+leaves the table when the call is answered, when the call could not be
+sent, when the callee departs, or when the caller does. Nothing expires
+it. A callee that stays connected and simply never replies therefore
+leaves its caller waiting for ever — the failure this table was built to
+remove, in the one shape the table does not see — and holds the caller's
+128 places for the life of the connection, after which that caller can
+call nobody. `dbus-daemon` has `reply_timeout` for exactly this. A clock
+is a larger change than this landing: it needs a timer source the broker
+does not have, a decision about whose clock, and an answer for a callee
+that is slow rather than silent. It is recorded here rather than implied
+by the paragraph above, which used to claim both halves were closed.
+
+**An entry lives exactly as long as the call does**, and getting that
+wrong reintroduces the failures the table exists to remove — reviewers
+found two ways in and both are closed.
+
+Resolving the destination and recording the call are ONE act under the
+lock a departure also takes. Two acts leave a window: between a lookup
+that found the callee and a record written after it, the callee can go,
+its sweep runs over a table that does not mention this call yet, the
+record lands behind the sweep, and the caller waits for ever on a
+connection that has gone — with the entry holding its share of the bound
+until the caller itself departs.
+
+The record is written BEFORE the message is queued, because the callee's
+reader is a different thread and may answer the moment the frame lands in
+its outbox; so every path that fails AFTER the record has to undo it. A
+relay can fail because the message cannot be re-encoded, because the
+recipient is behind, because the bus is at its ceiling, or because the
+recipient has gone. Each of those un-records the call. Left in place the
+entry would be a call nobody will ever answer, and since a relay can fail
+for reasons a THIRD peer caused, one peer could otherwise spend another's
+whole allowance and leave it unable to call anyone.
+
+The callee is recorded as the unique name the broker RESOLVED, never as
+the name the caller wrote. Today the two are the same string, because
+only a unique name routes; when `RequestName` lands they are not, and
+recording the written name would test a reply from the owner against a
+name the owner does not answer to — every genuine reply dropped, and
+every one of those calls invisible to the departure sweep, which looks
+for the departing peer's unique name. That is a forward guard with no
+test yet: a mutation that records the written name survives the suite,
+and it stays unobservable until a well-known name can be owned.
+
+**What may be SENT, beside who may be addressed.** The `see`/`talk`
+filter decides who a peer may address; message type decides what it may
+send them. A confined peer may CALL the portal, per §D's default. It may
+not originate a directed SIGNAL: §D grants a sandbox the right to call
+portal members and to RECEIVE the portal's replies and directed signals,
+and a signal aimed at the portal is the reverse channel, which nothing
+asked for and no toolkit uses. A directed signal from a confined peer is
+dropped in silence, the same answer a broadcast gets. A reply is neither
+— it is governed by the table above rather than by either rule.
+
+Together these are what make the talk set safe to widen when
+`RequestName` lands: the widening then admits calls to a name's owner
+rather than arbitrary traffic aimed at it.
 
 **A message can be legal to send and impossible to relay.** The broker
 inserts a `SENDER`, and the cap on an incoming header-field array is the

@@ -102,6 +102,31 @@ pub fn may_talk(caller: &Identity, own: Option<&str>, target: &str) -> bool {
     may_see(caller, own, target)
 }
 
+/// Whether `caller` may originate a directed SIGNAL.
+///
+/// §D's default sandboxed policy grants a confined peer the right to CALL any
+/// portal member and to RECEIVE the portal's replies and directed signals. It
+/// does not grant the reverse: a signal aimed at the portal is the sandbox
+/// telling the portal something happened, which is a channel nothing asked
+/// for and which no toolkit uses. Refusing it keeps `may_talk` a statement
+/// about who may be addressed and this a statement about what may be sent —
+/// the pair is what makes the talk set safe to widen when `RequestName`
+/// lands, since the widening then admits calls rather than arbitrary traffic.
+///
+/// The TARGET is not consulted, which makes the rule broader than that
+/// rationale: a confined peer may not aim a signal at its own name either,
+/// though `may_see` grants it that name as a fact it has already been told.
+/// Deliberate, and the cheaper way to be wrong. Nothing needs to signal
+/// itself through a broker — the sender already knows — so the permission
+/// would buy nothing, while a rule that reads "a confined peer originates no
+/// directed signals" has no edge for a later widening to be argued through.
+///
+/// A reply is neither of these: it is governed by whether it answers a real
+/// call, which the broker's pending-reply table decides.
+pub fn may_signal(caller: &Identity) -> bool {
+    matches!(caller, Identity::Unconfined)
+}
+
 /// Whether `caller` may use `td.Jail1` at all.
 ///
 /// Registration is authenticated by uid, which in v1 does not distinguish one
@@ -222,6 +247,16 @@ mod tests {
     #[test]
     fn a_jailed_peer_may_not_register() {
         assert!(!may_register(&jailed()));
+    }
+
+    /// Only an unconfined peer may originate a directed signal. §D grants a
+    /// sandbox the right to CALL the portal and to RECEIVE its signals, and
+    /// says nothing about sending any.
+    #[test]
+    fn only_an_unconfined_peer_may_signal() {
+        assert!(may_signal(&Identity::Unconfined));
+        assert!(!may_signal(&jailed()));
+        assert!(!may_signal(&Identity::Unknown("unplaceable".into())));
     }
 
     /// The bare prefix owns nothing and is not in the reservation.

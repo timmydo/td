@@ -16,7 +16,7 @@
 use std::collections::VecDeque;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -64,6 +64,16 @@ pub const MAX_OUTGOING_BYTES_TOTAL: usize = MAX_MESSAGE * 4;
 /// backstop beside the byte limit rather than the limit itself, which is the
 /// mistake it records a draft having made.
 pub const MAX_OUTGOING_MESSAGES: usize = 4096;
+
+/// How many calls one connection may have outstanding at once, per §D's
+/// bounds list.
+///
+/// Charged to the CALLER. The table is the broker's memory and a peer that
+/// could fill it without bound would be spending the broker's, but the peer
+/// to charge is the one that chose to call: a callee cannot decline to be
+/// called, so charging the callee would let one peer exhaust another's share
+/// by calling it.
+pub const MAX_PENDING_REPLIES: usize = 128;
 
 /// How long the bus's remedy waits for a relieved connection's writer to let
 /// go of the frame it is holding. Short because `shutdown` is what releases
@@ -152,6 +162,17 @@ pub struct Outbox {
     /// before the socket goes down.
     written: Condvar,
     total: Arc<AtomicUsize>,
+    /// The serial the broker stamps on the next message it ORIGINATES to this
+    /// connection.
+    ///
+    /// It lives here rather than on the connection because the sender it
+    /// numbers for is `org.freedesktop.DBus`, which is one sender across the
+    /// whole bus, while the stream those numbers have to stay distinct in is
+    /// this one. A departing peer's sweep writes into a caller's outbox from
+    /// the DEPARTING connection's thread, so a counter kept per connection
+    /// would let two of them hand the same caller two messages from the same
+    /// sender carrying the same serial.
+    next_serial: AtomicU32,
 }
 
 impl Outbox {
@@ -169,7 +190,18 @@ impl Outbox {
             ready: Condvar::new(),
             written: Condvar::new(),
             total,
+            next_serial: AtomicU32::new(1),
         }
+    }
+
+    /// The next serial for a message the broker originates to this
+    /// connection. Wraps to 1 rather than 0: zero is not a legal serial.
+    pub fn take_serial(&self) -> u32 {
+        let mut mine = self.next_serial.fetch_add(1, Ordering::Relaxed);
+        if mine == 0 {
+            mine = self.next_serial.fetch_add(1, Ordering::Relaxed);
+        }
+        mine
     }
 
     /// Append a frame for the writer thread. Never blocks on the recipient.
@@ -468,12 +500,58 @@ struct Registered {
     app_id: Option<String>,
 }
 
+/// One call that has been routed and not yet answered.
+///
+/// §D asks for this table for two reasons and the second is the sharper one.
+/// A caller whose callee disconnects mid-call otherwise waits for ever, which
+/// is the "left waiting on a serial" failure §D argues against everywhere
+/// else. And with nothing recording which call is outstanding to whom, ANY
+/// peer may send a `METHOD_RETURN` carrying an arbitrary `REPLY_SERIAL` to
+/// any other peer — libdbus and GDBus both match a pending call by serial
+/// without checking who answered — so one peer can answer a call another made
+/// to a third, and the client library hands it to the caller as the answer.
+/// The broker stamps a truthful SENDER, which makes that detectable; this is
+/// what detects it.
+struct Pending {
+    /// Who is waiting, and the serial it is waiting on. The pair is the
+    /// identity of the call: serials are unique per connection, not globally.
+    caller: String,
+    serial: u32,
+    /// Who was asked, and therefore the only connection whose answer counts.
+    callee: String,
+}
+
+/// What resolving a destination and recording a call to it found.
+pub enum Routing {
+    /// Nothing on this bus answers to that name.
+    Absent,
+    /// The caller already holds `MAX_PENDING_REPLIES` unanswered calls.
+    TooMany,
+    /// The caller already has a call outstanding on that serial.
+    Repeated,
+    /// The callee's outbox, with the call recorded against the connection
+    /// this lookup actually resolved.
+    Ready(Arc<Outbox>),
+}
+
+/// A call left unanswered because the peer it was routed to has gone.
+pub struct Abandoned {
+    pub outbox: Arc<Outbox>,
+    pub caller: String,
+    pub serial: u32,
+}
+
 struct Directory {
     /// The N in `:1.N`. Monotonic and never reused: a unique name that came
     /// back would let a message written for one connection reach its
     /// successor, which is the one thing a unique name exists to prevent.
     next: u32,
     peers: Vec<Registered>,
+    /// Under the SAME lock as `peers`, deliberately. A departing connection
+    /// has to leave the directory and sweep its outstanding calls as one act:
+    /// with two locks a caller could be handed a `NoReply` for a callee that
+    /// a concurrent `route` had just found still present, or the reverse.
+    pending: Vec<Pending>,
 }
 
 /// The bus's directory.
@@ -494,6 +572,7 @@ impl Bus {
             directory: Mutex::new(Directory {
                 next: 1,
                 peers: Vec::new(),
+                pending: Vec::new(),
             }),
             total_outgoing: Arc::new(AtomicUsize::new(0)),
         }
@@ -566,8 +645,123 @@ impl Bus {
         Ok(unique)
     }
 
-    /// Remove a connection. Silent if it never said `Hello`.
-    pub fn leave(&self, unique: &str) {
+    /// Resolve `name` and record `caller`'s call to it as ONE act.
+    ///
+    /// One act because two leave a window. Between a lookup that found the
+    /// callee and a record written afterwards, the callee can depart: `leave`
+    /// sweeps a table that does not mention the call yet, the record lands
+    /// after the sweep, and the caller is left waiting for ever on a
+    /// connection that has gone — while the entry holds the caller's share of
+    /// the bound until the caller itself departs. Both are the failure this
+    /// table exists to remove, so the lookup and the record share the lock
+    /// that `leave` also takes.
+    ///
+    /// The callee is recorded as the unique name this lookup RESOLVED, never
+    /// as the name the caller wrote. Today the two are the same string
+    /// because only a unique name routes. When a well-known name can be
+    /// owned they are not, and recording the written name would test a
+    /// reply from the owner against a name the owner does not answer to:
+    /// every genuine reply dropped, and every one of those calls leaked past
+    /// `leave`, which looks for the departing peer's unique name.
+    ///
+    /// Refused rather than trimmed at the bound: dropping an OLD entry to
+    /// make room would silently un-track a call that is still outstanding, so
+    /// that caller would go back to waiting for ever — the failure this table
+    /// exists to remove, reintroduced by the mechanism meant to bound it.
+    ///
+    /// A serial this caller already has outstanding is refused too, which the
+    /// specification asks for anyway — a serial is unique among a
+    /// connection's undelivered messages — and which this table needs. With a
+    /// duplicate allowed, `(caller, serial)` stops naming ONE call: two
+    /// answers carry the same `reply_serial` to a client that cannot tell
+    /// them apart, and `forget_reply`, which un-records a call that could not
+    /// be sent, could remove the wrong one and leave a live call untracked.
+    pub fn route_expecting(&self, name: &str, caller: &str, serial: u32) -> Routing {
+        let Ok(mut directory) = self.directory.lock() else {
+            return Routing::Absent;
+        };
+        let Some((outbox, callee)) = directory
+            .peers
+            .iter()
+            .find(|peer| peer.unique == name)
+            .map(|peer| (Arc::clone(&peer.outbox), peer.unique.clone()))
+        else {
+            return Routing::Absent;
+        };
+        let mut held = 0_usize;
+        for call in directory.pending.iter() {
+            if call.caller != caller {
+                continue;
+            }
+            if call.serial == serial {
+                return Routing::Repeated;
+            }
+            held = held.saturating_add(1);
+        }
+        if held >= MAX_PENDING_REPLIES {
+            return Routing::TooMany;
+        }
+        directory.pending.push(Pending {
+            caller: caller.to_string(),
+            serial,
+            callee,
+        });
+        Routing::Ready(outbox)
+    }
+
+    /// Un-record a call that was recorded and then never delivered.
+    ///
+    /// Recording precedes the queue push so that an answer cannot reach the
+    /// table before the question does, which means every path that fails
+    /// AFTER it has to undo it. Left in place the entry is a call nobody will
+    /// ever answer: it holds the caller's share of the bound for the life of
+    /// the connection, and since a relay can fail because a THIRD peer filled
+    /// the callee's queue, one peer could otherwise spend another's whole
+    /// allowance and leave it unable to call anyone.
+    pub fn forget_reply(&self, caller: &str, serial: u32) {
+        if let Ok(mut directory) = self.directory.lock() {
+            if let Some(at) = directory
+                .pending
+                .iter()
+                .position(|call| call.caller == caller && call.serial == serial)
+            {
+                directory.pending.swap_remove(at);
+            }
+        }
+    }
+
+    /// Whether `replier` is the peer `to` is waiting on for `reply_serial`,
+    /// consuming the record if so.
+    ///
+    /// Consumed, so a serial answers ONCE: a second reply carrying the same
+    /// serial is as forged as a first one from the wrong peer, and a caller
+    /// that has already been answered has nothing outstanding to confuse.
+    pub fn claim_reply(&self, replier: &str, to: &str, reply_serial: u32) -> bool {
+        let Ok(mut directory) = self.directory.lock() else {
+            return false;
+        };
+        let found = directory.pending.iter().position(|call| {
+            call.caller == to && call.serial == reply_serial && call.callee == replier
+        });
+        match found {
+            Some(at) => {
+                directory.pending.swap_remove(at);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Remove a connection, and report the calls that will now never be
+    /// answered.
+    ///
+    /// Silent if it never said `Hello`. The departing connection's own
+    /// outstanding calls are dropped without ceremony — there is nobody left
+    /// to deliver an error to — while the calls made TO it are what comes
+    /// back, each with the outbox its error has to reach.
+    #[must_use = "the abandoned calls have to be answered, or their callers wait for ever"]
+    pub fn leave(&self, unique: &str) -> Vec<Abandoned> {
+        let mut abandoned = Vec::new();
         if let Ok(mut directory) = self.directory.lock() {
             if let Some(at) = directory
                 .peers
@@ -576,7 +770,43 @@ impl Bus {
             {
                 directory.peers.swap_remove(at);
             }
+            // Both directions in one pass under the one lock. The list is
+            // taken out first so the peer lookup below can borrow the
+            // directory while this walks what used to be in it.
+            let outstanding = std::mem::take(&mut directory.pending);
+            let mut kept = Vec::with_capacity(outstanding.len());
+            for call in outstanding {
+                if call.caller == unique {
+                    continue;
+                }
+                if call.callee != unique {
+                    kept.push(call);
+                    continue;
+                }
+                let outbox = directory
+                    .peers
+                    .iter()
+                    .find(|peer| peer.unique == call.caller)
+                    .map(|peer| Arc::clone(&peer.outbox));
+                if let Some(outbox) = outbox {
+                    abandoned.push(Abandoned {
+                        outbox,
+                        caller: call.caller,
+                        serial: call.serial,
+                    });
+                }
+            }
+            directory.pending = kept;
         }
+        abandoned
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_replies(&self) -> usize {
+        self.directory
+            .lock()
+            .map(|directory| directory.pending.len())
+            .unwrap_or(0)
     }
 
     /// The outbox a message addressed to `name` should go to.
@@ -701,7 +931,10 @@ mod tests {
         assert_eq!(bus.join(&second, 1000, 4002).expect("join"), ":1.2");
         assert_eq!(bus.names(), vec![":1.1".to_string(), ":1.2".to_string()]);
 
-        bus.leave(":1.1");
+        assert!(
+            bus.leave(":1.1").is_empty(),
+            "a peer nobody called abandoned somebody"
+        );
         assert_eq!(bus.names(), vec![":1.2".to_string()]);
         assert!(bus.route(":1.1").is_none(), "a departed name still routes");
 
