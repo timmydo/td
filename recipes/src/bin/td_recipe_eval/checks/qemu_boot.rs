@@ -80,6 +80,10 @@ const UUTILS_RUNTIME_MARKER: &str = td_recipe::ladder::UUTILS_RUNTIME_MARKER;
 /// Printed after unprivileged ripgrep and fd searches return exact expected results.
 const RIPGREP_FD_RUNTIME_MARKER: &str = td_recipe::ladder::RIPGREP_FD_RUNTIME_MARKER;
 
+/// Printed after the installed Git client completes an unprivileged local
+/// clone/commit/push/reclone workflow and reads its pinned CA bundle.
+const GIT_RUNTIME_MARKER: &str = td_recipe::ladder::GIT_RUNTIME_MARKER;
+
 /// Printed by the root-owned health target after an unprivileged SSH loopback self-test.
 const SSHD_MARKER: &str = td_recipe::ladder::SSHD_MARKER;
 
@@ -164,16 +168,18 @@ const PERSIST_READ_CMDLINE_TOKEN: &str = td_recipe::ladder::PERSIST_READ_CMDLINE
 const DEPLOY_INSTALL_CMDLINE_TOKEN: &str = td_recipe::ladder::DEPLOY_INSTALL_CMDLINE_TOKEN;
 const BOOT_FAIL_TARGET_CMDLINE_TOKEN: &str = td_recipe::ladder::BOOT_FAIL_TARGET_CMDLINE_TOKEN;
 
-/// The three networking markers `/etc/netup` prints under the nettest token: the link
-/// came up + DHCP applied, td-netd's own DNS client resolved the test host, and a TCP
-/// connection reached it. `qemu-boot-net` asserts all three. Shared with the recipe
-/// (system-x86-64.rs `build_netup`) via `td_recipe::ladder` so they can never desync.
+/// The four networking markers `/etc/netup` prints under the nettest token: the link
+/// came up + DHCP applied, td-netd resolved and reached the test host, then Git read an
+/// upstream HEAD over verified HTTPS. `qemu-boot-net` asserts all four. Shared with the
+/// recipe via `td_recipe::ladder` so they can never desync.
 const SYSTEM_NET_UP_MARKER: &str = td_recipe::ladder::SYSTEM_NET_UP_MARKER;
 const SYSTEM_NET_RESOLVE_MARKER: &str = td_recipe::ladder::SYSTEM_NET_RESOLVE_MARKER;
 const SYSTEM_NET_REACH_MARKER: &str = td_recipe::ladder::SYSTEM_NET_REACH_MARKER;
+const GIT_HTTPS_RUNTIME_MARKER: &str = td_recipe::ladder::GIT_HTTPS_RUNTIME_MARKER;
+const GIT_HTTPS_TEST_URL: &str = td_recipe::ladder::GIT_HTTPS_TEST_URL;
 
 /// The kernel-cmdline token `qemu-boot-net` appends so `/etc/netup` runs the
-/// resolve+reach self-test (and prints the three markers above). Shared via
+/// resolve+reach+Git HTTPS self-test (and prints the four markers above). Shared via
 /// `td_recipe::ladder` with the recipe's netup gate.
 const NETTEST_CMDLINE_TOKEN: &str = td_recipe::ladder::NETTEST_CMDLINE_TOKEN;
 
@@ -257,6 +263,7 @@ struct ConsoleEvidence {
     state_owner: bool,
     uutils_runtime: bool,
     ripgrep_fd_runtime: bool,
+    git_runtime: bool,
     sshd: bool,
     td_util_runtime: bool,
     td_txt_runtime: bool,
@@ -280,6 +287,7 @@ struct ConsoleEvidence {
     net_up: bool,
     net_resolve: bool,
     net_reach: bool,
+    git_https: bool,
     kexec_stage1: bool,
     kernel_panic: bool,
 }
@@ -850,7 +858,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          symlinks still reached that writable state ({SYSTEM_ETC_MUTABLE_MARKER}), mounted \
          target-owned writable @var \
          ({SYSTEM_STATE_WRITABLE_MARKER}, {SYSTEM_STATE_OWNER_MARKER}), ran uutils \
-         ({UUTILS_RUNTIME_MARKER}), ripgrep+fd ({RIPGREP_FD_RUNTIME_MARKER}), td-util \
+         ({UUTILS_RUNTIME_MARKER}), ripgrep+fd ({RIPGREP_FD_RUNTIME_MARKER}), Git plus its \
+         installed CA bundle ({GIT_RUNTIME_MARKER}), td-util \
          ({TD_UTIL_RUNTIME_MARKER}), td-txt's grep+sed answering correctly over the live \
          /proc ({TD_TXT_RUNTIME_MARKER}), the td-init boot glue ({TD_INIT_RUNTIME_MARKER}) and a \
          td-login credential switch the switched process read back and confirmed \
@@ -954,6 +963,7 @@ fn validate_failed_target_boot(result: &BootResult, ordinal: &str) -> Result<(),
         || result.evidence.greeter
         || result.evidence.uutils_runtime
         || result.evidence.ripgrep_fd_runtime
+        || result.evidence.git_runtime
         || result.evidence.sshd
         || result.evidence.boot_success
     {
@@ -1173,6 +1183,18 @@ fn validate_system_boot(
              `/etc/hostname` path from `/bin/fd`. The console names the command and unexpected \
              result; either its /bin symlink is wrong or its dynamically linked runtime closure \
              does not resolve on the EROFS root. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.git_runtime {
+        return Err(format!(
+            "the greeter was reached and core search tools ran, but the Git runtime marker \
+             ({GIT_RUNTIME_MARKER:?}) was absent — the unprivileged health leg could not \
+             initialize a bare repository, clone through upload-pack, commit and push through \
+             receive-pack, clone it again, verify its history, run a shell-porcelain usage \
+             path, or read a PEM boundary from the installed CA bundle. Verified HTTPS use \
+             of that bundle is covered separately by the operator network oracle. Last serial \
+             output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -1608,7 +1630,8 @@ fn validate_persistent_shutdown(result: &BootResult, context: &str) -> Result<()
 /// user-mode NIC on virtio-net-pci and BOTH the nettest and autotest tokens on the
 /// cmdline: at sysinit `/etc/netup` DHCP-configures the link (SLIRP hands out
 /// 10.0.2.15), then td-netd's own DNS client resolves the test host via the DHCP
-/// nameserver (10.0.2.3) and TCP-connects it — printing the three net markers — before
+/// nameserver (10.0.2.3), TCP-connects it, and completes an unprivileged Git HTTPS
+/// query with the installed CA trust — printing the four net markers — before
 /// the greeter self-exits (autotest) and the VM powers off. Host-side (never a gated
 /// check) like the other qemu oracles: it needs host qemu AND outbound DNS/TCP from
 /// the operator host (SLIRP forwards the guest's DNS and NATs its TCP), which the
@@ -1618,15 +1641,16 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
     let (bzimage, init_cpio, disk, btrfs) = build_persistent_system(runner)?;
 
     println!(
-        "   [qemu-boot-net] {qemu} boots the recipe-built deployment under TCG with a user-mode NIC; /etc/netup DHCP-configures the link, then td-netd resolves + reaches {}:{}\n              kernel:        {}\n              initramfs:     {}\n              Btrfs volume:  {}",
+        "   [qemu-boot-net] {qemu} boots the recipe-built deployment under TCG with a user-mode NIC; /etc/netup DHCP-configures the link, td-netd resolves + reaches {}:{}, then Git reads HEAD from {} over verified HTTPS\n              kernel:        {}\n              initramfs:     {}\n              Btrfs volume:  {}",
         td_recipe::ladder::NETTEST_DEFAULT_HOST,
         td_recipe::ladder::NETTEST_DEFAULT_PORT,
+        GIT_HTTPS_TEST_URL,
         bzimage.display(),
         init_cpio.display(),
         disk.display()
     );
 
-    // Nettest drives netup's resolve+reach self-test (the three net markers); autotest
+    // Nettest drives netup's resolve+reach+Git HTTPS self-test (the four net markers); autotest
     // and its host-derived wait bound make the greeter self-exit after health completion
     // so the VM powers off cleanly. Key on the greeter (reached AFTER netup) with
     // kill_on_marker=false so the net markers, which print earlier at sysinit, are all
@@ -1666,6 +1690,14 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
         ));
     }
     validate_primary_selection(&result, "network boot")?;
+    if !result.evidence.git_runtime || !result.evidence.boot_success {
+        return Err(format!(
+            "the network boot reached the greeter but did not complete the installed Git \
+             image-health workflow and deployment health transaction ({GIT_RUNTIME_MARKER:?} \
+             and {SYSTEM_BOOT_SUCCESS_MARKER:?} are both required). Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
     if !result.evidence.net_up {
         return Err(format!(
             "the boot reached the greeter but td-netd did not bring the link up \
@@ -1693,6 +1725,16 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
             tail(&result.console, 80)
         ));
     }
+    if !result.evidence.git_https {
+        return Err(format!(
+            "the network stack was reachable but the unprivileged Git HTTPS oracle did not \
+             read upstream HEAD ({GIT_HTTPS_RUNTIME_MARKER:?} absent) — Git could not launch \
+             its HTTPS remote helper, resolve the host through glibc, connect on TCP/443, \
+             verify the hostname and certificate with the installed CA bundle, or finish \
+             the bounded transfer. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
     if result.evidence.kernel_panic {
         return Err(format!(
             "the net markers were printed but the kernel PANICKED rather than powering off cleanly — \
@@ -1714,8 +1756,8 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
     println!(
         "PASS: system-x86-64 brings the network up under qemu user-net — td-netd DHCP-configures the \
          virtio-net link ({SYSTEM_NET_UP_MARKER}), resolves the test host with its own DNS client \
-         ({SYSTEM_NET_RESOLVE_MARKER}), TCP-reaches it ({SYSTEM_NET_REACH_MARKER}), and the VM powers \
-         off cleanly"
+         ({SYSTEM_NET_RESOLVE_MARKER}), TCP-reaches it ({SYSTEM_NET_REACH_MARKER}), and completes \
+         a verified Git HTTPS query ({GIT_HTTPS_RUNTIME_MARKER}) before the VM powers off cleanly"
     );
     Ok(())
 }
@@ -3151,6 +3193,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         SYSTEM_STATE_OWNER_MARKER.len(),
         UUTILS_RUNTIME_MARKER.len(),
         RIPGREP_FD_RUNTIME_MARKER.len(),
+        GIT_RUNTIME_MARKER.len(),
         SSHD_MARKER.len(),
         TD_UTIL_RUNTIME_MARKER.len(),
         TD_TXT_RUNTIME_MARKER.len(),
@@ -3176,6 +3219,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         SYSTEM_NET_UP_MARKER.len(),
         SYSTEM_NET_RESOLVE_MARKER.len(),
         SYSTEM_NET_REACH_MARKER.len(),
+        GIT_HTTPS_RUNTIME_MARKER.len(),
         KEXEC_STAGE1_MARKER.len(),
         "Kernel panic".len(),
     ]
@@ -3279,6 +3323,11 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         &mut evidence.ripgrep_fd_runtime,
         buf,
         RIPGREP_FD_RUNTIME_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.git_runtime,
+        buf,
+        GIT_RUNTIME_MARKER.as_bytes(),
     );
     latch_marker(&mut evidence.sshd, buf, SSHD_MARKER.as_bytes());
     latch_marker(
@@ -3387,6 +3436,11 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         &mut evidence.net_reach,
         buf,
         SYSTEM_NET_REACH_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.git_https,
+        buf,
+        GIT_HTTPS_RUNTIME_MARKER.as_bytes(),
     );
     latch_marker(
         &mut evidence.kexec_stage1,
@@ -4242,7 +4296,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 41] {
+    fn all_console_markers() -> [&'static str; 43] {
         [
             MARKER,
             EROFS_MARKER,
@@ -4268,9 +4322,11 @@ mod tests {
             SYSTEM_SHUTDOWN_MARKER,
             UUTILS_RUNTIME_MARKER,
             RIPGREP_FD_RUNTIME_MARKER,
+            GIT_RUNTIME_MARKER,
             SYSTEM_NET_UP_MARKER,
             SYSTEM_NET_RESOLVE_MARKER,
             SYSTEM_NET_REACH_MARKER,
+            GIT_HTTPS_RUNTIME_MARKER,
             SSHD_MARKER,
             TD_UTIL_RUNTIME_MARKER,
             TD_TXT_RUNTIME_MARKER,
@@ -4581,6 +4637,7 @@ mod tests {
             SYSTEM_STATE_OWNER_MARKER,
             UUTILS_RUNTIME_MARKER,
             RIPGREP_FD_RUNTIME_MARKER,
+            GIT_RUNTIME_MARKER,
             SSHD_MARKER,
             TD_UTIL_RUNTIME_MARKER,
             TD_TXT_RUNTIME_MARKER,
@@ -4597,6 +4654,7 @@ mod tests {
             SYSTEM_NET_UP_MARKER,
             SYSTEM_NET_RESOLVE_MARKER,
             SYSTEM_NET_REACH_MARKER,
+            GIT_HTTPS_RUNTIME_MARKER,
             KEXEC_STAGE1_MARKER,
             "Kernel panic",
         ]
@@ -4637,6 +4695,7 @@ mod tests {
         assert!(evidence.state_owner);
         assert!(evidence.uutils_runtime);
         assert!(evidence.ripgrep_fd_runtime);
+        assert!(evidence.git_runtime);
         assert!(evidence.sshd);
         assert!(evidence.td_util_runtime);
         assert!(evidence.td_txt_runtime);
@@ -4653,6 +4712,7 @@ mod tests {
         assert!(evidence.net_up);
         assert!(evidence.net_resolve);
         assert!(evidence.net_reach);
+        assert!(evidence.git_https);
         assert!(evidence.kexec_stage1);
         assert!(evidence.kernel_panic);
         assert!(!contains(

@@ -1,6 +1,7 @@
 use crate::ladder::{
     post_bootstrap_path, AUTOTEST_CMDLINE_TOKEN, BOOT_FAIL_TARGET_CMDLINE_TOKEN,
-    BOOT_SUCCESS_WAIT_CMDLINE_PREFIX, DEPLOY_INSTALL_CMDLINE_TOKEN, GREETER_MARKER,
+    BOOT_SUCCESS_WAIT_CMDLINE_PREFIX, DEPLOY_INSTALL_CMDLINE_TOKEN, GIT_HTTPS_RUNTIME_MARKER,
+    GIT_HTTPS_TEST_URL, GIT_RUNTIME_MARKER, GREETER_MARKER,
     NETTEST_CMDLINE_TOKEN, NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN,
     PERSIST_WRITE_CMDLINE_TOKEN, POST_BOOTSTRAP_SH, RIPGREP_FD_RUNTIME_MARKER, SSHD_MARKER,
     SYSTEM_BOOT_SUCCESS_MARKER, SYSTEM_DEPLOY_INSTALL_MARKER, SYSTEM_DEPLOY_ROLLBACK_MARKER,
@@ -37,7 +38,7 @@ const BOOT_SUCCESS_RETRY_SECS: u8 = 3;
 /// instead of withholding it.
 const BUS_MARKER_GRACE_SWEEPS: u8 = 2;
 const BOOT_SUCCESS_RETRY_MAX_SECS: u8 = 10;
-/// What ONE iteration of the boot-success loop may cost on a slow TCG guest: eight
+/// What ONE iteration of the boot-success loop may cost on a slow TCG guest: nine
 /// `su` probe blocks, four `td-boot update` passes and a `rollback`. Exactly ONE of
 /// those copies an image; what the rest add is deployment-sized READS, and the
 /// distinction is worth the words because the fixture's own size budget turns on it
@@ -52,10 +53,13 @@ const BOOT_SUCCESS_RETRY_MAX_SECS: u8 = 10;
 /// broker that is wedged rather than absent spends all five, where an absent one
 /// costs nothing because `connect` is refused at once. So this is +7 and not +5: two
 /// for an eighth block's spawn, which is the per-block share the old 45 implied, and
-/// five for a wait the old figure had no equivalent of. A budget that covered only
-/// the healthy path would not be a backstop.
+/// five for a wait the old figure had no equivalent of. The ninth block is Git's
+/// local init/clone/commit/push/reclone/fsck and shell-porcelain workflow. Its local
+/// transport forks both service programs and performs pack/object work, so reserve
+/// 18 seconds on TCG rather than only the two-second spawn share. A budget that
+/// covered only the healthy path would not be a backstop.
 #[cfg(test)]
-const BOOT_SUCCESS_ITERATION_BUDGET_SECS: u32 = 52;
+const BOOT_SUCCESS_ITERATION_BUDGET_SECS: u32 = 70;
 const BOOT_FAIL_PARK_WAIT_SECS: u8 = 30;
 const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
 
@@ -665,7 +669,7 @@ const UUTILS_APPLETS: &[&str] = &[
     "uname", "ls", "cat", "echo", "printf", "pwd", "cp", "mv", "rm", "mkdir", "rmdir", "ln", "id",
     "env", "df", "du", "chmod", "chown", "sleep", "sync", "wc", "head", "tail", "sort", "date",
     "whoami", "tty", "dd", "mktemp", "seq", "touch", "mknod", "kill", "readlink", "basename",
-    "dirname", "true", "false", "printenv", "link", "unlink",
+    "dirname", "true", "false", "printenv", "link", "unlink", "cut", "tr", "expr",
 ];
 
 enum UutilsProbe {
@@ -676,6 +680,9 @@ enum UutilsProbe {
     },
     Succeeds(&'static str),
     Fails(&'static str),
+    Cut,
+    Tr,
+    Expr,
     Printenv,
     Link,
     Unlink,
@@ -694,6 +701,9 @@ const UUTILS_BEHAVIOR_PROBES: &[UutilsProbe] = &[
     },
     UutilsProbe::Succeeds("true"),
     UutilsProbe::Fails("false"),
+    UutilsProbe::Cut,
+    UutilsProbe::Tr,
+    UutilsProbe::Expr,
     UutilsProbe::Printenv,
     UutilsProbe::Link,
     UutilsProbe::Unlink,
@@ -703,6 +713,9 @@ impl UutilsProbe {
     fn applet(&self) -> &'static str {
         match self {
             Self::Output { applet, .. } | Self::Succeeds(applet) | Self::Fails(applet) => applet,
+            Self::Cut => "cut",
+            Self::Tr => "tr",
+            Self::Expr => "expr",
             Self::Printenv => "printenv",
             Self::Link => "link",
             Self::Unlink => "unlink",
@@ -729,6 +742,24 @@ fn uutils_behavior_probe(probe: &UutilsProbe) -> String {
             "o=$(/bin/{applet} 2>&1); s=$?; \
              if [ \"$s\" != 1 ] || [ -n \"$o\" ]; then \
              echo \"uutils: /bin/{applet} exited $s: $o\"; u=0; fi; "
+        ),
+        UutilsProbe::Cut => format!(
+            "if o=$(/bin/printf \"%s\\n\" left:right | /bin/{applet} -d: -f2 2>&1); then \
+             [ \"$o\" = right ] || \
+             {{ echo \"uutils: /bin/{applet} returned unexpected output: $o\"; u=0; }}; \
+             else echo \"uutils: /bin/{applet} failed: $o\"; u=0; fi; "
+        ),
+        UutilsProbe::Tr => format!(
+            "if o=$(/bin/printf \"%s\\n\" TD | /bin/{applet} A-Z a-z 2>&1); then \
+             [ \"$o\" = td ] || \
+             {{ echo \"uutils: /bin/{applet} returned unexpected output: $o\"; u=0; }}; \
+             else echo \"uutils: /bin/{applet} failed: $o\"; u=0; fi; "
+        ),
+        UutilsProbe::Expr => format!(
+            "if o=$(/bin/{applet} abc : \"a.*\" 2>&1); then \
+             [ \"$o\" = 3 ] || \
+             {{ echo \"uutils: /bin/{applet} returned unexpected output: $o\"; u=0; }}; \
+             else echo \"uutils: /bin/{applet} failed: $o\"; u=0; fi; "
         ),
         UutilsProbe::Printenv => format!(
             "TD_UUTILS_PROBE=td-uutils-v1; export TD_UUTILS_PROBE; \
@@ -913,11 +944,13 @@ mod svc_timeouts {
     pub const ROOTCHECK: u32 = 120;
     /// Validates and assigns one framebuffer plus the built-in evdev nodes.
     pub const SEAT: u32 = 30;
-    /// `td-netd up` is DHCP with bounded retries (2s reads); under the nettest token it
-    /// also resolves (3s x 3) and reaches (5s connect) a real host.
-    pub const NETUP: u32 = 300;
+    /// `td-netd up` is DHCP with bounded retries. Under the nettest token it also
+    /// resolves and reaches the upstream, then Git has libcurl's 300-second connect
+    /// bound plus the explicit 10-second low-speed transfer bound. Keep the service
+    /// above twice that reviewed 336-second worst case.
+    pub const NETUP: u32 = 700;
     /// The script's own retry loop is clamped to BOOT_SUCCESS_RETRY_MAX_SECS iterations,
-    /// but each runs a large probe farm (eight `su` blocks) and can run four
+    /// but each runs a large probe farm (nine `su` blocks) and can run four
     /// transactional `td-boot update` passes plus a `rollback`, so an iteration is worth
     /// seconds on a slow disk, not one. Two of the four are cheap by construction — a
     /// refusal and an idle tick each read a bounded manifest and stop.
@@ -935,18 +968,16 @@ mod svc_timeouts {
     /// the fallback being the deployment that is running, since this fixture has two
     /// deployments and not three.
     ///
-    /// Raised from 900 by the session-bus probe, and by the rule rather than by a
-    /// measurement: this backstop must clear the guest loop's own worst case TWICE,
-    /// and an eighth `su` block moved that worst case from 450s to 520s. What the
-    /// number bounds is a HANG — the loop exits as soon as it is healthy — so the
-    /// cost of the increase is only how long a wedged health target takes to be
-    /// called one.
+    /// Raised again for the ninth, Git-heavy `su` block, and by the rule rather than
+    /// by a measurement: this backstop must clear the guest loop's own worst case
+    /// TWICE. What the number bounds is a HANG — the loop exits as soon as it is
+    /// healthy — so the cost of the increase is only how long a wedged health target
+    /// takes to be called one.
     ///
-    /// Nothing relates this to the host's own ceiling and nothing should: at 1050
-    /// against a 540s `DEFAULT_BOOT_TIMEOUT_SECS` this can never fire under the QEMU
-    /// oracle, which is correct — the oracle is not the only thing that boots this
-    /// image, and on real hardware there is no host to give up first.
-    pub const BOOTSUCCESS: u32 = 1050;
+    /// This is independent of the host oracle's derived deadline: the oracle is not
+    /// the only thing that boots this image, and on real hardware there is no host to
+    /// give up first.
+    pub const BOOTSUCCESS: u32 = 1500;
     /// The park handshake: a grep and a 1s sleep, clamped to BOOT_FAIL_PARK_WAIT_SECS.
     pub const BOOTFAIL: u32 = 300;
 }
@@ -1129,7 +1160,10 @@ fn build_td_svc_conf() -> String {
          [bootsuccess]\n\
          type=oneshot\n\
          exec=/etc/bootsuccess\n\
-         after={sysinit},busd,wayland,terminal\n\
+         # Keep the process-heavy runtime probe farm out of the profiler's first\n\
+         # bounded capture. This is ordering only: profiler evidence cannot decide\n\
+         # whether a deployment is healthy, and a failed evidence unit still settles.\n\
+         after={sysinit},busd,wayland,terminal,profiler-evidence\n\
          requires=terminal\n\
          timeout={bootsuccess}\n\
          \n\
@@ -2033,7 +2067,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          n=0\n\
          bg={BUS_MARKER_GRACE_SWEEPS}\n\
          [ \"$bg\" -ge \"$wait\" ] && bg=$((wait-1))\n\
-         mu=0; mrf=0; ms=0; mtu=0; mti=0; mtl=0; mtt=0; mtb=0; btb=0\n\
+         mu=0; mrf=0; mg=0; ms=0; mtu=0; mti=0; mtl=0; mtt=0; mtb=0; btb=0\n\
          msk=0; mtj=0; mts=1\n\
          if /bin/su -s /bin/sh {} -c \
          '{sandbox_kernel_probes}[ \"$k\" = 1 ]'; then \
@@ -2093,6 +2127,48 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          {{ echo \"fd: /bin/fd failed\"; exit 1; }}; \
          [ \"$f\" = /etc/hostname ] || {{ echo \"fd: unexpected hostname path: $f\"; exit 1; }}'; then \
          [ \"$mrf\" = 1 ] || {{ echo {RIPGREP_FD_RUNTIME_MARKER}; mrf=1; }}; else healthy=0; fi; \
+         if /bin/su -s /bin/sh {git_user} -c \
+         'HOME=/tmp/td-git-probe/home; export HOME; \
+         XDG_CONFIG_HOME=/tmp/td-git-probe/xdg; export XDG_CONFIG_HOME; \
+         GIT_CONFIG_GLOBAL=/dev/null; export GIT_CONFIG_GLOBAL; \
+         GIT_CONFIG_NOSYSTEM=1; export GIT_CONFIG_NOSYSTEM; \
+         /bin/rm -rf /tmp/td-git-probe || \
+         {{ echo \"git: could not clear the health-probe directory\"; exit 1; }}; \
+         /bin/mkdir -p \"$HOME\" \"$XDG_CONFIG_HOME\" || \
+         {{ echo \"git: could not create isolated HOME and XDG config\"; exit 1; }}; \
+         cd /tmp/td-git-probe || \
+         {{ echo \"git: could not enter the health-probe directory\"; exit 1; }}; \
+         /bin/git init --bare -b main origin >/dev/null 2>&1 || \
+         {{ echo \"git: bare init failed\"; exit 1; }}; \
+         /bin/git clone --no-local origin work >/dev/null 2>&1 || \
+         {{ echo \"git: upload-pack clone failed\"; exit 1; }}; \
+         /bin/git -C work config user.name td-boot || \
+         {{ echo \"git: setting the probe user name failed\"; exit 1; }}; \
+         /bin/git -C work config user.email td-boot@example.invalid || \
+         {{ echo \"git: setting the probe user email failed\"; exit 1; }}; \
+         /bin/printf \"%s\\n\" installed > work/tracked || \
+         {{ echo \"git: writing the tracked fixture failed\"; exit 1; }}; \
+         /bin/git -C work add tracked || {{ echo \"git: add failed\"; exit 1; }}; \
+         /bin/git -C work commit -m installed >/dev/null 2>&1 || \
+         {{ echo \"git: commit failed\"; exit 1; }}; \
+         /bin/git -C work push -u origin main >/dev/null 2>&1 || \
+         {{ echo \"git: receive-pack push failed\"; exit 1; }}; \
+         /bin/git clone --no-local origin verify >/dev/null 2>&1 || \
+         {{ echo \"git: upload-pack reclone failed\"; exit 1; }}; \
+         [ \"$(/bin/git -C verify rev-list --count main)\" = 1 ] || \
+         {{ echo \"git: recloned history was not exactly one commit\"; exit 1; }}; \
+         /bin/git -C verify fsck --strict >/dev/null 2>&1 || \
+         {{ echo \"git: fsck rejected the recloned repository\"; exit 1; }}; \
+         if /bin/git -C work submodule --td-invalid \
+         >/tmp/td-git-probe/submodule.err 2>&1; then \
+         echo \"git: submodule accepted an invalid option\"; exit 1; fi; \
+         /bin/grep -q -F \"usage: git submodule\" \
+         /tmp/td-git-probe/submodule.err || \
+         {{ echo \"git: shell porcelain did not produce its usage text\"; exit 1; }}; \
+         /bin/grep -q -F -- \"-----BEGIN CERTIFICATE-----\" \
+         /etc/ssl/certs/ca-certificates.crt || \
+         {{ echo \"git: the installed CA bundle has no PEM certificate\"; exit 1; }}'; then \
+         [ \"$mg\" = 1 ] || {{ echo {GIT_RUNTIME_MARKER}; mg=1; }}; else healthy=0; fi; \
          if /bin/su -s /bin/sh {} -c \
          '/bin/sshd selftest >/dev/null 2>&1'; then \
          [ \"$ms\" = 1 ] || {{ echo {SSHD_MARKER}; ms=1; }}; else healthy=0; fi; \
@@ -2183,6 +2259,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
         sys.autologin,
         sys.autologin,
         sys.autologin,
+        git_user = sys.autologin,
         hostname = sys.hostname,
     )
 }
@@ -2300,8 +2377,9 @@ fn build_profile(sys: &SystemDef) -> String {
 /// autodetects the link, DHCP-configures it, and writes resolv.conf + hosts (a
 /// NIC-less boot is a clean no-op). Under the `NETTEST_CMDLINE_TOKEN` the headless
 /// `qemu-boot-net` oracle appends, it additionally self-tests the stack — resolve
-/// the default host via the DHCP-provided nameserver, then TCP-reach it — printing
-/// the three net markers on ttyS0. Off the token (normal boot, or the `-nic none`
+/// the default host via the DHCP-provided nameserver, TCP-reach it, then run an
+/// unprivileged Git HTTPS query with the installed CA trust — printing the four
+/// net markers on ttyS0. Off the token (normal boot, or the `-nic none`
 /// `qemu-boot-system` oracle) the link still comes up but no marker is printed.
 ///
 /// One `td-netd up`: `$up` records whether it configured the link so NET_UP is
@@ -2316,6 +2394,20 @@ fn build_netup() -> String {
          [ \"$up\" = 1 ] && echo {SYSTEM_NET_UP_MARKER}; \
          /bin/td-netd resolve {NETTEST_DEFAULT_HOST} && echo {SYSTEM_NET_RESOLVE_MARKER}; \
          /bin/td-netd reach {NETTEST_DEFAULT_HOST} {NETTEST_DEFAULT_PORT} && echo {SYSTEM_NET_REACH_MARKER}; \
+         /bin/su -s /bin/sh {UI_USER} -c \
+         'HOME=/tmp/td-git-net-home; export HOME; \
+         XDG_CONFIG_HOME=/tmp/td-git-net-xdg; export XDG_CONFIG_HOME; \
+         /bin/rm -rf \"$HOME\" \"$XDG_CONFIG_HOME\" && \
+         /bin/mkdir -p \"$HOME\" \"$XDG_CONFIG_HOME\" && \
+         GIT_CONFIG_GLOBAL=/dev/null; export GIT_CONFIG_GLOBAL; \
+         GIT_CONFIG_NOSYSTEM=1; export GIT_CONFIG_NOSYSTEM; \
+         GIT_TERMINAL_PROMPT=0; export GIT_TERMINAL_PROMPT; \
+         GIT_HTTP_LOW_SPEED_LIMIT=1; export GIT_HTTP_LOW_SPEED_LIMIT; \
+         GIT_HTTP_LOW_SPEED_TIME=10; export GIT_HTTP_LOW_SPEED_TIME; \
+         GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt; export GIT_SSL_CAINFO; \
+         r=$(/bin/git ls-remote {GIT_HTTPS_TEST_URL} HEAD) && \
+         set -- $r && [ \"$#\" = 2 ] && [ \"${{#1}}\" = 40 ] && [ \"$2\" = HEAD ]' && \
+         echo {GIT_HTTPS_RUNTIME_MARKER}; \
          fi\n"
     )
 }
@@ -2394,13 +2486,21 @@ struct ImmutableEtc {
     why: &'static str,
 }
 
-const IMMUTABLE_ETC: &[ImmutableEtc] = &[ImmutableEtc {
-    etc: "terminfo",
-    target: "{in:td-compositor}/share/terminfo",
-    why: "ncurses resolves TERM through TERMINFO, and td-term hands its child \
-          TERMINFO=/etc/terminfo because a content-addressed store path is not \
-          a name any child could have been given",
-}];
+const IMMUTABLE_ETC: &[ImmutableEtc] = &[
+    ImmutableEtc {
+        etc: "terminfo",
+        target: "{in:td-compositor}/share/terminfo",
+        why: "ncurses resolves TERM through TERMINFO, and td-term hands its child \
+              TERMINFO=/etc/terminfo because a content-addressed store path is not \
+              a name any child could have been given",
+    },
+    ImmutableEtc {
+        etc: "ssl/certs/ca-certificates.crt",
+        target: "{in:ca-certificates}/share/ca-certificates/ca-bundle.crt",
+        why: "The static curl transport used by Git needs this CA bundle path, \
+              while the pinned Mozilla extract remains immutable store content",
+    },
+];
 
 const MUTABLE_ETC: &[MutableEtc] = &[
     MutableEtc {
@@ -2449,15 +2549,21 @@ const MUTABLE_ETC: &[MutableEtc] = &[
 const SSHD_HOST_KEY: &str = "/etc/ssh/ssh_host_ed25519_key";
 const SSHD_AUTHORIZED_KEYS: &str = "/etc/ssh/authorized_keys";
 
-/// Directories that must exist under `/etc` to hold the table's symlinks, and the
-/// globs `shape_check` sweeps for symlinks that are not in the table. Derived from
-/// the table so a new entry in a new subdirectory extends both.
-fn mutable_etc_dirs() -> Vec<&'static str> {
+/// Every parent directory needed by either `/etc` table, including intermediate
+/// parents. The same list drives staging and the fail-closed directory and symlink
+/// sweeps, so adding a nested immutable name cannot create an unchecked subtree.
+fn etc_dirs() -> Vec<&'static str> {
     let mut dirs = Vec::new();
-    for entry in MUTABLE_ETC {
-        if let Some((dir, _)) = entry.etc.rsplit_once('/') {
-            if !dirs.contains(&dir) {
-                dirs.push(dir);
+    for path in MUTABLE_ETC
+        .iter()
+        .map(|entry| entry.etc)
+        .chain(IMMUTABLE_ETC.iter().map(|entry| entry.etc))
+    {
+        for (index, _) in path.match_indices('/') {
+            if let Some(dir) = path.get(..index) {
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
             }
         }
     }
@@ -2809,6 +2915,13 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         from: "{in:td-busd}".into(),
         dest: "{root}/real-root{in:td-busd}".into(),
     });
+    // The CA extract is immutable data, not an executable runtime closure. Copy
+    // the package at its canonical store path so IMMUTABLE_ETC can expose the
+    // conventional filename without duplicating the bundle in /etc.
+    steps.push(Step::CopyTree {
+        from: "{in:ca-certificates}".into(),
+        dest: "{root}/real-root{in:ca-certificates}".into(),
+    });
     // Stage the dynamically linked userland and every transitively referenced store item
     // at its canonical absolute path. uutils, ripgrep, and fd pull their td glibc closure;
     // sshd additionally pulls the aws-lc crypto C lib. The engine admits only direct recipe
@@ -2819,6 +2932,7 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         "{in:ripgrep}".into(),
         "{in:fd}".into(),
         "{in:sshd}".into(),
+        "{in:git-x86-64}".into(),
     ];
     runtime_roots.extend(
         application_payload_inputs(sys)
@@ -2866,7 +2980,23 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
             link: format!("{{root}}/real-root/bin/{app}"),
         });
     }
-    for (name, target) in [("rg", "{in:ripgrep}/bin/rg"), ("fd", "{in:fd}/bin/fd")] {
+    for (name, target) in [
+        ("rg", "{in:ripgrep}/bin/rg"),
+        ("fd", "{in:fd}/bin/fd"),
+        ("git", "{in:git-x86-64}/bin/git"),
+        (
+            "git-receive-pack",
+            "{in:git-x86-64}/bin/git-receive-pack",
+        ),
+        (
+            "git-upload-archive",
+            "{in:git-x86-64}/bin/git-upload-archive",
+        ),
+        (
+            "git-upload-pack",
+            "{in:git-x86-64}/bin/git-upload-pack",
+        ),
+    ] {
         steps.push(Step::Symlink {
             target: target.into(),
             link: format!("{{root}}/real-root/bin/{name}"),
@@ -2995,7 +3125,7 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     // persistent ones once per machine by td-firstboot. A dangling symlink is the
     // correct shipped state: it is what makes "this file is per-machine" a property
     // of the image rather than a convention.
-    for dir in mutable_etc_dirs() {
+    for dir in etc_dirs() {
         steps.push(Step::MkDir {
             path: format!("{{root}}/real-root/etc/{dir}"),
         });
@@ -3139,11 +3269,11 @@ fn shape_check() -> String {
          if grep -q -F \"$l  \" \"$root/etc/mutable-state\"; then echo \"root tree: /etc/mutable-state documents /etc/$l as per-machine state, but it is an IMMUTABLE_ETC entry pointing into the read-only store - one of the two tables is wrong\" >&2; exit 1; fi; \
      done; \
      ( cd \"$root/etc\" || exit 1; \
-       for p in * .*; do \
+       for p in @ETC_GLOBS@; do \
            { [ -d \"$p\" ] && [ ! -L \"$p\" ]; } || continue; \
-           case $p in .|..) continue;; esac; \
-           seen=0; for d in @MUTABLE_ETC_DIRS@; do if [ \"$d\" = \"$p\" ]; then seen=1; fi; done; \
-           [ \"$seen\" = 1 ] || { echo \"root tree: /etc/$p is a directory no MUTABLE_ETC entry declares, so the symlink sweep below cannot look inside it - add the entry that needs it (or the sweep stops being a proof)\" >&2; exit 1; }; \
+           case $p in .|..|*/.|*/..) continue;; esac; \
+           seen=0; for d in @ETC_DIRS@; do if [ \"$d\" = \"$p\" ]; then seen=1; fi; done; \
+           [ \"$seen\" = 1 ] || { echo \"root tree: /etc/$p is a directory neither etc table declares, so the symlink sweep below cannot look inside it - add the entry that needs it (or the sweep stops being a proof)\" >&2; exit 1; }; \
        done; \
        m=0; i=0; \
        for p in @ETC_GLOBS@; do \
@@ -3250,7 +3380,7 @@ fn shape_check() -> String {
      [ \"$nu\" -lt \"$sd\" ] || { echo 'td-svc would start sshd before netup - sshd binds loopback, which netup brings up' >&2; exit 1; }; \
      [ \"$fb\" -lt \"$sd\" ] || { echo 'td-svc would start sshd before td-firstboot - sshd is fail-closed on the host key td-firstboot mints, so it would refuse to start on every boot' >&2; exit 1; }; \
      [ \"$nu\" -lt \"$gr\" ] || { echo 'td-svc would start the greeter before netup' >&2; exit 1; }; \
-     [ \"$rc\" -lt \"$st\" ] && [ \"$st\" -lt \"$wl\" ] && [ \"$wl\" -lt \"$tm\" ] && [ \"$wl\" -lt \"$jf\" ] && [ \"$jf\" -lt \"$je\" ] && [ \"$tm\" -lt \"$bs\" ] || { echo 'td-svc would not serialize rootcheck -> seat -> wayland -> terminal+jailed fixture evidence and independent bootsuccess' >&2; exit 1; }; \
+     [ \"$rc\" -lt \"$st\" ] && [ \"$st\" -lt \"$wl\" ] && [ \"$wl\" -lt \"$tm\" ] && [ \"$wl\" -lt \"$jf\" ] && [ \"$jf\" -lt \"$je\" ] && [ \"$tm\" -lt \"$bs\" ] && [ \"$pe\" -lt \"$bs\" ] || { echo 'td-svc would not serialize rootcheck -> seat -> wayland -> terminal+jailed fixture evidence and profiler evidence -> independent bootsuccess' >&2; exit 1; }; \
      [ \"$st\" -lt \"$bd\" ] && [ \"$bd\" -lt \"$bs\" ] || { echo 'td-svc would not serialize seat -> busd -> bootsuccess - the broker binds inside the runtime directory td-seatd makes, and /etc/bootsuccess probes the RUNNING broker rather than a selftest' >&2; exit 1; }; \
      mkdir -p '{root}/pivot-probe' && cp \"$tdi\" '{root}/pivot-probe/init' || { echo 'root tree: could not build the switch_root probe NEWROOT' >&2; exit 1; }; \
      tdipiv=$(\"$tdi\" switch_root '{root}/pivot-probe' /init 2>&1) && { echo 'td-init switch_root ACCEPTED a NEWROOT that is not a mount point - the last refusal standing between a bad pivot and a panicked kernel is gone' >&2; exit 1; }; \
@@ -3275,6 +3405,16 @@ fn shape_check() -> String {
      fd=\"{root}/real-root{in:fd}/bin/fd\"; fdtgt=\"{in:fd}/bin/fd\"; \
      { [ -f \"$fd\" ] && [ -x \"$fd\" ]; } || { echo 'root tree: fd is not packed/executable at real-root{in:fd}/bin/fd - /bin/fd would dangle and StageRuntimeClosure did not stage it' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/fd\" 2>/dev/null)\" = \"$fdtgt\" ] || { echo 'root tree: /bin/fd is not a symlink to staged fd' >&2; exit 1; }; \
+     git=\"{root}/real-root{in:git-x86-64}/bin/git\"; gittgt=\"{in:git-x86-64}/bin/git\"; \
+     { [ -f \"$git\" ] && [ -x \"$git\" ]; } || { echo 'root tree: Git is not packed/executable at real-root{in:git-x86-64}/bin/git - /bin/git would dangle and StageRuntimeClosure did not stage it' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/git\" 2>/dev/null)\" = \"$gittgt\" ] || { echo 'root tree: /bin/git is not a symlink to staged Git' >&2; exit 1; }; \
+     for a in git-receive-pack git-upload-archive git-upload-pack; do \
+         githelper=\"{root}/real-root{in:git-x86-64}/bin/$a\"; \
+         { [ -f \"$githelper\" ] && [ -x \"$githelper\" ]; } || { echo \"root tree: $a is not packed/executable at real-root{in:git-x86-64}/bin/$a - /bin/$a would dangle\" >&2; exit 1; }; \
+         [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = \"{in:git-x86-64}/bin/$a\" ] || { echo \"root tree: /bin/$a is not a symlink to staged Git\" >&2; exit 1; }; \
+     done; \
+     [ -s \"{root}/real-root{in:ca-certificates}/share/ca-certificates/ca-bundle.crt\" ] || { echo 'root tree: the pinned CA bundle is missing or empty' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/etc/ssl/certs/ca-certificates.crt\" 2>/dev/null)\" = \"{in:ca-certificates}/share/ca-certificates/ca-bundle.crt\" ] || { echo 'root tree: Git curl CA path does not resolve to the pinned bundle' >&2; exit 1; }; \
      sshd=\"{root}/real-root{in:sshd}/bin/sshd\"; sshdtgt=\"{in:sshd}/bin/sshd\"; \
      { [ -f \"$sshd\" ] && [ -x \"$sshd\" ]; } || { echo 'root tree: the sshd daemon is not packed/executable at real-root{in:sshd}/bin/sshd - /bin/sshd would dangle and StageRuntimeClosure did not stage it' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/sshd\" 2>/dev/null)\" = \"$sshdtgt\" ] || { echo 'root tree: /bin/sshd is not a symlink to the staged sshd daemon' >&2; exit 1; }; \
@@ -3373,7 +3513,7 @@ fn shape_check() -> String {
         // because the ladder guard bans the host directory-walk tools by name, and
         // because the table is what decides which directories can hold one.
         .replace("@ETC_GLOBS@", &etc_globs().join(" "))
-        .replace("@MUTABLE_ETC_DIRS@", &mutable_etc_dirs().join(" "))
+        .replace("@ETC_DIRS@", &etc_dirs().join(" "))
         .replace("@MUTABLE_ETC_COUNT@", &MUTABLE_ETC.len().to_string())
 }
 
@@ -3388,7 +3528,7 @@ fn mutable_etc_names() -> Vec<&'static str> {
 /// scope a proof rather than a guess: no OTHER directory may exist under /etc.
 fn etc_globs() -> Vec<String> {
     let mut globs = vec!["*".to_string(), ".*".to_string()];
-    for dir in mutable_etc_dirs() {
+    for dir in etc_dirs() {
         globs.push(format!("{dir}/*"));
         globs.push(format!("{dir}/.*"));
     }
@@ -3527,6 +3667,8 @@ pub fn recipe() -> Recipe {
         // uutils: the dynamically-linked `coreutils` multicall packed as the /bin file/text
         //   userland (#547).
         // ripgrep/fd: dynamically linked Rust search tools exposed as /bin/rg and /bin/fd.
+        // Git: the source-built local and HTTP(S) client plus its executable helpers.
+        // ca-certificates: immutable Mozilla trust data at curl's conventional path.
         // sshd: the source-built russh SSH daemon, packed at /bin/sshd; its runtime closure
         //   (glibc, libgcc_s, aws-lc crypto C lib) is reached by StageRuntimeClosure.
         // glibc-x86-64: the dynamic Rust userland's declared runtime input.
@@ -3564,6 +3706,8 @@ pub fn recipe() -> Recipe {
             "uutils",
             "ripgrep",
             "fd",
+            "git-x86-64",
+            "ca-certificates",
             "glibc-x86-64",
             "sshd",
             "td-netd",
@@ -3735,6 +3879,15 @@ mod tests {
         assert_eq!(
             unit_key("profiler-evidence", "log").as_deref(),
             Some("/var/log/svc/td-profiler-evidence.log")
+        );
+        assert!(
+            unit_after("bootsuccess").contains(&"profiler-evidence".to_string()),
+            "the process-heavy health probes must wait for the initial profiler capture"
+        );
+        assert_eq!(
+            unit_key("bootsuccess", "requires").as_deref(),
+            Some("terminal"),
+            "profiler evidence is an ordering boundary, not deployment health"
         );
 
         let steps = real_root_steps(&SYSTEM);
@@ -4238,8 +4391,9 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
     /// VM at `DEFAULT_BOOT_TIMEOUT_SECS`. If it gives up first, an unhealthy boot
     /// stops being diagnosable — the guest never reaches the branch that prints WHICH
     /// probe failed, and the oracle reports a bare timeout instead. So the ceiling
-    /// must outlast the guest's own patience, which is the clamped iteration count
-    /// times what an iteration may cost.
+    /// must outlast the profiler-evidence ordering boundary plus the guest's own
+    /// patience, which is the clamped iteration count times what an iteration may
+    /// cost.
     ///
     /// Review found this the other way round: the rollback pass raised the guest's
     /// per-iteration budget past the host's whole ceiling, which no test noticed
@@ -4248,14 +4402,29 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
     fn the_host_ceiling_outlasts_the_guest_loop_it_waits_for() {
         let guest = u64::from(BOOT_SUCCESS_RETRY_MAX_SECS)
             .saturating_mul(u64::from(BOOT_SUCCESS_ITERATION_BUDGET_SECS));
+        let serial = u64::from(svc_timeouts::HOSTNAME)
+            .saturating_add(u64::from(svc_timeouts::FIRSTBOOT))
+            .saturating_add(u64::from(svc_timeouts::ROOTCHECK));
+        let predecessor = u64::from(PROFILER_EVIDENCE_SERVICE_TIMEOUT_SECS)
+            .max(u64::from(svc_timeouts::NETUP));
+        let required = serial
+            .saturating_add(guest)
+            .saturating_add(predecessor)
+            .saturating_add(crate::ladder::QEMU_GUEST_WAIT_MARGIN_SECS);
         assert!(
-            crate::ladder::DEFAULT_BOOT_TIMEOUT_SECS >= guest,
+            crate::ladder::DEFAULT_BOOT_TIMEOUT_SECS >= required,
             "the host gives up after {}s while the guest's boot-success loop may run \
              {}s ({BOOT_SUCCESS_RETRY_MAX_SECS} iterations x \
-             {BOOT_SUCCESS_ITERATION_BUDGET_SECS}s); the VM would be killed mid-loop \
-             and the failure reported with no guest-side reason in it",
+             {BOOT_SUCCESS_ITERATION_BUDGET_SECS}s), after {}s of serial identity/root \
+             checks and the slower of the profiler evidence and network services' \
+             {}s ceilings; the VM would be killed mid-loop or before its {}s diagnostic \
+             margin elapsed, and the failure would be reported with no guest-side \
+             reason in it",
             crate::ladder::DEFAULT_BOOT_TIMEOUT_SECS,
-            guest
+            guest,
+            serial,
+            predecessor,
+            crate::ladder::QEMU_GUEST_WAIT_MARGIN_SECS
         );
     }
 
@@ -4264,8 +4433,7 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
         // A backstop must clear its worst case with room, not by a hair: these run on a
         // TCG-emulated VM with a cold page cache, and the numbers below are computed from
         // read timeouts and spawn counts, not measured. So the rule is 2x the worst case.
-        // Verified red at NETUP=31 — which clears the raw 26s and still fails here, which
-        // is the point: 31 was the value review proposed as obviously-too-tight.
+        // Verified red at NETUP=31 — which cleared the old raw 26s and still failed here.
         const HEADROOM: u32 = 2;
         // (value, worst case in seconds, what that worst case is)
         let floors: [(u32, u32, &str); 7] = [
@@ -4279,15 +4447,16 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
             ),
             (
                 svc_timeouts::NETUP,
-                26,
-                "DHCP 3x2s DISCOVER + 3x2s REQUEST, then a 3s resolve and a 5s connect",
+                336,
+                "DHCP and td-netd resolve/reach, then libcurl's 300s connect and 10s \
+                 low-speed transfer bounds",
             ),
             (
                 svc_timeouts::BOOTSUCCESS,
                 // The loop is clamped to this many iterations; budget a slow one each.
                 (BOOT_SUCCESS_RETRY_MAX_SECS as u32)
                     .saturating_mul(BOOT_SUCCESS_ITERATION_BUDGET_SECS),
-                "clamped iterations of eight su probe blocks, four td-boot updates and \
+                "clamped iterations of nine su probe blocks, four td-boot updates and \
                  a rollback",
             ),
             (
@@ -4346,7 +4515,7 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
                 sysinit
                     .iter()
                     .copied()
-                    .chain(["busd", "wayland", "terminal"])
+                    .chain(["busd", "wayland", "terminal", "profiler-evidence"])
                     .collect(),
             ),
             ("bootfail", sysinit.to_vec()),
@@ -4616,6 +4785,7 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
             "{in:ripgrep}".to_string(),
             "{in:fd}".to_string(),
             "{in:sshd}".to_string(),
+            "{in:git-x86-64}".to_string(),
             "{payload:empty-runtime}".to_string(),
             format!("{{payload:{APPLICATION_FIXTURE_NAME}}}"),
         ];
@@ -4632,11 +4802,28 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
                     if from.contains("uutils")
                         || from.contains("ripgrep")
                         || from.starts_with("{in:fd}")
+                        || from.contains("git-x86-64")
                         || from.contains("glibc-x86-64")
             )),
             "runtime store items must not bypass StageRuntimeClosure"
         );
-        for (name, target) in [("rg", "{in:ripgrep}/bin/rg"), ("fd", "{in:fd}/bin/fd")] {
+        for (name, target) in [
+            ("rg", "{in:ripgrep}/bin/rg"),
+            ("fd", "{in:fd}/bin/fd"),
+            ("git", "{in:git-x86-64}/bin/git"),
+            (
+                "git-receive-pack",
+                "{in:git-x86-64}/bin/git-receive-pack",
+            ),
+            (
+                "git-upload-archive",
+                "{in:git-x86-64}/bin/git-upload-archive",
+            ),
+            (
+                "git-upload-pack",
+                "{in:git-x86-64}/bin/git-upload-pack",
+            ),
+        ] {
             let link = format!("{{root}}/real-root/bin/{name}");
             let targets: Vec<&str> = steps
                 .iter()
@@ -6000,13 +6187,6 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
                 "/etc/{etc}: a leading '-' in any component is read as an OPTION by the \
                  `grep`/`test` the generated shell runs on it"
             );
-            // At most one directory level: `etc_globs` sweeps exactly the levels the
-            // table declares, and a deeper path would be swept by nothing.
-            assert!(
-                etc.matches('/').count() <= 1,
-                "/etc/{etc} is nested deeper than one directory, so the unreviewed-symlink \
-                 sweep in shape_check would not reach it"
-            );
             for (label, path) in [("etc", etc), ("target", entry.target)] {
                 assert!(
                     path.bytes().all(|b| b.is_ascii_alphanumeric()
@@ -6179,6 +6359,11 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
             check.contains(&format!(r#"[ "$i" = {} ]"#, IMMUTABLE_ETC.len())),
             "the sweep does not compare the immutable count against IMMUTABLE_ETC"
         );
+        assert!(
+            check.contains("case $p in .|..|*/.|*/..) continue;; esac"),
+            "the directory sweep mistakes each declared directory's `.` and `..` glob \
+             entries for undeclared children"
+        );
     }
 
     /// An `IMMUTABLE_ETC` row reaches the shape check as an unquoted
@@ -6202,14 +6387,9 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
                 "/etc/{etc}: a leading '-' in any component is read as an OPTION by the \
                  `readlink`/`test` the generated shell runs on it"
             );
-            // Flat names only. `real_root_steps` stages the link with no MkDir
-            // ahead of it, and `etc_globs` sweeps exactly the levels MUTABLE_ETC
-            // declares — so a nested entry would be staged into a directory
-            // nothing creates and swept by nothing.
             assert!(
-                !etc.contains('/'),
-                "/etc/{etc} is nested, but nothing creates its parent directory and the \
-                 unreviewed-symlink sweep would not reach it"
+                !etc.contains("..") && !etc.contains("//"),
+                "/etc/{etc}: a traversal or empty component would escape /etc"
             );
             assert!(safe(etc), "/etc/{etc} is not safe unquoted in the generated shell");
             // The target is a store reference rather than a literal path: the
@@ -6289,7 +6469,7 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
                 entry.etc
             );
         }
-        for dir in mutable_etc_dirs() {
+        for dir in etc_dirs() {
             let path = format!("{{root}}/real-root/etc/{dir}");
             assert!(
                 steps
@@ -6959,6 +7139,17 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
                     "/bin/fd --color never --absolute-path --max-depth 1 ^hostname$ /etc"
                 )
                 && bootsuccess.contains(RIPGREP_FD_RUNTIME_MARKER)
+                && bootsuccess.contains("/bin/git init --bare -b main origin")
+                && bootsuccess.contains("/bin/git -C work push -u origin main")
+                && bootsuccess.contains("/bin/git clone --no-local origin work")
+                && bootsuccess.contains("/bin/git clone --no-local origin verify")
+                && bootsuccess.contains("HOME=/tmp/td-git-probe/home")
+                && bootsuccess.contains("GIT_CONFIG_GLOBAL=/dev/null")
+                && bootsuccess.contains("/bin/git -C work submodule --td-invalid")
+                && bootsuccess.contains("git: upload-pack clone failed")
+                && bootsuccess.contains("git: receive-pack push failed")
+                && bootsuccess.contains("/etc/ssl/certs/ca-certificates.crt")
+                && bootsuccess.contains(GIT_RUNTIME_MARKER)
                 && bootsuccess.contains("/bin/sshd selftest")
                 && bootsuccess.contains("/bin/td-util --list")
                 && bootsuccess.contains(TD_UTIL_RUNTIME_MARKER)
@@ -7069,6 +7260,10 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
                         .find("&& /bin/td-boot success /dev/vda")
                         .unwrap()
                 && bootsuccess.find("/bin/fd --color never").unwrap()
+                    < bootsuccess
+                        .find("&& /bin/td-boot success /dev/vda")
+                        .unwrap()
+                && bootsuccess.find("/bin/git init --bare").unwrap()
                     < bootsuccess
                         .find("&& /bin/td-boot success /dev/vda")
                         .unwrap()
@@ -7393,9 +7588,9 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         );
 
         // Networking: netup brings the link up unconditionally, and under the nettest
-        // token self-tests resolve + reach, printing the three net markers. Each marker
-        // must be `&&`-gated on its td-netd subcommand so a failure drops the marker and
-        // reds the qemu-boot-net oracle rather than false-passing.
+        // token self-tests resolve + reach + verified Git HTTPS, printing four net
+        // markers. Each marker must be gated on its real operation so a failure drops
+        // the marker and reds the qemu-boot-net oracle rather than false-passing.
         let netup = build_netup();
         assert!(
             netup.contains("/bin/td-netd up"),
@@ -7420,6 +7615,15 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
                 "/bin/td-netd reach {NETTEST_DEFAULT_HOST} {NETTEST_DEFAULT_PORT} && echo {SYSTEM_NET_REACH_MARKER}"
             )),
             "the reach marker must be gated on a successful td-netd reach"
+        );
+        assert!(
+            netup.contains("GIT_CONFIG_GLOBAL=/dev/null")
+                && netup.contains("GIT_TERMINAL_PROMPT=0")
+                && !netup.contains("GIT_SSL_NO_VERIFY")
+                && netup.contains("GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt")
+                && netup.contains(&format!("/bin/git ls-remote {GIT_HTTPS_TEST_URL} HEAD"))
+                && netup.contains(&format!("echo {GIT_HTTPS_RUNTIME_MARKER}")),
+            "the Git HTTPS marker must follow an isolated, noninteractive, verified upstream query"
         );
     }
 

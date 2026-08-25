@@ -326,7 +326,13 @@ pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 /// wait of its own — `td-busd probe` allows five seconds for an `OK` line, which a
 /// broker that is WEDGED rather than absent will spend in full. That went into the
 /// guest's per-iteration budget, and this follows it.
-pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 540;
+///
+/// Raised again when Git added a ninth, process-heavy health block. The initial
+/// profiler evidence is serialized ahead of that workload so its bounded capture
+/// stays deterministic. The host must outlast the serial identity/root checks, the
+/// slower of that 195-second service and the 700-second network service, then the
+/// clamped 700-second health loop and the diagnostic margin.
+pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 1950;
 pub const QEMU_GUEST_WAIT_MARGIN_SECS: u64 = 30;
 
 /// Printed after the running system installs and activates a verified candidate
@@ -366,6 +372,13 @@ pub const UUTILS_RUNTIME_MARKER: &str = "TD-UUTILS-RUN-OK";
 /// root. One marker covers the pair because both commands must pass before it is
 /// emitted; either failure withholds boot success and names the failing command.
 pub const RIPGREP_FD_RUNTIME_MARKER: &str = "TD-RG-FD-RUN-OK";
+
+/// Printed by the root-owned health target only after the unprivileged user can
+/// initialize a bare repository, clone it, commit and push to it, then clone it
+/// again and verify the resulting history. The same leg requires a pinned CA
+/// bundle at the image's conventional path. Verified use of that bundle and Git's
+/// compiled HTTPS helper is the operator-only `GIT_HTTPS_RUNTIME_MARKER` below.
+pub const GIT_RUNTIME_MARKER: &str = "TD-GIT-RUN-OK";
 
 /// Printed by the root-owned health target only after unprivileged `/bin/sshd selftest`
 /// exits 0 — the source-built russh daemon stood up an in-process server on an ephemeral
@@ -622,19 +635,25 @@ pub const SYSTEM_NET_RESOLVE_MARKER: &str = "TD-NET-RESOLVE-OK";
 /// host — the "reach a host" half of the QEMU user-net test.
 pub const SYSTEM_NET_REACH_MARKER: &str = "TD-NET-REACH-OK";
 
+/// Printed by `/etc/netup` after unprivileged Git resolves an upstream repository,
+/// launches its HTTPS remote helper, verifies TLS with the image CA bundle, and reads
+/// the remote HEAD. Like the other network markers, this is operator-only evidence.
+pub const GIT_HTTPS_RUNTIME_MARKER: &str = "TD-GIT-HTTPS-OK";
+
 /// Kernel-cmdline token the headless `qemu-boot-net` oracle appends so `/etc/netup`
-/// runs the resolve+reach self-test (and prints the three markers above). Absent it
+/// runs the resolve+reach and Git HTTPS self-tests (and prints the four markers
+/// above). Absent it
 /// (normal boot, or the `-nic none` `qemu-boot-system` oracle), td-netd still brings
 /// the link up but the self-test and its markers are skipped.
 pub const NETTEST_CMDLINE_TOKEN: &str = "td.nettest=1";
 
-/// Fixed resolve/reach target for the self-test. qemu user-net forwards DNS (via
-/// 10.0.2.3) and NATs outbound TCP, so a stable public anycast host answers both a
-/// DNS A-query and a TCP connect; `NETTEST_DEFAULT_PORT` is DNS-over-TCP (53), which
-/// that host serves reliably. `/etc/netup` compiles these in — there is no runtime
-/// cmdline override (that would need argument parsing in the boot shell).
-pub const NETTEST_DEFAULT_HOST: &str = "one.one.one.one";
-pub const NETTEST_DEFAULT_PORT: &str = "53";
+/// One upstream endpoint for every network-oracle leg. qemu user-net forwards DNS
+/// and NATs outbound TCP, so td-netd first resolves this host and reaches its HTTPS
+/// port, then Git reads the repository URL on the same service. `/etc/netup` compiles
+/// these in; there is no runtime cmdline override.
+pub const NETTEST_DEFAULT_HOST: &str = "git.kernel.org";
+pub const NETTEST_DEFAULT_PORT: &str = "443";
+pub const GIT_HTTPS_TEST_URL: &str = "https://git.kernel.org/pub/scm/git/git.git";
 
 // ── kexec-spike-x86-64 two-kernel boot markers (Phase-0 kexec spike) ─────────────
 // The spike proves the source-built kernel can kexec_file_load(2) + reboot(KEXEC) a

@@ -3,10 +3,11 @@ use crate::types::Recipe;
 // uutils ships coreutils as one multicall binary. Select exactly the applets
 // td's read-only root symlinks into /bin (UUTILS_APPLETS in system-x86-64.rs),
 // not a published aggregate: `feat_Tier1`/`unix` drag in ~185 crates we never
-// ship -- the checksum tools (sha*sum/md5sum/b2sum/cksum), `factor`'s bignum,
-// `more`'s pager stack, regex, rand, every `cc` C-build edge, and `stdbuf`,
-// whose crates.io archive lacks src/libstdbuf and embeds an empty preload
-// library. The residual closure is uucore + clap + uucore's baked-in i18n.
+// ship -- the checksum tools (sha*sum/md5sum/b2sum/cksum), `factor`, `more`'s
+// pager stack, rand, and `stdbuf`, whose crates.io archive lacks src/libstdbuf
+// and embeds an empty preload library. The resulting closure is the exact
+// union required by the selected applets; notably `expr` carries its pinned
+// regex/native support rather than broadening the selection to an aggregate.
 //
 // Like ripgrep/fd, uutils builds as a `--auto` graph node; the read-only-root
 // system image also consumes it. `source_input`
@@ -34,5 +35,6 @@ pub fn recipe() -> Recipe {
             "sleep", "sync", "wc", "head", "tail", "sort", "date", "whoami",
             "tty", "dd", "mktemp", "seq", "touch", "mknod", "kill", "readlink",
             "basename", "dirname", "true", "false", "printenv", "link", "unlink",
+            "cut", "tr", "expr",
         ])
 }
