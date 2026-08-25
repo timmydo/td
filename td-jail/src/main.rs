@@ -293,6 +293,50 @@ mod confinement {
                 .find(needle)
                 .unwrap_or_else(|| panic!("launch_application no longer contains {needle}"))
         };
+        // The GRANT reaches the wire, in the FIELD that carries it. A
+        // reviewer replaced `&application.owned_names` with `&[]` and the
+        // whole `td-jail` suite stayed green: `launch_application` needs
+        // namespaces, so no unit test reaches this call, and the QEMU gate
+        // that would is unrun here. That makes it the same class of rule as
+        // the orderings below — real, untestable at runtime, and stated in
+        // the source or nowhere.
+        //
+        // A second reviewer then defeated the first version of this
+        // assertion, which looked for `&application.owned_names` anywhere: at
+        // the time `register` took two adjacent `&[String]`, so SWAPPING them
+        // left the substring present, sent the broker an empty own-set, and
+        // recorded the granted names as predeclared services instead.
+        // `register` takes a `Registration` now, so the swap has to be
+        // written into a named field rather than slipped past a positional
+        // list, and this pins that field.
+        // The whole call, as one span. Pinning the two fields separately was
+        // defeated the same way the plan pin was: build the `Registration`
+        // into a `let mut request`, overwrite `request.owned = &[]`, pass
+        // `request`. Both field substrings survived and the wire carried no
+        // grant. A literal that is the ARGUMENT has nowhere to be edited
+        // between construction and the call.
+        assert!(
+            launch.contains("identity.uid,\n        crate::bus::Registration {"),
+            "the registration is no longer built as the argument of the call \
+             that sends it, so there is a window in which its own-set can be \
+             emptied after this test has seen it"
+        );
+        assert!(
+            launch.contains("owned: &application.owned_names,"),
+            "the launch no longer sends the permission file's own-set to the \
+             broker as its own-set, so a sandboxed application may hold no name"
+        );
+        assert!(
+            launch.contains("services: &[],"),
+            "the launch predeclares services now, which is a change §D has to \
+             carry rather than a slip in the argument this test is about"
+        );
+        assert_eq!(
+            launch.matches("owned").count(),
+            2,
+            "`owned` is named somewhere else on the launch path, so the field \
+             this test pins is not necessarily what reaches the broker"
+        );
         assert!(at("ManagedCgroup::create(") < at("bus::register("));
         assert!(at("bus::register(") < at("sys::unshare_namespaces("));
         assert!(at("bus::register(") < at("close_inherited_descriptors("));
@@ -331,6 +375,67 @@ mod confinement {
             refused.contains("return Err("),
             "a refused completion no longer stops the launch, so the proof \
              write below it now runs and releases an unregistered jail"
+        );
+    }
+
+    /// The plan's own-set is the permission file's, not an empty list.
+    ///
+    /// The companion to the `&application.owned_names` assertion above, at the
+    /// other end of the same hop. `resolve` reads a real config, a real spec
+    /// and a real store, so no unit test builds a `LaunchPlan` — a reviewer
+    /// replaced this assignment with `Vec::new()` and all 111 `td-jail` tests
+    /// passed while every application launched owning nothing.
+    ///
+    /// `granted_bus_names` itself IS unit-tested, which is exactly what makes
+    /// this necessary rather than redundant: the rule is pinned and the wire
+    /// to it was not, so the mutation that survived was not in the rule.
+    #[test]
+    fn a_launch_plan_carries_the_permission_files_own_entries() {
+        let resolve = without_line_comments(&without_block_comments(AUTHORITY))
+            .split_once("pub(crate) fn resolve")
+            .unwrap()
+            .1
+            .split_once("pub(crate) fn resolve_resource_limits")
+            .unwrap()
+            .0
+            .to_string();
+        // The FIELD, initialised in place. Two earlier versions of this
+        // assertion were defeated in review. The first looked for
+        // `granted_bus_names(` anywhere in `resolve`, which a mutation
+        // satisfies by calling it and discarding the result. The second
+        // looked for the binding `let owned_names = granted_bus_names(…);`,
+        // which a reviewer satisfied by leaving it in place and shadowing it
+        // on the next line with `let owned_names = Vec::new();`. Both kept
+        // every pinned substring and gave every launch an empty own-set.
+        //
+        // `resolve` now builds the field inside the struct literal, so there
+        // is no binding to shadow and the pinned text is the assignment
+        // itself. A determined rewrite can still defeat a substring — this
+        // bounds spellings, not semantics — but the cheap accident it exists
+        // to catch no longer has a shape.
+        assert!(
+            resolve.contains("owned_names: granted_bus_names(&spec.permissions),"),
+            "a launch plan no longer takes its own-set from the permission \
+             file, so an application may hold no name whatever its file says"
+        );
+        // Built in place AND never touched again. A reviewer defeated the
+        // assertion above by keeping it word for word and then emptying the
+        // field: bind the literal to `let mut plan`, `plan.owned_names.
+        // clear()`, return `plan`. Every pinned substring survived and every
+        // launch got an empty grant. One mention is the difference between
+        // "the plan takes its own-set from the file" and "the plan mentions
+        // taking its own-set from the file".
+        assert_eq!(
+            resolve.matches("owned_names").count(),
+            1,
+            "`owned_names` is named more than once while resolving a plan, so \
+             the field this test pins is not necessarily the value that \
+             survives to the caller"
+        );
+        assert!(
+            resolve.contains("Ok(LaunchPlan {"),
+            "the plan is no longer returned as the literal this test pins, so \
+             there is a window between building it and handing it back"
         );
     }
 

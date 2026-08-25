@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::auth::{Guid, Handshake, PeerIdentity, GUID_LEN};
-use crate::lineage::{Caller, Identity, Instances, Named, Procfs, Reading, RealProcfs};
+use crate::lineage::{
+    Caller, Identity, Instances, Named, Procfs, Reading, RealProcfs, Registration,
+};
 use crate::message;
 use crate::policy;
 use crate::registry::{Bus, Outbox, Overflow, Rejected, Released, Routing};
@@ -1315,7 +1317,8 @@ impl<'a> Connection<'a> {
         }
     }
 
-    /// Phase one: `Register(s instance, s app_id, as services) -> s token`.
+    /// Phase one:
+    /// `Register(s instance, s app_id, as services, as owned) -> s token`.
     ///
     /// Called by stage 0 before it unshares anything, because the pid the
     /// record needs does not exist yet. §D is explicit that this is
@@ -1329,9 +1332,7 @@ impl<'a> Connection<'a> {
         message: &message::Message<'_>,
         wants_reply: bool,
     ) -> Result<(), Ended> {
-        let Some((instance, app_id, services)) =
-            self.registration_arguments(message, wants_reply)?
-        else {
+        let Some(registration) = self.registration_arguments(message, wants_reply)? else {
             return Ok(());
         };
         let Some(registrant) = self.caller(&RealProcfs) else {
@@ -1342,14 +1343,10 @@ impl<'a> Connection<'a> {
                 wants_reply,
             );
         };
-        match self.instances.open(
-            &RealProcfs,
-            &instance,
-            &app_id,
-            services,
-            self.credential.uid,
-            registrant,
-        ) {
+        match self
+            .instances
+            .open(&RealProcfs, registration, self.credential.uid, registrant)
+        {
             Ok(token) if wants_reply => {
                 self.answer(message, "s", move |writer| writer.string(&token))
             }
@@ -1424,9 +1421,14 @@ impl<'a> Connection<'a> {
         // same answer the callers already give for a name that is not here,
         // which is what makes an invisible peer indistinguishable from an
         // absent one.
-        if !self.may_see(name) {
-            return None;
-        }
+        //
+        // `may_ask_credentials` and NOT `may_see`, and the difference is the
+        // permission file's grant. A granted name resolves to whoever holds
+        // it, so a gate that admitted every visible name would hand one
+        // instance the uid and pid of another the moment two windows of an
+        // application shared a grant — reached through a widening that was
+        // about names rather than about peers. A reviewer found it there.
+        let name = &self.askable(name)?;
         if name == BUS_NAME {
             // The bus is this process. Reading `/proc/self` rather than calling
             // `getuid` keeps the roster at three syscalls, for the reason
@@ -1456,9 +1458,12 @@ impl<'a> Connection<'a> {
     /// one peer's uid and pid beside another peer's application id, which is
     /// the claim `td.AppId` exists to make truthfully.
     fn about(&self, name: &str) -> Option<(u32, i32, Option<String>)> {
-        if !self.may_see(name) {
-            return None;
-        }
+        // The same narrower gate as `credentials_for`, and for a reason of
+        // its own on top: this one also answers `td.AppId`, which names the
+        // APPLICATION behind a peer. Telling one sandbox which application
+        // holds a name it merely shares a grant with is the disclosure this
+        // whole filter exists to prevent.
+        let name = &self.askable(name)?;
         if name == BUS_NAME {
             // The broker has no application id of its own; its uid and pid
             // come from the same place `credentials_for` reads them.
@@ -1475,6 +1480,48 @@ impl<'a> Connection<'a> {
     /// asks.
     fn may_see(&self, name: &str) -> bool {
         policy::may_see(&self.identity, self.unique.as_deref(), name)
+    }
+
+    /// The narrower question the two credential answers ask.
+    ///
+    /// Separate from `may_see` because a permission file's grant widened that
+    /// one: a granted name may be looked up and addressed, and the uid and
+    /// pid behind it still belong to whoever holds it. See
+    /// `policy::may_ask_credentials`.
+    fn may_ask_credentials(&self, name: &str) -> bool {
+        policy::may_ask_credentials(&self.identity, self.unique.as_deref(), name)
+    }
+
+    /// The name this connection may be told about, having asked about `name`.
+    ///
+    /// `None` refuses, and every caller reports that as an absent name. The
+    /// interesting case is the SECOND arm: a peer that HOLDS the name it is
+    /// asking about is asking about itself, and the first arm refuses it,
+    /// because `policy::may_ask_credentials` compares against the caller's
+    /// UNIQUE name and a holder's well-known name is not that. The result was
+    /// a broker that answered `NameHasOwner` yes, `GetNameOwner` with the
+    /// caller's own `:1.N`, and `GetConnectionUnixUser` with "that name has
+    /// no owner" -- three answers about one name, one of them contradicting
+    /// the other two, to the peer in the best position to notice. That is the
+    /// same self-contradiction this landing removed from `may_see`, arriving
+    /// through the narrower gate that replaced it. A reviewer found it by
+    /// asking what the HOLDER sees rather than what a neighbour sees.
+    ///
+    /// It returns the name to answer ABOUT rather than a `bool`, and that is
+    /// what keeps the second arm honest. Resolving the well-known name here
+    /// and then looking the answer up by that same well-known name would be
+    /// two lookups with a gap: the name can change hands between them, and
+    /// the reply would carry the NEW holder's uid and pid to a caller that
+    /// was admitted for holding it a moment ago. Answering by the caller's
+    /// own unique name cannot do that whatever happens in the gap, because
+    /// the caller is the peer it describes.
+    fn askable(&self, name: &str) -> Option<String> {
+        if self.may_ask_credentials(name) {
+            return Some(name.to_string());
+        }
+        let unique = self.unique.as_deref()?;
+        let mine = self.bus.owner_of(name).as_deref() == Some(unique);
+        mine.then(|| unique.to_string())
     }
 
     /// This connection's unique name.
@@ -1617,7 +1664,11 @@ impl<'a> Connection<'a> {
                 if policy::is_reserved_name(&asked) {
                     "that name is reserved for this broker and the portal"
                 } else {
-                    "this connection may own no name on this bus"
+                    // Not "may own no name": a peer whose permission file
+                    // granted it one may own THAT one and is refused here for
+                    // every other, so the old wording became false for the
+                    // callers most likely to read it.
+                    "this connection was not granted that name"
                 },
                 wants_reply,
             );
@@ -1764,31 +1815,43 @@ impl<'a> Connection<'a> {
         Ok(Some((name.to_string(), flags)))
     }
 
-    /// `Register`'s three arguments, validated, or a refusal already sent.
+    /// `Register`'s four arguments, validated, or a refusal already sent.
     ///
     /// Every one of them is checked here rather than in the registry, for the
     /// reason every other wire argument in this file is: the registry's job is
     /// to say what may be registered, and the wire's job is to make sure what
     /// reached it is the shape it claims. A registry that also had to defend
     /// against malformed strings would be two graders for one rule.
+    ///
+    /// The fourth is the application's `[Session Bus Policy]` `own` entries.
+    /// It is a REGISTRANT-supplied list, like the app id and on the same v1
+    /// terms — registration is authenticated by uid and nothing else — so
+    /// nothing here treats it as authenticated metadata. What this function
+    /// establishes is only that each entry is a well-known name and that none
+    /// of them is reserved; what the entries are WORTH is `may_own`'s
+    /// question, and §D's answer is that a launcher able to forge this list is
+    /// already able to launch whatever it likes.
     fn registration_arguments(
         &mut self,
         message: &message::Message<'_>,
         wants_reply: bool,
-    ) -> Result<Option<(String, String, Vec<String>)>, Ended> {
-        if !self.takes_if_wanted(message, "ssas", wants_reply)? {
+    ) -> Result<Option<Registration>, Ended> {
+        if !self.takes_if_wanted(message, "ssasas", wants_reply)? {
             return Ok(None);
         }
         let args = message.args();
         let instance = args.first().and_then(crate::wire::Value::as_str);
         let app_id = args.get(1).and_then(crate::wire::Value::as_str);
         let names = args.get(2).and_then(|value| value.as_seq());
-        let (Some(instance), Some(app_id), Some(names)) = (instance, app_id, names) else {
+        let grants = args.get(3).and_then(|value| value.as_seq());
+        let (Some(instance), Some(app_id), Some(names), Some(grants)) =
+            (instance, app_id, names, grants)
+        else {
             self.refuse_if_wanted(
                 message,
                 "org.freedesktop.DBus.Error.InvalidArgs",
-                "Register takes an instance name, an application id and a list \
-                 of service names",
+                "Register takes an instance name, an application id, a list of \
+                 service names and a list of names it may own",
                 wants_reply,
             )?;
             return Ok(None);
@@ -1811,37 +1874,103 @@ impl<'a> Connection<'a> {
             )?;
             return Ok(None);
         }
-        let Ok(values) = names.values(crate::lineage::MAX_SERVICES) else {
+        let Some(services) = self.well_known_names(
+            message,
+            &names,
+            crate::lineage::MAX_SERVICES,
+            "that service list cannot be read",
+            "a predeclared service must be a bus name",
+            wants_reply,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(owned) = self.well_known_names(
+            message,
+            &grants,
+            crate::lineage::MAX_OWNED_NAMES,
+            "that list of names cannot be read",
+            "a name an instance may own must be a bus name",
+            wants_reply,
+        )?
+        else {
+            return Ok(None);
+        };
+        // The reservation, refused where a name is RECORDED as well as where
+        // one is taken. `may_own` checks it again and would refuse the
+        // request anyway, so this is not what keeps the portal's names safe —
+        // it is what keeps a permission file from claiming something the
+        // broker will never honour. A claim recorded and then silently
+        // ignored is a file that lies about what it does, and the launcher
+        // finds out at registration instead of at first use. `engine`'s
+        // permission parser refuses the same set a third time, one layer
+        // further out; none of the three is the others' spare, because this
+        // argument arrives over a socket rather than out of that parser.
+        //
+        // BOTH lists, which a reviewer asked for and which costs one
+        // iterator. A predeclared service is a name the instance intends to
+        // answer on, so a reserved one is the same lie in the same file —
+        // inert only because activation has not landed, which is exactly the
+        // condition that makes it easy to forget later.
+        let mut claimed = owned.iter().chain(services.iter());
+        if let Some(reserved) = claimed.find(|name| policy::is_reserved_name(name)) {
+            self.refuse_if_wanted(
+                message,
+                "td.Jail1.Error.Refused",
+                &format!("{reserved:?} is reserved for this broker and the portal"),
+                wants_reply,
+            )?;
+            return Ok(None);
+        }
+        Ok(Some(Registration {
+            instance: instance.to_string(),
+            app_id: app_id.to_string(),
+            services,
+            owned,
+        }))
+    }
+
+    /// One `as` argument read as at most `most` well-known bus names.
+    ///
+    /// Both of `Register`'s name lists want the identical grading and differ
+    /// only in what they are FOR, so the two refusals are parameters rather
+    /// than a second copy of the loop. A unique name — `:1.7` — fails it:
+    /// those are the broker's to hand out and nobody's to claim, which makes
+    /// `valid_bus_name` the wrong grader for either list.
+    fn well_known_names(
+        &mut self,
+        message: &message::Message<'_>,
+        seq: &crate::wire::Seq<'_>,
+        most: usize,
+        unreadable: &str,
+        malformed: &str,
+        wants_reply: bool,
+    ) -> Result<Option<Vec<String>>, Ended> {
+        let Ok(values) = seq.values(most) else {
             self.refuse_if_wanted(
                 message,
                 "org.freedesktop.DBus.Error.InvalidArgs",
-                "that service list cannot be read",
+                unreadable,
                 wants_reply,
             )?;
             return Ok(None);
         };
-        let mut services = Vec::with_capacity(values.len());
+        let mut names = Vec::with_capacity(values.len());
         for value in &values {
-            match value.as_str() {
-                // A WELL-KNOWN name. A predeclared service is a name the
-                // instance intends to own, and a unique name — `:1.7` — is
-                // the broker's to hand out and nobody's to claim, so
-                // `valid_bus_name` was the wrong grader here too.
-                Some(name) if crate::name::valid_well_known_name(name) => {
-                    services.push(name.to_string());
-                }
-                _ => {
-                    self.refuse_if_wanted(
-                        message,
-                        "org.freedesktop.DBus.Error.InvalidArgs",
-                        "a predeclared service must be a bus name",
-                        wants_reply,
-                    )?;
-                    return Ok(None);
-                }
-            }
+            let Some(name) = value.as_str().filter(|name| {
+                crate::name::valid_well_known_name(name)
+            }) else {
+                self.refuse_if_wanted(
+                    message,
+                    "org.freedesktop.DBus.Error.InvalidArgs",
+                    malformed,
+                    wants_reply,
+                )?;
+                return Ok(None);
+            };
+            names.push(name.to_string());
         }
-        Ok(Some((instance.to_string(), app_id.to_string(), services)))
+        Ok(Some(names))
     }
 
     /// `Complete`'s two arguments, validated, or a refusal already sent.
@@ -2812,9 +2941,10 @@ mod tests {
     fn register_call(instance: &str, app_id: &str, serial: u32) -> Vec<u8> {
         let instance = instance.to_string();
         let app_id = app_id.to_string();
-        jail_call("Register", serial, "ssas", move |writer| {
+        jail_call("Register", serial, "ssasas", move |writer| {
             writer.string(&instance)?;
             writer.string(&app_id)?;
+            writer.array("s", |_| Ok(()))?;
             writer.array("s", |_| Ok(()))
         })
     }
@@ -2840,11 +2970,22 @@ mod tests {
     /// bind its own child and nothing else. The test harness stands in for
     /// stage 1 and this process stands in for the stage 2 it spawned.
     fn serving_as(app_id: &str) -> (UnixStream, mpsc::Receiver<Outcome>) {
+        serving_granted(app_id, &[])
+    }
+
+    /// `serving_as` for an instance whose permission file granted it `owned`.
+    ///
+    /// The grant travels through the REGISTRY rather than being set on the
+    /// connection, which is the whole point of the arrangement under test: a
+    /// jailed peer's grant is whatever the instance it descends from was
+    /// registered with, and nothing the connection itself says can alter it.
+    fn serving_granted(app_id: &str, owned: &[&str]) -> (UnixStream, mpsc::Receiver<Outcome>) {
         let (client, server) = UnixStream::pair().expect("socketpair");
         client
             .set_read_timeout(Some(std::time::Duration::from_secs(20)))
             .expect("client read timeout");
         let app_id = app_id.to_string();
+        let owned: Vec<String> = owned.iter().map(|name| (*name).to_string()).collect();
         let (tell, hear) = mpsc::channel();
         thread::spawn(move || {
             let guid = Guid::new(GUID).expect("guid");
@@ -2869,7 +3010,17 @@ mod tests {
                 starttime: theirs.starttime,
             };
             let token = instances
-                .open(&RealProcfs, "fixture", &app_id, Vec::new(), this_uid(), registrant)
+                .open(
+                    &RealProcfs,
+                    Registration {
+                        instance: "fixture".to_string(),
+                        app_id,
+                        services: Vec::new(),
+                        owned,
+                    },
+                    this_uid(),
+                    registrant,
+                )
                 .expect("phase one");
             instances
                 .complete(&RealProcfs, &token, pid, this_uid(), registrant)
@@ -2892,18 +3043,29 @@ mod tests {
     /// one: a regression that stops the bus answering should fail this suite,
     /// not stop it. Two mutations in the red-check hung here before it did.
     fn serving() -> (UnixStream, mpsc::Receiver<Outcome>) {
+        let (client, hear, _instances) = serving_watching();
+        (client, hear)
+    }
+
+    /// The same, handing back the registry the connection registers into.
+    ///
+    /// What a registration RECORDED is not visible from the wire — `Register`
+    /// answers a token and nothing else — so a test that wants to know
+    /// whether the right list was stored has to read the registry.
+    fn serving_watching() -> (UnixStream, mpsc::Receiver<Outcome>, Arc<Instances>) {
         let (client, server) = UnixStream::pair().expect("socketpair");
         client
             .set_read_timeout(Some(std::time::Duration::from_secs(20)))
             .expect("client read timeout");
         let (tell, hear) = mpsc::channel();
+        let instances = Arc::new(Instances::new());
+        let registry = Arc::clone(&instances);
         thread::spawn(move || {
             let guid = Guid::new(GUID).expect("guid");
             let quota = Quota::new();
             let bus = Bus::new();
-            let instances = Instances::new();
             let mut connection =
-                Connection::accept(server, guid, &quota, &bus, &instances).expect("accept");
+                Connection::accept(server, guid, &quota, &bus, &registry).expect("accept");
             let ended = connection.serve();
             let _ = tell.send(Outcome {
                 ended,
@@ -2911,7 +3073,7 @@ mod tests {
                 uid: connection.authenticated_uid(),
             });
         });
-        (client, hear)
+        (client, hear, instances)
     }
 
     /// A bus with several served connections on it, and the client end of
@@ -2988,6 +3150,17 @@ mod tests {
     /// It is the only shape in this suite where a message crosses a policy
     /// boundary, which is what the reply rules are about.
     fn mixed_bus() -> (Arc<Bus>, UnixStream, UnixStream) {
+        mixed_bus_granting(&[])
+    }
+
+    /// `mixed_bus` where the confined peer's instance was granted `owned`.
+    ///
+    /// This is the arrangement §B.3.2 describes and the only one in this
+    /// suite that can show it working: a sandboxed application holding its
+    /// own well-known name while an unconfined peer on the same bus reaches
+    /// it by that name.
+    fn mixed_bus_granting(owned: &[&str]) -> (Arc<Bus>, UnixStream, UnixStream) {
+        let owned: Vec<String> = owned.iter().map(|name| (*name).to_string()).collect();
         let (free_client, free_server) = UnixStream::pair().expect("socketpair");
         let (jailed_client, jailed_server) = UnixStream::pair().expect("socketpair");
         for client in [&free_client, &jailed_client] {
@@ -3023,7 +3196,17 @@ mod tests {
                 starttime: theirs.starttime,
             };
             let token = instances
-                .open(&RealProcfs, "fixture", "fixture", Vec::new(), this_uid(), registrant)
+                .open(
+                    &RealProcfs,
+                    Registration {
+                        instance: "fixture".to_string(),
+                        app_id: "fixture".to_string(),
+                        services: Vec::new(),
+                        owned,
+                    },
+                    this_uid(),
+                    registrant,
+                )
                 .expect("phase one");
             instances
                 .complete(&RealProcfs, &token, pid, this_uid(), registrant)
@@ -3055,6 +3238,21 @@ mod tests {
     /// the work is invisible from the wire, so the test that cares reads the
     /// registry instead.
     fn confined_bus_watching(peers: usize) -> (Arc<Bus>, Arc<Instances>, Vec<UnixStream>) {
+        confined_bus_granting(peers, &[])
+    }
+
+    /// `confined_bus_of` where the one registered instance was granted
+    /// `owned`.
+    ///
+    /// Every peer here descends from the same instance, so every peer carries
+    /// the same grant — which is the shape of two windows of one application,
+    /// and the only way this harness can put a granted CALLER and a granted
+    /// HOLDER on one bus.
+    fn confined_bus_granting(
+        peers: usize,
+        owned: &[&str],
+    ) -> (Arc<Bus>, Arc<Instances>, Vec<UnixStream>) {
+        let owned: Vec<String> = owned.iter().map(|name| (*name).to_string()).collect();
         let mut clients = Vec::new();
         let mut servers = Vec::new();
         for _ in 0..peers {
@@ -3085,7 +3283,17 @@ mod tests {
                 starttime: theirs.starttime,
             };
             let token = instances
-                .open(&RealProcfs, "fixture", "fixture", Vec::new(), this_uid(), registrant)
+                .open(
+                    &RealProcfs,
+                    Registration {
+                        instance: "fixture".to_string(),
+                        app_id: "fixture".to_string(),
+                        services: Vec::new(),
+                        owned,
+                    },
+                    this_uid(),
+                    registrant,
+                )
                 .expect("phase one");
             instances
                 .complete(&RealProcfs, &token, pid, this_uid(), registrant)
@@ -3150,7 +3358,17 @@ mod tests {
             };
             // Opened and deliberately NOT completed.
             instances
-                .open(&RealProcfs, "pending", "pending", Vec::new(), this_uid(), registrant)
+                .open(
+                    &RealProcfs,
+                    Registration {
+                        instance: "pending".to_string(),
+                        app_id: "pending".to_string(),
+                        services: Vec::new(),
+                        owned: Vec::new(),
+                    },
+                    this_uid(),
+                    registrant,
+                )
                 .expect("phase one");
             thread::scope(|scope| {
                 for server in servers {
@@ -3505,6 +3723,36 @@ mod tests {
             .to_string()
     }
 
+    /// A peer that has connected, authenticated and said `Hello`, ready to
+    /// register.
+    ///
+    /// `serving()` and not a confined fixture: `td.Jail1` answers only a
+    /// caller this broker has placed OUTSIDE a jail, so a confined peer would
+    /// be refused at the gate and never reach the argument grading these
+    /// tests are about.
+    fn registering_peer() -> (Peer, mpsc::Receiver<Outcome>) {
+        let (peer, hear, _instances) = registering_peer_watching();
+        (peer, hear)
+    }
+
+    /// The same, handing back the registry it registers into.
+    fn registering_peer_watching() -> (Peer, mpsc::Receiver<Outcome>, Arc<Instances>) {
+        let (mut client, hear, instances) = serving_watching();
+        let mut opening =
+            format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+        opening.extend_from_slice(&bus_call("Hello", 1));
+        client.write_all(&opening).expect("write");
+        let mut peer = Peer {
+            stream: client,
+            held: Vec::new(),
+            lines: 1,
+            deferred: Vec::new(),
+        };
+        let _hello = peer.frame();
+        let _gained = takes_its_name(&mut peer);
+        (peer, hear, instances)
+    }
+
     /// `RequestName(name, flags)`.
     fn request_name(name: &str, flags: u32, serial: u32) -> Vec<u8> {
         message::Builder::method_call(crate::wire::Endian::Little, BUS_PATH, Some(BUS_NAME), "RequestName")
@@ -3749,9 +3997,10 @@ mod tests {
         )
         .destination(BUS_NAME)
         .serial(2)
-        .body("ssas", |writer| {
+        .body("ssasas", |writer| {
             writer.string("shouted")?;
             writer.string("fixture")?;
+            writer.array("s", |_| Ok(()))?;
             writer.array("s", |_| Ok(()))
         })
         .expect("encode")
@@ -3802,9 +4051,10 @@ mod tests {
         .destination(BUS_NAME)
         .flags(message::FLAG_NO_REPLY_EXPECTED)
         .serial(2)
-        .body("ssas", |writer| {
+        .body("ssasas", |writer| {
             writer.string("quiet")?;
             writer.string("fixture")?;
+            writer.array("s", |_| Ok(()))?;
             writer.array("s", |_| Ok(()))
         })
         .expect("encode")
@@ -3968,19 +4218,7 @@ mod tests {
     /// Every argument is checked at the wire rather than in the registry.
     #[test]
     fn registration_refuses_arguments_that_are_not_what_they_claim() {
-        let (mut client, _hear) = serving();
-        let mut opening =
-            format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
-        opening.extend_from_slice(&bus_call("Hello", 1));
-        client.write_all(&opening).expect("write");
-        let mut peer = Peer {
-            stream: client,
-            held: Vec::new(),
-            lines: 1,
-            deferred: Vec::new(),
-        };
-        let _hello = peer.frame();
-        let _gained = takes_its_name(&mut peer);
+        let (mut peer, _hear) = registering_peer();
 
         // A name that is a `.` run and nothing else, which the grammar's
         // comment claims to exclude and a draft did not: `/` was refused and
@@ -4012,10 +4250,11 @@ mod tests {
         );
 
         // A predeclared service that is not a bus name either.
-        peer.send(&jail_call("Register", 4, "ssas", |writer| {
+        peer.send(&jail_call("Register", 4, "ssasas", |writer| {
             writer.string("fixture")?;
             writer.string("fixture")?;
-            writer.array("s", |array| array.string("nope"))
+            writer.array("s", |array| array.string("nope"))?;
+            writer.array("s", |_| Ok(()))
         }));
         assert_eq!(
             error_of(&peer.frame()).as_deref(),
@@ -4027,10 +4266,11 @@ mod tests {
         // `:1.7` is a unique name, which the broker hands out and nobody may
         // claim. A draft graded services with `valid_bus_name`, which accepts
         // it.
-        peer.send(&jail_call("Register", 5, "ssas", |writer| {
+        peer.send(&jail_call("Register", 5, "ssasas", |writer| {
             writer.string("fixture")?;
             writer.string("fixture")?;
-            writer.array("s", |array| array.string(":1.7"))
+            writer.array("s", |array| array.string(":1.7"))?;
+            writer.array("s", |_| Ok(()))
         }));
         assert_eq!(
             error_of(&peer.frame()).as_deref(),
@@ -4062,19 +4302,7 @@ mod tests {
     /// the broker hands out and nobody can be.
     #[test]
     fn the_application_id_is_a_flat_td_name() {
-        let (mut client, _hear) = serving();
-        let mut opening =
-            format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
-        opening.extend_from_slice(&bus_call("Hello", 1));
-        client.write_all(&opening).expect("write");
-        let mut peer = Peer {
-            stream: client,
-            held: Vec::new(),
-            lines: 1,
-            deferred: Vec::new(),
-        };
-        let _hello = peer.frame();
-        let _gained = takes_its_name(&mut peer);
+        let (mut peer, _hear) = registering_peer();
 
         let mut serial = 2;
         for (which, good) in ["fixture", "firefox", "td-jail-fixture", "org.td.Alias"]
@@ -4127,9 +4355,10 @@ mod tests {
         )
         .destination(BUS_NAME)
         .serial(2)
-        .body("ssas", |writer| {
+        .body("ssasas", |writer| {
             writer.string("fixture")?;
             writer.string("fixture")?;
+            writer.array("s", |_| Ok(()))?;
             writer.array("s", |_| Ok(()))
         })
         .expect("body")
@@ -4868,9 +5097,10 @@ mod tests {
         )
         .destination(BUS_NAME)
         .serial(2)
-        .body("ssas", |writer| {
+        .body("ssasas", |writer| {
             writer.string("mine")?;
             writer.string("mine")?;
+            writer.array("s", |_| Ok(()))?;
             writer.array("s", |_| Ok(()))
         })
         .expect("body")
@@ -5043,9 +5273,10 @@ mod tests {
             if flags != 0 {
                 call = call.flags(flags);
             }
-            call.body("ssas", |writer| {
+            call.body("ssasas", |writer| {
                 writer.string("mine")?;
                 writer.string("mine")?;
+                writer.array("s", |_| Ok(()))?;
                 writer.array("s", |_| Ok(()))
             })
             .expect("body")
@@ -6576,6 +6807,581 @@ mod tests {
             Some("org.freedesktop.DBus.Error.AccessDenied")
         );
         assert!(!bus.holds(&name, "org.example.Thing"));
+    }
+
+    /// A confined peer takes the name its permission file granted it.
+    ///
+    /// §B.3.2's second bullet, on the mixed bus because a grant is only
+    /// interesting beside a peer that did not get one: both connections here
+    /// are the same process, and what separates them is which of them was
+    /// accepted while the instance record existed.
+    #[test]
+    fn a_confined_peer_takes_the_name_it_was_granted() {
+        if !pidfd_available() {
+            return;
+        }
+        let (bus, _free, jailed) = mixed_bus_granting(&["org.mozilla.firefox"]);
+        let (mut app, app_name) = Peer::arrive(jailed);
+
+        app.send(&request_name("org.mozilla.firefox", 0, 2));
+        assert_eq!(
+            name_code(&app.answer()),
+            (1, Some(2)),
+            "a granted name was refused"
+        );
+        assert!(bus.holds(&app_name, "org.mozilla.firefox"));
+        assert_eq!(
+            announced(&app.frame()),
+            (
+                "NameAcquired".to_string(),
+                "org.mozilla.firefox".to_string()
+            )
+        );
+
+        // A grant is one name. Everything else is still §D's default.
+        app.send(&request_name("org.gnome.Nautilus", 0, 3));
+        let frame = app.answer();
+        let (refusal, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(
+            refusal.fields.error_name,
+            Some("org.freedesktop.DBus.Error.AccessDenied"),
+            "an ungranted name was taken"
+        );
+        assert!(!bus.holds(&app_name, "org.gnome.Nautilus"));
+    }
+
+    /// A granted name is a name it can give back, and take again.
+    ///
+    /// `ReleaseName` has no grant of its own to consult — a caller releases
+    /// what it holds — so what this pins is that the grant is not consumed by
+    /// being used, which a design storing the own-set on the connection and
+    /// removing entries as they were claimed would get wrong.
+    #[test]
+    fn a_granted_name_can_be_given_back_and_taken_again() {
+        if !pidfd_available() {
+            return;
+        }
+        let (bus, _free, jailed) = mixed_bus_granting(&["org.mozilla.firefox"]);
+        let (mut app, app_name) = Peer::arrive(jailed);
+
+        app.send(&request_name("org.mozilla.firefox", 0, 2));
+        assert_eq!(name_code(&app.answer()).0, 1);
+        let _acquired = app.frame();
+
+        app.send(&release_name("org.mozilla.firefox", 3));
+        assert_eq!(name_code(&app.answer()), (1, Some(3)), "released");
+        assert!(!bus.holds(&app_name, "org.mozilla.firefox"));
+        let _lost = app.frame();
+
+        app.send(&request_name("org.mozilla.firefox", 0, 4));
+        assert_eq!(
+            name_code(&app.answer()),
+            (1, Some(4)),
+            "the grant was spent by using it"
+        );
+        assert!(bus.holds(&app_name, "org.mozilla.firefox"));
+    }
+
+    /// The whole point of the grant: the application is reachable BY the name.
+    ///
+    /// A grant that let a peer hold a name nothing could then address would
+    /// discharge the mechanism and none of the purpose, so this drives the
+    /// message across the boundary in both directions — an unconfined caller
+    /// addressing the sandbox by its well-known name, and the sandbox's reply
+    /// getting back. The reply half rests on the pending-reply table rather
+    /// than on the talk set, which is what lets a confined peer answer a peer
+    /// it may not itself see.
+    #[test]
+    fn a_granted_name_routes_to_the_application_holding_it() {
+        if !pidfd_available() {
+            return;
+        }
+        let (_bus, free, jailed) = mixed_bus_granting(&["org.mozilla.firefox"]);
+        let (mut app, app_name) = Peer::arrive(jailed);
+        let (mut caller, caller_name) = Peer::arrive(free);
+
+        app.send(&request_name("org.mozilla.firefox", 0, 2));
+        assert_eq!(name_code(&app.answer()).0, 1);
+        let _acquired = app.frame();
+
+        caller.send(&peer_call("org.mozilla.firefox", 7, "over here"));
+        let frame = app.frame();
+        let (arrived, _) = message::decode(&frame, 0).expect("decode the call");
+        assert_eq!(arrived.kind, message::MessageType::MethodCall);
+        assert_eq!(
+            arrived.fields.sender,
+            Some(caller_name.as_str()),
+            "the broker's word about who called"
+        );
+        assert_eq!(
+            arrived.fields.destination,
+            Some("org.mozilla.firefox"),
+            "the destination is the name the caller wrote"
+        );
+        assert_eq!(
+            arrived.args().first().and_then(crate::wire::Value::as_str),
+            Some("over here")
+        );
+
+        app.send(&reply_to(&caller_name, 7, 2));
+        let frame = caller.frame();
+        let (answer, _) = message::decode(&frame, 0).expect("decode the reply");
+        assert_eq!(answer.kind, message::MessageType::MethodReturn);
+        assert_eq!(answer.fields.reply_serial, Some(7));
+        assert_eq!(answer.fields.sender, Some(app_name.as_str()));
+    }
+
+    /// The grant a registration carried is the grant the registry recorded.
+    ///
+    /// `Register` answers a token and says nothing about what it stored, so
+    /// this reads the registry. The two lists are deliberately DIFFERENT: a
+    /// registration that recorded its predeclared services as its grant, or
+    /// recorded no grant at all, answers exactly the same token, and a test
+    /// passing one list twice could not tell either mistake from correct
+    /// behaviour.
+    #[test]
+    fn a_registration_records_the_grant_it_carried_and_not_its_services() {
+        let (mut peer, hear, instances) = registering_peer_watching();
+
+        peer.send(&jail_call("Register", 2, "ssasas", |writer| {
+            writer.string("fixture")?;
+            writer.string("fixture")?;
+            writer.array("s", |array| array.string("ca.desrt.dconf"))?;
+            writer.array("s", |array| array.string("org.mozilla.firefox"))
+        }));
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode Register's reply");
+        assert_eq!(
+            reply.kind,
+            message::MessageType::MethodReturn,
+            "Register was refused: {:?}",
+            reply.fields.error_name
+        );
+        assert_eq!(
+            instances.granted("fixture"),
+            Some(vec!["org.mozilla.firefox".to_string()]),
+            "the registry recorded the wrong list"
+        );
+        drop(peer);
+        let _ = ended(&hear);
+    }
+
+    /// A confined peer can SEE the well-known name it holds.
+    ///
+    /// The broker sends `NameAcquired` for the name and then has to answer
+    /// questions about it consistently. Before the `own` grant reached
+    /// `may_see`, this peer was told by `GetNameOwner` that the name it was
+    /// holding had no owner, and `ListNames` omitted it — the broker denying
+    /// a fact it had just stated. Two reviewers and a probe found it
+    /// independently; the argument that settles it is that `BusAccess::Own`
+    /// allows `See`, so the permission file had already granted this.
+    #[test]
+    fn a_confined_peer_sees_and_lists_the_name_it_holds() {
+        if !pidfd_available() {
+            return;
+        }
+        let (bus, _free, jailed) = mixed_bus_granting(&["org.mozilla.firefox"]);
+        let (mut app, app_name) = Peer::arrive(jailed);
+
+        app.send(&request_name("org.mozilla.firefox", 0, 2));
+        assert_eq!(name_code(&app.answer()).0, 1);
+        assert_eq!(
+            announced(&app.frame()),
+            (
+                "NameAcquired".to_string(),
+                "org.mozilla.firefox".to_string()
+            )
+        );
+        assert!(bus.holds(&app_name, "org.mozilla.firefox"));
+
+        // `GetNameOwner` answers with the holder, which is this peer.
+        app.send(&name_query("GetNameOwner", "org.mozilla.firefox", 3));
+        let frame = app.answer();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(
+            reply.kind,
+            message::MessageType::MethodReturn,
+            "the holder was told its own name has no owner: {:?}",
+            reply.fields.error_name
+        );
+        assert_eq!(
+            reply.args().first().and_then(crate::wire::Value::as_str),
+            Some(app_name.as_str())
+        );
+
+        // And `ListNames` carries it beside the unique name.
+        app.send(&bus_call("ListNames", 4));
+        let frame = app.answer();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        let listed: Vec<String> = reply
+            .args()
+            .first()
+            .and_then(crate::wire::Value::as_seq)
+            .and_then(|seq| seq.values(64).ok())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(crate::wire::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(listed.contains(&app_name), "its own unique name");
+        assert!(
+            listed.contains(&"org.mozilla.firefox".to_string()),
+            "the name it holds is missing from {listed:?}"
+        );
+
+        // A name it was NOT granted stays invisible, so the widening is the
+        // grant and not the act of holding something.
+        app.send(&name_query("GetNameOwner", "org.gnome.Nautilus", 5));
+        let frame = app.answer();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.NameHasNoOwner")
+        );
+    }
+
+    /// A granted name is ADDRESSABLE by the peers granted it, not only by
+    /// unconfined callers.
+    ///
+    /// `BusAccess::Own` allows `Talk`, so a permission file naming a name has
+    /// licensed reaching whoever holds it. Both peers here descend from one
+    /// instance and so carry one grant, which is what two windows of an
+    /// application look like: the second asks the first to do something, and
+    /// before this the broker reported the name absent to it.
+    #[test]
+    fn a_confined_caller_reaches_a_granted_name_another_peer_holds() {
+        if !pidfd_available() {
+            return;
+        }
+        let (_bus, _instances, mut clients) =
+            confined_bus_granting(2, &["org.mozilla.firefox"]);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut holder, holder_name) = Peer::arrive(first);
+        let (mut caller, caller_name) = Peer::arrive(second);
+
+        holder.send(&request_name("org.mozilla.firefox", 0, 2));
+        assert_eq!(name_code(&holder.answer()).0, 1);
+        let _acquired = holder.frame();
+
+        caller.send(&peer_call("org.mozilla.firefox", 7, "over here"));
+        let frame = holder.frame();
+        let (arrived, _) = message::decode(&frame, 0).expect("decode the call");
+        assert_eq!(
+            arrived.kind,
+            message::MessageType::MethodCall,
+            "a granted caller was refused: {:?}",
+            arrived.fields.error_name
+        );
+        assert_eq!(arrived.fields.sender, Some(caller_name.as_str()));
+        assert_eq!(
+            arrived.fields.destination,
+            Some("org.mozilla.firefox"),
+            "the destination is the name the caller wrote"
+        );
+
+        holder.send(&reply_to(&caller_name, 7, 3));
+        let frame = caller.frame();
+        let (answer, _) = message::decode(&frame, 0).expect("decode the reply");
+        assert_eq!(answer.kind, message::MessageType::MethodReturn);
+        assert_eq!(answer.fields.reply_serial, Some(7));
+        assert_eq!(answer.fields.sender, Some(holder_name.as_str()));
+    }
+
+    /// A registration may not grant a reserved name, and the grant that got
+    /// past registration would not be honoured either.
+    ///
+    /// Two refusals, and this covers the first. The second is `may_own`'s and
+    /// is pinned in `policy`; neither is the other's spare, because this one
+    /// grades an argument that arrived over a socket and that one guards the
+    /// point where the name is actually taken.
+    #[test]
+    fn a_registration_may_not_grant_a_reserved_name() {
+        let (mut peer, hear) = registering_peer();
+
+        let mut serial = 2u32;
+        for name in [
+            "org.freedesktop.DBus",
+            "org.freedesktop.portal.Desktop",
+            "org.freedesktop.impl.portal.Access",
+        ] {
+            let owned = name.to_string();
+            peer.send(&jail_call("Register", serial, "ssasas", move |writer| {
+                writer.string("fixture")?;
+                writer.string("fixture")?;
+                writer.array("s", |_| Ok(()))?;
+                writer.array("s", |array| array.string(&owned))
+            }));
+            assert_eq!(
+                error_of(&peer.frame()).as_deref(),
+                Some("td.Jail1.Error.Refused"),
+                "{name} was recorded as a grant"
+            );
+            serial = serial.saturating_add(1);
+        }
+        drop(peer);
+        let _ = ended(&hear);
+    }
+
+    /// Seeing a granted name is not asking who holds it.
+    ///
+    /// The widening that let a granted peer address a granted name went
+    /// through `may_see`, which at the time also gated
+    /// `GetConnectionUnixUser`,
+    /// `GetConnectionUnixProcessID`, `GetConnectionCredentials` and
+    /// `td.AppId`. A reviewer pointed out where that lands: two windows of one
+    /// application share one grant, so each could have read the other's uid,
+    /// host pid and application id — a host pid being the input to exactly the
+    /// `/proc` walk §E's identity story rests on. `may_ask_credentials` is the
+    /// narrower gate that stayed behind, and this is the end-to-end statement
+    /// of the difference: the caller below can see the name, list it, and call
+    /// it, and is told nothing about the process on the other end.
+    #[test]
+    fn a_granted_name_does_not_hand_over_its_holders_credentials() {
+        if !pidfd_available() {
+            return;
+        }
+        let (_bus, _instances, mut clients) =
+            confined_bus_granting(2, &["org.mozilla.firefox"]);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut holder, holder_name) = Peer::arrive(first);
+        let (mut caller, _caller_name) = Peer::arrive(second);
+
+        holder.send(&request_name("org.mozilla.firefox", 0, 2));
+        assert_eq!(name_code(&holder.answer()).0, 1);
+        let _acquired = holder.frame();
+
+        // It is there, and the caller can prove it -- and learns the
+        // holder's UNIQUE name doing so, which is the routing fact §D grants
+        // and the thread this test then has to follow.
+        caller.send(&name_query("GetNameOwner", "org.mozilla.firefox", 5));
+        let frame = caller.answer();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(
+            reply.fields.error_name, None,
+            "the grant no longer makes the name visible, which is the \
+             premise this test refuses to extend"
+        );
+        let unique = reply
+            .args()
+            .first()
+            .and_then(crate::wire::Value::as_str)
+            .map(str::to_string)
+            .expect("GetNameOwner answers with a unique name");
+        assert_eq!(unique, holder_name, "the owner is the peer that took it");
+
+        // And every question about the process behind it is answered the way
+        // an absent name is -- asked by the GRANTED name, and asked again by
+        // the unique name the answer above just handed over. The second half
+        // is the one worth having: a gate that refused only the well-known
+        // spelling would be one `GetNameOwner` away from useless, since the
+        // caller can always convert one into the other.
+        let mut serial = 6u32;
+        for query in [
+            "GetConnectionUnixUser",
+            "GetConnectionUnixProcessID",
+            "GetConnectionCredentials",
+        ] {
+            for target in ["org.mozilla.firefox", unique.as_str()] {
+                caller.send(&name_query(query, target, serial));
+                let frame = caller.answer();
+                let (reply, _) = message::decode(&frame, 0).expect("decode");
+                assert_eq!(
+                    reply.fields.error_name,
+                    Some("org.freedesktop.DBus.Error.NameHasNoOwner"),
+                    "{query} told a sandboxed peer about its neighbour, \
+                     asked as {target}"
+                );
+                serial = serial.saturating_add(1);
+            }
+        }
+
+        // The unique name is not addressable either, which is the same rule
+        // one layer over: §D grants the NAME, and the peer behind it is not
+        // a thing the grant mentions. Reported ABSENT rather than denied, for
+        // the reason `dispatch` records where it makes that choice -- a
+        // refusal that said `AccessDenied` would announce the peer it was
+        // refusing to admit exists.
+        caller.send(&peer_call(&unique, serial, "over here"));
+        let frame = caller.answer();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.NameHasNoOwner"),
+            "a granted caller addressed the holder rather than the name"
+        );
+    }
+
+    /// The HOLDER of a granted name may ask about that name, because the
+    /// answer is itself.
+    ///
+    /// `policy::may_ask_credentials` compares the target against the caller's
+    /// UNIQUE name, and a holder's well-known name is not that -- so the
+    /// narrower gate refused a peer asking about a name it was holding. The
+    /// broker then answered `NameHasOwner` yes, `GetNameOwner` with the
+    /// caller's own `:1.N`, and `GetConnectionUnixUser` with "that name has
+    /// no owner": three answers about one name, one contradicting the other
+    /// two, delivered to the one peer certain to notice. `dbus-daemon`
+    /// answers all three. A reviewer found it by asking what the HOLDER sees
+    /// rather than what its neighbour sees.
+    ///
+    /// Nothing is disclosed by fixing it -- the caller is the subject -- and
+    /// the neighbour case above is untouched, which is what the pair of tests
+    /// is for.
+    #[test]
+    fn a_holder_may_ask_about_the_name_it_holds() {
+        if !pidfd_available() {
+            return;
+        }
+        let (_bus, _instances, mut clients) =
+            confined_bus_granting(1, &["org.mozilla.firefox"]);
+        let only = clients.pop().expect("one client");
+        let (mut holder, holder_name) = Peer::arrive(only);
+
+        holder.send(&request_name("org.mozilla.firefox", 0, 2));
+        assert_eq!(name_code(&holder.answer()).0, 1);
+        let _acquired = holder.frame();
+
+        // The three answers that disagreed.
+        holder.send(&name_query("GetNameOwner", "org.mozilla.firefox", 3));
+        let frame = holder.answer();
+        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(
+            reply.args().first().and_then(crate::wire::Value::as_str),
+            Some(holder_name.as_str()),
+            "the holder no longer resolves the name it holds"
+        );
+
+        let mut serial = 4u32;
+        for query in [
+            "GetConnectionUnixUser",
+            "GetConnectionUnixProcessID",
+            "GetConnectionCredentials",
+        ] {
+            holder.send(&name_query(query, "org.mozilla.firefox", serial));
+            let frame = holder.answer();
+            let (reply, _) = message::decode(&frame, 0).expect("decode");
+            assert_eq!(
+                reply.fields.error_name, None,
+                "{query} told a peer its OWN held name has no owner"
+            );
+            serial = serial.saturating_add(1);
+        }
+
+        // And the answer is the holder, not merely non-empty: asking by the
+        // well-known name and by its own unique name agree.
+        holder.send(&name_query("GetConnectionUnixUser", "org.mozilla.firefox", serial));
+        let by_name = holder.answer();
+        let (by_name, _) = message::decode(&by_name, 0).expect("decode");
+        serial = serial.saturating_add(1);
+        holder.send(&name_query("GetConnectionUnixUser", &holder_name, serial));
+        let by_unique = holder.answer();
+        let (by_unique, _) = message::decode(&by_unique, 0).expect("decode");
+        assert_eq!(
+            by_name.args().first().and_then(crate::wire::Value::as_u32),
+            by_unique.args().first().and_then(crate::wire::Value::as_u32),
+            "the two spellings of one peer answered differently"
+        );
+    }
+
+    /// The reservation covers the PREDECLARED SERVICES too.
+    ///
+    /// `services` and `owned` are graded by one iterator over both, and this
+    /// is the half a reviewer noticed was missing. Nothing activates a service
+    /// yet, so a reserved name recorded there is inert today — which is
+    /// precisely why it would be easy to leave unrefused until the rung that
+    /// makes it live.
+    #[test]
+    fn a_registration_may_not_predeclare_a_reserved_service() {
+        let (mut peer, hear) = registering_peer();
+
+        let mut serial = 2u32;
+        for name in [
+            "org.freedesktop.DBus",
+            "org.freedesktop.portal",
+            "org.freedesktop.impl.portal.Access",
+        ] {
+            let service = name.to_string();
+            peer.send(&jail_call("Register", serial, "ssasas", move |writer| {
+                writer.string("fixture")?;
+                writer.string("fixture")?;
+                writer.array("s", |array| array.string(&service))?;
+                writer.array("s", |_| Ok(()))
+            }));
+            assert_eq!(
+                error_of(&peer.frame()).as_deref(),
+                Some("td.Jail1.Error.Refused"),
+                "{name} was recorded as a predeclared service"
+            );
+            serial = serial.saturating_add(1);
+        }
+        drop(peer);
+        let _ = ended(&hear);
+    }
+
+    /// A granted name is graded the way a service name is.
+    ///
+    /// The same two mistakes are available: something that is not a bus name
+    /// at all, and a UNIQUE name, which is a legal bus name and is the
+    /// broker's to hand out. A grant list read with `valid_bus_name` would
+    /// admit `:1.7`, and `may_own` would then compare a caller's request
+    /// against it.
+    #[test]
+    fn a_granted_name_must_be_a_well_known_name() {
+        let (mut peer, hear) = registering_peer();
+
+        let mut serial = 2u32;
+        for name in ["nope", ":1.7", "", "org..double"] {
+            let owned = name.to_string();
+            peer.send(&jail_call("Register", serial, "ssasas", move |writer| {
+                writer.string("fixture")?;
+                writer.string("fixture")?;
+                writer.array("s", |_| Ok(()))?;
+                writer.array("s", |array| array.string(&owned))
+            }));
+            assert_eq!(
+                error_of(&peer.frame()).as_deref(),
+                Some("org.freedesktop.DBus.Error.InvalidArgs"),
+                "{name:?} was accepted as a grant"
+            );
+            serial = serial.saturating_add(1);
+        }
+        drop(peer);
+        let _ = ended(&hear);
+    }
+
+    /// The grant list is bounded on the wire, not only in the registry.
+    ///
+    /// `MAX_OWNED_NAMES` is charged by `Instances::open`, but a list longer
+    /// than the reader will read is refused before that — and the two limits
+    /// are the same number so the refusal is one rule with two enforcement
+    /// points rather than a reader that silently truncates.
+    #[test]
+    fn a_registration_may_not_grant_more_names_than_the_bound() {
+        let (mut peer, hear) = registering_peer();
+
+        peer.send(&jail_call("Register", 2, "ssasas", |writer| {
+            writer.string("fixture")?;
+            writer.string("fixture")?;
+            writer.array("s", |_| Ok(()))?;
+            writer.array("s", |array| {
+                for which in 0..=crate::lineage::MAX_OWNED_NAMES {
+                    array.string(&format!("org.example.N{which}"))?;
+                }
+                Ok(())
+            })
+        }));
+        assert_eq!(
+            error_of(&peer.frame()).as_deref(),
+            Some("org.freedesktop.DBus.Error.InvalidArgs"),
+            "an oversized grant list was accepted"
+        );
+        drop(peer);
+        let _ = ended(&hear);
     }
 
     /// `ReleaseName` tells a caller nothing the filter would withhold.

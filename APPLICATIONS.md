@@ -425,24 +425,23 @@ store hashes (§B.8): a short name leaves the application→runtime edge
 invisible to the closure query and to any future collector.
 
 **Registration is the crate's own obligation, not a separate program's,
-and it is split across the two stages the way §D describes.** Stage 0
-opens phase one — `{instance, app-id, permitted service names}`, for an
-opaque one-shot token — before it unshares anything, because the pid the
-record needs does not exist until after; stage 1 completes it with the
+and it is split across the two stages the way §D describes.** Stage 0 opens
+phase one — `{instance, app-id, permitted service names, owned bus names}`,
+for an opaque one-shot token — before it unshares anything, because the pid
+the record needs does not exist until after; stage 1 completes it with the
 stage-2 pid it gets back from `Command::spawn`. §E rests `Unconfined` —
 which grants full portal access — on the registry being complete by
 construction, because nothing entered a jail without a registrar running
-first. The registrar and the jail are now one binary and `/bin/td-jail`
-is a documented entry point, so that premise has to be restated as an
-invariant of the crate itself: **stage 1 refuses to proceed without the
-token stage 0 obtained**, and entering stage 1 without it is a refusal
-rather than an unregistered jail. (An earlier draft called registration
-"stage 1's obligation" flatly while §D and §E named stage 0, which are
-the two halves of one protocol described as though they were rival
-answers.) The
-exposure if it were not is bounded — an unregistered launcher is a
-uid-1000 process, which is `Unconfined` anyway — but the argument that
-makes `Unconfined` a positive result rather than a default is not.
+first. The registrar and the jail are now one binary and `/bin/td-jail` is a
+documented entry point, so that premise has to be restated as an invariant
+of the crate itself: **stage 1 refuses to proceed without the token stage 0
+obtained**, and entering stage 1 without it is a refusal rather than an
+unregistered jail. (An earlier draft called registration "stage 1's
+obligation" flatly while §D and §E named stage 0, which are the two halves
+of one protocol described as though they were rival answers.) The exposure
+if it were not is bounded — an unregistered launcher is a uid-1000 process,
+which is `Unconfined` anyway — but the argument that makes `Unconfined` a
+positive result rather than a default is not.
 
 **Not a shell script.** Directive 3 keeps shell out of these crates,
 `/bin/sh` is td-sh, and a launcher composes the argv of the process the
@@ -1040,9 +1039,11 @@ lifecycle remain a separate landing. The format does not pretend a lexical
 parser performed those filesystem operations.
 
 Session-bus keys are exact well-known names, never unique names or wildcards,
-and their values are the ordered capabilities `see`, `talk` and `own`.
-Applications cannot own the broker or reserved `org.freedesktop.portal.*` and
-`org.freedesktop.impl.portal.*` names. Resource values are bounded positive
+and their values are the ordered capabilities `see`, `talk` and `own` — an
+`own` entry confers the two below it, which is what `BusAccess::allows`
+states and what the broker implements. Applications cannot own the broker,
+the reserved `org.freedesktop.portal.*` and `org.freedesktop.impl.portal.*`
+names, or the two bare namespace roots. Resource values are bounded positive
 decimal integers. Memory is a byte count capped at
 9,223,372,036,854,767,616, the largest 4096-byte-aligned value below the first
 value the pinned kernel rounds to its unlimited page-counter sentinel, and
@@ -1245,13 +1246,19 @@ For `td-busd`, full Firefox fidelity needs:
   borrow the fixture, portal or another application's names and quotas;
 - `RequestName`/`ReleaseName` with the bounded owner queue for
   `org.mozilla.firefox.*` and `org.mpris.MediaPlayer2.firefox.*`. The
-  MECHANISM is landed — see §D — and the GRANT is not: §D's default sandboxed
-  policy owns no name, and the `[Session Bus Policy]` `own` entries that would
-  widen it do not reach the broker yet, because `td.Jail1`'s registration
-  carries an app id, an instance and a predeclared service list and no
-  own-set. Firefox can be routed to by name the moment something may hold one;
-  what is missing is the landing that carries the permission file's own
-  entries through the registration;
+  MECHANISM and the GRANT are both landed — see §D. `td.Jail1`'s registration
+  carries the permission file's `[Session Bus Policy]` `own` entries, and a
+  sandboxed application holds exactly the names they list. What is still owed
+  is the `.*` on BOTH families here, and a first version of this paragraph
+  got that wrong by claiming the bullet was discharged and attributing the
+  residual to MPRIS alone. Session-bus keys are EXACT names, and both starred
+  families carry a suffix the application picks at run time: MPRIS appends a
+  per-instance number, and Firefox's remote-control name appends an encoding
+  of the profile path. Neither can be written in a permission file, so what
+  an `own` entry can express today is the BARE `org.mozilla.firefox` — enough
+  to prove the path end to end, not enough for the two features this bullet
+  is about. Media keys, player integration and remote control need an
+  amendment admitting a suffix form for `own`, not more broker work;
 - `AddMatch`/`RemoveMatch` and sender validation, so portal, MPRIS,
   file-manager and accessibility signals cannot be spoofed or delivered
   across applications. Authenticated pending-reply ownership is landed — see
@@ -2083,17 +2090,21 @@ bus socket of step 12 and the five persistent state directories, and a
 read-back-up loopback interface in the otherwise-empty network namespace.
 It deliberately leaves `/etc`, `/sys`, `/var/lib`, `/var/cache`,
 `.flatpak-info`, extension mounts, network sharing, mutable permission
-overrides and resource grants absent. It accepts exactly `sockets=wayland`
-plus the closed filesystem subset below; any other policy is refused. Later
-rungs fill those named rows without making their absence a degraded launch
-mode.
+overrides absent. It accepts exactly `sockets=wayland`, the closed
+filesystem subset below, resource limits, and `[Session Bus Policy]` `own`
+entries, which it forwards to the broker at registration and does not itself
+act on; any other policy is refused, and the refusal names the request so an
+operator holding a permission file learns which line to change. Later rungs
+fill those named rows without making their absence a degraded launch mode.
 
 The bus is bound unconditionally and is deliberately not a `sockets=`
 permission, which is what step 12 has said since it was written. It is
 also the one landed row whose enclosing claim — that the broker is the
-policy — is a target rather than a description of what runs: today's
-td-busd routes directed calls and enforces admission quotas, and has no
-per-caller policy at all. Its PRESENCE is a launch precondition as well:
+policy — is now PARTLY a description of what runs rather than wholly a
+target: today's td-busd resolves a per-jail identity at accept, filters
+what each caller may see, address and own, and honours the `own` entries
+this row forwards. What it still lacks is match rules, so the claim is
+not yet whole. Its PRESENCE is a launch precondition as well:
 `plan_launch` resolves the socket before the jail unshares, so a missing
 or non-socket `/run/user/1000/bus` fails the launch of every application,
 including one that never opens D-Bus. §D records what all of that costs.
@@ -2951,7 +2962,11 @@ portal-owned names; and gets `AccessDenied` for everything else, with
 broadcasts silently undelivered rather than errored — answering a message
 that was not addressed to you is worse than dropping it.
 `[Session Bus Policy]` `see`/`talk`/`own` entries from authenticated
-metadata widen that.
+metadata widen that. Of the three, `own` is implemented: it reaches the
+broker through `td.Jail1`'s registration and is what a sandboxed application
+holds a well-known name by. `see` and `talk` are parsed and refused, because
+which imported services a sandbox may address is a decision this section owes
+rather than a mechanism it is waiting on.
 
 That grant is one-directional and the implementation reads it so. A
 sandbox may CALL a portal member and RECEIVE its replies and directed
@@ -2990,22 +3005,22 @@ privilege up.
 **Identity is lineage, not just `/proc/<pid>/root/.flatpak-info`.** This
 is a correction to the obvious design and it matters for exactly the app
 this project exists for: a nested Firefox child can change its mount
-namespace and so change what `/proc/<pid>/root/.flatpak-info` resolves
-to. So the broker holds `{instance, app-id, stage-2 pid, start time,
-permitted service names}`, and a connection is authenticated by **descent
-from that registered PID 1**. The pid the broker starts from is expressed
-in the *broker's* pid namespace, so it stays meaningful even though the app
-sees itself in a nested one — true of `SO_PEERCRED.pid`, and true of the
-`Pid:` line a pidfd's `fdinfo` carries, which is what the accept path
-actually reads and which reports in the namespace of the process doing the
-reading. `NSpid:` is the per-namespace chain and is deliberately not
-consulted: its innermost entry is 1 for every jail. A process whose lineage cannot be proven is
-denied. Unsandboxed same-uid connections are unrestricted — td's existing
-trust model, stated explicitly in §E — but **"unsandboxed" is a proved
-answer here and not a fallback**, because the two sentences you just read
-would otherwise resolve the same ambiguous peer in opposite directions.
-The broker's three-valued reply, and why the middle answer is provable,
-are in §E.
+namespace and so change what `/proc/<pid>/root/.flatpak-info` resolves to.
+So the broker holds `{instance, app-id, stage-2 pid, start time, permitted
+service names, owned bus names}`, and a connection is authenticated by
+**descent from that registered PID 1**. The pid the broker starts from is
+expressed in the *broker's* pid namespace, so it stays meaningful even
+though the app sees itself in a nested one — true of `SO_PEERCRED.pid`, and
+true of the `Pid:` line a pidfd's `fdinfo` carries, which is what the accept
+path actually reads and which reports in the namespace of the process doing
+the reading. `NSpid:` is the per-namespace chain and is deliberately not
+consulted: its innermost entry is 1 for every jail. A process whose lineage
+cannot be proven is denied. Unsandboxed same-uid connections are
+unrestricted — td's existing trust model, stated explicitly in §E — but
+**"unsandboxed" is a proved answer here and not a fallback**, because the
+two sentences you just read would otherwise resolve the same ambiguous peer
+in opposite directions. The broker's three-valued reply, and why the middle
+answer is provable, are in §E.
 
 **Every EDGE of that walk is validated, not just its endpoint.** An
 earlier draft checked the connecting pid's start time before and after
@@ -3051,8 +3066,9 @@ chronologically impossible: stage 1 unshares and spawns stage 2, and only
 then is there a stage-2 pid to name. So:
 
 1. **Before unsharing**, stage 0 registers `{instance, app-id, permitted
-   service names}` and receives an opaque one-shot token. The instance
-   exists; it has no pid and accepts no connections yet.
+   service names, owned bus names}` and receives an opaque one-shot
+   token. The instance exists; it has no pid and accepts no connections
+   yet.
 2. **Stage 1 completes the registration** with `{stage-2 pid, start
    time}` under that token, on its own broker connection — the pid is
    what `Command::spawn` returned, already in the broker's namespace for
@@ -3325,8 +3341,9 @@ and the test for it is two fd-carrying messages in a single `write`.
 ### What is landed of the bus interface
 
 Names, directed routing, the per-caller filter, authenticated
-pending-reply ownership and well-known name ownership are landed; match
-rules are not. Of the `org.freedesktop.DBus` roster above: `Hello` (assigning
+pending-reply ownership, well-known name ownership and the permission
+file's `own` grant that widens it are landed; match rules are not. Of the
+`org.freedesktop.DBus` roster above: `Hello` (assigning
 `:1.N`, with anything before it disconnecting and a second one ending the
 connection, and announcing the assigned name like any other name gained),
 `RequestName` and `ReleaseName` with the owner queue, `ListNames`,
@@ -3512,8 +3529,8 @@ it later would answer about a tree that has moved on.
 
 **Registration is `td.Jail1` at `/td/Jail1`.** §D specifies the two
 phases and their contents and does not name a wire interface, so this
-landing chose one: `Register(s instance, s app_id, as services) -> s
-token` and `Complete(s token, u pid)`, on td's own interface at td's own
+landing chose one: `Register(s instance, s app_id, as services, as owned)
+-> s token` and `Complete(s token, u pid)`, on td's own interface at td's own
 object rather than as additions to `org.freedesktop.DBus`. That
 interface belongs to the specification, and private methods hung off it
 would be indistinguishable from standard surface to anything that
@@ -4234,29 +4251,104 @@ identity story rests on stays withheld.
 
 That combination is not yet coherent, and saying so is better than
 pretending otherwise: a caller ends up holding an answer it can do nothing
-with. It is unreachable today, since the only names a confined caller may
-see are portal names and nobody may hold one yet, and it becomes live the
-moment the supervisor registers the portal's connection — at which point a
-sandbox would resolve `org.freedesktop.portal.Desktop` to `:1.N` and find
-that everything it may do with the name it may not do with the answer. The
-likely resolution is that a caller which may see a NAME may also see and
-address its HOLDER, which is what a client needs for the portal to work at
-all. That is a policy widening, so it belongs with the portal landing where
-it can be exercised rather than ahead of it.
+with. It is REACHABLE now. It was not when this paragraph was written — the
+only names a confined caller could see were portal names and nobody could
+hold one — but a permission file's `own` entries are names a confined caller
+both sees and may be told the holder of, so a second window of an application
+can resolve its own well-known name to a `:1.N` it may not then address or
+ask the credentials of. Nothing in §B.3.2's flows needs to: a call goes to
+the NAME and the reply comes back through the pending-reply table, so the
+unique name is a fact with no use rather than a missing capability. The
+portal makes the same shape matter more, since a sandbox resolving
+`org.freedesktop.portal.Desktop` to `:1.N` finds that everything it may do
+with the name it may not do with the answer.
 
-**Nobody may own a name yet except an unconfined caller, and nobody at all
-may own a reserved one.** §D's default sandboxed policy owns no name and that
-is what the code says; the `[Session Bus Policy]` `own` entries that widen it
-are exact names from an application's permission file and do not reach this
-broker yet. The reservation over `org.freedesktop.DBus`,
-`org.freedesktop.portal.*` and `org.freedesktop.impl.portal.*` holds against
-EVERYONE, including the unconfined callers this design otherwise leaves
-unrestricted — which is the point, since an unsandboxed same-uid process
-claiming `org.freedesktop.portal.Desktop` after a restart is precisely the
-caller the reservation exists to refuse. The connection that will hold those
-names is the one a supervisor registers as the portal at startup, and that
-path does not exist yet, so today the reservation means they are held by
-nobody. A name nobody can take is a name nobody can impersonate.
+The likely resolution is that a caller which may see a NAME may also see and
+address its HOLDER. That is a policy widening, so it belongs with the portal
+landing where it can be exercised rather than ahead of it — but it is no
+longer a hypothetical, and the first thing that landing must decide is
+whether `GetNameOwner` should have been answering a unique name to a confined
+caller at all.
+
+**A sandboxed application owns the names its permission file grants it, and
+nobody at all may own a reserved one.** §D's default sandboxed policy owns no
+name; the widening is the `[Session Bus Policy]` `own` entries, and those now
+reach the broker. `td.Jail1`'s `Register` carries them as a fourth argument —
+`Register(s instance, s app_id, as services, as owned) -> s token` — beside
+the predeclared service list they are deliberately NOT merged with: `services`
+names what an instance may activate on its own listener and `owned` names what
+it may take on the session bus, and a registration that confused the two would
+grant ownership of names an application only meant to answer for. They are
+graded on arrival as well-known names, bounded at 32, and recorded on the
+instance.
+
+The grant travels with the IDENTITY rather than being looked up when a name is
+asked for. Identity is resolved once at accept and never recomputed, and the
+instance record behind it is swept as soon as its process ends — so a second
+lookup at `RequestName` time could find the instance gone and silently drop a
+grant the connection still holds, or find a different instance that registered
+the same name in between. One walk answers about one instance and the grant is
+part of that answer.
+
+They are EXACT names. A grant of `org.mozilla.firefox` is not a grant of
+`org.mozilla.firefox.Anything`, which is this file's own rule for session-bus
+keys and is enforced by string equality with no prefix arm to argue through
+later. The cost is stated rather than buried: an application whose names carry
+a runtime-generated suffix cannot express its grant in this file at all, which
+is exactly the MPRIS case §B.3.2 names: the instance suffix on
+`org.mpris.MediaPlayer2.firefox.instance<N>` is chosen by the application at
+startup. Admitting a suffix form
+is an amendment to the key rule above, not a widening of the broker, and it is
+owed before media keys and player integration work.
+
+**An `own` entry carries the `see` and `talk` it implies.** `BusAccess` is an
+ORDERED capability — `own` allows `talk` allows `see` — so a file that grants
+a name has already granted the right to look that name up and to address
+whoever holds it. A first version of this landing read `own` as ownership
+alone, and the result was a broker that sent a peer `NameAcquired` for a name
+and then answered `NameHasNoOwner` when that same peer asked about it, with
+`ListNames` omitting it: the broker contradicting a fact it had just stated,
+which is the failure the per-caller filter's own rules exist to avoid. The
+grant does not depend on currently HOLDING the name, because it is the
+permission file that confers it and a caller queued behind a holder has to be
+able to reach it.
+
+Standalone `see` and `talk` entries — for names the file does not also grant
+`own` — parse and are refused by `td-jail` with a named reason. Widening what
+a sandbox may address BEYOND its own names is a decision about the imported
+services §B.3.2 lists rather than a mechanism this file is waiting on, and
+admitting those entries before that decision would let a permission file claim
+a grant nothing applies.
+
+The count of `own` entries is charged where the file is graded, not only at
+the wire. A permission file may carry 128 session-bus rows and a broker
+records at most 32 names per instance; without a rule at the grader, a
+33-entry file launched and failed with the broker's wire reader saying a list
+"cannot be read", which names neither the file nor the ceiling.
+
+The reservation covers `org.freedesktop.DBus`, `org.freedesktop.portal.*`,
+`org.freedesktop.impl.portal.*` AND the two bare namespace roots
+`org.freedesktop.portal` and `org.freedesktop.impl.portal`. The roots are
+legal well-known names — a comment in the broker once claimed otherwise, and
+that false premise was the whole argument for leaving them takeable — and the
+permission parser has always refused an application that asks to own one, so
+a broker that allowed them made the two graders state different rules with
+the broker the weaker. Nothing is reachable through a bare root, since D-Bus
+has no hierarchical routing; what was reachable was a namespace root held by
+an arbitrary peer.
+
+It holds against EVERYONE, including the
+unconfined callers this design otherwise leaves unrestricted and including a
+permission file that names one — which is the point, since an unsandboxed
+same-uid process claiming `org.freedesktop.portal.Desktop` after a restart is
+precisely the caller the reservation exists to refuse. It is refused twice
+independently: once where a registration would record it, so a file that
+claims it fails at launch rather than at first use, and once where the name
+would be taken, which is the refusal that holds if the first is ever bypassed.
+The connection that will hold those names is the one a supervisor registers as
+the portal at startup, and that path does not exist yet, so today the
+reservation means they are held by nobody. A name nobody can take is a name
+nobody can impersonate.
 
 **A callee that never answers is still not bounded in TIME.** An entry
 leaves the table when the call is answered, when the call could not be
@@ -4556,18 +4648,25 @@ a question belonging to the component that will have one. What an app may
 DO on the bus is the broker's business; that it HAS one is not a question
 the mount namespace should answer differently per app.
 
-**The broker is not that component yet, and this is the exposure.** A
-draft of this section wrote that a per-app switch would duplicate "a
-boundary td-busd already draws per connection". It draws no such
-boundary, as the rung-14 section above says plainly: no well-known names,
-no match rules, no per-caller filter. Any peer may list every unique name
-on the bus, read any peer's uid and pid out of `GetConnectionCredentials`
-and send a directed call to any of them. The broker also keeps no
-call/reply pairing, so a peer may aim a `METHOD_RETURN` at another peer
-carrying the serial that peer's pending call is waiting on, and libdbus
-and GDBus will both match it. And the admission quota is keyed on
-`SO_PEERCRED.pid` while a jail is a PID namespace with no pids cap, so
-one application can fork its way to the whole table.
+**The broker draws most of that boundary now, and what is left is the
+exposure.** A draft of this section wrote that a per-app switch would
+duplicate "a boundary td-busd already draws per connection", and when it
+was written that was false: no well-known names, no match rules, no
+per-caller filter, every peer able to list every unique name, read any
+peer's uid and pid out of `GetConnectionCredentials`, and send a directed
+call to any of them, with no call/reply pairing to stop a forged
+`METHOD_RETURN`. Rungs 15a–15c and this one closed all of those except
+one. A confined peer now resolves to a jail identity taken from
+`SO_PEERPIDFD` at accept; it sees, addresses and may be told the
+credentials of only the portal, its own name, and the names its
+permission file grants; well-known names and a bounded owner queue exist;
+and a reply is delivered only against a call the broker actually routed.
+MATCH RULES REMAIN, and they are the residual this paragraph is now
+about: without `AddMatch` there is no broadcast to filter, but there is
+also no sender validation for the signals a later rung will carry. The
+admission quota is also still keyed on `SO_PEERCRED.pid` while a jail is
+a PID namespace with no pids cap, so one application can fork its way to
+the whole table.
 
 Two more belong on that list. Descriptors do not cross between peers
 yet — the broker refuses to route a descriptor-bearing message with

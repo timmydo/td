@@ -103,7 +103,24 @@ const MAX_DEPTH: usize = 1024;
 /// both the broker and the portal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Identity {
-    Jailed { app_id: String, instance: String },
+    Jailed {
+        app_id: String,
+        instance: String,
+        /// The well-known names this instance's permission file granted it.
+        ///
+        /// It travels WITH the identity rather than being looked up when a
+        /// name is asked for, for the reason that makes identity a
+        /// once-at-accept decision in the first place: the record this came
+        /// from is swept as soon as its process ends, so a later second
+        /// lookup could find the instance gone — silently dropping a grant
+        /// the connection still holds — or find a DIFFERENT instance that
+        /// registered the same name in between. One walk answers about one
+        /// instance, and the grant is part of that answer.
+        ///
+        /// Empty is the ordinary case and the default: §D's sandboxed policy
+        /// owns no name unless a permission file says otherwise.
+        owned: Vec<String>,
+    },
     Unconfined,
     /// Carries why, because a denial nobody can explain is a bug report with
     /// no content: every arm below names the ambiguity it hit.
@@ -334,6 +351,39 @@ pub struct Instance {
     /// already specifies would be spending it badly.
     #[allow(dead_code, reason = "read by activation; predeclared here per §D")]
     pub services: Vec<String>,
+    /// Well-known names this instance may take on the session bus.
+    ///
+    /// §D's `[Session Bus Policy]` `own` entries, which are the only widening
+    /// of a default policy that owns no name. Unlike `services` this one is
+    /// READ: `policy::may_own` consults the copy that reached the identity.
+    ///
+    /// Registrant-supplied, like the app id and for the same reason — v1
+    /// authenticates registration by uid and nothing else — so the transport
+    /// grades every entry before it arrives, and the broker's reservation is
+    /// applied again at the point of use rather than trusted from here.
+    pub owned: Vec<String>,
+}
+
+/// What phase one is told about an instance.
+///
+/// A struct rather than four more parameters on `open`, and the reason is the
+/// pair of `Vec<String>` fields: as positional arguments they are adjacent and
+/// interchangeable, so a caller that swapped them would compile — and the
+/// mistake it makes, granting an instance ownership of the names it meant to
+/// ACTIVATE, is exactly the one no signature can catch. A mutation that did
+/// precisely that survived a whole suite before this became a struct.
+///
+/// Every field is registrant-supplied. §D authenticates registration by uid
+/// and nothing else in v1, so what is recorded here is a claim, graded for
+/// shape at the wire and worth what §D says a launcher's word is worth.
+#[derive(Debug, Clone)]
+pub struct Registration {
+    pub instance: String,
+    pub app_id: String,
+    /// Names this instance may activate on its own private listener.
+    pub services: Vec<String>,
+    /// Names it may take on the session bus — §D's `own` entries.
+    pub owned: Vec<String>,
 }
 
 /// A caller the transport has PROVED, rather than a number it was told.
@@ -377,6 +427,7 @@ struct Pending {
     instance: String,
     app_id: String,
     services: Vec<String>,
+    owned: Vec<String>,
     /// The uid that opened phase one. Phase two must come from the same uid.
     /// In v1 every session peer is uid 1000 so this refuses nothing today —
     /// §D is explicit that registration is authenticated by uid and that the
@@ -418,7 +469,8 @@ struct Pending {
 ///
 /// Registration is two-phase because the pid does not exist when the instance
 /// does: stage 0 unshares nothing yet and has no stage-2 pid to name, so it
-/// opens with `{instance, app-id, services}` and receives a one-shot token,
+/// opens with `{instance, app-id, services, owned names}` and receives a
+/// one-shot token,
 /// and stage 1 completes with the pid `Command::spawn` returned. A connection
 /// arriving between the two phases resolves against a registry that does not
 /// yet contain the instance — it fails closed, as §D requires, rather than
@@ -444,6 +496,24 @@ pub const MAX_INSTANCES: usize = 64;
 
 /// The most service names one instance may predeclare.
 pub const MAX_SERVICES: usize = 32;
+
+/// The most well-known names one instance's permission file may grant it.
+///
+/// The same number as `MAX_SERVICES` and for a plainer reason: this list is
+/// copied into every `Identity` the walk answers with, and an identity is
+/// resolved once per ACCEPT. An unbounded grant list would make one
+/// registration's permission file the cost of every later connection. It also
+/// bounds `may_own`, which scans the list on each `RequestName`.
+///
+/// It is a ceiling rather than a budget. Thirty-two exact well-known names is
+/// already far more than any application in §B declares.
+///
+/// `td_engine::permissions::MAX_OWNED_BUS_NAMES` is the same number, stated
+/// again because that crate is not linked here, and charged by `td-jail`'s
+/// spec grader so an oversized permission file is refused with a reason
+/// naming the ceiling rather than arriving as `that list of names cannot be
+/// read`. Change one and change the other.
+pub const MAX_OWNED_NAMES: usize = 32;
 
 impl Default for Instances {
     fn default() -> Self {
@@ -476,39 +546,37 @@ impl Instances {
     pub fn open(
         &self,
         procfs: &dyn Procfs,
-        instance: &str,
-        app_id: &str,
-        services: Vec<String>,
+        registration: Registration,
         uid: u32,
         registrant: Caller,
     ) -> Result<String, String> {
-        self.open_at(
-            procfs,
-            instance,
-            app_id,
-            services,
-            uid,
-            registrant,
-            Instant::now(),
-        )
+        self.open_at(procfs, registration, uid, registrant, Instant::now())
     }
 
     /// `open` with the clock supplied, so the sweep it performs can be
     /// asserted rather than waited for.
-    #[allow(clippy::too_many_arguments, reason = "one clock past rustc's six")]
     fn open_at(
         &self,
         procfs: &dyn Procfs,
-        instance: &str,
-        app_id: &str,
-        services: Vec<String>,
+        registration: Registration,
         uid: u32,
         registrant: Caller,
         now: Instant,
     ) -> Result<String, String> {
+        let Registration {
+            instance,
+            app_id,
+            services,
+            owned,
+        } = registration;
         if services.len() > MAX_SERVICES {
             return Err(format!(
                 "an instance may predeclare at most {MAX_SERVICES} service names"
+            ));
+        }
+        if owned.len() > MAX_OWNED_NAMES {
+            return Err(format!(
+                "an instance may be granted at most {MAX_OWNED_NAMES} well-known names"
             ));
         }
         // Read outside the lock: it touches a device file, and the registry is
@@ -541,9 +609,10 @@ impl Instances {
         }
         state.pending.push(Pending {
             token: token.clone(),
-            instance: instance.to_string(),
-            app_id: app_id.to_string(),
+            instance,
+            app_id,
             services,
+            owned,
             uid,
             opened: now,
             registrant,
@@ -700,8 +769,31 @@ impl Instances {
             pid,
             starttime: stat.starttime,
             services: pending.services,
+            owned: pending.owned,
         });
         Ok(())
+    }
+
+    /// The grant on record for `instance`, pending or live.
+    ///
+    /// Both halves, because the grant is carried at phase one and the whole
+    /// point of asking is to see what phase one recorded rather than what
+    /// phase two later copied.
+    #[cfg(test)]
+    pub(crate) fn granted(&self, instance: &str) -> Option<Vec<String>> {
+        let state = self.inner.lock().ok()?;
+        state
+            .pending
+            .iter()
+            .find(|p| p.instance == instance)
+            .map(|p| p.owned.clone())
+            .or_else(|| {
+                state
+                    .live
+                    .iter()
+                    .find(|i| i.instance == instance)
+                    .map(|i| i.owned.clone())
+            })
     }
 
     #[cfg(test)]
@@ -1070,6 +1162,7 @@ fn resolve_against(
         Some(instance) => Identity::Jailed {
             app_id: instance.app_id.clone(),
             instance: instance.instance.clone(),
+            owned: instance.owned.clone(),
         },
         // `Unconfined` is the claim that this pid descends from NO registered
         // instance, which is only worth anything if every registered instance
@@ -1327,6 +1420,27 @@ mod tests {
         }
     }
 
+    /// A registration that predeclares nothing and is granted nothing, which
+    /// is what almost every test here wants: the fields it does not name are
+    /// the ones it is not about.
+    fn registration(instance: &str, app_id: &str) -> Registration {
+        registration_with(instance, app_id, Vec::new(), Vec::new())
+    }
+
+    fn registration_with(
+        instance: &str,
+        app_id: &str,
+        services: Vec<String>,
+        owned: Vec<String>,
+    ) -> Registration {
+        Registration {
+            instance: instance.to_string(),
+            app_id: app_id.to_string(),
+            services,
+            owned,
+        }
+    }
+
     fn instance(name: &str, pid: i32, starttime: u64) -> Instance {
         Instance {
             instance: name.to_string(),
@@ -1334,6 +1448,15 @@ mod tests {
             pid,
             starttime,
             services: Vec::new(),
+            owned: Vec::new(),
+        }
+    }
+
+    /// A live instance whose permission file granted it `owned`.
+    fn instance_owning(name: &str, pid: i32, starttime: u64, owned: &[&str]) -> Instance {
+        Instance {
+            owned: owned.iter().map(|name| (*name).to_string()).collect(),
+            ..instance(name, pid, starttime)
         }
     }
 
@@ -1346,7 +1469,8 @@ mod tests {
             resolve_against(&table, &live, &[], &[], 300),
             Identity::Jailed {
                 app_id: "org.td.one".to_string(),
-                instance: "one".to_string()
+                instance: "one".to_string(),
+                owned: Vec::new(),
             }
         );
         // And the stage-2 process itself resolves to its own instance.
@@ -1354,7 +1478,8 @@ mod tests {
             resolve_against(&table, &live, &[], &[], 100),
             Identity::Jailed {
                 app_id: "org.td.one".to_string(),
-                instance: "one".to_string()
+                instance: "one".to_string(),
+                owned: Vec::new(),
             }
         );
     }
@@ -1569,7 +1694,7 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (400, 1, 40)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("phase one opens");
         instances
             .complete(&table, &token, 100, 1000, table.caller(900))
@@ -1649,10 +1774,10 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
         let instances = Instances::new();
         let first = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("phase one opens");
         let second = instances
-            .open(&table, "two", "org.td.Two", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("two", "org.td.Two"), 1000, table.caller(900))
             .expect("a second instance opens");
         instances
             .complete(&table, &first, 100, 1000, table.caller(900))
@@ -1692,7 +1817,7 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("phase one opens");
         instances
             .complete(&table, &token, 100, 1000, table.caller(900))
@@ -1729,7 +1854,7 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (700, 1, 70)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("phase one opens");
 
         for stranger in [1, 700] {
@@ -1755,7 +1880,7 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (901, 1, 91)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("phase one opens");
         let error = instances
             .complete(&table, &token, 100, 1000, table.caller(901))
@@ -1780,7 +1905,7 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("phase one opens");
 
         table.replace(900, Stat { ppid: 1, starttime: 91 });
@@ -1811,7 +1936,7 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (901, 1, 90)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("phase one opens");
         let error = instances
             .complete(&table, &token, 100, 1000, table.caller(901))
@@ -1833,7 +1958,7 @@ mod tests {
             let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
             let instances = Instances::new();
             let token = instances
-                .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+                .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
                 .expect("phase one opens");
             table.replace(900, Stat { ppid: 1, starttime: theirs });
             let error = instances
@@ -1850,7 +1975,7 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("phase one opens");
         let Some(later) = Instant::now()
             .checked_add(PENDING_LIFETIME)
@@ -1880,10 +2005,10 @@ mod tests {
         let table = Table::with(&[(900, 1, 90)]);
         let instances = Instances::new();
         let first = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("phase one opens");
         let second = instances
-            .open(&table, "two", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("two", "org.td.One"), 1000, table.caller(900))
             .expect("a second registration opens");
         assert_ne!(first, second);
         for token in [&first, &second] {
@@ -1909,7 +2034,7 @@ mod tests {
         // would hand out the same first token for the same instance name.
         let elsewhere = Instances::new();
         let same_name = elsewhere
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("a second registry opens");
         assert_ne!(
             first, same_name,
@@ -2061,12 +2186,13 @@ mod tests {
         let jailed = Identity::Jailed {
             app_id: "org.td.One".to_string(),
             instance: "one".to_string(),
+            owned: Vec::new(),
         };
 
         let clean = Table::with(rows);
         let instances = Instances::new();
         let token = instances
-            .open(&clean, "one", "org.td.One", Vec::new(), 1000, clean.caller(900))
+            .open(&clean, registration("one", "org.td.One"), 1000, clean.caller(900))
             .expect("phase one opens");
         instances
             .complete(&clean, &token, 400, 1000, clean.caller(900))
@@ -2078,7 +2204,7 @@ mod tests {
         let table = Table::with(rows);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("phase one opens");
         instances
             .complete(&table, &token, 400, 1000, table.caller(900))
@@ -2113,7 +2239,7 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (400, 900, 95), (401, 400, 96)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("phase one opens");
         instances
             .complete(&table, &token, 400, 1000, table.caller(900))
@@ -2158,7 +2284,7 @@ mod tests {
         table.pidfd_always(Named::Pid(401));
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("phase one opens");
         instances
             .complete(&table, &token, 400, 1000, table.caller(900))
@@ -2169,7 +2295,8 @@ mod tests {
             instances.resolve(&table, 7),
             Identity::Jailed {
                 app_id: "org.td.One".to_string(),
-                instance: "one".to_string()
+                instance: "one".to_string(),
+                owned: Vec::new(),
             }
         );
     }
@@ -2182,7 +2309,17 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (110, 900, 96)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", vec!["ca.desrt.dconf".to_string()], 1000, table.caller(900))
+            .open(
+                &table,
+                registration_with(
+                    "one",
+                    "org.td.One",
+                    vec!["ca.desrt.dconf".to_string()],
+                    Vec::new(),
+                ),
+                1000,
+                table.caller(900),
+            )
             .expect("phase one opens");
 
         // Between the phases the instance is not resolvable, and the peer
@@ -2201,7 +2338,8 @@ mod tests {
             instances.resolve(&table, 100),
             Identity::Jailed {
                 app_id: "org.td.One".to_string(),
-                instance: "one".to_string()
+                instance: "one".to_string(),
+                owned: Vec::new(),
             }
         );
 
@@ -2222,7 +2360,7 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("phase one opens");
         let wrong = instances.complete(&table, &token, 100, 1001, table.caller(900));
         assert!(wrong.is_err(), "another uid completed the registration");
@@ -2236,7 +2374,7 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("phase one opens");
         let error = instances
             .complete(&table, &token, 700, 1000, table.caller(900))
@@ -2261,25 +2399,173 @@ mod tests {
         let instances = Instances::new();
         for which in 0..MAX_INSTANCES {
             instances
-                .open(&table, &format!("i{which}"), "org.td.One", Vec::new(), 1000, table.caller(900))
+                .open(
+                    &table,
+                    registration(&format!("i{which}"), "org.td.One"),
+                    1000,
+                    table.caller(900),
+                )
                 .expect("under the ceiling");
         }
-        assert!(instances.open(&table, "more", "org.td.One", Vec::new(), 1000, table.caller(900)).is_err());
+        assert!(instances
+            .open(
+                &table,
+                registration("more", "org.td.One"),
+                1000,
+                table.caller(900)
+            )
+            .is_err());
 
         let fresh = Instances::new();
         fresh
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("first");
         assert!(
-            fresh.open(&table, "one", "org.td.Other", Vec::new(), 1000, table.caller(900)).is_err(),
+            fresh
+                .open(
+                    &table,
+                    registration("one", "org.td.Other"),
+                    1000,
+                    table.caller(900)
+                )
+                .is_err(),
             "a second registration took over a live instance name"
         );
         // A fresh name, or this leg never reaches the service ceiling: it
         // would be refused for the duplicate instance name instead, and the
         // ceiling could be deleted without failing anything.
         assert!(fresh
-            .open(&table, "two", "org.td.One", vec![String::new(); MAX_SERVICES + 1], 1000, table.caller(900))
+            .open(
+                &table,
+                registration_with(
+                    "two",
+                    "org.td.One",
+                    vec![String::new(); MAX_SERVICES + 1],
+                    Vec::new(),
+                ),
+                1000,
+                table.caller(900),
+            )
             .is_err());
+        // The grant list has its own ceiling, and a fresh instance name again
+        // for the same reason.
+        assert!(fresh
+            .open(
+                &table,
+                registration_with(
+                    "three",
+                    "org.td.One",
+                    Vec::new(),
+                    vec![String::new(); MAX_OWNED_NAMES + 1],
+                ),
+                1000,
+                table.caller(900),
+            )
+            .is_err());
+        // Exactly at the ceiling is admitted, or the bound could be off by one
+        // in the safe direction and nothing would say so.
+        assert!(fresh
+            .open(
+                &table,
+                registration_with(
+                    "four",
+                    "org.td.One",
+                    Vec::new(),
+                    vec![String::new(); MAX_OWNED_NAMES],
+                ),
+                1000,
+                table.caller(900),
+            )
+            .is_ok());
+    }
+
+    /// The permission file's grant reaches the identity the walk answers with.
+    ///
+    /// It is carried at phase ONE, held while the registration is pending, and
+    /// copied into the live record at phase two — so this follows it the whole
+    /// way rather than asserting the end state. A grant that survived neither
+    /// hop would look identical to one that survived both if only the last
+    /// step were checked.
+    #[test]
+    fn a_grant_travels_from_phase_one_to_the_resolved_identity() {
+        let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
+        let instances = Instances::new();
+        let token = instances
+            .open(
+                &table,
+                registration_with(
+                    "one",
+                    "org.td.One",
+                    Vec::new(),
+                    vec![
+                        "org.mozilla.firefox".to_string(),
+                        "org.example.Two".to_string(),
+                    ],
+                ),
+                1000,
+                table.caller(900),
+            )
+            .expect("phase one opens");
+        instances
+            .complete(&table, &token, 100, 1000, table.caller(900))
+            .expect("phase two completes");
+        assert_eq!(
+            instances.resolve(&table, 100),
+            Identity::Jailed {
+                app_id: "org.td.One".to_string(),
+                instance: "one".to_string(),
+                owned: vec![
+                    "org.mozilla.firefox".to_string(),
+                    "org.example.Two".to_string(),
+                ],
+            }
+        );
+    }
+
+    /// One instance's grant is not another's, and is nobody's when the peer
+    /// belongs to no instance at all.
+    ///
+    /// The walk picks ONE instance out of the live set, and the grant it
+    /// answers with has to be that instance's. A copy taken from the wrong
+    /// record — the first, the last, the union — would still produce a
+    /// plausible `Jailed` answer, and the app id alone would not catch it.
+    #[test]
+    fn a_grant_belongs_to_the_instance_the_walk_matched() {
+        // 100 and 200 are two stage 2s; 300 descends from 200; 400 from
+        // neither.
+        let table = Table::with(&[
+            (1, 0, 1),
+            (100, 1, 10),
+            (200, 1, 20),
+            (300, 200, 30),
+            (400, 1, 40),
+        ]);
+        let live = [
+            instance_owning("one", 100, 10, &["org.example.One"]),
+            instance_owning("two", 200, 20, &["org.example.Two"]),
+        ];
+        assert_eq!(
+            resolve_against(&table, &live, &[], &[], 100),
+            Identity::Jailed {
+                app_id: "org.td.one".to_string(),
+                instance: "one".to_string(),
+                owned: vec!["org.example.One".to_string()],
+            }
+        );
+        assert_eq!(
+            resolve_against(&table, &live, &[], &[], 300),
+            Identity::Jailed {
+                app_id: "org.td.two".to_string(),
+                instance: "two".to_string(),
+                owned: vec!["org.example.Two".to_string()],
+            }
+        );
+        // A peer under no instance is unconfined, which carries no list at
+        // all — the arm has nowhere to put one, and that is the point.
+        assert_eq!(
+            resolve_against(&table, &live, &[], &[], 400),
+            Identity::Unconfined
+        );
     }
 
     /// The instance ceiling is not a one-way ratchet.
@@ -2298,11 +2584,16 @@ mod tests {
         let instances = Instances::new();
         for which in 0..MAX_INSTANCES {
             instances
-                .open(&table, &format!("i{which}"), "org.td.One", Vec::new(), 1000, table.caller(900))
+                .open(
+                    &table,
+                    registration(&format!("i{which}"), "org.td.One"),
+                    1000,
+                    table.caller(900),
+                )
                 .expect("under the ceiling");
         }
         assert!(instances
-            .open(&table, "more", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("more", "org.td.One"), 1000, table.caller(900))
             .is_err());
 
         let Some(later) = Instant::now()
@@ -2312,7 +2603,7 @@ mod tests {
             return;
         };
         instances
-            .open_at(&table, "more", "org.td.One", Vec::new(), 1000, table.caller(900), later)
+            .open_at(&table, registration("more", "org.td.One"), 1000, table.caller(900), later)
             .expect("the abandoned registrations no longer hold their slots");
         assert_eq!(instances.pending_count(), 1);
     }
@@ -2334,7 +2625,12 @@ mod tests {
         let instances = Instances::new();
         for which in 0..MAX_INSTANCES as i32 {
             let token = instances
-                .open(&table, &format!("i{which}"), "fixture", Vec::new(), 1000, table.caller(900))
+                .open(
+                    &table,
+                    registration(&format!("i{which}"), "fixture"),
+                    1000,
+                    table.caller(900),
+                )
                 .expect("under the ceiling");
             instances
                 .complete(&table, &token, 1000 + which, 1000, table.caller(900))
@@ -2342,13 +2638,13 @@ mod tests {
         }
         assert_eq!(instances.live_count(), MAX_INSTANCES);
         assert!(instances
-            .open(&table, "more", "fixture", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("more", "fixture"), 1000, table.caller(900))
             .is_err());
 
         // Every jail exits, and no connection arrives to notice.
         let after = Table::with(&[(1, 0, 1), (900, 1, 90)]);
         instances
-            .open(&after, "more", "fixture", Vec::new(), 1000, after.caller(900))
+            .open(&after, registration("more", "fixture"), 1000, after.caller(900))
             .expect("dead instances still held their slots");
     }
 
@@ -2363,7 +2659,7 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (400, 1, 40)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("phase one opens");
         instances
             .complete(&table, &token, 100, 1000, table.caller(900))
@@ -2397,7 +2693,7 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("phase one opens");
         instances
             .complete(&table, &token, 100, 1000, table.caller(900))
@@ -2436,7 +2732,7 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (950, 900, 95)]);
         let instances = Instances::new();
         instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("phase one opens");
         // While the registrant that opened it is still there, its descendant
         // is denied -- which is the rule working.
@@ -2474,7 +2770,7 @@ mod tests {
         ]);
         let instances = Instances::new();
         instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("phase one opens");
         match instances.resolve(&table, 950) {
             Identity::Unknown(why) => assert!(why.contains("in flight"), "{why}"),
@@ -2507,7 +2803,7 @@ mod tests {
         assert_eq!(instances.resolve(&table, 400), Identity::Unconfined);
 
         let token = instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("phase one opens");
 
         // A peer that could belong to the pending instance is refused...
@@ -2532,7 +2828,8 @@ mod tests {
             instances.resolve(&table, 960),
             Identity::Jailed {
                 app_id: "org.td.One".to_string(),
-                instance: "one".to_string()
+                instance: "one".to_string(),
+                owned: Vec::new(),
             }
         );
     }
@@ -2549,7 +2846,7 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (950, 900, 95)]);
         let instances = Instances::new();
         instances
-            .open(&table, "one", "org.td.One", Vec::new(), 1000, table.caller(900))
+            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
             .expect("phase one opens");
         assert_eq!(instances.pending_count(), 1);
         assert!(matches!(
@@ -2576,7 +2873,8 @@ mod tests {
         assert_eq!(
             Identity::Jailed {
                 app_id: "org.td.One".to_string(),
-                instance: "one".to_string()
+                instance: "one".to_string(),
+                owned: Vec::new(),
             }
             .app_id(),
             Some("org.td.One")

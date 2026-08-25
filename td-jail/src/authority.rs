@@ -1,5 +1,5 @@
 use crate::permissions::{
-    FilesystemAccess, PermissionPolicy, ResourceLimits, MAX_FILESYSTEM_ENTRIES,
+    BusAccess, FilesystemAccess, PermissionPolicy, ResourceLimits, MAX_FILESYSTEM_ENTRIES,
     RESERVED_FILESYSTEM_TREES,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -60,6 +60,15 @@ pub(crate) struct LaunchPlan {
     pub(crate) wayland_socket: PathBuf,
     pub(crate) bus_socket: PathBuf,
     pub(crate) filesystems: Vec<FilesystemGrant>,
+    /// The `[Session Bus Policy]` `own` entries, in the permission file's own
+    /// order, which is the canonical one its parser imposes.
+    ///
+    /// Carried to the broker at phase one and nowhere else: the jail does not
+    /// act on these, cannot enforce them, and is not the component that
+    /// decides them. It is the courier for a grant the broker applies at
+    /// `RequestName`, which is why the list travels with the registration
+    /// rather than with the mount plan.
+    pub(crate) owned_names: Vec<String>,
     pub(crate) resources: ResolvedResourceLimits,
     pub(crate) entry: String,
     pub(crate) environment: Vec<(OsString, OsString)>,
@@ -286,12 +295,13 @@ where
     // in the component with no policy language and take it away from the one
     // that will have it.
     //
-    // Today's broker does NOT have it: no per-caller filter, no match rules, an
-    // admission quota keyed on a pid a jailed caller can fork past. So the
-    // isolation this mount declines to enforce is not being enforced anywhere,
-    // and what bounds that is the image shipping ONE application — asserted in
-    // the system recipe, not promised here. APPLICATIONS.md §D carries what has
-    // to land before a second one does.
+    // The broker now has some of it: a per-caller filter keyed on the instance
+    // this jail registers, authenticated reply ownership, and well-known names
+    // whose grant comes from the list below. It does NOT yet have match rules,
+    // and its admission quota is still keyed on a pid a jailed caller can fork
+    // past. What bounds the remainder is the image shipping ONE application —
+    // asserted in the system recipe, not promised here. APPLICATIONS.md §D
+    // carries what has to land before a second one does.
     let state = prepare_state(
         name,
         outside_identity,
@@ -316,6 +326,12 @@ where
         wayland_socket,
         bus_socket,
         filesystems,
+        // Built HERE rather than bound above it. A reviewer defeated the
+        // source pin on this rule by shadowing the binding — compute the
+        // grant, then `let owned_names = Vec::new();` — which kept every
+        // pinned substring and gave every launch an empty own-set. A field
+        // initialised in place has no binding to shadow.
+        owned_names: granted_bus_names(&spec.permissions),
         resources,
         entry: spec.entry,
         environment,
@@ -327,6 +343,23 @@ where
         enforce_cgroup: config.enforce_cgroup,
         host_mode: config.host_mode,
     })
+}
+
+/// The names an application's permission file says it may OWN.
+///
+/// `see` and `talk` cannot reach this from a real launch: `parse_spec`
+/// refuses a spec that carries either, so on that path this narrows a set the
+/// grader has already emptied. It is a filter and not a bare `map` anyway,
+/// because the day `see` lands is the day a `map` would start telling the
+/// broker to grant OWNERSHIP of a name the file only said `see` about — and
+/// it is a named function so that rule can be exercised directly rather than
+/// only through a spec no grader will admit.
+fn granted_bus_names(permissions: &PermissionPolicy) -> Vec<String> {
+    permissions
+        .session_bus()
+        .filter(|(_, access)| *access == BusAccess::Own)
+        .map(|(name, _)| name.to_string())
+        .collect()
 }
 
 pub(crate) fn resolve_resource_limits(name: &str) -> io::Result<ResolvedResourceLimits> {
@@ -684,10 +717,11 @@ fn parse_spec(text: &str) -> io::Result<ParsedSpec> {
     if permissions.to_keyfile() != permission_text {
         return Err(invalid("application spec permissions are not canonical"));
     }
-    if !permissions.is_wayland_filesystem_resources_only() {
-        return Err(invalid(
-            "application requests policy not implemented by this td-jail rung",
-        ));
+    if let Some(unhonoured) = permissions.unhonoured_request() {
+        return Err(invalid(format!(
+            "application requests {unhonoured}, which this td-jail rung does \
+             not implement"
+        )));
     }
     ResolvedResourceLimits::from_policy(permissions.resources())?;
     Ok(ParsedSpec {
@@ -2214,6 +2248,35 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Only `own` entries become a grant, and every one of them does.
+    ///
+    /// Exercised on the policy directly rather than through a spec, because
+    /// `parse_spec` refuses `see` and `talk` outright — so the rule that
+    /// separates them is unreachable from that direction and would sit here
+    /// unexercised until the day it started mattering, which is the worst
+    /// time to find out it was a `map`.
+    #[test]
+    fn only_own_entries_become_a_bus_grant() {
+        let policy = PermissionPolicy::new()
+            .with_session_bus("org.mozilla.firefox", BusAccess::Own)
+            .unwrap()
+            .with_session_bus("org.freedesktop.FileManager1", BusAccess::Talk)
+            .unwrap()
+            .with_session_bus("org.a11y.Bus", BusAccess::See)
+            .unwrap()
+            .with_session_bus("org.example.Second", BusAccess::Own)
+            .unwrap();
+        assert_eq!(
+            granted_bus_names(&policy),
+            vec![
+                "org.example.Second".to_string(),
+                "org.mozilla.firefox".to_string(),
+            ],
+            "the grant is the `own' entries, in the file's canonical order"
+        );
+        assert!(granted_bus_names(&PermissionPolicy::new()).is_empty());
     }
 
     #[test]

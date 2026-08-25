@@ -17,7 +17,7 @@
 //! fixed at compile time, to one destination it already trusts. Copying two thousand lines of general encoding to place three
 //! known messages would put a second copy of the wire rules in the tree, and
 //! principle 2 says the dependency-free surfaces stay small rather than
-//! convenient. So this encodes `""`, `"ssas"` and `"su"`, decodes a reply
+//! convenient. So this encodes `""`, `"ssasas"` and `"su"`, decodes a reply
 //! header and a `"s"` body, and refuses everything else it meets.
 //!
 //! The asymmetry is deliberate in the other direction too. A malformed reply
@@ -87,20 +87,57 @@ const MAX_UNRELATED_MESSAGES: usize = 8;
 /// wedged broker holds an application slot and reports nothing.
 const TIMEOUT: Duration = Duration::from_secs(20);
 
+/// What phase one tells the broker about an instance.
+///
+/// A struct because `services` and `owned` are both `&[String]` and were
+/// adjacent parameters: swapping them compiled, sent the broker an empty
+/// own-set, and left the application unable to take the name its permission
+/// file granted. A reviewer wrote exactly that mutation and no test in this
+/// crate caught it — `register`'s own wire test calls this function, so it
+/// sees whatever the caller passed as `services` and cannot know the caller
+/// meant otherwise. Named fields do not make the swap impossible, since the
+/// two types are still the same; they make it something somebody has to
+/// WRITE rather than something a positional list lets them slip.
+pub struct Registration<'a> {
+    pub instance: &'a str,
+    pub app_id: &'a str,
+    /// Names the instance may activate on its own private listener.
+    pub services: &'a [String],
+    /// Names it may take on the session bus — §D's `own` entries.
+    pub owned: &'a [String],
+}
+
 /// Phase one: the instance exists and has no pid yet. Returns its token.
+///
+/// `owned` is the application's `[Session Bus Policy]` `own` entries. It is
+/// forwarded, not interpreted: this crate has no bus policy of its own and no
+/// way to enforce one — the broker is the component that decides whether a
+/// connection may take a name, and this is how the permission file reaches
+/// it.
 pub fn register(
     socket: &Path,
     uid: u32,
-    instance: &str,
-    app_id: &str,
-    services: &[String],
+    registration: Registration<'_>,
 ) -> io::Result<String> {
+    let Registration {
+        instance,
+        app_id,
+        services,
+        owned,
+    } = registration;
     let mut connection = Connection::open(socket, uid)?;
     let mut body = Encoder::default();
     body.string(instance)?;
     body.string(app_id)?;
     body.array_of_strings(services)?;
-    let reply = connection.call(JAIL_PATH, JAIL_INTERFACE, "Register", "ssas", &body.bytes)?;
+    body.array_of_strings(owned)?;
+    let reply = connection.call(
+        JAIL_PATH,
+        JAIL_INTERFACE,
+        "Register",
+        "ssasas",
+        &body.bytes,
+    )?;
     reply.one_string()
 }
 
@@ -1095,6 +1132,17 @@ mod tests {
 
     static NEXT_SOCKET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+    /// A registration that predeclares nothing and is granted nothing, for
+    /// the tests that are about the CONNECTION rather than the arguments.
+    fn nothing_declared<'a>(instance: &'a str, app_id: &'a str) -> Registration<'a> {
+        Registration {
+            instance,
+            app_id,
+            services: &[],
+            owned: &[],
+        }
+    }
+
     /// `register` end to end: connect, handshake, `Hello`, `Register`, token.
     #[test]
     fn a_registration_runs_from_connect_to_token() {
@@ -1102,9 +1150,16 @@ mod tests {
         let token = reply_frame(METHOD_RETURN, 2, None, Some("0f1e2d3c4b5a69788796a5b4c3d2e1f0"));
         let (socket, broker, dir) = fake_broker(vec![hello, token]);
 
-        let got = register(&socket, 1000, "firefox-0011223344556677", "firefox", &[
-            "org.mozilla.firefox".to_string(),
-        ]);
+        let got = register(
+            &socket,
+            1000,
+            Registration {
+                instance: "firefox-0011223344556677",
+                app_id: "firefox",
+                services: &["ca.desrt.dconf".to_string()],
+                owned: &["org.mozilla.firefox".to_string()],
+            },
+        );
         let received = broker.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -1112,11 +1167,15 @@ mod tests {
         // The AUTH line carried the uid this call claimed, and BEGIN followed.
         assert_eq!(received.first().unwrap(), auth_line(1000).as_bytes());
         assert_eq!(received.get(1).unwrap(), b"BEGIN\r\n");
-        // Hello's body is empty; Register's is the three arguments.
+        // Hello's body is empty; Register's is the four arguments.
         assert!(received.get(2).unwrap().is_empty());
         let mut body = Encoder::default();
         body.string("firefox-0011223344556677").unwrap();
         body.string("firefox").unwrap();
+        body.array_of_strings(&["ca.desrt.dconf".to_string()]).unwrap();
+        // DIFFERENT lists, which is what makes this assertion say the grant
+        // was sent. Two identical lists would be satisfied by a `register`
+        // that encoded its services twice and never looked at its grant.
         body.array_of_strings(&["org.mozilla.firefox".to_string()])
             .unwrap();
         assert_eq!(received.get(3).unwrap(), &body.bytes);
@@ -1153,7 +1212,11 @@ mod tests {
         );
         let (socket, broker, dir) = fake_broker(vec![hello, refusal]);
 
-        let got = register(&socket, 1000, "firefox-1", "firefox", &[]);
+        let got = register(
+            &socket,
+            1000,
+            nothing_declared("firefox-1", "firefox"),
+        );
         let _ = broker.join();
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -1189,7 +1252,11 @@ mod tests {
             }
         });
 
-        let error = register(&socket, 1000, "firefox-1", "firefox", &[]).unwrap_err();
+        let error = register(
+            &socket,
+            1000,
+            nothing_declared("firefox-1", "firefox"),
+        ).unwrap_err();
         let _ = handle.join();
         let _ = std::fs::remove_dir_all(&dir);
         let text = error.to_string();
@@ -1201,7 +1268,11 @@ mod tests {
     #[test]
     fn an_absent_broker_is_named() {
         let missing = std::env::temp_dir().join("td-jail-bus-test-nothing-is-bound-here/bus");
-        let error = register(&missing, 1000, "firefox-1", "firefox", &[])
+        let error = register(
+            &missing,
+            1000,
+            nothing_declared("firefox-1", "firefox"),
+        )
             .unwrap_err()
             .to_string();
         assert!(error.contains("connect to the session bus"), "{error}");
@@ -1256,7 +1327,11 @@ mod tests {
         let hello = reply_frame(METHOD_RETURN, 1, None, Some(":1.9"));
         let empty = reply_frame(METHOD_RETURN, 2, None, None);
         let (socket, broker, dir) = fake_broker(vec![hello, empty]);
-        let error = register(&socket, 1000, "firefox-1", "firefox", &[]).unwrap_err();
+        let error = register(
+            &socket,
+            1000,
+            nothing_declared("firefox-1", "firefox"),
+        ).unwrap_err();
         let _ = broker.join();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
@@ -1405,7 +1480,11 @@ mod tests {
         padded.push(0);
         let hello = reply_frame(METHOD_RETURN, 1, None, Some(":1.9"));
         let (socket, broker, dir) = fake_broker(vec![hello, padded]);
-        let error = register(&socket, 1000, "firefox-1", "firefox", &[]).unwrap_err();
+        let error = register(
+            &socket,
+            1000,
+            nothing_declared("firefox-1", "firefox"),
+        ).unwrap_err();
         let _ = broker.join();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
@@ -1792,10 +1871,17 @@ mod tests {
     /// fields within these two signatures.
     #[test]
     fn the_registration_bodies_are_laid_out_by_the_specification() {
+        // BOTH arrays, which is the field this rung added and the reason the
+        // signature grew from `ssas`. A version of this test that stopped
+        // after the first one matched the bytes of the OLD body exactly, so
+        // it would have gone on passing had the grant never been encoded.
         let mut register = Encoder::default();
         register.string("one").unwrap();
         register.string("fixture").unwrap();
         register.array_of_strings(&[]).unwrap();
+        register
+            .array_of_strings(&["a.b".to_string()])
+            .unwrap();
         assert_eq!(
             register.bytes,
             [
@@ -1805,8 +1891,13 @@ mod tests {
                 7, 0, 0, 0, b'f', b'i', b'x', b't', b'u', b'r', b'e', 0,
                 // An empty array is its length and nothing else, at 20.
                 0, 0, 0, 0,
+                // The grant, at 24: a byte count of the CONTENTS — eight for
+                // one four-byte length, three bytes and a NUL — and then the
+                // contents themselves, needing no padding after a length that
+                // left the offset four-aligned.
+                8, 0, 0, 0, 3, 0, 0, 0, b'a', b'.', b'b', 0,
             ],
-            "Register's ssas body is not laid out as the specification says"
+            "Register's ssasas body is not laid out as the specification says"
         );
 
         let mut complete = Encoder::default();

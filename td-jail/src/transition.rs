@@ -3167,13 +3167,21 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
     //
     // No predeclared service names yet. §D carries them for app-local
     // activation, which lands with the activation listener; an empty list is
-    // the honest statement that this instance may own none.
+    // the honest statement that this instance activates none.
+    //
+    // The names it may OWN are not empty and are not this crate's to choose:
+    // they are the permission file's `own` entries, which reach the broker
+    // here because phase one is the only place a jail speaks to it about the
+    // instance rather than on the instance's behalf.
     let registration = crate::bus::register(
         &application.bus_socket,
         outside_identity.uid,
-        &instance,
-        &application.name,
-        &[],
+        crate::bus::Registration {
+            instance: &instance,
+            app_id: &application.name,
+            services: &[],
+            owned: &application.owned_names,
+        },
     )
     .map_err(|e| io::Error::other(format!("register jail instance {instance:?}: {e}")))?;
 

@@ -10,6 +10,19 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const MAX_PERMISSION_FILE_BYTES: usize = 16 * 1024;
 pub const MAX_FILESYSTEM_ENTRIES: usize = 128;
 const MAX_BUS_POLICY_ENTRIES: usize = 128;
+
+/// The most `own` entries a launch can actually deliver.
+///
+/// A permission file may carry `MAX_BUS_POLICY_ENTRIES` session-bus rows, and
+/// that ceiling is about the FILE. This one is about what reaches the broker:
+/// `td-busd`'s `MAX_OWNED_NAMES` is the same number, and it is 32 because the
+/// broker copies an instance's grant into every identity it resolves, once
+/// per accept. The two constants cannot be shared — `td-busd` is a standalone
+/// dependency-free lock and does not link this crate — so they are stated
+/// twice and each names the other. Changing one without the other turns a
+/// clear refusal here into `InvalidArgs: that list of names cannot be read`
+/// at launch, which is what happened before this rule existed.
+pub const MAX_OWNED_BUS_NAMES: usize = 32;
 const MAX_FILESYSTEM_LOCATION_BYTES: usize = 4096;
 const MAX_BUS_NAME_BYTES: usize = 255;
 pub const RESERVED_FILESYSTEM_TREES: &[&str] = &[
@@ -423,7 +436,25 @@ impl PermissionPolicy {
         self.resources
     }
 
-    pub fn is_wayland_filesystem_resources_only(&self) -> bool {
+    /// The first thing this policy asks for that `td-jail` cannot honour yet.
+    ///
+    /// A named reason rather than a boolean, because the refusal reaches an
+    /// operator holding a permission file and "policy not implemented" does
+    /// not say which line to change.
+    ///
+    /// What is honoured is the wayland socket, filesystem entries, resource
+    /// limits, and `[Session Bus Policy]` `own` entries — the last of which
+    /// the broker consults when the application asks for the name. `see` and
+    /// `talk` parse and are refused here: widening what a sandbox may ADDRESS
+    /// is a decision about the imported services §B.3.2 lists, not a
+    /// mechanism this file is waiting on, and admitting the entries before
+    /// that decision would make the file claim a grant nothing applies.
+    ///
+    /// Wayland is REQUIRED and not merely honoured, which is what the
+    /// destructure below is for: every rule here is a statement about a named
+    /// field, so a field added to this struct fails to compile rather than
+    /// being silently admitted.
+    pub fn unhonoured_request(&self) -> Option<String> {
         let PermissionPolicy {
             network,
             sockets,
@@ -432,11 +463,38 @@ impl PermissionPolicy {
             session_bus,
             resources: _,
         } = self;
-        !network
-            && sockets.len() == 1
-            && sockets.contains(&PermissionSocket::Wayland)
-            && !allow_devel
-            && session_bus.is_empty()
+        if *network {
+            return Some("shared=network".to_string());
+        }
+        if !sockets.contains(&PermissionSocket::Wayland) {
+            return Some("a launch with no wayland socket".to_string());
+        }
+        if let Some(socket) = sockets
+            .iter()
+            .find(|socket| **socket != PermissionSocket::Wayland)
+        {
+            return Some(format!("the {} socket", socket.as_str()));
+        }
+        if *allow_devel {
+            return Some("features=allow-devel".to_string());
+        }
+        if let Some((name, access)) = session_bus
+            .iter()
+            .find(|(_, access)| **access != BusAccess::Own)
+        {
+            return Some(format!("`{}' access to {name}", access.as_str()));
+        }
+        let owned = session_bus
+            .values()
+            .filter(|access| **access == BusAccess::Own)
+            .count();
+        if owned > MAX_OWNED_BUS_NAMES {
+            return Some(format!(
+                "{owned} `own' entries, more than the {MAX_OWNED_BUS_NAMES} a \
+                 broker will record"
+            ));
+        }
+        None
     }
 
     /// Canonical bytes for either immutable defaults or an operator override.
@@ -1079,24 +1137,44 @@ mod tests {
     }
 
     #[test]
-    fn jail_subset_is_exactly_wayland_plus_filesystems() {
+    fn jail_subset_is_wayland_filesystems_resources_and_owned_names() {
         let admitted = PermissionPolicy::new()
             .with_socket(PermissionSocket::Wayland)
             .unwrap()
             .with_filesystem("xdg-download", FilesystemAccess::ReadWrite, false)
             .unwrap();
-        assert!(admitted.is_wayland_filesystem_resources_only());
-        assert!(!PermissionPolicy::new().is_wayland_filesystem_resources_only());
-        assert!(!admitted
-            .clone()
-            .with_socket(PermissionSocket::PulseAudio)
-            .unwrap()
-            .is_wayland_filesystem_resources_only());
-        assert!(!admitted
-            .clone()
-            .with_network()
-            .unwrap()
-            .is_wayland_filesystem_resources_only());
+        assert_eq!(admitted.unhonoured_request(), None);
+        assert_eq!(
+            PermissionPolicy::new().unhonoured_request().as_deref(),
+            Some("a launch with no wayland socket")
+        );
+        assert_eq!(
+            admitted
+                .clone()
+                .with_socket(PermissionSocket::PulseAudio)
+                .unwrap()
+                .unhonoured_request()
+                .as_deref(),
+            Some("the pulseaudio socket")
+        );
+        assert_eq!(
+            admitted
+                .clone()
+                .with_network()
+                .unwrap()
+                .unhonoured_request()
+                .as_deref(),
+            Some("shared=network")
+        );
+        assert_eq!(
+            admitted
+                .clone()
+                .with_development()
+                .unwrap()
+                .unhonoured_request()
+                .as_deref(),
+            Some("features=allow-devel")
+        );
         let resource_policy = admitted
             .clone()
             .with_memory_high(4096)
@@ -1105,11 +1183,61 @@ mod tests {
             .unwrap()
             .with_pids_max(8)
             .unwrap();
-        assert!(resource_policy.is_wayland_filesystem_resources_only());
-        assert!(admitted
-            .with_pids_max(8)
-            .unwrap()
-            .is_wayland_filesystem_resources_only());
+        assert_eq!(resource_policy.unhonoured_request(), None);
+        assert_eq!(
+            admitted.clone().with_pids_max(8).unwrap().unhonoured_request(),
+            None
+        );
+
+        // An `own` entry is honoured; `see` and `talk` are not, and the
+        // refusal names the access and the name so an operator can find the
+        // line.
+        assert_eq!(
+            admitted
+                .clone()
+                .with_session_bus("org.mozilla.firefox", BusAccess::Own)
+                .unwrap()
+                .unhonoured_request(),
+            None
+        );
+        // The file's own ceiling is larger than what a launch can deliver, so
+        // the grader has to charge the smaller one — or an operator learns
+        // about it from the broker's wire reader at launch, in a message
+        // about a list that "cannot be read".
+        let mut many = admitted.clone();
+        for index in 0..MAX_OWNED_BUS_NAMES {
+            many = many
+                .with_session_bus(&format!("org.example.N{index}"), BusAccess::Own)
+                .unwrap();
+        }
+        assert_eq!(many.unhonoured_request(), None, "at the ceiling");
+        let over = many
+            .with_session_bus("org.example.Spill", BusAccess::Own)
+            .unwrap();
+        assert_eq!(
+            over.unhonoured_request().as_deref(),
+            Some(
+                format!(
+                    "{} `own' entries, more than the {MAX_OWNED_BUS_NAMES} a broker will record",
+                    MAX_OWNED_BUS_NAMES + 1
+                )
+                .as_str()
+            )
+        );
+
+        for (access, spelling) in [(BusAccess::See, "see"), (BusAccess::Talk, "talk")] {
+            assert_eq!(
+                admitted
+                    .clone()
+                    .with_session_bus("org.freedesktop.FileManager1", access)
+                    .unwrap()
+                    .unhonoured_request()
+                    .as_deref(),
+                Some(
+                    format!("`{spelling}\' access to org.freedesktop.FileManager1").as_str()
+                )
+            );
+        }
     }
 
     #[test]

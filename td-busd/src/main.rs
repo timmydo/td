@@ -744,6 +744,119 @@ mod tests {
         }
     }
 
+    /// The reservation is ONE gate, ahead of the dispatch on the caller.
+    ///
+    /// `may_own` used to be a single expression with no ordering to get
+    /// wrong. It now has three arms and a grant list, and what keeps a
+    /// permission file from claiming `org.freedesktop.portal.Desktop` is that
+    /// the reservation is decided before the broker looks at who is asking.
+    ///
+    /// Behaviour is pinned by `nobody_may_own_a_reserved_name`, which asks on
+    /// behalf of a caller that WAS granted a reserved name. This pins the
+    /// SHAPE, and the two are not the same claim: a rewrite that applied the
+    /// reservation inside each arm passes that test — it is exactly
+    /// equivalent today — and leaves the next arm somebody adds unguarded,
+    /// with no test failing to say so.
+    ///
+    /// It took three attempts, and the failures are worth recording because
+    /// each looked sufficient. The first compared where `is_reserved_name`
+    /// and the grant first APPEARED, which the per-arm rewrite satisfies
+    /// because the pattern binding comes later in the text. The second added
+    /// "before `match caller`, and exactly once", which a reviewer defeated
+    /// by hoisting the call into a `let reserved = …` above the match and
+    /// writing `!reserved` into each arm — one call, before the dispatch, and
+    /// the gate gone. What actually has to be true is that the reservation
+    /// RETURNS, so this pins the early exit between the two.
+    ///
+    /// A source pin bounds spellings, not semantics, and this one is no
+    /// exception: it says the function refuses before it dispatches, in the
+    /// one shape that sentence has. That is worth having and is not proof.
+    #[test]
+    fn the_reservation_is_one_gate_before_may_own_dispatches() {
+        let policy = without_line_comments(&without_block_comments(source("policy")));
+        let Some(from) = policy.find("pub fn may_own(") else {
+            panic!("may_own is gone");
+        };
+        let body = policy.get(from..).unwrap_or("");
+        let Some(span) = body.find("\n}") else {
+            panic!("may_own no longer ends where this test slices it");
+        };
+        let body = body.get(..span).unwrap_or("");
+        // The GATE as one span, rather than two landmarks with an ordering
+        // between them. A reviewer defeated the landmark version by adding an
+        // unrelated early return -- `if matches!(caller, Identity::Unknown(_))
+        // { return false; }` -- between the hoisted reservation and the
+        // match: `is_reserved_name` still came first, a `return false` still
+        // came second, `match caller` still came third, and the reservation
+        // was a value the arms could forget. Landmarks in the right order do
+        // not say the FIRST is what the SECOND returns for; the span does.
+        let gate = "if is_reserved_name(name) {\n        return false;\n    }";
+        let Some(gate_at) = body.find(gate) else {
+            panic!("may_own no longer opens with the reservation gate: {body}");
+        };
+        let Some(dispatch) = body.find("match caller") else {
+            panic!("may_own no longer dispatches on the caller");
+        };
+        assert!(
+            gate_at < dispatch,
+            "the reservation no longer RETURNS before the dispatch, so it is \
+             a value each arm may apply or forget rather than a gate"
+        );
+        assert_eq!(
+            body.matches("is_reserved_name(").count(),
+            1,
+            "the reservation is asked more than once, so one of them is the \
+             one a later arm will be written without"
+        );
+        // And exactly one early exit, which is the gate's. A second `return`
+        // above the match is how the landmark version was defeated, and it is
+        // also how a future arm-specific shortcut would creep in.
+        assert_eq!(
+            body.matches("return ").count(),
+            1,
+            "may_own returns early somewhere other than the reservation \
+             gate, so the gate is no longer the only thing between the \
+             caller and the dispatch"
+        );
+    }
+
+    /// A holder is told about ITSELF, by its own unique name.
+    ///
+    /// `askable`'s second arm admits a peer asking about a well-known name it
+    /// holds. The name it then answers ABOUT is the load-bearing part and no
+    /// behaviour test can reach it: resolving the well-known name in the gate
+    /// and looking the answer up by that same well-known name is two lookups
+    /// with a gap, and in the gap the name can change hands — so the reply
+    /// would carry the NEW holder's uid and pid to a caller admitted for
+    /// holding it a moment ago. Answering by the caller's own unique name is
+    /// correct whatever happens in the gap. Both spellings pass every test
+    /// in this crate, which is exactly why the rule is stated here.
+    #[test]
+    fn a_holder_is_told_about_itself_and_not_about_the_name() {
+        let transport = without_line_comments(&without_block_comments(source("transport")));
+        let Some(from) = transport.find("fn askable(") else {
+            panic!("askable is gone, so the holder exemption moved somewhere \
+                    this test does not watch");
+        };
+        let body = transport.get(from..).unwrap_or("");
+        let Some(span) = body.find("\n    }") else {
+            panic!("askable no longer ends where this test slices it");
+        };
+        let body = body.get(..span).unwrap_or("");
+        assert!(
+            body.contains("mine.then(|| unique.to_string())"),
+            "the holder exemption answers about a name rather than about the \
+             caller, so the peer it describes is whoever holds that name when \
+             the second lookup runs: {body}"
+        );
+        assert_eq!(
+            body.matches("owner_of(").count(),
+            1,
+            "the holder exemption resolves the name more than once, which is \
+             the gap this rule exists to close"
+        );
+    }
+
     /// Comments out, so that commenting a check out is not a way to pass the
     /// test that pins it. Lifted from `td-jail/src/main.rs`, which arrived at
     /// it the same way; the two crates are separate dependency-free locks and
