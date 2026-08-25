@@ -72,13 +72,37 @@
 #               and the golden is `1 err.txt`. That
 #               kind of pass turns on the wording of a diagnostic, so it would red as
 #               a REGRESSION in a `cd` test the day the wording changed.
-#               (b), (c) and (d) are decided from the CODE and so are applied BEFORE
-#               the case is run at all. That was cosmetic while the staging commands
-#               were missing; with `mkdir` and `touch` staged, running one of these
-#               first would CREATE the shared path it is being skipped for.
-#           These heuristics are conservative substring matches over the case code
+#           (e) its verdict is a fact about the host's SCHEDULER rather than about
+#               the shell, listed by key in `HOST_SCHEDULED` because no reading of
+#               the code separates these from the many cases that merely sleep.
+#               One live case: `background.test.sh::wait for N parallel jobs and
+#               check failure` starts three jobs sleeping 0.03, 0.02 and 0.01
+#               seconds and asserts their output arrives in that order before the
+#               first `wait` returns. Ten milliseconds is the entire margin, and it
+#               buys two races: scheduling jitter under load exceeds it, and the
+#               jobs START staggered, so the one forked last (0.01s) can wake after
+#               the one forked first (0.03s). Idle it never fails; under load
+#               every shell measured fails a minority of runs, busybox ash -- the
+#               shell td-sh is graded against -- MORE often than td-sh itself.
+#               The rates, and the harness and sample size each was taken in, are
+#               in the commit that added this entry: they are facts about one
+#               host on one date, and the no-counts rule above is the reason they
+#               are not restated here where nothing will ever refresh them. The
+#               golden is not a claim any shell satisfies under load, so listing
+#               it either way would red the gate on whichever machine is busy --
+#               the same reason (c) exists.
+#               (b), (c) and (d) are decided from the CODE and (e) from the KEY,
+#               so all four are applied BEFORE the case is run at all. For (c)
+#               that is not cosmetic: with `mkdir` and `touch` staged, running one
+#               of those first would CREATE the shared path it is being skipped
+#               for.
+#           (b), (c) and (d) are conservative substring matches over the case code
 #           with FULL-LINE comments stripped, so a token mentioned only in prose does
-#           not force a skip. KNOWN over-match (safe direction): a token inside an
+#           not force a skip. (e) is a LIST, not a match, because nothing in the code
+#           separates a racy ordering assertion from a case that merely sleeps; the
+#           generator instead checks that each key it names still exists and still
+#           times a background job, and refuses to emit this file if either fails.
+#           KNOWN over-match (safe direction): a token inside an
 #           INLINE comment (`cmd  # ... spec/ ...`) still trips it, so a self-contained
 #           case can be over-skipped and lose gate coverage; a follow-up fixture rig
 #           plus proper comment tokenizing would let most of (b) run.
@@ -1151,6 +1175,7 @@ xfail zsh-idioms.test.sh::zsh var sub is rejected at runtime
 skip assign-extended.test.sh::declare -F with shopt -s extdebug and main file
 skip assign-extended.test.sh::declare -F with shopt -s extdebug prints more info
 skip assign.test.sh::Assignment doesn't do glob expansion
+skip background.test.sh::wait for N parallel jobs and check failure
 skip builtin-bracket.test.sh::-k for sticky bit
 skip builtin-bracket.test.sh::test -b -c -S (block, character, socket)
 skip builtin-bracket.test.sh::test -p named pipe

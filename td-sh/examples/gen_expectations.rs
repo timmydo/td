@@ -12,12 +12,15 @@
 //!
 //! It runs every case in <spec-dir> through the built td-sh under the SAME isolated
 //! `-c` harness the gate uses (`td_sh::run_case`), and buckets each case:
-//!   skip  -> BEFORE running, if its comment-stripped code reads the repo tree (see
-//!            `reads_repo_tree`), depends on shared `/tmp` state (see
-//!            `depends_on_shared_tmp`), or measures the shell's syscalls (see
-//!            `measures_syscalls`): the isolated cwd stages none of them, so any
-//!            verdict is a probable false-green. Decided from the code alone, so
-//!            running it first would only leave the shared state behind.
+//!   skip  -> BEFORE running, for either of two reasons. Its comment-stripped code
+//!            reads the repo tree (see `reads_repo_tree`), depends on shared `/tmp`
+//!            state (see `depends_on_shared_tmp`), or measures the shell's syscalls
+//!            (see `measures_syscalls`): the isolated cwd stages none of them, so
+//!            any verdict is a probable false-green, and deciding from the code
+//!            alone means running it first would only leave the shared state
+//!            behind. Or it is named in `HOST_SCHEDULED`, because its verdict is a
+//!            fact about the host's SCHEDULER rather than about the shell -- which
+//!            is why that one is a list and not a predicate.
 //!   skip  -> AFTER running, if it timed out or hit the capture cap (the typed
 //!            `CaseOutcome::timed_out`/`truncated`): it cannot be evaluated here.
 //!   pass  -> unlisted.
@@ -33,8 +36,9 @@
 //! committed file with partial output.
 //!
 //! This is dev tooling, not shipped code, but it is held to td's defensive style
-//! (no unwrap/expect/panic, `.get` over indexing) so `clippy --all-targets` stays
-//! clean.
+//! (no unwrap/expect/panic, `.get` over indexing). By hand: the gate's td-sh
+//! clippy run omits `--all-targets`, so nothing here is linted unless the example
+//! is named explicitly.
 // A crate root of its own: `main.rs`'s lint reaches nothing here. `forbid`
 // rather than `deny` because no scoped allow belongs in this one, and
 // `forbid` is the spelling a later `#[allow(unsafe_code)]` cannot override.
@@ -121,13 +125,37 @@ const HEADER: &str = "\
 #               and the golden is `1 err.txt`. That
 #               kind of pass turns on the wording of a diagnostic, so it would red as
 #               a REGRESSION in a `cd` test the day the wording changed.
-#               (b), (c) and (d) are decided from the CODE and so are applied BEFORE
-#               the case is run at all. That was cosmetic while the staging commands
-#               were missing; with `mkdir` and `touch` staged, running one of these
-#               first would CREATE the shared path it is being skipped for.
-#           These heuristics are conservative substring matches over the case code
+#           (e) its verdict is a fact about the host's SCHEDULER rather than about
+#               the shell, listed by key in `HOST_SCHEDULED` because no reading of
+#               the code separates these from the many cases that merely sleep.
+#               One live case: `background.test.sh::wait for N parallel jobs and
+#               check failure` starts three jobs sleeping 0.03, 0.02 and 0.01
+#               seconds and asserts their output arrives in that order before the
+#               first `wait` returns. Ten milliseconds is the entire margin, and it
+#               buys two races: scheduling jitter under load exceeds it, and the
+#               jobs START staggered, so the one forked last (0.01s) can wake after
+#               the one forked first (0.03s). Idle it never fails; under load
+#               every shell measured fails a minority of runs, busybox ash -- the
+#               shell td-sh is graded against -- MORE often than td-sh itself.
+#               The rates, and the harness and sample size each was taken in, are
+#               in the commit that added this entry: they are facts about one
+#               host on one date, and the no-counts rule above is the reason they
+#               are not restated here where nothing will ever refresh them. The
+#               golden is not a claim any shell satisfies under load, so listing
+#               it either way would red the gate on whichever machine is busy --
+#               the same reason (c) exists.
+#               (b), (c) and (d) are decided from the CODE and (e) from the KEY,
+#               so all four are applied BEFORE the case is run at all. For (c)
+#               that is not cosmetic: with `mkdir` and `touch` staged, running one
+#               of those first would CREATE the shared path it is being skipped
+#               for.
+#           (b), (c) and (d) are conservative substring matches over the case code
 #           with FULL-LINE comments stripped, so a token mentioned only in prose does
-#           not force a skip. KNOWN over-match (safe direction): a token inside an
+#           not force a skip. (e) is a LIST, not a match, because nothing in the code
+#           separates a racy ordering assertion from a case that merely sleeps; the
+#           generator instead checks that each key it names still exists and still
+#           times a background job, and refuses to emit this file if either fails.
+#           KNOWN over-match (safe direction): a token inside an
 #           INLINE comment (`cmd  # ... spec/ ...`) still trips it, so a self-contained
 #           case can be over-skipped and lose gate coverage; a follow-up fixture rig
 #           plus proper comment tokenizing would let most of (b) run.
@@ -198,6 +226,27 @@ fn depends_on_shared_tmp(code: &str) -> bool {
 // regression the day that wording changes, in a test about `cd`.
 fn measures_syscalls(code: &str) -> bool {
     code.contains("strace")
+}
+
+// The shape a `HOST_SCHEDULED` entry CLAIMS: something is timed and something
+// runs in the background, without which no scheduler decides the verdict.
+// Deliberately loose -- thirty cases match it, so it selects nothing -- because
+// it is a drift guard, not a category: the key check sees a rename, this sees a
+// rewrite. Neither sees a golden loosened under an unchanged shape.
+fn backgrounds_a_timed_job(code: &str) -> bool {
+    if !code.contains("sleep") {
+        return false;
+    }
+    // A control `&&`, a `2>&1` and a `&>` are not backgrounding.
+    let b = code.as_bytes();
+    b.iter().enumerate().any(|(i, &c)| {
+        c == b'&'
+            && !matches!(
+                i.checked_sub(1).and_then(|j| b.get(j)),
+                Some(b'>' | b'<' | b'&')
+            )
+            && !matches!(b.get(i + 1), Some(b'&' | b'>'))
+    })
 }
 
 /// Identities this shell CANNOT be staged as. Each probe is a real case run
@@ -389,6 +438,21 @@ fn json_string(s: &str) -> String {
     out
 }
 
+/// Cases whose verdict is a fact about the host's SCHEDULER, not about the
+/// shell. See the overlay header's (e) for the one live entry and its measured
+/// failure rates.
+///
+/// Listed, not detected: nothing syntactic separates a racy ordering assertion
+/// from a case that merely sleeps to let a job settle, so a predicate would
+/// over-skip by an order of magnitude to catch these. See the header's (e).
+///
+/// Every key must still name a case the corpus has AND one that still times a
+/// background job (`backgrounds_a_timed_job`); `main` aborts on either, so
+/// neither a rename nor a rewrite can quietly turn an entry into a hole. A
+/// golden loosened under an unchanged shape defeats both and needs re-measuring.
+const HOST_SCHEDULED: &[&str] =
+    &["background.test.sh::wait for N parallel jobs and check failure"];
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let shell = PathBuf::from(args.next().ok_or("usage: gen_expectations <shell-binary> <spec-helpers-binary> <spec-dir>")?);
@@ -443,13 +507,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             let exec = executable_code(&case.code);
-            // Decided WITHOUT running: both arms below mapped these to `skip`
-            // whatever the outcome, so the verdict is unchanged -- but the run
-            // was not free. Once `mkdir` and `touch` were staged, a case naming
+            // Listed, so decided without reading the code -- but the shape it
+            // claims is still asserted, because a rewrite keeps the key.
+            if HOST_SCHEDULED.contains(&key.as_str()) {
+                if !backgrounds_a_timed_job(&exec) {
+                    errors.push(format!(
+                        "HOST_SCHEDULED names a case that no longer times a \
+                         background job: {key}"
+                    ));
+                }
+                skip.push(key);
+                continue;
+            }
+            // Decided WITHOUT running: both arms mapped these to `skip` whatever
+            // the outcome, so the verdict is unchanged -- but the run was not
+            // free. Once `mkdir` and `touch` were staged, a case naming
             // `/tmp/spam` CREATED it on the build host on the way to being
             // classified as a skip: shared state this harness neither owns nor
             // cleans, left behind by the very run that decided to ignore it.
-            if reads_repo_tree(&exec) || depends_on_shared_tmp(&exec) || measures_syscalls(&exec) {
+            if reads_repo_tree(&exec)
+                || depends_on_shared_tmp(&exec)
+                || measures_syscalls(&exec)
+            {
                 skip.push(key);
                 continue;
             }
@@ -470,6 +549,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // or a case with no golden for this chain) — not a real xfail. Abort.
                 Err(e) => errors.push(format!("run-error {key}: {e}")),
             }
+        }
+    }
+
+    // A listed key that matches nothing is a hole, not a no-op: the case it was
+    // meant to withhold is being graded again, or was renamed and the entry now
+    // withholds nothing -- and the overlay records that as a MISSING line, not a
+    // stale one, so `conformance`'s stale-entry assert cannot see it. Fail closed
+    // here instead. Suppressed after a parse error, which leaves `seen` short of
+    // a whole file and would blame this list for the parser's failure.
+    let parse_failed = errors.iter().any(|e| e.starts_with("parse-error "));
+    for want in HOST_SCHEDULED {
+        if !parse_failed && !seen.contains(*want) {
+            errors.push(format!(
+                "HOST_SCHEDULED names a case this corpus does not have: {want}"
+            ));
         }
     }
 
