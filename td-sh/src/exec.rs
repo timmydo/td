@@ -1650,6 +1650,17 @@ fn run_case(sh: &mut Shell, word: &Word, items: &[crate::ast::CaseItem]) -> R<()
             let chars = expand::expand_pattern(sh, pat)?;
             let units = pattern::compile(&chars);
             if pattern::matches(&units, &subject) {
+                // A matched arm with NOTHING to run answers 0, not the status
+                // the `case` inherited: `evalcase` starts `status` at 0 and
+                // evaluates the body only `if (cp->nclist.body)`
+                // (ash.c:9553-9569), commenting that the emptiness has to be
+                // checked. An empty arm is the one empty body the grammar
+                // allows, so it is the only one that reaches here with nothing
+                // in it -- and it read `false` as its own answer.
+                if item.body.items.is_empty() {
+                    sh.set_status(0);
+                    return Ok(());
+                }
                 return run_list(sh, &item.body);
             }
         }
@@ -4282,6 +4293,106 @@ mod tests {
             let (status, out, err) = run(src);
             assert_eq!((status, out.as_str()), (2, ""), "{src:?}");
             assert!(err.contains("unexpected \""), "{src:?}: {err}");
+        }
+    }
+
+    /// A compound body must contain a command. ash reads one with `list(0)`,
+    /// whose terminator check is skipped on the first iteration, so a closer
+    /// arriving before any item reaches `command()` and is refused there --
+    /// the same refusal a closer gets anywhere else, not a rule of its own.
+    /// This shell ended the list instead and built an EMPTY body.
+    ///
+    /// Mostly that was a wrong-answer bug. For `while` it was worse: an empty
+    /// loop body has nothing in it to fail, return, or be interrupted, so
+    /// `while true; do done` was entered and never left. The corpus carries
+    /// this rule independently -- `spec/empty-bodies.test.sh` annotates
+    /// do/done and then/fi with `## OK dash/bash status: 2` and expects
+    /// case/esac to succeed, which is the same split.
+    #[test]
+    fn a_compound_body_must_hold_a_command_except_where_a_case_arm_may_not() {
+        // All ten of ash's `list(0)` positions, and the TOKEN each names.
+        // The three CONDITION lists are `list(0)` as much as the bodies are
+        // (ash.c:12232, 12241, 12259), and a mutant that reverts only those
+        // three passes every other test in this crate and the corpus gate with
+        // it -- while restoring an infinite loop.
+        for (src, want) in [
+            ("{ }", "}"),
+            ("{\n}", "}"),
+            ("( )", ")"),
+            ("(\n)", ")"),
+            ("if true; then fi", "fi"),
+            ("if true; then :; else fi", "fi"),
+            ("if false; then :; elif true; then fi", "fi"),
+            ("until true; do done", "done"),
+            ("for i in a; do done", "done"),
+            ("if then :; fi", "then"),
+            ("if true; then :; elif then :; fi", "then"),
+            ("until do :; done", "do"),
+            ("f() { }", "}"),
+            // Neither a comment nor a blank line is a command. `list(0)` sets
+            // `CHKNL`, so its lexer never even offers the newline.
+            ("{ # nothing\n}", "}"),
+            ("{\n\n\n}", "}"),
+        ] {
+            let (status, out, err) = run(src);
+            assert_eq!((status, out.as_str()), (2, ""), "{src:?}");
+            assert!(err.contains(&format!("unexpected \"{want}\"")), "{src:?}: {err}");
+        }
+        // `while` end to end, in the spelling that cannot hang if the rule
+        // regresses: an empty `while false` body exits and fails the assert,
+        // where `while true` would loop forever and hang the suite instead of
+        // reporting. The `while true` witness is pinned in `parser.rs`, which
+        // answers without running anything.
+        let (status, out, err) = run("while false; do done");
+        assert_eq!((status, out.as_str()), (2, ""));
+        assert!(err.contains("unexpected \"done\""), "{err}");
+        // A `case` arm is `list(2)` (ash.c:12351), whose check IS live on the
+        // first iteration, so emptiness is legal exactly here -- with or
+        // without the `;;` the last arm may omit, and with no arms at all.
+        for src in [
+            "case x in x) ;; esac",
+            "case x in x) esac",
+            "case x in esac",
+            "case x in x|y) ;; *) :; esac",
+        ] {
+            assert_eq!(run(src), (0, String::new(), String::new()), "{src:?}");
+        }
+        // And it ANSWERS for that emptiness rather than passing on what it
+        // inherited. Every row is 0 in ash; only the matched-and-empty arm was
+        // wrong here, which the rows above cannot see because `$?` is already
+        // 0 for them.
+        for src in [
+            "false; case y in y) ;; esac",
+            "false; case y in y) esac",
+            "false; case y in esac",
+            "false; case y in y) :; esac",
+            "false; if false; then :; else case y in y) ;; esac; fi",
+        ] {
+            assert_eq!(run(src).0, 0, "{src:?}");
+        }
+        // A non-empty arm still answers with its body.
+        assert_eq!(run("true; case y in y) false;; esac").0, 1);
+        // Running off the end still reports the terminator the caller wanted
+        // rather than whatever a command position makes of end of file: ash
+        // handles `TEOF` before the check this commit gates, and so does this.
+        let (status, _, err) = run("{ ");
+        assert_eq!(status, 2);
+        assert!(err.contains("end of file (expecting \"}\")"), "{err}");
+        // One command is enough, in every spelling that puts it against the
+        // closer, and a redirection or an assignment is one.
+        for src in [
+            "{ :; }",
+            "{ :\n}",
+            "(:)",
+            "if true; then :; fi",
+            "while false; do :; done",
+            "for i in a; do :; done",
+            "{ >/dev/null; }",
+            "{ x=1; }",
+            "{ { :; }; }",
+            "{ # c\n:; }",
+        ] {
+            assert_eq!(run(src), (0, String::new(), String::new()), "{src:?}");
         }
     }
 

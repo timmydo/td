@@ -775,23 +775,56 @@ impl Units {
     }
 
     /// True where a list ends: at EOF, at `)`, at `;;`, or at one of the
-    /// caller's closing reserved words.
-    fn at_list_end(&mut self, terms: &[&str]) -> bool {
+    /// caller's closing reserved words. `allow_closers` is off where a CLOSER
+    /// may not end the list yet -- see `parse_list`. End of file is not one of
+    /// them: ash
+    /// handles `TEOF` in the switch above its `tokendlist` check, so it ends a
+    /// list whatever the flag says, and `{ ` still reports the `}` it wanted
+    /// rather than whatever a command position makes of end of file.
+    fn at_list_end(&mut self, terms: &[&str], allow_closers: bool) -> bool {
         match self.peek() {
             None | Some(Tok::Eof) => true,
+            _ if !allow_closers => false,
             Some(Tok::Op(Op::RParen)) | Some(Tok::Op(Op::DSemi)) => true,
             Some(Tok::Word(w)) => w.plain().is_some_and(|s| terms.contains(&s)),
             _ => false,
         }
     }
 
+    /// A body where the grammar demands a command: ash's `list(0)`. Its
+    /// terminator check is skipped on the FIRST iteration -- `nlflag` starts at
+    /// 0, the check wants exactly 2, and `nlflag |= 2` runs after it -- so a
+    /// closer arriving before any item falls through to `parse_command`, which
+    /// refuses it. That is the whole of why `{ }`, `( )`, `if true; then fi`
+    /// and `while true; do done` are syntax errors in ash rather than empty
+    /// bodies. The loop is why it matters beyond conformance: a `while` body
+    /// that parses empty is a loop with nothing in it to fail, return or be
+    /// interrupted, which this shell entered and never left.
+    ///
+    /// Newlines cannot reach the check either way. `list(0)` sets `CHKNL`, so
+    /// its lexer skips them, which is why `{`, a newline and `}` is refused
+    /// exactly as `{ }` is rather than being an empty list ended by the line.
     fn parse_list(&mut self, terms: &[&str]) -> Syn<List> {
+        self.parse_list_inner(terms, true)
+    }
+
+    /// A body that MAY be empty: ash's `list(2)`, whose check is live from the
+    /// first iteration. A `case` arm is the only caller -- ash reads one with
+    /// `list(2)` (ash.c:12351) -- so `case x in x) ;; esac` and `case x in x)
+    /// esac` are both legal, where every list above refuses the same emptiness.
+    /// A backtick body is `list(2)` too, but its outermost list is `parse_unit`
+    /// and `at_backtick_end` answers for it.
+    fn parse_arm_list(&mut self, terms: &[&str]) -> Syn<List> {
+        self.parse_list_inner(terms, false)
+    }
+
+    fn parse_list_inner(&mut self, terms: &[&str], first_required: bool) -> Syn<List> {
         let mut items = Vec::new();
         loop {
             // Before the terminator test, not after: `alias t=then` has to become
             // `then` for `if …; t …; fi` to see the arm end.
             self.open_command()?;
-            if self.at_list_end(terms) {
+            if self.at_list_end(terms, !first_required || !items.is_empty()) {
                 break;
             }
             let and_or = self.parse_and_or()?;
@@ -1343,7 +1376,7 @@ impl Units {
                 patterns.push(self.take_word(Some("word"))?);
             }
             self.expect_op_in_word(Op::RParen)?;
-            let body = self.parse_list(&["esac"])?;
+            let body = self.parse_arm_list(&["esac"])?;
             items.push(CaseItem { patterns, body });
             if self.peek_op() == Some(Op::DSemi) {
                 self.bump();
@@ -1667,6 +1700,35 @@ mod tests {
             .filter(|w| !ENDS_A_LIST.contains(w))
             .collect();
         assert_eq!(extra, [&"in"], "the two lists differ by more than `in`");
+    }
+
+    /// `while true; do done` is refused, asserted WITHOUT running it. If the
+    /// empty-body rule regresses, that script is a loop whose body holds
+    /// nothing to fail, return, be interrupted, or change the condition, so
+    /// executing it in a test would hang the suite rather than fail it -- the
+    /// one shape here where a broken rule costs a report instead of giving
+    /// one. The parser settles it with nothing executed. `exec.rs` carries the
+    /// end-to-end rows in `while false` spelling, which exits either way.
+    #[test]
+    fn an_empty_loop_body_is_refused_before_anything_could_run() {
+        for (src, want) in [
+            ("while true; do done", "done"),
+            ("until false; do done", "done"),
+            // The CONDITION is a list too, and an empty one loops just as
+            // surely: nothing in it changes the status the `while` tests, so
+            // this spun as well before the rule. Review found it; the commit
+            // had fixed it without knowing.
+            ("while do :; done", "do"),
+            ("until do :; done", "do"),
+        ] {
+            let e = parse(src).unwrap_err();
+            assert!(e.msg.contains(&format!("unexpected \"{want}\"")), "{src:?}: {e}");
+            assert!(!e.is_incomplete(), "{src:?}: more input cannot fix it");
+        }
+        // The same shapes with one command in them parse, so the refusal is
+        // the emptiness and not the loop.
+        assert!(parse("while true; do :; done").is_ok());
+        assert!(parse("while :; do :; done").is_ok());
     }
 
     /// The flag and the message are separate things, and the alias splice is

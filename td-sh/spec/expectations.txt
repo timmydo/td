@@ -716,8 +716,6 @@ xfail dparen.test.sh::bash: V in (( A["K"] = V )) gets coerced to integer
 xfail dparen.test.sh::literal strings inside (( ))
 xfail dparen.test.sh::negative number is true
 xfail dparen.test.sh::set associative array
-xfail empty-bodies.test.sh::Empty do/done
-xfail empty-bodies.test.sh::Empty then/fi
 xfail errexit-osh.test.sh::command sub with command_sub_errexit only
 xfail errexit-osh.test.sh::command sub with inherit_errexit and command_sub_errexit
 xfail errexit-osh.test.sh::command sub with inherit_errexit only
