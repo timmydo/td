@@ -5251,7 +5251,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 10 | **capability drop/readback + PID-1 reaper — LANDED**: ambient is explicitly cleared before effective/permitted/inheritable become empty, all five sets are read back zero, and a copied static internal helper leaves a zero-capability grandchild for PID 1's bounded `wait4(-1)` oracle; ordinary application launch still refuses | none |
 | 11 | **const BPF assembler, standard filter, interpreter tests, build-host and target probes — LANDED**: stage 2 sets and reads back no-new-privileges, validates and installs the constant policy, requires `Seccomp: 2`, and its filtered PID-1 descendants inherit the same restriction; the non-shipped td-GCC probe is injected only into the disposable QEMU volume | none |
 | 12 | **fixture package shipped in the image and launched by `/bin/<fixture>` — LANDED**: the static `td-compositor` artifact's fixture personality is copied through an ordinary declared input into a generated application package with an empty payload-only runtime and a canonical application spec; the image selects it into the immutable registry and `/bin` farm, its supervised boot unit and the compositor launcher both enter through `/bin/td-jail-fixture`, and td-jail accepts only the canonical index/spec subset implemented by the landed rungs. Stage 1 canonicalizes, mounts and source-identity-checks immutable `/app` and `/usr`, the exact compositor socket, bounded private tmpfs trees, the five persistent state directories, and one private volatile runtime directory; stage 2 verifies the mount plan, clears capabilities, installs seccomp, holds a parent-death pipe, replaces application stdio with null descriptors, preserves the direct application's status, and gives survivors bounded TERM/KILL reap phases. The client publishes readiness through that volatile bind only after confinement readback and a presented frame; a separate readiness-gated evidence unit emits the exact QEMU marker without making mutable application state deployment-success authority | **first jailed pixels on the QEMU screen** |
-| 12a | the same fixture under `--host`, asserting the degradation report (§X.5) | host mode works, and says what it could not enforce |
+| 12a | **explicit development-host launch — LANDED**: `td-jail --host CONFIG APPLICATION [ARG...]` resolves the ordinary authenticated manifest/spec through a separately materialized physical package root, maps the caller to the fixed uid/gid 1000 jail identity, binds caller-owned Wayland and local td-busd sockets, preserves the target `/app` and `/usr` layout and the full namespace/mount/capability/seccomp transition, and refuses missing user-namespace or seccomp support. The ordinary rung-12 fixture is the recipe acceptance test; it asserts exactly one named diagnostic each for the unavailable aggregate cgroup caps and direct host-Wayland global filtering. Mapped downstream bus authentication and host forwarding remain §D work | host mode works, and says exactly what it could not enforce |
 | 12b | **immutable typed filesystem grants — LANDED**: canonical source resolution and identity pinning, reserved alias refusal, deny-wins/overlap merging, separate recursive bind targets, nested-mount hardening and stage-1/stage-2 readback. Mutable per-user overrides remain a later lifecycle landing | a jailed app can open only a builder-authenticated explicitly granted host path |
 | 12c | **typed memory/task policy — LANDED**: cgroup2 is mounted by PID 1; PID 1 and system services remain at the hierarchy root under cgroup v2's root exception while td-svc enables `memory`/`pids` top-down and delegates an empty user subtree; td-jail creates one direct per-instance leaf, writes and exactly reads `memory.high`, `memory.max`, `memory.oom.group=1`, and `pids.max`, moves blocked stage 2 before release, verifies membership, sets and reads equal hard/soft `RLIMIT_DATA`, reports `memory.events`/`memory.peak`, and removes the empty leaf. Omitted policy gets the documented finite baseline; partial or page-rounded policy is refused. The 48 MiB/64 MiB/32-task fixture and active-cgroup probe gate the QEMU marker. `cpu-max` remains refused until the kernel bandwidth controller lands | application resource limits are effective rather than metadata |
 | 13 | `td-busd` codec, auth, surface #10 | none |
@@ -6759,12 +6759,47 @@ bookkeeping §A.0 keeps out of it.
 
 **The two configurations differ in where a package sits**, which the rule
 above says must not happen casually. It is a divergence in *availability*
-— a host has no image, and no feature is bent to pretend otherwise — and
-it is **one configuration value, not a code path**: the package root
-joins the state root (§B.4) as configuration, so `td-jail` binds
-`<pkgroot>/<name>/files` at `/app` and neither the jail nor the
-application can tell which configuration produced the path. If it ever
-becomes two code paths, the divergence has stopped being availability.
+— a host has no image, and no feature is bent to pretend otherwise. The
+package root joins the state root (§B.4) as configuration and feeds the
+same manifest/spec resolver and mount transition, so `td-jail` binds
+`<pkgroot>/<name>/files` at `/app` and neither the jail nor the application
+can tell which physical package root supplied it. Explicit host-mode
+branches are confined to availability boundaries the product owns but a
+foreign host does not: caller identity mapping, session-socket discovery,
+aggregate cgroup enforcement and their diagnostics. A second application
+layout or a weakened confinement transition would be behavioural
+divergence and is still refused.
+
+The landed invocation is:
+
+```text
+td-jail --host HOST-CONFIG APPLICATION [ARG...]
+```
+
+`--host` is recognized only in that position under the exact `td-jail`
+argv[0] and is never inferred. It is refused whenever the compiled product
+configuration is installed, so the development interface is absent from a
+booted td image even though the same static artifact is exercised by the
+host recipe test. The host configuration is an exact, ordered keyfile:
+
+```text
+format=1
+package-root=/absolute/materialized/packages
+state-root=/absolute/caller/home/.td/app
+registry=/absolute/td-applications.tsv
+launcher-table=/absolute/td-launcher.tsv
+cgroup-root=none
+```
+
+The builder or test harness creates that tree; `td-jail` never extracts
+it. Registry entries retain their logical `/td/store/<object>` identity,
+while host resolution takes that object's basename directly beneath
+`package-root` and refuses symlinks or canonical escapes. The state home,
+the `0700` `XDG_RUNTIME_DIR`, the selected `$WAYLAND_DISPLAY` socket, and
+the local td-busd socket at `$XDG_RUNTIME_DIR/bus` must be direct paths
+owned by the invoking uid. Inside the jail that caller is mapped to the
+product identity uid/gid 1000, so `/app`, `/usr`, `/home/td`, and
+`/run/user/1000` do not change between configurations.
 
 ### X.2 What is missing on a host, and what answers it
 
@@ -6778,6 +6813,14 @@ in every case is flatpak's: **bind the host's socket into the jail.**
 | `td-portal` | **cannot run** — it is a personality of `td-compositor` and speaks a private Wayland protocol to it. `td-busd` **forwards** to the host session bus, where `xdg-desktop-portal` answers |
 | `td-seatd` | absent and unneeded; the host owns its own devices |
 | `td-authd` | absent, and nothing replaces it. There is no elevated operation here, so host mode has no privileged path at all — and it must not grow one by reaching for the host's `sudo`, which would be a password prompt from td's own code (principle 7) and a shell (directive 3) |
+
+Rung 12a supplies the local td-busd endpoint needed by the existing
+registration handshake, but it does not yet make that endpoint a usable
+application bus for a caller mapped to uid 1000: the live broker transport
+still treats the outside `SO_PEERCRED` uid as an unmapped EXTERNAL claim.
+Mapped downstream authentication and the upstream host-bus proxy described
+below both remain §D work. Applications that need the bus therefore remain
+blocked there rather than bypassing td-busd or binding the host bus directly.
 
 **Forwarding is the largest piece of work in this section, not the
 smallest.** §D makes `td-busd` a *bus daemon* — it owns the socket,
@@ -6917,10 +6960,17 @@ gets all three:
 - **Rung 12a**, immediately after the in-image fixture launch —
   deliberately after, since a host that worked first would invert the
   two-configuration rule at the only moment it matters.
-- **An acceptance test**: the rung-12 fixture run under `--host` in CI,
-  asserting the launch **and the degradation report** against what that
-  host's kernel and compositor actually offer. A test that asserted only
-  "it ran" would pass on a host enforcing nothing.
+- **The landed acceptance test** runs the ordinary rung-12 fixture
+  identity, manifest, spec and binary under `--host` from a materialized
+  host prefix. Its declaration, permissions and launcher come directly from
+  the shipped fixture recipe rather than a copied policy. It uses the real
+  td-busd registration path (not an application-originated bus handshake)
+  and caller-owned session-socket endpoints, and asserts the exact two-line
+  degradation report: aggregate memory/task caps are unavailable without a
+  delegated cgroup, and direct host Wayland cannot filter globals. User
+  namespaces and the standard seccomp filter remain fatal prerequisites
+  rather than degradation entries. A test that asserted only "it ran" would
+  pass on a host enforcing nothing.
 
 ### X.6 A prerequisite in the control plane, since fixed
 

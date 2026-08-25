@@ -1,8 +1,8 @@
 //! td-jail — td's application confinement boundary.
 //!
-//! Applications are selected only by an installed argv[0] name, resolved
-//! through the immutable image index, then launched below the same transition
-//! exercised by the target-kernel probe.
+//! Product applications are selected by an installed argv[0] name and the
+//! immutable image index. The exact `td-jail` argv[0] also exposes an explicit
+//! development-host launch when no product configuration is installed.
 #![deny(unsafe_code)]
 
 mod authority;
@@ -33,6 +33,21 @@ fn run() -> std::io::Result<()> {
     if !RESERVED_LAUNCHER_NAMES.contains(&name) {
         return transition::launch_application(authority::resolve(name, arguments)?);
     }
+    let mut arguments = arguments.peekable();
+    if name == "td-jail"
+        && arguments
+        .peek()
+        .is_some_and(|argument| authority::is_host_argument(argument))
+    {
+        drop(arguments.next());
+        let config = arguments.next().ok_or_else(host_usage_error)?;
+        let application = arguments.next().ok_or_else(host_usage_error)?;
+        return transition::launch_application(authority::resolve_host(
+            &config,
+            &application,
+            arguments,
+        )?);
+    }
     match transition::parse_mode(arguments)? {
         transition::Mode::Probe => transition::probe_transition(),
         transition::Mode::ResourceProbe { application } => {
@@ -48,13 +63,21 @@ fn run() -> std::io::Result<()> {
         transition::Mode::Stage2 {
             token,
             identity,
+            outside_identity,
             action,
-        } => transition::run_stage2(token, identity, action),
+        } => transition::run_stage2(token, identity, outside_identity, action),
         transition::Mode::ReaperChild => transition::run_reaper_child(),
         transition::Mode::ReaperOrphan => transition::run_reaper_orphan(),
         transition::Mode::SurvivorChild => transition::run_survivor_child(),
         transition::Mode::SurvivorOrphan => transition::run_survivor_orphan(),
     }
+}
+
+fn host_usage_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "host usage: td-jail --host CONFIG APPLICATION [ARG ...]",
+    )
 }
 
 fn main() -> ExitCode {
@@ -101,6 +124,17 @@ mod confinement {
         assert_eq!(SECCOMP.matches("unsafe {").count(), 0);
         assert_eq!(TRANSITION.matches("#[allow(unsafe_code)]").count(), 0);
         assert_eq!(TRANSITION.matches("unsafe {").count(), 0);
+    }
+
+    #[test]
+    fn host_mode_is_explicit_and_absent_from_the_product_configuration() {
+        let shipped_main = MAIN.split_once("#[cfg(test)]").unwrap().0;
+        assert!(shipped_main.contains("if name == \"td-jail\""));
+        assert!(shipped_main.contains("authority::is_host_argument(argument)"));
+        assert!(AUTHORITY.contains("match fs::symlink_metadata(CONFIG_PATH)"));
+        assert!(AUTHORITY.contains(
+            "host mode is unavailable when the product application configuration is installed"
+        ));
     }
 
     /// §D's two-phase registration is an ORDERING, and no type expresses it.
@@ -302,7 +336,8 @@ mod confinement {
         assert_eq!(TRANSITION.matches("sys::start_new_session()?").count(), 2);
         assert_eq!(TRANSITION.matches(".current_dir(\"/\")").count(), 2);
         assert!(TRANSITION.contains("read_exact(&mut readiness)"));
-        assert!(TRANSITION.contains("close_inherited_descriptors(Some(cleanup_descriptor))?;"));
+        assert!(TRANSITION.contains("close_inherited_descriptors(cleanup_descriptor)?;"));
+        assert!(managed.contains("None if self.instance.is_none() => Ok(None)"));
         assert!(MAIN.contains("run_cgroup_cleanup_bootstrap(&membership)"));
         assert!(MAIN.contains("run_cgroup_cleanup_watcher(&membership)"));
         assert_eq!(CGROUP.matches("wait_until_empty(&directory)").count(), 1);
@@ -425,9 +460,10 @@ mod confinement {
         let shipped_main = MAIN.split_once("#[cfg(test)]").unwrap().0;
         assert_eq!(
             TRANSITION.matches("sys::unshare_namespaces(true)?;").count(),
-            2
+            1
         );
         assert_eq!(TRANSITION.matches("sys::unshare_namespaces(").count(), 2);
+        assert!(TRANSITION.contains("sys::unshare_namespaces(true).map_err(|error|"));
         assert!(TRANSITION.contains(
             "let flags = sys::MS_BIND\n        | if grant.source_kind == FilesystemSourceKind::Directory {\n            sys::MS_REC"
         ));
@@ -486,7 +522,7 @@ mod confinement {
         assert!(TRANSITION.contains(".into_raw_fd()"));
         assert!(TRANSITION.contains("require_descriptor_closed(descriptor)?;"));
         assert!(TRANSITION.contains("clear_and_require_empty_capabilities()?;"));
-        assert!(TRANSITION.contains("install_standard_seccomp_filter()?;"));
+        assert!(TRANSITION.contains("install_standard_seccomp_filter().map_err(|error|"));
         assert!(TRANSITION.contains("probe_pid1_lifecycle()?;"));
         assert_eq!(TRANSITION.matches(".env_clear()").count(), 4);
         assert_eq!(TRANSITION.matches(".envs(").count(), 1);

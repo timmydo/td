@@ -237,7 +237,7 @@ mod tests {
             assert!(sys.contains(row), "td-jail syscall source lacks {row}");
         }
         let filter = transition
-            .find("install_standard_seccomp_filter()?;")
+            .find("install_standard_seccomp_filter().map_err(|error|")
             .expect("seccomp installation");
         let nondumpable = transition
             .find("sys::set_dumpable(false)?;")

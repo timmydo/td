@@ -30,11 +30,16 @@ const STAGE2_ENVIRONMENT_ARG: &str = "--environment";
 const STAGE2_FILESYSTEMS_ARG: &str = "--filesystems";
 const STAGE2_RESOURCES_ARG: &str = "--resources";
 const STAGE2_ARGUMENTS_ARG: &str = "--arguments";
+const NO_CGROUP_MEMBERSHIP: &str = "none";
 const REAPER_CHILD_ARG: &str = "--internal-reaper-child";
 const REAPER_ORPHAN_ARG: &str = "--internal-reaper-orphan";
 const SURVIVOR_CHILD_ARG: &str = "--internal-survivor-child";
 const SURVIVOR_ORPHAN_ARG: &str = "--internal-survivor-orphan";
 pub const TRANSITION_MARKER: &str = "TD-JAIL-TRANSITION-OK";
+pub const HOST_DEGRADATION_CGROUP: &str =
+    "TD-JAIL-HOST-DEGRADATION aggregate-memory-and-task-caps=unenforced reason=no-delegated-cgroup";
+pub const HOST_DEGRADATION_WAYLAND: &str =
+    "TD-JAIL-HOST-DEGRADATION wayland-global-filter=unenforced reason=direct-host-socket";
 const STAGE2_MARKER: &str = "TD-JAIL-STAGE2-OK";
 const TOKEN_LEN: usize = 32;
 /// Bytes of randomness in an instance name's suffix.
@@ -74,6 +79,12 @@ const DEVICE_NODES: &[(&str, u64, u64)] = &[
 pub(crate) struct Identity {
     uid: u32,
     gid: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LaunchIdentityMap {
+    inside: Identity,
+    outside: Identity,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -164,6 +175,7 @@ pub enum Mode {
     Stage2 {
         token: [u8; TOKEN_LEN],
         identity: Identity,
+        outside_identity: Identity,
         action: Stage2Action,
     },
     ReaperChild,
@@ -265,10 +277,16 @@ where
         let encoded = args.next().ok_or_else(usage_error)?;
         let uid = parse_id(args.next(), "uid")?;
         let gid = parse_id(args.next(), "gid")?;
+        let outside_uid = parse_id(args.next(), "outside uid")?;
+        let outside_gid = parse_id(args.next(), "outside gid")?;
         let action = parse_stage2_action(&mut args, uid)?;
         return Ok(Mode::Stage2 {
             token: decode_token(&encoded)?,
             identity: Identity { uid, gid },
+            outside_identity: Identity {
+                uid: outside_uid,
+                gid: outside_gid,
+            },
             action,
         });
     }
@@ -385,7 +403,9 @@ where
             .ok_or_else(usage_error)?
             .into_string()
             .map_err(|_| usage_error())?;
-        cgroup::validate_expected_membership(&cgroup_membership)?;
+        if cgroup_membership != NO_CGROUP_MEMBERSHIP {
+            cgroup::validate_expected_membership(&cgroup_membership)?;
+        }
         if args.next().as_deref() != Some(STAGE2_ARGUMENTS_ARG.as_ref()) {
             return Err(usage_error());
         }
@@ -436,7 +456,7 @@ fn parse_id(value: Option<OsString>, name: &str) -> io::Result<u32> {
 
 fn stage2_launch_arguments(
     token: &[u8; TOKEN_LEN],
-    identity: Identity,
+    identity_map: LaunchIdentityMap,
     entry: &str,
     environment: &[(OsString, OsString)],
     filesystems: &[FilesystemGrant],
@@ -452,8 +472,10 @@ fn stage2_launch_arguments(
     stage2.extend([
         OsString::from(STAGE2_ARG),
         OsString::from(encode_token(token)),
-        OsString::from(identity.uid.to_string()),
-        OsString::from(identity.gid.to_string()),
+        OsString::from(identity_map.inside.uid.to_string()),
+        OsString::from(identity_map.inside.gid.to_string()),
+        OsString::from(identity_map.outside.uid.to_string()),
+        OsString::from(identity_map.outside.gid.to_string()),
         OsString::from(STAGE2_LAUNCH_ARG),
         OsString::from(entry),
         OsString::from(STAGE2_ENVIRONMENT_ARG),
@@ -550,22 +572,58 @@ fn decimal_status_row(status: &str, key: &str) -> io::Result<u32> {
         .map_err(|e| io::Error::other(format!("invalid /proc/self/status {key}: {e}")))
 }
 
-fn install_identity_maps(identity: Identity) -> io::Result<()> {
+fn install_identity_maps(inside: Identity, outside: Identity) -> io::Result<()> {
     fs::write("/proc/self/setgroups", "deny\n")?;
     fs::write(
         "/proc/self/uid_map",
-        format!("{} {} 1\n", identity.uid, identity.uid),
+        format!("{} {} 1\n", inside.uid, outside.uid),
     )?;
     fs::write(
         "/proc/self/gid_map",
-        format!("{} {} 1\n", identity.gid, identity.gid),
+        format!("{} {} 1\n", inside.gid, outside.gid),
     )?;
-    require_single_map("/proc/self/uid_map", identity.uid)?;
-    require_single_map("/proc/self/gid_map", identity.gid)
+    require_single_map("/proc/self/uid_map", inside.uid, Some(outside.uid))?;
+    require_single_map("/proc/self/gid_map", inside.gid, Some(outside.gid))
 }
 
-fn require_single_map(path: &str, id: u32) -> io::Result<()> {
+fn install_launch_identity_maps(
+    inside: Identity,
+    outside: Identity,
+    host_mode: bool,
+) -> io::Result<()> {
+    let result = (|| {
+        install_identity_maps(inside, outside)?;
+        if current_identity()? != inside {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "application identity map did not produce the configured inside identity",
+            ));
+        }
+        Ok(())
+    })();
+    result.map_err(|error| {
+        if host_mode {
+            io::Error::new(
+                error.kind(),
+                format!("host mode requires user-namespace identity mapping: {error}"),
+            )
+        } else {
+            error
+        }
+    })
+}
+
+fn require_single_map(path: &str, inside: u32, outside: Option<u32>) -> io::Result<()> {
     let text = fs::read_to_string(path)?;
+    validate_single_map(path, &text, inside, outside)
+}
+
+fn validate_single_map(
+    path: &str,
+    text: &str,
+    inside: u32,
+    outside: Option<u32>,
+) -> io::Result<()> {
     let mut rows = text.lines().filter(|line| !line.trim().is_empty());
     let row = rows
         .next()
@@ -580,7 +638,11 @@ fn require_single_map(path: &str, id: u32) -> io::Result<()> {
         .map(str::parse::<u32>)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| io::Error::other(format!("invalid {path} readback: {e}")))?;
-    if values.as_slice() != [id, id, 1] {
+    let valid = values.len() == 3
+        && values.first() == Some(&inside)
+        && values.get(2) == Some(&1)
+        && outside.is_none_or(|expected| values.get(1) == Some(&expected));
+    if !valid {
         return Err(io::Error::other(format!(
             "{path} readback does not match the identity map td-jail wrote"
         )));
@@ -2304,7 +2366,7 @@ pub fn probe_transition() -> io::Result<()> {
     let executable = std::env::current_exe()?;
 
     sys::unshare_namespaces(true)?;
-    install_identity_maps(identity)?;
+    install_identity_maps(identity, identity)?;
     NamespaceSnapshot::read()?.require_all_changed(&before)?;
     sys::bring_up_loopback()
         .map_err(|e| io::Error::other(format!("bring up isolated loopback: {e}")))?;
@@ -2322,6 +2384,8 @@ pub fn probe_transition() -> io::Result<()> {
     let mut child = Command::new(executable)
         .arg(STAGE2_ARG)
         .arg(encode_token(&token))
+        .arg(identity.uid.to_string())
+        .arg(identity.gid.to_string())
         .arg(identity.uid.to_string())
         .arg(identity.gid.to_string())
         .arg(STAGE2_PROBE_ARG)
@@ -2512,6 +2576,7 @@ fn wait_for_parent_end(reader: &mut impl Read) -> io::Result<()> {
 pub fn run_stage2(
     expected: [u8; TOKEN_LEN],
     expected_identity: Identity,
+    expected_outside_identity: Identity,
     action: Stage2Action,
 ) -> io::Result<()> {
     if std::process::id() != 1 {
@@ -2545,8 +2610,16 @@ pub fn run_stage2(
             "stage-2 credentials do not match stage 1",
         ));
     }
-    require_single_map("/proc/self/uid_map", identity.uid)?;
-    require_single_map("/proc/self/gid_map", identity.gid)?;
+    require_single_map(
+        "/proc/self/uid_map",
+        identity.uid,
+        Some(expected_outside_identity.uid),
+    )?;
+    require_single_map(
+        "/proc/self/gid_map",
+        identity.gid,
+        Some(expected_outside_identity.gid),
+    )?;
     require_stage2_capabilities()?;
     enter_mount_plan()?;
     let mount_probe_token = random_token()?;
@@ -2556,7 +2629,23 @@ pub fn run_stage2(
     };
     require_mount_plan(filesystems, &mount_probe_token, identity)?;
     clear_and_require_empty_capabilities()?;
-    install_standard_seccomp_filter()?;
+    let host_mode = matches!(
+        &action,
+        Stage2Action::Launch {
+            cgroup_membership,
+            ..
+        } if cgroup_membership == NO_CGROUP_MEMBERSHIP
+    );
+    install_standard_seccomp_filter().map_err(|error| {
+        if host_mode {
+            io::Error::new(
+                error.kind(),
+                format!("host mode requires the standard seccomp filter: {error}"),
+            )
+        } else {
+            error
+        }
+    })?;
     match action {
         Stage2Action::Probe => {
             probe_pid1_lifecycle()?;
@@ -2570,7 +2659,9 @@ pub fn run_stage2(
             cgroup_membership,
             arguments,
         } => {
-            cgroup::require_current_membership(&cgroup_membership)?;
+            if cgroup_membership != NO_CGROUP_MEMBERSHIP {
+                cgroup::require_current_membership(&cgroup_membership)?;
+            }
             sys::set_and_require_data_limit(resources.memory_max_bytes)?;
             sys::set_dumpable(false)?;
             if sys::dumpable()? {
@@ -2808,6 +2899,13 @@ impl Drop for CgroupCleanup {
 }
 
 impl ManagedCgroup {
+    fn disabled() -> Self {
+        Self {
+            instance: None,
+            cleanup: None,
+        }
+    }
+
     fn create(
         executable: &Path,
         instance: &str,
@@ -2831,27 +2929,39 @@ impl ManagedCgroup {
     }
 
     fn membership(&self) -> io::Result<&str> {
+        if self.instance.is_none() && self.cleanup.is_none() {
+            return Ok(NO_CGROUP_MEMBERSHIP);
+        }
         self.instance
             .as_ref()
             .map(cgroup::Instance::membership)
             .ok_or_else(|| io::Error::other("application cgroup is already finished"))
     }
 
-    fn keepalive_descriptor(&self) -> io::Result<u32> {
-        self.cleanup
-            .as_ref()
-            .ok_or_else(|| io::Error::other("cgroup cleanup helper is already finished"))?
-            .keepalive_descriptor()
+    fn keepalive_descriptor(&self) -> io::Result<Option<u32>> {
+        match self.cleanup.as_ref() {
+            Some(cleanup) => cleanup.keepalive_descriptor().map(Some),
+            None if self.instance.is_none() => Ok(None),
+            None => Err(io::Error::other(
+                "cgroup cleanup helper is already finished",
+            )),
+        }
     }
 
     fn attach(&self, pid: u32) -> io::Result<()> {
+        if self.instance.is_none() && self.cleanup.is_none() {
+            return Ok(());
+        }
         self.instance
             .as_ref()
             .ok_or_else(|| io::Error::other("application cgroup is already finished"))?
             .attach(pid)
     }
 
-    fn finish(mut self) -> io::Result<cgroup::Report> {
+    fn finish(mut self) -> io::Result<Option<cgroup::Report>> {
+        if self.instance.is_none() && self.cleanup.is_none() {
+            return Ok(None);
+        }
         let cgroup_result = self
             .instance
             .take()
@@ -2863,7 +2973,7 @@ impl ManagedCgroup {
             .ok_or_else(|| io::Error::other("cgroup cleanup helper is already finished"))?
             .finish();
         match (cgroup_result, cleanup_result) {
-            (Ok(report), Ok(())) => Ok(report),
+            (Ok(report), Ok(())) => Ok(Some(report)),
             (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
             (Err(cgroup), Err(cleanup)) => Err(io::Error::other(format!(
                 "{cgroup}; cgroup cleanup helper: {cleanup}"
@@ -2880,24 +2990,40 @@ impl Drop for ManagedCgroup {
 }
 
 pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
-    let identity = current_identity()?;
-    if identity.uid == 0 || identity.gid == 0 {
+    let outside_identity = current_identity()?;
+    if outside_identity.uid == 0 || outside_identity.gid == 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "td-jail requires the nonzero application identity",
         ));
     }
+    if outside_identity.uid != application.outside_uid
+        || outside_identity.gid != application.outside_gid
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "td-jail launch identity changed after authority resolution",
+        ));
+    }
+    let inside_identity = Identity {
+        uid: application.inside_uid,
+        gid: application.inside_gid,
+    };
     let before = NamespaceSnapshot::read()?;
     let token = random_token()?;
     let executable = std::env::current_exe()?;
 
     let instance = instance_name(&application.name)?;
-    let application_cgroup = ManagedCgroup::create(
-        &executable,
-        &instance,
-        application.resources,
-        identity,
-    )?;
+    let application_cgroup = if application.enforce_cgroup {
+        ManagedCgroup::create(
+            &executable,
+            &instance,
+            application.resources,
+            outside_identity,
+        )?
+    } else {
+        ManagedCgroup::disabled()
+    };
     let cleanup_descriptor = application_cgroup.keepalive_descriptor()?;
 
     // Phase one. What is load-bearing is that it precedes the SPAWN: the
@@ -2925,28 +3051,49 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
     // the honest statement that this instance may own none.
     let registration = crate::bus::register(
         &application.bus_socket,
-        identity.uid,
+        outside_identity.uid,
         &instance,
         &application.name,
         &[],
     )
     .map_err(|e| io::Error::other(format!("register jail instance {instance:?}: {e}")))?;
 
+    if application.host_mode {
+        writeln!(io::stderr(), "{HOST_DEGRADATION_CGROUP}")?;
+        writeln!(io::stderr(), "{HOST_DEGRADATION_WAYLAND}")?;
+    }
+
     let launch_result = (|| -> io::Result<()> {
-        sys::unshare_namespaces(true)?;
-        install_identity_maps(identity)?;
+        sys::unshare_namespaces(true).map_err(|error| {
+            if application.host_mode {
+                io::Error::new(
+                    error.kind(),
+                    format!("host mode requires namespace confinement: {error}"),
+                )
+            } else {
+                error
+            }
+        })?;
+        install_launch_identity_maps(
+            inside_identity,
+            outside_identity,
+            application.host_mode,
+        )?;
         NamespaceSnapshot::read()?.require_all_changed(&before)?;
         sys::bring_up_loopback()
             .map_err(|e| io::Error::other(format!("bring up isolated loopback: {e}")))?;
-        close_inherited_descriptors(Some(cleanup_descriptor))?;
-        prepare_mount_plan(identity, &executable, Some(&application))?;
+        close_inherited_descriptors(cleanup_descriptor)?;
+        prepare_mount_plan(inside_identity, &executable, Some(&application))?;
         prepare_capability_bridge()?;
 
         let (proof_reader, mut proof_writer) = io::pipe()?;
         let (mut stage2_error, stage2_error_writer) = io::pipe()?;
         let stage2_arguments = stage2_launch_arguments(
             &token,
-            identity,
+            LaunchIdentityMap {
+                inside: inside_identity,
+                outside: outside_identity,
+            },
             &application.entry,
             &application.environment,
             &application.filesystems,
@@ -3015,7 +3162,7 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
         // placed where it is actually enforceable.
         if let Err(error) = crate::bus::complete(
             &application.bus_socket,
-            identity.uid,
+            outside_identity.uid,
             &registration,
             child.id(),
         ) {
@@ -3085,10 +3232,11 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
     let cgroup_result = application_cgroup.finish();
     match (launch_result, cgroup_result) {
         (Ok(()), Ok(_)) => Ok(()),
-        (Err(error), Ok(report)) => Err(io::Error::other(format!(
+        (Err(error), Ok(Some(report))) => Err(io::Error::other(format!(
             "{error}; application cgroup diagnostics: {}",
             report.diagnostic()
         ))),
+        (Err(error), Ok(None)) => Err(error),
         (Ok(()), Err(error)) => Err(io::Error::other(format!(
             "application exited successfully but cgroup cleanup failed: {error}"
         ))),
@@ -3425,6 +3573,8 @@ mod tests {
             &encoded,
             "1000",
             "1000",
+            "1000",
+            "1000",
             STAGE2_PROBE_ARG,
         ]))
         .is_ok());
@@ -3434,6 +3584,8 @@ mod tests {
                 &encoded,
                 "1000",
                 "1000",
+                "1234",
+                "2345",
                 STAGE2_LAUNCH_ARG,
                 "/app/bin/app",
                 STAGE2_ENVIRONMENT_ARG,
@@ -3498,6 +3650,8 @@ mod tests {
             &encoded,
             "1000",
             "1000",
+            "1000",
+            "1000",
             STAGE2_LAUNCH_ARG,
             "/usr/bin/app",
             STAGE2_ENVIRONMENT_ARG,
@@ -3510,6 +3664,8 @@ mod tests {
         assert!(parse_mode(args(&[
             STAGE2_ARG,
             &encoded,
+            "1000",
+            "1000",
             "1000",
             "1000",
             STAGE2_LAUNCH_ARG,
@@ -3537,6 +3693,10 @@ mod tests {
         let identity = Identity {
             uid: 1000,
             gid: 1000,
+        };
+        let outside_identity = Identity {
+            uid: 1234,
+            gid: 2345,
         };
         let environment = vec![
             (
@@ -3571,7 +3731,10 @@ mod tests {
         }];
         let emitted = stage2_launch_arguments(
             &token,
-            identity,
+            LaunchIdentityMap {
+                inside: identity,
+                outside: outside_identity,
+            },
             "/app/bin/app",
             &environment,
             &filesystems,
@@ -3586,6 +3749,7 @@ mod tests {
             Mode::Stage2 {
                 token,
                 identity,
+                outside_identity,
                 action: Stage2Action::Launch {
                     entry: "/app/bin/app".into(),
                     environment,
@@ -3720,6 +3884,23 @@ mod tests {
         assert!(effective_id(status, "Groups:").is_err());
         assert!(capability_row("Name:\ttd-jail\n", "CapEff:").is_err());
         assert!(decimal_status_row(status, "Missing:").is_err());
+    }
+
+    #[test]
+    fn identity_map_accepts_a_distinct_host_identity_only_when_expected() {
+        let map = "1000 1234 1\n";
+        validate_single_map("uid_map", map, 1000, Some(1234)).unwrap();
+        validate_single_map("uid_map", map, 1000, None).unwrap();
+        assert!(validate_single_map("uid_map", map, 1000, Some(1000)).is_err());
+        assert!(validate_single_map("uid_map", map, 1234, Some(1000)).is_err());
+        assert!(validate_single_map("uid_map", "1000 1234 2\n", 1000, None).is_err());
+        assert!(validate_single_map(
+            "uid_map",
+            "1000 1234 1\n2000 2234 1\n",
+            1000,
+            None,
+        )
+        .is_err());
     }
 
     #[test]

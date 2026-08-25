@@ -3,6 +3,7 @@ use crate::permissions::{
     RESERVED_FILESYSTEM_TREES,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
@@ -14,9 +15,19 @@ const CONFIG_PATH: &str = "/etc/td-app.conf";
 const REGISTRY_PATH: &str = "/etc/td-applications.tsv";
 const PACKAGE_ROOT: &str = "/td/store";
 const STATE_ROOT: &str = ".td/app";
+const APPLICATION_UID: u32 = 1000;
+const APPLICATION_GID: u32 = 1000;
 pub(crate) const CGROUP_ROOT: &str = "/sys/fs/cgroup/td-user-1000";
 pub(crate) const RUNTIME_ROOT_NAME: &str = "td-app";
 const CONFIG: &str = "format=1\npackage-root=/td/store\nstate-root=.td/app\nregistry=/etc/td-applications.tsv\nlauncher-table=/etc/td-launcher.tsv\ncgroup-root=/sys/fs/cgroup/td-user-1000\n";
+const HOST_ARG: &str = "--host";
+const HOST_CGROUP_ROOT: &str = "none";
+const FORMAT_PREFIX: &str = "format=";
+const PACKAGE_ROOT_PREFIX: &str = "package-root=";
+const STATE_ROOT_PREFIX: &str = "state-root=";
+const REGISTRY_PREFIX: &str = "registry=";
+const LAUNCHER_TABLE_PREFIX: &str = "launcher-table=";
+const CGROUP_ROOT_PREFIX: &str = "cgroup-root=";
 const SPEC_FORMAT: &str = "format=1";
 const NAME_PREFIX: &str = "name=";
 const RUNTIME_PREFIX: &str = "runtime=";
@@ -53,6 +64,22 @@ pub(crate) struct LaunchPlan {
     pub(crate) entry: String,
     pub(crate) environment: Vec<(OsString, OsString)>,
     pub(crate) arguments: Vec<OsString>,
+    pub(crate) outside_uid: u32,
+    pub(crate) outside_gid: u32,
+    pub(crate) inside_uid: u32,
+    pub(crate) inside_gid: u32,
+    pub(crate) enforce_cgroup: bool,
+    pub(crate) host_mode: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ProductConfig {
+    package_root: PathBuf,
+    registry: PathBuf,
+    real_home: Option<PathBuf>,
+    runtime_root: Option<PathBuf>,
+    enforce_cgroup: bool,
+    host_mode: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -160,21 +187,59 @@ pub(crate) fn resolve<I>(name: &str, arguments: I) -> io::Result<LaunchPlan>
 where
     I: Iterator<Item = OsString>,
 {
-    validate_application_name(name)?;
     let identity = effective_identity()?;
-    if identity.0 == 0 || identity.1 == 0 {
+    let config = target_config()?;
+    resolve_with_config(name, arguments, identity, identity, config)
+}
+
+pub(crate) fn is_host_argument(argument: &OsStr) -> bool {
+    argument == HOST_ARG
+}
+
+pub(crate) fn resolve_host<I>(
+    config_path: &OsStr,
+    name: &OsStr,
+    arguments: I,
+) -> io::Result<LaunchPlan>
+where
+    I: Iterator<Item = OsString>,
+{
+    let name = name
+        .to_str()
+        .ok_or_else(|| invalid("host application name is not UTF-8"))?;
+    let outside = effective_identity()?;
+    let inside = (APPLICATION_UID, APPLICATION_GID);
+    let config = host_config(Path::new(config_path), outside)?;
+    resolve_with_config(name, arguments, outside, inside, config)
+}
+
+fn resolve_with_config<I>(
+    name: &str,
+    arguments: I,
+    outside_identity: (u32, u32),
+    inside_identity: (u32, u32),
+    config: ProductConfig,
+) -> io::Result<LaunchPlan>
+where
+    I: Iterator<Item = OsString>,
+{
+    validate_application_name(name)?;
+    if outside_identity.0 == 0 || outside_identity.1 == 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "td-jail requires the nonzero application identity",
         ));
     }
     let arguments = collect_arguments(arguments)?;
-    let (package, spec) = read_application_spec(name)?;
+    let (package, spec) = read_application_spec(name, &config)?;
 
     let package_files =
         canonical_child_directory(&package, "files", "application files")?;
-    let runtime = PathBuf::from(&spec.runtime);
-    let runtime = canonical_store_directory(&runtime, "application runtime")?;
+    let runtime = physical_store_directory(
+        &config.package_root,
+        Path::new(&spec.runtime),
+        "application runtime",
+    )?;
     let runtime_files =
         canonical_child_directory(&runtime, "files", "application runtime files")?;
 
@@ -204,8 +269,17 @@ where
         .iter()
         .map(|(key, value)| (OsString::from(key), OsString::from(value)))
         .collect::<Vec<_>>();
-    validate_environment_list(&environment, identity.0)?;
-    let wayland_socket = session_socket("wayland-0", "Wayland authority", identity.0)?;
+    validate_environment_list(&environment, inside_identity.0)?;
+    let (wayland_socket, bus_socket, runtime_root) = if config.host_mode {
+        host_session_sockets(outside_identity, config.runtime_root.as_deref())?
+    } else {
+        let runtime_root = PathBuf::from(format!("/run/user/{}", outside_identity.0));
+        (
+            session_socket("wayland-0", "Wayland authority", outside_identity.0)?,
+            session_socket("bus", "session bus", outside_identity.0)?,
+            runtime_root,
+        )
+    };
     // Unconditional, like the mount it feeds: APPLICATIONS.md §C's mount plan,
     // step 12, binds the bus ALWAYS, because the BROKER is the policy. A jail
     // that omitted it when a manifest asked for no bus would put that decision
@@ -218,8 +292,12 @@ where
     // and what bounds that is the image shipping ONE application — asserted in
     // the system recipe, not promised here. APPLICATIONS.md §D carries what has
     // to land before a second one does.
-    let bus_socket = session_socket("bus", "session bus", identity.0)?;
-    let state = prepare_state(name, identity)?;
+    let state = prepare_state(
+        name,
+        outside_identity,
+        config.real_home.as_deref(),
+        &runtime_root,
+    )?;
     let filesystems = resolve_filesystem_grants(
         &spec.permissions,
         &state,
@@ -242,27 +320,189 @@ where
         entry: spec.entry,
         environment,
         arguments,
+        outside_uid: outside_identity.0,
+        outside_gid: outside_identity.1,
+        inside_uid: inside_identity.0,
+        inside_gid: inside_identity.1,
+        enforce_cgroup: config.enforce_cgroup,
+        host_mode: config.host_mode,
     })
 }
 
 pub(crate) fn resolve_resource_limits(name: &str) -> io::Result<ResolvedResourceLimits> {
-    let (_, spec) = read_application_spec(name)?;
+    let config = target_config()?;
+    let (_, spec) = read_application_spec(name, &config)?;
     ResolvedResourceLimits::from_policy(spec.permissions.resources())
 }
 
-fn read_application_spec(name: &str) -> io::Result<(PathBuf, ParsedSpec)> {
-    validate_application_name(name)?;
-    let config = read_bounded(CONFIG_PATH, MAX_CONFIG_BYTES)?;
-    if config != CONFIG {
+fn target_config() -> io::Result<ProductConfig> {
+    let text = read_bounded(CONFIG_PATH, MAX_CONFIG_BYTES)?;
+    if text != CONFIG {
         return Err(invalid(
             "application configuration is not the compiled product configuration",
         ));
     }
+    Ok(ProductConfig {
+        package_root: PathBuf::from(PACKAGE_ROOT),
+        registry: PathBuf::from(REGISTRY_PATH),
+        real_home: None,
+        runtime_root: None,
+        enforce_cgroup: true,
+        host_mode: false,
+    })
+}
 
-    let registry_text = read_bounded(REGISTRY_PATH, MAX_APPLICATION_TABLE_BYTES)?;
-    let package = registry_entry(&registry_text, name)?
+fn host_config(path: &Path, identity: (u32, u32)) -> io::Result<ProductConfig> {
+    match fs::symlink_metadata(CONFIG_PATH) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "host mode is unavailable when the product application configuration is installed",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("inspect product application configuration: {error}"),
+            ));
+        }
+    }
+    validate_absolute_config_path(path, "host configuration")?;
+    require_regular(path, "host configuration")?;
+    let canonical_config = fs::canonicalize(path)?;
+    if canonical_config != path {
+        return Err(invalid(format!(
+            "host configuration {} is not a direct regular file",
+            path.display()
+        )));
+    }
+    let text = read_bounded_path(path, MAX_CONFIG_BYTES)?;
+    validate_text("host configuration", &text, MAX_CONFIG_BYTES)?;
+    let mut lines = text.lines();
+    let format = prefixed_line(&mut lines, FORMAT_PREFIX, "host configuration format")?;
+    if format != "1" {
+        return Err(invalid("host configuration requires format=1"));
+    }
+    let package_root = PathBuf::from(prefixed_line(
+        &mut lines,
+        PACKAGE_ROOT_PREFIX,
+        "host package root",
+    )?);
+    let state_root = PathBuf::from(prefixed_line(
+        &mut lines,
+        STATE_ROOT_PREFIX,
+        "host state root",
+    )?);
+    let registry = PathBuf::from(prefixed_line(
+        &mut lines,
+        REGISTRY_PREFIX,
+        "host application registry",
+    )?);
+    let launcher_table = PathBuf::from(prefixed_line(
+        &mut lines,
+        LAUNCHER_TABLE_PREFIX,
+        "host launcher table",
+    )?);
+    let cgroup_root = prefixed_line(
+        &mut lines,
+        CGROUP_ROOT_PREFIX,
+        "host cgroup root",
+    )?;
+    if lines.next().is_some() {
+        return Err(invalid("host configuration has trailing rows"));
+    }
+    if cgroup_root != HOST_CGROUP_ROOT {
+        return Err(invalid(
+            "host configuration cgroup-root must be `none' until a delegated host hierarchy is implemented",
+        ));
+    }
+
+    validate_absolute_config_path(&package_root, "host package root")?;
+    let canonical_package_root = canonical_directory(&package_root, "host package root")?;
+    if canonical_package_root != package_root {
+        return Err(invalid("host package root is not a direct directory"));
+    }
+    for (candidate, label) in [
+        (&registry, "host application registry"),
+        (&launcher_table, "host launcher table"),
+    ] {
+        validate_absolute_config_path(candidate, label)?;
+        require_regular(candidate, label)?;
+        if fs::canonicalize(candidate)? != *candidate {
+            return Err(invalid(format!("{label} is not a direct regular file")));
+        }
+    }
+    validate_absolute_config_path(&state_root, "host state root")?;
+    let real_home = state_root
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .filter(|home| !home.as_os_str().is_empty())
+        .ok_or_else(|| invalid("host state root must end in /.td/app"))?;
+    if real_home.join(STATE_ROOT) != state_root {
+        return Err(invalid("host state root must end in /.td/app"));
+    }
+    let canonical_home = canonical_directory(&real_home, "host real home")?;
+    if canonical_home != real_home {
+        return Err(invalid("host real home is not a direct directory"));
+    }
+    require_owned_directory(&real_home, identity, false)?;
+
+    let runtime_root = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| invalid("host mode requires XDG_RUNTIME_DIR"))?;
+    validate_absolute_config_path(&runtime_root, "host runtime directory")?;
+    require_owned_directory(&runtime_root, identity, true)?;
+    let canonical_runtime = fs::canonicalize(&runtime_root)?;
+    if canonical_runtime != runtime_root {
+        return Err(invalid("host runtime directory is not a direct directory"));
+    }
+
+    Ok(ProductConfig {
+        package_root,
+        registry,
+        real_home: Some(real_home),
+        runtime_root: Some(runtime_root),
+        enforce_cgroup: false,
+        host_mode: true,
+    })
+}
+
+fn validate_absolute_config_path(path: &Path, label: &str) -> io::Result<()> {
+    let raw = path.as_os_str().as_bytes();
+    if raw.len() > 4096
+        || !path.is_absolute()
+        || path == Path::new("/")
+        || raw.last() == Some(&b'/')
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err(invalid(format!(
+            "{label} {} is not a bounded canonical absolute path",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn read_application_spec(
+    name: &str,
+    config: &ProductConfig,
+) -> io::Result<(PathBuf, ParsedSpec)> {
+    validate_application_name(name)?;
+    let registry_text = read_bounded_path(&config.registry, MAX_APPLICATION_TABLE_BYTES)?;
+    let logical_package = registry_entry(&registry_text, name)?
         .ok_or_else(|| invalid(format!("application {name:?} is not installed")))?;
-    let package = canonical_store_directory(&package, "application package")?;
+    let package = physical_store_directory(
+        &config.package_root,
+        &logical_package,
+        "application package",
+    )?;
     // Installation authenticated the manifest; launch pins its immutable
     // package-layout slot without interpreting recipe metadata again.
     require_regular(&package.join("manifest"), "application manifest")?;
@@ -1549,10 +1789,23 @@ fn canonical_directory(path: &Path, label: &str) -> io::Result<PathBuf> {
     Ok(canonical)
 }
 
-fn canonical_store_directory(path: &Path, label: &str) -> io::Result<PathBuf> {
-    require_store_child(path, label)?;
-    let canonical = canonical_directory(path, label)?;
-    require_store_child(&canonical, label)?;
+fn physical_store_directory(
+    package_root: &Path,
+    logical_path: &Path,
+    label: &str,
+) -> io::Result<PathBuf> {
+    require_store_child(logical_path, label)?;
+    let name = logical_path
+        .file_name()
+        .ok_or_else(|| invalid(format!("{label} has no store object name")))?;
+    let expected = package_root.join(name);
+    let canonical = canonical_directory(&expected, label)?;
+    if canonical != expected {
+        return Err(invalid(format!(
+            "{label} {} resolves outside the configured package root",
+            expected.display()
+        )));
+    }
     Ok(canonical)
 }
 
@@ -1611,6 +1864,55 @@ fn session_socket(name: &str, what: &str, uid: u32) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+fn host_session_sockets(
+    identity: (u32, u32),
+    runtime_root: Option<&Path>,
+) -> io::Result<(PathBuf, PathBuf, PathBuf)> {
+    let runtime_root = runtime_root
+        .ok_or_else(|| invalid("host mode has no validated runtime directory"))?;
+    let display = env::var_os("WAYLAND_DISPLAY")
+        .ok_or_else(|| invalid("host mode requires WAYLAND_DISPLAY"))?;
+    let display_path = Path::new(&display);
+    if display_path.components().count() != 1
+        || display_path.as_os_str().is_empty()
+        || display_path.as_os_str().as_bytes().len() > 255
+        || display_path
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .any(|byte| byte.is_ascii_control())
+    {
+        return Err(invalid(
+            "host WAYLAND_DISPLAY is not one bounded runtime-directory entry",
+        ));
+    }
+    let wayland = runtime_root.join(display_path);
+    require_session_socket(&wayland, identity.0, "host Wayland authority")?;
+    let wayland = fs::canonicalize(&wayland).map_err(|error| {
+        invalid(format!(
+            "host Wayland authority {}: {error}",
+            wayland.display()
+        ))
+    })?;
+    require_session_socket(&wayland, identity.0, "host Wayland authority")?;
+
+    let bus = runtime_root.join("bus");
+    require_session_socket(&bus, identity.0, "host td-busd authority")?;
+    let bus = fs::canonicalize(&bus).map_err(|error| {
+        invalid(format!(
+            "host td-busd authority {}: {error}",
+            bus.display()
+        ))
+    })?;
+    require_session_socket(&bus, identity.0, "host td-busd authority")?;
+    if wayland == bus {
+        return Err(invalid(
+            "host Wayland and td-busd authorities resolve to the same socket",
+        ));
+    }
+    Ok((wayland, bus, runtime_root.to_path_buf()))
+}
+
 fn require_session_socket(path: &Path, uid: u32, what: &str) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| invalid(format!("{what} {}: {error}", path.display())))?;
@@ -1638,31 +1940,16 @@ fn status_id(status: &str, key: &str) -> io::Result<u32> {
         .map_err(|error| invalid(format!("invalid /proc/self/status {key} field: {error}")))
 }
 
-fn prepare_state(name: &str, identity: (u32, u32)) -> io::Result<StatePlan> {
-    let passwd = read_bounded("/etc/passwd", MAX_PASSWD_BYTES)?;
-    let mut home = None;
-    for line in passwd.lines() {
-        let fields = line.split(':').collect::<Vec<_>>();
-        if fields.len() != 7 {
-            return Err(invalid("/etc/passwd contains a noncanonical row"));
-        }
-        let Some(uid) = fields.get(2).and_then(|value| value.parse::<u32>().ok()) else {
-            return Err(invalid("/etc/passwd contains an invalid uid"));
-        };
-        if uid != identity.0 {
-            continue;
-        }
-        if home.is_some() {
-            return Err(invalid(
-                "/etc/passwd maps the application uid more than once",
-            ));
-        }
-        let value = fields
-            .get(5)
-            .ok_or_else(|| invalid("/etc/passwd row has no home directory"))?;
-        home = Some(PathBuf::from(value));
-    }
-    let home = home.ok_or_else(|| invalid("application uid has no /etc/passwd entry"))?;
+fn prepare_state(
+    name: &str,
+    identity: (u32, u32),
+    configured_home: Option<&Path>,
+    runtime_root: &Path,
+) -> io::Result<StatePlan> {
+    let home = match configured_home {
+        Some(home) => home.to_path_buf(),
+        None => passwd_home(identity.0)?,
+    };
     require_owned_directory(&home, identity, false)?;
     let home = fs::canonicalize(&home)?;
     require_owned_directory(&home, identity, false)?;
@@ -1684,10 +1971,9 @@ fn prepare_state(name: &str, identity: (u32, u32)) -> io::Result<StatePlan> {
     let cache = ensure_state_component(&application, "cache", identity, true)?;
     let data = ensure_state_component(&application, "data", identity, true)?;
     let local_state = ensure_state_component(&application, "state", identity, true)?;
-    let runtime_root = PathBuf::from(format!("/run/user/{}", identity.0));
-    require_owned_directory(&runtime_root, identity, true)?;
+    require_owned_directory(runtime_root, identity, true)?;
     let runtime_applications =
-        ensure_state_component(&runtime_root, RUNTIME_ROOT_NAME, identity, true)?;
+        ensure_state_component(runtime_root, RUNTIME_ROOT_NAME, identity, true)?;
     let runtime = ensure_state_component(&runtime_applications, name, identity, true)?;
     Ok(StatePlan {
         real_home: home,
@@ -1699,6 +1985,33 @@ fn prepare_state(name: &str, identity: (u32, u32)) -> io::Result<StatePlan> {
         local_state,
         runtime,
     })
+}
+
+fn passwd_home(application_uid: u32) -> io::Result<PathBuf> {
+    let passwd = read_bounded("/etc/passwd", MAX_PASSWD_BYTES)?;
+    let mut home = None;
+    for line in passwd.lines() {
+        let fields = line.split(':').collect::<Vec<_>>();
+        if fields.len() != 7 {
+            return Err(invalid("/etc/passwd contains a noncanonical row"));
+        }
+        let Some(uid) = fields.get(2).and_then(|value| value.parse::<u32>().ok()) else {
+            return Err(invalid("/etc/passwd contains an invalid uid"));
+        };
+        if uid != application_uid {
+            continue;
+        }
+        if home.is_some() {
+            return Err(invalid(
+                "/etc/passwd maps the application uid more than once",
+            ));
+        }
+        let value = fields
+            .get(5)
+            .ok_or_else(|| invalid("/etc/passwd row has no home directory"))?;
+        home = Some(PathBuf::from(value));
+    }
+    home.ok_or_else(|| invalid("application uid has no /etc/passwd entry"))
 }
 
 fn ensure_state_component(
@@ -1952,6 +2265,34 @@ mod tests {
         ));
         let error = read_bounded_path(&path, 1).unwrap_err();
         assert!(error.to_string().contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn configured_package_root_relocates_only_direct_store_children() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDirectory::new("host-packages").unwrap();
+        let name = "00000000000000000000000000000000-fixture-1";
+        let physical = root.join(name);
+        fs::create_dir(&physical).unwrap();
+        let logical = PathBuf::from(PACKAGE_ROOT).join(name);
+        assert_eq!(
+            physical_store_directory(&root, &logical, "fixture").unwrap(),
+            physical
+        );
+
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        let alias_name = "00000000000000000000000000000000-alias-1";
+        symlink("elsewhere", root.join(alias_name)).unwrap();
+        assert!(physical_store_directory(
+            &root,
+            &PathBuf::from(PACKAGE_ROOT).join(alias_name),
+            "fixture alias",
+        )
+        .is_err());
+        assert!(physical_store_directory(&root, Path::new("/elsewhere/object"), "fixture")
+            .is_err());
     }
 
     #[test]
