@@ -95,6 +95,18 @@ impl<'a> Cursor<'a> {
         if length == 0 {
             return Err("Wayland string has zero length".into());
         }
+        self.string_of_length(length)
+    }
+
+    pub fn optional_string(&mut self) -> Result<Option<String>, String> {
+        let length = self.u32()? as usize;
+        if length == 0 {
+            return Ok(None);
+        }
+        self.string_of_length(length).map(Some)
+    }
+
+    fn string_of_length(&mut self, length: usize) -> Result<String, String> {
         let end = self
             .offset
             .checked_add(length)
@@ -238,5 +250,17 @@ mod tests {
 
         let mut cursor = Cursor::new(&[2, 0, 0, 0, b'x', b'y', 0, 0]);
         assert!(cursor.string().is_err());
+    }
+
+    #[test]
+    fn nullable_strings_distinguish_null_from_empty_payloads() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u32.to_ne_bytes());
+        bytes.extend_from_slice(&2u32.to_ne_bytes());
+        bytes.extend_from_slice(b"x\0\0\0");
+        let mut cursor = Cursor::new(&bytes);
+        assert_eq!(cursor.optional_string().unwrap(), None);
+        assert_eq!(cursor.optional_string().unwrap(), Some("x".to_string()));
+        cursor.finish().unwrap();
     }
 }

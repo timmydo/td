@@ -647,6 +647,41 @@ pub fn duplicate_received(fd: RawFd) -> Result<File, String> {
     reopen_and_close(fd, OpenOptions::new().read(true), "received")
 }
 
+/// Own one descriptor obtained from `SCM_RIGHTS` without reopening it.
+///
+/// A `/proc/self/fd` reopen creates a different open-file description and can
+/// lose offsets and status flags. Selection transfer endpoints must instead
+/// travel to their source exactly as the destination supplied them.
+pub struct ReceivedFd {
+    fd: RawFd,
+}
+
+impl ReceivedFd {
+    pub fn adopt(fd: RawFd) -> Result<ReceivedFd, String> {
+        if fd < 0 {
+            return Err(format!("invalid received descriptor {fd}"));
+        }
+        Ok(ReceivedFd { fd })
+    }
+}
+
+impl AsRawFd for ReceivedFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd
+    }
+}
+
+impl Drop for ReceivedFd {
+    fn drop(&mut self) {
+        let _ = close_raw(self.fd);
+    }
+}
+
+#[cfg(test)]
+pub fn duplicate_received_writer(fd: RawFd) -> Result<File, String> {
+    reopen_and_close(fd, OpenOptions::new().write(true), "selection transfer")
+}
+
 pub fn discard_received(fds: &[RawFd]) {
     close_all(fds);
 }

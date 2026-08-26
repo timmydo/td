@@ -4,8 +4,8 @@ use crate::layout::ViewLayout;
 use crate::pointer::{PointerEvent, PointerSnapshot, RoutedPointerFrame};
 use crate::positioner::{Anchor, Gravity, Positioner, Rect as PositionerRect};
 use crate::runtime::{
-    KeyboardDelivery, KeyboardSubscriptionStop, PopupRegistration, PopupRegistrations, Runtime,
-    SubscriptionStop,
+    DataSourceIdentity, KeyboardDelivery, KeyboardSubscriptionStop, PopupRegistration,
+    PopupRegistrations, Runtime, SelectionSource, SelectionUpdate, SubscriptionStop,
 };
 use crate::scene::{
     CursorRequest, InputRegion, PopupPlacement, SharedInputRegion, Surface, SurfaceKey,
@@ -20,6 +20,8 @@ use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::Write;
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, RawFd};
+#[cfg(test)]
+use std::os::fd::IntoRawFd;
 use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -37,6 +39,7 @@ const GLOBAL_XDG_WM_BASE: u32 = 4;
 const GLOBAL_SEAT: u32 = 5;
 const GLOBAL_DECORATION: u32 = 6;
 const GLOBAL_SUBCOMPOSITOR: u32 = 7;
+const GLOBAL_DATA_DEVICE_MANAGER: u32 = 8;
 const WL_DISPLAY_ERROR_IMPLEMENTATION: u32 = 3;
 /// Three of `xdg_surface.error`, each named by the protocol for exactly the
 /// mistake it is raised for: a request to an xdg_surface that has no role
@@ -82,6 +85,17 @@ const WL_SEAT_ERROR_MISSING_CAPABILITY: u32 = 0;
 const WL_POINTER_ERROR_ROLE: u32 = 0;
 const WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE: u32 = 0;
 const WL_SUBSURFACE_ERROR_BAD_SURFACE: u32 = 0;
+const WL_DATA_DEVICE_ERROR_ROLE: u32 = 0;
+const WL_DATA_DEVICE_ERROR_USED_SOURCE: u32 = 1;
+const WL_DATA_SOURCE_ERROR_INVALID_ACTION_MASK: u32 = 0;
+const WL_DATA_SOURCE_ERROR_INVALID_SOURCE: u32 = 1;
+const WL_DATA_OFFER_ERROR_INVALID_FINISH: u32 = 0;
+const WL_DATA_OFFER_ERROR_INVALID_OFFER: u32 = 3;
+const WL_DATA_SOURCE_SEND: u16 = 1;
+const WL_DATA_SOURCE_CANCELLED: u16 = 2;
+const WL_DATA_DEVICE_DATA_OFFER: u16 = 0;
+const WL_DATA_DEVICE_SELECTION: u16 = 5;
+const WL_DATA_OFFER_OFFER: u16 = 0;
 /// `wl_pointer.axis_source`'s `wheel`. The other three sources — finger,
 /// continuous, wheel tilt — describe devices this compositor does not read,
 /// and naming one it cannot tell apart would be worse than the silence a
@@ -138,11 +152,22 @@ const MAX_PENDING_FDS: usize = 64;
 const MAX_OBJECTS: usize = 512;
 const MAX_CLIENTS: usize = 32;
 const MAX_CLIENT_INPUT_REGION_OPERATIONS: usize = 4_096;
+/// Server-created data offers use the range the Wayland core reserves for
+/// them. Client-created ids are refused from this boundary upwards, so the two
+/// allocators cannot race into the same object number.
+const WL_SERVER_ID_START: u32 = 0xff00_0000;
+const MAX_DATA_OFFERS: usize = 64;
+const MAX_DATA_SOURCE_MIME_TYPES: usize = 64;
+const MAX_DATA_SOURCE_MIME_BYTES: usize = 16 * 1024;
+const MAX_MIME_TYPE_BYTES: usize = 256;
+const DATA_DEVICE_MANAGER_VERSION: u32 = 3;
+const DND_ACTION_MASK: u32 = 1 | 2 | 4;
 
 static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
 static NEXT_SERIAL: AtomicU64 = AtomicU64::new(1);
 static NEXT_BUFFER_SERIAL: AtomicU64 = AtomicU64::new(1);
 static NEXT_KEYMAP_FILE: AtomicU64 = AtomicU64::new(1);
+static NEXT_DATA_SOURCE: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_CLIENTS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
@@ -259,6 +284,75 @@ enum SurfaceRole {
     SubsurfaceRetired,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DataSourceUse {
+    Fresh,
+    Selection,
+    Drag,
+}
+
+#[derive(Clone, Copy)]
+struct DataDeviceRegistration {
+    version: u32,
+    after_revision: u64,
+    active_offer: Option<u32>,
+}
+
+#[derive(Clone)]
+struct DataOffer {
+    version: u32,
+    source: DataSourceIdentity,
+    mime_types: Arc<Vec<String>>,
+    valid: bool,
+}
+
+struct DataObjects {
+    devices: BTreeMap<u32, DataDeviceRegistration>,
+    sources: BTreeMap<u32, u64>,
+    offers: BTreeMap<u32, DataOffer>,
+    next_server_id: u32,
+}
+
+impl Default for DataObjects {
+    fn default() -> DataObjects {
+        DataObjects {
+            devices: BTreeMap::new(),
+            sources: BTreeMap::new(),
+            offers: BTreeMap::new(),
+            next_server_id: WL_SERVER_ID_START,
+        }
+    }
+}
+
+struct DataObjectState {
+    objects: Mutex<DataObjects>,
+    /// Serializes seat-thread data delivery with device registration. A
+    /// stalled peer may hold this gate, so registration takes it before the
+    /// global runtime lock.
+    delivery: Mutex<()>,
+}
+
+impl DataObjectState {
+    fn new(objects: DataObjects) -> DataObjectState {
+        DataObjectState {
+            objects: Mutex::new(objects),
+            delivery: Mutex::new(()),
+        }
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::LockResult<std::sync::MutexGuard<'_, DataObjects>> {
+        self.objects.lock()
+    }
+
+    fn lock_delivery(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, ()>> {
+        self.delivery.lock()
+    }
+}
+
+type SharedDataObjects = Arc<DataObjectState>;
+
 #[derive(Clone, Default)]
 struct SurfaceState {
     pending_buffer: Option<PendingBuffer>,
@@ -310,6 +404,19 @@ enum Object {
         pending_position: Option<(i32, i32)>,
         synchronized: bool,
         cached: CachedSurfaceCommit,
+    },
+    DataDeviceManager {
+        version: u32,
+    },
+    DataSource {
+        version: u32,
+        identity: DataSourceIdentity,
+        mime_types: Arc<Vec<String>>,
+        actions_set: bool,
+        used: DataSourceUse,
+    },
+    DataDevice {
+        version: u32,
     },
     XdgWmBase,
     XdgSurface {
@@ -498,6 +605,8 @@ struct Client {
     pointer_authority: PointerAuthority,
     keyboard_active: Arc<AtomicBool>,
     pointer_active: Arc<AtomicBool>,
+    data_device_active: Arc<AtomicBool>,
+    data_objects: SharedDataObjects,
     pending_deletes: PendingDeletes,
     objects: BTreeMap<u32, Object>,
     /// Events produced while the runtime lock is held for one compound commit.
@@ -1108,6 +1217,211 @@ fn dismiss_from_seat(
     outbound.send(&message)
 }
 
+fn allocate_data_offer(data: &mut DataObjects) -> Result<u32, String> {
+    if data.offers.len() >= MAX_DATA_OFFERS {
+        return Err(format!(
+            "client retained more than {MAX_DATA_OFFERS} wl_data_offer objects"
+        ));
+    }
+    let id = data.next_server_id;
+    data.next_server_id = id
+        .checked_add(1)
+        .ok_or_else(|| "server-created Wayland object ids exhausted".to_string())?;
+    Ok(id)
+}
+
+/// Build one selection update while holding the client-local data-object
+/// state. The caller sends only after this returns, so no global runtime lock
+/// can be held across a socket write. A device's revision is advanced with its
+/// offer creation, which also makes a registration racing an already-queued
+/// focus event see exactly one of the initial or queued update.
+fn data_selection_messages(
+    data: &mut DataObjects,
+    update: &SelectionUpdate,
+    only: Option<u32>,
+) -> Result<Vec<Vec<u8>>, String> {
+    let targets: Vec<u32> = data
+        .devices
+        .iter()
+        .filter_map(|(id, registration)| {
+            (only.is_none_or(|wanted| wanted == *id)
+                && update.revision > registration.after_revision)
+                .then_some(*id)
+        })
+        .collect();
+    if update.source.is_some()
+        && data.offers.len().saturating_add(targets.len()) > MAX_DATA_OFFERS
+    {
+        return Err(format!(
+            "selection would exceed the {MAX_DATA_OFFERS}-offer client limit"
+        ));
+    }
+    let mut messages = Vec::new();
+    for device in targets {
+        let (version, old_offer) = {
+            let registration = data
+                .devices
+                .get_mut(&device)
+                .ok_or_else(|| format!("data device {device} disappeared during update"))?;
+            registration.after_revision = update.revision;
+            (registration.version, registration.active_offer.take())
+        };
+        if let Some(old_offer) = old_offer {
+            if let Some(offer) = data.offers.get_mut(&old_offer) {
+                offer.valid = false;
+            }
+        }
+        let Some(source) = &update.source else {
+            let mut selection = wire::Builder::new();
+            selection.u32(0);
+            messages.push(selection.message(device, WL_DATA_DEVICE_SELECTION)?);
+            continue;
+        };
+        let offer_id = allocate_data_offer(data)?;
+        data.offers.insert(
+            offer_id,
+            DataOffer {
+                version,
+                source: source.identity,
+                mime_types: Arc::clone(&source.mime_types),
+                valid: true,
+            },
+        );
+        let registration = data
+            .devices
+            .get_mut(&device)
+            .ok_or_else(|| format!("data device {device} disappeared during offer creation"))?;
+        registration.active_offer = Some(offer_id);
+
+        let mut introduced = wire::Builder::new();
+        introduced.u32(offer_id);
+        messages.push(introduced.message(device, WL_DATA_DEVICE_DATA_OFFER)?);
+        for mime_type in source.mime_types.iter() {
+            let mut offered = wire::Builder::new();
+            offered.string(mime_type)?;
+            messages.push(offered.message(offer_id, WL_DATA_OFFER_OFFER)?);
+        }
+        let mut selection = wire::Builder::new();
+        selection.u32(offer_id);
+        messages.push(selection.message(device, WL_DATA_DEVICE_SELECTION)?);
+    }
+    Ok(messages)
+}
+
+fn send_data_selection(
+    data: &SharedDataObjects,
+    outbound: &Arc<Mutex<Outbound>>,
+    update: &SelectionUpdate,
+    only: Option<u32>,
+) -> Result<(), String> {
+    let mut data = data
+        .lock()
+        .map_err(|_| "data-object registration lock poisoned".to_string())?;
+    let messages = data_selection_messages(&mut data, update, only)?;
+    if messages.is_empty() {
+        return Ok(());
+    }
+    // The client-local data lock spans this client's outbound write. It is
+    // never taken by the runtime or an input thread, so a stalled peer can
+    // block only its own dispatch. In exchange, wl_data_device.release and
+    // wl_data_offer.destroy cannot retire an object between creation in the
+    // registration map and the event that introduces it on the wire.
+    let mut outbound = outbound
+        .lock()
+        .map_err(|_| "Wayland outbound lock poisoned".to_string())?;
+    for message in messages {
+        outbound.send(&message)?;
+    }
+    Ok(())
+}
+
+fn invalidate_data_selection(
+    data: &SharedDataObjects,
+    revision: u64,
+) -> Result<(), String> {
+    let mut data = data
+        .lock()
+        .map_err(|_| "data-object registration lock poisoned".to_string())?;
+    let devices: Vec<u32> = data
+        .devices
+        .iter()
+        .filter_map(|(id, registration)| {
+            (revision > registration.after_revision).then_some(*id)
+        })
+        .collect();
+    for device in devices {
+        let old_offer = {
+            let registration = data
+                .devices
+                .get_mut(&device)
+                .ok_or_else(|| format!("data device {device} disappeared during focus loss"))?;
+            registration.after_revision = revision;
+            registration.active_offer.take()
+        };
+        if let Some(old_offer) = old_offer {
+            if let Some(offer) = data.offers.get_mut(&old_offer) {
+                offer.valid = false;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn data_source_is_live(data: &DataObjects, source: DataSourceIdentity) -> bool {
+    data.sources.get(&source.object).copied() == Some(source.generation)
+}
+
+/// An exact, owned selection endpoint whose raw descriptor stays confined to
+/// the protocol server. The runtime may route this opaque capability between
+/// clients, but only this module can attach it to a Wayland event.
+pub(crate) struct TransferEndpoint(sys::ReceivedFd);
+
+impl TransferEndpoint {
+    fn adopt(fd: RawFd) -> Result<TransferEndpoint, String> {
+        sys::ReceivedFd::adopt(fd).map(TransferEndpoint)
+    }
+}
+
+fn send_data_source_cancelled(
+    data: &SharedDataObjects,
+    outbound: &Arc<Mutex<Outbound>>,
+    source: DataSourceIdentity,
+) -> Result<(), String> {
+    let data = data
+        .lock()
+        .map_err(|_| "data-object registration lock poisoned".to_string())?;
+    if !data_source_is_live(&data, source) {
+        return Ok(());
+    }
+    let message = wire::Builder::new().message(source.object, WL_DATA_SOURCE_CANCELLED)?;
+    outbound
+        .lock()
+        .map_err(|_| "Wayland outbound lock poisoned".to_string())?
+        .send(&message)
+}
+
+fn send_data_source_data(
+    data: &SharedDataObjects,
+    outbound: &Arc<Mutex<Outbound>>,
+    source: DataSourceIdentity,
+    mime_type: &str,
+    file: &TransferEndpoint,
+) -> Result<(), String> {
+    let data = data
+        .lock()
+        .map_err(|_| "data-object registration lock poisoned".to_string())?;
+    if !data_source_is_live(&data, source) {
+        return Ok(());
+    }
+    let mut event = wire::Builder::new();
+    event.string(mime_type)?;
+    let message = event.message(source.object, WL_DATA_SOURCE_SEND)?;
+    outbound
+        .lock()
+        .map_err(|_| "Wayland outbound lock poisoned".to_string())?
+        .send_with_fd(&message, file.0.as_raw_fd())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn seat_worker(
     receiver: Receiver<KeyboardDelivery>,
@@ -1117,6 +1431,7 @@ fn seat_worker(
     popups: PopupRegistrations,
     pointer_authority: PointerAuthority,
     pending_deletes: PendingDeletes,
+    data: SharedDataObjects,
     outbound: Arc<Mutex<Outbound>>,
 ) -> Result<(), String> {
     while let Ok(delivery) = receiver.recv() {
@@ -1152,6 +1467,59 @@ fn seat_worker(
             }
             KeyboardDelivery::DeleteId(id) => {
                 send_reserved_delete_id(&outbound, &pending_deletes, id)?;
+                if outbound
+                    .lock()
+                    .map_err(|_| "Wayland outbound lock poisoned".to_string())?
+                    .disconnected
+                {
+                    return Ok(());
+                }
+                continue;
+            }
+            KeyboardDelivery::Selection(update) => {
+                let _delivery = data
+                    .lock_delivery()
+                    .map_err(|_| "data delivery lock poisoned".to_string())?;
+                send_data_selection(&data, &outbound, &update, None)?;
+                if outbound
+                    .lock()
+                    .map_err(|_| "Wayland outbound lock poisoned".to_string())?
+                    .disconnected
+                {
+                    return Ok(());
+                }
+                continue;
+            }
+            KeyboardDelivery::SelectionFocusLost(revision) => {
+                let _delivery = data
+                    .lock_delivery()
+                    .map_err(|_| "data delivery lock poisoned".to_string())?;
+                invalidate_data_selection(&data, revision)?;
+                continue;
+            }
+            KeyboardDelivery::DataSourceCancelled(source) => {
+                let _delivery = data
+                    .lock_delivery()
+                    .map_err(|_| "data delivery lock poisoned".to_string())?;
+                send_data_source_cancelled(&data, &outbound, source)?;
+                if outbound
+                    .lock()
+                    .map_err(|_| "Wayland outbound lock poisoned".to_string())?
+                    .disconnected
+                {
+                    return Ok(());
+                }
+                continue;
+            }
+            KeyboardDelivery::DataSourceSend {
+                source,
+                mime_type,
+                file,
+            } => {
+                let _delivery = data
+                    .lock_delivery()
+                    .map_err(|_| "data delivery lock poisoned".to_string())?;
+                send_data_source_data(&data, &outbound, source, &mime_type, &file)?;
                 if outbound
                     .lock()
                     .map_err(|_| "Wayland outbound lock poisoned".to_string())?
@@ -1210,6 +1578,7 @@ fn supervise_seat_worker(
     popups: PopupRegistrations,
     pointer_authority: PointerAuthority,
     pending_deletes: PendingDeletes,
+    data: SharedDataObjects,
     outbound: Arc<Mutex<Outbound>>,
 ) -> Result<(), String> {
     let result = seat_worker(
@@ -1220,6 +1589,7 @@ fn supervise_seat_worker(
         popups,
         pointer_authority,
         pending_deletes,
+        data,
         Arc::clone(&outbound),
     );
     if let Err(error) = &result {
@@ -1278,6 +1648,8 @@ impl Client {
             pointer_authority: Arc::new(Mutex::new(None)),
             keyboard_active: Arc::new(AtomicBool::new(false)),
             pointer_active: Arc::new(AtomicBool::new(false)),
+            data_device_active: Arc::new(AtomicBool::new(false)),
+            data_objects: Arc::new(DataObjectState::new(DataObjects::default())),
             pending_deletes: Arc::new(Mutex::new(BTreeMap::new())),
             objects,
             deferred_outbound: None,
@@ -1716,6 +2088,443 @@ impl Client {
         self.remove_object(id)
     }
 
+    fn create_data_source(&mut self, id: u32, version: u32) -> Result<(), String> {
+        let identity = DataSourceIdentity {
+            client: self.id,
+            object: id,
+            generation: NEXT_DATA_SOURCE.fetch_add(1, Ordering::Relaxed),
+        };
+        self.insert(
+            id,
+            Object::DataSource {
+                version,
+                identity,
+                mime_types: Arc::new(Vec::new()),
+                actions_set: false,
+                used: DataSourceUse::Fresh,
+            },
+        )?;
+        let replaced = self
+            .data_objects
+            .lock()
+            .map_err(|_| "data-object registration lock poisoned".to_string())?
+            .sources
+            .insert(id, identity.generation);
+        if replaced.is_some() {
+            return Err(format!("data source object {id} was already registered"));
+        }
+        Ok(())
+    }
+
+    fn retained_data_mime_bytes(&self) -> usize {
+        self.objects
+            .values()
+            .filter_map(|object| match object {
+                Object::DataSource { mime_types, .. } => Some(
+                    mime_types
+                        .iter()
+                        .fold(0usize, |total, mime_type| total.saturating_add(mime_type.len())),
+                ),
+                _ => None,
+            })
+            .fold(0usize, usize::saturating_add)
+    }
+
+    fn offer_data_source(&mut self, id: u32, mime_type: String) -> Result<(), String> {
+        if mime_type.is_empty() || mime_type.contains('\0') {
+            return Err(format!("wl_data_source {id} offered an invalid empty MIME type"));
+        }
+        if mime_type.len() > MAX_MIME_TYPE_BYTES {
+            return Err(format!(
+                "wl_data_source {id} MIME type needs {} bytes, exceeding {MAX_MIME_TYPE_BYTES}",
+                mime_type.len()
+            ));
+        }
+        let Some(Object::DataSource {
+            mime_types, used, ..
+        }) = self.objects.get(&id)
+        else {
+            return Err(format!("request for non-data-source object {id}"));
+        };
+        if *used != DataSourceUse::Fresh {
+            // Core permits offer more than once and assigns no used-source
+            // error to it. This selection-only implementation snapshots MIME
+            // types at set_selection, so a legal late offer is ignored.
+            return Ok(());
+        }
+        if mime_types.iter().any(|offered| offered == &mime_type) {
+            return Ok(());
+        }
+        if mime_types.len() >= MAX_DATA_SOURCE_MIME_TYPES {
+            return Err(format!(
+                "wl_data_source {id} exceeded {MAX_DATA_SOURCE_MIME_TYPES} MIME types"
+            ));
+        }
+        if self
+            .retained_data_mime_bytes()
+            .saturating_add(mime_type.len())
+            > MAX_DATA_SOURCE_MIME_BYTES
+        {
+            return Err(format!(
+                "client data-source MIME types exceed {MAX_DATA_SOURCE_MIME_BYTES} bytes"
+            ));
+        }
+        let Some(Object::DataSource { mime_types, .. }) = self.objects.get_mut(&id) else {
+            return Err(format!("data source object {id} disappeared"));
+        };
+        Arc::make_mut(mime_types).push(mime_type);
+        Ok(())
+    }
+
+    fn set_data_source_actions(&mut self, id: u32, actions: u32) -> Result<(), String> {
+        if actions & !DND_ACTION_MASK != 0 {
+            return self.fail_protocol_on(
+                id,
+                WL_DATA_SOURCE_ERROR_INVALID_ACTION_MASK,
+                &format!("wl_data_source {id} used invalid action mask {actions:#x}"),
+            );
+        }
+        let Some(Object::DataSource {
+            actions_set, used, ..
+        }) = self.objects.get_mut(&id)
+        else {
+            return Err(format!("request for non-data-source object {id}"));
+        };
+        if *actions_set || *used != DataSourceUse::Fresh {
+            return self.fail_protocol_on(
+                id,
+                WL_DATA_SOURCE_ERROR_INVALID_SOURCE,
+                &format!("wl_data_source {id} cannot set drag actions now"),
+            );
+        }
+        *actions_set = true;
+        Ok(())
+    }
+
+    fn destroy_data_source(&mut self, id: u32, source: DataSourceIdentity) -> Result<(), String> {
+        let update = self
+            .runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .clear_selection(source, Some(self.id))?;
+        if let Some(update) = update {
+            send_data_selection(&self.data_objects, &self.outbound, &update, None)?;
+        }
+        let removed = self
+            .data_objects
+            .lock()
+            .map_err(|_| "data-object registration lock poisoned".to_string())?
+            .sources
+            .remove(&id);
+        if removed != Some(source.generation) {
+            return Err(format!("data source object {id} lost its registration"));
+        }
+        self.remove_object(id)
+    }
+
+    fn create_data_device(&mut self, id: u32, seat: u32, version: u32) -> Result<(), String> {
+        if !matches!(self.objects.get(&seat), Some(Object::Seat { .. })) {
+            return Err(format!(
+                "wl_data_device_manager references non-seat object {seat}"
+            ));
+        }
+        self.insert(id, Object::DataDevice { version })?;
+        // The seat worker takes this gate before touching data-object state.
+        // Wait for a stalled local delivery BEFORE taking the global runtime
+        // lock; once admitted, runtime + data can close the registration/focus
+        // race without letting that stalled peer freeze any other client.
+        let _delivery = self
+            .data_objects
+            .lock_delivery()
+            .map_err(|_| "data delivery lock poisoned".to_string())?;
+        let (focused, revision, selection) = {
+            let runtime = self
+                .runtime
+                .lock()
+                .map_err(|_| "runtime lock poisoned".to_string())?;
+            let snapshot = runtime.selection_for_client(self.id);
+            let mut data = self
+                .data_objects
+                .lock()
+                .map_err(|_| "data-object registration lock poisoned".to_string())?;
+            let after_revision = if snapshot.0 {
+                snapshot.1.saturating_sub(1)
+            } else {
+                snapshot.1
+            };
+            if data
+                .devices
+                .insert(
+                    id,
+                    DataDeviceRegistration {
+                        version,
+                        after_revision,
+                        active_offer: None,
+                    },
+                )
+                .is_some()
+            {
+                return Err(format!("data device object {id} was already registered"));
+            }
+            self.data_device_active.store(true, Ordering::Release);
+            drop(data);
+            drop(runtime);
+            snapshot
+        };
+        if focused {
+            send_data_selection(
+                &self.data_objects,
+                &self.outbound,
+                &SelectionUpdate {
+                    revision,
+                    source: selection,
+                },
+                Some(id),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn remove_data_device(&mut self, id: u32) -> Result<(), String> {
+        let mut data = self
+            .data_objects
+            .lock()
+            .map_err(|_| "data-object registration lock poisoned".to_string())?;
+        let registration = data
+            .devices
+            .remove(&id)
+            .ok_or_else(|| format!("data device object {id} lost its registration"))?;
+        if let Some(offer) = registration.active_offer {
+            if let Some(offer) = data.offers.get_mut(&offer) {
+                offer.valid = false;
+            }
+        }
+        if data.devices.is_empty() {
+            self.data_device_active.store(false, Ordering::Release);
+        }
+        drop(data);
+        self.remove_object(id)
+    }
+
+    fn set_data_device_selection(&mut self, source: u32) -> Result<(), String> {
+        let selection = if source == 0 {
+            None
+        } else {
+            let Some(Object::DataSource {
+                identity,
+                mime_types,
+                actions_set,
+                used,
+                ..
+            }) = self.objects.get(&source)
+            else {
+                return Err(format!("selection references non-data-source {source}"));
+            };
+            if *used != DataSourceUse::Fresh {
+                return self.fail_protocol(
+                    WL_DATA_DEVICE_ERROR_USED_SOURCE,
+                    &format!("wl_data_source {source} was already used"),
+                );
+            }
+            if *actions_set {
+                return self.fail_protocol_on(
+                    source,
+                    WL_DATA_SOURCE_ERROR_INVALID_SOURCE,
+                    &format!("drag source {source} cannot become a selection source"),
+                );
+            }
+            Some(SelectionSource {
+                identity: *identity,
+                mime_types: Arc::clone(mime_types),
+            })
+        };
+        if source != 0 {
+            let Some(Object::DataSource { used, .. }) = self.objects.get_mut(&source) else {
+                return Err(format!("data source object {source} disappeared"));
+            };
+            *used = DataSourceUse::Selection;
+        }
+        let ignored_source = selection.as_ref().map(|selection| selection.identity);
+        let change = self
+            .runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .set_selection(self.id, selection)?;
+        let Some(change) = change else {
+            if let Some(source) = ignored_source {
+                send_data_source_cancelled(&self.data_objects, &self.outbound, source)?;
+            }
+            return Ok(());
+        };
+        if let Some(source) = change.local_cancel {
+            send_data_source_cancelled(&self.data_objects, &self.outbound, source)?;
+        }
+        send_data_selection(
+            &self.data_objects,
+            &self.outbound,
+            &change.update,
+            None,
+        )
+    }
+
+    fn start_cancelled_drag(
+        &mut self,
+        source: u32,
+        origin: u32,
+        icon: u32,
+    ) -> Result<(), String> {
+        if !matches!(self.objects.get(&origin), Some(Object::Surface(_))) {
+            return Err(format!("drag origin {origin} is no wl_surface"));
+        }
+        if icon != 0 {
+            let Some(Object::Surface(state)) = self.objects.get(&icon) else {
+                return Err(format!("drag icon {icon} is no wl_surface"));
+            };
+            if state.role.is_some() {
+                return self.fail_protocol(
+                    WL_DATA_DEVICE_ERROR_ROLE,
+                    &format!("drag icon surface {icon} already has a role"),
+                );
+            }
+        }
+        if source == 0 {
+            return Ok(());
+        }
+        let Some(Object::DataSource {
+            version,
+            actions_set,
+            used,
+            ..
+        }) = self.objects.get(&source)
+        else {
+            return Err(format!("drag references non-data-source {source}"));
+        };
+        if *used != DataSourceUse::Fresh {
+            return self.fail_protocol(
+                WL_DATA_DEVICE_ERROR_USED_SOURCE,
+                &format!("wl_data_source {source} was already used"),
+            );
+        }
+        if *version >= 3 && !*actions_set {
+            return self.fail_protocol_on(
+                source,
+                WL_DATA_SOURCE_ERROR_INVALID_SOURCE,
+                &format!("wl_data_source {source} started a version-3 drag without actions"),
+            );
+        }
+        let version = *version;
+        let Some(Object::DataSource { used, .. }) = self.objects.get_mut(&source) else {
+            return Err(format!("data source object {source} disappeared"));
+        };
+        *used = DataSourceUse::Drag;
+        // Drag-and-drop is deliberately not part of this increment. Version 3
+        // has a general cancellation event; versions 1 and 2 permit it only
+        // when a source is replaced, so their consumed request ends quietly.
+        if version >= 3 {
+            self.send(source, WL_DATA_SOURCE_CANCELLED, wire::Builder::new())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn dispatch_data_offer(
+        &mut self,
+        message: &wire::Message,
+        fds: &mut VecDeque<RawFd>,
+    ) -> Result<(), String> {
+        let offer = self
+            .data_objects
+            .lock()
+            .map_err(|_| "data-object registration lock poisoned".to_string())?
+            .offers
+            .get(&message.object)
+            .cloned()
+            .ok_or_else(|| format!("request for unknown data offer {}", message.object))?;
+        let mut args = wire::Cursor::new(&message.payload);
+        match message.opcode {
+            0 => {
+                args.u32()?;
+                let accepted = args.optional_string()?;
+                args.finish()?;
+                if !offer.valid {
+                    return Ok(());
+                }
+                if accepted
+                    .as_ref()
+                    .is_some_and(|mime_type| !offer.mime_types.contains(mime_type))
+                {
+                    return self.fail_protocol(
+                        WL_DATA_OFFER_ERROR_INVALID_OFFER,
+                        &format!(
+                            "wl_data_offer {} accepted an unoffered MIME type",
+                            message.object
+                        ),
+                    );
+                }
+                Ok(())
+            }
+            1 => {
+                let mime_type = args.string()?;
+                args.finish()?;
+                let fd = fds.pop_front().ok_or_else(|| {
+                    format!("wl_data_offer {} receive lacked a descriptor", message.object)
+                })?;
+                let file = TransferEndpoint::adopt(fd)?;
+                if !offer.valid {
+                    return Ok(());
+                }
+                if !offer.mime_types.contains(&mime_type) {
+                    return self.fail_protocol(
+                        WL_DATA_OFFER_ERROR_INVALID_OFFER,
+                        &format!("wl_data_offer {} lacks {mime_type}", message.object),
+                    );
+                }
+                self
+                    .runtime
+                    .lock()
+                    .map_err(|_| "runtime lock poisoned".to_string())?
+                    .send_selection_data(self.id, offer.source, mime_type, file)?;
+                Ok(())
+            }
+            2 => {
+                args.finish()?;
+                let mut data = self
+                    .data_objects
+                    .lock()
+                    .map_err(|_| "data-object registration lock poisoned".to_string())?;
+                if data.offers.remove(&message.object).is_none() {
+                    return Err(format!("data offer {} disappeared", message.object));
+                }
+                for registration in data.devices.values_mut() {
+                    if registration.active_offer == Some(message.object) {
+                        registration.active_offer = None;
+                    }
+                }
+                Ok(())
+            }
+            3 if offer.version >= 3 => {
+                args.finish()?;
+                self.fail_protocol(
+                    WL_DATA_OFFER_ERROR_INVALID_FINISH,
+                    &format!("selection offer {} cannot be finished as a drag", message.object),
+                )
+            }
+            4 if offer.version >= 3 => {
+                args.u32()?;
+                args.u32()?;
+                args.finish()?;
+                self.fail_protocol(
+                    WL_DATA_OFFER_ERROR_INVALID_OFFER,
+                    &format!("selection offer {} has no drag actions", message.object),
+                )
+            }
+            _ => Err(format!(
+                "unsupported wl_data_offer request {}",
+                message.opcode
+            )),
+        }
+    }
+
     fn disconnected(&self) -> Result<bool, String> {
         self.outbound
             .lock()
@@ -1988,6 +2797,11 @@ impl Client {
         if id <= 1 {
             return Err(format!("new object id {id} is reserved"));
         }
+        if id >= WL_SERVER_ID_START {
+            return Err(format!(
+                "client object id {id} is in the server-created range"
+            ));
+        }
         let reservation = self
             .pending_deletes
             .lock()
@@ -2043,6 +2857,12 @@ impl Client {
             XDG_WM_BASE_VERSION,
         )?;
         self.global(registry, GLOBAL_DECORATION, "zxdg_decoration_manager_v1", 1)?;
+        self.global(
+            registry,
+            GLOBAL_DATA_DEVICE_MANAGER,
+            "wl_data_device_manager",
+            DATA_DEVICE_MANAGER_VERSION,
+        )?;
         self.global(registry, GLOBAL_SEAT, "wl_seat", SEAT_VERSION)
     }
 
@@ -2090,6 +2910,11 @@ impl Client {
                     self.send(id, 1, name)?;
                 }
                 Ok(())
+            }
+            (GLOBAL_DATA_DEVICE_MANAGER, "wl_data_device_manager")
+                if (1..=DATA_DEVICE_MANAGER_VERSION).contains(&version) =>
+            {
+                self.insert(id, Object::DataDeviceManager { version })
             }
             _ => Err(format!(
                 "global {name} does not provide {interface} version {version}"
@@ -3435,6 +4260,18 @@ impl Client {
         if matches!(self.objects.get(&message.object), Some(Object::Region(_))) {
             return self.dispatch_region(&message);
         }
+        let data_offer = if message.object >= WL_SERVER_ID_START {
+            self.data_objects
+                .lock()
+                .map_err(|_| "data-object registration lock poisoned".to_string())?
+                .offers
+                .contains_key(&message.object)
+        } else {
+            false
+        };
+        if data_offer {
+            return self.dispatch_data_offer(&message, fds);
+        }
         let object = self
             .objects
             .get(&message.object)
@@ -3870,6 +4707,69 @@ impl Client {
                 }
                 _ => Err(format!(
                     "unsupported wl_subsurface request {}",
+                    message.opcode
+                )),
+            },
+            Object::DataDeviceManager { version } => match message.opcode {
+                0 => {
+                    let id = args.u32()?;
+                    args.finish()?;
+                    self.create_data_source(id, version)
+                }
+                1 => {
+                    let id = args.u32()?;
+                    let seat = args.u32()?;
+                    args.finish()?;
+                    self.create_data_device(id, seat, version)
+                }
+                _ => Err(format!(
+                    "unsupported wl_data_device_manager request {}",
+                    message.opcode
+                )),
+            },
+            Object::DataSource {
+                version, identity, ..
+            } => match message.opcode {
+                0 => {
+                    let mime_type = args.string()?;
+                    args.finish()?;
+                    self.offer_data_source(message.object, mime_type)
+                }
+                1 => {
+                    args.finish()?;
+                    self.destroy_data_source(message.object, identity)
+                }
+                2 if version >= 3 => {
+                    let actions = args.u32()?;
+                    args.finish()?;
+                    self.set_data_source_actions(message.object, actions)
+                }
+                _ => Err(format!(
+                    "unsupported wl_data_source request {}",
+                    message.opcode
+                )),
+            },
+            Object::DataDevice { version } => match message.opcode {
+                0 => {
+                    let source = args.u32()?;
+                    let origin = args.u32()?;
+                    let icon = args.u32()?;
+                    args.u32()?;
+                    args.finish()?;
+                    self.start_cancelled_drag(source, origin, icon)
+                }
+                1 => {
+                    let source = args.u32()?;
+                    args.u32()?;
+                    args.finish()?;
+                    self.set_data_device_selection(source)
+                }
+                2 if version >= 2 => {
+                    args.finish()?;
+                    self.remove_data_device(message.object)
+                }
+                _ => Err(format!(
+                    "unsupported wl_data_device request {}",
                     message.opcode
                 )),
             },
@@ -4776,10 +5676,11 @@ fn serve_client(
             // the thread that read the press — which needs this client's own
             // registrations, since the dispatch thread may be blocked.
             runtime.register_popups(id, Arc::clone(&client.popups));
-            runtime.subscribe_input_with_activity(
+            runtime.subscribe_seat_with_activity(
                 id,
                 Arc::clone(&client.keyboard_active),
                 Arc::clone(&client.pointer_active),
+                Arc::clone(&client.data_device_active),
             )
         }
         Err(poisoned) => {
@@ -4841,6 +5742,7 @@ fn serve_client(
     let seat_popups = Arc::clone(&client.popups);
     let pointer_authority = Arc::clone(&client.pointer_authority);
     let pending_deletes = Arc::clone(&client.pending_deletes);
+    let data_objects = Arc::clone(&client.data_objects);
     let outbound = Arc::clone(&client.outbound);
     let worker_outbound = Arc::clone(&outbound);
     let seat_thread = match thread::Builder::new()
@@ -4855,6 +5757,7 @@ fn serve_client(
                 seat_popups,
                 pointer_authority,
                 pending_deletes,
+                data_objects,
                 worker_outbound,
             )
         }) {
@@ -4917,11 +5820,17 @@ fn serve_client(
     keyboard_stop.stop();
     let cleanup = match runtime.lock() {
         Ok(mut runtime) => {
+            let selection = runtime.clear_client_selection(id);
             let cleanup = runtime.remove_client(id);
             runtime.unsubscribe(id);
             runtime.unsubscribe_keyboard(id);
             runtime.unregister_popups(id);
-            cleanup
+            match (selection, cleanup) {
+                (Ok(()), result) | (result, Ok(())) => result,
+                (Err(selection), Err(cleanup)) => Err(format!(
+                    "clear departing selection: {selection}; remove client: {cleanup}"
+                )),
+            }
         }
         Err(_) => Err("runtime lock poisoned".to_string()),
     };
@@ -5062,7 +5971,7 @@ mod tests {
     /// them read the next message as a global and hang waiting for it.
     /// `the_registry_advertises_exactly_the_globals_td_serves` is what ties the
     /// two together.
-    const GLOBAL_COUNT: usize = 7;
+    const GLOBAL_COUNT: usize = 8;
 
     fn receive_messages(stream: &mut UnixStream, count: usize) -> Vec<wire::Message> {
         let mut bytes = Vec::new();
@@ -6006,6 +6915,7 @@ mod tests {
                 Arc::new(Mutex::new(BTreeMap::new())),
                 Arc::new(Mutex::new(None)),
                 worker_pending_deletes,
+                Arc::new(DataObjectState::new(DataObjects::default())),
                 worker_outbound,
             )
         });
@@ -6146,6 +7056,7 @@ mod tests {
                 Arc::new(Mutex::new(BTreeMap::new())),
                 worker_authority,
                 worker_pending_deletes,
+                Arc::new(DataObjectState::new(DataObjects::default())),
                 worker_outbound,
             )
         });
@@ -6356,6 +7267,7 @@ mod tests {
                 Arc::new(Mutex::new(BTreeMap::new())),
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(BTreeMap::new())),
+                Arc::new(DataObjectState::new(DataObjects::default())),
                 worker_outbound,
             )
         });
@@ -6509,6 +7421,7 @@ mod tests {
                 Arc::new(Mutex::new(BTreeMap::new())),
                 worker_authority,
                 Arc::new(Mutex::new(BTreeMap::new())),
+                Arc::new(DataObjectState::new(DataObjects::default())),
                 worker_outbound,
             )
         });
@@ -6909,6 +7822,7 @@ mod tests {
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(DataObjectState::new(DataObjects::default())),
             Arc::new(Mutex::new(Outbound {
                 stream: server,
                 disconnected: false,
@@ -6977,6 +7891,7 @@ mod tests {
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(DataObjectState::new(DataObjects::default())),
             Arc::clone(&outbound),
         )
         .unwrap_err();
@@ -7013,6 +7928,7 @@ mod tests {
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(Mutex::new(None)),
             Arc::clone(&pending),
+            Arc::new(DataObjectState::new(DataObjects::default())),
             Arc::new(Mutex::new(Outbound {
                 stream: server,
                 disconnected: false,
@@ -7731,11 +8647,889 @@ mod tests {
                     "zxdg_decoration_manager_v1".to_string(),
                     1
                 ),
+                (
+                    GLOBAL_DATA_DEVICE_MANAGER,
+                    "wl_data_device_manager".to_string(),
+                    DATA_DEVICE_MANAGER_VERSION
+                ),
                 (GLOBAL_SEAT, "wl_seat".to_string(), SEAT_VERSION),
             ]
         );
 
         let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    fn bind_data_device_stack(
+        peer: &mut UnixStream,
+        seat: u32,
+        manager: u32,
+        device: u32,
+        expect_initial_selection: bool,
+    ) {
+        let mut registry = wire::Builder::new();
+        registry.u32(2);
+        send(peer, 1, 1, registry);
+        receive_messages(peer, GLOBAL_COUNT);
+
+        let mut bind_seat = wire::Builder::new();
+        bind_seat.u32(GLOBAL_SEAT);
+        bind_seat.string("wl_seat").unwrap();
+        bind_seat.u32(3);
+        bind_seat.u32(seat);
+        send(peer, 2, 0, bind_seat);
+        receive_messages(peer, 2);
+
+        let mut bind_manager = wire::Builder::new();
+        bind_manager.u32(GLOBAL_DATA_DEVICE_MANAGER);
+        bind_manager.string("wl_data_device_manager").unwrap();
+        bind_manager.u32(DATA_DEVICE_MANAGER_VERSION);
+        bind_manager.u32(manager);
+        send(peer, 2, 0, bind_manager);
+
+        let mut get_device = wire::Builder::new();
+        get_device.u32(device);
+        get_device.u32(seat);
+        send(peer, manager, 1, get_device);
+        if expect_initial_selection {
+            let initial = receive_messages(peer, 1);
+            let event = initial.first().unwrap();
+            assert_eq!((event.object, event.opcode), (device, WL_DATA_DEVICE_SELECTION));
+            let mut payload = wire::Cursor::new(&event.payload);
+            assert_eq!(payload.u32().unwrap(), 0);
+            payload.finish().unwrap();
+        }
+    }
+
+    fn advertised_selection(messages: &[wire::Message], device: u32, mime_type: &str) -> u32 {
+        assert_eq!(messages.len(), 3);
+        let introduced = messages.first().unwrap();
+        assert_eq!(
+            (introduced.object, introduced.opcode),
+            (device, WL_DATA_DEVICE_DATA_OFFER)
+        );
+        let mut payload = wire::Cursor::new(&introduced.payload);
+        let offer = payload.u32().unwrap();
+        assert!(offer >= WL_SERVER_ID_START);
+        payload.finish().unwrap();
+
+        let mime = messages.get(1).unwrap();
+        assert_eq!((mime.object, mime.opcode), (offer, WL_DATA_OFFER_OFFER));
+        let mut payload = wire::Cursor::new(&mime.payload);
+        assert_eq!(payload.string().unwrap(), mime_type);
+        payload.finish().unwrap();
+
+        let selection = messages.get(2).unwrap();
+        assert_eq!(
+            (selection.object, selection.opcode),
+            (device, WL_DATA_DEVICE_SELECTION)
+        );
+        let mut payload = wire::Cursor::new(&selection.payload);
+        assert_eq!(payload.u32().unwrap(), offer);
+        payload.finish().unwrap();
+        offer
+    }
+
+    /// One real source connection and one real destination connection. This
+    /// pins the whole selection route: focus-scoped offers, server-created ids,
+    /// MIME advertisement, an SCM_RIGHTS endpoint forwarded to the source,
+    /// offer retirement, and cancellation when a second client replaces the
+    /// source.
+    #[test]
+    fn selection_crosses_focus_and_forwards_one_descriptor_to_its_source() {
+        let stem = format!(
+            "td-data-device-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let transfer_path = std::env::temp_dir().join(format!("{stem}.transfer"));
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let source_client = 401;
+        let destination_client = 402;
+        runtime
+            .lock()
+            .unwrap()
+            .commit(
+                SurfaceKey {
+                    client: source_client,
+                    object: 90,
+                },
+                Surface {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![1, 2, 3, 0],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+
+        let (source_server, mut source_peer) = UnixStream::pair().unwrap();
+        let (destination_server, mut destination_peer) = UnixStream::pair().unwrap();
+        source_peer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        destination_peer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let source_runtime = Arc::clone(&runtime);
+        let source_worker = thread::spawn(move || {
+            serve_client(source_server, source_client, source_runtime, test_keymap())
+        });
+        let destination_runtime = Arc::clone(&runtime);
+        let destination_worker = thread::spawn(move || {
+            serve_client(
+                destination_server,
+                destination_client,
+                destination_runtime,
+                test_keymap(),
+            )
+        });
+
+        bind_data_device_stack(&mut source_peer, 10, 11, 12, true);
+        bind_data_device_stack(&mut destination_peer, 10, 11, 12, false);
+
+        let mut create_source = wire::Builder::new();
+        create_source.u32(13);
+        send(&mut source_peer, 11, 0, create_source);
+        let mut offer_mime = wire::Builder::new();
+        offer_mime.string("text/plain;charset=utf-8").unwrap();
+        send(&mut source_peer, 13, 0, offer_mime);
+        let mut set_selection = wire::Builder::new();
+        set_selection.u32(13);
+        set_selection.u32(77);
+        send(&mut source_peer, 12, 1, set_selection);
+        let mut sync = wire::Builder::new();
+        sync.u32(15);
+        send(&mut source_peer, 1, 0, sync);
+        let selection_and_sync = receive_messages(&mut source_peer, 5);
+        advertised_selection(
+            selection_and_sync.get(..3).unwrap(),
+            12,
+            "text/plain;charset=utf-8",
+        );
+        assert_eq!(
+            (
+                selection_and_sync.get(3).unwrap().object,
+                selection_and_sync.get(3).unwrap().opcode
+            ),
+            (15, WL_CALLBACK_DONE)
+        );
+        assert_eq!(
+            (
+                selection_and_sync.get(4).unwrap().object,
+                selection_and_sync.get(4).unwrap().opcode
+            ),
+            (1, 1)
+        );
+
+        runtime
+            .lock()
+            .unwrap()
+            .commit(
+                SurfaceKey {
+                    client: destination_client,
+                    object: 91,
+                },
+                Surface {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![4, 5, 6, 0],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        let destination_offer = advertised_selection(
+            &receive_messages(&mut destination_peer, 3),
+            12,
+            "text/plain;charset=utf-8",
+        );
+
+        let transfer = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&transfer_path)
+            .unwrap();
+        let mut receive = wire::Builder::new();
+        receive.string("text/plain;charset=utf-8").unwrap();
+        let receive = receive.message(destination_offer, 1).unwrap();
+        sys::send_with_fd(&destination_peer, &receive, transfer.as_raw_fd()).unwrap();
+
+        let mut received_bytes = Vec::new();
+        let mut descriptors = Vec::new();
+        let sent = loop {
+            let mut scratch = [0u8; 4096];
+            let received = sys::recv_with_fds(&source_peer, &mut scratch).unwrap();
+            received_bytes.extend_from_slice(scratch.get(..received.count).unwrap());
+            descriptors.extend(received.fds);
+            if let Some(message) = wire::take(&mut received_bytes).unwrap() {
+                break message;
+            }
+        };
+        assert!(received_bytes.is_empty());
+        assert_eq!((sent.object, sent.opcode), (13, WL_DATA_SOURCE_SEND));
+        let mut payload = wire::Cursor::new(&sent.payload);
+        assert_eq!(payload.string().unwrap(), "text/plain;charset=utf-8");
+        payload.finish().unwrap();
+        assert_eq!(descriptors.len(), 1);
+        let descriptor = descriptors.remove(0);
+        let mut source_endpoint = sys::duplicate_received_writer(descriptor).unwrap();
+        source_endpoint.write_all(b"clipboard bytes").unwrap();
+        drop(source_endpoint);
+        assert_eq!(fs::read(&transfer_path).unwrap(), b"clipboard bytes");
+
+        send(
+            &mut destination_peer,
+            destination_offer,
+            2,
+            wire::Builder::new(),
+        );
+
+        let mut replacement = wire::Builder::new();
+        replacement.u32(14);
+        send(&mut destination_peer, 11, 0, replacement);
+        let mut replacement_mime = wire::Builder::new();
+        replacement_mime.string("text/html").unwrap();
+        send(&mut destination_peer, 14, 0, replacement_mime);
+        let mut replace_selection = wire::Builder::new();
+        replace_selection.u32(14);
+        replace_selection.u32(88);
+        send(&mut destination_peer, 12, 1, replace_selection);
+        advertised_selection(
+            &receive_messages(&mut destination_peer, 3),
+            12,
+            "text/html",
+        );
+        let cancelled = receive_messages(&mut source_peer, 1);
+        let cancelled = cancelled.first().unwrap();
+        assert_eq!(
+            (cancelled.object, cancelled.opcode),
+            (13, WL_DATA_SOURCE_CANCELLED)
+        );
+        assert!(cancelled.payload.is_empty());
+
+        drop(transfer);
+        drop(source_peer);
+        drop(destination_peer);
+        source_worker.join().unwrap().unwrap();
+        destination_worker.join().unwrap().unwrap();
+        fs::remove_file(framebuffer_path).unwrap();
+        fs::remove_file(transfer_path).unwrap();
+    }
+
+    #[test]
+    fn selection_precedes_enter_and_owner_departure_sends_null_to_focused_peer() {
+        let stem = format!(
+            "td-selection-order-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let first = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        runtime
+            .commit(
+                first,
+                Surface {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![1, 2, 3, 0],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        runtime
+            .set_selection(
+                1,
+                Some(SelectionSource {
+                    identity: DataSourceIdentity {
+                        client: 1,
+                        object: 20,
+                        generation: 1,
+                    },
+                    mime_types: Arc::new(vec!["text/plain".to_string()]),
+                }),
+            )
+            .unwrap();
+
+        let keyboard_active = Arc::new(AtomicBool::new(true));
+        let pointer_active = Arc::new(AtomicBool::new(false));
+        let data_active = Arc::new(AtomicBool::new(true));
+        let subscription = runtime
+            .subscribe_seat_with_activity(
+                2,
+                keyboard_active,
+                pointer_active,
+                data_active,
+            )
+            .unwrap();
+        let (receiver, stop) = subscription.split();
+        let after_revision = runtime.keyboard_snapshot().revision;
+        let data_revision = runtime.selection_for_client(2).1;
+        let data = Arc::new(DataObjectState::new(DataObjects {
+            devices: BTreeMap::from([(
+                12,
+                DataDeviceRegistration {
+                    version: 3,
+                    after_revision: data_revision,
+                    active_offer: None,
+                },
+            )]),
+            ..DataObjects::default()
+        }));
+        let keyboards = Arc::new(Mutex::new(BTreeMap::from([(
+            9,
+            KeyboardRegistration { after_revision },
+        )])));
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let outbound = Arc::new(Mutex::new(Outbound {
+            stream: server,
+            disconnected: false,
+        }));
+        let worker_data = Arc::clone(&data);
+        let worker_stop = stop.clone();
+        let worker = thread::spawn(move || {
+            seat_worker(
+                receiver,
+                worker_stop,
+                keyboards,
+                Arc::new(Mutex::new(BTreeMap::new())),
+                Arc::new(Mutex::new(BTreeMap::new())),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(BTreeMap::new())),
+                worker_data,
+                outbound,
+            )
+        });
+
+        let second = SurfaceKey {
+            client: 2,
+            object: 11,
+        };
+        runtime
+            .commit(
+                second,
+                Surface {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![4, 5, 6, 0],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        let gained = receive_messages(&mut peer, 5);
+        advertised_selection(gained.get(..3).unwrap(), 12, "text/plain");
+        assert_eq!(
+            gained
+                .get(3..)
+                .unwrap()
+                .iter()
+                .map(|message| (message.object, message.opcode))
+                .collect::<Vec<_>>(),
+            vec![(9, 1), (9, 4)]
+        );
+
+        runtime
+            .commit(
+                SurfaceKey {
+                    client: 2,
+                    object: 13,
+                },
+                Surface {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![7, 8, 9, 0],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        let within_client = receive_messages(&mut peer, 3);
+        assert_eq!(
+            within_client
+                .iter()
+                .map(|message| (message.object, message.opcode))
+                .collect::<Vec<_>>(),
+            vec![(9, 2), (9, 1), (9, 4)]
+        );
+        assert_eq!(data.lock().unwrap().offers.len(), 1);
+
+        // `serve_client` calls this exact operation when client 1 departs.
+        // The focused peer must observe that departed owner's selection clear
+        // even though the source object and its connection are already gone.
+        runtime.clear_client_selection(1).unwrap();
+        let cleared = receive_messages(&mut peer, 1);
+        assert_eq!(
+            (cleared.first().unwrap().object, cleared.first().unwrap().opcode),
+            (12, WL_DATA_DEVICE_SELECTION)
+        );
+        let mut payload = wire::Cursor::new(&cleared.first().unwrap().payload);
+        assert_eq!(payload.u32().unwrap(), 0);
+        payload.finish().unwrap();
+        assert!(!data
+            .lock()
+            .unwrap()
+            .offers
+            .values()
+            .next()
+            .unwrap()
+            .valid);
+
+        stop.stop();
+        worker.join().unwrap().unwrap();
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn stalled_data_delivery_blocks_registration_before_the_runtime_lock() {
+        let stem = format!(
+            "td-data-registration-lock-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let mut client = Client::new(88, server, Arc::clone(&runtime), test_keymap()).unwrap();
+        client.insert(5, Object::Seat { version: 3 }).unwrap();
+
+        // The seat worker holds this gate across its local socket write. A
+        // second get_data_device may wait for that client, but must wait
+        // before acquiring Runtime or every other client's compositor work
+        // would wait with it.
+        let data = Arc::clone(&client.data_objects);
+        let stalled_delivery = data.lock_delivery().unwrap();
+        let (started, running) = std::sync::mpsc::channel();
+        let (finished, result) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            started.send(()).unwrap();
+            finished.send(client.create_data_device(7, 5, 3)).unwrap();
+        });
+        running.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            result.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(
+            runtime.try_lock().is_ok(),
+            "registration held Runtime while waiting for a stalled data delivery"
+        );
+
+        drop(stalled_delivery);
+        result
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn data_source_actions_reuse_and_deferred_drag_have_exact_protocol_answers() {
+        let stem = format!(
+            "td-data-errors-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        runtime
+            .lock()
+            .unwrap()
+            .commit(
+                SurfaceKey {
+                    client: 88,
+                    object: 90,
+                },
+                Surface {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![1, 2, 3, 0],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut client = Client::new(88, server, runtime, test_keymap()).unwrap();
+        client.insert(5, Object::Seat { version: 3 }).unwrap();
+        client
+            .insert(6, Object::DataDeviceManager { version: 3 })
+            .unwrap();
+        client
+            .insert(20, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        client.create_data_device(7, 5, 3).unwrap();
+        receive_messages(&mut peer, 1);
+
+        client.create_data_source(8, 3).unwrap();
+        client.set_data_source_actions(8, 1).unwrap();
+        client.start_cancelled_drag(8, 20, 0).unwrap();
+        let cancelled = receive_messages(&mut peer, 1);
+        assert_eq!(
+            (cancelled.first().unwrap().object, cancelled.first().unwrap().opcode),
+            (8, WL_DATA_SOURCE_CANCELLED)
+        );
+        assert!(client.start_cancelled_drag(8, 20, 0).is_err());
+        assert_eq!(client.protocol_error_code, WL_DATA_DEVICE_ERROR_USED_SOURCE);
+
+        client.create_data_source(9, 3).unwrap();
+        client.offer_data_source(9, "text/plain".to_string()).unwrap();
+        client.set_data_device_selection(9).unwrap();
+        advertised_selection(&receive_messages(&mut peer, 3), 7, "text/plain");
+        client
+            .offer_data_source(9, "application/x-late".to_string())
+            .unwrap();
+        let Some(Object::DataSource { mime_types, .. }) = client.objects.get(&9) else {
+            panic!("data source disappeared")
+        };
+        assert_eq!(mime_types.as_slice(), &["text/plain".to_string()]);
+        assert!(client.set_data_device_selection(9).is_err());
+        assert_eq!(client.protocol_error_code, WL_DATA_DEVICE_ERROR_USED_SOURCE);
+
+        client.create_data_source(10, 3).unwrap();
+        client.set_data_source_actions(10, 1).unwrap();
+        assert!(client.set_data_device_selection(10).is_err());
+        assert_eq!(client.protocol_error_object, Some(10));
+        assert_eq!(client.protocol_error_code, WL_DATA_SOURCE_ERROR_INVALID_SOURCE);
+
+        client.create_data_source(11, 3).unwrap();
+        assert!(client.set_data_source_actions(11, 8).is_err());
+        assert_eq!(client.protocol_error_object, Some(11));
+        assert_eq!(
+            client.protocol_error_code,
+            WL_DATA_SOURCE_ERROR_INVALID_ACTION_MASK
+        );
+        client.create_data_source(12, 3).unwrap();
+        assert!(client.start_cancelled_drag(12, 20, 0).is_err());
+        assert_eq!(client.protocol_error_object, Some(12));
+        assert_eq!(client.protocol_error_code, WL_DATA_SOURCE_ERROR_INVALID_SOURCE);
+
+        client.create_data_source(13, 2).unwrap();
+        client.start_cancelled_drag(13, 20, 0).unwrap();
+        assert!(matches!(
+            client.objects.get(&13),
+            Some(Object::DataSource {
+                used: DataSourceUse::Drag,
+                ..
+            })
+        ));
+
+        let source_identity = match client.objects.get(&9) {
+            Some(Object::DataSource { identity, .. }) => *identity,
+            _ => panic!("data source disappeared"),
+        };
+        client.destroy_data_source(9, source_identity).unwrap();
+        let cleared = receive_messages(&mut peer, 2);
+        assert_eq!(
+            cleared
+                .iter()
+                .map(|message| (message.object, message.opcode))
+                .collect::<Vec<_>>(),
+            vec![(7, WL_DATA_DEVICE_SELECTION), (1, 1)]
+        );
+        let mut payload = wire::Cursor::new(&cleared.first().unwrap().payload);
+        assert_eq!(payload.u32().unwrap(), 0);
+        payload.finish().unwrap();
+
+        client.remove_data_device(7).unwrap();
+        assert!(!client.data_device_active.load(Ordering::Acquire));
+        let released = receive_messages(&mut peer, 1);
+        assert_eq!(
+            (released.first().unwrap().object, released.first().unwrap().opcode),
+            (1, 1)
+        );
+        assert!(client
+            .insert(WL_SERVER_ID_START, Object::Callback)
+            .is_err());
+
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn an_ignored_background_selection_cancels_its_consumed_source() {
+        let stem = format!(
+            "td-data-background-selection-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut client = Client::new(88, server, runtime, test_keymap()).unwrap();
+        client.create_data_source(8, 3).unwrap();
+
+        client.set_data_device_selection(8).unwrap();
+        let cancelled = receive_messages(&mut peer, 1);
+        assert_eq!(
+            (cancelled.first().unwrap().object, cancelled.first().unwrap().opcode),
+            (8, WL_DATA_SOURCE_CANCELLED)
+        );
+        assert!(client.set_data_device_selection(8).is_err());
+        assert_eq!(client.protocol_error_code, WL_DATA_DEVICE_ERROR_USED_SOURCE);
+
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn stale_selection_receives_close_the_endpoint_without_disconnect() {
+        let stem = format!(
+            "td-data-stale-receive-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let source = DataSourceIdentity {
+            client: 9,
+            object: 8,
+            generation: 7,
+        };
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let mut client = Client::new(88, server, runtime, test_keymap()).unwrap();
+        let offer = WL_SERVER_ID_START;
+        client.data_objects.lock().unwrap().offers.insert(
+            offer,
+            DataOffer {
+                version: 3,
+                source,
+                mime_types: Arc::new(vec!["text/plain".to_string()]),
+                valid: true,
+            },
+        );
+
+        let (endpoint, mut observer) = UnixStream::pair().unwrap();
+        observer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut fds = VecDeque::from([endpoint.into_raw_fd()]);
+        let mut receive = wire::Builder::new();
+        receive.string("text/plain").unwrap();
+        let receive = request(offer, 1, receive).unwrap();
+        client.dispatch_data_offer(&receive, &mut fds).unwrap();
+        assert!(fds.is_empty());
+        assert_eq!(observer.read(&mut [0u8; 1]).unwrap(), 0);
+
+        client.data_objects.lock().unwrap().offers.get_mut(&offer).unwrap().valid = false;
+        let (endpoint, mut observer) = UnixStream::pair().unwrap();
+        observer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut fds = VecDeque::from([endpoint.into_raw_fd()]);
+        let mut receive = wire::Builder::new();
+        receive.string("text/plain").unwrap();
+        let receive = request(offer, 1, receive).unwrap();
+        client.dispatch_data_offer(&receive, &mut fds).unwrap();
+        assert!(fds.is_empty());
+        assert_eq!(observer.read(&mut [0u8; 1]).unwrap(), 0);
+
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn destroyed_and_reused_source_ids_drop_stale_events_and_endpoints() {
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let stem = format!(
+            "td-data-source-reuse-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let mut client = Client::new(9, server, runtime, test_keymap()).unwrap();
+        client.create_data_source(8, 3).unwrap();
+        let stale = match client.objects.get(&8) {
+            Some(Object::DataSource { identity, .. }) => *identity,
+            _ => panic!("data source disappeared"),
+        };
+        client.destroy_data_source(8, stale).unwrap();
+        let deleted = receive_messages(&mut peer, 1);
+        assert_eq!(
+            (deleted.first().unwrap().object, deleted.first().unwrap().opcode),
+            (1, 1)
+        );
+        client.create_data_source(8, 3).unwrap();
+        let live = match client.objects.get(&8) {
+            Some(Object::DataSource { identity, .. }) => *identity,
+            _ => panic!("reused data source disappeared"),
+        };
+        assert_ne!(stale.generation, live.generation);
+
+        let (endpoint, mut observer) = UnixStream::pair().unwrap();
+        observer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let endpoint = TransferEndpoint::adopt(endpoint.into_raw_fd()).unwrap();
+
+        send_data_source_cancelled(&client.data_objects, &client.outbound, stale).unwrap();
+        send_data_source_data(
+            &client.data_objects,
+            &client.outbound,
+            stale,
+            "text/plain",
+            &endpoint,
+        )
+        .unwrap();
+        drop(endpoint);
+        send_data_source_cancelled(&client.data_objects, &client.outbound, live).unwrap();
+
+        let messages = receive_messages(&mut peer, 1);
+        assert_eq!(
+            (messages.first().unwrap().object, messages.first().unwrap().opcode),
+            (live.object, WL_DATA_SOURCE_CANCELLED)
+        );
+        assert_eq!(observer.read(&mut [0u8; 1]).unwrap(), 0);
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn focus_loss_invalidates_an_offer_without_destroying_its_object() {
+        let offer = WL_SERVER_ID_START;
+        let data = DataObjects {
+            devices: BTreeMap::from([(
+                12,
+                DataDeviceRegistration {
+                    version: 3,
+                    after_revision: 4,
+                    active_offer: Some(offer),
+                },
+            )]),
+            offers: BTreeMap::from([(
+                offer,
+                DataOffer {
+                    version: 3,
+                    source: DataSourceIdentity {
+                        client: 9,
+                        object: 8,
+                        generation: 1,
+                    },
+                    mime_types: Arc::new(vec!["text/plain".to_string()]),
+                    valid: true,
+                },
+            )]),
+            ..DataObjects::default()
+        };
+        let shared = Arc::new(DataObjectState::new(data));
+        invalidate_data_selection(&shared, 5).unwrap();
+
+        let data = shared.lock().unwrap();
+        assert!(!data.offers.get(&offer).unwrap().valid);
+        let device = data.devices.get(&12).unwrap();
+        assert_eq!(device.after_revision, 5);
+        assert_eq!(device.active_offer, None);
+    }
+
+    #[test]
+    fn data_source_mime_limits_are_aggregate_and_exact() {
+        let stem = format!(
+            "td-data-mime-limits-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let mut client = Client::new(88, server, runtime, test_keymap()).unwrap();
+        client.create_data_source(8, 3).unwrap();
+
+        assert!(client
+            .offer_data_source(8, "x".repeat(MAX_MIME_TYPE_BYTES + 1))
+            .is_err());
+        let mut first = None;
+        for index in 0..MAX_DATA_SOURCE_MIME_TYPES {
+            let prefix = format!("application/x-td-{index:02};");
+            let mime_type = format!(
+                "{prefix}{}",
+                "x".repeat(MAX_MIME_TYPE_BYTES - prefix.len())
+            );
+            assert_eq!(mime_type.len(), MAX_MIME_TYPE_BYTES);
+            client.offer_data_source(8, mime_type.clone()).unwrap();
+            if first.is_none() {
+                first = Some(mime_type);
+            }
+        }
+        client.offer_data_source(8, first.unwrap()).unwrap();
+        assert_eq!(client.retained_data_mime_bytes(), MAX_DATA_SOURCE_MIME_BYTES);
+        assert!(client
+            .offer_data_source(8, "application/x-one-too-many".to_string())
+            .is_err());
+
+        client.create_data_source(9, 3).unwrap();
+        assert!(client.offer_data_source(9, "x".to_string()).is_err());
+        assert_eq!(client.retained_data_mime_bytes(), MAX_DATA_SOURCE_MIME_BYTES);
+
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn retained_selection_offers_stop_at_the_server_object_ceiling_atomically() {
+        let source = SelectionSource {
+            identity: DataSourceIdentity {
+                client: 1,
+                object: 8,
+                generation: 9,
+            },
+            mime_types: Arc::new(vec!["text/plain".to_string()]),
+        };
+        let mut data = DataObjects {
+            devices: BTreeMap::from([(
+                12,
+                DataDeviceRegistration {
+                    version: 3,
+                    after_revision: 0,
+                    active_offer: None,
+                },
+            )]),
+            ..DataObjects::default()
+        };
+        for revision in 1..=u64::try_from(MAX_DATA_OFFERS).unwrap() {
+            let messages = data_selection_messages(
+                &mut data,
+                &SelectionUpdate {
+                    revision,
+                    source: Some(source.clone()),
+                },
+                None,
+            )
+            .unwrap();
+            assert_eq!(messages.len(), 3);
+        }
+        let before = data.devices.get(&12).copied().unwrap();
+        assert!(data_selection_messages(
+            &mut data,
+            &SelectionUpdate {
+                revision: before.after_revision + 1,
+                source: Some(source),
+            },
+            None,
+        )
+        .is_err());
+        assert_eq!(data.offers.len(), MAX_DATA_OFFERS);
+        let after = data.devices.get(&12).copied().unwrap();
+        assert_eq!(after.after_revision, before.after_revision);
+        assert_eq!(after.active_offer, before.active_offer);
+        assert_eq!(data.offers.values().filter(|offer| offer.valid).count(), 1);
     }
 
     fn subsurface_fixture(

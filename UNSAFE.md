@@ -286,9 +286,10 @@ delayed).
 ## 6. `td-compositor` — the software Wayland server
 
 The `td-compositor` software Wayland server, whose one `syscall3` body in
-`td-compositor/src/sys.rs` carries `recvmsg(2)` for wl_shm and demo-client
-keymap SCM_RIGHTS reception, `close(2)` for the received descriptor after
-safe duplication through `/proc/self/fd/N`, and `sendmsg(2)` for the
+`td-compositor/src/sys.rs` carries `recvmsg(2)` for wl_shm, clipboard and
+demo-client keymap SCM_RIGHTS reception, `close(2)` for a received descriptor
+after safe duplication through `/proc/self/fd/N` or after its lifetime as an
+exact clipboard endpoint, and `sendmsg(2)` for the
 td-native demo client's wl_shm pool descriptor, the server's wl_keyboard
 keymap descriptor, and the transport selftest. Stable Rust exposes no
 stable ancillary-data API. It also carries a FOURTH, `ioctl(2)`, for
@@ -341,11 +342,18 @@ syscall — and the winsize argument is an `[u16; 4]` rather than a
 `#[repr(C)]` struct so its field ORDER is a tested function; a swapped
 rows/columns pair is a well-formed resize to a different size.
 `TIOCGPTPEER`'s returned number is adopted through the SAME
-`/proc/self/fd/N` reopen the received-descriptor path uses, deliberately
-NOT `OwnedFd::from_raw_fd`: that would be a second scoped allow of a
-different shape — a descriptor adoption rather than the
-syscall-instruction layer — and the crate can reopen by descriptor
-identity instead. Deliberately NOT in that surface: framebuffer and evdev
+`/proc/self/fd/N` reopen the file-backed received-descriptor path uses,
+deliberately NOT `OwnedFd::from_raw_fd`: that would be a second scoped allow
+of a different shape — a descriptor adoption rather than the
+syscall-instruction layer — and the crate can reopen by descriptor identity
+instead. A clipboard transfer endpoint is the narrower exception to the
+REOPEN, not to the unsafe roster: it may be a pipe or socket and SCM_RIGHTS
+requires its original open-file description. `sys.rs` stores that raw number
+in `ReceivedFd`, whose `Drop` calls the existing close wrapper. The one
+`ReceivedFd::adopt` site is source-pinned inside `server.rs`, which wraps it in
+an opaque `TransferEndpoint` before the runtime can route it. No unsafe
+conversion or second scoped allow is added. Deliberately NOT in that surface:
+framebuffer and evdev
 READING (ordinary files — every input REPORT td acts on arrives as bytes off
 a `File`; the one thing that does not is the POSITION a resync reads, since
 `EVIOCGABS` answers `value` beside the bounds and the recovery frame
@@ -1345,13 +1353,15 @@ rather than of process-wide state, which is worth the zero it costs.
 This is the ONE surface with two `#[allow(unsafe_code)]` of different
 shapes: the `syscall` instruction, and `OwnedFd::from_raw_fd` for adopting
 a descriptor the kernel has already installed. §6 turned that same allow
-down and re-derived received descriptors through `/proc/self/fd/N`
-instead, so taking it here needs the reason §6's reason does not cover.
+down: it re-derives file-backed descriptors through `/proc/self/fd/N` and
+keeps an exact clipboard endpoint in a small safe owner whose `Drop` reaches
+its already-rostered close syscall. Taking the allow here therefore still
+needs the reason that pair of choices does not cover.
 
-It is this: the reopen trick works on what a compositor receives and not
-on what a broker receives. td-compositor receives wl_shm pool files and
-keymap memfds, and a file-backed descriptor reopens by that path
-faithfully. A broker forwards whatever an application chooses to send, and
+It is this: the reopen trick works on the compositor's wl_shm pool files and
+keymap memfds, but not on its clipboard pipes and sockets; those stay in the
+bespoke owner until the compositor forwards or drops them. A broker forwards
+whatever an application chooses to send, and
 for a socket `open("/proc/self/fd/N")` fails with ENXIO — a socket inode
 has no open method — while an `eventfd` or other `anon_inode` fails with
 EACCES. Both are ordinary D-Bus payloads. A broker built on the reopen
@@ -1418,9 +1428,10 @@ time rather than plateauing.
 `close(2)` is NOT on this roster, and its absence is the point of taking
 the adoption: `OwnedFd` means `std` performs every close, so the crate
 needs no close of its own. §6 needs one precisely because it declined the
-adoption and must dispose of the raw number it reopened from — the two
-choices are a matched pair, and this surface pays for its second allow by
-giving back a syscall.
+unsafe adoption and must dispose both the raw number it reopened from and the
+exact clipboard endpoint held by its safe owner — the two choices are a
+matched pair, and this surface pays for its second allow by giving back a
+syscall.
 
 There is no `poll(2)` or `epoll_*`. Stable `std` exposes neither, and
 readiness multiplexing would be a FOURTH rostered syscall bought for a

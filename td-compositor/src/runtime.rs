@@ -14,6 +14,7 @@ use crate::scene::{
     BandPress, CursorRequest, Fraction, PopupConstraint, PopupPlacement, Scene, SharedInputRegion,
     Surface, SurfaceKey, WindowGeometry,
 };
+use crate::server::TransferEndpoint;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -71,12 +72,32 @@ struct KeyboardSender {
     channel: Arc<Mutex<KeyboardChannel>>,
     keyboard_active: Arc<AtomicBool>,
     pointer_active: Arc<AtomicBool>,
+    data_device_active: Arc<AtomicBool>,
 }
 
 pub enum KeyboardDelivery {
     Event(RoutedKeyboardEvent),
     Pointer(RoutedPointerFrame),
     DeleteId(u32),
+    /// The seat's selection immediately before this client gains keyboard
+    /// focus, or when the focused client changes it. It shares the seat queue
+    /// with `Event`, which is what makes the data-device event precede the
+    /// corresponding `wl_keyboard.enter` without a cross-thread race.
+    Selection(SelectionUpdate),
+    /// Selection offers stop accepting transfers as soon as keyboard focus
+    /// leaves the client. No wire event is attached to that boundary; the
+    /// client learns the next selection when it next gains focus.
+    SelectionFocusLost(u64),
+    /// A replaced selection source is told exactly once. The identity includes
+    /// a generation so an object id destroyed and reused before the seat
+    /// worker runs cannot receive somebody else's cancellation.
+    DataSourceCancelled(DataSourceIdentity),
+    /// Forward one bounded selection-transfer descriptor to its source.
+    DataSourceSend {
+        source: DataSourceIdentity,
+        mime_type: String,
+        file: TransferEndpoint,
+    },
     /// One menu already taken down: tell its client. Named BOTH ways, and
     /// both are needed. The wl_surface is what the registrations are keyed on
     /// and what the scene places a popup by; the xdg_popup is what the event
@@ -91,6 +112,34 @@ pub enum KeyboardDelivery {
         surface: u32,
         popup: u32,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DataSourceIdentity {
+    pub client: u64,
+    pub object: u32,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectionSource {
+    pub identity: DataSourceIdentity,
+    pub mime_types: Arc<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectionUpdate {
+    pub revision: u64,
+    pub source: Option<SelectionSource>,
+}
+
+pub struct SelectionChange {
+    pub update: SelectionUpdate,
+    /// A replaced source on the requesting client's own connection. It is
+    /// returned so that dispatch can send `cancelled` before the selection
+    /// events caused by the same request; cross-client cancellation still
+    /// travels on the old source's seat queue.
+    pub local_cancel: Option<DataSourceIdentity>,
 }
 
 /// What taking one popup down needs, in a place more than one thread reaches.
@@ -130,7 +179,7 @@ enum KeyboardChannel {
     Closed,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum KeyboardQueueResult {
     Sent,
     Overflowed,
@@ -150,6 +199,36 @@ impl KeyboardSender {
             return KeyboardQueueResult::Sent;
         }
         self.try_send(KeyboardDelivery::Pointer(frame))
+    }
+
+    fn try_send_selection(&self, delivery: KeyboardDelivery) -> KeyboardQueueResult {
+        if !self.data_device_active.load(Ordering::Acquire) {
+            return KeyboardQueueResult::Sent;
+        }
+        self.try_send(delivery)
+    }
+
+    /// A transfer request is authored by ANOTHER client. A full source queue
+    /// refuses that one request without poisoning the source's whole seat
+    /// channel, otherwise a destination could disconnect the clipboard owner
+    /// by issuing 65 receives before it ran.
+    fn try_send_transient(&self, delivery: KeyboardDelivery) -> KeyboardQueueResult {
+        let mut channel = match self.channel.lock() {
+            Ok(channel) => channel,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match &*channel {
+            KeyboardChannel::Open(sender) => match sender.try_send(delivery) {
+                Ok(()) => KeyboardQueueResult::Sent,
+                Err(TrySendError::Full(_)) => KeyboardQueueResult::Overflowed,
+                Err(TrySendError::Disconnected(_)) => {
+                    *channel = KeyboardChannel::Closed;
+                    KeyboardQueueResult::Closed
+                }
+            },
+            KeyboardChannel::Overflowed => KeyboardQueueResult::Overflowed,
+            KeyboardChannel::Closed => KeyboardQueueResult::Closed,
+        }
     }
 
     fn try_send(&self, delivery: KeyboardDelivery) -> KeyboardQueueResult {
@@ -220,6 +299,11 @@ pub struct Runtime {
     keyboard: KeyboardState,
     pointer: PointerState,
     keyboard_subscribers: BTreeMap<u64, KeyboardSender>,
+    /// The one seat's clipboard selection. Pixels and shell objects are
+    /// client-local; this is deliberately not, because the protocol's purpose
+    /// is transferring an offer between the focused client and its source.
+    selection: Option<SelectionSource>,
+    selection_revision: u64,
     pending_paint: bool,
     /// A compound-surface commit holds the runtime lock across every scene
     /// mutation and settles once. Calls made inside it record what they owe
@@ -287,6 +371,8 @@ impl Runtime {
             keyboard: KeyboardState::default(),
             pointer: PointerState::default(),
             keyboard_subscribers: BTreeMap::new(),
+            selection: None,
+            selection_revision: 0,
             pending_paint: false,
             compound_settle: None,
             dragging: None,
@@ -1431,11 +1517,27 @@ impl Runtime {
         self.subscribe_input_with_activity(id, keyboard_active, Arc::new(AtomicBool::new(false)))
     }
 
+    #[cfg(test)]
     pub fn subscribe_input_with_activity(
         &mut self,
         id: u64,
         keyboard_active: Arc<AtomicBool>,
         pointer_active: Arc<AtomicBool>,
+    ) -> Result<KeyboardSubscription, String> {
+        self.subscribe_seat_with_activity(
+            id,
+            keyboard_active,
+            pointer_active,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    pub fn subscribe_seat_with_activity(
+        &mut self,
+        id: u64,
+        keyboard_active: Arc<AtomicBool>,
+        pointer_active: Arc<AtomicBool>,
+        data_device_active: Arc<AtomicBool>,
     ) -> Result<KeyboardSubscription, String> {
         if self.keyboard_subscribers.contains_key(&id) {
             return Err(format!("keyboard subscriber {id} already exists"));
@@ -1445,6 +1547,7 @@ impl Runtime {
             channel: Arc::new(Mutex::new(KeyboardChannel::Open(sender))),
             keyboard_active,
             pointer_active,
+            data_device_active,
         };
         self.keyboard_subscribers.insert(id, sender.clone());
         Ok(KeyboardSubscription {
@@ -1467,6 +1570,210 @@ impl Runtime {
 
     pub fn unregister_popups(&mut self, id: u64) {
         self.popup_registrations.remove(&id);
+    }
+
+    /// The clipboard visible to a client that currently owns keyboard focus.
+    /// The boolean distinguishes an unfocused client from a focused one with
+    /// an empty selection; `wl_data_device.selection(NULL)` is owed only in
+    /// the latter case.
+    pub fn selection_for_client(&self, id: u64) -> (bool, u64, Option<SelectionSource>) {
+        let focused = self
+            .keyboard
+            .snapshot()
+            .focus
+            .is_some_and(|surface| surface.client == id);
+        (
+            focused,
+            self.selection_revision,
+            focused.then(|| self.selection.clone()).flatten(),
+        )
+    }
+
+    fn queue_data_delivery(
+        &mut self,
+        client: u64,
+        delivery: KeyboardDelivery,
+    ) -> Result<bool, String> {
+        let Some(sender) = self.keyboard_subscribers.get(&client).cloned() else {
+            return Ok(false);
+        };
+        match sender.try_send(delivery) {
+            KeyboardQueueResult::Sent => Ok(true),
+            KeyboardQueueResult::Closed => {
+                self.keyboard_subscribers.remove(&client);
+                Ok(false)
+            }
+            KeyboardQueueResult::Overflowed => Ok(false),
+        }
+    }
+
+    fn queue_transfer_delivery(
+        &mut self,
+        client: u64,
+        delivery: KeyboardDelivery,
+    ) -> Result<bool, String> {
+        let Some(sender) = self.keyboard_subscribers.get(&client).cloned() else {
+            return Ok(false);
+        };
+        match sender.try_send_transient(delivery) {
+            KeyboardQueueResult::Sent => Ok(true),
+            KeyboardQueueResult::Closed => {
+                self.keyboard_subscribers.remove(&client);
+                Ok(false)
+            }
+            KeyboardQueueResult::Overflowed => Ok(false),
+        }
+    }
+
+    fn next_selection_revision(&mut self) -> Result<u64, String> {
+        self.selection_revision = self
+            .selection_revision
+            .checked_add(1)
+            .ok_or_else(|| "selection revision exhausted".to_string())?;
+        Ok(self.selection_revision)
+    }
+
+    fn queue_selection_update(
+        &mut self,
+        client: u64,
+        update: SelectionUpdate,
+    ) -> Result<(), String> {
+        let Some(sender) = self.keyboard_subscribers.get(&client).cloned() else {
+            return Ok(());
+        };
+        let result = sender.try_send_selection(KeyboardDelivery::Selection(update));
+        match result {
+            KeyboardQueueResult::Sent => Ok(()),
+            KeyboardQueueResult::Closed => {
+                self.keyboard_subscribers.remove(&client);
+                Ok(())
+            }
+            // A client that stopped draining its socket may lose its own
+            // clipboard update, but it must not take the shared input reader
+            // down. Keyboard, pointer and popup delivery use the same rule.
+            KeyboardQueueResult::Overflowed => Ok(()),
+        }
+    }
+
+    fn queue_selection_for(&mut self, client: u64) -> Result<(), String> {
+        let update = SelectionUpdate {
+            revision: self.next_selection_revision()?,
+            source: self.selection.clone(),
+        };
+        self.queue_selection_update(client, update)
+    }
+
+    fn queue_selection_focus_lost(&mut self, client: u64) -> Result<(), String> {
+        let revision = self.next_selection_revision()?;
+        let Some(sender) = self.keyboard_subscribers.get(&client).cloned() else {
+            return Ok(());
+        };
+        let result = sender.try_send_selection(KeyboardDelivery::SelectionFocusLost(revision));
+        match result {
+            KeyboardQueueResult::Sent => Ok(()),
+            KeyboardQueueResult::Closed => {
+                self.keyboard_subscribers.remove(&client);
+                Ok(())
+            }
+            KeyboardQueueResult::Overflowed => Ok(()),
+        }
+    }
+
+    /// Replace the one-seat clipboard. Background clients are ignored: td
+    /// does not retain the input serial ledger needed to prove the exact
+    /// triggering event, so current keyboard ownership is the narrower
+    /// authority it can enforce honestly.
+    pub fn set_selection(
+        &mut self,
+        client: u64,
+        source: Option<SelectionSource>,
+    ) -> Result<Option<SelectionChange>, String> {
+        let (focused, _, _) = self.selection_for_client(client);
+        if !focused {
+            return Ok(None);
+        }
+        let prior = std::mem::replace(&mut self.selection, source);
+        let mut local_cancel = None;
+        if let Some(prior) = prior {
+            if prior.identity.client == client {
+                local_cancel = Some(prior.identity);
+            } else {
+                self.queue_data_delivery(
+                    prior.identity.client,
+                    KeyboardDelivery::DataSourceCancelled(prior.identity),
+                )?;
+            }
+        }
+        let update = SelectionUpdate {
+            revision: self.next_selection_revision()?,
+            source: self.selection.clone(),
+        };
+        Ok(Some(SelectionChange {
+            update,
+            local_cancel,
+        }))
+    }
+
+    /// Clear a selection whose source object is going away. No cancellation
+    /// is sent: destroying wl_data_source is the client giving that object up.
+    pub fn clear_selection(
+        &mut self,
+        source: DataSourceIdentity,
+        direct_client: Option<u64>,
+    ) -> Result<Option<SelectionUpdate>, String> {
+        if self.selection.as_ref().map(|current| current.identity) != Some(source) {
+            return Ok(None);
+        }
+        self.selection = None;
+        let focused = self.keyboard.snapshot().focus.map(|surface| surface.client);
+        if let Some(client) = focused {
+            let update = SelectionUpdate {
+                revision: self.next_selection_revision()?,
+                source: None,
+            };
+            if direct_client == Some(client) {
+                return Ok(Some(update));
+            }
+            self.queue_selection_update(client, update)?;
+        }
+        Ok(None)
+    }
+
+    pub fn clear_client_selection(&mut self, client: u64) -> Result<(), String> {
+        let Some(source) = self.selection.as_ref().map(|source| source.identity) else {
+            return Ok(());
+        };
+        if source.client != client {
+            return Ok(());
+        }
+        self.clear_selection(source, None).map(|_| ())
+    }
+
+    /// Hand the receiver's pipe end to the source client. The current
+    /// selection is checked again here, after the destination's offer check,
+    /// so a queued focus/selection event cannot leave a stale offer usable in
+    /// the window before its seat worker processes that event.
+    pub fn send_selection_data(
+        &mut self,
+        receiver: u64,
+        source: DataSourceIdentity,
+        mime_type: String,
+        file: TransferEndpoint,
+    ) -> Result<bool, String> {
+        if self.selection.as_ref().map(|current| current.identity) != Some(source) {
+            return Ok(false);
+        }
+        if self.keyboard.snapshot().focus.map(|surface| surface.client) != Some(receiver) {
+            return Ok(false);
+        }
+        self.queue_transfer_delivery(
+            source.client,
+            KeyboardDelivery::DataSourceSend {
+                source,
+                mime_type,
+                file,
+            },
+        )
     }
 
     /// Record that a menu is over, on the thread that decided it.
@@ -1724,9 +2031,43 @@ impl Runtime {
         });
     }
 
-    fn publish_keyboard(&mut self, events: Vec<RoutedKeyboardEvent>) {
+    fn publish_keyboard(&mut self, events: Vec<RoutedKeyboardEvent>) -> Result<(), String> {
+        let leaving = events.iter().find_map(|event| match event.event {
+            crate::keyboard::KeyboardEvent::Leave { surface } => Some(surface.client),
+            _ => None,
+        });
+        let entering = events.iter().find_map(|event| match event.event {
+            crate::keyboard::KeyboardEvent::Enter { surface, .. } => Some(surface.client),
+            _ => None,
+        });
+        let client_changed = leaving != entering;
+        let mut failures = Vec::new();
         for event in events {
+            let transition = match event.event {
+                crate::keyboard::KeyboardEvent::Leave { surface } if client_changed => {
+                    Some((false, surface.client))
+                }
+                crate::keyboard::KeyboardEvent::Enter { surface, .. } if client_changed => {
+                    Some((true, surface.client))
+                }
+                _ => None,
+            };
+            if let Some((true, client)) = transition {
+                if let Err(error) = self.queue_selection_for(client) {
+                    failures.push(error);
+                }
+            }
             self.publish_keyboard_event(event);
+            if let Some((false, client)) = transition {
+                if let Err(error) = self.queue_selection_focus_lost(client) {
+                    failures.push(error);
+                }
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
         }
     }
 
@@ -1755,7 +2096,11 @@ impl Runtime {
         // explicable.
         let mut failures = Vec::new();
         match self.keyboard.set_focus(self.keyboard_target()) {
-            Ok(keyboard) => self.publish_keyboard(keyboard),
+            Ok(keyboard) => {
+                if let Err(error) = self.publish_keyboard(keyboard) {
+                    failures.push(error);
+                }
+            }
             Err(error) => failures.push(error),
         }
         let (hover, grab) = self.routed_pointer_targets();
@@ -1949,6 +2294,12 @@ mod tests {
             Ok(KeyboardDelivery::PopupDone { surface, .. }) => {
                 panic!("unexpected menu dismissal for surface {surface}")
             }
+            Ok(KeyboardDelivery::Selection(_)
+            | KeyboardDelivery::SelectionFocusLost(_)
+            | KeyboardDelivery::DataSourceCancelled(_)
+            | KeyboardDelivery::DataSourceSend { .. }) => {
+                panic!("unexpected data-device delivery")
+            }
             Err(error) => panic!("no keyboard event was published: {error}"),
         }
     }
@@ -1964,6 +2315,12 @@ mod tests {
             }
             KeyboardDelivery::PopupDone { surface, .. } => {
                 panic!("unexpected menu dismissal for surface {surface}");
+            }
+            KeyboardDelivery::Selection(_)
+            | KeyboardDelivery::SelectionFocusLost(_)
+            | KeyboardDelivery::DataSourceCancelled(_)
+            | KeyboardDelivery::DataSourceSend { .. } => {
+                panic!("unexpected data-device delivery");
             }
         }
     }
@@ -1985,6 +2342,12 @@ mod tests {
             }
             KeyboardDelivery::PopupDone { surface, .. } => {
                 panic!("unexpected menu dismissal for surface {surface}");
+            }
+            KeyboardDelivery::Selection(_)
+            | KeyboardDelivery::SelectionFocusLost(_)
+            | KeyboardDelivery::DataSourceCancelled(_)
+            | KeyboardDelivery::DataSourceSend { .. } => {
+                panic!("unexpected data-device delivery");
             }
         }
     }
@@ -2669,6 +3032,76 @@ mod tests {
         second_stop.stop();
         runtime.unsubscribe_keyboard(1);
         runtime.unsubscribe_keyboard(2);
+    }
+
+    #[test]
+    fn a_full_transient_transfer_queue_does_not_poison_the_source_channel() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let sender = KeyboardSender {
+            channel: Arc::new(Mutex::new(KeyboardChannel::Open(sender))),
+            keyboard_active: Arc::new(AtomicBool::new(false)),
+            pointer_active: Arc::new(AtomicBool::new(false)),
+            data_device_active: Arc::new(AtomicBool::new(false)),
+        };
+        assert_eq!(
+            sender.try_send_transient(KeyboardDelivery::DeleteId(7)),
+            KeyboardQueueResult::Sent
+        );
+        assert_eq!(
+            sender.try_send_transient(KeyboardDelivery::DeleteId(8)),
+            KeyboardQueueResult::Overflowed
+        );
+        assert!(matches!(
+            *sender.channel.lock().unwrap(),
+            KeyboardChannel::Open(_)
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            KeyboardDelivery::DeleteId(7)
+        ));
+        assert_eq!(
+            sender.try_send_transient(KeyboardDelivery::DeleteId(9)),
+            KeyboardQueueResult::Sent
+        );
+    }
+
+    #[test]
+    fn a_stalled_data_client_cannot_fail_shared_input_or_another_copy() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        sender.send(KeyboardDelivery::DeleteId(7)).unwrap();
+        let sender = KeyboardSender {
+            channel: Arc::new(Mutex::new(KeyboardChannel::Open(sender))),
+            keyboard_active: Arc::new(AtomicBool::new(false)),
+            pointer_active: Arc::new(AtomicBool::new(false)),
+            data_device_active: Arc::new(AtomicBool::new(true)),
+        };
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-selection-overflow-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let framebuffer = Framebuffer::test_file(&path, 1, 1, 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        runtime.keyboard_subscribers.insert(7, sender);
+
+        runtime
+            .queue_selection_update(
+                7,
+                SelectionUpdate {
+                    revision: 1,
+                    source: None,
+                },
+            )
+            .unwrap();
+        runtime.queue_selection_focus_lost(7).unwrap();
+        assert!(!runtime
+            .queue_data_delivery(7, KeyboardDelivery::DeleteId(8))
+            .unwrap());
+        assert!(!runtime
+            .queue_transfer_delivery(7, KeyboardDelivery::DeleteId(9))
+            .unwrap());
+
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -8067,7 +8500,11 @@ mod tests {
                 KeyboardDelivery::Event(event) => Some(event),
                 KeyboardDelivery::Pointer(_)
                 | KeyboardDelivery::DeleteId(_)
-                | KeyboardDelivery::PopupDone { .. } => None,
+                | KeyboardDelivery::PopupDone { .. }
+                | KeyboardDelivery::Selection(_)
+                | KeyboardDelivery::SelectionFocusLost(_)
+                | KeyboardDelivery::DataSourceCancelled(_)
+                | KeyboardDelivery::DataSourceSend { .. } => None,
             })
             .collect();
         assert_eq!(retained.len(), MAX_PENDING_KEYBOARD_DELIVERIES);

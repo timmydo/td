@@ -866,6 +866,7 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             "sys::recv_with_fds(",
             "sys::duplicate_received(",
             "sys::discard_received(",
+            "sys::ReceivedFd::adopt(",
         ];
         const TERMINAL: &[&str] = &[
             "sys::unlock_pty(",
@@ -959,6 +960,11 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         let conn = include_str!("conn.rs");
         let server = include_str!("server.rs");
         let pty = include_str!("pty.rs");
+        assert_eq!(
+            occurrences(production(server), "sys::ReceivedFd::adopt("),
+            1,
+            "selection descriptor ownership must have one adoption site"
+        );
         for operation in TRANSPORT {
             assert!(
                 client.contains(operation) || conn.contains(operation) || server.contains(operation),

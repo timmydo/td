@@ -669,11 +669,12 @@ The first protocol surface is:
 - wl_shm, wl_shm_pool, and wl_buffer
 - wl_output
 - wl_seat, wl_keyboard, and wl_pointer
+- wl_data_device_manager, wl_data_device, wl_data_source, and wl_data_offer
 - xdg_wm_base, xdg_surface, xdg_toplevel, xdg_positioner, and xdg_popup
 - zxdg_decoration_manager_v1 and zxdg_toplevel_decoration_v1
 - wl_callback completion and wl_buffer release
 
-Those seven globals are the whole of what the registry advertises, and the set is
+Those eight globals are the whole of what the registry advertises, and the set is
 a TEST rather than a sentence here: the name, order, and version of each are
 pinned by
 `the_registry_advertises_exactly_the_globals_td_serves`.
@@ -912,6 +913,90 @@ mapped and hidden children; each synchronized surface retains at most one
 pending buffer and input-region state while callbacks remain under the object
 ceiling. Cached input-region snapshots participate in the same aggregate
 operation quota as live and pending surface regions.
+
+**The core data device is the one-seat clipboard.**
+`wl_data_device_manager` version 3 is advertised and versions 1 through 3 may
+bind it. Each manager creates version-matched sources and devices for
+`td-seat0`. A source advertises at most 64 distinct MIME strings, no one string
+is longer than 256 bytes, and all live source strings of one client retain at
+most 16 KiB. A source becomes single-use when passed to `set_selection` or
+`start_drag`; setting drag actions twice, using unknown action bits, turning a
+drag-marked source into a selection, and reusing any source raise the interface
+errors the core protocol assigns them. Core assigns no used-state error to
+`offer`, so a bounded late offer is accepted and ignored rather than retained
+where no already-announced target could learn it.
+
+The runtime holds one selection for the logical seat. Only the client that
+currently owns keyboard focus may replace or clear it. The request's serial is
+read but is not checked against an input-event ledger, because td does not keep
+one; current keyboard ownership is the narrower authority it can enforce. A
+background request is ignored after consuming the source, as a compositor may
+ignore a stale serial, so the same source cannot be retried through another
+request. Its source receives `cancelled`, making that refusal observable.
+Replacing or explicitly clearing a selection sends `cancelled` to the old live
+source. Destroying that source, or losing its client, clears the selection
+without sending an event to an object that has gone.
+
+Selection visibility follows CLIENT keyboard focus rather than surface focus.
+Before a different client receives `wl_keyboard.enter`, every data device it
+owns receives a fresh `wl_data_offer`, all MIME events, and then
+`selection`; an empty clipboard is an explicit NULL selection. Leaving that
+client invalidates its offers. Moving focus between two surfaces of the same
+client sends the ordinary keyboard leave/enter pair but neither invalidates nor
+re-advertises the selection. Registration and focus delivery share a monotonic
+revision, so a data device created across a queued focus change receives the
+initial snapshot or the queued update exactly once.
+
+A focused client's `set_selection` publishes the cancellation of its replaced
+local source and the new selection directly on that client's dispatch path.
+Those events therefore precede replies to later requests already buffered on
+the same connection, including `wl_display.sync`. A replaced source owned by a
+different client still receives its cancellation through that source client's
+bounded seat queue.
+
+Data offers use Wayland's server-created id range, never the client's range.
+One client may retain at most 64 of them; a 65th selection update disconnects
+that client before partially advancing any device. A new selection or focus
+loss makes the preceding offer stale, but the object remains until its client
+destroys it. Server-created ids are never acknowledged with
+`wl_display.delete_id`, which is only for client-created ids. Selection offers
+accept `accept` as feedback, transfer only a MIME type they advertised, and
+reject the DnD-only `finish` and `set_actions` requests with the data-offer
+errors defined for those cases.
+
+`wl_data_offer.receive` adopts exactly one descriptor as the endpoint the
+source writes, preserving its original open-file description, offset and
+status flags. It rechecks both the current source identity and destination
+keyboard focus under the runtime lock, closing the interval before a queued
+focus event reaches the destination's seat worker. A transfer that loses that
+race, or reaches a full or stopped source queue, is closed so the destination
+observes EOF rather than a protocol error. The endpoint otherwise travels on
+that source client's existing 64-entry seat queue and is sent with one
+`wl_data_source.send`; teardown and stale object-id generation checks also
+close it. Selection, cancellation and focus-loss queue overflow is isolated to
+the stalled clipboard client and never fails the shared input reader or a
+different client's copy request. Source generations prevent a destroyed and
+reused client id from receiving an old send or cancellation.
+
+Seat-thread selection delivery takes a client-local delivery gate before the
+data-object lock and retains both across only that client's outbound write, so
+release/destroy cannot cross an object's introducing event. Registration waits
+for that gate BEFORE taking the runtime lock, then takes runtime and data-object
+state together to close the focus race. A stalled clipboard client can
+therefore block its own second registration but cannot make a global runtime
+lock wait behind its socket. No data event holds a runtime or input lock.
+
+Drag-and-drop remains deferred. `start_drag` validates that its origin is a
+surface, its optional icon is roleless, and its optional source has not been
+used. A version-3 source must first set its actions; it is then consumed and
+immediately receives the general version-3 `cancelled` event. Versions 1 and 2
+are consumed quietly because their `cancelled` event is restricted to source
+replacement. A NULL-source internal drag is accepted as a no-op. No icon role,
+pointer grab, enter/motion/drop event, or transfer is created because no drag
+begins. Ignoring the NULL-source operation and consuming an older source
+without performing a drag are explicit selection-only divergences. The request
+serial and implicit grab are not validated on this deferred path. Primary
+selection is likewise a separate protocol and remains unadvertised.
 
 **An attach's offset is the cursor's to move.** `wl_surface.attach` carries an
 x and a y placing the new buffer's corner relative to the one it replaces. At
@@ -2432,10 +2517,10 @@ failing more often than not. Closing that one needs the search to measure from
 the group's whole area rather than from a leaf's fraction, which is the same
 fall-through limit the paragraph above records.
 
-Clipboard, drag-and-drop, output reconfiguration, fractional scale, screen
-capture, data devices, and touch are not yet advertised. Unknown objects,
-malformed sizes, invalid object reuse, missing file descriptors, and
-unsupported requests disconnect only that client.
+Primary selection, drag-and-drop, output reconfiguration, fractional scale,
+screen capture, and touch are not yet advertised. Unknown objects, malformed
+sizes, invalid object reuse, missing file descriptors, and unsupported requests
+disconnect only that client.
 
 The server advertises `wl_seat` version 7 as `td-seat0` with keyboard and
 pointer capabilities. Every `wl_keyboard` receives a dependency-free,
@@ -2857,8 +2942,9 @@ connection closes all descriptors it owns.
   keymap descriptor, or a test request;
 - recvmsg(2), to receive wl_shm pool descriptors or the demo client's XKB
   keymap descriptor;
-- close(2), to release a received descriptor after it has been safely
-  duplicated through `/proc/self/fd/N`; and
+- close(2), to release a received descriptor after it has either been safely
+  duplicated through `/proc/self/fd/N` or exactly transferred as an owned
+  clipboard endpoint; and
 - ioctl(2), for the four pinned terminal-control requests in section 12 and
   the two pinned `EVIOCGABS` requests that read an absolute pointer's
   declared axis range.
@@ -2878,6 +2964,14 @@ tests pin the allow count, assembly body, syscall numbers, callers, and the
 absence of unsafe from every other target source file. Each developer tool is
 a separate crate root that also denies unsafe. Adding a syscall or another
 scoped allow amends this document and the repository-wide unsafe inventory.
+
+File-backed wl_shm and keymap descriptors are reopened before their raw
+numbers are closed. A clipboard receiver may instead supply a pipe or socket,
+and reopening would either fail or create another open-file description. The
+syscall module therefore owns that exact raw number in `ReceivedFd`; its one
+server-side adoption site is pinned by the confinement test, the runtime sees
+only the server's opaque `TransferEndpoint`, and `Drop` reaches the already
+rostered close wrapper. This adds no second unsafe allowance.
 
 The three surfaces behind that one body are disjoint and are pinned to
 disjoint modules: descriptor transport is reachable only from `client.rs`,
@@ -3035,6 +3129,16 @@ The landing must prove:
 - wl_seat advertises keyboard and pointer, sends a structurally validated
   self-contained keymap descriptor, repeat information, held keys, and all
   four modifier fields;
+- data-device tests pin the eight-global registry, initial NULL selection,
+  selection-before-keyboard-enter and selection-before-sync ordering, no
+  re-offer across same-client surface focus, exact per-string, per-source and
+  aggregate MIME ceilings, server-created id and retained-offer ceilings,
+  source reuse and versioned action errors, deferred DnD, focus-loss
+  invalidation, device release, source destruction and departure, stale-race
+  EOF, cross-client source replacement, generation-safe id reuse, and a real
+  descriptor forwarded from
+  `wl_data_offer.receive` to `wl_data_source.send` and written through by the
+  source;
 - the exact serialized keymap parses with libxkbcommon 1.11, where an ordinary
   key reports repeatable and an excluded modifier reports non-repeating;
   in-tree tests also pin its delimiter, type, explicit repeat exclusions,
