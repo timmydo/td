@@ -2466,20 +2466,31 @@ aliases that path and mount identities cannot distinguish. Canonical paths are
 not the only alias. The single-link rule applies to an explicit regular-file
 grant root; a directory grant authorizes entries reachable inside that tree.
 The source and every nested mount are also compared by mountinfo device/root
-identity with every visible mount below the reserved trees and all users'
-homes. An alias of the launching user's own real-home subtree remains
-admissible. Every source and target is preflighted before any `:create`
-mutation, then revalidated afterward. Targets in the
-fresh root are checked component by component and may not replace or overlap
-`/app`, `/usr`, `/run`, `/proc`, `/sys`, `/dev`, `/tmp`, `/var/tmp`, `/etc`,
-`/boot`, `/.flatpak-info`, `/oldroot`, `/root-write-probe`, the private-home
-root, or its fixed config, cache, data and local-state mounts. Directory grants
-are recursive binds. Every mount
-at or below a granted target is enumerated from mountinfo and remounted
-`nosuid,nodev,noexec`; a read-only grant additionally makes every nested mount
-read-only, deepest first. Stage 1 and stage 2 independently read those rows
-back. Stage 2 exactly enumerates every fresh scaffold outside the dynamic
-private home, stopping at each declared grant root. The shipped fixture proves
+identity with every visible mount below the reserved trees and mounted home
+trees. An alias physically below the launching user's exact real-home root
+remains admissible. A reserved identity that strictly contains that exact
+home does not by itself reject a source physically below the home: the source
+does not carry its reserved siblings. Specific state identities and a nested
+alias of the backing filesystem remain refused. This exception is
+intentionally home-specific. A non-home grant on that backing filesystem, or
+a home whose mount identity is itself the filesystem root, may be refused
+conservatively. The current allowed-home mount-set check does not distinguish
+a plain-directory home alias mounted only inside the launching home from that
+user's own nested tree. Their physical roots differ, but using that narrower
+rule would also refuse legitimate different-device mounts below the home. The
+shipped backing-volume reservation refuses the alias.
+Every source and target is preflighted before any `:create` mutation, then
+revalidated afterward. Targets in the fresh root are checked component by
+component and may not replace or overlap `/app`, `/usr`, `/run`, `/proc`,
+`/sys`, `/dev`, `/tmp`, `/var/tmp`, `/etc`, `/boot`, `/.flatpak-info`,
+`/oldroot`, `/root-write-probe`, the private-home root, or its fixed config,
+cache, data and local-state mounts. Directory grants are recursive binds.
+Every mount at or below a granted target is enumerated from mountinfo and
+remounted `nosuid,nodev,noexec`; a read-only grant additionally makes every
+nested mount read-only, deepest first. Stage 1 and stage 2 independently
+read those rows back. Stage 2 exactly enumerates every fresh scaffold
+outside the dynamic private home, stopping at each declared grant root. The
+shipped fixture proves
 read-write Downloads, read-only Pictures, and a read-only regular-file grant.
 The two XDG sources are made distinct self-bind mounts before `switch_root`:
 they retain the graphical user's persistent storage and normal capacity while
@@ -5388,9 +5399,10 @@ packaged selftest, boot oracle — with **network never in the gate**.
    parent-death/containment ordering and a behavioral parent-death regression,
    plus in-QEMU assertions from
    *inside* a jail — `getuid()==1000`, `/proc/1/exe` is td-jail, host
-   processes absent, `/app` and `/usr` reject writes, host `/usr` and
-   `/td/store` absent, `/dev/fb0` and `/dev/input` absent, a large
-   `/dev/shm` mapping works, `memfd_create` works, both sockets work.
+   processes absent, `/app`, `/usr`, and `/etc` reject writes, `/td/store`
+   and the target-root `/etc` sentinels absent,
+   `/dev/fb0` and `/dev/input` absent, a large `/dev/shm` mapping works,
+   `memfd_create` works, both sockets work.
    The transition-only probes deliberately begin after the application
    bootstrap; the installed QEMU fixture is what traverses both layers.
 4. **Broker conformance**: committed byte streams with expected decode
@@ -5417,8 +5429,8 @@ packaged selftest, boot oracle — with **network never in the gate**.
    fixture is *in the image the test boots*, so the boot runs
    `/bin/<fixture>` directly with no install step at all. The guest
    currently asserts its `/proc` says `NoNewPrivs`/`Seccomp` and all five
-   capability sets are zero, that
-   `/app` and `/usr` reject writes, and that the host store, `/etc`,
+   capability sets are zero, that `/app`, `/usr`, and selective `/etc` reject
+   writes, and that the host store, target-root `/etc` sentinels,
    framebuffer and input nodes are absent; it completes a bounded datagram
    round-trip over the isolated loopback, connects the one granted
    `wayland-0`, maps a toplevel, commits a frame, then publishes readiness in
@@ -5598,7 +5610,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 12d | **application terminal/session containment — LANDED**: the argv0-selected launcher waits on a later-born stage 1; stage 1 binds its lifetime to that exact parent, then either preserves and reads back an existing no-terminal supervisor group or enters and reads back a new session with no controlling terminal. Only then may it resolve authority, register or create state. Parent death still tears down stage 1, stage 2 and the cgroup leaf. `devices=tty` remains refused until a fresh-terminal policy exists | the jail is not an ambient terminal member, and it does not escape a dedicated service stop scope |
 | 12e | **typed CPU bandwidth policy — LANDED**: permission format 2 adds bounded `cpu-max=QUOTA PERIOD`; format 1 remains accepted and inherits a one-CPU baseline. The kernel pins fair-group scheduling and CFS bandwidth while keeping real-time group scheduling off; td-svc delegates `cpu` top-down; td-jail writes and exactly reads `cpu.max`, reports the bandwidth rows from `cpu.stat`, and the 50%-CPU fixture's active leaf gates the QEMU marker | aggregate CPU time is capped with the memory and task budgets |
 | 12f | **typed shared-network policy — LANDED**: the authenticated `shared=network` permission selects the compiled namespace set without `CLONE_NEWNET`; stage 1 requires the network namespace inode to remain unchanged and skips the isolated-loopback ioctl. Omitted policy retains `CLONE_NEWNET`, exact changed-inode readback and the up-loopback oracle. The host fixture launches both its isolated defaults and a derived shared-network variant; the shipped QEMU fixture remains isolated. `/etc/resolv.conf` and mediated network policy remain later work | a declared application can use td's network stack without weakening the default isolated path |
-| 12g | **selective immutable `/etc` — IMPLEMENTED; integration pending**: a bounded tmpfs admits only the closed runtime configuration allowlist, synthesized passwd/group/host/NSS identity, one persisted per-application machine id, the pinned curl-rendered Mozilla CA bundle, and a read-only resolver bind only for declared shared networking. Stage 1 source-identity-checks every external file and recursively hardens selected runtime directories; stage 2 derives the exact tree from `/usr/etc`, checks synthesized contents, mount flags, nested mounts, PEM shape and write refusal. Host mode names fixture-owned CA and resolver inputs rather than borrowing ambient `/etc`. The compositor's target fixture must replace its stale `/etc`-absent oracle before this rung is landed | applications get libc/toolkit identity and trust data without seeing the host configuration |
+| 12g | **selective immutable `/etc` — LANDED**: a bounded tmpfs admits only the closed runtime configuration allowlist, synthesized passwd/group/host/NSS identity, one persisted per-application machine id, the pinned curl-rendered Mozilla CA bundle, and a read-only resolver bind only for declared shared networking. Stage 1 source-identity-checks every external file and recursively hardens selected runtime directories; stage 2 derives the exact tree from `/usr/etc`, checks synthesized contents, mount flags, nested mounts, PEM shape and write refusal. Host mode names fixture-owned CA and resolver inputs rather than borrowing ambient `/etc` | applications get libc/toolkit identity and trust data without seeing the host configuration |
 | 13 | `td-busd` codec, auth, surface #10 | none |
 | 14 | names, routing, match rules, descriptor passing | none |
 | 15 | per-app policy, lineage identity, in-jail activation | none |

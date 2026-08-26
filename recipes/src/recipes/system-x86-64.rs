@@ -888,6 +888,9 @@ fn build_inittab() -> String {
 /// the shape check would still validate it, both exiting 0.
 const TD_SVC_CONF: &str = "/etc/td-svc.conf";
 
+pub(super) const ROOTCHECK_ETC_NAME: &str = "rootcheck";
+pub(super) const SHADOW_ETC_NAME: &str = "shadow";
+
 /// `TD_SVC_CONF` as `etc_files` names it: relative to /etc, since that is the directory
 /// it writes into. Derived rather than repeated — see TD_SVC_CONF for what a divergence
 /// costs. `the_unit_table_path_has_exactly_one_source_of_truth` pins the relationship.
@@ -2706,7 +2709,7 @@ fn etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
     vec![
         ("passwd", build_passwd(sys), false),
         ("group", build_group(sys), false),
-        ("shadow", build_shadow(sys), false),
+        (SHADOW_ETC_NAME, build_shadow(sys), false),
         ("hostname", format!("{}\n", sys.hostname), false),
         ("os-release", build_os_release(sys), false),
         ("mutable-state", build_mutable_state(), false),
@@ -2729,7 +2732,7 @@ fn etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
         ("autologin", build_autologin(sys), true),
         ("tty-session", build_tty_session(), true),
         ("shutdown", build_shutdown(), true),
-        ("rootcheck", build_rootcheck(sys), true),
+        (ROOTCHECK_ETC_NAME, build_rootcheck(sys), true),
         ("netup", build_netup(), true),
         ("bootsuccess", build_bootsuccess(sys), true),
         ("bootfail", build_bootfail(), true),

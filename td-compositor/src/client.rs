@@ -794,7 +794,17 @@ fn verify_jail_boundary() -> Result<(), String> {
         }
         Ok(_) => return Err("jailed application can reopen PID 1 output".into()),
     }
-    for path in ["/td/store", "/etc", "/dev/fb0", "/dev/input"] {
+    // The recipe pins the image-owned and application-registry names below.
+    for path in [
+        "/td/store",
+        "/etc/rootcheck",
+        "/etc/shadow",
+        "/etc/td-app.conf",
+        "/etc/td-applications.tsv",
+        "/etc/td-launcher.tsv",
+        "/dev/fb0",
+        "/dev/input",
+    ] {
         match fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(format!("inspect confined path {path}: {error}")),
@@ -810,19 +820,21 @@ fn verify_jail_mounts() -> Result<(), String> {
     if !entry.file_type().is_file() {
         return Err("jailed application entry is not a regular file".into());
     }
-    if !fs::symlink_metadata("/usr")
-        .map_err(|e| format!("inspect jailed runtime: {e}"))?
-        .file_type()
-        .is_dir()
-    {
-        return Err("jailed runtime is not a directory".into());
+    for (path, label) in [("/usr", "runtime"), ("/etc", "configuration")] {
+        if !fs::symlink_metadata(path)
+            .map_err(|e| format!("inspect jailed {label}: {e}"))?
+            .file_type()
+            .is_dir()
+        {
+            return Err(format!("jailed {label} is not a directory"));
+        }
     }
     let mut probe_bytes = [0_u8; 8];
     fs::File::open("/dev/urandom")
         .and_then(|mut random| random.read_exact(&mut probe_bytes))
         .map_err(|e| format!("read jailed write-probe randomness: {e}"))?;
     let probe_tag = u64::from_le_bytes(probe_bytes);
-    for immutable_root in ["/app", "/usr"] {
+    for immutable_root in ["/app", "/usr", "/etc"] {
         let path = format!("{immutable_root}/.td-jail-write-probe-{probe_tag:016x}");
         if fs::symlink_metadata(&path).is_ok() {
             return Err(format!("immutable probe path {path} already exists"));

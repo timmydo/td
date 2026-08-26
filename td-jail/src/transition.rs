@@ -5083,6 +5083,7 @@ mod tests {
                 source,
                 &mount_tree_identities(mountinfo, source).unwrap(),
                 &mount_tree_identities(mountinfo, Path::new("/run")).unwrap(),
+                &mount_identity_for_path(mountinfo, allowed_home).unwrap(),
                 &mount_tree_identities(mountinfo, Path::new("/home")).unwrap(),
                 &mount_tree_identities(mountinfo, allowed_home).unwrap(),
                 &mount_identities_outside_allowed_home(
@@ -5100,6 +5101,7 @@ mod tests {
             source,
             &mount_tree_identities(&reserved_alias, source).unwrap(),
             &mount_tree_identities(&reserved_alias, Path::new("/run")).unwrap(),
+            &mount_identity_for_path(&reserved_alias, allowed_home).unwrap(),
             &mount_tree_identities(&reserved_alias, Path::new("/home")).unwrap(),
             &mount_tree_identities(&reserved_alias, allowed_home).unwrap(),
             &mount_identities_outside_allowed_home(
@@ -5145,6 +5147,157 @@ mod tests {
         ] {
             check(&admitted).unwrap();
         }
+    }
+
+    #[test]
+    fn grant_mount_identity_allows_home_below_reserved_backing_volume() {
+        let base = "1 0 7:0 / / ro - erofs root ro\n\
+                    2 1 0:16 / /run rw - tmpfs run rw\n\
+                    3 2 0:18 / /run/td-volume ro - btrfs volume ro\n\
+                    4 1 0:18 /@var /var rw - btrfs volume rw\n\
+                    5 4 0:18 /@var/home/tester/Downloads /var/home/tester/Downloads rw - btrfs volume rw\n";
+        let source = Path::new("/var/home/tester/Downloads");
+        let allowed_home = Path::new("/var/home/tester");
+        let home_roots = vec![PathBuf::from("/var/home")];
+        let state_root = Path::new("/var/home/tester/.td/app");
+
+        let check = |mountinfo: &str| {
+            let mut reserved = mount_tree_identities(mountinfo, Path::new("/run")).unwrap();
+            reserved.extend(mount_tree_identities(mountinfo, state_root).unwrap());
+            require_grant_mount_identities(
+                source,
+                &mount_tree_identities(mountinfo, source).unwrap(),
+                &reserved,
+                &mount_identity_for_path(mountinfo, allowed_home).unwrap(),
+                &mount_tree_identities(mountinfo, Path::new("/var/home")).unwrap(),
+                &mount_tree_identities(mountinfo, allowed_home).unwrap(),
+                &mount_identities_outside_allowed_home(
+                    mountinfo,
+                    &home_roots,
+                    allowed_home,
+                )
+                .unwrap(),
+            )
+        };
+
+        check(base).unwrap();
+
+        let own_home_nested = format!(
+            "{base}6 5 0:18 /@var/home/tester/Documents \
+             /var/home/tester/Downloads/nested rw - btrfs volume rw\n"
+        );
+        check(&own_home_nested).unwrap();
+
+        let other_home_nested = format!(
+            "{base}6 4 0:18 /@var/home/other /var/home/other rw - btrfs volume rw\n\
+             7 5 0:18 /@var/home/other \
+             /var/home/tester/Downloads/nested rw - btrfs volume rw\n"
+        );
+        assert!(check(&other_home_nested)
+            .unwrap_err()
+            .to_string()
+            .contains("aliases a reserved mount"));
+        assert!(require_grant_mount_identities(
+            source,
+            &mount_tree_identities(&other_home_nested, source).unwrap(),
+            &mount_tree_identities(&other_home_nested, state_root).unwrap(),
+            &mount_identity_for_path(&other_home_nested, allowed_home).unwrap(),
+            &mount_tree_identities(&other_home_nested, Path::new("/var/home")).unwrap(),
+            &mount_tree_identities(&other_home_nested, allowed_home).unwrap(),
+            &mount_identities_outside_allowed_home(
+                &other_home_nested,
+                &home_roots,
+                allowed_home,
+            )
+            .unwrap(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("aliases another home mount"));
+
+        let whole_volume_nested =
+            format!("{base}6 5 0:18 / /var/home/tester/Downloads/nested rw - btrfs volume rw\n");
+        assert!(check(&whole_volume_nested)
+            .unwrap_err()
+            .to_string()
+            .contains("aliases a reserved mount"));
+
+        let state_alias = base.replace(
+            "/@var/home/tester/Downloads /var/home/tester/Downloads",
+            "/@var/home/tester/.td/app /var/home/tester/Downloads",
+        );
+        assert!(check(&state_alias)
+            .unwrap_err()
+            .to_string()
+            .contains("aliases a reserved mount"));
+    }
+
+    #[test]
+    fn grant_mount_identity_keeps_backing_volume_exception_home_specific() {
+        let mountinfo = "1 0 7:0 / / ro - erofs root ro\n\
+                         2 1 0:16 / /run rw - tmpfs run rw\n\
+                         3 2 0:18 / /run/td-volume ro - btrfs volume ro\n\
+                         4 1 0:18 /@var /var rw - btrfs volume rw\n";
+        let source = Path::new("/var/media");
+        let allowed_home = Path::new("/var/home/tester");
+        assert!(require_grant_mount_identities(
+            source,
+            &mount_tree_identities(mountinfo, source).unwrap(),
+            &mount_tree_identities(mountinfo, Path::new("/run")).unwrap(),
+            &mount_identity_for_path(mountinfo, allowed_home).unwrap(),
+            &mount_tree_identities(mountinfo, Path::new("/var/home")).unwrap(),
+            &mount_tree_identities(mountinfo, allowed_home).unwrap(),
+            &BTreeSet::new(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("aliases a reserved mount"));
+
+        let root_home = "1 0 7:0 / / ro - erofs root ro\n\
+                         2 1 0:16 / /run rw - tmpfs run rw\n\
+                         3 2 0:19 / /run/td-volume ro - ext4 home ro\n\
+                         4 1 0:19 / /var/home/tester rw - ext4 home rw\n";
+        assert!(require_grant_mount_identities(
+            Path::new("/var/home/tester/Downloads"),
+            &mount_tree_identities(root_home, Path::new("/var/home/tester/Downloads")).unwrap(),
+            &mount_tree_identities(root_home, Path::new("/run")).unwrap(),
+            &mount_identity_for_path(root_home, allowed_home).unwrap(),
+            &mount_tree_identities(root_home, Path::new("/var/home")).unwrap(),
+            &mount_tree_identities(root_home, allowed_home).unwrap(),
+            &BTreeSet::new(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("aliases a reserved mount"));
+
+        let whole_home_alias = "1 0 7:0 / / ro - erofs root ro\n\
+                                2 1 0:16 / /run rw - tmpfs run rw\n\
+                                3 2 0:18 / /run/td-volume ro - btrfs volume ro\n\
+                                4 1 0:18 /@var /var rw - btrfs volume rw\n\
+                                5 4 0:20 / /var/home/tester/.td/app rw - tmpfs state rw\n\
+                                6 4 0:18 /@var/home/tester \
+                                /var/home/tester/homelink rw - btrfs volume rw\n";
+        let alias = Path::new("/var/home/tester/homelink");
+        let mut reserved =
+            mount_tree_identities(whole_home_alias, Path::new("/run")).unwrap();
+        reserved.extend(
+            mount_tree_identities(whole_home_alias, Path::new("/var/home/tester/.td/app"))
+                .unwrap(),
+        );
+        let whole_home_error = require_grant_mount_identities(
+            alias,
+            &mount_tree_identities(whole_home_alias, alias).unwrap(),
+            &reserved,
+            &mount_identity_for_path(whole_home_alias, allowed_home).unwrap(),
+            &mount_tree_identities(whole_home_alias, Path::new("/var/home")).unwrap(),
+            &mount_tree_identities(whole_home_alias, allowed_home).unwrap(),
+            &BTreeSet::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(whole_home_error.contains(
+            "identity 0:18:/@var/home/tester aliases a reserved mount identity 0:18:/"
+        ));
     }
 
     #[test]

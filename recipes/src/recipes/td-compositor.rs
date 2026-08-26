@@ -216,11 +216,13 @@ pub fn recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::system_x86_64::{ROOTCHECK_ETC_NAME, SHADOW_ETC_NAME};
     use crate::ladder::{
+        TD_APPLICATION_CONFIG_PATH, TD_APPLICATION_LAUNCHER_TABLE, TD_APPLICATION_REGISTRY,
         TD_JAIL_FIXTURE_ALIAS, TD_JAIL_FIXTURE_DOWNLOAD_TARGET, TD_JAIL_FIXTURE_ENTRY,
-        TD_JAIL_FIXTURE_GRANT_FILE, TD_JAIL_FIXTURE_GRANT_ROOT,
-        TD_JAIL_FIXTURE_PICTURES_TARGET, TD_POINTER_ABSOLUTE_MARKER, TD_TERM_RUNTIME_MARKER,
-        TD_UI_CLIENT_RUNTIME_MARKER, TD_WAYLAND_RUNTIME_MARKER,
+        TD_JAIL_FIXTURE_GRANT_FILE, TD_JAIL_FIXTURE_GRANT_ROOT, TD_JAIL_FIXTURE_PICTURES_TARGET,
+        TD_POINTER_ABSOLUTE_MARKER, TD_TERM_RUNTIME_MARKER, TD_UI_CLIENT_RUNTIME_MARKER,
+        TD_WAYLAND_RUNTIME_MARKER,
     };
 
     #[test]
@@ -257,6 +259,20 @@ mod tests {
             .iter()
             .find_map(|(name, source)| (*name == "client").then_some(*source))
             .expect("client source");
+        let fixture_boundary = client
+            .split_once("fn verify_jail_boundary")
+            .expect("jail fixture boundary")
+            .1
+            .split_once("fn verify_jail_mounts")
+            .expect("jail fixture mount boundary")
+            .0;
+        let fixture_mounts = client
+            .split_once("fn verify_jail_mounts")
+            .expect("jail fixture mounts")
+            .1
+            .split_once("fn verify_jail_loopback")
+            .expect("jail fixture network boundary")
+            .0;
         assert!(client.contains(&format!(
             "pub(crate) const JAIL_FIXTURE_ID: &str = \"{TD_JAIL_FIXTURE_ALIAS}\";"
         )));
@@ -279,6 +295,25 @@ mod tests {
             "pub(crate) const JAIL_FIXTURE_UID: u32 = {};",
             td_engine::application_spec::APPLICATION_UID
         )));
+        for authority in [
+            TD_APPLICATION_CONFIG_PATH,
+            TD_APPLICATION_REGISTRY,
+            TD_APPLICATION_LAUNCHER_TABLE,
+        ] {
+            assert!(
+                fixture_boundary.contains(&format!("        \"{authority}\",")),
+                "fixture source lacks authority sentinel {authority}"
+            );
+        }
+        for image_name in [ROOTCHECK_ETC_NAME, SHADOW_ETC_NAME] {
+            assert!(
+                fixture_boundary.contains(&format!("        \"/etc/{image_name}\",")),
+                "fixture source lacks image sentinel /etc/{image_name}"
+            );
+        }
+        assert!(fixture_mounts.contains("(\"/etc\", \"configuration\")"));
+        assert!(fixture_mounts
+            .contains("for immutable_root in [\"/app\", \"/usr\", \"/etc\"]"));
         for row in [
             "const JAIL_FIXTURE_STATUS_EXIT_CODE: i32 = 70;",
             "const JAIL_FIXTURE_BOUNDARY_EXIT_CODE: i32 = 71;",

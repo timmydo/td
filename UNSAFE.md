@@ -1230,8 +1230,13 @@ volatile runtime directory read-write, and only the resolved filesystem
 grants. Package and runtime binds are builder-authenticated. State sources are
 canonicalized and checked for the application uid, private mode, source device
 and subtree root before stage 2 can enter them. Grant sources are canonicalized
-to regular files or directories, refused when they alias a reserved tree, and
-pinned by type/device/inode across the bind. Thus the shipped
+to regular files or directories and refused when they alias a reserved tree.
+The only exception is a source physically and strictly below the exact real
+home overlapping a reserved identity that strictly contains that home; the
+source cannot carry the reservation's siblings. Exact state and whole-home
+aliases remain refused in the shipped topology; the backing-volume
+reservation refuses every whole-home alias there. Sources
+are pinned by type/device/inode across the bind. Thus the shipped
 `/home -> /var/home` alias and
 mountinfo's escaped path fields resolve to the same identity the kernel
 records. This is not isolation from an unsandboxed same-uid process, which can

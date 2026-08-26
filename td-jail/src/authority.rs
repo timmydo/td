@@ -1274,6 +1274,7 @@ struct GrantBoundary {
     allowed_home: PathBuf,
     reserved_mounts: BTreeSet<MountIdentity>,
     home_mounts: BTreeSet<MountIdentity>,
+    allowed_home_mount: MountIdentity,
     allowed_home_mounts: BTreeSet<MountIdentity>,
     other_home_mounts: BTreeSet<MountIdentity>,
 }
@@ -1318,6 +1319,7 @@ impl GrantBoundary {
         }
         let reserved_mounts = mount_identities_for_roots(mountinfo, &reserved)?;
         let home_mounts = mount_identities_for_roots(mountinfo, &home_roots)?;
+        let allowed_home_mount = mount_identity_for_path(mountinfo, &state.real_home)?;
         let allowed_home_mounts = mount_tree_identities(mountinfo, &state.real_home)?;
         let other_home_mounts =
             mount_identities_outside_allowed_home(mountinfo, &home_roots, &state.real_home)?;
@@ -1327,6 +1329,7 @@ impl GrantBoundary {
             allowed_home: state.real_home.clone(),
             reserved_mounts,
             home_mounts,
+            allowed_home_mount,
             allowed_home_mounts,
             other_home_mounts,
         })
@@ -1356,6 +1359,7 @@ impl GrantBoundary {
         ];
         Ok(Self {
             reserved_mounts: mount_identities_for_roots(mountinfo, &reserved)?,
+            allowed_home_mount: mount_identity_for_path(mountinfo, &state.real_home)?,
             allowed_home_mounts: mount_tree_identities(mountinfo, &state.real_home)?,
             reserved,
             home_roots: Vec::new(),
@@ -1394,6 +1398,7 @@ impl GrantBoundary {
             source,
             source_mounts,
             &self.reserved_mounts,
+            &self.allowed_home_mount,
             &self.home_mounts,
             &self.allowed_home_mounts,
             &self.other_home_mounts,
@@ -1468,16 +1473,39 @@ pub(crate) fn require_grant_mount_identities(
     source: &Path,
     source_mounts: &BTreeSet<MountIdentity>,
     reserved_mounts: &BTreeSet<MountIdentity>,
+    allowed_home_mount: &MountIdentity,
     home_mounts: &BTreeSet<MountIdentity>,
     allowed_home_mounts: &BTreeSet<MountIdentity>,
     other_home_mounts: &BTreeSet<MountIdentity>,
 ) -> io::Result<()> {
-    if mount_identity_sets_overlap(source_mounts, reserved_mounts) {
+    let reserved_overlap = source_mounts.iter().find_map(|source_mount| {
+        reserved_mounts.iter().find_map(|reserved_mount| {
+            if !mount_identities_overlap(source_mount, reserved_mount) {
+                return None;
+            }
+            // A maintenance mount of the filesystem root contains the whole
+            // home; binding one home child does not carry its reserved siblings.
+            let reservation_contains_home = reserved_mount.device == allowed_home_mount.device
+                && reserved_mount.root != allowed_home_mount.root
+                && path_is_same_or_child(&allowed_home_mount.root, &reserved_mount.root);
+            let source_is_below_home = source_mount.device == allowed_home_mount.device
+                && source_mount.root != allowed_home_mount.root
+                && path_is_same_or_child(&source_mount.root, &allowed_home_mount.root);
+            (!(reservation_contains_home && source_is_below_home))
+                .then_some((source_mount, reserved_mount))
+        })
+    });
+    if let Some((source_mount, reserved_mount)) = reserved_overlap {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "filesystem permission source {} aliases a reserved mount",
-                source.display()
+                "filesystem permission source {} identity {}:{} aliases a reserved mount \
+                 identity {}:{}",
+                source.display(),
+                source_mount.device,
+                source_mount.root.display(),
+                reserved_mount.device,
+                reserved_mount.root.display()
             ),
         ));
     }
