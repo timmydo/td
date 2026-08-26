@@ -20,8 +20,9 @@
 //! td-boot includes `sha256`. Neither bin uses `gpt` or `fat`.
 //!
 //! The control-plane-only `gzip` module holds the one std-only DEFLATE
-//! implementation shared by builder source extraction and the bounded OSTree
-//! archive decoder. No target binary `#[path]`-includes it.
+//! implementation shared by builder source extraction, `td-net`'s bounded
+//! OSTree acquisition and the later deploy materializer. No target binary
+//! `#[path]`-includes it.
 //!
 //! `sha512` and `ed25519` arrive with AUTHENTICATED deployments, and are
 //! target-side in that same way — which is why the crate's first line no

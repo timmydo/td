@@ -34,6 +34,7 @@ mod deploy;
 mod feed;
 mod fetch;
 mod http;
+mod ostree;
 mod sig;
 mod subst;
 

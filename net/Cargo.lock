@@ -405,11 +405,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "td-engine"
+version = "0.1.0"
+
+[[package]]
 name = "td-net"
 version = "0.1.0"
 dependencies = [
  "ring",
  "sha2",
+ "td-engine",
  "ureq",
 ]
 

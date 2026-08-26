@@ -284,10 +284,9 @@ fn add_build_gate_targets(root: &Path, sel: &mut Selection) {
 /// differs. A `#[path]` include whose source is MISSING here is the direction
 /// that matters.
 ///
-/// Being in this table does NOT mean a gate builds that consumer. Nothing
-/// builds td-net from source (recorded in aa347e60), so a change to
-/// ed25519.rs/sha512.rs still runs its ring differential nowhere; naming the
-/// consumer here at least makes that gap visible at the routing decision.
+/// Being in this table does NOT mean a target gate builds that consumer.
+/// The host `net-test` preflight now compiles td-net and runs its differential
+/// tests; no target/bootstrap gate embeds that external-dependency crate.
 const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     (
         "engine/src/sha256.rs",
@@ -687,6 +686,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     if p == "engine/src/gzip.rs" {
         sel.add_preflight("cargo-test");
+        sel.add_preflight("net-test");
         sel.add_target("check-engine");
         sel.add_target("check");
         sel.add_note(
@@ -696,17 +696,21 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     // The shared std-only engine lib and its wire fixtures, plus the
-    // workspace-root manifest/lock. The engine compiles INTO both td-builder
-    // (build engine -> check-engine) and td-recipe-eval (recipe surface ->
-    // recipe-rs + package build gates), and the fixtures determine its tests.
-    // Route their UNION conservatively. builder/Cargo.lock and
-    // recipes/Cargo.lock are tombstones for the workspace-root lock.
+    // workspace-root manifest/lock. The engine compiles INTO td-builder (build
+    // engine -> check-engine), td-recipe-eval (recipe surface -> recipe-rs +
+    // package build gates), and td-net (host preflight), and the fixtures
+    // determine its tests. Route their UNION conservatively.
+    // builder/Cargo.lock and recipes/Cargo.lock are tombstones for the
+    // workspace-root lock.
     if pattern_matches(
         "engine/Cargo.toml|engine/src/*|engine/tests/*|Cargo.toml|Cargo.lock|builder/Cargo.lock|recipes/Cargo.lock",
         p,
     ) {
         sel.add_preflight("shell-syntax");
         sel.add_preflight("cargo-test");
+        if pattern_matches("engine/Cargo.toml|engine/src/*|engine/tests/*", p) {
+            sel.add_preflight("net-test");
+        }
         sel.add_target("check-engine");
         sel.add_target("recipe-rs");
         let consumers = if let Some(consumers) = target_included_consumers(p) {
@@ -718,7 +722,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
             sel.add_target("recipe-checks");
             consumers
         } else {
-            "td-builder and td-recipe-eval"
+            "td-builder, td-recipe-eval, and td-net"
         };
         add_build_gate_targets(root, sel);
         if pattern_matches("engine/tests/*", p) {
@@ -835,8 +839,9 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         // (former feed coverage); AND, since the old fetch/* rule mapped to the broad
         // behavioral tier, a net-only change keeps that too — without it such a diff
         // would run nothing while waiving the full check. The union of BOTH former
-        // rules. No gate builds td-net from source;
-        // the warm compiles it.
+        // rules. The host net-test preflight compiles and tests td-net; no
+        // target gate builds its external-dependency crate from source.
+        sel.add_preflight("net-test");
         sel.add_target("check");
         add_chain_targets(sel);
         return;
@@ -1404,6 +1409,9 @@ fn preflight_cmd(name: &str, changed: &[String]) -> Option<String> {
         // Rendered from the SAME list that runs, so a scoped run cannot print a
         // command it will not issue — the dry run is what a reader trusts.
         "cargo-test" => Some(render_cargo_test(&cargo_test_cmds(changed))),
+        "net-test" => {
+            Some("  CC=gcc cargo test --frozen --manifest-path net/Cargo.toml".to_string())
+        }
         "affected-self-test" => Some("  td-builder affected-checks --self-test".to_string()),
         "local-source-digests" => Some("  td-recipe-eval local-source-digests".to_string()),
         _ => None,
@@ -1786,7 +1794,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("engine/src/json.rs", "recipe-rs");
     assert_target!("engine/src/gzip.rs", "check-engine");
     assert_target!("engine/src/gzip.rs", "check");
+    assert_preflight!("engine/src/gzip.rs", "net-test");
     assert_contains!("engine/src/gzip.rs", "source extraction");
+    assert_preflight!("engine/src/ostree.rs", "net-test");
+    assert_preflight!("engine/src/lib.rs", "net-test");
     assert_target!(
         "engine/tests/fixtures/flathub-firefox-154.commit.hex",
         "check-engine"
@@ -2028,13 +2039,20 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("builder/Cargo.lock", "recipe-rs");
     assert_target!("recipes/Cargo.lock", "check-engine");
     assert_target!("recipes/Cargo.lock", "recipe-rs");
-    // The merged td-net gets the union of the former fetch/feed rules: the chain targets
-    // (no gate builds it from source; its main.rs holds the warm-sources consumer smoked by
-    // the i686 chain's proof set) AND the whole behavioral tier (former fetch coverage).
+    // The merged td-net gets the union of the former fetch/feed rules plus its
+    // host unit-test preflight. No target gate builds the external-dependency
+    // crate; main.rs still holds the warm-sources consumer smoked by the chain.
     assert_target!("net/Cargo.lock", "recipe-checks");
     assert_target!("net/src/main.rs", "recipe-checks");
     assert_target!("net/src/fetch.rs", "check");
     assert_target!("net/Cargo.toml", "check");
+    assert_preflight!("net/src/ostree.rs", "net-test");
+    assert_preflight!("net/src/http.rs", "net-test");
+    assert_preflight!("net/Cargo.toml", "net-test");
+    assert_contains!(
+        "net/src/ostree.rs",
+        "CC=gcc cargo test --frozen --manifest-path net/Cargo.toml"
+    );
     // td-kexec/src is include_str!'d into the target artifact, so a helper-source edit
     // rides the host cargo preflight AND is recorded against recipe-checks,
     // which statically links it via td-kexec-test.
@@ -2764,6 +2782,10 @@ fn run_preflight(root: &Path, name: &str, changed: &[String]) -> i32 {
             }
             0
         }
+        "net-test" => run_shell(
+            root,
+            "CC=gcc cargo test --frozen --manifest-path net/Cargo.toml",
+        ),
         // The dispatcher's own self-test — run IN-PROCESS (the shell oracle is gone,
         // and this binary IS the dispatcher), so no `td-builder` re-resolution.
         "affected-self-test" => {

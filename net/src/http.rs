@@ -28,6 +28,7 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Long enough that a saturated link mid-tarball never trips it, short enough that a
@@ -74,17 +75,29 @@ fn agent() -> ureq::Agent {
         .build()
 }
 
-fn agent_before(deadline: Instant) -> Result<ureq::Agent, String> {
+fn agent_no_redirects() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout_read(READ_TIMEOUT)
+        .timeout_write(WRITE_TIMEOUT)
+        .redirects(0)
+        .build()
+}
+
+fn agent_before(deadline: Instant, allow_redirects: bool) -> Result<ureq::Agent, String> {
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .ok_or_else(|| "HTTP request exceeded its absolute deadline".to_string())?;
-    Ok(ureq::AgentBuilder::new()
+    let mut builder = ureq::AgentBuilder::new()
         // ureq's global timeout covers connect, redirects, and a trickling
         // response body. DNS uses the platform's blocking resolver and cannot
         // be interrupted, but is checked immediately when it returns.
         .timeout(remaining)
-        .timeout_connect(CONNECT_TIMEOUT.min(remaining))
-        .build())
+        .timeout_connect(CONNECT_TIMEOUT.min(remaining));
+    if !allow_redirects {
+        builder = builder.redirects(0);
+    }
+    Ok(builder.build())
 }
 
 fn retry_pause(deadline: Option<Instant>) -> Result<(), String> {
@@ -143,7 +156,8 @@ fn get_to_file_once(
     url: &str,
     path: &Path,
     max_bytes: u64,
-) -> Result<(), Attempt> {
+    aggregate: Option<(&AtomicU64, u64)>,
+) -> Result<u64, Attempt> {
     let resp = match agent.get(url).call() {
         Ok(resp) => resp,
         Err(ureq::Error::Status(code, _)) if retryable_status(code) => {
@@ -152,35 +166,71 @@ fn get_to_file_once(
         Err(e @ ureq::Error::Status(..)) => return Err(Attempt::Answered(e.to_string())),
         Err(e) => return Err(Attempt::Transport(e.to_string())),
     };
+    if (300..400).contains(&resp.status()) {
+        return Err(Attempt::Answered(format!(
+            "{url}: redirect status {} is refused",
+            resp.status()
+        )));
+    }
     let mut output = File::create(path).map_err(|e| {
         Attempt::Answered(format!("create streamed response {}: {e}", path.display()))
     })?;
     let mut reader = resp.into_reader();
     let mut buf = [0u8; 64 * 1024];
     let mut total = 0u64;
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| Attempt::Transport(format!("read {url}: {e}")))?;
-        if n == 0 {
-            break;
+    let mut charged = 0u64;
+    let result = (|| {
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .map_err(|e| Attempt::Transport(format!("read {url}: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            let count = u64::try_from(n).map_err(|_| {
+                Attempt::Answered(format!("{url}: response read count does not fit u64"))
+            })?;
+            total = total
+                .checked_add(count)
+                .ok_or_else(|| Attempt::Answered(format!("{url}: response byte count overflow")))?;
+            if total > max_bytes {
+                return Err(Attempt::Answered(format!(
+                    "{url}: response exceeds its {max_bytes}-byte limit"
+                )));
+            }
+            if let Some((counter, limit)) = aggregate {
+                let next_charged = charged.checked_add(count).ok_or_else(|| {
+                    Attempt::Answered(format!("{url}: aggregate response charge overflow"))
+                })?;
+                counter
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                        used.checked_add(count).filter(|next| *next <= limit)
+                    })
+                    .map_err(|used| {
+                        Attempt::Answered(format!(
+                            "{url}: aggregate response exceeds its {limit}-byte limit after {used}"
+                        ))
+                    })?;
+                charged = next_charged;
+            }
+            let chunk = buf.get(..n).ok_or_else(|| {
+                Attempt::Answered(format!("{url}: response read exceeded its buffer"))
+            })?;
+            output.write_all(chunk).map_err(|e| {
+                Attempt::Answered(format!("write streamed response {}: {e}", path.display()))
+            })?;
         }
-        total = total.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
-        if total > max_bytes {
-            return Err(Attempt::Answered(format!(
-                "{url}: response exceeds its {max_bytes}-byte limit"
-            )));
+        output.sync_all().map_err(|e| {
+            Attempt::Answered(format!("sync streamed response {}: {e}", path.display()))
+        })?;
+        Ok(total)
+    })();
+    if result.is_err() {
+        if let Some((counter, _)) = aggregate {
+            counter.fetch_sub(charged, Ordering::AcqRel);
         }
-        let chunk = buf.get(..n).ok_or_else(|| {
-            Attempt::Answered(format!("{url}: response read exceeded its buffer"))
-        })?;
-        output.write_all(chunk).map_err(|e| {
-            Attempt::Answered(format!("write streamed response {}: {e}", path.display()))
-        })?;
     }
-    output.flush().map_err(|e| {
-        Attempt::Answered(format!("flush streamed response {}: {e}", path.display()))
-    })
+    result
 }
 
 /// GET `url`'s body. Each attempt is a fresh `call()`, so it re-resolves and
@@ -206,7 +256,7 @@ fn get_body_with_deadline(url: &str, deadline: Option<Instant>) -> Result<Vec<u8
         // re-resolve/re-connect above an accident rather than a property — and the
         // whole reason to try again is to reach somewhere else.
         let request_agent = match deadline {
-            Some(deadline) => agent_before(deadline)?,
+            Some(deadline) => agent_before(deadline, true)?,
             None => agent(),
         };
         match get_once(&request_agent, url) {
@@ -229,7 +279,7 @@ fn get_body_with_deadline(url: &str, deadline: Option<Instant>) -> Result<Vec<u8
 /// caller's declared ceiling. This is the cold-source path; unlike `get_body`,
 /// memory use stays constant as an archive grows.
 pub(crate) fn get_to_file(url: &str, path: &Path, max_bytes: u64) -> Result<(), String> {
-    get_to_file_with_deadline(url, path, max_bytes, None)
+    get_to_file_with_deadline(url, path, max_bytes, None, None, true).map(|_| ())
 }
 
 pub(crate) fn get_to_file_before(
@@ -238,7 +288,28 @@ pub(crate) fn get_to_file_before(
     max_bytes: u64,
     deadline: Instant,
 ) -> Result<(), String> {
-    get_to_file_with_deadline(url, path, max_bytes, Some(deadline))
+    get_to_file_with_deadline(url, path, max_bytes, Some(deadline), None, true).map(|_| ())
+}
+
+/// Stream one immutable object under both byte budgets and an absolute graph
+/// deadline. Failed attempts roll their reservation back before retrying, and
+/// redirect refusal remains active on the deadline-built agent.
+pub(crate) fn get_to_file_accounted_no_redirects_before(
+    url: &str,
+    path: &Path,
+    max_bytes: u64,
+    aggregate: &AtomicU64,
+    max_aggregate: u64,
+    deadline: Instant,
+) -> Result<u64, String> {
+    get_to_file_with_deadline(
+        url,
+        path,
+        max_bytes,
+        Some(deadline),
+        Some((aggregate, max_aggregate)),
+        false,
+    )
 }
 
 fn get_to_file_with_deadline(
@@ -246,15 +317,18 @@ fn get_to_file_with_deadline(
     path: &Path,
     max_bytes: u64,
     deadline: Option<Instant>,
-) -> Result<(), String> {
+    aggregate: Option<(&AtomicU64, u64)>,
+    allow_redirects: bool,
+) -> Result<u64, String> {
     let mut last = String::new();
     for attempt in 1..=ATTEMPTS {
         let request_agent = match deadline {
-            Some(deadline) => agent_before(deadline)?,
-            None => agent(),
+            Some(deadline) => agent_before(deadline, allow_redirects)?,
+            None if allow_redirects => agent(),
+            None => agent_no_redirects(),
         };
-        match get_to_file_once(&request_agent, url, path, max_bytes) {
-            Ok(()) => return Ok(()),
+        match get_to_file_once(&request_agent, url, path, max_bytes, aggregate) {
+            Ok(bytes) => return Ok(bytes),
             Err(Attempt::Answered(e)) => return Err(e),
             Err(Attempt::Transport(e)) => {
                 last = e;
@@ -396,18 +470,119 @@ mod tests {
                 );
             }
         });
-        let path = std::env::temp_dir().join(format!(
-            "td-http-stream-limit-{}",
-            std::process::id()
-        ));
-        let err = get_to_file_once(&agent(), &format!("http://127.0.0.1:{port}/x"), &path, 4)
-            .expect_err("a response above the ceiling must fail");
+        let path =
+            std::env::temp_dir().join(format!("td-http-stream-limit-{}", std::process::id()));
+        let err = get_to_file_once(
+            &agent(),
+            &format!("http://127.0.0.1:{port}/x"),
+            &path,
+            4,
+            None,
+        )
+        .expect_err("a response above the ceiling must fail");
         assert!(
             matches!(&err, Attempt::Answered(message) if message.contains("exceeds")),
             "unexpected streamed-limit error"
         );
         let _ = std::fs::remove_file(path);
         let _ = server.join();
+    }
+
+    #[test]
+    fn a_streamed_body_cannot_overshoot_a_shared_aggregate_ceiling() {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(_) => return,
+        };
+        let port = match listener.local_addr() {
+            Ok(addr) => addr.port(),
+            Err(_) => return,
+        };
+        let server = std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut scratch = [0u8; 1024];
+                let _ = conn.read(&mut scratch);
+                let body = vec![b'x'; 70_000];
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = conn.write_all(head.as_bytes());
+                let _ = conn.write_all(&body);
+            }
+        });
+        let path =
+            std::env::temp_dir().join(format!("td-http-aggregate-limit-{}", std::process::id()));
+        let aggregate = AtomicU64::new(3);
+
+        let error = get_to_file_accounted_no_redirects_before(
+            &format!("http://127.0.0.1:{port}/x"),
+            &path,
+            100_000,
+            &aggregate,
+            66_000,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .expect_err("a response crossing the aggregate ceiling must fail");
+
+        assert!(error.contains("aggregate response exceeds"), "{error}");
+        assert_eq!(aggregate.load(Ordering::Acquire), 3);
+        assert!(std::fs::metadata(&path).unwrap().len() > 0);
+        let _ = std::fs::remove_file(path);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn immutable_object_deadlines_do_not_reenable_redirects() {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(_) => return,
+        };
+        let port = match listener.local_addr() {
+            Ok(addr) => addr.port(),
+            Err(_) => return,
+        };
+        if listener.set_nonblocking(true).is_err() {
+            return;
+        }
+        let requests = std::sync::Arc::new(AtomicU64::new(0));
+        let observed = std::sync::Arc::clone(&requests);
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut connection, _)) => {
+                        observed.fetch_add(1, Ordering::AcqRel);
+                        let mut request = [0u8; 1024];
+                        let _ = connection.read(&mut request);
+                        let answer = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/second\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = connection.write_all(answer.as_bytes());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::yield_now();
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        let path = std::env::temp_dir().join(format!("td-http-no-redirect-{}", std::process::id()));
+        let aggregate = AtomicU64::new(0);
+        let error = get_to_file_with_deadline(
+            &format!("http://127.0.0.1:{port}/first"),
+            &path,
+            1024,
+            Some(Instant::now() + Duration::from_secs(2)),
+            Some((&aggregate, 1024)),
+            false,
+        )
+        .expect_err("an immutable object redirect must be an answer, not navigation");
+
+        assert!(error.contains("302"), "{error}");
+        let _ = server.join();
+        assert_eq!(requests.load(Ordering::Acquire), 1);
+        let _ = std::fs::remove_file(path);
     }
 
     /// The split is by CODE, not by error variant: a mirror answering 503 under load

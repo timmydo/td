@@ -19,9 +19,9 @@
 // reproducibility (the output depends on a secret) and offline purity (the key
 // is an undeclared input). Nothing here ever runs on a target.
 //
-// WHERE THIS RUNS: no gate builds td-net from source (see the note in
-// `ed25519_cross.rs` and the net rule in `builder/src/affected.rs`), so this
-// applet's own tests are a developer and prep-time check:
+// WHERE THIS RUNS: no target gate embeds td-net, but affected-checks runs the
+// host `net-test` preflight for net and td-engine changes (see the net rule in
+// `builder/src/affected.rs`). A developer can run the same suite directly:
 //
 //     CC=<cc> cargo test --manifest-path net/Cargo.toml
 //

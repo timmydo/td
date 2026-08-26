@@ -1147,7 +1147,7 @@ execute Firefox and did not touch the system image. Mutable refs were used only
 to discover the current commits; these are the immutable objects that were
 inspected:
 
-| role | ref | commit | deployed/download size |
+| role | ref | commit | publisher deployed/download estimate |
 |---|---|---|---|
 | application | `app/org.mozilla.firefox/x86_64/stable` | `86ba63a1c2378a9525b495e1ba2c3ed9dc71ee92f67e45d8016cc4972024b410` | 333.8 MB / 125.6 MB |
 | runtime | `runtime/org.freedesktop.Platform/x86_64/25.08` | `bd44a6230581917d04f89812a4c21090c304d390edb73995af1c2f9fd8abf4e8` | 659.9 MB / 257.1 MB |
@@ -1169,24 +1169,35 @@ signed deploy: its `application.ini` says Firefox 154.0, build ID
 
 This answers E1's layout question. The application deploy's `files/` tree is
 the hierarchy td mounts at `/app`; the platform deploy's `files/` tree is the
-hierarchy td mounts at `/usr`. The application tree had 480 children: 184
-directories, 151 regular files and 145 symlinks. The runtime tree had 18,201
-children: 1,947 directories, 13,744 regular files and 2,510 symlinks. Neither
-tree contained a device, FIFO or socket node, and neither contained a setuid or
-setgid regular file. The two base refs total 993.7 MB deployed, versus the
-approximately 1.4 GB uncompressed closure of the host Guix `mpv` package. Their
-separate compressed-transfer figure is 382.7 MB; it is not compared with the
-uncompressed Guix closure. Both figures exclude every related extension. The
-659.9 MB deployed runtime, whose transfer is 257.1 MB, is shared by every
-application on the same runtime major.
+hierarchy td mounts at `/usr`. The bounded importer independently walked the
+same immutable objects. The application graph has 357 unique objects and 480
+paths: 184 directories, 151 regular files and 145 symlinks. Its logical file
+payload is 333,694,837 bytes and its unique object transfer is 125,579,637
+bytes. The runtime graph has 14,346 unique objects and 18,196 paths: 1,947
+directories, 13,740 regular files and 2,509 symlinks. Its logical file payload
+is 656,400,310 bytes and its unique object transfer is 241,573,468 bytes. The
+earlier host Flatpak checkout reported five additional nodes (four regular
+files and one symlink), but that scratch checkout was removed before their
+paths were recorded. The cause was not captured; the authenticated object
+graph, not checkout side effects, is the materialization input.
 
-The proof is deliberately not called a td package landing. Flathub publishes
-an OSTree repository rather than a stable deploy tarball, and invoking the
-caller's `flatpak` from a recipe would make the derivation depend on ambient
-programs, remote configuration and a mutable ref. A locally exported tarball
-would instead make td its distributor. Neither is admissible. The repository
-workstream must implement and review the importer before these bytes can be a
-recipe input.
+Neither tree contained a device, FIFO or socket node, and neither contained a
+setuid or setgid regular file. The publisher estimates in the table total
+993.7 MB deployed and 382.7 MB downloaded; they are retained as publisher
+capacity guidance, not substituted for the importer's exact graph accounting.
+The deployed estimate is smaller than the approximately 1.4 GB uncompressed
+closure of the host Guix `mpv` package; its compressed-transfer figure is not
+compared with that uncompressed closure. Both sets of figures exclude every
+related extension. The runtime is shared by every application on the same
+runtime major.
+
+The authenticated object-cache landing is deliberately not called a td package
+landing. Flathub publishes an OSTree repository rather than a stable deploy
+tarball, and invoking the caller's `flatpak` from a recipe would make the
+derivation depend on ambient programs, remote configuration and a mutable ref.
+A locally exported tarball would instead make td its distributor. Neither is
+admissible. The remaining materializer must convert the authenticated cache
+into a marked foreign recipe input before these bytes enter the store.
 
 The importer contract is narrower than Flatpak:
 
@@ -1224,7 +1235,7 @@ The importer contract is narrower than Flatpak:
    obtains payload bytes from outside the signed commit-reachable object graph,
    is refused. The inspected application and runtime do not use extra data.
 
-**The bounded metadata and archive decoders have LANDED.**
+**The bounded object acquisition and decoders have LANDED.**
 `td_engine::ostree` accepts an expected checksum rooted in the reviewed commit
 pin, authenticates the exact commit, dirtree or dirmeta bytes before parsing,
 and exposes no unauthenticated public metadata parse route. This is object
@@ -1233,13 +1244,14 @@ decision in item 1. The metadata decoder parses only the three big-endian
 GVariant layouts needed to walk a deploy. It bounds individual metadata
 objects, entries per tree and UTF-8 component names; rejects noncanonical
 framing, unsafe or duplicate names, xattrs, non-directories and undefined or
-special permission bits; and exposes typed child checksums for the later
-fetch/materialize increment. Commit metadata is a closed, typed subset
+special permission bits; and exposes typed child checksums for acquisition and
+materialization. Commit metadata is a closed, typed subset
 matching the reviewed app and runtime commits: unknown keys,
 `xa.extra-data-sources`, duplicate keys or mistyped values, and nonempty
-related objects are refused. The decoder retains bindings but does not require
-their presence or choose a ref; the acquisition increment must require and
-compare the exact pinned ref before walking its graph.
+related objects are refused. Acquisition requires both `xa.ref` and a singleton
+`ostree.ref-binding` to equal the reviewed exact ref before walking its graph.
+It also verifies OSTree's root-tree/root-metadata content checksum from the
+pin; no mutable ref or summary is resolved.
 
 The archive decoder accepts only OSTree's `(tuuuusa(ayay))` archive-z2
 regular-file and symlink headers. It bounds the transfer, header, decoded file
@@ -1253,11 +1265,50 @@ compares it with the tree-reachable checksum. The existing gzip inflater is
 now the shared std-only implementation rather than a second decoder. Tests
 pin real Firefox regular-file and symlink `.filez` transfers and their
 semantic identities; the regular fixture is linked to the authenticated root
-dirtree. This is deliberately not a repository client or a general GVariant
-implementation. Network acquisition, exact-ref admission, whole-graph bounds
-and transactional materialization remain part of E1b. Authenticated symlink
-targets remain opaque content here; materialization must create each link
-without following it while resolving the destination path.
+dirtree. This is deliberately not a general repository client or GVariant
+implementation.
+
+`td-feed warm ostree` addresses only the immutable object URLs below an exact
+commit. HTTPS object requests refuse redirects; the loopback-only HTTP test
+exception parses an exact authority and refuses userinfo. It walks only the
+authenticated `files/` subtree and admits at most
+300,000 unique objects, 262,144 paths, 4095 bytes per path, 64 MiB of aggregate
+path text, 2 GiB of unique transfer, 2 GiB of logical decoded payload and 256
+directory levels. Each file's structurally admitted size, multiplied by its
+tree reference count, is charged before inflation, so a graph crossing the
+logical limit does not perform unbounded decompression work. Metadata objects
+download and authenticate with at most 16 workers. File objects use at most
+eight constant-memory downloads followed by serial archive authentication,
+because one archive authentication can hold a 257 MiB transfer and a 256 MiB
+decoded file. One graph acquisition also has a 12-hour request deadline;
+the platform's blocking DNS resolver cannot be interrupted, but an overdue
+lookup is rejected when it returns. Applying the deadline does not re-enable
+redirects. Object bytes and their fanout directories are synchronized before
+publication. Only a fully authenticated graph and canonical completion
+manifest is renamed into the cache. Reuse performs a complete read-only offline
+authentication and tree walk; missing, malformed or same-size corrupted
+objects are diagnosed before a fresh exact replacement is downloaded.
+
+A destination-derived lock and an exact graph-ownership record serialize td
+writers to that path. A destination is permanently bound to one reviewed pin;
+a pin bump uses a new destination, preserving the old application cache for
+the later side-by-side retention policy. An absent destination is reserved
+before network work through recoverable transaction state. Ownership is
+checked before publication and again after the old directory is atomically
+moved into the private transaction; changed state is restored or preserved,
+not deleted. Interrupted reservations, work directories and old-cache moves
+are recovered on the next run. These checks prevent accidents and races among
+td invocations; they are not a security boundary against a hostile process
+running as the same host UID, which can mutate that UID's cache directly.
+Synthetic low-limit, redirect, ownership, missing-object, malformed-manifest
+and interruption regressions make those mechanisms load-bearing. The full
+Firefox and runtime graph counts above are permanent reviewed pin evidence and
+were reauthenticated offline during this landing, not downloaded test
+fixtures. The `net-test` affected-checks preflight runs the td-net suite for
+net and td-engine changes.
+Transactional payload materialization remains part of E1b.
+Authenticated symlink targets remain opaque content here; materialization must
+create each link without following it while resolving the destination path.
 
 The inspected Firefox entry is a short `#!/bin/bash` wrapper that sets
 `TMPDIR=$XDG_CACHE_HOME/tmp` and execs `/app/lib/firefox/firefox`. Its ELF
@@ -1520,6 +1571,7 @@ served the repository client:
 | `builder/src/store.rs` | **read, do not port** — the store semantics are the control plane's, and with packages in the store there is nothing on the target that creates a store path |
 | `builder/src/elf.rs` | **never** — see §G |
 | `engine/src/gzip.rs` | **reuse only in the control plane** — builder source extraction and the bounded deploy importer share this std-only gzip/raw-DEFLATE implementation; nothing on the target decompresses a package |
+| `net/src/http.rs`, `td-feed` | **reuse only in the control plane** — exact immutable OSTree objects use td-net's bounded HTTP/TLS fetcher and a commit-specific authenticated local cache; there is no target network or repository client |
 | `builder/src/xz.rs`, `bzip2.rs`, `erofs.rs`, `tar.rs`, `oci.rs` | do not port — these serve source extraction or the image writer on the control plane |
 | `builder/src/nar.rs` | **needed, but only in the control plane** — `read_nar` is how host mode materializes a package (§X.1). Nothing on the target extracts an archive. §X.6 records the arbitrary-file-write this design found in it, fixed on main before this landed |
 | `engine` SHA-256 | **not needed** — nothing on the target hashes a package; the deployment's signed manifest is the integrity check |
@@ -6864,8 +6916,8 @@ The experiments that settle what is left, none longer than a week:
 
 | # | experiment | settles |
 |---|---|---|
-| **E1 — package half answered (§B.3.1)** | inspect the signed Firefox 154.0 and Freedesktop 25.08 deploy commits without executing the app; map their exact `files/` trees to `/app` and `/usr` | the deploy hierarchy is the right package/runtime split, has no special or setid files, and at 993.7 MB deployed is smaller than the roughly 1.4 GB uncompressed standalone Guix closure. Its separate compressed transfer is 382.7 MB. Execution waits on the dynamic-runtime/jail, bus and Wayland stop line rather than using host `bwrap` as a substitute for td-jail |
-| **E1b — object decoders landed** | fetch and materialize the same exact signed Flathub commits through a bounded control-plane importer | The authenticated commit/dirtree/dirmeta and archive-z2 regular-file/symlink decoders are landed. Network acquisition, exact-ref admission, whole-graph bounds and transactional materialization remain. Flathub publishes no stable deploy tarball, so an ambient `flatpak` recipe and a locally hosted export are both refused. §B.3.1 is the importer contract |
+| **E1 — package half answered (§B.3.1)** | inspect the signed Firefox 154.0 and Freedesktop 25.08 deploy commits without executing the app; map their exact `files/` trees to `/app` and `/usr` | the deploy hierarchy is the right package/runtime split and has no special or setid files. Publisher estimates total 993.7 MB deployed and 382.7 MB downloaded; the bounded importer records exact authenticated graph totals separately. Execution waits on the dynamic-runtime/jail, bus and Wayland stop line rather than using host `bwrap` as a substitute for td-jail |
+| **E1b — acquisition landed; materialization remains** | fetch and materialize the same exact signed Flathub commits through a bounded control-plane importer | Exact-ref admission, commit/root/file authentication, bounded graph acquisition, offline cache re-authentication and transactional cache publication are landed and exercised against both pins. Transactional deploy materialization and recipe/store integration remain. Flathub publishes no stable deploy tarball, so an ambient `flatpak` recipe and a locally hosted export are both refused. §B.3.1 is the importer contract |
 | **E2 — COMPLETE** | filter globals from GTK 4.22.1; exercise forced Cairo; compile in exact Freedesktop SDK 25.08 and run against the exact pinned Platform; run pinned Firefox 154.0 on no-dmabuf Weston and test its nested user namespace and `about:support` sandbox report | data-device is the GTK first-window blocker while subcompositor is class U; forced Cairo, pinned llvmpipe, and pinned Firefox all attach shm without dmabuf; stock Firefox denies nested user namespaces yet retains effective content sandbox level 6, selecting one standard td filter. The pinned Freedesktop runtime contains GTK 3 rather than GTK 4, so a future GTK 4 runtime selection repeats that identified part of the matrix |
 | **E3** | a Meson-world pilot — recipes for `pkgconf`, Ninja, Meson, a native CPython, then GLib and a Wayland-only `gtk3-demo` | td's *actual* per-package source cost, the number with the widest error bars. Near `cmake-x86-64`'s cost and the source track is real; a multi-week fight per package and the hybrid is permanent posture |
 | **E4 — COMPLETE** | the §0 cgroup pins plus a fixture under `memory.high=48M`, `memory.max=64M`, `pids.max=32`, and `cpu.max=50000 100000`, with active membership and exact controller readback gating the QEMU oracle | §P's mechanism works on the target kernel |

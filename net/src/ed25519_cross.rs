@@ -9,17 +9,15 @@
 // point whose x is zero or a scalar with a rare bit pattern is found here and
 // not in production.
 //
-// WHERE IT RUNS, stated exactly, because the tempting claim is wrong: NO GATE
-// RUNS THIS. `cargo test --frozen --workspace` does not reach net (it is
-// excluded from the engine workspace), and the cargo-test preflight's roster
-// does not name net/Cargo.toml — deliberately, since no gate builds td-net
-// from source at all (builder/src/affected.rs, the net routing rule): the host
-// warm compiles it, and adding it to that preflight would put ring's C build
-// in the gate's path. So this is a developer and prep-time check, run with
+// WHERE IT RUNS, stated exactly: `cargo test --frozen --workspace` does not
+// reach net (it is excluded from the engine workspace), but the affected-checks
+// `net-test` preflight names net/Cargo.toml for net and td-engine changes. That
+// deliberately puts ring's host C build in this security boundary's check path.
+// A developer can run the same suite directly with
 //
 //     CC=<cc> cargo test --manifest-path net/Cargo.toml
 //
-// What the gate does carry is the RESULT: the signatures a run of this file
+// Target gates carry the RESULT too: the signatures a run of this file
 // produced are committed as fixtures in ed25519.rs, whose tests do run there.
 // That covers the direction which can actually rot — a change to the engine
 // verifier — and leaves uncovered only ring changing what it signs, which

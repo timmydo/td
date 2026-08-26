@@ -97,6 +97,20 @@ pub struct Commit {
     pub metadata: CommitMetadata,
 }
 
+impl Commit {
+    /// OSTree's metadata-independent checksum for a commit's complete root.
+    ///
+    /// This is SHA-256 over the binary root dirtree checksum followed by the
+    /// binary root dirmeta checksum. It is distinct from the checksum naming a
+    /// particular dirtree object, including the Flatpak `files/` subtree.
+    pub fn content_checksum(&self) -> Checksum {
+        let mut hasher = sha256::Sha256::new();
+        hasher.update(self.root_tree.as_bytes());
+        hasher.update(self.root_meta.as_bytes());
+        Checksum(hasher.finalize())
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CommitMetadata {
     pub collection_binding: Option<String>,
@@ -108,6 +122,35 @@ pub struct CommitMetadata {
     pub installed_size: Option<u64>,
     pub subsets: Vec<String>,
     pub flatpak_metadata: Option<String>,
+}
+
+impl CommitMetadata {
+    /// Require both ref declarations carried by the reviewed Flatpak commits.
+    ///
+    /// Acquisition addresses the commit object directly by checksum; this is
+    /// therefore an admission check on the immutable object, never a mutable
+    /// ref lookup. Requiring both spellings keeps a commit copied from another
+    /// branch from being accepted under the caller's reviewed identity.
+    pub fn require_exact_ref(&self, expected: &str) -> Result<(), String> {
+        if expected.is_empty() {
+            return Err("expected OSTree ref is empty".into());
+        }
+        if self.xa_ref.as_deref() != Some(expected) {
+            return Err(format!(
+                "commit xa.ref {:?} does not match exact ref {expected:?}",
+                self.xa_ref
+            ));
+        }
+        if self.ref_binding.len() != 1
+            || self.ref_binding.first().map(String::as_str) != Some(expected)
+        {
+            return Err(format!(
+                "commit ostree.ref-binding {:?} does not name only exact ref {expected:?}",
+                self.ref_binding
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,6 +200,15 @@ struct ArchiveHeader {
     gid: u32,
     mode: u32,
     target: String,
+}
+
+/// Read the logical payload size declared by one structurally valid archive-z2
+/// object without inflating it. This is an admission aid, not authentication;
+/// callers must still use [`decode_archive_file_verified`] before trusting the
+/// object or its contents.
+pub fn archive_file_logical_size(bytes: &[u8]) -> Result<u64, String> {
+    let (header, body) = parse_archive_envelope(bytes)?;
+    admitted_archive_logical_size(&header, body)
 }
 
 pub fn verify_object(expected: Checksum, bytes: &[u8], what: &str) -> Result<(), String> {
@@ -435,6 +487,39 @@ pub fn decode_archive_file_verified(
     expected: Checksum,
     bytes: &[u8],
 ) -> Result<ArchiveFile, String> {
+    let (header, body) = parse_archive_envelope(bytes)?;
+    let _ = admitted_archive_logical_size(&header, body)?;
+
+    let kind = match header.mode & FILE_TYPE_MASK {
+        REGULAR_TYPE => {
+            let size = usize::try_from(header.size)
+                .map_err(|_| "archive file size does not fit usize".to_string())?;
+            let contents = gzip::decompress_raw_exact(body, size, MAX_ARCHIVE_FILE_BYTES)
+                .map_err(|error| format!("archive file payload: {error}"))?;
+            verify_archive_content(expected, &header, &contents)?;
+            ArchiveFileKind::Regular(contents)
+        }
+        SYMLINK_TYPE => {
+            verify_archive_content(expected, &header, &[])?;
+            ArchiveFileKind::Symlink(header.target.clone())
+        }
+        kind => {
+            return Err(format!(
+                "archive file mode {:#o} has refused file type {kind:#o}",
+                header.mode
+            ));
+        }
+    };
+
+    Ok(ArchiveFile {
+        uid: header.uid,
+        gid: header.gid,
+        mode: header.mode,
+        kind,
+    })
+}
+
+fn parse_archive_envelope(bytes: &[u8]) -> Result<(ArchiveHeader, &[u8]), String> {
     require_archive_input_size(bytes.len())?;
     let header_len = usize::try_from(u32_be(bytes, 0, "archive header length")?)
         .map_err(|_| "archive header length does not fit usize".to_string())?;
@@ -463,17 +548,23 @@ pub fn decode_archive_file_verified(
         ));
     }
 
-    let kind = match header.mode & FILE_TYPE_MASK {
+    Ok((header, body))
+}
+
+fn admitted_archive_logical_size(header: &ArchiveHeader, body: &[u8]) -> Result<u64, String> {
+    match header.mode & FILE_TYPE_MASK {
         REGULAR_TYPE => {
             if !header.target.is_empty() {
                 return Err("regular archive file carries a symlink target".into());
             }
             let size = usize::try_from(header.size)
                 .map_err(|_| "archive file size does not fit usize".to_string())?;
-            let contents = gzip::decompress_raw_exact(body, size, MAX_ARCHIVE_FILE_BYTES)
-                .map_err(|error| format!("archive file payload: {error}"))?;
-            verify_archive_content(expected, &header, &contents)?;
-            ArchiveFileKind::Regular(contents)
+            if size > MAX_ARCHIVE_FILE_BYTES {
+                return Err(format!(
+                    "archive file payload declares {size} bytes; limit is {MAX_ARCHIVE_FILE_BYTES}"
+                ));
+            }
+            Ok(header.size)
         }
         SYMLINK_TYPE => {
             if header.size != 0 {
@@ -487,23 +578,14 @@ pub fn decode_archive_file_verified(
                     "archive symlink target length must be in 1..={MAX_SYMLINK_TARGET_BYTES} bytes"
                 ));
             }
-            verify_archive_content(expected, &header, &[])?;
-            ArchiveFileKind::Symlink(header.target.clone())
+            u64::try_from(header.target.len())
+                .map_err(|_| "archive symlink target length does not fit u64".to_string())
         }
-        kind => {
-            return Err(format!(
-                "archive file mode {:#o} has refused file type {kind:#o}",
-                header.mode
-            ));
-        }
-    };
-
-    Ok(ArchiveFile {
-        uid: header.uid,
-        gid: header.gid,
-        mode: header.mode,
-        kind,
-    })
+        kind => Err(format!(
+            "archive file mode {:#o} has refused file type {kind:#o}",
+            header.mode
+        )),
+    }
 }
 
 fn require_archive_input_size(size: usize) -> Result<(), String> {
@@ -1252,6 +1334,10 @@ mod tests {
             "20e1f5dac181295e0e51d3628008003be53ab5d28873507ef10c9d7d28e52524"
         );
         assert_eq!(
+            commit.content_checksum().to_hex(),
+            "e511b540f42135f8703d6ea0f65abe3b798f93d4ab73ad27bf272d372a72fac3"
+        );
+        assert_eq!(
             commit.metadata.xa_ref.as_deref(),
             Some("app/org.mozilla.firefox/x86_64/stable")
         );
@@ -1259,6 +1345,15 @@ mod tests {
             commit.metadata.ref_binding,
             vec!["app/org.mozilla.firefox/x86_64/stable".to_string()]
         );
+        commit
+            .metadata
+            .require_exact_ref("app/org.mozilla.firefox/x86_64/stable")
+            .unwrap();
+        assert!(commit
+            .metadata
+            .require_exact_ref("app/org.mozilla.firefox/x86_64/beta")
+            .unwrap_err()
+            .contains("xa.ref"));
         assert!(commit
             .metadata
             .flatpak_metadata
@@ -1307,6 +1402,7 @@ mod tests {
             sha256_hex(&bytes),
             "5ded1bbcd3337033da61f7274a422804615039605291063b1118e5a3e149abae"
         );
+        assert_eq!(archive_file_logical_size(&bytes).unwrap(), 908);
 
         let decoded = decode_archive_file_verified(expected, &bytes).unwrap();
 
@@ -1334,6 +1430,7 @@ mod tests {
             sha256_hex(&bytes),
             "b9de86ad749eb567387080bc76725ecca24160f7ad9ae1ce6d010c8f1643d98a"
         );
+        assert_eq!(archive_file_logical_size(&bytes).unwrap(), 25);
 
         let decoded = decode_archive_file_verified(expected, &bytes).unwrap();
 
@@ -1342,6 +1439,20 @@ mod tests {
             decoded.kind,
             ArchiveFileKind::Symlink("libcanberra-gtk3.so.0.1.9".to_string())
         );
+    }
+
+    #[test]
+    fn archive_admission_reads_size_without_inflating_or_authenticating() {
+        let mut bytes = fixture_hex(include_str!(
+            "../tests/fixtures/flathub-firefox-154-metadata.filez.hex"
+        ));
+        let expected =
+            Checksum::from_hex("e2893afcb40e2252a53c4bb1a795d179c7f09dd46d93a165afbfae993dbf0c57")
+                .unwrap();
+        *bytes.last_mut().unwrap() ^= 0xff;
+
+        assert_eq!(archive_file_logical_size(&bytes).unwrap(), 908);
+        assert!(decode_archive_file_verified(expected, &bytes).is_err());
     }
 
     #[test]
@@ -1557,6 +1668,10 @@ mod tests {
             "446a0ef11b7cc167f3b603e585c7eeeeb675faa412d5ec73f62988eb0b6c5488"
         );
         assert_eq!(
+            commit.content_checksum().to_hex(),
+            "e8c3f71b355e2248fba4e04492de33242355ddd4b552f809ea06292859200c72"
+        );
+        assert_eq!(
             commit.metadata.xa_ref.as_deref(),
             Some("runtime/org.freedesktop.Platform/x86_64/25.08")
         );
@@ -1564,6 +1679,38 @@ mod tests {
             commit.metadata.ref_binding,
             vec!["runtime/org.freedesktop.Platform/x86_64/25.08".to_string()]
         );
+        commit
+            .metadata
+            .require_exact_ref("runtime/org.freedesktop.Platform/x86_64/25.08")
+            .unwrap();
+    }
+
+    #[test]
+    fn exact_ref_admission_requires_both_identical_single_bindings() {
+        let expected = "app/example/x86_64/stable";
+        let mut metadata = CommitMetadata {
+            xa_ref: Some(expected.to_string()),
+            ref_binding: vec![expected.to_string()],
+            ..CommitMetadata::default()
+        };
+        assert!(metadata.require_exact_ref(expected).is_ok());
+
+        metadata.xa_ref = None;
+        assert!(metadata
+            .require_exact_ref(expected)
+            .unwrap_err()
+            .contains("xa.ref"));
+        metadata.xa_ref = Some(expected.to_string());
+        metadata.ref_binding.clear();
+        assert!(metadata
+            .require_exact_ref(expected)
+            .unwrap_err()
+            .contains("ref-binding"));
+        metadata.ref_binding = vec![expected.to_string(), expected.to_string()];
+        assert!(metadata
+            .require_exact_ref(expected)
+            .unwrap_err()
+            .contains("only exact ref"));
     }
 
     #[test]
