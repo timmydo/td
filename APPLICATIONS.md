@@ -1271,11 +1271,10 @@ For `td-busd`, full Firefox fidelity needs:
   to prove the path end to end, not enough for the two features this bullet
   is about. Media keys, player integration and remote control need an
   amendment admitting a suffix form for `own`, not more broker work;
-- `AddMatch`/`RemoveMatch` and sender validation, so portal, MPRIS,
-  file-manager and accessibility signals cannot be spoofed or delivered
-  across applications. Authenticated pending-reply ownership is landed — see
-  §D — so the REPLY half of this bullet is discharged and the match-rule half
-  is not;
+- `AddMatch`/`RemoveMatch`, authenticated sender stamping and per-recipient
+  broadcast filtering are landed — see §D. Portal, MPRIS, file-manager and
+  accessibility delivery now depends on the corresponding service and grant,
+  not on missing broker match machinery;
 - complete bounded `SCM_RIGHTS` forwarding in both directions for portal file
   results, with descriptor indices and counts tied to the message that owns
   them;
@@ -2114,9 +2113,9 @@ permission, which is what step 12 has said since it was written. It is
 also the one landed row whose enclosing claim — that the broker is the
 policy — is now PARTLY a description of what runs rather than wholly a
 target: today's td-busd resolves a per-jail identity at accept, filters
-what each caller may see, address and own, and honours the `own` entries
-this row forwards. What it still lacks is match rules, so the claim is
-not yet whole. Its PRESENCE is a launch precondition as well:
+what each caller may see, address and own, honours the `own` entries this row
+forwards, and filters matched broadcasts per recipient. Its PRESENCE is a
+launch precondition as well:
 `plan_launch` resolves the socket before the jail unshares, so a missing
 or non-socket `/run/user/1000/bus` fails the launch of every application,
 including one that never opens D-Bus. §D records what all of that costs.
@@ -2970,7 +2969,7 @@ as permitted and said nothing about their answers, which would have made
 the `see` policy a filter on calls the caller never needed to make.
 
 Match rules parse `type`, `sender`, `interface`, `member`, `path`,
-`path_namespace`, `destination`, `arg0`…`arg63`, `arg0path`,
+`path_namespace`, `destination`, `arg0`…`arg63`, `arg0path`…`arg63path`, and
 `arg0namespace`, with exact D-Bus escaping. `eavesdrop=true` and
 `BecomeMonitor` are refused. A signal is delivered at most once per
 connection however many rules match.
@@ -3368,25 +3367,23 @@ and the test for it is two fd-carrying messages in a single `write`.
 ### What is landed of the bus interface
 
 Names, directed routing, the per-caller filter, authenticated
-pending-reply ownership, well-known name ownership and the permission
-file's `own` grant that widens it are landed; match rules are not. Of the
+pending-reply ownership, well-known name ownership, the permission file's
+`own` grant that widens it, and bounded match rules are landed. Of the
 `org.freedesktop.DBus` roster above: `Hello` (assigning
 `:1.N`, with anything before it disconnecting and a second one ending the
 connection, and announcing the assigned name like any other name gained),
 `RequestName` and `ReleaseName` with the owner queue, `ListNames`,
 `ListActivatableNames`, `NameHasOwner`,
 `GetNameOwner`, `GetConnectionUnixUser`, `GetConnectionUnixProcessID`,
-`GetConnectionCredentials`, `GetId` and `Peer.Ping`, plus the directed
-`NameAcquired` and `NameLost` signals. A `Hello` that omits
+`GetConnectionCredentials`, `AddMatch`, `RemoveMatch`, `GetId` and
+`Peer.Ping`, plus `NameAcquired`, `NameLost`, and filtered
+`NameOwnerChanged` signals. A `Hello` that omits
 its `DESTINATION` is accepted, because there is nothing else a connection
 with no name could be addressing — the broker is the only peer it can
 reach — and requiring the field made the no-destination case unreachable
 in the routing match while turning a lenient one into a disconnect whose
-stated reason was "Hello before Hello". Absent: `AddMatch`/`RemoveMatch`,
-`Introspectable.Introspect`, `Peer.GetMachineId`, and the
-`NameOwnerChanged` signal — which is the broadcast form of news the
-directed `NameAcquired`/`NameLost` pair already carries to the peers it
-concerns, and which waits for match rules because §D filters it per caller.
+stated reason was "Hello before Hello". Absent:
+`Introspectable.Introspect` and `Peer.GetMachineId`.
 
 **Absent means `UnknownMethod`, not silence.** A client told its match
 rule was installed and then never signalled is worse off than one told
@@ -4241,10 +4238,9 @@ there is nowhere to report to, and disconnecting a recipient for being
 behind is what the budget remedy above exists to avoid, since it did not
 choose when this fired. A failure is therefore LOGGED as a broker-level
 condition: reaching it means a peer's view of the bus and the bus's view of
-it have parted. `NameOwnerChanged` is the broadcast form
-of the same news and is NOT landed: it waits for match rules, and §D filters
-it per caller, which is a subscription-shaped version of the `see` question
-and belongs with the machinery that answers it.
+it have parted. `NameOwnerChanged` is the subscribed broadcast form of the
+same news. It is landed and filtered per recipient by the subject name,
+which is the subscription-shaped version of the `see` question.
 
 **A grant of a NAME is a grant of everything its holder serves**, and that
 is worth stating because it is the shape of every destination-based bus
@@ -4675,23 +4671,21 @@ a question belonging to the component that will have one. What an app may
 DO on the bus is the broker's business; that it HAS one is not a question
 the mount namespace should answer differently per app.
 
-**The broker draws most of that boundary now, and what is left is the
-exposure.** A draft of this section wrote that a per-app switch would
+**The broker draws that boundary now; the remaining work is substrate
+exposure and service integration.** A draft of this section wrote that a per-app switch would
 duplicate "a boundary td-busd already draws per connection", and when it
 was written that was false: no well-known names, no match rules, no
 per-caller filter, every peer able to list every unique name, read any
 peer's uid and pid out of `GetConnectionCredentials`, and send a directed
 call to any of them, with no call/reply pairing to stop a forged
-`METHOD_RETURN`. Rungs 15a–15c and this one closed all of those except
-one. A confined peer now resolves to a jail identity taken from
+`METHOD_RETURN`. Rungs 15a–15c and the match-rule landing closed those
+broker-policy gaps. A confined peer now resolves to a jail identity taken from
 `SO_PEERPIDFD` at accept; it sees, addresses and may be told the
 credentials of only the portal, its own name, and the names its
 permission file grants; well-known names and a bounded owner queue exist;
-and a reply is delivered only against a call the broker actually routed.
-MATCH RULES REMAIN, and they are the residual this paragraph is now
-about: without `AddMatch` there is no broadcast to filter, but there is
-also no sender validation for the signals a later rung will carry. The
-admission quota is also still keyed on `SO_PEERCRED.pid` while a jail is
+and a reply is delivered only against a call the broker actually routed;
+matched broadcasts are delivered once and filtered by the same visibility
+policy. The admission quota is still keyed on `SO_PEERCRED.pid` while a jail is
 a PID namespace with no pids cap, so one application can fork its way to
 the whole table.
 

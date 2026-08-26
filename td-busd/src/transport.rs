@@ -940,19 +940,17 @@ impl<'a> Connection<'a> {
             Some(BUS_NAME) => self.bus_method(&message, wants_reply),
             Some(destination) => self.route(&message, destination, wants_reply, wanted),
             // No DESTINATION and not `Hello`. A SIGNAL without one is a
-            // broadcast, which needs the match rules that land next, so it is
-            // accepted and goes nowhere rather than being refused — a signal
-            // has no reply to be missing, and erroring one would be answering
-            // a message that was addressed to nobody. A method CALL without
-            // one is the opposite case and gets the opposite treatment: the
-            // caller is waiting on a serial, and until match rules land there
-            // is no route that could ever produce the reply, so it is told
+            // broadcast and is selected by each recipient's installed match
+            // rules. A method CALL without one is the opposite case: the
+            // caller is waiting on a serial but named no callee, so it is told
             // rather than left to time out.
+            None if message.kind == message::MessageType::Signal => {
+                self.broadcast(&message, wanted)
+            }
             None if wants_reply => self.refuse(
                 &message,
                 "org.freedesktop.DBus.Error.NotSupported",
-                "a method call must name a destination on this bus; \
-                 undirected delivery lands with match rules",
+                "a method call must name a destination on this bus",
             ),
             None => Ok(()),
         }
@@ -1006,7 +1004,7 @@ impl<'a> Connection<'a> {
                 &self.outbox,
                 self.credential.uid,
                 self.credential.pid,
-                self.identity.app_id().map(str::to_string),
+                self.identity.clone(),
             )
             .map_err(|why| Ended::Failed(format!("cannot name a peer: {why}")))?;
         // A unique name is a name this connection now OWNS, and the reference
@@ -1028,11 +1026,10 @@ impl<'a> Connection<'a> {
     /// Everything here is answered from the directory, and none of it reaches
     /// another peer. §D's rule for the rest is `UnknownMethod` rather than
     /// silence — a client that calls a method this bus does not have should
-    /// find out now, not on a reply that never comes. `RequestName`,
-    /// `AddMatch` and their neighbours land with match rules; until then they
-    /// are honestly absent rather than quietly accepted, because a client told
-    /// its match rule was installed and then never signalled is worse off than
-    /// one told there is no such method.
+    /// find out now, not on a reply that never comes. A missing method is
+    /// honestly absent rather than quietly accepted, because a client told an
+    /// operation succeeded and then given none of its effects is worse off
+    /// than one told there is no such method.
     fn bus_method(
         &mut self,
         message: &message::Message<'_>,
@@ -1120,6 +1117,13 @@ impl<'a> Connection<'a> {
                 // and spelled out for the reason the jail dispatch above is.
                 _ => Ok(()),
             };
+        }
+        let match_method = matches!(member, "AddMatch" | "RemoveMatch")
+            && is_call
+            && here
+            && on(BUS_NAME);
+        if match_method {
+            return self.change_match(message, member == "AddMatch", wants_reply);
         }
         // Everything below is a question rather than a change, so a peer that
         // is not waiting for an answer simply gets none.
@@ -1310,9 +1314,7 @@ impl<'a> Connection<'a> {
             _ => self.refuse(
                 message,
                 "org.freedesktop.DBus.Error.UnknownMethod",
-                "td-busd serves Hello, the name and credential lookups, \
-                 directed routing and td.Jail1 registration; the rest of \
-                 org.freedesktop.DBus lands with match rules",
+                "td-busd does not serve that bus method",
             ),
         }
     }
@@ -1635,6 +1637,72 @@ impl<'a> Connection<'a> {
                     "that is not a bus name",
                 )?;
                 Ok(None)
+            }
+        }
+    }
+
+    /// `AddMatch` and `RemoveMatch`, including the per-connection count and
+    /// text budgets §D assigns them.
+    fn change_match(
+        &mut self,
+        message: &message::Message<'_>,
+        add: bool,
+        wants_reply: bool,
+    ) -> Result<(), Ended> {
+        if !self.takes_if_wanted(message, "s", wants_reply)? {
+            return Ok(());
+        }
+        let Some(text) = message.args().first().and_then(crate::wire::Value::as_str) else {
+            return self.refuse_if_wanted(
+                message,
+                "org.freedesktop.DBus.Error.InvalidArgs",
+                "a match rule must be a string",
+                wants_reply,
+            );
+        };
+        let rule = match crate::match_rule::Rule::parse(text) {
+            Ok(rule) => rule,
+            Err(crate::match_rule::RuleError::TooLong) => {
+                return self.refuse_if_wanted(
+                    message,
+                    "org.freedesktop.DBus.Error.LimitsExceeded",
+                    "this match rule exceeds the text ceiling",
+                    wants_reply,
+                );
+            }
+            Err(error) => {
+                return self.refuse_if_wanted(
+                    message,
+                    "org.freedesktop.DBus.Error.MatchRuleInvalid",
+                    &error.to_string(),
+                    wants_reply,
+                );
+            }
+        };
+        let unique = self.named()?.to_string();
+        let changed = if add {
+            self.bus.add_match(&unique, text.len(), rule)
+        } else {
+            self.bus.remove_match(&unique, &rule)
+        };
+        match changed {
+            Ok(()) if wants_reply => self.answer(message, "", |_| Ok(())),
+            Ok(()) => Ok(()),
+            Err(crate::registry::MatchChange::NotFound) => self.refuse_if_wanted(
+                message,
+                "org.freedesktop.DBus.Error.MatchRuleNotFound",
+                "this connection did not install that match rule",
+                wants_reply,
+            ),
+            Err(crate::registry::MatchChange::TooMany)
+            | Err(crate::registry::MatchChange::TooMuchText) => self.refuse_if_wanted(
+                message,
+                "org.freedesktop.DBus.Error.LimitsExceeded",
+                "this connection has reached its match-rule ceiling",
+                wants_reply,
+            ),
+            Err(crate::registry::MatchChange::NoSuchPeer) => {
+                Err(Ended::Failed("the named connection vanished from its bus".into()))
             }
         }
     }
@@ -2043,10 +2111,8 @@ impl<'a> Connection<'a> {
     ///
     /// `NameAcquired` and `NameLost` are DIRECTED signals -- each goes to the
     /// one connection it is about -- so they need no subscription and no match
-    /// rule. `NameOwnerChanged` is the broadcast form of the same news and
-    /// waits for match rules to land; §D filters it per caller, which is a
-    /// subscription-shaped version of the `see` question and belongs with the
-    /// machinery that answers it.
+    /// rule. `NameOwnerChanged` is the subscribed broadcast form of the same
+    /// news and is filtered per caller by the name whose ownership changed.
     ///
     /// Best effort, and the cost of that is worth stating: these are
     /// STATE-MACHINE signals, not news. A peer that misses `NameLost` goes on
@@ -2097,6 +2163,103 @@ impl<'a> Connection<'a> {
                 );
             }
         }
+        self.announce_owner_change(handover);
+    }
+
+    /// The subscribed, per-recipient-filtered form of an ownership change.
+    fn announce_owner_change(&self, handover: &crate::registry::Handover) {
+        let old_owner = handover.lost.as_deref().unwrap_or("");
+        let new_owner = handover.gained.as_deref().unwrap_or("");
+        let candidate = message::Builder::signal(
+            crate::wire::Endian::Little,
+            BUS_PATH,
+            BUS_NAME,
+            "NameOwnerChanged",
+        )
+        .sender(BUS_NAME)
+        .serial(1)
+        .body("sss", |writer| {
+            writer.string(&handover.name)?;
+            writer.string(old_owner)?;
+            writer.string(new_owner)
+        });
+        let Ok(candidate) = candidate else {
+            eprintln!(
+                "td-busd: cannot build NameOwnerChanged for {}",
+                handover.name
+            );
+            return;
+        };
+        let Ok(candidate) = candidate.encode() else {
+            eprintln!(
+                "td-busd: cannot encode NameOwnerChanged for {}",
+                handover.name
+            );
+            return;
+        };
+        let Ok((decoded, _)) = message::decode(&candidate, 0) else {
+            eprintln!(
+                "td-busd: cannot decode its own NameOwnerChanged for {}",
+                handover.name
+            );
+            return;
+        };
+        for subscriber in self
+            .bus
+            .subscribers(&decoded, BUS_NAME, Some(&handover.name))
+        {
+            let built = message::Builder::signal(
+                crate::wire::Endian::Little,
+                BUS_PATH,
+                BUS_NAME,
+                "NameOwnerChanged",
+            )
+            .sender(BUS_NAME)
+            .serial(subscriber.outbox.take_serial())
+            .body("sss", |writer| {
+                writer.string(&handover.name)?;
+                writer.string(old_owner)?;
+                writer.string(new_owner)
+            });
+            let Ok(built) = built else {
+                continue;
+            };
+            let Ok(frame) = built.encode() else {
+                continue;
+            };
+            if self.deliver(&subscriber.outbox, frame).is_err() {
+                eprintln!(
+                    "td-busd: {} missed NameOwnerChanged for {}",
+                    subscriber.unique, handover.name
+                );
+            }
+        }
+    }
+
+    /// Route one client broadcast once to each matching, permitted subscriber.
+    fn broadcast(&self, message: &message::Message<'_>, wanted: usize) -> Result<(), Ended> {
+        // Descriptor forwarding is all-or-nothing. Until that path lands, an
+        // fd-carrying broadcast is dropped exactly like its directed twin;
+        // restamping bytes while discarding the indexed descriptors would
+        // create a corrupt message at the recipient.
+        if wanted != 0 || !policy::may_signal(&self.identity) {
+            return Ok(());
+        }
+        let sender = self.named()?.to_string();
+        let Ok(forwarded) = self.restamp(message, &sender) else {
+            // A legal incoming header can sit too close to the field ceiling
+            // for the authenticated SENDER the broker must add. A signal has
+            // no error-reply channel, so that relay limit drops it rather than
+            // disconnecting a peer for input the decoder accepted.
+            return Ok(());
+        };
+        for subscriber in self.bus.subscribers(message, &sender, None) {
+            // A recipient that exhausted its queue did not choose when this
+            // broadcast fired. Its loss is expected backpressure, not a line
+            // per subsequent signal in the broker journal.
+            let _ = self.deliver(&subscriber.outbox, forwarded.clone());
+        }
+        Ok(())
     }
 
     /// Un-record a call this connection recorded and then could not send.
@@ -3642,6 +3805,35 @@ mod tests {
             .expect("encode a bus call")
     }
 
+    fn match_call(member: &str, rule: &str, serial: u32) -> Vec<u8> {
+        message::Builder::method_call(
+            crate::wire::Endian::Little,
+            BUS_PATH,
+            Some(BUS_NAME),
+            member,
+        )
+        .destination(BUS_NAME)
+        .serial(serial)
+        .body("s", |writer| writer.string(rule))
+        .expect("match-rule body")
+        .encode()
+        .expect("encode a match-rule call")
+    }
+
+    fn broadcast_signal(serial: u32, text: &str) -> Vec<u8> {
+        message::Builder::signal(
+            crate::wire::Endian::Little,
+            "/org/example/Thing",
+            "org.example.Thing",
+            "Changed",
+        )
+        .serial(serial)
+        .body("s", |writer| writer.string(text))
+        .expect("broadcast body")
+        .encode()
+        .expect("encode a broadcast")
+    }
+
     /// A method call addressed to another peer, carrying a string so the test
     /// can tell a forwarded body from a rebuilt one.
     fn peer_call(destination: &str, serial: u32, text: &str) -> Vec<u8> {
@@ -4704,17 +4896,168 @@ mod tests {
         assert_eq!(reply.fields.reply_serial, Some(3));
     }
 
-    /// A bus method this version does not have is `UnknownMethod`, not
-    /// silence. `RequestName` and `AddMatch` land with match rules; a client
-    /// told its match rule was installed and then never signalled is worse off
-    /// than one told there is no such method.
     #[test]
-    fn a_bus_method_this_version_lacks_is_an_error_rather_than_silence() {
+    fn match_rules_select_one_copy_and_remove_semantically() {
+        let (_bus, mut clients) = bus_of(2);
+        let sending = clients.pop().expect("two clients");
+        let receiving = clients.pop().expect("two clients");
+        let (mut sender, sender_name) = Peer::arrive(sending);
+        let (mut recipient, _) = Peer::arrive(receiving);
+
+        let exact = "type='signal',interface='org.example.Thing',member='Changed'";
+        recipient.send(&match_call("AddMatch", exact, 2));
+        let frame = recipient.answer();
+        let (reply, _) = message::decode(&frame, 0).expect("decode AddMatch");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
+        // Two matching rules still mean one delivery to this connection.
+        recipient.send(&match_call("AddMatch", "type='signal'", 3));
+        let _ = recipient.answer();
+        sender.send(&broadcast_signal(2, "first"));
+        let frame = recipient.frame();
+        let (signal, _) = message::decode(&frame, 0).expect("decode the broadcast");
+        assert_eq!(signal.fields.sender, Some(sender_name.as_str()));
+        assert_eq!(
+            signal.args().first().and_then(crate::wire::Value::as_str),
+            Some("first")
+        );
+        recipient.expect_silence();
+
+        // Term order and quoting are not the identity of a rule.
+        let reordered = " member = 'Changed' , type = 'signal' , interface = 'org.example.Thing' ";
+        recipient.send(&match_call("RemoveMatch", reordered, 4));
+        let frame = recipient.answer();
+        let (reply, _) = message::decode(&frame, 0).expect("decode RemoveMatch");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
+        recipient.send(&match_call("RemoveMatch", "type=signal", 5));
+        let _ = recipient.answer();
+        sender.send(&broadcast_signal(3, "gone"));
+        recipient.expect_silence();
+    }
+
+    #[test]
+    fn match_rule_count_and_text_ceilings_answer_limits_exceeded() {
         let (_bus, mut clients) = bus_of(1);
         let only = clients.pop().expect("one client");
         let (mut peer, _) = Peer::arrive(only);
 
-        peer.send(&bus_call("AddMatch", 2));
+        let mut serial = 2u32;
+        for _ in 0..crate::match_rule::MAX_RULES_PER_CONNECTION {
+            peer.send(&match_call("AddMatch", "type='signal'", serial));
+            let frame = peer.answer();
+            let (reply, _) = message::decode(&frame, 0).expect("decode AddMatch");
+            assert_eq!(reply.kind, message::MessageType::MethodReturn);
+            serial = serial.saturating_add(1);
+        }
+        peer.send(&match_call("AddMatch", "type='signal'", serial));
+        let frame = peer.answer();
+        let (reply, _) = message::decode(&frame, 0).expect("decode count refusal");
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.LimitsExceeded")
+        );
+
+        let (_bus, mut clients) = bus_of(1);
+        let only = clients.pop().expect("one client");
+        let (mut peer, _) = Peer::arrive(only);
+        let half = "x".repeat(crate::match_rule::MAX_RULE_TEXT_PER_CONNECTION / 2);
+        let large = format!("arg0='{half}'");
+        peer.send(&match_call("AddMatch", &large, 2));
+        let frame = peer.answer();
+        let (reply, _) = message::decode(&frame, 0).expect("decode first large rule");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
+        peer.send(&match_call("AddMatch", &large, 3));
+        let frame = peer.answer();
+        let (reply, _) = message::decode(&frame, 0).expect("decode text refusal");
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.LimitsExceeded")
+        );
+    }
+
+    /// A visible sender may hold a second name the recipient cannot see. A
+    /// `sender=` rule for that hidden alias must not become an ownership
+    /// oracle merely because a visible alias lets the signal cross policy.
+    #[test]
+    fn a_sender_match_cannot_resolve_a_hidden_alias() {
+        if !pidfd_available() {
+            return;
+        }
+        let (_bus, free, jailed) = mixed_bus_granting(&["org.example.Visible"]);
+        let (mut sender, sender_name) = Peer::arrive(free);
+        let (mut recipient, _) = Peer::arrive(jailed);
+
+        for (serial, name) in [
+            (2, "org.example.Visible"),
+            (3, "org.example.Hidden"),
+        ] {
+            sender.send(&request_name(name, 0, serial));
+            assert_eq!(name_code(&sender.answer()).0, 1);
+            let _ = sender.frame();
+        }
+        recipient.send(&match_call(
+            "AddMatch",
+            "type='signal',sender='org.example.Hidden'",
+            2,
+        ));
+        let _ = recipient.answer();
+        sender.send(&broadcast_signal(4, "hidden alias"));
+        recipient.expect_silence();
+
+        recipient.send(&match_call(
+            "AddMatch",
+            "type='signal',sender='org.example.Visible'",
+            3,
+        ));
+        let _ = recipient.answer();
+        sender.send(&broadcast_signal(5, "visible alias"));
+        let frame = recipient.frame();
+        let (signal, _) = message::decode(&frame, 0).expect("decode visible broadcast");
+        assert_eq!(signal.fields.sender, Some(sender_name.as_str()));
+    }
+
+    #[test]
+    fn name_owner_changed_is_subscribed_and_filtered_per_recipient() {
+        let rule = "type='signal',sender='org.freedesktop.DBus',\
+                    interface='org.freedesktop.DBus',member='NameOwnerChanged'";
+
+        let (_bus, mut clients) = bus_of(2);
+        let newcomer = clients.pop().expect("two clients");
+        let waiting = clients.pop().expect("two clients");
+        let (mut visible, _) = Peer::arrive(waiting);
+        visible.send(&match_call("AddMatch", rule, 2));
+        let _ = visible.answer();
+        let (_newcomer, new_name) = Peer::arrive(newcomer);
+        let frame = visible.frame();
+        let (changed, _) = message::decode(&frame, 0).expect("decode NameOwnerChanged");
+        assert_eq!(changed.fields.member, Some("NameOwnerChanged"));
+        assert_eq!(
+            changed.args().first().and_then(crate::wire::Value::as_str),
+            Some(new_name.as_str())
+        );
+
+        if !pidfd_available() {
+            return;
+        }
+        let (_bus, mut clients) = confined_bus_of(2);
+        let hidden_newcomer = clients.pop().expect("two confined clients");
+        let waiting = clients.pop().expect("two confined clients");
+        let (mut confined, _) = Peer::arrive(waiting);
+        confined.send(&match_call("AddMatch", rule, 2));
+        let _ = confined.answer();
+        let (_newcomer, _) = Peer::arrive(hidden_newcomer);
+        confined.expect_silence();
+    }
+
+    /// A bus method this version does not have is `UnknownMethod`, not
+    /// silence. This exercises the fallback on the broker's own interface and
+    /// object rather than a wrong-path or wrong-interface refusal.
+    #[test]
+    fn an_absent_bus_method_is_an_error_rather_than_silence() {
+        let (_bus, mut clients) = bus_of(1);
+        let only = clients.pop().expect("one client");
+        let (mut peer, _) = Peer::arrive(only);
+
+        peer.send(&bus_call("GetMachineId", 2));
         let frame = peer.frame();
         let (reply, _) = message::decode(&frame, 0).expect("decode the refusal");
         assert_eq!(reply.kind, message::MessageType::Error);
@@ -5768,6 +6111,24 @@ mod tests {
         let (call, _) = message::decode(&frame, 0).expect("decode the call");
         assert_eq!(call.kind, message::MessageType::MethodCall);
         assert_eq!(call.fields.sender, Some(name.as_str()));
+    }
+
+    /// The same signal-origin policy applies before broadcast matching. A
+    /// match rule must not turn a confined peer's otherwise-forbidden signal
+    /// into a channel to an unconfined subscriber.
+    #[test]
+    fn a_confined_peer_may_not_broadcast() {
+        if !pidfd_available() {
+            return;
+        }
+        let (_bus, free, jailed) = mixed_bus();
+        let (mut recipient, _) = Peer::arrive(free);
+        let (mut sender, _) = Peer::arrive(jailed);
+
+        recipient.send(&match_call("AddMatch", "type='signal'", 2));
+        let _ = recipient.answer();
+        sender.send(&broadcast_signal(2, "not permitted"));
+        recipient.expect_silence();
     }
 
     /// The control: an unconfined peer's directed signal is carried.
@@ -7948,6 +8309,44 @@ mod tests {
         assert_eq!(reply.kind, message::MessageType::MethodReturn);
         assert_eq!(reply.fields.reply_serial, Some(8));
         two.expect_silence();
+    }
+
+    /// Broadcasts have no error-reply channel, but a relay limit is still not
+    /// grounds to tear down a sender whose input passed validation.
+    #[test]
+    fn a_broadcast_that_cannot_be_re_encoded_is_dropped_not_fatal() {
+        let (_bus, mut clients) = bus_of(2);
+        let receiving = clients.pop().expect("two clients");
+        let sending = clients.pop().expect("two clients");
+        let (mut sender, _) = Peer::arrive(sending);
+        let (mut recipient, _) = Peer::arrive(receiving);
+        recipient.send(&match_call("AddMatch", "type='signal'", 2));
+        let _ = recipient.answer();
+
+        let mut brimful = None;
+        for len in (65_000..65_500).rev() {
+            let path = format!("/{}", "a".repeat(len));
+            let built = message::Builder::signal(
+                crate::wire::Endian::Little,
+                &path,
+                "org.example.Thing",
+                "Changed",
+            )
+            .serial(7)
+            .encode();
+            if let Ok(frame) = built {
+                brimful = Some(frame);
+                break;
+            }
+        }
+        sender.send(&brimful.expect("no signal path fits inside the field cap"));
+        recipient.expect_silence();
+
+        sender.send(&bus_call("GetId", 8));
+        let frame = sender.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode the later reply");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
+        assert_eq!(reply.fields.reply_serial, Some(8));
     }
 
     /// A SENDER cannot evict a RECIPIENT by writing at it.

@@ -20,6 +20,11 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::lineage::Identity;
+use crate::match_rule::{
+    Rule, MAX_RULES_PER_CONNECTION, MAX_RULE_TEXT_PER_CONNECTION,
+};
+use crate::{message, policy};
 use crate::transport::MAX_MESSAGE;
 
 /// The most bytes one connection may have waiting to be written.
@@ -494,10 +499,32 @@ struct Registered {
     /// name the raw-syscall module to do it.
     uid: u32,
     pid: i32,
-    /// The application this peer's lineage proved it belongs to, or `None` for
-    /// one that is not a confined application. Decided at accept and stored,
-    /// never recomputed — see `app_id` below.
-    app_id: Option<String>,
+    /// The confinement decision made once at accept. Name queries and match
+    /// delivery both derive their answers from this one stored decision.
+    identity: Identity,
+    matches: Vec<RuleEntry>,
+    match_bytes: usize,
+}
+
+struct RuleEntry {
+    rule: Rule,
+    bytes: usize,
+}
+
+/// Why an installed match rule could not be changed.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum MatchChange {
+    NoSuchPeer,
+    TooMany,
+    TooMuchText,
+    NotFound,
+}
+
+/// One recipient selected for a broadcast. There is at most one entry per
+/// connection even when several of its rules match.
+pub struct Subscriber {
+    pub unique: String,
+    pub outbox: Arc<Outbox>,
 }
 
 /// One call that has been routed and not yet answered.
@@ -595,8 +622,8 @@ impl Released {
 ///
 /// `NameAcquired` and `NameLost` are DIRECTED signals: each goes to the one
 /// connection it is about, so they need no subscription and land with the
-/// machinery this broker already has. `NameOwnerChanged` is a broadcast and
-/// waits for match rules.
+/// machinery this broker already has. `NameOwnerChanged` is the subscribed,
+/// per-recipient-filtered broadcast form of the same transition.
 pub struct Handover {
     pub name: String,
     /// The connection that no longer holds it, if there was one.
@@ -752,7 +779,7 @@ impl Bus {
         outbox: &Arc<Outbox>,
         uid: u32,
         pid: i32,
-        app_id: Option<String>,
+        identity: Identity,
     ) -> Result<(), String> {
         let mut directory = self
             .directory
@@ -763,7 +790,9 @@ impl Bus {
             outbox: Arc::clone(outbox),
             uid,
             pid,
-            app_id,
+            identity,
+            matches: Vec::new(),
+            match_bytes: 0,
         });
         Ok(())
     }
@@ -778,8 +807,120 @@ impl Bus {
         pid: i32,
     ) -> Result<String, String> {
         let unique = self.reserve()?;
-        self.publish(&unique, outbox, uid, pid, None)?;
+        self.publish(&unique, outbox, uid, pid, Identity::Unconfined)?;
         Ok(unique)
+    }
+
+    /// Install one parsed match rule, charging both the rule and its original
+    /// text to the connection that asked for it.
+    pub fn add_match(
+        &self,
+        unique: &str,
+        text_bytes: usize,
+        rule: Rule,
+    ) -> Result<(), MatchChange> {
+        let mut directory = self.directory.lock().map_err(|_| MatchChange::NoSuchPeer)?;
+        let peer = directory
+            .peers
+            .iter_mut()
+            .find(|peer| peer.unique == unique)
+            .ok_or(MatchChange::NoSuchPeer)?;
+        if peer.matches.len() >= MAX_RULES_PER_CONNECTION {
+            return Err(MatchChange::TooMany);
+        }
+        if peer.match_bytes.saturating_add(text_bytes) > MAX_RULE_TEXT_PER_CONNECTION {
+            return Err(MatchChange::TooMuchText);
+        }
+        peer.match_bytes = peer.match_bytes.saturating_add(text_bytes);
+        peer.matches.push(RuleEntry {
+            rule,
+            bytes: text_bytes,
+        });
+        Ok(())
+    }
+
+    /// Remove the first semantically equal rule, as the D-Bus method
+    /// specifies. Whitespace, quoting and term order therefore need not be the
+    /// same spelling used at `AddMatch`.
+    pub fn remove_match(&self, unique: &str, rule: &Rule) -> Result<(), MatchChange> {
+        let mut directory = self.directory.lock().map_err(|_| MatchChange::NoSuchPeer)?;
+        let peer = directory
+            .peers
+            .iter_mut()
+            .find(|peer| peer.unique == unique)
+            .ok_or(MatchChange::NoSuchPeer)?;
+        let at = peer
+            .matches
+            .iter()
+            .position(|entry| &entry.rule == rule)
+            .ok_or(MatchChange::NotFound)?;
+        let removed = peer.matches.remove(at);
+        peer.match_bytes = peer.match_bytes.saturating_sub(removed.bytes);
+        Ok(())
+    }
+
+    /// Select one copy of a broadcast for every connection with at least one
+    /// matching rule and permission to see its source.
+    ///
+    /// `subject` is the name carried by `NameOwnerChanged`. That signal is
+    /// broker-originated, but its visibility is the visibility of the name it
+    /// describes rather than the universally-visible broker name.
+    pub fn subscribers(
+        &self,
+        broadcast: &message::Message<'_>,
+        sender: &str,
+        subject: Option<&str>,
+    ) -> Vec<Subscriber> {
+        if broadcast.kind != message::MessageType::Signal
+            || broadcast.fields.destination.is_some()
+        {
+            return Vec::new();
+        }
+        let Ok(directory) = self.directory.lock() else {
+            return Vec::new();
+        };
+        let source_names: Vec<&str> = if subject.is_none() {
+            directory
+                .owned
+                .iter()
+                .filter_map(|owned| {
+                    owned
+                        .queue
+                        .first()
+                        .filter(|claim| claim.unique == sender)
+                        .map(|_| owned.name.as_str())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut selected = Vec::new();
+        for peer in &directory.peers {
+            let visible = if let Some(name) = subject {
+                policy::may_see(&peer.identity, Some(&peer.unique), name)
+            } else {
+                policy::may_see(&peer.identity, Some(&peer.unique), sender)
+                    || source_names
+                        .iter()
+                        .any(|name| policy::may_see(&peer.identity, Some(&peer.unique), name))
+            };
+            if !visible {
+                continue;
+            }
+            let matched = peer.matches.iter().any(|entry| {
+                entry.rule.matches(broadcast, sender, |wanted| {
+                    policy::may_see(&peer.identity, Some(&peer.unique), wanted)
+                        && source_names.contains(&wanted)
+                })
+            });
+            if matched {
+                selected.push(Subscriber {
+                    unique: peer.unique.clone(),
+                    outbox: Arc::clone(&peer.outbox),
+                });
+            }
+        }
+        selected
     }
 
     /// Resolve `name` and record `caller`'s call to it as ONE act.
@@ -917,6 +1058,11 @@ impl Bus {
                 .position(|peer| peer.unique == unique)
             {
                 directory.peers.swap_remove(at);
+                handovers.push(Handover {
+                    name: unique.to_string(),
+                    lost: Some(unique.to_string()),
+                    gained: None,
+                });
             }
             // Both directions in one pass under the one lock. The list is
             // taken out first so the peer lookup below can borrow the
@@ -1341,7 +1487,13 @@ impl Bus {
             .peers
             .iter()
             .find(|peer| peer.unique == unique)
-            .map(|peer| (peer.uid, peer.pid, peer.app_id.clone()))
+            .map(|peer| {
+                (
+                    peer.uid,
+                    peer.pid,
+                    peer.identity.app_id().map(str::to_string),
+                )
+            })
     }
 
     /// Every unique name currently on the bus, in the order they joined.

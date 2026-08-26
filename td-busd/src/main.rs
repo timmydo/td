@@ -6,20 +6,18 @@
 //! socket they happen on. `run` binds the session bus and serves it; `probe` is
 //! what `APPLICATIONS.md` §A's `ready=` line calls to decide the bus is up.
 //!
-//! Rung 14's first half is here: a connection says `Hello`, earns a `:1.N`,
-//! and is addressable by it. A call naming a connection that exists is RELAYED
-//! to it with the broker's own `SENDER` stamped on; one addressed to the bus is
-//! answered by the bus — `Hello`, `Ping`, `GetId`, the name lookups and the
-//! credential lookups; one naming a name nobody owns comes back
-//! `NameHasNoOwner`. Well-known names and match rules are the second half, so
-//! `RequestName` and `AddMatch` are `UnknownMethod` until then and nothing on
-//! this bus broadcasts.
+//! A connection says `Hello`, earns a `:1.N`, and is addressable by unique or
+//! well-known name. Directed calls and replies are relayed with an
+//! authenticated `SENDER`; the broker serves the bounded name, credential and
+//! match-rule methods documented in `APPLICATIONS.md` §D. Permitted signals
+//! broadcast once to each matching, visible recipient, including filtered
+//! `NameOwnerChanged` transitions.
 //!
 //! Rung 15's first increment is here too, on td's own interface rather than
 //! the specification's: `td.Jail1.Register` and `td.Jail1.Complete` at
 //! `/td/Jail1` record which jailed instance a process belongs to, and
 //! `lineage` answers that question for a connection. Nothing consults the
-//! answer to decide anything yet.
+//! answer drives per-connection name visibility, ownership and signal policy.
 //!
 //! What no call gets is silence. A caller waiting on a serial that will never
 //! be answered hangs rather than fails, so a call this broker cannot serve is
@@ -34,6 +32,7 @@ mod auth;
 mod authscript;
 mod corpus;
 mod lineage;
+mod match_rule;
 mod message;
 mod name;
 mod policy;
@@ -269,6 +268,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("authscript", include_str!("authscript.rs")),
     ("corpus", include_str!("corpus.rs")),
     ("lineage", include_str!("lineage.rs")),
+    ("match_rule", include_str!("match_rule.rs")),
     ("message", include_str!("message.rs")),
     ("name", include_str!("name.rs")),
     ("policy", include_str!("policy.rs")),
