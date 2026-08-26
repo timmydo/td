@@ -956,6 +956,13 @@ pub struct Recipe {
     pub phases: Option<Vec<Phase>>,
     pub tests: Option<bool>,
     pub bins: Option<Vec<String>>,
+    /// Relative path from the materialized source root to the Cargo workspace.
+    /// Absent means the source root itself, preserving existing recipes.
+    pub cargo_subdir: Option<String>,
+    /// Cargo package selected from the workspace. Absent builds the workspace's
+    /// normal default target set, preserving existing recipes. When set, every
+    /// `bins` entry must name a binary target owned by this package.
+    pub cargo_package: Option<String>,
     pub no_default_features: Option<bool>,
     pub features: Option<Vec<String>>,
     /// Package-owned behavioral/reproducibility checks. The gate runner consumes
@@ -1028,6 +1035,8 @@ impl Recipe {
             phases: None,
             tests: None,
             bins: None,
+            cargo_subdir: None,
+            cargo_package: None,
             no_default_features: None,
             features: None,
             checks: None,
@@ -1146,6 +1155,14 @@ impl Recipe {
     }
     pub fn bins(mut self, xs: &[&str]) -> Recipe {
         self.bins = Some(vs(xs));
+        self
+    }
+    pub fn cargo_subdir(mut self, path: &str) -> Recipe {
+        self.cargo_subdir = Some(path.into());
+        self
+    }
+    pub fn cargo_package(mut self, package: &str) -> Recipe {
+        self.cargo_package = Some(package.into());
         self
     }
     pub fn no_default_features(mut self) -> Recipe {
@@ -1332,6 +1349,12 @@ impl Recipe {
         if let Some(x) = &self.bins {
             o.push(("bins".into(), arr(x)));
         }
+        if let Some(path) = &self.cargo_subdir {
+            o.push(("cargoSubdir".into(), Json::Str(path.clone())));
+        }
+        if let Some(package) = &self.cargo_package {
+            o.push(("cargoPackage".into(), Json::Str(package.clone())));
+        }
         if let Some(b) = self.no_default_features {
             o.push(("noDefaultFeatures".into(), Json::Bool(b)));
         }
@@ -1368,6 +1391,18 @@ mod tests {
         assert_eq!(
             r.to_json().to_canonical(),
             r#"{"bins":["cat"],"buildSystem":"rust","name":"cat","version":"0.9.0"}"#
+        );
+    }
+
+    #[test]
+    fn rust_workspace_selection_is_explicit_recipe_data() {
+        let r = Recipe::rust("codex", "0.149.1")
+            .bins(&["codex"])
+            .cargo_subdir("codex-rs")
+            .cargo_package("codex-cli");
+        assert_eq!(
+            r.to_json().to_canonical(),
+            r#"{"bins":["codex"],"buildSystem":"rust","cargoPackage":"codex-cli","cargoSubdir":"codex-rs","name":"codex","version":"0.149.1"}"#
         );
     }
 

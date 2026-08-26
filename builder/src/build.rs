@@ -1362,6 +1362,20 @@ fn collect_vendor_crates(
     Ok(out)
 }
 
+pub(crate) fn valid_cargo_subdir(subdir: &str) -> bool {
+    !subdir.is_empty()
+        && !subdir.as_bytes().contains(&0)
+        && Path::new(subdir)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+pub(crate) fn valid_cargo_package_name(package: &str) -> bool {
+    let mut bytes = package.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 /// rust-build — td's OWN Rust/cargo build "system" (sibling of `run`, the
 /// autotools runner). The REPLACEMENT for Guix's `cargo-build-system`: here the
 /// build LOGIC is td's Rust; only the rustc/cargo/gcc seed is the external
@@ -1388,6 +1402,10 @@ fn collect_vendor_crates(
 ///                compiler prefix (the native GCC ladder output).
 ///   TD_RUST_STORE_INCLUDE optional ':'-joined native include directories.
 ///   TD_RUST_BINS space-separated binary names to install into $out/bin.
+///   TD_CARGO_SUBDIR optional relative path from the materialized source root to
+///                the Cargo workspace.
+///   TD_CARGO_PACKAGE optional package selected from that workspace. Every
+///                TD_RUST_BINS entry must be a binary target of this package.
 ///   TD_VENDOR_CRATES optional ':'-joined `.crate` STORE paths (the dependency closure
 ///                pinned by Cargo.lock; nv from the store-path basename). The guix-realized
 ///                FOD inputs.
@@ -1404,6 +1422,25 @@ pub fn run_rust() -> Result<(), String> {
     let bins_spec = env::var("TD_RUST_BINS").map_err(|_| "TD_RUST_BINS not set".to_string())?;
     let recipe_name =
         env::var("TD_RECIPE_NAME").map_err(|_| "TD_RECIPE_NAME not set".to_string())?;
+    let cargo_subdir = match env::var("TD_CARGO_SUBDIR") {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err("TD_CARGO_SUBDIR is not valid UTF-8".into())
+        }
+    };
+    let cargo_package = match env::var("TD_CARGO_PACKAGE") {
+        Ok(value) if valid_cargo_package_name(&value) => Some(value),
+        Ok(_) => {
+            return Err(
+                "TD_CARGO_PACKAGE must start with an ASCII letter or digit and use only ASCII letters, digits, `-' or `_'".into(),
+            )
+        }
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err("TD_CARGO_PACKAGE is not valid UTF-8".into())
+        }
+    };
     let bins: Vec<&str> = bins_spec.split_whitespace().collect();
     if bins.is_empty() {
         return Err("TD_RUST_BINS is empty (no binaries to install)".into());
@@ -1482,6 +1519,14 @@ pub fn run_rust() -> Result<(), String> {
 
     let cwd = env::current_dir().map_err(|e| e.to_string())?;
     let build_abs = cwd.join(build_dir);
+    let cargo_dir = cargo_workspace_dir(
+        &build_abs,
+        cargo_subdir.as_deref(),
+    )?;
+    let cargo_dir_str = cargo_dir
+        .to_str()
+        .ok_or("non-utf8 Cargo workspace path")?
+        .to_string();
     let build_abs = build_abs.to_str().ok_or("non-utf8 build path")?.to_string();
     let cargo_home = cwd.join("td-cargo-home");
     let cargo_home = cargo_home.to_str().ok_or("non-utf8 cargo-home")?.to_string();
@@ -1609,6 +1654,13 @@ pub fn run_rust() -> Result<(), String> {
     // Absent ⇒ the plain default build, unchanged.
     let mut cargo_args: Vec<String> =
         ["build", "--release", "--offline", "--frozen"].iter().map(|s| s.to_string()).collect();
+    let (selection_args, cargo_release_dir) = cargo_selection(
+        &cargo_dir,
+        &bins,
+        cargo_subdir.is_some(),
+        cargo_package.as_deref(),
+    )?;
+    cargo_args.extend(selection_args);
     if env::var("TD_CARGO_NO_DEFAULT").is_ok() {
         cargo_args.push("--no-default-features".into());
     }
@@ -1619,20 +1671,101 @@ pub fn run_rust() -> Result<(), String> {
         }
     }
     let cargo_argv: Vec<&str> = cargo_args.iter().map(String::as_str).collect();
-    run_cmd(&cargo, &cargo_argv, build_dir, &envs, &WATCH_PHASE)?;
+    run_cmd(&cargo, &cargo_argv, &cargo_dir_str, &envs, &WATCH_PHASE)?;
 
     // install the named binaries to $out/bin.
     let bindir = format!("{out}/bin");
     fs::create_dir_all(&bindir).map_err(|e| format!("mkdir {bindir}: {e}"))?;
     for b in &bins {
-        let from = format!("{build_dir}/target/release/{b}");
-        if !Path::new(&from).is_file() {
-            return Err(format!("cargo did not produce expected binary `{b}' at {from}"));
+        let from = cargo_release_dir.join(b);
+        if !from.is_file() {
+            return Err(format!(
+                "cargo did not produce expected binary `{b}' at {}",
+                from.display()
+            ));
         }
-        run_cmd(&cp, &["-p", &from, &format!("{bindir}/{b}")], ".", &path_env, &WATCH_PHASE)?;
+        let from = from.to_str().ok_or("non-utf8 Cargo binary path")?;
+        run_cmd(&cp, &["-p", from, &format!("{bindir}/{b}")], ".", &path_env, &WATCH_PHASE)?;
     }
     split_debug_tree(Path::new(&out), Path::new(&objcopy), &recipe_name)?;
     Ok(())
+}
+
+fn cargo_workspace_dir(source_root: &Path, subdir: Option<&str>) -> Result<PathBuf, String> {
+    let mut workspace = source_root.to_path_buf();
+    if let Some(subdir) = subdir {
+        if !valid_cargo_subdir(subdir) {
+            return Err(format!(
+                "TD_CARGO_SUBDIR must be a plain relative path below the source root: {subdir}"
+            ));
+        }
+        let relative = Path::new(subdir);
+        for component in relative.components() {
+            let std::path::Component::Normal(component) = component else {
+                return Err(format!(
+                    "TD_CARGO_SUBDIR must be a plain relative path below the source root: {subdir}"
+                ));
+            };
+            workspace.push(component);
+            let metadata = fs::symlink_metadata(&workspace).map_err(|error| {
+                format!("inspect Cargo workspace component {}: {error}", workspace.display())
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(format!(
+                    "Cargo workspace component is not a real directory: {}",
+                    workspace.display()
+                ));
+            }
+        }
+    }
+    let manifest = workspace.join("Cargo.toml");
+    let metadata = fs::symlink_metadata(&manifest)
+        .map_err(|error| format!("inspect Cargo workspace manifest {}: {error}", manifest.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "Cargo workspace has no regular Cargo.toml: {}",
+            workspace.display()
+        ));
+    }
+    Ok(workspace)
+}
+
+const RUST_TARGET: &str = "x86_64-unknown-linux-gnu";
+
+fn cargo_selection(
+    cargo_dir: &Path,
+    bins: &[&str],
+    subdir_selected: bool,
+    package: Option<&str>,
+) -> Result<(Vec<String>, PathBuf), String> {
+    let mut args = Vec::new();
+    let selected = subdir_selected || package.is_some();
+    let release_dir = if selected {
+        let target_dir = cargo_dir.join("target");
+        let target_arg = target_dir
+            .to_str()
+            .ok_or("non-utf8 Cargo target directory")?;
+        args.push("--target-dir".into());
+        args.push(target_arg.into());
+        // A workspace-local `.cargo/config.toml` may set `build.target` and
+        // otherwise move a successful artifact below an unanticipated triple.
+        // The distribution graph is x86-64-only, and its source-built sysroot
+        // carries this exact target, so pin it and make the install path exact.
+        args.push("--target".into());
+        args.push(RUST_TARGET.into());
+        target_dir.join(RUST_TARGET).join("release")
+    } else {
+        cargo_dir.join("target/release")
+    };
+    if let Some(package) = package {
+        args.push("--package".into());
+        args.push(package.into());
+        for bin in bins {
+            args.push("--bin".into());
+            args.push((*bin).to_owned());
+        }
+    }
+    Ok((args, release_dir))
 }
 
 /// cmake-build — td's OWN minimal cmake build "system", in Rust (sibling of `run`,
@@ -4005,6 +4138,81 @@ pub fn run_mesboot() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cargo_workspace_selection_stays_below_the_source_root() {
+        let base = std::env::temp_dir().join(format!(
+            "td-cargo-workspace-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("codex-rs")).unwrap();
+        fs::create_dir_all(base.join("nested")).unwrap();
+        fs::write(base.join("Cargo.toml"), "[workspace]\n").unwrap();
+        fs::write(base.join("codex-rs/Cargo.toml"), "[workspace]\n").unwrap();
+
+        assert_eq!(cargo_workspace_dir(&base, None).unwrap(), base);
+        assert_eq!(
+            cargo_workspace_dir(&base, Some("codex-rs")).unwrap(),
+            base.join("codex-rs")
+        );
+        for subdir in ["", ".", "../escape", "/absolute", "nested/../escape"] {
+            assert!(cargo_workspace_dir(&base, Some(subdir)).is_err(), "{subdir}");
+        }
+
+        let real = base.join("real-workspace");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::os::unix::fs::symlink(&real, base.join("linked-workspace")).unwrap();
+        assert!(cargo_workspace_dir(&base, Some("linked-workspace")).is_err());
+
+        let linked_manifest = base.join("linked-manifest");
+        fs::create_dir_all(&linked_manifest).unwrap();
+        std::os::unix::fs::symlink(base.join("Cargo.toml"), linked_manifest.join("Cargo.toml"))
+            .unwrap();
+        assert!(cargo_workspace_dir(&base, Some("linked-manifest")).is_err());
+
+        let directory_manifest = base.join("directory-manifest/Cargo.toml");
+        fs::create_dir_all(&directory_manifest).unwrap();
+        assert!(cargo_workspace_dir(&base, Some("directory-manifest")).is_err());
+        fs::create_dir_all(base.join("missing-manifest")).unwrap();
+        assert!(cargo_workspace_dir(&base, Some("missing-manifest")).is_err());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cargo_selection_pins_the_target_and_selected_bins() {
+        let (args, release_dir) = cargo_selection(
+            Path::new("/build/codex-rs"),
+            &["codex", "apply_patch"],
+            true,
+            Some("codex-cli"),
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            [
+                "--target-dir",
+                "/build/codex-rs/target",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "--package",
+                "codex-cli",
+                "--bin",
+                "codex",
+                "--bin",
+                "apply_patch",
+            ]
+        );
+        assert_eq!(
+            release_dir,
+            Path::new("/build/codex-rs/target/x86_64-unknown-linux-gnu/release")
+        );
+        let (plain_args, plain_release_dir) =
+            cargo_selection(Path::new("/build"), &["tool"], false, None).unwrap();
+        assert!(plain_args.is_empty());
+        assert_eq!(plain_release_dir, Path::new("/build/target/release"));
+    }
 
     #[test]
     fn runtime_closure_walk_skips_only_debug_companion_directories() {

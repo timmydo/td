@@ -5276,6 +5276,33 @@ fn assemble_recipe_drv(
     // autotools path; "rust" is the cargo path (build::run_rust), used to SELF-HOST
     // td-builder itself off Guile-construction + the daemon.
     let build_system = alist.get("buildSystem").and_then(json::Json::as_str).unwrap_or("gnu");
+    let cargo_subdir = match alist.get("cargoSubdir") {
+        None => None,
+        Some(json::Json::Str(value)) if build::valid_cargo_subdir(value) => Some(value.as_str()),
+        Some(json::Json::Str(_)) => {
+            return Err(
+                "recipe: `cargoSubdir' must be a non-empty plain relative path".into(),
+            )
+        }
+        Some(_) => return Err("recipe: `cargoSubdir' must be a string".into()),
+    };
+    let cargo_package = match alist.get("cargoPackage") {
+        None => None,
+        Some(json::Json::Str(value)) if build::valid_cargo_package_name(value) => {
+            Some(value.as_str())
+        }
+        Some(json::Json::Str(_)) => {
+            return Err(
+                "recipe: `cargoPackage' must start with an ASCII letter or digit and use only ASCII letters, digits, `-' or `_'".into(),
+            )
+        }
+        Some(_) => return Err("recipe: `cargoPackage' must be a string".into()),
+    };
+    if build_system != "rust" && (cargo_subdir.is_some() || cargo_package.is_some()) {
+        return Err(format!(
+            "recipe: buildSystem \"{build_system}\" cannot declare cargoSubdir/cargoPackage"
+        ));
+    }
     let foreign_source = foreign_source_of(name, &alist)?;
     let phase_runner = match build_system {
         "gnu" => "autotools-build",
@@ -5644,6 +5671,12 @@ fn assemble_recipe_drv(
         // if any vendored deps were locked, resolves them offline (TD_VENDOR_CRATES).
         "rust" => {
             push_drv_env(&mut spec, "TD_RECIPE_NAME", name)?;
+            if let Some(subdir) = cargo_subdir {
+                push_drv_env(&mut spec, "TD_CARGO_SUBDIR", subdir)?;
+            }
+            if let Some(package) = cargo_package {
+                push_drv_env(&mut spec, "TD_CARGO_PACKAGE", package)?;
+            }
             let bins: Vec<&str> = alist
                 .get("bins")
                 .and_then(json::Json::as_arr)
@@ -14977,7 +15010,7 @@ daemon build START (2/2 active)
              /td/store/cccccccccccccccccccccccccccccccc-rust-1.96.0-x86_64-store-native /td/store/cccccccccccccccccccccccccccccccc-rust-1.96.0-x86_64-store-native\n",
         )
         .unwrap();
-        let recipe = r#"{"name":"ripgrep","version":"14.1.1","buildSystem":"rust","bins":["rg"]}"#;
+        let recipe = r#"{"name":"ripgrep","version":"14.1.1","buildSystem":"rust","bins":["rg"],"cargoSubdir":"workspace","cargoPackage":"ripgrep"}"#;
         let lockp = lock.to_str().unwrap();
         let env_of = |drv: &drv::Derivation, k: &str| {
             drv.env.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone())
@@ -15015,8 +15048,10 @@ daemon build START (2/2 active)
             "debug splitting binds the exact named tool input"
         );
         assert_eq!(env_of(&drv, "TD_RECIPE_NAME").as_deref(), Some("ripgrep"));
+        assert_eq!(env_of(&drv, "TD_CARGO_SUBDIR").as_deref(), Some("workspace"));
+        assert_eq!(env_of(&drv, "TD_CARGO_PACKAGE").as_deref(), Some("ripgrep"));
 
-        // WITHOUT the vars (default): none are emitted.
+        // WITHOUT the native-link vars: none of those six are emitted.
         let (_p, _f, drv0, _s) = assemble_recipe_drv(recipe, lockp, &dir, None).unwrap();
         assert!(env_of(&drv0, "TD_RUST_STORE_INTERP").is_none(), "no interp in the drv env by default");
         assert!(env_of(&drv0, "TD_RUST_STORE_RPATH").is_none(), "no rpath by default");
@@ -15024,7 +15059,60 @@ daemon build START (2/2 active)
         assert!(env_of(&drv0, "TD_RUST_STORE_CC").is_none(), "no cc by default");
         assert!(env_of(&drv0, "TD_RUST_STORE_CXX").is_none(), "no cxx by default");
         assert!(env_of(&drv0, "TD_RUST_STORE_INCLUDE").is_none(), "no include by default");
+
+        // A recipe omitting the workspace selectors emits neither env line, so
+        // existing Rust derivations retain their prior environment shape.
+        let plain_recipe =
+            r#"{"name":"ripgrep","version":"14.1.1","buildSystem":"rust","bins":["rg"]}"#;
+        let (_p, _f, plain_drv, _s) =
+            assemble_recipe_drv(plain_recipe, lockp, &dir, None).unwrap();
+        assert!(env_of(&plain_drv, "TD_CARGO_SUBDIR").is_none());
+        assert!(env_of(&plain_drv, "TD_CARGO_PACKAGE").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn assemble_recipe_drv_rejects_malformed_cargo_selection() {
+        let cases = [
+            (
+                r#"{"name":"x","version":"1","buildSystem":"rust","cargoSubdir":""}"#,
+                "plain relative path",
+            ),
+            (
+                r#"{"name":"x","version":"1","buildSystem":"rust","cargoSubdir":"../x"}"#,
+                "plain relative path",
+            ),
+            (
+                r#"{"name":"x","version":"1","buildSystem":"rust","cargoSubdir":1}"#,
+                "must be a string",
+            ),
+            (
+                r#"{"name":"x","version":"1","buildSystem":"rust","cargoPackage":"-x"}"#,
+                "must start with an ASCII letter or digit",
+            ),
+            (
+                r#"{"name":"x","version":"1","buildSystem":"rust","cargoPackage":""}"#,
+                "must start with an ASCII letter or digit",
+            ),
+            (
+                r#"{"name":"x","version":"1","buildSystem":"rust","cargoPackage":1}"#,
+                "must be a string",
+            ),
+            (
+                r#"{"name":"x","version":"1","buildSystem":"gnu","cargoPackage":"x"}"#,
+                "cannot declare cargoSubdir/cargoPackage",
+            ),
+        ];
+        for (recipe, expected) in cases {
+            let error = assemble_recipe_drv(
+                recipe,
+                "/unreadable-lock-is-never-reached",
+                Path::new("/tmp"),
+                None,
+            )
+            .expect_err("malformed Cargo selection must fail during assembly");
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     // build-plan --auto derives TD_RUST_STORE_* from the declared native inputs (the env
