@@ -1275,9 +1275,11 @@ For `td-busd`, full Firefox fidelity needs:
   broadcast filtering are landed — see §D. Portal, MPRIS, file-manager and
   accessibility delivery now depends on the corresponding service and grant,
   not on missing broker match machinery;
-- complete bounded `SCM_RIGHTS` forwarding in both directions for portal file
-  results, with descriptor indices and counts tied to the message that owns
-  them;
+- bounded `SCM_RIGHTS` forwarding is landed for directed and matched-broadcast
+  traffic between peers that negotiated `UNIX_FD`. Descriptor indices and
+  counts stay tied to their message even when several descriptor-bearing
+  messages share one `recvmsg`; portal file results now depend on the portal
+  service rather than missing broker forwarding;
 - per-instance portal activation and Request/Session handle routing. The
   portal namespace remains reserved even while the portal is restarting;
 - a deliberate decision for the imported requests to
@@ -2897,9 +2899,9 @@ reader entirely, so the argument is settled by there being nothing to
 share with.
 
 Bounds, each a named constant with a refusal test: 64 KiB header fields,
-16 MiB body, nesting 32, signature 255, 64
-descriptors per message, 256 match rules and 64 KiB of rule text per
-connection, 128 pending replies, 64 connections — the last **per
+16 MiB body, nesting 32, signature 255, 64 descriptors per message, 64
+queued descriptor attachments per recipient, 256 match rules and 64 KiB
+of rule text per connection, 128 pending replies, 64 connections — the last **per
 instance as well as globally**, since every other bound in that list is
 per-connection and a single global one is a denial of service any jailed
 app can perform by opening 64: the portal, the compositor's own clients
@@ -3331,38 +3333,42 @@ no readiness API, so multiplexing would buy a FOURTH rostered syscall for
 a concurrency the session bus does not have; `td-busd` serves one
 connection per thread and blocks in `recvmsg`.
 
-What is landed of the above is the receive side: descriptors are adopted
-first, queued as freight, and claimed by the message whose `UNIX_FDS`
-says so, with a bound on how many may sit unclaimed. The `h`-index bounds
-check is landed too, in the codec: `wire.rs` refuses an index at or past
-the count `decode` was given, so a body value naming a descriptor that did
-not arrive is a decode failure rather than a lookup. An earlier draft of
-this paragraph said that check "lands with rung 14", which was simply
-false about live code — the inverse of the dead-branch mistake recorded
-below, and worth the same warning: a doc that reports a present check as
-missing costs the next reader either a redundant implementation or a
-wasted audit. What rung 14 adds is FORWARDING the descriptors that index
-names.
+What is landed of the above is the complete bounded broker path.
+Descriptors are adopted first, queued as freight, and claimed by the
+message whose `UNIX_FDS` says so, with a bound on how many may sit
+unclaimed. The `h`-index bounds check is in the codec: `wire.rs` refuses
+an index at or past the count `decode` was given, so a body value naming a
+descriptor that did not arrive is a decode failure rather than a lookup.
+The broker preserves the `UNIX_FDS` header, transfers descriptor ownership
+and its global quota charge with the frame, bounds queued attachments per
+recipient, and attaches them on that recipient's writer thread. Directed
+calls and matched broadcasts carry descriptors only to recipients that
+also completed `NEGOTIATE_UNIX_FD`; a directed call that expects an answer
+gets `NotSupported` when its recipient did not negotiate. If a reply would
+carry descriptors to a caller that did not negotiate, the broker consumes
+the authenticated pending-reply record and answers the original call with
+`NotSupported` rather than silently losing both the reply and its record.
 
-**Which layer counts the descriptors, and one thing rung 14 must fix.**
+**Which layer counts the descriptors, and how pipelining is framed.**
 "Mismatch disconnects the sender" is enforced in `message.rs`, which takes
 the number that arrived and refuses any message whose `UNIX_FDS` is not
-EQUAL to it. The transport's own re-check of the same fact was therefore
-unreachable, and the red-check found it by reverting it and watching every
-test stay green — a dead branch shaped like a safety check, which is worse
-than no branch, because the next reader trusts it. It is gone; the message
-layer owns the count.
+EQUAL to it. On a Linux stream, ancillary data is a barrier: one `recvmsg`
+may return bytes sent before the control-bearing write together with that
+write and its descriptors. The transport therefore never lets a receive
+cross the end of the D-Bus frame it is assembling. It reads the fixed header,
+then at most that frame's declared remainder, and only then decodes against
+the freight accumulated inside those reads. Missing and surplus descriptors
+both disconnect; neither can drift into an adjacent message. Two legal
+descriptor-bearing `sendmsg` calls pipelined without waiting are an end-to-end
+regression, beside cases that put the descriptor only in the following frame
+or add an undeclared descriptor to this one.
 
-The equality is right for one message and not yet right for two. The
-transport hands the decoder its WHOLE freight queue as "what arrived", so
-a peer that pipelines two descriptor-carrying messages into one write —
-legal, since `SCM_RIGHTS` boundaries have nothing to do with message
-boundaries — presents the first message with both messages' descriptors
-and is disconnected for a count it got right. Nothing reaches this today:
-descriptors go to peers, and until rung 14 there are no peers to name, so
-no client sends one to this broker. Rung 14 must make the decoder's count
-the message's DECLARED share of the queue rather than the queue's depth,
-and the test for it is two fd-carrying messages in a single `write`.
+The broker-wide 256-descriptor budget includes outbound queues now that
+ownership follows a forwarded frame. If stalled recipient writers fill it,
+the receive path disconnects the connection holding the most queued
+descriptor attachments and retries once, mirroring the broker-wide byte
+remedy. It does not make the next unrelated sender the victim of pressure it
+merely observed.
 
 ### What is landed of the bus interface
 
@@ -3990,18 +3996,15 @@ it now covers the larger failure it always nominally covered. The gain is
 that the boot gate became an end-to-end test of this protocol: the image's
 one application cannot reach the screen without having registered.
 
-**Routing is DIRECTED only.** A message naming a `DESTINATION` that is a
-unique name on this bus is delivered to it; one naming a name nobody owns
-is refused with `NameHasNoOwner`; one with no `DESTINATION` splits by
-TYPE. A signal without one is a broadcast, which needs the match rules
-that have not landed, so it is accepted and goes nowhere — the one silent
-drop this increment keeps, for the reason the specification gives: a
-signal has no reply to be missing, and erroring one would be answering a
-message addressed to nobody. A method CALL without one gets the opposite
-treatment. A draft of this section had both dropped, which is exactly the
-failure the paragraph above argues against: the caller is waiting on a
-serial that no route can currently answer, so it is told `NotSupported`
-rather than left to time out.
+**Routing is directed or matched broadcast.** A message naming a
+`DESTINATION` that is a unique name on this bus is delivered to it; one
+naming a name nobody owns is refused with `NameHasNoOwner`; one with no
+`DESTINATION` splits by TYPE. A signal without one is offered once to each
+permitted connection whose bounded match-rule set selects it; a method CALL
+without one gets the opposite treatment. A draft of this section had both
+dropped, which is exactly the failure the paragraph above argues against:
+the caller is waiting on a serial that no route can answer, so it is told
+`NotSupported` rather than left to time out.
 
 **`SENDER` is rebuilt, not relayed, and the body is copied.** The broker
 re-encodes the header with the sending connection's unique name in
@@ -4014,27 +4017,14 @@ does not choose, and it would cost the whole body twice. The sender's
 `serial` is preserved, because it is what the sender will match a reply
 against.
 
-**A message carrying descriptors between peers is REFUSED, not delivered
-without them.** Forwarding is the descriptor half of rung 14. Until it
-lands, a peer-directed message with a nonzero `UNIX_FDS` gets
-`NotSupported`, because delivering it stripped would hand the recipient a
-body whose `h` values index nothing.
-
-**And the pipelined-count mismatch recorded above is now LIVE.** A draft
-of this section claimed the refusal above made it unreachable. That is
-false twice over. It is decided in `message.rs`, against the whole
-freight queue, before `dispatch` has looked at the destination at all —
-so a refusal at the routing layer cannot make a decode-layer refusal
-unreachable. And the direction is backwards: the reason the case was
-unreachable is quoted above — *"until rung 14 there are no peers to name,
-so no client sends one to this broker"* — and this landing is what
-creates peers to name. A client that negotiates `UNIX_FD` and pipelines
-two descriptor-carrying messages into one write is disconnected with a
-count mismatch for a count it got right. The fix is the one already
-stated: the decoder's count must become the message's DECLARED share of
-the queue rather than the queue's depth, and it lands with forwarding,
-where the declared share is needed anyway. Recorded as reachable rather
-than left reading as closed.
+**A message carrying descriptors is delivered only with them.** The
+broker forwards the ordered descriptor array together with the restamped
+bytes and preserves its `UNIX_FDS` header. Both sender and recipient must
+have negotiated descriptor passing. If the recipient did not, a directed
+method call gets `NotSupported` and a signal is omitted for that recipient;
+the broker never delivers a body whose `h` values index a stripped array.
+The pipelined-count regression and its frame-bounded receive fix are recorded
+in the syscall subsection above.
 
 **One writer per socket.** Each connection has an outgoing queue and a
 thread that drains it, which is what makes the byte ceilings above a
@@ -4689,14 +4679,13 @@ policy. The admission quota is still keyed on `SO_PEERCRED.pid` while a jail is
 a PID namespace with no pids cap, so one application can fork its way to
 the whole table.
 
-Two more belong on that list. Descriptors do not cross between peers
-yet — the broker refuses to route a descriptor-bearing message with
-`NotSupported` and drops what it claimed, which is rung 14's remaining
-work — but a peer can still ATTACH them, and they are charged against the
-BUS's queued-descriptor budget rather than the sender's. So a jailed peer
-can hold that whole allowance against everyone else: the same family as
-the connection table, through a different door, and the read-only bind
-does not reach it because `SCM_RIGHTS` is socket-layer. And
+Two more belong on that list. Descriptors cross between negotiated peers,
+but the global open-descriptor budget is still shared rather than charged
+to an application instance. A jailed peer can drive that shared budget to
+its relief path and lose the connection holding the most attachments: safer
+than evicting the unrelated peer that observes the pressure, but still the
+same attribution gap as the connection table, through a different door. The
+read-only bind does not reach it because `SCM_RIGHTS` is socket-layer. And
 `GetConnectionCredentials` reports the pid `SO_PEERCRED` gave the broker,
 which is a pid in the INIT namespace, so a jailed caller reads host
 pids — its own included — through a channel its PID namespace otherwise

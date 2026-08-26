@@ -26,7 +26,10 @@ use crate::lineage::{
 };
 use crate::message;
 use crate::policy;
-use crate::registry::{Bus, Outbox, Overflow, Rejected, Released, Routing};
+use crate::registry::{
+    Bus, DescriptorCharge, Descriptors, Outbox, Overflow, QueuedFrame, Rejected, Released,
+    Routing,
+};
 use crate::sys::{self, PeerCredential};
 use crate::wire::{WireError, Writer};
 
@@ -149,7 +152,7 @@ pub struct Quota {
     /// scan happens once per accept.
     live: std::sync::Mutex<Vec<i32>>,
     /// Descriptors queued and unclaimed across every connection.
-    queued_fds: std::sync::atomic::AtomicUsize,
+    queued_fds: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// A live connection's place in the quota, given back when it ends — however
@@ -220,7 +223,7 @@ impl Quota {
     }
 
     /// Charge `count` descriptors against the bus's budget, or refuse.
-    fn take_fds(&self, count: usize) -> Result<(), String> {
+    fn take_fds(&self, count: usize) -> Result<DescriptorCharge, String> {
         use std::sync::atomic::Ordering;
         let mut held = self.queued_fds.load(Ordering::Acquire);
         loop {
@@ -239,21 +242,15 @@ impl Quota {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    return Ok(DescriptorCharge::new(
+                        Arc::clone(&self.queued_fds),
+                        count,
+                    ));
+                }
                 Err(seen) => held = seen,
             }
         }
-    }
-
-    fn release_fds(&self, count: usize) {
-        use std::sync::atomic::Ordering;
-        // An update rather than `fetch_sub`: a subtraction below zero wraps to
-        // an enormous budget, which is the failure that hides itself.
-        let _ = self
-            .queued_fds
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                Some(held.saturating_sub(count))
-            });
     }
 }
 
@@ -409,6 +406,11 @@ pub struct Connection<'a> {
     inbox: Vec<u8>,
     /// Descriptors received and not yet claimed by a message's `UNIX_FDS`.
     freight: Vec<OwnedFd>,
+    /// The bus-wide descriptor charge that travels with `freight`. Splitting
+    /// it when a message claims descriptors transfers the charge into that
+    /// message's outgoing frame without a moment in which open descriptors
+    /// are invisible to the quota.
+    freight_charge: DescriptorCharge,
     /// One read's bytes, reused. `[0u8; READ_CHUNK]` as a local zeroes eight
     /// kilobytes of stack on EVERY read — the per-read hot loop, and a larger
     /// cost than the per-message allocation below that was fixed first.
@@ -491,11 +493,6 @@ impl Drop for Connection<'_> {
             }
         }
         self.outbox.close();
-        // Whatever is still queued was charged and is about to be closed by
-        // `OwnedFd`. Without this the bus's budget only ever falls, and a
-        // broker that has served enough connections refuses descriptors it has
-        // the room for.
-        self.quota.release_fds(self.freight.len());
     }
 }
 
@@ -559,6 +556,9 @@ impl<'a> Connection<'a> {
             chunk: vec![0u8; READ_CHUNK],
             inbox: Vec::new(),
             freight: Vec::new(),
+            freight_charge: quota
+                .take_fds(0)
+                .map_err(io::Error::other)?,
             frame: Vec::new(),
         })
     }
@@ -667,13 +667,23 @@ impl<'a> Connection<'a> {
         let writing = Arc::clone(&self.outbox);
         let writer = std::thread::Builder::new().spawn(move || {
             while let Some(frame) = writing.take() {
-                let size = frame.len();
-                let outcome = write_frame(writing.stream(), &frame, &[]);
-                // Dropped BEFORE the bytes are given back, so the moment the
-                // budget says this connection is holding nothing is a moment
-                // at which it really is.
+                let size = frame.bytes.len();
+                let fds = frame
+                    .descriptors
+                    .as_ref()
+                    .map(Descriptors::len)
+                    .unwrap_or(0);
+                let raw = frame
+                    .descriptors
+                    .as_ref()
+                    .map(Descriptors::raw)
+                    .unwrap_or(&[]);
+                let outcome = write_frame(writing.stream(), &frame.bytes, raw);
+                // Dropped BEFORE the bytes and descriptor count are given
+                // back, so the moment the budgets say this connection is
+                // holding nothing is a moment at which it really is.
                 drop(frame);
-                writing.finished(size);
+                writing.finished(size, fds);
                 if let Err(why) = outcome {
                     // The peer is unreachable. Closing is what tells everyone
                     // queuing to it to stop, and what wakes the reader.
@@ -712,7 +722,32 @@ impl<'a> Connection<'a> {
     /// peer closed its end.
     fn pump(&mut self) -> Result<bool, Ended> {
         let mut chunk = std::mem::take(&mut self.chunk);
-        let read = sys::receive(&self.stream, &mut chunk);
+        // A Linux stream's ancillary data is a barrier: one `recvmsg` may
+        // return bytes sent before the control-bearing write together with
+        // that write and its descriptors. D-Bus requires those descriptors
+        // to occur between the first and last bytes of their own message, so
+        // never let one receive cross the end of the frame currently being
+        // assembled. Otherwise a descriptor attached to the next message can
+        // be offered to this one. Authentication is read one byte at a time
+        // for the same reason: until BEGIN is complete there is no message
+        // boundary to cap against, and this is a cold, bounded prefix.
+        let limit = if !self.shake.begun() {
+            1
+        } else {
+            match message::frame_len(&self.inbox) {
+                Ok(Some(length)) => length.saturating_sub(self.inbox.len()),
+                Ok(None) => message::HEADER_LEN.saturating_sub(self.inbox.len()),
+                // `advance_messages` reports this after every receive. This
+                // arm exists only to keep an invalid buffered header from
+                // turning the receive window into an accidental whole chunk.
+                Err(_) => 1,
+            }
+            .clamp(1, chunk.len())
+        };
+        let read = match chunk.get_mut(..limit) {
+            Some(window) => sys::receive(&self.stream, window),
+            None => Err(io::Error::other("the receive window exceeds its buffer")),
+        };
         self.chunk = chunk;
         let received = read.map_err(|error| {
             // `InvalidData` is this layer's word for "the peer sent something
@@ -734,21 +769,17 @@ impl<'a> Connection<'a> {
         // server's half of that exchange, and a peer that never asked has no
         // business sending one.
         //
-        // The gate is the AGREEMENT and deliberately not `begun()` as well,
-        // though a descriptor before BEGIN carries no message that could claim
-        // it. A client may pipeline `BEGIN` and its first message into one
-        // write — libdbus does — and the kernel attaches that write's
-        // descriptors to the read this loop is in the middle of, where BEGIN
-        // has not been parsed yet. Requiring `begun()` here would refuse the
-        // ordinary case. Descriptors arriving before BEGIN are held as freight
-        // and bounded like any other.
+        // BEGIN is required too. The one-byte authentication reads above mean
+        // a descriptor observed before BEGIN was attached to an auth byte,
+        // before the first byte of any D-Bus message, and is invalid rather
+        // than freight a future message may claim.
         //
         // The descriptors are already owned by `received`, so this refusal
         // CLOSES them on the way out: the ordering rule holds through this
         // path exactly as it does through a truncated control buffer.
-        if !received.fds.is_empty() && !self.shake.unix_fd() {
+        if !received.fds.is_empty() && (!self.shake.unix_fd() || !self.shake.begun()) {
             return Err(Ended::Refused(format!(
-                "{} descriptors arrived without AGREE_UNIX_FD",
+                "{} descriptors arrived before BEGIN or without AGREE_UNIX_FD",
                 received.fds.len()
             )));
         }
@@ -759,9 +790,37 @@ impl<'a> Connection<'a> {
         let arrived = received.fds.len();
         // Charged BEFORE they join the queue, so a refusal drops them here
         // rather than leaving the bus's count and this connection's disagreeing.
-        self.quota
-            .take_fds(arrived)
-            .map_err(Ended::Refused)?;
+        let charge = match self.quota.take_fds(arrived) {
+            Ok(charge) => charge,
+            Err(mut refusal) => {
+                let mut relieved = 0usize;
+                let charge = loop {
+                    if relieved >= MAX_CONNECTIONS {
+                        break Err(refusal);
+                    }
+                    let Some(_) = self.bus.relieve_largest_descriptors() else {
+                        break Err(refusal);
+                    };
+                    relieved = relieved.saturating_add(1);
+                    match self.quota.take_fds(arrived) {
+                        Ok(charge) => break Ok(charge),
+                        Err(again) => refusal = again,
+                    }
+                };
+                if relieved != 0 {
+                    eprintln!(
+                        "td-busd: descriptor budget pressure disconnected {relieved} holders"
+                    );
+                }
+                charge.map_err(Ended::Refused)?
+            }
+        };
+        // `take_fds` above and the zero charge installed by `accept` both
+        // come from this connection's one Quota. A different Arc means an
+        // internal ownership invariant was broken; it is not peer input.
+        self.freight_charge
+            .absorb(charge)
+            .map_err(|_| Ended::Failed("descriptor charges came from different buses".into()))?;
         self.freight.extend(received.fds);
         if self.freight.len() > MAX_QUEUED_FDS {
             return Err(Ended::Refused(format!(
@@ -808,6 +867,7 @@ impl<'a> Connection<'a> {
         if !fed.reply.is_empty() {
             self.queue_own(fed.reply)?;
         }
+        self.outbox.set_unix_fd(self.shake.unix_fd());
         // `consumed` stops at BEGIN, so whatever a client pipelined behind it
         // stays in the inbox and is framed below rather than swallowed here.
         self.inbox.drain(..fed.consumed.min(self.inbox.len()));
@@ -838,31 +898,34 @@ impl<'a> Connection<'a> {
         }
     }
 
-    /// One complete message. Routing is rung 14; what this landing owes is that
-    /// the message DECODES against the descriptors that actually arrived, that
-    /// the ones it claims are taken off the queue, and that the peer is told
-    /// something rather than left waiting.
+    /// One complete message and the descriptor freight received while reading
+    /// only that frame. `pump` caps every receive at this frame's end, so the
+    /// codec's equality check is both directions: missing and surplus
+    /// descriptors disconnect the sender here rather than drifting into an
+    /// adjacent message.
     fn dispatch(&mut self, frame: &[u8]) -> Result<(), Ended> {
         let available = u32::try_from(self.freight.len()).unwrap_or(u32::MAX);
         let (message, _) = message::decode_from_client(frame, available)
             .map_err(|error| Ended::Refused(format!("message: {error}")))?;
-        // The count is already settled: `decode_from_client` was handed
-        // `available` and refuses any message whose UNIX_FDS disagrees with
-        // it, so by here `wanted` and the queue length are the same number. An
-        // earlier draft re-checked `wanted > self.freight.len()` here, which
-        // reads like the load-bearing check and is in fact unreachable — the
-        // red-check found it by reverting it and watching every test stay
-        // green. A dead branch shaped like a safety check is worse than none,
-        // because the next reader trusts it.
         let wanted = usize::try_from(message.fields.unix_fds.unwrap_or(0)).unwrap_or(0);
-        // Claimed descriptors leave the queue with the message that named them.
-        // Forwarding them is the descriptor half of rung 14; this increment
-        // routes bytes, and a message carrying descriptors is refused rather
-        // than delivered without them — silently dropping an `h` a recipient
-        // will index is worse than saying no.
-        let claimed: Vec<OwnedFd> = self.freight.drain(..wanted.min(self.freight.len())).collect();
-        self.quota.release_fds(claimed.len());
-        drop(claimed);
+        // Equality was established by `decode_from_client`, and every charge
+        // was absorbed before its fd joined `freight`. Failure here therefore
+        // names an internal ownership invariant rather than a second peer
+        // input check.
+        let charge = self
+            .freight_charge
+            .split(wanted)
+            .ok_or_else(|| Ended::Failed("descriptor freight lost its quota charge".into()))?;
+        let descriptors = if wanted == 0 {
+            drop(charge);
+            None
+        } else {
+            let claimed: Vec<OwnedFd> = self.freight.drain(..wanted).collect();
+            Some(
+                Descriptors::new(claimed, charge)
+                    .map_err(|why| Ended::Failed(format!("descriptor ownership: {why}")))?,
+            )
+        };
 
         // A message type this version does not know is IGNORED, which the
         // specification requires and which has to be decided HERE rather than
@@ -935,17 +998,20 @@ impl<'a> Connection<'a> {
         }
 
         // Addressed to the broker, or to a peer?
+        let mut descriptors = descriptors;
         match message.fields.destination {
             Some(BUS_NAME) | None if is_hello => self.say_hello(&message, wants_reply),
             Some(BUS_NAME) => self.bus_method(&message, wants_reply),
-            Some(destination) => self.route(&message, destination, wants_reply, wanted),
+            Some(destination) => {
+                self.route(&message, destination, wants_reply, descriptors.take())
+            }
             // No DESTINATION and not `Hello`. A SIGNAL without one is a
             // broadcast and is selected by each recipient's installed match
             // rules. A method CALL without one is the opposite case: the
             // caller is waiting on a serial but named no callee, so it is told
             // rather than left to time out.
             None if message.kind == message::MessageType::Signal => {
-                self.broadcast(&message, wanted)
+                self.broadcast(&message, descriptors.take())
             }
             None if wants_reply => self.refuse(
                 &message,
@@ -2237,12 +2303,12 @@ impl<'a> Connection<'a> {
     }
 
     /// Route one client broadcast once to each matching, permitted subscriber.
-    fn broadcast(&self, message: &message::Message<'_>, wanted: usize) -> Result<(), Ended> {
-        // Descriptor forwarding is all-or-nothing. Until that path lands, an
-        // fd-carrying broadcast is dropped exactly like its directed twin;
-        // restamping bytes while discarding the indexed descriptors would
-        // create a corrupt message at the recipient.
-        if wanted != 0 || !policy::may_signal(&self.identity) {
+    fn broadcast(
+        &self,
+        message: &message::Message<'_>,
+        descriptors: Option<Descriptors>,
+    ) -> Result<(), Ended> {
+        if !policy::may_signal(&self.identity) {
             return Ok(());
         }
         let sender = self.named()?.to_string();
@@ -2254,10 +2320,19 @@ impl<'a> Connection<'a> {
             return Ok(());
         };
         for subscriber in self.bus.subscribers(message, &sender, None) {
+            if descriptors.is_some() && !subscriber.outbox.accepts_unix_fd() {
+                continue;
+            }
             // A recipient that exhausted its queue did not choose when this
             // broadcast fired. Its loss is expected backpressure, not a line
             // per subsequent signal in the broker journal.
-            let _ = self.deliver(&subscriber.outbox, forwarded.clone());
+            let frame = match descriptors.as_ref() {
+                Some(descriptors) => {
+                    QueuedFrame::carrying(forwarded.clone(), descriptors.clone())
+                }
+                None => QueuedFrame::plain(forwarded.clone()),
+            };
+            let _ = self.deliver_frame(&subscriber.outbox, frame);
         }
         Ok(())
     }
@@ -2282,22 +2357,8 @@ impl<'a> Connection<'a> {
         message: &message::Message<'_>,
         destination: &str,
         wants_reply: bool,
-        descriptors: usize,
+        descriptors: Option<Descriptors>,
     ) -> Result<(), Ended> {
-        // A message carrying descriptors is not forwarded yet, and saying so
-        // is the point: delivering it WITHOUT them would hand the recipient a
-        // body whose `h` values index nothing.
-        if descriptors > 0 {
-            return if wants_reply {
-                self.refuse(
-                    message,
-                    "org.freedesktop.DBus.Error.NotSupported",
-                    "descriptor passing between peers lands with the rest of rung 14",
-                )
-            } else {
-                Ok(())
-            };
-        }
         // A destination this caller may not reach is reported ABSENT, not
         // denied, and that is deliberate. §D asks for `AccessDenied` for what
         // the default policy does not permit, and separately that a name the
@@ -2421,6 +2482,43 @@ impl<'a> Connection<'a> {
                 Ok(())
             };
         };
+        if descriptors.is_some() && !outbox.accepts_unix_fd() {
+            self.forget(recorded, message.serial);
+            if let Some(reply_serial) = reply {
+                // Ownership has already been consumed by `claim_reply`, so a
+                // silent drop here would strand the caller permanently: the
+                // callee's later departure would no longer find a pending
+                // call to sweep. Answer the original call from the broker.
+                let error = message::Builder::error(
+                    message.endian,
+                    "org.freedesktop.DBus.Error.NotSupported",
+                    reply_serial,
+                )
+                .sender(BUS_NAME)
+                .destination(destination)
+                .serial(outbox.take_serial())
+                .body("s", |writer| {
+                    writer.string("this caller did not negotiate UNIX_FD passing")
+                })
+                .map_err(|why| Ended::Failed(format!("descriptor refusal body: {why}")))?
+                .encode()
+                .map_err(|why| Ended::Failed(format!("descriptor refusal: {why}")))?;
+                // A caller whose own output queue is unavailable cannot read
+                // this answer. It is not a fault in the replying peer and
+                // must not disconnect that peer instead.
+                let _ = self.deliver(&outbox, error);
+                return Ok(());
+            }
+            return if wants_reply {
+                self.refuse(
+                    message,
+                    "org.freedesktop.DBus.Error.NotSupported",
+                    "the recipient did not negotiate UNIX_FD passing",
+                )
+            } else {
+                Ok(())
+            };
+        }
         let sender = self.named()?.to_string();
         // Re-encoding can FAIL on a message the broker itself accepted, and
         // the sender must be told rather than torn down for it. The broker
@@ -2451,7 +2549,11 @@ impl<'a> Connection<'a> {
                 };
             }
         };
-        match self.deliver(&outbox, forwarded) {
+        let frame = match descriptors {
+            Some(descriptors) => QueuedFrame::carrying(forwarded, descriptors),
+            None => QueuedFrame::plain(forwarded),
+        };
+        match self.deliver_frame(&outbox, frame) {
             Ok(()) => Ok(()),
             // The recipient's queue is full, and the SENDER is told. The
             // recipient is NOT disconnected: it did not choose when this
@@ -2460,14 +2562,15 @@ impl<'a> Connection<'a> {
             // disconnected here let any peer evict any other with two frames.
             // A peer that genuinely never reads is removed by the BUS ceiling's
             // remedy instead, which picks the largest consumer.
-            Err(Overflow::Connection { bytes, frames }) => {
+            Err(Overflow::Connection { bytes, frames, fds }) => {
                 self.forget(recorded, message.serial);
                 if wants_reply {
                     self.refuse(
                         message,
                         "org.freedesktop.DBus.Error.LimitsExceeded",
                         &format!(
-                            "the recipient is {bytes} bytes behind in {frames} frames"
+                            "the recipient is {bytes} bytes behind in {frames} frames \
+                             with {fds} descriptor attachments"
                         ),
                     )
                 } else {
@@ -2558,6 +2661,9 @@ impl<'a> Connection<'a> {
         if let Some(destination) = message.fields.destination {
             builder = builder.destination(destination);
         }
+        if let Some(unix_fds) = message.fields.unix_fds {
+            builder = builder.unix_fds(unix_fds);
+        }
         let body = message.body_bytes().to_vec();
         if !body.is_empty() || message.fields.signature.is_some() {
             builder = builder
@@ -2600,7 +2706,17 @@ impl<'a> Connection<'a> {
     /// One retry. If the bus is still over its ceiling after its largest
     /// consumer has gone, the answer really is that the bus is full.
     fn deliver(&self, outbox: &Arc<Outbox>, frame: Vec<u8>) -> Result<(), Overflow> {
-        let rejected = match outbox.push(frame) {
+        self.deliver_frame(outbox, QueuedFrame::plain(frame))
+    }
+
+    /// Append bytes and any descriptor ownership to an outbox, applying the
+    /// same bus-level remedy as a broker-originated plain frame.
+    fn deliver_frame(
+        &self,
+        outbox: &Arc<Outbox>,
+        frame: QueuedFrame,
+    ) -> Result<(), Overflow> {
+        let rejected = match outbox.push_frame(frame) {
             Ok(()) => return Ok(()),
             Err(rejected) => rejected,
         };
@@ -2618,7 +2734,7 @@ impl<'a> Connection<'a> {
             "td-busd: the bus is {bytes} bytes behind; disconnected {}",
             relieved.as_deref().unwrap_or("nobody")
         );
-        outbox.push(frame).map_err(|again| again.why)
+        outbox.push_frame(frame).map_err(|again| again.why)
     }
 
     /// Queue a frame this broker generated for its own peer.
@@ -2626,8 +2742,8 @@ impl<'a> Connection<'a> {
         match self.deliver(&Arc::clone(&self.outbox), frame) {
             Ok(()) => Ok(()),
             Err(Overflow::Closed) => Err(Ended::PeerLeft),
-            Err(Overflow::Connection { bytes, frames }) => Err(Ended::Refused(format!(
-                "{bytes} bytes in {frames} frames queued and unread"
+            Err(Overflow::Connection { bytes, frames, fds }) => Err(Ended::Refused(format!(
+                "{bytes} bytes in {frames} frames with {fds} descriptor attachments queued and unread"
             ))),
             Err(Overflow::Bus(bytes)) => {
                 Err(Ended::Failed(format!("the bus is {bytes} bytes behind")))
@@ -3682,6 +3798,42 @@ mod tests {
             assert_eq!(sent, frame.len(), "the test wrote only part of a frame");
         }
 
+        /// Read several descriptor-carrying frames without losing ancillary
+        /// data when one `recvmsg` contains more than one of them.
+        fn frames_with_fds(&mut self, count: usize) -> Vec<(Vec<u8>, Vec<OwnedFd>)> {
+            assert_eq!(self.lines, 0, "the descriptor reader saw handshake lines");
+            assert!(self.deferred.is_empty(), "a plain frame was deferred");
+            let mut freight = Vec::new();
+            let mut frames = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while frames.len() < count {
+                while let Ok(Some(length)) = message::frame_len(&self.held) {
+                    if self.held.len() < length || frames.len() >= count {
+                        break;
+                    }
+                    let frame: Vec<u8> = self.held.drain(..length).collect();
+                    let available = u32::try_from(freight.len())
+                        .expect("the test descriptor count fits u32");
+                    let (decoded, _) = message::decode(&frame, available)
+                        .expect("decode the descriptor-bearing frame");
+                    let declared = usize::try_from(decoded.fields.unix_fds.unwrap_or(0))
+                        .expect("the descriptor count fits usize");
+                    let fds = freight.drain(..declared).collect();
+                    frames.push((frame, fds));
+                }
+                if frames.len() >= count {
+                    break;
+                }
+                let received = sys::receive(&self.stream, &mut chunk).expect("recvmsg");
+                assert_ne!(received.count, 0, "the bus closed without answering");
+                self.held
+                    .extend_from_slice(chunk.get(..received.count).unwrap_or(&[]));
+                freight.extend(received.fds);
+            }
+            assert!(freight.is_empty(), "descriptors arrived without a requested frame");
+            frames
+        }
+
         /// The next whole frame, reading until there is one. The handshake's
         /// lines are stepped over on the way past.
         fn frame(&mut self) -> Vec<u8> {
@@ -3849,6 +4001,57 @@ mod tests {
         .expect("body")
         .encode()
         .expect("encode a peer call")
+    }
+
+    fn descriptor_call(destination: &str, serial: u32) -> Vec<u8> {
+        message::Builder::method_call(
+            crate::wire::Endian::Little,
+            "/org/example/Thing",
+            Some("org.example.Thing"),
+            "Take",
+        )
+        .destination(destination)
+        .serial(serial)
+        .unix_fds(1)
+        .body("h", |writer| {
+            writer.unix_fd(0);
+            Ok(())
+        })
+        .expect("descriptor body")
+        .encode()
+        .expect("encode a descriptor call")
+    }
+
+    fn descriptor_signal(serial: u32) -> Vec<u8> {
+        message::Builder::signal(
+            crate::wire::Endian::Little,
+            "/org/example/Thing",
+            "org.example.Thing",
+            "Changed",
+        )
+        .serial(serial)
+        .unix_fds(1)
+        .body("h", |writer| {
+            writer.unix_fd(0);
+            Ok(())
+        })
+        .expect("descriptor body")
+        .encode()
+        .expect("encode a descriptor signal")
+    }
+
+    fn descriptor_return(destination: &str, answers: u32, serial: u32) -> Vec<u8> {
+        message::Builder::method_return(crate::wire::Endian::Little, answers)
+            .destination(destination)
+            .serial(serial)
+            .unix_fds(1)
+            .body("h", |writer| {
+                writer.unix_fd(0);
+                Ok(())
+            })
+            .expect("descriptor body")
+            .encode()
+            .expect("encode a descriptor return")
     }
 
     /// A method call whose sender is not listening for the answer.
@@ -5068,12 +5271,10 @@ mod tests {
         assert_eq!(reply.fields.reply_serial, Some(2));
     }
 
-    /// A message carrying descriptors to a PEER is refused, not stripped.
-    /// Delivering it without them would hand the recipient a body whose `h`
-    /// values index nothing — a corruption the recipient cannot detect,
-    /// because the message it receives is well formed and simply wrong.
+    /// Both ends must negotiate descriptor passing. A sender's agreement does
+    /// not let it install descriptors in a recipient that never agreed.
     #[test]
-    fn a_message_carrying_descriptors_to_a_peer_is_refused_rather_than_stripped() {
+    fn a_descriptor_message_is_refused_when_the_recipient_did_not_negotiate() {
         let (_bus, mut clients) = bus_of(2);
         let second = clients.pop().expect("two clients");
         let first = clients.pop().expect("two clients");
@@ -5081,22 +5282,7 @@ mod tests {
         let (mut two, name_two) = Peer::arrive(second);
 
         let spare = fs::File::open("/dev/null").expect("/dev/null");
-        let carrying = message::Builder::method_call(
-            crate::wire::Endian::Little,
-            "/org/example/Thing",
-            Some("org.example.Thing"),
-            "Take",
-        )
-        .destination(&name_two)
-        .serial(7)
-        .unix_fds(1)
-        .body("h", |writer| {
-            writer.unix_fd(0);
-            Ok(())
-        })
-        .expect("body")
-        .encode()
-        .expect("encode");
+        let carrying = descriptor_call(&name_two, 7);
         one.send_with_fd(&carrying, spare.as_raw_fd());
 
         let frame = one.frame();
@@ -5109,6 +5295,183 @@ mod tests {
         assert_eq!(reply.fields.reply_serial, Some(7));
         // And nothing at all reached the peer it was addressed to.
         two.expect_silence();
+    }
+
+    #[test]
+    fn a_descriptor_reaches_a_peer_that_negotiated_it() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut sender, sender_name) = Peer::arrive_with_fds(first);
+        let (mut recipient, recipient_name) = Peer::arrive_with_fds(second);
+
+        let spare = fs::File::open("/dev/null").expect("/dev/null");
+        sender.send_with_fd(&descriptor_call(&recipient_name, 7), spare.as_raw_fd());
+
+        let mut arrived = recipient.frames_with_fds(1);
+        let (frame, fds) = arrived.pop().expect("one descriptor frame");
+        let count = u32::try_from(fds.len()).expect("descriptor count fits");
+        let (call, _) = message::decode(&frame, count).expect("decode descriptor call");
+        assert_eq!(call.fields.sender, Some(sender_name.as_str()));
+        assert_eq!(call.fields.unix_fds, Some(1));
+        assert_eq!(fds.len(), 1);
+    }
+
+    #[test]
+    fn a_descriptor_reply_to_an_unnegotiated_caller_is_answered_by_the_bus() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut caller, caller_name) = Peer::arrive(first);
+        let (mut callee, callee_name) = Peer::arrive_with_fds(second);
+
+        caller.send(&peer_call(&callee_name, 7, "give me a file"));
+        let frame = callee.frame();
+        let (call, _) = message::decode(&frame, 0).expect("decode the call");
+        assert_eq!(call.fields.sender, Some(caller_name.as_str()));
+
+        let spare = fs::File::open("/dev/null").expect("/dev/null");
+        callee.send_with_fd(
+            &descriptor_return(&caller_name, 7, 8),
+            spare.as_raw_fd(),
+        );
+
+        let frame = caller.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode broker refusal");
+        assert_eq!(reply.kind, message::MessageType::Error);
+        assert_eq!(reply.fields.sender, Some(BUS_NAME));
+        assert_eq!(reply.fields.reply_serial, Some(7));
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.NotSupported")
+        );
+    }
+
+    /// Several control-bearing sends may be pipelined without waiting for the
+    /// first delivery. The receive path must stop at each D-Bus frame boundary
+    /// so each frame is decoded against the descriptors sent within it.
+    #[test]
+    fn pipelined_descriptor_messages_keep_receive_boundaries() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut sender, _) = Peer::arrive_with_fds(first);
+        let (mut recipient, recipient_name) = Peer::arrive_with_fds(second);
+
+        let first_fd = fs::File::open("/dev/null").expect("/dev/null");
+        let second_fd = fs::File::open("/proc/self/stat").expect("/proc/self/stat");
+        sender.send_with_fd(&descriptor_call(&recipient_name, 7), first_fd.as_raw_fd());
+        sender.send_with_fd(&descriptor_call(&recipient_name, 8), second_fd.as_raw_fd());
+
+        let arrived = recipient.frames_with_fds(2);
+        assert_eq!(arrived.len(), 2);
+        for (index, (frame, fds)) in arrived.iter().enumerate() {
+            assert_eq!(fds.len(), 1, "frame {index} did not get one descriptor");
+            let (call, _) = message::decode(frame, 1).expect("decode descriptor call");
+            assert_eq!(call.serial, 7 + u32::try_from(index).unwrap_or(0));
+            assert_eq!(call.fields.unix_fds, Some(1));
+        }
+    }
+
+    fn begin_fd_handshake(connection: &mut Connection<'_>, client: &mut UnixStream) {
+        let opening = format!(
+            "\0AUTH EXTERNAL {}\r\nNEGOTIATE_UNIX_FD\r\nBEGIN\r\n",
+            uid_hex()
+        );
+        client.write_all(opening.as_bytes()).expect("write opening");
+        while !connection.shake.begun() {
+            assert!(connection.pump().expect("advance handshake"));
+        }
+    }
+
+    /// The kernel may return bytes preceding a control-bearing send together
+    /// with that send's descriptors. A receive capped at the current frame's
+    /// end prevents a missing descriptor in this frame from stealing the one
+    /// sent inside the next frame.
+    #[test]
+    fn a_descriptor_sent_in_the_next_message_cannot_satisfy_this_one() {
+        let (mut client, server) = UnixStream::pair().expect("socketpair");
+        let quota = Quota::new();
+        let bus = Bus::new();
+        let instances = Instances::new();
+        let guid = Guid::new(GUID).expect("guid");
+        let mut connection =
+            Connection::accept(server, guid, &quota, &bus, &instances).expect("accept");
+        begin_fd_handshake(&mut connection, &mut client);
+
+        client
+            .write_all(&descriptor_call(":1.404", 7))
+            .expect("write first frame without its descriptor");
+        let spare = fs::File::open("/dev/null").expect("/dev/null");
+        let second = descriptor_call(":1.404", 8);
+        let sent = sys::send(&client, &second, &[spare.as_raw_fd()]).expect("send second frame");
+        assert_eq!(sent, second.len());
+
+        loop {
+            match connection.pump() {
+                Ok(true) => {}
+                Ok(false) => panic!("the peer closed before its malformed frame was judged"),
+                Err(Ended::Refused(why)) => {
+                    assert!(why.contains("UNIX_FDS disagrees"), "{why}");
+                    break;
+                }
+                Err(other) => panic!("the frame ended the connection as {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_surplus_descriptor_cannot_drift_into_a_later_message() {
+        let (mut client, server) = UnixStream::pair().expect("socketpair");
+        let quota = Quota::new();
+        let bus = Bus::new();
+        let instances = Instances::new();
+        let guid = Guid::new(GUID).expect("guid");
+        let mut connection =
+            Connection::accept(server, guid, &quota, &bus, &instances).expect("accept");
+        begin_fd_handshake(&mut connection, &mut client);
+
+        let first = peer_call(":1.404", 7, "no descriptor declared");
+        let spare = fs::File::open("/dev/null").expect("/dev/null");
+        let sent = sys::send(&client, &first, &[spare.as_raw_fd()]).expect("send surplus fd");
+        assert_eq!(sent, first.len());
+
+        loop {
+            match connection.pump() {
+                Ok(true) => {}
+                Ok(false) => panic!("the peer closed before its malformed frame was judged"),
+                Err(Ended::Refused(why)) => {
+                    assert!(why.contains("UNIX_FDS disagrees"), "{why}");
+                    break;
+                }
+                Err(other) => panic!("the frame ended the connection as {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_descriptor_broadcast_reaches_each_negotiated_subscriber() {
+        let (_bus, mut clients) = bus_of(2);
+        let second = clients.pop().expect("two clients");
+        let first = clients.pop().expect("two clients");
+        let (mut sender, sender_name) = Peer::arrive_with_fds(first);
+        let (mut recipient, _) = Peer::arrive_with_fds(second);
+
+        recipient.send(&match_call(
+            "AddMatch",
+            "type='signal',interface='org.example.Thing',member='Changed'",
+            2,
+        ));
+        let _ = recipient.answer();
+        let spare = fs::File::open("/dev/null").expect("/dev/null");
+        sender.send_with_fd(&descriptor_signal(3), spare.as_raw_fd());
+
+        let mut arrived = recipient.frames_with_fds(1);
+        let (frame, fds) = arrived.pop().expect("one descriptor signal");
+        let (signal, _) = message::decode(&frame, 1).expect("decode descriptor signal");
+        assert_eq!(signal.fields.sender, Some(sender_name.as_str()));
+        assert_eq!(signal.fields.unix_fds, Some(1));
+        assert_eq!(fds.len(), 1);
     }
 
     /// A name leaves the bus with its connection. A unique name that outlived
@@ -8793,11 +9156,11 @@ mod tests {
 
         let frame = connection.outbox.take().expect("a refusal was queued");
         assert_eq!(
-            error_of(&frame).as_deref(),
+            error_of(&frame.bytes).as_deref(),
             Some("td.Jail1.Error.Refused"),
             "a registration was answered for a process that does not exist"
         );
-        let (reply, _) = message::decode(&frame, 0).expect("decode the refusal");
+        let (reply, _) = message::decode(&frame.bytes, 0).expect("decode the refusal");
         let why = reply
             .args()
             .first()
@@ -9014,11 +9377,11 @@ mod tests {
 
         let frame = connection.outbox.take().expect("a refusal was queued");
         assert_eq!(
-            error_of(&frame).as_deref(),
+            error_of(&frame.bytes).as_deref(),
             Some("td.Jail1.Error.Refused"),
             "a completion was answered for a process that does not exist"
         );
-        let (reply, _) = message::decode(&frame, 0).expect("decode the refusal");
+        let (reply, _) = message::decode(&frame.bytes, 0).expect("decode the refusal");
         let why = reply
             .args()
             .first()
@@ -9387,25 +9750,84 @@ mod tests {
         let quota = Quota::new();
         // One message's worth at a time, up to the bus's budget.
         let batches = MAX_QUEUED_FDS_TOTAL / sys::MAX_FDS;
+        let mut charges = Vec::new();
         for which in 0..batches {
-            if let Err(why) = quota.take_fds(sys::MAX_FDS) {
-                panic!("batch {which} refused: {why}");
+            match quota.take_fds(sys::MAX_FDS) {
+                Ok(charge) => charges.push(charge),
+                Err(why) => panic!("batch {which} refused: {why}"),
             }
         }
         match quota.take_fds(1) {
-            Ok(()) => panic!("the bus went past its descriptor budget"),
+            Ok(_) => panic!("the bus went past its descriptor budget"),
             Err(why) => assert!(why.contains("across the bus"), "{why}"),
         }
-        // Claimed descriptors come back.
-        quota.release_fds(sys::MAX_FDS);
-        quota.take_fds(sys::MAX_FDS).expect("room after a claim");
-        // And a release of more than is held floors at zero rather than
-        // wrapping into an enormous budget.
-        quota.release_fds(MAX_QUEUED_FDS_TOTAL * 4);
-        quota
+        // Ownership returning a batch returns exactly its charge.
+        drop(charges.pop());
+        charges.push(quota.take_fds(sys::MAX_FDS).expect("room after a claim"));
+        drop(charges);
+        let whole = quota
             .take_fds(MAX_QUEUED_FDS_TOTAL)
             .expect("an emptied budget is the whole budget");
         assert!(quota.take_fds(1).is_err(), "the budget wrapped");
+        drop(whole);
+    }
+
+    /// Outgoing writers now retain the broker's descriptor charge until the
+    /// recipient has taken the message. When those writers fill the global
+    /// budget, relief targets a recipient holding descriptors rather than the
+    /// unrelated sender whose next `recvmsg` noticed the condition.
+    #[test]
+    fn a_full_descriptor_budget_relieves_a_descriptor_holder() {
+        let quota = Quota::new();
+        let bus = Bus::new();
+        let mut clients = Vec::new();
+        let batches = MAX_QUEUED_FDS_TOTAL / sys::MAX_FDS;
+        for which in 0..batches {
+            let charge = quota.take_fds(sys::MAX_FDS).expect("take a batch");
+            let mut fds = Vec::new();
+            for _ in 0..sys::MAX_FDS {
+                let file = fs::File::open("/dev/null").expect("/dev/null");
+                let fd: OwnedFd = file.into();
+                fds.push(fd);
+            }
+            let descriptors =
+                Descriptors::new(fds, charge).expect("matching descriptor charge");
+            let copies = [descriptors.clone(), descriptors];
+            for (copy, descriptors) in copies.into_iter().enumerate() {
+                let (client, server) = UnixStream::pair().expect("socketpair");
+                clients.push(client);
+                let outbox = bus.outbox_for(server);
+                let index = which.saturating_mul(2).saturating_add(copy);
+                bus.join(
+                    &outbox,
+                    this_uid(),
+                    7000 + i32::try_from(index).unwrap_or(0),
+                )
+                .expect("join descriptor holder");
+                outbox
+                    .push_frame(QueuedFrame::carrying(vec![0], descriptors))
+                    .expect("queue descriptor frame");
+            }
+        }
+        assert!(quota.take_fds(1).is_err(), "the descriptor budget was not full");
+        // Every underlying batch is shared by two recipients. Relieving only
+        // one largest queue drops one Arc clone and returns no global charge;
+        // the retry must continue until the sibling is gone too.
+        let mut relieved = 0usize;
+        while quota.take_fds(1).is_err() {
+            assert!(
+                bus.relieve_largest_descriptors().is_some(),
+                "no descriptor holder was relieved"
+            );
+            relieved = relieved.saturating_add(1);
+            assert!(relieved <= MAX_CONNECTIONS, "descriptor relief did not converge");
+        }
+        assert!(relieved >= 2, "shared ownership was not exercised");
+        let returned = quota
+            .take_fds(sys::MAX_FDS)
+            .expect("relieving one holder returned its descriptor batch");
+        drop(returned);
+        drop(clients);
     }
 
     /// A connection that ends returns whatever it was still holding. Without
@@ -9414,7 +9836,6 @@ mod tests {
     #[test]
     fn a_connection_returns_its_freight_to_the_bus_when_it_ends() {
         let quota = Quota::new();
-        quota.take_fds(sys::MAX_FDS).expect("charge");
         {
             let (_client, server) = UnixStream::pair().expect("socketpair");
             let guid = Guid::new(GUID).expect("guid");
@@ -9424,12 +9845,18 @@ mod tests {
             let mut connection = accepted.expect("accept");
             let spare = fs::File::open("/dev/null").expect("/dev/null");
             let owned: OwnedFd = spare.into();
+            let charge = quota.take_fds(1).expect("charge the freight");
+            connection
+                .freight_charge
+                .absorb(charge)
+                .expect("one quota supplies both charges");
             connection.freight.push(owned);
         }
         // The connection is gone; what it held is back.
-        quota
-            .take_fds(MAX_QUEUED_FDS_TOTAL - sys::MAX_FDS + 1)
+        let whole = quota
+            .take_fds(MAX_QUEUED_FDS_TOTAL)
             .expect("the freight was returned");
+        drop(whole);
     }
 
     /// §D asks for the socket at 0600 as well as the parent at 0700. A bind

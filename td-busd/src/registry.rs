@@ -15,8 +15,9 @@
 
 use std::collections::VecDeque;
 use std::net::Shutdown;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -80,6 +81,11 @@ pub const MAX_OUTGOING_MESSAGES: usize = 4096;
 /// by calling it.
 pub const MAX_PENDING_REPLIES: usize = 128;
 
+/// Descriptors attached to frames held for one connection. The byte and frame
+/// ceilings do not bound them: an otherwise tiny message can carry 64, so a
+/// stalled recipient needs an explicit attachment ceiling as well.
+pub const MAX_OUTGOING_FDS: usize = 64;
+
 /// How long the bus's remedy waits for a relieved connection's writer to let
 /// go of the frame it is holding. Short because `shutdown` is what releases
 /// it: a `sendmsg` on a shut-down socket returns at once, so this is a bound
@@ -95,7 +101,7 @@ const SETTLE: Duration = Duration::from_millis(500);
 #[derive(Debug)]
 pub struct Rejected {
     pub why: Overflow,
-    pub frame: Vec<u8>,
+    pub frame: QueuedFrame,
 }
 
 /// Why an append failed.
@@ -107,14 +113,142 @@ pub enum Overflow {
     /// numbers are carried because either can be what fired: a draft reported
     /// every refusal as a byte overflow, so a flood of 4096 tiny frames was
     /// diagnosed as "bytes behind" with a byte count far under the ceiling.
-    Connection { bytes: usize, frames: usize },
+    Connection {
+        bytes: usize,
+        frames: usize,
+        fds: usize,
+    },
     /// The bus's ceiling. §D calls this a broker-level condition: the fault is
     /// a policy elsewhere, so it is logged apart from an ordinary refusal.
     Bus(usize),
 }
 
+/// One charge against the broker's open-descriptor budget.
+///
+/// The charge follows ownership from the receive-side freight queue into one
+/// or more outgoing frames. Cloned broadcasts share the same descriptor
+/// owner, so the broker counts the open file description once while each
+/// recipient queue separately counts its attachment.
+#[derive(Debug)]
+pub(crate) struct DescriptorCharge {
+    total: Arc<AtomicUsize>,
+    count: usize,
+}
+
+impl DescriptorCharge {
+    pub(crate) fn new(total: Arc<AtomicUsize>, count: usize) -> Self {
+        Self { total, count }
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.count
+    }
+
+    pub(crate) fn absorb(&mut self, mut other: Self) -> Result<(), Self> {
+        if !Arc::ptr_eq(&self.total, &other.total) {
+            return Err(other);
+        }
+        self.count = self.count.saturating_add(other.count);
+        other.count = 0;
+        Ok(())
+    }
+
+    pub(crate) fn split(&mut self, count: usize) -> Option<Self> {
+        if count > self.count {
+            return None;
+        }
+        self.count = self.count.saturating_sub(count);
+        Some(Self::new(Arc::clone(&self.total), count))
+    }
+}
+
+impl Drop for DescriptorCharge {
+    fn drop(&mut self) {
+        let _ = self
+            .total
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                Some(held.saturating_sub(self.count))
+            });
+    }
+}
+
+#[derive(Debug)]
+struct DescriptorOwner {
+    /// Ownership keeps the raw numbers below valid until the final queued or
+    /// in-flight clone is dropped.
+    _fds: Vec<OwnedFd>,
+    raw: Vec<RawFd>,
+    _charge: DescriptorCharge,
+}
+
+/// One message's ordered descriptor array. Cloning shares ownership; it does
+/// not call `dup`, and each `sendmsg` still installs a distinct array in its
+/// recipient as SCM_RIGHTS requires.
+#[derive(Clone, Debug)]
+pub struct Descriptors {
+    owner: Arc<DescriptorOwner>,
+}
+
+impl Descriptors {
+    pub(crate) fn new(
+        fds: Vec<OwnedFd>,
+        charge: DescriptorCharge,
+    ) -> Result<Self, String> {
+        if fds.len() != charge.count() {
+            return Err(format!(
+                "{} owned descriptors carry a charge for {}",
+                fds.len(),
+                charge.count()
+            ));
+        }
+        let raw = fds.iter().map(AsRawFd::as_raw_fd).collect();
+        Ok(Self {
+            owner: Arc::new(DescriptorOwner {
+                _fds: fds,
+                raw,
+                _charge: charge,
+            }),
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.owner.raw.len()
+    }
+
+    pub fn raw(&self) -> &[RawFd] {
+        &self.owner.raw
+    }
+}
+
+/// Bytes and the descriptor array whose indices their body contains.
+#[derive(Debug)]
+pub struct QueuedFrame {
+    pub bytes: Vec<u8>,
+    pub descriptors: Option<Descriptors>,
+}
+
+impl QueuedFrame {
+    pub fn plain(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            descriptors: None,
+        }
+    }
+
+    pub fn carrying(bytes: Vec<u8>, descriptors: Descriptors) -> Self {
+        Self {
+            bytes,
+            descriptors: Some(descriptors),
+        }
+    }
+
+    fn fd_count(&self) -> usize {
+        self.descriptors.as_ref().map(Descriptors::len).unwrap_or(0)
+    }
+}
+
 struct Queue {
-    frames: VecDeque<Vec<u8>>,
+    frames: VecDeque<QueuedFrame>,
     /// Bytes sitting in `frames`.
     bytes: usize,
     /// Bytes the writer has taken and not yet finished writing.
@@ -134,6 +268,11 @@ struct Queue {
     /// let a peer hold one more than the backstop allows — the byte ceiling
     /// learned to count the writer's frame and the count ceiling did not.
     in_flight_frames: usize,
+    /// Descriptor attachments in the deque and in the writer's hands. The
+    /// underlying broker fd may be shared by broadcast clones, but each queue
+    /// is bounded on what it will try to attach for its own recipient.
+    fds: usize,
+    in_flight_fds: usize,
     /// Refuses new frames. Set by `seal` and by `close`.
     accepting: bool,
     /// Nothing more will be written at all; `take` gives up rather than
@@ -150,6 +289,10 @@ impl Queue {
     /// How many frames it is holding, on the same principle.
     fn frames_held(&self) -> usize {
         self.frames.len().saturating_add(self.in_flight_frames)
+    }
+
+    fn fds_held(&self) -> usize {
+        self.fds.saturating_add(self.in_flight_fds)
     }
 }
 
@@ -178,6 +321,9 @@ pub struct Outbox {
     /// would let two of them hand the same caller two messages from the same
     /// sender carrying the same serial.
     next_serial: AtomicU32,
+    /// Whether this recipient completed `NEGOTIATE_UNIX_FD`. A sender may
+    /// negotiate independently, so forwarding checks the destination too.
+    unix_fd: AtomicBool,
 }
 
 impl Outbox {
@@ -189,6 +335,8 @@ impl Outbox {
                 bytes: 0,
                 in_flight: 0,
                 in_flight_frames: 0,
+                fds: 0,
+                in_flight_fds: 0,
                 accepting: true,
                 closed: false,
             }),
@@ -196,7 +344,16 @@ impl Outbox {
             written: Condvar::new(),
             total,
             next_serial: AtomicU32::new(1),
+            unix_fd: AtomicBool::new(false),
         }
+    }
+
+    pub fn set_unix_fd(&self, agreed: bool) {
+        self.unix_fd.store(agreed, Ordering::Release);
+    }
+
+    pub fn accepts_unix_fd(&self) -> bool {
+        self.unix_fd.load(Ordering::Acquire)
     }
 
     /// The next serial for a message the broker originates to this
@@ -210,7 +367,13 @@ impl Outbox {
     }
 
     /// Append a frame for the writer thread. Never blocks on the recipient.
+    #[cfg(test)]
     pub fn push(&self, frame: Vec<u8>) -> Result<(), Rejected> {
+        self.push_frame(QueuedFrame::plain(frame))
+    }
+
+    /// Append bytes and their descriptor ownership for the writer thread.
+    pub fn push_frame(&self, frame: QueuedFrame) -> Result<(), Rejected> {
         let mut queue = match self.queue.lock() {
             Ok(queue) => queue,
             // A poisoned queue belongs to a connection whose thread died
@@ -221,7 +384,8 @@ impl Outbox {
         if !queue.accepting {
             return Err(Rejected { why: Overflow::Closed, frame });
         }
-        let size = frame.len();
+        let size = frame.bytes.len();
+        let fds = frame.fd_count();
         // The empty-queue exception, so one legal message fits a connection
         // that is holding nothing. IN FLIGHT counts as holding: a frame the
         // writer is blocked on is this connection's memory just as much as one
@@ -230,12 +394,14 @@ impl Outbox {
         // left here.
         if queue.held() > 0
             && (queue.held().saturating_add(size) > MAX_OUTGOING_BYTES
-                || queue.frames_held() >= MAX_OUTGOING_MESSAGES)
+                || queue.frames_held() >= MAX_OUTGOING_MESSAGES
+                || queue.fds_held().saturating_add(fds) > MAX_OUTGOING_FDS)
         {
             return Err(Rejected {
                 why: Overflow::Connection {
                     bytes: queue.held(),
                     frames: queue.frames_held(),
+                    fds: queue.fds_held(),
                 },
                 frame,
             });
@@ -272,6 +438,7 @@ impl Outbox {
             }
         }
         queue.bytes = queue.bytes.saturating_add(size);
+        queue.fds = queue.fds.saturating_add(fds);
         queue.frames.push_back(frame);
         drop(queue);
         self.ready.notify_one();
@@ -285,6 +452,15 @@ impl Outbox {
     /// disconnects an innocent peer instead.
     pub fn pending(&self) -> usize {
         self.queue.lock().map(|queue| queue.held()).unwrap_or(0)
+    }
+
+    /// Descriptor attachments this connection is holding, queued or in the
+    /// writer's hands. This is the descriptor-budget analogue of `pending`.
+    pub fn pending_descriptors(&self) -> usize {
+        self.queue
+            .lock()
+            .map(|queue| queue.fds_held())
+            .unwrap_or(0)
     }
 
     /// Stop accepting, wake the writer, and take the socket down so a reader
@@ -306,6 +482,7 @@ impl Outbox {
             let dropped = queue.bytes;
             queue.frames.clear();
             queue.bytes = 0;
+            queue.fds = 0;
             let _ = self
                 .total
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
@@ -326,16 +503,20 @@ impl Outbox {
     ///
     /// Returns `None` when nothing more will ever be written: the outbox is
     /// closed, or it is sealed and the queue has run dry.
-    pub fn take(&self) -> Option<Vec<u8>> {
+    pub fn take(&self) -> Option<QueuedFrame> {
         let mut queue = self.queue.lock().ok()?;
         loop {
             if queue.closed {
                 return None;
             }
             if let Some(frame) = queue.frames.pop_front() {
-                queue.bytes = queue.bytes.saturating_sub(frame.len());
-                queue.in_flight = queue.in_flight.saturating_add(frame.len());
+                let size = frame.bytes.len();
+                let fds = frame.fd_count();
+                queue.bytes = queue.bytes.saturating_sub(size);
+                queue.in_flight = queue.in_flight.saturating_add(size);
                 queue.in_flight_frames = queue.in_flight_frames.saturating_add(1);
+                queue.fds = queue.fds.saturating_sub(fds);
+                queue.in_flight_fds = queue.in_flight_fds.saturating_add(fds);
                 return Some(frame);
             }
             if !queue.accepting {
@@ -363,11 +544,12 @@ impl Outbox {
     /// may have written the frame off, and giving it back twice would drift
     /// the bus's count DOWN, which is the direction that silently removes the
     /// ceiling.
-    pub fn finished(&self, size: usize) {
+    pub fn finished(&self, size: usize, fds: usize) {
         if let Ok(mut queue) = self.queue.lock() {
             let give = size.min(queue.in_flight);
             queue.in_flight = queue.in_flight.saturating_sub(give);
             queue.in_flight_frames = queue.in_flight_frames.saturating_sub(1);
+            queue.in_flight_fds = queue.in_flight_fds.saturating_sub(fds);
             let _ = self
                 .total
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
@@ -1550,6 +1732,26 @@ impl Bus {
         Some(name)
     }
 
+    /// Relieve the connection holding the most descriptor attachments when
+    /// the broker-wide open-descriptor budget is full. Without this analogue
+    /// of the byte remedy, stalled recipient writers spend the budget and the
+    /// next unrelated sender is the connection refused for it.
+    pub fn relieve_largest_descriptors(&self) -> Option<String> {
+        let (name, outbox) = {
+            let directory = self.directory.lock().ok()?;
+            let worst = directory
+                .peers
+                .iter()
+                .max_by_key(|peer| peer.outbox.pending_descriptors())?;
+            if worst.outbox.pending_descriptors() == 0 {
+                return None;
+            }
+            (worst.unique.clone(), Arc::clone(&worst.outbox))
+        };
+        outbox.close_and_settle(SETTLE);
+        Some(name)
+    }
+
     #[cfg(test)]
     pub(crate) fn queued_bytes(&self) -> usize {
         self.total_outgoing.load(Ordering::Acquire)
@@ -1632,7 +1834,7 @@ mod tests {
             }
         }
         match outbox.offer(vec![0u8; 1]) {
-            Err(Overflow::Connection { bytes, frames }) => {
+            Err(Overflow::Connection { bytes, frames, .. }) => {
                 assert!(
                     bytes < MAX_OUTGOING_BYTES,
                     "the count guard did not fire; the byte ceiling did"
@@ -1647,6 +1849,47 @@ mod tests {
                 );
             }
             other => panic!("the count guard did not fire: {other:?}"),
+        }
+    }
+
+    /// Tiny frames with descriptor attachments need their own ceiling: byte
+    /// and frame counts do not say how many kernel objects a stalled writer
+    /// is keeping live for its recipient.
+    #[test]
+    fn descriptor_attachments_are_bounded_per_recipient() {
+        let bus = Bus::new();
+        let (_client, server) = pair();
+        let outbox = bus.outbox_for(server);
+        for which in 0..MAX_OUTGOING_FDS {
+            let file = std::fs::File::open("/dev/null").expect("/dev/null");
+            let fd: OwnedFd = file.into();
+            let total = Arc::new(AtomicUsize::new(1));
+            let descriptors = Descriptors::new(
+                vec![fd],
+                DescriptorCharge::new(total, 1),
+            )
+            .expect("one descriptor and one charge");
+            if let Err(rejected) = outbox.push_frame(QueuedFrame::carrying(vec![0], descriptors)) {
+                panic!("descriptor frame {which} refused: {:?}", rejected.why);
+            }
+        }
+        let file = std::fs::File::open("/dev/null").expect("/dev/null");
+        let fd: OwnedFd = file.into();
+        let descriptors = Descriptors::new(
+            vec![fd],
+            DescriptorCharge::new(Arc::new(AtomicUsize::new(1)), 1),
+        )
+        .expect("one descriptor and one charge");
+        match outbox.push_frame(QueuedFrame::carrying(vec![0], descriptors)) {
+            Err(Rejected {
+                why: Overflow::Connection { bytes, frames, fds },
+                ..
+            }) => {
+                assert_eq!(bytes, MAX_OUTGOING_FDS);
+                assert_eq!(frames, MAX_OUTGOING_FDS);
+                assert_eq!(fds, MAX_OUTGOING_FDS);
+            }
+            other => panic!("the descriptor attachment ceiling did not fire: {other:?}"),
         }
     }
 
@@ -1668,7 +1911,7 @@ mod tests {
         // The writer takes one. The deque is one shorter; what the connection
         // is holding is not.
         let taken = outbox.take().expect("a frame to write");
-        assert_eq!(taken.len(), 1);
+        assert_eq!(taken.bytes.len(), 1);
         assert!(
             matches!(
                 outbox.offer(vec![0u8; 1]),
@@ -1676,7 +1919,7 @@ mod tests {
             ),
             "taking a frame off the deque made room past the count ceiling"
         );
-        outbox.finished(1);
+        outbox.finished(1, 0);
         // And once it really is written, there is room again.
         assert!(outbox.offer(vec![0u8; 1]).is_ok());
     }
@@ -1791,11 +2034,11 @@ mod tests {
         let writing = Arc::clone(&outbox);
         let writer = std::thread::spawn(move || {
             while let Some(frame) = writing.take() {
-                let size = frame.len();
+                let size = frame.bytes.len();
                 let mut stream = writing.stream();
-                let outcome = stream.write_all(&frame);
+                let outcome = stream.write_all(&frame.bytes);
                 drop(frame);
-                writing.finished(size);
+                writing.finished(size, 0);
                 if outcome.is_err() {
                     return;
                 }
@@ -1868,11 +2111,11 @@ mod tests {
         let writing = Arc::clone(&outbox);
         let writer = std::thread::spawn(move || {
             while let Some(frame) = writing.take() {
-                let size = frame.len();
+                let size = frame.bytes.len();
                 let mut stream = writing.stream();
-                let outcome = stream.write_all(&frame);
+                let outcome = stream.write_all(&frame.bytes);
                 drop(frame);
-                writing.finished(size);
+                writing.finished(size, 0);
                 if outcome.is_err() {
                     return;
                 }
@@ -1928,7 +2171,7 @@ mod tests {
         );
 
         drop(frame);
-        outbox.finished(4096);
+        outbox.finished(4096, 0);
         assert_eq!(bus.queued_bytes(), 0, "the writer's release did not land");
     }
 
@@ -1976,11 +2219,11 @@ mod tests {
             let writing = Arc::clone(&outbox);
             writers.push(std::thread::spawn(move || {
                 while let Some(frame) = writing.take() {
-                    let size = frame.len();
+                    let size = frame.bytes.len();
                     let mut stream = writing.stream();
-                    let outcome = stream.write_all(&frame);
+                    let outcome = stream.write_all(&frame.bytes);
                     drop(frame);
-                    writing.finished(size);
+                    writing.finished(size, 0);
                     if outcome.is_err() {
                         return;
                     }
@@ -2087,7 +2330,7 @@ mod tests {
         let writer = std::thread::spawn(move || {
             while let Some(frame) = writing.take() {
                 let mut stream = writing.stream();
-                if stream.write_all(&frame).is_err() {
+                if stream.write_all(&frame.bytes).is_err() {
                     return;
                 }
             }
