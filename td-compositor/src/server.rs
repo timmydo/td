@@ -4,8 +4,9 @@ use crate::layout::ViewLayout;
 use crate::pointer::{PointerEvent, PointerSnapshot, RoutedPointerFrame};
 use crate::positioner::{Anchor, Gravity, Positioner, Rect as PositionerRect};
 use crate::runtime::{
-    DataSourceIdentity, KeyboardDelivery, KeyboardSubscriptionStop, PopupRegistration,
-    PopupRegistrations, Runtime, SelectionSource, SelectionUpdate, SubscriptionStop,
+    DataSourceIdentity, ForeignImportIdentity, KeyboardDelivery, KeyboardSubscriptionStop,
+    PopupRegistration, PopupRegistrations, Runtime, SelectionSource, SelectionUpdate,
+    SubscriptionStop, ToplevelParentError,
 };
 use crate::scene::{
     CursorRequest, InputRegion, PopupPlacement, SharedInputRegion, Surface, SurfaceKey,
@@ -17,7 +18,7 @@ use crate::scene::{GAP, TITLE_HEIGHT};
 use crate::{socket, sys, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions, Permissions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, RawFd};
 #[cfg(test)]
@@ -40,6 +41,8 @@ const GLOBAL_SEAT: u32 = 5;
 const GLOBAL_DECORATION: u32 = 6;
 const GLOBAL_SUBCOMPOSITOR: u32 = 7;
 const GLOBAL_DATA_DEVICE_MANAGER: u32 = 8;
+const GLOBAL_XDG_EXPORTER: u32 = 9;
+const GLOBAL_XDG_IMPORTER: u32 = 10;
 const WL_DISPLAY_ERROR_IMPLEMENTATION: u32 = 3;
 /// Three of `xdg_surface.error`, each named by the protocol for exactly the
 /// mistake it is raised for: a request to an xdg_surface that has no role
@@ -55,6 +58,7 @@ const XDG_SURFACE_ERROR_NOT_CONSTRUCTED: u32 = 1;
 const XDG_SURFACE_ERROR_ALREADY_CONSTRUCTED: u32 = 2;
 const XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER: u32 = 3;
 const XDG_SURFACE_ERROR_INVALID_SIZE: u32 = 5;
+const XDG_TOPLEVEL_ERROR_INVALID_PARENT: u32 = 1;
 /// `invalid_input` is the positioner's own error and is raised ON the
 /// positioner, since that is the object the client got wrong. The five
 /// `xdg_wm_base` codes belong to the SHELL object and are raised on it
@@ -96,6 +100,9 @@ const WL_DATA_SOURCE_CANCELLED: u16 = 2;
 const WL_DATA_DEVICE_DATA_OFFER: u16 = 0;
 const WL_DATA_DEVICE_SELECTION: u16 = 5;
 const WL_DATA_OFFER_OFFER: u16 = 0;
+const XDG_FOREIGN_ERROR_INVALID_SURFACE: u32 = 0;
+const XDG_EXPORTED_HANDLE: u16 = 0;
+const XDG_IMPORTED_DESTROYED: u16 = 0;
 /// `wl_pointer.axis_source`'s `wheel`. The other three sources — finger,
 /// continuous, wheel tilt — describe devices this compositor does not read,
 /// and naming one it cannot tell apart would be worse than the silence a
@@ -161,6 +168,8 @@ const MAX_DATA_SOURCE_MIME_TYPES: usize = 64;
 const MAX_DATA_SOURCE_MIME_BYTES: usize = 16 * 1024;
 const MAX_MIME_TYPE_BYTES: usize = 256;
 const DATA_DEVICE_MANAGER_VERSION: u32 = 3;
+const XDG_FOREIGN_VERSION: u32 = 1;
+const MAX_FOREIGN_HANDLE_BYTES: usize = 128;
 const DND_ACTION_MASK: u32 = 1 | 2 | 4;
 
 static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
@@ -168,6 +177,7 @@ static NEXT_SERIAL: AtomicU64 = AtomicU64::new(1);
 static NEXT_BUFFER_SERIAL: AtomicU64 = AtomicU64::new(1);
 static NEXT_KEYMAP_FILE: AtomicU64 = AtomicU64::new(1);
 static NEXT_DATA_SOURCE: AtomicU64 = AtomicU64::new(1);
+static NEXT_FOREIGN_IMPORT: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_CLIENTS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
@@ -352,6 +362,7 @@ impl DataObjectState {
 }
 
 type SharedDataObjects = Arc<DataObjectState>;
+type SharedForeignImports = Arc<Mutex<BTreeMap<u32, u64>>>;
 
 #[derive(Clone, Default)]
 struct SurfaceState {
@@ -417,6 +428,14 @@ enum Object {
     },
     DataDevice {
         version: u32,
+    },
+    XdgExporter,
+    XdgExported {
+        handle: String,
+    },
+    XdgImporter,
+    XdgImported {
+        identity: ForeignImportIdentity,
     },
     XdgWmBase,
     XdgSurface {
@@ -607,6 +626,7 @@ struct Client {
     pointer_active: Arc<AtomicBool>,
     data_device_active: Arc<AtomicBool>,
     data_objects: SharedDataObjects,
+    foreign_imports: SharedForeignImports,
     pending_deletes: PendingDeletes,
     objects: BTreeMap<u32, Object>,
     /// Events produced while the runtime lock is held for one compound commit.
@@ -665,6 +685,14 @@ fn next_serial() -> u32 {
     let value = NEXT_SERIAL.fetch_add(1, Ordering::Relaxed);
     let folded = value % u64::from(u32::MAX);
     u32::try_from(folded).unwrap_or(1).max(1)
+}
+
+fn foreign_handle() -> Result<String, String> {
+    let mut bytes = [0u8; 16];
+    File::open("/dev/urandom")
+        .and_then(|mut random| random.read_exact(&mut bytes))
+        .map_err(|error| format!("read xdg-foreign handle randomness: {error}"))?;
+    Ok(format!("{:032x}", u128::from_ne_bytes(bytes)))
 }
 
 fn configure_state_bytes(state: ToplevelState) -> Vec<u8> {
@@ -1422,6 +1450,34 @@ fn send_data_source_data(
         .send_with_fd(&message, file.0.as_raw_fd())
 }
 
+fn send_foreign_destroyed(
+    imports: &SharedForeignImports,
+    outbound: &Arc<Mutex<Outbound>>,
+    identities: &[ForeignImportIdentity],
+) -> Result<(), String> {
+    let mut imports = imports
+        .lock()
+        .map_err(|_| "xdg-foreign import registration lock poisoned".to_string())?;
+    let mut messages = Vec::new();
+    for identity in identities {
+        if imports.get(&identity.object).copied() != Some(identity.generation) {
+            continue;
+        }
+        imports.remove(&identity.object);
+        messages.push(wire::Builder::new().message(identity.object, XDG_IMPORTED_DESTROYED)?);
+    }
+    if messages.is_empty() {
+        return Ok(());
+    }
+    let mut outbound = outbound
+        .lock()
+        .map_err(|_| "Wayland outbound lock poisoned".to_string())?;
+    for message in messages {
+        outbound.send(&message)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn seat_worker(
     receiver: Receiver<KeyboardDelivery>,
@@ -1432,6 +1488,7 @@ fn seat_worker(
     pointer_authority: PointerAuthority,
     pending_deletes: PendingDeletes,
     data: SharedDataObjects,
+    foreign_imports: SharedForeignImports,
     outbound: Arc<Mutex<Outbound>>,
 ) -> Result<(), String> {
     while let Ok(delivery) = receiver.recv() {
@@ -1529,6 +1586,17 @@ fn seat_worker(
                 }
                 continue;
             }
+            KeyboardDelivery::ForeignDestroyed(identities) => {
+                send_foreign_destroyed(&foreign_imports, &outbound, &identities)?;
+                if outbound
+                    .lock()
+                    .map_err(|_| "Wayland outbound lock poisoned".to_string())?
+                    .disconnected
+                {
+                    return Ok(());
+                }
+                continue;
+            }
             KeyboardDelivery::PopupDone { surface, popup } => {
                 dismiss_from_seat(surface, popup, &popups, &outbound)?;
                 if outbound
@@ -1579,6 +1647,7 @@ fn supervise_seat_worker(
     pointer_authority: PointerAuthority,
     pending_deletes: PendingDeletes,
     data: SharedDataObjects,
+    foreign_imports: SharedForeignImports,
     outbound: Arc<Mutex<Outbound>>,
 ) -> Result<(), String> {
     let result = seat_worker(
@@ -1590,6 +1659,7 @@ fn supervise_seat_worker(
         pointer_authority,
         pending_deletes,
         data,
+        foreign_imports,
         Arc::clone(&outbound),
     );
     if let Err(error) = &result {
@@ -1650,6 +1720,7 @@ impl Client {
             pointer_active: Arc::new(AtomicBool::new(false)),
             data_device_active: Arc::new(AtomicBool::new(false)),
             data_objects: Arc::new(DataObjectState::new(DataObjects::default())),
+            foreign_imports: Arc::new(Mutex::new(BTreeMap::new())),
             pending_deletes: Arc::new(Mutex::new(BTreeMap::new())),
             objects,
             deferred_outbound: None,
@@ -2793,6 +2864,220 @@ impl Client {
         self.delete_id(id)
     }
 
+    fn is_toplevel_surface(&self, surface: u32) -> bool {
+        let Some(Object::Surface(SurfaceState {
+            role: Some(SurfaceRole::Xdg(xdg_surface)),
+            ..
+        })) = self.objects.get(&surface)
+        else {
+            return false;
+        };
+        matches!(
+            self.objects.get(xdg_surface),
+            Some(Object::XdgSurface {
+                role_object: Some(RoleObject::Toplevel(_)),
+                ..
+            })
+        )
+    }
+
+    fn create_foreign_export(
+        &mut self,
+        exporter: u32,
+        object: u32,
+        surface: u32,
+    ) -> Result<(), String> {
+        if !self.is_toplevel_surface(surface) {
+            return self.fail_protocol_on(
+                exporter,
+                XDG_FOREIGN_ERROR_INVALID_SURFACE,
+                &format!("zxdg_exporter_v2 references non-toplevel wl_surface {surface}"),
+            );
+        }
+        let handle = foreign_handle()?;
+        self.insert(
+            object,
+            Object::XdgExported {
+                handle: handle.clone(),
+            },
+        )?;
+        let registered = self
+            .runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .export_foreign_toplevel(
+                SurfaceKey {
+                    client: self.id,
+                    object: surface,
+                },
+                handle.clone(),
+            );
+        if let Err(error) = registered {
+            self.objects.remove(&object);
+            return Err(error);
+        }
+        let mut event = wire::Builder::new();
+        event.string(&handle)?;
+        self.send(object, XDG_EXPORTED_HANDLE, event)
+    }
+
+    fn destroy_foreign_export(&mut self, object: u32, handle: &str) -> Result<(), String> {
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .destroy_foreign_export(handle);
+        self.remove_object(object)
+    }
+
+    fn create_foreign_import(&mut self, object: u32, handle: String) -> Result<(), String> {
+        let identity = ForeignImportIdentity {
+            client: self.id,
+            object,
+            generation: NEXT_FOREIGN_IMPORT.fetch_add(1, Ordering::Relaxed),
+        };
+        self.insert(object, Object::XdgImported { identity })?;
+        self.foreign_imports
+            .lock()
+            .map_err(|_| "xdg-foreign import registration lock poisoned".to_string())?
+            .insert(object, identity.generation);
+        let imported = if handle.len() <= MAX_FOREIGN_HANDLE_BYTES {
+            self.runtime
+                .lock()
+                .map_err(|_| "runtime lock poisoned".to_string())?
+                .import_foreign_toplevel(identity, &handle)?
+        } else {
+            false
+        };
+        if imported {
+            return Ok(());
+        }
+        self.foreign_imports
+            .lock()
+            .map_err(|_| "xdg-foreign import registration lock poisoned".to_string())?
+            .remove(&object);
+        self.send(object, XDG_IMPORTED_DESTROYED, wire::Builder::new())
+    }
+
+    fn destroy_foreign_import(
+        &mut self,
+        object: u32,
+        identity: ForeignImportIdentity,
+    ) -> Result<(), String> {
+        let mut imports = self
+            .foreign_imports
+            .lock()
+            .map_err(|_| "xdg-foreign import registration lock poisoned".to_string())?;
+        if imports.get(&object).copied() == Some(identity.generation) {
+            imports.remove(&object);
+        }
+        drop(imports);
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .destroy_foreign_import(identity);
+        self.remove_object(object)
+    }
+
+    fn set_foreign_parent(
+        &mut self,
+        imported: u32,
+        identity: ForeignImportIdentity,
+        surface: u32,
+    ) -> Result<(), String> {
+        // A destroyed event makes the imported object inert. Requests which
+        // were already queued behind the revocation are ignored, including a
+        // stale or otherwise invalid child id.
+        if !self
+            .runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .foreign_import_is_live(identity)
+        {
+            return Ok(());
+        }
+        if !self.is_toplevel_surface(surface) {
+            return self.fail_protocol_on(
+                imported,
+                XDG_FOREIGN_ERROR_INVALID_SURFACE,
+                &format!("zxdg_imported_v2 references non-toplevel wl_surface {surface}"),
+            );
+        }
+        let result = self
+            .runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .set_foreign_parent(
+                identity,
+                SurfaceKey {
+                    client: self.id,
+                    object: surface,
+                },
+            );
+        match result {
+            Ok(_) => Ok(()),
+            Err(ToplevelParentError::InvalidParent) => self.fail_protocol_on(
+                imported,
+                XDG_FOREIGN_ERROR_INVALID_SURFACE,
+                &format!("zxdg_imported_v2 {imported} creates a toplevel parent cycle"),
+            ),
+            Err(ToplevelParentError::Failed(error)) => Err(error),
+        }
+    }
+
+    fn toplevel_surface(&self, toplevel: u32) -> Option<u32> {
+        let Object::XdgToplevel { xdg_surface, .. } = self.objects.get(&toplevel)? else {
+            return None;
+        };
+        let Object::XdgSurface { surface, .. } = self.objects.get(xdg_surface)? else {
+            return None;
+        };
+        Some(*surface)
+    }
+
+    fn set_local_parent(
+        &mut self,
+        toplevel: u32,
+        xdg_surface: u32,
+        parent: u32,
+    ) -> Result<(), String> {
+        let Some(Object::XdgSurface { surface, .. }) = self.objects.get(&xdg_surface) else {
+            return Err(format!(
+                "xdg_toplevel {toplevel} lost xdg_surface {xdg_surface}"
+            ));
+        };
+        let child = SurfaceKey {
+            client: self.id,
+            object: *surface,
+        };
+        let parent = if parent == 0 {
+            None
+        } else {
+            let Some(surface) = self.toplevel_surface(parent) else {
+                return Err(format!(
+                    "xdg_toplevel {toplevel} references non-toplevel parent {parent}"
+                ));
+            };
+            Some(SurfaceKey {
+                client: self.id,
+                object: surface,
+            })
+        };
+        let result = self
+            .runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .set_local_parent(child, parent);
+        match result {
+            Ok(_) => Ok(()),
+            Err(ToplevelParentError::InvalidParent) => self.fail_protocol_on(
+                toplevel,
+                XDG_TOPLEVEL_ERROR_INVALID_PARENT,
+                &format!("xdg_toplevel {toplevel} names itself or a descendant as parent"),
+            ),
+            Err(ToplevelParentError::Failed(error)) => Err(error),
+        }
+    }
+
     fn insert(&mut self, id: u32, object: Object) -> Result<(), String> {
         if id <= 1 {
             return Err(format!("new object id {id} is reserved"));
@@ -2863,6 +3148,18 @@ impl Client {
             "wl_data_device_manager",
             DATA_DEVICE_MANAGER_VERSION,
         )?;
+        self.global(
+            registry,
+            GLOBAL_XDG_EXPORTER,
+            "zxdg_exporter_v2",
+            XDG_FOREIGN_VERSION,
+        )?;
+        self.global(
+            registry,
+            GLOBAL_XDG_IMPORTER,
+            "zxdg_importer_v2",
+            XDG_FOREIGN_VERSION,
+        )?;
         self.global(registry, GLOBAL_SEAT, "wl_seat", SEAT_VERSION)
     }
 
@@ -2915,6 +3212,12 @@ impl Client {
                 if (1..=DATA_DEVICE_MANAGER_VERSION).contains(&version) =>
             {
                 self.insert(id, Object::DataDeviceManager { version })
+            }
+            (GLOBAL_XDG_EXPORTER, "zxdg_exporter_v2") if version == XDG_FOREIGN_VERSION => {
+                self.insert(id, Object::XdgExporter)
+            }
+            (GLOBAL_XDG_IMPORTER, "zxdg_importer_v2") if version == XDG_FOREIGN_VERSION => {
+                self.insert(id, Object::XdgImporter)
             }
             _ => Err(format!(
                 "global {name} does not provide {interface} version {version}"
@@ -4773,6 +5076,63 @@ impl Client {
                     message.opcode
                 )),
             },
+            Object::XdgExporter => match message.opcode {
+                0 => {
+                    args.finish()?;
+                    self.remove_object(message.object)
+                }
+                1 => {
+                    let object = args.u32()?;
+                    let surface = args.u32()?;
+                    args.finish()?;
+                    self.create_foreign_export(message.object, object, surface)
+                }
+                _ => Err(format!(
+                    "unsupported zxdg_exporter_v2 request {}",
+                    message.opcode
+                )),
+            },
+            Object::XdgExported { handle } => match message.opcode {
+                0 => {
+                    args.finish()?;
+                    self.destroy_foreign_export(message.object, &handle)
+                }
+                _ => Err(format!(
+                    "unsupported zxdg_exported_v2 request {}",
+                    message.opcode
+                )),
+            },
+            Object::XdgImporter => match message.opcode {
+                0 => {
+                    args.finish()?;
+                    self.remove_object(message.object)
+                }
+                1 => {
+                    let object = args.u32()?;
+                    let handle = args.string()?;
+                    args.finish()?;
+                    self.create_foreign_import(object, handle)
+                }
+                _ => Err(format!(
+                    "unsupported zxdg_importer_v2 request {}",
+                    message.opcode
+                )),
+            },
+            Object::XdgImported { identity } => match message.opcode {
+                0 => {
+                    args.finish()?;
+                    self.destroy_foreign_import(message.object, identity)
+                }
+                1 => {
+                    let surface = args.u32()?;
+                    args.finish()?;
+                    self.set_foreign_parent(message.object, identity, surface)
+                }
+                _ => Err(format!(
+                    "unsupported zxdg_imported_v2 request {}",
+                    message.opcode
+                )),
+            },
             Object::XdgWmBase => match message.opcode {
                 0 => {
                     args.finish()?;
@@ -5526,8 +5886,9 @@ impl Client {
                     Ok(())
                 }
                 1 => {
-                    args.u32()?;
-                    args.finish()
+                    let parent = args.u32()?;
+                    args.finish()?;
+                    self.set_local_parent(message.object, xdg_surface, parent)
                 }
                 // set_title. Kept, where set_app_id below is still read for
                 // wire validity and dropped: the title is what a title bar
@@ -5743,6 +6104,7 @@ fn serve_client(
     let pointer_authority = Arc::clone(&client.pointer_authority);
     let pending_deletes = Arc::clone(&client.pending_deletes);
     let data_objects = Arc::clone(&client.data_objects);
+    let foreign_imports = Arc::clone(&client.foreign_imports);
     let outbound = Arc::clone(&client.outbound);
     let worker_outbound = Arc::clone(&outbound);
     let seat_thread = match thread::Builder::new()
@@ -5758,6 +6120,7 @@ fn serve_client(
                 pointer_authority,
                 pending_deletes,
                 data_objects,
+                foreign_imports,
                 worker_outbound,
             )
         }) {
@@ -5971,7 +6334,7 @@ mod tests {
     /// them read the next message as a global and hang waiting for it.
     /// `the_registry_advertises_exactly_the_globals_td_serves` is what ties the
     /// two together.
-    const GLOBAL_COUNT: usize = 8;
+    const GLOBAL_COUNT: usize = 10;
 
     fn receive_messages(stream: &mut UnixStream, count: usize) -> Vec<wire::Message> {
         let mut bytes = Vec::new();
@@ -6916,6 +7279,7 @@ mod tests {
                 Arc::new(Mutex::new(None)),
                 worker_pending_deletes,
                 Arc::new(DataObjectState::new(DataObjects::default())),
+                Arc::new(Mutex::new(BTreeMap::new())),
                 worker_outbound,
             )
         });
@@ -7057,6 +7421,7 @@ mod tests {
                 worker_authority,
                 worker_pending_deletes,
                 Arc::new(DataObjectState::new(DataObjects::default())),
+                Arc::new(Mutex::new(BTreeMap::new())),
                 worker_outbound,
             )
         });
@@ -7268,6 +7633,7 @@ mod tests {
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(BTreeMap::new())),
                 Arc::new(DataObjectState::new(DataObjects::default())),
+                Arc::new(Mutex::new(BTreeMap::new())),
                 worker_outbound,
             )
         });
@@ -7422,6 +7788,7 @@ mod tests {
                 worker_authority,
                 Arc::new(Mutex::new(BTreeMap::new())),
                 Arc::new(DataObjectState::new(DataObjects::default())),
+                Arc::new(Mutex::new(BTreeMap::new())),
                 worker_outbound,
             )
         });
@@ -7823,6 +8190,7 @@ mod tests {
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(DataObjectState::new(DataObjects::default())),
+            Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(Mutex::new(Outbound {
                 stream: server,
                 disconnected: false,
@@ -7892,6 +8260,7 @@ mod tests {
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(DataObjectState::new(DataObjects::default())),
+            Arc::new(Mutex::new(BTreeMap::new())),
             Arc::clone(&outbound),
         )
         .unwrap_err();
@@ -7929,6 +8298,7 @@ mod tests {
             Arc::new(Mutex::new(None)),
             Arc::clone(&pending),
             Arc::new(DataObjectState::new(DataObjects::default())),
+            Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(Mutex::new(Outbound {
                 stream: server,
                 disconnected: false,
@@ -8580,6 +8950,47 @@ mod tests {
         (client, peer, runtime, framebuffer_path)
     }
 
+    fn install_foreign_toplevel(
+        client: &mut Client,
+        surface: u32,
+        xdg_surface: u32,
+        toplevel: u32,
+        wm_base: u32,
+    ) {
+        client
+            .insert(
+                surface,
+                Object::Surface(SurfaceState {
+                    role: Some(SurfaceRole::Xdg(xdg_surface)),
+                    ..SurfaceState::default()
+                }),
+            )
+            .unwrap();
+        client.insert(wm_base, Object::XdgWmBase).unwrap();
+        client
+            .insert(
+                xdg_surface,
+                Object::XdgSurface {
+                    surface,
+                    wm_base,
+                    role_object: Some(RoleObject::Toplevel(toplevel)),
+                    assigned: Some(RoleKind::Toplevel),
+                    configure: Arc::new(Mutex::new(ConfigureTracker::new())),
+                    pending_geometry: None,
+                },
+            )
+            .unwrap();
+        client
+            .insert(
+                toplevel,
+                Object::XdgToplevel {
+                    xdg_surface,
+                    decoration: None,
+                },
+            )
+            .unwrap();
+    }
+
     /// `get_toplevel_decoration(id, toplevel)` on the manager at object 11.
     fn get_decoration(client: &mut Client, id: u32, toplevel: u32) -> Result<(), String> {
         let mut request_body = wire::Builder::new();
@@ -8652,10 +9063,380 @@ mod tests {
                     "wl_data_device_manager".to_string(),
                     DATA_DEVICE_MANAGER_VERSION
                 ),
+                (
+                    GLOBAL_XDG_EXPORTER,
+                    "zxdg_exporter_v2".to_string(),
+                    XDG_FOREIGN_VERSION
+                ),
+                (
+                    GLOBAL_XDG_IMPORTER,
+                    "zxdg_importer_v2".to_string(),
+                    XDG_FOREIGN_VERSION
+                ),
                 (GLOBAL_SEAT, "wl_seat".to_string(), SEAT_VERSION),
             ]
         );
 
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    #[test]
+    fn xdg_foreign_parents_across_clients_and_revokes_on_the_wire() {
+        let stem = format!(
+            "td-wayland-foreign-wire-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (owner_stream, mut owner_peer) = UnixStream::pair().unwrap();
+        let (importer_stream, mut importer_peer) = UnixStream::pair().unwrap();
+        owner_peer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        importer_peer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut owner = Client::new(
+            1,
+            owner_stream,
+            Arc::clone(&runtime),
+            test_keymap(),
+        )
+        .unwrap();
+        let mut importer = Client::new(
+            2,
+            importer_stream,
+            Arc::clone(&runtime),
+            test_keymap(),
+        )
+        .unwrap();
+        install_foreign_toplevel(&mut owner, 5, 6, 7, 8);
+        install_foreign_toplevel(&mut importer, 5, 6, 7, 8);
+        {
+            let mut runtime = runtime.lock().unwrap();
+            runtime
+                .commit(
+                    SurfaceKey {
+                        client: 1,
+                        object: 5,
+                    },
+                    Surface {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![1, 2, 3, 0],
+                        format: SHM_XRGB8888,
+                    },
+                )
+                .unwrap();
+            runtime
+                .commit(
+                    SurfaceKey {
+                        client: 2,
+                        object: 5,
+                    },
+                    Surface {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![4, 5, 6, 0],
+                        format: SHM_XRGB8888,
+                    },
+                )
+                .unwrap();
+        }
+        owner.insert(20, Object::XdgExporter).unwrap();
+        importer.insert(20, Object::XdgImporter).unwrap();
+
+        let subscription = runtime.lock().unwrap().subscribe_keyboard(2).unwrap();
+        let (receiver, stop) = subscription.split();
+        let worker_stop = stop.clone();
+        let worker = thread::spawn({
+            let imports = Arc::clone(&importer.foreign_imports);
+            let outbound = Arc::clone(&importer.outbound);
+            move || {
+                seat_worker(
+                    receiver,
+                    worker_stop,
+                    Arc::new(Mutex::new(BTreeMap::new())),
+                    Arc::new(Mutex::new(BTreeMap::new())),
+                    Arc::new(Mutex::new(BTreeMap::new())),
+                    Arc::new(Mutex::new(None)),
+                    Arc::new(Mutex::new(BTreeMap::new())),
+                    Arc::new(DataObjectState::new(DataObjects::default())),
+                    imports,
+                    outbound,
+                )
+            }
+        });
+
+        let mut export = wire::Builder::new();
+        export.u32(21);
+        export.u32(5);
+        owner
+            .dispatch(request(20, 1, export).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let handles = receive_messages(&mut owner_peer, 1);
+        let handle_event = handles.first().unwrap();
+        assert_eq!((handle_event.object, handle_event.opcode), (21, XDG_EXPORTED_HANDLE));
+        let mut payload = wire::Cursor::new(&handle_event.payload);
+        let handle = payload.string().unwrap();
+        payload.finish().unwrap();
+        assert_eq!(handle.len(), 32);
+        assert!(handle.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        let mut import = wire::Builder::new();
+        import.u32(21);
+        import.string(&handle).unwrap();
+        importer
+            .dispatch(request(20, 1, import).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut parent = wire::Builder::new();
+        parent.u32(5);
+        importer
+            .dispatch(request(21, 1, parent).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert_eq!(
+            runtime.lock().unwrap().effective_toplevel_parent(SurfaceKey {
+                client: 2,
+                object: 5,
+            }),
+            Some(SurfaceKey {
+                client: 1,
+                object: 5,
+            })
+        );
+        assert_eq!(
+            runtime.lock().unwrap().focused_toplevel(),
+            Some(SurfaceKey {
+                client: 2,
+                object: 5,
+            })
+        );
+
+        owner
+            .dispatch(
+                request(21, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        let destroyed = receive_messages(&mut importer_peer, 1);
+        let destroyed = destroyed.first().unwrap();
+        assert_eq!(
+            (destroyed.object, destroyed.opcode),
+            (21, XDG_IMPORTED_DESTROYED)
+        );
+        assert!(destroyed.payload.is_empty());
+
+        stop.stop();
+        runtime.lock().unwrap().unsubscribe_keyboard(2);
+        worker.join().unwrap().unwrap();
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    #[test]
+    fn local_toplevel_parent_replaces_unsets_and_rejects_cycles_on_the_wire() {
+        let (mut client, _peer, runtime, framebuffer_path) =
+            toplevel_fixture("local-toplevel-parent");
+        install_foreign_toplevel(&mut client, 12, 13, 14, 15);
+        {
+            let mut runtime = runtime.lock().unwrap();
+            for (object, color) in [(5, [1, 2, 3, 0]), (12, [4, 5, 6, 0])] {
+                runtime
+                    .commit(
+                        SurfaceKey {
+                            client: 88,
+                            object,
+                        },
+                        Surface {
+                            width: 1,
+                            height: 1,
+                            pixels: color.to_vec(),
+                            format: SHM_XRGB8888,
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+
+        let mut set_parent = wire::Builder::new();
+        set_parent.u32(14);
+        client
+            .dispatch(request(10, 1, set_parent).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert_eq!(
+            runtime.lock().unwrap().effective_toplevel_parent(SurfaceKey {
+                client: 88,
+                object: 5,
+            }),
+            Some(SurfaceKey {
+                client: 88,
+                object: 12,
+            })
+        );
+
+        let mut unset = wire::Builder::new();
+        unset.u32(0);
+        client
+            .dispatch(request(10, 1, unset).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert_eq!(
+            runtime.lock().unwrap().effective_toplevel_parent(SurfaceKey {
+                client: 88,
+                object: 5,
+            }),
+            None
+        );
+
+        let mut restore = wire::Builder::new();
+        restore.u32(14);
+        client
+            .dispatch(request(10, 1, restore).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut cycle = wire::Builder::new();
+        cycle.u32(10);
+        let error = client
+            .dispatch(request(14, 1, cycle).unwrap(), &mut VecDeque::new())
+            .unwrap_err();
+        assert!(error.contains("parent"));
+        assert_eq!(client.protocol_error_object, Some(14));
+        assert_eq!(client.protocol_error_code, XDG_TOPLEVEL_ERROR_INVALID_PARENT);
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    #[test]
+    fn an_unknown_or_oversized_foreign_handle_is_immediately_destroyed() {
+        let (mut client, mut peer, _runtime, framebuffer_path) =
+            toplevel_fixture("foreign-invalid-handle");
+        client.insert(20, Object::XdgImporter).unwrap();
+        for (object, handle) in [
+            (21, "unknown".to_string()),
+            (22, "x".repeat(MAX_FOREIGN_HANDLE_BYTES.saturating_add(1))),
+        ] {
+            let mut import = wire::Builder::new();
+            import.u32(object);
+            import.string(&handle).unwrap();
+            client
+                .dispatch(request(20, 1, import).unwrap(), &mut VecDeque::new())
+                .unwrap();
+            let destroyed = receive_messages(&mut peer, 1);
+            let destroyed = destroyed.first().unwrap();
+            assert_eq!(
+                (destroyed.object, destroyed.opcode),
+                (object, XDG_IMPORTED_DESTROYED)
+            );
+            assert!(destroyed.payload.is_empty());
+        }
+        let mut stale_parent = wire::Builder::new();
+        stale_parent.u32(999);
+        client
+            .dispatch(
+                request(22, 1, stale_parent).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    #[test]
+    fn xdg_foreign_rejects_surfaces_that_are_not_toplevels() {
+        let (mut client, _peer, runtime, framebuffer_path) =
+            toplevel_fixture("foreign-invalid-surface");
+        client.insert(20, Object::XdgExporter).unwrap();
+        client
+            .insert(30, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        let mut export = wire::Builder::new();
+        export.u32(21);
+        export.u32(30);
+        let error = client
+            .dispatch(request(20, 1, export).unwrap(), &mut VecDeque::new())
+            .unwrap_err();
+        assert!(error.contains("non-toplevel"));
+        assert_eq!(client.protocol_error_object, Some(20));
+        assert_eq!(client.protocol_error_code, XDG_FOREIGN_ERROR_INVALID_SURFACE);
+
+        client.protocol_error_object = None;
+        client.insert(22, Object::XdgImporter).unwrap();
+        runtime
+            .lock()
+            .unwrap()
+            .export_foreign_toplevel(
+                SurfaceKey {
+                    client: 1,
+                    object: 5,
+                },
+                "valid-parent".to_string(),
+            )
+            .unwrap();
+        let mut import = wire::Builder::new();
+        import.u32(23);
+        import.string("valid-parent").unwrap();
+        client
+            .dispatch(request(22, 1, import).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut parent = wire::Builder::new();
+        parent.u32(30);
+        let error = client
+            .dispatch(request(23, 1, parent).unwrap(), &mut VecDeque::new())
+            .unwrap_err();
+        assert!(error.contains("non-toplevel"));
+        assert_eq!(client.protocol_error_object, Some(23));
+        assert_eq!(client.protocol_error_code, XDG_FOREIGN_ERROR_INVALID_SURFACE);
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    #[test]
+    fn a_reused_import_id_does_not_receive_its_stale_destruction() {
+        let (mut client, mut peer, runtime, framebuffer_path) =
+            toplevel_fixture("foreign-import-generation");
+        client.insert(20, Object::XdgImporter).unwrap();
+        runtime
+            .lock()
+            .unwrap()
+            .export_foreign_toplevel(
+                SurfaceKey {
+                    client: 1,
+                    object: 5,
+                },
+                "live".to_string(),
+            )
+            .unwrap();
+        let create = |client: &mut Client| {
+            let mut import = wire::Builder::new();
+            import.u32(21);
+            import.string("live").unwrap();
+            client
+                .dispatch(request(20, 1, import).unwrap(), &mut VecDeque::new())
+                .unwrap();
+            match client.objects.get(&21) {
+                Some(Object::XdgImported { identity }) => *identity,
+                _ => panic!("imported object was not created"),
+            }
+        };
+        let stale = create(&mut client);
+        client
+            .dispatch(
+                request(21, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        let retired = receive_messages(&mut peer, 1);
+        assert_eq!((retired[0].object, retired[0].opcode), (1, 1));
+        let live = create(&mut client);
+        assert_ne!(stale.generation, live.generation);
+
+        send_foreign_destroyed(&client.foreign_imports, &client.outbound, &[stale]).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        assert!(drain_messages(&mut peer).is_empty());
+        peer.set_nonblocking(false).unwrap();
+        send_foreign_destroyed(&client.foreign_imports, &client.outbound, &[live]).unwrap();
+        let destroyed = receive_messages(&mut peer, 1);
+        assert_eq!(
+            (destroyed[0].object, destroyed[0].opcode),
+            (21, XDG_IMPORTED_DESTROYED)
+        );
         let _ = fs::remove_file(&framebuffer_path);
     }
 
@@ -9006,6 +9787,7 @@ mod tests {
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(BTreeMap::new())),
                 worker_data,
+                Arc::new(Mutex::new(BTreeMap::new())),
                 outbound,
             )
         });

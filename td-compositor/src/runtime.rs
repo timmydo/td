@@ -98,6 +98,10 @@ pub enum KeyboardDelivery {
         mime_type: String,
         file: TransferEndpoint,
     },
+    /// One runtime operation invalidated these imported xdg-foreign handles.
+    /// Each generation makes the queued batch harmless after the client
+    /// destroys and reuses an imported object's id.
+    ForeignDestroyed(Vec<ForeignImportIdentity>),
     /// One menu already taken down: tell its client. Named BOTH ways, and
     /// both are needed. The wl_surface is what the registrations are keyed on
     /// and what the scene places a popup by; the xdg_popup is what the event
@@ -119,6 +123,36 @@ pub struct DataSourceIdentity {
     pub client: u64,
     pub object: u32,
     pub generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ForeignImportIdentity {
+    pub client: u64,
+    pub object: u32,
+    pub generation: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum ToplevelParentError {
+    InvalidParent,
+    Failed(String),
+}
+
+struct ForeignExport {
+    surface: SurfaceKey,
+    imports: BTreeSet<ForeignImportIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToplevelParentSource {
+    Local,
+    Foreign(ForeignImportIdentity),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ToplevelParent {
+    source: ToplevelParentSource,
+    parent: SurfaceKey,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -304,6 +338,15 @@ pub struct Runtime {
     /// is transferring an offer between the focused client and its source.
     selection: Option<SelectionSource>,
     selection_revision: u64,
+    /// xdg-foreign handles are compositor-wide bearer capabilities. The
+    /// object maps stay on their owning client threads; this registry carries
+    /// only the cross-client identity and relationship needed to resolve one.
+    foreign_exports: BTreeMap<String, ForeignExport>,
+    foreign_imports: BTreeMap<ForeignImportIdentity, String>,
+    /// The effective xdg_toplevel parent, whether named by the local shell or
+    /// by xdg-foreign. One map is what makes either request replace the other
+    /// and gives mapping, focus, and unmapping lifecycle one answer to read.
+    toplevel_parents: BTreeMap<SurfaceKey, ToplevelParent>,
     pending_paint: bool,
     /// A compound-surface commit holds the runtime lock across every scene
     /// mutation and settles once. Calls made inside it record what they owe
@@ -373,6 +416,9 @@ impl Runtime {
             keyboard_subscribers: BTreeMap::new(),
             selection: None,
             selection_revision: 0,
+            foreign_exports: BTreeMap::new(),
+            foreign_imports: BTreeMap::new(),
+            toplevel_parents: BTreeMap::new(),
             pending_paint: false,
             compound_settle: None,
             dragging: None,
@@ -446,7 +492,8 @@ impl Runtime {
 
     #[cfg(test)]
     pub fn commit(&mut self, key: SurfaceKey, surface: Surface) -> Result<(), String> {
-        let layout_changed = self.scene.commit(key, surface)?;
+        let parent = self.toplevel_parent(key);
+        let layout_changed = self.scene.commit_parented(key, surface, parent)?;
         self.settle(layout_changed)
     }
 
@@ -475,7 +522,8 @@ impl Runtime {
         let mut painted = false;
         let mut aimed = false;
         if let Some(surface) = surface {
-            layout_changed = self.scene.commit(key, surface)?;
+            let parent = self.toplevel_parent(key);
+            layout_changed = self.scene.commit_parented(key, surface, parent)?;
             painted = true;
         }
         if let Some(input_region) = input_region {
@@ -758,7 +806,10 @@ impl Runtime {
     /// owed anywhere, so a step skipped here is lost outright. Failures are
     /// reported together rather than first-wins, as the overlay rollback
     /// paths report theirs.
-    fn settle(&mut self, layout_changed: bool) -> Result<(), String> {
+    fn settle(&mut self, mut layout_changed: bool) -> Result<(), String> {
+        if layout_changed {
+            layout_changed |= self.enforce_parent_layout();
+        }
         if let Some(compound) = self.compound_settle.as_mut() {
             compound.paint = true;
             compound.focus = true;
@@ -794,6 +845,10 @@ impl Runtime {
             .compound_settle
             .take()
             .ok_or_else(|| "runtime compound commit was not started".to_string())?;
+        let mut layout_changed = compound.layout_changed;
+        if layout_changed {
+            layout_changed |= self.enforce_parent_layout();
+        }
         let mut failures = Vec::new();
         if compound.paint {
             if let Err(error) = self.repaint() {
@@ -805,7 +860,7 @@ impl Runtime {
                 failures.push(error);
             }
         }
-        if compound.layout_changed && self.refresh_layout() {
+        if layout_changed && self.refresh_layout() {
             self.publish_layout();
         }
         if failures.is_empty() {
@@ -874,6 +929,11 @@ impl Runtime {
         self.scene.is_mapped(key)
     }
 
+    #[cfg(test)]
+    pub fn focused_toplevel(&self) -> Option<SurfaceKey> {
+        self.scene.focused()
+    }
+
     /// The xdg_toplevel went. Its wl_surface may not have.
     pub fn forget_title(&mut self, key: SurfaceKey) -> Result<(), String> {
         self.scene.forget_title(key);
@@ -899,21 +959,35 @@ impl Runtime {
     // `unmap_popup`'s reason above.
     pub fn remove(&mut self, key: SurfaceKey) -> Result<Vec<SurfaceKey>, String> {
         self.forget_drag(|dragged| dragged == key);
-        let (layout_changed, dropped) = self.scene.remove(key);
+        let reparented = self.reparent_around_unmap(key);
+        self.forget_foreign_surface(key);
+        let (mut layout_changed, dropped) = self.scene.remove(key);
+        for (child, parent) in reparented {
+            layout_changed |= self.scene.place_toplevel(child, parent);
+        }
         self.settle(layout_changed)?;
         Ok(dropped)
     }
 
     pub fn unmap(&mut self, key: SurfaceKey) -> Result<Vec<SurfaceKey>, String> {
         self.forget_drag(|dragged| dragged == key);
-        let (layout_changed, dropped) = self.scene.unmap(key);
+        let reparented = self.reparent_around_unmap(key);
+        let (mut layout_changed, dropped) = self.scene.unmap(key);
+        for (child, parent) in reparented {
+            layout_changed |= self.scene.place_toplevel(child, parent);
+        }
         self.settle(layout_changed)?;
         Ok(dropped)
     }
 
     pub fn remove_client(&mut self, client: u64) -> Result<(), String> {
         self.forget_drag(|dragged| dragged.client == client);
-        let layout_changed = self.scene.remove_client(client);
+        let reparented = self.reparent_around_client(client);
+        self.forget_foreign_client(client);
+        let mut layout_changed = self.scene.remove_client(client);
+        for (child, parent) in reparented {
+            layout_changed |= self.scene.place_toplevel(child, parent);
+        }
         self.settle(layout_changed)
     }
 
@@ -1422,6 +1496,7 @@ impl Runtime {
     }
 
     fn focus_surface(&mut self, key: SurfaceKey) -> Result<(), String> {
+        let key = self.topmost_parented(key);
         if !self.scene.focus_key(key) {
             return Ok(());
         }
@@ -1570,6 +1645,351 @@ impl Runtime {
 
     pub fn unregister_popups(&mut self, id: u64) {
         self.popup_registrations.remove(&id);
+    }
+
+    pub fn export_foreign_toplevel(
+        &mut self,
+        surface: SurfaceKey,
+        handle: String,
+    ) -> Result<(), String> {
+        if self.foreign_exports.contains_key(&handle) {
+            return Err("xdg-foreign handle collision".to_string());
+        }
+        self.foreign_exports.insert(
+            handle,
+            ForeignExport {
+                surface,
+                imports: BTreeSet::new(),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn import_foreign_toplevel(
+        &mut self,
+        identity: ForeignImportIdentity,
+        handle: &str,
+    ) -> Result<bool, String> {
+        if self.foreign_imports.contains_key(&identity) {
+            return Err(format!(
+                "xdg-foreign import {}:{} generation {} is already registered",
+                identity.client, identity.object, identity.generation
+            ));
+        }
+        let Some(export) = self.foreign_exports.get_mut(handle) else {
+            return Ok(false);
+        };
+        export.imports.insert(identity);
+        self.foreign_imports.insert(identity, handle.to_string());
+        Ok(true)
+    }
+
+    pub fn destroy_foreign_import(&mut self, identity: ForeignImportIdentity) {
+        let Some(handle) = self.foreign_imports.remove(&identity) else {
+            return;
+        };
+        if let Some(export) = self.foreign_exports.get_mut(&handle) {
+            export.imports.remove(&identity);
+        }
+        self.toplevel_parents.retain(|_, relation| {
+            relation.source != ToplevelParentSource::Foreign(identity)
+        });
+    }
+
+    pub fn destroy_foreign_export(&mut self, handle: &str) {
+        let invalidated = self.invalidate_foreign_exports(&[handle.to_string()]);
+        self.queue_foreign_destroyed(invalidated);
+    }
+
+    pub fn foreign_import_is_live(&self, identity: ForeignImportIdentity) -> bool {
+        self.foreign_imports.contains_key(&identity)
+    }
+
+    pub fn set_local_parent(
+        &mut self,
+        child: SurfaceKey,
+        parent: Option<SurfaceKey>,
+    ) -> Result<Option<SurfaceKey>, ToplevelParentError> {
+        self.set_toplevel_parent(child, parent, ToplevelParentSource::Local)
+    }
+
+    pub fn set_foreign_parent(
+        &mut self,
+        identity: ForeignImportIdentity,
+        child: SurfaceKey,
+    ) -> Result<Option<SurfaceKey>, ToplevelParentError> {
+        let parent = self
+            .foreign_imports
+            .get(&identity)
+            .and_then(|handle| self.foreign_exports.get(handle))
+            .map(|export| export.surface);
+        let Some(parent) = parent else {
+            return Ok(None);
+        };
+        self.set_toplevel_parent(
+            child,
+            Some(parent),
+            ToplevelParentSource::Foreign(identity),
+        )
+    }
+
+    fn set_toplevel_parent(
+        &mut self,
+        child: SurfaceKey,
+        parent: Option<SurfaceKey>,
+        source: ToplevelParentSource,
+    ) -> Result<Option<SurfaceKey>, ToplevelParentError> {
+        // xdg_toplevel.set_parent defines an unmapped parent as NULL. This
+        // also replaces any relationship established through the other
+        // protocol, so normalization happens before the shared map is edited.
+        let parent = parent.filter(|parent| self.scene.is_mapped(*parent));
+        if parent.is_some_and(|parent| self.parent_would_cycle(child, parent)) {
+            return Err(ToplevelParentError::InvalidParent);
+        }
+        let Some(parent) = parent else {
+            self.toplevel_parents.remove(&child);
+            return Ok(None);
+        };
+        self.toplevel_parents
+            .insert(child, ToplevelParent { source, parent });
+        let layout_changed = self.scene.place_toplevel(child, parent);
+        self.settle(layout_changed)
+            .map_err(ToplevelParentError::Failed)?;
+        Ok(Some(parent))
+    }
+
+    fn parent_would_cycle(&self, child: SurfaceKey, parent: SurfaceKey) -> bool {
+        let mut at = parent;
+        for _ in 0..=self.toplevel_parents.len() {
+            if at == child {
+                return true;
+            }
+            let Some(relation) = self.toplevel_parents.get(&at) else {
+                return false;
+            };
+            at = relation.parent;
+        }
+        true
+    }
+
+    fn toplevel_parent(&self, child: SurfaceKey) -> Option<SurfaceKey> {
+        self.toplevel_parents
+            .get(&child)
+            .map(|relation| relation.parent)
+    }
+
+    #[cfg(test)]
+    pub fn effective_toplevel_parent(&self, child: SurfaceKey) -> Option<SurfaceKey> {
+        self.toplevel_parent(child)
+    }
+
+    /// Follow mapped children until the highest constrained descendant. A
+    /// parent can have multiple auxiliary windows; their mutual order is not
+    /// specified, while every one must remain above the ancestor they share.
+    fn topmost_parented(&self, key: SurfaceKey) -> SurfaceKey {
+        let mut at = key;
+        for _ in 0..=self.toplevel_parents.len() {
+            let Some(child) = self.toplevel_parents.iter().find_map(|(child, relation)| {
+                (relation.parent == at
+                    && self.scene.is_mapped(*child)
+                    && self.scene.toplevels_overlap_in_group(at, *child))
+                .then_some(*child)
+            }) else {
+                return at;
+            };
+            at = child;
+        }
+        at
+    }
+
+    fn enforce_parent_focus(&mut self) -> bool {
+        let Some(focused) = self.scene.focused() else {
+            return false;
+        };
+        let topmost = self.topmost_parented(focused);
+        topmost != focused && self.scene.focus_key(topmost)
+    }
+
+    /// A layout operation may move either side of a relationship. Keep the
+    /// family on one workspace, while leaving ordinary within-workspace tiling
+    /// gestures alone; split tiles do not overlap, and grouped overlap is
+    /// governed by the focus constraint below.
+    fn enforce_parent_layout(&mut self) -> bool {
+        let mut children = BTreeMap::<SurfaceKey, Vec<SurfaceKey>>::new();
+        for (child, relation) in &self.toplevel_parents {
+            children.entry(relation.parent).or_default().push(*child);
+        }
+        let mut pending: Vec<SurfaceKey> = children
+            .keys()
+            .filter(|parent| !self.toplevel_parents.contains_key(parent))
+            .copied()
+            .collect();
+        let mut changed = false;
+        // Child-key order is not ancestry order. Walk the cycle-free forest
+        // from roots to leaves so a moving parent settles before its child.
+        // Each relationship enters `pending` once, keeping repair linear in
+        // retained relationship count apart from the bounded map lookups.
+        while let Some(parent) = pending.pop() {
+            let Some(direct) = children.remove(&parent) else {
+                continue;
+            };
+            for child in direct {
+                if self.scene.is_mapped(child)
+                    && self.scene.is_mapped(parent)
+                    && !self.scene.toplevels_share_workspace(child, parent)
+                {
+                    changed |= self.scene.place_toplevel(child, parent);
+                }
+                pending.push(child);
+            }
+        }
+        changed | self.enforce_parent_focus()
+    }
+
+    /// Apply xdg-shell's unmapping rule before the scene forgets `surface`:
+    /// the surface loses its own parent, while each child inherits that parent
+    /// once. Remapping cannot recreate either discarded edge.
+    fn reparent_around_unmap(&mut self, surface: SurfaceKey) -> Vec<(SurfaceKey, SurfaceKey)> {
+        let inherited = self
+            .toplevel_parents
+            .remove(&surface)
+            .map(|relation| relation.parent)
+            .filter(|parent| self.scene.is_mapped(*parent));
+        let children: Vec<SurfaceKey> = self
+            .toplevel_parents
+            .iter()
+            .filter_map(|(child, relation)| (relation.parent == surface).then_some(*child))
+            .collect();
+        let mut reparented = Vec::new();
+        for child in children {
+            let Some(parent) = inherited else {
+                self.toplevel_parents.remove(&child);
+                continue;
+            };
+            if let Some(relation) = self.toplevel_parents.get_mut(&child) {
+                relation.parent = parent;
+                reparented.push((child, parent));
+            }
+        }
+        reparented
+    }
+
+    fn reparent_around_client(&mut self, client: u64) -> Vec<(SurfaceKey, SurfaceKey)> {
+        let snapshot = self.toplevel_parents.clone();
+        let mut next = BTreeMap::new();
+        let mut reparented = Vec::new();
+        for (child, mut relation) in snapshot.iter().map(|(child, relation)| (*child, *relation)) {
+            if child.client == client {
+                continue;
+            }
+            let mut parent = relation.parent;
+            for _ in 0..=snapshot.len() {
+                if parent.client != client {
+                    break;
+                }
+                let Some(ancestor) = snapshot.get(&parent) else {
+                    parent = relation.parent;
+                    break;
+                };
+                parent = ancestor.parent;
+            }
+            if parent.client == client || !self.scene.is_mapped(parent) {
+                continue;
+            }
+            if parent != relation.parent {
+                relation.parent = parent;
+                reparented.push((child, parent));
+            }
+            next.insert(child, relation);
+        }
+        self.toplevel_parents = next;
+        reparented
+    }
+
+    fn queue_foreign_destroyed(&mut self, identities: Vec<ForeignImportIdentity>) {
+        let mut by_client: BTreeMap<u64, Vec<ForeignImportIdentity>> = BTreeMap::new();
+        for identity in identities {
+            by_client.entry(identity.client).or_default().push(identity);
+        }
+        for (client, identities) in by_client {
+            let Some(sender) = self.keyboard_subscribers.get(&client).cloned() else {
+                continue;
+            };
+            match sender.try_send(KeyboardDelivery::ForeignDestroyed(identities)) {
+                KeyboardQueueResult::Closed => {
+                    self.keyboard_subscribers.remove(&client);
+                }
+                // Every import one runtime operation invalidates for this
+                // client travels in one bounded delivery. A full queue still
+                // drops its sender rather than losing a required lifecycle
+                // event or blocking the revoking client on a peer socket.
+                KeyboardQueueResult::Sent | KeyboardQueueResult::Overflowed => {}
+            }
+        }
+    }
+
+    fn invalidate_foreign_exports(&mut self, handles: &[String]) -> Vec<ForeignImportIdentity> {
+        let mut invalidated = BTreeSet::new();
+        for handle in handles {
+            let Some(export) = self.foreign_exports.remove(handle) else {
+                continue;
+            };
+            invalidated.extend(export.imports);
+        }
+        self.toplevel_parents.retain(|_, relation| {
+            !matches!(
+                relation.source,
+                ToplevelParentSource::Foreign(identity) if invalidated.contains(&identity)
+            )
+        });
+        for identity in &invalidated {
+            self.foreign_imports.remove(identity);
+        }
+        invalidated.into_iter().collect()
+    }
+
+    fn forget_foreign_surface(&mut self, surface: SurfaceKey) {
+        self.toplevel_parents.remove(&surface);
+        let handles: Vec<String> = self
+            .foreign_exports
+            .iter()
+            .filter(|(_, export)| export.surface == surface)
+            .map(|(handle, _)| handle.clone())
+            .collect();
+        let invalidated = self.invalidate_foreign_exports(&handles);
+        self.queue_foreign_destroyed(invalidated);
+    }
+
+    fn forget_foreign_client(&mut self, client: u64) {
+        let imports: BTreeSet<ForeignImportIdentity> = self
+            .foreign_imports
+            .keys()
+            .copied()
+            .filter(|identity| identity.client == client)
+            .collect();
+        for identity in &imports {
+            let Some(handle) = self.foreign_imports.remove(identity) else {
+                continue;
+            };
+            if let Some(export) = self.foreign_exports.get_mut(&handle) {
+                export.imports.remove(identity);
+            }
+        }
+        self.toplevel_parents.retain(|child, relation| {
+            child.client != client
+                && !matches!(
+                    relation.source,
+                    ToplevelParentSource::Foreign(identity) if imports.contains(&identity)
+                )
+        });
+        let handles: Vec<String> = self
+            .foreign_exports
+            .iter()
+            .filter(|(_, export)| export.surface.client == client)
+            .map(|(handle, _)| handle.clone())
+            .collect();
+        let invalidated = self.invalidate_foreign_exports(&handles);
+        self.queue_foreign_destroyed(invalidated);
     }
 
     /// The clipboard visible to a client that currently owns keyboard focus.
@@ -2141,7 +2561,7 @@ impl Runtime {
     fn keyboard_target(&self) -> Option<SurfaceKey> {
         self.scene
             .topmost_grab(self.framebuffer.width, self.framebuffer.height)
-            .or_else(|| self.scene.focused())
+            .or_else(|| self.scene.focused().map(|key| self.topmost_parented(key)))
     }
 
     /// Point the scene at the client the pointer model now focuses, so a
@@ -2297,7 +2717,8 @@ mod tests {
             Ok(KeyboardDelivery::Selection(_)
             | KeyboardDelivery::SelectionFocusLost(_)
             | KeyboardDelivery::DataSourceCancelled(_)
-            | KeyboardDelivery::DataSourceSend { .. }) => {
+            | KeyboardDelivery::DataSourceSend { .. }
+            | KeyboardDelivery::ForeignDestroyed(_)) => {
                 panic!("unexpected data-device delivery")
             }
             Err(error) => panic!("no keyboard event was published: {error}"),
@@ -2319,7 +2740,8 @@ mod tests {
             KeyboardDelivery::Selection(_)
             | KeyboardDelivery::SelectionFocusLost(_)
             | KeyboardDelivery::DataSourceCancelled(_)
-            | KeyboardDelivery::DataSourceSend { .. } => {
+            | KeyboardDelivery::DataSourceSend { .. }
+            | KeyboardDelivery::ForeignDestroyed(_) => {
                 panic!("unexpected data-device delivery");
             }
         }
@@ -2346,7 +2768,8 @@ mod tests {
             KeyboardDelivery::Selection(_)
             | KeyboardDelivery::SelectionFocusLost(_)
             | KeyboardDelivery::DataSourceCancelled(_)
-            | KeyboardDelivery::DataSourceSend { .. } => {
+            | KeyboardDelivery::DataSourceSend { .. }
+            | KeyboardDelivery::ForeignDestroyed(_) => {
                 panic!("unexpected data-device delivery");
             }
         }
@@ -8504,7 +8927,8 @@ mod tests {
                 | KeyboardDelivery::Selection(_)
                 | KeyboardDelivery::SelectionFocusLost(_)
                 | KeyboardDelivery::DataSourceCancelled(_)
-                | KeyboardDelivery::DataSourceSend { .. } => None,
+                | KeyboardDelivery::DataSourceSend { .. }
+                | KeyboardDelivery::ForeignDestroyed(_) => None,
             })
             .collect();
         assert_eq!(retained.len(), MAX_PENDING_KEYBOARD_DELIVERIES);
@@ -8585,6 +9009,305 @@ mod tests {
         assert!(!runtime.queue_keyboard_delete(5, 8).unwrap());
         stop.stop();
         assert!(!runtime.queue_keyboard_delete(5, 9).unwrap());
+    }
+
+    #[test]
+    fn local_and_foreign_parents_share_placement_focus_and_unmap_lifecycle() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-foreign-parent-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 8, 8, 8 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let subscription = runtime.subscribe_keyboard(2).unwrap();
+        let (deliveries, stop) = subscription.split();
+        let grandparent = SurfaceKey {
+            client: 1,
+            object: 4,
+        };
+        let parent = SurfaceKey {
+            client: 1,
+            object: 5,
+        };
+        let child = SurfaceKey {
+            client: 2,
+            object: 6,
+        };
+        let identity = ForeignImportIdentity {
+            client: 2,
+            object: 9,
+            generation: 11,
+        };
+
+        runtime.commit(grandparent, surface([1, 2, 3, 0])).unwrap();
+        runtime.commit(parent, surface([4, 5, 6, 0])).unwrap();
+        assert_eq!(
+            runtime.set_local_parent(parent, Some(grandparent)),
+            Ok(Some(grandparent))
+        );
+        runtime.command(Command::SwitchWorkspace(2)).unwrap();
+        runtime.commit(child, surface([7, 8, 9, 0])).unwrap();
+        assert_eq!(runtime.scene.layout().workspace_of(child), Some(2));
+        runtime.command(Command::SwitchWorkspace(1)).unwrap();
+
+        runtime
+            .export_foreign_toplevel(parent, "opaque-handle".to_string())
+            .unwrap();
+        assert!(runtime
+            .import_foreign_toplevel(identity, "opaque-handle")
+            .unwrap());
+        assert_eq!(
+            runtime.set_foreign_parent(identity, child),
+            Ok(Some(parent))
+        );
+        assert_eq!(runtime.effective_toplevel_parent(child), Some(parent));
+        assert_eq!(runtime.scene.layout().workspace_of(child), Some(1));
+        assert_eq!(runtime.scene.focused(), Some(child));
+
+        runtime.focus_surface(grandparent).unwrap();
+        runtime.command(Command::MoveToWorkspace(2)).unwrap();
+        assert_eq!(runtime.scene.layout().workspace_of(grandparent), Some(2));
+        assert_eq!(runtime.scene.layout().workspace_of(parent), Some(2));
+        assert_eq!(runtime.scene.layout().workspace_of(child), Some(2));
+        runtime.command(Command::SwitchWorkspace(2)).unwrap();
+
+        // A local request replaces the imported relationship, and a later
+        // imported request replaces it back in the one effective map.
+        assert_eq!(
+            runtime.set_local_parent(child, Some(grandparent)),
+            Ok(Some(grandparent))
+        );
+        assert_eq!(runtime.effective_toplevel_parent(child), Some(grandparent));
+        assert_eq!(
+            runtime.set_foreign_parent(identity, child),
+            Ok(Some(parent))
+        );
+        runtime.focus_surface(parent).unwrap();
+        assert_eq!(runtime.scene.focused(), Some(parent));
+        runtime.command(Command::ToggleGrouped).unwrap();
+        assert_eq!(runtime.scene.focused(), Some(child));
+        assert_eq!(
+            runtime.set_local_parent(grandparent, Some(child)),
+            Err(ToplevelParentError::InvalidParent)
+        );
+
+        // Unmapping bypasses the parent once. Remapping it does not restore
+        // either discarded edge, while the child's inherited edge remains.
+        runtime.unmap(parent).unwrap();
+        assert_eq!(runtime.effective_toplevel_parent(parent), None);
+        assert_eq!(runtime.effective_toplevel_parent(child), Some(grandparent));
+        runtime.commit(parent, surface([4, 5, 6, 0])).unwrap();
+        assert_eq!(runtime.effective_toplevel_parent(parent), None);
+        assert_eq!(runtime.effective_toplevel_parent(child), Some(grandparent));
+
+        while deliveries.try_recv().is_ok() {}
+        runtime.destroy_foreign_export("opaque-handle");
+        assert_eq!(runtime.effective_toplevel_parent(child), None);
+        assert!(matches!(
+            deliveries.recv().unwrap(),
+            KeyboardDelivery::ForeignDestroyed(delivery) if delivery == vec![identity]
+        ));
+        stop.stop();
+        runtime.unsubscribe_keyboard(2);
+    }
+
+    #[test]
+    fn parented_mapping_and_reparenting_leave_fullscreen_before_focusing_child() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-parent-fullscreen-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 8, 8, 8 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let parent = SurfaceKey {
+            client: 2,
+            object: 20,
+        };
+        let child = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+
+        runtime.commit(parent, surface([1, 2, 3, 0])).unwrap();
+        runtime.command(Command::ToggleFullscreen).unwrap();
+        assert_eq!(
+            runtime.set_local_parent(child, Some(parent)),
+            Ok(Some(parent))
+        );
+        runtime.commit(child, surface([4, 5, 6, 0])).unwrap();
+        assert_eq!(runtime.keyboard_target(), Some(child));
+        let layout = runtime.layout_snapshot();
+        assert!(layout
+            .get(&parent)
+            .is_some_and(|view| view.visible && !view.fullscreen));
+        assert!(layout
+            .get(&child)
+            .is_some_and(|view| view.visible && view.activated && !view.fullscreen));
+        runtime.scene.layout().check_invariants().unwrap();
+
+        assert_eq!(runtime.set_local_parent(child, None), Ok(None));
+        runtime.focus_surface(parent).unwrap();
+        runtime.command(Command::ToggleFullscreen).unwrap();
+        assert_eq!(
+            runtime.set_local_parent(child, Some(parent)),
+            Ok(Some(parent))
+        );
+        assert_eq!(runtime.keyboard_target(), Some(child));
+        let layout = runtime.layout_snapshot();
+        assert!(layout
+            .get(&parent)
+            .is_some_and(|view| view.visible && !view.fullscreen));
+        assert!(layout
+            .get(&child)
+            .is_some_and(|view| view.visible && view.activated && !view.fullscreen));
+        runtime.scene.layout().check_invariants().unwrap();
+    }
+
+    #[test]
+    fn reverse_order_parent_chain_moves_to_one_workspace() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-parent-chain-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 8, 8, 8 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        // BTree order visits child before parent, the adverse order for a
+        // one-pass repair after the grandparent moves.
+        let child = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let parent = SurfaceKey {
+            client: 2,
+            object: 20,
+        };
+        let grandparent = SurfaceKey {
+            client: 3,
+            object: 30,
+        };
+
+        runtime.commit(child, surface([1, 2, 3, 0])).unwrap();
+        runtime.commit(parent, surface([4, 5, 6, 0])).unwrap();
+        runtime.commit(grandparent, surface([7, 8, 9, 0])).unwrap();
+        assert_eq!(
+            runtime.set_local_parent(child, Some(parent)),
+            Ok(Some(parent))
+        );
+        assert_eq!(
+            runtime.set_local_parent(parent, Some(grandparent)),
+            Ok(Some(grandparent))
+        );
+
+        runtime.focus_surface(grandparent).unwrap();
+        runtime.command(Command::MoveToWorkspace(2)).unwrap();
+        assert_eq!(runtime.scene.layout().workspace_of(child), Some(2));
+        assert_eq!(runtime.scene.layout().workspace_of(parent), Some(2));
+        assert_eq!(runtime.scene.layout().workspace_of(grandparent), Some(2));
+        runtime.scene.layout().check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_foreign_export_dies_with_its_surface_or_owning_client() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-foreign-lifetime-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 8, 8, 8 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let subscription = runtime.subscribe_keyboard(2).unwrap();
+        let (deliveries, stop) = subscription.split();
+        let first = ForeignImportIdentity {
+            client: 2,
+            object: 9,
+            generation: 1,
+        };
+        let second = ForeignImportIdentity {
+            client: 2,
+            object: 10,
+            generation: 2,
+        };
+        let first_parent = SurfaceKey {
+            client: 1,
+            object: 5,
+        };
+        let second_parent = SurfaceKey {
+            client: 1,
+            object: 6,
+        };
+
+        runtime
+            .export_foreign_toplevel(first_parent, "first".to_string())
+            .unwrap();
+        assert!(runtime.import_foreign_toplevel(first, "first").unwrap());
+        runtime.remove(first_parent).unwrap();
+        assert!(matches!(
+            deliveries.recv().unwrap(),
+            KeyboardDelivery::ForeignDestroyed(delivery) if delivery == vec![first]
+        ));
+
+        runtime
+            .export_foreign_toplevel(second_parent, "second".to_string())
+            .unwrap();
+        assert!(runtime
+            .import_foreign_toplevel(second, "second")
+            .unwrap());
+        runtime.remove_client(1).unwrap();
+        assert!(matches!(
+            deliveries.recv().unwrap(),
+            KeyboardDelivery::ForeignDestroyed(delivery) if delivery == vec![second]
+        ));
+        stop.stop();
+        runtime.unsubscribe_keyboard(2);
+    }
+
+    #[test]
+    fn revoking_a_saturated_foreign_export_uses_one_bounded_delivery() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-foreign-batch-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 8, 8, 8 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let subscription = runtime.subscribe_keyboard(2).unwrap();
+        let (deliveries, stop) = subscription.split();
+        let parent = SurfaceKey {
+            client: 1,
+            object: 5,
+        };
+        runtime
+            .export_foreign_toplevel(parent, "saturated".to_string())
+            .unwrap();
+        let identities: Vec<ForeignImportIdentity> = (0..512)
+            .map(|offset| ForeignImportIdentity {
+                client: 2,
+                object: 100 + offset,
+                generation: u64::from(offset),
+            })
+            .collect();
+        for identity in &identities {
+            assert!(runtime
+                .import_foreign_toplevel(*identity, "saturated")
+                .unwrap());
+        }
+
+        runtime.destroy_foreign_export("saturated");
+        assert!(matches!(
+            deliveries.recv().unwrap(),
+            KeyboardDelivery::ForeignDestroyed(delivery) if delivery == identities
+        ));
+        assert!(matches!(deliveries.try_recv(), Err(TryRecvError::Empty)));
+        stop.stop();
+        runtime.unsubscribe_keyboard(2);
     }
 
     #[test]

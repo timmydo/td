@@ -1334,8 +1334,8 @@ gap is:
   runtime;
 - popup outside-click dismissal and edge constraint solving are landed, so
   browser menus close and stay within the usable output;
-- add `zxdg_exporter_v2`/`zxdg_importer_v2`, so Firefox and GTK can give portal
-  dialogs an authenticated Wayland parent handle;
+- `zxdg_exporter_v2`/`zxdg_importer_v2` are landed, so Firefox and GTK can give
+  the future private portal path an opaque Wayland parent handle;
 - add primary selection, then bounded drag and drop; core data-device
   clipboard transfer is landed;
 - add `wp_viewporter` and `xdg_activation_v1` for correct scaling and launch
@@ -5023,9 +5023,10 @@ resolves them; the compositor authenticates no token an app supplied.
 ## F. The Wayland protocol gap
 
 Verified against the tree rather than assumed. Today the compositor
-advertises exactly eight globals: `wl_compositor` v4,
+advertises exactly ten globals: `wl_compositor` v4,
 `wl_subcompositor` v1, `wl_shm` v1, `wl_output` v4, `xdg_wm_base` **v1**,
 `zxdg_decoration_manager_v1` v1, `wl_data_device_manager` v3,
+`zxdg_exporter_v2` v1, `zxdg_importer_v2` v1,
 `wl_seat` v7.
 
 That set is no longer only a claim here. The decoration landing added the
@@ -5033,7 +5034,8 @@ sixth and introduced
 `the_registry_advertises_exactly_the_globals_td_serves`; the subsurface
 landing adds the seventh and updates the same test. It pins the name, order
 and version of each against `advertise_globals`; the data-device landing adds
-the eighth through that gate, so the next change to the list reds a test in
+the eighth through that gate, and xdg-foreign adds the ninth and tenth, so the
+next change to the list reds a test in
 the crate rather than silently falsifying this paragraph.
 
 Three corrections to the obvious assumptions, all checked in
@@ -5161,7 +5163,7 @@ by them, and records why a tile ignores them and what an offset cannot reach.
 | popup constraint solving (slide/flip/resize) | **landed** | — | ~450 — spent. The six version-1 adjustment bits are applied in protocol order, independently per axis, against the usable output in the mapped parent's coordinates; unknown bits remain inert permissions |
 | client cursor rendering | **done** (`1c4b7f88`) | — | spent |
 | `zxdg_decoration_manager_v1` (answer `server_side`) | **landed** | **U** | ~500 — spent. Suppresses CSD, fits tiling, and removes most of the geometry problem for cooperating apps. One divergence, deliberate: `destroy` asks the compositor to stop decorating, and td keeps drawing the band because it is layout rather than a decoration td can withdraw |
-| `zxdg_exporter_v2`/`importer_v2` | absent | **portal-blocking** | 1,200–2,000 |
+| `zxdg_exporter_v2`/`importer_v2` | **landed** | — | spent. Version-1 exporter/importer globals issue 128-bit random fixed-width bearer handles for currently constructed toplevel surfaces and retain no unknown or oversized handle. Foreign and ordinary toplevel requests share one cycle-checked parent relation: a mapped child joins its mapped parent's workspace and run, grouped overlap keeps the highest child focused, and unmapping bypasses a parent without restoring it on remap. Export revocation batches all of one importer's affected generations into one bounded asynchronous delivery and removes relationships in one pass; generation checks close object-id reuse without letting a stalled importer block its exporter or the runtime. The handle authenticates no application identity: private portal policy still owns that decision |
 | `zwp_primary_selection_v1` | absent | C | ~1,000 once data-device exists |
 | `xdg_wm_base` v2→v6 | v1 | C | 1,000–1,800 after popups |
 | `wp_viewporter` | absent | C at scale 1 | 1,500–2,500 |
@@ -5587,7 +5589,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 18 | Wayland B: `wl_subcompositor` — **LANDED** | a compound window renders and receives input in client-defined subsurface order, with synchronized frames applied on the parent commit |
 | 19 | Wayland C: `xdg_positioner`/`xdg_popup`, click-outside dismissal and edge constraint solving LANDED | a menu appears where its client asked, takes the keyboard while it is up, closes when the operator presses outside it, and is flipped, slid or resized clear of an output edge as its positioner permits |
 | 20 | **clipboard LANDED**: data-device v3 selection forwards a focus-scoped MIME offer and one bounded descriptor to its source; client cursors landed separately (`1c4b7f88`) | **paste, and the I-beam already arrived** |
-| 21 | xdg-foreign + private portal socket + dialog placement | modal portal window |
+| 21 | **xdg-foreign LANDED**; private portal socket + dialog placement remain | modal portal window |
 | 22 | FileChooser, OpenURI, Screenshot, Notification | file dialog visible |
 | 23 | **a pinned small GTK application as a seed package** | **first foreign-toolkit window** |
 | 24 | runtime compatibility sweep; the launcher table is read from the image | none |

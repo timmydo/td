@@ -1100,12 +1100,50 @@ impl Scene {
     }
 
     pub fn commit(&mut self, key: SurfaceKey, surface: Surface) -> Result<bool, String> {
+        self.commit_parented(key, surface, None)
+    }
+
+    /// Map an auxiliary toplevel into its mapped parent's run. Existing
+    /// contents are merely replaced; a later parent request moves the layout
+    /// through `place_toplevel` instead of making every repaint raise a
+    /// window again.
+    pub fn commit_parented(
+        &mut self,
+        key: SurfaceKey,
+        surface: Surface,
+        parent: Option<SurfaceKey>,
+    ) -> Result<bool, String> {
         let is_new = self.store_surface(key, surface)?;
         if is_new {
-            self.layout.map(key);
+            if !parent.is_some_and(|parent| self.layout.place_after(key, parent)) {
+                self.layout.map(key);
+            }
             self.hint = None;
         }
         Ok(is_new)
+    }
+
+    /// Apply a parent request to windows which are already mapped. Unmapped
+    /// children keep the relationship in the shell and are placed when their
+    /// first pixels arrive.
+    pub fn place_toplevel(&mut self, key: SurfaceKey, parent: SurfaceKey) -> bool {
+        if !self.is_mapped(key) || !self.is_mapped(parent) {
+            return false;
+        }
+        let changed = self.layout.place_after(key, parent);
+        if changed {
+            self.hint = None;
+        }
+        changed
+    }
+
+    pub fn toplevels_share_workspace(&self, one: SurfaceKey, other: SurfaceKey) -> bool {
+        self.layout.workspace_of(one).is_some()
+            && self.layout.workspace_of(one) == self.layout.workspace_of(other)
+    }
+
+    pub fn toplevels_overlap_in_group(&self, one: SurfaceKey, other: SurfaceKey) -> bool {
+        self.layout.grouped_together(one, other)
     }
 
     /// A popup's pixels and where they go. It shares `surfaces` with the tiles

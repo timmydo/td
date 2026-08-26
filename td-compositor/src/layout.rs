@@ -613,6 +613,63 @@ impl Workspace {
         self.focus(key);
     }
 
+    /// Put a mapped auxiliary window in its parent's run. Toplevel parents do
+    /// not make a second kind of scene node: td remains a tiling compositor,
+    /// so "above" is expressed by the child following the parent in the same
+    /// run and taking focus when a grouped presentation makes the two overlap.
+    fn place_after(&mut self, key: SurfaceKey, parent: SurfaceKey) -> bool {
+        if key == parent {
+            return false;
+        }
+        let Some(root) = self.root.take() else {
+            return false;
+        };
+        if !root.contains(parent) {
+            self.root = Some(root);
+            return false;
+        }
+        let unchanged = root.clone();
+        let mut next = if root.contains(key) {
+            let Some(rest) = detach(root, key) else {
+                self.root = Some(unchanged);
+                return false;
+            };
+            rest
+        } else {
+            root
+        };
+        if !next.insert_beside(parent, key, None, false, false) {
+            // A lone parent has no run yet. It becomes the first split in the
+            // same way `map` introduces an ordinary second window.
+            if next == Node::Leaf(parent) {
+                next = Node::Split {
+                    axis: FIRST_SPLIT,
+                    children: vec![next, Node::Leaf(key)],
+                    presentation: std::mem::replace(
+                        &mut self.presentation,
+                        Presentation::Split,
+                    ),
+                };
+            } else {
+                self.root = Some(unchanged);
+                return false;
+            }
+        }
+        let Some(next) = collapsed(next) else {
+            self.root = Some(unchanged);
+            return false;
+        };
+        let next = Some(next);
+        // An auxiliary toplevel is still an ordinary tile. Revealing it exits
+        // fullscreen just as `map` does; otherwise focus would move to a leaf
+        // which the fullscreen projection does not paint.
+        let left_fullscreen = self.fullscreen.take().is_some();
+        let changed = next != Some(unchanged) || self.focused != Some(key) || left_fullscreen;
+        self.root = next;
+        self.focus(key);
+        changed
+    }
+
     fn unmap(&mut self, key: SurfaceKey) {
         let before = self.leaves();
         let removed = before.iter().position(|candidate| *candidate == key);
@@ -794,6 +851,22 @@ impl Layout {
         parent_axis(root, key)
     }
 
+    /// Whether two leaves are presented by the same grouped container and
+    /// therefore compete for one client rectangle.
+    pub fn grouped_together(&self, one: SurfaceKey, other: SurfaceKey) -> bool {
+        let Some(workspace) = self
+            .homes
+            .get(&one)
+            .and_then(|number| self.workspaces.get(number))
+        else {
+            return false;
+        };
+        let Some(root) = workspace.root.as_ref() else {
+            return false;
+        };
+        stack_run(root, one).is_some_and(|(run, _)| run.contains(&other))
+    }
+
     /// Whether dragging this window could reach anywhere at all. Asked BEFORE
     /// a gesture takes a button, since one that cannot move anything would
     /// swallow the click with nothing to show for it.
@@ -971,6 +1044,42 @@ impl Layout {
         let workspace = self.homes.get(&key).copied().unwrap_or(self.active);
         self.workspace_mut(workspace).map(key);
         self.homes.insert(key, workspace);
+    }
+
+    /// Place a mapped child immediately after a mapped parent, moving it to
+    /// the parent's workspace when necessary. A relationship whose parent is
+    /// absent is deliberately a no-op; the shell layer normalizes that case
+    /// to an unset parent before reaching here.
+    pub fn place_after(&mut self, key: SurfaceKey, parent: SurfaceKey) -> bool {
+        if key == parent {
+            return false;
+        }
+        let Some(parent_workspace) = self.workspaces.iter().find_map(|(number, workspace)| {
+            workspace
+                .root
+                .as_ref()
+                .is_some_and(|root| root.contains(parent))
+                .then_some(*number)
+        }) else {
+            return false;
+        };
+        let child_workspace = self.workspaces.iter().find_map(|(number, workspace)| {
+            workspace
+                .root
+                .as_ref()
+                .is_some_and(|root| root.contains(key))
+                .then_some(*number)
+        });
+        let mut changed = false;
+        if child_workspace.is_some_and(|number| number != parent_workspace) {
+            if let Some(number) = child_workspace {
+                self.workspace_mut(number).unmap(key);
+                changed = true;
+            }
+        }
+        changed |= self.workspace_mut(parent_workspace).place_after(key, parent);
+        self.homes.insert(key, parent_workspace);
+        changed
     }
 
     pub fn unmap(&mut self, key: SurfaceKey) {
@@ -4147,6 +4256,39 @@ mod tests {
         layout.map(key(2));
         assert_eq!(layout.focused(), Some(key(2)));
         assert_eq!(layout.placements(80, 60, 0, 0).len(), 2);
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn placing_a_parented_surface_leaves_fullscreen_and_reveals_its_focus() {
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.apply(Command::ToggleFullscreen);
+
+        // A child first mapped with a parent exits the parent's fullscreen
+        // projection rather than taking keyboard focus while hidden.
+        assert!(layout.place_after(key(2), key(1)));
+        assert_eq!(layout.focused(), Some(key(2)));
+        let views = layout.views(80, 60, 0, 0);
+        assert!(views.iter().all(|view| view.visible && !view.fullscreen));
+        assert_eq!(
+            views
+                .iter()
+                .filter(|view| view.activated)
+                .map(|view| view.key)
+                .collect::<Vec<_>>(),
+            vec![key(2)]
+        );
+        layout.check_invariants().unwrap();
+
+        // Setting the relationship after both surfaces are mapped follows the
+        // same policy, including when their order already happens to match.
+        assert!(layout.focus_key(key(1)));
+        layout.apply(Command::ToggleFullscreen);
+        assert!(layout.place_after(key(2), key(1)));
+        let views = layout.views(80, 60, 0, 0);
+        assert!(views.iter().all(|view| view.visible && !view.fullscreen));
+        assert_eq!(layout.focused(), Some(key(2)));
         layout.check_invariants().unwrap();
     }
 

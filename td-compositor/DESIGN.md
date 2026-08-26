@@ -670,11 +670,12 @@ The first protocol surface is:
 - wl_output
 - wl_seat, wl_keyboard, and wl_pointer
 - wl_data_device_manager, wl_data_device, wl_data_source, and wl_data_offer
+- zxdg_exporter_v2, zxdg_exported_v2, zxdg_importer_v2, and zxdg_imported_v2
 - xdg_wm_base, xdg_surface, xdg_toplevel, xdg_positioner, and xdg_popup
 - zxdg_decoration_manager_v1 and zxdg_toplevel_decoration_v1
 - wl_callback completion and wl_buffer release
 
-Those eight globals are the whole of what the registry advertises, and the set is
+Those ten globals are the whole of what the registry advertises, and the set is
 a TEST rather than a sentence here: the name, order, and version of each are
 pinned by
 `the_registry_advertises_exactly_the_globals_td_serves`.
@@ -997,6 +998,73 @@ begins. Ignoring the NULL-source operation and consuming an older source
 without performing a drag are explicit selection-only divergences. The request
 serial and implicit grab are not validated on this deferred path. Primary
 selection is likewise a separate protocol and remains unadvertised.
+
+**xdg-foreign resolves a bounded cross-client toplevel relationship.** td
+advertises `zxdg_exporter_v2` and `zxdg_importer_v2` at interface version 1.
+At each `export_toplevel` or `set_parent_of` request the named surface must
+have a currently constructed `xdg_toplevel` object; either manager/object
+raises its `invalid_surface` error for anything else. The exported reference
+then follows the `wl_surface` and exported object's lifetime, including across
+an unmap or role-object reconstruction. Exporting reads 128 bits from
+`/dev/urandom` and publishes the 32-character hexadecimal value as the handle.
+Failure to obtain randomness refuses that export rather than issuing a
+predictable bearer capability.
+
+The runtime registry maps that opaque handle to the exporting `SurfaceKey`.
+The handle is a capability and NOT a client identity: the compositor resolves
+the relationship, while the portal must decide which requesting sandbox may
+present a handle. One surface may have multiple exports and one export may
+have multiple imports. `xdg_toplevel.set_parent` and
+`zxdg_imported_v2.set_parent_of` write one effective parent map, so whichever
+request arrives later replaces the earlier local or foreign relationship.
+Self-parenting and descendant cycles raise the requesting interface's
+parent/surface error. An inert imported object ignores later requests,
+including an invalid child id, after its `destroyed` event.
+
+td remains a tiling compositor: a mapped auxiliary toplevel is placed directly
+after its mapped parent in the same layout run and is moved onto the parent's
+workspace if necessary. In a split presentation this is the positioning
+policy and the tiles do not overlap. In a stacked or tabbed presentation the
+highest mapped child retains focus, which keeps it above its ancestors;
+raising the child therefore raises the family rather than obscuring its
+parent. Mapping or reparenting a child exits the workspace's fullscreen state,
+as ordinary toplevel mapping already does, so the focused child cannot remain
+hidden behind a fullscreen parent. A later layout operation may rearrange the
+family within that workspace, but it may not strand its two sides on different
+workspaces. Repair walks the cycle-free relationship forest ancestor first so
+a multi-generation chain follows its ancestor independently of object-id order
+with each relationship visited once. This relationship does not turn the child
+into an `xdg_popup` or itself impose modal input.
+
+The xdg-shell unmap rules are shared too. Naming an unmapped parent is the same
+as naming NULL. When a toplevel unmaps, its own parent is discarded and each
+child inherits that parent, or becomes parentless if there was none. Remapping
+does not restore either edge. Destroying and reconstructing the role object
+therefore preserves an export but not the old stacking attributes.
+
+An unknown handle, or an input longer than 128 bytes, creates the requested
+`zxdg_imported_v2` and immediately sends its `destroyed` event without
+retaining the string. A live import is generation-tagged. Destroying the
+import removes only its relationships; destroying its exported object, its
+wl_surface, or its client removes the export, every relationship derived from
+it, and sends `destroyed` to every live import. The generation is checked on
+the importing client's delivery thread, so a queued revocation cannot reach a
+destroyed and reused object id.
+
+Foreign object and relationship counts need no independent unbounded
+allocator: every export and import consumes one of the client's 512 objects,
+there are at most 32 clients, generated handles have fixed size, and rejected
+handles are not retained. One revocation batches all invalidated generations
+per importing client into one item on the existing 64-entry seat queue and
+removes all affected relationships in one bounded map pass. Thus the number of
+imports behind one export neither creates one queue entry apiece nor repeatedly
+rescans the relationship map. A full queue drops its sender and eventually
+disconnects only that stalled importer; revoking an export performs no peer
+socket write and holds no client-local registration lock, so it cannot park an
+exporter or the global runtime behind another client's socket. The importing
+delivery thread holds its local generation map across the batch of `destroyed`
+events, ordered the same way as `delete_id`; local destroy takes that map before
+Runtime, so the ordering does not create a Runtime-to-stalled-I/O cycle.
 
 **An attach's offset is the cursor's to move.** `wl_surface.attach` carries an
 x and a y placing the new buffer's corner relative to the one it replaces. At
@@ -3129,7 +3197,8 @@ The landing must prove:
 - wl_seat advertises keyboard and pointer, sends a structurally validated
   self-contained keymap descriptor, repeat information, held keys, and all
   four modifier fields;
-- data-device tests pin the eight-global registry, initial NULL selection,
+- the registry test pins all ten globals by name, order, and version;
+- data-device tests pin initial NULL selection,
   selection-before-keyboard-enter and selection-before-sync ordering, no
   re-offer across same-client surface focus, exact per-string, per-source and
   aggregate MIME ceilings, server-created id and retained-offer ceilings,
@@ -3139,6 +3208,14 @@ The landing must prove:
   descriptor forwarded from
   `wl_data_offer.receive` to `wl_data_source.send` and written through by the
   source;
+- xdg-foreign tests pin fixed-width handle delivery, unknown and
+  oversized-handle destruction, inert-object requests, exact invalid-surface
+  and invalid-parent error objects, mapped cross-client placement and focus,
+  local-versus-foreign replacement, unmap bypass without remap restoration,
+  fullscreen exit for both initially parented mapping and mapped reparenting,
+  reverse-object-order multi-generation workspace repair, exported-object,
+  surface, and client lifetime, one batched delivery for a saturated export,
+  and actual imported-object id reuse with a stale generation suppressed;
 - the exact serialized keymap parses with libxkbcommon 1.11, where an ordinary
   key reports repeatable and an excluded modifier reports non-repeating;
   in-tree tests also pin its delimiter, type, explicit repeat exclusions,
