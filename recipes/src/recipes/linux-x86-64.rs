@@ -526,6 +526,10 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_SECCOMP[ =]/d; \
                   /^#? *CONFIG_INOTIFY_USER[ =]/d; \
                   /^#? *CONFIG_CGROUPS[ =]/d; \
+                  /^#? *CONFIG_CGROUP_SCHED[ =]/d; \
+                  /^#? *CONFIG_FAIR_GROUP_SCHED[ =]/d; \
+                  /^#? *CONFIG_CFS_BANDWIDTH[ =]/d; \
+                  /^#? *CONFIG_RT_GROUP_SCHED[ =]/d; \
                   /^#? *CONFIG_MEMCG[ =]/d; \
                   /^#? *CONFIG_CGROUP_PIDS[ =]/d' .config && \
                  printf '%s\\n' \
@@ -606,6 +610,10 @@ pub fn recipe() -> Recipe {
                    'CONFIG_SECCOMP=y' \
                    'CONFIG_INOTIFY_USER=y' \
                    'CONFIG_CGROUPS=y' \
+                   'CONFIG_CGROUP_SCHED=y' \
+                   'CONFIG_FAIR_GROUP_SCHED=y' \
+                   'CONFIG_CFS_BANDWIDTH=y' \
+                   '# CONFIG_RT_GROUP_SCHED is not set' \
                    'CONFIG_MEMCG=y' \
                    'CONFIG_CGROUP_PIDS=y' >> .config",
             ],
@@ -682,7 +690,11 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_SECCOMP=y' .config || { echo 'SECCOMP off — seccomp(2) returns ENOSYS, so td-jail ships namespaces with no syscall filter' >&2; exit 1; }; \
                  grep -q '^CONFIG_SECCOMP_FILTER=y' .config || { echo 'SECCOMP_FILTER off — no BPF syscall filtering. It is unprompted (def_bool y on HAVE_ARCH_SECCOMP_FILTER && SECCOMP && NET), so it cannot be pinned: something took SECCOMP or NET away' >&2; exit 1; }; \
                  grep -q '^CONFIG_INOTIFY_USER=y' .config || { echo 'INOTIFY_USER off — GLib file monitoring in a jailed app degrades to polling' >&2; exit 1; }; \
-                 grep -q '^CONFIG_CGROUPS=y' .config || { echo 'CGROUPS off — no cgroup v2, so an application has no aggregate memory or pid cap' >&2; exit 1; }; \
+                 grep -q '^CONFIG_CGROUPS=y' .config || { echo 'CGROUPS off — no cgroup v2, so an application has no aggregate CPU, memory, or pid cap' >&2; exit 1; }; \
+                 grep -q '^CONFIG_CGROUP_SCHED=y' .config || { echo 'CGROUP_SCHED off — the cgroup v2 cpu controller does not exist' >&2; exit 1; }; \
+                 grep -q '^CONFIG_FAIR_GROUP_SCHED=y' .config || { echo 'FAIR_GROUP_SCHED off — fair-scheduler cgroup accounting does not exist' >&2; exit 1; }; \
+                 grep -q '^CONFIG_CFS_BANDWIDTH=y' .config || { echo 'CFS_BANDWIDTH off — cpu.max cannot throttle a jailed application' >&2; exit 1; }; \
+                 if grep -q '^CONFIG_RT_GROUP_SCHED=y' .config; then echo 'RT_GROUP_SCHED on — real-time tasks in the populated root can block enabling the cpu controller, and td does not delegate real-time bandwidth' >&2; exit 1; fi; \
                  grep -q '^CONFIG_MEMCG=y' .config || { echo 'MEMCG off — memory.max/memory.high do not exist, so a multi-process app is bounded only per process' >&2; exit 1; }; \
                  grep -q '^CONFIG_CGROUP_PIDS=y' .config || { echo 'CGROUP_PIDS off — pids.max does not exist, so nothing bounds a fork bomb inside a jail' >&2; exit 1; }; \
                  if grep -q '^CONFIG_IPC_NS=y' .config; then echo 'IPC_NS on — it is default y behind SYSVIPC||POSIX_MQUEUE, so pinning either brings it along unasked; td-jail omits CLONE_NEWIPC and APPLICATIONS.md §0 defers it deliberately' >&2; exit 1; fi",
@@ -955,6 +967,33 @@ mod tests {
             assert!(
                 command_text.contains(required),
                 "kernel profiler contract omitted {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn fair_scheduler_bandwidth_is_builtin_and_rt_groups_are_off() {
+        let command_text = recipe()
+            .steps
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|step| match step {
+                Step::Run { argv, .. } => Some(argv.join("\n")),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for required in [
+            "CONFIG_CGROUP_SCHED=y",
+            "CONFIG_FAIR_GROUP_SCHED=y",
+            "CONFIG_CFS_BANDWIDTH=y",
+            "# CONFIG_RT_GROUP_SCHED is not set",
+            "grep -q '^CONFIG_CFS_BANDWIDTH=y' .config",
+            "grep -q '^CONFIG_RT_GROUP_SCHED=y' .config",
+        ] {
+            assert!(
+                command_text.contains(required),
+                "kernel CPU bandwidth contract omitted {required}"
             );
         }
     }

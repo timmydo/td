@@ -408,6 +408,7 @@ mod tests {
             .and_then(|permissions| permissions.with_memory_high(48 * 1024 * 1024))
             .and_then(|permissions| permissions.with_memory_max(64 * 1024 * 1024))
             .and_then(|permissions| permissions.with_pids_max(32))
+            .and_then(|permissions| permissions.with_cpu_max(50_000, 100_000))
             .expect("Wayland, filesystem and resource policy");
         let spec = ApplicationSpec::compile(
             &manifest,
@@ -485,7 +486,7 @@ mod tests {
         assert!(spec.contains("[Context]\nsockets=wayland\n"));
         assert!(spec.contains("[Filesystem]\nxdg-download=rw:create\n"));
         assert!(spec.contains(
-            "[Resources]\nmemory-high=50331648\nmemory-max=67108864\npids-max=32\n"
+            "[Resources]\nmemory-high=50331648\nmemory-max=67108864\npids-max=32\ncpu-max=50000 100000\n"
         ));
     }
 }

@@ -275,7 +275,9 @@ Everything else td-svc needs is still reachable through safe `std`, which
 is what keeps that surface at one. That includes cgroup-v2 delegation:
 PID 1 mounts the hierarchy through the existing audited mount applet, while
 td-svc creates cgroups, enables controllers at the root exception, and
-changes ownership through safe filesystem APIs. `td-svc/DESIGN.md` is its normative
+changes ownership through safe filesystem APIs. This includes the `cpu`,
+`memory`, and `pids` controllers; no controller operation adds an unsafe call.
+`td-svc/DESIGN.md` is its normative
 specification, recording both that and the invariants no compiler checks
 (no `pre_exec`, liveness read from `/proc` rather than inferred from an
 exit status, and a console that is neither skippable nor indefinitely
@@ -1218,7 +1220,9 @@ performs the same mount/capability/filter readbacks before spawning the entry.
 Before stage 2 is released, stage 1 creates one direct child of the delegated
 `/sys/fs/cgroup/td-user-1000` root, writes and exactly reads back
 `memory.high`, `memory.max`, `memory.oom.group=1`, and `pids.max`, and moves
-the blocked stage-2 pid through `cgroup.procs`. Stage 2 re-reads its exact
+the blocked stage-2 pid through `cgroup.procs`. The same safe filesystem path
+writes and exactly reads `cpu.max`; diagnostics read the required CFS-bandwidth
+rows from `cpu.stat`. Stage 2 re-reads its exact
 unified membership from procfs before setting `RLIMIT_DATA`. The cgroup
 filesystem remains masked by the mount plan, so the application cannot move
 itself into a sibling. Before the leaf exists, stage 1 starts a cleanup
@@ -1228,8 +1232,8 @@ only then spawns the watcher. The watcher issues the same proved detachment and
 sends one readiness byte. It was therefore never present in a terminal-member
 snapshot that could still signal the bootstrap and stage 1 after readiness.
 Stage 1 does not create the leaf until it receives that byte.
-After PID 1 and its descendants are reaped, stage 1 reads `memory.events` and
-`memory.peak`, releases the leaf to the watcher, and closes the pipe. Normal
+After PID 1 and its descendants are reaped, stage 1 reads `memory.events`,
+`memory.peak`, and `cpu.stat`, releases the leaf to the watcher, and closes the pipe. Normal
 exit, signal, and abort therefore use the same bounded drain and removal. The
 watcher's detached session survives both process-group and controlling-terminal
 shutdown. Controller operations remain safe filesystem I/O.

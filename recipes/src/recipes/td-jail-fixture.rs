@@ -53,6 +53,7 @@ pub fn recipe() -> Recipe {
         .and_then(|permissions| permissions.with_memory_high(48 * 1024 * 1024))
         .and_then(|permissions| permissions.with_memory_max(64 * 1024 * 1024))
         .and_then(|permissions| permissions.with_pids_max(32))
+        .and_then(|permissions| permissions.with_cpu_max(50_000, 100_000))
     else {
         return invalid_recipe("permissions");
     };
@@ -119,7 +120,7 @@ mod tests {
                 .expect("permissions")
                 .to_keyfile(),
             format!(
-                "format=1\n\n[Context]\nsockets=wayland\n\n[Filesystem]\n{}=ro\n{}=ro\nxdg-download=rw:create\nxdg-pictures=ro:create\n\n[Resources]\nmemory-high=50331648\nmemory-max=67108864\npids-max=32\n",
+                "format=2\n\n[Context]\nsockets=wayland\n\n[Filesystem]\n{}=ro\n{}=ro\nxdg-download=rw:create\nxdg-pictures=ro:create\n\n[Resources]\nmemory-high=50331648\nmemory-max=67108864\npids-max=32\ncpu-max=50000 100000\n",
                 crate::ladder::TD_JAIL_FIXTURE_GRANT_ROOT,
                 crate::ladder::TD_JAIL_FIXTURE_GRANT_FILE,
             )

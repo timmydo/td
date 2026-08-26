@@ -51,9 +51,15 @@ const PAGE_SIZE_BYTES: u64 = 4096;
 const MAX_MEMORY_BYTES: u64 = (((i64::MAX as u64) / PAGE_SIZE_BYTES) - 1) * PAGE_SIZE_BYTES;
 // Linux x86-64's PID_MAX_LIMIT, which bounds pids.max.
 const MAX_PIDS: u32 = 4 * 1024 * 1024;
+const MIN_CPU_BANDWIDTH_USEC: u64 = 1000;
+const MAX_CPU_PERIOD_USEC: u64 = 1_000_000;
+// Linux 7.1.4's MAX_BW with BW_SHIFT=20.
+const MAX_CPU_QUOTA_USEC: u64 = (1_u64 << (64 - 20)) - 1;
 pub const DEFAULT_MEMORY_HIGH_BYTES: u64 = 1024 * 1024 * 1024;
 pub const DEFAULT_MEMORY_MAX_BYTES: u64 = 1280 * 1024 * 1024;
 pub const DEFAULT_PIDS_MAX: u32 = 1024;
+pub const DEFAULT_CPU_QUOTA_USEC: u64 = 100_000;
+pub const DEFAULT_CPU_PERIOD_USEC: u64 = 100_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PermissionSocket {
@@ -209,11 +215,36 @@ impl BusAccess {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuMax {
+    quota_usec: u64,
+    period_usec: u64,
+}
+
+impl CpuMax {
+    fn new(quota_usec: u64, period_usec: u64) -> Result<CpuMax, String> {
+        validate_cpu_max(quota_usec, period_usec)?;
+        Ok(CpuMax {
+            quota_usec,
+            period_usec,
+        })
+    }
+
+    pub fn quota_usec(self) -> u64 {
+        self.quota_usec
+    }
+
+    pub fn period_usec(self) -> u64 {
+        self.period_usec
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResourceLimits {
     memory_high_bytes: Option<u64>,
     memory_max_bytes: Option<u64>,
     pids_max: Option<u32>,
+    cpu_max: Option<CpuMax>,
 }
 
 impl ResourceLimits {
@@ -229,6 +260,10 @@ impl ResourceLimits {
         self.pids_max
     }
 
+    pub fn cpu_max(self) -> Option<CpuMax> {
+        self.cpu_max
+    }
+
     /// The launch-time baseline: omission means the reviewed defaults, never
     /// an unlimited cgroup. An explicit resource policy is atomic so a partial
     /// edit cannot silently mix operator intent with unrelated defaults.
@@ -237,21 +272,30 @@ impl ResourceLimits {
             memory_high_bytes,
             memory_max_bytes,
             pids_max,
+            cpu_max,
         } = self;
-        let completed = match (memory_high_bytes, memory_max_bytes, pids_max) {
-            (None, None, None) => ResourceLimits {
+        let completed = match (memory_high_bytes, memory_max_bytes, pids_max, cpu_max) {
+            (None, None, None, None) => ResourceLimits {
                 memory_high_bytes: Some(DEFAULT_MEMORY_HIGH_BYTES),
                 memory_max_bytes: Some(DEFAULT_MEMORY_MAX_BYTES),
                 pids_max: Some(DEFAULT_PIDS_MAX),
+                cpu_max: Some(CpuMax {
+                    quota_usec: DEFAULT_CPU_QUOTA_USEC,
+                    period_usec: DEFAULT_CPU_PERIOD_USEC,
+                }),
             },
-            (Some(memory_high_bytes), Some(memory_max_bytes), Some(pids_max)) => ResourceLimits {
+            (Some(memory_high_bytes), Some(memory_max_bytes), Some(pids_max), cpu_max) => ResourceLimits {
                 memory_high_bytes: Some(memory_high_bytes),
                 memory_max_bytes: Some(memory_max_bytes),
                 pids_max: Some(pids_max),
+                cpu_max: Some(cpu_max.unwrap_or(CpuMax {
+                    quota_usec: DEFAULT_CPU_QUOTA_USEC,
+                    period_usec: DEFAULT_CPU_PERIOD_USEC,
+                })),
             },
             _ => {
                 return Err(
-                    "an explicit resource policy must set memory-high, memory-max and pids-max together"
+                    "an explicit resource policy must set memory-high, memory-max and pids-max together; cpu-max cannot appear alone"
                         .into(),
                 )
             }
@@ -274,6 +318,7 @@ impl ResourceLimits {
         self.memory_high_bytes.is_none()
             && self.memory_max_bytes.is_none()
             && self.pids_max.is_none()
+            && self.cpu_max.is_none()
     }
 
     fn validate(self) -> Result<(), String> {
@@ -286,6 +331,12 @@ impl ResourceLimits {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PermissionFormat {
+    One,
+    Two,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -408,6 +459,19 @@ impl PermissionPolicy {
         Ok(self)
     }
 
+    pub fn with_cpu_max(
+        mut self,
+        quota_usec: u64,
+        period_usec: u64,
+    ) -> Result<PermissionPolicy, String> {
+        if self.resources.cpu_max.is_some() {
+            return Err("duplicate cpu-max resource limit".into());
+        }
+        self.resources.cpu_max = Some(CpuMax::new(quota_usec, period_usec)?);
+        self.ensure_size()?;
+        Ok(self)
+    }
+
     pub fn network(&self) -> bool {
         self.network
     }
@@ -499,7 +563,12 @@ impl PermissionPolicy {
 
     /// Canonical bytes for either immutable defaults or an operator override.
     pub fn to_keyfile(&self) -> String {
-        let mut out = String::from("format=1\n");
+        let format = if self.resources.cpu_max.is_some() {
+            "2"
+        } else {
+            "1"
+        };
+        let mut out = format!("format={format}\n");
         if self.network || !self.sockets.is_empty() || self.allow_devel {
             out.push_str("\n[Context]\n");
             if self.network {
@@ -537,6 +606,13 @@ impl PermissionPolicy {
             if let Some(value) = self.resources.pids_max {
                 push_key(&mut out, "pids-max", &value.to_string());
             }
+            if let Some(value) = self.resources.cpu_max {
+                push_key(
+                    &mut out,
+                    "cpu-max",
+                    &format!("{} {}", value.quota_usec(), value.period_usec()),
+                );
+            }
         }
         out
     }
@@ -563,7 +639,7 @@ enum Section {
 #[derive(Default)]
 struct ParseState {
     policy: PermissionPolicy,
-    format_seen: bool,
+    format: Option<PermissionFormat>,
     sections: BTreeSet<Section>,
     shared_seen: bool,
     sockets_seen: bool,
@@ -611,8 +687,17 @@ fn parse_permission_policy(text: &str) -> Result<PermissionPolicy, String> {
         };
         result.map_err(|reason| permission_line(number, &reason))?;
     }
-    if !state.format_seen {
-        return Err("application permission file is missing `format'".into());
+    let format = state
+        .format
+        .ok_or_else(|| "application permission file is missing `format'".to_string())?;
+    match (format, state.policy.resources.cpu_max) {
+        (PermissionFormat::One, Some(_)) => {
+            return Err("cpu-max requires application permission format=2".into());
+        }
+        (PermissionFormat::Two, None) => {
+            return Err("application permission format=2 requires cpu-max".into());
+        }
+        _ => {}
     }
     state.policy.ensure_size()?;
     Ok(state.policy)
@@ -654,15 +739,18 @@ fn apply_root(state: &mut ParseState, key: &str, value: &str) -> Result<(), Stri
     if key != "format" {
         return Err(format!("unknown permission root key {key:?}"));
     }
-    if state.format_seen {
+    if state.format.is_some() {
         return Err("duplicate permission key `format'".into());
     }
-    if value != "1" {
-        return Err(format!(
-            "unsupported application permission format {value:?}; expected `1'"
-        ));
-    }
-    state.format_seen = true;
+    state.format = Some(match value {
+        "1" => PermissionFormat::One,
+        "2" => PermissionFormat::Two,
+        _ => {
+            return Err(format!(
+                "unsupported application permission format {value:?}; expected `1' or `2'"
+            ));
+        }
+    });
     Ok(())
 }
 
@@ -779,10 +867,10 @@ fn apply_resource(state: &mut ParseState, key: &str, value: &str) -> Result<(), 
             state.policy.resources.pids_max = Some(pids);
         }
         "cpu-max" => {
-            return Err(
-                "cpu-max is recognized but unavailable until td enables and guards the kernel CPU bandwidth controller"
-                    .into(),
-            );
+            if state.policy.resources.cpu_max.is_some() {
+                return Err("duplicate resource key `cpu-max'".into());
+            }
+            state.policy.resources.cpu_max = Some(parse_cpu_max(value)?);
         }
         _ => return Err(format!("unknown [Resources] key {key:?}")),
     }
@@ -967,6 +1055,30 @@ fn validate_pids(pids: u32) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_cpu_max(quota_usec: u64, period_usec: u64) -> Result<(), String> {
+    if quota_usec < MIN_CPU_BANDWIDTH_USEC {
+        return Err(format!(
+            "cpu-max quota must be at least {MIN_CPU_BANDWIDTH_USEC} microseconds"
+        ));
+    }
+    if quota_usec > MAX_CPU_QUOTA_USEC {
+        return Err(format!(
+            "cpu-max quota exceeds the pinned kernel limit {MAX_CPU_QUOTA_USEC} microseconds"
+        ));
+    }
+    if period_usec < MIN_CPU_BANDWIDTH_USEC {
+        return Err(format!(
+            "cpu-max period must be at least {MIN_CPU_BANDWIDTH_USEC} microseconds"
+        ));
+    }
+    if period_usec > MAX_CPU_PERIOD_USEC {
+        return Err(format!(
+            "cpu-max period exceeds the pinned kernel limit {MAX_CPU_PERIOD_USEC} microseconds"
+        ));
+    }
+    Ok(())
+}
+
 fn parse_bounded_positive_u64(
     label: &str,
     value: &str,
@@ -1009,6 +1121,28 @@ fn parse_pids(value: &str) -> Result<u32, String> {
         .map_err(|_| format!("pids-max exceeds the kernel task limit {MAX_PIDS}"))?;
     validate_pids(pids)?;
     Ok(pids)
+}
+
+fn parse_cpu_max(value: &str) -> Result<CpuMax, String> {
+    let Some((quota, period)) = value.split_once(' ') else {
+        return Err("cpu-max requires a quota and period in microseconds".into());
+    };
+    if quota.is_empty() || period.is_empty() || quota.contains(' ') || period.contains(' ') {
+        return Err("cpu-max quota and period must be separated by exactly one ASCII space".into());
+    }
+    let quota_usec = parse_bounded_positive_u64(
+        "cpu-max quota",
+        quota,
+        MAX_CPU_QUOTA_USEC,
+        "the pinned kernel limit",
+    )?;
+    let period_usec = parse_bounded_positive_u64(
+        "cpu-max period",
+        period,
+        MAX_CPU_PERIOD_USEC,
+        "the pinned kernel limit",
+    )?;
+    CpuMax::new(quota_usec, period_usec)
 }
 
 fn validate_scalar(label: &str, value: &str, max: usize) -> Result<(), String> {
@@ -1258,7 +1392,8 @@ mod tests {
             ("format=1\r\n", "carriage return"),
             ("format=1\0\n", "NUL"),
             ("# absent\n", "missing `format'"),
-            ("format=2\n", "unsupported"),
+            ("format=3\n", "unsupported"),
+            ("format=2\n", "requires cpu-max"),
             ("format=1\nformat=1\n", "duplicate"),
             ("unknown=1\n", "unknown permission root key"),
             ("format=1\n[Unknown]\n", "unknown permission section"),
@@ -1455,6 +1590,12 @@ mod tests {
 
     #[test]
     fn resource_limits_match_the_cgroup_contract() {
+        let cpu_policy = "format=2\n\n[Resources]\nmemory-high=50331648\nmemory-max=67108864\npids-max=32\ncpu-max=50000 100000\n";
+        assert_eq!(
+            PermissionPolicy::parse(cpu_policy).unwrap().to_keyfile(),
+            cpu_policy
+        );
+
         for (line, reason) in [
             ("memory-high=0", "greater than zero"),
             ("memory-max=01", "canonical positive"),
@@ -1474,7 +1615,10 @@ mod tests {
                 "pids-max=99999999999999999999999",
                 "kernel task limit 4194304",
             ),
-            ("cpu-max=50000 100000", "recognized but unavailable"),
+            (
+                "cpu-max=50000 100000",
+                "requires application permission format=2",
+            ),
             ("unknown=1", "unknown [Resources]"),
         ] {
             let text = format!("format=1\n[Resources]\n{line}\n");
@@ -1512,6 +1656,38 @@ mod tests {
         );
         assert_eq!(defaults.memory_max_bytes(), Some(DEFAULT_MEMORY_MAX_BYTES));
         assert_eq!(defaults.pids_max(), Some(DEFAULT_PIDS_MAX));
+        let default_cpu = defaults.cpu_max().unwrap();
+        assert_eq!(default_cpu.quota_usec(), DEFAULT_CPU_QUOTA_USEC);
+        assert_eq!(default_cpu.period_usec(), DEFAULT_CPU_PERIOD_USEC);
+
+        let typed_cpu = PermissionPolicy::new()
+            .with_memory_high(48 * 1024 * 1024)
+            .unwrap()
+            .with_memory_max(64 * 1024 * 1024)
+            .unwrap()
+            .with_pids_max(32)
+            .unwrap()
+            .with_cpu_max(50_000, 100_000)
+            .unwrap();
+        assert_eq!(typed_cpu.to_keyfile(), cpu_policy);
+        for (value, reason) in [
+            ("999 100000", "at least 1000"),
+            ("17592186044416 100000", "pinned kernel limit"),
+            ("50000 999", "at least 1000"),
+            ("50000 1000001", "pinned kernel limit"),
+            ("50000", "quota and period"),
+            ("50000  100000", "exactly one ASCII space"),
+            ("50000 100000 extra", "exactly one ASCII space"),
+            ("50000\t100000", "quota and period"),
+            ("50000\u{000c}100000", "quota and period"),
+            ("max 100000", "unsigned decimal"),
+        ] {
+            let text = format!(
+                "format=2\n[Resources]\nmemory-high=50331648\nmemory-max=67108864\npids-max=32\ncpu-max={value}\n"
+            );
+            let got = error(&text);
+            assert!(got.contains(reason), "{value:?}: {got}");
+        }
 
         let incomplete = PermissionPolicy::new()
             .with_pids_max(32)

@@ -39,7 +39,7 @@ const SURVIVOR_CHILD_ARG: &str = "--internal-survivor-child";
 const SURVIVOR_ORPHAN_ARG: &str = "--internal-survivor-orphan";
 pub const TRANSITION_MARKER: &str = "TD-JAIL-TRANSITION-OK";
 pub const HOST_DEGRADATION_CGROUP: &str =
-    "TD-JAIL-HOST-DEGRADATION aggregate-memory-and-task-caps=unenforced reason=no-delegated-cgroup";
+    "TD-JAIL-HOST-DEGRADATION aggregate-memory-task-and-cpu-caps=unenforced reason=no-delegated-cgroup";
 pub const HOST_DEGRADATION_WAYLAND: &str =
     "TD-JAIL-HOST-DEGRADATION wayland-global-filter=unenforced reason=direct-host-socket";
 const STAGE2_MARKER: &str = "TD-JAIL-STAGE2-OK";
@@ -412,8 +412,15 @@ where
         let memory_high_bytes = parse_u64(args.next(), "memory-high")?;
         let memory_max_bytes = parse_u64(args.next(), "memory-max")?;
         let pids_max = parse_id(args.next(), "pids-max")?;
-        let resources =
-            ResolvedResourceLimits::from_stage2(memory_high_bytes, memory_max_bytes, pids_max)?;
+        let cpu_quota_usec = parse_u64(args.next(), "cpu-max quota")?;
+        let cpu_period_usec = parse_u64(args.next(), "cpu-max period")?;
+        let resources = ResolvedResourceLimits::from_stage2(
+            memory_high_bytes,
+            memory_max_bytes,
+            pids_max,
+            cpu_quota_usec,
+            cpu_period_usec,
+        )?;
         let cgroup_membership = args
             .next()
             .ok_or_else(usage_error)?
@@ -493,7 +500,7 @@ fn stage2_launch_arguments(
     arguments: &[OsString],
 ) -> Vec<OsString> {
     let mut stage2 = Vec::with_capacity(
-        16usize
+        18usize
             .saturating_add(environment.len().saturating_mul(2))
             .saturating_add(filesystems.len().saturating_mul(2))
             .saturating_add(arguments.len()),
@@ -532,6 +539,8 @@ fn stage2_launch_arguments(
         OsString::from(resources.limits.memory_high_bytes.to_string()),
         OsString::from(resources.limits.memory_max_bytes.to_string()),
         OsString::from(resources.limits.pids_max.to_string()),
+        OsString::from(resources.limits.cpu_quota_usec.to_string()),
+        OsString::from(resources.limits.cpu_period_usec.to_string()),
         OsString::from(resources.membership),
     ]);
     stage2.push(OsString::from(STAGE2_ARGUMENTS_ARG));
@@ -3757,6 +3766,8 @@ mod tests {
                 "50331648",
                 "67108864",
                 "32",
+                "50000",
+                "100000",
                 "/td-user-1000/app-0123456789abcdef",
                 STAGE2_ARGUMENTS_ARG,
                 "--flag",
@@ -3786,6 +3797,8 @@ mod tests {
                     memory_high_bytes: 50_331_648,
                     memory_max_bytes: 67_108_864,
                     pids_max: 32,
+                    cpu_quota_usec: 50_000,
+                    cpu_period_usec: 100_000,
                 }
                 && cgroup_membership == "/td-user-1000/app-0123456789abcdef"
                 && arguments == [OsString::from("--flag")]
@@ -3866,6 +3879,8 @@ mod tests {
             memory_high_bytes: 50_331_648,
             memory_max_bytes: 67_108_864,
             pids_max: 32,
+            cpu_quota_usec: 50_000,
+            cpu_period_usec: 100_000,
         };
         let membership = "/td-user-1000/app-0123456789abcdef";
         let filesystems = vec![FilesystemGrant {

@@ -112,9 +112,9 @@ filesystems.
 
 **I7. The application cgroup delegation root is empty and controller-complete.**
 PID 1 mounts cgroup2 before it starts td-svc. At the beginning of `run`, before
-td-svc spawns a control thread or service, it enables `memory` and `pids` at
-the hierarchy root, creates `/sys/fs/cgroup/td-user-1000`, enables the
-same controllers there, and delegates the directory plus `cgroup.procs`,
+td-svc spawns a control thread or service, it enables `cpu`, `memory`, and
+`pids` at the hierarchy root, creates `/sys/fs/cgroup/td-user-1000`, enables
+the same controllers there, and delegates the directory plus `cgroup.procs`,
 `cgroup.subtree_control`, and `cgroup.threads` to 1000:1000. The delegated root
 itself stays empty: ordinary user processes live in the root-owned `session`
 leaf and jailed stage-2 processes live in direct per-instance leaves.
@@ -1134,11 +1134,10 @@ the one whose output a failed login has to be reconstructed from.
 
 Landing 8 realizes I7 for application resource caps. PID 1 mounts cgroup2
 beside `/proc` and `/sys`; PID 1 and system services stay at the hierarchy root
-under cgroup v2's root exception. td-svc enables `memory` and `pids` there and
-delegates the empty
-`td-user-1000` subtree with exact ownership and controller readback. The
-application fixture's QEMU evidence now depends on td-jail observing a live
-per-instance leaf with its exact configured limits.
+under cgroup v2's root exception. td-svc enables `cpu`, `memory`, and `pids`
+there and delegates the empty `td-user-1000` subtree with exact ownership and
+controller readback. The application fixture's QEMU evidence now depends on
+td-jail observing a live per-instance leaf with its exact configured limits.
 
 The shipped greeter's containment reaching only its wrapper process is
 RESOLVED, and not the way this document previously said.

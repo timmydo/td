@@ -96,6 +96,8 @@ pub(crate) struct ResolvedResourceLimits {
     pub(crate) memory_high_bytes: u64,
     pub(crate) memory_max_bytes: u64,
     pub(crate) pids_max: u32,
+    pub(crate) cpu_quota_usec: u64,
+    pub(crate) cpu_period_usec: u64,
 }
 
 impl ResolvedResourceLimits {
@@ -103,10 +105,11 @@ impl ResolvedResourceLimits {
         let resources = resources
             .complete_or_default()
             .map_err(|error| invalid(format!("application resource policy: {error}")))?;
-        let (Some(memory_high_bytes), Some(memory_max_bytes), Some(pids_max)) = (
+        let (Some(memory_high_bytes), Some(memory_max_bytes), Some(pids_max), Some(cpu_max)) = (
             resources.memory_high_bytes(),
             resources.memory_max_bytes(),
             resources.pids_max(),
+            resources.cpu_max(),
         ) else {
             return Err(invalid("application resource baseline is incomplete"));
         };
@@ -114,6 +117,8 @@ impl ResolvedResourceLimits {
             memory_high_bytes,
             memory_max_bytes,
             pids_max,
+            cpu_quota_usec: cpu_max.quota_usec(),
+            cpu_period_usec: cpu_max.period_usec(),
         })
     }
 
@@ -121,11 +126,14 @@ impl ResolvedResourceLimits {
         memory_high_bytes: u64,
         memory_max_bytes: u64,
         pids_max: u32,
+        cpu_quota_usec: u64,
+        cpu_period_usec: u64,
     ) -> io::Result<Self> {
         let policy = PermissionPolicy::new()
             .with_memory_high(memory_high_bytes)
             .and_then(|policy| policy.with_memory_max(memory_max_bytes))
             .and_then(|policy| policy.with_pids_max(pids_max))
+            .and_then(|policy| policy.with_cpu_max(cpu_quota_usec, cpu_period_usec))
             .map_err(|error| invalid(format!("invalid stage-2 resource limits: {error}")))?;
         Self::from_policy(policy.resources())
     }
@@ -702,16 +710,31 @@ fn parse_spec(text: &str) -> io::Result<ParsedSpec> {
         previous = Some(key.to_string());
         environment.insert(key.to_string(), value.to_string());
     }
-    let mut permission_text = String::from("format=1\n\n");
+    let mut permission_text = String::new();
+    let mut permission_has_cpu_max = false;
+    let mut permission_section = None;
     let mut first = true;
     for line in lines {
         if !first {
             permission_text.push('\n');
         }
         first = false;
+        if line.starts_with('[') {
+            permission_section = Some(line);
+        } else if permission_section == Some("[Resources]") && line.starts_with("cpu-max=") {
+            permission_has_cpu_max = true;
+        }
         permission_text.push_str(line);
     }
     permission_text.push('\n');
+    permission_text.insert_str(
+        0,
+        if permission_has_cpu_max {
+            "format=2\n\n"
+        } else {
+            "format=1\n\n"
+        },
+    );
     let permissions = PermissionPolicy::parse(&permission_text)
         .map_err(|error| invalid(format!("application spec permissions: {error}")))?;
     if permissions.to_keyfile() != permission_text {
@@ -2427,7 +2450,7 @@ mod tests {
 
         let resources = text.replace(
             "sockets=wayland\n",
-            "sockets=wayland\n\n[Resources]\nmemory-high=50331648\nmemory-max=67108864\npids-max=32\n",
+            "sockets=wayland\n\n[Resources]\nmemory-high=50331648\nmemory-max=67108864\npids-max=32\ncpu-max=50000 100000\n",
         );
         let spec = parse_spec(&resources).unwrap();
         assert_eq!(
@@ -2436,6 +2459,8 @@ mod tests {
                 memory_high_bytes: 50_331_648,
                 memory_max_bytes: 67_108_864,
                 pids_max: 32,
+                cpu_quota_usec: 50_000,
+                cpu_period_usec: 100_000,
             }
         );
         assert_eq!(
@@ -2445,19 +2470,33 @@ mod tests {
                 memory_high_bytes: crate::permissions::DEFAULT_MEMORY_HIGH_BYTES,
                 memory_max_bytes: crate::permissions::DEFAULT_MEMORY_MAX_BYTES,
                 pids_max: crate::permissions::DEFAULT_PIDS_MAX,
+                cpu_quota_usec: crate::permissions::DEFAULT_CPU_QUOTA_USEC,
+                cpu_period_usec: crate::permissions::DEFAULT_CPU_PERIOD_USEC,
             }
         );
 
         assert_eq!(
-            ResolvedResourceLimits::from_stage2(50_331_648, 67_108_864, 32).unwrap(),
+            ResolvedResourceLimits::from_stage2(50_331_648, 67_108_864, 32, 50_000, 100_000)
+                .unwrap(),
             ResolvedResourceLimits {
                 memory_high_bytes: 50_331_648,
                 memory_max_bytes: 67_108_864,
                 pids_max: 32,
+                cpu_quota_usec: 50_000,
+                cpu_period_usec: 100_000,
             }
         );
-        assert!(ResolvedResourceLimits::from_stage2(4096, u64::MAX, 1).is_err());
-        assert!(ResolvedResourceLimits::from_stage2(4096, 8192, u32::MAX).is_err());
+        assert!(ResolvedResourceLimits::from_stage2(
+            4096, u64::MAX, 1, 50_000, 100_000
+        )
+        .is_err());
+        assert!(ResolvedResourceLimits::from_stage2(
+            4096, 8192, u32::MAX, 50_000, 100_000
+        )
+        .is_err());
+        assert!(
+            ResolvedResourceLimits::from_stage2(4096, 8192, 1, 999, 100_000).is_err()
+        );
 
         let partial = text.replace(
             "sockets=wayland\n",
@@ -2468,6 +2507,14 @@ mod tests {
             .map(|error| error.to_string())
             .unwrap()
             .contains("must set memory-high, memory-max and pids-max"));
+
+        let misplaced_cpu = text.replace(
+            "sockets=wayland\n",
+            "sockets=wayland\n\n[Filesystem]\ncpu-max=ro\n",
+        );
+        let misplaced_error = parse_spec(&misplaced_cpu).err().unwrap().to_string();
+        assert!(misplaced_error.contains("filesystem location"));
+        assert!(!misplaced_error.contains("format=2 requires cpu-max"));
         let unaligned = text.replace(
             "sockets=wayland\n",
             "sockets=wayland\n\n[Resources]\nmemory-high=50331649\nmemory-max=67108864\npids-max=32\n",

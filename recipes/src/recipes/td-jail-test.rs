@@ -11,7 +11,7 @@ const HOST_PACKAGE: &str =
     "/td/store/00000000000000000000000000000000-td-jail-fixture-0.1";
 const HOST_RUNTIME: &str = "/td/store/00000000000000000000000000000000-empty-runtime-1";
 const HOST_DEGRADATION_CGROUP: &str =
-    "TD-JAIL-HOST-DEGRADATION aggregate-memory-and-task-caps=unenforced reason=no-delegated-cgroup";
+    "TD-JAIL-HOST-DEGRADATION aggregate-memory-task-and-cpu-caps=unenforced reason=no-delegated-cgroup";
 const HOST_DEGRADATION_WAYLAND: &str =
     "TD-JAIL-HOST-DEGRADATION wayland-global-filter=unenforced reason=direct-host-socket";
 

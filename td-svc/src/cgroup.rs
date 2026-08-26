@@ -17,27 +17,30 @@ pub(crate) fn delegate_session() -> io::Result<()> {
     let root = Path::new(ROOT);
     require_words(
         &read_control(&root.join("cgroup.controllers"))?,
-        &["memory", "pids"],
+        &["cpu", "memory", "pids"],
         "root cgroup controllers",
     )?;
 
     // The hierarchy root is exempt from the no-internal-process rule. Keep
     // PID 1 and system services there; only the empty application subtree is
     // delegated below the enabled controllers.
-    write_control(&root.join("cgroup.subtree_control"), "+memory +pids")?;
+    write_control(&root.join("cgroup.subtree_control"), "+cpu +memory +pids")?;
     require_words(
         &read_control(&root.join("cgroup.subtree_control"))?,
-        &["memory", "pids"],
+        &["cpu", "memory", "pids"],
         "root cgroup subtree control",
     )?;
 
     let delegate = Path::new(DELEGATE);
     create_leaf(delegate)?;
     require_empty(&delegate.join("cgroup.procs"), "delegated cgroup")?;
-    write_control(&delegate.join("cgroup.subtree_control"), "+memory +pids")?;
+    write_control(
+        &delegate.join("cgroup.subtree_control"),
+        "+cpu +memory +pids",
+    )?;
     require_words(
         &read_control(&delegate.join("cgroup.subtree_control"))?,
-        &["memory", "pids"],
+        &["cpu", "memory", "pids"],
         "delegated cgroup subtree control",
     )?;
     let session = Path::new(SESSION);
@@ -191,7 +194,7 @@ mod tests {
 
     #[test]
     fn controller_names_are_tokens() {
-        require_words("cpu memory pids", &["memory", "pids"], "controllers").unwrap();
+        require_words("cpu memory pids", &["cpu", "memory", "pids"], "controllers").unwrap();
         assert!(require_words("memoryish pids", &["memory"], "controllers").is_err());
     }
 

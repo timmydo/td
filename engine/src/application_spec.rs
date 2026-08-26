@@ -141,7 +141,8 @@ impl ApplicationSpec {
         let mut environment = BTreeMap::new();
         let mut environment_seen = false;
         let mut permission_sections = BTreeSet::new();
-        let mut permission_text = String::from("format=1\n");
+        let mut permission_text = String::new();
+        let mut permission_has_cpu_max = false;
         let mut section: Option<&str> = None;
 
         for (index, raw) in text.lines().enumerate() {
@@ -224,6 +225,9 @@ impl ApplicationSpec {
                             &format!("unknown application spec section [{permission_section}]"),
                         ));
                     }
+                    if permission_section == "Resources" && key == "cpu-max" {
+                        permission_has_cpu_max = true;
+                    }
                     permission_text.push_str(raw);
                     permission_text.push('\n');
                 }
@@ -236,6 +240,14 @@ impl ApplicationSpec {
         let name = name.ok_or("application spec is missing `name'")?;
         let runtime = runtime.ok_or("application spec is missing `runtime'")?;
         let entry = entry.ok_or("application spec is missing `entry'")?;
+        permission_text.insert_str(
+            0,
+            if permission_has_cpu_max {
+                "format=2\n"
+            } else {
+                "format=1\n"
+            },
+        );
         let permissions = PermissionPolicy::parse(&permission_text)
             .map_err(|reason| format!("application spec permissions: {reason}"))?;
         let spec = ApplicationSpec {
@@ -264,7 +276,10 @@ impl ApplicationSpec {
             }
         }
         let permissions = self.permissions.to_keyfile();
-        if let Some(tail) = permissions.strip_prefix("format=1\n") {
+        if let Some(tail) = permissions
+            .strip_prefix("format=1\n")
+            .or_else(|| permissions.strip_prefix("format=2\n"))
+        {
             out.push_str(tail);
         }
         out
@@ -440,6 +455,8 @@ mod tests {
             .with_memory_max(64 * 1024 * 1024)
             .unwrap()
             .with_pids_max(32)
+            .unwrap()
+            .with_cpu_max(50_000, 100_000)
             .unwrap();
         let spec = ApplicationSpec::compile(
             &manifest(),
@@ -449,8 +466,10 @@ mod tests {
         .unwrap();
         let text = spec.to_keyfile();
         assert_eq!(text.matches("format=1\n").count(), 1);
+        assert!(!text.contains("format=2\n"));
         assert!(text.contains("[Context]\nshared=network\nsockets=wayland\n"));
         assert!(text.contains("[Filesystem]\nxdg-download=ro\n"));
+        assert!(text.contains("cpu-max=50000 100000\n"));
         assert_eq!(
             ApplicationSpec::parse(&text).unwrap().permissions(),
             &policy

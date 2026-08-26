@@ -1818,7 +1818,7 @@ const SANDBOX_KERNEL_NODES: [(&str, &str, &str); 6] = [
     (
         "/proc/cgroups",
         "CONFIG_CGROUPS",
-        "no cgroup v2 at all, so an application has no aggregate memory or pid cap",
+        "no cgroup v2 at all, so an application has no aggregate CPU, memory, or pid cap",
     ),
     (
         "/proc/self/ns/user",
@@ -1891,7 +1891,12 @@ const SANDBOX_KERNEL_CONTROLLERS: [(&str, &str, &str); 1] = [(
 
 /// The controllers the mounted unified hierarchy must actually expose. Unlike
 /// `/proc/cgroups`, this is authoritative for the v2 memory controller.
-const SANDBOX_KERNEL_CGROUP2_CONTROLLERS: [(&str, &str, &str); 2] = [
+const SANDBOX_KERNEL_CGROUP2_CONTROLLERS: [(&str, &str, &str); 3] = [
+    (
+        "cpu",
+        "CONFIG_CGROUP_SCHED",
+        "the cgroup v2 CPU controller does not exist",
+    ),
     (
         "memory",
         "CONFIG_MEMCG",
@@ -1903,6 +1908,24 @@ const SANDBOX_KERNEL_CGROUP2_CONTROLLERS: [(&str, &str, &str); 2] = [
         "pids.max never exists in cgroup v2, so a jail cannot contain a fork bomb",
     ),
 ];
+
+/// Controller files whose presence witnesses scheduler features narrower than
+/// the controller itself.
+const SANDBOX_KERNEL_CGROUP2_NODES: [(&str, &str, &str, &str); 1] = [(
+    crate::ladder::TD_APPLICATION_CGROUP_SESSION,
+    "cpu.weight",
+    "CONFIG_FAIR_GROUP_SCHED",
+    "fair-scheduler cgroup accounting does not exist",
+)];
+
+/// Rows compiled into controller files only with the named scheduler feature.
+const SANDBOX_KERNEL_CGROUP2_ROWS: [(&str, &str, &str, &str, &str); 1] = [(
+    crate::ladder::TD_APPLICATION_CGROUP_SESSION,
+    "cpu.stat",
+    "nr_periods",
+    "CONFIG_CFS_BANDWIDTH",
+    "a jail cannot enforce CPU bandwidth",
+)];
 
 /// The per-namespace ucount ceilings, one per `CLONE_NEW*` td-jail's single `unshare(2)`
 /// asks for. Each is a kill switch a compiled-in namespace cannot survive: set to 0, the
@@ -1972,6 +1995,20 @@ fn build_sandbox_kernel_probes() -> String {
              /sys/fs/cgroup/cgroup.controllers || \
              {{ echo \"kernel: cgroup2 does not expose {controller} \
              ({symbol} off, disabled, or not mounted) — {cost}\"; k=0; }}; "
+        ));
+    }
+    for (directory, node, symbol, cost) in SANDBOX_KERNEL_CGROUP2_NODES {
+        p.push_str(&format!(
+            "[ -e {directory}/{node} ] || \
+             {{ echo \"kernel: {directory}/{node} missing \
+             ({symbol} off, or td-svc cgroup delegation failed) — {cost}\"; k=0; }}; "
+        ));
+    }
+    for (directory, node, row, symbol, cost) in SANDBOX_KERNEL_CGROUP2_ROWS {
+        p.push_str(&format!(
+            "/bin/grep -Eq \"^{row}[[:space:]][0-9]+$\" {directory}/{node} || \
+             {{ echo \"kernel: {directory}/{node} lacks {row} \
+             ({symbol} off, or td-svc cgroup delegation failed) — {cost}\"; k=0; }}; "
         ));
     }
     for (limit, clone_flag) in SANDBOX_KERNEL_UCOUNTS {
@@ -8218,7 +8255,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// fails below. What this roster cannot catch is a pin added to the kernel recipe
     /// and to nothing else — the recipe's own `.config` guard is what covers that, and
     /// it fails the producer build rather than this test.
-    const SANDBOX_SYMBOLS: [&str; 10] = [
+    const SANDBOX_SYMBOLS: [&str; 13] = [
         "CONFIG_USER_NS",
         "CONFIG_PID_NS",
         "CONFIG_UTS_NS",
@@ -8227,6 +8264,9 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         "CONFIG_SECCOMP_FILTER",
         "CONFIG_INOTIFY_USER",
         "CONFIG_CGROUPS",
+        "CONFIG_CGROUP_SCHED",
+        "CONFIG_FAIR_GROUP_SCHED",
+        "CONFIG_CFS_BANDWIDTH",
         "CONFIG_MEMCG",
         "CONFIG_CGROUP_PIDS",
     ];
@@ -8268,19 +8308,37 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
                 "the kernel recipe does not guard {symbol} over the RESOLVED config"
             );
         }
-        let probed: Vec<&str> = SANDBOX_KERNEL_NODES
+        let mut probed: Vec<&str> = SANDBOX_KERNEL_NODES
             .iter()
             .chain(SANDBOX_KERNEL_STATUS_FIELDS.iter())
             .chain(SANDBOX_KERNEL_CONTROLLERS.iter())
             .chain(SANDBOX_KERNEL_CGROUP2_CONTROLLERS.iter())
             .map(|(_, symbol, _)| *symbol)
             .collect();
+        probed.extend(
+            SANDBOX_KERNEL_CGROUP2_NODES
+                .iter()
+                .map(|(_, _, symbol, _)| *symbol),
+        );
+        probed.extend(
+            SANDBOX_KERNEL_CGROUP2_ROWS
+                .iter()
+                .map(|(_, _, _, symbol, _)| *symbol),
+        );
         for symbol in &probed {
             assert!(
                 SANDBOX_SYMBOLS.contains(symbol),
                 "{symbol} is probed but is not one of the symbols §0 pins"
             );
         }
+        assert!(
+            LINUX_RECIPE.contains("# CONFIG_RT_GROUP_SCHED is not set"),
+            "the kernel must keep real-time group scheduling outside the delegated CPU contract"
+        );
+        assert!(
+            LINUX_RECIPE.contains("grep -q '^CONFIG_RT_GROUP_SCHED=y' .config"),
+            "the resolved kernel config must reject real-time group scheduling"
+        );
     }
 
     /// Every leg actually TESTS something, and tests the thing its diagnostic names.
@@ -8319,6 +8377,22 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             assert!(probes.contains(&format!(
                 "\"(^|[[:space:]]){controller}([[:space:]]|$)\" /sys/fs/cgroup/cgroup.controllers ||"
             )));
+        }
+        for (directory, node, _, _) in SANDBOX_KERNEL_CGROUP2_NODES {
+            let path = format!("{directory}/{node}");
+            assert!(
+                probes.contains(&format!("[ -e {path} ] ||")),
+                "no leg tests {path} for existence"
+            );
+        }
+        for (directory, node, row, _, _) in SANDBOX_KERNEL_CGROUP2_ROWS {
+            let path = format!("{directory}/{node}");
+            assert!(
+                probes.contains(&format!(
+                    "/bin/grep -Eq \"^{row}[[:space:]][0-9]+$\" {path} ||"
+                )),
+                "no leg tests {path} for {row}"
+            );
         }
         for (limit, clone_flag) in SANDBOX_KERNEL_UCOUNTS {
             assert!(
@@ -8401,6 +8475,8 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             + SANDBOX_KERNEL_STATUS_FIELDS.len()
             + SANDBOX_KERNEL_CONTROLLERS.len()
             + SANDBOX_KERNEL_CGROUP2_CONTROLLERS.len()
+            + SANDBOX_KERNEL_CGROUP2_NODES.len()
+            + SANDBOX_KERNEL_CGROUP2_ROWS.len()
             + SANDBOX_KERNEL_UCOUNTS.len() * 3;
         assert_eq!(
             probes.matches("k=0").count(),

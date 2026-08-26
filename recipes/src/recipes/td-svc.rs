@@ -225,5 +225,7 @@ mod tests {
             "const SESSION: &str = {:?};",
             crate::ladder::TD_APPLICATION_CGROUP_SESSION
         )));
+        assert!(cgroup.contains("\"+cpu +memory +pids\""));
+        assert!(cgroup.contains("&[\"cpu\", \"memory\", \"pids\"]"));
     }
 }

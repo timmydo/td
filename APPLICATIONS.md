@@ -254,6 +254,8 @@ CONFIG_SND_ALOOP=y                 # in-guest loopback, the audio test oracle
 # CONFIG_SND_PCM_OSS stays OFF — present in 7.1.4, deliberately refused (§K.3)
 # resource caps (§P) — NOT deferred after all, see below:
 CONFIG_CGROUPS=y  CONFIG_MEMCG=y  CONFIG_CGROUP_PIDS=y
+CONFIG_CGROUP_SCHED=y  CONFIG_FAIR_GROUP_SCHED=y  CONFIG_CFS_BANDWIDTH=y
+# CONFIG_RT_GROUP_SCHED is not set  # fair-scheduler bandwidth only
 # IPC_NS deferred: needs SYSVIPC, which nothing else on the image wants
 # FUSE_FS deferred: lands with the Documents portal, not before
 ```
@@ -344,9 +346,11 @@ files unconditionally, so the greeter also asserts that legacy view — anchored
 it, which is the one failure no config guard can see.
 
 The consequence for §P is that **`cgroup.controllers` on a mounted
-cgroup2 is the only interface that answers "is the memory controller
-available"**. The resource-cap landing makes both `memory` and `pids` there
-image assertions. A first
+cgroup2 is the interface that answers whether the v2 `cpu`, `memory`, and
+`pids` controllers are available**. The resource-cap landings make all three
+image assertions; the session leaf's CFS-only `nr_periods` row in `cpu.stat`
+separately witnesses that bandwidth, rather than only CPU accounting, is
+active. A first
 draft of this rung probed `memory` in `/proc/cgroups` and would have
 failed every boot; it was caught in review rather than in QEMU.
 
@@ -973,11 +977,11 @@ content and changes only when the package does, while a permission grant
 is a decision an operator revisits without rebuilding anything.
 
 **The typed permission keyfile has LANDED.** `td_engine::permissions` owns its
-parser, canonical writer and construction API. This is the complete version-1
-vocabulary:
+parser, canonical writer and construction API. Version 1 remains accepted;
+version 2 adds the CPU bandwidth key shown here:
 
 ```ini
-format=1
+format=2
 
 [Context]
 shared=network
@@ -998,11 +1002,13 @@ org.mozilla.firefox=own
 memory-high=1073741824
 memory-max=1342177280
 pids-max=1024
+cpu-max=100000 100000
 ```
 
 The authored file and its canonical rendering are each at most 16 KiB, UTF-8
-with a trailing LF and no CR or NUL. `format=1` is required before the first
-section. Full-line `#` comments, blank lines and ASCII space/tab layout are
+with a trailing LF and no CR or NUL. `format=1` or `format=2` is required
+before the first section. Version 2 requires `cpu-max`; version 1 cannot spell
+it. Full-line `#` comments, blank lines and ASCII space/tab layout are
 accepted and canonicalized away; sections, keys and list members may not
 repeat, unknown intent is refused, and the writer fixes section/key/list order.
 Empty sections disappear. A compact boundary input whose normalized rendering
@@ -1047,18 +1053,24 @@ names, or the two bare namespace roots. Resource values are bounded positive
 decimal integers. Memory is a byte count capped at
 9,223,372,036,854,767,616, the largest 4096-byte-aligned value below the first
 value the pinned kernel rounds to its unlimited page-counter sentinel, and
-`pids-max` is a task/TID count
-capped at the kernel's 4,194,304-task limit. `cpu-max` is
-recognized but refused until td enables and guards the kernel CPU bandwidth
-controller. `memory-high` must be below `memory-max` when both appear, and the
-format has no spelling for an unlimited resource.
+`pids-max` is a task/TID count capped at the kernel's 4,194,304-task limit.
+`cpu-max` is a quota and period in microseconds, separated by one space. The
+quota is 1,000 through 17,592,186,044,415 and the period is 1,000 through
+1,000,000, matching the pinned kernel's CFS bandwidth bounds. The format has
+no literal `max` spelling; its upper bound is kernel representability, not a
+practical CPU allotment. `memory-high` must be below `memory-max` when both
+appear.
 The spec compiler embeds the immutable authored policy. At launch, omission
 selects the reviewed non-unlimited baseline: `memory-high=1073741824`,
-`memory-max=1342177280`, and `pids-max=1024`. An explicit resource section is
-atomic — all three keys are required — and both memory values must be aligned
-to the target's 4096-byte page size so kernel readback is exact rather than a
-silently rounded value. Mutable operator overrides remain a later lifecycle
-landing.
+`memory-max=1342177280`, `pids-max=1024`, and `cpu-max=100000 100000` — one
+fair-scheduler CPU. An explicit format-1 resource section is atomic over its
+three keys and inherits that CPU baseline; format 2 requires those three plus
+`cpu-max`. Both memory values must be aligned to the target's 4096-byte page
+size so kernel readback is exact rather than a silently rounded value. The
+compiled application spec stays format 1 and embeds the permission sections
+without a second root key; the presence of `cpu-max` selects the embedded
+version-2 permission grammar. Mutable operator overrides remain a later
+lifecycle landing.
 
 **The runtime/application split is the one piece of flatpak's
 architecture worth adopting wholesale.** A runtime is just another
@@ -5555,6 +5567,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 12b | **immutable typed filesystem grants — LANDED**: canonical source resolution and identity pinning, reserved alias refusal, deny-wins/overlap merging, separate recursive bind targets, nested-mount hardening and stage-1/stage-2 readback. Mutable per-user overrides remain a later lifecycle landing | a jailed app can open only a builder-authenticated explicitly granted host path |
 | 12c | **typed memory/task policy — LANDED**: cgroup2 is mounted by PID 1; PID 1 and system services remain at the hierarchy root under cgroup v2's root exception while td-svc enables `memory`/`pids` top-down and delegates an empty user subtree; td-jail creates one direct per-instance leaf, writes and exactly reads `memory.high`, `memory.max`, `memory.oom.group=1`, and `pids.max`, moves blocked stage 2 before release, verifies membership, sets and reads equal hard/soft `RLIMIT_DATA`, reports `memory.events`/`memory.peak`, and removes the empty leaf. Omitted policy gets the documented finite baseline; partial or page-rounded policy is refused. The 48 MiB/64 MiB/32-task fixture and active-cgroup probe gate the QEMU marker. `cpu-max` remains refused until the kernel bandwidth controller lands | application resource limits are effective rather than metadata |
 | 12d | **application terminal/session containment — LANDED**: the argv0-selected launcher waits on a later-born stage 1; stage 1 binds its lifetime to that exact parent, then either preserves and reads back an existing no-terminal supervisor group or enters and reads back a new session with no controlling terminal. Only then may it resolve authority, register or create state. Parent death still tears down stage 1, stage 2 and the cgroup leaf. `devices=tty` remains refused until a fresh-terminal policy exists | the jail is not an ambient terminal member, and it does not escape a dedicated service stop scope |
+| 12e | **typed CPU bandwidth policy — LANDED**: permission format 2 adds bounded `cpu-max=QUOTA PERIOD`; format 1 remains accepted and inherits a one-CPU baseline. The kernel pins fair-group scheduling and CFS bandwidth while keeping real-time group scheduling off; td-svc delegates `cpu` top-down; td-jail writes and exactly reads `cpu.max`, reports the bandwidth rows from `cpu.stat`, and the 50%-CPU fixture's active leaf gates the QEMU marker | aggregate CPU time is capped with the memory and task budgets |
 | 13 | `td-busd` codec, auth, surface #10 | none |
 | 14 | names, routing, match rules, descriptor passing | none |
 | 15 | per-app policy, lineage identity, in-jail activation | none |
@@ -6645,9 +6658,9 @@ is a **prlimit64(2) amendment** to surface #9 that the earlier draft did
 not account for, and it should be landed with the caps rather than
 discovered at implementation time).
 
-**The aggregate bound needs cgroup v2 `memory.max`**, which is why §0
-now pins `CONFIG_CGROUPS`, `CONFIG_MEMCG` and `CONFIG_CGROUP_PIDS`
-rather than deferring them. The shape:
+**The aggregate bound needs cgroup v2**, which is why §0 pins the memory,
+PID, fair-scheduler, and CFS-bandwidth controller symbols rather than
+deferring them. The shape:
 
 - `td-svc` (root) creates the session's cgroup subtree at boot and
   **delegates** it, which is the same thing systemd's `user@.service`
@@ -6655,9 +6668,9 @@ rather than deferring them. The shape:
   it. The delegation set is **three files, not one**: the directory,
   `cgroup.procs`, AND `cgroup.subtree_control`. The third is the one an
   earlier draft omitted and it is load-bearing — without ownership of
-  `cgroup.subtree_control` the delegate cannot enable the `memory`
-  controller for the cgroups it creates, so `memory.max` and
-  `memory.high` never come into existence and every write below fails
+  `cgroup.subtree_control` the delegate cannot enable the `cpu`, `memory`,
+  and `pids` controllers for the cgroups it creates, so their leaf controls
+  never come into existence and every write below fails
   `ENOENT`. (`cgroup.threads` completes the conventional set and is
   harmless to include.) The failure mode is worth stating because it is
   not "permission denied" but "the file is not there", which reads like
@@ -6669,7 +6682,7 @@ rather than deferring them. The shape:
   are therefore part of the trusted session boundary.
 - **Two cgroup-v2 rules make that delegation fail if it is a bare
   `chown`, and both reviewers found it independently.** Controllers are
-  enabled TOP-DOWN — `memory` must already be in the parent's
+  enabled TOP-DOWN — every controller must already be in the parent's
   `cgroup.subtree_control` before the delegate can enable it in its own —
   so `td-svc` enables it down the chain at boot rather than assuming a
   distribution did. And a cgroup with member processes cannot enable
@@ -6685,10 +6698,11 @@ rather than deferring them. The shape:
   blocked stage 2 into a sibling per-instance leaf, the delegated root is the
   source/destination common ancestor and uid 1000 owns the required control files.
 - `td-jail` creates one cgroup per instance, writes `memory.max`,
-  `memory.high` and `pids.max` from the app's permission file, then moves
-  stage 2 into it *before* spawning the app, so every descendant is inside by
-  construction. Version 1 refuses `cpu-max`; a later format may write
-  `cpu.max` only after td enables and guards the kernel bandwidth controller.
+  `memory.high`, `pids.max`, and `cpu.max` from the resolved permission policy,
+  then moves stage 2 into it *before* spawning the app, so every descendant is
+  inside by construction. Permission format 2 carries the explicit CPU quota
+  and period; format 1 inherits the reviewed `100000 100000` baseline.
+  The bounds mirror the pinned kernel and there is no `max` spelling.
 - Before creating the leaf, stage 1 starts a cleanup bootstrap with cwd `/` and
   retains a close-on-exec keepalive pipe. The bootstrap enters and proves a new
   session before spawning the watcher; the watcher enters and proves its own
@@ -6705,6 +6719,12 @@ rather than deferring them. The shape:
   reclaims, `max` invokes the OOM killer inside the cgroup. A browser
   that gets slow near its ceiling is better behaviour than one that
   loses a tab, so set both, `high` below `max`.
+- `cpu.max` covers the fair scheduler only. td deliberately keeps
+  `RT_GROUP_SCHED` off: applications get no real-time scheduling grant, and a
+  real-time task in the populated hierarchy root cannot prevent td-svc from
+  enabling the delegated CPU controller. The exact quota/period readback and
+  required `nr_periods`, `nr_throttled`, and `throttled_usec` rows in
+  `cpu.stat` prove the bandwidth interface rather than CPU accounting alone.
 - **`memory.oom.group=1` is not optional, and leaving it out was the
   gap a review found.** `memory.max` on its own does not bound *the
   application*; it bounds the cgroup, and the memcg OOM killer's default
@@ -6718,18 +6738,18 @@ rather than deferring them. The shape:
   handles `ENOMEM` badly hangs instead of dying. So `memory.high` is
   what keeps the machine usable and `oom.group` is what makes the
   failure clean; neither substitutes for the other.
-- Read `memory.events` and `memory.peak` back for the diagnostic: an app
-  killed for memory should say so, since an OOM kill inside a cgroup is
-  otherwise indistinguishable from a crash.
+- Read `memory.events`, `memory.peak`, and the bandwidth rows from `cpu.stat`
+  back for diagnostics: an app killed for memory or throttled for CPU should
+  say so rather than looking like an unexplained failure or slowdown.
 
 The landed hierarchy leaves PID 1 and system services at the hierarchy root,
 which cgroup v2 explicitly exempts from the no-internal-process rule, beside
 the empty delegated `td-user-1000` root. Application sessions and per-instance
 leaves are the only descendants placed under the delegated subtree.
 Per-app values live in the same per-package permission file as the filesystem
-and device grants (decision 9). Omission means 1 GiB high, 1.25 GiB max, and
-1024 tasks rather than unlimited — *unlimited* is the setting that produced
-the complaint.
+and device grants (decision 9). Omission means 1 GiB high, 1.25 GiB max, 1024
+tasks, and one fair-scheduler CPU rather than unlimited — *unlimited* is the
+setting that produced the complaint.
 
 ---
 
@@ -6760,7 +6780,7 @@ The experiments that settle what is left, none longer than a week:
 | **E1b — route selected, importer not landed** | fetch and materialize the same exact signed Flathub commits through a bounded control-plane importer | Flathub publishes no stable deploy tarball, so an ambient `flatpak` recipe and a locally hosted export are both refused. §B.3.1 is the importer contract |
 | **E2 — COMPLETE** | filter globals from GTK 4.22.1; exercise forced Cairo; compile in exact Freedesktop SDK 25.08 and run against the exact pinned Platform; run pinned Firefox 154.0 on no-dmabuf Weston and test its nested user namespace and `about:support` sandbox report | data-device is the GTK first-window blocker while subcompositor is class U; forced Cairo, pinned llvmpipe, and pinned Firefox all attach shm without dmabuf; stock Firefox denies nested user namespaces yet retains effective content sandbox level 6, selecting one standard td filter. The pinned Freedesktop runtime contains GTK 3 rather than GTK 4, so a future GTK 4 runtime selection repeats that identified part of the matrix |
 | **E3** | a Meson-world pilot — recipes for `pkgconf`, Ninja, Meson, a native CPython, then GLib and a Wayland-only `gtk3-demo` | td's *actual* per-package source cost, the number with the widest error bars. Near `cmake-x86-64`'s cost and the source track is real; a multi-week fight per package and the hybrid is permanent posture |
-| **E4 — COMPLETE** | the §0 cgroup pins plus a fixture under `memory.high=48M`, `memory.max=64M`, `pids.max=32`, with active membership and `memory.oom.group` readback gating the QEMU oracle | §P's mechanism works on the target kernel |
+| **E4 — COMPLETE** | the §0 cgroup pins plus a fixture under `memory.high=48M`, `memory.max=64M`, `pids.max=32`, and `cpu.max=50000 100000`, with active membership and exact controller readback gating the QEMU oracle | §P's mechanism works on the target kernel |
 | **E5** | `glxinfo` inside a jail on virtio-gpu QEMU with the runtime's GL extension mounted | §M's first step |
 | **E6** | `RLIMIT_AS=2G` on Firefox; record the crash | closes the rlimits-versus-cgroups argument with data |
 
@@ -7270,7 +7290,7 @@ gets all three:
   the shipped fixture recipe rather than a copied policy. It uses the real
   td-busd registration path (not an application-originated bus handshake)
   and caller-owned session-socket endpoints, and asserts the exact two-line
-  degradation report: aggregate memory/task caps are unavailable without a
+  degradation report: aggregate memory/task/CPU caps are unavailable without a
   delegated cgroup, and direct host Wayland cannot filter globals. User
   namespaces and the standard seccomp filter remain fatal prerequisites
   rather than degradation entries. A test that asserted only "it ran" would

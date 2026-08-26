@@ -23,21 +23,32 @@ pub(crate) struct MemoryEvents {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CpuStat {
+    pub(crate) periods: u64,
+    pub(crate) throttled: u64,
+    pub(crate) throttled_usec: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Report {
     pub(crate) events: MemoryEvents,
     pub(crate) peak: u64,
+    pub(crate) cpu: CpuStat,
 }
 
 impl Report {
     pub(crate) fn diagnostic(self) -> String {
         format!(
-            "memory.events high={} max={} oom={} oom_kill={} oom_group_kill={}; memory.peak={}",
+            "memory.events high={} max={} oom={} oom_kill={} oom_group_kill={}; memory.peak={}; cpu.stat nr_periods={} nr_throttled={} throttled_usec={}",
             self.events.high,
             self.events.max,
             self.events.oom,
             self.events.oom_kill,
             self.events.oom_group_kill,
             self.peak,
+            self.cpu.periods,
+            self.cpu.throttled,
+            self.cpu.throttled_usec,
         )
     }
 }
@@ -258,6 +269,10 @@ fn configure(directory: &Path, limits: ResolvedResourceLimits) -> io::Result<()>
     )?;
     write_control(&directory.join("memory.oom.group"), "1")?;
     write_control(&directory.join("pids.max"), &limits.pids_max.to_string())?;
+    write_control(
+        &directory.join("cpu.max"),
+        &format!("{} {}", limits.cpu_quota_usec, limits.cpu_period_usec),
+    )?;
     require_configuration(directory, limits)
 }
 
@@ -267,6 +282,10 @@ fn require_configuration(directory: &Path, limits: ResolvedResourceLimits) -> io
         ("memory.max", limits.memory_max_bytes.to_string()),
         ("memory.oom.group", "1".to_string()),
         ("pids.max", limits.pids_max.to_string()),
+        (
+            "cpu.max",
+            format!("{} {}", limits.cpu_quota_usec, limits.cpu_period_usec),
+        ),
     ] {
         let actual = read_control(&directory.join(name))?;
         if actual != expected {
@@ -308,12 +327,12 @@ fn require_delegation(root: &Path, uid: u32, gid: u32) -> io::Result<()> {
     }
     require_words(
         &read_control(&root.join("cgroup.controllers"))?,
-        &["memory", "pids"],
+        &["cpu", "memory", "pids"],
         "delegated cgroup controllers",
     )?;
     require_words(
         &read_control(&root.join("cgroup.subtree_control"))?,
-        &["memory", "pids"],
+        &["cpu", "memory", "pids"],
         "delegated cgroup subtree control",
     )
 }
@@ -344,7 +363,52 @@ fn report(directory: &Path) -> io::Result<Report> {
         peak: read_control(&directory.join("memory.peak"))?
             .parse()
             .map_err(|error| io::Error::other(format!("invalid memory.peak: {error}")))?,
+        cpu: parse_cpu_stat(&read_control(&directory.join("cpu.stat"))?)?,
     })
+}
+
+fn parse_cpu_stat(text: &str) -> io::Result<CpuStat> {
+    let mut stat = CpuStat::default();
+    let mut found_periods = false;
+    let mut found_throttled = false;
+    let mut found_throttled_usec = false;
+    for line in text.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let name = fields
+            .next()
+            .ok_or_else(|| io::Error::other("empty cpu.stat row"))?;
+        let value: u64 = fields
+            .next()
+            .ok_or_else(|| io::Error::other(format!("cpu.stat {name} has no value")))?
+            .parse()
+            .map_err(|error| io::Error::other(format!("cpu.stat {name} is invalid: {error}")))?;
+        if fields.next().is_some() {
+            return Err(io::Error::other(format!(
+                "cpu.stat {name} has trailing fields"
+            )));
+        }
+        match name {
+            "nr_periods" => {
+                stat.periods = value;
+                found_periods = true;
+            }
+            "nr_throttled" => {
+                stat.throttled = value;
+                found_throttled = true;
+            }
+            "throttled_usec" => {
+                stat.throttled_usec = value;
+                found_throttled_usec = true;
+            }
+            _ => {}
+        }
+    }
+    if !(found_periods && found_throttled && found_throttled_usec) {
+        return Err(io::Error::other(
+            "cpu.stat lacks nr_periods, nr_throttled or throttled_usec",
+        ));
+    }
+    Ok(stat)
 }
 
 fn parse_memory_events(text: &str) -> io::Result<MemoryEvents> {
@@ -598,8 +662,26 @@ mod tests {
     }
 
     #[test]
+    fn cpu_diagnostics_require_the_bandwidth_rows() {
+        let parsed = parse_cpu_stat(
+            "usage_usec 100\nuser_usec 60\nsystem_usec 40\nnr_periods 7\nnr_throttled 2\nthrottled_usec 15\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            CpuStat {
+                periods: 7,
+                throttled: 2,
+                throttled_usec: 15,
+            }
+        );
+        assert!(parse_cpu_stat("usage_usec 100\nnr_periods 7\nnr_throttled 2\n").is_err());
+        assert!(parse_cpu_stat("nr_periods 7 extra\nnr_throttled 2\nthrottled_usec 15\n").is_err());
+    }
+
+    #[test]
     fn controller_words_are_tokens_not_substrings() {
-        require_words("cpu memory pids", &["memory", "pids"], "controllers").unwrap();
+        require_words("cpu memory pids", &["cpu", "memory", "pids"], "controllers").unwrap();
         assert!(require_words("cpu memoryish pids", &["memory"], "controllers").is_err());
     }
 }
