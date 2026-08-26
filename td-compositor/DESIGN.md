@@ -679,6 +679,28 @@ pinned by
 A document cannot notice when the code moves under it, and this list has been
 read as a state claim by work outside this crate.
 
+The E2 application-compatibility experiment on 2026-08-25 fixes the priority
+of the next globals without changing that current-state list. GTK 4.22.1's
+`gtk4-demo`, run against Weston through a registry-listener filter, completed
+its XDG configure and attached a shm buffer with `wl_subcompositor` hidden. It
+refused the display before creating a surface when
+`wl_data_device_manager` alone was hidden. The data-device manager is therefore
+a first-window blocker for current GTK; the subcompositor is a usability
+requirement whose synchronized-child paths remain to be exercised, not a
+first-toplevel requirement. This compositor's exact six-global registry still
+lacks both, so it does not yet claim a GTK window.
+
+The same experiment closes the no-GPU presentation question. GTK 4.22.1's
+forced Cairo configuration attached shm with and without the subcompositor.
+More importantly, a Wayland-EGL smoke client compiled by exact Freedesktop SDK
+25.08 and executed against the exact pinned Freedesktop Platform 25.08
+reported llvmpipe and created, attached, and committed a `wl_shm` buffer when
+the reference compositor advertised neither dmabuf nor `wl_drm`. Exact pinned
+Firefox 154.0 also acknowledged its XDG configure and attached two shm buffers
+on that no-dmabuf display. These are development-host compatibility results,
+not tests of td's wire implementation; `APPLICATIONS.md` §F records the exact
+commits, limitations, and runtime-major repeat rule.
+
 **Decorations are the compositor's.** td answers every
 `zxdg_toplevel_decoration_v1` with `server_side` and never `client_side`: a
 tile already carries a title band this compositor draws, so a client drawing

@@ -1235,8 +1235,8 @@ Those capabilities are necessary, not a claim that Firefox becomes ready when
 they land. The resumed application workstream still owns the bounded importer
 and dynamic validator from §B.3.1, the runtime aliases and synthesized `/etc`,
 the narrowed td permission and resource policy, and image-capacity accounting
-for the 993.7 MB base deploy. It must also complete E2's toolkit and nested
-sandbox experiments and the exact §H Firefox oracle. `td-portal` itself is a
+for the 993.7 MB base deploy. E2's toolkit and nested-sandbox experiments are
+now complete; the exact §H Firefox oracle remains. `td-portal` itself is a
 separate platform prerequisite. None of those obligations is discharged by
 the bus/compositor list below.
 
@@ -2599,10 +2599,10 @@ stack and the outer policy could change any result. The QEMU invocation passes
 no allowance, requires both states to begin at zero, and always runs the exact
 behavior checks on the target kernel.
 
-### The open question: Firefox's nested sandbox
+### Firefox's nested sandbox
 
-**The two source designs disagreed here, and it is not resolvable from a
-document.** One holds that upstream flatpak denies `clone(CLONE_NEWUSER)`
+**The two source designs disagreed here; the resolution below required an
+experiment.** One holds that upstream flatpak denies `clone(CLONE_NEWUSER)`
 and that Firefox detects this and runs its content sandbox in fallback
 mode, so td should match upstream exactly and inherit a decade of
 ecosystem testing. The other holds that Firefox must be allowed to build
@@ -2636,14 +2636,29 @@ that assertion, "Firefox runs" is compatible with Firefox having quietly
 disabled its own defences inside td's jail, which is the one outcome
 neither design wants and which nothing else here would detect.
 
-**Resolution:** build the standard (deny) filter first, and structure the
-filter as `static STANDARD_FILTER: [SockFilter; N]` from the outset so a
-second profile is a data change rather than a redesign. Settle it by
-experiment before Firefox milestones are sequenced — on a dev host with
-real flatpak, run `flatpak run --command=sh org.mozilla.firefox -c
-'unshare -Ur true'` and read `about:support`'s sandbox section on a
-stock flatpak Firefox. That is a ten-minute check and it decides whether
-td ships one filter or two. Record the answer here when it is known.
+**Resolution — E2, 2026-08-25:** td ships the one standard deny filter; there
+is no `BROWSER_FILTER`. The development host had no seccomp filter and
+`unshare -Ur true` succeeded, so the kernel and host policy supported an
+unprivileged user namespace. Inside the exact pinned Firefox 154.0 deploy,
+the stock Flatpak sandbox reported `NoNewPrivs: 1`, seccomp mode 2 with one
+filter, and the same command failed `EPERM`. Firefox printed
+`CanCreateUserNamespace() clone() failure: EPERM`, continued running, and
+installed its own seccomp filters with thread synchronization in eight child
+processes observed by `MOZ_SANDBOX_LOGGING=1`.
+
+The same stock run's `about:support` report said Seccomp-BPF and seccomp thread
+synchronization were true, user namespaces were false, content and media
+plugin sandboxing were true, and both the configured and effective content
+sandbox levels were 6. Its headless process list contained Socket, Fork
+Server, RDD, and Extension processes. This is the upstream fallback outcome
+the standard filter was intended to match: denying a nested user namespace
+does not disable Firefox's content seccomp sandbox.
+
+That bounded experiment selects the filter; it does **not** discharge §H's
+stronger oracle. A headless `about:support` page does not exercise ordinary
+web content, GPU, socket, and utility classes together under td-jail. The
+Firefox milestone must still open ordinary content and assert the expected
+sandbox result for every process class that the pinned build creates.
 
 ### `UNSAFE.md` surface #9 (target-state draft)
 
@@ -5114,8 +5129,8 @@ by them, and records why a tile ignores them and what an offset cannot reach.
 |---|---|---|---|
 | `xdg_surface.set_window_geometry` honoured | **landed** | — | ~250 across scene and hit-test — spent. The geometry is the crop: a tile draws the client's own rectangle from its own origin and a pointer arrives in the client's coordinates. Two deliberate divergences, both in DESIGN.md §3 — the surface intersection is taken where it is used rather than frozen at the applying commit, and a geometry naming no part of the surface leaves the whole surface standing rather than cropping to nothing |
 | `wl_shm` ARGB blending | **present** | — | verify with a golden |
-| `wl_subcompositor` | absent | **B** | 2,500–4,000 |
-| `wl_data_device_manager` v3, selection | absent | **B** | 4,000–6,000 (DnD later, +~900) |
+| `wl_subcompositor` | absent | **U** | 2,500–4,000 — E2 proved it is not a GTK 4 first-window dependency; synchronized child surfaces remain untested and it stays required for general toolkit usability |
+| `wl_data_device_manager` v3, selection | absent | **B** | 4,000–6,000 (DnD later, +~900) — E2 confirmed that current GTK 4 refuses the Wayland display when this global is absent |
 | `xdg_positioner` + `get_popup` | **landed** | — | ~900 — spent. Rules recorded and copied at `get_popup`; anchor, gravity and offset resolved on independent axes; the popup floats over its parent, above the tiles and below td's own bar, hit-tested first (though never over the bar), placed by its window geometry, required to abut its parent, stacked by td's own order, and relative to the parent so a submenu hangs off the menu that opened it. A null parent is refused (td implements no protocol that could supply one later) and a zero-area anchor rectangle is accepted as a point |
 | popup grabs + dismissal | **part** | **U** | 1,200–2,000, ~1,300 spent — `popup_done` is now sent for every popup a take-down cascades over, deepest first, which is the order the protocol makes a client destroy nested popups in; a menu whose window went is no longer left open to its client. The surface is UNMAPPED with it, which the protocol makes the same act: the configure tracker is reset, so a client that ignores the event and repaints gets `unconfigured_buffer` instead of its menu back, and the runtime refuses to place a menu it has recorded as over, so a commit already in flight when the press landed is dropped rather than painting the menu back over a grab that has gone — the dismissal is enforced rather than advised. A popup whose parent went before its own initial commit is dismissed AT that commit rather than configured and then refunded, taking the placed submenus down with it, deepest first, and one that maps again under a live parent gets the xdg_surface serial alone, since version 1 has no event that may revise a placement. `grab` is now recorded and checked. The chain is walked to a toplevel rather than read one level deep, since a menu whose window went keeps both its grab and its role object and would otherwise go on lending grabs to submenus opened under it. Only an ungrabbed popup parent is an error, `invalid_popup_parent` on the shell object; a chain that is dismissed, orphaned or gone gets the dismissal the protocol asks for instead of a closed connection. `invalid_grab` refuses a grab after the popup has ever been mapped, and the seat must name a `wl_seat`. The grab now takes the KEYBOARD: the topmost grabbing popup has focus, read off the same stacking order the paint uses, and bounded two ways td records as divergences from the protocol's "always" — the menu must have a pixel on screen, and it must hang off the focused window. The second is the operator's way back: without it a background client's popup was an inescapable keystroke sink, since the override outranks click-to-focus and `Super+arrow` and a grab suspends focus-follows-mouse. The seat's record is dropped when a mapping ends, and separately when the popup object or its surface is destroyed, so neither a menu painted back nor a reused id holds a grab it never asked for. Focus-follows-mouse is suspended for the grab's length, so the window under the menu is what focus falls back to. What is NOT enforced is that the parent is the topmost grabbing popup — the protocol names no error for it, so a branching client gets the keyboard on whichever branch it mapped last. A PRESS is routed through a grab too — motion and the wheel are not, and still go to whatever the pointer is over: a press with none of the grabbing menus under it closes them, deepest first, taking the pixels down and sending `popup_done`. "Outside" is a question about the chain — a grabbing menu survives a press on itself or on anything hanging off it, so a submenu's own press does not close the menu it hangs off — and the set asked is the seat's unfiltered, so a menu that holds no keyboard is still one a press ends. The press is CONSUMED rather than also delivered, since closing a menu must not click what it covered — except for the grab-owning client, which the protocol gives its pointer events for all of its surfaces as normal, so only somebody else's press is td's to take. Everything that decides a dismissal happens on the thread that read the press — grab, pixels, focus, the configure reset and the record that the menu is over — because a record left for another thread leaves a gap a client's own commit paints the menu back through. Only the wire event is the client's seat thread, since addressing it needs that client's registrations; the delivery carries the xdg_popup as well as the surface so that thread can prove the surface still wears the menu the press was about, and it holds the outbound lock across that lookup so `popup_done` cannot cross `delete_id` — never the registration lock, which the runtime takes with the runtime lock held, and which a blocking socket write must therefore not span. One cost is recorded: the byte ceiling is refunded on destroy rather than on dismissal. What is NOT dismissed yet is a chain on a WORKSPACE SWITCH, which the path now exists for and is held for its own landing. The input-event serial is read and not checked: td keeps no ledger of issued input serials to check one against |
 | popup protocol conformance (error object, permanent role, `not_the_topmost_popup`, `defunct_surfaces`, `already_constructed`) | **landed** | — | ~350 — spent. `xdg_wm_base`'s errors name the shell object rather than the xdg_surface they arrived at, and it outlives the surfaces it made so that id stays meaningful; a surface's role kind outlives its role object, so a former menu cannot come back as a tiled window; and a menu may not be destroyed before the submenu hanging off it |
@@ -5141,27 +5156,46 @@ by them, and records why a tile ignores them and what an offset cannot reach.
 **B** blocks a first window, **U** blocks a *usable* one, **C**
 cosmetic, **R** refused.
 
-`wl_subcompositor` and `wl_data_device_manager` are classed blocking on
-purpose, even though a particular GTK build might tolerate their absence:
-the gate is compatibility across the pinned runtime, not accidental
-startup. Confirm cheaply anyway — run `gtk4-demo` from the actual runtime
-against weston or sway with a ~20-line proxy that filters the global out,
-and watch. One afternoon settles it.
+**E2 result, 2026-08-25:** `wl_data_device_manager` is the first-window
+blocker; `wl_subcompositor` is not. A registry-listener filter ran Guix's GTK
+4.22.1 `gtk4-demo` against Weston 10.0.2's headless pixman backend. With only
+`wl_subcompositor` hidden, the client acknowledged its XDG configure, created
+a shm buffer, attached it, and remained alive until the four-second harness
+timeout. With only `wl_data_device_manager` hidden, it exited 1 before making
+a surface and reported that the compositor lacked a required interface.
+Hiding both produced the same refusal.
+
+That GTK binary is deliberately identified rather than called "the runtime's
+`gtk4-demo`": the exact pinned `org.freedesktop.Platform` 25.08 deploy contains
+GTK 3 (`libgtk-3.so.0`) and no GTK 4 library or demo. The experiment settles
+current GTK's first-toplevel behavior, not every use of synchronized
+subsurfaces and not an as-yet-unselected GTK 4 application runtime. Repeat the
+matrix when that runtime is pinned; until then `wl_subcompositor` remains
+class U rather than cosmetic.
 
 **dmabuf is never advertised.** Advertising it and rejecting every useful
 format is worse than letting clients pick the shm fallback immediately.
 
 ### Software rendering
 
-The claim the whole plan leans on is that the runtime's Mesa presents
-through `wl_shm` with no dmabuf. `LIBGL_ALWAYS_SOFTWARE` selects llvmpipe,
-but llvmpipe being a software *renderer* is not proof that Mesa's Wayland
-winsys can *present* without dmabuf in the pinned runtime build. **Treat
-that as an explicit unknown and prove it against the runtime**, on the
-same dev-host afternoon as the subcompositor check.
+E2 proves the runtime's Mesa can present through `wl_shm` with no dmabuf. A
+small Wayland-EGL client was compiled in exact Freedesktop SDK 25.08 commit
+`b90ed309cc1d505dea48b6a2121c5dcfac22868120eee643b0596d31f96b9bb8` and
+then executed with `flatpak build --runtime`, so `/usr` came from the pinned
+Platform commit
+`bd44a6230581917d04f89812a4c21090c304d390edb73995af1c2f9fd8abf4e8`.
+Against a Weston registry with neither dmabuf nor `wl_drm` advertised and with
+`LIBGL_ALWAYS_SOFTWARE=1`, it reported `GL_RENDERER=llvmpipe (LLVM 21.1.8,
+256 bits)`, created a `wl_shm` buffer, attached it, and committed the surface.
 
-The answer that makes it not blocking either way: **GTK4 with no GL at
-all is the designed configuration, not a fallback.** `GSK_RENDERER=cairo`
+The exact pinned Firefox deploy independently acknowledged an XDG configure
+and attached two shm buffers against the same no-dmabuf compositor while
+remaining alive for the ten-second harness. That launch intentionally lacked
+the portal, D-Bus, accessibility, and input services and is a presentation
+probe, not §H's usable-browser oracle.
+
+**GTK4 with no GL at all is still the designed configuration, not a
+fallback.** `GSK_RENDERER=cairo`
 plus `GDK_DISABLE=gl,vulkan,dmabuf,offload` gives a pure-CPU renderer
 submitting shm buffers; GTK3's default renderer is already cairo; and
 Firefox's Software WebRender presents via shm natively. What still fails
@@ -5174,9 +5208,11 @@ Do **not** rely on `MOZ_WEBRENDER=0`; current Firefox treats
 fallback. Select it through a per-profile policy and prove the result in
 `about:support`.
 
-The env policy is a small **per-runtime-major table** reviewed when a new
-major is first installed, not one global set, because each yearly runtime
-rebases Mesa and GTK.
+The forced-Cairo half was measured too: GTK 4.22.1 with that exact environment
+created and attached a shm buffer both with all Weston globals and with
+`wl_subcompositor` hidden. The env policy remains a small
+**per-runtime-major table** reviewed when a new major is first installed, not
+one global set, because each yearly runtime rebases Mesa and GTK.
 
 ### Budgets
 
@@ -5523,7 +5559,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 14 | names, routing, match rules, descriptor passing | none |
 | 15 | per-app policy, lineage identity, in-jail activation | none |
 | 16 | `td-portal` personality: Request/Session core, Settings, Account | GTK settings call works |
-| 17 | Wayland A: `set_window_geometry`, decoration manager, ARGB golden, single-pixel-buffer; **the GDK and llvmpipe experiments run and their answers land in DESIGN.md** | none |
+| 17 | Wayland A: `set_window_geometry`, decoration manager, ARGB golden, single-pixel-buffer; **E2's GDK, llvmpipe, and Firefox presentation answers are recorded in §F and `td-compositor/DESIGN.md`** | none |
 | 18 | Wayland B: `wl_subcompositor` | none |
 | 19 | Wayland C: `xdg_positioner`/`xdg_popup` and click-outside dismissal LANDED — constraint solving is what is left of this rung | a menu appears where its client asked, takes the keyboard while it is up, and closes when the operator presses outside it; it does not yet slide clear of a screen edge |
 | 20 | clipboard (data-device v3) — client cursors LANDED separately (`1c4b7f88`), so this rung is the clipboard alone | paste, and the I-beam already arrived |
@@ -5563,8 +5599,9 @@ plan: the surface amendment gets reviewed on its own diff.
 **The ladder has no GPU rung, and premise 6 says GPU is required.**
 Stated plainly because the two read as a contradiction and are not quite
 one. Every rung above delivers against td's **software** compositor: M12
-is jailed pixels through `wl_shm`, M28 is a Firefox window painted by
-llvmpipe inside the runtime and blitted by td's CPU renderer. Nothing
+is jailed pixels through `wl_shm`, M28 is a Firefox Software WebRender window
+presented through runtime shm and blitted by td's CPU renderer. The runtime's
+llvmpipe-over-shm path is available separately for EGL applications. Nothing
 here does modeset, dmabuf import or direct scanout.
 
 That is deliberate, and the reconciliation has three parts:
@@ -5627,13 +5664,15 @@ Ranked by how likely they are to change the plan:
    is how `NET_NS` arrived unasked), so the landing is checked against
    the *resolved* config rather than the pin list, and the boot oracle
    is what keeps a later regression from surfacing as a broken app.
-2. **Toolkit hard requirements and Mesa-over-shm** — both settled by one
-   dev-host afternoon (§F). If GTK4's cairo path has rotted in the pinned
-   runtime, the GL-less story weakens and dmabuf pressure rises, which is
-   a dead end with no GPU. This is the most expensive possible surprise.
-3. **Firefox's nested sandbox** (§C) — one filter or two, decided by a
-   ten-minute experiment, affecting the security posture of the most
-   exposed program on the image.
+2. ~~**Toolkit hard requirements and Mesa-over-shm**~~ — **RETIRED by E2.**
+   Current GTK 4 requires data-device but not subcompositor for its first
+   toplevel, forced Cairo attaches shm, and the exact pinned Platform's
+   llvmpipe attaches shm without a dmabuf global. A newly selected GTK 4
+   runtime major still repeats the matrix (§F).
+3. ~~**Firefox's nested sandbox**~~ — **RETIRED by E2.** Stock Firefox keeps
+   its effective level-6 content seccomp sandbox when Flatpak denies the
+   nested user namespace, so td selects one standard deny filter (§C). The
+   full per-process §H oracle remains implementation work.
 4. **Seed repackaging turns out to be lossy.** The seed path (§B.3)
    assumes a foreign deploy tree is a self-contained `files/` hierarchy
    that runs given its runtime. If some application needs
@@ -6719,7 +6758,7 @@ The experiments that settle what is left, none longer than a week:
 |---|---|---|
 | **E1 — package half answered (§B.3.1)** | inspect the signed Firefox 154.0 and Freedesktop 25.08 deploy commits without executing the app; map their exact `files/` trees to `/app` and `/usr` | the deploy hierarchy is the right package/runtime split, has no special or setid files, and at 993.7 MB deployed is smaller than the roughly 1.4 GB uncompressed standalone Guix closure. Its separate compressed transfer is 382.7 MB. Execution waits on the dynamic-runtime/jail, bus and Wayland stop line rather than using host `bwrap` as a substitute for td-jail |
 | **E1b — route selected, importer not landed** | fetch and materialize the same exact signed Flathub commits through a bounded control-plane importer | Flathub publishes no stable deploy tarball, so an ambient `flatpak` recipe and a locally hosted export are both refused. §B.3.1 is the importer contract |
-| **E2** | `gtk4-demo` behind a global-filtering proxy; llvmpipe-over-shm in the pinned runtime; the ten-minute Firefox nested-userns check | §F's toolkit requirements and §C's open question. The most expensive possible surprise is here: if GTK4's cairo path has rotted, the GL-less story weakens with no GPU to fall back on |
+| **E2 — COMPLETE** | filter globals from GTK 4.22.1; exercise forced Cairo; compile in exact Freedesktop SDK 25.08 and run against the exact pinned Platform; run pinned Firefox 154.0 on no-dmabuf Weston and test its nested user namespace and `about:support` sandbox report | data-device is the GTK first-window blocker while subcompositor is class U; forced Cairo, pinned llvmpipe, and pinned Firefox all attach shm without dmabuf; stock Firefox denies nested user namespaces yet retains effective content sandbox level 6, selecting one standard td filter. The pinned Freedesktop runtime contains GTK 3 rather than GTK 4, so a future GTK 4 runtime selection repeats that identified part of the matrix |
 | **E3** | a Meson-world pilot — recipes for `pkgconf`, Ninja, Meson, a native CPython, then GLib and a Wayland-only `gtk3-demo` | td's *actual* per-package source cost, the number with the widest error bars. Near `cmake-x86-64`'s cost and the source track is real; a multi-week fight per package and the hybrid is permanent posture |
 | **E4 — COMPLETE** | the §0 cgroup pins plus a fixture under `memory.high=48M`, `memory.max=64M`, `pids.max=32`, with active membership and `memory.oom.group` readback gating the QEMU oracle | §P's mechanism works on the target kernel |
 | **E5** | `glxinfo` inside a jail on virtio-gpu QEMU with the runtime's GL extension mounted | §M's first step |
