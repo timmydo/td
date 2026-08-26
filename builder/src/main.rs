@@ -4805,7 +4805,6 @@ fn substitute_gcc_toolchain(inputs: &mut [String], tc: &str) -> bool {
 // These embed the same pinned versions the rust-toolchain check's GCC_STAGE/GLIBC_STAGE
 // consts do; the two must move together on a compiler/libc bump (re #547).
 const NATIVE_GCC_STAGE: &str = "stage/td/store/gcc-14.3.0-x86_64-self";
-const NATIVE_GLIBC_STAGE: &str = "stage/td/store/glibc-2.41-x86_64";
 
 /// The six native `/td/store` link strings a `rust` recipe bakes into its drv env
 /// (TD_RUST_STORE_*), derived from the declared native inputs.
@@ -4838,7 +4837,10 @@ fn derive_native_rust_link_env(entries: &[lock::Entry]) -> Option<NativeRustLink
     let glibc_root = find("glibc-x86-64")?;
     let gcc_path = format!("{gcc_root}/{NATIVE_GCC_STAGE}");
     let binutils_path = format!("{binutils_root}/bin");
-    let glibc_path = format!("{glibc_root}/{NATIVE_GLIBC_STAGE}");
+    let glibc_path = format!(
+        "{glibc_root}/{}",
+        toolchain_x86_64::GLIBC_X86_64_STAGE
+    );
     Some(NativeRustLinkEnv {
         interp: format!("{glibc_path}/lib/ld-linux-x86-64.so.2"),
         rpath: format!("{glibc_path}/lib"),
@@ -5422,12 +5424,18 @@ fn assemble_recipe_drv(
         Some(value) => build::parse_cargo_git_sources(value)
             .map_err(|error| format!("recipe: {error}"))?,
     };
+    let cargo_source_patches = match alist.get("cargoSourcePatches") {
+        None => Vec::new(),
+        Some(value) => build::parse_cargo_source_patches(value)
+            .map_err(|error| format!("recipe: {error}"))?,
+    };
     if build_system != "rust"
         && (cargo_subdir.is_some()
             || cargo_package.is_some()
             || cargo_lock.is_some()
             || alist.get("replaceCargoLock").is_some()
-            || alist.get("cargoGitSources").is_some())
+            || alist.get("cargoGitSources").is_some()
+            || alist.get("cargoSourcePatches").is_some())
     {
         return Err(format!(
             "recipe: buildSystem \"{build_system}\" cannot declare Cargo build policy"
@@ -5438,6 +5446,9 @@ fn assemble_recipe_drv(
     }
     if !cargo_git_sources.is_empty() && cargo_lock.is_none() {
         return Err("recipe: `cargoGitSources' requires `cargoLock'".into());
+    }
+    if !cargo_source_patches.is_empty() && cargo_lock.is_none() {
+        return Err("recipe: `cargoSourcePatches' requires `cargoLock'".into());
     }
     if cargo_lock.is_some() && vendor_dir.is_none() {
         return Err(
@@ -5831,6 +5842,13 @@ fn assemble_recipe_drv(
                     &resolved.to_json_string(),
                 )?;
             }
+            if let Some(patches) = alist.get("cargoSourcePatches") {
+                push_drv_env(
+                    &mut spec,
+                    "TD_CARGO_SOURCE_PATCHES",
+                    &patches.to_json_string(),
+                )?;
+            }
             let bins: Vec<&str> = alist
                 .get("bins")
                 .and_then(json::Json::as_arr)
@@ -5890,6 +5908,16 @@ fn assemble_recipe_drv(
                         push_drv_env(&mut spec, k, &v)?;
                     }
                 }
+            }
+            if let Some(protobuf) = entries
+                .iter()
+                .find(|entry| entry.name == "protobuf-x86-64")
+            {
+                push_drv_env(
+                    &mut spec,
+                    "TD_RUST_PROTOC",
+                    &format!("{}/bin/protoc", protobuf.path),
+                )?;
             }
             // Optional cargo feature selection (both default-absent ⇒ a plain
             // `cargo build` with the crate's defaults, unchanged). `noDefaultFeatures`
@@ -15499,7 +15527,8 @@ daemon build START (2/2 active)
             &lock,
             "tool-source /td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-tool-source source\n\
              tool-git-source /td/store/cccccccccccccccccccccccccccccccc-tool-git-source seed\n\
-             binutils-x86-64-self /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-binutils-x86-64-self td-recipe-output\n",
+             binutils-x86-64-self /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-binutils-x86-64-self td-recipe-output\n\
+             protobuf-x86-64 /td/store/pppppppppppppppppppppppppppppppp-protobuf-x86-64 td-recipe-output\n",
         )
         .unwrap();
         let lockp = lock.to_str().unwrap();
@@ -15544,6 +15573,25 @@ daemon build START (2/2 active)
             "/td/store/cccccccccccccccccccccccccccccccc-tool-git-source"
         );
 
+        let with_source_patch = r#"{"name":"tool","version":"1","buildSystem":"rust","sourceInput":"tool-source","nativeInputs":["protobuf-x86-64"],"bins":["tool"],"cargoLock":"recipes/locks/tool/Cargo.lock","cargoSourcePatches":[{"file":"Cargo.toml","edits":[{"from":"native-tls","to":"rustls","expect":"1"}]}]}"#;
+        let (_, _, patch_drv, _) =
+            assemble_recipe_drv(with_source_patch, lockp, &dir, Some(vendor)).unwrap();
+        let patch_env = env_of(&patch_drv, "TD_CARGO_SOURCE_PATCHES")
+            .expect("Cargo source patches must enter the runner environment");
+        let parsed_patch_env = json::parse(&patch_env).unwrap();
+        assert_eq!(
+            build::parse_cargo_source_patches(&parsed_patch_env)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            env_of(&patch_drv, "TD_RUST_PROTOC").as_deref(),
+            Some(
+                "/td/store/pppppppppppppppppppppppppppppppp-protobuf-x86-64/bin/protoc"
+            )
+        );
+
         let plain = r#"{"name":"tool","version":"1","buildSystem":"rust","sourceInput":"tool-source","bins":["tool"]}"#;
         let (_, _, plain_drv, _) = assemble_recipe_drv(plain, lockp, &dir, None).unwrap();
         assert!(env_of(&plain_drv, "TD_CARGO_LOCK_POLICY").is_none());
@@ -15572,6 +15620,16 @@ daemon build START (2/2 active)
             (
                 r#"{"name":"x","version":"1","buildSystem":"gnu","cargoLock":"recipes/locks/x/Cargo.lock"}"#,
                 Some(vendor),
+                "cannot declare Cargo build policy",
+            ),
+            (
+                r#"{"name":"x","version":"1","buildSystem":"rust","cargoSourcePatches":[{"file":"Cargo.toml","edits":[{"from":"a","to":"b","expect":"1"}]}]}"#,
+                None,
+                "requires `cargoLock'",
+            ),
+            (
+                r#"{"name":"x","version":"1","buildSystem":"gnu","cargoSourcePatches":[{"file":"Cargo.toml","edits":[{"from":"a","to":"b","expect":"1"}]}]}"#,
+                None,
                 "cannot declare Cargo build policy",
             ),
             (
@@ -15615,7 +15673,7 @@ daemon build START (2/2 active)
             mk("busybox-x86-64", "/td/store/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-busybox-x86-64"),
         ];
         let d = derive_native_rust_link_env(&entries).expect("all three inputs present");
-        let gp = format!("{glibc}/{NATIVE_GLIBC_STAGE}");
+        let gp = format!("{glibc}/{}", toolchain_x86_64::GLIBC_X86_64_STAGE);
         let gccp = format!("{gcc}/{NATIVE_GCC_STAGE}");
         assert_eq!(d.interp, format!("{gp}/lib/ld-linux-x86-64.so.2"));
         assert_eq!(d.rpath, format!("{gp}/lib"));

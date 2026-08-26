@@ -64,7 +64,8 @@ const SHF_ALLOC: u64 = 2;
 const SHF_COMPRESSED: u64 = 0x800;
 const MAX_SECTION_NAME_TABLE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SECTION_HEADER_BYTES: usize = 4096;
-const MAX_PROFILE_LINE_SECTION_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_PROFILE_LINE_SECTION_BYTES: u64 =
+    td_engine::target_profile::DEFAULT_PROFILE_LINE_SECTION_BYTES;
 
 fn validate_line_address_shape(address_size: u8, segment_size: u8) -> Result<(), String> {
     if !matches!(address_size, 1 | 2 | 4 | 8) || segment_size != 0 {
@@ -827,6 +828,14 @@ fn one_build_id(path: &Path, elf: &mut FileElf) -> Result<Vec<u8>, String> {
 /// contents. The runtime retains only allocated/runtime metadata and dynamic
 /// symbols; the full ordinary symbol table lives in the companion.
 pub fn assert_debug_pair(runtime: &Path, debug: &Path) -> Result<(), String> {
+    assert_debug_pair_with_line_limit(runtime, debug, MAX_PROFILE_LINE_SECTION_BYTES)
+}
+
+pub fn assert_debug_pair_with_line_limit(
+    runtime: &Path,
+    debug: &Path,
+    max_debug_line_section_bytes: u64,
+) -> Result<(), String> {
     if !is_runtime_elf(runtime)? {
         return Err(format!("{}: debug-pair runtime is not ET_EXEC/ET_DYN", runtime.display()));
     }
@@ -897,6 +906,11 @@ pub fn assert_debug_pair(runtime: &Path, debug: &Path) -> Result<(), String> {
         let is_lines = section.kind == SHT_PROGBITS && name == b".debug_line";
         let line_data =
             name == b".debug_line" || name == b".debug_line_str" || name == b".debug_str";
+        let max_section_bytes = if name == b".debug_line" {
+            max_debug_line_section_bytes
+        } else {
+            MAX_PROFILE_LINE_SECTION_BYTES
+        };
         let compressed_line_data = name == b".zdebug_line"
             || name == b".zdebug_line_str"
             || name == b".zdebug_str"
@@ -908,11 +922,9 @@ pub fn assert_debug_pair(runtime: &Path, debug: &Path) -> Result<(), String> {
                 String::from_utf8_lossy(name)
             ));
         }
-        if line_data
-            && (section.kind != SHT_PROGBITS || section.size > MAX_PROFILE_LINE_SECTION_BYTES)
-        {
+        if line_data && (section.kind != SHT_PROGBITS || section.size > max_section_bytes) {
             return Err(format!(
-                "{}: {} has unsupported type or exceeds {MAX_PROFILE_LINE_SECTION_BYTES} bytes",
+                "{}: {} has unsupported type or exceeds {max_section_bytes} bytes",
                 debug.display(),
                 String::from_utf8_lossy(name)
             ));
@@ -1932,6 +1944,30 @@ mod tests {
         assert!(is_runtime_elf(&runtime).unwrap());
         assert_eq!(read_build_id(&runtime).unwrap(), id);
         assert_debug_pair(&runtime, &debug).unwrap();
+        let error = assert_debug_pair_with_line_limit(&runtime, &debug, 1).unwrap_err();
+        assert!(error.contains("exceeds 1 bytes"), "unexpected error: {error}");
+
+        let mut oversized_line_strings = synth_profiled_elf(&[id], true, true);
+        let line_strings = profile_section_offset(&oversized_line_strings, 8) as u64;
+        let oversized = MAX_PROFILE_LINE_SECTION_BYTES + 1;
+        profile_section_u64(&mut oversized_line_strings, 8, 0x20, oversized);
+        std::fs::write(&debug, oversized_line_strings).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&debug)
+            .unwrap()
+            .set_len(line_strings + oversized)
+            .unwrap();
+        let error = assert_debug_pair_with_line_limit(
+            &runtime,
+            &debug,
+            MAX_PROFILE_LINE_SECTION_BYTES * 5,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains(".debug_line_str has unsupported type or exceeds 33554432 bytes"),
+            "unexpected error: {error}"
+        );
 
         let mut wrong_names_type = synth_profiled_elf(&[id], true, true);
         profile_section_u32(&mut wrong_names_type, 1, 4, SHT_PROGBITS);

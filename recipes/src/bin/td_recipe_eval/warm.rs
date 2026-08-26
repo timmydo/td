@@ -243,12 +243,34 @@ fn vendor_warm_args(recipe: &Recipe, dest: &str) -> Result<Vec<String>, String> 
         .as_deref()
         .ok_or_else(|| format!("`{dest}' declares a cargoLock but no source"))?;
     let pin = source_pin_for_key(key)?;
-    let name = crate_name_from_pin(&pin.file, &recipe.version)?;
+    if pin.file.ends_with(".crate") {
+        let name = crate_name_from_pin(&pin.file, &recipe.version)?;
+        return Ok(vec![
+            s("warm"),
+            s("crate"),
+            name,
+            recipe.version.clone(),
+            dest.to_string(),
+        ]);
+    }
+    // Fixed-output archives are materialized from their top-level source root;
+    // fail during warming if the later build has not selected its Cargo workspace.
+    recipe.cargo_subdir.as_deref().ok_or_else(|| {
+        format!(
+            "fixed-output source archive `{}` needs an explicit cargoSubdir",
+            pin.file
+        )
+    })?;
+    let lock = recipe
+        .cargo_lock
+        .as_deref()
+        .ok_or_else(|| format!("`{dest}' declares no committed Cargo.lock"))?;
     Ok(vec![
         s("warm"),
-        s("crate"),
-        name,
-        recipe.version.clone(),
+        s("crate-source"),
+        pin.file,
+        pin.sha256,
+        lock.to_string(),
         dest.to_string(),
     ])
 }
@@ -471,6 +493,14 @@ mod tests {
         assert!(crate_name_from_pin("-1.0.0.crate", "1.0.0").is_err());
     }
 
+    #[test]
+    fn malformed_crate_pin_is_not_reinterpreted_as_a_workspace_archive() {
+        let mut recipe = td_recipe::catalog::lookup("uutils").unwrap();
+        recipe.version = "wrong-version".into();
+        let error = vendor_warm_args(&recipe, "uutils").unwrap_err();
+        assert!(error.contains("is not `<name>-wrong-version.crate'"), "{error}");
+    }
+
     // The vendor warms the distro's closure needs, derived from the recipes
     // rather than a hand-kept list: a crates.io rung and the in-tree one.
     #[test]
@@ -497,5 +527,21 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fixed_output_workspace_archives_warm_from_the_committed_lock() {
+        let codex = td_recipe::catalog::lookup("codex").unwrap();
+        assert_eq!(
+            vendor_warm_args(&codex, "codex").unwrap(),
+            vec![
+                "warm",
+                "crate-source",
+                "codex-rust-v0.148.0.tar.gz",
+                "a45e90403eb36b7d6093b167fe1c7dba9b36063bef6d39359eed52c47a21f94a",
+                "recipes/locks/codex/Cargo.lock",
+                "codex",
+            ]
+        );
     }
 }

@@ -1007,12 +1007,15 @@ mod tests {
         );
     }
 
-    const POST_BOOTSTRAP_BOUNDARY_OUTPUTS: [&str; 5] = [
+    const POST_BOOTSTRAP_BOUNDARY_OUTPUTS: [&str; 6] = [
         "rust-toolchain",
         "gcc-x86-64-self",
         "binutils-x86-64-self",
         "glibc-x86-64",
         "busybox-x86-64",
+        // Static CMake is already built with the final native GCC and is the
+        // reviewed configure-language boundary for later C/C++ build tools.
+        "cmake-x86-64",
     ];
     // These independent target artifacts and checks deliberately run before
     // self-hosting but are not ancestors of rust-toolchain. New recipes default

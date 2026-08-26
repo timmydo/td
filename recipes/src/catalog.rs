@@ -292,6 +292,22 @@ mod tests {
     }
 
     #[test]
+    fn every_line_attribution_exception_reaches_the_target_splitter() {
+        for (stem, _) in td_engine::target_profile::LINE_ATTRIBUTION_EXCEPTIONS {
+            let recipe = lookup(stem)
+                .unwrap_or_else(|| panic!("line-attribution exception names missing recipe {stem}"));
+            let generic_cargo_split = matches!(recipe.build_system, crate::types::BuildSystem::Rust);
+            let typed_split = recipe.steps.as_deref().unwrap_or_default().iter().any(|step| {
+                matches!(step, crate::types::Step::SplitDebugTree { .. })
+            });
+            assert!(
+                generic_cargo_split || typed_split,
+                "{stem}: line-attribution exception would not reach the marker-producing splitter"
+            );
+        }
+    }
+
+    #[test]
     fn deployment_and_toolchain_have_independent_external_debug_ceilings() {
         for (stem, expected_scope, expected_report, expected_ceiling) in [
             (

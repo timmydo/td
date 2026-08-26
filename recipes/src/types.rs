@@ -272,6 +272,16 @@ impl TextEdit {
             expect,
         }
     }
+
+    fn to_json(&self) -> Json {
+        Json::Obj(vec![
+            ("from".into(), Json::Str(self.from.clone())),
+            ("to".into(), Json::Str(self.to.clone())),
+            // Counts ride as strings because the builder's minimal JSON API
+            // intentionally exposes strings, arrays and booleans only.
+            ("expect".into(), Json::Str(self.expect.to_string())),
+        ])
+    }
 }
 
 impl Step {
@@ -521,22 +531,7 @@ impl Step {
                     ("file".into(), Json::Str(file.clone())),
                     (
                         "edits".into(),
-                        Json::Arr(
-                            edits
-                                .iter()
-                                .map(|e| {
-                                    Json::Obj(vec![
-                                        ("from".into(), Json::Str(e.from.clone())),
-                                        ("to".into(), Json::Str(e.to.clone())),
-                                        // The count rides as a string: the builder's
-                                        // JSON reader exposes only string/array/bool
-                                        // (numbers are parsed-but-unused), and this is
-                                        // an internal recipe→builder protocol.
-                                        ("expect".into(), Json::Str(e.expect.to_string())),
-                                    ])
-                                })
-                                .collect(),
-                        ),
+                        Json::Arr(edits.iter().map(TextEdit::to_json).collect()),
                     ),
                 ]),
             )]),
@@ -905,6 +900,35 @@ impl CargoGitSource {
     }
 }
 
+/// A literal, count-checked patch to one Cargo.toml or build.rs below the
+/// selected Rust workspace. This is narrower than a generic build phase, and
+/// the Rust runner applies the edits before enforcing the exact reviewed
+/// Cargo.lock and invoking frozen Cargo.
+#[derive(Clone)]
+pub struct CargoSourcePatch {
+    pub file: String,
+    pub edits: Vec<TextEdit>,
+}
+
+impl CargoSourcePatch {
+    pub fn new(file: &str, edits: Vec<TextEdit>) -> CargoSourcePatch {
+        CargoSourcePatch {
+            file: file.into(),
+            edits,
+        }
+    }
+
+    fn to_json(&self) -> Json {
+        Json::Obj(vec![
+            ("file".into(), Json::Str(self.file.clone())),
+            (
+                "edits".into(),
+                Json::Arr(self.edits.iter().map(TextEdit::to_json).collect()),
+            ),
+        ])
+    }
+}
+
 impl Phase {
     pub fn new(position: &str, anchor: &str, name: &str) -> Phase {
         Phase {
@@ -1056,6 +1080,10 @@ pub struct Recipe {
     /// may expose from it. The input is also added to the ordinary source/tool graph;
     /// the Rust runner consumes it as source data and never invokes Git.
     pub cargo_git_sources: Option<Vec<CargoGitSource>>,
+    /// Reviewed, literal edits to Cargo manifests or build scripts in the
+    /// selected workspace. Each edit pins its expected occurrence count so
+    /// upstream drift fails before Cargo runs.
+    pub cargo_source_patches: Option<Vec<CargoSourcePatch>>,
     /// Repo-relative path to an IN-TREE source directory this recipe builds from
     /// (#469 local-source provenance). Set via `local_source`, which also points
     /// `source_input` at this recipe's own `<name>-source` key. The runner
@@ -1075,6 +1103,7 @@ pub struct RecipeCheck {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CheckRunner {
     BuildOnly,
+    Codex,
     RustToolchain,
 }
 
@@ -1122,6 +1151,7 @@ impl Recipe {
             cargo_lock: None,
             replace_cargo_lock: None,
             cargo_git_sources: None,
+            cargo_source_patches: None,
             local_source: None,
         }
     }
@@ -1302,6 +1332,10 @@ impl Recipe {
             self.add_source_pin_for_key(&source.input);
         }
         self.cargo_git_sources = Some(sources);
+        self
+    }
+    pub fn cargo_source_patches(mut self, patches: Vec<CargoSourcePatch>) -> Recipe {
+        self.cargo_source_patches = Some(patches);
         self
     }
     /// Build this recipe from an IN-TREE source directory (repo-relative `path`),
@@ -1490,6 +1524,12 @@ impl Recipe {
                 Json::Arr(sources.iter().map(CargoGitSource::to_json).collect()),
             ));
         }
+        if let Some(patches) = &self.cargo_source_patches {
+            o.push((
+                "cargoSourcePatches".into(),
+                Json::Arr(patches.iter().map(CargoSourcePatch::to_json).collect()),
+            ));
+        }
         Json::Obj(o)
     }
 }
@@ -1567,6 +1607,18 @@ mod tests {
         assert_eq!(
             r.to_json().to_canonical(),
             r#"{"bins":["codex"],"buildSystem":"rust","cargoPackage":"codex-cli","cargoSubdir":"codex-rs","name":"codex","version":"0.149.1"}"#
+        );
+    }
+
+    #[test]
+    fn cargo_source_patches_are_literal_count_checked_recipe_data() {
+        let r = Recipe::rust("tool", "1").cargo_source_patches(vec![CargoSourcePatch::new(
+            "nested/Cargo.toml",
+            vec![TextEdit::new("native-tls", "rustls", 1)],
+        )]);
+        assert_eq!(
+            r.to_json().to_canonical(),
+            r#"{"buildSystem":"rust","cargoSourcePatches":[{"edits":[{"expect":"1","from":"native-tls","to":"rustls"}],"file":"nested/Cargo.toml"}],"name":"tool","version":"1"}"#
         );
     }
 

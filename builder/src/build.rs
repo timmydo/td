@@ -1378,8 +1378,24 @@ pub(crate) fn valid_cargo_package_name(package: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+fn valid_cargo_source_patch_path(path: &str) -> bool {
+    for suffix in ["Cargo.toml", "build.rs"] {
+        let nested = format!("/{suffix}");
+        if path == suffix
+            || path
+                .strip_suffix(nested.as_str())
+                .is_some_and(valid_cargo_subdir)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 const MAX_CARGO_GIT_SOURCES: usize = 64;
 const MAX_CARGO_GIT_PACKAGES: usize = 256;
+const MAX_CARGO_SOURCE_PATCHES: usize = 32;
+const MAX_CARGO_SOURCE_EDITS: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CargoGitPackage {
@@ -1393,6 +1409,12 @@ pub(crate) struct CargoGitSource {
     pub source: String,
     pub input: String,
     pub packages: Vec<CargoGitPackage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CargoSourcePatch {
+    file: String,
+    edits: Vec<TextEdit>,
 }
 
 fn exact_object_fields(value: &Json, expected: &[&str], label: &str) -> Result<(), String> {
@@ -1591,6 +1613,80 @@ pub(crate) fn parse_cargo_git_sources(value: &Json) -> Result<Vec<CargoGitSource
             source: source.to_string(),
             input: input.to_string(),
             packages: parsed_packages,
+        });
+    }
+    Ok(parsed)
+}
+
+pub(crate) fn parse_cargo_source_patches(
+    value: &Json,
+) -> Result<Vec<CargoSourcePatch>, String> {
+    let patches = value
+        .as_arr()
+        .ok_or("`cargoSourcePatches' must be an array")?;
+    if patches.is_empty() || patches.len() > MAX_CARGO_SOURCE_PATCHES {
+        return Err(format!(
+            "`cargoSourcePatches' must contain 1 through {MAX_CARGO_SOURCE_PATCHES} patches"
+        ));
+    }
+    let mut parsed = Vec::new();
+    let mut seen_files = std::collections::BTreeSet::new();
+    let mut edit_count = 0usize;
+    for patch in patches {
+        exact_object_fields(patch, &["file", "edits"], "Cargo source patch")?;
+        let file = patch
+            .get("file")
+            .and_then(Json::as_str)
+            .ok_or("Cargo source patch `file' must be a string")?;
+        if !valid_cargo_source_patch_path(file) {
+            return Err(format!(
+                "Cargo source patch path must be a plain relative Cargo.toml or build.rs path: {file}"
+            ));
+        }
+        if !seen_files.insert(file.to_string()) {
+            return Err(format!("duplicate Cargo source patch path: {file}"));
+        }
+        let edits = patch
+            .get("edits")
+            .and_then(Json::as_arr)
+            .ok_or("Cargo source patch `edits' must be an array")?;
+        if edits.is_empty() {
+            return Err(format!("Cargo source patch {file} has no edits"));
+        }
+        let mut parsed_edits = Vec::new();
+        for edit in edits {
+            edit_count = edit_count
+                .checked_add(1)
+                .ok_or("Cargo source edit count overflow")?;
+            if edit_count > MAX_CARGO_SOURCE_EDITS {
+                return Err(format!(
+                    "Cargo source patches declare more than {MAX_CARGO_SOURCE_EDITS} edits"
+                ));
+            }
+            exact_object_fields(edit, &["from", "to", "expect"], "Cargo source edit")?;
+            let from = edit
+                .get("from")
+                .and_then(Json::as_str)
+                .ok_or("Cargo source edit `from' must be a string")?;
+            let to = edit
+                .get("to")
+                .and_then(Json::as_str)
+                .ok_or("Cargo source edit `to' must be a string")?;
+            let expect = edit
+                .get("expect")
+                .and_then(Json::as_str)
+                .and_then(|count| count.parse::<usize>().ok())
+                .ok_or("Cargo source edit `expect' must be a count string")?;
+            if from.is_empty() || !from.is_ascii() || !to.is_ascii() || expect == 0 || from == to {
+                return Err(format!(
+                    "Cargo source edit for {file} must change non-empty ASCII text with a positive expectation"
+                ));
+            }
+            parsed_edits.push((from.to_string(), to.to_string(), expect));
+        }
+        parsed.push(CargoSourcePatch {
+            file: file.to_string(),
+            edits: parsed_edits,
         });
     }
     Ok(parsed)
@@ -1944,6 +2040,11 @@ fn enforce_cargo_lock_policy(
 ///   TD_CARGO_GIT_SOURCES optional typed JSON mapping exact Cargo Git source ids
 ///                to fixed-output source archive store paths and the package
 ///                directories copied from each archive into the vendor tree.
+///   TD_CARGO_SOURCE_PATCHES optional typed JSON literal edits to Cargo.toml or
+///                build.rs files below the selected workspace. Every edit
+///                carries an exact count, and no path may traverse a symlink.
+///   TD_RUST_PROTOC optional exact declared source-built Protocol Buffers
+///                compiler exposed to Cargo build scripts as PROTOC.
 ///   TD_VENDOR_CRATES optional ':'-joined `.crate` STORE paths (the dependency closure
 ///                pinned by Cargo.lock; nv from the store-path basename). The guix-realized
 ///                FOD inputs.
@@ -2006,6 +2107,27 @@ pub fn run_rust() -> Result<(), String> {
             return Err("TD_CARGO_GIT_SOURCES is not valid UTF-8".into())
         }
     };
+    let cargo_source_patches = match env::var("TD_CARGO_SOURCE_PATCHES") {
+        Ok(value) => {
+            let parsed = crate::json::parse(&value)
+                .map_err(|error| format!("TD_CARGO_SOURCE_PATCHES JSON: {error}"))?;
+            parse_cargo_source_patches(&parsed)?
+        }
+        Err(env::VarError::NotPresent) => Vec::new(),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err("TD_CARGO_SOURCE_PATCHES is not valid UTF-8".into())
+        }
+    };
+    let protoc = match env::var("TD_RUST_PROTOC") {
+        Ok(value) => {
+            require_executable_file(&value, "source-built protoc")?;
+            Some(value)
+        }
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err("TD_RUST_PROTOC is not valid UTF-8".into())
+        }
+    };
     let vendor_input_dir = match env::var("TD_VENDOR_DIR") {
         Ok(value) => value,
         Err(env::VarError::NotPresent) => String::new(),
@@ -2044,7 +2166,7 @@ pub fn run_rust() -> Result<(), String> {
             cinc.push(inc);
         }
     }
-    let path = path.join(":");
+    let mut path = path.join(":");
     let cargo = find_in_path(&path, "cargo").ok_or("cargo not found in TD_INPUTS")?;
     find_in_path(&path, "rustc").ok_or("rustc not found in TD_INPUTS")?;
     let objcopy = env::var("TD_RUST_OBJCOPY").map_err(|_| {
@@ -2093,11 +2215,30 @@ pub fn run_rust() -> Result<(), String> {
     run_cmd(&chmod, &["-R", "u+w", build_dir], ".", &path_env, &WATCH_PHASE)?;
 
     let cwd = env::current_dir().map_err(|e| e.to_string())?;
-    let build_abs = cwd.join(build_dir);
-    let cargo_dir = cargo_workspace_dir(
-        &build_abs,
+    if rust_workspace_needs_native_host_linker(
+        &recipe_name,
         cargo_subdir.as_deref(),
-    )?;
+        cargo_package.as_deref(),
+    ) {
+        if let Ok(interp) = env::var("TD_RUST_STORE_INTERP") {
+            if !interp.is_empty() {
+                let shell = find_in_path(&path, "sh")
+                    .ok_or("sh not found in TD_INPUTS (native Rust host-link wrapper)")?;
+                path = install_native_rust_host_linker(
+                    &cwd,
+                    &shell,
+                    &gcc,
+                    &interp,
+                    &env::var("TD_RUST_STORE_RPATH").unwrap_or_default(),
+                    &env::var("TD_RUST_STORE_BDIR").unwrap_or_default(),
+                    &path,
+                )?;
+            }
+        }
+    }
+    let build_abs = cwd.join(build_dir);
+    let cargo_dir = cargo_workspace_dir(&build_abs, cargo_subdir.as_deref())?;
+    apply_cargo_source_patches(&cargo_dir, &cargo_source_patches)?;
     let committed_lock = if let Some(policy) = cargo_lock_policy {
         if vendor_input_dir.is_empty() {
             return Err("TD_CARGO_LOCK_POLICY requires TD_VENDOR_DIR".into());
@@ -2196,6 +2337,9 @@ pub fn run_rust() -> Result<(), String> {
     ];
     if let Some(gpp) = gpp {
         envs.push(("CXX".into(), gpp));
+    }
+    if let Some(protoc) = protoc {
+        envs.push(("PROTOC".into(), protoc));
     }
     envs.push(("LDFLAGS".into(), ldflags));
 
@@ -2346,6 +2490,93 @@ pub fn run_rust() -> Result<(), String> {
     }
     split_debug_tree(Path::new(&out), Path::new(&objcopy), &recipe_name)?;
     Ok(())
+}
+
+/// Cargo's explicit `--target` keeps proc macros and build scripts on its host
+/// side. That side does not inherit target RUSTFLAGS, so rustc asks PATH for the
+/// conventional linker name `cc`. Native td GCC is deliberately nested inside
+/// its recipe output and has no `cc` alias; install a scratch-only wrapper which
+/// gives host tools the same declared interpreter, search roots and static
+/// libgcc policy as target links. The wrapper is build machinery, never copied
+/// into the output. Codex is the reviewed caller; pinning its full selection
+/// shape keeps another selected workspace from silently acquiring the wrapper.
+fn rust_workspace_needs_native_host_linker(
+    recipe_name: &str,
+    cargo_subdir: Option<&str>,
+    cargo_package: Option<&str>,
+) -> bool {
+    recipe_name == "codex"
+        && cargo_subdir == Some("codex-rs")
+        && cargo_package == Some("codex-cli")
+}
+
+fn install_native_rust_host_linker(
+    cwd: &Path,
+    shell: &str,
+    gcc: &str,
+    interp: &str,
+    rpaths: &str,
+    bdirs: &str,
+    path: &str,
+) -> Result<String, String> {
+    for (name, value) in [("shell", shell), ("gcc", gcc), ("interpreter", interp)] {
+        if !safe_wrapper_word(value) {
+            return Err(format!(
+                "native Rust host-link {name} is not a safe absolute path"
+            ));
+        }
+    }
+    let dir = cwd.join("td-native-bin");
+    fs::create_dir_all(&dir).map_err(|error| format!("mkdir {}: {error}", dir.display()))?;
+    let wrapper = dir.join("cc");
+    let mut script = format!(
+        "#!{shell}\nexec \"{gcc}\" \"$@\" -static-libgcc -Wl,--dynamic-linker,\"{interp}\""
+    );
+    for rpath in rpaths.split(':').filter(|value| !value.is_empty()) {
+        if !safe_wrapper_word(rpath) {
+            return Err("native Rust host-link rpath is not a safe absolute path".into());
+        }
+        script.push_str(&format!(" -Wl,-rpath,\"{rpath}\""));
+    }
+    for bdir in bdirs.split(':').filter(|value| !value.is_empty()) {
+        if !safe_wrapper_word(bdir) {
+            return Err("native Rust host-link -B directory is not a safe absolute path".into());
+        }
+        script.push_str(&format!(" -B\"{bdir}\""));
+    }
+    script.push('\n');
+    fs::write(&wrapper, script).map_err(|error| {
+        format!(
+            "write native Rust host linker {}: {error}",
+            wrapper.display()
+        )
+    })?;
+    let mut permissions = fs::metadata(&wrapper)
+        .map_err(|error| {
+            format!(
+                "inspect native Rust host linker {}: {error}",
+                wrapper.display()
+            )
+        })?
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&wrapper, permissions).map_err(|error| {
+        format!(
+            "chmod native Rust host linker {}: {error}",
+            wrapper.display()
+        )
+    })?;
+    let dir = dir
+        .to_str()
+        .ok_or("native Rust host-link directory is not UTF-8")?;
+    Ok(format!("{dir}:{path}"))
+}
+
+fn safe_wrapper_word(value: &str) -> bool {
+    value.starts_with('/')
+        && !value
+            .bytes()
+            .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r' | b'"' | b'\\' | b'$' | b'`'))
 }
 
 fn cargo_git_package_root(archive_root: &Path, path: &str) -> Result<PathBuf, String> {
@@ -3230,11 +3461,20 @@ type TextEdit = (String, String, usize);
 /// closed here rather than silently corrupting the patched output.
 fn apply_text_edits(
     file: &str,
+    content: String,
+    edits: &[TextEdit],
+) -> Result<String, String> {
+    apply_named_text_edits("substituteText", file, content, edits)
+}
+
+fn apply_named_text_edits(
+    label: &str,
+    file: &str,
     mut content: String,
     edits: &[TextEdit],
 ) -> Result<String, String> {
     for (j, (from, to, expect)) in edits.iter().enumerate() {
-        let at = |m: String| format!("substituteText {file} edit {}: {m}", j + 1);
+        let at = |m: String| format!("{label} {file} edit {}: {m}", j + 1);
         if from.is_empty() {
             return Err(at("empty `from' string".into()));
         }
@@ -3287,6 +3527,59 @@ fn write_preserving_mode(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         Ok(())
     };
     wrote.and(restored)
+}
+
+fn cargo_source_patch_path(workspace: &Path, relative: &str) -> Result<PathBuf, String> {
+    if !valid_cargo_source_patch_path(relative) {
+        return Err(format!("invalid Cargo source patch path: {relative}"));
+    }
+    let mut current = workspace.to_path_buf();
+    let components: Vec<_> = Path::new(relative).components().collect();
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(format!("invalid Cargo source patch path: {relative}"));
+        };
+        current.push(name);
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            format!(
+                "inspect Cargo source patch path {}: {error}",
+                current.display()
+            )
+        })?;
+        let final_component = index.saturating_add(1) == components.len();
+        let valid_kind = if final_component {
+            metadata.is_file()
+        } else {
+            metadata.is_dir()
+        };
+        if metadata.file_type().is_symlink() || !valid_kind {
+            return Err(format!(
+                "Cargo source patch path traverses a symlink or wrong file type: {}",
+                current.display()
+            ));
+        }
+    }
+    Ok(current)
+}
+
+fn apply_cargo_source_patches(
+    workspace: &Path,
+    patches: &[CargoSourcePatch],
+) -> Result<(), String> {
+    for patch in patches {
+        let path = cargo_source_patch_path(workspace, &patch.file)?;
+        let content = fs::read_to_string(&path)
+            .map_err(|error| format!("read Cargo source patch {}: {error}", path.display()))?;
+        let edited = apply_named_text_edits(
+            "cargoSourcePatches",
+            &patch.file,
+            content,
+            &patch.edits,
+        )?;
+        write_preserving_mode(&path, edited.as_bytes())
+            .map_err(|error| format!("write Cargo source patch {}: {error}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Parse a `substituteText` step: expand ONLY `file` (the target path) with
@@ -4421,6 +4714,35 @@ fn compare_files(left: &Path, right: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_line_exception_runtime(
+    root: &Path,
+    runtimes: &[PathBuf],
+    exception: td_engine::target_profile::LineAttributionException,
+) -> Result<(), String> {
+    let target = root.join(exception.runtime_relative_path);
+    if !runtimes.iter().any(|runtime| runtime == &target) {
+        return Err(format!(
+            "named line-attribution exception runtime is absent: {}",
+            target.display()
+        ));
+    }
+    let target_metadata = fs::metadata(&target)
+        .map_err(|e| format!("stat line-attribution exception {}: {e}", target.display()))?;
+    let target_inode = (target_metadata.dev(), target_metadata.ino());
+    for runtime in runtimes.iter().filter(|runtime| *runtime != &target) {
+        let metadata = fs::metadata(runtime)
+            .map_err(|e| format!("stat installed ELF {}: {e}", runtime.display()))?;
+        if (metadata.dev(), metadata.ino()) == target_inode {
+            return Err(format!(
+                "named line-attribution exception {} aliases ordinary runtime {}",
+                target.display(),
+                runtime.display(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Split every installed executable/shared object below `root`, then verify
 /// the runtime and companion as one build-ID-addressed pair. The walker and
 /// validation are engine-native; only the declared target `objcopy` executes.
@@ -4453,6 +4775,10 @@ fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<()
             root.display()
         ));
     }
+    let line_exception = td_engine::target_profile::line_attribution_exception(recipe_name);
+    if let Some(exception) = line_exception {
+        validate_line_exception_runtime(root, &runtimes, exception)?;
+    }
     let objcopy = objcopy
         .to_str()
         .ok_or_else(|| format!("non-UTF-8 objcopy path: {}", objcopy.display()))?;
@@ -4463,7 +4789,7 @@ fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<()
     // may expose one ELF through several hard links (glibc getconf does); a
     // later in-place objcopy of one name must not become the source for another
     // name's companion.
-    let mut companion_by_inode: std::collections::HashMap<(u64, u64), (PathBuf, PathBuf)> =
+    let mut companion_by_inode: std::collections::HashMap<(u64, u64), (PathBuf, PathBuf, bool)> =
         std::collections::HashMap::new();
     let mut pairs = Vec::with_capacity(runtimes.len());
     for runtime in &runtimes {
@@ -4483,6 +4809,8 @@ fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<()
         let relative_text = relative
             .to_str()
             .ok_or_else(|| format!("non-UTF-8 installed ELF path: {}", relative.display()))?;
+        let runtime_line_exception = line_exception
+            .filter(|exception| exception.runtime_relative_path == relative_text);
         let debug = debug_root.join(format!("{relative_text}.debug"));
         let parent = debug
             .parent()
@@ -4495,9 +4823,16 @@ fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<()
         let debug_text = debug
             .to_str()
             .ok_or_else(|| format!("non-UTF-8 debug companion path: {}", debug.display()))?;
-        let canonical_runtime = if let Some((first_debug, first_runtime)) =
+        let canonical_runtime = if let Some((first_debug, first_runtime, first_has_exception)) =
             companion_by_inode.get(&inode)
         {
+            if *first_has_exception != runtime_line_exception.is_some() {
+                return Err(format!(
+                    "named line-attribution exception {} aliases ordinary runtime {}",
+                    runtime.display(),
+                    first_runtime.display(),
+                ));
+            }
             fs::hard_link(first_debug, &debug).map_err(|e| {
                 format!(
                     "hard-link debug companion {} from {}: {e}",
@@ -4514,15 +4849,64 @@ fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<()
                 &[],
                 &WATCH_PHASE,
             )?;
+            if runtime_line_exception.is_some() {
+                // The named oversized-line companion retains ordinary symbols
+                // and structurally checked producer evidence. td-profiler
+                // refuses its line program; this pruning makes no external
+                // reader compatibility claim.
+                run_cmd(
+                    objcopy,
+                    &[
+                        "--remove-section=.debug_info",
+                        "--remove-section=.debug_abbrev",
+                        "--remove-section=.debug_aranges",
+                        "--remove-section=.debug_ranges",
+                        "--remove-section=.debug_rnglists",
+                        "--remove-section=.debug_frame",
+                        "--remove-section=.debug_loc",
+                        "--remove-section=.debug_loclists",
+                        "--remove-section=.debug_str",
+                        debug_text,
+                    ],
+                    cwd,
+                    &[],
+                    &WATCH_PHASE,
+                )?;
+            }
             fs::set_permissions(&debug, fs::Permissions::from_mode(0o644))
                 .map_err(|e| format!("chmod debug companion {}: {e}", debug.display()))?;
-            companion_by_inode.insert(inode, (debug.clone(), runtime.clone()));
+            if let Some(exception) = runtime_line_exception {
+                let bytes = fs::metadata(&debug)
+                    .map_err(|e| format!("stat debug companion {}: {e}", debug.display()))?
+                    .len();
+                if bytes > exception.max_companion_bytes {
+                    return Err(format!(
+                        "debug companion {} uses {bytes} bytes, exceeding named line-attribution exception ceiling {}",
+                        debug.display(),
+                        exception.max_companion_bytes,
+                    ));
+                }
+            }
+            companion_by_inode.insert(
+                inode,
+                (
+                    debug.clone(),
+                    runtime.clone(),
+                    runtime_line_exception.is_some(),
+                ),
+            );
             runtime.clone()
         };
-        pairs.push((runtime.clone(), debug, canonical_runtime, inode));
+        pairs.push((
+            runtime.clone(),
+            debug,
+            canonical_runtime,
+            inode,
+            runtime_line_exception,
+        ));
     }
     let mut stripped_inodes = std::collections::HashSet::new();
-    for (_, _, canonical_runtime, original_inode) in &pairs {
+    for (_, _, canonical_runtime, original_inode, _) in &pairs {
         if !stripped_inodes.insert(*original_inode) {
             continue;
         }
@@ -4546,7 +4930,7 @@ fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<()
     // installed relation rather than depending on that implementation detail.
     // If objcopy replaced the canonical name, every alias is reconnected to the
     // stripped bytes before pair validation.
-    for (runtime, _, canonical_runtime, _) in &pairs {
+    for (runtime, _, canonical_runtime, _, _) in &pairs {
         if runtime == canonical_runtime {
             continue;
         }
@@ -4560,8 +4944,16 @@ fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<()
             )
         })?;
     }
-    for (runtime, debug, _, _) in &pairs {
-        crate::elf::assert_debug_pair(runtime, debug)?;
+    for (runtime, debug, _, _, runtime_line_exception) in &pairs {
+        if let Some(exception) = runtime_line_exception {
+            crate::elf::assert_debug_pair_with_line_limit(
+                runtime,
+                debug,
+                exception.max_line_section_bytes,
+            )?;
+        } else {
+            crate::elf::assert_debug_pair(runtime, debug)?;
+        }
     }
     let exceptions = td_engine::target_profile::output_assembly_exceptions(recipe_name);
     if !exceptions.is_empty() {
@@ -4575,6 +4967,29 @@ fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<()
             .map_err(|e| format!("write assembly-exception marker {}: {e}", marker.display()))?;
         fs::set_permissions(&marker, fs::Permissions::from_mode(0o644))
             .map_err(|e| format!("chmod assembly-exception marker {}: {e}", marker.display()))?;
+    }
+    if let Some(exception) = line_exception {
+        let marker = debug_root.join(".td-line-attribution-exception");
+        let content = format!(
+            "format=1\noutput={recipe_name}\nruntime={}\nreader_ceiling_bytes={}\nadmitted_ceiling_bytes={}\ncompanion_ceiling_bytes={}\nreason={}\n",
+            exception.runtime_relative_path,
+            td_engine::target_profile::DEFAULT_PROFILE_LINE_SECTION_BYTES,
+            exception.max_line_section_bytes,
+            exception.max_companion_bytes,
+            exception.reason,
+        );
+        fs::write(&marker, content).map_err(|e| {
+            format!(
+                "write line-attribution-exception marker {}: {e}",
+                marker.display()
+            )
+        })?;
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).map_err(|e| {
+            format!(
+                "chmod line-attribution-exception marker {}: {e}",
+                marker.display()
+            )
+        })?;
     }
     Ok(())
 }
@@ -4996,6 +5411,100 @@ mod tests {
     }
 
     #[test]
+    fn cargo_source_patches_are_scoped_literal_and_count_checked() {
+        let declaration = crate::json::parse(
+            r#"[{"file":"nested/Cargo.toml","edits":[{"from":"native-tls","to":"rustls","expect":"1"}]}]"#,
+        )
+        .unwrap();
+        let patches = parse_cargo_source_patches(&declaration).unwrap();
+        assert_eq!(patches[0].file, "nested/Cargo.toml");
+        let build_script = crate::json::parse(
+            r#"[{"file":"nested/build.rs","edits":[{"from":"old","to":"new","expect":"1"}]}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_cargo_source_patches(&build_script).unwrap()[0].file,
+            "nested/build.rs"
+        );
+
+        for invalid in [
+            r#"[{"file":"../Cargo.toml","edits":[{"from":"a","to":"b","expect":"1"}]}]"#,
+            r#"[{"file":"nested/config.toml","edits":[{"from":"a","to":"b","expect":"1"}]}]"#,
+            r#"[{"file":"Cargo.toml","edits":[{"from":"a","to":"a","expect":"1"}]}]"#,
+            r#"[{"file":"Cargo.toml","edits":[{"from":"a","to":"b","expect":"0"}]}]"#,
+        ] {
+            let value = crate::json::parse(invalid).unwrap();
+            assert!(parse_cargo_source_patches(&value).is_err(), "{invalid}");
+        }
+
+        let base =
+            std::env::temp_dir().join(format!("td-cargo-source-patch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("nested")).unwrap();
+        fs::write(
+            base.join("nested/Cargo.toml"),
+            "transport = \"native-tls\"\n",
+        )
+        .unwrap();
+        apply_cargo_source_patches(&base, &patches).unwrap();
+        assert_eq!(
+            fs::read_to_string(base.join("nested/Cargo.toml")).unwrap(),
+            "transport = \"rustls\"\n"
+        );
+        let error = apply_cargo_source_patches(&base, &patches).unwrap_err();
+        assert!(error.contains("occurs 0×"), "{error}");
+        assert!(error.starts_with("cargoSourcePatches "), "{error}");
+
+        fs::remove_file(base.join("nested/Cargo.toml")).unwrap();
+        std::os::unix::fs::symlink(base.join("outside.toml"), base.join("nested/Cargo.toml"))
+            .unwrap();
+        let error = apply_cargo_source_patches(&base, &patches).unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn native_host_link_wrapper_is_scoped_to_selected_workspaces() {
+        assert!(!rust_workspace_needs_native_host_linker(
+            "ripgrep", None, None
+        ));
+        assert!(!rust_workspace_needs_native_host_linker(
+            "other-workspace",
+            Some("workspace"),
+            Some("tool")
+        ));
+        assert!(rust_workspace_needs_native_host_linker(
+            "codex",
+            Some("codex-rs"),
+            Some("codex-cli")
+        ));
+    }
+
+    #[test]
+    fn line_exception_runtime_is_present_and_not_an_ordinary_alias() {
+        let base = std::env::temp_dir().join(format!(
+            "td-line-exception-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("bin")).unwrap();
+        let codex = base.join("bin/codex");
+        fs::write(&codex, b"codex").unwrap();
+        let exception = td_engine::target_profile::line_attribution_exception("codex").unwrap();
+
+        validate_line_exception_runtime(&base, std::slice::from_ref(&codex), exception).unwrap();
+        let missing = validate_line_exception_runtime(&base, &[], exception).unwrap_err();
+        assert!(missing.contains("runtime is absent"), "{missing}");
+
+        let alias = base.join("bin/codex-alias");
+        fs::hard_link(&codex, &alias).unwrap();
+        let aliased = validate_line_exception_runtime(&base, &[codex, alias], exception)
+            .unwrap_err();
+        assert!(aliased.contains("aliases ordinary runtime"), "{aliased}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn cargo_git_vendor_config_resolves_offline_without_a_git_checkout() {
         let base = std::env::temp_dir().join(format!(
             "td-cargo-git-vendor-{}",
@@ -5243,6 +5752,47 @@ mod tests {
             cargo_selection(Path::new("/build"), &["tool"], false, None).unwrap();
         assert!(plain_args.is_empty());
         assert_eq!(plain_release_dir, Path::new("/build/target/release"));
+    }
+
+    #[test]
+    fn native_rust_host_linker_is_a_scratch_only_declared_toolchain_wrapper() {
+        let base =
+            std::env::temp_dir().join(format!("td-native-rust-host-linker-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let path = install_native_rust_host_linker(
+            &base,
+            "/td/store/busybox/bin/sh",
+            "/td/store/gcc/bin/gcc",
+            "/td/store/glibc/lib/ld-linux-x86-64.so.2",
+            "/td/store/glibc/lib:/td/store/zlib/lib",
+            "/td/store/binutils/bin:/td/store/glibc/lib",
+            "/td/store/rust/bin:/td/store/busybox/bin",
+        )
+        .unwrap();
+        assert!(path.starts_with(base.join("td-native-bin").to_str().unwrap()));
+        let wrapper = fs::read_to_string(base.join("td-native-bin/cc")).unwrap();
+        for required in [
+            "#!/td/store/busybox/bin/sh",
+            "exec \"/td/store/gcc/bin/gcc\" \"$@\"",
+            "-static-libgcc",
+            "-Wl,--dynamic-linker,\"/td/store/glibc/lib/ld-linux-x86-64.so.2\"",
+            "-Wl,-rpath,\"/td/store/glibc/lib\"",
+            "-B\"/td/store/binutils/bin\"",
+        ] {
+            assert!(wrapper.contains(required), "wrapper omits {required}");
+        }
+        assert!(!safe_wrapper_word("/td/store/path\nexec bad"));
+        assert!(!safe_wrapper_word("relative/path"));
+        assert_eq!(
+            fs::metadata(base.join("td-native-bin/cc"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

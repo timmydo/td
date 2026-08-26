@@ -238,7 +238,7 @@ pub fn run_self(inp: &BuildInputs) -> Result<String, String> {
 /// The staged install-prefix subpaths of the x86_64 toolchain rung outputs (a mesboot rung
 /// installs into <out>/stage/td/store/<prefix>). Kept beside the transform so the resolution
 /// stays in one place if a rung's version bumps.
-const GLIBC_X86_64_STAGE: &str = "stage/td/store/glibc-2.41-x86_64";
+pub(crate) const GLIBC_X86_64_STAGE: &str = "stage/td/store/glibc-2.41-x86_64";
 const GCC_X86_64_STAGE: &str = "stage/td/store/gcc-14.3.0-x86_64";
 const ZLIB_X86_64_LIB: &str = "stage/td/store/zlib-1.3.1/lib";
 

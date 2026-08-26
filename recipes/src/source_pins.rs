@@ -15,6 +15,16 @@ struct PinDef {
 
 const PINS: &[PinDef] = &[
     PinDef {
+        key: "abseil-cpp-x86-64-source",
+        aliases: &[],
+        // Protobuf 31.1's build declares this exact Abseil release. It is
+        // staged as source data and consumed through CMake's local
+        // FetchContent override; the build never invokes a network transport.
+        url: "https://github.com/abseil/abseil-cpp/releases/download/20250127.0/abseil-cpp-20250127.0.tar.gz",
+        sha256: "16242f394245627e508ec6bb296b433c90f8d914f73b9c026fddb905e27276e8",
+        file: "abseil-cpp-20250127.0.tar.gz",
+    },
+    PinDef {
         key: "bash-mesboot-source",
         aliases: &[],
         // GNU bash 2.05b — the from-source bootstrap shell (re #469). Same
@@ -87,6 +97,43 @@ const PINS: &[PinDef] = &[
         url: "https://cmake.org/files/v3.31/cmake-3.31.12.tar.gz",
         sha256: "5f3fd5a54dfa65602bdbed64f981a72673cc19f2d304cc2955cf0dfa0cfd8272",
         file: "cmake-3.31.12.tar.gz",
+    },
+    PinDef {
+        key: "codex-cargo-crossterm-source",
+        aliases: &[],
+        // Cargo pins this fork by its full commit. The fixed-output archive is
+        // source data only: td's Rust runner vendors it without invoking Git.
+        url: "https://github.com/openai-oss-forks/crossterm/archive/45fecb9508105988f42fe6ff0441783ed3717f92.tar.gz",
+        sha256: "408decc2710285f01e6a154e2605891e1af297961fd4e6517dcbfb9491eb6c6f",
+        file: "codex-crossterm-45fecb9508105988f42fe6ff0441783ed3717f92.tar.gz",
+    },
+    PinDef {
+        key: "codex-cargo-nucleo-source",
+        aliases: &[],
+        url: "https://github.com/helix-editor/nucleo/archive/4253de9faabb4e5c6d81d946a5e35a90f87347ee.tar.gz",
+        sha256: "d1676ac33a82c5903ffede68ce73c9d924666aa8a102bb649a8fb926a7a61ce1",
+        file: "codex-nucleo-4253de9faabb4e5c6d81d946a5e35a90f87347ee.tar.gz",
+    },
+    PinDef {
+        key: "codex-cargo-rules-rust-source",
+        aliases: &[],
+        url: "https://github.com/dzbarsky/rules_rust/archive/b56cbaa8465e74127f1ea216f813cd377295ad81.tar.gz",
+        sha256: "ddbdf40db8df685df67c3260dfe59cf7ffa4b193a9324e10b359bbe8981db9e0",
+        file: "codex-rules-rust-b56cbaa8465e74127f1ea216f813cd377295ad81.tar.gz",
+    },
+    PinDef {
+        key: "codex-cargo-tokio-tungstenite-source",
+        aliases: &[],
+        url: "https://github.com/openai-oss-forks/tokio-tungstenite/archive/0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186.tar.gz",
+        sha256: "a1d8bfedf41ea59d5ed375ebc280dad7099d0c3398e91406c51d485270196a3d",
+        file: "codex-tokio-tungstenite-0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186.tar.gz",
+    },
+    PinDef {
+        key: "codex-cargo-tungstenite-source",
+        aliases: &[],
+        url: "https://github.com/openai-oss-forks/tungstenite-rs/archive/4fffad30fe373adbdcffab9545e9e9bf4f2fc19f.tar.gz",
+        sha256: "d85393467dd5843688059bb204a61b7450dce1166a2c8aab3c87478955ffce48",
+        file: "codex-tungstenite-4fffad30fe373adbdcffab9545e9e9bf4f2fc19f.tar.gz",
     },
     PinDef {
         key: "codex-source",
@@ -463,6 +510,16 @@ const PINS: &[PinDef] = &[
         file: "Python-3.11.1.tar.xz",
     },
     PinDef {
+        key: "protobuf-x86-64-source",
+        aliases: &[],
+        // Codex's code-mode build script needs protoc 31.1. Build it from the
+        // official Protobuf source instead of executing protoc-bin-vendored's
+        // target prebuilt payload during the source bootstrap.
+        url: "https://github.com/protocolbuffers/protobuf/releases/download/v31.1/protobuf-31.1.tar.gz",
+        sha256: "12bfd76d27b9ac3d65c00966901609e020481b9474ef75c7ff4601ac06fa0b82",
+        file: "protobuf-31.1.tar.gz",
+    },
+    PinDef {
         key: "ripgrep-seed-source",
         aliases: &[],
         // The upstream x86-64 musl release is a static PIE and is admitted only
@@ -684,8 +741,9 @@ mod tests {
         // foreign application seed, upstream ripgrep 15.2.0, LibreSSL 4.3.2,
         // curl 8.21.0 (the static HTTPS foundation for Git), Git 2.55.0, and
         // curl's dated Mozilla CA extract, OpenAI Codex 0.148.0 (including its
-        // vendored Bubblewrap), and libcap 2.78.
-        assert_eq!(all().len(), 63);
+        // vendored Bubblewrap and five Cargo Git commit archives), libcap 2.78,
+        // and Protobuf 31.1 with its exact Abseil 20250127.0 source dependency.
+        assert_eq!(all().len(), 70);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice

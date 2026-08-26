@@ -3,6 +3,7 @@ use td_recipe::types::CheckRunner;
 use crate::check_runner::RecipeCheckRunner;
 
 mod basic;
+mod codex;
 // qemu_boot is NOT a CheckRunner variant: booting the kernel needs HOST qemu,
 // which the gate's host-free sandbox hides, so it can't run as a sandboxed
 // gate check. It is exposed as the host-side `td-recipe-eval qemu-boot` subcommand
@@ -18,6 +19,7 @@ pub(crate) fn run(
 ) -> Result<(), String> {
     match check_runner {
         CheckRunner::BuildOnly => basic::run_build_only(runner, stem),
+        CheckRunner::Codex => codex::run(runner),
         CheckRunner::RustToolchain => rust_toolchain::run(runner),
     }
 }

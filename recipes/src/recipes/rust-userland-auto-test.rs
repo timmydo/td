@@ -1,7 +1,8 @@
 use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
-// Keep in lockstep with NATIVE_GLIBC_STAGE and rust_toolchain::GLIBC_STAGE.
+// Keep in lockstep with toolchain_x86_64::GLIBC_X86_64_STAGE and
+// rust_toolchain::GLIBC_STAGE.
 const GLIBC_STAGE: &str = "stage/td/store/glibc-2.41-x86_64";
 
 fn dynamic_contract(label: &str, binary: &str, expected_needed: &str) -> Step {

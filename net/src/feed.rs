@@ -1948,6 +1948,84 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
     );
 }
 
+/// warm crate-source FILE SHA256 LOCK DEST — provision the registry closure for
+/// an already-warmed fixed-output source archive from the recipe's exact
+/// committed lock. The archive is re-hashed to bind this warm job to its source
+/// pin, but dependency selection needs neither its manifest nor an extracted
+/// scratch source tree: the committed lock is the build gate's exact oracle.
+fn valid_crate_source_coordinates(
+    file: &str,
+    sha256: &str,
+    lock: &str,
+    dest: &str,
+) -> bool {
+    let file_is_plain = Path::new(file).file_name() == Some(std::ffi::OsStr::new(file));
+    let lock_is_plain = Path::new(lock).file_name() == Some(std::ffi::OsStr::new("Cargo.lock"))
+        && Path::new(lock)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)));
+    let dest_is_plain = Path::new(dest).file_name() == Some(std::ffi::OsStr::new(dest));
+    let sha_is_hex = sha256.len() == 64
+        && sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
+    file_is_plain && lock_is_plain && dest_is_plain && sha_is_hex
+}
+
+fn real_relative_file(root: &Path, relative: &str, label: &str) -> Result<PathBuf, String> {
+    if relative.is_empty() {
+        return Err(format!("{label} is not a plain relative path: {relative}"));
+    }
+    let mut current = root.to_path_buf();
+    let mut components = Path::new(relative).components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(format!("{label} is not a plain relative path: {relative}"));
+        };
+        current.push(name);
+        let metadata = std::fs::symlink_metadata(&current)
+            .map_err(|error| format!("inspect {label} {}: {error}", current.display()))?;
+        let final_component = components.peek().is_none();
+        let valid_kind = if final_component {
+            metadata.is_file()
+        } else {
+            metadata.is_dir()
+        };
+        if metadata.file_type().is_symlink() || !valid_kind {
+            return Err(format!(
+                "{label} traverses a symlink or wrong file type: {}",
+                current.display()
+            ));
+        }
+    }
+    Ok(current)
+}
+
+fn warm_crate_source(root: &Path, file: &str, sha256: &str, lock: &str, dest: &str) {
+    if !valid_crate_source_coordinates(file, sha256, lock, dest) {
+        eprintln!(
+            "td-feed warm crate-source: FILE, SHA256, LOCK, or DEST is malformed — skipping {dest}"
+        );
+        return;
+    }
+    let committed_lock = match real_relative_file(root, lock, "committed Cargo.lock") {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("td-feed warm crate-source: {error} — skipping {dest}");
+            return;
+        }
+    };
+    let archive = sources_dir().join(file);
+    if file_sha256(&archive).ok().as_deref() != Some(sha256) {
+        eprintln!(
+            "td-feed warm crate-source: {} is absent or does not match the declared SHA-256 — skipping {dest}",
+            archive.display()
+        );
+        return;
+    }
+    warm_crate_lock(root, &committed_lock, dest, "crate-source");
+}
+
 /// warm crate-local SRCDIR DEST — provision a LOCAL (in-tree) crate's locked registry
 /// closure through td's verifying egress. No source crate to fetch (the source IS the in-tree dir, which
 /// the gate interns itself); only the locked dep closure ->
@@ -1961,13 +2039,18 @@ fn warm_crate_local(root: &Path, srcrel: &str, dest: &str) {
             return;
         }
     };
+    let lock = srcdir.join("Cargo.lock");
+    warm_crate_lock(root, &lock, dest, "crate-local");
+}
+
+fn warm_crate_lock(root: &Path, lock: &Path, dest: &str, action: &str) {
     let vendor = root
         .join(".td-build-cache/crate-vendor")
         .join(dest)
         .join("vendor");
     if is_warm_complete(&vendor) {
         eprintln!(
-            "td-feed warm crate-local: {dest} already warm ({} crates) in {}",
+            "td-feed warm {action}: {dest} already warm ({} crates) in {}",
             count_crates(&vendor),
             vendor.display()
         );
@@ -1978,19 +2061,19 @@ fn warm_crate_local(root: &Path, srcrel: &str, dest: &str) {
         .join(format!("{dest}.work"));
     let _ = std::fs::remove_dir_all(&work);
     let proxy_store = work.join("proxy-store");
-    let sources = match fetch_locked_registry(&srcdir.join("Cargo.lock"), &proxy_store) {
+    let sources = match fetch_locked_registry(lock, &proxy_store) {
         Ok(sources) => sources,
         Err(error) => {
             eprintln!(
-                "td-feed warm crate-local: locked registry fetch failed for {dest} (in {}): {error}",
-                srcdir.display()
+                "td-feed warm {action}: locked registry fetch failed for {dest} (lock {}): {error}",
+                lock.display()
             );
             return;
         }
     };
     let _ = std::fs::remove_dir_all(&vendor);
     if std::fs::create_dir_all(&vendor).is_err() {
-        eprintln!("td-feed warm crate-local: could not create vendor dir for {dest}");
+        eprintln!("td-feed warm {action}: could not create vendor dir for {dest}");
         return;
     }
     let crates_src = proxy_store.join("crates");
@@ -1998,21 +2081,21 @@ fn warm_crate_local(root: &Path, srcrel: &str, dest: &str) {
     let n = copy_crates(&crates_src, &vendor);
     let _ = std::fs::remove_dir_all(&work);
     if want == 0 && sources.git_packages == 0 {
-        eprintln!("td-feed warm crate-local: Cargo.lock has no external dependencies for {dest}");
+        eprintln!("td-feed warm {action}: Cargo.lock has no external dependencies for {dest}");
         return;
     }
     // Complete only if EVERY fetched crate copied (see warm_crate) — a short copy leaves no
     // marker so the next warm re-does it, instead of sealing a partial set forever.
     if n != want {
-        eprintln!("td-feed warm crate-local: copied only {n}/{want} crates for {dest} - a copy failed; NOT marking complete so the next warm re-does it");
+        eprintln!("td-feed warm {action}: copied only {n}/{want} crates for {dest} - a copy failed; NOT marking complete so the next warm re-does it");
         return;
     }
     mark_warm_complete(&vendor, n);
     eprintln!(
-        "td-feed warm crate-local: {dest} — {n} registry crates and {} Git package pin(s) provisioned guix-free \
-         ({}/Cargo.lock-pinned, registry sha==index cksum; no Git transport) in {}",
+        "td-feed warm {action}: {dest} — {n} registry crates and {} Git package pin(s) provisioned guix-free \
+         (lock {}, registry sha==index cksum; no Git transport) in {}",
         sources.git_packages,
-        srcdir.display(),
+        lock.display(),
         vendor.display()
     );
 }
@@ -2759,6 +2842,7 @@ fn warm_usage() -> ! {
     eprintln!(
         "usage:\n  td-feed warm index INDEX STORE        (also: td-feed warm INDEX STORE)\n  \
          td-feed warm crate CRATE VERSION [DEST]\n  td-feed warm crate-local SRCDIR DEST\n  \
+         td-feed warm crate-source FILE SHA256 LOCK DEST\n  \
          td-feed warm sources\n  td-feed warm kernel-headers ARCH"
     );
     std::process::exit(2);
@@ -2961,6 +3045,9 @@ pub fn run(a: &[String]) {
                 Some("crate") if a.len() == 5 => warm_crate(&root, &a[3], &a[4], &a[3]),
                 Some("crate") if a.len() == 6 => warm_crate(&root, &a[3], &a[4], &a[5]),
                 Some("crate-local") if a.len() == 5 => warm_crate_local(&root, &a[3], &a[4]),
+                Some("crate-source") if a.len() == 7 => {
+                    warm_crate_source(&root, &a[3], &a[4], &a[5], &a[6])
+                }
                 Some("sources") if a.len() == 3 => {
                     if let Err(e) = warm_sources(&root) {
                         die(format!("warm sources: {e}"));
@@ -2974,7 +3061,12 @@ pub fn run(a: &[String]) {
                     if a.len() == 4
                         && !matches!(
                             kw,
-                            "index" | "crate" | "crate-local" | "sources" | "kernel-headers"
+                            "index"
+                                | "crate"
+                                | "crate-local"
+                                | "crate-source"
+                                | "sources"
+                                | "kernel-headers"
                         ) =>
                 {
                     warm_index(&a[2], &a[3])
@@ -3015,6 +3107,7 @@ pub fn run(a: &[String]) {
             eprintln!(
                 "usage:\n  td-feed warm INDEX STORE   (low-level; also: warm index INDEX STORE)\n  \
                  td-feed warm crate CRATE VERSION [DEST]\n  td-feed warm crate-local SRCDIR DEST\n  \
+                 td-feed warm crate-source FILE SHA256 LOCK DEST\n  \
                  td-feed warm sources\n  td-feed warm kernel-headers ARCH\n  td-feed serve STORE ADDR\n  \
                  td-feed ensure-serve\n  td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  \
                  td-feed cargo-proxy-selftest\n  td-feed warm-selftest"
@@ -3028,10 +3121,11 @@ pub fn run(a: &[String]) {
 mod tests {
     use super::{
         cargo_route, detach_from_workspace, download_verified, ensure_serve_daemon,
-        feed_daemon_policy, file_sha256_before, index_path, mount_is_memory_backed, parse_serve_addr,
-        parse_locked_cargo_sources, read_digest_sidecar, resolve_feed_dir, snapshot_for_serve, snapshot_for_serve_before,
-        sweep_download_temps, sweep_kernel_header_temps, write_before,
-        FeedDaemonPolicy, ResponseGuard, RESPONSE_DEADLINE,
+        feed_daemon_policy, file_sha256_before, index_path, mount_is_memory_backed,
+        parse_locked_cargo_sources, parse_serve_addr, read_digest_sidecar, real_relative_file,
+        resolve_feed_dir, snapshot_for_serve, snapshot_for_serve_before, sweep_download_temps,
+        sweep_kernel_header_temps, valid_crate_source_coordinates, write_before, FeedDaemonPolicy,
+        ResponseGuard, RESPONSE_DEADLINE,
     };
     use std::io::Read;
     use std::path::PathBuf;
@@ -3524,6 +3618,65 @@ mod tests {
         assert_eq!(parse_serve_addr("on http://127.0.0.1/"), None); // no port
         assert_eq!(parse_serve_addr("on http://:8080/"), None); // no host
         assert_eq!(parse_serve_addr("on http://host:port/"), None); // non-numeric port
+    }
+
+    #[test]
+    fn fixed_output_workspace_warm_coordinates_cannot_traverse() {
+        let sha = "a".repeat(64);
+        assert!(valid_crate_source_coordinates(
+            "source.tar.gz",
+            &sha,
+            "recipes/locks/codex/Cargo.lock",
+            "codex"
+        ));
+        for (file, digest, lock, dest) in [
+            (
+                "../source.tar.gz",
+                sha.as_str(),
+                "recipes/locks/codex/Cargo.lock",
+                "codex",
+            ),
+            (
+                "source.tar.gz",
+                "A",
+                "recipes/locks/codex/Cargo.lock",
+                "codex",
+            ),
+            (
+                "source.tar.gz",
+                sha.as_str(),
+                "../Cargo.lock",
+                "codex",
+            ),
+            (
+                "source.tar.gz",
+                sha.as_str(),
+                "recipes/locks/codex/Cargo.lock",
+                "../codex",
+            ),
+        ] {
+            assert!(!valid_crate_source_coordinates(file, digest, lock, dest));
+        }
+    }
+
+    #[test]
+    fn committed_lock_resolution_rejects_symlinks() {
+        let root = std::env::temp_dir().join(format!(
+            "td-feed-committed-lock-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("locks/real")).unwrap();
+        std::fs::write(root.join("locks/real/Cargo.lock"), "version = 4\n").unwrap();
+        assert_eq!(
+            real_relative_file(&root, "locks/real/Cargo.lock", "lock").unwrap(),
+            root.join("locks/real/Cargo.lock")
+        );
+        assert!(real_relative_file(&root, "", "lock").is_err());
+        std::os::unix::fs::symlink("real", root.join("locks/link")).unwrap();
+        let error = real_relative_file(&root, "locks/link/Cargo.lock", "lock").unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

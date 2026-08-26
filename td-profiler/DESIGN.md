@@ -62,6 +62,26 @@ build scratch, and `/td-cargo` for Cargo's working state; vendor source is
 mapped below `/td-cargo/vendor`. Timestamps, archive ordering, and other build
 identity inputs remain pinned by the normal recipe reproducibility contract.
 
+Codex 0.148.0 is the one named source-line attribution exception. Its shipped
+ThinLTO CLI contains 18,612,350 numeric line rows and a 134,994,980-byte
+`.debug_line`; expanding that program would exceed the dependency-free reader's
+one-million-row and 128-MiB object ceilings. The exception is bound to
+`bin/codex`; any other ELF in that recipe remains under the ordinary policy.
+The producer still structurally validates and retains the uncompressed line
+program under a literal 160-MiB section ceiling, retains ordinary function
+symbols, and records
+`lib/debug/.td-line-attribution-exception`. It removes `.debug_info`,
+`.debug_abbrev`, `.debug_aranges`, `.debug_ranges`, `.debug_rnglists`,
+`.debug_frame`, `.debug_loc`, `.debug_loclists`, and `.debug_str` to bound the
+exception rather than retain full variable, type, range, and string payload.
+`.debug_line_str` remains. This policy does not claim that an external reader
+can resolve every retained line row: the producer check does not inspect each
+line-table string form. The resulting companion has a 256-MiB file ceiling.
+td-profiler deliberately refuses that oversized line program, preserves
+function attribution, and emits its existing explicit line-resolution
+diagnostic. A Codex update must remeasure the row and section sizes and
+re-review or remove this exception.
+
 A recipe links each user-mode ELF with a deterministic GNU build ID, using the
 linker's SHA-1 build-id form. This is a pair check over linked bytes, not object
 provenance or a statement of cryptographic trust. Every ELF gets a debug
@@ -102,11 +122,13 @@ full debugger SDK.
 The line program and its `.debug_line_str` or `.debug_str` path tables remain
 uncompressed. Pair validation rejects both ELF `SHF_COMPRESSED` and legacy
 `.zdebug_*` forms for those sections, so the dependency-free runtime reader is
-the checked consumer of every accepted companion rather than silently relying
-on a decompressor that is absent from the image. It also rejects duplicate
-named line/string sections and sections above the runtime's 32-MiB input
-ceiling. The runtime reads `.debug_str` only when a line-table `DW_FORM_strp`
-actually refers to it.
+the checked consumer of every ordinary accepted companion rather than silently
+relying on a decompressor that is absent from the image. It also rejects
+duplicate named line/string sections and sections above the runtime's 32-MiB
+input ceiling. The named Codex boundary above raises only the producer's
+structural `.debug_line` ceiling; it does not relax the runtime reader. The
+runtime reads `.debug_str` only when a line-table `DW_FORM_strp` actually
+refers to it.
 
 The deployment bundle records `deployment/debug-size` beside `root.erofs`.
 It remains a derived build report rather than a boot payload: the exact
@@ -346,9 +368,11 @@ unknown instructions are not silently merged. Its resolved and unresolved
 sample totals in the manifest count sampled leaf frames, not every caller in a
 callchain.
 
-One object accepts at most 32 MiB of `.debug_line`, 32 MiB for either external
-line-string section, one million retained line ranges, and 4,096 bytes in one
-reported source path. One unit may declare at most 200,000 transient
+One ordinary object accepts at most 32 MiB of `.debug_line`, 32 MiB for either
+external line-string section, one million retained line ranges, and 4,096 bytes
+in one reported source path. The named Codex producer exception is not accepted
+by this reader: function symbols remain available and source-line attribution
+fails explicitly at the 32-MiB check. One unit may declare at most 200,000 transient
 file/directory entries; the section byte ceiling bounds aggregate work across
 units. The section-name roster, symbol state, raw line-parser inputs, and all
 transient and retained line-parser heap state share the 128-MiB object-load

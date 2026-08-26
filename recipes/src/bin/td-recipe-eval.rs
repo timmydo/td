@@ -423,12 +423,29 @@ mod tests {
         // uutils, ripgrep, and fd userland `.crate` sources) + btrfs-progs 7.0
         // and util-linux 2.42.2 (the persistent-volume writer and its minimal
         // libraries) + the ripgrep 15.2.0 static application seed + curl's
-        // dated Mozilla CA extract + OpenAI Codex 0.148.0 and libcap 2.78.
-        assert_eq!(pins.len(), 63);
+        // dated Mozilla CA extract + OpenAI Codex 0.148.0, its five exact Cargo
+        // Git commit archives, libcap 2.78, and Protobuf 31.1 with its exact
+        // Abseil 20250127.0 source dependency.
+        assert_eq!(pins.len(), 70);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
         assert!(pins.iter().any(|pin| pin.key == "ca-certificates-source"));
         assert!(pins.iter().any(|pin| pin.key == "cmake-x86-64-source"));
         assert!(pins.iter().any(|pin| pin.key == "codex-source"));
+        assert!(pins
+            .iter()
+            .any(|pin| pin.key == "abseil-cpp-x86-64-source"));
+        assert!(pins
+            .iter()
+            .any(|pin| pin.key == "protobuf-x86-64-source"));
+        for key in [
+            "codex-cargo-crossterm-source",
+            "codex-cargo-nucleo-source",
+            "codex-cargo-rules-rust-source",
+            "codex-cargo-tokio-tungstenite-source",
+            "codex-cargo-tungstenite-source",
+        ] {
+            assert!(pins.iter().any(|pin| pin.key == key), "missing {key}");
+        }
         assert!(pins.iter().any(|pin| pin.key == "libcap-x86-64-source"));
         assert!(pins.iter().any(|pin| pin.key == "rust-source"));
         assert!(pins.iter().any(|pin| pin.key == "rust-stage0-rustc-source"));
