@@ -106,6 +106,20 @@ struct PlacedPopup {
     order: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlacedSubsurface {
+    parent: SurfaceKey,
+    x: i32,
+    y: i32,
+}
+
+#[derive(Clone, Copy)]
+struct SurfaceLayer {
+    key: SurfaceKey,
+    rect: ImageRect,
+    crop: Crop,
+}
+
 /// A window's own bounds inside its surface, as `xdg_surface.set_window_geometry`
 /// gave them: surface-local, so the origin is where the client's invisible
 /// margin ends and the window a person sees begins. Signed and unclipped,
@@ -759,6 +773,7 @@ pub(crate) fn least_output_height(rows: usize) -> usize {
 /// submenu is three; anything past this is a client fault or a cycle, and the
 /// bound is what stops the walk rather than a guarantee about the chain.
 const MAX_POPUP_DEPTH: usize = 32;
+pub(crate) const MAX_SUBSURFACE_DEPTH: usize = 32;
 
 pub struct Scene {
     surfaces: BTreeMap<SurfaceKey, Surface>,
@@ -775,6 +790,12 @@ pub struct Scene {
     /// is disturbed by it.
     popups: BTreeMap<SurfaceKey, PlacedPopup>,
     popup_order: u64,
+    /// Active subsurface edges and each parent's active bottom-to-top stack.
+    /// A `None` stack entry is the parent surface itself. The server owns the
+    /// pending copy because parent commits are the protocol boundary that
+    /// applies it; the scene sees only one drawable, hit-testable answer.
+    subsurfaces: BTreeMap<SurfaceKey, PlacedSubsurface>,
+    subsurface_stacks: BTreeMap<SurfaceKey, Vec<Option<SurfaceKey>>>,
     /// The popups holding an explicit grab. Kept beside `popups` rather than
     /// inside `PlacedPopup` because a grab is taken BEFORE the popup is
     /// mapped — the protocol refuses one after — so at the moment it is
@@ -824,6 +845,8 @@ impl Scene {
             geometries: BTreeMap::new(),
             popups: BTreeMap::new(),
             popup_order: 0,
+            subsurfaces: BTreeMap::new(),
+            subsurface_stacks: BTreeMap::new(),
             grabs: BTreeSet::new(),
             titles: BTreeMap::new(),
             layout: Layout::new(),
@@ -1109,6 +1132,143 @@ impl Scene {
         Ok(())
     }
 
+    /// Store a subsurface frame without introducing a layout leaf. Its parent
+    /// edge is applied separately by the parent's commit, so a child may have
+    /// pixels before it becomes visible and mapping still remains recursive.
+    pub fn commit_subsurface(&mut self, key: SurfaceKey, surface: Surface) -> Result<(), String> {
+        self.store_surface(key, surface)?;
+        Ok(())
+    }
+
+    pub fn associate_subsurface(
+        &mut self,
+        key: SurfaceKey,
+        parent: SurfaceKey,
+        x: i32,
+        y: i32,
+    ) -> bool {
+        self.subsurfaces
+            .insert(key, PlacedSubsurface { parent, x, y })
+            != Some(PlacedSubsurface { parent, x, y })
+    }
+
+    pub fn stack_subsurfaces(
+        &mut self,
+        parent: SurfaceKey,
+        stack: Vec<Option<SurfaceKey>>,
+    ) -> bool {
+        if self.subsurface_stacks.get(&parent) == Some(&stack) {
+            return false;
+        }
+        self.subsurface_stacks.insert(parent, stack);
+        true
+    }
+
+    /// Remove a subsurface's contents while retaining its active parent edge.
+    /// A NULL attach hides the compound branch but does not forget the role,
+    /// position, or sibling order.
+    pub fn detach_subsurface(&mut self, key: SurfaceKey) -> bool {
+        self.discard_pixels(key)
+    }
+
+    /// End the association and unmap the role surface immediately. Child
+    /// associations remain: they are hidden until this surface is mapped as a
+    /// root again, exactly as children of any other unmapped parent are.
+    pub fn remove_subsurface(&mut self, key: SurfaceKey) -> bool {
+        if let Some(placed) = self.subsurfaces.remove(&key) {
+            if let Some(stack) = self.subsurface_stacks.get_mut(&placed.parent) {
+                stack.retain(|entry| *entry != Some(key));
+            }
+        }
+        self.discard_pixels(key)
+    }
+
+    fn subsurface_root(&self, key: SurfaceKey) -> Option<SurfaceKey> {
+        let mut at = key;
+        for _ in 0..=MAX_SUBSURFACE_DEPTH {
+            let Some(placed) = self.subsurfaces.get(&at) else {
+                return Some(at);
+            };
+            at = placed.parent;
+        }
+        None
+    }
+
+    fn append_surface_layers(
+        &self,
+        key: SurfaceKey,
+        origin: (i64, i64),
+        root_rect: Option<ImageRect>,
+        root_clip: ImageRect,
+        depth: usize,
+        layers: &mut Vec<SurfaceLayer>,
+    ) {
+        if depth > MAX_SUBSURFACE_DEPTH {
+            return;
+        }
+        let Some(surface) = self.surfaces.get(&key) else {
+            return;
+        };
+        let crop = self.crop_of(key, surface);
+        let rect = root_rect.unwrap_or(ImageRect {
+            x: origin.0,
+            y: origin.1,
+            width: surface.width,
+            height: surface.height,
+        });
+        let layer = clip_surface_layer(SurfaceLayer { key, rect, crop }, root_clip);
+        let default_stack = [None];
+        let stack = self
+            .subsurface_stacks
+            .get(&key)
+            .map(Vec::as_slice)
+            .unwrap_or(&default_stack);
+        for entry in stack {
+            match entry {
+                None => {
+                    if let Some(layer) = layer {
+                        layers.push(layer);
+                    }
+                }
+                Some(child) => {
+                    let Some(placed) = self.subsurfaces.get(child) else {
+                        continue;
+                    };
+                    if placed.parent != key {
+                        continue;
+                    }
+                    self.append_surface_layers(
+                        *child,
+                        (
+                            origin.0.saturating_add(i64::from(placed.x)),
+                            origin.1.saturating_add(i64::from(placed.y)),
+                        ),
+                        None,
+                        root_clip,
+                        depth.saturating_add(1),
+                        layers,
+                    );
+                }
+            }
+        }
+    }
+
+    fn surface_layers(&self, root: SurfaceKey, rect: ImageRect) -> Vec<SurfaceLayer> {
+        let mut layers = Vec::new();
+        let Some(surface) = self.surfaces.get(&root) else {
+            return layers;
+        };
+        let crop = self.crop_of(root, surface);
+        let origin = (
+            rect.x
+                .saturating_sub(i64::try_from(crop.x).unwrap_or(i64::MAX)),
+            rect.y
+                .saturating_sub(i64::try_from(crop.y).unwrap_or(i64::MAX)),
+        );
+        self.append_surface_layers(root, origin, Some(rect), rect, 0, &mut layers);
+        layers
+    }
+
     /// This popup holds the seat's grab. Answers whether that was news, so a
     /// caller need not re-answer focus for a grab it already recorded.
     ///
@@ -1225,7 +1385,7 @@ impl Scene {
     /// or on one descended from it. Bounded by the depth the placement walk is
     /// bounded by, so a broken edge is a false rather than a loop.
     fn shelters(&self, key: SurfaceKey, hit: Option<SurfaceKey>) -> bool {
-        let mut at = hit;
+        let mut at = hit.and_then(|hit| self.subsurface_root(hit));
         for _ in 0..=MAX_POPUP_DEPTH {
             let Some(current) = at else {
                 return false;
@@ -1542,6 +1702,8 @@ impl Scene {
 
     pub fn remove(&mut self, key: SurfaceKey) -> (bool, Vec<SurfaceKey>) {
         let layout_changed = self.layout.contains(key);
+        self.remove_subsurface(key);
+        self.subsurface_stacks.remove(&key);
         self.discard_pixels(key);
         self.geometries.remove(&key);
         // The SURFACE is gone, so the grab goes whether or not this popup was
@@ -1589,6 +1751,15 @@ impl Scene {
         self.input_regions.retain(|key, _| key.client != client);
         self.geometries.retain(|key, _| key.client != client);
         self.popups.retain(|key, _| key.client != client);
+        self.subsurfaces
+            .retain(|key, placed| key.client != client && placed.parent.client != client);
+        self.subsurface_stacks.retain(|key, stack| {
+            if key.client == client {
+                return false;
+            }
+            stack.retain(|entry| entry.is_none_or(|key| key.client != client));
+            true
+        });
         self.grabs.retain(|key| key.client != client);
         self.titles.retain(|key, _| key.client != client);
         self.surface_bytes = self.surface_bytes.saturating_sub(removed);
@@ -1922,7 +2093,13 @@ impl Scene {
         // menu overhangs, and a toolkit told its window was deactivated closes
         // the menu — so the menu would shut as the pointer moved onto it.
         if let Some(popup) = self.popup_target_from(&placements) {
-            return self.popup_root(popup.key);
+            return self.popup_root(self.subsurface_root(popup.key)?);
+        }
+        if let Some(point) = self.pointer_target_from(&placements) {
+            let root = self.subsurface_root(point.key)?;
+            if self.layout.contains(root) {
+                return Some(root);
+            }
         }
         let (x, y) = self.pointer_at_usize()?;
         Some(placements.get(tile_at(&placements, x, y)?)?.key)
@@ -2164,28 +2341,27 @@ impl Scene {
             return None;
         }
         for key in self.popups_stacked().into_iter().rev() {
-            let Some(surface) = self.surfaces.get(&key) else {
-                continue;
-            };
             let Some(rect) = self.popup_rect(key, placements) else {
                 continue;
             };
-            let crop = self.crop_of(key, surface);
-            let Some(point) = inside(rect, crop, self.pointer_x, self.pointer_y) else {
-                continue;
-            };
-            if self
-                .input_regions
-                .get(&key)
-                .is_some_and(|region| !region.contains(point.0, point.1))
-            {
-                continue;
+            for layer in self.surface_layers(key, rect).into_iter().rev() {
+                let Some(point) = inside(layer.rect, layer.crop, self.pointer_x, self.pointer_y)
+                else {
+                    continue;
+                };
+                if self
+                    .input_regions
+                    .get(&layer.key)
+                    .is_some_and(|region| !region.contains(point.0, point.1))
+                {
+                    continue;
+                }
+                return Some(SurfacePoint {
+                    key: layer.key,
+                    x: point.0,
+                    y: point.1,
+                });
             }
-            return Some(SurfacePoint {
-                key,
-                x: point.0,
-                y: point.1,
-            });
         }
         None
     }
@@ -2194,37 +2370,30 @@ impl Scene {
         if let Some(popup) = self.popup_target_from(placements) {
             return Some(popup);
         }
-        for placement in placements {
+        for placement in placements.iter().rev() {
             if !placement.visible {
                 continue;
             }
-            let Some(surface) = self.surfaces.get(&placement.key) else {
-                continue;
-            };
-            // The WINDOW's extent, not the surface's: the drawn part is the
-            // crop, so a pointer over a margin td cropped away is over
-            // whatever is behind the tile rather than over this client.
-            let crop = self.crop_of(placement.key, surface);
-            let Some((local_x, local_y)) = inside(
-                ImageRect::tile(placement.rect),
-                crop,
-                self.pointer_x,
-                self.pointer_y,
-            ) else {
-                continue;
-            };
-            if self
-                .input_regions
-                .get(&placement.key)
-                .is_some_and(|region| !region.contains(local_x, local_y))
-            {
-                continue;
+            let rect = ImageRect::tile(placement.rect);
+            for layer in self.surface_layers(placement.key, rect).into_iter().rev() {
+                let Some((local_x, local_y)) =
+                    inside(layer.rect, layer.crop, self.pointer_x, self.pointer_y)
+                else {
+                    continue;
+                };
+                if self
+                    .input_regions
+                    .get(&layer.key)
+                    .is_some_and(|region| !region.contains(local_x, local_y))
+                {
+                    continue;
+                }
+                return Some(SurfacePoint {
+                    key: layer.key,
+                    x: local_x,
+                    y: local_y,
+                });
             }
-            return Some(SurfacePoint {
-                key: placement.key,
-                x: local_x,
-                y: local_y,
-            });
         }
         None
     }
@@ -2251,15 +2420,19 @@ impl Scene {
         // and `Pointer::reconcile_grab` reads that as the press having nothing
         // left to release against: the menu got a press and never the release
         // a toolkit activates on.
-        let rect = match self.popups.contains_key(&key) {
-            true => self.popup_rect(key, placements)?,
+        let root = self.subsurface_root(key)?;
+        let rect = match self.popups.contains_key(&root) {
+            true => self.popup_rect(root, placements)?,
             false => placements
                 .iter()
-                .filter(|placement| placement.key == key && placement.visible)
+                .filter(|placement| placement.key == root && placement.visible)
                 .map(|placement| ImageRect::tile(placement.rect))
                 .next()?,
         };
-        let crop = self.crop_of(key, self.surfaces.get(&key)?);
+        let layer = self
+            .surface_layers(root, rect)
+            .into_iter()
+            .find(|layer| layer.key == key)?;
         // Deliberately NOT bounded by that rectangle, for either kind: a grab
         // follows the pointer wherever it goes, and a drag that left the
         // surface still reports to the surface it started on.
@@ -2273,8 +2446,8 @@ impl Scene {
         };
         Some(SurfacePoint {
             key,
-            x: local(self.pointer_x, rect.x, crop.x)?,
-            y: local(self.pointer_y, rect.y, crop.y)?,
+            x: local(self.pointer_x, layer.rect.x, layer.crop.x)?,
+            y: local(self.pointer_y, layer.rect.y, layer.crop.y)?,
         })
     }
 
@@ -2418,18 +2591,14 @@ impl Scene {
             if !placement.visible || placement.rect.width == 0 || placement.rect.height == 0 {
                 continue;
             }
-            let Some(surface) = self.surfaces.get(&placement.key) else {
-                continue;
-            };
-            draw_surface(
-                frame,
-                width,
-                height,
-                stride,
-                ImageRect::tile(placement.rect),
-                surface,
-                self.crop_of(placement.key, surface),
-            );
+            for layer in self.surface_layers(placement.key, ImageRect::tile(placement.rect)) {
+                let Some(surface) = self.surfaces.get(&layer.key) else {
+                    continue;
+                };
+                draw_surface(
+                    frame, width, height, stride, layer.rect, surface, layer.crop,
+                );
+            }
         }
         // Popups go over every window and under everything that is not one.
         // Over, because a menu belongs on top of the window that opened it;
@@ -2438,21 +2607,17 @@ impl Scene {
         // first, so a submenu lands on the menu it hangs off rather than under
         // it.
         for key in self.popups_stacked() {
-            let Some(surface) = self.surfaces.get(&key) else {
-                continue;
-            };
             let Some(rect) = self.popup_rect(key, &placements) else {
                 continue;
             };
-            draw_surface(
-                frame,
-                width,
-                height,
-                stride,
-                rect,
-                surface,
-                self.crop_of(key, surface),
-            );
+            for layer in self.surface_layers(key, rect) {
+                let Some(surface) = self.surfaces.get(&layer.key) else {
+                    continue;
+                };
+                draw_surface(
+                    frame, width, height, stride, layer.rect, surface, layer.crop,
+                );
+            }
         }
         // Over the windows and under everything that is not one: the block
         // says where a release would land, and a bar or an overlay it hid
@@ -2897,6 +3062,51 @@ fn draw_pointer(
         ),
         None => draw_cross(frame, width, height, stride, x, y),
     }
+}
+
+fn clip_surface_layer(layer: SurfaceLayer, bounds: ImageRect) -> Option<SurfaceLayer> {
+    let width = layer.crop.width.min(layer.rect.width);
+    let height = layer.crop.height.min(layer.rect.height);
+    let right = layer
+        .rect
+        .x
+        .saturating_add(i64::try_from(width).unwrap_or(i64::MAX));
+    let bottom = layer
+        .rect
+        .y
+        .saturating_add(i64::try_from(height).unwrap_or(i64::MAX));
+    let bound_right = bounds
+        .x
+        .saturating_add(i64::try_from(bounds.width).unwrap_or(i64::MAX));
+    let bound_bottom = bounds
+        .y
+        .saturating_add(i64::try_from(bounds.height).unwrap_or(i64::MAX));
+    let left = layer.rect.x.max(bounds.x);
+    let top = layer.rect.y.max(bounds.y);
+    let right = right.min(bound_right);
+    let bottom = bottom.min(bound_bottom);
+    if left >= right || top >= bottom {
+        return None;
+    }
+    let source_x = usize::try_from(left.checked_sub(layer.rect.x)?).ok()?;
+    let source_y = usize::try_from(top.checked_sub(layer.rect.y)?).ok()?;
+    let width = usize::try_from(right.checked_sub(left)?).ok()?;
+    let height = usize::try_from(bottom.checked_sub(top)?).ok()?;
+    Some(SurfaceLayer {
+        key: layer.key,
+        rect: ImageRect {
+            x: left,
+            y: top,
+            width,
+            height,
+        },
+        crop: Crop {
+            x: layer.crop.x.checked_add(source_x)?,
+            y: layer.crop.y.checked_add(source_y)?,
+            width,
+            height,
+        },
+    })
 }
 
 /// Whether a point is on a drawn rectangle, and where in the SURFACE's own
@@ -5418,6 +5628,237 @@ mod tests {
         assert_eq!(
             scene.pointer_target_for(key, 100, least_output_height(8)),
             None
+        );
+    }
+
+    #[test]
+    fn subsurface_trees_draw_and_hit_test_in_compound_stack_order() {
+        let mut scene = Scene::new();
+        let root = SurfaceKey {
+            client: 4,
+            object: 20,
+        };
+        let below = SurfaceKey {
+            client: 4,
+            object: 21,
+        };
+        let child = SurfaceKey {
+            client: 4,
+            object: 22,
+        };
+        let grandchild = SurfaceKey {
+            client: 4,
+            object: 23,
+        };
+        let blue = [1, 2, 90, 0];
+        let yellow = [3, 80, 90, 0];
+        let red = [90, 4, 5, 0];
+        let green = [6, 90, 7, 0];
+        scene.commit(root, surface(blue, 20, 20)).unwrap();
+        scene
+            .commit_subsurface(below, surface(yellow, 4, 4))
+            .unwrap();
+        scene.commit_subsurface(child, surface(red, 4, 4)).unwrap();
+        scene
+            .commit_subsurface(grandchild, surface(green, 2, 2))
+            .unwrap();
+        scene.associate_subsurface(below, root, 2, 3);
+        scene.associate_subsurface(child, root, 2, 3);
+        scene.associate_subsurface(grandchild, child, 1, 1);
+        scene.stack_subsurfaces(root, vec![Some(below), None, Some(child)]);
+        scene.stack_subsurfaces(child, vec![None, Some(grandchild)]);
+
+        let width = 80;
+        let height = least_output_height(8);
+        let stride = width * 4;
+        let mut frame = vec![0; stride * height];
+        scene.render(&mut frame, width, height, stride);
+        assert!(frame.as_chunks::<4>().0.contains(&blue));
+        assert!(!frame.as_chunks::<4>().0.contains(&yellow));
+        assert!(frame.as_chunks::<4>().0.contains(&red));
+        assert!(frame.as_chunks::<4>().0.contains(&green));
+
+        let view = scene.views(width, height).first().copied().unwrap();
+        let x = i32::try_from(view.rect.x.saturating_add(4)).unwrap();
+        let y = i32::try_from(view.rect.y.saturating_add(5)).unwrap();
+        scene.move_pointer(x, y, width, height);
+        assert_eq!(
+            scene.pointer_target(width, height),
+            Some(SurfacePoint {
+                key: grandchild,
+                x: 1,
+                y: 1,
+            })
+        );
+
+        scene.stack_subsurfaces(root, vec![None, Some(child), Some(below)]);
+        scene.render(&mut frame, width, height, stride);
+        assert!(frame.as_chunks::<4>().0.contains(&yellow));
+        assert_eq!(
+            scene.pointer_target(width, height),
+            Some(SurfacePoint {
+                key: below,
+                x: 2,
+                y: 2,
+            })
+        );
+
+        assert!(scene.detach_subsurface(below));
+        assert_eq!(
+            scene.pointer_target(width, height).map(|point| point.key),
+            Some(grandchild)
+        );
+        scene
+            .commit_subsurface(below, surface(yellow, 4, 4))
+            .unwrap();
+        assert!(scene.remove_subsurface(below));
+        assert_eq!(
+            scene.pointer_target(width, height).map(|point| point.key),
+            Some(grandchild)
+        );
+    }
+
+    #[test]
+    fn subsurface_trees_cannot_escape_their_owned_client_tile() {
+        let mut scene = Scene::new();
+        let first = SurfaceKey {
+            client: 4,
+            object: 30,
+        };
+        let second = SurfaceKey {
+            client: 5,
+            object: 31,
+        };
+        let child = SurfaceKey {
+            client: 5,
+            object: 32,
+        };
+        let blue = [1, 2, 90, 0];
+        let green = [4, 90, 5, 0];
+        let red = [90, 6, 7, 0];
+        let clipped_edge = [80, 9, 10, 0];
+        scene.commit(first, surface(blue, 400, 200)).unwrap();
+        scene.commit(second, surface(green, 400, 200)).unwrap();
+
+        let width = 240;
+        let height = least_output_height(80);
+        let placements = scene.tiled_placements(width, height);
+        let first_placement = placements
+            .iter()
+            .find(|placement| placement.key == first)
+            .copied()
+            .unwrap();
+        let second_placement = placements
+            .iter()
+            .find(|placement| placement.key == second)
+            .copied()
+            .unwrap();
+        let x = i64::try_from(first_placement.rect.x).unwrap()
+            - i64::try_from(second_placement.rect.x).unwrap();
+        let x = i32::try_from(x).unwrap();
+        let y = -i32::try_from(TITLE_HEIGHT).unwrap();
+        let source_x = usize::try_from(-i64::from(x)).unwrap();
+        let source_y = TITLE_HEIGHT;
+        let mut child_surface = surface(red, 400, 200);
+        let source_offset = source_y
+            .saturating_mul(child_surface.width)
+            .saturating_add(source_x)
+            .saturating_mul(4);
+        child_surface
+            .pixels
+            .get_mut(source_offset..source_offset.saturating_add(4))
+            .unwrap()
+            .copy_from_slice(&clipped_edge);
+        scene.commit_subsurface(child, child_surface).unwrap();
+        scene.associate_subsurface(child, second, x, y);
+        scene.stack_subsurfaces(second, vec![None, Some(child)]);
+
+        let stride = width * 4;
+        let mut frame = vec![0; stride * height];
+        scene.render(&mut frame, width, height, stride);
+        let pixel = |x: usize, y: usize| {
+            let offset = y.saturating_mul(stride).saturating_add(x.saturating_mul(4));
+            frame.get(offset..offset.saturating_add(4)).unwrap()
+        };
+        assert_eq!(
+            pixel(first_placement.rect.x, first_placement.rect.y),
+            blue
+        );
+        assert_ne!(
+            pixel(second_placement.band.x, second_placement.band.y),
+            red
+        );
+        assert_eq!(
+            pixel(second_placement.rect.x, second_placement.rect.y),
+            clipped_edge
+        );
+
+        scene.pointer_x = i32::try_from(first_placement.rect.x).unwrap();
+        scene.pointer_y = i32::try_from(first_placement.rect.y).unwrap();
+        assert_eq!(
+            scene.pointer_target(width, height).map(|point| point.key),
+            Some(first)
+        );
+        scene.pointer_x = i32::try_from(second_placement.band.x).unwrap();
+        scene.pointer_y = i32::try_from(second_placement.band.y).unwrap();
+        assert_ne!(
+            scene.pointer_target(width, height).map(|point| point.key),
+            Some(child)
+        );
+        scene.pointer_x = i32::try_from(second_placement.rect.x).unwrap();
+        scene.pointer_y = i32::try_from(second_placement.rect.y).unwrap();
+        assert_eq!(
+            scene.pointer_target(width, height),
+            Some(SurfacePoint {
+                key: child,
+                x: i32::try_from(source_x).unwrap(),
+                y: i32::try_from(source_y).unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn deepest_admitted_subsurface_renders_hits_and_resolves_to_its_root() {
+        let mut scene = Scene::new();
+        let root = SurfaceKey {
+            client: 4,
+            object: 100,
+        };
+        scene.commit(root, surface([1, 2, 3, 0], 1, 1)).unwrap();
+        let mut parent = root;
+        for depth in 1..=MAX_SUBSURFACE_DEPTH {
+            let key = SurfaceKey {
+                client: 4,
+                object: 100 + u32::try_from(depth).unwrap(),
+            };
+            let color = if depth == MAX_SUBSURFACE_DEPTH {
+                [90, 8, 9, 0]
+            } else {
+                [4, 5, 6, 0]
+            };
+            scene.commit_subsurface(key, surface(color, 1, 1)).unwrap();
+            scene.associate_subsurface(key, parent, 0, 0);
+            scene.stack_subsurfaces(parent, vec![None, Some(key)]);
+            parent = key;
+        }
+        assert_eq!(scene.subsurface_root(parent), Some(root));
+
+        let width = 80;
+        let height = least_output_height(8);
+        let stride = width * 4;
+        let mut frame = vec![0; stride * height];
+        scene.render(&mut frame, width, height, stride);
+        assert!(frame.as_chunks::<4>().0.contains(&[90, 8, 9, 0]));
+        let view = scene.views(width, height).first().copied().unwrap();
+        scene.move_pointer(
+            i32::try_from(view.rect.x).unwrap(),
+            i32::try_from(view.rect.y).unwrap(),
+            width,
+            height,
+        );
+        assert_eq!(
+            scene.pointer_target(width, height).map(|point| point.key),
+            Some(parent)
         );
     }
 

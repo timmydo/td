@@ -9,7 +9,8 @@ use crate::runtime::{
 };
 use crate::scene::{
     CursorRequest, InputRegion, PopupPlacement, SharedInputRegion, Surface, SurfaceKey,
-    WindowGeometry, MAX_CURSOR_DIMENSION, MAX_INPUT_REGION_OPERATIONS, SHM_ARGB8888, SHM_XRGB8888,
+    WindowGeometry, MAX_CURSOR_DIMENSION, MAX_INPUT_REGION_OPERATIONS, MAX_SUBSURFACE_DEPTH,
+    SHM_ARGB8888, SHM_XRGB8888,
 };
 #[cfg(test)]
 use crate::scene::{GAP, TITLE_HEIGHT};
@@ -35,6 +36,7 @@ const GLOBAL_OUTPUT: u32 = 3;
 const GLOBAL_XDG_WM_BASE: u32 = 4;
 const GLOBAL_SEAT: u32 = 5;
 const GLOBAL_DECORATION: u32 = 6;
+const GLOBAL_SUBCOMPOSITOR: u32 = 7;
 const WL_DISPLAY_ERROR_IMPLEMENTATION: u32 = 3;
 /// Three of `xdg_surface.error`, each named by the protocol for exactly the
 /// mistake it is raised for: a request to an xdg_surface that has no role
@@ -78,6 +80,8 @@ const MAX_POPUP_CHAIN: usize = 32;
 const XDG_POPUP_ERROR_INVALID_GRAB: u32 = 0;
 const WL_SEAT_ERROR_MISSING_CAPABILITY: u32 = 0;
 const WL_POINTER_ERROR_ROLE: u32 = 0;
+const WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE: u32 = 0;
+const WL_SUBSURFACE_ERROR_BAD_SURFACE: u32 = 0;
 /// `wl_pointer.axis_source`'s `wheel`. The other three sources — finger,
 /// continuous, wheel tilt — describe devices this compositor does not read,
 /// and naming one it cannot tell apart would be worse than the silence a
@@ -248,6 +252,11 @@ enum SurfaceRole {
     /// number back and may put anything behind it.
     XdgRetired,
     Cursor,
+    Subsurface(u32),
+    /// The wl_subsurface object, placement, and association are gone, but
+    /// wl_surface roles are permanent: only another wl_subsurface may
+    /// make this surface play its existing role again.
+    SubsurfaceRetired,
 }
 
 #[derive(Clone, Default)]
@@ -257,6 +266,17 @@ struct SurfaceState {
     input_region: Option<SharedInputRegion>,
     frame_callbacks: Vec<u32>,
     role: Option<SurfaceRole>,
+}
+
+#[derive(Clone, Default)]
+struct CachedSurfaceCommit {
+    /// A state application exists even when it carries no changed fields: an
+    /// empty child commit is still the boundary that applies that child's own
+    /// pending subsurface positions and stack.
+    committed: bool,
+    pending_buffer: Option<PendingBuffer>,
+    pending_input_region: Option<Option<SharedInputRegion>>,
+    frame_callbacks: Vec<u32>,
 }
 
 #[derive(Clone)]
@@ -281,6 +301,15 @@ enum Object {
     },
     Pointer {
         version: u32,
+    },
+    Subcompositor,
+    Subsurface {
+        surface: Option<u32>,
+        parent: Option<u32>,
+        position: (i32, i32),
+        pending_position: Option<(i32, i32)>,
+        synchronized: bool,
+        cached: CachedSurfaceCommit,
     },
     XdgWmBase,
     XdgSurface {
@@ -471,6 +500,13 @@ struct Client {
     pointer_active: Arc<AtomicBool>,
     pending_deletes: PendingDeletes,
     objects: BTreeMap<u32, Object>,
+    /// Events produced while the runtime lock is held for one compound commit.
+    /// They leave only after the scene has settled, so a stalled client cannot
+    /// hold the global runtime lock in a blocking socket write.
+    deferred_outbound: Option<Vec<Vec<u8>>>,
+    /// Pending stack per parent surface, bottom to top. `None` is the parent
+    /// itself; child entries name wl_surface objects rather than protocol ids.
+    subsurface_stacks: BTreeMap<u32, Vec<Option<u32>>>,
     runtime: Arc<Mutex<Runtime>>,
     keymap: KeymapFile,
     protocol_error_code: u32,
@@ -553,67 +589,6 @@ fn send_configure(
         .lock()
         .map_err(|_| "Wayland outbound lock poisoned".to_string())?;
     outbound.send(&toplevel)?;
-    outbound.send(&surface)
-}
-
-fn send_initial_configure(
-    outbound: &Arc<Mutex<Outbound>>,
-    registration: &ConfigureRegistration,
-) -> Result<(), String> {
-    let mut tracker = registration
-        .tracker
-        .lock()
-        .map_err(|_| "XDG configure tracker lock poisoned".to_string())?;
-    let configure = tracker.initial(next_serial())?;
-    let sent = send_configure(outbound, registration, configure);
-    drop(tracker);
-    sent
-}
-
-/// Answer a popup's initial commit: optionally where it was placed and how
-/// big, then the xdg_surface serial. The rectangle rather than a size alone
-/// is what distinguishes this from a toplevel's — a popup is placed by its
-/// client's own rules, and the client is told the answer it will be drawn at.
-///
-/// `placement` is `Some` only the FIRST time for a given popup object; see
-/// `XdgPopup::configure_sent`. So the two are a PAIR on the first map and the
-/// xdg_surface event alone on a re-map, which the protocol allows for: "a
-/// configure sequence is a set of one or more events", with the role event
-/// extending it only where applicable. The serial is the half that is never
-/// optional, since it is what the client must acknowledge before attaching.
-fn send_popup_configure(
-    outbound: &Arc<Mutex<Outbound>>,
-    xdg_surface: u32,
-    popup: u32,
-    placement: Option<PositionerRect>,
-    tracker: &Arc<Mutex<ConfigureTracker>>,
-) -> Result<(), String> {
-    let configure = tracker
-        .lock()
-        .map_err(|_| "XDG configure tracker lock poisoned".to_string())?
-        .initial(next_serial())?;
-    let placed = match placement {
-        Some(rect) => {
-            let mut placed = wire::Builder::new();
-            placed.i32(rect.x);
-            placed.i32(rect.y);
-            placed.i32(rect.width);
-            placed.i32(rect.height);
-            Some(placed.message(popup, XDG_POPUP_CONFIGURE)?)
-        }
-        None => None,
-    };
-
-    let mut surface = wire::Builder::new();
-    surface.u32(configure.serial);
-    let surface = surface.message(xdg_surface, XDG_SURFACE_CONFIGURE)?;
-
-    let mut outbound = outbound
-        .lock()
-        .map_err(|_| "Wayland outbound lock poisoned".to_string())?;
-    if let Some(placed) = placed {
-        outbound.send(&placed)?;
-    }
     outbound.send(&surface)
 }
 
@@ -1305,6 +1280,8 @@ impl Client {
             pointer_active: Arc::new(AtomicBool::new(false)),
             pending_deletes: Arc::new(Mutex::new(BTreeMap::new())),
             objects,
+            deferred_outbound: None,
+            subsurface_stacks: BTreeMap::new(),
             runtime,
             keymap,
             protocol_error_code: WL_DISPLAY_ERROR_IMPLEMENTATION,
@@ -1321,29 +1298,37 @@ impl Client {
     }
 
     fn unmap_surface(&mut self, surface: u32) -> Result<(), String> {
-        self.clear_surface_bytes(surface);
-        let dropped = self
-            .runtime
+        let runtime = Arc::clone(&self.runtime);
+        let mut runtime = runtime
             .lock()
-            .map_err(|_| "runtime lock poisoned".to_string())?
-            .unmap(SurfaceKey {
-                client: self.id,
-                object: surface,
-            })?;
+            .map_err(|_| "runtime lock poisoned".to_string())?;
+        self.unmap_surface_with_runtime(surface, &mut runtime)
+    }
+
+    fn unmap_surface_with_runtime(
+        &mut self,
+        surface: u32,
+        runtime: &mut Runtime,
+    ) -> Result<(), String> {
+        self.clear_surface_bytes(surface);
+        let dropped = runtime.unmap(SurfaceKey {
+            client: self.id,
+            object: surface,
+        })?;
         self.release_dropped(&dropped)?;
         Ok(())
     }
 
-    fn remove_surface(&mut self, surface: u32) -> Result<(), String> {
+    fn remove_surface_with_runtime(
+        &mut self,
+        surface: u32,
+        runtime: &mut Runtime,
+    ) -> Result<(), String> {
         self.clear_surface_bytes(surface);
-        let dropped = self
-            .runtime
-            .lock()
-            .map_err(|_| "runtime lock poisoned".to_string())?
-            .remove(SurfaceKey {
-                client: self.id,
-                object: surface,
-            })?;
+        let dropped = runtime.remove(SurfaceKey {
+            client: self.id,
+            object: surface,
+        })?;
         // Reached by a menu repainted after its window's role object went: the
         // popup object outlives that, so its placement goes back into the
         // scene and only this gives the bytes back.
@@ -1547,10 +1532,85 @@ impl Client {
 
     fn send(&mut self, object: u32, opcode: u16, builder: wire::Builder) -> Result<(), String> {
         let message = builder.message(object, opcode)?;
+        if let Some(deferred) = self.deferred_outbound.as_mut() {
+            deferred.push(message);
+            return Ok(());
+        }
         self.outbound
             .lock()
             .map_err(|_| "Wayland outbound lock poisoned".to_string())?
             .send(&message)
+    }
+
+    fn begin_deferred_outbound(&mut self) -> Result<(), String> {
+        if self.deferred_outbound.is_some() {
+            return Err("nested deferred Wayland output".to_string());
+        }
+        self.deferred_outbound = Some(Vec::new());
+        Ok(())
+    }
+
+    fn discard_deferred_outbound(&mut self) {
+        self.deferred_outbound = None;
+    }
+
+    fn flush_deferred_outbound(&mut self) -> Result<(), String> {
+        let messages = self
+            .deferred_outbound
+            .take()
+            .ok_or_else(|| "deferred Wayland output was not started".to_string())?;
+        let mut outbound = self
+            .outbound
+            .lock()
+            .map_err(|_| "Wayland outbound lock poisoned".to_string())?;
+        for message in messages {
+            outbound.send(&message)?;
+        }
+        Ok(())
+    }
+
+    fn send_initial_configure(
+        &mut self,
+        registration: &ConfigureRegistration,
+    ) -> Result<(), String> {
+        let configure = registration
+            .tracker
+            .lock()
+            .map_err(|_| "XDG configure tracker lock poisoned".to_string())?
+            .initial(next_serial())?;
+        let states = configure_state_bytes(configure.state);
+        let mut toplevel = wire::Builder::new();
+        toplevel.i32(configure.state.width);
+        toplevel.i32(configure.state.height);
+        toplevel.array(&states)?;
+        self.send(registration.toplevel, 0, toplevel)?;
+        let mut surface = wire::Builder::new();
+        surface.u32(configure.serial);
+        self.send(registration.xdg_surface, XDG_SURFACE_CONFIGURE, surface)
+    }
+
+    fn send_popup_configure(
+        &mut self,
+        xdg_surface: u32,
+        popup: u32,
+        placement: Option<PositionerRect>,
+        tracker: &Arc<Mutex<ConfigureTracker>>,
+    ) -> Result<(), String> {
+        let configure = tracker
+            .lock()
+            .map_err(|_| "XDG configure tracker lock poisoned".to_string())?
+            .initial(next_serial())?;
+        if let Some(rect) = placement {
+            let mut placed = wire::Builder::new();
+            placed.i32(rect.x);
+            placed.i32(rect.y);
+            placed.i32(rect.width);
+            placed.i32(rect.height);
+            self.send(popup, XDG_POPUP_CONFIGURE, placed)?;
+        }
+        let mut surface = wire::Builder::new();
+        surface.u32(configure.serial);
+        self.send(xdg_surface, XDG_SURFACE_CONFIGURE, surface)
     }
 
     fn create_keyboard(&mut self, id: u32, version: u32) -> Result<(), String> {
@@ -1736,15 +1796,23 @@ impl Client {
     /// to the scene and not to the accounting would have a client opening and
     /// dismissing menus disconnected for buffers td is not holding.
     fn unmap_popup(&mut self, surface: u32) -> Result<(), String> {
-        self.clear_surface_bytes(surface);
-        let dropped = self
-            .runtime
+        let runtime = Arc::clone(&self.runtime);
+        let mut runtime = runtime
             .lock()
-            .map_err(|_| "runtime lock poisoned".to_string())?
-            .unmap_popup(SurfaceKey {
-                client: self.id,
-                object: surface,
-            })?;
+            .map_err(|_| "runtime lock poisoned".to_string())?;
+        self.unmap_popup_with_runtime(surface, &mut runtime)
+    }
+
+    fn unmap_popup_with_runtime(
+        &mut self,
+        surface: u32,
+        runtime: &mut Runtime,
+    ) -> Result<(), String> {
+        self.clear_surface_bytes(surface);
+        let dropped = runtime.unmap_popup(SurfaceKey {
+            client: self.id,
+            object: surface,
+        })?;
         self.release_dropped(&dropped)?;
         Ok(())
     }
@@ -1965,6 +2033,7 @@ impl Client {
 
     fn advertise_globals(&mut self, registry: u32) -> Result<(), String> {
         self.global(registry, GLOBAL_COMPOSITOR, "wl_compositor", 4)?;
+        self.global(registry, GLOBAL_SUBCOMPOSITOR, "wl_subcompositor", 1)?;
         self.global(registry, GLOBAL_SHM, "wl_shm", 1)?;
         self.global(registry, GLOBAL_OUTPUT, "wl_output", 4)?;
         self.global(
@@ -1987,6 +2056,9 @@ impl Client {
         match (name, interface) {
             (GLOBAL_COMPOSITOR, "wl_compositor") if (1..=4).contains(&version) => {
                 self.insert(id, Object::Compositor)
+            }
+            (GLOBAL_SUBCOMPOSITOR, "wl_subcompositor") if version == 1 => {
+                self.insert(id, Object::Subcompositor)
             }
             (GLOBAL_SHM, "wl_shm") if version == 1 => {
                 self.insert(id, Object::Shm)?;
@@ -2224,7 +2296,558 @@ impl Client {
         })
     }
 
-    fn commit_surface(&mut self, id: u32, mut state: SurfaceState) -> Result<(), String> {
+    fn subsurface_parent(&self, surface: u32) -> Option<u32> {
+        let Object::Surface(SurfaceState {
+            role: Some(SurfaceRole::Subsurface(object)),
+            ..
+        }) = self.objects.get(&surface)?
+        else {
+            return None;
+        };
+        let Object::Subsurface { parent, .. } = self.objects.get(object)? else {
+            return None;
+        };
+        *parent
+    }
+
+    fn direct_subsurface_children(&self, parent: u32) -> Vec<(u32, u32)> {
+        self.subsurface_stacks
+            .get(&parent)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                let surface = (*entry)?;
+                let Some(Object::Surface(SurfaceState {
+                    role: Some(SurfaceRole::Subsurface(object)),
+                    ..
+                })) = self.objects.get(&surface)
+                else {
+                    return None;
+                };
+                match self.objects.get(object) {
+                    Some(Object::Subsurface {
+                        surface: Some(role_surface),
+                        parent: Some(role_parent),
+                        ..
+                    }) if *role_surface == surface && *role_parent == parent => {
+                        Some((*object, surface))
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    fn subsurface_is_synchronized(&self, surface: u32) -> bool {
+        let mut at = Some(surface);
+        for _ in 0..=MAX_SUBSURFACE_DEPTH {
+            let Some(current) = at else {
+                return false;
+            };
+            let Some(Object::Surface(SurfaceState {
+                role: Some(SurfaceRole::Subsurface(object)),
+                ..
+            })) = self.objects.get(&current)
+            else {
+                return false;
+            };
+            let Some(Object::Subsurface {
+                synchronized,
+                parent,
+                ..
+            }) = self.objects.get(object)
+            else {
+                return false;
+            };
+            if *synchronized {
+                return true;
+            }
+            at = *parent;
+        }
+        false
+    }
+
+    fn cache_subsurface_commit(
+        &mut self,
+        surface: u32,
+        mut state: SurfaceState,
+    ) -> Result<(), String> {
+        let object = match state.role {
+            Some(SurfaceRole::Subsurface(object)) => object,
+            _ => return Err(format!("wl_surface {surface} has no subsurface role")),
+        };
+        let replacement = state.pending_buffer.take();
+        let previous = {
+            let Some(Object::Subsurface { cached, .. }) = self.objects.get_mut(&object) else {
+                return Err(format!("wl_surface {surface} lost wl_subsurface {object}"));
+            };
+            let previous = if replacement.is_some() {
+                cached.pending_buffer.take()
+            } else {
+                None
+            };
+            if replacement.is_some() {
+                cached.pending_buffer = replacement;
+            }
+            if state.pending_input_region.is_some() {
+                cached.pending_input_region = state.pending_input_region.take();
+            }
+            cached.committed = true;
+            cached.frame_callbacks.append(&mut state.frame_callbacks);
+            previous
+        };
+        if let Some(PendingBuffer::Buffer { object, buffer, .. }) = previous {
+            if matches!(
+                self.objects.get(&object),
+                Some(Object::Buffer(current)) if current.serial == buffer.serial
+            ) {
+                self.send(object, WL_BUFFER_RELEASE, wire::Builder::new())?;
+            }
+        }
+        self.objects.insert(surface, Object::Surface(state));
+        Ok(())
+    }
+
+    fn apply_cached_subsurface_with_runtime(
+        &mut self,
+        surface: u32,
+        runtime: &mut Runtime,
+    ) -> Result<bool, String> {
+        let object = match self.objects.get(&surface) {
+            Some(Object::Surface(SurfaceState {
+                role: Some(SurfaceRole::Subsurface(object)),
+                ..
+            })) => *object,
+            _ => return Ok(false),
+        };
+        let cached = match self.objects.get_mut(&object) {
+            Some(Object::Subsurface { cached, .. }) => std::mem::take(cached),
+            _ => return Ok(false),
+        };
+        if !cached.committed {
+            return Ok(false);
+        }
+        let Some(Object::Surface(mut state)) = self.objects.get(&surface).cloned() else {
+            return Ok(false);
+        };
+        let next_pending_buffer = state.pending_buffer.take();
+        let next_pending_input_region = state.pending_input_region.take();
+        let next_frame_callbacks = std::mem::take(&mut state.frame_callbacks);
+        state.pending_buffer = cached.pending_buffer;
+        state.pending_input_region = cached.pending_input_region;
+        state.frame_callbacks = cached.frame_callbacks;
+        let applied = self.commit_surface_with_runtime(surface, state, runtime);
+        if let Some(Object::Surface(current)) = self.objects.get_mut(&surface) {
+            current.pending_buffer = next_pending_buffer;
+            current.pending_input_region = next_pending_input_region;
+            current.frame_callbacks = next_frame_callbacks;
+        }
+        applied?;
+        Ok(true)
+    }
+
+    fn apply_subsurface_parent_commit_with_runtime(
+        &mut self,
+        parent: u32,
+        forced_sync: bool,
+        runtime: &mut Runtime,
+    ) -> Result<(), String> {
+        let children: Vec<(u32, u32, i32, i32, bool)> = self
+            .direct_subsurface_children(parent)
+            .into_iter()
+            .filter_map(|(object, surface)| match self.objects.get(&object) {
+                Some(Object::Subsurface {
+                    position,
+                    pending_position,
+                    synchronized,
+                    ..
+                }) => {
+                    let (x, y) = pending_position.unwrap_or(*position);
+                    Some((object, surface, x, y, *synchronized))
+                }
+                _ => None,
+            })
+            .collect();
+        if children.is_empty() && !self.subsurface_stacks.contains_key(&parent) {
+            return Ok(());
+        }
+        let parent_key = SurfaceKey {
+            client: self.id,
+            object: parent,
+        };
+        let child_state: Vec<(SurfaceKey, i32, i32)> = children
+            .iter()
+            .map(|(_, surface, x, y, _)| {
+                (
+                    SurfaceKey {
+                        client: self.id,
+                        object: *surface,
+                    },
+                    *x,
+                    *y,
+                )
+            })
+            .collect();
+        let stack = self
+            .subsurface_stacks
+            .get(&parent)
+            .cloned()
+            .unwrap_or_else(|| vec![None])
+            .into_iter()
+            .map(|entry| {
+                entry.map(|surface| SurfaceKey {
+                    client: self.id,
+                    object: surface,
+                })
+            })
+            .collect();
+        runtime.configure_subsurfaces(parent_key, &child_state, stack)?;
+        for (object, surface, x, y, synchronized) in children {
+            if let Some(Object::Subsurface {
+                position,
+                pending_position,
+                ..
+            }) = self.objects.get_mut(&object)
+            {
+                *position = (x, y);
+                *pending_position = None;
+            }
+            if forced_sync || synchronized {
+                self.apply_cached_subsurface_with_runtime(surface, runtime)?;
+                self.apply_subsurface_parent_commit_with_runtime(surface, true, runtime)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn release_cached_commit(&mut self, cached: &mut CachedSurfaceCommit) -> Result<(), String> {
+        if let Some(PendingBuffer::Buffer { object, buffer, .. }) = cached.pending_buffer.take() {
+            if matches!(
+                self.objects.get(&object),
+                Some(Object::Buffer(current)) if current.serial == buffer.serial
+            ) {
+                self.send(object, WL_BUFFER_RELEASE, wire::Builder::new())?;
+            }
+        }
+        for callback in std::mem::take(&mut cached.frame_callbacks) {
+            if matches!(self.objects.get(&callback), Some(Object::Callback)) {
+                self.objects.remove(&callback);
+                self.delete_id(callback)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_subsurface_role(&mut self, object: u32) -> Result<(), String> {
+        let (surface, parent, mut cached) = match self.objects.get(&object).cloned() {
+            Some(Object::Subsurface {
+                surface,
+                parent,
+                cached,
+                ..
+            }) => (surface, parent, cached),
+            _ => return Err(format!("request for non-wl_subsurface object {object}")),
+        };
+        self.release_cached_commit(&mut cached)?;
+        if let Some(surface) = surface {
+            if let Some(Object::Surface(state)) = self.objects.get_mut(&surface) {
+                if state.role == Some(SurfaceRole::Subsurface(object)) {
+                    state.role = Some(SurfaceRole::SubsurfaceRetired);
+                }
+            }
+            if let Some(stack) = parent.and_then(|parent| self.subsurface_stacks.get_mut(&parent)) {
+                stack.retain(|entry| *entry != Some(surface));
+            }
+            self.clear_surface_bytes(surface);
+            self.runtime
+                .lock()
+                .map_err(|_| "runtime lock poisoned".to_string())?
+                .remove_subsurface(SurfaceKey {
+                    client: self.id,
+                    object: surface,
+                })?;
+        }
+        self.remove_object(object)
+    }
+
+    fn orphan_subsurfaces_of_with_runtime(
+        &mut self,
+        parent: u32,
+        runtime: &mut Runtime,
+    ) -> Result<(), String> {
+        let children = self.direct_subsurface_children(parent);
+        self.subsurface_stacks.remove(&parent);
+        for (object, surface) in children {
+            let mut cached = CachedSurfaceCommit::default();
+            if let Some(Object::Subsurface {
+                parent,
+                synchronized,
+                cached: current,
+                ..
+            }) = self.objects.get_mut(&object)
+            {
+                *parent = None;
+                *synchronized = false;
+                cached = std::mem::take(current);
+            }
+            self.release_cached_commit(&mut cached)?;
+            self.clear_surface_bytes(surface);
+            runtime.remove_subsurface(SurfaceKey {
+                client: self.id,
+                object: surface,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn retire_subsurface_surface_with_runtime(
+        &mut self,
+        surface: u32,
+        object: u32,
+        runtime: &mut Runtime,
+    ) -> Result<(), String> {
+        let mut parent = None;
+        let mut cached = CachedSurfaceCommit::default();
+        if let Some(Object::Subsurface {
+            surface: role_surface,
+            parent: role_parent,
+            cached: current,
+            ..
+        }) = self.objects.get_mut(&object)
+        {
+            *role_surface = None;
+            parent = *role_parent;
+            cached = std::mem::take(current);
+        }
+        self.release_cached_commit(&mut cached)?;
+        if let Some(stack) = parent.and_then(|parent| self.subsurface_stacks.get_mut(&parent)) {
+            stack.retain(|entry| *entry != Some(surface));
+        }
+        self.clear_surface_bytes(surface);
+        runtime.remove_subsurface(SurfaceKey {
+            client: self.id,
+            object: surface,
+        })
+    }
+
+    fn create_subsurface(
+        &mut self,
+        manager: u32,
+        object: u32,
+        surface: u32,
+        parent: u32,
+    ) -> Result<(), String> {
+        if surface == parent {
+            return self.fail_protocol_on(
+                manager,
+                WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE,
+                "a wl_surface cannot be its own subsurface parent",
+            );
+        }
+        let mut state = match self.objects.get(&surface).cloned() {
+            Some(Object::Surface(state)) => state,
+            _ => {
+                return self.fail_protocol_on(
+                    manager,
+                    WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE,
+                    &format!("wl_subsurface references non-surface {surface}"),
+                )
+            }
+        };
+        if !matches!(self.objects.get(&parent), Some(Object::Surface(_))) {
+            return self.fail_protocol_on(
+                manager,
+                WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE,
+                &format!("wl_subsurface references non-parent surface {parent}"),
+            );
+        }
+        if !matches!(state.role, None | Some(SurfaceRole::SubsurfaceRetired)) {
+            return self.fail_protocol_on(
+                manager,
+                WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE,
+                &format!("wl_surface {surface} already has an incompatible role"),
+            );
+        }
+        let mut at = Some(parent);
+        for _ in 0..MAX_SUBSURFACE_DEPTH {
+            let Some(current) = at else {
+                break;
+            };
+            if current == surface {
+                return self.fail_protocol_on(
+                    manager,
+                    WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE,
+                    "wl_subsurface relationship would create a cycle",
+                );
+            }
+            at = self.subsurface_parent(current);
+        }
+        if at.is_some() {
+            return self.fail_protocol_on(
+                manager,
+                WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE,
+                "wl_subsurface parent chain exceeds the supported depth",
+            );
+        }
+        self.insert(
+            object,
+            Object::Subsurface {
+                surface: Some(surface),
+                parent: Some(parent),
+                position: (0, 0),
+                pending_position: None,
+                synchronized: true,
+                cached: CachedSurfaceCommit::default(),
+            },
+        )?;
+        state.role = Some(SurfaceRole::Subsurface(object));
+        self.objects.insert(surface, Object::Surface(state));
+        let stack = self
+            .subsurface_stacks
+            .entry(parent)
+            .or_insert_with(|| vec![None]);
+        stack.push(Some(surface));
+        Ok(())
+    }
+
+    fn restack_subsurface(&mut self, object: u32, sibling: u32, above: bool) -> Result<(), String> {
+        let (surface, parent) = match self.objects.get(&object) {
+            Some(Object::Subsurface {
+                surface: Some(surface),
+                parent: Some(parent),
+                ..
+            }) => (*surface, *parent),
+            Some(Object::Subsurface { .. }) => return Ok(()),
+            _ => return Err(format!("request for non-wl_subsurface object {object}")),
+        };
+        let valid = sibling == parent
+            || (sibling != surface && self.subsurface_parent(sibling) == Some(parent));
+        if !valid {
+            return self.fail_protocol_on(
+                object,
+                WL_SUBSURFACE_ERROR_BAD_SURFACE,
+                &format!("wl_surface {sibling} is not a sibling or the parent"),
+            );
+        }
+        let marker = if sibling == parent {
+            None
+        } else {
+            Some(sibling)
+        };
+        let Some(stack) = self.subsurface_stacks.get_mut(&parent) else {
+            return Err(format!("wl_surface {parent} lost its subsurface stack"));
+        };
+        stack.retain(|entry| *entry != Some(surface));
+        let Some(index) = stack.iter().position(|entry| *entry == marker) else {
+            return Err(format!(
+                "wl_surface {sibling} is absent from its subsurface stack"
+            ));
+        };
+        let insertion = if above {
+            index.saturating_add(1)
+        } else {
+            index
+        };
+        stack.insert(insertion, Some(surface));
+        Ok(())
+    }
+
+    fn finish_surface_transaction(
+        &mut self,
+        operation: Result<(), String>,
+        settle: Result<(), String>,
+    ) -> Result<(), String> {
+        match (operation, settle) {
+            (Ok(()), Ok(())) => self.flush_deferred_outbound(),
+            (Err(error), _) | (Ok(()), Err(error)) => {
+                self.discard_deferred_outbound();
+                Err(error)
+            }
+        }
+    }
+
+    fn commit_surface(&mut self, id: u32, state: SurfaceState) -> Result<(), String> {
+        self.begin_deferred_outbound()?;
+        let shared = Arc::clone(&self.runtime);
+        let mut runtime = match shared.lock() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                self.discard_deferred_outbound();
+                return Err("runtime lock poisoned".to_string());
+            }
+        };
+        if let Err(error) = runtime.begin_compound_commit() {
+            self.discard_deferred_outbound();
+            return Err(error);
+        }
+        let operation = self
+            .commit_surface_with_runtime(id, state, &mut runtime)
+            .and_then(|()| {
+                self.apply_subsurface_parent_commit_with_runtime(id, false, &mut runtime)
+            });
+        let settle = runtime.finish_compound_commit();
+        drop(runtime);
+        self.finish_surface_transaction(operation, settle)
+    }
+
+    fn apply_cached_subsurface_transaction(&mut self, surface: u32) -> Result<(), String> {
+        self.begin_deferred_outbound()?;
+        let shared = Arc::clone(&self.runtime);
+        let mut runtime = match shared.lock() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                self.discard_deferred_outbound();
+                return Err("runtime lock poisoned".to_string());
+            }
+        };
+        if let Err(error) = runtime.begin_compound_commit() {
+            self.discard_deferred_outbound();
+            return Err(error);
+        }
+        let operation = self
+            .apply_cached_subsurface_with_runtime(surface, &mut runtime)
+            .and_then(|_| {
+                self.apply_subsurface_parent_commit_with_runtime(surface, false, &mut runtime)
+            });
+        let settle = runtime.finish_compound_commit();
+        drop(runtime);
+        self.finish_surface_transaction(operation, settle)
+    }
+
+    fn destroy_surface(&mut self, surface: u32, role: Option<SurfaceRole>) -> Result<(), String> {
+        self.begin_deferred_outbound()?;
+        let shared = Arc::clone(&self.runtime);
+        let mut runtime = match shared.lock() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                self.discard_deferred_outbound();
+                return Err("runtime lock poisoned".to_string());
+            }
+        };
+        if let Err(error) = runtime.begin_compound_commit() {
+            self.discard_deferred_outbound();
+            return Err(error);
+        }
+        let operation = (|| {
+            if let Some(SurfaceRole::Subsurface(object)) = role {
+                self.retire_subsurface_surface_with_runtime(surface, object, &mut runtime)?;
+            }
+            self.orphan_popups_of(surface);
+            self.orphan_subsurfaces_of_with_runtime(surface, &mut runtime)?;
+            self.remove_surface_with_runtime(surface, &mut runtime)
+        })();
+        let settle = runtime.finish_compound_commit();
+        drop(runtime);
+        self.finish_surface_transaction(operation, settle)?;
+        self.remove_surface_object(surface)
+    }
+
+    fn commit_surface_with_runtime(
+        &mut self,
+        id: u32,
+        mut state: SurfaceState,
+        runtime: &mut Runtime,
+    ) -> Result<(), String> {
         let input_region_changed = if let Some(region) = state.pending_input_region.take() {
             state.input_region = region;
             true
@@ -2235,9 +2858,15 @@ impl Client {
         let attaching_buffer = matches!(state.pending_buffer, Some(PendingBuffer::Buffer { .. }));
         let was_mapped = self.mapped_bytes.contains_key(&id);
         let cursor = state.role == Some(SurfaceRole::Cursor);
+        let subsurface = matches!(state.role, Some(SurfaceRole::Subsurface(_)));
         if state.role == Some(SurfaceRole::XdgRetired) {
             return Err(format!(
                 "wl_surface {id} was committed after its xdg_surface was destroyed"
+            ));
+        }
+        if state.role == Some(SurfaceRole::SubsurfaceRetired) {
+            return Err(format!(
+                "wl_surface {id} was committed after its wl_subsurface was destroyed"
             ));
         }
         let mut xdg_configure = None;
@@ -2281,14 +2910,13 @@ impl Client {
                     );
                 }
                 match role_object {
-                    RoleObject::Toplevel(toplevel) => send_initial_configure(
-                        &self.outbound,
-                        &ConfigureRegistration {
+                    RoleObject::Toplevel(toplevel) => {
+                        self.send_initial_configure(&ConfigureRegistration {
                             xdg_surface: role,
                             toplevel,
                             tracker: Arc::clone(&configure),
-                        },
-                    )?,
+                        })?
+                    }
                     // A popup is told WHERE as well as how big — on its
                     // first map; see `configure_sent` — and is not registered
                     // for layout updates: it is in no arrangement, so the
@@ -2312,7 +2940,7 @@ impl Client {
                             // parent ahead of its child on the wire and leave
                             // a client that obeys the event it heard unable
                             // to destroy the popup it was told about.
-                            self.unmap_popup(id)?;
+                            self.unmap_popup_with_runtime(id, runtime)?;
                             self.dismiss_popup(id)?;
                         } else {
                             // Inviting it back ends the dismissal. The flag
@@ -2346,10 +2974,7 @@ impl Client {
                                 let parent = parent.ok_or_else(|| {
                                     format!("xdg_popup {popup_object} lost its parent")
                                 })?;
-                                let constraint = self
-                                    .runtime
-                                    .lock()
-                                    .map_err(|_| "runtime lock poisoned".to_string())?
+                                let constraint = runtime
                                     .popup_constraint(SurfaceKey {
                                         client: self.id,
                                         object: parent,
@@ -2371,13 +2996,7 @@ impl Client {
                                         })?,
                                 )
                             };
-                            send_popup_configure(
-                                &self.outbound,
-                                role,
-                                popup_object,
-                                placement,
-                                &configure,
-                            )?;
+                            self.send_popup_configure(role, popup_object, placement, &configure)?;
                             let Some(Object::XdgPopup {
                                 rect,
                                 configure_sent,
@@ -2478,11 +3097,7 @@ impl Client {
                     // read as "hide": a client asking for no cursor says so
                     // with a null SURFACE, which cannot be confused with a
                     // client between two frames of an animated one.
-                    PendingBuffer::Detach { .. } => self
-                        .runtime
-                        .lock()
-                        .map_err(|_| "runtime lock poisoned".to_string())?
-                        .detach_cursor(key, offset)?,
+                    PendingBuffer::Detach { .. } => runtime.detach_cursor(key, offset)?,
                     PendingBuffer::Buffer { object, buffer, .. } => {
                         // The dimension bound is applied HERE rather than at
                         // the scene, because `copy_buffer` allocates and
@@ -2496,24 +3111,48 @@ impl Client {
                             && buffer.height <= MAX_CURSOR_DIMENSION
                         {
                             let image = Self::copy_buffer(&buffer)?;
-                            self.runtime
-                                .lock()
-                                .map_err(|_| "runtime lock poisoned".to_string())?
-                                .commit_cursor(key, image, offset)?;
+                            runtime.commit_cursor(key, image, offset)?;
                         } else {
                             // Still a REPLACEMENT: the surface's contents are
                             // now something td will not draw, so the frame it
                             // held is one the client has superseded.
-                            self.runtime
-                                .lock()
-                                .map_err(|_| "runtime lock poisoned".to_string())?
-                                .detach_cursor(key, offset)?;
+                            runtime.detach_cursor(key, offset)?;
                         }
                         // Released whether or not the image was KEPT. A
                         // cursor over the scene's bound is refused, and a
                         // client left waiting on the buffer it would have
                         // reused is a client that stops drawing — a worse
                         // failure than the cursor it asked for not appearing.
+                        if matches!(
+                            self.objects.get(&object),
+                            Some(Object::Buffer(current)) if current.serial == buffer.serial
+                        ) {
+                            self.send(object, WL_BUFFER_RELEASE, wire::Builder::new())?;
+                        }
+                    }
+                }
+            } else if subsurface {
+                match pending {
+                    PendingBuffer::Detach { .. } => {
+                        self.clear_surface_bytes(id);
+                        runtime.detach_subsurface(key)?;
+                    }
+                    PendingBuffer::Buffer { object, buffer, .. } => {
+                        let surface_bytes = buffer
+                            .width
+                            .checked_mul(buffer.height)
+                            .and_then(|pixels| pixels.checked_mul(4))
+                            .ok_or_else(|| "client surface byte count overflow".to_string())?;
+                        let prior = self.mapped_bytes.get(&id).copied().unwrap_or(0);
+                        let next = client_surface_total(self.mapped_total, prior, surface_bytes)?;
+                        let surface = Self::copy_buffer(&buffer)?;
+                        runtime.commit_subsurface(
+                            key,
+                            Some(surface),
+                            Some(input_region.clone()),
+                        )?;
+                        self.mapped_bytes.insert(id, surface_bytes);
+                        self.mapped_total = next;
                         if matches!(
                             self.objects.get(&object),
                             Some(Object::Buffer(current)) if current.serial == buffer.serial
@@ -2538,7 +3177,7 @@ impl Client {
                                     .unmap()?;
                             }
                         }
-                        self.unmap_popup(id)?;
+                        self.unmap_popup_with_runtime(id, runtime)?;
                     }
                     // The parent surface is gone, so there is nowhere to put
                     // this. Taken DOWN rather than left as it was: the menu is
@@ -2560,7 +3199,7 @@ impl Client {
                         // clearing the bytes leaves `was_mapped` false
                         // from here on, so the detach path's own reset
                         // would never fire for this surface afterwards.
-                        self.unmap_popup(id)?;
+                        self.unmap_popup_with_runtime(id, runtime)?;
                         // AFTER the submenus `unmap_popup` just dismissed,
                         // which hang above this one: the protocol's order is
                         // topmost first whichever call the popups came from.
@@ -2581,16 +3220,13 @@ impl Client {
                         let prior = self.mapped_bytes.get(&id).copied().unwrap_or(0);
                         let next = client_surface_total(self.mapped_total, prior, surface_bytes)?;
                         let surface = Self::copy_buffer(&buffer)?;
-                        self.runtime
-                            .lock()
-                            .map_err(|_| "runtime lock poisoned".to_string())?
-                            .commit_popup(
-                                key,
-                                Some(surface),
-                                placement,
-                                Some(input_region.clone()),
-                                geometry,
-                            )?;
+                        runtime.commit_popup(
+                            key,
+                            Some(surface),
+                            placement,
+                            Some(input_region.clone()),
+                            geometry,
+                        )?;
                         self.mapped_bytes.insert(id, surface_bytes);
                         self.mapped_total = next;
                         // Pixels are up, which is what `invalid_grab` dates
@@ -2625,17 +3261,14 @@ impl Client {
                                     .unmap()?;
                             }
                         }
-                        self.unmap_surface(id)?;
+                        self.unmap_surface_with_runtime(id, runtime)?;
                         // The one commit shape where the geometry is applied on
                         // its own, and it needs no atomicity: a surface with no
                         // pixels is drawn nowhere and aimed at by nothing, so
                         // the unmap and the crop cannot be told apart from
                         // outside whichever order they land in.
                         if geometry.is_some() {
-                            self.runtime
-                                .lock()
-                                .map_err(|_| "runtime lock poisoned".to_string())?
-                                .set_window_geometry(key, geometry)?;
+                            runtime.set_window_geometry(key, geometry)?;
                         }
                     }
                     PendingBuffer::Buffer { object, buffer, .. } => {
@@ -2647,15 +3280,12 @@ impl Client {
                         let prior = self.mapped_bytes.get(&id).copied().unwrap_or(0);
                         let next = client_surface_total(self.mapped_total, prior, surface_bytes)?;
                         let surface = Self::copy_buffer(&buffer)?;
-                        self.runtime
-                            .lock()
-                            .map_err(|_| "runtime lock poisoned".to_string())?
-                            .apply_commit(
-                                key,
-                                Some(surface),
-                                Some(input_region.clone()),
-                                geometry,
-                            )?;
+                        runtime.apply_commit(
+                            key,
+                            Some(surface),
+                            Some(input_region.clone()),
+                            geometry,
+                        )?;
                         self.mapped_bytes.insert(id, surface_bytes);
                         self.mapped_total = next;
                         if matches!(
@@ -2669,35 +3299,38 @@ impl Client {
             }
         } else if let (Some(placement), true) = (popup, input_region_changed || geometry.is_some())
         {
-            self.runtime
-                .lock()
-                .map_err(|_| "runtime lock poisoned".to_string())?
-                .commit_popup(
-                    SurfaceKey {
-                        client: self.id,
-                        object: id,
-                    },
-                    None,
-                    placement,
-                    input_region_changed.then(|| input_region.clone()),
-                    geometry,
-                )?;
+            runtime.commit_popup(
+                SurfaceKey {
+                    client: self.id,
+                    object: id,
+                },
+                None,
+                placement,
+                input_region_changed.then(|| input_region.clone()),
+                geometry,
+            )?;
+        } else if input_region_changed && subsurface {
+            runtime.commit_subsurface(
+                SurfaceKey {
+                    client: self.id,
+                    object: id,
+                },
+                None,
+                Some(input_region.clone()),
+            )?;
         } else if (input_region_changed || geometry.is_some()) && !cursor && !is_popup {
             // No buffer, so the state this commit carries is whichever of the
             // two arrived — the geometry alone being the ordinary opening
             // sequence, set on the empty commit before the first frame.
-            self.runtime
-                .lock()
-                .map_err(|_| "runtime lock poisoned".to_string())?
-                .apply_commit(
-                    SurfaceKey {
-                        client: self.id,
-                        object: id,
-                    },
-                    None,
-                    input_region_changed.then(|| input_region.clone()),
-                    geometry,
-                )?;
+            runtime.apply_commit(
+                SurfaceKey {
+                    client: self.id,
+                    object: id,
+                },
+                None,
+                input_region_changed.then(|| input_region.clone()),
+                geometry,
+            )?;
         }
         for callback in state.frame_callbacks {
             let mut done = wire::Builder::new();
@@ -2732,6 +3365,11 @@ impl Client {
                         count(region);
                     }
                     if let Some(Some(region)) = &surface.pending_input_region {
+                        count(region);
+                    }
+                }
+                Object::Subsurface { cached, .. } => {
+                    if let Some(Some(region)) = &cached.pending_input_region {
                         count(region);
                     }
                 }
@@ -2934,12 +3572,7 @@ impl Client {
                             message.object
                         ));
                     }
-                    // Every popup that named this surface as its parent loses
-                    // that edge HERE, while the id still means what it meant.
-                    // A moment later it is back in the client's pool.
-                    self.orphan_popups_of(message.object);
-                    self.remove_surface(message.object)?;
-                    self.remove_surface_object(message.object)
+                    self.destroy_surface(message.object, state.role)
                 }
                 1 => {
                     let buffer = args.u32()?;
@@ -3012,7 +3645,11 @@ impl Client {
                 }
                 6 => {
                     args.finish()?;
-                    self.commit_surface(message.object, state)
+                    if self.subsurface_is_synchronized(message.object) {
+                        self.cache_subsurface_commit(message.object, state)
+                    } else {
+                        self.commit_surface(message.object, state)
+                    }
                 }
                 7 => {
                     let transform = args.i32()?;
@@ -3130,7 +3767,12 @@ impl Client {
                     match state.role {
                         None => state.role = Some(SurfaceRole::Cursor),
                         Some(SurfaceRole::Cursor) => {}
-                        Some(SurfaceRole::Xdg(_) | SurfaceRole::XdgRetired) => {
+                        Some(
+                            SurfaceRole::Xdg(_)
+                            | SurfaceRole::XdgRetired
+                            | SurfaceRole::Subsurface(_)
+                            | SurfaceRole::SubsurfaceRetired,
+                        ) => {
                             drop(runtime);
                             return self.fail_protocol(
                                 WL_POINTER_ERROR_ROLE,
@@ -3153,6 +3795,83 @@ impl Client {
                     self.remove_pointer(message.object)
                 }
                 _ => Err(format!("unsupported wl_pointer request {}", message.opcode)),
+            },
+            Object::Subcompositor => match message.opcode {
+                0 => {
+                    args.finish()?;
+                    self.remove_object(message.object)
+                }
+                1 => {
+                    let object = args.u32()?;
+                    let surface = args.u32()?;
+                    let parent = args.u32()?;
+                    args.finish()?;
+                    self.create_subsurface(message.object, object, surface, parent)
+                }
+                _ => Err(format!(
+                    "unsupported wl_subcompositor request {}",
+                    message.opcode
+                )),
+            },
+            Object::Subsurface {
+                surface,
+                parent,
+                synchronized,
+                ..
+            } => match message.opcode {
+                0 => {
+                    args.finish()?;
+                    self.remove_subsurface_role(message.object)
+                }
+                1 => {
+                    let x = args.i32()?;
+                    let y = args.i32()?;
+                    args.finish()?;
+                    if surface.is_some() && parent.is_some() {
+                        if let Some(Object::Subsurface {
+                            pending_position, ..
+                        }) = self.objects.get_mut(&message.object)
+                        {
+                            *pending_position = Some((x, y));
+                        }
+                    }
+                    Ok(())
+                }
+                2 | 3 => {
+                    let sibling = args.u32()?;
+                    args.finish()?;
+                    self.restack_subsurface(message.object, sibling, message.opcode == 2)
+                }
+                4 => {
+                    args.finish()?;
+                    if let Some(Object::Subsurface { synchronized, .. }) =
+                        self.objects.get_mut(&message.object)
+                    {
+                        *synchronized = true;
+                    }
+                    Ok(())
+                }
+                5 => {
+                    args.finish()?;
+                    if let Some(Object::Subsurface { synchronized, .. }) =
+                        self.objects.get_mut(&message.object)
+                    {
+                        *synchronized = false;
+                    }
+                    if synchronized
+                        && surface.is_some_and(|surface| !self.subsurface_is_synchronized(surface))
+                    {
+                        let surface = surface.ok_or_else(|| {
+                            format!("wl_subsurface {} lost its wl_surface", message.object)
+                        })?;
+                        self.apply_cached_subsurface_transaction(surface)?;
+                    }
+                    Ok(())
+                }
+                _ => Err(format!(
+                    "unsupported wl_subsurface request {}",
+                    message.opcode
+                )),
             },
             Object::XdgWmBase => match message.opcode {
                 0 => {
@@ -4343,7 +5062,7 @@ mod tests {
     /// them read the next message as a global and hang waiting for it.
     /// `the_registry_advertises_exactly_the_globals_td_serves` is what ties the
     /// two together.
-    const GLOBAL_COUNT: usize = 6;
+    const GLOBAL_COUNT: usize = 7;
 
     fn receive_messages(stream: &mut UnixStream, count: usize) -> Vec<wire::Message> {
         let mut bytes = Vec::new();
@@ -7003,6 +7722,7 @@ mod tests {
             advertised,
             vec![
                 (GLOBAL_COMPOSITOR, "wl_compositor".to_string(), 4),
+                (GLOBAL_SUBCOMPOSITOR, "wl_subcompositor".to_string(), 1),
                 (GLOBAL_SHM, "wl_shm".to_string(), 1),
                 (GLOBAL_OUTPUT, "wl_output".to_string(), 4),
                 (GLOBAL_XDG_WM_BASE, "xdg_wm_base".to_string(), 1),
@@ -7016,6 +7736,646 @@ mod tests {
         );
 
         let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    fn subsurface_fixture(
+        label: &str,
+    ) -> (Client, UnixStream, Arc<Mutex<Runtime>>, PathBuf, PathBuf) {
+        let stem = format!(
+            "td-subsurface-{label}-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let pool_path = std::env::temp_dir().join(format!("{stem}.pool"));
+        fs::write(
+            &pool_path,
+            [
+                0x21u8, 0x43, 0x65, 0, 0x76, 0x54, 0x32, 0, 0x19, 0x87, 0x45, 0,
+            ],
+        )
+        .unwrap();
+        let framebuffer = Framebuffer::test_file(
+            &framebuffer_path,
+            80,
+            crate::scene::least_output_height(8),
+            80 * 4,
+        )
+        .unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut client = Client::new(88, server, Arc::clone(&runtime), test_keymap()).unwrap();
+        for surface in [5, 6, 7] {
+            client
+                .insert(surface, Object::Surface(SurfaceState::default()))
+                .unwrap();
+        }
+        client.insert(20, Object::Subcompositor).unwrap();
+        runtime
+            .lock()
+            .unwrap()
+            .commit(
+                SurfaceKey {
+                    client: 88,
+                    object: 5,
+                },
+                Surface {
+                    width: 8,
+                    height: 8,
+                    pixels: [1u8, 2, 90, 0].repeat(64),
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        for (object, offset) in [(40, 0usize), (41, 4), (42, 8)] {
+            client
+                .insert(
+                    object,
+                    Object::Buffer(Buffer {
+                        serial: u64::from(object),
+                        file: Arc::new(File::open(&pool_path).unwrap()),
+                        offset,
+                        width: 1,
+                        height: 1,
+                        stride: 4,
+                        format: SHM_XRGB8888,
+                    }),
+                )
+                .unwrap();
+        }
+        (client, peer, runtime, framebuffer_path, pool_path)
+    }
+
+    fn get_subsurface(
+        client: &mut Client,
+        object: u32,
+        surface: u32,
+        parent: u32,
+    ) -> Result<(), String> {
+        let mut body = wire::Builder::new();
+        body.u32(object);
+        body.u32(surface);
+        body.u32(parent);
+        client.dispatch(request(20, 1, body).unwrap(), &mut VecDeque::new())
+    }
+
+    fn attach_surface(client: &mut Client, surface: u32, buffer: u32) -> Result<(), String> {
+        let mut body = wire::Builder::new();
+        body.u32(buffer);
+        body.i32(0);
+        body.i32(0);
+        client.dispatch(request(surface, 1, body).unwrap(), &mut VecDeque::new())
+    }
+
+    #[test]
+    fn synchronized_subsurface_state_waits_for_and_tracks_parent_commits() {
+        let (mut client, mut peer, _runtime, framebuffer_path, pool_path) =
+            subsurface_fixture("sync");
+        get_subsurface(&mut client, 30, 6, 5).unwrap();
+
+        let mut position = wire::Builder::new();
+        position.i32(2);
+        position.i32(3);
+        client
+            .dispatch(request(30, 1, position).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        attach_surface(&mut client, 6, 40).unwrap();
+        let mut frame = wire::Builder::new();
+        frame.u32(50);
+        client
+            .dispatch(request(6, 3, frame).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+
+        // State authored after the synchronized commit is the child's next
+        // commit. Applying the cache must neither consume nor acknowledge it.
+        attach_surface(&mut client, 6, 41).unwrap();
+        let mut next_frame = wire::Builder::new();
+        next_frame.u32(51);
+        client
+            .dispatch(request(6, 3, next_frame).unwrap(), &mut VecDeque::new())
+            .unwrap();
+
+        assert_eq!(client.mapped_total, 0);
+        assert!(!fs::read(&framebuffer_path)
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .contains(&[0x21, 0x43, 0x65, 0]));
+        assert!(matches!(
+            client.objects.get(&30),
+            Some(Object::Subsurface {
+                cached: CachedSurfaceCommit {
+                    pending_buffer: Some(_),
+                    frame_callbacks,
+                    ..
+                },
+                ..
+            }) if frame_callbacks == &[50]
+        ));
+
+        client
+            .dispatch(
+                request(5, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(client.mapped_total, 4);
+        assert!(fs::read(&framebuffer_path)
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .contains(&[0x21, 0x43, 0x65, 0]));
+        assert!(matches!(
+            client.objects.get(&30),
+            Some(Object::Subsurface {
+                position: (2, 3),
+                pending_position: None,
+                cached: CachedSurfaceCommit {
+                    pending_buffer: None,
+                    frame_callbacks,
+                    ..
+                },
+                ..
+            }) if frame_callbacks.is_empty()
+        ));
+        assert!(matches!(
+            client.objects.get(&6),
+            Some(Object::Surface(SurfaceState {
+                pending_buffer: Some(PendingBuffer::Buffer { object: 41, .. }),
+                frame_callbacks,
+                ..
+            })) if frame_callbacks == &[51]
+        ));
+        let events = receive_messages(&mut peer, 3);
+        assert_eq!(
+            (events[0].object, events[0].opcode),
+            (40, WL_BUFFER_RELEASE)
+        );
+        assert_eq!((events[1].object, events[1].opcode), (50, WL_CALLBACK_DONE));
+        assert_eq!((events[2].object, events[2].opcode), (1, 1));
+
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        client
+            .dispatch(
+                request(5, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(fs::read(&framebuffer_path)
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .contains(&[0x76, 0x54, 0x32, 0]));
+        let events = receive_messages(&mut peer, 3);
+        assert_eq!(
+            (events[0].object, events[0].opcode),
+            (41, WL_BUFFER_RELEASE)
+        );
+        assert_eq!((events[1].object, events[1].opcode), (51, WL_CALLBACK_DONE));
+        assert_eq!((events[2].object, events[2].opcode), (1, 1));
+
+        let mut below = wire::Builder::new();
+        below.u32(5);
+        client
+            .dispatch(request(30, 3, below).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert!(fs::read(&framebuffer_path)
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .contains(&[0x76, 0x54, 0x32, 0]));
+        client
+            .dispatch(
+                request(5, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(!fs::read(&framebuffer_path)
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .contains(&[0x76, 0x54, 0x32, 0]));
+
+        let mut above = wire::Builder::new();
+        above.u32(5);
+        client
+            .dispatch(request(30, 2, above).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(5, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(fs::read(&framebuffer_path)
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .contains(&[0x76, 0x54, 0x32, 0]));
+
+        client
+            .dispatch(
+                request(30, 5, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        attach_surface(&mut client, 6, 41).unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(fs::read(&framebuffer_path)
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .contains(&[0x76, 0x54, 0x32, 0]));
+
+        attach_surface(&mut client, 6, 0).unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(client.mapped_total, 0);
+        client
+            .dispatch(
+                request(30, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(matches!(
+            client.objects.get(&6),
+            Some(Object::Surface(SurfaceState {
+                role: Some(SurfaceRole::SubsurfaceRetired),
+                ..
+            }))
+        ));
+        get_subsurface(&mut client, 31, 6, 5).unwrap();
+        assert!(matches!(
+            client.objects.get(&6),
+            Some(Object::Surface(SurfaceState {
+                role: Some(SurfaceRole::Subsurface(31)),
+                ..
+            }))
+        ));
+        client
+            .dispatch(
+                request(6, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(matches!(
+            client.objects.get(&31),
+            Some(Object::Subsurface {
+                surface: None,
+                ..
+            })
+        ));
+
+        let _ = fs::remove_file(framebuffer_path);
+        let _ = fs::remove_file(pool_path);
+    }
+
+    #[test]
+    fn inherited_sync_crosses_clean_intermediate_subsurfaces() {
+        let (mut client, _peer, _runtime, framebuffer_path, pool_path) =
+            subsurface_fixture("nested-sync");
+        get_subsurface(&mut client, 30, 6, 5).unwrap();
+        get_subsurface(&mut client, 31, 7, 6).unwrap();
+        client
+            .dispatch(
+                request(31, 5, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+
+        attach_surface(&mut client, 7, 42).unwrap();
+        client
+            .dispatch(
+                request(7, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(client.mapped_total, 0);
+        client
+            .dispatch(
+                request(5, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(client.mapped_total, 4);
+        assert!(matches!(
+            client.objects.get(&31),
+            Some(Object::Subsurface {
+                cached: CachedSurfaceCommit {
+                    committed: false,
+                    ..
+                },
+                ..
+            })
+        ));
+
+        let mut position = wire::Builder::new();
+        position.i32(7);
+        position.i32(9);
+        client
+            .dispatch(request(31, 1, position).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(5, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(matches!(
+            client.objects.get(&31),
+            Some(Object::Subsurface {
+                position: (7, 9),
+                pending_position: None,
+                ..
+            })
+        ));
+
+        let _ = fs::remove_file(framebuffer_path);
+        let _ = fs::remove_file(pool_path);
+    }
+
+    #[test]
+    fn destroying_a_subsurface_parent_unmaps_and_inerts_each_direct_child() {
+        let (mut client, _peer, runtime, framebuffer_path, pool_path) =
+            subsurface_fixture("parent-life");
+        get_subsurface(&mut client, 30, 6, 5).unwrap();
+        get_subsurface(&mut client, 31, 7, 5).unwrap();
+        client
+            .dispatch(
+                request(30, 5, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        client
+            .dispatch(
+                request(31, 5, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        attach_surface(&mut client, 6, 40).unwrap();
+        attach_surface(&mut client, 7, 42).unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        client
+            .dispatch(
+                request(7, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        client
+            .dispatch(
+                request(5, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(client.mapped_total, 8);
+        runtime.lock().unwrap().take_writes();
+
+        client
+            .dispatch(
+                request(5, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(client.mapped_total, 0);
+        assert_eq!(runtime.lock().unwrap().take_writes().len(), 1);
+        assert!(matches!(
+            client.objects.get(&30),
+            Some(Object::Subsurface {
+                surface: Some(6),
+                parent: None,
+                ..
+            })
+        ));
+        assert!(matches!(
+            client.objects.get(&31),
+            Some(Object::Subsurface {
+                surface: Some(7),
+                parent: None,
+                ..
+            })
+        ));
+        assert!(!fs::read(&framebuffer_path)
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .contains(&[0x21, 0x43, 0x65, 0]));
+
+        let _ = fs::remove_file(framebuffer_path);
+        let _ = fs::remove_file(pool_path);
+    }
+
+    #[test]
+    fn orphaned_synchronized_child_commits_and_completes_callbacks_directly() {
+        let (mut client, _peer, _runtime, framebuffer_path, pool_path) =
+            subsurface_fixture("orphan-progress");
+        get_subsurface(&mut client, 30, 6, 5).unwrap();
+        attach_surface(&mut client, 6, 40).unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        client
+            .dispatch(
+                request(5, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        client
+            .dispatch(
+                request(5, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            client.objects.get(&30),
+            Some(Object::Subsurface {
+                parent: None,
+                synchronized: false,
+                ..
+            })
+        ));
+        attach_surface(&mut client, 6, 41).unwrap();
+        let mut frame = wire::Builder::new();
+        frame.u32(50);
+        client
+            .dispatch(request(6, 3, frame).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(client.mapped_total, 4);
+        assert!(!client.objects.contains_key(&50));
+        assert!(matches!(
+            client.objects.get(&30),
+            Some(Object::Subsurface {
+                cached: CachedSurfaceCommit {
+                    committed: false,
+                    frame_callbacks,
+                    ..
+                },
+                ..
+            }) if frame_callbacks.is_empty()
+        ));
+
+        let _ = fs::remove_file(framebuffer_path);
+        let _ = fs::remove_file(pool_path);
+    }
+
+    #[test]
+    fn cached_callbacks_are_retired_on_each_subsurface_teardown_path() {
+        for (suffix, destroy_object) in [("role", 30), ("child", 6), ("parent", 5)] {
+            let (mut client, mut peer, _runtime, framebuffer_path, pool_path) =
+                subsurface_fixture(&format!("cached-callback-{suffix}"));
+            get_subsurface(&mut client, 30, 6, 5).unwrap();
+            let mut frame = wire::Builder::new();
+            frame.u32(50);
+            client
+                .dispatch(request(6, 3, frame).unwrap(), &mut VecDeque::new())
+                .unwrap();
+            client
+                .dispatch(
+                    request(6, 6, wire::Builder::new()).unwrap(),
+                    &mut VecDeque::new(),
+                )
+                .unwrap();
+            assert!(matches!(client.objects.get(&50), Some(Object::Callback)));
+
+            client
+                .dispatch(
+                    request(destroy_object, 0, wire::Builder::new()).unwrap(),
+                    &mut VecDeque::new(),
+                )
+                .unwrap();
+            assert!(!client.objects.contains_key(&50));
+            let events = receive_messages(&mut peer, 2);
+            assert_eq!((events[0].object, events[0].opcode), (1, 1));
+            let mut args = wire::Cursor::new(&events[0].payload);
+            assert_eq!(args.u32().unwrap(), 50);
+            args.finish().unwrap();
+            client.insert(50, Object::Callback).unwrap();
+
+            let _ = fs::remove_file(framebuffer_path);
+            let _ = fs::remove_file(pool_path);
+        }
+    }
+
+    #[test]
+    fn subsurface_role_cycles_and_foreign_restack_targets_are_protocol_errors() {
+        let (mut client, _peer, _runtime, framebuffer_path, pool_path) =
+            subsurface_fixture("errors");
+        get_subsurface(&mut client, 30, 6, 5).unwrap();
+
+        let error = get_subsurface(&mut client, 31, 5, 6).unwrap_err();
+        assert!(error.contains("cycle"), "{error}");
+        assert_eq!(
+            client.protocol_error_code,
+            WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE
+        );
+        assert_eq!(client.protocol_error_object, Some(20));
+        assert!(!client.objects.contains_key(&31));
+
+        let mut self_reference = wire::Builder::new();
+        self_reference.u32(6);
+        let error = client
+            .dispatch(
+                request(30, 2, self_reference).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap_err();
+        assert!(error.contains("not a sibling"), "{error}");
+        assert_eq!(client.protocol_error_code, WL_SUBSURFACE_ERROR_BAD_SURFACE);
+        assert_eq!(client.protocol_error_object, Some(30));
+
+        let _ = fs::remove_file(framebuffer_path);
+        let _ = fs::remove_file(pool_path);
+    }
+
+    #[test]
+    fn subsurface_depth_admission_matches_synchronization_walk() {
+        let stem = format!(
+            "td-wayland-subsurface-depth-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 8, 8, 8 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let mut client = Client::new(3, server, runtime, test_keymap()).unwrap();
+        client.insert(20, Object::Subcompositor).unwrap();
+
+        let root = 100u32;
+        client
+            .insert(root, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        let mut parent = root;
+        let mut role_objects = Vec::new();
+        for depth in 1..=MAX_SUBSURFACE_DEPTH {
+            let depth = u32::try_from(depth).unwrap();
+            let surface = root + depth;
+            let role = 200 + depth;
+            client
+                .insert(surface, Object::Surface(SurfaceState::default()))
+                .unwrap();
+            get_subsurface(&mut client, role, surface, parent).unwrap();
+            role_objects.push(role);
+            parent = surface;
+        }
+        assert!(client.subsurface_is_synchronized(parent));
+
+        let excess_surface = root + u32::try_from(MAX_SUBSURFACE_DEPTH).unwrap() + 1;
+        client
+            .insert(
+                excess_surface,
+                Object::Surface(SurfaceState::default()),
+            )
+            .unwrap();
+        let error = get_subsurface(&mut client, 400, excess_surface, parent).unwrap_err();
+        assert!(error.contains("depth"), "{error}");
+
+        for role in role_objects {
+            client
+                .dispatch(
+                    request(role, 5, wire::Builder::new()).unwrap(),
+                    &mut VecDeque::new(),
+                )
+                .unwrap();
+        }
+        assert!(!client.subsurface_is_synchronized(parent));
+
+        fs::remove_file(framebuffer_path).unwrap();
     }
 
     /// The numbers this interface is spoken in, pinned by VALUE. Every other
@@ -8426,6 +9786,65 @@ mod tests {
             client.objects.get(&10),
             Some(Object::Region(region)) if region.len() == MAX_INPUT_REGION_OPERATIONS
         ));
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn input_region_quota_counts_synchronized_subsurface_caches() {
+        let stem = format!(
+            "td-wayland-cached-input-region-limit-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 8, 8, 8 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let mut client = Client::new(3, server, runtime, test_keymap()).unwrap();
+
+        for object in 10..26 {
+            let mut region = InputRegion::new();
+            for _ in 0..MAX_INPUT_REGION_OPERATIONS {
+                assert!(region.add(0, 0, 1, 1));
+            }
+            client
+                .insert(
+                    object,
+                    Object::Subsurface {
+                        surface: None,
+                        parent: None,
+                        position: (0, 0),
+                        pending_position: None,
+                        synchronized: true,
+                        cached: CachedSurfaceCommit {
+                            committed: true,
+                            pending_input_region: Some(Some(Arc::new(region))),
+                            ..CachedSurfaceCommit::default()
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            client.retained_input_region_operations(),
+            MAX_CLIENT_INPUT_REGION_OPERATIONS
+        );
+
+        client
+            .insert(26, Object::Region(Arc::new(InputRegion::new())))
+            .unwrap();
+        let mut add = wire::Builder::new();
+        for value in [0, 0, 1, 1] {
+            add.i32(value);
+        }
+        client
+            .dispatch(request(26, 1, add).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert!(matches!(
+            client.objects.get(&26),
+            Some(Object::Region(region)) if region.len() == 0
+        ));
+
         fs::remove_file(framebuffer_path).unwrap();
     }
 

@@ -665,14 +665,15 @@ The first protocol surface is:
 
 - wl_display and wl_registry
 - wl_compositor, wl_surface, and wl_region
+- wl_subcompositor and wl_subsurface
 - wl_shm, wl_shm_pool, and wl_buffer
 - wl_output
 - wl_seat, wl_keyboard, and wl_pointer
-- xdg_wm_base, xdg_surface, and xdg_toplevel
+- xdg_wm_base, xdg_surface, xdg_toplevel, xdg_positioner, and xdg_popup
 - zxdg_decoration_manager_v1 and zxdg_toplevel_decoration_v1
 - wl_callback completion and wl_buffer release
 
-Those six globals are the whole of what the registry advertises, and the set is
+Those seven globals are the whole of what the registry advertises, and the set is
 a TEST rather than a sentence here: the name, order, and version of each are
 pinned by
 `the_registry_advertises_exactly_the_globals_td_serves`.
@@ -829,10 +830,9 @@ client re-mapping does not re-send a geometry it sent once at startup.
 
 The rectangle is resolved against the pixels a client committed rather than
 trusted, because it may name coordinates outside the surface and the protocol
-allows that. The effective crop is therefore the intersection, and with no
-`wl_subcompositor` the surface's own bounds ARE the bounding rectangle the
-protocol asks for. Two divergences follow, recorded here rather than found in a
-diff later. The intersection is taken where it is USED rather than frozen by
+allows that. The effective crop is therefore the intersection. Three
+divergences follow, recorded here rather than found in a diff later. The
+intersection is taken where it is USED rather than frozen by
 the commit that applied it, where the protocol says the effective geometry is
 not recalculated until the next `set_window_geometry`: a geometry outlives the
 buffer it was measured against, so a later, smaller buffer would otherwise
@@ -843,11 +843,75 @@ nothing — the protocol makes an effective geometry with a non-positive side an
 client mistake at all, and a window cropped to nothing is a black tile with
 nothing on screen saying why.
 
+The third divergence is now reachable through `wl_subcompositor`: td clamps
+and defaults that crop against the root surface, not the bounding rectangle of
+the root plus its mapped subsurfaces. Subsurface pixels are still drawn at
+their signed surface-local positions and are not clipped to each intermediate
+parent. The whole compound is clipped to the compositor-owned client rectangle
+of its tiled or popup root, for paint and input alike, so a signed child cannot
+cover a title band or another tile. An unset or oversized xdg window geometry
+does not grow to include children beyond that rectangle. GTK's ordinary
+toplevel path supplies an explicit root-surface geometry; closing the general
+case requires a signed compound-bounds calculation shared by tiling,
+popup-parent coordinates, and the crop rather than another special case in the
+renderer.
+
 What IS refused is the request: a width or height that is not positive raises
 `invalid_size`, the code the protocol names for it, in place of the generic
 `implementation` every other refusal on this interface carries. Nothing is
 recorded before the refusal, so a client is never left holding a geometry the
 compositor also thinks is pending.
+
+**Subsurfaces form one compound window.** `wl_subcompositor` version 1 turns a
+roleless surface, or one whose earlier subsurface object was destroyed, into a
+child of another surface. The role KIND remains permanent: destroying the
+`wl_subsurface` immediately unmaps it and forgets its position and z-order,
+but only a new `wl_subsurface` may make that wl_surface play a role again. A
+destroyed child wl_surface leaves its role object inert; a destroyed parent
+unmaps every direct child and breaks the parent edge before that object id can
+be reused.
+
+Association, signed position, and the bottom-to-top stack are pending state of
+the PARENT. A new child is pending above the parent and every sibling;
+`set_position` replaces its pending coordinates, and `place_above` or
+`place_below` edits the pending stack in request order after proving the named
+surface is that parent or a sibling. One parent commit copies all three into
+the scene. A NULL buffer hides the child's branch recursively without losing
+that active edge. Children are not clipped to each intermediate parent's
+bounds, but the entire compound is clipped to its root's compositor-owned
+client rectangle. The clip adjusts both destination and source coordinates,
+so paint and surface-local pointer coordinates agree at negative edges and no
+child can paint or receive input over compositor chrome or another tile.
+
+A child starts synchronized. Its buffer, input region, and frame callbacks are
+cached until its parent's state applies; a synchronized ancestor makes every
+descendant effectively synchronized, even after a descendant asks for
+desynchronized mode. `set_sync` and `set_desync` themselves take effect
+immediately, and leaving the last effective synchronized mode applies any
+cache at once. Application walks through clean intermediate children, because
+a grandchild's cache and pending placement still belong to the root commit;
+state authored after a child's own cached commit remains the child's next
+uncommitted state. The applying parent and every synchronized descendant mutate
+under one runtime lock and incur one paint/focus/layout settlement, so neither
+input nor the framebuffer can observe a half-applied compound frame. Buffer
+releases, frame callbacks, configures, and popup dismissals generated along
+that path are queued until after the runtime lock is released; a client that
+stops reading therefore cannot freeze the compositor through this atomicity
+boundary. Parent destruction uses the same transaction for every direct child
+and the root. Every teardown releases a cached buffer and retires cached frame
+callback ids; an orphan becomes desynchronized and inert rather than retaining
+callbacks for a parent boundary that can no longer arrive.
+
+Rendering and hit testing walk the same bounded 32-level tree and the same
+active stack. Children below the parent draw first, children above it draw
+last, nested children keep that order recursively, and the topmost accepting
+input region receives pointer coordinates in its own surface-local space. The
+layout, title band, focus, popup ancestry, and window-management identity stay
+with the compound root. Per-client copied-pixel and object ceilings cover
+mapped and hidden children; each synchronized surface retains at most one
+pending buffer and input-region state while callbacks remain under the object
+ceiling. Cached input-region snapshots participate in the same aggregate
+operation quota as live and pending surface regions.
 
 **An attach's offset is the cursor's to move.** `wl_surface.attach` carries an
 x and a y placing the new buffer's corner relative to the one it replaces. At
@@ -2368,9 +2432,8 @@ failing more often than not. Closing that one needs the search to measure from
 the group's whole area rather than from a leaf's fraction, which is the same
 fall-through limit the paragraph above records.
 
-Client-side decoration negotiation, clipboard, drag-and-drop, subsurfaces,
-popups, output reconfiguration, fractional scale, screen capture, data
-devices, and touch are not yet advertised. Unknown objects,
+Clipboard, drag-and-drop, output reconfiguration, fractional scale, screen
+capture, data devices, and touch are not yet advertised. Unknown objects,
 malformed sizes, invalid object reuse, missing file descriptors, and
 unsupported requests disconnect only that client.
 

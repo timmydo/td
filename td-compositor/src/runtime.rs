@@ -221,10 +221,22 @@ pub struct Runtime {
     pointer: PointerState,
     keyboard_subscribers: BTreeMap<u64, KeyboardSender>,
     pending_paint: bool,
+    /// A compound-surface commit holds the runtime lock across every scene
+    /// mutation and settles once. Calls made inside it record what they owe
+    /// here instead of exposing a parent frame before its synchronized
+    /// children.
+    compound_settle: Option<CompoundSettle>,
     /// The window a press picked up, held until the button is released.
     /// Nothing in the pointer model carries it: neither press a drag begins
     /// with is delivered, so no client is told any of this.
     dragging: Option<Drag>,
+}
+
+#[derive(Default)]
+struct CompoundSettle {
+    paint: bool,
+    focus: bool,
+    layout_changed: bool,
 }
 
 /// How far the pointer must leave the press point, on either axis, before a
@@ -276,6 +288,7 @@ impl Runtime {
             pointer: PointerState::default(),
             keyboard_subscribers: BTreeMap::new(),
             pending_paint: false,
+            compound_settle: None,
             dragging: None,
         }
     }
@@ -295,6 +308,10 @@ impl Runtime {
     /// Pessimistic across the paint, as the framebuffer's shadow copy is across
     /// its write: a paint that failed leaves the screen owed, not settled.
     pub fn repaint(&mut self) -> Result<(), String> {
+        if let Some(compound) = self.compound_settle.as_mut() {
+            compound.paint = true;
+            return Ok(());
+        }
         self.pending_paint = true;
         self.framebuffer.paint(&self.scene)?;
         self.pending_paint = false;
@@ -386,6 +403,66 @@ impl Runtime {
         }
         if aimed {
             return self.refresh_focus();
+        }
+        Ok(())
+    }
+
+    /// Apply a subsurface's committed contents without making it a layout
+    /// leaf. Visibility and coordinates come from the active parent edge in
+    /// the scene, so storing pixels before the parent maps remains harmless.
+    pub fn commit_subsurface(
+        &mut self,
+        key: SurfaceKey,
+        surface: Option<Surface>,
+        input_region: Option<Option<SharedInputRegion>>,
+    ) -> Result<(), String> {
+        let mut painted = false;
+        let mut aimed = false;
+        if let Some(surface) = surface {
+            self.scene.commit_subsurface(key, surface)?;
+            painted = true;
+        }
+        if let Some(input_region) = input_region {
+            aimed |= self.scene.set_input_region(key, input_region);
+        }
+        if painted {
+            return self.settle(false);
+        }
+        if aimed {
+            return self.refresh_focus();
+        }
+        Ok(())
+    }
+
+    /// The parent-commit half of subsurface state: activate new edges, apply
+    /// scheduled positions, and replace the sibling stack as one scene answer.
+    pub fn configure_subsurfaces(
+        &mut self,
+        parent: SurfaceKey,
+        children: &[(SurfaceKey, i32, i32)],
+        stack: Vec<Option<SurfaceKey>>,
+    ) -> Result<(), String> {
+        let mut changed = false;
+        for (key, x, y) in children {
+            changed |= self.scene.associate_subsurface(*key, parent, *x, *y);
+        }
+        changed |= self.scene.stack_subsurfaces(parent, stack);
+        if changed {
+            return self.settle(false);
+        }
+        Ok(())
+    }
+
+    pub fn detach_subsurface(&mut self, key: SurfaceKey) -> Result<(), String> {
+        if self.scene.detach_subsurface(key) {
+            return self.settle(false);
+        }
+        Ok(())
+    }
+
+    pub fn remove_subsurface(&mut self, key: SurfaceKey) -> Result<(), String> {
+        if self.scene.remove_subsurface(key) {
+            return self.settle(false);
         }
         Ok(())
     }
@@ -596,6 +673,12 @@ impl Runtime {
     /// reported together rather than first-wins, as the overlay rollback
     /// paths report theirs.
     fn settle(&mut self, layout_changed: bool) -> Result<(), String> {
+        if let Some(compound) = self.compound_settle.as_mut() {
+            compound.paint = true;
+            compound.focus = true;
+            compound.layout_changed |= layout_changed;
+            return Ok(());
+        }
         let mut failures = Vec::new();
         if let Err(error) = self.repaint() {
             failures.push(error);
@@ -610,6 +693,40 @@ impl Runtime {
             return Ok(());
         }
         Err(failures.join("; "))
+    }
+
+    pub fn begin_compound_commit(&mut self) -> Result<(), String> {
+        if self.compound_settle.is_some() {
+            return Err("nested runtime compound commit".to_string());
+        }
+        self.compound_settle = Some(CompoundSettle::default());
+        Ok(())
+    }
+
+    pub fn finish_compound_commit(&mut self) -> Result<(), String> {
+        let compound = self
+            .compound_settle
+            .take()
+            .ok_or_else(|| "runtime compound commit was not started".to_string())?;
+        let mut failures = Vec::new();
+        if compound.paint {
+            if let Err(error) = self.repaint() {
+                failures.push(error);
+            }
+        }
+        if compound.focus {
+            if let Err(error) = self.refresh_focus() {
+                failures.push(error);
+            }
+        }
+        if compound.layout_changed && self.refresh_layout() {
+            self.publish_layout();
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
     }
 
     /// A window's own bounds inside its surface took effect, or went with the
@@ -1626,6 +1743,10 @@ impl Runtime {
     }
 
     fn refresh_focus(&mut self) -> Result<(), String> {
+        if let Some(compound) = self.compound_settle.as_mut() {
+            compound.focus = true;
+            return Ok(());
+        }
         // Every step runs whatever the one before it did, as `settle`'s own
         // steps do and for its reason: the cursor settle below is OWED, so a
         // `?` above it loses the drop outright rather than deferring it. The
@@ -2140,6 +2261,50 @@ mod tests {
         // A second flush owes nothing and must not touch the device.
         runtime.flush_paint().unwrap();
         assert_eq!(runtime.take_writes(), vec![]);
+    }
+
+    #[test]
+    fn unchanged_subsurface_configuration_owes_no_compound_settlement() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-subsurface-noop-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let root = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+
+        runtime.begin_compound_commit().unwrap();
+        runtime
+            .configure_subsurfaces(root, &[], vec![None])
+            .unwrap();
+        assert!(matches!(
+            runtime.compound_settle,
+            Some(CompoundSettle {
+                paint: true,
+                focus: true,
+                ..
+            })
+        ));
+        runtime.finish_compound_commit().unwrap();
+
+        runtime.begin_compound_commit().unwrap();
+        runtime
+            .configure_subsurfaces(root, &[], vec![None])
+            .unwrap();
+        assert!(matches!(
+            runtime.compound_settle,
+            Some(CompoundSettle {
+                paint: false,
+                focus: false,
+                layout_changed: false,
+            })
+        ));
+        runtime.finish_compound_commit().unwrap();
     }
 
     #[test]

@@ -1329,10 +1329,11 @@ For `td-compositor`, the minimum useful Firefox target is Software WebRender
 over `wl_shm`; dmabuf must remain unadvertised until it works. The platform
 gap is:
 
-- land `wl_subcompositor` and `wl_data_device_manager` v3 with selection;
-  §F classifies both as first-window blockers for the pinned runtime;
-- finish edge constraint solving, so browser menus are usable rather than
-  merely drawable; the pointer grab and outside-click dismissal are landed;
+- land `wl_data_device_manager` v3 with selection; `wl_subcompositor` is
+  landed, and §F keeps the remaining data-device work as a first-window
+  blocker for the pinned runtime;
+- popup outside-click dismissal and edge constraint solving are landed, so
+  browser menus close and stay within the usable output;
 - add `zxdg_exporter_v2`/`zxdg_importer_v2`, so Firefox and GTK can give portal
   dialogs an authenticated Wayland parent handle;
 - add primary selection and data-device clipboard transfer, then bounded drag
@@ -5022,16 +5023,16 @@ resolves them; the compositor authenticates no token an app supplied.
 ## F. The Wayland protocol gap
 
 Verified against the tree rather than assumed. Today the compositor
-advertises exactly six globals: `wl_compositor` v4, `wl_shm` v1,
-`wl_output` v4, `xdg_wm_base` **v1**,
+advertises exactly seven globals: `wl_compositor` v4,
+`wl_subcompositor` v1, `wl_shm` v1, `wl_output` v4, `xdg_wm_base` **v1**,
 `zxdg_decoration_manager_v1` v1, `wl_seat` v7.
 
-That set is no longer only a claim here. `ui: a window is told the
-compositor draws its titlebar` added the sixth and, with it,
-`the_registry_advertises_exactly_the_globals_td_serves`, which pins the
-name, order and version of each against `advertise_globals` — so the next
-change to that list reds a test in the crate rather than silently
-falsifying this paragraph, as that commit itself would have.
+That set is no longer only a claim here. The decoration landing added the
+sixth and introduced
+`the_registry_advertises_exactly_the_globals_td_serves`; the subsurface
+landing adds the seventh and updates the same test. It pins the name, order
+and version of each against `advertise_globals`, so the next change to that
+list reds a test in the crate rather than silently falsifying this paragraph.
 
 Three corrections to the obvious assumptions, all checked in
 `td-compositor/src/server.rs`:
@@ -5148,7 +5149,7 @@ by them, and records why a tile ignores them and what an offset cannot reach.
 |---|---|---|---|
 | `xdg_surface.set_window_geometry` honoured | **landed** | — | ~250 across scene and hit-test — spent. The geometry is the crop: a tile draws the client's own rectangle from its own origin and a pointer arrives in the client's coordinates. Two deliberate divergences, both in DESIGN.md §3 — the surface intersection is taken where it is used rather than frozen at the applying commit, and a geometry naming no part of the surface leaves the whole surface standing rather than cropping to nothing |
 | `wl_shm` ARGB blending | **present** | — | verify with a golden |
-| `wl_subcompositor` | absent | **U** | 2,500–4,000 — E2 proved it is not a GTK 4 first-window dependency; synchronized child surfaces remain untested and it stays required for general toolkit usability |
+| `wl_subcompositor` | **landed** | — | spent. Version 1 implements nested compound windows, parent-commit application of association/position/z-order, synchronized and desynchronized commits with recursive inherited synchronization through clean intermediate nodes, exact sibling validation, permanent role-kind and inert-object lifecycle, recursive rendering and child-local hit testing. A compound is clipped to its root's owned client rectangle, so signed children cannot cover compositor chrome or another tile. Parent plus synchronized descendants, and a parent-destruction cascade, mutate and settle under one runtime lock; their wire events wait until that lock is released. Cached callbacks are retired on teardown and cached input regions remain inside the aggregate quota |
 | `wl_data_device_manager` v3, selection | absent | **B** | 4,000–6,000 (DnD later, +~900) — E2 confirmed that current GTK 4 refuses the Wayland display when this global is absent |
 | `xdg_positioner` + `get_popup` | **landed** | — | ~900 — spent. Rules recorded and copied at `get_popup`; anchor, gravity and offset resolved on independent axes; the popup floats over its parent, above the tiles and below td's own bar, hit-tested first (though never over the bar), placed by its window geometry, required to abut its parent, stacked by td's own order, and relative to the parent so a submenu hangs off the menu that opened it. A null parent is refused (td implements no protocol that could supply one later) and a zero-area anchor rectangle is accepted as a point |
 | popup grabs + dismissal | **part** | **U** | 1,200–2,000, ~1,300 spent — `popup_done` is now sent for every popup a take-down cascades over, deepest first, which is the order the protocol makes a client destroy nested popups in; a menu whose window went is no longer left open to its client. The surface is UNMAPPED with it, which the protocol makes the same act: the configure tracker is reset, so a client that ignores the event and repaints gets `unconfigured_buffer` instead of its menu back, and the runtime refuses to place a menu it has recorded as over, so a commit already in flight when the press landed is dropped rather than painting the menu back over a grab that has gone — the dismissal is enforced rather than advised. A popup whose parent went before its own initial commit is dismissed AT that commit rather than configured and then refunded, taking the placed submenus down with it, deepest first, and one that maps again under a live parent gets the xdg_surface serial alone, since version 1 has no event that may revise a placement. `grab` is now recorded and checked. The chain is walked to a toplevel rather than read one level deep, since a menu whose window went keeps both its grab and its role object and would otherwise go on lending grabs to submenus opened under it. Only an ungrabbed popup parent is an error, `invalid_popup_parent` on the shell object; a chain that is dismissed, orphaned or gone gets the dismissal the protocol asks for instead of a closed connection. `invalid_grab` refuses a grab after the popup has ever been mapped, and the seat must name a `wl_seat`. The grab now takes the KEYBOARD: the topmost grabbing popup has focus, read off the same stacking order the paint uses, and bounded two ways td records as divergences from the protocol's "always" — the menu must have a pixel on screen, and it must hang off the focused window. The second is the operator's way back: without it a background client's popup was an inescapable keystroke sink, since the override outranks click-to-focus and `Super+arrow` and a grab suspends focus-follows-mouse. The seat's record is dropped when a mapping ends, and separately when the popup object or its surface is destroyed, so neither a menu painted back nor a reused id holds a grab it never asked for. Focus-follows-mouse is suspended for the grab's length, so the window under the menu is what focus falls back to. What is NOT enforced is that the parent is the topmost grabbing popup — the protocol names no error for it, so a branching client gets the keyboard on whichever branch it mapped last. A PRESS is routed through a grab too — motion and the wheel are not, and still go to whatever the pointer is over: a press with none of the grabbing menus under it closes them, deepest first, taking the pixels down and sending `popup_done`. "Outside" is a question about the chain — a grabbing menu survives a press on itself or on anything hanging off it, so a submenu's own press does not close the menu it hangs off — and the set asked is the seat's unfiltered, so a menu that holds no keyboard is still one a press ends. The press is CONSUMED rather than also delivered, since closing a menu must not click what it covered — except for the grab-owning client, which the protocol gives its pointer events for all of its surfaces as normal, so only somebody else's press is td's to take. Everything that decides a dismissal happens on the thread that read the press — grab, pixels, focus, the configure reset and the record that the menu is over — because a record left for another thread leaves a gap a client's own commit paints the menu back through. Only the wire event is the client's seat thread, since addressing it needs that client's registrations; the delivery carries the xdg_popup as well as the surface so that thread can prove the surface still wears the menu the press was about, and it holds the outbound lock across that lookup so `popup_done` cannot cross `delete_id` — never the registration lock, which the runtime takes with the runtime lock held, and which a blocking socket write must therefore not span. One cost is recorded: the byte ceiling is refunded on destroy rather than on dismissal. What is NOT dismissed yet is a chain on a WORKSPACE SWITCH, which the path now exists for and is held for its own landing. The input-event serial is read and not checked: td keeps no ledger of issued input serials to check one against |
@@ -5581,7 +5582,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 15 | per-app policy, lineage identity, in-jail activation | none |
 | 16 | `td-portal` personality: Request/Session core, Settings, Account | GTK settings call works |
 | 17 | Wayland A: `set_window_geometry`, decoration manager, ARGB golden, single-pixel-buffer; **E2's GDK, llvmpipe, and Firefox presentation answers are recorded in §F and `td-compositor/DESIGN.md`** | none |
-| 18 | Wayland B: `wl_subcompositor` | none |
+| 18 | Wayland B: `wl_subcompositor` — **LANDED** | a compound window renders and receives input in client-defined subsurface order, with synchronized frames applied on the parent commit |
 | 19 | Wayland C: `xdg_positioner`/`xdg_popup`, click-outside dismissal and edge constraint solving LANDED | a menu appears where its client asked, takes the keyboard while it is up, closes when the operator presses outside it, and is flipped, slid or resized clear of an output edge as its positioner permits |
 | 20 | clipboard (data-device v3) — client cursors LANDED separately (`1c4b7f88`), so this rung is the clipboard alone | paste, and the I-beam already arrived |
 | 21 | xdg-foreign + private portal socket + dialog placement | modal portal window |
