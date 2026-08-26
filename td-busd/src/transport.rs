@@ -84,21 +84,18 @@ pub const MAX_MESSAGE: usize = (message::HEADER_LEN
 /// for the portal, the compositor or anything else.
 pub const MAX_CONNECTIONS: usize = 64;
 
-/// The same ceiling's other half. §D asks for 64 "per instance as well as
-/// globally", and says why in terms: a GLOBAL cap alone is the denial of
-/// service, since one jailed app reaches it by opening 64 sockets and saying
-/// nothing, and every other application is then locked off the bus.
+/// The same ceiling's other half. §D asks for one share per jail instance as
+/// well as a global cap, and says why in terms: a global cap alone is the
+/// denial of service, since one multiprocess application can consume it by
+/// opening sockets and every other application is then locked off the bus.
 ///
-/// §D maps a peer to its instance through the registered jail instance, and
-/// does it from the pidfd rather than from this number — see `lineage`. The
-/// QUOTA still counts per `SO_PEERCRED.pid`, which is the right trade for a
-/// rate limit: the cost of a recycled number here is a miscounted share, and
-/// the accept path already refuses a peer whose pid cannot be proved. So the
-/// share is counted per pid: an approximation that is wrong only where one instance
-/// spans several processes, and right about the case §D names. The number is
-/// a quarter of the ceiling, so four busy peers still fit and no single one
-/// can lock the rest out.
-pub const MAX_CONNECTIONS_PER_PEER: usize = MAX_CONNECTIONS / 4;
+/// One share is a quarter of the ceiling, so four busy instances still fit.
+/// Peers proved to belong to the same registered instance use the same key
+/// regardless of their host pids. A proved unconfined peer falls back to its
+/// process key. Unidentifiable peers share one fail-closed key, so rotating a
+/// reaped connecting pid cannot rotate quota shares; neither fallback is ever
+/// collapsed into somebody else's jail.
+pub const MAX_CONNECTIONS_PER_INSTANCE: usize = MAX_CONNECTIONS / 4;
 
 /// Descriptors queued across the WHOLE bus, not per connection.
 ///
@@ -147,12 +144,30 @@ const MAX_QUEUED_FDS: usize = sys::MAX_FDS;
 /// every abuse §D describes here.
 #[derive(Default)]
 pub struct Quota {
-    /// One entry per live connection, holding its peer's pid. A `Vec` scanned
-    /// linearly rather than a map: it holds at most `MAX_CONNECTIONS`, and the
-    /// scan happens once per accept.
-    live: std::sync::Mutex<Vec<i32>>,
+    /// One entry per live connection. A `Vec` scanned linearly rather than a
+    /// map: it holds at most `MAX_CONNECTIONS`, and the scan happens once per
+    /// accept.
+    live: std::sync::Mutex<Vec<LiveAdmission>>,
     /// Descriptors queued and unclaimed across every connection.
     queued_fds: Arc<std::sync::atomic::AtomicUsize>,
+    /// Consecutive admission refusals, shared because identity resolution now
+    /// runs in bounded worker threads rather than on the listener thread.
+    refused: std::sync::atomic::AtomicUsize,
+}
+
+struct LiveAdmission {
+    token: Arc<()>,
+    pid: i32,
+    key: Option<AdmissionKey>,
+}
+
+/// One global place reserved cheaply before the lineage walk starts.
+///
+/// It bounds both the number of identification workers and the connections
+/// they may become. The per-instance decision follows once the worker has the
+/// identity, and converting this place does not open a gap in the global cap.
+pub struct Reservation {
+    place: Option<QuotaPlace>,
 }
 
 /// A live connection's place in the quota, given back when it ends — however
@@ -162,31 +177,119 @@ pub struct Quota {
 /// it travels to outlives the frame that admitted it: connection threads are
 /// detached, so there is no scope whose lifetime a borrow could use.
 pub struct Admitted {
+    place: QuotaPlace,
+}
+
+struct QuotaPlace {
     quota: std::sync::Arc<Quota>,
-    pid: i32,
+    token: Arc<()>,
+}
+
+/// The authority unit charged for accepting a connection.
+///
+/// A jailed key is the registered instance, not the connecting process: GTK
+/// and Firefox legitimately spread one application over several processes,
+/// and a per-pid share would give each child another admission budget.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdmissionKey {
+    Instance(String),
+    Process(i32),
+    Unknown,
+}
+
+impl std::fmt::Display for AdmissionKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Instance(instance) => write!(formatter, "instance {instance}"),
+            Self::Process(pid) => write!(formatter, "pid {pid}"),
+            Self::Unknown => formatter.write_str("unidentified peers"),
+        }
+    }
+}
+
+/// The once-at-accept kernel credential and lineage answer.
+///
+/// `main` needs the answer before it admits a peer, and `Connection` needs the
+/// exact same answer for policy. Keeping both in one value prevents a second
+/// lineage walk from charging one identity and serving another.
+pub struct IdentifiedPeer {
+    credential: PeerCredential,
+    identity: Identity,
+}
+
+impl IdentifiedPeer {
+    pub fn admission_key(&self) -> AdmissionKey {
+        if let Some(instance) = self.identity.admission_instance() {
+            AdmissionKey::Instance(instance.to_string())
+        } else if self.identity.is_unknown() {
+            AdmissionKey::Unknown
+        } else {
+            AdmissionKey::Process(self.credential.pid)
+        }
+    }
 }
 
 impl Admitted {
     pub fn quota(&self) -> &Quota {
-        &self.quota
+        &self.place.quota
     }
 }
 
-impl Drop for Admitted {
+impl Drop for QuotaPlace {
     fn drop(&mut self) {
         if let Ok(mut live) = self.quota.live.lock() {
-            if let Some(at) = live.iter().position(|pid| *pid == self.pid) {
+            if let Some(at) = live
+                .iter()
+                .position(|entry| Arc::ptr_eq(&entry.token, &self.token))
+            {
                 live.swap_remove(at);
             }
         }
     }
 }
 
-/// The kernel's account of who is on the other end. `main` asks through here
-/// rather than reaching into `sys`, which the roster says only this module
-/// does — and the confinement test enforces.
+/// The kernel's cheap account of the peer. The listener uses it only for the
+/// provisional global/per-process reservation; the pidfd lineage answer that
+/// establishes authority is taken by the bounded worker afterwards.
 pub fn peer_of(stream: &UnixStream) -> io::Result<PeerCredential> {
     sys::peer_credential(stream)
+}
+
+impl Reservation {
+    /// Convert this globally reserved place to the identified authority key.
+    /// Refusal drops the reservation and returns the global place.
+    pub fn admit(mut self, key: AdmissionKey) -> Result<Admitted, String> {
+        let Some(place) = self.place.as_ref() else {
+            return Err("the admission reservation is absent".to_string());
+        };
+        let mut live = place
+            .quota
+            .live
+            .lock()
+            .map_err(|_| "the connection table is poisoned".to_string())?;
+        let mine = live
+            .iter()
+            .filter(|entry| entry.key.as_ref() == Some(&key))
+            .count();
+        if mine >= MAX_CONNECTIONS_PER_INSTANCE {
+            let why = format!("{key} already holds {mine}");
+            drop(live);
+            return Err(why);
+        }
+        let Some(entry) = live
+            .iter_mut()
+            .find(|entry| Arc::ptr_eq(&entry.token, &place.token))
+        else {
+            drop(live);
+            return Err("the admission reservation left the table".to_string());
+        };
+        entry.key = Some(key);
+        drop(live);
+        let Some(place) = self.place.take() else {
+            return Err("the admission reservation is absent".to_string());
+        };
+        Ok(Admitted { place })
+    }
 }
 
 impl Quota {
@@ -194,10 +297,13 @@ impl Quota {
         Self::default()
     }
 
-    /// Take a place for a peer, or say why there is none. A poisoned lock is
-    /// treated as a full bus rather than unwrapped: this is the accept path,
-    /// and refusing a peer is always available where panicking is not.
-    pub fn try_admit(self: &std::sync::Arc<Self>, pid: i32) -> Result<Admitted, String> {
+    /// Reserve a global place before doing a lineage walk. The provisional
+    /// per-pid share makes reconnect refusal cheap for one process; the
+    /// instance share is enforced by `Reservation::admit` after resolution.
+    pub fn try_reserve(
+        self: &std::sync::Arc<Self>,
+        pid: i32,
+    ) -> Result<Reservation, String> {
         let mut live = self
             .live
             .lock()
@@ -205,16 +311,34 @@ impl Quota {
         if live.len() >= MAX_CONNECTIONS {
             return Err(format!("already serving {}", live.len()));
         }
-        let mine = live.iter().filter(|held| **held == pid).count();
-        if mine >= MAX_CONNECTIONS_PER_PEER {
-            return Err(format!("pid {pid} already holds {mine}"));
+        let mine = live.iter().filter(|entry| entry.pid == pid).count();
+        if mine >= MAX_CONNECTIONS_PER_INSTANCE {
+            return Err(format!("pid {pid} already holds {mine} provisional places"));
         }
-        live.push(pid);
-        drop(live);
-        Ok(Admitted {
-            quota: std::sync::Arc::clone(self),
+        let token = Arc::new(());
+        live.push(LiveAdmission {
+            token: Arc::clone(&token),
             pid,
+            key: None,
+        });
+        drop(live);
+        Ok(Reservation {
+            place: Some(QuotaPlace {
+                quota: std::sync::Arc::clone(self),
+                token,
+            }),
         })
+    }
+
+    pub fn admission_succeeded(&self) {
+        self.refused
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn admission_refused(&self) -> usize {
+        self.refused
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1)
     }
 
     #[cfg(test)]
@@ -497,24 +621,13 @@ impl Drop for Connection<'_> {
 }
 
 impl<'a> Connection<'a> {
-    /// Take a peer the listener accepted. The credential is read HERE, once, at
-    /// accept, and is what the handshake admits by — never anything the peer
-    /// says about itself.
-    pub fn accept(
-        stream: UnixStream,
-        guid: Guid<'a>,
-        quota: &'a Quota,
-        bus: &'a Bus,
-        instances: &'a Instances,
-    ) -> io::Result<Self> {
-        let credential = sys::peer_credential(&stream)?;
-        let guid_text = guid.as_str();
+    /// Resolve the peer once, before admission as well as authentication.
+    pub fn identify(stream: &UnixStream, instances: &Instances) -> io::Result<IdentifiedPeer> {
+        let credential = sys::peer_credential(stream)?;
         // Before the handshake, because this is the kernel's account of the
         // peer and the handshake is the peer's account of itself. It is taken
-        // once, here, so that every later answer is the one that was true at
-        // accept rather than one taken whenever it was first needed: a
-        // lineage is a statement about a process tree at an instant, and
-        // re-walking it later would answer about a tree that has moved on.
+        // once, here, so admission and every later policy answer describe the
+        // same process tree at the same instant.
         //
         // The pidfd rather than `credential.pid`: the credential carries a
         // NUMBER sampled at connect, and a peer that has since been reaped can
@@ -530,7 +643,7 @@ impl<'a> Connection<'a> {
         // connection lands here and this bus routes nothing between peers.
         // That is fail-closed working as intended rather than a fallback, and
         // it is why the image pins 7.x.
-        let identity = match sys::peer_pidfd(&stream) {
+        let identity = match sys::peer_pidfd(stream) {
             // Dropped at the end of this expression, and deliberately: the
             // answer is taken once, here, and never recomputed, so holding one
             // descriptor per connection would spend an fd on a question
@@ -538,19 +651,49 @@ impl<'a> Connection<'a> {
             Ok(pidfd) => instances.resolve(&RealProcfs, pidfd.as_raw_fd()),
             Err(why) => Self::unidentifiable(&why),
         };
+        Ok(IdentifiedPeer {
+            credential,
+            identity,
+        })
+    }
+
+    /// Take a peer the listener accepted. Test callers that do not have an
+    /// outer admission loop use this convenience path; the daemon uses
+    /// `identify` followed by `accept_identified` so quota and policy consume
+    /// one answer.
+    pub fn accept(
+        stream: UnixStream,
+        guid: Guid<'a>,
+        quota: &'a Quota,
+        bus: &'a Bus,
+        instances: &'a Instances,
+    ) -> io::Result<Self> {
+        let identified = Self::identify(&stream, instances)?;
+        Self::accept_identified(stream, guid, quota, bus, instances, identified)
+    }
+
+    pub fn accept_identified(
+        stream: UnixStream,
+        guid: Guid<'a>,
+        quota: &'a Quota,
+        bus: &'a Bus,
+        instances: &'a Instances,
+        identified: IdentifiedPeer,
+    ) -> io::Result<Self> {
+        let guid_text = guid.as_str();
         // The writer's half of the socket. Cloned here rather than later
         // because a connection without an outbox has no way to be answered,
         // and the failure to make one belongs at accept where it can be seen.
         let outbox = bus.outbox_for(stream.try_clone()?);
         Ok(Connection {
             stream,
-            shake: Handshake::new(PeerIdentity::unmapped(credential.uid), guid),
+            shake: Handshake::new(PeerIdentity::unmapped(identified.credential.uid), guid),
             guid: guid_text,
-            credential,
+            credential: identified.credential,
             quota,
             bus,
             instances,
-            identity,
+            identity: identified.identity,
             outbox,
             unique: None,
             chunk: vec![0u8; READ_CHUNK],
@@ -9704,32 +9847,38 @@ mod tests {
     #[test]
     fn the_quota_holds_a_peer_to_its_share_and_the_bus_to_its_ceiling() {
         let quota = std::sync::Arc::new(Quota::new());
-        // One peer may take its share and no more.
+        let instance = |name: &str| AdmissionKey::Instance(name.to_string());
+        let process = AdmissionKey::Process;
+        let admit = |pid, key| quota.try_reserve(pid).and_then(|place| place.admit(key));
+        // One jail instance may take its share and no more, however many host
+        // processes its connections came from.
         let mut mine = Vec::new();
-        for which in 0..MAX_CONNECTIONS_PER_PEER {
-            match quota.try_admit(7) {
+        for which in 0..MAX_CONNECTIONS_PER_INSTANCE {
+            let pid = i32::try_from(which).unwrap_or(0).saturating_add(1);
+            match admit(pid, instance("one")) {
                 Ok(place) => mine.push(place),
-                Err(why) => panic!("pid 7 refused at {which}: {why}"),
+                Err(why) => panic!("instance one refused at {which}: {why}"),
             }
         }
-        match quota.try_admit(7) {
-            Ok(_) => panic!("pid 7 took more than its share"),
-            Err(why) => assert!(why.contains("pid 7"), "{why}"),
+        match admit(4000, instance("one")) {
+            Ok(_) => panic!("instance one took more than its share"),
+            Err(why) => assert!(why.contains("instance one"), "{why}"),
         }
-        // And another peer is unaffected, which is the whole point.
-        let other = quota.try_admit(8).expect("a different peer is refused");
-        assert_eq!(quota.live_count(), MAX_CONNECTIONS_PER_PEER + 1);
+        // And another instance is unaffected, which is the whole point.
+        let other = admit(4001, instance("two")).expect("a different instance is refused");
+        assert_eq!(quota.live_count(), MAX_CONNECTIONS_PER_INSTANCE + 1);
 
-        // Filling the bus from enough distinct peers reaches the global cap.
+        // Filling the bus from enough distinct unconfined process keys reaches
+        // the independent global cap.
         let mut rest = Vec::new();
         let mut pid = 9;
         while quota.live_count() < MAX_CONNECTIONS {
-            match quota.try_admit(pid) {
+            match admit(pid, process(pid)) {
                 Ok(place) => rest.push(place),
                 Err(_) => pid += 1,
             }
         }
-        match quota.try_admit(4242) {
+        match admit(4242, process(4242)) {
             Ok(_) => panic!("the bus went past its ceiling"),
             Err(why) => assert!(why.contains("already serving"), "{why}"),
         }
@@ -9738,7 +9887,80 @@ mod tests {
         drop(other);
         drop(mine.pop());
         assert_eq!(quota.live_count(), MAX_CONNECTIONS - 2);
-        quota.try_admit(4242).expect("room after two left");
+        admit(4242, process(4242)).expect("room after two left");
+    }
+
+    #[test]
+    fn reservations_bound_lineage_workers_before_identification() {
+        let quota = std::sync::Arc::new(Quota::new());
+        let mut held = Vec::new();
+        for pid in 1..=MAX_CONNECTIONS {
+            let pid = i32::try_from(pid).unwrap_or(0);
+            match quota.try_reserve(pid) {
+                Ok(place) => held.push(place),
+                Err(why) => panic!("reservation {pid} was refused early: {why}"),
+            }
+        }
+        match quota.try_reserve(4242) {
+            Ok(_) => panic!("an unbounded identification worker was admitted"),
+            Err(why) => assert!(why.contains("already serving"), "{why}"),
+        }
+        drop(held.pop());
+        quota.try_reserve(4242).expect("a returned worker place stayed held");
+    }
+
+    #[test]
+    fn distinct_processes_of_one_jail_share_one_admission_key() {
+        let peer = |pid| IdentifiedPeer {
+            credential: PeerCredential {
+                pid,
+                uid: this_uid(),
+                gid: 0,
+            },
+            identity: Identity::Jailed {
+                app_id: "demo".to_string(),
+                instance: "same-instance".to_string(),
+                owned: Vec::new(),
+            },
+        };
+        assert_eq!(peer(7).admission_key(), peer(8).admission_key());
+        assert_eq!(
+            peer(7).admission_key(),
+            AdmissionKey::Instance("same-instance".to_string())
+        );
+    }
+
+    #[test]
+    fn unknown_processes_share_one_fail_closed_admission_key() {
+        let peer = |pid| IdentifiedPeer {
+            credential: PeerCredential {
+                pid,
+                uid: this_uid(),
+                gid: 0,
+            },
+            identity: Identity::Unknown("the connecting process was reaped".to_string()),
+        };
+        assert_eq!(peer(7).admission_key(), AdmissionKey::Unknown);
+        assert_eq!(peer(7).admission_key(), peer(8).admission_key());
+        let quota = std::sync::Arc::new(Quota::new());
+        let mut held = Vec::new();
+        for pid in 1..=MAX_CONNECTIONS_PER_INSTANCE {
+            let pid = i32::try_from(pid).unwrap_or(0);
+            match quota
+                .try_reserve(pid)
+                .and_then(|place| place.admit(peer(pid).admission_key()))
+            {
+                Ok(place) => held.push(place),
+                Err(why) => panic!("unknown pid {pid} was refused early: {why}"),
+            }
+        }
+        match quota
+            .try_reserve(4242)
+            .and_then(|place| place.admit(peer(4242).admission_key()))
+        {
+            Ok(_) => panic!("rotating an unknown pid minted another share"),
+            Err(why) => assert!(why.contains("unidentified peers"), "{why}"),
+        }
     }
 
     /// The descriptor budget is the BUS's, not a connection's. A per-connection

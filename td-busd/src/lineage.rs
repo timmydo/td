@@ -137,6 +137,23 @@ impl Identity {
             _ => None,
         }
     }
+
+    /// The registered instance that connection admission must charge, when
+    /// this identity proved one.
+    pub fn admission_instance(&self) -> Option<&str> {
+        match self {
+            Self::Jailed { instance, .. } => Some(instance),
+            Self::Unconfined | Self::Unknown(_) => None,
+        }
+    }
+
+    /// Whether admission must use the shared fail-closed fallback.
+    pub fn is_unknown(&self) -> bool {
+        match self {
+            Self::Unknown(_) => true,
+            Self::Jailed { .. } | Self::Unconfined => false,
+        }
+    }
 }
 
 /// One process as `/proc/<pid>/stat` describes it, reduced to the three fields

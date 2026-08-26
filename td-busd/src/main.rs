@@ -72,6 +72,13 @@ fn current_uid() -> Result<u32, String> {
     Ok(std::os::unix::fs::MetadataExt::uid(&entry))
 }
 
+fn report_admission_refusal(quota: &transport::Quota, pid: i32, why: &str) {
+    let refusals = quota.admission_refused();
+    if refusals == 1 || refusals.is_multiple_of(REFUSALS_PER_LINE) {
+        eprintln!("td-busd: refused pid {pid} ({refusals} in a row): {why}");
+    }
+}
+
 /// Bind the bus and serve it. Never returns while the listener is good: a
 /// broker that exited zero having served nothing would satisfy its supervision
 /// unit and leave every portal call hanging.
@@ -99,9 +106,6 @@ fn run(socket: &Path) -> Result<String, String> {
     // Consecutive failed accepts. Reset by any success, so a busy bus that
     // sheds the occasional peer never approaches the ceiling.
     let mut failures = 0usize;
-    // Consecutive refusals, for the log rate below. Reset by any admission.
-    let mut refusals = 0usize;
-
     // DETACHED threads, not `thread::scope`. A scope joins every thread it
     // spawned before it returns, and a connection thread returns only when its
     // peer leaves — so the give-up below, written inside a scope, would wait
@@ -134,9 +138,10 @@ fn run(socket: &Path) -> Result<String, String> {
                 continue;
             }
         };
-        // Who this is, before deciding whether there is room for them: §D's
-        // ceiling has a per-peer half, and the peer is the kernel's answer
-        // rather than anything the connection has said yet.
+        // Reserve the cheap global/per-process place on the listener thread.
+        // The lineage walk may read a deep process chain, so it runs in the
+        // bounded worker this reservation accounts for rather than serially
+        // holding every later accept behind it.
         let credential = match transport::peer_of(&stream) {
             Ok(credential) => credential,
             Err(error) => {
@@ -144,27 +149,13 @@ fn run(socket: &Path) -> Result<String, String> {
                 continue;
             }
         };
-        let admitted = match quota.try_admit(credential.pid) {
-            Ok(admitted) => {
-                refusals = 0;
-                admitted
-            }
+        let reservation = match quota.try_reserve(credential.pid) {
+            Ok(reservation) => reservation,
             // Refusing is a CLOSE: there is nothing to say before a handshake,
             // and a peer left holding an accepted socket that nobody will ever
             // read is worse off than one told nothing.
             Err(why) => {
-                // A peer that reconnects in a loop against a full share would
-                // otherwise write one journal line per connect — the same
-                // flood the accept backoff above exists to stop, arriving
-                // through the door that IS working. Say it, then say it
-                // rarely.
-                refusals += 1;
-                if refusals == 1 || refusals.is_multiple_of(REFUSALS_PER_LINE) {
-                    eprintln!(
-                        "td-busd: refused pid {} ({refusals} in a row): {why}",
-                        credential.pid
-                    );
-                }
+                report_admission_refusal(&quota, credential.pid, &why);
                 drop(stream);
                 continue;
             }
@@ -172,12 +163,35 @@ fn run(socket: &Path) -> Result<String, String> {
         let text = Arc::clone(&guid_text);
         let directory = Arc::clone(&bus);
         let registered = Arc::clone(&instances);
+        let limits = Arc::clone(&quota);
         let spawned = thread::Builder::new().spawn(move || {
-            // `admitted` is moved in, so this peer's place in the quota is
-            // given back when this thread ends, however it ends.
+            let identified = match transport::Connection::identify(&stream, &registered) {
+                Ok(identified) => identified,
+                Err(error) => {
+                    eprintln!("td-busd: cannot identify a peer: {error}");
+                    return;
+                }
+            };
+            let admitted = match reservation.admit(identified.admission_key()) {
+                Ok(admitted) => admitted,
+                Err(why) => {
+                    report_admission_refusal(&limits, credential.pid, &why);
+                    return;
+                }
+            };
+            limits.admission_succeeded();
+            // `admitted` stays in this frame, so the peer's place is given
+            // back when the worker ends, however it ends.
             let _admitted = admitted;
             match auth::Guid::new(text.as_str()) {
-                Ok(guid) => serve_one(stream, guid, &_admitted, &directory, &registered),
+                Ok(guid) => serve_one(
+                    stream,
+                    guid,
+                    &_admitted,
+                    &directory,
+                    &registered,
+                    identified,
+                ),
                 Err(error) => eprintln!("td-busd: bad guid: {error:?}"),
             }
         });
@@ -199,8 +213,16 @@ fn serve_one(
     admitted: &transport::Admitted,
     bus: &registry::Bus,
     instances: &lineage::Instances,
+    identified: transport::IdentifiedPeer,
 ) {
-    match transport::Connection::accept(stream, guid, admitted.quota(), bus, instances) {
+    match transport::Connection::accept_identified(
+        stream,
+        guid,
+        admitted.quota(),
+        bus,
+        instances,
+        identified,
+    ) {
         Ok(mut connection) => {
             let peer = connection.credential();
             let ended = connection.serve();
@@ -390,14 +412,14 @@ mod tests {
 
     /// §D's ceiling, against a real bus, from ONE process — which is the
     /// share half rather than the global half, and is what a test running in
-    /// a single process can reach. Every connection it makes carries the same
-    /// `SO_PEERCRED.pid`, so the bus holds it to `MAX_CONNECTIONS_PER_PEER`
-    /// and closes the next.
+    /// a single process can reach. A proved unconfined peer has no jail
+    /// instance, so every connection it makes carries the same process
+    /// fallback key and the bus closes the one past the instance share.
     ///
     /// That is the point of the share: reaching the GLOBAL ceiling from one
     /// peer is precisely what §D says must not lock everyone else off the bus.
-    /// The quota's own unit tests cover both halves with synthetic pids; this
-    /// one proves the accept loop consults it at all.
+    /// The quota's own unit tests cover both halves with synthetic instance
+    /// keys; this one proves the accept loop consults it at all.
     #[test]
     fn the_bus_holds_one_peer_to_its_share_and_closes_the_next() {
         use std::os::unix::net::UnixStream;
@@ -421,7 +443,7 @@ mod tests {
         // Hold this process's whole share open. Each is a peer that connects
         // and says nothing, which is the shape being defended against.
         let mut held = Vec::new();
-        for which in 0..transport::MAX_CONNECTIONS_PER_PEER {
+        for which in 0..transport::MAX_CONNECTIONS_PER_INSTANCE {
             match UnixStream::connect(&path) {
                 Ok(stream) => held.push(stream),
                 Err(error) => panic!("peer {which} could not connect: {error}"),
@@ -462,6 +484,43 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The listener reserves globally before the worker walks lineage, and
+    /// the worker charges the exact identity it then gives to the connection.
+    ///
+    /// The transport tests pin both transformations in isolation. This source
+    /// pin joins them across `run`: replacing the instance key with the cheap
+    /// peer pid would otherwise leave every behavioural test green, because
+    /// this process's real-bus peer is deliberately unconfined.
+    #[test]
+    fn the_accept_worker_charges_the_identity_it_serves() {
+        let main = source("main");
+        let Some(run) = main.find("fn run(") else {
+            panic!("run is gone");
+        };
+        let Some(end) = main.get(run..).and_then(|body| body.find("fn serve_one(")) else {
+            panic!("run no longer ends at serve_one");
+        };
+        let body = main.get(run..run + end).unwrap_or("");
+        let reserved = body.find("quota.try_reserve(credential.pid)");
+        let spawned = body.find("thread::Builder::new().spawn");
+        let identified = body.find("Connection::identify(&stream, &registered)");
+        let charged = body.find("reservation.admit(identified.admission_key())");
+        let served = charged.and_then(|at| {
+            body.get(at..)
+                .and_then(|tail| tail.find("                    identified,"))
+                .map(|found| at.saturating_add(found))
+        });
+        match (reserved, spawned, identified, charged, served) {
+            (Some(reserved), Some(spawned), Some(identified), Some(charged), Some(served)) => {
+                assert!(reserved < spawned, "lineage starts without a reserved place");
+                assert!(spawned < identified, "lineage still runs on the listener thread");
+                assert!(identified < charged, "admission precedes the identity answer");
+                assert!(charged < served, "the charged identity is not the one served");
+            }
+            shape => panic!("the accept/identify/admit path changed shape: {shape:?}"),
+        }
     }
 
     /// A probe against a path nothing is listening on FAILS. `ready=` reads

@@ -1290,20 +1290,22 @@ For `td-busd`, full Firefox fidelity needs:
   integration.
 
 The current broker has authentication, `Hello`, names-and-directed routing,
-receive-side descriptor adoption, global quotas, and — since the landings
+receive-side descriptor adoption, a global connection ceiling with
+per-instance admission shares, and — since the landings
 recorded in §D's "what is landed" — the per-caller filter and the per-jail
 identity it reads, authenticated pending-reply ownership, and well-known
-names with their owner queue. The first bullet above is therefore PARTLY discharged: a
+names with their owner queue. The first bullet above is therefore discharged
+for connection admission and routing: a
 confined connection is resolved to its instance and answered accordingly, so
-it cannot see or ADDRESS the fixture or another application's peers. Not
-"reach": the shared budget below is still a way to affect a peer this filter
-will not name. It can
+all of that instance's processes share one admission key and it cannot see or
+ADDRESS the fixture or another application's peers. Not "reach": the shared
+descriptor budget below is still a way to affect a peer this filter will not
+name. It can
 see and reach the portal namespace, which is the grant that bullet exists to
 scope rather than something withheld.
 
-What is NOT discharged in that bullet: quotas remain global rather than
-per-caller, and are charged per PID, so a multiprocess jail takes more than
-one share; and the name half cannot exist before `RequestName` does.
+What remains of the quota issue is descriptor attribution, described below;
+the connection table no longer grants one share per process.
 
 The ordering constraint this paragraph carried has been DISCHARGED rather
 than deleted, and it is worth keeping the record of why it was here. The
@@ -3280,17 +3282,21 @@ it says nothing about whether index 7 exists when three arrived, and a
 parser that checks only the count will happily hand a caller the wrong
 descriptor from an adjacent message.
 
-**What enforces the 64-connection bound, and what it approximates.** The
-global half is exact. The per-instance half is not yet: mapping a peer to
-its jail instance needs the registry that `SO_PEERCRED.pid` is looked up
-in, and that lands with the integration rung. Until then the share is
-counted per PID, which is the finest identity the broker has before the
-registry exists. It is wrong only where one instance spans several
-processes — an instance then gets a share per process rather than one
-between them — and right about the case this section names, which is one
-app opening 64 sockets and locking everyone else off the bus. The number
-is a quarter of the ceiling. When the registry lands, the key changes from
-pid to instance and the bound stops being an approximation.
+**What enforces the 64-connection bound.** The global half is exact and cheap:
+the listener reserves one place using `SO_PEERCRED` before it starts a lineage
+walk. That reservation bounds the identification workers as well as live
+connections, so a deep ancestry cannot serialize the listener or create an
+unbounded thread queue. The worker then resolves the same once-at-accept
+lineage identity that connection policy will use and atomically converts its
+place to the final authority key. Every process proved to descend from one
+registered jail is charged to that instance string, so forking does not mint
+new shares. A proved unconfined process uses its process as a fallback key.
+All peers whose lineage is unknown and therefore receive no instance
+authority share one fail-closed key: rotating an already-reaped connecting pid
+cannot mint shares for sockets it left behind. On a kernel that cannot answer
+`SO_PEERPIDFD` at all, those peers collectively stop at one 16-connection
+share; policy already makes every one unusable there. The per-key number is a
+quarter of the global ceiling.
 
 **A second bound the list above does not state, and needs.** "64
 descriptors per message" is per message; a broker also has to bound what
@@ -3304,7 +3310,7 @@ the connection sockets, the listener and stdio their room.
 **Three bounds this landing does NOT have, named so they are not
 rediscovered.** A served connection has no idle or authentication timeout,
 so a peer that connects and never writes holds its slot until it leaves.
-That is bounded rather than open-ended — the per-peer share above means one
+That is bounded rather than open-ended — the per-instance share above means one
 app can hold only its own quarter, not the bus — but the slot is held
 indefinitely, and the bound that should replace "indefinitely" is a
 deadline on completing the handshake. Second, `inbox` and `frame` retain
@@ -4675,9 +4681,9 @@ credentials of only the portal, its own name, and the names its
 permission file grants; well-known names and a bounded owner queue exist;
 and a reply is delivered only against a call the broker actually routed;
 matched broadcasts are delivered once and filtered by the same visibility
-policy. The admission quota is still keyed on `SO_PEERCRED.pid` while a jail is
-a PID namespace with no pids cap, so one application can fork its way to
-the whole table.
+policy. Admission now resolves that identity before taking a place and keys
+the share on the registered instance, so one application's children do not
+each receive another quarter of the table.
 
 Two more belong on that list. Descriptors cross between negotiated peers,
 but the global open-descriptor budget is still shared rather than charged
@@ -4711,14 +4717,11 @@ APPLICATIONS; the exposures are about PEERS.
   single-instance lock, and the image has two launch routes for the
   fixture: the `jail-fixture` unit and the compositor's launcher menu.
 
-So the honest statement is that the bus is bound into a jail whose
-occupant does not use it, ahead of the policy that will make using it
-safe, and the count is a tripwire on the likeliest next step rather than
-a proof. Before ANYTHING in a jail opens the bus — the portal
-included — the broker needs its per-caller filter and a per-INSTANCE
-admission key, since per-pid is the wrong key once a caller can fork.
-That is the sentence to check against, and this paragraph is amended in
-the landing that makes it false.
+The per-caller filter and per-instance admission key are now landed, so the
+connection-table condition this paragraph used to defer is discharged. The
+remaining shared descriptor budget is named above rather than hidden by that
+statement, and portal service integration remains the next peer that makes
+the routed policy observable.
 
 ---
 
