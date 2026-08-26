@@ -1224,6 +1224,26 @@ The importer contract is narrower than Flatpak:
    obtains payload bytes from outside the signed commit-reachable object graph,
    is refused. The inspected application and runtime do not use extra data.
 
+**The bounded metadata decoder has LANDED.** `td_engine::ostree` accepts an
+expected checksum rooted in the reviewed commit pin, authenticates the exact
+commit, dirtree or dirmeta bytes before parsing, and exposes no unauthenticated
+public parse route. This is object integrity, not signature verification; pin
+review still owns the signing-key decision in item 1. The decoder parses only
+the three big-endian GVariant layouts needed to walk a deploy. It bounds
+individual metadata objects, entries per tree and UTF-8 component names;
+rejects noncanonical framing, unsafe or duplicate names, xattrs,
+non-directories and undefined or special permission bits; and exposes typed
+child checksums for the later fetch/materialize increment. Commit metadata is
+a closed, typed subset matching the reviewed app and runtime commits: unknown
+keys, `xa.extra-data-sources`, duplicate keys or mistyped values, and nonempty
+related objects are refused. The decoder retains bindings but does not require
+their presence or choose a ref; the acquisition increment must require and
+compare the exact pinned ref before walking its graph. Tests pin the exact
+Firefox and runtime commits plus the Firefox root dirtree and dirmeta bytes as
+independent wire oracles. This is deliberately not a repository client or a
+general GVariant implementation. Network acquisition, archive-file decoding,
+whole-graph bounds and transactional materialization remain part of E1b.
+
 The inspected Firefox entry is a short `#!/bin/bash` wrapper that sets
 `TMPDIR=$XDG_CACHE_HOME/tmp` and execs `/app/lib/firefox/firefox`. Its ELF
 interpreter is `/lib64/ld-linux-x86-64.so.2`, supplied by the platform under
@@ -6829,7 +6849,7 @@ The experiments that settle what is left, none longer than a week:
 | # | experiment | settles |
 |---|---|---|
 | **E1 — package half answered (§B.3.1)** | inspect the signed Firefox 154.0 and Freedesktop 25.08 deploy commits without executing the app; map their exact `files/` trees to `/app` and `/usr` | the deploy hierarchy is the right package/runtime split, has no special or setid files, and at 993.7 MB deployed is smaller than the roughly 1.4 GB uncompressed standalone Guix closure. Its separate compressed transfer is 382.7 MB. Execution waits on the dynamic-runtime/jail, bus and Wayland stop line rather than using host `bwrap` as a substitute for td-jail |
-| **E1b — route selected, importer not landed** | fetch and materialize the same exact signed Flathub commits through a bounded control-plane importer | Flathub publishes no stable deploy tarball, so an ambient `flatpak` recipe and a locally hosted export are both refused. §B.3.1 is the importer contract |
+| **E1b — metadata subset landed** | fetch and materialize the same exact signed Flathub commits through a bounded control-plane importer | The authenticated commit/dirtree/dirmeta decoder is landed. Network acquisition, archive-file decoding, whole-graph bounds and transactional materialization remain. Flathub publishes no stable deploy tarball, so an ambient `flatpak` recipe and a locally hosted export are both refused. §B.3.1 is the importer contract |
 | **E2 — COMPLETE** | filter globals from GTK 4.22.1; exercise forced Cairo; compile in exact Freedesktop SDK 25.08 and run against the exact pinned Platform; run pinned Firefox 154.0 on no-dmabuf Weston and test its nested user namespace and `about:support` sandbox report | data-device is the GTK first-window blocker while subcompositor is class U; forced Cairo, pinned llvmpipe, and pinned Firefox all attach shm without dmabuf; stock Firefox denies nested user namespaces yet retains effective content sandbox level 6, selecting one standard td filter. The pinned Freedesktop runtime contains GTK 3 rather than GTK 4, so a future GTK 4 runtime selection repeats that identified part of the matrix |
 | **E3** | a Meson-world pilot — recipes for `pkgconf`, Ninja, Meson, a native CPython, then GLib and a Wayland-only `gtk3-demo` | td's *actual* per-package source cost, the number with the widest error bars. Near `cmake-x86-64`'s cost and the source track is real; a multi-week fight per package and the hybrid is permanent posture |
 | **E4 — COMPLETE** | the §0 cgroup pins plus a fixture under `memory.high=48M`, `memory.max=64M`, `pids.max=32`, and `cpu.max=50000 100000`, with active membership and exact controller readback gating the QEMU oracle | §P's mechanism works on the target kernel |

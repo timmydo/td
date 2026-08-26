@@ -685,16 +685,14 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    // The shared std-only engine lib (JSON + SHA-256) AND the workspace-root
-    // manifest/lock. The engine compiles INTO both td-builder (build engine ->
-    // check-engine) and td-recipe-eval (recipe surface -> recipe-rs + the package
-    // build gates), and the root Cargo.toml/Cargo.lock govern how both bins build
-    // (release profile, member set, dependency graph). So route the UNION of the
-    // builder and recipes rules — a conservative superset. builder/Cargo.lock and
-    // recipes/Cargo.lock are TOMBSTONES: the per-crate locks folded into the one
-    // workspace-root Cargo.lock, so a diff deleting them routes to the same check.
+    // The shared std-only engine lib and its wire fixtures, plus the
+    // workspace-root manifest/lock. The engine compiles INTO both td-builder
+    // (build engine -> check-engine) and td-recipe-eval (recipe surface ->
+    // recipe-rs + package build gates), and the fixtures determine its tests.
+    // Route their UNION conservatively. builder/Cargo.lock and
+    // recipes/Cargo.lock are tombstones for the workspace-root lock.
     if pattern_matches(
-        "engine/Cargo.toml|engine/src/*|Cargo.toml|Cargo.lock|builder/Cargo.lock|recipes/Cargo.lock",
+        "engine/Cargo.toml|engine/src/*|engine/tests/*|Cargo.toml|Cargo.lock|builder/Cargo.lock|recipes/Cargo.lock",
         p,
     ) {
         sel.add_preflight("shell-syntax");
@@ -713,9 +711,15 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
             "td-builder and td-recipe-eval"
         };
         add_build_gate_targets(root, sel);
-        sel.add_note(&format!(
-            "{p} is shared engine/workspace code compiled into {consumers}: validated by check-engine (compile + unit tests) and the recipe/package build gates."
-        ));
+        if pattern_matches("engine/tests/*", p) {
+            sel.add_note(&format!(
+                "{p} is a td-engine test input: cargo-test and check-engine exercise it directly, while recipe-rs and the package build gates cover the shared engine consumers."
+            ));
+        } else {
+            sel.add_note(&format!(
+                "{p} is shared engine/workspace code compiled into {consumers}: validated by check-engine (compile + unit tests) and the recipe/package build gates."
+            ));
+        }
         return;
     }
 
@@ -1770,6 +1774,18 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // side) AND recipe-rs + the package build gates (recipe side).
     assert_target!("engine/src/json.rs", "check-engine");
     assert_target!("engine/src/json.rs", "recipe-rs");
+    assert_target!(
+        "engine/tests/fixtures/flathub-firefox-154.commit.hex",
+        "check-engine"
+    );
+    assert_target!(
+        "engine/tests/fixtures/flathub-firefox-154.commit.hex",
+        "recipe-rs"
+    );
+    assert_contains!(
+        "engine/tests/fixtures/flathub-firefox-154.commit.hex",
+        "is a td-engine test input"
+    );
     // The premise the table rests on, pinned rather than asserted in a comment:
     // json.rs is target-included by NOTHING and still selects recipe-checks,
     // because it is a build gate. If that ever stops being true this line reds,
