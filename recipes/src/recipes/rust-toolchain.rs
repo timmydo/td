@@ -14,8 +14,9 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step, TextEdit};
 // compiler. CMake is the explicitly approved build-only dependency used to build
 // LLVM; Ninja is disabled and the td-built GNU Make drives its generated graph.
 //
-// td Cargo builds are normatively offline and git dependencies are unsupported.
-// The source Cargo manifest is therefore narrowed to curl/libgit2 without their
+// td Cargo builds are normatively offline. Reviewed Git dependencies are supplied
+// as commit-and-archive-hash-pinned vendor sources, so shipped Cargo does not need
+// Git transport. Its source manifest is narrowed to curl/libgit2 without their
 // OpenSSL/SSH features. That avoids adding Perl, OpenSSL, or an extra rustls-ffi
 // crate outside the pinned upstream source closure. The corresponding vendored
 // checksum and Cargo.lock edits are literal and count-checked below.

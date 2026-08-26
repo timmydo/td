@@ -840,6 +840,71 @@ pub struct Phase {
     pub body: Option<Vec<Stmt>>,
 }
 
+/// One package selected from a fixed-output archive of a Cargo Git source.
+/// `path` is relative to the archive's single top-level directory; `.` names
+/// that directory itself. The lock gate binds the declared name and version to
+/// the exact Git source entry; Cargo then validates the copied manifest.
+#[derive(Clone)]
+pub struct CargoGitPackage {
+    pub name: String,
+    pub version: String,
+    pub path: String,
+}
+
+impl CargoGitPackage {
+    pub fn new(name: &str, version: &str, path: &str) -> CargoGitPackage {
+        CargoGitPackage {
+            name: name.into(),
+            version: version.into(),
+            path: path.into(),
+        }
+    }
+
+    fn to_json(&self) -> Json {
+        Json::Obj(vec![
+            ("name".into(), Json::Str(self.name.clone())),
+            ("version".into(), Json::Str(self.version.clone())),
+            ("path".into(), Json::Str(self.path.clone())),
+        ])
+    }
+}
+
+/// A Cargo `git+` source represented as an ordinary td fixed-output input.
+/// `source` is the exact Cargo.lock source id, including its full commit;
+/// `input` names a source pin whose URL and SHA-256 authenticate the commit
+/// archive. No Git client or network access enters the target build.
+#[derive(Clone)]
+pub struct CargoGitSource {
+    pub source: String,
+    pub input: String,
+    pub packages: Vec<CargoGitPackage>,
+}
+
+impl CargoGitSource {
+    pub fn new(
+        source: &str,
+        input: &str,
+        packages: Vec<CargoGitPackage>,
+    ) -> CargoGitSource {
+        CargoGitSource {
+            source: source.into(),
+            input: input.into(),
+            packages,
+        }
+    }
+
+    fn to_json(&self) -> Json {
+        Json::Obj(vec![
+            ("source".into(), Json::Str(self.source.clone())),
+            ("input".into(), Json::Str(self.input.clone())),
+            (
+                "packages".into(),
+                Json::Arr(self.packages.iter().map(CargoGitPackage::to_json).collect()),
+            ),
+        ])
+    }
+}
+
 impl Phase {
     pub fn new(position: &str, anchor: &str, name: &str) -> Phase {
         Phase {
@@ -986,6 +1051,11 @@ pub struct Recipe {
     /// workspace locks; ordinary recipes must use the upstream source's embedded lock
     /// verbatim. It does not generate a lock for source that omits one.
     pub replace_cargo_lock: Option<bool>,
+    /// Exact Cargo Git sources admitted by explicit review. Each declaration binds
+    /// lock source id + commit to a fixed-output archive input and the packages td
+    /// may expose from it. The input is also added to the ordinary source/tool graph;
+    /// the Rust runner consumes it as source data and never invokes Git.
+    pub cargo_git_sources: Option<Vec<CargoGitSource>>,
     /// Repo-relative path to an IN-TREE source directory this recipe builds from
     /// (#469 local-source provenance). Set via `local_source`, which also points
     /// `source_input` at this recipe's own `<name>-source` key. The runner
@@ -1051,6 +1121,7 @@ impl Recipe {
             source_pins: None,
             cargo_lock: None,
             replace_cargo_lock: None,
+            cargo_git_sources: None,
             local_source: None,
         }
     }
@@ -1131,7 +1202,15 @@ impl Recipe {
         self
     }
     pub fn inputs(mut self, xs: &[&str]) -> Recipe {
-        self.inputs = Some(vs(xs));
+        let mut inputs = vs(xs);
+        if let Some(sources) = &self.cargo_git_sources {
+            for source in sources {
+                if !inputs.contains(&source.input) {
+                    inputs.push(source.input.clone());
+                }
+            }
+        }
+        self.inputs = Some(inputs);
         self.add_source_pins_for_keys(xs.iter().copied());
         self
     }
@@ -1139,7 +1218,15 @@ impl Recipe {
     /// assembles the extras + MESBOOT0_TOOLS list at runtime.
     pub fn inputs_owned(mut self, xs: Vec<String>) -> Recipe {
         self.add_source_pins_for_keys(xs.iter().map(String::as_str));
-        self.inputs = Some(xs);
+        let mut inputs = xs;
+        if let Some(sources) = &self.cargo_git_sources {
+            for source in sources {
+                if !inputs.contains(&source.input) {
+                    inputs.push(source.input.clone());
+                }
+            }
+        }
+        self.inputs = Some(inputs);
         self
     }
     pub fn configure_flags(mut self, xs: &[&str]) -> Recipe {
@@ -1200,6 +1287,21 @@ impl Recipe {
     /// workspace. The default is stricter: require the source's lock to match it.
     pub fn replace_cargo_lock(mut self) -> Recipe {
         self.replace_cargo_lock = Some(true);
+        self
+    }
+    /// Admit explicitly reviewed Cargo Git dependencies through fixed-output
+    /// commit archives. The archive inputs join `inputs` whichever order these
+    /// setters are called; downstream seed provenance still authenticates the
+    /// resolved bytes before they may be staged.
+    pub fn cargo_git_sources(mut self, sources: Vec<CargoGitSource>) -> Recipe {
+        for source in &sources {
+            let inputs = self.inputs.get_or_insert_with(Vec::new);
+            if !inputs.contains(&source.input) {
+                inputs.push(source.input.clone());
+            }
+            self.add_source_pin_for_key(&source.input);
+        }
+        self.cargo_git_sources = Some(sources);
         self
     }
     /// Build this recipe from an IN-TREE source directory (repo-relative `path`),
@@ -1382,6 +1484,12 @@ impl Recipe {
         if let Some(replace) = self.replace_cargo_lock {
             o.push(("replaceCargoLock".into(), Json::Bool(replace)));
         }
+        if let Some(sources) = &self.cargo_git_sources {
+            o.push((
+                "cargoGitSources".into(),
+                Json::Arr(sources.iter().map(CargoGitSource::to_json).collect()),
+            ));
+        }
         Json::Obj(o)
     }
 }
@@ -1424,6 +1532,29 @@ mod tests {
         assert_eq!(
             plain.replace_cargo_lock().to_json().to_canonical(),
             r#"{"bins":["tool"],"buildSystem":"rust","cargoLock":"recipes/locks/tool/Cargo.lock","name":"tool","replaceCargoLock":true,"version":"1.0"}"#
+        );
+    }
+
+    #[test]
+    fn cargo_git_sources_are_typed_and_attach_their_fixed_output_inputs() {
+        let source = CargoGitSource::new(
+            "git+https://example.invalid/tool?rev=0123456789abcdef0123456789abcdef01234567#0123456789abcdef0123456789abcdef01234567",
+            "tool-git-source",
+            vec![CargoGitPackage::new("tool", "1.2.3", ".")],
+        );
+        let recipe = Recipe::rust("consumer", "1")
+            .cargo_git_sources(vec![source.clone()])
+            .inputs(&["rust-toolchain"]);
+        assert_eq!(
+            recipe.to_json().to_canonical(),
+            r#"{"buildSystem":"rust","cargoGitSources":[{"input":"tool-git-source","packages":[{"name":"tool","path":".","version":"1.2.3"}],"source":"git+https://example.invalid/tool?rev=0123456789abcdef0123456789abcdef01234567#0123456789abcdef0123456789abcdef01234567"}],"inputs":["rust-toolchain","tool-git-source"],"name":"consumer","version":"1"}"#
+        );
+        let owned = Recipe::rust("consumer", "1")
+            .cargo_git_sources(vec![source])
+            .inputs_owned(vec!["rust-toolchain".into()]);
+        assert_eq!(
+            owned.inputs,
+            Some(vec!["rust-toolchain".into(), "tool-git-source".into()])
         );
     }
 

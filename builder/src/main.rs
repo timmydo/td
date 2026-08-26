@@ -3009,6 +3009,46 @@ struct SrcOverride {
     db: String,
 }
 
+/// Bind every lock root registered by one td-owned source DB. A shell source
+/// store may contain the recipe archive plus several fixed-output Cargo Git
+/// archives; limiting the override to the primary source leaves those extra
+/// derivation roots with no physical staging path.
+fn source_overrides_for_lock(
+    primary_source: &str,
+    lock_file: &str,
+    store_dir: &str,
+    db_path: &str,
+) -> Result<Vec<SrcOverride>, String> {
+    let data = std::fs::read(db_path).map_err(|e| format!("read source db {db_path}: {e}"))?;
+    let registered = store_db_read::Db::open(data)?.hashes_by_path()?;
+    if primary_source.is_empty() || !registered.contains_key(primary_source) {
+        return Err(format!(
+            "source db {db_path} does not register the recipe source `{primary_source}'"
+        ));
+    }
+    let mut overrides = Vec::new();
+    for canonical in lock_paths(lock_file, None)? {
+        if !registered.contains_key(&canonical) {
+            continue;
+        }
+        let base = Path::new(&canonical)
+            .file_name()
+            .ok_or_else(|| format!("source db path has no basename: {canonical}"))?
+            .to_os_string();
+        overrides.push(SrcOverride {
+            canonical,
+            on_disk: Path::new(store_dir).join(base).to_string_lossy().into_owned(),
+            db: db_path.to_string(),
+        });
+    }
+    if !overrides.iter().any(|override_| override_.canonical == primary_source) {
+        return Err(format!(
+            "lock {lock_file} does not name the source `{primary_source}' registered by {db_path}"
+        ));
+    }
+    Ok(overrides)
+}
+
 /// A td-OWNED builder handed to `build-recipe` (bootstrap brick 2): the `canonical`
 /// builder path is NOT in the daemon DB — td placed a stage0 td-builder there itself
 /// (store-add-builder), a binary guix NEVER produced. Unlike `SrcOverride` the builder
@@ -4121,10 +4161,11 @@ fn stage_input_closure(
         scan_candidate_index(seed_store_dirs, seed_canonical_prefix)?;
     recanonicalize_candidates(&mut candidates, &mut on_disk, &canonical_overrides);
     let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
-    // Each td-OWNED interned tree (the recipe source AND the vendored-crate tree) has its
-    // own DB — the seed store has no row for it. Open them paired with their override so a
-    // root can be matched to its store + db. Both are no-reference content-addressed trees
-    // (store-add-recursive), so they share the SrcOverride handling.
+    // Each td-OWNED interned tree (the recipe/Git sources and vendored-crate tree) has a
+    // placement DB — one source DB may register several roots, while the seed store has no
+    // row for any of them. Open each override's DB so a root can be matched to its physical
+    // store. These are no-reference content-addressed trees (store-add-recursive), so they
+    // share the SrcOverride handling.
     let src_dbs: Vec<(&SrcOverride, store_db_read::Db)> = src_overrides
         .iter()
         .map(|ov| {
@@ -4532,18 +4573,14 @@ fn build_recipe(
     )?;
     let t_assemble = t.elapsed();
     let rname: String = drv_path.rsplit('/').next().unwrap_or(&drv_path).to_string();
-    // A td-OWNED source store (optional): the `<name>-source` path was interned by td
-    // itself into SRC-STORE-DIR + SRC-DB, so realize stages it from there + reads its
-    // closure from SRC-DB — no daemon interning. The on-disk tree is the canonical
-    // basename under SRC-STORE-DIR (store-add-recursive restored it there).
-    let src_override = src_store.map(|(store_dir, db)| {
-        let base = source.rsplit('/').next().unwrap_or(&source);
-        SrcOverride {
-            canonical: source.clone(),
-            on_disk: format!("{store_dir}/{base}"),
-            db: db.to_string(),
-        }
-    });
+    // A td-OWNED source store (optional): the `<name>-source` path and any fixed-output
+    // Cargo Git archives were interned by td into SRC-STORE-DIR + SRC-DB. Every registered
+    // root named by the lock is staged from its canonical basename under SRC-STORE-DIR and
+    // its closure is read from SRC-DB — no daemon interning.
+    let src_overrides = match src_store {
+        Some((store_dir, db)) => source_overrides_for_lock(&source, lock_file, store_dir, db)?,
+        None => Vec::new(),
+    };
     // A td-OWNED vendored-crate tree (optional, the guix-free crate path): td interned the
     // crate SET itself (store-add-recursive) into VENDOR-STORE-DIR + VENDOR-DB — a no-ref
     // content-addressed tree, staged + its closure read from there exactly like the source,
@@ -4558,7 +4595,7 @@ fn build_recipe(
     });
     // Both no-ref td-interned trees go to realize_drv as src-overrides.
     let src_overrides: Vec<SrcOverride> =
-        src_override.into_iter().chain(vendor_override).collect();
+        src_overrides.into_iter().chain(vendor_override).collect();
     // The reuse identity, derived from the CURRENT plan BEFORE any cache is read
     // (re #469 round-7): the typed staging manifest is assembled FIRST — the same
     // assembly realize_drv enforces at the bind boundary — so a reuse decision is
@@ -5231,6 +5268,73 @@ fn resolve_application_runtime<'a>(
     Ok(&entry.path)
 }
 
+fn resolved_cargo_git_sources_json(
+    sources: &[build::CargoGitSource],
+    entries: &[lock::Entry],
+) -> Result<json::Json, String> {
+    let mut resolved = Vec::new();
+    for source in sources {
+        if !build::cargo_git_input_is_name(&source.input) {
+            return Err(format!(
+                "recipe: Cargo Git source input must be a plain recipe input name: {}",
+                source.input
+            ));
+        }
+        let mut matches = entries.iter().filter(|entry| entry.name == source.input);
+        let entry = matches.next().ok_or_else(|| {
+            format!(
+                "recipe: Cargo Git source input `{}` has no lock entry",
+                source.input
+            )
+        })?;
+        if matches.next().is_some() {
+            return Err(format!(
+                "recipe: Cargo Git source input `{}` has duplicate lock entries",
+                source.input
+            ));
+        }
+        if entry.class != lock::Class::Seed {
+            return Err(format!(
+                "recipe: Cargo Git source input `{}` must be a fixed-output seed, not {}",
+                source.input,
+                entry.class.as_str()
+            ));
+        }
+        let prefix = format!("{}/", store::store_dir().trim_end_matches('/'));
+        let Some(basename) = entry.path.strip_prefix(&prefix) else {
+            return Err(format!(
+                "recipe: Cargo Git source input `{}` path {} is outside the active store {}",
+                source.input,
+                entry.path,
+                store::store_dir()
+            ));
+        };
+        if basename.contains('/') || store::hash_from_store_path(&entry.path).is_none() {
+            return Err(format!(
+                "recipe: Cargo Git source input `{}` path {} is not a canonical store path",
+                source.input, entry.path
+            ));
+        }
+        let packages = source
+            .packages
+            .iter()
+            .map(|package| {
+                json::Json::Obj(vec![
+                    ("name".into(), json::Json::Str(package.name.clone())),
+                    ("version".into(), json::Json::Str(package.version.clone())),
+                    ("path".into(), json::Json::Str(package.path.clone())),
+                ])
+            })
+            .collect();
+        resolved.push(json::Json::Obj(vec![
+            ("source".into(), json::Json::Str(source.source.clone())),
+            ("input".into(), json::Json::Str(entry.path.clone())),
+            ("packages".into(), json::Json::Arr(packages)),
+        ]));
+    }
+    Ok(json::Json::Arr(resolved))
+}
+
 fn push_drv_env_line(spec: &mut String, name: &str, value: &str) -> Result<(), String> {
     if name.contains('=') {
         return Err(format!(
@@ -5313,11 +5417,17 @@ fn assemble_recipe_drv(
         }
         Some(_) => return Err("recipe: `cargoPackage' must be a string".into()),
     };
+    let cargo_git_sources = match alist.get("cargoGitSources") {
+        None => Vec::new(),
+        Some(value) => build::parse_cargo_git_sources(value)
+            .map_err(|error| format!("recipe: {error}"))?,
+    };
     if build_system != "rust"
         && (cargo_subdir.is_some()
             || cargo_package.is_some()
             || cargo_lock.is_some()
-            || alist.get("replaceCargoLock").is_some())
+            || alist.get("replaceCargoLock").is_some()
+            || alist.get("cargoGitSources").is_some())
     {
         return Err(format!(
             "recipe: buildSystem \"{build_system}\" cannot declare Cargo build policy"
@@ -5325,6 +5435,9 @@ fn assemble_recipe_drv(
     }
     if replace_cargo_lock && cargo_lock.is_none() {
         return Err("recipe: `replaceCargoLock' requires `cargoLock'".into());
+    }
+    if !cargo_git_sources.is_empty() && cargo_lock.is_none() {
+        return Err("recipe: `cargoGitSources' requires `cargoLock'".into());
     }
     if cargo_lock.is_some() && vendor_dir.is_none() {
         return Err(
@@ -5710,6 +5823,14 @@ fn assemble_recipe_drv(
                 let policy = if replace_cargo_lock { "replace" } else { "verify" };
                 push_drv_env(&mut spec, "TD_CARGO_LOCK_POLICY", policy)?;
             }
+            if !cargo_git_sources.is_empty() {
+                let resolved = resolved_cargo_git_sources_json(&cargo_git_sources, &entries)?;
+                push_drv_env(
+                    &mut spec,
+                    "TD_CARGO_GIT_SOURCES",
+                    &resolved.to_json_string(),
+                )?;
+            }
             let bins: Vec<&str> = alist
                 .get("bins")
                 .and_then(json::Json::as_arr)
@@ -5932,8 +6053,8 @@ fn clear_dir(dir: &Path) -> Result<(), String> {
     }
 }
 
-/// Stage the crates a recipe's COMMITTED Cargo.lock pins and the exact lock itself
-/// into a FRESH private tree,
+/// Stage the registry crates a recipe's COMMITTED Cargo.lock pins and the exact
+/// lock itself into a FRESH private tree,
 /// verifying as we go: every lock entry must be present in `vendor_dir` as
 /// `<name>-<version>.crate` with a matching sha256, the dir must carry NO extra
 /// `.crate` beyond that pinned set, and only the verified bytes are copied into
@@ -5948,12 +6069,13 @@ fn stage_verified_vendor(
     vendor_dir: &Path,
     lock_text: &str,
     staged_dir: &Path,
+    allow_no_registry_packages: bool,
 ) -> Result<usize, String> {
     let want = check_loop::parse_lock_checksums(lock_text);
-    if want.is_empty() {
+    if want.is_empty() && !allow_no_registry_packages {
         return Err("committed Cargo.lock pins no checksummed crates".to_string());
     }
-    if !vendor_dir.is_dir() {
+    if !want.is_empty() && !vendor_dir.is_dir() {
         return Err(format!(
             "vendored crate dir {} absent — `td-builder check` normally warms it before \
              the graph build; from a source checkout run:\n  \
@@ -5980,16 +6102,19 @@ fn stage_verified_vendor(
     }
     // Reject extras up front: a `.crate` the committed lock never pinned is a stale or
     // tampered cache and must fail loudly rather than be silently left behind.
-    for entry in std::fs::read_dir(vendor_dir)
-        .map_err(|e| format!("read vendor dir {}: {e}", vendor_dir.display()))?
-    {
-        let entry = entry.map_err(|e| format!("read vendor dir {}: {e}", vendor_dir.display()))?;
-        let file_name = entry.file_name();
-        let fname = file_name.to_string_lossy();
-        if fname.ends_with(".crate") && !expected.contains(fname.as_ref()) {
-            return Err(format!(
-                "vendored crate `{fname}' is not pinned by the committed Cargo.lock — the vendor dir carries a crate the gate did not verify"
-            ));
+    if vendor_dir.is_dir() {
+        for entry in std::fs::read_dir(vendor_dir)
+            .map_err(|e| format!("read vendor dir {}: {e}", vendor_dir.display()))?
+        {
+            let entry =
+                entry.map_err(|e| format!("read vendor dir {}: {e}", vendor_dir.display()))?;
+            let file_name = entry.file_name();
+            let fname = file_name.to_string_lossy();
+            if fname.ends_with(".crate") && !expected.contains(fname.as_ref()) {
+                return Err(format!(
+                    "vendored crate `{fname}' is not pinned by the committed Cargo.lock — the vendor dir carries a crate the gate did not verify"
+                ));
+            }
         }
     }
     // Fail-closed clean: the staged tree is interned wholesale, so it must start empty —
@@ -6018,76 +6143,6 @@ fn stage_verified_vendor(
         }
     }
     Ok(want.len())
-}
-
-/// A committed `Cargo.lock` must be fully checksum-pinned before it is trusted as the
-/// closure record: reject any package with a `git+` source (git deps are unsupported)
-/// or a registry source lacking a valid sha256 checksum. Workspace/path members (no
-/// `source`) legitimately carry no checksum. stage_verified_vendor gates only the
-/// CHECKSUMMED set, so without this a git or unchecksummed dependency would be silently
-/// omitted while the gate reported success (re #547).
-fn reject_unpinned_dependencies(lock_text: &str) -> Result<(), String> {
-    let (mut name, mut source, mut checksum) = (String::new(), None, None);
-    let mut in_pkg = false;
-    for line in lock_text.lines() {
-        let t = line.trim();
-        if t == "[[package]]" {
-            if in_pkg {
-                check_pkg_pinned(&name, &source, &checksum)?;
-            }
-            in_pkg = true;
-            name.clear();
-            source = None;
-            checksum = None;
-        } else if t.starts_with('[') {
-            // any other table (e.g. a trailing [metadata]) ends the package section
-            if in_pkg {
-                check_pkg_pinned(&name, &source, &checksum)?;
-                in_pkg = false;
-            }
-        } else if in_pkg {
-            // Split on the first `=` and trim both sides so non-canonical spacing
-            // (e.g. `source="git+…"`) cannot hide a field from the pin check.
-            if let Some((k, v)) = t.split_once('=') {
-                let val = v.trim().trim_matches('"').to_string();
-                match k.trim() {
-                    "name" => name = val,
-                    "source" => source = Some(val),
-                    "checksum" => checksum = Some(val),
-                    _ => {}
-                }
-            }
-        }
-    }
-    if in_pkg {
-        check_pkg_pinned(&name, &source, &checksum)?;
-    }
-    Ok(())
-}
-
-fn is_sha256_hex(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-fn check_pkg_pinned(
-    name: &str,
-    source: &Option<String>,
-    checksum: &Option<String>,
-) -> Result<(), String> {
-    let Some(src) = source else {
-        return Ok(()); // no source ⇒ workspace/path member ⇒ no checksum expected
-    };
-    if src.starts_with("git+") {
-        return Err(format!(
-            "committed lock package `{name}' is a git dependency (`{src}') — git deps are unsupported"
-        ));
-    }
-    match checksum {
-        Some(c) if is_sha256_hex(c) => Ok(()),
-        _ => Err(format!(
-            "committed lock package `{name}' has registry source `{src}' but no valid sha256 checksum"
-        )),
-    }
 }
 
 /// build-plan `--auto` crate vendoring: a `rust` recipe's dependency closure rides the
@@ -6135,12 +6190,24 @@ fn provision_auto_vendor(
     let root = Path::new(&repo_root);
     let (_committed, lock_text) = read_confined_repo_file(root, lock_rel)
         .map_err(|e| format!("--auto rust `{name}': {e}"))?;
-    // Trust the committed lock as the closure record only if it is fully checksum-pinned —
-    // no git/unchecksummed deps that the set-equality gate below would silently skip.
-    reject_unpinned_dependencies(&lock_text).map_err(|e| format!("--auto rust `{name}': {e}"))?;
+    let git_sources = match alist.get("cargoGitSources") {
+        None => Vec::new(),
+        Some(value) => build::parse_cargo_git_sources(value)
+            .map_err(|error| format!("--auto rust `{name}': {error}"))?,
+    };
+    // Trust the committed lock as the closure record only if every registry
+    // package has a checksum and every Git package has the exact reviewed
+    // fixed-output declaration that assembly will resolve below.
+    let lock_sources = build::validate_cargo_lock_sources(&lock_text, &git_sources)
+        .map_err(|e| format!("--auto rust `{name}': {e}"))?;
     let vendor_dir = root.join(format!(".td-build-cache/crate-vendor/{name}/vendor"));
     let staged = step_scratch.join("vendor-verified");
-    let n = stage_verified_vendor(&vendor_dir, &lock_text, &staged)
+    let n = stage_verified_vendor(
+        &vendor_dir,
+        &lock_text,
+        &staged,
+        lock_sources.registry == 0,
+    )
         .map_err(|e| format!("--auto rust `{name}': {e}"))?;
     let self_exe = std::env::current_exe()
         .map_err(|e| format!("--auto rust `{name}': locate td-builder: {e}"))?
@@ -7031,7 +7098,9 @@ impl NativeToolchain {
 /// recipe),
 /// TD_SHELL_NATIVE_* (the pre-provisioned native `/td/store` toolchain for vendored rust builds —
 /// `NativeToolchain::from_env`), TD_SHELL_REPO_ROOT (the checkout containing each recipe's
-/// committed `cargoLock`), TD_SHELL_CACHE (build cache root, default `$HOME/.cache/td-shell`),
+/// committed `cargoLock`), TD_SHELL_CACHE (build cache root, default
+/// `$HOME/.cache/td-shell`); fixed-output sources always come from the shared
+/// `$HOME/.td/sources` cache,
 /// TD_BUILDER_PATH/STORE/DB (optional stage0 builder override, so the build's builder
 /// is td-placed too).
 ///
@@ -7246,6 +7315,7 @@ fn source_lock_body(sourcekey: &str, src_canonical: &str) -> String {
     format!("{sourcekey} {src_canonical} source\n")
 }
 
+#[derive(Clone)]
 struct ShellSourcePin {
     key: String,
     sha256: String,
@@ -7255,7 +7325,7 @@ struct ShellSourcePin {
 /// Resolve a package's recipe-owned fixed-output source pin. Keeping this
 /// lookup in td-recipe-eval means the builder does not duplicate package URLs
 /// or hashes, and final-userland pins do not enter the bootstrap seed table.
-fn shell_recipe_source_pin(pkg: &str) -> Result<ShellSourcePin, String> {
+fn shell_recipe_source_pins(pkg: &str) -> Result<Vec<ShellSourcePin>, String> {
     let eval = std::env::var("TD_RECIPE_EVAL").map_err(|_| {
         "TD_RECIPE_EVAL must point at td's td-recipe-eval binary (source pin lookup)".to_string()
     })?;
@@ -7271,11 +7341,12 @@ fn shell_recipe_source_pin(pkg: &str) -> Result<ShellSourcePin, String> {
     }
     let pins = String::from_utf8(out.stdout)
         .map_err(|e| format!("td-recipe-eval source pins are not UTF-8: {e}"))?;
-    parse_shell_source_pin(&pins)
+    parse_shell_source_pins(&pins)
 }
 
-fn parse_shell_source_pin(pins: &str) -> Result<ShellSourcePin, String> {
-    let mut found: Option<ShellSourcePin> = None;
+fn parse_shell_source_pins(pins: &str) -> Result<Vec<ShellSourcePin>, String> {
+    let mut found = Vec::new();
+    let mut keys = std::collections::BTreeSet::new();
     for line in pins.lines() {
         if line.is_empty() {
             continue;
@@ -7284,9 +7355,6 @@ fn parse_shell_source_pin(pins: &str) -> Result<ShellSourcePin, String> {
         let [pin_key, url, sha256, file] = fields.as_slice() else {
             return Err(format!("malformed td shell recipe source pin: {line}"));
         };
-        if found.is_some() {
-            return Err("td shell Rust recipe must declare exactly one fixed-output source pin".into());
-        }
         let key = *pin_key;
         if key.is_empty() {
             return Err("td shell recipe source pin has an empty key".into());
@@ -7307,13 +7375,19 @@ fn parse_shell_source_pin(pins: &str) -> Result<ShellSourcePin, String> {
         {
             return Err(format!("recipe source pin `{key}' has a non-basename file `{file}'"));
         }
-        found = Some(ShellSourcePin {
+        if !keys.insert(key.to_string()) {
+            return Err(format!("td shell recipe source pins duplicate key `{key}'"));
+        }
+        found.push(ShellSourcePin {
             key: key.to_string(),
             sha256: (*sha256).to_string(),
             file: (*file).to_string(),
         });
     }
-    found.ok_or_else(|| "td shell Rust recipe declares no fixed-output source pin".to_string())
+    if found.is_empty() {
+        return Err("td shell Rust recipe declares no fixed-output source pin".into());
+    }
+    Ok(found)
 }
 
 fn verify_shell_source_archive(path: &Path, pin: &ShellSourcePin) -> Result<(), String> {
@@ -7328,29 +7402,76 @@ fn verify_shell_source_archive(path: &Path, pin: &ShellSourcePin) -> Result<(), 
     Ok(())
 }
 
+/// Copy one mutable warm-cache archive into package-private scratch, then
+/// authenticate that exact copy. The following store-add opens the private
+/// path, so a concurrent cache replacement cannot change the bytes between
+/// verification and interning.
+fn stage_verified_shell_source_archive(
+    source: &Path,
+    pin: &ShellSourcePin,
+    private_dir: &Path,
+    index: usize,
+) -> Result<PathBuf, String> {
+    let metadata = std::fs::symlink_metadata(source)
+        .map_err(|e| format!("inspect pinned source archive {}: {e}", source.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "pinned source archive is not a regular file: {}",
+            source.display()
+        ));
+    }
+    std::fs::create_dir_all(private_dir)
+        .map_err(|e| format!("mkdir {}: {e}", private_dir.display()))?;
+    let staged = private_dir.join(format!("{index}-{}", pin.file));
+    std::fs::copy(source, &staged).map_err(|e| {
+        format!(
+            "copy pinned source archive {} -> {}: {e}",
+            source.display(),
+            staged.display()
+        )
+    })?;
+    verify_shell_source_archive(&staged, pin)?;
+    Ok(staged)
+}
+
 /// Add the authenticated `/td/store` recipe-output build platform to an
 /// interned-source lock. This replaces the old mixed Guix/native retargeting:
 /// any `/gnu/store` line or downloaded `rust-stage0` input is now a hard error,
 /// not something filtered heuristically.
 fn recipe_toolchain_lock_body(seed_body: &str, native_lines: &str) -> Result<String, String> {
-    let source_lines: Vec<&str> = seed_body.lines().filter(|line| !line.trim().is_empty()).collect();
-    if source_lines.len() != 1 {
-        return Err("td shell package source lock must contain exactly one source line".into());
-    }
-    let source_line = source_lines
-        .first()
-        .copied()
-        .ok_or("td shell package source lock has no source line")?;
-    let source_fields: Vec<&str> = source_line
-        .split_whitespace()
+    let seed_lines: Vec<&str> = seed_body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
         .collect();
-    if source_fields.len() != 3
-        || source_fields.get(1).is_none_or(|path| !path.starts_with("/td/store/"))
-        || source_fields.get(2).copied() != Some("source")
-    {
+    let mut source_count = 0usize;
+    let mut names = std::collections::BTreeSet::new();
+    for line in &seed_lines {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() != 3
+            || fields
+                .get(1)
+                .is_none_or(|path| !path.starts_with("/td/store/"))
+            || fields
+                .get(2)
+                .is_none_or(|class| !matches!(*class, "source" | "seed"))
+        {
+            return Err(format!(
+                "td shell package source lock line is not a canonical /td/store source or seed: {line}"
+            ));
+        }
+        let name = fields.first().copied().ok_or("source lock line has no name")?;
+        if !names.insert(name) {
+            return Err(format!("td shell package source lock duplicates `{name}'"));
+        }
+        if fields.get(2).copied() == Some("source") {
+            source_count = source_count
+                .checked_add(1)
+                .ok_or("td shell package source count overflow")?;
+        }
+    }
+    if source_count != 1 {
         return Err(format!(
-            "td shell package source lock is not one canonical /td/store source: {}",
-            source_line
+            "td shell package source lock must contain exactly one source line, found {source_count}"
         ));
     }
     let native = native_lines.trim_end_matches('\n');
@@ -7373,7 +7494,7 @@ fn recipe_toolchain_lock_body(seed_body: &str, native_lines: &str) -> Result<Str
             ));
         }
     }
-    let mut out = source_line.to_string();
+    let mut out = seed_lines.join("\n");
     out.push('\n');
     out.push_str(native);
     out.push('\n');
@@ -7390,18 +7511,20 @@ fn recipe_toolchain_lock_body(seed_body: &str, native_lines: &str) -> Result<Str
 /// dependency archives are staged through the same committed-lock set/checksum gate as
 /// `build-plan --auto` before that private verified tree is interned.
 /// This:
-///   - verifies and interns the immutable source `.crate` with `store-add-recursive`,
+///   - verifies and interns the immutable package source plus any reviewed Cargo
+///     Git source archives with `store-add-recursive`,
 ///   - resolves the recipe's `cargoLock` beneath `$TD_SHELL_REPO_ROOT`, stages its exact
 ///     bytes plus exactly the checksum-verified crate set, and interns that private tree,
-///   - writes a lock containing only `<pkg>-source <interned-src>`; Cargo.lock
-///     inside that source selects and verifies the separately interned crates,
+///   - writes a lock containing the package source and fixed-output Git archive
+///     seeds; Cargo.lock inside that source selects the separately interned crates,
 ///
 /// and returns `(seed-lock-path, seed-lock-body, [src-store, src-db, vendor-canonical, vendor-store,
 /// vendor-db])` — the extra positional args build-recipe's 11-arg form takes.
 ///
-/// Returns `Ok(None)` when no warmed closure exists for PKG (`TD_SHELL_VENDOR_ROOT` unset,
-/// or no `<pkg>/vendor` under it); the caller fails closed because the legacy
-/// shell fallback was retired with the corpus.
+/// Returns `Ok(None)` when no warmed closure exists for PKG
+/// (`TD_SHELL_VENDOR_ROOT` unset, or no registry vendor directory for a recipe
+/// without Git sources); the caller fails closed because the legacy shell
+/// fallback was retired with the corpus.
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn provision_rust_inputs(
     pkg: &str,
@@ -7415,10 +7538,6 @@ fn provision_rust_inputs(
     };
     let pkg_root = Path::new(&vendor_root).join(pkg);
     let vendor = pkg_root.join("vendor");
-    // No warmed crate closure for this package here ⇒ not a vendored rust build.
-    if !vendor.is_dir() {
-        return Ok(None);
-    }
     let alist = json::parse(recipe_json)
         .map_err(|e| format!("td shell rust `{pkg}': parse emitted recipe JSON: {e}"))?;
     let lock_rel = alist
@@ -7439,24 +7558,51 @@ fn provision_rust_inputs(
         })?;
     let (_committed, lock_text) = read_confined_repo_file(Path::new(&repo_root), lock_rel)
         .map_err(|e| format!("td shell rust `{pkg}': {e}"))?;
-    reject_unpinned_dependencies(&lock_text)
+    let cargo_git_sources = match alist.get("cargoGitSources") {
+        None => Vec::new(),
+        Some(value) => build::parse_cargo_git_sources(value)
+            .map_err(|error| format!("td shell rust `{pkg}': {error}"))?,
+    };
+    if !vendor.is_dir() && cargo_git_sources.is_empty() {
+        return Ok(None);
+    }
+    let lock_sources = build::validate_cargo_lock_sources(&lock_text, &cargo_git_sources)
         .map_err(|e| format!("td shell rust `{pkg}': {e}"))?;
-    let pin = shell_recipe_source_pin(pkg)?;
+    let pins = shell_recipe_source_pins(pkg)?;
+    let source_input = alist
+        .get("sourceInput")
+        .and_then(json::Json::as_str)
+        .ok_or_else(|| format!("td shell rust `{pkg}': recipe has no sourceInput"))?;
+    let pin = pins
+        .iter()
+        .find(|pin| pin.key == source_input)
+        .ok_or_else(|| {
+            format!(
+                "td shell rust `{pkg}': sourceInput `{source_input}' has no recipe-owned source pin"
+            )
+        })?;
     let source_archive = pkg_root.join("work").join(&pin.file);
-    verify_shell_source_archive(&source_archive, &pin)?;
-    let ncrate = std::fs::read_dir(&vendor)
-        .map_err(|e| format!("read {}: {e}", vendor.display()))?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|x| x == "crate"))
-        .count();
-    if ncrate == 0 {
+    let ncrate = match std::fs::read_dir(&vendor) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "crate"))
+            .count(),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && !cargo_git_sources.is_empty() => 0,
+        Err(error) => return Err(format!("read {}: {error}", vendor.display())),
+    };
+    if ncrate == 0 && cargo_git_sources.is_empty() {
         return Err(format!(
-            "no `.crate' files under {} — re-run `td-feed warm crate'",
+            "no registry `.crate' files or Cargo Git sources for {} — re-run `td-feed warm crate'",
             vendor.display()
         ));
     }
 
     let work = Path::new(sd);
+    let verified_sources = work.join("sources-verified");
+    clear_dir(&verified_sources)?;
+    let staged_source =
+        stage_verified_shell_source_archive(&source_archive, pin, &verified_sources, 0)?;
     // --- intern the recipe-authenticated source archive ---
     let src_store = work.join("srcstore");
     let src_db = work.join("src.db");
@@ -7465,14 +7611,55 @@ fn provision_rust_inputs(
     let src_canonical = run_store_add(
         self_exe,
         &format!("{pkg}-src"),
-        &source_archive,
+        &staged_source,
         &src_store,
         &src_db,
     )?;
 
+    let mut source_lock = source_lock_body(&pin.key, &src_canonical);
+    if !cargo_git_sources.is_empty() {
+        let sources_dir = crate::bootstrap::shared_sources_dir();
+        for (index, source) in cargo_git_sources.iter().enumerate() {
+            let git_pin = pins
+                .iter()
+                .find(|candidate| candidate.key == source.input)
+                .ok_or_else(|| {
+                    format!(
+                        "td shell rust `{pkg}': Cargo Git input `{}` has no recipe-owned source pin",
+                        source.input
+                    )
+            })?;
+            let archive = sources_dir.join(&git_pin.file);
+            let staged_archive = stage_verified_shell_source_archive(
+                &archive,
+                git_pin,
+                &verified_sources,
+                index.saturating_add(1),
+            )
+            .map_err(|error| {
+                format!(
+                    "td shell rust `{pkg}': {error}; run `td-feed warm sources'"
+                )
+            })?;
+            let canonical = run_store_add(
+                self_exe,
+                &format!("{pkg}-cargo-git-{index}"),
+                &staged_archive,
+                &src_store,
+                &src_db,
+            )?;
+            source_lock.push_str(&format!("{} {canonical} seed\n", source.input));
+        }
+    }
+
     // --- verify, privately stage, and intern the crate set + exact lock ---
     let staged_vendor = work.join("vendor-verified");
-    stage_verified_vendor(&vendor, &lock_text, &staged_vendor)
+    stage_verified_vendor(
+        &vendor,
+        &lock_text,
+        &staged_vendor,
+        lock_sources.registry == 0,
+    )
         .map_err(|e| format!("td shell rust `{pkg}': {e}"))?;
     let vendor_store = work.join("vendorstore");
     let vendor_db = work.join("vendor.db");
@@ -7486,14 +7673,12 @@ fn provision_rust_inputs(
         &vendor_db,
     )?;
 
-    // --- source lock: exact interned package source only --------------------
-    let sourcekey = pin.key;
-    let seed = source_lock_body(&sourcekey, &src_canonical);
+    // --- source lock: exact interned package and Git sources only -----------
     let seedlock = work.join("seed.lock");
 
     Ok(Some((
         seedlock.to_string_lossy().into_owned(),
-        seed,
+        source_lock,
         [
             src_store.to_string_lossy().into_owned(),
             src_db.to_string_lossy().into_owned(),
@@ -11155,17 +11340,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn source_overrides_cover_every_registered_lock_root() {
+        let dir = std::env::temp_dir().join(format!(
+            "td-source-overrides-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let primary = "/td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-tool-src";
+        let git = "/td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-git-src";
+        let unrelated = "/td/store/cccccccccccccccccccccccccccccccc-unrelated";
+        let registered = |path: &str| OutputReg {
+            store_path: path.to_string(),
+            nar_hash: format!("sha256:{}", "1".repeat(64)),
+            nar_size: 1,
+            refs: Vec::new(),
+            deriver: String::new(),
+        };
+        let db = dir.join("src.db");
+        write_output_db(
+            &[registered(primary), registered(git), registered(unrelated)],
+            &db,
+        )
+        .unwrap();
+        let lock = dir.join("seed.lock");
+        std::fs::write(
+            &lock,
+            format!("tool-source {primary} source\ngit-source {git} seed\n"),
+        )
+        .unwrap();
+        let overrides = source_overrides_for_lock(
+            primary,
+            lock.to_str().unwrap(),
+            dir.to_str().unwrap(),
+            db.to_str().unwrap(),
+        )
+        .unwrap();
+        let paths: std::collections::BTreeSet<&str> = overrides
+            .iter()
+            .map(|override_| override_.canonical.as_str())
+            .collect();
+        assert_eq!(paths, std::collections::BTreeSet::from([primary, git]));
+        assert!(!paths.contains(unrelated));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // A warmed extraction is mutable cache state, so td shell consumes only the
     // archived bytes whose digest the recipe catalog commits. The second leg is
     // the verified-red control: changing one source byte must reject the cache.
     #[test]
     fn shell_source_archive_must_match_the_recipe_pin() {
         let pins = "ripgrep-source\thttps://example.invalid/ripgrep.crate\tba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\tripgrep.crate\n";
-        let pin = parse_shell_source_pin(pins).unwrap();
+        let parsed = parse_shell_source_pins(pins).unwrap();
+        let pin = parsed.first().unwrap();
         assert_eq!(pin.key, "ripgrep-source");
         assert_eq!(pin.file, "ripgrep.crate");
+        let second = format!(
+            "{pins}git-source\thttps://example.invalid/git.tar.gz\tba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\tgit.tar.gz\n"
+        );
+        assert_eq!(parse_shell_source_pins(&second).unwrap().len(), 2);
         let malformed_second = format!("{pins}not-a-tab-separated-pin\n");
-        let err = parse_shell_source_pin(&malformed_second).err().unwrap();
+        let err = parse_shell_source_pins(&malformed_second).err().unwrap();
         assert!(err.contains("malformed td shell recipe source pin"), "{err}");
 
         let dir = std::env::temp_dir().join(format!(
@@ -11177,7 +11413,11 @@ mod tests {
         let archive = dir.join("ripgrep.crate");
         std::fs::write(&archive, b"abc").unwrap();
         verify_shell_source_archive(&archive, &pin).unwrap();
+        let private = dir.join("private");
+        let staged =
+            stage_verified_shell_source_archive(&archive, &pin, &private, 0).unwrap();
         std::fs::write(&archive, b"abd").unwrap();
+        verify_shell_source_archive(&staged, &pin).unwrap();
         let err = verify_shell_source_archive(&archive, &pin).unwrap_err();
         assert!(err.contains("!= recipe source pin"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -11203,6 +11443,11 @@ glibc-x86-64 /td/store/gl-glibc td-recipe-output
         assert!(!out.contains("/gnu/store"));
         let padded = format!("\n{source}\n");
         assert_eq!(recipe_toolchain_lock_body(&padded, native).unwrap(), out);
+        let with_git = format!(
+            "{source}codex-crossterm-source /td/store/git-crossterm seed\n"
+        );
+        let git_out = recipe_toolchain_lock_body(&with_git, native).unwrap();
+        assert!(git_out.starts_with(&with_git));
     }
 
     #[test]
@@ -11230,6 +11475,11 @@ glibc-x86-64 /td/store/gl-glibc td-recipe-output
         .is_err());
         assert!(recipe_toolchain_lock_body(
             "ripgrep-source /td/store/src-ripgrep source\nextra /td/store/extra source\n",
+            "rust-toolchain /td/store/final td-recipe-output\n"
+        )
+        .is_err());
+        assert!(recipe_toolchain_lock_body(
+            "ripgrep-source /td/store/src-ripgrep source\nextra /td/store/extra crate\n",
             "rust-toolchain /td/store/final td-recipe-output\n"
         )
         .is_err());
@@ -15248,6 +15498,7 @@ daemon build START (2/2 active)
         std::fs::write(
             &lock,
             "tool-source /td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-tool-source source\n\
+             tool-git-source /td/store/cccccccccccccccccccccccccccccccc-tool-git-source seed\n\
              binutils-x86-64-self /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-binutils-x86-64-self td-recipe-output\n",
         )
         .unwrap();
@@ -15275,6 +15526,23 @@ daemon build START (2/2 active)
             Some("replace")
         );
         assert_ne!(verify_path, replace_path, "lock policy must change the derivation");
+
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let with_git = format!(
+            r#"{{"name":"tool","version":"1","buildSystem":"rust","sourceInput":"tool-source","bins":["tool"],"cargoLock":"recipes/locks/tool/Cargo.lock","cargoGitSources":[{{"source":"git+https://example.invalid/tool?rev={commit}#{commit}","input":"tool-git-source","packages":[{{"name":"git-tool","version":"1.2.3","path":"crate"}}]}}]}}"#
+        );
+        let (_, _, git_drv, _) =
+            assemble_recipe_drv(&with_git, lockp, &dir, Some(vendor)).unwrap();
+        let git_env = env_of(&git_drv, "TD_CARGO_GIT_SOURCES")
+            .expect("Cargo Git declarations must enter the runner environment");
+        let parsed_git_env = build::parse_cargo_git_sources(
+            &json::parse(&git_env).expect("assembled Git env must stay typed JSON"),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed_git_env[0].input,
+            "/td/store/cccccccccccccccccccccccccccccccc-tool-git-source"
+        );
 
         let plain = r#"{"name":"tool","version":"1","buildSystem":"rust","sourceInput":"tool-source","bins":["tool"]}"#;
         let (_, _, plain_drv, _) = assemble_recipe_drv(plain, lockp, &dir, None).unwrap();
@@ -15614,7 +15882,7 @@ daemon build START (2/2 active)
         );
         let absent = dir.with_extension("absent");
         let _ = std::fs::remove_dir_all(&absent);
-        let error = stage_verified_vendor(&absent, &lock, &staged).unwrap_err();
+        let error = stage_verified_vendor(&absent, &lock, &staged, false).unwrap_err();
         assert!(
             error.contains(
                 "\n  cargo run --release --manifest-path builder/Cargo.toml -- check\n"
@@ -15631,7 +15899,7 @@ daemon build START (2/2 active)
         );
         // All present + matching (root without a checksum is excluded ⇒ 2 verified), and
         // exactly the verified crates land in the fresh private staged tree.
-        assert_eq!(stage_verified_vendor(&dir, &lock, &staged).unwrap(), 2);
+        assert_eq!(stage_verified_vendor(&dir, &lock, &staged, false).unwrap(), 2);
         assert!(staged.join("foo-1.2.3.crate").is_file());
         assert!(staged.join("bar-0.1.0.crate").is_file());
         assert_eq!(
@@ -15641,7 +15909,7 @@ daemon build START (2/2 active)
         );
         // A committed crate absent from the vendor dir fails closed.
         let missing = format!("{lock}\n[[package]]\nname = \"baz\"\nversion = \"2.0.0\"\nchecksum = \"{foo}\"\n");
-        assert!(stage_verified_vendor(&dir, &missing, &staged).is_err());
+        assert!(stage_verified_vendor(&dir, &missing, &staged, false).is_err());
         // A checksum mismatch on a PINNED crate (bar re-pinned to foo's sha) fails closed
         // at the per-crate hash. Pin the full dir set (foo+bar) so set-equality passes and
         // this isolates the checksum-mismatch branch rather than the reject-extras scan.
@@ -15650,25 +15918,30 @@ daemon build START (2/2 active)
              [[package]]\nname = \"foo\"\nversion = \"1.2.3\"\nchecksum = \"{foo}\"\n\n\
              [[package]]\nname = \"bar\"\nversion = \"0.1.0\"\nchecksum = \"{foo}\"\n"
         );
-        assert!(stage_verified_vendor(&dir, &tampered, &staged).is_err());
+        assert!(stage_verified_vendor(&dir, &tampered, &staged, false).is_err());
         // A lock pinning no checksummed crates is rejected (nothing to gate).
-        assert!(stage_verified_vendor(&dir, "version = 4\n", &staged).is_err());
+        assert!(stage_verified_vendor(&dir, "version = 4\n", &staged, false).is_err());
+        assert_eq!(
+            stage_verified_vendor(&absent, "version = 4\n", &staged, true).unwrap(),
+            0,
+            "a declared fixed-output Git closure does not need a registry archive"
+        );
         // A smuggled `.crate` the lock does NOT pin fails closed (set equality, not subset).
         write_crate("evil-9.9.9", b"smuggled newer version");
-        assert!(stage_verified_vendor(&dir, &lock, &staged).is_err());
+        assert!(stage_verified_vendor(&dir, &lock, &staged, false).is_err());
         // A committed lock whose crate name carries a path component is rejected before
         // any filesystem join (no `<dir>.join(fname)` escape from the staged/vendor trees).
         let traversal = format!(
             "version = 4\n\n[[package]]\nname = \"../../../../tmp/pwn\"\nversion = \"1.0.0\"\nchecksum = \"{foo}\"\n"
         );
-        assert!(stage_verified_vendor(&dir, &traversal, &staged).is_err());
+        assert!(stage_verified_vendor(&dir, &traversal, &staged, false).is_err());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&absent);
         let _ = std::fs::remove_dir_all(&staged);
     }
 
     #[test]
-    fn reject_unpinned_dependencies_rejects_git_and_unchecksummed() {
+    fn committed_locks_require_declared_git_and_registry_checksums() {
         let hex = "a".repeat(64);
         // A workspace root (no source) plus a checksummed registry dep: accepted.
         let clean = format!(
@@ -15676,24 +15949,39 @@ daemon build START (2/2 active)
              [[package]]\nname = \"theroot\"\nversion = \"0.9.0\"\n\n\
              [[package]]\nname = \"foo\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{hex}\"\n"
         );
-        assert!(reject_unpinned_dependencies(&clean).is_ok());
-        // A git dependency is rejected (git deps are unsupported).
+        assert!(build::validate_cargo_lock_sources(&clean, &[]).is_ok());
+        // A Git dependency without a fixed-output declaration is rejected.
         let git = "version = 4\n\n[[package]]\nname = \"bar\"\nversion = \"0.1.0\"\nsource = \"git+https://example.com/bar#deadbeef\"\n";
-        assert!(reject_unpinned_dependencies(git).is_err());
+        assert!(build::validate_cargo_lock_sources(git, &[]).is_err());
         // A registry dependency with no checksum is rejected.
         let no_sum = "version = 4\n\n[[package]]\nname = \"baz\"\nversion = \"2.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
-        assert!(reject_unpinned_dependencies(no_sum).is_err());
+        assert!(build::validate_cargo_lock_sources(no_sum, &[]).is_err());
         // A registry dependency whose checksum is not 64 hex chars is rejected.
         let bad_sum = "version = 4\n\n[[package]]\nname = \"qux\"\nversion = \"3.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"nothex\"\n";
-        assert!(reject_unpinned_dependencies(bad_sum).is_err());
+        assert!(build::validate_cargo_lock_sources(bad_sum, &[]).is_err());
         // Non-canonical spacing around `=` must not hide a git source from the check.
         let tight_git = "version = 4\n\n[[package]]\nname=\"bar\"\nversion=\"0.1.0\"\nsource=\"git+https://example.com/bar#deadbeef\"\n";
-        assert!(reject_unpinned_dependencies(tight_git).is_err());
+        assert!(build::validate_cargo_lock_sources(tight_git, &[]).is_err());
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let exact_source = format!(
+            "git+https://example.com/bar?rev={commit}#{commit}"
+        );
+        let declared_json = json::parse(&format!(
+            r#"[{{"source":"{exact_source}","input":"bar-source","packages":[{{"name":"bar","version":"0.1.0","path":"."}}]}}]"#
+        ))
+        .unwrap();
+        let declared = build::parse_cargo_git_sources(&declared_json).unwrap();
+        let exact_lock = format!(
+            "version = 4\n\n[[package]]\nname = \"bar\"\nversion = \"0.1.0\"\nsource = \"{exact_source}\"\n"
+        );
+        assert!(build::validate_cargo_lock_sources(&exact_lock, &declared).is_ok());
+        let wrong_version = exact_lock.replace("0.1.0", "0.2.0");
+        assert!(build::validate_cargo_lock_sources(&wrong_version, &declared).is_err());
         // The actual committed uutils lock (verbatim upstream) must pass the gate.
         let real = concat!(env!("CARGO_MANIFEST_DIR"), "/../recipes/locks/uutils/Cargo.lock");
         if let Ok(text) = std::fs::read_to_string(real) {
             assert!(
-                reject_unpinned_dependencies(&text).is_ok(),
+                build::validate_cargo_lock_sources(&text, &[]).is_ok(),
                 "the committed uutils Cargo.lock must be fully checksum-pinned"
             );
         }

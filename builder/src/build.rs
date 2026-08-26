@@ -1378,6 +1378,445 @@ pub(crate) fn valid_cargo_package_name(package: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+const MAX_CARGO_GIT_SOURCES: usize = 64;
+const MAX_CARGO_GIT_PACKAGES: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CargoGitPackage {
+    pub name: String,
+    pub version: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CargoGitSource {
+    pub source: String,
+    pub input: String,
+    pub packages: Vec<CargoGitPackage>,
+}
+
+fn exact_object_fields(value: &Json, expected: &[&str], label: &str) -> Result<(), String> {
+    let Json::Obj(fields) = value else {
+        return Err(format!("{label} must be an object"));
+    };
+    if fields.len() != expected.len()
+        || expected
+            .iter()
+            .any(|key| fields.iter().filter(|(held, _)| held == key).count() != 1)
+    {
+        return Err(format!(
+            "{label} must contain exactly {}",
+            expected.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn cargo_git_input_is_name(input: &str) -> bool {
+    let mut bytes = input.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && input.len() <= 128
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+pub(crate) fn cargo_git_input_is_store_path(input: &str) -> bool {
+    let store_prefix = format!("{}/", crate::store::store_dir().trim_end_matches('/'));
+    input
+        .strip_prefix(&store_prefix)
+        .is_some_and(|basename| {
+            !basename.contains('/') && crate::store::hash_from_store_path(input).is_some()
+        })
+}
+
+fn valid_cargo_git_input(input: &str) -> bool {
+    cargo_git_input_is_name(input) || cargo_git_input_is_store_path(input)
+}
+
+fn valid_cargo_git_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 128
+        && version.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_')
+        })
+}
+
+fn valid_cargo_git_package_path(path: &str) -> bool {
+    path == "." || valid_cargo_subdir(path)
+}
+
+/// Split an exact Cargo Git source id into the source-table key Cargo expects,
+/// the transport URL, and the full commit. td deliberately admits only a
+/// `rev=<40-hex>#<same-40-hex>` HTTPS source: a branch/tag-only lock entry is
+/// not the commit pin AGENTS.md requires.
+pub(crate) fn cargo_git_source_parts(source: &str) -> Result<(String, String, String), String> {
+    if source.is_empty()
+        || source.len() > 1024
+        || source.bytes().any(|byte| matches!(byte, b'\n' | b'\r' | 0))
+    {
+        return Err("Cargo Git source id is empty, oversized, or contains a line break".into());
+    }
+    let source_body = source
+        .strip_prefix("git+")
+        .ok_or_else(|| format!("Cargo Git source id must start with `git+': {source}"))?;
+    let (without_fragment, fragment) = source_body
+        .split_once('#')
+        .ok_or_else(|| format!("Cargo Git source id has no pinned commit fragment: {source}"))?;
+    if fragment.len() != 40
+        || !fragment
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "Cargo Git source id commit must be exactly 40 lowercase hexadecimal digits: {source}"
+        ));
+    }
+    let (url, rev) = without_fragment
+        .rsplit_once("?rev=")
+        .ok_or_else(|| format!("Cargo Git source id must carry `?rev=<commit>': {source}"))?;
+    if !url.starts_with("https://")
+        || url.contains('?')
+        || url.contains('"')
+        || url.contains('\\')
+        || rev != fragment
+    {
+        return Err(format!(
+            "Cargo Git source id must be an HTTPS URL with matching rev and fragment commits: {source}"
+        ));
+    }
+    Ok((
+        format!("git+{without_fragment}"),
+        url.to_string(),
+        fragment.to_string(),
+    ))
+}
+
+/// Parse the typed recipe/env form shared by assembly and the Rust runner.
+/// The `input` is a recipe input name before assembly and its resolved store
+/// path afterwards; callers decide which of those two forms they require.
+pub(crate) fn parse_cargo_git_sources(value: &Json) -> Result<Vec<CargoGitSource>, String> {
+    let sources = value
+        .as_arr()
+        .ok_or("`cargoGitSources' must be an array")?;
+    if sources.is_empty() || sources.len() > MAX_CARGO_GIT_SOURCES {
+        return Err(format!(
+            "`cargoGitSources' must contain 1 through {MAX_CARGO_GIT_SOURCES} sources"
+        ));
+    }
+    let mut parsed = Vec::new();
+    let mut seen_sources = std::collections::BTreeSet::new();
+    let mut seen_inputs = std::collections::BTreeSet::new();
+    let mut seen_packages = std::collections::BTreeSet::new();
+    let mut package_count = 0usize;
+    for source_value in sources {
+        exact_object_fields(
+            source_value,
+            &["source", "input", "packages"],
+            "Cargo Git source",
+        )?;
+        let source = source_value
+            .get("source")
+            .and_then(Json::as_str)
+            .ok_or("Cargo Git source `source' must be a string")?;
+        cargo_git_source_parts(source)?;
+        if !seen_sources.insert(source.to_string()) {
+            return Err(format!("duplicate Cargo Git source id: {source}"));
+        }
+        let input = source_value
+            .get("input")
+            .and_then(Json::as_str)
+            .ok_or("Cargo Git source `input' must be a string")?;
+        if !valid_cargo_git_input(input) {
+            return Err(format!(
+                "Cargo Git source input is neither a plain input name nor a canonical store path: {input}"
+            ));
+        }
+        if !seen_inputs.insert(input.to_string()) {
+            return Err(format!("duplicate Cargo Git source input: {input}"));
+        }
+        let packages = source_value
+            .get("packages")
+            .and_then(Json::as_arr)
+            .ok_or("Cargo Git source `packages' must be an array")?;
+        if packages.is_empty() {
+            return Err(format!("Cargo Git source {source} declares no packages"));
+        }
+        let mut parsed_packages = Vec::new();
+        for package_value in packages {
+            package_count = package_count
+                .checked_add(1)
+                .ok_or("Cargo Git package count overflow")?;
+            if package_count > MAX_CARGO_GIT_PACKAGES {
+                return Err(format!(
+                    "Cargo Git sources declare more than {MAX_CARGO_GIT_PACKAGES} packages"
+                ));
+            }
+            exact_object_fields(
+                package_value,
+                &["name", "version", "path"],
+                "Cargo Git package",
+            )?;
+            let name = package_value
+                .get("name")
+                .and_then(Json::as_str)
+                .ok_or("Cargo Git package `name' must be a string")?;
+            let version = package_value
+                .get("version")
+                .and_then(Json::as_str)
+                .ok_or("Cargo Git package `version' must be a string")?;
+            let path = package_value
+                .get("path")
+                .and_then(Json::as_str)
+                .ok_or("Cargo Git package `path' must be a string")?;
+            if !valid_cargo_package_name(name) {
+                return Err(format!("invalid Cargo Git package name: {name}"));
+            }
+            if !valid_cargo_git_version(version) {
+                return Err(format!("invalid Cargo Git package version: {version}"));
+            }
+            if !valid_cargo_git_package_path(path) {
+                return Err(format!("invalid Cargo Git package path: {path}"));
+            }
+            if !seen_packages.insert((name.to_string(), version.to_string())) {
+                return Err(format!(
+                    "duplicate Cargo Git package destination: {name}-{version}"
+                ));
+            }
+            parsed_packages.push(CargoGitPackage {
+                name: name.to_string(),
+                version: version.to_string(),
+                path: path.to_string(),
+            });
+        }
+        parsed.push(CargoGitSource {
+            source: source.to_string(),
+            input: input.to_string(),
+            packages: parsed_packages,
+        });
+    }
+    Ok(parsed)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CargoLockSourceCounts {
+    pub registry: usize,
+    pub git: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CargoLockPackageSource {
+    Path,
+    Registry,
+    Git,
+}
+
+/// Require every external package in a committed Cargo.lock to have the
+/// fixed-output representation td knows how to stage. Registry packages carry
+/// their ordinary SHA-256. Git packages must match one exact declared
+/// source/name/version tuple, and every declaration must occur in the lock.
+pub(crate) fn validate_cargo_lock_sources(
+    lock_text: &str,
+    git_sources: &[CargoGitSource],
+) -> Result<CargoLockSourceCounts, String> {
+    let declared_git: std::collections::BTreeSet<(String, String, String)> = git_sources
+        .iter()
+        .flat_map(|source| {
+            source.packages.iter().map(|package| {
+                (
+                    package.name.clone(),
+                    package.version.clone(),
+                    source.source.clone(),
+                )
+            })
+        })
+        .collect();
+    let mut found_git = std::collections::BTreeSet::new();
+    let (mut name, mut version, mut source, mut checksum) =
+        (String::new(), String::new(), None, None);
+    let mut in_package = false;
+    let mut counts = CargoLockSourceCounts::default();
+    for line in lock_text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[[package]]" {
+            if in_package {
+                account_cargo_lock_package(
+                    &name,
+                    &version,
+                    &source,
+                    &checksum,
+                    &declared_git,
+                    &mut found_git,
+                    &mut counts,
+                )?;
+            }
+            in_package = true;
+            name.clear();
+            version.clear();
+            source = None;
+            checksum = None;
+        } else if trimmed.starts_with('[') {
+            if in_package {
+                account_cargo_lock_package(
+                    &name,
+                    &version,
+                    &source,
+                    &checksum,
+                    &declared_git,
+                    &mut found_git,
+                    &mut counts,
+                )?;
+                in_package = false;
+            }
+        } else if in_package {
+            if let Some((key, value)) = trimmed.split_once('=') {
+                let value = value.trim().trim_matches('"').to_string();
+                match key.trim() {
+                    "name" => name = value,
+                    "version" => version = value,
+                    "source" => source = Some(value),
+                    "checksum" => checksum = Some(value),
+                    _ => {}
+                }
+            }
+        }
+    }
+    if in_package {
+        account_cargo_lock_package(
+            &name,
+            &version,
+            &source,
+            &checksum,
+            &declared_git,
+            &mut found_git,
+            &mut counts,
+        )?;
+    }
+    if let Some(missing) = declared_git.difference(&found_git).next() {
+        return Err(format!(
+            "declared Cargo Git package `{}-{}' from `{}` is absent from the committed lock",
+            missing.0, missing.1, missing.2
+        ));
+    }
+    Ok(counts)
+}
+
+fn account_cargo_lock_package(
+    name: &str,
+    version: &str,
+    source: &Option<String>,
+    checksum: &Option<String>,
+    declared_git: &std::collections::BTreeSet<(String, String, String)>,
+    found_git: &mut std::collections::BTreeSet<(String, String, String)>,
+    counts: &mut CargoLockSourceCounts,
+) -> Result<(), String> {
+    let kind = check_cargo_lock_package(
+        name,
+        version,
+        source,
+        checksum,
+        declared_git,
+        found_git,
+    )?;
+    let count = match kind {
+        CargoLockPackageSource::Path => return Ok(()),
+        CargoLockPackageSource::Registry => &mut counts.registry,
+        CargoLockPackageSource::Git => &mut counts.git,
+    };
+    *count = (*count)
+        .checked_add(1)
+        .ok_or("committed Cargo.lock package count overflow")?;
+    Ok(())
+}
+
+fn validate_runner_cargo_lock_sources(
+    committed_lock: Option<&[u8]>,
+    git_sources: &[CargoGitSource],
+) -> Result<(), String> {
+    let Some(lock) = committed_lock else {
+        if git_sources.is_empty() {
+            return Ok(());
+        }
+        return Err("Cargo Git sources require a staged committed Cargo.lock".into());
+    };
+    let lock = std::str::from_utf8(lock)
+        .map_err(|error| format!("staged committed Cargo.lock is not UTF-8: {error}"))?;
+    validate_cargo_lock_sources(lock, git_sources).map(|_| ())
+}
+
+fn check_cargo_lock_package(
+    name: &str,
+    version: &str,
+    source: &Option<String>,
+    checksum: &Option<String>,
+    declared_git: &std::collections::BTreeSet<(String, String, String)>,
+    found_git: &mut std::collections::BTreeSet<(String, String, String)>,
+) -> Result<CargoLockPackageSource, String> {
+    let Some(source) = source else {
+        return Ok(CargoLockPackageSource::Path);
+    };
+    if name.is_empty() || version.is_empty() {
+        return Err(format!(
+            "committed lock external package from `{source}' has no name or version"
+        ));
+    }
+    if source.starts_with("git+") {
+        let key = (name.to_string(), version.to_string(), source.to_string());
+        if !declared_git.contains(&key) {
+            return Err(format!(
+                "committed lock package `{name}-{version}' is an undeclared Git dependency (`{source}') — add an explicitly approved fixed-output cargoGitSources mapping"
+            ));
+        }
+        found_git.insert(key);
+        return Ok(CargoLockPackageSource::Git);
+    }
+    if !source.starts_with("registry+") {
+        return Err(format!(
+            "committed lock package `{name}-{version}' has unsupported source `{source}'"
+        ));
+    }
+    match checksum {
+        Some(value)
+            if value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+        {
+            Ok(CargoLockPackageSource::Registry)
+        }
+        _ => Err(format!(
+            "committed lock package `{name}' has registry source `{source}' but no valid sha256 checksum"
+        )),
+    }
+}
+
+fn cargo_vendor_config(
+    has_registry_packages: bool,
+    git_sources: &[CargoGitSource],
+    vendor_dir: &str,
+) -> Result<String, String> {
+    if vendor_dir
+        .bytes()
+        .any(|byte| matches!(byte, b'"' | b'\\' | b'\n' | b'\r' | 0))
+    {
+        return Err(format!(
+            "Cargo vendor directory cannot be represented as a literal TOML path: {vendor_dir}"
+        ));
+    }
+    let mut config = String::new();
+    if has_registry_packages {
+        config.push_str("[source.crates-io]\nreplace-with = \"vendored-sources\"\n");
+    }
+    for source in git_sources {
+        let (key, url, rev) = cargo_git_source_parts(&source.source)?;
+        config.push_str(&format!(
+            "[source.\"{key}\"]\ngit = \"{url}\"\nrev = \"{rev}\"\nreplace-with = \"vendored-sources\"\n"
+        ));
+    }
+    config.push_str(&format!(
+        "[source.vendored-sources]\ndirectory = \"{vendor_dir}\"\n"
+    ));
+    Ok(config)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CargoLockPolicy {
     Verify,
@@ -1444,7 +1883,7 @@ fn enforce_cargo_lock_policy(
     cargo_dir: &Path,
     staged_vendor_dir: &Path,
     policy: CargoLockPolicy,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     let committed_path = staged_vendor_dir.join(STAGED_CARGO_LOCK);
     let committed = read_regular_file(&committed_path, "staged committed Cargo.lock")?;
     let source_path = cargo_dir.join("Cargo.lock");
@@ -1454,7 +1893,7 @@ fn enforce_cargo_lock_policy(
             "source workspace Cargo.lock {} does not byte-match the committed lock; update the reviewed lock from the pinned source, or declare replaceCargoLock for an intentional normalized workspace lock",
             source_path.display()
         )),
-        CargoLockPolicy::Verify => Ok(()),
+        CargoLockPolicy::Verify => Ok(committed),
         CargoLockPolicy::Replace => {
             if source != committed {
                 write_regular_file(
@@ -1463,7 +1902,7 @@ fn enforce_cargo_lock_policy(
                     &committed,
                 )?;
             }
-            Ok(())
+            Ok(committed)
         }
     }
 }
@@ -1502,6 +1941,9 @@ fn enforce_cargo_lock_policy(
 ///                lock is `TD_VENDOR_DIR/.td-Cargo.lock`; verify requires the
 ///                materialized workspace lock to byte-match it, while replace
 ///                writes those exact reviewed bytes before cargo `--frozen`.
+///   TD_CARGO_GIT_SOURCES optional typed JSON mapping exact Cargo Git source ids
+///                to fixed-output source archive store paths and the package
+///                directories copied from each archive into the vendor tree.
 ///   TD_VENDOR_CRATES optional ':'-joined `.crate` STORE paths (the dependency closure
 ///                pinned by Cargo.lock; nv from the store-path basename). The guix-realized
 ///                FOD inputs.
@@ -1544,6 +1986,26 @@ pub fn run_rust() -> Result<(), String> {
             return Err("TD_CARGO_LOCK_POLICY is not valid UTF-8".into())
         }
     };
+    let cargo_git_sources = match env::var("TD_CARGO_GIT_SOURCES") {
+        Ok(value) => {
+            let parsed = crate::json::parse(&value)
+                .map_err(|error| format!("TD_CARGO_GIT_SOURCES JSON: {error}"))?;
+            let sources = parse_cargo_git_sources(&parsed)?;
+            for source in &sources {
+                if !cargo_git_input_is_store_path(&source.input) {
+                    return Err(format!(
+                        "TD_CARGO_GIT_SOURCES input is not a canonical active-store path: {}",
+                        source.input
+                    ));
+                }
+            }
+            sources
+        }
+        Err(env::VarError::NotPresent) => Vec::new(),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err("TD_CARGO_GIT_SOURCES is not valid UTF-8".into())
+        }
+    };
     let vendor_input_dir = match env::var("TD_VENDOR_DIR") {
         Ok(value) => value,
         Err(env::VarError::NotPresent) => String::new(),
@@ -1554,6 +2016,9 @@ pub fn run_rust() -> Result<(), String> {
     let bins: Vec<&str> = bins_spec.split_whitespace().collect();
     if bins.is_empty() {
         return Err("TD_RUST_BINS is empty (no binaries to install)".into());
+    }
+    if !cargo_git_sources.is_empty() && cargo_lock_policy.is_none() {
+        return Err("TD_CARGO_GIT_SOURCES requires TD_CARGO_LOCK_POLICY".into());
     }
 
     // set-paths: PATH from inputs' bin/ dirs; LIBRARY_PATH from lib/lib64 so the
@@ -1633,13 +2098,20 @@ pub fn run_rust() -> Result<(), String> {
         &build_abs,
         cargo_subdir.as_deref(),
     )?;
-    if let Some(policy) = cargo_lock_policy {
+    let committed_lock = if let Some(policy) = cargo_lock_policy {
         if vendor_input_dir.is_empty() {
             return Err("TD_CARGO_LOCK_POLICY requires TD_VENDOR_DIR".into());
         }
         require_selected_cargo_workspace(&cargo, &cargo_dir, &path_env)?;
-        enforce_cargo_lock_policy(&cargo_dir, Path::new(&vendor_input_dir), policy)?;
-    }
+        Some(enforce_cargo_lock_policy(
+            &cargo_dir,
+            Path::new(&vendor_input_dir),
+            policy,
+        )?)
+    } else {
+        None
+    };
+    validate_runner_cargo_lock_sources(committed_lock.as_deref(), &cargo_git_sources)?;
     let cargo_dir_str = cargo_dir
         .to_str()
         .ok_or("non-utf8 Cargo workspace path")?
@@ -1727,18 +2199,16 @@ pub fn run_rust() -> Result<(), String> {
     }
     envs.push(("LDFLAGS".into(), ldflags));
 
-    // vendored deps: if TD_VENDOR_CRATES is set, assemble a cargo `vendored-sources`
-    // directory from each `.crate` (untar -> `<name>-<version>/`, plus a minimal
-    // `.cargo-checksum.json` whose `package` is the crate's sha256 — cargo verifies
-    // only that against Cargo.lock, not the per-file map) and point CARGO_HOME's
-    // config at it, so `cargo build --offline` resolves deps from the vendor dir
-    // instead of the network. Unset ⇒ the dependency-free self-host path, unchanged.
+    // Assemble one Cargo vendor directory from registry archives and reviewed
+    // fixed-output Git archives. Registry packages retain their Cargo.lock
+    // checksums. Git packages have no registry checksum; their archive input's
+    // fixed-output hash authenticates the source tree before this runner starts.
     fs::create_dir_all(&cargo_home).map_err(|e| format!("mkdir CARGO_HOME {cargo_home}: {e}"))?;
     let crate_files = collect_vendor_crates(
         &env::var("TD_VENDOR_CRATES").unwrap_or_default(),
         &vendor_input_dir,
     )?;
-    if !crate_files.is_empty() {
+    if !crate_files.is_empty() || !cargo_git_sources.is_empty() {
         let tar = find_in_path(&path, "tar").ok_or("tar not found in TD_INPUTS (vendor)")?;
         fs::create_dir_all(&vendor_dir).map_err(|e| format!("mkdir vendor: {e}"))?;
         for (c, nv) in &crate_files {
@@ -1757,10 +2227,80 @@ pub fn run_rust() -> Result<(), String> {
             fs::write(cdir.join(".cargo-checksum.json"), format!("{{\"files\":{{}},\"package\":\"{sha}\"}}"))
                 .map_err(|e| format!("write checksum for {nv}: {e}"))?;
         }
-        // CARGO_HOME config: replace crates-io with the assembled vendor dir.
+        let git_unpack = cwd.join("td-rust-git-sources");
+        for (index, source) in cargo_git_sources.iter().enumerate() {
+            let archive = Path::new(&source.input);
+            let metadata = fs::symlink_metadata(archive).map_err(|error| {
+                format!("inspect Cargo Git source archive {}: {error}", archive.display())
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(format!(
+                    "Cargo Git source archive is not a regular file: {}",
+                    archive.display()
+                ));
+            }
+            let unpack = git_unpack.join(index.to_string());
+            fs::create_dir_all(&unpack)
+                .map_err(|error| format!("mkdir {}: {error}", unpack.display()))?;
+            let unpack_text = unpack
+                .to_str()
+                .ok_or("non-utf8 Cargo Git source unpack directory")?;
+            run_cmd(
+                &tar,
+                &["xf", source.input.as_str(), "-C", unpack_text],
+                ".",
+                &path_env,
+                &WATCH_PHASE,
+            )?;
+            let archive_root = PathBuf::from(single_subdir(unpack_text)?);
+            let root_metadata = fs::symlink_metadata(&archive_root).map_err(|error| {
+                format!("inspect Cargo Git archive root {}: {error}", archive_root.display())
+            })?;
+            if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+                return Err(format!(
+                    "Cargo Git archive root is not a real directory: {}",
+                    archive_root.display()
+                ));
+            }
+            for package in &source.packages {
+                let package_root = cargo_git_package_root(&archive_root, &package.path)?;
+                let manifest = package_root.join("Cargo.toml");
+                let manifest_metadata = fs::symlink_metadata(&manifest).map_err(|error| {
+                    format!("inspect Cargo Git package manifest {}: {error}", manifest.display())
+                })?;
+                if manifest_metadata.file_type().is_symlink() || !manifest_metadata.is_file() {
+                    return Err(format!(
+                        "Cargo Git package has no regular Cargo.toml: {}",
+                        manifest.display()
+                    ));
+                }
+                let destination =
+                    vendor_dir.join(format!("{}-{}", package.name, package.version));
+                if destination.exists() {
+                    return Err(format!(
+                        "duplicate Cargo vendor destination: {}",
+                        destination.display()
+                    ));
+                }
+                copy_tree_writable(&package_root, &destination)?;
+                fs::write(
+                    destination.join(".cargo-checksum.json"),
+                    "{\"files\":{},\"package\":null}",
+                )
+                .map_err(|error| {
+                    format!(
+                        "write Git package checksum for {}: {error}",
+                        destination.display()
+                    )
+                })?;
+            }
+        }
+
+        let cargo_config =
+            cargo_vendor_config(!crate_files.is_empty(), &cargo_git_sources, &vendor_abs)?;
         fs::write(
             format!("{cargo_home}/config.toml"),
-            format!("[source.crates-io]\nreplace-with = \"vendored-sources\"\n[source.vendored-sources]\ndirectory = \"{vendor_abs}\"\n"),
+            cargo_config,
         )
         .map_err(|e| format!("write cargo config: {e}"))?;
     }
@@ -1806,6 +2346,35 @@ pub fn run_rust() -> Result<(), String> {
     }
     split_debug_tree(Path::new(&out), Path::new(&objcopy), &recipe_name)?;
     Ok(())
+}
+
+fn cargo_git_package_root(archive_root: &Path, path: &str) -> Result<PathBuf, String> {
+    if !valid_cargo_git_package_path(path) {
+        return Err(format!("invalid Cargo Git package path: {path}"));
+    }
+    let mut current = archive_root.to_path_buf();
+    if path == "." {
+        return Ok(current);
+    }
+    for component in Path::new(path).components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(format!("invalid Cargo Git package path: {path}"));
+        };
+        current.push(component);
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            format!(
+                "inspect Cargo Git package path {}: {error}",
+                current.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(format!(
+                "Cargo Git package path traverses a symlink or non-directory: {}",
+                current.display()
+            ));
+        }
+    }
+    Ok(current)
 }
 
 fn cargo_workspace_dir(source_root: &Path, subdir: Option<&str>) -> Result<PathBuf, String> {
@@ -4350,6 +4919,142 @@ pub fn run_mesboot() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cargo_git_fixture() -> (String, Vec<CargoGitSource>) {
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let source = format!(
+            "git+https://example.invalid/example?rev={commit}#{commit}"
+        );
+        let declaration = crate::json::parse(&format!(
+            r#"[{{"source":"{source}","input":"example-git-source","packages":[{{"name":"gitdep","version":"1.2.3","path":"crate"}}]}}]"#
+        ))
+        .unwrap();
+        (source, parse_cargo_git_sources(&declaration).unwrap())
+    }
+
+    #[test]
+    fn cargo_git_sources_require_exact_commits_and_typed_packages() {
+        let (source, parsed) = cargo_git_fixture();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].source, source);
+        assert_eq!(parsed[0].input, "example-git-source");
+        assert_eq!(parsed[0].packages[0].path, "crate");
+
+        for invalid in [
+            source.replace("?rev=", "?branch="),
+            source.replace(
+                "0123456789abcdef0123456789abcdef01234567",
+                "0123456789ABCDEF0123456789ABCDEF01234567",
+            ),
+            source.replace(
+                "#0123456789abcdef0123456789abcdef01234567",
+                "#fedcba9876543210fedcba9876543210fedcba98",
+            ),
+            "git+http://example.invalid/example?rev=0123456789abcdef0123456789abcdef01234567#0123456789abcdef0123456789abcdef01234567".into(),
+        ] {
+            let declaration = crate::json::parse(&format!(
+                r#"[{{"source":"{invalid}","input":"example-git-source","packages":[{{"name":"gitdep","version":"1.2.3","path":"crate"}}]}}]"#
+            ))
+            .unwrap();
+            assert!(parse_cargo_git_sources(&declaration).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn rust_runner_rejects_git_lock_entries_without_declarations() {
+        let (source, declared) = cargo_git_fixture();
+        let lock = format!(
+            "version = 4\n\n[[package]]\nname = \"gitdep\"\nversion = \"1.2.3\"\nsource = \"{source}\"\n"
+        );
+        let error = validate_runner_cargo_lock_sources(Some(lock.as_bytes()), &[])
+            .unwrap_err();
+        assert!(error.contains("undeclared Git dependency"), "{error}");
+        validate_runner_cargo_lock_sources(Some(lock.as_bytes()), &declared).unwrap();
+        assert!(validate_runner_cargo_lock_sources(None, &declared).is_err());
+    }
+
+    #[test]
+    fn cargo_git_package_paths_refuse_symlink_traversal() {
+        let base = std::env::temp_dir().join(format!(
+            "td-cargo-git-path-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("root");
+        let outside = base.join("outside");
+        fs::create_dir_all(root.join("real/nested")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linked")).unwrap();
+        assert_eq!(
+            cargo_git_package_root(&root, "real/nested").unwrap(),
+            root.join("real/nested")
+        );
+        let error = cargo_git_package_root(&root, "linked").unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+        assert!(cargo_git_package_root(&root, "../outside").is_err());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cargo_git_vendor_config_resolves_offline_without_a_git_checkout() {
+        let base = std::env::temp_dir().join(format!(
+            "td-cargo-git-vendor-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("consumer");
+        let cargo_home = base.join("cargo-home");
+        let vendor = base.join("vendor");
+        let package = vendor.join("gitdep-1.2.3");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(cargo_home.as_path()).unwrap();
+        fs::create_dir_all(package.join("src")).unwrap();
+        let (source, sources) = cargo_git_fixture();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ngitdep = { git = \"https://example.invalid/example\", rev = \"0123456789abcdef0123456789abcdef01234567\" }\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() { gitdep::called(); }\n").unwrap();
+        fs::write(
+            root.join("Cargo.lock"),
+            format!(
+                "version = 4\n\n[[package]]\nname = \"consumer\"\nversion = \"0.1.0\"\ndependencies = [\n \"gitdep\",\n]\n\n[[package]]\nname = \"gitdep\"\nversion = \"1.2.3\"\nsource = \"{source}\"\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            package.join("Cargo.toml"),
+            "[package]\nname = \"gitdep\"\nversion = \"1.2.3\"\nedition = \"2021\"\n[lib]\npath = \"src/lib.rs\"\n",
+        )
+        .unwrap();
+        fs::write(package.join("src/lib.rs"), "pub fn called() {}\n").unwrap();
+        fs::write(
+            package.join(".cargo-checksum.json"),
+            "{\"files\":{},\"package\":null}",
+        )
+        .unwrap();
+        let vendor_text = vendor.to_str().unwrap();
+        fs::write(
+            cargo_home.join("config.toml"),
+            cargo_vendor_config(false, &sources, vendor_text).unwrap(),
+        )
+        .unwrap();
+
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let output = Command::new(cargo)
+            .args(["check", "--offline", "--frozen"])
+            .current_dir(&root)
+            .env("CARGO_HOME", &cargo_home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cargo did not accept the exact Git source replacement:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn cargo_workspace_selection_stays_below_the_source_root() {
